@@ -14,7 +14,7 @@ jobs:
     name: cargo test --workspace
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           # The git_history integration tests walk this repo's history.
           # Default shallow clone produces 0 commits after soft-skip filters
