@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version from tag
+        id: ver
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Extract CHANGELOG section for this version
+        id: notes
+        run: |
+          version='${{ steps.ver.outputs.version }}'
+          # Print lines between '## [VERSION]' and the next top-level '## ' heading.
+          # Strip the version heading itself; release UI already shows it.
+          # Skip markdown link references like '[Unreleased]: https://...' that
+          # accumulate at the bottom of CHANGELOG.md and would render as raw text.
+          awk -v ver="$version" '
+            $0 ~ "^## \\[" ver "\\]" { found=1; next }
+            found && /^## / { exit }
+            found && /^\[[^]]+\]: / { next }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+
+          if [ ! -s release-notes.md ]; then
+            echo "::error::No CHANGELOG section found for [$version]. Update CHANGELOG.md before tagging." >&2
+            exit 1
+          fi
+
+          # Trim leading and trailing blank lines for a tidier release body.
+          sed -i -e '/./,$!d' -e ':a; /^\s*$/ { $d; N; ba; }' release-notes.md
+
+          echo "--- release notes for ${{ steps.ver.outputs.tag }} ---"
+          cat release-notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag='${{ steps.ver.outputs.tag }}'
+          # Pre-1.0: every release marked as a normal release (not pre-release).
+          # GitHub auto-attaches source tarball + zip for the tag.
+          gh release create "$tag" \
+            --title "$tag" \
+            --notes-file release-notes.md \
+            --verify-tag

@@ -92,7 +92,17 @@ This repo follows [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/)
 
 - Put entries under `## [Unreleased]` at the top of the file, in one of the standard sections: `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`.
 - One bullet per change, written for the reader of the next release notes — describe the user-observable effect, not the implementation.
-- When cutting a release: rename `[Unreleased]` to `[X.Y.Z] - YYYY-MM-DD`, add a fresh empty `[Unreleased]` above it, bump the workspace version, and tag `vX.Y.Z`.
+
+### Cutting a release
+
+1. Move everything under `## [Unreleased]` into a new `## [X.Y.Z] - YYYY-MM-DD` section. Leave `## [Unreleased]` empty above it.
+2. Append a link reference at the bottom of `CHANGELOG.md`: `[X.Y.Z]: https://github.com/iliaal/codesage/releases/tag/vX.Y.Z` and update the `[Unreleased]` compare URL to `...vX.Y.Z...HEAD`.
+3. Bump `[workspace.package] version` in the root `Cargo.toml`. All six crates inherit it.
+4. Commit: `git commit -am "release: vX.Y.Z"`.
+5. Tag: `git tag -a vX.Y.Z -m "codesage X.Y.Z"`.
+6. Push: `git push origin master && git push origin vX.Y.Z`.
+
+The `Release` workflow (`.github/workflows/release.yml`) fires on the tag push, extracts the matching `[X.Y.Z]` section from `CHANGELOG.md`, and creates a GitHub Release with those notes plus the auto-attached source tarball. If the section is empty or missing, the workflow fails.
 
 Pre-1.0 rule: minor bumps may include breaking changes, patch bumps are backwards-compatible within a minor line.
 

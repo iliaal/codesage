@@ -17,6 +17,7 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 - Secret-scan workflow (`.github/workflows/secret-scan.yml`): runs `scripts/leak-check.sh --range <base>..<head>` against the PR diff (or `--all` on push to master) and `gitleaks-action` for generic credential detection.
 - `scripts/leak-check.sh` gains `--range A..B` and `--all` modes so the same script powers both the pre-commit hook and CI.
 - `rust-toolchain.toml` pinning to `stable` with `rustfmt` and `clippy` components.
+- Release workflow (`.github/workflows/release.yml`): pushing a `vX.Y.Z` tag automatically creates a GitHub Release with notes extracted from the matching `[X.Y.Z]` section of `CHANGELOG.md`. Fails if the section is missing or empty. AGENTS.md "Cutting a release" lists the steps.
 
 ### Changed
 
