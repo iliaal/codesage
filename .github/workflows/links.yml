@@ -1,0 +1,32 @@
+name: Link check
+
+on:
+  schedule:
+    # Weekly, Monday 07:23 UTC. Catches link rot from external URL changes
+    # without spamming the action queue.
+    - cron: '23 7 * * 1'
+  pull_request:
+    paths:
+      - '**/*.md'
+      - '.github/workflows/links.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lychee:
+    name: lychee
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lycheeverse/lychee-action@v2
+        with:
+          # Scan all markdown in the repo. fail: true exits non-zero on any
+          # broken link, surfacing the failure as a check rejection.
+          args: --verbose --no-progress './**/*.md'
+          fail: true
+        env:
+          # GitHub-hosted URLs hit secondary rate limits anonymously.
+          # The default GITHUB_TOKEN is enough to lift the limit.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
