@@ -1,9 +1,7 @@
 use std::path::Path;
 
 use anyhow::Result;
-use codesage_protocol::{
-    DependencyEntry, FileInfo, Reference, ReferenceKind, Symbol, SymbolKind,
-};
+use codesage_protocol::{DependencyEntry, FileInfo, Reference, ReferenceKind, Symbol, SymbolKind};
 use rusqlite::{Connection, params};
 
 use crate::schema::{ensure_chunk_table, init_db, init_vec_extension, model_table_name, name_tail};
@@ -43,10 +41,7 @@ impl Database {
         init_db(&conn)?;
         let chunk_table = model_table_name("default", DEFAULT_EMBEDDING_DIM);
         ensure_chunk_table(&conn, &chunk_table, DEFAULT_EMBEDDING_DIM)?;
-        Ok(Database {
-            conn,
-            chunk_table,
-        })
+        Ok(Database { conn, chunk_table })
     }
 
     pub fn chunk_table_name(&self) -> &str {
@@ -189,7 +184,8 @@ impl Database {
         to_name: &str,
         kind: Option<ReferenceKind>,
     ) -> Result<Vec<Reference>> {
-        let is_qualified = to_name.contains('\\') || to_name.contains("::") || to_name.contains('/');
+        let is_qualified =
+            to_name.contains('\\') || to_name.contains("::") || to_name.contains('/');
 
         let mut refs = if is_qualified {
             self.query_refs(
@@ -379,16 +375,15 @@ impl Database {
 
         for (content, start_line, end_line, embedding) in chunks {
             let bytes = embedding_to_bytes(embedding);
-            vec_stmt.execute(params![file_path, language, content, start_line, end_line, bytes])?;
+            vec_stmt.execute(params![
+                file_path, language, content, start_line, end_line, bytes
+            ])?;
         }
         Ok(())
     }
 
     pub fn delete_chunks_for_file(&self, file_path: &str) -> Result<usize> {
-        let sql = format!(
-            "DELETE FROM \"{}\" WHERE file_path = ?1",
-            self.chunk_table
-        );
+        let sql = format!("DELETE FROM \"{}\" WHERE file_path = ?1", self.chunk_table);
         let count = self.conn.execute(&sql, params![file_path])?;
         Ok(count)
     }
@@ -638,7 +633,10 @@ impl Database {
         count: u32,
         last_observed_at: Option<i64>,
     ) -> Result<()> {
-        debug_assert!(file_a < file_b, "co-change pair must be sorted: {file_a} >= {file_b}");
+        debug_assert!(
+            file_a < file_b,
+            "co-change pair must be sorted: {file_a} >= {file_b}"
+        );
         self.conn.execute(
             "INSERT INTO git_co_changes (file_a, file_b, weight, count, last_observed_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -737,7 +735,10 @@ impl Database {
         add_count: u32,
         last_observed_at: Option<i64>,
     ) -> Result<()> {
-        debug_assert!(file_a < file_b, "co-change pair must be sorted: {file_a} >= {file_b}");
+        debug_assert!(
+            file_a < file_b,
+            "co-change pair must be sorted: {file_a} >= {file_b}"
+        );
         self.conn.execute(
             "INSERT INTO git_co_changes (file_a, file_b, weight, count, last_observed_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -1074,12 +1075,8 @@ mod tests {
             &[("close code".to_string(), 1, 5, e_close.clone())],
         )
         .unwrap();
-        db.insert_chunks(
-            "far.rs",
-            "rust",
-            &[("far code".to_string(), 1, 5, e_far)],
-        )
-        .unwrap();
+        db.insert_chunks("far.rs", "rust", &[("far code".to_string(), 1, 5, e_far)])
+            .unwrap();
         let query_bytes = super::embedding_to_bytes(&e_close);
         let results = db.search_knn(&query_bytes, 2, None).unwrap();
         assert_eq!(results.len(), 2);

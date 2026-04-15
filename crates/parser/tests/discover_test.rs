@@ -1,5 +1,5 @@
-use codesage_protocol::Language;
 use codesage_parser::discover::discover_files_with_excludes;
+use codesage_protocol::Language;
 
 #[test]
 fn discovers_only_supported_languages() {
@@ -8,7 +8,11 @@ fn discovers_only_supported_languages() {
 
     std::fs::write(root.join("controller.php"), "<?php\nclass Foo {}\n").unwrap();
     std::fs::write(root.join("main.py"), "def main(): pass\n").unwrap();
-    std::fs::write(root.join("util.c"), "int add(int a, int b) { return a + b; }\n").unwrap();
+    std::fs::write(
+        root.join("util.c"),
+        "int add(int a, int b) { return a + b; }\n",
+    )
+    .unwrap();
     std::fs::write(root.join("header.h"), "#pragma once\nint add(int, int);\n").unwrap();
     std::fs::write(root.join("readme.txt"), "ignore me\n").unwrap();
     std::fs::write(root.join("Makefile"), "all:\n\techo hi\n").unwrap();
@@ -23,10 +27,30 @@ fn discovers_only_supported_languages() {
     assert!(names.contains(&"util.c"));
     assert!(names.contains(&"header.h"));
 
-    assert_eq!(files.iter().find(|f| f.path == "controller.php").unwrap().language, Language::Php);
-    assert_eq!(files.iter().find(|f| f.path == "main.py").unwrap().language, Language::Python);
-    assert_eq!(files.iter().find(|f| f.path == "util.c").unwrap().language, Language::C);
-    assert_eq!(files.iter().find(|f| f.path == "header.h").unwrap().language, Language::C);
+    assert_eq!(
+        files
+            .iter()
+            .find(|f| f.path == "controller.php")
+            .unwrap()
+            .language,
+        Language::Php
+    );
+    assert_eq!(
+        files.iter().find(|f| f.path == "main.py").unwrap().language,
+        Language::Python
+    );
+    assert_eq!(
+        files.iter().find(|f| f.path == "util.c").unwrap().language,
+        Language::C
+    );
+    assert_eq!(
+        files
+            .iter()
+            .find(|f| f.path == "header.h")
+            .unwrap()
+            .language,
+        Language::C
+    );
 
     for f in &files {
         assert!(!f.content_hash.is_empty());

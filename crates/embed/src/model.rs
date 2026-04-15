@@ -28,7 +28,11 @@ fn discover_nvidia_lib_dirs() -> &'static Vec<PathBuf> {
             roots.push(PathBuf::from(explicit));
         }
 
-        roots.extend(probe_python_site_packages().into_iter().map(|p| p.join("nvidia")));
+        roots.extend(
+            probe_python_site_packages()
+                .into_iter()
+                .map(|p| p.join("nvidia")),
+        );
 
         for sys in [
             "/usr/lib/x86_64-linux-gnu/nvidia",
@@ -164,7 +168,10 @@ fn discover_ort_dylib() -> Option<PathBuf> {
         }
     }
 
-    for sys in ["/usr/lib/libonnxruntime.so", "/usr/local/lib/libonnxruntime.so"] {
+    for sys in [
+        "/usr/lib/libonnxruntime.so",
+        "/usr/local/lib/libonnxruntime.so",
+    ] {
         let p = PathBuf::from(sys);
         if p.exists() {
             return Some(p);
@@ -253,7 +260,9 @@ impl Embedder {
             }
             #[cfg(not(feature = "cuda"))]
             {
-                anyhow::bail!("GPU requested but binary built without cuda feature. Rebuild with: cargo build --features cuda");
+                anyhow::bail!(
+                    "GPU requested but binary built without cuda feature. Rebuild with: cargo build --features cuda"
+                );
             }
         }
 
@@ -392,8 +401,9 @@ fn detect_dim(session: &Session) -> Result<usize> {
     let output = &session.outputs()[0];
     if let ort::value::ValueType::Tensor { shape, .. } = output.dtype()
         && let Some(&d) = shape.last()
-            && d > 0 {
-                return Ok(d as usize);
-            }
+        && d > 0
+    {
+        return Ok(d as usize);
+    }
     Ok(crate::config::DEFAULT_EMBEDDING_DIM)
 }

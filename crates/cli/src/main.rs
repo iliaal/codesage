@@ -9,8 +9,8 @@ use codesage_embed::config::ProjectConfig;
 use codesage_embed::model::Embedder;
 use codesage_graph::{
     assess_risk, export_context, find_coupling, find_references, find_symbol, full_index,
-    impact_analysis, incremental_index, list_dependencies, search,
-    semantic_full_index, semantic_incremental_index,
+    impact_analysis, incremental_index, list_dependencies, search, semantic_full_index,
+    semantic_incremental_index,
 };
 use codesage_parser::discover::DEFAULT_EXCLUDE_PATTERNS;
 use codesage_protocol::{
@@ -23,7 +23,11 @@ pub(crate) const PROJECT_DIR: &str = ".codesage";
 pub(crate) const DB_FILE: &str = "index.db";
 
 #[derive(Parser)]
-#[command(name = "codesage", version, about = "Code intelligence engine for AI agents: semantic search, structural graph, impact analysis")]
+#[command(
+    name = "codesage",
+    version,
+    about = "Code intelligence engine for AI agents: semantic search, structural graph, impact analysis"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -182,8 +186,9 @@ enum Commands {
 }
 
 fn find_project_root() -> Result<PathBuf> {
-    find_project_root_opt()
-        .ok_or_else(|| anyhow::anyhow!("not a codesage project (no .codesage/ found). Run 'codesage init' first."))
+    find_project_root_opt().ok_or_else(|| {
+        anyhow::anyhow!("not a codesage project (no .codesage/ found). Run 'codesage init' first.")
+    })
 }
 
 pub(crate) fn find_project_root_opt() -> Option<PathBuf> {
@@ -222,7 +227,11 @@ fn get_exclude_patterns(config: &ProjectConfig) -> Vec<String> {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    if let Some(user) = config.index.as_ref().and_then(|i| i.exclude_patterns.clone()) {
+    if let Some(user) = config
+        .index
+        .as_ref()
+        .and_then(|i| i.exclude_patterns.clone())
+    {
         patterns.extend(user);
     }
     patterns
@@ -232,7 +241,11 @@ fn get_exclude_patterns(config: &ProjectConfig) -> Vec<String> {
 /// Shared by `cmd_search` and `cmd_export`.
 fn load_query_stack(
     root: &Path,
-) -> Result<(Database, Embedder, Option<codesage_embed::reranker::Reranker>)> {
+) -> Result<(
+    Database,
+    Embedder,
+    Option<codesage_embed::reranker::Reranker>,
+)> {
     let config = load_project_config(root);
     let emb_config = config.embedding.unwrap_or_default();
     let embedder = Embedder::new(&emb_config)?;
@@ -284,7 +297,11 @@ fn main() -> Result<()> {
         Commands::InstallHooks => cmd_install_hooks(),
         Commands::Cleanup { dry_run } => cmd_cleanup(dry_run),
         Commands::Doctor { json } => doctor::run(json),
-        Commands::GitIndex { json, full, incremental } => cmd_git_index(json, full, incremental),
+        Commands::GitIndex {
+            json,
+            full,
+            incremental,
+        } => cmd_git_index(json, full, incremental),
         Commands::Coupling { file, limit, json } => cmd_coupling(&file, limit, json),
         Commands::Risk { file, json } => cmd_risk(&file, json),
     }
@@ -327,7 +344,10 @@ fn cmd_install_hooks() -> Result<()> {
         if path.exists() {
             let existing = std::fs::read_to_string(&path).unwrap_or_default();
             if !existing.contains("codesage install-hooks") {
-                println!("skip: {} already exists and is not a codesage hook", path.display());
+                println!(
+                    "skip: {} already exists and is not a codesage hook",
+                    path.display()
+                );
                 continue;
             }
         }
@@ -371,7 +391,10 @@ fn install_leak_check_hook(
     if path.exists() {
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
         if !existing.contains("codesage install-hooks") {
-            println!("skip: {} already exists and is not a codesage hook", path.display());
+            println!(
+                "skip: {} already exists and is not a codesage hook",
+                path.display()
+            );
             return Ok(());
         }
     }
@@ -779,7 +802,9 @@ fn cmd_coupling(file: &str, limit: usize, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&entries)?);
     } else if entries.is_empty() {
-        println!("No co-change history for {file}. Run `codesage git-index` if you haven't, or check the path.");
+        println!(
+            "No co-change history for {file}. Run `codesage git-index` if you haven't, or check the path."
+        );
     } else {
         println!("Files that historically change with {file}:");
         for e in &entries {
@@ -796,7 +821,10 @@ fn cmd_risk(file: &str, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&assessment)?);
     } else {
-        println!("Risk: {} (score: {:.2}/1.00)", assessment.file, assessment.score);
+        println!(
+            "Risk: {} (score: {:.2}/1.00)",
+            assessment.file, assessment.score
+        );
         println!(
             "  churn={:.2} (percentile {:.0}%) | fix={}/{} ({:.0}%) | dependents={} | coupled={} | test_gap={}",
             assessment.churn_score,
@@ -852,9 +880,7 @@ fn cmd_cleanup(dry_run: bool) -> Result<()> {
     let db = open_db_for_model(&root, &emb_config.model, active_dim)?;
 
     let db_path = root.join(PROJECT_DIR).join(DB_FILE);
-    let size_before = std::fs::metadata(&db_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let size_before = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
     let tables = db.list_vec_tables()?;
     let mut dropped = 0;
@@ -893,9 +919,7 @@ fn cmd_cleanup(dry_run: bool) -> Result<()> {
         db.vacuum()?;
     }
 
-    let size_after = std::fs::metadata(&db_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let size_after = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
     let saved = size_before.saturating_sub(size_after);
 
     println!("DB size after:  {}", format_bytes(size_after));
@@ -926,9 +950,7 @@ fn cmd_impact(
     let root = find_project_root()?;
     let db = open_db(&root)?;
 
-    let looks_like_file = is_file
-        || target.contains('/')
-        || target.contains('.');
+    let looks_like_file = is_file || target.contains('/') || target.contains('.');
     let impact_target = if looks_like_file {
         ImpactTarget::File {
             path: target.to_string(),
@@ -994,8 +1016,16 @@ fn cmd_export(
     let (db, mut embedder, mut reranker) = load_query_stack(&root)?;
 
     let req = ExportRequest {
-        query: if is_symbol { None } else { Some(target.to_string()) },
-        symbol: if is_symbol { Some(target.to_string()) } else { None },
+        query: if is_symbol {
+            None
+        } else {
+            Some(target.to_string())
+        },
+        symbol: if is_symbol {
+            Some(target.to_string())
+        } else {
+            None
+        },
         limit,
         include_callers: callers,
         include_callees: callees,
@@ -1051,10 +1081,7 @@ fn print_bundle_ingest(bundle: &ContextBundle, target: &str, is_symbol: bool) {
         approx_tokens
     );
     if !bundle.symbol_definitions.is_empty() {
-        println!(
-            "Symbol definitions: {}",
-            bundle.symbol_definitions.len()
-        );
+        println!("Symbol definitions: {}", bundle.symbol_definitions.len());
     }
     println!();
 
@@ -1069,7 +1096,11 @@ fn print_bundle_ingest(bundle: &ContextBundle, target: &str, is_symbol: bool) {
         for s in &bundle.symbol_definitions {
             println!(
                 "- {} ({}): {}:{} qualified={}",
-                s.name, s.kind.as_str(), s.file_path, s.line_start, s.qualified_name
+                s.name,
+                s.kind.as_str(),
+                s.file_path,
+                s.line_start,
+                s.qualified_name
             );
         }
         println!();
@@ -1081,7 +1112,11 @@ fn print_bundle_ingest(bundle: &ContextBundle, target: &str, is_symbol: bool) {
         let symbols = if r.symbols.is_empty() {
             String::new()
         } else {
-            let names: Vec<String> = r.symbols.iter().map(|s| format!("{}({})", s.name, s.kind)).collect();
+            let names: Vec<String> = r
+                .symbols
+                .iter()
+                .map(|s| format!("{}({})", s.name, s.kind))
+                .collect();
             format!(" symbols=[{}]", names.join(", "))
         };
         println!(
@@ -1155,7 +1190,10 @@ fn print_bundle_markdown(bundle: &ContextBundle) {
     }
 
     if !bundle.symbol_definitions.is_empty() {
-        println!("## Symbol definitions ({})\n", bundle.symbol_definitions.len());
+        println!(
+            "## Symbol definitions ({})\n",
+            bundle.symbol_definitions.len()
+        );
         for s in &bundle.symbol_definitions {
             println!(
                 "- **{}** ({}) — `{}:{}` ({})",
@@ -1218,7 +1256,11 @@ mod tests {
 
     #[test]
     fn render_file_tree_nested() {
-        let owned = paths_owned(&["src/auth/login.php", "src/auth/session.php", "src/handlers/webhook.php"]);
+        let owned = paths_owned(&[
+            "src/auth/login.php",
+            "src/auth/session.php",
+            "src/handlers/webhook.php",
+        ]);
         let out = render_file_tree(&paths_refs(&owned));
         assert_eq!(
             out,
@@ -1259,8 +1301,14 @@ mod tests {
         };
         let patterns = get_exclude_patterns(&cfg);
         assert_eq!(patterns.len(), DEFAULT_EXCLUDE_PATTERNS.len() + 1);
-        assert!(patterns.iter().any(|p| p == "**/node_modules/**"), "defaults preserved");
-        assert!(patterns.iter().any(|p| p == "**/my-custom/**"), "user pattern added");
+        assert!(
+            patterns.iter().any(|p| p == "**/node_modules/**"),
+            "defaults preserved"
+        );
+        assert!(
+            patterns.iter().any(|p| p == "**/my-custom/**"),
+            "user pattern added"
+        );
     }
 
     #[test]

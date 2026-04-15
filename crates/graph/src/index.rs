@@ -60,9 +60,9 @@ fn index(
         IndexStrategy::Full => files.iter().collect(),
         IndexStrategy::Incremental => files
             .iter()
-            .filter(|f| {
-                !matches!(db.get_file_hash(&f.path), Ok(Some(hash)) if hash == f.content_hash)
-            })
+            .filter(
+                |f| !matches!(db.get_file_hash(&f.path), Ok(Some(hash)) if hash == f.content_hash),
+            )
             .collect(),
     };
     if strategy == IndexStrategy::Incremental {

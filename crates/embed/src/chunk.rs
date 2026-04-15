@@ -157,10 +157,11 @@ fn merge_small_chunks(segments: Vec<Segment>, min_size: usize) -> Vec<Segment> {
     let mut merged: Vec<Segment> = Vec::new();
     for seg in segments {
         if let Some(last) = merged.last_mut()
-            && (last.end - last.start) < min_size {
-                last.end = seg.end;
-                continue;
-            }
+            && (last.end - last.start) < min_size
+        {
+            last.end = seg.end;
+            continue;
+        }
         merged.push(seg);
     }
 
@@ -282,7 +283,9 @@ mod tests {
 
     #[test]
     fn overlap_between_chunks() {
-        let lines: Vec<String> = (0..20).map(|i| format!("line {i}: {}", "x".repeat(80))).collect();
+        let lines: Vec<String> = (0..20)
+            .map(|i| format!("line {i}: {}", "x".repeat(80)))
+            .collect();
         let text = lines.join("\n");
         let config = ChunkConfig {
             chunk_size: 500,

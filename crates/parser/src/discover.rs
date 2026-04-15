@@ -49,9 +49,10 @@ pub fn discover_files_with_excludes(
             .into_owned();
 
         if let Some(ref exc) = excludes
-            && exc.is_match(&rel_path) {
-                continue;
-            }
+            && exc.is_match(&rel_path)
+        {
+            continue;
+        }
 
         let content = std::fs::read(path)?;
         let hash = hex::encode(Sha256::digest(&content));
@@ -104,8 +105,8 @@ pub const DEFAULT_EXCLUDE_PATTERNS: &[&str] = &[
     "**/dist/**",
     "**/build/**",
     "**/out/**",
-    "**/target/**",                 // Rust, Java/Maven
-    "**/_build/**",                 // Erlang, Elixir, OCaml
+    "**/target/**", // Rust, Java/Maven
+    "**/_build/**", // Erlang, Elixir, OCaml
     "**/.next/**",
     "**/.nuxt/**",
     "**/.svelte-kit/**",
@@ -174,8 +175,8 @@ pub const DEFAULT_EXCLUDE_PATTERNS: &[&str] = &[
     //       with everything because the team touches them on every commit) -----
     "**/docs/**",
     "**/doc/**",
-    "**/site/**",                   // mkdocs default output
-    "**/_site/**",                  // jekyll
+    "**/site/**",  // mkdocs default output
+    "**/_site/**", // jekyll
     "**/NEWS",
     "**/NEWS.md",
     "**/UPGRADING",

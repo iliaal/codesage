@@ -94,7 +94,10 @@ fn migrates_legacy_schema_to_current() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(has_col_after, 1, "to_name_tail column must exist after init_db");
+    assert_eq!(
+        has_col_after, 1,
+        "to_name_tail column must exist after init_db"
+    );
 
     // Index created.
     let has_idx: i64 = conn
@@ -115,7 +118,11 @@ fn migrates_legacy_schema_to_current() {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(tail, name_tail(to_name), "backfill mismatch for id={id} to_name={to_name}");
+        assert_eq!(
+            tail,
+            name_tail(to_name),
+            "backfill mismatch for id={id} to_name={to_name}"
+        );
     }
 }
 

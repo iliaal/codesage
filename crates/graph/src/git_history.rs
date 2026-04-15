@@ -683,7 +683,10 @@ mod tests {
 
     #[test]
     fn rename_normalization() {
-        assert_eq!(normalize_rename_path("src/{foo.rs => bar.rs}"), "src/bar.rs");
+        assert_eq!(
+            normalize_rename_path("src/{foo.rs => bar.rs}"),
+            "src/bar.rs"
+        );
         assert_eq!(
             normalize_rename_path("src/{old => new}/inner.rs"),
             "src/new/inner.rs"

@@ -131,9 +131,10 @@ fn semantic_index(
 
     for cf in &mut chunked {
         if should_augment(&cf.language)
-            && let Ok(symbols) = db.symbols_for_file(&cf.path) {
-                augment_chunks(cf, &symbols);
-            }
+            && let Ok(symbols) = db.symbols_for_file(&cf.path)
+        {
+            augment_chunks(cf, &symbols);
+        }
     }
 
     let all_texts: Vec<&str> = chunked
@@ -149,12 +150,7 @@ fn semantic_index(
             db.delete_chunks_for_file(&cf.path)?;
             let mut chunk_data = Vec::with_capacity(cf.chunks.len());
             for (text, start, end) in &cf.chunks {
-                chunk_data.push((
-                    text.clone(),
-                    *start,
-                    *end,
-                    all_embeddings[emb_idx].clone(),
-                ));
+                chunk_data.push((text.clone(), *start, *end, all_embeddings[emb_idx].clone()));
                 emb_idx += 1;
             }
             db.insert_chunks(&cf.path, &cf.language, &chunk_data)?;
@@ -182,5 +178,11 @@ pub fn semantic_incremental_index(
     embedder: &mut Embedder,
     exclude_patterns: &[String],
 ) -> Result<SemanticIndexStats> {
-    semantic_index(root, db, embedder, exclude_patterns, IndexStrategy::Incremental)
+    semantic_index(
+        root,
+        db,
+        embedder,
+        exclude_patterns,
+        IndexStrategy::Incremental,
+    )
 }

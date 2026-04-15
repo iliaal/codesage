@@ -8,8 +8,10 @@ use codesage_storage::Database;
 fn upsert_git_file_replaces_on_conflict() {
     let db = Database::open_in_memory().unwrap();
 
-    db.upsert_git_file("src/foo.rs", 1.5, 1, 5, Some(1700000000)).unwrap();
-    db.upsert_git_file("src/foo.rs", 3.7, 4, 12, Some(1700001000)).unwrap();
+    db.upsert_git_file("src/foo.rs", 1.5, 1, 5, Some(1700000000))
+        .unwrap();
+    db.upsert_git_file("src/foo.rs", 3.7, 4, 12, Some(1700001000))
+        .unwrap();
 
     let row = db.git_file("src/foo.rs").unwrap().expect("present");
     assert_eq!(row.path, "src/foo.rs");
@@ -29,9 +31,12 @@ fn git_file_returns_none_for_unknown_path() {
 fn co_changes_for_returns_from_both_pair_sides() {
     let db = Database::open_in_memory().unwrap();
     // Pair stored sorted: (a, b) where a < b lexicographically.
-    db.upsert_git_co_change("src/a.rs", "src/b.rs", 5.0, 7, Some(1700000000)).unwrap();
-    db.upsert_git_co_change("src/a.rs", "src/c.rs", 3.0, 5, Some(1700001000)).unwrap();
-    db.upsert_git_co_change("src/b.rs", "src/c.rs", 1.0, 4, Some(1700002000)).unwrap();
+    db.upsert_git_co_change("src/a.rs", "src/b.rs", 5.0, 7, Some(1700000000))
+        .unwrap();
+    db.upsert_git_co_change("src/a.rs", "src/c.rs", 3.0, 5, Some(1700001000))
+        .unwrap();
+    db.upsert_git_co_change("src/b.rs", "src/c.rs", 1.0, 4, Some(1700002000))
+        .unwrap();
 
     // Querying from the smaller side (file_a) returns the larger side.
     let from_a = db.co_changes_for("src/a.rs", 10).unwrap();
@@ -50,7 +55,8 @@ fn co_changes_respects_limit() {
     let db = Database::open_in_memory().unwrap();
     for i in 0..10 {
         let other = format!("src/other_{i:02}.rs");
-        db.upsert_git_co_change("src/main.rs", &other, (10 - i) as f64, 5, Some(1700000000)).unwrap();
+        db.upsert_git_co_change("src/main.rs", &other, (10 - i) as f64, 5, Some(1700000000))
+            .unwrap();
     }
     let top3 = db.co_changes_for("src/main.rs", 3).unwrap();
     assert_eq!(top3.len(), 3);
@@ -94,8 +100,10 @@ fn churn_percentile_handles_ties() {
 #[test]
 fn clear_git_data_wipes_both_tables() {
     let db = Database::open_in_memory().unwrap();
-    db.upsert_git_file("src/a.rs", 5.0, 1, 3, Some(1700000000)).unwrap();
-    db.upsert_git_co_change("src/a.rs", "src/b.rs", 5.0, 7, Some(1700000000)).unwrap();
+    db.upsert_git_file("src/a.rs", 5.0, 1, 3, Some(1700000000))
+        .unwrap();
+    db.upsert_git_co_change("src/a.rs", "src/b.rs", 5.0, 7, Some(1700000000))
+        .unwrap();
 
     db.clear_git_data().unwrap();
 
@@ -106,8 +114,10 @@ fn clear_git_data_wipes_both_tables() {
 #[test]
 fn co_changes_upsert_replaces_on_conflict() {
     let db = Database::open_in_memory().unwrap();
-    db.upsert_git_co_change("src/a.rs", "src/b.rs", 1.0, 2, Some(1700000000)).unwrap();
-    db.upsert_git_co_change("src/a.rs", "src/b.rs", 5.0, 8, Some(1700001000)).unwrap();
+    db.upsert_git_co_change("src/a.rs", "src/b.rs", 1.0, 2, Some(1700000000))
+        .unwrap();
+    db.upsert_git_co_change("src/a.rs", "src/b.rs", 5.0, 8, Some(1700001000))
+        .unwrap();
     let rows = db.co_changes_for("src/a.rs", 10).unwrap();
     assert_eq!(rows.len(), 1, "no duplicate row");
     assert!((rows[0].weight - 5.0).abs() < 1e-9);
@@ -118,7 +128,10 @@ fn co_changes_upsert_replaces_on_conflict() {
 #[test]
 fn git_index_state_round_trip() {
     let db = Database::open_in_memory().unwrap();
-    assert!(db.get_git_index_state().unwrap().is_none(), "fresh DB has no state");
+    assert!(
+        db.get_git_index_state().unwrap().is_none(),
+        "fresh DB has no state"
+    );
 
     db.set_git_index_state("abc123").unwrap();
     let (sha, at) = db.get_git_index_state().unwrap().expect("state present");
@@ -144,8 +157,10 @@ fn clear_git_data_drops_state_too() {
 #[test]
 fn incr_git_file_accumulates_counters() {
     let db = Database::open_in_memory().unwrap();
-    db.incr_git_file("src/foo.rs", 1.5, 1, 3, Some(1700000000)).unwrap();
-    db.incr_git_file("src/foo.rs", 0.5, 2, 4, Some(1700001000)).unwrap();
+    db.incr_git_file("src/foo.rs", 1.5, 1, 3, Some(1700000000))
+        .unwrap();
+    db.incr_git_file("src/foo.rs", 0.5, 2, 4, Some(1700001000))
+        .unwrap();
     let row = db.git_file("src/foo.rs").unwrap().expect("present");
     assert!((row.churn_score - 2.0).abs() < 1e-9, "churn summed");
     assert_eq!(row.fix_count, 3, "fix_count summed");
@@ -156,17 +171,25 @@ fn incr_git_file_accumulates_counters() {
 #[test]
 fn incr_git_file_keeps_existing_last_when_new_is_older() {
     let db = Database::open_in_memory().unwrap();
-    db.incr_git_file("src/foo.rs", 1.0, 0, 1, Some(1700001000)).unwrap();
-    db.incr_git_file("src/foo.rs", 1.0, 0, 1, Some(1700000000)).unwrap();
+    db.incr_git_file("src/foo.rs", 1.0, 0, 1, Some(1700001000))
+        .unwrap();
+    db.incr_git_file("src/foo.rs", 1.0, 0, 1, Some(1700000000))
+        .unwrap();
     let row = db.git_file("src/foo.rs").unwrap().expect("present");
-    assert_eq!(row.last_commit_at, Some(1700001000), "MAX kept the older row");
+    assert_eq!(
+        row.last_commit_at,
+        Some(1700001000),
+        "MAX kept the older row"
+    );
 }
 
 #[test]
 fn incr_git_co_change_accumulates_pair() {
     let db = Database::open_in_memory().unwrap();
-    db.incr_git_co_change("a.rs", "b.rs", 1.0, 2, Some(1700000000)).unwrap();
-    db.incr_git_co_change("a.rs", "b.rs", 0.5, 3, Some(1700001000)).unwrap();
+    db.incr_git_co_change("a.rs", "b.rs", 1.0, 2, Some(1700000000))
+        .unwrap();
+    db.incr_git_co_change("a.rs", "b.rs", 0.5, 3, Some(1700001000))
+        .unwrap();
     let rows = db.co_changes_for("a.rs", 10).unwrap();
     assert_eq!(rows.len(), 1);
     assert!((rows[0].weight - 1.5).abs() < 1e-9);
@@ -178,7 +201,8 @@ fn incr_git_co_change_accumulates_pair() {
 fn co_change_pair_exists_detects_both_orderings() {
     let db = Database::open_in_memory().unwrap();
     assert!(!db.co_change_pair_exists("a.rs", "b.rs").unwrap());
-    db.upsert_git_co_change("a.rs", "b.rs", 1.0, 3, Some(1700000000)).unwrap();
+    db.upsert_git_co_change("a.rs", "b.rs", 1.0, 3, Some(1700000000))
+        .unwrap();
     assert!(db.co_change_pair_exists("a.rs", "b.rs").unwrap());
     // Pairs are stored sorted, so b/a (unsorted) would be a debug_assert hit in incr_;
     // exists() also requires sorted input. Validate the sorted lookup works.
@@ -188,9 +212,12 @@ fn co_change_pair_exists_detects_both_orderings() {
 #[test]
 fn scale_git_decay_multiplies_churn_and_pair_weights() {
     let db = Database::open_in_memory().unwrap();
-    db.upsert_git_file("a.rs", 4.0, 1, 5, Some(1700000000)).unwrap();
-    db.upsert_git_file("b.rs", 2.0, 0, 3, Some(1700000000)).unwrap();
-    db.upsert_git_co_change("a.rs", "b.rs", 6.0, 4, Some(1700000000)).unwrap();
+    db.upsert_git_file("a.rs", 4.0, 1, 5, Some(1700000000))
+        .unwrap();
+    db.upsert_git_file("b.rs", 2.0, 0, 3, Some(1700000000))
+        .unwrap();
+    db.upsert_git_co_change("a.rs", "b.rs", 6.0, 4, Some(1700000000))
+        .unwrap();
 
     db.scale_git_decay(0.5).unwrap();
 

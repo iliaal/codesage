@@ -409,21 +409,48 @@ mod tests {
     #[test]
     fn file_category_classifies_tests() {
         assert_eq!(FileCategory::classify("tests/foo.rs"), FileCategory::Test);
-        assert_eq!(FileCategory::classify("app/tests/UserTest.php"), FileCategory::Test);
-        assert_eq!(FileCategory::classify("src/components/Button.test.tsx"), FileCategory::Test);
-        assert_eq!(FileCategory::classify("src/utils.spec.ts"), FileCategory::Test);
-        assert_eq!(FileCategory::classify("app/tests/UserTest.php"), FileCategory::Test);
-        assert_eq!(FileCategory::classify("src/ext/iconv/tests/bug_001.phpt"), FileCategory::Test);
-        assert_eq!(FileCategory::classify("pkg/auth_test.py"), FileCategory::Test);
-        assert_eq!(FileCategory::classify("app/__tests__/helper.js"), FileCategory::Test);
-        assert_eq!(FileCategory::classify("src/spec/helpers.rb"), FileCategory::Test);
+        assert_eq!(
+            FileCategory::classify("app/tests/UserTest.php"),
+            FileCategory::Test
+        );
+        assert_eq!(
+            FileCategory::classify("src/components/Button.test.tsx"),
+            FileCategory::Test
+        );
+        assert_eq!(
+            FileCategory::classify("src/utils.spec.ts"),
+            FileCategory::Test
+        );
+        assert_eq!(
+            FileCategory::classify("app/tests/UserTest.php"),
+            FileCategory::Test
+        );
+        assert_eq!(
+            FileCategory::classify("src/ext/iconv/tests/bug_001.phpt"),
+            FileCategory::Test
+        );
+        assert_eq!(
+            FileCategory::classify("pkg/auth_test.py"),
+            FileCategory::Test
+        );
+        assert_eq!(
+            FileCategory::classify("app/__tests__/helper.js"),
+            FileCategory::Test
+        );
+        assert_eq!(
+            FileCategory::classify("src/spec/helpers.rb"),
+            FileCategory::Test
+        );
     }
 
     #[test]
     fn file_category_classifies_configs() {
         assert_eq!(FileCategory::classify("Cargo.toml"), FileCategory::Config);
         assert_eq!(FileCategory::classify(".env"), FileCategory::Config);
-        assert_eq!(FileCategory::classify("config/database.yml"), FileCategory::Config);
+        assert_eq!(
+            FileCategory::classify("config/database.yml"),
+            FileCategory::Config
+        );
         assert_eq!(FileCategory::classify("package.json"), FileCategory::Config);
         assert_eq!(FileCategory::classify("nginx.conf"), FileCategory::Config);
     }
@@ -431,9 +458,18 @@ mod tests {
     #[test]
     fn file_category_classifies_source() {
         assert_eq!(FileCategory::classify("src/main.rs"), FileCategory::Source);
-        assert_eq!(FileCategory::classify("app/Services/AuthService.php"), FileCategory::Source);
-        assert_eq!(FileCategory::classify("pkg/handlers.py"), FileCategory::Source);
-        assert_eq!(FileCategory::classify("src/components/Button.tsx"), FileCategory::Source);
+        assert_eq!(
+            FileCategory::classify("app/Services/AuthService.php"),
+            FileCategory::Source
+        );
+        assert_eq!(
+            FileCategory::classify("pkg/handlers.py"),
+            FileCategory::Source
+        );
+        assert_eq!(
+            FileCategory::classify("src/components/Button.tsx"),
+            FileCategory::Source
+        );
     }
 
     #[test]
@@ -443,7 +479,9 @@ mod tests {
         assert!(json.contains("\"type\":\"symbol\""));
         assert!(json.contains("\"name\":\"Foo\""));
 
-        let file = ImpactTarget::File { path: "src/a.rs".into() };
+        let file = ImpactTarget::File {
+            path: "src/a.rs".into(),
+        };
         let json = serde_json::to_string(&file).unwrap();
         assert!(json.contains("\"type\":\"file\""));
         assert!(json.contains("\"path\":\"src/a.rs\""));

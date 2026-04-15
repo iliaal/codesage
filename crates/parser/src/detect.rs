@@ -27,7 +27,10 @@ mod tests {
     #[test]
     fn python_extensions() {
         assert_eq!(detect_language(Path::new("bar.py")), Some(Language::Python));
-        assert_eq!(detect_language(Path::new("types.pyi")), Some(Language::Python));
+        assert_eq!(
+            detect_language(Path::new("types.pyi")),
+            Some(Language::Python)
+        );
     }
 
     #[test]
@@ -44,16 +47,34 @@ mod tests {
 
     #[test]
     fn javascript_extensions() {
-        assert_eq!(detect_language(Path::new("app.js")), Some(Language::JavaScript));
-        assert_eq!(detect_language(Path::new("index.mjs")), Some(Language::JavaScript));
-        assert_eq!(detect_language(Path::new("lib.cjs")), Some(Language::JavaScript));
-        assert_eq!(detect_language(Path::new("App.jsx")), Some(Language::JavaScript));
+        assert_eq!(
+            detect_language(Path::new("app.js")),
+            Some(Language::JavaScript)
+        );
+        assert_eq!(
+            detect_language(Path::new("index.mjs")),
+            Some(Language::JavaScript)
+        );
+        assert_eq!(
+            detect_language(Path::new("lib.cjs")),
+            Some(Language::JavaScript)
+        );
+        assert_eq!(
+            detect_language(Path::new("App.jsx")),
+            Some(Language::JavaScript)
+        );
     }
 
     #[test]
     fn typescript_extensions() {
-        assert_eq!(detect_language(Path::new("app.ts")), Some(Language::TypeScript));
-        assert_eq!(detect_language(Path::new("App.tsx")), Some(Language::TypeScript));
+        assert_eq!(
+            detect_language(Path::new("app.ts")),
+            Some(Language::TypeScript)
+        );
+        assert_eq!(
+            detect_language(Path::new("App.tsx")),
+            Some(Language::TypeScript)
+        );
     }
 
     #[test]

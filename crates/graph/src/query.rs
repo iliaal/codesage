@@ -1,5 +1,5 @@
-use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use anyhow::Result;
 use codesage_embed::model::Embedder;
@@ -41,7 +41,13 @@ pub fn search(
     let known_symbols = extract_known_symbols(db, &req.query);
     let has_symbols = !known_symbols.is_empty();
     let has_reranker = reranker.is_some();
-    let overfetch = if has_reranker { RERANK_OVERFETCH } else if has_symbols { 3 } else { 1 };
+    let overfetch = if has_reranker {
+        RERANK_OVERFETCH
+    } else if has_symbols {
+        3
+    } else {
+        1
+    };
 
     let query_embedding = embedder.embed_one(&req.query)?;
     let embedding_bytes = embedding_to_bytes(&query_embedding);
@@ -49,12 +55,14 @@ pub fn search(
     let semantic_fetch = limit * overfetch;
 
     let rows = if req.paths.is_some() {
-        let languages: Option<Vec<&str>> = req.languages.as_ref().map(|langs| {
-            langs.iter().map(|l| l.as_str()).collect()
-        });
-        let paths: Option<Vec<&str>> = req.paths.as_ref().map(|p| {
-            p.iter().map(|s| s.as_str()).collect()
-        });
+        let languages: Option<Vec<&str>> = req
+            .languages
+            .as_ref()
+            .map(|langs| langs.iter().map(|l| l.as_str()).collect());
+        let paths: Option<Vec<&str>> = req
+            .paths
+            .as_ref()
+            .map(|p| p.iter().map(|s| s.as_str()).collect());
         db.search_fullscan(
             &embedding_bytes,
             semantic_fetch,
@@ -171,9 +179,10 @@ fn extract_known_symbols(db: &Database, query: &str) -> Vec<String> {
             continue;
         }
         if let Ok(syms) = db.find_symbols(token, None)
-            && !syms.is_empty() {
-                known.push(token.to_lowercase());
-            }
+            && !syms.is_empty()
+        {
+            known.push(token.to_lowercase());
+        }
     }
     known
 }
@@ -188,8 +197,7 @@ fn looks_like_identifier(s: &str) -> bool {
     }
     s.contains('_')
         || s.chars().any(|c| c.is_uppercase())
-        || s.chars().all(|c| c.is_alphanumeric() || c == '_')
-            && s.len() >= 4
+        || s.chars().all(|c| c.is_alphanumeric() || c == '_') && s.len() >= 4
 }
 
 fn apply_symbol_boost(results: &mut [SearchResult], known_symbols: &[String]) {
@@ -357,7 +365,11 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
         .filter(|e| !req.source_only || e.category == FileCategory::Source)
         .collect();
 
-    entries.sort_by(|a, b| a.distance.cmp(&b.distance).then_with(|| b.reasons.len().cmp(&a.reasons.len())));
+    entries.sort_by(|a, b| {
+        a.distance
+            .cmp(&b.distance)
+            .then_with(|| b.reasons.len().cmp(&a.reasons.len()))
+    });
     Ok(entries)
 }
 
@@ -409,17 +421,18 @@ pub fn export_context(
     if req.include_callees || req.include_callers {
         for sym in symbol_defs.clone().iter().take(5) {
             if req.include_callers
-                && let Ok(refs) = db.find_references(&sym.name, None) {
-                    for r in refs.into_iter().take(3) {
-                        add_related_from_file(
-                            db,
-                            &r.from_file,
-                            r.line,
-                            &mut related,
-                            &mut related_keys,
-                        );
-                    }
+                && let Ok(refs) = db.find_references(&sym.name, None)
+            {
+                for r in refs.into_iter().take(3) {
+                    add_related_from_file(
+                        db,
+                        &r.from_file,
+                        r.line,
+                        &mut related,
+                        &mut related_keys,
+                    );
                 }
+            }
             if req.include_callees {
                 add_related_from_file(
                     db,
@@ -458,7 +471,13 @@ pub fn export_context_for_symbol(
     let mut primary: Vec<SearchResult> = Vec::new();
     let mut primary_keys: HashSet<(String, u32)> = HashSet::new();
     for def in &defs {
-        add_related_from_file(db, &def.file_path, def.line_start, &mut primary, &mut primary_keys);
+        add_related_from_file(
+            db,
+            &def.file_path,
+            def.line_start,
+            &mut primary,
+            &mut primary_keys,
+        );
     }
 
     let mut related: Vec<SearchResult> = Vec::new();

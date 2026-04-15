@@ -97,7 +97,10 @@ impl Reranker {
             .map(|doc| (query.to_string(), doc.to_string()))
             .collect();
 
-        let pair_refs: Vec<(&str, &str)> = pairs.iter().map(|(q, d)| (q.as_str(), d.as_str())).collect();
+        let pair_refs: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(q, d)| (q.as_str(), d.as_str()))
+            .collect();
 
         let encodings = self
             .tokenizer

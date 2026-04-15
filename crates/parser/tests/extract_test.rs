@@ -3,10 +3,7 @@ use codesage_parser::parse::parse_file;
 use codesage_protocol::{Language, SymbolKind};
 
 fn symbols_for(fixture: &str, language: Language) -> Vec<codesage_protocol::Symbol> {
-    let path = format!(
-        "{}/tests/fixtures/{fixture}",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let path = format!("{}/tests/fixtures/{fixture}", env!("CARGO_MANIFEST_DIR"));
     let source = std::fs::read(&path).unwrap();
     let tree = parse_file(&source, language).unwrap();
     extract_symbols(&tree, &source, language, fixture).unwrap()
@@ -45,7 +42,10 @@ fn php_qualified_names() {
     assert_eq!(helper.qualified_name, "App\\Http\\Controllers\\helper");
 
     let class = syms.iter().find(|s| s.name == "UserController").unwrap();
-    assert_eq!(class.qualified_name, "App\\Http\\Controllers\\UserController");
+    assert_eq!(
+        class.qualified_name,
+        "App\\Http\\Controllers\\UserController"
+    );
 }
 
 #[test]
@@ -53,7 +53,11 @@ fn php_line_numbers_are_positive() {
     let syms = symbols_for("sample.php", Language::Php);
     for s in &syms {
         assert!(s.line_start > 0, "symbol {} has line_start 0", s.name);
-        assert!(s.line_end >= s.line_start, "symbol {} has bad line range", s.name);
+        assert!(
+            s.line_end >= s.line_start,
+            "symbol {} has bad line range",
+            s.name
+        );
     }
 }
 

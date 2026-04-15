@@ -28,7 +28,10 @@ fn codesage_repo_root() -> PathBuf {
 fn indexer_runs_against_codesage_repo_and_populates_tables() {
     let root = codesage_repo_root();
     if !root.join(".git").exists() {
-        eprintln!("skipping: codesage repo has no .git/ (sandbox?); path={}", root.display());
+        eprintln!(
+            "skipping: codesage repo has no .git/ (sandbox?); path={}",
+            root.display()
+        );
         return;
     }
 
@@ -36,8 +39,16 @@ fn indexer_runs_against_codesage_repo_and_populates_tables() {
     let stats = git_history_index(&db, &root).expect("git-index on codesage repo must succeed");
 
     // Loose structural assertions. Exact numbers drift; these just prove the pipe is alive.
-    assert!(stats.commits_scanned > 0, "expected > 0 commits, got {}", stats.commits_scanned);
-    assert!(stats.files_tracked > 0, "expected > 0 files tracked, got {}", stats.files_tracked);
+    assert!(
+        stats.commits_scanned > 0,
+        "expected > 0 commits, got {}",
+        stats.commits_scanned
+    );
+    assert!(
+        stats.files_tracked > 0,
+        "expected > 0 files tracked, got {}",
+        stats.files_tracked
+    );
     // Even tiny histories should produce some qualifying pairs (min_count=3), but a brand-new
     // repo could have zero. Allow either.
 
@@ -92,7 +103,10 @@ fn incremental_after_full_is_noop_when_head_unchanged() {
 
     // State must still point at the HEAD SHA.
     let state = db.get_git_index_state().unwrap();
-    assert!(state.is_some(), "state should still be present after no-op incremental");
+    assert!(
+        state.is_some(),
+        "state should still be present after no-op incremental"
+    );
 }
 
 #[test]

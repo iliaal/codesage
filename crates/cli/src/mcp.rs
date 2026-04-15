@@ -116,9 +116,7 @@ pub struct SearchParams {
     pub limit: Option<usize>,
     #[schemars(description = "Results offset for pagination")]
     pub offset: Option<usize>,
-    #[schemars(
-        description = "Filter by language: php, python, c, rust, javascript, typescript"
-    )]
+    #[schemars(description = "Filter by language: php, python, c, rust, javascript, typescript")]
     pub language: Option<String>,
     #[schemars(description = "Filter by file path glob patterns")]
     pub paths: Option<Vec<String>>,
@@ -167,9 +165,9 @@ impl CodeSageServer {
                 project
             );
         }
-        let canonical = path.canonicalize().map_err(|e| {
-            anyhow::anyhow!("project path `{}` does not exist: {}", project, e)
-        })?;
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| anyhow::anyhow!("project path `{}` does not exist: {}", project, e))?;
         {
             let guard = self.projects.lock().unwrap();
             if let Some(state) = guard.get(&canonical) {
@@ -258,11 +256,10 @@ impl CodeSageServer {
         let state = self.resolve_project(project)?;
         let db = self.open_db_for(&state)?;
         let embedder_arc = self.get_or_load_embedder(&state.embedding_config)?;
-        let reranker_arc = state
-            .embedding_config
-            .reranker
-            .as_deref()
-            .and_then(|m| self.get_or_load_reranker(m, &state.embedding_config.device).ok());
+        let reranker_arc = state.embedding_config.reranker.as_deref().and_then(|m| {
+            self.get_or_load_reranker(m, &state.embedding_config.device)
+                .ok()
+        });
         let mut embedder_guard = embedder_arc.lock().unwrap();
         let mut reranker_guard = reranker_arc.as_ref().map(|a| a.lock().unwrap());
         let reranker_opt = reranker_guard.as_deref_mut();
@@ -394,16 +391,15 @@ fn load_embedding_config(path: &Path) -> EmbeddingConfig {
 impl ServerHandler for CodeSageServer {
     fn get_info(&self) -> ServerInfo {
         use rmcp::model::ServerCapabilities;
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(
-                "Structural and semantic code intelligence across multiple projects. \
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+            "Structural and semantic code intelligence across multiple projects. \
                  Every tool requires an absolute `project` path pointing at an onboarded \
                  CodeSage project (one containing .codesage/index.db). \
                  Use find_symbol to locate definitions, find_references to trace callers \
                  and imports, list_dependencies for file-level dependency mapping, search \
                  for natural-language semantic code search, impact_analysis to estimate \
                  blast radius of a change, and export_context to bundle code for an LLM.",
-            )
+        )
     }
 }
 
@@ -429,10 +425,7 @@ impl CodeSageServer {
         name = "find_references",
         description = "Find all references to a symbol across the codebase. Shows where a function, class, or module is called, imported, instantiated, or inherited."
     )]
-    fn find_references_tool(
-        &self,
-        Parameters(params): Parameters<FindReferencesParams>,
-    ) -> String {
+    fn find_references_tool(&self, Parameters(params): Parameters<FindReferencesParams>) -> String {
         let kind = params.kind.as_deref().and_then(ReferenceKind::parse);
         let req = FindReferencesRequest {
             symbol_name: params.name,
@@ -515,7 +508,11 @@ impl CodeSageServer {
         let is_symbol = params.is_symbol.unwrap_or(false);
         let target = params.target.clone();
         let req = ExportRequest {
-            query: if is_symbol { None } else { Some(target.clone()) },
+            query: if is_symbol {
+                None
+            } else {
+                Some(target.clone())
+            },
             symbol: if is_symbol { Some(target) } else { None },
             limit: params.limit.unwrap_or(5),
             include_callers: params.include_callers.unwrap_or(false),
@@ -553,6 +550,20 @@ impl CodeSageServer {
             "assess_risk",
         )
     }
+}
+
+pub async fn run_mcp_server() -> Result<()> {
+    let server = CodeSageServer::new();
+    let transport = rmcp::transport::io::stdio();
+    let service = server
+        .serve(transport)
+        .await
+        .map_err(|e| anyhow::anyhow!("MCP server error: {e}"))?;
+    service
+        .waiting()
+        .await
+        .map_err(|e| anyhow::anyhow!("MCP server stopped: {e}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -601,7 +612,11 @@ mod tests {
         });
         let out = cap_to_budget(v, "export_context");
         let obj = out.as_object().expect("still an object");
-        assert_eq!(obj["primary"].as_array().unwrap().len(), 1, "primary preserved");
+        assert_eq!(
+            obj["primary"].as_array().unwrap().len(),
+            1,
+            "primary preserved"
+        );
         let meta = &obj["_meta"];
         assert_eq!(meta["truncated"], json!(true));
         assert_eq!(meta["field"], json!("related"), "trimmed largest field");
@@ -650,18 +665,4 @@ mod tests {
         let kept = truncate_array(vec![], 100);
         assert!(kept.is_empty());
     }
-}
-
-pub async fn run_mcp_server() -> Result<()> {
-    let server = CodeSageServer::new();
-    let transport = rmcp::transport::io::stdio();
-    let service = server
-        .serve(transport)
-        .await
-        .map_err(|e| anyhow::anyhow!("MCP server error: {e}"))?;
-    service
-        .waiting()
-        .await
-        .map_err(|e| anyhow::anyhow!("MCP server stopped: {e}"))?;
-    Ok(())
 }

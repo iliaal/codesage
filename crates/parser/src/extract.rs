@@ -167,7 +167,8 @@ pub fn extract_symbols(
             kind = SymbolKind::Method;
         }
 
-        let qualified_name = build_qualified_name(&name, kind, &def_node, source, language, &namespace);
+        let qualified_name =
+            build_qualified_name(&name, kind, &def_node, source, language, &namespace);
 
         let start = def_node.start_position();
         let end = def_node.end_position();
@@ -191,9 +192,10 @@ fn find_php_namespace(root: &Node, source: &[u8]) -> Option<String> {
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
         if child.kind() == "namespace_definition"
-            && let Some(name_node) = child.child_by_field_name("name") {
-                return Some(name_node.utf8_text(source).ok()?.to_string());
-            }
+            && let Some(name_node) = child.child_by_field_name("name")
+        {
+            return Some(name_node.utf8_text(source).ok()?.to_string());
+        }
     }
     None
 }
@@ -202,7 +204,9 @@ fn is_inside_impl_or_class(node: &Node, language: Language) -> bool {
     let mut current = node.parent();
     while let Some(parent) = current {
         match parent.kind() {
-            "class_definition" | "class_declaration" if language == Language::Python => return true,
+            "class_definition" | "class_declaration" if language == Language::Python => {
+                return true;
+            }
             "impl_item" if language == Language::Rust => return true,
             _ => current = parent.parent(),
         }
@@ -214,8 +218,11 @@ fn find_parent_class_name<'a>(node: &Node, source: &'a [u8]) -> Option<&'a str> 
     let mut current = node.parent();
     while let Some(parent) = current {
         match parent.kind() {
-            "class_definition" | "class_declaration" | "trait_declaration"
-            | "interface_declaration" | "enum_declaration" => {
+            "class_definition"
+            | "class_declaration"
+            | "trait_declaration"
+            | "interface_declaration"
+            | "enum_declaration" => {
                 let name_node = parent.child_by_field_name("name")?;
                 return name_node.utf8_text(source).ok();
             }
@@ -244,32 +251,36 @@ fn build_qualified_name(
                 parts.push(ns.as_str().to_string());
             }
             if (kind == SymbolKind::Method || kind == SymbolKind::Constant)
-                && let Some(class_name) = find_parent_class_name(def_node, source) {
-                    parts.push(class_name.to_string());
-                }
+                && let Some(class_name) = find_parent_class_name(def_node, source)
+            {
+                parts.push(class_name.to_string());
+            }
             parts.push(name.to_string());
             parts.join("\\")
         }
         Language::Python => {
             if kind == SymbolKind::Method
-                && let Some(class_name) = find_parent_class_name(def_node, source) {
-                    return format!("{class_name}.{name}");
-                }
+                && let Some(class_name) = find_parent_class_name(def_node, source)
+            {
+                return format!("{class_name}.{name}");
+            }
             name.to_string()
         }
         Language::C => name.to_string(),
         Language::Rust => {
             if kind == SymbolKind::Method
-                && let Some(type_name) = find_parent_class_name(def_node, source) {
-                    return format!("{type_name}::{name}");
-                }
+                && let Some(type_name) = find_parent_class_name(def_node, source)
+            {
+                return format!("{type_name}::{name}");
+            }
             name.to_string()
         }
         Language::JavaScript | Language::TypeScript => {
             if kind == SymbolKind::Method
-                && let Some(class_name) = find_parent_class_name(def_node, source) {
-                    return format!("{class_name}.{name}");
-                }
+                && let Some(class_name) = find_parent_class_name(def_node, source)
+            {
+                return format!("{class_name}.{name}");
+            }
             name.to_string()
         }
     }

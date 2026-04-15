@@ -12,14 +12,14 @@ static TS_REF_QUERY: &str = include_str!("queries/typescript_refs.scm");
 
 fn php_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
     match pattern_index {
-        0 => Some(ReferenceKind::Import),      // namespace_use_declaration
-        1 => Some(ReferenceKind::Import),      // use_declaration
-        2 => Some(ReferenceKind::Call),         // function_call_expression
+        0 => Some(ReferenceKind::Import), // namespace_use_declaration
+        1 => Some(ReferenceKind::Import), // use_declaration
+        2 => Some(ReferenceKind::Call),   // function_call_expression
         3 => Some(ReferenceKind::Instantiation), // object_creation_expression
-        4 => Some(ReferenceKind::Call),         // scoped_call_expression
-        5 => Some(ReferenceKind::Inheritance),  // class extends
-        6 => Some(ReferenceKind::Inheritance),  // class implements
-        7 => Some(ReferenceKind::TraitUse),     // use_declaration inside class
+        4 => Some(ReferenceKind::Call),   // scoped_call_expression
+        5 => Some(ReferenceKind::Inheritance), // class extends
+        6 => Some(ReferenceKind::Inheritance), // class implements
+        7 => Some(ReferenceKind::TraitUse), // use_declaration inside class
         _ => None,
     }
 }
@@ -38,7 +38,7 @@ fn python_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
 fn c_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
     match pattern_index {
         0 | 1 => Some(ReferenceKind::Include), // preproc_include (system_lib_string, string_literal)
-        2 => Some(ReferenceKind::Call),         // call_expression
+        2 => Some(ReferenceKind::Call),        // call_expression
         _ => None,
     }
 }
@@ -46,8 +46,8 @@ fn c_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
 fn rust_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
     match pattern_index {
         0 | 1 => Some(ReferenceKind::Import), // use_declaration
-        2 | 3 => Some(ReferenceKind::Call),    // call_expression
-        4 | 5 => Some(ReferenceKind::Call),    // macro_invocation
+        2 | 3 => Some(ReferenceKind::Call),   // call_expression
+        4 | 5 => Some(ReferenceKind::Call),   // macro_invocation
         _ => None,
     }
 }
@@ -56,8 +56,8 @@ fn js_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
     match pattern_index {
         0 => Some(ReferenceKind::Import), // import statement
         1 => Some(ReferenceKind::Import), // require("module")
-        2 => Some(ReferenceKind::Call),    // call (identifier)
-        3 => Some(ReferenceKind::Call),    // call (member expression)
+        2 => Some(ReferenceKind::Call),   // call (identifier)
+        3 => Some(ReferenceKind::Call),   // call (member expression)
         _ => None,
     }
 }
@@ -86,8 +86,7 @@ pub fn extract_references(
         Language::TypeScript => (TS_REF_QUERY, js_ref_kind), // same ref structure
     };
 
-    let query =
-        Query::new(&ts_language, query_src).context("failed to compile reference query")?;
+    let query = Query::new(&ts_language, query_src).context("failed to compile reference query")?;
 
     let name_idx = query
         .capture_index_for_name("ref")

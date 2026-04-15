@@ -44,7 +44,11 @@ fn impact_by_symbol_finds_direct_callers() {
     };
 
     let entries = impact_analysis(&db, &req).unwrap();
-    assert!(entries.len() >= 2, "expected at least 2 affected files, got {}", entries.len());
+    assert!(
+        entries.len() >= 2,
+        "expected at least 2 affected files, got {}",
+        entries.len()
+    );
 
     let paths: Vec<String> = entries.iter().map(|e| e.file_path.clone()).collect();
     assert!(paths.iter().any(|p| p.ends_with("Controller.php")));
@@ -130,8 +134,7 @@ fn export_context_for_symbol_returns_definition() {
         include_callees: false,
     };
 
-    let bundle = codesage_graph::query::export_context_for_symbol(&db, "Repository", &req)
-        .unwrap();
+    let bundle = codesage_graph::query::export_context_for_symbol(&db, "Repository", &req).unwrap();
 
     assert!(bundle.target_description.contains("Repository"));
     assert!(
@@ -154,8 +157,7 @@ fn export_context_for_symbol_with_callers() {
         include_callees: false,
     };
 
-    let bundle = codesage_graph::query::export_context_for_symbol(&db, "Repository", &req)
-        .unwrap();
+    let bundle = codesage_graph::query::export_context_for_symbol(&db, "Repository", &req).unwrap();
 
     assert!(
         !bundle.symbol_definitions.is_empty(),
@@ -175,8 +177,8 @@ fn export_context_unknown_symbol_returns_empty_bundle() {
         include_callees: false,
     };
 
-    let bundle = codesage_graph::query::export_context_for_symbol(&db, "NoSuchSymbol", &req)
-        .unwrap();
+    let bundle =
+        codesage_graph::query::export_context_for_symbol(&db, "NoSuchSymbol", &req).unwrap();
     assert!(bundle.primary.is_empty());
     assert!(bundle.symbol_definitions.is_empty());
     assert!(bundle.target_description.contains("not found"));
