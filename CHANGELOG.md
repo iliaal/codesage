@@ -13,10 +13,16 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 - `codesage install-hooks` now installs a `pre-commit` hook when the repo contains `scripts/leak-check.sh`. The hook greps staged content against extended-regex patterns from `scripts/leak-patterns.txt` (tracked, shared) and `.git/info/leak-patterns.txt` (local-only, per-developer) and blocks the commit on a match. Bypass with `git commit --no-verify` when a false positive is intentional.
 - `scripts/leak-patterns.txt` with default patterns for private-key material and common token formats (AWS, GitHub PATs, Slack, Stripe live keys).
 - Pre-commit filename policy. The hook blocks any staged file whose name matches a secret/credential pattern: `.env*` (except `.example`, `.template`, `.sample`), `.secret`, `.secrets/`, `*.pem`, `*.p12`, `*.pfx`, `id_rsa*` / `id_dsa*` / `id_ecdsa*` / `id_ed25519*` (except `.pub` public-key variants), `credentials.json`, `service-account*.json`.
+- GitHub Actions CI (`.github/workflows/ci.yml`) on every PR and push to `master`: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `cargo build --release -p codesage` (CPU-only) to confirm the build works without the `cuda` feature.
+- Secret-scan workflow (`.github/workflows/secret-scan.yml`): runs `scripts/leak-check.sh --range <base>..<head>` against the PR diff (or `--all` on push to master) and `gitleaks-action` for generic credential detection.
+- `scripts/leak-check.sh` gains `--range A..B` and `--all` modes so the same script powers both the pre-commit hook and CI.
+- `rust-toolchain.toml` pinning to `stable` with `rustfmt` and `clippy` components.
 
 ### Changed
 
 - `.gitignore` excludes benchmark artifacts under `bench/` (results, corpora, history, scorecards) and common secret filenames (`.env*`, `*.pem`, `id_rsa*`, `credentials.json`, etc.) so local data never enters a commit by default. Template files (`.env.example`, `.env.template`, `.env.sample`) remain committable.
+- Workspace-wide `cargo fmt`. No semantic change; resets the formatting baseline so the CI fmt check has a clean starting point.
+- `crates/cli/src/mcp.rs`: `pub async fn run_mcp_server` moved to before the `#[cfg(test)] mod tests` block to satisfy `clippy::items_after_test_module`.
 
 ## [0.2.0] - 2026-04-15
 
