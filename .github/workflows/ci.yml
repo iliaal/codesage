@@ -37,6 +37,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The git_history integration tests walk this repo's history.
+          # Default shallow clone produces 0 commits after soft-skip filters
+          # (e.g. a `ci:`-prefixed HEAD), failing assertions that need >0.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --no-fail-fast
