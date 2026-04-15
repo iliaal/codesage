@@ -39,7 +39,7 @@ clap = { version = "4", features = ["derive"] }
 
 rmcp = { version = "1.4", features = ["server", "transport-io", "macros"] }
 tokio = { version = "1", features = ["full"] }
-schemars = "0.8"
+schemars = "1.2"
 
 rayon = "1.12"
 anyhow = "1"
