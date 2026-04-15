@@ -209,7 +209,14 @@ Per-file (slice 1):
 
 Patch-level (slice 2, added in 0.3.0):
 - \`assess_risk_diff\`: aggregate risk for a SET of files (the file list of a patch). Returns max/mean scores, the highest-risk file, and bucketed lists (hotspot, fix-heavy, test-gap, wide blast radius). Use BEFORE submitting: if max_score is high or any test_gap_files exist, add tests, split the patch, or flag concerns. \`summary_notes\` are paste-ready for a PR description.
-- \`recommend_tests\`: tests an agent should run after editing a set of files. \`primary\` (sibling tests by language convention — FooTest.php, foo.test.ts, test_foo.py, foo_test.go, plus Rust integration tests under crates/<name>/tests/*.rs) plus \`coupled\` (tests from co-change history). Replaces "I'll run all tests" hedging with a focused list.
+- \`recommend_tests\`: tests an agent should run after editing a set of files. \`primary\` resolves siblings by language convention; \`coupled\` adds tests from co-change history. Replaces "I'll run all tests" hedging with a focused list. Sibling conventions covered:
+  - PHP/Laravel: \`FooTest.php\` flat siblings; mirror-tree \`tests/{Unit,Feature,Integration,Browser}/<rest>/<file>Test.php\` for \`app/<rest>/<file>.php\` sources.
+  - PHP/Symfony: mirror-tree \`tests/<rest>/<file>Test.php\` for \`src/<rest>/<file>.php\` sources.
+  - PHP internals: \`<dir>/tests/*.phpt\` for \`.c\` / \`.h\` source files (capped at 50 to keep noisy dirs like \`ext/standard/tests\` out of \`primary\`).
+  - Python: \`test_foo.py\` and \`foo_test.py\` (sibling and \`tests/\` flat).
+  - Go: \`foo_test.go\`.
+  - JavaScript/TypeScript: \`foo.test.ts(x)\`, \`foo.spec.ts(x)\`, \`.js\` variants.
+  - Rust: integration tests under \`<crate_root>/tests/*.rs\`. (Inline \`#[cfg(test)] mod tests\` not surfaced — they ride along with the source file.)
 
 All four require git history indexed. Initial \`codesage git-index\` runs at onboard; subsequent commits/merges auto-refresh via git hooks. Run \`codesage git-index --full\` weekly to rebaseline. Empty results mean either no history yet or the file is too new.
 
