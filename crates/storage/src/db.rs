@@ -677,6 +677,21 @@ impl Database {
         }
     }
 
+    /// All file paths in `git_files` whose path begins with `prefix`. Used by
+    /// the test recommender to enumerate Rust integration tests under a crate's
+    /// `tests/` directory, where there's no per-file naming convention to lean on.
+    pub fn git_files_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM git_files WHERE path LIKE ?1 ORDER BY path")?;
+        let pattern = format!("{prefix}%");
+        let rows: Vec<String> = stmt
+            .query_map(rusqlite::params![pattern], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
     /// Record the commit SHA we just indexed up to. indexed_at stamped with unixepoch().
     pub fn set_git_index_state(&self, sha: &str) -> Result<()> {
         self.conn.execute(

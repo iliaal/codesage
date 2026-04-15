@@ -18,7 +18,9 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow};
-use codesage_parser::discover::{DEFAULT_EXCLUDE_PATTERNS, build_exclude_set};
+use codesage_parser::discover::{
+    DEFAULT_EXCLUDE_PATTERNS, TEST_LIKE_EXCLUDE_PATTERNS, build_exclude_set,
+};
 use codesage_protocol::{
     CoChangeEntry, CoupledTestEntry, FileCategory, GitIndexStats, ImpactRequest, ImpactTarget,
     RiskAssessment, RiskDiffAssessment, TestRecommendations,
@@ -87,7 +89,7 @@ pub fn git_history_index_with_options(
     extra_excludes: &[String],
     mode: IndexMode,
 ) -> Result<GitIndexStats> {
-    let exclude_set = compile_excludes(extra_excludes)?;
+    let (exclude_set, test_like_set) = compile_excludes(extra_excludes)?;
     let head_sha = resolve_head_sha(root)?;
 
     let effective_mode = match mode {
@@ -110,30 +112,60 @@ pub fn git_history_index_with_options(
     };
 
     match effective_mode {
-        IndexMode::Full => run_full(db, root, &exclude_set, &head_sha),
+        IndexMode::Full => run_full(db, root, &exclude_set, &test_like_set, &head_sha),
         IndexMode::Incremental => {
             let (last_sha, last_at) = db
                 .get_git_index_state()?
                 .expect("incremental path checked state present above");
-            run_incremental(db, root, &exclude_set, &head_sha, &last_sha, last_at)
+            run_incremental(
+                db,
+                root,
+                &exclude_set,
+                &test_like_set,
+                &head_sha,
+                &last_sha,
+                last_at,
+            )
         }
         IndexMode::Auto => unreachable!("resolved above"),
     }
 }
 
-fn compile_excludes(extra: &[String]) -> Result<GlobSet> {
-    let mut all: Vec<String> = DEFAULT_EXCLUDE_PATTERNS
+/// Returns two glob sets:
+/// - `hard_exclude`: files that don't enter `git_files` at all (vendor, build
+///   outputs, binaries, lock files, generated docs).
+/// - `test_like`: files that enter `git_files` (so `recommend_tests` and
+///   `assess_risk` test-gap detection can find them) but are dropped from
+///   co-change pair generation. Tests, benches.
+fn compile_excludes(extra: &[String]) -> Result<(GlobSet, GlobSet)> {
+    use std::collections::HashSet;
+
+    let test_like_set: HashSet<&&str> = TEST_LIKE_EXCLUDE_PATTERNS.iter().collect();
+
+    let mut hard: Vec<String> = DEFAULT_EXCLUDE_PATTERNS
+        .iter()
+        .filter(|p| !test_like_set.contains(p))
+        .map(|s| s.to_string())
+        .collect();
+    hard.extend(extra.iter().cloned());
+    let hard_set =
+        build_exclude_set(&hard).with_context(|| "compiling git history hard-exclude patterns")?;
+
+    let test_patterns: Vec<String> = TEST_LIKE_EXCLUDE_PATTERNS
         .iter()
         .map(|s| s.to_string())
         .collect();
-    all.extend(extra.iter().cloned());
-    build_exclude_set(&all).with_context(|| "compiling git history exclude patterns")
+    let test_set = build_exclude_set(&test_patterns)
+        .with_context(|| "compiling test-like exclude patterns")?;
+
+    Ok((hard_set, test_set))
 }
 
 fn run_full(
     db: &Database,
     root: &Path,
     exclude_set: &GlobSet,
+    test_like_set: &GlobSet,
     head_sha: &str,
 ) -> Result<GitIndexStats> {
     let now = unix_now();
@@ -151,7 +183,14 @@ fn run_full(
             continue;
         };
         commits_scanned += 1;
-        accumulate(&mut files, &mut pairs, commit, &kept_changes, now);
+        accumulate(
+            &mut files,
+            &mut pairs,
+            commit,
+            &kept_changes,
+            now,
+            test_like_set,
+        );
     }
 
     for (path, stats) in &files {
@@ -185,6 +224,7 @@ fn run_incremental(
     db: &Database,
     root: &Path,
     exclude_set: &GlobSet,
+    test_like_set: &GlobSet,
     head_sha: &str,
     last_sha: &str,
     last_indexed_at: i64,
@@ -212,7 +252,14 @@ fn run_incremental(
             continue;
         };
         commits_scanned += 1;
-        accumulate(&mut files, &mut pairs, commit, &kept_changes, now);
+        accumulate(
+            &mut files,
+            &mut pairs,
+            commit,
+            &kept_changes,
+            now,
+            test_like_set,
+        );
     }
 
     for (path, stats) in &files {
@@ -264,6 +311,7 @@ fn accumulate(
     commit: &Commit,
     kept_changes: &[&FileChange],
     now: i64,
+    test_like_set: &GlobSet,
 ) {
     let age_days = ((now - commit.timestamp).max(0) as f64) / SECONDS_PER_DAY;
     let decay = (-age_days / DECAY_HALFLIFE_DAYS).exp();
@@ -283,11 +331,19 @@ fn accumulate(
         stats.churn_score += weight;
     }
 
-    if kept_changes.len() <= MAX_FILES_PER_COMMIT_FOR_COCHANGE {
-        for i in 0..kept_changes.len() {
-            for j in (i + 1)..kept_changes.len() {
-                let a = &kept_changes[i].path;
-                let b = &kept_changes[j].path;
+    // Drop test-like files from co-change pair generation: they pair with
+    // everything they cover and would dominate coupling rankings. They stay in
+    // `git_files` so the test-discovery tools can find them.
+    let pairable: Vec<&&FileChange> = kept_changes
+        .iter()
+        .filter(|c| !test_like_set.is_match(&c.path))
+        .collect();
+
+    if pairable.len() <= MAX_FILES_PER_COMMIT_FOR_COCHANGE {
+        for i in 0..pairable.len() {
+            for j in (i + 1)..pairable.len() {
+                let a = &pairable[i].path;
+                let b = &pairable[j].path;
                 let (lo, hi) = if a < b { (a, b) } else { (b, a) };
                 let pair = pairs.entry((lo.clone(), hi.clone())).or_default();
                 pair.weight += decay;
@@ -644,6 +700,31 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<Vec<String>> {
             found.push(normalized);
         }
     }
+
+    // Rust: integration tests live in `<crate_root>/tests/*.rs`, not as siblings
+    // and not name-keyed to the source file. List every `.rs` file under the
+    // crate's `tests/` directory; the agent can filter further if it has more
+    // context. Skips fixture files since those aren't test entry points.
+    if file_path.ends_with(".rs")
+        && let Some(idx) = file_path.rfind("/src/")
+    {
+        let crate_root = &file_path[..idx];
+        let tests_prefix = format!("{crate_root}/tests/");
+        for path in db.git_files_with_prefix(&tests_prefix)? {
+            if path.ends_with(".rs") && !path.contains("/fixtures/") && !found.contains(&path) {
+                found.push(path);
+            }
+        }
+    }
+    // Workspace-root case: src/foo.rs paired with tests/*.rs at the same level.
+    if file_path.ends_with(".rs") && file_path.starts_with("src/") {
+        for path in db.git_files_with_prefix("tests/")? {
+            if path.ends_with(".rs") && !path.contains("/fixtures/") && !found.contains(&path) {
+                found.push(path);
+            }
+        }
+    }
+
     Ok(found)
 }
 

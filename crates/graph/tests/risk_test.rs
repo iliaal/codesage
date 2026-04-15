@@ -394,3 +394,93 @@ fn recommend_tests_aggregates_across_multiple_input_files() {
     assert!(r.primary.contains(&"RepositoryTest.php".to_string()));
     assert!(r.primary.contains(&"ServiceTest.php".to_string()));
 }
+
+#[test]
+fn recommend_tests_finds_rust_integration_tests_under_crate_tests_dir() {
+    let (_dir, db) = setup_project();
+    // Rust convention: source at crates/<name>/src/, integration tests at
+    // crates/<name>/tests/. There's no per-file naming convention, so the
+    // recommender lists every .rs file in that tests/ directory.
+    db.upsert_git_file("crates/storage/src/db.rs", 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+    db.upsert_git_file(
+        "crates/storage/tests/db_integration.rs",
+        0.5,
+        0,
+        5,
+        Some(1_700_000_000),
+    )
+    .unwrap();
+    db.upsert_git_file(
+        "crates/storage/tests/schema_migration_test.rs",
+        0.5,
+        0,
+        5,
+        Some(1_700_000_000),
+    )
+    .unwrap();
+    // A test under a different crate must NOT leak in.
+    db.upsert_git_file(
+        "crates/parser/tests/extract_test.rs",
+        0.5,
+        0,
+        5,
+        Some(1_700_000_000),
+    )
+    .unwrap();
+
+    let r =
+        codesage_graph::recommend_tests(&db, &["crates/storage/src/db.rs".to_string()]).unwrap();
+    assert!(
+        r.primary
+            .contains(&"crates/storage/tests/db_integration.rs".to_string())
+    );
+    assert!(
+        r.primary
+            .contains(&"crates/storage/tests/schema_migration_test.rs".to_string())
+    );
+    assert!(
+        !r.primary
+            .contains(&"crates/parser/tests/extract_test.rs".to_string()),
+        "tests from a different crate must not leak in: {:?}",
+        r.primary
+    );
+}
+
+#[test]
+fn recommend_tests_skips_fixture_files_under_rust_tests_dir() {
+    let (_dir, db) = setup_project();
+    db.upsert_git_file(
+        "crates/parser/src/extract.rs",
+        1.0,
+        0,
+        5,
+        Some(1_700_000_000),
+    )
+    .unwrap();
+    db.upsert_git_file(
+        "crates/parser/tests/extract_test.rs",
+        0.5,
+        0,
+        5,
+        Some(1_700_000_000),
+    )
+    .unwrap();
+    // Fixture files are NOT test entry points; should not be recommended.
+    db.upsert_git_file(
+        "crates/parser/tests/fixtures/sample.rs",
+        0.1,
+        0,
+        2,
+        Some(1_700_000_000),
+    )
+    .unwrap();
+
+    let r = codesage_graph::recommend_tests(&db, &["crates/parser/src/extract.rs".to_string()])
+        .unwrap();
+    assert_eq!(r.primary, vec!["crates/parser/tests/extract_test.rs"]);
+    assert!(
+        !r.primary
+            .contains(&"crates/parser/tests/fixtures/sample.rs".to_string())
+    );
+}

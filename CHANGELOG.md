@@ -8,11 +8,23 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-15
+
+V2b slice 2: tools that change agent behavior per-task instead of just informing it.
+
 ### Added
 
 - **`assess_risk_diff(project, file_paths[])`** MCP tool and `codesage risk-diff` CLI command. Aggregate risk for a set of files (the file list of a patch). Returns per-file decomposition plus rollups: `max_score`, `mean_score`, `max_risk_file`, and lists of files in each risk category (hotspot, fix-heavy, test-gap, wide blast radius). Output includes paste-ready `summary_notes` for PR descriptions. Use BEFORE submitting a patch to decide whether to add tests, split the change, or flag concerns.
-- **`recommend_tests(project, file_paths[])`** MCP tool and `codesage tests-for` CLI command. Returns the tests an agent should run after editing a set of files. Two layers: `primary` (sibling tests resolved by language convention — `FooTest.php`, `foo.test.ts`, `test_foo.py`, `foo_test.go` — high confidence) and `coupled` (tests that historically change with the input files via git co-change history — medium confidence, catches integration tests that don't follow naming conventions). Coupled entries are deduped against primary so each test appears once. Empty result means no test files in the index for these paths.
+- **`recommend_tests(project, file_paths[])`** MCP tool and `codesage tests-for` CLI command. Returns the tests an agent should run after editing a set of files. Two layers: `primary` (sibling tests resolved by language convention — `FooTest.php`, `foo.test.ts`, `test_foo.py`, `foo_test.go`, plus Rust integration tests under `crates/<name>/tests/*.rs`) and `coupled` (tests that historically change with the input files via git co-change history). Coupled entries are deduped against primary so each test appears once. Empty result means no test files in the index for these paths.
 - Both new CLI commands accept positional file args or read newline-separated paths from stdin, so they compose with `git diff --name-only | codesage risk-diff` and similar pipelines.
+- `discover::TEST_LIKE_EXCLUDE_PATTERNS`: subset of the default exclude list covering test and bench files. Exposed so `git_history` can split test files from hard-excluded files.
+
+### Changed
+
+- `codesage git-index` now keeps test and bench files in `git_files` so `recommend_tests` and `assess_risk` test-gap detection can find them. Test files remain dropped from co-change pair generation, so coupling rankings stay focused on production code. Re-run `codesage git-index --full` after upgrading to populate test files.
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/iliaal/codesage/releases/tag/v0.3.0
 
 ## [0.2.1] - 2026-04-15
 
@@ -54,6 +66,5 @@ Initial public release.
 - Bench plugin commands honor `CODESAGE_BENCH_CORPUS_DIR` (default: `./bench-corpora`). No hardcoded personal paths.
 - Workspace-level versioning. `[workspace.package]` owns the version; every crate inherits via `version.workspace = true`, so releases bump in one line.
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.2.1...HEAD
 [0.2.1]: https://github.com/iliaal/codesage/releases/tag/v0.2.1
 [0.2.0]: https://github.com/iliaal/codesage/releases/tag/v0.2.0

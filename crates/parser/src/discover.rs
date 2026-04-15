@@ -72,6 +72,35 @@ pub fn discover_files_with_excludes(
 /// Most build outputs live under top-level gitignore on real projects already; these defaults
 /// catch the cases where they do not (vendored repos, sandboxed checkouts) and add language /
 /// IDE / cache patterns that gitignore alone misses.
+/// Subset of `DEFAULT_EXCLUDE_PATTERNS` that identifies test and bench files.
+/// Used by `git_history` to keep these files in `git_files` (so `recommend_tests`
+/// and `assess_risk`'s test-gap check can find them) while still dropping them
+/// from co-change pair generation (where they'd pair with everything they cover
+/// and skew coupling rankings).
+pub const TEST_LIKE_EXCLUDE_PATTERNS: &[&str] = &[
+    "**/tests/**",
+    "**/test/**",
+    "**/__tests__/**",
+    "**/Tests/**",
+    "**/*Test.php",
+    "**/*_test.php",
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "**/*.test.js",
+    "**/*.test.jsx",
+    "**/*.spec.ts",
+    "**/*.spec.tsx",
+    "**/*.spec.js",
+    "**/*.spec.jsx",
+    "**/test_*.py",
+    "**/*_test.py",
+    "**/*_test.rs",
+    "**/*_test.go",
+    "**/*.phpt",
+    "**/benches/**",
+    "**/benchmarks/**",
+];
+
 pub const DEFAULT_EXCLUDE_PATTERNS: &[&str] = &[
     // ----- tests (excluded from semantic search; structural pass still sees test code) -----
     "**/tests/**",
