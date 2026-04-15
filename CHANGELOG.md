@@ -8,6 +8,16 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-04-15
+
+Performance fix.
+
+### Fixed
+
+- `codesage git-index` was issuing one fsync per upserted row. On large repos like php-src (~25k files + ~10k pairs per worktree) this burned multi-minute disk waits in `jbd2_log_wait_commit` — visible as ~1% CPU per process. Now wraps clear + every upsert in a single SQLite transaction (one fsync per indexer instead of N). Estimated 10-20x speed-up on large repos with the same disk; bigger when multiple indexers share the same disk journal.
+
+[0.3.2]: https://github.com/iliaal/codesage/releases/tag/v0.3.2
+
 ## [0.3.1] - 2026-04-15
 
 Bug-fix release for two issues exposed by dogfooding 0.3.0 against php-src.

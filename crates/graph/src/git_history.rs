@@ -172,8 +172,6 @@ fn run_full(
     let raw = run_git_log(root, None)?;
     let commits = parse_log(&raw);
 
-    db.clear_git_data()?;
-
     let mut files: HashMap<String, FileStats> = HashMap::new();
     let mut pairs: HashMap<(String, String), PairStats> = HashMap::new();
     let mut commits_scanned = 0usize;
@@ -193,25 +191,31 @@ fn run_full(
         );
     }
 
-    for (path, stats) in &files {
-        db.upsert_git_file(
-            path,
-            stats.churn_score,
-            stats.fix_count,
-            stats.total_commits,
-            stats.last_commit_at,
-        )?;
-    }
-
+    // Wrap clear + every upsert in one transaction. SQLite default-mode commits
+    // each execute, which means N rows = N fsync()s. On large repos (php-src
+    // ~25k files + ~10k pairs) that turns into a multi-minute disk wait
+    // (jbd2_log_wait_commit). One transaction = one fsync.
     let mut co_change_kept = 0usize;
-    for ((a, b), stats) in &pairs {
-        if stats.count >= MIN_CO_CHANGE_COUNT {
-            db.upsert_git_co_change(a, b, stats.weight, stats.count, stats.last_observed_at)?;
-            co_change_kept += 1;
+    db.execute_batch(|db| {
+        db.clear_git_data()?;
+        for (path, stats) in &files {
+            db.upsert_git_file(
+                path,
+                stats.churn_score,
+                stats.fix_count,
+                stats.total_commits,
+                stats.last_commit_at,
+            )?;
         }
-    }
-
-    db.set_git_index_state(head_sha)?;
+        for ((a, b), stats) in &pairs {
+            if stats.count >= MIN_CO_CHANGE_COUNT {
+                db.upsert_git_co_change(a, b, stats.weight, stats.count, stats.last_observed_at)?;
+                co_change_kept += 1;
+            }
+        }
+        db.set_git_index_state(head_sha)?;
+        Ok(())
+    })?;
 
     Ok(GitIndexStats {
         commits_scanned,
@@ -234,15 +238,6 @@ fn run_incremental(
     let raw = run_git_log(root, Some(&range))?;
     let commits = parse_log(&raw);
 
-    // Age existing rows forward by the time elapsed since last index. Exponential decay
-    // composes multiplicatively: e^(-(now - t)/τ) = e^(-(last - t)/τ) * e^(-(now-last)/τ),
-    // so a single global scale is mathematically exact.
-    let delta_seconds = (now - last_indexed_at).max(0) as f64;
-    if delta_seconds > 0.0 {
-        let factor = (-delta_seconds / (DECAY_HALFLIFE_DAYS * SECONDS_PER_DAY)).exp();
-        db.scale_git_decay(factor)?;
-    }
-
     let mut files: HashMap<String, FileStats> = HashMap::new();
     let mut pairs: HashMap<(String, String), PairStats> = HashMap::new();
     let mut commits_scanned = 0usize;
@@ -262,29 +257,40 @@ fn run_incremental(
         );
     }
 
-    for (path, stats) in &files {
-        db.incr_git_file(
-            path,
-            stats.churn_score,
-            stats.fix_count,
-            stats.total_commits,
-            stats.last_commit_at,
-        )?;
-    }
-
+    // One transaction wraps decay-scale + every upsert. See run_full for the
+    // fsync motivation. Decay scale needs to be inside the same transaction
+    // as the deltas, otherwise a crash mid-write leaves us with scaled-but-
+    // not-incremented rows.
     let mut co_change_kept = 0usize;
-    for ((a, b), stats) in &pairs {
-        // Surface a pair if either it already exists in DB (accumulate onto it) or
-        // its delta alone cleared the min-count filter. Sub-threshold pairs that
-        // straddle the boundary will be caught by the next full rescan.
-        let should_upsert = stats.count >= MIN_CO_CHANGE_COUNT || db.co_change_pair_exists(a, b)?;
-        if should_upsert {
-            db.incr_git_co_change(a, b, stats.weight, stats.count, stats.last_observed_at)?;
-            co_change_kept += 1;
+    db.execute_batch(|db| {
+        let delta_seconds = (now - last_indexed_at).max(0) as f64;
+        if delta_seconds > 0.0 {
+            let factor = (-delta_seconds / (DECAY_HALFLIFE_DAYS * SECONDS_PER_DAY)).exp();
+            db.scale_git_decay(factor)?;
         }
-    }
-
-    db.set_git_index_state(head_sha)?;
+        for (path, stats) in &files {
+            db.incr_git_file(
+                path,
+                stats.churn_score,
+                stats.fix_count,
+                stats.total_commits,
+                stats.last_commit_at,
+            )?;
+        }
+        for ((a, b), stats) in &pairs {
+            // Surface a pair if either it already exists in DB (accumulate onto it) or
+            // its delta alone cleared the min-count filter. Sub-threshold pairs that
+            // straddle the boundary will be caught by the next full rescan.
+            let should_upsert =
+                stats.count >= MIN_CO_CHANGE_COUNT || db.co_change_pair_exists(a, b)?;
+            if should_upsert {
+                db.incr_git_co_change(a, b, stats.weight, stats.count, stats.last_observed_at)?;
+                co_change_kept += 1;
+            }
+        }
+        db.set_git_index_state(head_sha)?;
+        Ok(())
+    })?;
 
     Ok(GitIndexStats {
         commits_scanned,
