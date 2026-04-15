@@ -20,7 +20,8 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow};
 use codesage_parser::discover::{DEFAULT_EXCLUDE_PATTERNS, build_exclude_set};
 use codesage_protocol::{
-    CoChangeEntry, FileCategory, GitIndexStats, ImpactRequest, ImpactTarget, RiskAssessment,
+    CoChangeEntry, CoupledTestEntry, FileCategory, GitIndexStats, ImpactRequest, ImpactTarget,
+    RiskAssessment, RiskDiffAssessment, TestRecommendations,
 };
 use codesage_storage::Database;
 use globset::GlobSet;
@@ -599,9 +600,9 @@ pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
     })
 }
 
-/// Heuristic: do any indexed files look like tests for `file_path`?
-/// Looks for sibling and same-package conventions across PHP, Python, JS/TS, Rust, Go.
-fn test_sibling_exists(db: &Database, file_path: &str) -> Result<bool> {
+/// All sibling test files for `file_path` that exist in the index, by language
+/// convention. Used by `recommend_tests` and (via .is_empty()) by `assess_risk`.
+fn test_sibling_paths(db: &Database, file_path: &str) -> Result<Vec<String>> {
     let stem = file_path
         .rsplit('/')
         .next()
@@ -609,7 +610,7 @@ fn test_sibling_exists(db: &Database, file_path: &str) -> Result<bool> {
         .map(|(s, _)| s.to_string())
         .unwrap_or_default();
     if stem.is_empty() {
-        return Ok(false);
+        return Ok(Vec::new());
     }
     let dir = file_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
 
@@ -631,16 +632,190 @@ fn test_sibling_exists(db: &Database, file_path: &str) -> Result<bool> {
         format!("{dir}/{stem}.spec.ts"),
         format!("{dir}/{stem}.spec.tsx"),
         format!("{dir}/{stem}.spec.js"),
-        // Rust: foo.rs uses inline #[cfg(test)] mod tests so often no separate file.
-        // Skip explicit rust check; absence here just means rust file relies on inline tests.
+        // Rust: foo.rs uses inline #[cfg(test)] mod tests so often no separate
+        // file. Skip the explicit rust check; absence here just means the rust
+        // file relies on inline tests.
     ];
 
+    let mut found = Vec::new();
     for c in &candidates {
-        if db.git_file(c.trim_start_matches('/'))?.is_some() {
-            return Ok(true);
+        let normalized = c.trim_start_matches('/').to_string();
+        if db.git_file(&normalized)?.is_some() {
+            found.push(normalized);
         }
     }
-    Ok(false)
+    Ok(found)
+}
+
+/// Heuristic: do any indexed files look like tests for `file_path`?
+fn test_sibling_exists(db: &Database, file_path: &str) -> Result<bool> {
+    Ok(!test_sibling_paths(db, file_path)?.is_empty())
+}
+
+/// Aggregate `assess_risk` across the file list of a patch. Lets an agent
+/// ask one question instead of N round-trips. Output exposes both the
+/// per-file decomposition and patch-level rollups (max/mean, files in each
+/// risk category, paste-ready summary notes).
+pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiffAssessment> {
+    if file_paths.is_empty() {
+        return Ok(RiskDiffAssessment::default());
+    }
+
+    let files: Vec<RiskAssessment> = file_paths
+        .iter()
+        .map(|p| assess_risk(db, p))
+        .collect::<Result<Vec<_>>>()?;
+
+    let max_score = files.iter().map(|f| f.score).fold(0.0_f64, f64::max);
+    let mean_score = files.iter().map(|f| f.score).sum::<f64>() / files.len() as f64;
+    let max_risk_file = files
+        .iter()
+        .max_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|f| f.file.clone());
+
+    let test_gap_files: Vec<String> = files
+        .iter()
+        .filter(|f| f.test_gap)
+        .map(|f| f.file.clone())
+        .collect();
+
+    let wide_blast_files: Vec<String> = files
+        .iter()
+        .filter(|f| f.dependent_files >= 10)
+        .map(|f| f.file.clone())
+        .collect();
+
+    let fix_heavy_files: Vec<String> = files
+        .iter()
+        .filter(|f| f.fix_ratio >= 0.4 && f.total_commits >= 5)
+        .map(|f| f.file.clone())
+        .collect();
+
+    let hotspot_files: Vec<String> = files
+        .iter()
+        .filter(|f| f.churn_percentile >= 0.75)
+        .map(|f| f.file.clone())
+        .collect();
+
+    let mut summary_notes = Vec::new();
+    if !hotspot_files.is_empty() {
+        summary_notes.push(format!(
+            "patch touches {} hotspot file(s)",
+            hotspot_files.len()
+        ));
+    }
+    if !fix_heavy_files.is_empty() {
+        summary_notes.push(format!(
+            "{} file(s) historically fix-heavy",
+            fix_heavy_files.len()
+        ));
+    }
+    if !test_gap_files.is_empty() {
+        summary_notes.push(format!(
+            "{} file(s) lack test coverage (no sibling test, no test in co-change history)",
+            test_gap_files.len()
+        ));
+    }
+    if !wide_blast_files.is_empty() {
+        summary_notes.push(format!(
+            "{} file(s) have wide blast radius (>=10 dependents)",
+            wide_blast_files.len()
+        ));
+    }
+    if max_score >= 0.6 {
+        summary_notes.push(format!(
+            "max risk score {max_score:.2}; consider smaller patch and broader test sweep"
+        ));
+    }
+
+    Ok(RiskDiffAssessment {
+        files,
+        max_score,
+        mean_score,
+        max_risk_file,
+        test_gap_files,
+        wide_blast_files,
+        fix_heavy_files,
+        hotspot_files,
+        summary_notes,
+    })
+}
+
+/// Tests an agent should run after editing the given files. Two layers:
+/// sibling tests (high confidence, language convention) plus tests that
+/// historically co-change (medium confidence, catches integration-style
+/// tests that don't follow naming conventions). Empty result means no
+/// matching test files in the index.
+pub fn recommend_tests(db: &Database, file_paths: &[String]) -> Result<TestRecommendations> {
+    use std::collections::HashSet;
+
+    let mut primary: HashSet<String> = HashSet::new();
+    let mut coupled: Vec<CoupledTestEntry> = Vec::new();
+
+    for path in file_paths {
+        for sibling in test_sibling_paths(db, path)? {
+            primary.insert(sibling);
+        }
+        let co = db.co_changes_for(path, 20)?;
+        for entry in co {
+            if matches!(FileCategory::classify(&entry.file), FileCategory::Test) {
+                coupled.push(CoupledTestEntry {
+                    file: entry.file,
+                    weight: entry.weight,
+                    count: entry.count,
+                    source: path.clone(),
+                });
+            }
+        }
+    }
+
+    // Drop coupled entries that are also in primary; primary already says "run me".
+    coupled.retain(|c| !primary.contains(&c.file));
+
+    // Dedupe coupled entries by file, keeping the highest-weight pairing so the
+    // agent sees the strongest signal. Source attribution refers to that pairing.
+    coupled.sort_by(|a, b| {
+        b.weight
+            .partial_cmp(&a.weight)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut seen: HashSet<String> = HashSet::new();
+    coupled.retain(|e| seen.insert(e.file.clone()));
+
+    let mut primary_sorted: Vec<String> = primary.into_iter().collect();
+    primary_sorted.sort();
+
+    let mut notes = Vec::new();
+    if primary_sorted.is_empty() && coupled.is_empty() {
+        notes.push(
+            "no test files found via sibling conventions or co-change history; \
+             run `codesage git-index` if you haven't, or add tests for these files"
+                .to_string(),
+        );
+    } else {
+        if !primary_sorted.is_empty() {
+            notes.push(format!(
+                "{} sibling test file(s) found by language convention",
+                primary_sorted.len()
+            ));
+        }
+        if !coupled.is_empty() {
+            notes.push(format!(
+                "{} additional test file(s) suggested by co-change history",
+                coupled.len()
+            ));
+        }
+    }
+
+    Ok(TestRecommendations {
+        primary: primary_sorted,
+        coupled,
+        notes,
+    })
 }
 
 fn unix_now() -> i64 {

@@ -4,7 +4,8 @@ pub mod query;
 pub mod semantic;
 
 pub use git_history::{
-    IndexMode, assess_risk, find_coupling, git_history_index, git_history_index_with_options,
+    IndexMode, assess_risk, assess_risk_diff, find_coupling, git_history_index,
+    git_history_index_with_options, recommend_tests,
 };
 pub use index::{full_index, incremental_index};
 pub use query::{

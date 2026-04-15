@@ -214,3 +214,183 @@ fn wide_blast_radius_note_fires_when_many_dependents() {
         r.notes
     );
 }
+
+// ----- assess_risk_diff -----
+
+#[test]
+fn risk_diff_empty_input_returns_defaults() {
+    let (_dir, db) = setup_project();
+    let r = codesage_graph::assess_risk_diff(&db, &[]).unwrap();
+    assert!(r.files.is_empty());
+    assert_eq!(r.max_score, 0.0);
+    assert_eq!(r.mean_score, 0.0);
+    assert!(r.max_risk_file.is_none());
+    assert!(r.summary_notes.is_empty());
+}
+
+#[test]
+fn risk_diff_aggregates_max_and_mean_across_files() {
+    let (_dir, db) = setup_project();
+
+    // Hot+fix-heavy + lots of cooler files for a wide percentile distribution.
+    db.upsert_git_file("Repository.php", 100.0, 40, 80, Some(1_700_000_000))
+        .unwrap();
+    db.upsert_git_file("Controller.php", 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+    for (p, c) in [
+        ("Service.php", 2.0_f64),
+        ("other_a.php", 0.5),
+        ("other_b.php", 0.7),
+    ] {
+        db.upsert_git_file(p, c, 0, 5, Some(1_700_000_000)).unwrap();
+    }
+
+    let files = vec!["Repository.php".to_string(), "Controller.php".to_string()];
+    let r = codesage_graph::assess_risk_diff(&db, &files).unwrap();
+
+    assert_eq!(r.files.len(), 2);
+    assert_eq!(r.max_risk_file.as_deref(), Some("Repository.php"));
+    assert!(
+        r.max_score >= 0.6,
+        "max should reflect the hot file, got {}",
+        r.max_score
+    );
+    assert!(
+        r.mean_score < r.max_score,
+        "mean should pull below max, got {}",
+        r.mean_score
+    );
+    assert!(r.hotspot_files.contains(&"Repository.php".to_string()));
+    assert!(r.fix_heavy_files.contains(&"Repository.php".to_string()));
+    assert!(
+        r.summary_notes.iter().any(|n| n.contains("hotspot")),
+        "expected hotspot note, got {:?}",
+        r.summary_notes
+    );
+}
+
+#[test]
+fn risk_diff_summary_includes_max_score_warning_when_high() {
+    let (_dir, db) = setup_project();
+    db.upsert_git_file("Repository.php", 100.0, 40, 80, Some(1_700_000_000))
+        .unwrap();
+    for p in ["Controller.php", "Service.php"] {
+        db.upsert_git_file(p, 0.1, 0, 5, Some(1_700_000_000))
+            .unwrap();
+    }
+    let r = codesage_graph::assess_risk_diff(&db, &["Repository.php".to_string()]).unwrap();
+    assert!(r.max_score >= 0.6);
+    assert!(
+        r.summary_notes.iter().any(|n| n.contains("max risk score")),
+        "expected explicit max-score warning, got {:?}",
+        r.summary_notes
+    );
+}
+
+// ----- recommend_tests -----
+
+#[test]
+fn recommend_tests_returns_empty_when_no_test_signal() {
+    let (_dir, db) = setup_project();
+    let r = codesage_graph::recommend_tests(&db, &["Repository.php".to_string()]).unwrap();
+    assert!(r.primary.is_empty());
+    assert!(r.coupled.is_empty());
+    assert!(
+        r.notes.iter().any(|n| n.contains("no test files found")),
+        "expected explanatory note, got {:?}",
+        r.notes
+    );
+}
+
+#[test]
+fn recommend_tests_finds_sibling_test_in_index() {
+    let (_dir, db) = setup_project();
+    // Seed a sibling test file in git_files. assess_risk's test_sibling check
+    // queries the same table, so this is the canonical "sibling exists" signal.
+    db.upsert_git_file("RepositoryTest.php", 0.5, 0, 5, Some(1_700_000_000))
+        .unwrap();
+
+    let r = codesage_graph::recommend_tests(&db, &["Repository.php".to_string()]).unwrap();
+    assert_eq!(r.primary, vec!["RepositoryTest.php".to_string()]);
+    assert!(r.coupled.is_empty(), "no co-change history seeded");
+}
+
+#[test]
+fn recommend_tests_finds_coupled_test_via_co_change() {
+    let (_dir, db) = setup_project();
+    // No sibling file. Coupled test surfaces via co-change.
+    db.upsert_git_file("Repository.php", 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+    db.upsert_git_file(
+        "tests/integration/auth_flow.test.ts",
+        0.5,
+        0,
+        5,
+        Some(1_700_000_000),
+    )
+    .unwrap();
+    db.upsert_git_co_change(
+        "Repository.php",
+        "tests/integration/auth_flow.test.ts",
+        4.2,
+        8,
+        Some(1_700_000_000),
+    )
+    .unwrap();
+
+    let r = codesage_graph::recommend_tests(&db, &["Repository.php".to_string()]).unwrap();
+    assert!(r.primary.is_empty(), "no sibling seeded");
+    assert_eq!(r.coupled.len(), 1);
+    let entry = &r.coupled[0];
+    assert_eq!(entry.file, "tests/integration/auth_flow.test.ts");
+    assert_eq!(entry.source, "Repository.php");
+    assert_eq!(entry.count, 8);
+}
+
+#[test]
+fn recommend_tests_dedupes_coupled_when_also_primary() {
+    let (_dir, db) = setup_project();
+    // Same file shows up as both sibling and a co-changer; recommend_tests should
+    // only list it once, in primary, to avoid duplicate "run me" lines.
+    db.upsert_git_file("Repository.php", 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+    db.upsert_git_file("RepositoryTest.php", 0.5, 0, 5, Some(1_700_000_000))
+        .unwrap();
+    db.upsert_git_co_change(
+        "Repository.php",
+        "RepositoryTest.php",
+        5.0,
+        5,
+        Some(1_700_000_000),
+    )
+    .unwrap();
+
+    let r = codesage_graph::recommend_tests(&db, &["Repository.php".to_string()]).unwrap();
+    assert_eq!(r.primary, vec!["RepositoryTest.php".to_string()]);
+    assert!(
+        r.coupled.is_empty(),
+        "RepositoryTest.php was already in primary; expected no duplicate in coupled"
+    );
+}
+
+#[test]
+fn recommend_tests_aggregates_across_multiple_input_files() {
+    let (_dir, db) = setup_project();
+    db.upsert_git_file("Repository.php", 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+    db.upsert_git_file("Service.php", 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+    db.upsert_git_file("RepositoryTest.php", 0.5, 0, 5, Some(1_700_000_000))
+        .unwrap();
+    db.upsert_git_file("ServiceTest.php", 0.5, 0, 5, Some(1_700_000_000))
+        .unwrap();
+
+    let r = codesage_graph::recommend_tests(
+        &db,
+        &["Repository.php".to_string(), "Service.php".to_string()],
+    )
+    .unwrap();
+    assert_eq!(r.primary.len(), 2, "both siblings should surface");
+    assert!(r.primary.contains(&"RepositoryTest.php".to_string()));
+    assert!(r.primary.contains(&"ServiceTest.php".to_string()));
+}

@@ -7,8 +7,8 @@ use codesage_embed::config::EmbeddingConfig;
 use codesage_embed::model::Embedder;
 use codesage_embed::reranker::Reranker;
 use codesage_graph::{
-    assess_risk, export_context, find_coupling, find_references, find_symbol, impact_analysis,
-    list_dependencies, search,
+    assess_risk, assess_risk_diff, export_context, find_coupling, find_references, find_symbol,
+    impact_analysis, list_dependencies, recommend_tests, search,
 };
 use codesage_protocol::{
     ExportRequest, FindReferencesRequest, FindSymbolRequest, ImpactRequest, ImpactTarget, Language,
@@ -72,6 +72,24 @@ pub struct RiskParams {
     pub project: String,
     #[schemars(description = "Repo-relative file path to assess")]
     pub file_path: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RiskDiffParams {
+    #[schemars(description = PROJECT_ARG_DESC)]
+    pub project: String,
+    #[schemars(
+        description = "Repo-relative file paths in the patch (typically the output of `git diff --name-only`)"
+    )]
+    pub file_paths: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct TestsForParams {
+    #[schemars(description = PROJECT_ARG_DESC)]
+    pub project: String,
+    #[schemars(description = "Repo-relative file paths whose tests should be recommended")]
+    pub file_paths: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -548,6 +566,30 @@ impl CodeSageServer {
         render_with_kind(
             self.with_project_db(&params.project, |db| assess_risk(db, &file_path)),
             "assess_risk",
+        )
+    }
+
+    #[tool(
+        name = "assess_risk_diff",
+        description = "Aggregate risk for a SET of files (the file list of a patch or PR). Returns per-file decomposition plus rollups: max_score, mean_score, max_risk_file, and lists of files in each risk category (test_gap, hotspot, fix-heavy, wide blast radius). Use BEFORE submitting a patch: if max_score is high or any test_gap_files exist, add tests, split the patch, or flag concerns. summary_notes are paste-ready for a PR description."
+    )]
+    fn assess_risk_diff_tool(&self, Parameters(params): Parameters<RiskDiffParams>) -> String {
+        let file_paths = params.file_paths.clone();
+        render_with_kind(
+            self.with_project_db(&params.project, |db| assess_risk_diff(db, &file_paths)),
+            "assess_risk_diff",
+        )
+    }
+
+    #[tool(
+        name = "recommend_tests",
+        description = "Tests an agent should run after editing the given files. Returns `primary` (sibling tests resolved by language convention — FooTest.php, foo.test.ts, test_foo.py, foo_test.go — high confidence, always run these) and `coupled` (tests that historically change with the input files via git co-change history — medium confidence, catches integration tests that don't follow naming conventions). Empty result means no test files in the index for these paths. Use AFTER making a change to know which subset of tests to actually run."
+    )]
+    fn recommend_tests_tool(&self, Parameters(params): Parameters<TestsForParams>) -> String {
+        let file_paths = params.file_paths.clone();
+        render_with_kind(
+            self.with_project_db(&params.project, |db| recommend_tests(db, &file_paths)),
+            "recommend_tests",
         )
     }
 }

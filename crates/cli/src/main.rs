@@ -183,6 +183,24 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Aggregate risk across a patch (multiple files). Reads file paths from stdin (one per line)
+    /// or from positional args. (V2b slice 2)
+    RiskDiff {
+        /// Repo-relative file paths. If empty, read newline-separated paths from stdin.
+        files: Vec<String>,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Tests that should run after editing the given files: sibling tests + co-change history.
+    /// Reads file paths from stdin (one per line) or from positional args. (V2b slice 2)
+    TestsFor {
+        /// Repo-relative file paths. If empty, read newline-separated paths from stdin.
+        files: Vec<String>,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn find_project_root() -> Result<PathBuf> {
@@ -304,6 +322,8 @@ fn main() -> Result<()> {
         } => cmd_git_index(json, full, incremental),
         Commands::Coupling { file, limit, json } => cmd_coupling(&file, limit, json),
         Commands::Risk { file, json } => cmd_risk(&file, json),
+        Commands::RiskDiff { files, json } => cmd_risk_diff(files, json),
+        Commands::TestsFor { files, json } => cmd_tests_for(files, json),
     }
 }
 
@@ -846,6 +866,105 @@ fn cmd_risk(file: &str, json: bool) -> Result<()> {
             println!("  Top coupled:");
             for c in assessment.top_coupled.iter().take(5) {
                 println!("    {:>5.2}  {}", c.weight, c.file);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a file-list argument: positional args if non-empty, else newline-separated
+/// from stdin. Used by `risk-diff` and `tests-for` so they compose with `git diff
+/// --name-only` and similar pipelines.
+fn resolve_file_list(files: Vec<String>) -> Result<Vec<String>> {
+    if !files.is_empty() {
+        return Ok(files);
+    }
+    use std::io::Read;
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf)?;
+    Ok(buf
+        .lines()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect())
+}
+
+fn cmd_risk_diff(files: Vec<String>, json: bool) -> Result<()> {
+    let root = find_project_root()?;
+    let db = open_db(&root)?;
+    let files = resolve_file_list(files)?;
+    if files.is_empty() {
+        bail!("no file paths provided (pass as args or pipe via stdin)");
+    }
+    let assessment = codesage_graph::assess_risk_diff(&db, &files)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&assessment)?);
+    } else {
+        println!(
+            "Patch risk: {} file(s) | max={:.2} mean={:.2}",
+            assessment.files.len(),
+            assessment.max_score,
+            assessment.mean_score
+        );
+        if let Some(top) = &assessment.max_risk_file {
+            println!("  highest-risk file: {top}");
+        }
+        for label in [
+            ("hotspot", &assessment.hotspot_files),
+            ("fix-heavy", &assessment.fix_heavy_files),
+            ("test gap", &assessment.test_gap_files),
+            ("wide blast radius", &assessment.wide_blast_files),
+        ] {
+            if !label.1.is_empty() {
+                println!("  {} ({}):", label.0, label.1.len());
+                for f in label.1 {
+                    println!("    - {f}");
+                }
+            }
+        }
+        if !assessment.summary_notes.is_empty() {
+            println!("  Notes:");
+            for n in &assessment.summary_notes {
+                println!("    - {n}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_tests_for(files: Vec<String>, json: bool) -> Result<()> {
+    let root = find_project_root()?;
+    let db = open_db(&root)?;
+    let files = resolve_file_list(files)?;
+    if files.is_empty() {
+        bail!("no file paths provided (pass as args or pipe via stdin)");
+    }
+    let recs = codesage_graph::recommend_tests(&db, &files)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&recs)?);
+    } else {
+        if !recs.primary.is_empty() {
+            println!("Primary tests (sibling convention):");
+            for f in &recs.primary {
+                println!("  {f}");
+            }
+        }
+        if !recs.coupled.is_empty() {
+            println!("Coupled tests (co-change history):");
+            for c in &recs.coupled {
+                println!(
+                    "  {:>5.2}  {:>4}x  {}  (couples with {})",
+                    c.weight, c.count, c.file, c.source
+                );
+            }
+        }
+        if recs.primary.is_empty() && recs.coupled.is_empty() {
+            println!("No test files found for the given paths.");
+        }
+        if !recs.notes.is_empty() {
+            for n in &recs.notes {
+                println!("# {n}");
             }
         }
     }

@@ -8,6 +8,12 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ## [Unreleased]
 
+### Added
+
+- **`assess_risk_diff(project, file_paths[])`** MCP tool and `codesage risk-diff` CLI command. Aggregate risk for a set of files (the file list of a patch). Returns per-file decomposition plus rollups: `max_score`, `mean_score`, `max_risk_file`, and lists of files in each risk category (hotspot, fix-heavy, test-gap, wide blast radius). Output includes paste-ready `summary_notes` for PR descriptions. Use BEFORE submitting a patch to decide whether to add tests, split the change, or flag concerns.
+- **`recommend_tests(project, file_paths[])`** MCP tool and `codesage tests-for` CLI command. Returns the tests an agent should run after editing a set of files. Two layers: `primary` (sibling tests resolved by language convention — `FooTest.php`, `foo.test.ts`, `test_foo.py`, `foo_test.go` — high confidence) and `coupled` (tests that historically change with the input files via git co-change history — medium confidence, catches integration tests that don't follow naming conventions). Coupled entries are deduped against primary so each test appears once. Empty result means no test files in the index for these paths.
+- Both new CLI commands accept positional file args or read newline-separated paths from stdin, so they compose with `git diff --name-only | codesage risk-diff` and similar pipelines.
+
 ## [0.2.1] - 2026-04-15
 
 Hardening release. New defensive mechanisms around accidentally committing private data plus the public-release CI surface (CI, secret scan, automated release notes from CHANGELOG).

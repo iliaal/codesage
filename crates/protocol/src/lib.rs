@@ -394,6 +394,66 @@ pub struct RiskAssessment {
     pub notes: Vec<String>,
 }
 
+/// Aggregate risk for a set of files (typically the file list of a patch or PR).
+/// Lets an agent ask one question — "how risky is this change?" — instead of
+/// per-file round-trips and manual aggregation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RiskDiffAssessment {
+    /// Per-file decomposition. Same shape as a single `assess_risk` call.
+    pub files: Vec<RiskAssessment>,
+    /// Highest score across the patch. The signal that should drive the agent's
+    /// caution: split the patch, add tests, request review.
+    pub max_score: f64,
+    pub mean_score: f64,
+    /// File contributing `max_score`. None when the patch is empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_risk_file: Option<String>,
+    /// Files with `test_gap == true`. Adding tests for these closes the most
+    /// common reviewer concern.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub test_gap_files: Vec<String>,
+    /// Files with `dependent_files >= 10` (depth-2). Wide blast radius.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub wide_blast_files: Vec<String>,
+    /// Files with `fix_ratio >= 0.4 && total_commits >= 5`. Historically buggy.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub fix_heavy_files: Vec<String>,
+    /// Files with `churn_percentile >= 0.75`. Pain points.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub hotspot_files: Vec<String>,
+    /// Aggregate notes the agent can paste verbatim into a PR description.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub summary_notes: Vec<String>,
+}
+
+/// A test file recommended for a change, with the reason it was suggested.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoupledTestEntry {
+    pub file: String,
+    pub weight: f64,
+    pub count: u32,
+    /// Which file in the changed set this test couples with. Lets the agent
+    /// explain "I ran X.test.ts because it co-changes with X.ts (8 times)".
+    pub source: String,
+}
+
+/// Tests an agent should run after editing a set of files. Splits into
+/// sibling-convention matches (high confidence) and historical co-change
+/// (medium confidence; surfaces tests that other test heuristics miss).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TestRecommendations {
+    /// Sibling tests resolved by language conventions (FooTest.php,
+    /// foo.test.ts, test_foo.py, foo_test.go). Always run these.
+    pub primary: Vec<String>,
+    /// Tests that historically change with one of the input files. Worth
+    /// running when sibling tests don't exist or when behavior crosses
+    /// component boundaries.
+    pub coupled: Vec<CoupledTestEntry>,
+    /// Human-readable rationale.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub notes: Vec<String>,
+}
+
 /// Stats from a git history indexing pass. Mirrors IndexStats shape.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GitIndexStats {
