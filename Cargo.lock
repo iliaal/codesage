@@ -261,7 +261,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "codesage"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "codesage-embed"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "codesage-protocol",
@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "codesage-graph"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "codesage-embed",
@@ -306,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "codesage-parser"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "codesage-protocol",
@@ -327,7 +327,7 @@ dependencies = [
 
 [[package]]
 name = "codesage-protocol"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -335,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "codesage-storage"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "cc",

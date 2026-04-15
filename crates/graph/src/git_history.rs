@@ -331,19 +331,20 @@ fn accumulate(
         stats.churn_score += weight;
     }
 
-    // Drop test-like files from co-change pair generation: they pair with
-    // everything they cover and would dominate coupling rankings. They stay in
-    // `git_files` so the test-discovery tools can find them.
-    let pairable: Vec<&&FileChange> = kept_changes
-        .iter()
-        .filter(|c| !test_like_set.is_match(&c.path))
-        .collect();
-
-    if pairable.len() <= MAX_FILES_PER_COMMIT_FOR_COCHANGE {
-        for i in 0..pairable.len() {
-            for j in (i + 1)..pairable.len() {
-                let a = &pairable[i].path;
-                let b = &pairable[j].path;
+    // Skip pairs where BOTH sides are test-like. Test-test co-changes are noise
+    // (running multiple test files in one PR doesn't imply the underlying code
+    // is related). Source-test pairs are kept — that's the signal
+    // `recommend_tests` uses to surface tests that historically follow a source
+    // change (essential for codebases like php-src where .phpt tests are the
+    // primary partner of .c source edits). Source-source pairs are kept as before.
+    if kept_changes.len() <= MAX_FILES_PER_COMMIT_FOR_COCHANGE {
+        for i in 0..kept_changes.len() {
+            for j in (i + 1)..kept_changes.len() {
+                let a = &kept_changes[i].path;
+                let b = &kept_changes[j].path;
+                if test_like_set.is_match(a) && test_like_set.is_match(b) {
+                    continue;
+                }
                 let (lo, hi) = if a < b { (a, b) } else { (b, a) };
                 let pair = pairs.entry((lo.clone(), hi.clone())).or_default();
                 pair.weight += decay;
@@ -722,6 +723,26 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<Vec<String>> {
             if path.ends_with(".rs") && !path.contains("/fixtures/") && !found.contains(&path) {
                 found.push(path);
             }
+        }
+    }
+
+    // PHP internals (.c/.h source): .phpt tests live in `<dir>/tests/*.phpt`.
+    // The naming convention is loose (bug12345.phpt, gh21709.phpt, feature
+    // descriptions) so we list the directory like Rust integration tests
+    // rather than try to name-match. The agent or coupled-test signal can
+    // narrow further. Skip if the tests dir would dump >50 files (typical
+    // for ext/standard/tests) — too noisy as a "primary" recommendation.
+    if (file_path.ends_with(".c") || file_path.ends_with(".h"))
+        && let Some((dir, _)) = file_path.rsplit_once('/')
+    {
+        let tests_prefix = format!("{dir}/tests/");
+        let candidates: Vec<String> = db
+            .git_files_with_prefix(&tests_prefix)?
+            .into_iter()
+            .filter(|p| p.ends_with(".phpt") && !found.contains(p))
+            .collect();
+        if candidates.len() <= 50 {
+            found.extend(candidates);
         }
     }
 

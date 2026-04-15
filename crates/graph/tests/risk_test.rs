@@ -484,3 +484,54 @@ fn recommend_tests_skips_fixture_files_under_rust_tests_dir() {
             .contains(&"crates/parser/tests/fixtures/sample.rs".to_string())
     );
 }
+
+#[test]
+fn recommend_tests_finds_phpt_tests_for_c_source() {
+    let (_dir, db) = setup_project();
+    // php-src convention: source at Zend/zend_compile.c, tests at Zend/tests/*.phpt.
+    db.upsert_git_file("Zend/zend_compile.c", 5.0, 0, 10, Some(1_700_000_000))
+        .unwrap();
+    db.upsert_git_file("Zend/tests/bug12345.phpt", 0.5, 0, 2, Some(1_700_000_000))
+        .unwrap();
+    db.upsert_git_file("Zend/tests/gh21709.phpt", 0.5, 0, 2, Some(1_700_000_000))
+        .unwrap();
+    // Different subsystem's tests must not leak in.
+    db.upsert_git_file(
+        "ext/standard/tests/array_test.phpt",
+        0.5,
+        0,
+        2,
+        Some(1_700_000_000),
+    )
+    .unwrap();
+
+    let r = codesage_graph::recommend_tests(&db, &["Zend/zend_compile.c".to_string()]).unwrap();
+    assert!(r.primary.contains(&"Zend/tests/bug12345.phpt".to_string()));
+    assert!(r.primary.contains(&"Zend/tests/gh21709.phpt".to_string()));
+    assert!(
+        !r.primary
+            .contains(&"ext/standard/tests/array_test.phpt".to_string()),
+        "tests from a different subsystem must not leak in: {:?}",
+        r.primary
+    );
+}
+
+#[test]
+fn recommend_tests_skips_phpt_tests_dir_when_oversized() {
+    let (_dir, db) = setup_project();
+    db.upsert_git_file("ext/standard/array.c", 5.0, 0, 10, Some(1_700_000_000))
+        .unwrap();
+    // Seed 60 .phpt files — should be skipped as too noisy for "primary".
+    for i in 0..60 {
+        let p = format!("ext/standard/tests/test_{i:03}.phpt");
+        db.upsert_git_file(&p, 0.1, 0, 2, Some(1_700_000_000))
+            .unwrap();
+    }
+
+    let r = codesage_graph::recommend_tests(&db, &["ext/standard/array.c".to_string()]).unwrap();
+    assert!(
+        r.primary.is_empty(),
+        "tests dir over the 50-file threshold should not be returned as primary, got {} entries",
+        r.primary.len()
+    );
+}

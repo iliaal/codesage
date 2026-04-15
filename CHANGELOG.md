@@ -8,6 +8,21 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-04-15
+
+Bug-fix release for two issues exposed by dogfooding 0.3.0 against php-src.
+
+### Fixed
+
+- `codesage git-index` was dropping test-like files from co-change pair generation entirely, which made `recommend_tests`'s `coupled` section empty for codebases where tests are the primary partner of source changes (e.g., php-src `.c` ↔ `.phpt`). Now only test↔test pairs are skipped (which is the actual noise); source↔test pairs are kept (which is the signal `recommend_tests` needs).
+- `recommend_tests` for `.c` / `.h` source files now lists `.phpt` tests in `<dir>/tests/` as primary (php-src convention). Skips when the `tests/` directory has more than 50 files (typical of `ext/standard/tests/`) — that's too noisy for "primary" and the agent should rely on coupling history instead.
+
+### Required action
+
+Re-run `codesage git-index --full` in any repo that was indexed under 0.3.0 to repopulate co-change pairs with the corrected logic.
+
+[0.3.1]: https://github.com/iliaal/codesage/releases/tag/v0.3.1
+
 ## [0.3.0] - 2026-04-15
 
 V2b slice 2: tools that change agent behavior per-task instead of just informing it.
