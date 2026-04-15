@@ -149,20 +149,20 @@ A Rust workspace with six crates:
 ```mermaid
 flowchart TD
     cli[cli<br/>binary + MCP server]
-    graph[graph<br/>indexing + query pipeline]
+    gr[graph<br/>indexing + query pipeline]
     parser[parser<br/>tree-sitter + discovery]
     storage[storage<br/>SQLite + sqlite-vec + FTS5]
     embed[embed<br/>ONNX + reranker + chunking]
     protocol[protocol<br/>shared types]
 
-    cli --> graph
-    graph --> parser
-    graph --> storage
-    graph --> embed
+    cli --> gr
+    gr --> parser
+    gr --> storage
+    gr --> embed
     parser --> protocol
     storage --> protocol
     embed --> protocol
-    graph --> protocol
+    gr --> protocol
 ```
 
 | Crate | Role |
