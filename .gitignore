@@ -5,3 +5,13 @@
 /notes/
 /.claude/
 /.claude-cycles/
+
+# Benchmark artifacts. Tracked content under bench/ is infrastructure only
+# (runner script, extractor, cleanup). Results, corpora, history, and
+# scorecards stay local so private-repo names and case IDs never reach a
+# commit by accident.
+/bench/results-*
+/bench/corpora/
+/bench/history/
+/bench/private/
+/bench/*.scorecard.md

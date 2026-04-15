@@ -8,6 +8,15 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ## [Unreleased]
 
+### Added
+
+- `codesage install-hooks` now installs a `pre-commit` hook when the repo contains `scripts/leak-check.sh`. The hook greps staged content against extended-regex patterns from `scripts/leak-patterns.txt` (tracked, shared) and `.git/info/leak-patterns.txt` (local-only, per-developer) and blocks the commit on a match. Bypass with `git commit --no-verify` when a false positive is intentional.
+- `scripts/leak-patterns.txt` with default patterns for private-key material and common token formats (AWS, GitHub PATs, Slack, Stripe live keys).
+
+### Changed
+
+- `.gitignore` excludes benchmark artifacts under `bench/` (results, corpora, history, scorecards) by default so local benchmarking output never enters a commit.
+
 ## [0.2.0] - 2026-04-15
 
 Initial public release.

@@ -1,0 +1,22 @@
+# Leak patterns checked by the pre-commit hook installed via
+# `codesage install-hooks`. One extended-regex per line.
+# Blank lines and lines starting with '#' are ignored.
+#
+# Add per-developer or per-team patterns in .git/info/leak-patterns.txt
+# (local, not tracked; survives on each clone independently).
+
+# Private key material in any common form
+-----BEGIN (RSA |DSA |EC |OPENSSH |PGP )?PRIVATE KEY-----
+
+# AWS access key id
+\bAKIA[0-9A-Z]{16}\b
+
+# GitHub personal access tokens (classic + fine-grained)
+\bghp_[A-Za-z0-9]{36}\b
+\bgithub_pat_[A-Za-z0-9_]{80,}\b
+
+# Slack tokens
+\bxox[baprs]-[0-9A-Za-z-]{10,}
+
+# Stripe live key
+\bsk_live_[0-9a-zA-Z]{24,}\b

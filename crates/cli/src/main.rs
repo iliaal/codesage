@@ -348,6 +348,54 @@ fn cmd_install_hooks() -> Result<()> {
         exclude_husky_hook_paths(&root, &installed)?;
     }
 
+    install_leak_check_hook(&root, &hooks_dir, is_husky, &mut installed)?;
+
+    Ok(())
+}
+
+/// Install a pre-commit leak-check hook if the repo ships `scripts/leak-check.sh`.
+/// Keeps the hook a thin wrapper that invokes the repo's own script so the pattern
+/// list and script logic can be iterated without re-running install-hooks.
+fn install_leak_check_hook(
+    root: &std::path::Path,
+    hooks_dir: &std::path::Path,
+    is_husky: bool,
+    installed: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let script = root.join("scripts/leak-check.sh");
+    if !script.exists() {
+        return Ok(());
+    }
+
+    let path = hooks_dir.join("pre-commit");
+    if path.exists() {
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        if !existing.contains("codesage install-hooks") {
+            println!("skip: {} already exists and is not a codesage hook", path.display());
+            return Ok(());
+        }
+    }
+
+    let body = "#!/bin/sh\n\
+                # installed by codesage install-hooks\n\
+                root=\"$(git rev-parse --show-toplevel 2>/dev/null)\" || exit 0\n\
+                script=\"$root/scripts/leak-check.sh\"\n\
+                [ -x \"$script\" ] || exit 0\n\
+                exec \"$script\"\n";
+    std::fs::write(&path, body)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    println!("installed: {} (leak-check)", path.display());
+    installed.push(path.clone());
+
+    if is_husky {
+        exclude_husky_hook_paths(root, std::slice::from_ref(&path))?;
+    }
+
     Ok(())
 }
 

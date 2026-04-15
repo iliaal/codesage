@@ -56,6 +56,21 @@ One bullet per change. Describe what a user can now do, not how you implemented 
 
 Keep them focused. One topic per PR. Aim for under ~300 lines of diff; split if it grows. Explain the *why* in the PR description, the *what* in the commits, and the *how* in the code. CI must be green before review.
 
+## Keeping private data out of commits
+
+CodeSage is actively developed and dogfooded against private codebases. Two mechanisms keep that work from leaking into the public repo.
+
+**Pre-commit leak check.** `codesage install-hooks` installs a `pre-commit` hook that greps every staged file against extended-regex patterns in two files:
+
+- `scripts/leak-patterns.txt` — tracked, shared. Generic secret formats (private keys, AWS/GitHub/Slack tokens).
+- `.git/info/leak-patterns.txt` — local-only, per-developer. Add your own entries here: private repo names, internal domain terms, absolute home paths. This file never enters git.
+
+The hook prints the offending `file:line` and blocks the commit. Bypass with `git commit --no-verify` only when you're sure the match is a false positive, and refine the pattern afterwards.
+
+**External test data via env vars.** Any path that points at private test data lives outside the repo and gets injected via environment variable. The existing example is `CODESAGE_BENCH_CORPUS_DIR` (default: `./bench-corpora`); set it to wherever your corpora actually live. Do not hardcode paths in tests, fixtures, or plugin commands.
+
+Test fixtures under `crates/parser/tests/fixtures/` must be synthetic code, not copied from real repositories. If you need a fixture with a specific shape, write it; don't paste it in.
+
 ## License
 
 By contributing, you agree your contributions will be licensed under the MIT license, as described in [LICENSE](LICENSE).
