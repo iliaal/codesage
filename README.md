@@ -69,6 +69,52 @@ codesage install-hooks
 codesage doctor
 ```
 
+## Recipes
+
+Common pipelines using `codesage` with `git`. Each is one shell line plus what the output tells you.
+
+### Risk check before committing
+
+```bash
+git diff --cached --name-only | codesage risk-diff
+```
+
+Pipes the staged file list through `assess_risk_diff`. Output shows the max risk score, files in each risk bucket (hotspot, fix-heavy, test-gap, wide blast radius), and paste-ready summary notes for the commit message or PR description. If `max_score >= 0.6` or any `test_gap_files` appear, consider adding tests, splitting the patch, or flagging concerns.
+
+### Tests to run after editing
+
+```bash
+git diff --cached --name-only | codesage tests-for
+```
+
+Returns sibling tests (resolved by language convention) plus tests that historically change with the edited files (from co-change history). Replaces "I'll run all tests" with a focused list.
+
+### Audit a feature branch before opening a PR
+
+```bash
+git diff origin/main...HEAD --name-only | codesage risk-diff
+```
+
+Same as the pre-commit check, but scoped to everything on the branch instead of just the staged diff. Useful as the last step before `gh pr create`.
+
+### What changed in the last week, ranked by risk
+
+```bash
+git log --since='1 week ago' --name-only --pretty='' | sort -u | codesage risk-diff --json | jq '.files[] | select(.score >= 0.5) | .file'
+```
+
+Lists high-risk files touched in recent history. Good signal during a retrospective or a "where should we focus refactoring?" discussion.
+
+### Trifecta for one file
+
+```bash
+codesage risk path/to/file.rs
+codesage tests-for path/to/file.rs
+codesage coupling path/to/file.rs --limit 5
+```
+
+When you're about to dive into one specific file. Risk score, suggested tests, and what historically co-changes — together they calibrate caution before you start editing.
+
 ## Claude Code plugin
 
 `plugins/codesage-tools/` wraps everything above into one command per task. The marketplace manifest lives at the repo root.
