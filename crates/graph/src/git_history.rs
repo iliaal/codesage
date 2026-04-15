@@ -752,6 +752,37 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<Vec<String>> {
         }
     }
 
+    // Laravel mirror-tree: source at `app/<rest>/<file>.php` pairs with test at
+    // `tests/{Unit,Feature,Integration,Browser}/<rest>/<file>Test.php`. This is
+    // the convention most modern Laravel projects use; the flat
+    // `tests/Unit/FooTest.php` candidates above only cover root-level sources.
+    if file_path.ends_with(".php")
+        && let Some(rest) = file_path.strip_prefix("app/")
+        && let Some((rest_dir, stem_with_ext)) = rest.rsplit_once('/')
+        && let Some((mirror_stem, _)) = stem_with_ext.rsplit_once('.')
+    {
+        for type_dir in ["Unit", "Feature", "Integration", "Browser"] {
+            let candidate = format!("tests/{type_dir}/{rest_dir}/{mirror_stem}Test.php");
+            if !found.contains(&candidate) && db.git_file(&candidate)?.is_some() {
+                found.push(candidate);
+            }
+        }
+    }
+
+    // Symfony mirror-tree: source at `src/<rest>/<file>.php` pairs with test at
+    // `tests/<rest>/<file>Test.php` (no Unit/Feature subdivisor; Symfony tests
+    // mirror src/ directly).
+    if file_path.ends_with(".php")
+        && let Some(rest) = file_path.strip_prefix("src/")
+        && let Some((rest_dir, stem_with_ext)) = rest.rsplit_once('/')
+        && let Some((mirror_stem, _)) = stem_with_ext.rsplit_once('.')
+    {
+        let candidate = format!("tests/{rest_dir}/{mirror_stem}Test.php");
+        if !found.contains(&candidate) && db.git_file(&candidate)?.is_some() {
+            found.push(candidate);
+        }
+    }
+
     Ok(found)
 }
 
@@ -991,5 +1022,84 @@ mod tests {
         assert_eq!(commits[0].changes.len(), 2);
         assert_eq!(commits[1].changes.len(), 1, "binary file skipped");
         assert_eq!(commits[1].changes[0].path, "src/c.rs");
+    }
+
+    fn make_change(path: &str) -> FileChange {
+        FileChange {
+            path: path.to_string(),
+            added: 5,
+            deleted: 1,
+        }
+    }
+
+    fn test_glob() -> GlobSet {
+        build_exclude_set(&["**/*Test.php".to_string(), "**/*.phpt".to_string()])
+            .expect("build glob set")
+    }
+
+    #[test]
+    fn accumulate_keeps_source_test_pair_drops_test_test_pair() {
+        // The v0.3.1 fix: the previous behavior dropped tests entirely from
+        // pair generation; this test pins down the corrected rule.
+        let now = 1_700_000_100;
+        let commit = Commit {
+            timestamp: 1_700_000_000,
+            subject: "fix: thing".into(),
+            changes: vec![],
+        };
+        let changes = [
+            make_change("Repository.php"),     // source
+            make_change("RepositoryTest.php"), // test
+            make_change("AnotherTest.php"),    // test
+        ];
+        let kept: Vec<&FileChange> = changes.iter().collect();
+        let mut files = HashMap::new();
+        let mut pairs = HashMap::new();
+        accumulate(&mut files, &mut pairs, &commit, &kept, now, &test_glob());
+
+        // Source <-> test pair MUST be present (the v0.3.1 signal we want).
+        assert!(
+            pairs.contains_key(&("Repository.php".into(), "RepositoryTest.php".into())),
+            "source-test pair must be kept; got pairs: {:?}",
+            pairs.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            pairs.contains_key(&("AnotherTest.php".into(), "Repository.php".into())),
+            "source-test pair must be kept regardless of stem"
+        );
+        // Test <-> test pair MUST NOT be present (still noise).
+        assert!(
+            !pairs.contains_key(&("AnotherTest.php".into(), "RepositoryTest.php".into())),
+            "test-test pair must be skipped"
+        );
+        // All three files contribute to per-file churn (test files stay in git_files).
+        assert!(files.contains_key("Repository.php"));
+        assert!(files.contains_key("RepositoryTest.php"));
+        assert!(files.contains_key("AnotherTest.php"));
+    }
+
+    #[test]
+    fn accumulate_keeps_source_source_pairs_when_tests_present() {
+        // Sanity: source <-> source pairs unaffected by the test filter.
+        let now = 1_700_000_100;
+        let commit = Commit {
+            timestamp: 1_700_000_000,
+            subject: "feat: x".into(),
+            changes: vec![],
+        };
+        let changes = [
+            make_change("Repository.php"),
+            make_change("Service.php"),
+            make_change("RepositoryTest.php"),
+        ];
+        let kept: Vec<&FileChange> = changes.iter().collect();
+        let mut files = HashMap::new();
+        let mut pairs = HashMap::new();
+        accumulate(&mut files, &mut pairs, &commit, &kept, now, &test_glob());
+
+        assert!(
+            pairs.contains_key(&("Repository.php".into(), "Service.php".into())),
+            "source-source pair must always be kept"
+        );
     }
 }

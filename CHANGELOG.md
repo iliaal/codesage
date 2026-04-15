@@ -8,6 +8,21 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-04-15
+
+Test discovery for Laravel/Symfony mirror-tree projects + test backfill.
+
+### Added
+
+- `recommend_tests` now finds tests for Laravel mirror-tree layouts. Source at `app/<rest>/<file>.php` resolves to tests at `tests/{Unit,Feature,Integration,Browser}/<rest>/<file>Test.php`. Previously only flat `tests/Unit/FooTest.php` was checked, missing tests like `tests/Integration/Actions/CredentialingApplication/ExportZipActionTest.php`.
+- `recommend_tests` now finds tests for Symfony mirror-tree layouts. Source at `src/<rest>/<file>.php` resolves to test at `tests/<rest>/<file>Test.php` (no Unit/Feature subdir; tests/ mirrors src/ directly).
+
+### Fixed
+
+- Inline unit tests for `accumulate()` cover the v0.3.1 source↔test pair filter (previously verified only via integration). Pins down the rule: source-test pairs are kept; test-test pairs are skipped.
+
+[0.3.3]: https://github.com/iliaal/codesage/releases/tag/v0.3.3
+
 ## [0.3.2] - 2026-04-15
 
 Performance fix.

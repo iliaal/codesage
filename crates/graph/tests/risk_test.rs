@@ -535,3 +535,82 @@ fn recommend_tests_skips_phpt_tests_dir_when_oversized() {
         r.primary.len()
     );
 }
+
+#[test]
+fn recommend_tests_finds_laravel_mirror_tree_tests() {
+    let (_dir, db) = setup_project();
+    // Laravel convention seen in real projects: source at
+    // app/Actions/Foo/Bar.php paired with test at
+    // tests/Integration/Actions/Foo/BarTest.php (mirror tree under
+    // tests/{Unit,Feature,Integration,Browser}). The flat sibling check
+    // (tests/Unit/BarTest.php) misses these because the test path has the
+    // intermediate Actions/Foo segments.
+    let src = "app/Actions/CredentialingApplication/ExportZipAction.php";
+    let test = "tests/Integration/Actions/CredentialingApplication/ExportZipActionTest.php";
+    db.upsert_git_file(src, 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+    db.upsert_git_file(test, 0.5, 0, 5, Some(1_700_000_000))
+        .unwrap();
+    // A test for an unrelated class must not leak in.
+    db.upsert_git_file(
+        "tests/Integration/Actions/Other/UnrelatedActionTest.php",
+        0.5,
+        0,
+        5,
+        Some(1_700_000_000),
+    )
+    .unwrap();
+
+    let r = codesage_graph::recommend_tests(&db, &[src.to_string()]).unwrap();
+    assert_eq!(r.primary, vec![test.to_string()]);
+}
+
+#[test]
+fn recommend_tests_finds_laravel_test_under_unit_or_feature_too() {
+    let (_dir, db) = setup_project();
+    let src = "app/Services/Facility/ProviderService.php";
+    db.upsert_git_file(src, 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+    db.upsert_git_file(
+        "tests/Unit/Services/Facility/ProviderServiceTest.php",
+        0.5,
+        0,
+        5,
+        Some(1_700_000_000),
+    )
+    .unwrap();
+    db.upsert_git_file(
+        "tests/Feature/Services/Facility/ProviderServiceTest.php",
+        0.5,
+        0,
+        5,
+        Some(1_700_000_000),
+    )
+    .unwrap();
+
+    let r = codesage_graph::recommend_tests(&db, &[src.to_string()]).unwrap();
+    assert!(
+        r.primary
+            .contains(&"tests/Unit/Services/Facility/ProviderServiceTest.php".to_string())
+    );
+    assert!(
+        r.primary
+            .contains(&"tests/Feature/Services/Facility/ProviderServiceTest.php".to_string())
+    );
+}
+
+#[test]
+fn recommend_tests_finds_symfony_mirror_tree_tests() {
+    let (_dir, db) = setup_project();
+    // Symfony convention: src/<rest>/<stem>.php pairs with tests/<rest>/<stem>Test.php
+    // (no Unit/Feature subdir; tests/ mirrors src/ directly).
+    let src = "src/Domain/Order/OrderService.php";
+    let test = "tests/Domain/Order/OrderServiceTest.php";
+    db.upsert_git_file(src, 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+    db.upsert_git_file(test, 0.5, 0, 5, Some(1_700_000_000))
+        .unwrap();
+
+    let r = codesage_graph::recommend_tests(&db, &[src.to_string()]).unwrap();
+    assert_eq!(r.primary, vec![test.to_string()]);
+}
