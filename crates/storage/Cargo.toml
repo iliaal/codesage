@@ -1,0 +1,13 @@
+[package]
+name = "codesage-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+codesage-protocol.workspace = true
+rusqlite.workspace = true
+anyhow.workspace = true
+
+[build-dependencies]
+cc = "1"

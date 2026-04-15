@@ -1,0 +1,17 @@
+[package]
+name = "codesage-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+codesage-protocol.workspace = true
+codesage-parser.workspace = true
+codesage-storage.workspace = true
+codesage-embed.workspace = true
+rayon.workspace = true
+anyhow.workspace = true
+globset.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""
+Benchmark CodeSage semantic search against ground-truth YAML corpora.
+Mirrors ccc-bench-runner methodology for direct comparison.
+
+Usage:
+  codesage-bench-runner <corpus.yaml> [--limit 10] [--verbose] [--codesage-bin PATH]
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    sys.exit("pyyaml required: pip install pyyaml")
+
+
+def run_codesage_search(codesage_bin: str, project_root: Path, query: str, limit: int) -> str:
+    cmd = [codesage_bin, "search", "--json", "--limit", str(limit), query]
+    result = subprocess.run(
+        cmd,
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if result.returncode != 0:
+        print(f"[warn] codesage search failed rc={result.returncode}: {result.stderr}", file=sys.stderr)
+    return result.stdout
+
+
+def parse_result_paths(output: str) -> list[str]:
+    """Extract ordered file paths from codesage search --json output."""
+    seen = set()
+    ordered: list[str] = []
+    # Skip stderr lines (model loading messages)
+    lines = []
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith("[") or line.startswith("{"):
+            lines.append(line)
+        elif lines:
+            lines.append(line)
+
+    json_str = "\n".join(lines)
+    if not json_str:
+        return []
+
+    try:
+        results = json.loads(json_str)
+    except json.JSONDecodeError:
+        return []
+
+    for r in results:
+        path = r.get("file_path", "")
+        if path and path not in seen:
+            seen.add(path)
+            ordered.append(path)
+    return ordered
+
+
+def score_case(expected: list[str], returned: list[str], k_values: list[int]) -> dict:
+    expected_set = set(expected)
+    first_rank = None
+    for i, r in enumerate(returned, start=1):
+        if r in expected_set:
+            first_rank = i
+            break
+    noise_before = (first_rank - 1) if first_rank else len(returned)
+
+    recalls = {}
+    for k in k_values:
+        topk = set(returned[:k])
+        hits = len(topk & expected_set)
+        recalls[k] = hits / len(expected_set) if expected_set else 0.0
+
+    return {
+        "first_hit_rank": first_rank,
+        "noise_before_first_hit": noise_before,
+        **{f"recall@{k}": recalls[k] for k in k_values},
+        "returned_count": len(returned),
+    }
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("corpus", type=Path)
+    ap.add_argument("--limit", type=int, default=10)
+    ap.add_argument("--verbose", "-v", action="store_true")
+    ap.add_argument("--codesage-bin", default="codesage")
+    args = ap.parse_args()
+
+    corpus = yaml.safe_load(args.corpus.read_text())
+    project_root = Path(corpus["project_root"]).expanduser()
+    k_values = corpus.get("scoring", {}).get("k_values", [5, 10])
+    cases = corpus["cases"]
+
+    if not project_root.exists():
+        sys.exit(f"project_root does not exist: {project_root}")
+
+    results = []
+    for case in cases:
+        cid = case["id"]
+        query = case["query"]
+        expected = case["expected_files"]
+        raw = run_codesage_search(args.codesage_bin, project_root, query, args.limit)
+        returned = parse_result_paths(raw)
+        scored = score_case(expected, returned, k_values)
+        scored["id"] = cid
+        scored["source"] = case.get("source", "?")
+        scored["returned"] = returned
+        scored["expected"] = expected
+        results.append(scored)
+        if args.verbose:
+            print(f"[{cid}] first_hit={scored['first_hit_rank']} "
+                  f"noise={scored['noise_before_first_hit']} "
+                  f"r@5={scored['recall@5']:.2f} r@10={scored['recall@10']:.2f}",
+                  file=sys.stderr)
+            print(f"  expected: {expected}", file=sys.stderr)
+            print(f"  returned[:5]: {returned[:5]}", file=sys.stderr)
+
+    print(f"# CodeSage retrieval scorecard")
+    print(f"\n**Project:** `{project_root}`  ")
+    print(f"**Corpus:** `{args.corpus.name}`  ")
+    print(f"**Cases:** {len(results)}  ")
+    print(f"**k values:** {k_values}")
+    print()
+    print("| id | src | first hit | noise | r@5 | r@10 |")
+    print("|---|---|---:|---:|---:|---:|")
+    for r in results:
+        fh = r["first_hit_rank"] if r["first_hit_rank"] else "MISS"
+        print(f"| {r['id']} | {r['source']} | {fh} | {r['noise_before_first_hit']} "
+              f"| {r['recall@5']:.2f} | {r['recall@10']:.2f} |")
+
+    hits = [r for r in results if r["first_hit_rank"] is not None]
+    miss_rate = 1.0 - len(hits) / len(results)
+    avg_r5 = sum(r["recall@5"] for r in results) / len(results)
+    avg_r10 = sum(r["recall@10"] for r in results) / len(results)
+    median_first = (
+        sorted(r["first_hit_rank"] for r in hits)[len(hits) // 2] if hits else None
+    )
+
+    print()
+    print("## Aggregate")
+    print(f"- **Miss rate (no ground-truth file in top-{args.limit}):** {miss_rate:.0%}")
+    print(f"- **Median first-hit rank (hits only):** {median_first}")
+    print(f"- **Mean recall@5:** {avg_r5:.2f}")
+    print(f"- **Mean recall@10:** {avg_r10:.2f}")
+
+    print()
+    print(f"<!-- METRICS: miss_rate={miss_rate:.4f} median_first={median_first or 'MISS'} "
+          f"r5={avg_r5:.4f} r10={avg_r10:.4f} cases={len(results)} -->")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,244 @@
+#!/bin/bash
+# codesage-onboard <project-path> [--device gpu|cpu] [--codesage-bin PATH]
+#                                 [--no-mcp] [--no-hooks] [--no-hint]
+#
+# Single-command CodeSage project bootstrap:
+#   1. Resolve codesage binary
+#   2. Ensure global MCP server `codesage` is registered (idempotent)
+#   3. codesage init in <project>
+#   4. Override device in config.toml if --device was passed (default: gpu)
+#   5. codesage index (structural + semantic)
+#   6. Verify CUDA actually engaged if device=gpu
+#   7. codesage install-hooks (if git repo)
+#   8. Write .claude/CLAUDE.md hint file teaching tool selection and the
+#      required `project` argument for every MCP call
+#
+# Every step is idempotent or skippable — safe to re-run.
+
+set -euo pipefail
+
+usage() {
+    cat >&2 <<EOF
+usage: codesage-onboard <project-path> [options]
+
+Options:
+  --device gpu|cpu        Embedding device (default: gpu)
+  --codesage-bin PATH     Path to codesage binary (default: \$PATH lookup)
+  --no-mcp                Skip global MCP registration
+  --no-hooks              Skip git hook installation
+  --no-hint               Skip writing .claude/CLAUDE.md hint file
+  -h, --help              This help
+EOF
+    exit 2
+}
+
+project=""
+device="gpu"
+codesage_bin=""
+skip_mcp=0
+skip_hooks=0
+skip_hint=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --device)       shift; device="$1" ;;
+        --codesage-bin) shift; codesage_bin="$1" ;;
+        --no-mcp)       skip_mcp=1 ;;
+        --no-hooks)     skip_hooks=1 ;;
+        --no-hint)      skip_hint=1 ;;
+        -h|--help)      usage ;;
+        --*)            echo "unknown option: $1" >&2; usage ;;
+        *)              [ -z "$project" ] && project="$1" || usage ;;
+    esac
+    shift
+done
+
+[ -z "$project" ] && usage
+
+if [ "$device" != "gpu" ] && [ "$device" != "cpu" ]; then
+    echo "error: --device must be 'gpu' or 'cpu', got '$device'" >&2
+    exit 2
+fi
+
+# Normalize to absolute path
+if ! project="$(cd "$project" 2>/dev/null && pwd)"; then
+    echo "error: project path does not exist or is not a directory: $project" >&2
+    exit 1
+fi
+
+# Resolve codesage binary
+if [ -z "$codesage_bin" ]; then
+    if ! codesage_bin="$(command -v codesage)"; then
+        echo "error: 'codesage' not found in \$PATH. Build it (cargo build --release --features cuda -p codesage) and either install it or pass --codesage-bin /path/to/codesage" >&2
+        exit 1
+    fi
+fi
+if [ ! -x "$codesage_bin" ]; then
+    echo "error: $codesage_bin is not executable" >&2
+    exit 1
+fi
+
+name="$(basename "$project")"
+
+echo "==> codesage-onboard"
+echo "    project:      $project"
+echo "    codesage bin: $codesage_bin"
+echo "    device:       $device"
+echo
+
+# --- Step 1: global MCP registration ---
+if [ "$skip_mcp" -eq 0 ]; then
+    echo "==> [1/6] global MCP registration"
+    if claude mcp list 2>/dev/null | grep -qE '^codesage[[:space:]:]'; then
+        echo "    'codesage' already registered, skipping"
+    else
+        if claude mcp add --scope user codesage -- "$codesage_bin" mcp; then
+            echo "    registered: codesage -> $codesage_bin mcp"
+        else
+            echo "warn: claude mcp add failed — register manually with:" >&2
+            echo "  claude mcp add --scope user codesage -- $codesage_bin mcp" >&2
+        fi
+    fi
+else
+    echo "==> [1/6] MCP registration skipped (--no-mcp)"
+fi
+
+# --- Step 2: codesage init ---
+echo "==> [2/6] codesage init"
+( cd "$project" && "$codesage_bin" init )
+
+config="$project/.codesage/config.toml"
+if [ ! -f "$config" ]; then
+    echo "error: $config missing after init" >&2
+    exit 1
+fi
+
+# --- Step 3: set device in config.toml ---
+echo "==> [3/6] set device = $device"
+# Replace the first `device = "..."` line under [embedding].
+# codesage init writes device = "cpu" by default.
+python3 - "$config" "$device" <<'PY'
+import sys, pathlib, re
+path = pathlib.Path(sys.argv[1])
+device = sys.argv[2]
+text = path.read_text()
+new_text, n = re.subn(r'^device\s*=\s*"[^"]*"', f'device = "{device}"', text, count=1, flags=re.MULTILINE)
+if n == 0:
+    sys.exit(f"could not find `device = \"...\"` line in {path}")
+path.write_text(new_text)
+PY
+
+# --- Step 4: codesage index ---
+echo "==> [4/6] codesage index"
+index_log="$(mktemp)"
+trap 'rm -f "$index_log"' EXIT
+
+if ( cd "$project" && "$codesage_bin" index ) 2>&1 | tee "$index_log"; then
+    :
+else
+    echo "error: codesage index failed — see output above" >&2
+    exit 1
+fi
+
+# CUDA verification: only if device=gpu. The binary errors out if CUDA is
+# requested and fails, so this is a belt-and-suspenders check that surfaces
+# fallback warnings loudly to the user.
+if [ "$device" = "gpu" ]; then
+    if grep -qiE '(cuda.*(not|failed|unavailable|disabled))|cpu.*fallback|falling back to cpu' "$index_log"; then
+        echo "WARNING: CUDA appears to have fallen back to CPU — check the log above." >&2
+        echo "         Embeddings produced on CPU are not bit-identical to CUDA;" >&2
+        echo "         this will degrade retrieval quality if the index is mixed." >&2
+    fi
+fi
+
+# --- Step 5: git hooks ---
+if [ "$skip_hooks" -eq 0 ] && [ -e "$project/.git" ]; then
+    echo "==> [5/7] installing git hooks"
+    ( cd "$project" && "$codesage_bin" install-hooks )
+elif [ "$skip_hooks" -eq 0 ]; then
+    echo "==> [5/7] not a git repo, skipping hooks"
+else
+    echo "==> [5/7] hook installation skipped (--no-hooks)"
+fi
+
+# --- Step 6: V2b git history index ---
+if [ -e "$project/.git" ]; then
+    echo "==> [6/7] indexing git history (V2b)"
+    ( cd "$project" && "$codesage_bin" git-index ) || echo "    (git-index failed; find_coupling/assess_risk will return empty)"
+else
+    echo "==> [6/7] not a git repo, skipping git history index"
+fi
+
+# --- Step 7: .claude/CLAUDE.md hint ---
+if [ "$skip_hint" -eq 0 ]; then
+    hint_file="$project/.claude/CLAUDE.md"
+    if [ -f "$hint_file" ]; then
+        echo "==> [7/7] $hint_file already exists, skipping"
+    else
+        echo "==> [7/7] writing $hint_file"
+        mkdir -p "$project/.claude"
+        cat > "$hint_file" <<HINT
+# Local: code intelligence (CodeSage)
+
+Global MCP server \`codesage\` provides semantic search and structural graph queries for this project.
+
+## The \`project\` argument
+
+Every CodeSage MCP tool requires an absolute path to the project root. For this project:
+
+\`\`\`
+project: "$project"
+\`\`\`
+
+Pass that on every call. The server uses it to route to the right index.
+
+## Tool selection
+
+### Code intelligence
+- \`search\`: "where does X happen?", debugging by symptom, intent queries spanning files, when you don't know the symbol name.
+- \`find_symbol\` / \`find_references\`: exact symbol lookups, callers/callees, dependency mapping.
+- \`impact_analysis\`: before renaming a symbol or modifying a widely-used class or function. Identifies tests to run.
+- \`export_context\`: package code for another LLM or focused prompt about a specific concept.
+- grep / ripgrep: exact strings, constants, error messages; when you already have the exact symbol name.
+
+### Risk and history (V2b)
+- \`assess_risk\`: BEFORE writing a patch, query risk for the file. Score combines churn, fix ratio, blast radius, coupling, and test gap. Hot+fix-heavy file means smaller patch + broader test sweep. Quote the notes in PR descriptions so reviewers see your calibration.
+- \`find_coupling\`: when planning the test sweep, ask which files have historically changed with the file you're touching. Replaces "consider running tests in X" guesses with named files.
+- Both tools require git history to be indexed. Initial \`codesage git-index\` runs at onboard; subsequent commits/merges auto-refresh via git hooks (\`--incremental\`). Run \`codesage git-index --full\` weekly to rebaseline. Empty results mean either no history yet or the file is too new.
+
+## Operations
+
+- Structural + semantic index auto-refreshes on commit/merge/checkout via installed git hooks.
+- Git history index auto-refreshes incrementally on commit/merge/checkout/rebase via the same hooks. Weekly \`codesage git-index --full\` to rebaseline is still good hygiene.
+- Manual refresh: \`codesage index\`, or \`/codesage-reindex\`. Force a full git-history rescan with \`codesage git-index --full\`.
+- CLI: \`codesage search --limit 5 'query'\`, \`codesage coupling <file>\`, \`codesage risk <file>\`.
+HINT
+        # Keep the local hint out of the project's commit history.
+        if [ -e "$project/.git" ]; then
+            exclude_file="$(git -C "$project" rev-parse --git-path info/exclude 2>/dev/null)"
+            if [ -n "$exclude_file" ]; then
+                # git rev-parse may return a path relative to $project
+                case "$exclude_file" in
+                    /*) ;;
+                    *) exclude_file="$project/$exclude_file" ;;
+                esac
+                mkdir -p "$(dirname "$exclude_file")"
+                if ! grep -qxF ".claude/CLAUDE.md" "$exclude_file" 2>/dev/null; then
+                    echo ".claude/CLAUDE.md" >> "$exclude_file"
+                    echo "    added to $exclude_file (local-only, not committed)"
+                fi
+            fi
+        fi
+    fi
+else
+    echo "==> [6/6] hint file skipped (--no-hint)"
+fi
+
+echo
+echo "==> verification: codesage doctor"
+( cd "$project" && "$codesage_bin" doctor ) || echo "    (one or more checks failed; review above)"
+
+echo
+echo "==> done."
+echo "    MCP tool calls target this project via: project: \"$project\""
+echo "    try it:   cd $project && $codesage_bin search 'your query'"

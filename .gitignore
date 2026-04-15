@@ -1,0 +1,7 @@
+/target
+/.codesage/
+*.db
+.plan/
+/notes/
+/.claude/
+/.claude-cycles/

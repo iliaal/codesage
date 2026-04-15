@@ -1,0 +1,19 @@
+{
+  "name": "codesage-tools",
+  "version": "0.1.0",
+  "description": "Claude Code integration for CodeSage, a Rust-based code intelligence engine. Provides slash commands for onboarding a project (init + index + global MCP registration + git hooks + agent hint), reset, incremental reindex with model-mismatch cleanup, and retrieval benchmarking. A single global MCP server serves every onboarded project, routed by an absolute `project` argument on each call.",
+  "author": {
+    "name": "Ilia Alshanetsky",
+    "url": "https://github.com/iliaal"
+  },
+  "license": "MIT",
+  "keywords": [
+    "codesage",
+    "semantic-search",
+    "mcp",
+    "code-intelligence",
+    "retrieval",
+    "impact-analysis",
+    "agent-tools"
+  ]
+}

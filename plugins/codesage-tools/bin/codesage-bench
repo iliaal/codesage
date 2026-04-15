@@ -1,0 +1,164 @@
+#!/bin/bash
+# codesage-bench [--corpus-dir DIR] [--no-save] [--runner PATH] [--codesage-bin PATH]
+#
+# Retrieval regression check. Discovers all `*-eval.yaml` corpora in
+# --corpus-dir, runs the bench runner against each, prints a compact
+# summary table, and saves timestamped scorecards to <corpus-dir>/history/.
+#
+# Corpus directory resolution (first match wins):
+#   1. --corpus-dir DIR command-line arg
+#   2. $CODESAGE_BENCH_CORPUS_DIR environment variable
+#   3. $PWD/bench-corpora (fallback default)
+
+set -euo pipefail
+
+CORPUS_DIR="${CODESAGE_BENCH_CORPUS_DIR:-$PWD/bench-corpora}"
+SAVE_HISTORY=1
+RUNNER=""
+CODESAGE_BIN=""
+
+usage() {
+    cat >&2 <<EOF
+usage: codesage-bench [--corpus-dir DIR] [--no-save] [--runner PATH] [--codesage-bin PATH]
+
+Options:
+  --corpus-dir DIR       Directory containing *-eval.yaml corpora (default: $CORPUS_DIR)
+  --no-save              Do not save scorecards to <corpus-dir>/history/
+  --runner PATH          Override path to codesage-bench-runner
+  --codesage-bin PATH    Override codesage binary used by the runner
+  -h, --help             This help
+EOF
+    exit 2
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --corpus-dir)   shift; CORPUS_DIR="$1" ;;
+        --no-save)      SAVE_HISTORY=0 ;;
+        --runner)       shift; RUNNER="$1" ;;
+        --codesage-bin) shift; CODESAGE_BIN="$1" ;;
+        -h|--help)      usage ;;
+        *)              echo "unknown arg: $1" >&2; usage ;;
+    esac
+    shift
+done
+
+if [ ! -d "$CORPUS_DIR" ]; then
+    echo "error: corpus dir does not exist: $CORPUS_DIR" >&2
+    exit 1
+fi
+
+# Default runner: repo-local script next to the plugin, then $HOME/ai/codesage.
+if [ -z "$RUNNER" ]; then
+    plugin_root="$(cd "$(dirname "$0")/../../.." && pwd)"
+    if [ -x "$plugin_root/bench/codesage-bench-runner" ]; then
+        RUNNER="$plugin_root/bench/codesage-bench-runner"
+    elif [ -x "$HOME/ai/codesage/bench/codesage-bench-runner" ]; then
+        RUNNER="$HOME/ai/codesage/bench/codesage-bench-runner"
+    else
+        echo "error: codesage-bench-runner not found; pass --runner PATH" >&2
+        exit 1
+    fi
+fi
+
+if [ ! -x "$RUNNER" ]; then
+    echo "error: runner not executable: $RUNNER" >&2
+    exit 1
+fi
+
+HISTORY_DIR="$CORPUS_DIR/history"
+if [ "$SAVE_HISTORY" -eq 1 ]; then
+    mkdir -p "$HISTORY_DIR"
+fi
+
+TIMESTAMP="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
+corpora=()
+while IFS= read -r -d '' f; do
+    corpora+=("$f")
+done < <(find "$CORPUS_DIR" -maxdepth 1 -type f -name "*-eval.yaml" -print0 | sort -z)
+
+if [ "${#corpora[@]}" -eq 0 ]; then
+    echo "no *-eval.yaml found in $CORPUS_DIR" >&2
+    exit 1
+fi
+
+echo "==> codesage-bench: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "    corpus dir: $CORPUS_DIR"
+echo "    corpora:    ${#corpora[@]}"
+echo "    runner:     $RUNNER"
+[ -n "$CODESAGE_BIN" ] && echo "    codesage:   $CODESAGE_BIN"
+echo
+
+declare -a summary_rows
+overall_fail=0
+
+for corpus in "${corpora[@]}"; do
+    name="$(basename "$corpus" .yaml)"
+    echo "==> $name"
+
+    runner_args=("$corpus")
+    [ -n "$CODESAGE_BIN" ] && runner_args+=(--codesage-bin "$CODESAGE_BIN")
+
+    if [ "$SAVE_HISTORY" -eq 1 ]; then
+        out_file="$HISTORY_DIR/${TIMESTAMP}__${name}.md"
+        if "$RUNNER" "${runner_args[@]}" > "$out_file" 2>&1; then
+            :
+        else
+            rc=$?
+            echo "    RUNNER FAILED rc=$rc — see $out_file"
+            overall_fail=1
+            summary_rows+=("$name|FAIL|-|-|-|-")
+            continue
+        fi
+        output="$(cat "$out_file")"
+    else
+        if ! output="$("$RUNNER" "${runner_args[@]}" 2>&1)"; then
+            rc=$?
+            echo "    RUNNER FAILED rc=$rc"
+            overall_fail=1
+            summary_rows+=("$name|FAIL|-|-|-|-")
+            continue
+        fi
+    fi
+
+    metrics_line="$(echo "$output" | grep -o '<!-- METRICS:.*-->' || true)"
+    if [ -z "$metrics_line" ]; then
+        echo "    no METRICS line in runner output"
+        summary_rows+=("$name|?|?|?|?|?")
+        continue
+    fi
+
+    miss_rate="$(echo "$metrics_line" | grep -oE 'miss_rate=[0-9.]+' | cut -d= -f2)"
+    median="$(echo "$metrics_line"    | grep -oE 'median_first=[^ ]+' | cut -d= -f2)"
+    r5="$(echo "$metrics_line"        | grep -oE 'r5=[0-9.]+' | cut -d= -f2)"
+    r10="$(echo "$metrics_line"       | grep -oE 'r10=[0-9.]+' | cut -d= -f2)"
+    cases="$(echo "$metrics_line"     | grep -oE 'cases=[0-9]+' | cut -d= -f2)"
+
+    echo "    cases=$cases  miss_rate=$miss_rate  median_first=$median  r@5=$r5  r@10=$r10"
+    summary_rows+=("$name|$cases|$miss_rate|$median|$r5|$r10")
+    [ "$SAVE_HISTORY" -eq 1 ] && echo "    saved: $out_file"
+    echo
+done
+
+echo "==> summary"
+echo
+printf '%-40s %6s %10s %14s %8s %8s\n' corpus cases miss_rate median_first r@5 r@10
+printf '%-40s %6s %10s %14s %8s %8s\n' "$(printf '%.0s-' {1..40})" "-----" "---------" "-------------" "-------" "-------"
+for row in "${summary_rows[@]}"; do
+    IFS='|' read -r name cases miss_rate median r5 r10 <<< "$row"
+    printf '%-40s %6s %10s %14s %8s %8s\n' "$name" "$cases" "$miss_rate" "$median" "$r5" "$r10"
+done
+
+if [ "$SAVE_HISTORY" -eq 1 ]; then
+    echo
+    echo "history: $HISTORY_DIR"
+    echo "previous runs: $(find "$HISTORY_DIR" -maxdepth 1 -type f -name "*.md" 2>/dev/null | wc -l) scorecards"
+fi
+
+if [ "$overall_fail" -eq 1 ]; then
+    echo
+    echo "==> one or more corpora failed — review scorecards before trusting results" >&2
+    exit 1
+fi
+
+exit 0

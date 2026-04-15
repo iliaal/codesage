@@ -1,0 +1,184 @@
+#!/bin/bash
+# codesage-eval <project-path> [--corpus-dir DIR] [--max-cases N] [--min-files N]
+#                              [--runner PATH] [--extractor PATH]
+#                              [--codesage-bin PATH] [--no-save]
+#
+# Post-deployment effectiveness evaluation for a CodeSage-onboarded project.
+#
+#   1. Discover the Claude Code session dir for <project-path>
+#      (~/.claude/projects/<absolute-path-with-slashes-as-dashes>)
+#   2. Mine eval cases with bench/extract-eval-cases.py --yaml
+#   3. Save corpus to <corpus-dir>/<project-name>-session-eval.yaml
+#   4. Run codesage-bench-runner against the fresh corpus
+#   5. Save scorecard to <corpus-dir>/history/ and print metrics
+#
+# Skip steps 1-3 (reuse existing corpus) by passing --no-extract.
+
+set -euo pipefail
+
+CORPUS_DIR="${CODESAGE_BENCH_CORPUS_DIR:-$PWD/bench-corpora}"
+MAX_CASES=50
+MIN_FILES=1
+RUNNER=""
+EXTRACTOR=""
+CODESAGE_BIN=""
+SAVE_HISTORY=1
+NO_EXTRACT=0
+project=""
+
+usage() {
+    cat >&2 <<EOF
+usage: codesage-eval <project-path> [options]
+
+Options:
+  --corpus-dir DIR      Where to save the corpus YAML (default: $CORPUS_DIR)
+  --max-cases N         Max eval cases to mine (default: $MAX_CASES)
+  --min-files N         Require each case to reference >= N project files (default: $MIN_FILES)
+  --runner PATH         Override codesage-bench-runner path
+  --extractor PATH      Override extract-eval-cases.py path
+  --codesage-bin PATH   Override codesage binary used by the runner
+  --no-extract          Reuse existing <project>-session-eval.yaml, skip mining
+  --no-save             Do not save a scorecard to <corpus-dir>/history/
+  -h, --help            This help
+EOF
+    exit 2
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --corpus-dir)    shift; CORPUS_DIR="$1" ;;
+        --max-cases)     shift; MAX_CASES="$1" ;;
+        --min-files)     shift; MIN_FILES="$1" ;;
+        --runner)        shift; RUNNER="$1" ;;
+        --extractor)     shift; EXTRACTOR="$1" ;;
+        --codesage-bin)  shift; CODESAGE_BIN="$1" ;;
+        --no-extract)    NO_EXTRACT=1 ;;
+        --no-save)       SAVE_HISTORY=0 ;;
+        -h|--help)       usage ;;
+        --*)             echo "unknown option: $1" >&2; usage ;;
+        *)               [ -z "$project" ] && project="$1" || usage ;;
+    esac
+    shift
+done
+
+[ -z "$project" ] && usage
+
+if ! project="$(cd "$project" 2>/dev/null && pwd)"; then
+    echo "error: project path does not exist or is not a directory: $project" >&2
+    exit 1
+fi
+
+name="$(basename "$project")"
+mkdir -p "$CORPUS_DIR"
+corpus_yaml="$CORPUS_DIR/${name}-session-eval.yaml"
+
+# Resolve helpers (runner + extractor) relative to the plugin layout, then fall
+# back to the canonical repo location.
+plugin_root="$(cd "$(dirname "$0")/../../.." && pwd)"
+if [ -z "$RUNNER" ]; then
+    for cand in "$plugin_root/bench/codesage-bench-runner" "$HOME/ai/codesage/bench/codesage-bench-runner"; do
+        if [ -x "$cand" ]; then RUNNER="$cand"; break; fi
+    done
+fi
+if [ -z "$EXTRACTOR" ]; then
+    for cand in "$plugin_root/bench/extract-eval-cases.py" "$HOME/ai/codesage/bench/extract-eval-cases.py"; do
+        if [ -f "$cand" ]; then EXTRACTOR="$cand"; break; fi
+    done
+fi
+
+[ -x "$RUNNER" ]  || { echo "error: bench runner not found or not executable: $RUNNER" >&2; exit 1; }
+[ -f "$EXTRACTOR" ] || { echo "error: extract-eval-cases.py not found: $EXTRACTOR" >&2; exit 1; }
+
+echo "==> codesage-eval"
+echo "    project:     $project"
+echo "    corpus yaml: $corpus_yaml"
+echo
+
+# --- Step 1: mine session cases ---
+if [ "$NO_EXTRACT" -eq 1 ]; then
+    if [ ! -f "$corpus_yaml" ]; then
+        echo "error: --no-extract passed but $corpus_yaml does not exist" >&2
+        exit 1
+    fi
+    echo "==> [1/2] reusing existing corpus ($corpus_yaml), skipping mining"
+else
+    # Claude Code slugifies absolute paths by replacing every / with -.
+    slug="$(echo "$project" | tr '/' '-')"
+    session_dir="$HOME/.claude/projects/$slug"
+    if [ ! -d "$session_dir" ]; then
+        echo "error: no Claude Code session history for $project" >&2
+        echo "       expected: $session_dir" >&2
+        echo "       use the project in Claude Code for a while, then re-run." >&2
+        exit 1
+    fi
+
+    echo "==> [1/2] mining session cases"
+    echo "    session dir: $session_dir"
+    echo "    max cases:   $MAX_CASES"
+    echo "    min files:   $MIN_FILES"
+    if ! python3 "$EXTRACTOR" \
+        "$session_dir" \
+        "$project" \
+        --yaml "$corpus_yaml" \
+        --max-cases "$MAX_CASES" \
+        --min-files "$MIN_FILES" \
+        --project-name "$name"
+    then
+        echo "error: no cases mined — session history may be too thin or off-topic" >&2
+        exit 1
+    fi
+fi
+
+echo
+
+# --- Step 2: run the bench ---
+echo "==> [2/2] running bench on $(basename "$corpus_yaml")"
+
+runner_args=("$corpus_yaml")
+[ -n "$CODESAGE_BIN" ] && runner_args+=(--codesage-bin "$CODESAGE_BIN")
+
+if [ "$SAVE_HISTORY" -eq 1 ]; then
+    history_dir="$CORPUS_DIR/history"
+    mkdir -p "$history_dir"
+    timestamp="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
+    out_file="$history_dir/${timestamp}__${name}-session-eval.md"
+    if ! "$RUNNER" "${runner_args[@]}" > "$out_file" 2>&1; then
+        rc=$?
+        echo "error: bench runner failed (rc=$rc) — see $out_file" >&2
+        exit 1
+    fi
+    output="$(cat "$out_file")"
+else
+    output="$("$RUNNER" "${runner_args[@]}" 2>&1)" || {
+        rc=$?
+        echo "error: bench runner failed (rc=$rc)" >&2
+        echo "$output" >&2
+        exit 1
+    }
+fi
+
+metrics_line="$(echo "$output" | grep -o '<!-- METRICS:.*-->' || true)"
+if [ -z "$metrics_line" ]; then
+    echo "error: bench runner produced no METRICS line" >&2
+    echo "$output" | tail -20 >&2
+    exit 1
+fi
+
+cases="$(echo    "$metrics_line" | grep -oE 'cases=[0-9]+'         | cut -d= -f2)"
+miss_rate="$(echo "$metrics_line" | grep -oE 'miss_rate=[0-9.]+'    | cut -d= -f2)"
+median="$(echo    "$metrics_line" | grep -oE 'median_first=[^ ]+'   | cut -d= -f2)"
+r5="$(echo        "$metrics_line" | grep -oE 'r5=[0-9.]+'           | cut -d= -f2)"
+r10="$(echo       "$metrics_line" | grep -oE 'r10=[0-9.]+'          | cut -d= -f2)"
+
+echo
+echo "==> effectiveness summary"
+echo "    project:      $name"
+echo "    cases mined:  $cases"
+echo "    miss_rate:    $miss_rate"
+echo "    median_first: $median"
+echo "    recall@5:     $r5"
+echo "    recall@10:    $r10"
+[ "$SAVE_HISTORY" -eq 1 ] && echo "    scorecard:    $out_file"
+echo
+echo "    raw corpus: $corpus_yaml"
+echo "    (heuristic mining has noise — spot-check the queries before trusting numbers)"
