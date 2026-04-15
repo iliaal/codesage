@@ -202,16 +202,23 @@ Pass that on every call. The server uses it to route to the right index.
 - grep / ripgrep: exact strings, constants, error messages; when you already have the exact symbol name.
 
 ### Risk and history (V2b)
+
+Per-file (slice 1):
 - \`assess_risk\`: BEFORE writing a patch, query risk for the file. Score combines churn, fix ratio, blast radius, coupling, and test gap. Hot+fix-heavy file means smaller patch + broader test sweep. Quote the notes in PR descriptions so reviewers see your calibration.
 - \`find_coupling\`: when planning the test sweep, ask which files have historically changed with the file you're touching. Replaces "consider running tests in X" guesses with named files.
-- Both tools require git history to be indexed. Initial \`codesage git-index\` runs at onboard; subsequent commits/merges auto-refresh via git hooks (\`--incremental\`). Run \`codesage git-index --full\` weekly to rebaseline. Empty results mean either no history yet or the file is too new.
+
+Patch-level (slice 2, added in 0.3.0):
+- \`assess_risk_diff\`: aggregate risk for a SET of files (the file list of a patch). Returns max/mean scores, the highest-risk file, and bucketed lists (hotspot, fix-heavy, test-gap, wide blast radius). Use BEFORE submitting: if max_score is high or any test_gap_files exist, add tests, split the patch, or flag concerns. \`summary_notes\` are paste-ready for a PR description.
+- \`recommend_tests\`: tests an agent should run after editing a set of files. \`primary\` (sibling tests by language convention — FooTest.php, foo.test.ts, test_foo.py, foo_test.go, plus Rust integration tests under crates/<name>/tests/*.rs) plus \`coupled\` (tests from co-change history). Replaces "I'll run all tests" hedging with a focused list.
+
+All four require git history indexed. Initial \`codesage git-index\` runs at onboard; subsequent commits/merges auto-refresh via git hooks. Run \`codesage git-index --full\` weekly to rebaseline. Empty results mean either no history yet or the file is too new.
 
 ## Operations
 
 - Structural + semantic index auto-refreshes on commit/merge/checkout via installed git hooks.
 - Git history index auto-refreshes incrementally on commit/merge/checkout/rebase via the same hooks. Weekly \`codesage git-index --full\` to rebaseline is still good hygiene.
 - Manual refresh: \`codesage index\`, or \`/codesage-reindex\`. Force a full git-history rescan with \`codesage git-index --full\`.
-- CLI: \`codesage search --limit 5 'query'\`, \`codesage coupling <file>\`, \`codesage risk <file>\`.
+- CLI: \`codesage search --limit 5 'query'\`, \`codesage coupling <file>\`, \`codesage risk <file>\`, \`codesage risk-diff <files...>\`, \`codesage tests-for <files...>\` (both accept stdin too: \`git diff --name-only | codesage risk-diff\`).
 HINT
         # Keep the local hint out of the project's commit history.
         if [ -e "$project/.git" ]; then
