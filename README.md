@@ -81,9 +81,36 @@ claude plugin install codesage-tools@codesage
 
 Slash commands: `/codesage-onboard`, `/codesage-reset`, `/codesage-reindex`, `/codesage-bench`, `/codesage-eval`. The plugin handles global MCP registration, per-project init, indexing, git hook install (Husky-aware), and writes a `.claude/CLAUDE.md` hint teaching the agent how to route MCP calls.
 
+## Indexing pipeline
+
+`codesage index` walks the project, parses every supported file, extracts structural data and embeddings, and writes both into the same SQLite database.
+
+```mermaid
+flowchart LR
+    A[Project files] --> B[Discover<br/>walk + excludes]
+    B --> C[Tree-sitter parse]
+    C --> D[Extract symbols<br/>and references]
+    C --> E[Chunk text<br/>recursive splitter]
+    D --> F[(SQLite<br/>files, symbols, refs)]
+    E --> G[Embed via ONNX<br/>MiniLM-L6-v2]
+    G --> H[(sqlite-vec<br/>chunks_minilm_384)]
+```
+
+Parsing happens in parallel via Rayon; SQLite writes are batched. Re-running `codesage index` is incremental: only files whose content hash changed are re-parsed and re-embedded.
+
 ## Search pipeline
 
 A query flows through five stages:
+
+```mermaid
+flowchart LR
+    Q[Query string] --> E[Embed<br/>MiniLM-L6-v2]
+    E --> K[KNN retrieval<br/>sqlite-vec<br/>overfetch 5x]
+    K --> B[Symbol boost<br/>+0.1 per token match]
+    B --> R[Cross-encoder rerank<br/>ms-marco<br/>blend 50/50]
+    R --> A[Symbol annotation]
+    A --> T[Top-N results]
+```
 
 1. Embed the query with MiniLM-L6-v2 (22M params, 384d) via ONNX Runtime.
 2. Prepend file path and symbol context to chunks before embedding.
@@ -118,6 +145,25 @@ Models download from HuggingFace the first time you use them.
 ## Architecture
 
 A Rust workspace with six crates:
+
+```mermaid
+flowchart TD
+    cli[cli<br/>binary + MCP server]
+    graph[graph<br/>indexing + query pipeline]
+    parser[parser<br/>tree-sitter + discovery]
+    storage[storage<br/>SQLite + sqlite-vec + FTS5]
+    embed[embed<br/>ONNX + reranker + chunking]
+    protocol[protocol<br/>shared types]
+
+    cli --> graph
+    graph --> parser
+    graph --> storage
+    graph --> embed
+    parser --> protocol
+    storage --> protocol
+    embed --> protocol
+    graph --> protocol
+```
 
 | Crate | Role |
 |-------|------|
