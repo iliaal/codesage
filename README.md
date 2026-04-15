@@ -1,17 +1,17 @@
 # CodeSage
 
-Code intelligence engine for AI coding agents. Combines structural graph queries (symbols, references, dependencies) with semantic search (embedding-based retrieval + cross-encoder reranking) in a single Rust binary.
+CodeSage is a code intelligence engine for AI coding agents. It combines structural graph queries (symbols, references, dependencies) and semantic search (embedding retrieval with cross-encoder reranking) in a single Rust binary, usable as a CLI or over MCP.
 
-## What it does
+## What you can do with it
 
-- **Semantic search** -- find code by natural language query ("where does auth happen?", "error handling in the GC")
-- **Symbol lookup** -- find definitions by name across a codebase
-- **Reference tracing** -- trace imports, calls, inheritance for any symbol
-- **Dependency mapping** -- map import/include relationships between files
-- **Change impact analysis** -- estimate which files are affected by changing a symbol or file
-- **Context export** -- build curated code bundles ready for LLM consumption (JSON, markdown, or gitingest-style flat-text)
-- **Git history intelligence** -- per-file churn, fix ratio, historical co-change, risk score (V2b slice 1)
-- **MCP interface** -- all tools exposed via Model Context Protocol for AI agents
+- Find code by natural-language query: "where does auth happen?", "error handling in the GC".
+- Look up symbol definitions by name across a codebase.
+- Trace imports, calls, and inheritance for any symbol.
+- Map import and include relationships between files.
+- Estimate which files a change breaks (change impact analysis).
+- Build curated code bundles for LLM consumption in JSON, markdown, or flat-text (gitingest-style) form.
+- Read per-file git history: churn, fix ratio, historical co-change, risk score.
+- Expose all of the above over MCP so Claude Code, Codex, or Cursor can call them.
 
 ## Supported languages
 
@@ -20,10 +20,10 @@ PHP, Python, C, Rust, JavaScript, TypeScript.
 ## Getting started
 
 ```bash
-# Build (GPU support)
+# Build with GPU support
 cargo build --release -p codesage --features cuda
 
-# Initialize a project
+# Initialize and index a project
 cd /path/to/your/project
 codesage init
 codesage index
@@ -46,13 +46,13 @@ codesage export "authentication flow" --limit 5 --callers
 codesage export MyClass --symbol --format md
 codesage export "auth flow" --format ingest    # gitingest-style flat-text bundle
 
-# Git history intelligence (V2b): churn, fix ratio, co-change, risk score
-codesage git-index                                          # initial populate (auto mode); hooks auto-refresh
+# Git history: churn, fix ratio, co-change, risk score
+codesage git-index                                          # initial populate; hooks keep it fresh
 codesage git-index --full                                   # force full rescan (weekly hygiene)
 codesage coupling src/auth/session.ts --limit 5             # files that historically change with this
-codesage risk src/auth/session.ts                           # score + decomposition
+codesage risk src/auth/session.ts                           # score with decomposition
 
-# MCP server for Claude Code / Codex / Cursor (global, serves every onboarded project)
+# MCP server for Claude Code / Codex / Cursor (one global server, every onboarded project)
 claude mcp add --scope user codesage -- codesage mcp
 
 # Auto-reindex on git operations
@@ -64,7 +64,7 @@ codesage doctor
 
 ## Claude Code plugin
 
-`plugins/codesage-tools/` is a Claude Code plugin that wraps the above into one command per task. Marketplace manifest at the repo root.
+`plugins/codesage-tools/` wraps everything above into one command per task. The marketplace manifest lives at the repo root.
 
 ```bash
 claude plugin marketplace add /path/to/codesage
@@ -76,15 +76,15 @@ Slash commands: `/codesage-onboard`, `/codesage-reset`, `/codesage-reindex`, `/c
 
 ## Search pipeline
 
-Retrieval combines multiple signals:
+A query flows through five stages:
 
-1. **Embedding search** -- MiniLM-L6-v2 (22M params, 384d) via ONNX Runtime with CUDA
-2. **Structural augmentation** -- file path + symbol context prepended to chunks before embedding
-3. **Symbol boost** -- query tokens matching known symbols get a relevance boost
-4. **Cross-encoder reranking** -- ms-marco-MiniLM-L6-v2 re-scores top candidates, blended 50/50 with semantic score
-5. **Symbol annotation** -- results annotated with overlapping function/class names
+1. Embed the query with MiniLM-L6-v2 (22M params, 384d) via ONNX Runtime.
+2. Prepend file path and symbol context to chunks before embedding.
+3. Boost chunks whose content matches known symbol names.
+4. Re-score the top candidates with ms-marco-MiniLM-L6-v2 and blend 50/50 with the semantic score.
+5. Annotate each result with overlapping function and class names.
 
-The reranker is configurable per-project. Without it, embedding search + symbol boost still runs.
+The reranker is optional. Set or remove it in `config.toml`; stages 1-3 and the annotation still run without it.
 
 ## Configuration
 
@@ -106,31 +106,35 @@ exclude_patterns = [
 ]
 ```
 
-Models download automatically from HuggingFace on first use.
+Models download from HuggingFace the first time you use them.
 
 ## Architecture
 
-Rust workspace with 6 crates:
+A Rust workspace with six crates:
 
 | Crate | Role |
 |-------|------|
 | `protocol` | Shared types (Symbol, Reference, SearchResult) |
-| `parser` | File discovery, tree-sitter parsing, symbol/reference extraction |
-| `storage` | SQLite + sqlite-vec KNN + FTS5 |
-| `embed` | ONNX embedding inference + cross-encoder reranking + text chunking |
-| `graph` | Indexing orchestration + search pipeline |
-| `cli` | Binary with CLI subcommands + MCP server |
+| `parser` | File discovery, tree-sitter parsing, symbol and reference extraction |
+| `storage` | SQLite with sqlite-vec KNN and FTS5 |
+| `embed` | ONNX embedding inference, cross-encoder reranking, chunking |
+| `graph` | Indexing orchestration and search pipeline |
+| `cli` | Binary with CLI subcommands and MCP server |
 
-Storage: single SQLite database per project (`.codesage/index.db`) with structural tables (symbols, refs, files) and model-specific vector tables for embeddings.
+Storage is a single SQLite database per project at `.codesage/index.db`: structural tables (symbols, refs, files) plus model-specific vector tables for embeddings.
 
 ## Retrieval benchmarks
 
-Benchmark runner and eval-case extractor live under `bench/`:
+`bench/` holds the harness:
 
-- `bench/codesage-bench-runner` — runs a YAML corpus of ground-truth cases through `codesage search` and reports miss rate, median first-hit, and recall at 5/10.
-- `bench/extract-eval-cases.py` — mines eval cases from Claude Code session transcripts and git commit history; emits a corpus YAML.
+- `codesage-bench-runner` runs a YAML corpus of ground-truth cases through `codesage search` and reports miss rate, median first-hit, recall@5, and recall@10.
+- `extract-eval-cases.py` mines eval cases from Claude Code session transcripts and git commit history.
 
-Bring your own corpus; results are not bundled.
+Corpora aren't bundled. Bring your own, or point the plugin at `$CODESAGE_BENCH_CORPUS_DIR`.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). In short: file an issue first, add a test, update `CHANGELOG.md` under `[Unreleased]` for user-visible changes.
 
 ## License
 
