@@ -41,7 +41,7 @@ rmcp = { version = "1.4", features = ["server", "transport-io", "macros"] }
 tokio = { version = "1", features = ["full"] }
 schemars = "0.8"
 
-rayon = "1.10"
+rayon = "1.12"
 anyhow = "1"
 sha2 = "0.10"
 hex = "0.4"
