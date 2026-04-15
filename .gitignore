@@ -15,3 +15,24 @@
 /bench/history/
 /bench/private/
 /bench/*.scorecard.md
+
+# Secrets and credentials. Never track these. The pre-commit leak check
+# enforces the same policy with filename + content regex; this list is
+# the front door so `git add -A` can't sweep them in.
+.env
+.env.*
+!.env.example
+!.env.template
+!.env.sample
+.secret
+.secrets
+.secrets/
+*.pem
+*.p12
+*.pfx
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+credentials.json
+service-account*.json

@@ -20,6 +20,11 @@ esac
 shared_patterns="$repo_root/scripts/leak-patterns.txt"
 local_patterns="$git_dir/info/leak-patterns.txt"
 
+# Filenames that should never be committed regardless of their content.
+# Allowlist takes precedence so templates (.env.example etc.) stay committable.
+FILENAME_BLOCK_RE='(^|/)\.env$|(^|/)\.env\..+|(^|/)\.secret$|(^|/)\.secrets$|(^|/)\.secrets/|\.pem$|\.p12$|\.pfx$|(^|/)id_(rsa|dsa|ecdsa|ed25519)$|(^|/)id_(rsa|dsa|ecdsa|ed25519)\.|(^|/)credentials\.json$|(^|/)service-account.*\.json$'
+FILENAME_ALLOW_RE='(^|/)\.env\.(example|template|sample)$|(^|/)id_(rsa|dsa|ecdsa|ed25519)\.pub$'
+
 collect_patterns() {
     local file="$1"
     [ -f "$file" ] || return 0
@@ -47,6 +52,16 @@ fi
 found=0
 while IFS= read -r file; do
     [ -z "$file" ] && continue
+
+    # Filename policy: allowlist first, then deny-list.
+    if echo "$file" | grep -qE -- "$FILENAME_ALLOW_RE"; then
+        : # explicitly allowed, fall through to content scan
+    elif echo "$file" | grep -qE -- "$FILENAME_BLOCK_RE"; then
+        echo "leak-check: $file is denied by filename policy (secret/credential pattern)" >&2
+        found=1
+        continue
+    fi
+
     # Skip binary files: git's numstat reports "-" for binary additions/deletions.
     added="$(git diff --cached --numstat -- "$file" | awk 'NR==1{print $1}')"
     if [ "$added" = "-" ]; then
