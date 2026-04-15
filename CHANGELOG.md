@@ -8,22 +8,20 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-04-15
+
+Hardening release. New defensive mechanisms around accidentally committing private data plus the public-release CI surface (CI, secret scan, automated release notes from CHANGELOG).
+
 ### Added
 
 - `codesage install-hooks` now installs a `pre-commit` hook when the repo contains `scripts/leak-check.sh`. The hook greps staged content against extended-regex patterns from `scripts/leak-patterns.txt` (tracked, shared) and `.git/info/leak-patterns.txt` (local-only, per-developer) and blocks the commit on a match. Bypass with `git commit --no-verify` when a false positive is intentional.
 - `scripts/leak-patterns.txt` with default patterns for private-key material and common token formats (AWS, GitHub PATs, Slack, Stripe live keys).
 - Pre-commit filename policy. The hook blocks any staged file whose name matches a secret/credential pattern: `.env*` (except `.example`, `.template`, `.sample`), `.secret`, `.secrets/`, `*.pem`, `*.p12`, `*.pfx`, `id_rsa*` / `id_dsa*` / `id_ecdsa*` / `id_ed25519*` (except `.pub` public-key variants), `credentials.json`, `service-account*.json`.
-- GitHub Actions CI (`.github/workflows/ci.yml`) on every PR and push to `master`: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `cargo build --release -p codesage` (CPU-only) to confirm the build works without the `cuda` feature.
-- Secret-scan workflow (`.github/workflows/secret-scan.yml`): runs `scripts/leak-check.sh --range <base>..<head>` against the PR diff (or `--all` on push to master) and `gitleaks-action` for generic credential detection.
-- `scripts/leak-check.sh` gains `--range A..B` and `--all` modes so the same script powers both the pre-commit hook and CI.
-- `rust-toolchain.toml` pinning to `stable` with `rustfmt` and `clippy` components.
-- Release workflow (`.github/workflows/release.yml`): pushing a `vX.Y.Z` tag automatically creates a GitHub Release with notes extracted from the matching `[X.Y.Z]` section of `CHANGELOG.md`. Fails if the section is missing or empty. AGENTS.md "Cutting a release" lists the steps.
+- `scripts/leak-check.sh` supports `--range A..B` and `--all` modes so the same script powers both the pre-commit hook and CI.
 
 ### Changed
 
 - `.gitignore` excludes benchmark artifacts under `bench/` (results, corpora, history, scorecards) and common secret filenames (`.env*`, `*.pem`, `id_rsa*`, `credentials.json`, etc.) so local data never enters a commit by default. Template files (`.env.example`, `.env.template`, `.env.sample`) remain committable.
-- Workspace-wide `cargo fmt`. No semantic change; resets the formatting baseline so the CI fmt check has a clean starting point.
-- `crates/cli/src/mcp.rs`: `pub async fn run_mcp_server` moved to before the `#[cfg(test)] mod tests` block to satisfy `clippy::items_after_test_module`.
 
 ## [0.2.0] - 2026-04-15
 
@@ -50,5 +48,6 @@ Initial public release.
 - Bench plugin commands honor `CODESAGE_BENCH_CORPUS_DIR` (default: `./bench-corpora`). No hardcoded personal paths.
 - Workspace-level versioning. `[workspace.package]` owns the version; every crate inherits via `version.workspace = true`, so releases bump in one line.
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/iliaal/codesage/releases/tag/v0.2.1
 [0.2.0]: https://github.com/iliaal/codesage/releases/tag/v0.2.0
