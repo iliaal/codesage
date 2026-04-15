@@ -30,7 +30,7 @@ tree-sitter-php = "0.24"
 tree-sitter-python = "0.25"
 tree-sitter-c = "0.24"
 
-rusqlite = { version = "0.34", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 
 ignore = "0.4"
 globset = "0.4"

@@ -343,21 +343,24 @@ impl Database {
     }
 
     pub fn file_count(&self) -> Result<usize> {
-        Ok(self
+        let n: i64 = self
             .conn
-            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?)
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
+        Ok(n as usize)
     }
 
     pub fn symbol_count(&self) -> Result<usize> {
-        Ok(self
+        let n: i64 = self
             .conn
-            .query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))?)
+            .query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))?;
+        Ok(n as usize)
     }
 
     pub fn reference_count(&self) -> Result<usize> {
-        Ok(self
+        let n: i64 = self
             .conn
-            .query_row("SELECT COUNT(*) FROM refs", [], |row| row.get(0))?)
+            .query_row("SELECT COUNT(*) FROM refs", [], |row| row.get(0))?;
+        Ok(n as usize)
     }
 
     pub fn insert_chunks(
@@ -524,7 +527,8 @@ impl Database {
 
     pub fn chunk_count(&self) -> Result<usize> {
         let sql = format!("SELECT COUNT(*) FROM \"{}\"", self.chunk_table);
-        Ok(self.conn.query_row(&sql, [], |row| row.get(0))?)
+        let n: i64 = self.conn.query_row(&sql, [], |row| row.get(0))?;
+        Ok(n as usize)
     }
 
     pub fn list_vec_tables(&self) -> Result<Vec<String>> {
