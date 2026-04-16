@@ -1,7 +1,4 @@
-//! Git history indexer (V2b slice 1).
-//!
-//! Populates `git_files` (per-file churn / fix counts) and `git_co_changes`
-//! (per-pair historical co-change weight) from a single `git log` pass.
+//! Git history indexer: `git log` pass, decay math, txn-wrapped writes.
 //!
 //! Source patterns from repowise's git_indexer.py, re-implemented from algorithm:
 //! - one subprocess for the whole repo
@@ -21,14 +18,9 @@ use anyhow::{Context, Result, anyhow};
 use codesage_parser::discover::{
     DEFAULT_EXCLUDE_PATTERNS, TEST_LIKE_EXCLUDE_PATTERNS, build_exclude_set,
 };
-use codesage_protocol::{
-    CoChangeEntry, CoupledTestEntry, FileCategory, GitIndexStats, ImpactRequest, ImpactTarget,
-    RiskAssessment, RiskDiffAssessment, TestRecommendations,
-};
+use codesage_protocol::GitIndexStats;
 use codesage_storage::Database;
 use globset::GlobSet;
-
-use crate::query::impact_analysis;
 
 const DECAY_HALFLIFE_DAYS: f64 = 180.0;
 const SECONDS_PER_DAY: f64 = 86_400.0;
@@ -67,18 +59,10 @@ pub enum IndexMode {
     Auto,
 }
 
+/// Shorthand: full-mode scan with no extra excludes. Used by tests that want the
+/// simplest entry point; production callers go through `git_history_index_with_options`.
 pub fn git_history_index(db: &Database, root: &Path) -> Result<GitIndexStats> {
-    git_history_index_with_options(db, root, &default_excludes(), IndexMode::Full)
-}
-
-/// Same as `git_history_index` but with a caller-provided exclude pattern list.
-/// Defaults to Full mode for API compatibility.
-pub fn git_history_index_with_excludes(
-    db: &Database,
-    root: &Path,
-    extra_excludes: &[String],
-) -> Result<GitIndexStats> {
-    git_history_index_with_options(db, root, extra_excludes, IndexMode::Full)
+    git_history_index_with_options(db, root, &[], IndexMode::Full)
 }
 
 /// Full control: excludes + mode. Public entry point for CLI/hook callers that want
@@ -104,10 +88,14 @@ pub fn git_history_index_with_options(
                     co_change_pairs: 0,
                 });
             }
-            Some((last_sha, _)) if is_ancestor(root, &last_sha, &head_sha) => {
-                IndexMode::Incremental
+            Some((last_sha, _)) => {
+                if is_ancestor(root, &last_sha, &head_sha)? {
+                    IndexMode::Incremental
+                } else {
+                    IndexMode::Full
+                }
             }
-            _ => IndexMode::Full,
+            None => IndexMode::Full,
         },
     };
 
@@ -257,6 +245,11 @@ fn run_incremental(
         );
     }
 
+    // Preload existing pair keys once, outside the write transaction, so the
+    // inner loop's "does this sub-threshold pair already exist in DB?" check is
+    // an in-memory HashMap lookup instead of one `SELECT COUNT(*)` per pair.
+    let existing_pairs = db.all_co_change_pairs()?;
+
     // One transaction wraps decay-scale + every upsert. See run_full for the
     // fsync motivation. Decay scale needs to be inside the same transaction
     // as the deltas, otherwise a crash mid-write leaves us with scaled-but-
@@ -281,9 +274,10 @@ fn run_incremental(
             // Surface a pair if either it already exists in DB (accumulate onto it) or
             // its delta alone cleared the min-count filter. Sub-threshold pairs that
             // straddle the boundary will be caught by the next full rescan.
-            let should_upsert =
-                stats.count >= MIN_CO_CHANGE_COUNT || db.co_change_pair_exists(a, b)?;
-            if should_upsert {
+            let pair_exists = existing_pairs
+                .get(a)
+                .is_some_and(|rhs| rhs.contains(b));
+            if stats.count >= MIN_CO_CHANGE_COUNT || pair_exists {
                 db.incr_git_co_change(a, b, stats.weight, stats.count, stats.last_observed_at)?;
                 co_change_kept += 1;
             }
@@ -381,15 +375,29 @@ fn resolve_head_sha(root: &Path) -> Result<String> {
         .to_string())
 }
 
-fn is_ancestor(root: &Path, old: &str, new: &str) -> bool {
-    // Also confirms old still exists in the repo. If it doesn't resolve, git returns
-    // nonzero, and we treat that as "not an ancestor" and fall back to full.
-    Command::new("git")
+fn is_ancestor(root: &Path, old: &str, new: &str) -> Result<bool> {
+    // Distinguishes spawn failure (git missing / setup error -> propagate) from a clean
+    // exit-1 (genuine "not an ancestor", caller falls back to full rescan). Exit-128
+    // (sha doesn't exist after force-push or shallow clone) is also Ok(false): same
+    // recovery path, but worth a note in logs because it tells you why a hook is
+    // doing extra work.
+    let status = Command::new("git")
         .args(["merge-base", "--is-ancestor", old, new])
         .current_dir(root)
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .with_context(|| {
+            format!(
+                "spawning `git merge-base --is-ancestor {old} {new}` in {}",
+                root.display()
+            )
+        })?;
+    if !status.success() && status.code() == Some(128) {
+        tracing::warn!(
+            %old,
+            "git rejected old SHA (likely rewritten history); falling back to full rescan"
+        );
+    }
+    Ok(status.success())
 }
 
 #[derive(Debug)]
@@ -435,6 +443,8 @@ fn run_git_log(root: &Path, range: Option<&str>) -> Result<String> {
 fn parse_log(raw: &str) -> Vec<Commit> {
     let mut commits = Vec::new();
     let mut current: Option<Commit> = None;
+    let mut skipped_commits = 0usize;
+    let mut skipped_changes = 0usize;
 
     for line in raw.lines() {
         if let Some(rest) = line.strip_prefix("commit\t") {
@@ -443,7 +453,15 @@ fn parse_log(raw: &str) -> Vec<Commit> {
             }
             let mut parts = rest.splitn(3, '\t');
             let _sha = parts.next().unwrap_or("");
-            let ts: i64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            // Drop commits with unparseable timestamps. ts=0 would survive as a
+            // 1970-01-01 commit that contributes nothing to churn (decay≈0) yet still
+            // increments fix_count and total_commits, silently skewing fix_ratio.
+            let ts: Option<i64> = parts.next().and_then(|s| s.parse().ok());
+            let Some(ts) = ts else {
+                skipped_commits += 1;
+                current = None;
+                continue;
+            };
             let subject = parts.next().unwrap_or("").to_string();
             current = Some(Commit {
                 timestamp: ts,
@@ -466,11 +484,16 @@ fn parse_log(raw: &str) -> Vec<Commit> {
         if path.is_empty() || added_s == "-" || deleted_s == "-" {
             continue;
         }
+        // Drop the change rather than fabricate zeros: a parse failure was
+        // indistinguishable from "0 lines added/deleted", which means a corrupt log
+        // line silently turned into a zero-churn commit-to-file entry.
+        let (Ok(added), Ok(deleted)) = (added_s.parse::<u32>(), deleted_s.parse::<u32>()) else {
+            skipped_changes += 1;
+            continue;
+        };
         // Rename detection in numstat looks like `path/{old => new}/file`. Normalize
         // to the destination by stripping `{old => ` and `}`.
         let normalized = normalize_rename_path(path);
-        let added: u32 = added_s.parse().unwrap_or(0);
-        let deleted: u32 = deleted_s.parse().unwrap_or(0);
         commit.changes.push(FileChange {
             path: normalized,
             added,
@@ -479,6 +502,13 @@ fn parse_log(raw: &str) -> Vec<Commit> {
     }
     if let Some(prev) = current.take() {
         commits.push(prev);
+    }
+    if skipped_commits > 0 || skipped_changes > 0 {
+        tracing::warn!(
+            skipped_commits,
+            skipped_changes,
+            "parse_log skipped unparseable git output entries"
+        );
     }
     commits
 }
@@ -533,430 +563,6 @@ fn soft_skip(subject: &str) -> bool {
     !rescued
 }
 
-/// Top-N files that historically co-change with `file_path`. Returns the OTHER file in
-/// each pair, weight-sorted descending. Backed by the `git_co_changes` table populated
-/// by `git_history_index`.
-pub fn find_coupling(db: &Database, file_path: &str, limit: usize) -> Result<Vec<CoChangeEntry>> {
-    let rows = db.co_changes_for(file_path, limit)?;
-    Ok(rows
-        .into_iter()
-        .map(|r| CoChangeEntry {
-            file: r.file,
-            weight: r.weight,
-            count: r.count,
-            last_observed_at: r.last_observed_at,
-        })
-        .collect())
-}
-
-/// Risk score for a single file. Composes:
-/// - churn percentile (0..1) — weight 0.35
-/// - fix ratio (fix_count / total_commits, capped at 1.0) — weight 0.20
-/// - dependent file pressure (capped via 20 dependents) — weight 0.15
-/// - coupled file pressure (capped via 10 coupled) — weight 0.15
-/// - test gap (no test among coupled or as adjacent file) — weight 0.15
-///
-/// Output includes the decomposition so the agent can quote specific signals
-/// in PR descriptions or risk callouts. Empty git history → score=0 with a note.
-pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
-    let git = db.git_file(file_path)?;
-    let churn_score = git.as_ref().map(|g| g.churn_score).unwrap_or(0.0);
-    let total_commits = git.as_ref().map(|g| g.total_commits).unwrap_or(0);
-    let fix_count = git.as_ref().map(|g| g.fix_count).unwrap_or(0);
-    let churn_percentile = db.churn_percentile(file_path)?;
-    let fix_ratio = if total_commits > 0 {
-        (fix_count as f64 / total_commits as f64).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-
-    let coupled = db.co_changes_for(file_path, 10)?;
-    let coupled_files = coupled.len() as u32;
-    let top_coupled: Vec<CoChangeEntry> = coupled
-        .into_iter()
-        .map(|r| CoChangeEntry {
-            file: r.file,
-            weight: r.weight,
-            count: r.count,
-            last_observed_at: r.last_observed_at,
-        })
-        .collect();
-
-    // Reverse-dependency pressure via existing impact analysis (depth=2).
-    let dependent_files = impact_analysis(
-        db,
-        &ImpactRequest {
-            target: ImpactTarget::File {
-                path: file_path.to_string(),
-            },
-            depth: 2,
-            source_only: true,
-        },
-    )
-    .map(|v| v.len() as u32)
-    .unwrap_or(0);
-
-    // Test gap: do any coupled files look like tests, or does a sibling file matching
-    // common test conventions exist in the index?
-    let has_coupled_test = top_coupled
-        .iter()
-        .any(|e| matches!(FileCategory::classify(&e.file), FileCategory::Test));
-    let has_sibling_test = test_sibling_exists(db, file_path).unwrap_or(false);
-    let test_gap = !has_coupled_test && !has_sibling_test;
-
-    let dep_pressure = (dependent_files as f64 / 20.0).min(1.0);
-    let coup_pressure = (coupled_files as f64 / 10.0).min(1.0);
-    let test_gap_term = if test_gap { 1.0 } else { 0.0 };
-
-    let score = 0.35 * churn_percentile
-        + 0.20 * fix_ratio
-        + 0.15 * dep_pressure
-        + 0.15 * coup_pressure
-        + 0.15 * test_gap_term;
-
-    let mut notes = Vec::new();
-    if git.is_none() {
-        notes.push(
-            "no git history for this file (file too new, or `codesage git-index` hasn't been run)"
-                .to_string(),
-        );
-    }
-    if churn_percentile >= 0.75 {
-        notes.push(format!(
-            "hotspot: churn percentile {:.0}%",
-            churn_percentile * 100.0
-        ));
-    }
-    if fix_ratio >= 0.4 && total_commits >= 5 {
-        notes.push(format!(
-            "fix-heavy: {fix_count}/{total_commits} commits ({:.0}%) tagged as fixes",
-            fix_ratio * 100.0
-        ));
-    }
-    if dependent_files >= 10 {
-        notes.push(format!(
-            "wide blast radius: {dependent_files} files depend on this (depth-2)"
-        ));
-    }
-    if coupled_files >= 5 {
-        notes.push(format!(
-            "high coupling: {coupled_files} files historically change with this"
-        ));
-    }
-    if test_gap {
-        notes.push("test gap: no obvious test file (sibling or co-changer)".to_string());
-    }
-
-    Ok(RiskAssessment {
-        file: file_path.to_string(),
-        score,
-        churn_score,
-        churn_percentile,
-        fix_ratio,
-        total_commits,
-        fix_count,
-        dependent_files,
-        coupled_files,
-        test_gap,
-        top_coupled,
-        notes,
-    })
-}
-
-/// All sibling test files for `file_path` that exist in the index, by language
-/// convention. Used by `recommend_tests` and (via .is_empty()) by `assess_risk`.
-fn test_sibling_paths(db: &Database, file_path: &str) -> Result<Vec<String>> {
-    let stem = file_path
-        .rsplit('/')
-        .next()
-        .and_then(|name| name.rsplit_once('.'))
-        .map(|(s, _)| s.to_string())
-        .unwrap_or_default();
-    if stem.is_empty() {
-        return Ok(Vec::new());
-    }
-    let dir = file_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-
-    let candidates: Vec<String> = vec![
-        // PHP: FooTest.php in same dir or app/tests
-        format!("{dir}/{stem}Test.php"),
-        format!("tests/Unit/{stem}Test.php"),
-        format!("tests/Feature/{stem}Test.php"),
-        // Python: test_foo.py / foo_test.py in same dir or tests/
-        format!("{dir}/test_{stem}.py"),
-        format!("{dir}/{stem}_test.py"),
-        format!("tests/test_{stem}.py"),
-        // Go: foo_test.go
-        format!("{dir}/{stem}_test.go"),
-        // JS/TS: foo.test.ts(x), foo.spec.ts(x)
-        format!("{dir}/{stem}.test.ts"),
-        format!("{dir}/{stem}.test.tsx"),
-        format!("{dir}/{stem}.test.js"),
-        format!("{dir}/{stem}.spec.ts"),
-        format!("{dir}/{stem}.spec.tsx"),
-        format!("{dir}/{stem}.spec.js"),
-        // Rust: foo.rs uses inline #[cfg(test)] mod tests so often no separate
-        // file. Skip the explicit rust check; absence here just means the rust
-        // file relies on inline tests.
-    ];
-
-    let mut found = Vec::new();
-    for c in &candidates {
-        let normalized = c.trim_start_matches('/').to_string();
-        if db.git_file(&normalized)?.is_some() {
-            found.push(normalized);
-        }
-    }
-
-    // Rust: integration tests live in `<crate_root>/tests/*.rs`, not as siblings
-    // and not name-keyed to the source file. List every `.rs` file under the
-    // crate's `tests/` directory; the agent can filter further if it has more
-    // context. Skips fixture files since those aren't test entry points.
-    if file_path.ends_with(".rs")
-        && let Some(idx) = file_path.rfind("/src/")
-    {
-        let crate_root = &file_path[..idx];
-        let tests_prefix = format!("{crate_root}/tests/");
-        for path in db.git_files_with_prefix(&tests_prefix)? {
-            if path.ends_with(".rs") && !path.contains("/fixtures/") && !found.contains(&path) {
-                found.push(path);
-            }
-        }
-    }
-    // Workspace-root case: src/foo.rs paired with tests/*.rs at the same level.
-    if file_path.ends_with(".rs") && file_path.starts_with("src/") {
-        for path in db.git_files_with_prefix("tests/")? {
-            if path.ends_with(".rs") && !path.contains("/fixtures/") && !found.contains(&path) {
-                found.push(path);
-            }
-        }
-    }
-
-    // PHP internals (.c/.h source): .phpt tests live in `<dir>/tests/*.phpt`.
-    // The naming convention is loose (bug12345.phpt, gh21709.phpt, feature
-    // descriptions) so we list the directory like Rust integration tests
-    // rather than try to name-match. The agent or coupled-test signal can
-    // narrow further. Skip if the tests dir would dump >50 files (typical
-    // for ext/standard/tests) — too noisy as a "primary" recommendation.
-    if (file_path.ends_with(".c") || file_path.ends_with(".h"))
-        && let Some((dir, _)) = file_path.rsplit_once('/')
-    {
-        let tests_prefix = format!("{dir}/tests/");
-        let candidates: Vec<String> = db
-            .git_files_with_prefix(&tests_prefix)?
-            .into_iter()
-            .filter(|p| p.ends_with(".phpt") && !found.contains(p))
-            .collect();
-        if candidates.len() <= 50 {
-            found.extend(candidates);
-        }
-    }
-
-    // Laravel mirror-tree: source at `app/<rest>/<file>.php` pairs with test at
-    // `tests/{Unit,Feature,Integration,Browser}/<rest>/<file>Test.php`. This is
-    // the convention most modern Laravel projects use; the flat
-    // `tests/Unit/FooTest.php` candidates above only cover root-level sources.
-    if file_path.ends_with(".php")
-        && let Some(rest) = file_path.strip_prefix("app/")
-        && let Some((rest_dir, stem_with_ext)) = rest.rsplit_once('/')
-        && let Some((mirror_stem, _)) = stem_with_ext.rsplit_once('.')
-    {
-        for type_dir in ["Unit", "Feature", "Integration", "Browser"] {
-            let candidate = format!("tests/{type_dir}/{rest_dir}/{mirror_stem}Test.php");
-            if !found.contains(&candidate) && db.git_file(&candidate)?.is_some() {
-                found.push(candidate);
-            }
-        }
-    }
-
-    // Symfony mirror-tree: source at `src/<rest>/<file>.php` pairs with test at
-    // `tests/<rest>/<file>Test.php` (no Unit/Feature subdivisor; Symfony tests
-    // mirror src/ directly).
-    if file_path.ends_with(".php")
-        && let Some(rest) = file_path.strip_prefix("src/")
-        && let Some((rest_dir, stem_with_ext)) = rest.rsplit_once('/')
-        && let Some((mirror_stem, _)) = stem_with_ext.rsplit_once('.')
-    {
-        let candidate = format!("tests/{rest_dir}/{mirror_stem}Test.php");
-        if !found.contains(&candidate) && db.git_file(&candidate)?.is_some() {
-            found.push(candidate);
-        }
-    }
-
-    Ok(found)
-}
-
-/// Heuristic: do any indexed files look like tests for `file_path`?
-fn test_sibling_exists(db: &Database, file_path: &str) -> Result<bool> {
-    Ok(!test_sibling_paths(db, file_path)?.is_empty())
-}
-
-/// Aggregate `assess_risk` across the file list of a patch. Lets an agent
-/// ask one question instead of N round-trips. Output exposes both the
-/// per-file decomposition and patch-level rollups (max/mean, files in each
-/// risk category, paste-ready summary notes).
-pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiffAssessment> {
-    if file_paths.is_empty() {
-        return Ok(RiskDiffAssessment::default());
-    }
-
-    let files: Vec<RiskAssessment> = file_paths
-        .iter()
-        .map(|p| assess_risk(db, p))
-        .collect::<Result<Vec<_>>>()?;
-
-    let max_score = files.iter().map(|f| f.score).fold(0.0_f64, f64::max);
-    let mean_score = files.iter().map(|f| f.score).sum::<f64>() / files.len() as f64;
-    let max_risk_file = files
-        .iter()
-        .max_by(|a, b| {
-            a.score
-                .partial_cmp(&b.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|f| f.file.clone());
-
-    let test_gap_files: Vec<String> = files
-        .iter()
-        .filter(|f| f.test_gap)
-        .map(|f| f.file.clone())
-        .collect();
-
-    let wide_blast_files: Vec<String> = files
-        .iter()
-        .filter(|f| f.dependent_files >= 10)
-        .map(|f| f.file.clone())
-        .collect();
-
-    let fix_heavy_files: Vec<String> = files
-        .iter()
-        .filter(|f| f.fix_ratio >= 0.4 && f.total_commits >= 5)
-        .map(|f| f.file.clone())
-        .collect();
-
-    let hotspot_files: Vec<String> = files
-        .iter()
-        .filter(|f| f.churn_percentile >= 0.75)
-        .map(|f| f.file.clone())
-        .collect();
-
-    let mut summary_notes = Vec::new();
-    if !hotspot_files.is_empty() {
-        summary_notes.push(format!(
-            "patch touches {} hotspot file(s)",
-            hotspot_files.len()
-        ));
-    }
-    if !fix_heavy_files.is_empty() {
-        summary_notes.push(format!(
-            "{} file(s) historically fix-heavy",
-            fix_heavy_files.len()
-        ));
-    }
-    if !test_gap_files.is_empty() {
-        summary_notes.push(format!(
-            "{} file(s) lack test coverage (no sibling test, no test in co-change history)",
-            test_gap_files.len()
-        ));
-    }
-    if !wide_blast_files.is_empty() {
-        summary_notes.push(format!(
-            "{} file(s) have wide blast radius (>=10 dependents)",
-            wide_blast_files.len()
-        ));
-    }
-    if max_score >= 0.6 {
-        summary_notes.push(format!(
-            "max risk score {max_score:.2}; consider smaller patch and broader test sweep"
-        ));
-    }
-
-    Ok(RiskDiffAssessment {
-        files,
-        max_score,
-        mean_score,
-        max_risk_file,
-        test_gap_files,
-        wide_blast_files,
-        fix_heavy_files,
-        hotspot_files,
-        summary_notes,
-    })
-}
-
-/// Tests an agent should run after editing the given files. Two layers:
-/// sibling tests (high confidence, language convention) plus tests that
-/// historically co-change (medium confidence, catches integration-style
-/// tests that don't follow naming conventions). Empty result means no
-/// matching test files in the index.
-pub fn recommend_tests(db: &Database, file_paths: &[String]) -> Result<TestRecommendations> {
-    use std::collections::HashSet;
-
-    let mut primary: HashSet<String> = HashSet::new();
-    let mut coupled: Vec<CoupledTestEntry> = Vec::new();
-
-    for path in file_paths {
-        for sibling in test_sibling_paths(db, path)? {
-            primary.insert(sibling);
-        }
-        let co = db.co_changes_for(path, 20)?;
-        for entry in co {
-            if matches!(FileCategory::classify(&entry.file), FileCategory::Test) {
-                coupled.push(CoupledTestEntry {
-                    file: entry.file,
-                    weight: entry.weight,
-                    count: entry.count,
-                    source: path.clone(),
-                });
-            }
-        }
-    }
-
-    // Drop coupled entries that are also in primary; primary already says "run me".
-    coupled.retain(|c| !primary.contains(&c.file));
-
-    // Dedupe coupled entries by file, keeping the highest-weight pairing so the
-    // agent sees the strongest signal. Source attribution refers to that pairing.
-    coupled.sort_by(|a, b| {
-        b.weight
-            .partial_cmp(&a.weight)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut seen: HashSet<String> = HashSet::new();
-    coupled.retain(|e| seen.insert(e.file.clone()));
-
-    let mut primary_sorted: Vec<String> = primary.into_iter().collect();
-    primary_sorted.sort();
-
-    let mut notes = Vec::new();
-    if primary_sorted.is_empty() && coupled.is_empty() {
-        notes.push(
-            "no test files found via sibling conventions or co-change history; \
-             run `codesage git-index` if you haven't, or add tests for these files"
-                .to_string(),
-        );
-    } else {
-        if !primary_sorted.is_empty() {
-            notes.push(format!(
-                "{} sibling test file(s) found by language convention",
-                primary_sorted.len()
-            ));
-        }
-        if !coupled.is_empty() {
-            notes.push(format!(
-                "{} additional test file(s) suggested by co-change history",
-                coupled.len()
-            ));
-        }
-    }
-
-    Ok(TestRecommendations {
-        primary: primary_sorted,
-        coupled,
-        notes,
-    })
-}
-
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -966,10 +572,6 @@ fn unix_now() -> i64 {
 
 fn is_excluded(set: &GlobSet, path: &str) -> bool {
     set.is_match(path)
-}
-
-fn default_excludes() -> Vec<String> {
-    Vec::new()
 }
 
 #[cfg(test)]

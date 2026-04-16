@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use codesage_embed::model::Embedder;
@@ -38,7 +38,7 @@ pub fn search(
     let limit = req.limit.unwrap_or(10);
     let offset = req.offset.unwrap_or(0);
 
-    let known_symbols = extract_known_symbols(db, &req.query);
+    let known_symbols = extract_known_symbols(db, &req.query)?;
     let has_symbols = !known_symbols.is_empty();
     let has_reranker = reranker.is_some();
     let overfetch = if has_reranker {
@@ -94,21 +94,21 @@ pub fn search(
             }
             Some(langs) => {
                 let fetch_k = semantic_fetch + offset;
-                let mut heap: BinaryHeap<DistRow> = BinaryHeap::new();
-
+                // Fan-out per language (sqlite-vec's partition key forces
+                // per-value queries) and merge in-memory. sort+truncate is
+                // simpler than a bounded BinaryHeap and fetch_k stays small
+                // enough (N_langs * ~50) that asymptotic cost doesn't matter.
+                let mut merged: Vec<RawSearchRow> = Vec::new();
                 for lang in langs {
                     let lang_rows =
                         db.search_knn(&embedding_bytes, fetch_k, Some(lang.as_str()))?;
-                    for row in lang_rows {
-                        heap.push(DistRow(row));
-                        if heap.len() > fetch_k {
-                            heap.pop();
-                        }
-                    }
+                    merged.extend(lang_rows);
                 }
-
-                let mut merged: Vec<RawSearchRow> =
-                    heap.into_sorted_vec().into_iter().map(|d| d.0).collect();
+                merged.sort_by(|a, b| {
+                    a.distance
+                        .partial_cmp(&b.distance)
+                        .unwrap_or(Ordering::Equal)
+                });
                 if offset > 0 && offset < merged.len() {
                     merged.drain(..offset);
                 }
@@ -137,7 +137,7 @@ pub fn search(
         apply_symbol_boost(&mut results, &known_symbols);
     }
 
-    annotate_with_symbols(db, &mut results);
+    annotate_with_symbols(db, &mut results)?;
 
     if let Some(reranker) = reranker {
         apply_reranking(reranker, &req.query, &mut results);
@@ -147,44 +147,20 @@ pub fn search(
     Ok(results)
 }
 
-struct DistRow(RawSearchRow);
-
-impl PartialEq for DistRow {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.distance == other.0.distance
-    }
-}
-impl Eq for DistRow {}
-
-impl PartialOrd for DistRow {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for DistRow {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0
-            .distance
-            .partial_cmp(&other.0.distance)
-            .unwrap_or(Ordering::Equal)
-    }
-}
-
-fn extract_known_symbols(db: &Database, query: &str) -> Vec<String> {
+fn extract_known_symbols(db: &Database, query: &str) -> Result<Vec<String>> {
     let mut known = Vec::new();
     for token in query.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
         let token = token.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
         if token.len() < 3 || !looks_like_identifier(token) {
             continue;
         }
-        if let Ok(syms) = db.find_symbols(token, None)
-            && !syms.is_empty()
-        {
+        // `symbol_exists` issues a LIMIT 1 probe instead of materializing every
+        // matching Symbol row just to test non-emptiness.
+        if db.symbol_exists(token)? {
             known.push(token.to_lowercase());
         }
     }
-    known
+    Ok(known)
 }
 
 fn looks_like_identifier(s: &str) -> bool {
@@ -242,13 +218,23 @@ fn apply_reranking(reranker: &mut Reranker, query: &str, results: &mut [SearchRe
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 }
 
-fn annotate_with_symbols(db: &Database, results: &mut [SearchResult]) {
-    let mut cache: HashMap<String, Vec<Symbol>> = HashMap::new();
+fn annotate_with_symbols(db: &Database, results: &mut [SearchResult]) -> Result<()> {
+    if results.is_empty() {
+        return Ok(());
+    }
+
+    // Batched lookup: one multi-path query instead of one per distinct file.
+    let distinct_files: Vec<String> = {
+        let set: HashSet<&str> = results.iter().map(|r| r.file_path.as_str()).collect();
+        set.into_iter().map(|s| s.to_string()).collect()
+    };
+    let by_file = db.symbols_for_files(&distinct_files)?;
 
     for result in results.iter_mut() {
-        let symbols = cache
-            .entry(result.file_path.clone())
-            .or_insert_with(|| db.symbols_for_file(&result.file_path).unwrap_or_default());
+        let symbols: &[Symbol] = by_file
+            .get(&result.file_path)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
 
         let overlapping: Vec<SymbolSummary> = symbols
             .iter()
@@ -262,6 +248,7 @@ fn annotate_with_symbols(db: &Database, results: &mut [SearchResult]) {
 
         result.symbols = overlapping;
     }
+    Ok(())
 }
 
 pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactEntry>> {
@@ -295,7 +282,7 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
             if !visited_symbols.insert(sym.qualified_name.clone()) {
                 continue;
             }
-            let refs = db.find_references(&sym.name, None).unwrap_or_default();
+            let refs = db.find_references(&sym.name, None)?;
             for r in refs {
                 if origin_files.contains(&r.from_file) {
                     continue;
@@ -332,7 +319,7 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
             });
             set.into_iter().collect()
         };
-        let syms_by_file = db.symbols_for_files(&distinct_files).unwrap_or_default();
+        let syms_by_file = db.symbols_for_files(&distinct_files)?;
 
         let mut next_frontier: Vec<Symbol> = Vec::new();
         for (from_file, line) in &pending_callers {
@@ -410,19 +397,17 @@ pub fn export_context(
             if !seen_sym.insert(sum.qualified_name.clone()) {
                 continue;
             }
-            if let Ok(defs) = db.find_symbols(&sum.name, None) {
-                for d in defs.into_iter().take(1) {
-                    symbol_defs.push(d);
-                }
+            let defs = db.find_symbols(&sum.name, None)?;
+            for d in defs.into_iter().take(1) {
+                symbol_defs.push(d);
             }
         }
     }
 
     if req.include_callees || req.include_callers {
         for sym in symbol_defs.clone().iter().take(5) {
-            if req.include_callers
-                && let Ok(refs) = db.find_references(&sym.name, None)
-            {
+            if req.include_callers {
+                let refs = db.find_references(&sym.name, None)?;
                 for r in refs.into_iter().take(3) {
                     add_related_from_file(
                         db,
@@ -430,7 +415,7 @@ pub fn export_context(
                         r.line,
                         &mut related,
                         &mut related_keys,
-                    );
+                    )?;
                 }
             }
             if req.include_callees {
@@ -440,7 +425,7 @@ pub fn export_context(
                     sym.line_start,
                     &mut related,
                     &mut related_keys,
-                );
+                )?;
             }
         }
     }
@@ -477,16 +462,16 @@ pub fn export_context_for_symbol(
             def.line_start,
             &mut primary,
             &mut primary_keys,
-        );
+        )?;
     }
 
     let mut related: Vec<SearchResult> = Vec::new();
     let mut related_keys: HashSet<(String, u32)> = primary_keys.clone();
 
     if req.include_callers {
-        let refs = db.find_references(sym_name, None).unwrap_or_default();
+        let refs = db.find_references(sym_name, None)?;
         for r in refs.into_iter().take(req.limit) {
-            add_related_from_file(db, &r.from_file, r.line, &mut related, &mut related_keys);
+            add_related_from_file(db, &r.from_file, r.line, &mut related, &mut related_keys)?;
         }
     }
 
@@ -504,11 +489,8 @@ fn add_related_from_file(
     line: u32,
     out: &mut Vec<SearchResult>,
     seen: &mut HashSet<(String, u32)>,
-) {
-    let chunks = match db.chunks_for_file(file_path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
+) -> Result<()> {
+    let chunks = db.chunks_for_file(file_path)?;
     let best = chunks
         .into_iter()
         .find(|c| c.start_line <= line && c.end_line >= line);
@@ -524,8 +506,9 @@ fn add_related_from_file(
                 score: 0.0,
                 symbols: Vec::new(),
             };
-            annotate_with_symbols(db, std::slice::from_mut(&mut result));
+            annotate_with_symbols(db, std::slice::from_mut(&mut result))?;
             out.push(result);
         }
     }
+    Ok(())
 }

@@ -1,4 +1,6 @@
-use anyhow::{Context, Result};
+use std::sync::LazyLock;
+
+use anyhow::Result;
 use codesage_protocol::{Language, Symbol, SymbolKind};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Query, QueryCursor, Tree};
@@ -10,6 +12,59 @@ static RUST_QUERY: &str = include_str!("queries/rust.scm");
 static JS_QUERY: &str = include_str!("queries/javascript.scm");
 static TS_QUERY: &str = include_str!("queries/typescript.scm");
 static GO_QUERY: &str = include_str!("queries/go.scm");
+
+/// A compiled tree-sitter symbol query plus its capture indices. Compiled once
+/// per language on first use, then reused across every file. `capture_index_for_name`
+/// is O(n) over captures, so caching it beside the Query matters when the indexer
+/// runs through tens of thousands of files.
+struct SymbolQuerySpec {
+    query: Query,
+    name_idx: u32,
+    def_idx: u32,
+}
+
+fn compile_symbol_query(lang: tree_sitter::Language, src: &str) -> SymbolQuerySpec {
+    let query = Query::new(&lang, src).expect("embedded .scm symbol query compiles");
+    let name_idx = query
+        .capture_index_for_name("name")
+        .expect("embedded .scm has @name capture");
+    let def_idx = query
+        .capture_index_for_name("def")
+        .expect("embedded .scm has @def capture");
+    SymbolQuerySpec {
+        query,
+        name_idx,
+        def_idx,
+    }
+}
+
+static PHP_SYM: LazyLock<SymbolQuerySpec> =
+    LazyLock::new(|| compile_symbol_query(tree_sitter_php::LANGUAGE_PHP.into(), PHP_QUERY));
+static PY_SYM: LazyLock<SymbolQuerySpec> =
+    LazyLock::new(|| compile_symbol_query(tree_sitter_python::LANGUAGE.into(), PYTHON_QUERY));
+static C_SYM: LazyLock<SymbolQuerySpec> =
+    LazyLock::new(|| compile_symbol_query(tree_sitter_c::LANGUAGE.into(), C_QUERY));
+static RUST_SYM: LazyLock<SymbolQuerySpec> =
+    LazyLock::new(|| compile_symbol_query(tree_sitter_rust::LANGUAGE.into(), RUST_QUERY));
+static JS_SYM: LazyLock<SymbolQuerySpec> =
+    LazyLock::new(|| compile_symbol_query(tree_sitter_javascript::LANGUAGE.into(), JS_QUERY));
+static TS_SYM: LazyLock<SymbolQuerySpec> = LazyLock::new(|| {
+    compile_symbol_query(tree_sitter_typescript::LANGUAGE_TSX.into(), TS_QUERY)
+});
+static GO_SYM: LazyLock<SymbolQuerySpec> =
+    LazyLock::new(|| compile_symbol_query(tree_sitter_go::LANGUAGE.into(), GO_QUERY));
+
+fn symbol_query_for(lang: Language) -> &'static SymbolQuerySpec {
+    match lang {
+        Language::Php => &PHP_SYM,
+        Language::Python => &PY_SYM,
+        Language::C => &C_SYM,
+        Language::Rust => &RUST_SYM,
+        Language::JavaScript => &JS_SYM,
+        Language::TypeScript => &TS_SYM,
+        Language::Go => &GO_SYM,
+    }
+}
 
 fn php_kind_map(pattern_index: usize) -> Option<SymbolKind> {
     match pattern_index {
@@ -102,39 +157,24 @@ pub fn extract_symbols(
     language: Language,
     file_path: &str,
 ) -> Result<Vec<Symbol>> {
-    let ts_language = match language {
-        Language::Php => tree_sitter_php::LANGUAGE_PHP.into(),
-        Language::Python => tree_sitter_python::LANGUAGE.into(),
-        Language::C => tree_sitter_c::LANGUAGE.into(),
-        Language::Rust => tree_sitter_rust::LANGUAGE.into(),
-        Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
-        Language::TypeScript => tree_sitter_typescript::LANGUAGE_TSX.into(),
-        Language::Go => tree_sitter_go::LANGUAGE.into(),
+    let kind_map: fn(usize) -> Option<SymbolKind> = match language {
+        Language::Php => php_kind_map,
+        Language::Python => python_kind_map,
+        Language::C => c_kind_map,
+        Language::Rust => rust_kind_map,
+        Language::JavaScript => js_kind_map,
+        Language::TypeScript => ts_kind_map,
+        Language::Go => go_kind_map,
     };
 
-    let (query_src, kind_map): (&str, fn(usize) -> Option<SymbolKind>) = match language {
-        Language::Php => (PHP_QUERY, php_kind_map),
-        Language::Python => (PYTHON_QUERY, python_kind_map),
-        Language::C => (C_QUERY, c_kind_map),
-        Language::Rust => (RUST_QUERY, rust_kind_map),
-        Language::JavaScript => (JS_QUERY, js_kind_map),
-        Language::TypeScript => (TS_QUERY, ts_kind_map),
-        Language::Go => (GO_QUERY, go_kind_map),
-    };
-
-    let query =
-        Query::new(&ts_language, query_src).context("failed to compile tree-sitter query")?;
-
-    let name_idx = query
-        .capture_index_for_name("name")
-        .context("query has no @name capture")?;
-    let def_idx = query
-        .capture_index_for_name("def")
-        .context("query has no @def capture")?;
+    let spec = symbol_query_for(language);
+    let query = &spec.query;
+    let name_idx = spec.name_idx;
+    let def_idx = spec.def_idx;
 
     let root = tree.root_node();
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, root, source);
+    let mut matches = cursor.matches(query, root, source);
 
     let namespace = match language {
         Language::Php => find_php_namespace(&root, source),

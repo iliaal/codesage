@@ -312,6 +312,22 @@ pub enum ImpactTarget {
     File { path: String },
 }
 
+impl ImpactTarget {
+    /// Build from a user-supplied hint. `is_file=Some(true|false)` honors the explicit flag;
+    /// `None` falls back to a heuristic: a `/` or `.` in the target string means file path.
+    /// Callers with a CLI-style bool flag should pass `Some(true)` only when the user set it,
+    /// else `None` (so an unset-false doesn't force a Symbol classification).
+    pub fn from_hint(target: String, is_file: Option<bool>) -> Self {
+        let looks_like_file =
+            is_file.unwrap_or_else(|| target.contains('/') || target.contains('.'));
+        if looks_like_file {
+            ImpactTarget::File { path: target }
+        } else {
+            ImpactTarget::Symbol { name: target }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImpactRequest {
     pub target: ImpactTarget,
@@ -350,6 +366,36 @@ pub struct ExportRequest {
     pub include_callers: bool,
     #[serde(default)]
     pub include_callees: bool,
+}
+
+impl ExportRequest {
+    /// Build from a user-supplied target + is_symbol toggle. Centralizes the
+    /// "exactly one of query/symbol" invariant so CLI and MCP can't drift.
+    pub fn from_target(
+        target: String,
+        is_symbol: bool,
+        limit: usize,
+        include_callers: bool,
+        include_callees: bool,
+    ) -> Self {
+        if is_symbol {
+            Self {
+                query: None,
+                symbol: Some(target),
+                limit,
+                include_callers,
+                include_callees,
+            }
+        } else {
+            Self {
+                query: Some(target),
+                symbol: None,
+                limit,
+                include_callers,
+                include_callees,
+            }
+        }
+    }
 }
 
 fn default_export_limit() -> usize {

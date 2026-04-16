@@ -1,5 +1,6 @@
 mod doctor;
 mod mcp;
+mod util;
 
 use std::path::{Path, PathBuf};
 
@@ -231,13 +232,19 @@ fn open_db_for_model(root: &Path, model: &str, dim: usize) -> Result<Database> {
     Database::open_for_model(&db_path, model, dim).context("failed to open index database")
 }
 
-pub(crate) fn load_project_config(root: &Path) -> ProjectConfig {
+pub(crate) fn load_project_config(root: &Path) -> Result<ProjectConfig> {
     let config_path = root.join(PROJECT_DIR).join("config.toml");
     let content = match std::fs::read_to_string(&config_path) {
         Ok(c) => c,
-        Err(_) => return ProjectConfig::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ProjectConfig::default());
+        }
+        Err(e) => {
+            return Err(anyhow::Error::from(e))
+                .with_context(|| format!("reading {}", config_path.display()));
+        }
     };
-    toml::from_str(&content).unwrap_or_default()
+    toml::from_str(&content).with_context(|| format!("parsing {}", config_path.display()))
 }
 
 fn get_exclude_patterns(config: &ProjectConfig) -> Vec<String> {
@@ -264,7 +271,7 @@ fn load_query_stack(
     Embedder,
     Option<codesage_embed::reranker::Reranker>,
 )> {
-    let config = load_project_config(root);
+    let config = load_project_config(root)?;
     let emb_config = config.embedding.unwrap_or_default();
     let embedder = Embedder::new(&emb_config)?;
     let db = open_db_for_model(root, &emb_config.model, embedder.dim())?;
@@ -277,6 +284,7 @@ fn load_query_stack(
 }
 
 fn main() -> Result<()> {
+    init_tracing();
     let cli = Cli::parse();
 
     match cli.command {
@@ -341,7 +349,8 @@ fn cmd_install_hooks() -> Result<()> {
     let (hooks_dir, is_husky) = resolve_hooks_dir(&root)?;
     std::fs::create_dir_all(&hooks_dir)?;
 
-    let codesage_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("codesage"));
+    let codesage_bin =
+        std::env::current_exe().context("resolving current_exe for git hook body")?;
     let codesage_path = codesage_bin.display();
 
     let hook_body = format!(
@@ -489,28 +498,7 @@ fn resolve_hooks_dir(root: &std::path::Path) -> Result<(PathBuf, bool)> {
     }
 }
 
-fn git_common_dir(cwd: &std::path::Path) -> Option<PathBuf> {
-    let out = std::process::Command::new("git")
-        .arg("rev-parse")
-        .arg("--git-common-dir")
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let dir = String::from_utf8(out.stdout).ok()?;
-    let dir = dir.trim();
-    if dir.is_empty() {
-        return None;
-    }
-    let path = std::path::Path::new(dir);
-    Some(if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    })
-}
+use util::{format_bytes, git_common_dir, init_tracing};
 
 fn exclude_husky_hook_paths(root: &std::path::Path, hooks: &[PathBuf]) -> Result<()> {
     let Some(exclude) = git_local_exclude_path(root) else {
@@ -605,7 +593,7 @@ fn git_local_exclude_path(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
 
 fn cmd_index(full: bool, no_semantic: bool) -> Result<()> {
     let root = find_project_root()?;
-    let config = load_project_config(&root);
+    let config = load_project_config(&root)?;
     let excludes = get_exclude_patterns(&config);
 
     let emb_config = config.embedding.unwrap_or_default();
@@ -653,7 +641,7 @@ fn cmd_index(full: bool, no_semantic: bool) -> Result<()> {
                 );
             }
             Err(e) => {
-                eprintln!("Semantic indexing skipped: {e}");
+                tracing::warn!(error = %e, "semantic indexing skipped");
             }
         }
     }
@@ -989,7 +977,7 @@ fn cmd_status() -> Result<()> {
 
 fn cmd_cleanup(dry_run: bool) -> Result<()> {
     let root = find_project_root()?;
-    let config = load_project_config(&root);
+    let config = load_project_config(&root)?;
     let emb_config = config.embedding.unwrap_or_default();
 
     let embedder = Embedder::new(&emb_config)?;
@@ -1020,7 +1008,7 @@ fn cmd_cleanup(dry_run: bool) -> Result<()> {
             match db.drop_vec_table(table) {
                 Ok(()) => println!("  drop: {table}"),
                 Err(e) => {
-                    eprintln!("  FAIL drop {table}: {e}");
+                    tracing::error!(%table, error = %e, "failed to drop orphan vec table");
                     continue;
                 }
             }
@@ -1047,18 +1035,6 @@ fn cmd_cleanup(dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn format_bytes(n: u64) -> String {
-    if n >= 1 << 30 {
-        format!("{:.2} GiB", n as f64 / (1u64 << 30) as f64)
-    } else if n >= 1 << 20 {
-        format!("{:.2} MiB", n as f64 / (1u64 << 20) as f64)
-    } else if n >= 1 << 10 {
-        format!("{:.2} KiB", n as f64 / (1u64 << 10) as f64)
-    } else {
-        format!("{n} B")
-    }
-}
-
 fn cmd_impact(
     target: &str,
     is_file: bool,
@@ -1069,19 +1045,11 @@ fn cmd_impact(
     let root = find_project_root()?;
     let db = open_db(&root)?;
 
-    let looks_like_file = is_file || target.contains('/') || target.contains('.');
-    let impact_target = if looks_like_file {
-        ImpactTarget::File {
-            path: target.to_string(),
-        }
-    } else {
-        ImpactTarget::Symbol {
-            name: target.to_string(),
-        }
-    };
-
+    // Pass Some(true) only when the user explicitly set --file; an unset false
+    // would force Symbol classification and break the heuristic fallback.
+    let hint = if is_file { Some(true) } else { None };
     let req = ImpactRequest {
-        target: impact_target,
+        target: ImpactTarget::from_hint(target.to_string(), hint),
         depth,
         source_only,
     };
@@ -1134,21 +1102,7 @@ fn cmd_export(
     let root = find_project_root()?;
     let (db, mut embedder, mut reranker) = load_query_stack(&root)?;
 
-    let req = ExportRequest {
-        query: if is_symbol {
-            None
-        } else {
-            Some(target.to_string())
-        },
-        symbol: if is_symbol {
-            Some(target.to_string())
-        } else {
-            None
-        },
-        limit,
-        include_callers: callers,
-        include_callees: callees,
-    };
+    let req = ExportRequest::from_target(target.to_string(), is_symbol, limit, callers, callees);
 
     let bundle = export_context(&db, &mut embedder, reranker.as_mut(), &req)?;
 

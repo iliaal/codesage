@@ -19,7 +19,7 @@ cargo clippy --workspace                       # lint
 |-------|------|------------|
 | `protocol` | Shared types (Symbol, Reference, SearchResult, etc.) | nothing |
 | `parser` | File discovery, language detection, tree-sitter symbol/reference extraction | protocol |
-| `storage` | SQLite schema, CRUD, sqlite-vec KNN, FTS5 | protocol |
+| `storage` | SQLite schema, CRUD, sqlite-vec KNN | protocol |
 | `embed` | ONNX embedding inference (Embedder), cross-encoder reranking (Reranker), chunking | ort, tokenizers, hf-hub |
 | `graph` | Indexing orchestration, search pipeline, query API | parser, storage, embed, protocol |
 | `cli` | `codesage` binary: CLI subcommands + MCP server | everything |
@@ -82,7 +82,6 @@ Required pip packages: `onnxruntime-gpu`, `nvidia-cudnn-cu12`, `nvidia-cublas-cu
 - Tree-sitter queries in `.scm` files under `crates/parser/src/queries/`, embedded via `include_str!`
 - JSON output on all query commands (`--json`)
 - Model-specific vec0 tables (`chunks_{model}_{dim}`) allow switching models without re-indexing structural data
-- FTS5 + fts5vocab tables populated during indexing (BM25 infrastructure retained but disabled in search path)
 
 ## Versioning and changelog
 

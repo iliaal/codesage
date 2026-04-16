@@ -12,6 +12,7 @@ codesage-embed.workspace = true
 rayon.workspace = true
 anyhow.workspace = true
 globset.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

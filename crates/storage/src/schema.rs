@@ -112,7 +112,57 @@ pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch("PRAGMA journal_mode=WAL;")?;
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     conn.execute_batch(SCHEMA)?;
-    migrate_refs_to_name_tail(conn)?;
+    run_migrations(conn)?;
+    Ok(())
+}
+
+/// Hard rule for anyone adding a new migration to [`MIGRATIONS`]: the `up` body
+/// must be **safe when run against an already-current schema**. On a fresh DB,
+/// [`init_db`] creates the latest `SCHEMA` first, then still runs every entry
+/// in [`MIGRATIONS`] to record them in `schema_migrations` (registry + fresh
+/// schema are decoupled). Each migration therefore needs to self-check its
+/// target state (existence of a column, index, or row) and no-op if already
+/// applied. The existing `0001_refs_name_tail` migration is the template.
+///
+/// `up` functions do NOT need to open their own transactions; the runner opens
+/// one transaction per migration and records the migration in
+/// `schema_migrations` within that same transaction, so either both land or
+/// neither does.
+type MigrationUp = fn(&Connection) -> rusqlite::Result<()>;
+
+const MIGRATIONS: &[(&str, MigrationUp)] = &[("0001_refs_name_tail", migrate_0001_refs_name_tail)];
+
+fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+             id INTEGER PRIMARY KEY,
+             name TEXT NOT NULL UNIQUE,
+             applied_at INTEGER NOT NULL DEFAULT (unixepoch())
+         );",
+    )?;
+    for (name, up) in MIGRATIONS {
+        let already: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE name = ?1",
+            rusqlite::params![name],
+            |r| r.get(0),
+        )?;
+        if already > 0 {
+            continue;
+        }
+        conn.execute_batch("BEGIN")?;
+        if let Err(e) = (|| -> rusqlite::Result<()> {
+            up(conn)?;
+            conn.execute(
+                "INSERT INTO schema_migrations (name) VALUES (?1)",
+                rusqlite::params![name],
+            )?;
+            Ok(())
+        })() {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+        conn.execute_batch("COMMIT")?;
+    }
     Ok(())
 }
 
@@ -135,7 +185,10 @@ pub fn name_tail(s: &str) -> &str {
     }
 }
 
-fn migrate_refs_to_name_tail(conn: &Connection) -> rusqlite::Result<()> {
+/// Adds `refs.to_name_tail` + backfill + supporting index. Safe against
+/// already-current schema: guarded by `pragma_table_info` check. Runner owns
+/// the transaction; this body can issue SQL directly.
+fn migrate_0001_refs_name_tail(conn: &Connection) -> rusqlite::Result<()> {
     let has_column: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('refs') WHERE name = 'to_name_tail'",
         [],
@@ -146,17 +199,12 @@ fn migrate_refs_to_name_tail(conn: &Connection) -> rusqlite::Result<()> {
         let rows: Vec<(i64, String)> = {
             let mut stmt = conn.prepare("SELECT id, to_name FROM refs")?;
             stmt.query_map([], |row| Ok((row.get(0)?, row.get::<_, String>(1)?)))?
-                .filter_map(|r| r.ok())
-                .collect()
+                .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        conn.execute_batch("BEGIN")?;
-        {
-            let mut update = conn.prepare("UPDATE refs SET to_name_tail = ?1 WHERE id = ?2")?;
-            for (id, to_name) in &rows {
-                update.execute(rusqlite::params![name_tail(to_name), id])?;
-            }
+        let mut update = conn.prepare("UPDATE refs SET to_name_tail = ?1 WHERE id = ?2")?;
+        for (id, to_name) in &rows {
+            update.execute(rusqlite::params![name_tail(to_name), id])?;
         }
-        conn.execute_batch("COMMIT")?;
     }
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_refs_to_name_tail ON refs(to_name_tail);")?;
     Ok(())

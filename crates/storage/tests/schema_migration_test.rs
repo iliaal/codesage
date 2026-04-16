@@ -169,6 +169,70 @@ fn init_db_adds_v2b_git_tables_to_legacy_db() {
 }
 
 #[test]
+fn fresh_db_records_migrations_exactly_once() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_db(&conn).expect("init_db on fresh DB");
+
+    // schema_migrations table must exist.
+    let has_table: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(has_table, 1);
+
+    // Each migration name must be present exactly once after first init.
+    let count_0001: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE name = '0001_refs_name_tail'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count_0001, 1, "0001 recorded on fresh DB");
+
+    // Running init_db again must be a no-op: count stays at 1.
+    init_db(&conn).expect("second init_db");
+    let count_after: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE name = '0001_refs_name_tail'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count_after, 1, "second init_db must not re-apply migrations");
+}
+
+#[test]
+fn legacy_db_records_migration_after_upgrade() {
+    let conn = Connection::open_in_memory().unwrap();
+    create_old_schema(&conn);
+    // Pre-condition: no schema_migrations yet.
+    let has_table_before: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(has_table_before, 0);
+
+    init_db(&conn).expect("init_db on legacy DB");
+
+    // schema_migrations exists with 0001 recorded.
+    let count_0001: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE name = '0001_refs_name_tail'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count_0001, 1);
+}
+
+#[test]
 fn name_tail_handles_separators() {
     assert_eq!(name_tail("App\\Http\\Controllers\\Foo"), "Foo");
     assert_eq!(name_tail("mod::sub::bar"), "bar");

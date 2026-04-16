@@ -109,7 +109,7 @@ pub fn preload_cuda_libs() {
                 let path = dir.join(lib_name);
                 if path.exists() {
                     if let Err(e) = ort::util::preload_dylib(path) {
-                        eprintln!("CUDA preload warning for {lib_name}: {e}");
+                        tracing::warn!(lib = lib_name, error = %e, "CUDA preload failed");
                     }
                     break;
                 }
@@ -216,7 +216,7 @@ pub struct Embedder {
 impl Embedder {
     pub fn new(config: &EmbeddingConfig) -> Result<Self> {
         init_ort_dylib();
-        eprintln!("Loading embedding model: {}", config.model);
+        tracing::info!(model = %config.model, "loading embedding model");
 
         let api =
             hf_hub::api::sync::Api::new().context("failed to create HuggingFace API client")?;
@@ -276,8 +276,11 @@ impl Embedder {
         let dim = detect_dim(&session)?;
         let pooling = config.pooling_strategy();
 
-        eprintln!(
-            "Embedding model loaded (dim={dim}, pooling={pooling:?}, token_type_ids={has_token_type_ids})"
+        tracing::info!(
+            dim,
+            pooling = ?pooling,
+            token_type_ids = has_token_type_ids,
+            "embedding model loaded"
         );
 
         Ok(Self {

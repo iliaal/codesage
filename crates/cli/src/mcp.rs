@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use parking_lot::Mutex;
 use codesage_embed::config::EmbeddingConfig;
 use codesage_embed::model::Embedder;
 use codesage_embed::reranker::Reranker;
@@ -18,7 +19,7 @@ use codesage_storage::Database;
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::ServerInfo,
+    model::{CallToolResult, Content, ServerInfo},
     schemars, tool, tool_handler, tool_router,
 };
 
@@ -187,7 +188,7 @@ impl CodeSageServer {
             .canonicalize()
             .map_err(|e| anyhow::anyhow!("project path `{}` does not exist: {}", project, e))?;
         {
-            let guard = self.projects.lock().unwrap();
+            let guard = self.projects.lock();
             if let Some(state) = guard.get(&canonical) {
                 return Ok(state.clone());
             }
@@ -202,12 +203,12 @@ impl CodeSageServer {
                 canonical.display()
             );
         }
-        let embedding_config = load_embedding_config(&codesage_dir.join("config.toml"));
+        let embedding_config = load_embedding_config(&codesage_dir.join("config.toml"))?;
         let state = ProjectState {
             db_path,
             embedding_config,
         };
-        let mut guard = self.projects.lock().unwrap();
+        let mut guard = self.projects.lock();
         guard.entry(canonical).or_insert(state.clone());
         Ok(state)
     }
@@ -215,14 +216,19 @@ impl CodeSageServer {
     fn get_or_load_embedder(&self, config: &EmbeddingConfig) -> Result<Arc<Mutex<Embedder>>> {
         let key = format!("{}|{}", config.model, config.device);
         {
-            let guard = self.embedders.lock().unwrap();
+            let guard = self.embedders.lock();
             if let Some(arc) = guard.get(&key) {
                 return Ok(arc.clone());
             }
         }
-        let embedder = Embedder::new(config)?;
+        let embedder = Embedder::new(config).with_context(|| {
+            format!(
+                "loading embedding model '{}' on device '{}'",
+                config.model, config.device
+            )
+        })?;
         let arc = Arc::new(Mutex::new(embedder));
-        let mut guard = self.embedders.lock().unwrap();
+        let mut guard = self.embedders.lock();
         Ok(guard.entry(key).or_insert(arc).clone())
     }
 
@@ -233,20 +239,22 @@ impl CodeSageServer {
     ) -> Result<Arc<Mutex<Reranker>>> {
         let key = format!("{}|{}", reranker_model, device);
         {
-            let guard = self.rerankers.lock().unwrap();
+            let guard = self.rerankers.lock();
             if let Some(arc) = guard.get(&key) {
                 return Ok(arc.clone());
             }
         }
-        let reranker = Reranker::new(reranker_model, device)?;
+        let reranker = Reranker::new(reranker_model, device).with_context(|| {
+            format!("loading reranker model '{reranker_model}' on device '{device}'")
+        })?;
         let arc = Arc::new(Mutex::new(reranker));
-        let mut guard = self.rerankers.lock().unwrap();
+        let mut guard = self.rerankers.lock();
         Ok(guard.entry(key).or_insert(arc).clone())
     }
 
     fn open_db_for(&self, state: &ProjectState) -> Result<Database> {
         let embedder_arc = self.get_or_load_embedder(&state.embedding_config)?;
-        let embedder = embedder_arc.lock().unwrap();
+        let embedder = embedder_arc.lock();
         Database::open_for_model(
             &state.db_path,
             &state.embedding_config.model,
@@ -274,20 +282,19 @@ impl CodeSageServer {
         let state = self.resolve_project(project)?;
         let db = self.open_db_for(&state)?;
         let embedder_arc = self.get_or_load_embedder(&state.embedding_config)?;
-        let reranker_arc = state.embedding_config.reranker.as_deref().and_then(|m| {
-            self.get_or_load_reranker(m, &state.embedding_config.device)
-                .ok()
-        });
-        let mut embedder_guard = embedder_arc.lock().unwrap();
-        let mut reranker_guard = reranker_arc.as_ref().map(|a| a.lock().unwrap());
+        let reranker_arc = state
+            .embedding_config
+            .reranker
+            .as_deref()
+            .map(|m| self.get_or_load_reranker(m, &state.embedding_config.device))
+            .transpose()?;
+        let mut embedder_guard = embedder_arc.lock();
+        let mut reranker_guard = reranker_arc.as_ref().map(|a| a.lock());
         let reranker_opt = reranker_guard.as_deref_mut();
         f(&db, &mut embedder_guard, reranker_opt)
     }
 }
 
-fn to_error_string(e: anyhow::Error) -> String {
-    format!("Error: {e}")
-}
 
 /// Token budget for a single MCP tool response. Above ~10k tokens Claude Code starts to
 /// reject results and the agent falls back to multi-call patterns that blow the prompt cache.
@@ -298,14 +305,24 @@ const MCP_TOKEN_BUDGET: usize = 8000;
 const MCP_CHARS_PER_TOKEN: usize = 4;
 const MCP_BUDGET_CHARS: usize = MCP_TOKEN_BUDGET * MCP_CHARS_PER_TOKEN;
 
-fn render_with_kind<T: serde::Serialize>(r: Result<T>, kind: &str) -> String {
+/// Render a handler's `Result<T>` as a structured MCP `CallToolResult`. Successful
+/// responses ship both the pretty-printed JSON (for the transcript) and the raw
+/// `Value` as `structured_content` so clients can parse without re-deserializing.
+/// Failures set `isError: true` per MCP spec; the full anyhow cause chain is
+/// included via `{:#}`.
+fn render_with_kind<T: serde::Serialize>(r: Result<T>, kind: &str) -> CallToolResult {
     match r {
         Ok(v) => {
             let value = serde_json::to_value(&v).unwrap_or(serde_json::Value::Null);
             let capped = cap_to_budget(value, kind);
-            serde_json::to_string_pretty(&capped).unwrap_or_else(|e| e.to_string())
+            let text = serde_json::to_string_pretty(&capped).unwrap_or_default();
+            let mut result = CallToolResult::structured(capped);
+            // `CallToolResult::structured` defaults content to a compact
+            // `value.to_string()`; replace with pretty JSON for transcript use.
+            result.content = vec![Content::text(text)];
+            result
         }
-        Err(e) => to_error_string(e),
+        Err(e) => CallToolResult::error(vec![Content::text(format!("Error: {e:#}"))]),
     }
 }
 
@@ -391,18 +408,24 @@ fn truncate_array(items: Vec<serde_json::Value>, budget_chars: usize) -> Vec<ser
     kept
 }
 
-fn load_embedding_config(path: &Path) -> EmbeddingConfig {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return EmbeddingConfig::default();
+fn load_embedding_config(path: &Path) -> Result<EmbeddingConfig> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(EmbeddingConfig::default());
+        }
+        Err(e) => {
+            return Err(anyhow::Error::from(e))
+                .with_context(|| format!("reading {}", path.display()));
+        }
     };
     #[derive(serde::Deserialize)]
     struct Config {
         embedding: Option<EmbeddingConfig>,
     }
-    toml::from_str::<Config>(&content)
-        .ok()
-        .and_then(|c| c.embedding)
-        .unwrap_or_default()
+    let parsed: Config = toml::from_str(&content)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    Ok(parsed.embedding.unwrap_or_default())
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -427,7 +450,7 @@ impl CodeSageServer {
         name = "find_symbol",
         description = "Find symbol definitions (functions, classes, methods, structs) by name. Returns file path, line number, and kind. Use partial names for broad search or qualified names (e.g. 'MyClass\\\\method' for PHP, 'MyClass.method' for Python) for exact match."
     )]
-    fn find_symbol_tool(&self, Parameters(params): Parameters<FindSymbolParams>) -> String {
+    fn find_symbol_tool(&self, Parameters(params): Parameters<FindSymbolParams>) -> CallToolResult {
         let kind = params.kind.as_deref().and_then(SymbolKind::parse);
         let req = FindSymbolRequest {
             name: params.name,
@@ -443,7 +466,7 @@ impl CodeSageServer {
         name = "find_references",
         description = "Find all references to a symbol across the codebase. Shows where a function, class, or module is called, imported, instantiated, or inherited."
     )]
-    fn find_references_tool(&self, Parameters(params): Parameters<FindReferencesParams>) -> String {
+    fn find_references_tool(&self, Parameters(params): Parameters<FindReferencesParams>) -> CallToolResult {
         let kind = params.kind.as_deref().and_then(ReferenceKind::parse);
         let req = FindReferencesRequest {
             symbol_name: params.name,
@@ -462,7 +485,7 @@ impl CodeSageServer {
     fn list_dependencies_tool(
         &self,
         Parameters(params): Parameters<ListDependenciesParams>,
-    ) -> String {
+    ) -> CallToolResult {
         render_with_kind(
             self.with_project_db(&params.project, |db| {
                 list_dependencies(db, &params.file_path)
@@ -475,7 +498,7 @@ impl CodeSageServer {
         name = "search",
         description = "Semantic code search. Finds code chunks most similar to a natural language query using embedding-based similarity. Use for conceptual searches like 'error handling in authentication' or 'database connection pooling'."
     )]
-    fn search_tool(&self, Parameters(params): Parameters<SearchParams>) -> String {
+    fn search_tool(&self, Parameters(params): Parameters<SearchParams>) -> CallToolResult {
         let languages = params
             .language
             .as_deref()
@@ -498,17 +521,9 @@ impl CodeSageServer {
         name = "impact_analysis",
         description = "Estimate which files are affected by changing a symbol or file. Walks the reference graph up to `depth` hops, reports affected files ranked by distance and reference count. Use before making changes to understand blast radius."
     )]
-    fn impact_analysis_tool(&self, Parameters(params): Parameters<ImpactParams>) -> String {
-        let target = params.target.clone();
-        let is_file = params
-            .is_file
-            .unwrap_or_else(|| target.contains('/') || target.contains('.'));
+    fn impact_analysis_tool(&self, Parameters(params): Parameters<ImpactParams>) -> CallToolResult {
         let req = ImpactRequest {
-            target: if is_file {
-                ImpactTarget::File { path: target }
-            } else {
-                ImpactTarget::Symbol { name: target }
-            },
+            target: ImpactTarget::from_hint(params.target, params.is_file),
             depth: params.depth.unwrap_or(2),
             source_only: params.source_only.unwrap_or(false),
         };
@@ -522,20 +537,14 @@ impl CodeSageServer {
         name = "export_context",
         description = "Build a curated context bundle for a query or symbol. Combines semantic search results, overlapping symbol definitions, and optionally caller/callee code. Output is a structured bundle ready for LLM consumption."
     )]
-    fn export_context_tool(&self, Parameters(params): Parameters<ExportContextParams>) -> String {
-        let is_symbol = params.is_symbol.unwrap_or(false);
-        let target = params.target.clone();
-        let req = ExportRequest {
-            query: if is_symbol {
-                None
-            } else {
-                Some(target.clone())
-            },
-            symbol: if is_symbol { Some(target) } else { None },
-            limit: params.limit.unwrap_or(5),
-            include_callers: params.include_callers.unwrap_or(false),
-            include_callees: params.include_callees.unwrap_or(false),
-        };
+    fn export_context_tool(&self, Parameters(params): Parameters<ExportContextParams>) -> CallToolResult {
+        let req = ExportRequest::from_target(
+            params.target,
+            params.is_symbol.unwrap_or(false),
+            params.limit.unwrap_or(5),
+            params.include_callers.unwrap_or(false),
+            params.include_callees.unwrap_or(false),
+        );
         render_with_kind(
             self.with_project_search(&params.project, |db, emb, rr| {
                 export_context(db, emb, rr, &req)
@@ -548,7 +557,7 @@ impl CodeSageServer {
         name = "find_coupling",
         description = "Files that historically change together with the given file, ranked by exponentially-decayed weight (τ=180d). Backed by git history. Use when planning a change to know which OTHER files (especially tests) tend to need updates too. Empty result means no co-change history yet — run `codesage git-index` if you haven't, or the file is too new to have signal."
     )]
-    fn find_coupling_tool(&self, Parameters(params): Parameters<CouplingParams>) -> String {
+    fn find_coupling_tool(&self, Parameters(params): Parameters<CouplingParams>) -> CallToolResult {
         let limit = params.limit.unwrap_or(10);
         let file_path = params.file_path.clone();
         render_with_kind(
@@ -561,7 +570,7 @@ impl CodeSageServer {
         name = "assess_risk",
         description = "Risk score for changing a file: combines churn percentile, fix ratio, blast radius (depth-2 reverse deps), historical coupling, and a test-gap signal. Output includes the decomposition and human-readable notes you can quote in PR descriptions or risk callouts. Use BEFORE writing a patch to calibrate caution and BEFORE submitting to flag concerns."
     )]
-    fn assess_risk_tool(&self, Parameters(params): Parameters<RiskParams>) -> String {
+    fn assess_risk_tool(&self, Parameters(params): Parameters<RiskParams>) -> CallToolResult {
         let file_path = params.file_path.clone();
         render_with_kind(
             self.with_project_db(&params.project, |db| assess_risk(db, &file_path)),
@@ -573,7 +582,7 @@ impl CodeSageServer {
         name = "assess_risk_diff",
         description = "Aggregate risk for a SET of files (the file list of a patch or PR). Returns per-file decomposition plus rollups: max_score, mean_score, max_risk_file, and lists of files in each risk category (test_gap, hotspot, fix-heavy, wide blast radius). Use BEFORE submitting a patch: if max_score is high or any test_gap_files exist, add tests, split the patch, or flag concerns. summary_notes are paste-ready for a PR description."
     )]
-    fn assess_risk_diff_tool(&self, Parameters(params): Parameters<RiskDiffParams>) -> String {
+    fn assess_risk_diff_tool(&self, Parameters(params): Parameters<RiskDiffParams>) -> CallToolResult {
         let file_paths = params.file_paths.clone();
         render_with_kind(
             self.with_project_db(&params.project, |db| assess_risk_diff(db, &file_paths)),
@@ -585,7 +594,7 @@ impl CodeSageServer {
         name = "recommend_tests",
         description = "Tests an agent should run after editing the given files. Returns `primary` (sibling tests resolved by language convention — FooTest.php, foo.test.ts, test_foo.py, foo_test.go — high confidence, always run these) and `coupled` (tests that historically change with the input files via git co-change history — medium confidence, catches integration tests that don't follow naming conventions). Empty result means no test files in the index for these paths. Use AFTER making a change to know which subset of tests to actually run."
     )]
-    fn recommend_tests_tool(&self, Parameters(params): Parameters<TestsForParams>) -> String {
+    fn recommend_tests_tool(&self, Parameters(params): Parameters<TestsForParams>) -> CallToolResult {
         let file_paths = params.file_paths.clone();
         render_with_kind(
             self.with_project_db(&params.project, |db| recommend_tests(db, &file_paths)),

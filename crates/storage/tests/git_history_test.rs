@@ -233,3 +233,45 @@ fn scale_git_decay_multiplies_churn_and_pair_weights() {
     assert!((pairs[0].weight - 3.0).abs() < 1e-9);
     assert_eq!(pairs[0].count, 4, "count preserved");
 }
+
+#[test]
+fn remove_file_cascades_to_git_tables() {
+    let db = Database::open_in_memory().unwrap();
+    // Seed: one git_files row for the doomed path, and co-change pairs using it on
+    // both sides.
+    db.upsert_git_file("src/doomed.rs", 4.0, 2, 8, Some(1700000000))
+        .unwrap();
+    db.upsert_git_file("src/survivor.rs", 2.0, 1, 3, Some(1700001000))
+        .unwrap();
+    // pair with doomed as file_a
+    db.upsert_git_co_change("src/doomed.rs", "src/z.rs", 3.0, 5, Some(1700000100))
+        .unwrap();
+    // pair with doomed as file_b (lexicographic ordering puts a_file first)
+    db.upsert_git_co_change("src/a_file.rs", "src/doomed.rs", 2.0, 4, Some(1700000200))
+        .unwrap();
+    // unrelated pair that must stay
+    db.upsert_git_co_change("src/a_file.rs", "src/z.rs", 1.0, 3, Some(1700000300))
+        .unwrap();
+
+    db.remove_file("src/doomed.rs").unwrap();
+
+    assert!(
+        db.git_file("src/doomed.rs").unwrap().is_none(),
+        "git_files row gone"
+    );
+    assert!(
+        db.git_file("src/survivor.rs").unwrap().is_some(),
+        "unrelated git_files row survives"
+    );
+
+    let remaining_for_a = db.co_changes_for("src/a_file.rs", 10).unwrap();
+    let names: Vec<&str> = remaining_for_a.iter().map(|r| r.file.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["src/z.rs"],
+        "pair with doomed.rs on either side removed; unrelated pair stays"
+    );
+    let remaining_for_z = db.co_changes_for("src/z.rs", 10).unwrap();
+    let names: Vec<&str> = remaining_for_z.iter().map(|r| r.file.as_str()).collect();
+    assert_eq!(names, vec!["src/a_file.rs"]);
+}

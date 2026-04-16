@@ -16,7 +16,7 @@ pub struct Reranker {
 impl Reranker {
     pub fn new(model: &str, device: &str) -> Result<Self> {
         init_ort_dylib();
-        eprintln!("Loading reranker model: {model}");
+        tracing::info!(%model, "loading reranker model");
 
         let api =
             hf_hub::api::sync::Api::new().context("failed to create HuggingFace API client")?;
@@ -56,6 +56,12 @@ impl Reranker {
                     ])
                     .map_err(|e| anyhow::anyhow!("CUDA provider failed to register: {e}"))?;
             }
+            #[cfg(not(feature = "cuda"))]
+            {
+                anyhow::bail!(
+                    "GPU requested but binary built without cuda feature. Rebuild with: cargo build --features cuda"
+                );
+            }
         }
 
         let session = builder.commit_from_file(&model_path)?;
@@ -65,7 +71,7 @@ impl Reranker {
             .iter()
             .any(|i| i.name() == "token_type_ids");
 
-        eprintln!("Reranker loaded (token_type_ids={has_token_type_ids})");
+        tracing::info!(token_type_ids = has_token_type_ids, "reranker loaded");
 
         Ok(Self {
             session,
@@ -92,15 +98,7 @@ impl Reranker {
     }
 
     fn score_batch(&mut self, query: &str, documents: &[&str]) -> Result<Vec<f32>> {
-        let pairs: Vec<(String, String)> = documents
-            .iter()
-            .map(|doc| (query.to_string(), doc.to_string()))
-            .collect();
-
-        let pair_refs: Vec<(&str, &str)> = pairs
-            .iter()
-            .map(|(q, d)| (q.as_str(), d.as_str()))
-            .collect();
+        let pair_refs: Vec<(&str, &str)> = documents.iter().map(|doc| (query, *doc)).collect();
 
         let encodings = self
             .tokenizer

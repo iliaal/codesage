@@ -46,24 +46,34 @@ fn index(
     let files = discover_files_with_excludes(root, exclude_patterns)?;
     let mut stats = IndexStats::default();
 
-    let discovered_paths: std::collections::HashSet<String> =
-        files.iter().map(|f| f.path.clone()).collect();
+    let discovered_paths: std::collections::HashSet<&str> =
+        files.iter().map(|f| f.path.as_str()).collect();
     let existing_paths = db.all_file_paths()?;
-    for path in &existing_paths {
-        if !discovered_paths.contains(path) {
-            db.remove_file(path)?;
-            stats.files_removed += 1;
-        }
+    let orphans: Vec<&str> = existing_paths
+        .iter()
+        .filter(|p| !discovered_paths.contains(p.as_str()))
+        .map(|p| p.as_str())
+        .collect();
+    if !orphans.is_empty() {
+        db.execute_batch(|db| {
+            for path in &orphans {
+                db.remove_file(path)?;
+            }
+            Ok(())
+        })?;
+        stats.files_removed = orphans.len();
     }
 
     let to_parse: Vec<&FileInfo> = match strategy {
         IndexStrategy::Full => files.iter().collect(),
-        IndexStrategy::Incremental => files
-            .iter()
-            .filter(
-                |f| !matches!(db.get_file_hash(&f.path), Ok(Some(hash)) if hash == f.content_hash),
-            )
-            .collect(),
+        IndexStrategy::Incremental => {
+            // One sequential scan of `files` instead of one SELECT per discovered file.
+            let existing_hashes = db.all_file_hashes()?;
+            files
+                .iter()
+                .filter(|f| existing_hashes.get(&f.path) != Some(&f.content_hash))
+                .collect()
+        }
     };
     if strategy == IndexStrategy::Incremental {
         stats.files_skipped = files.len() - to_parse.len();

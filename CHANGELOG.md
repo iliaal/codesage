@@ -12,6 +12,44 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 - Go language support. Parses functions, methods (with pointer and value receivers), structs, interfaces, type aliases, and constants. Qualified names use `ReceiverType.MethodName` convention. References track imports and function/method calls. Test discovery already recognized `_test.go` convention from v0.3.0; now the parser can index Go source files too.
 
+### Fixed
+
+- MCP server no longer dies on mutex poisoning. Switched the per-server caches and per-instance Embedder/Reranker locks from `std::sync::Mutex` to `parking_lot::Mutex`, eliminating panic-induced cascading death of the stdio transport.
+- MCP `search` and `export_context` no longer silently degrade when the configured reranker fails to load. Reranker init errors now propagate to the agent as structured errors with model/device context instead of being swallowed.
+- `Reranker::new` now bails when GPU is requested but the binary was built without the `cuda` feature, matching `Embedder::new`. Previously fell through to CPU silently.
+- MCP error responses now include the full anyhow cause chain (`{:#}`) so root causes survive across tool boundaries.
+- DB row decoders no longer silently drop rows on schema drift or type mismatch. All 15 `filter_map(|r| r.ok())` / `flatten()` sites in `storage::Database` now propagate `rusqlite::Error`; unknown `SymbolKind` / `ReferenceKind` values surface as typed conversion errors instead of being relabelled as `Function` / `Call`.
+- Malformed `.codesage/config.toml` is now a hard error instead of a silent revert to defaults (MiniLM/CPU/empty excludes). `load_project_config` and MCP `load_embedding_config` return `Result` and surface parse errors with path context.
+- `parse_log` drops commits with unparseable timestamps and changes with unparseable add/delete counts instead of fabricating zeros that were indistinguishable from legitimate `ts=0` or zero-line changes. Reports a one-line summary when any lines were dropped.
+- `is_ancestor` now distinguishes spawn failure (propagated) from exit-1 / exit-128 (fall back to full rescan with a warning). A broken `git` install is no longer silently hidden as "rebased history".
+- `install-hooks` now propagates `current_exe()` failures instead of silently writing a hook that embeds the literal `codesage` path.
+- `assess_risk` no longer swallows errors from internal `impact_analysis` and `test_sibling_exists`. A DB failure during risk computation surfaces with context instead of silently lowering the score.
+- Graph query pipeline (`extract_known_symbols`, `annotate_with_symbols`, `impact_analysis`, `export_context`, `export_context_for_symbol`, `add_related_from_file`) propagates internal DB errors instead of converting them into "no matches" / "no symbols".
+- `churn_percentile` now distinguishes "no git row" (Ok(0.0)) from DB error (Err), so a broken git-index doesn't silently lower risk scores.
+
+### Changed
+
+- Orphan-file cleanup (structural + semantic indexers) now runs inside a single transaction instead of one autocommit per deleted file. On a post-rename or mass-delete index this removes N fsyncs.
+- Incremental indexing (structural + semantic) replaces its N+1 `get_file_hash` pattern with a single-query `all_file_hashes` preload. On 25k-file repos this cuts thousands of SQL round-trips to one sequential scan.
+- Incremental git-history indexing preloads `git_co_changes` pair keys once (`all_co_change_pairs`) instead of running `SELECT COUNT(*)` per delta pair inside the write transaction. Uses `HashMap<String, HashSet<String>>` so membership probes are alloc-free.
+- Search boost path now calls `symbol_exists` (LIMIT 1 probe) instead of `find_symbols` when all it needs is non-emptiness for a token.
+- `annotate_with_symbols` batches its per-file symbol lookup via `symbols_for_files`, replacing N queries with one multi-path query. Same batching applied to semantic chunk augmentation during indexing.
+- Tree-sitter symbol and reference queries now compile once per language into `LazyLock<QuerySpec>` statics (with cached capture indices) instead of being recompiled on every file parse. On a 25k-file repo this removes 50k `Query::new` invocations and their `capture_index_for_name` scans.
+- `Database::insert_chunks` takes `&[(&str, u32, u32, &[f32])]` instead of `&[(String, u32, u32, Vec<f32>)]`. Semantic indexing stops cloning chunk text and embedding vectors just to satisfy the API; on repo-sized batches this saves hundreds of megabytes of redundant allocation.
+- `embedding_to_bytes` uses a single memcpy on little-endian targets instead of per-element `to_le_bytes`. The function is hit once per chunk write and once per search query.
+- Reranker `score_batch` stops building an intermediate `Vec<(String, String)>` for tokenizer pairs; it now borrows query + doc refs directly.
+- `Database::remove_file` now cascades the deletion to `git_files` and `git_co_changes`. Deleted files no longer linger in `find_coupling` / `assess_risk` output after an index refresh.
+- Schema migrations now live in a registry (`MIGRATIONS` + `schema_migrations` table) rather than as hand-wired function calls inside `init_db`. Adding migration `0002`, `0003`, ... is now a one-line addition. The first migration (`0001_refs_name_tail`) is recorded on both fresh and legacy databases so subsequent init calls are no-ops.
+- `crates/graph/src/git_history.rs` (1149 lines) split into `git_history/{mod.rs, indexer.rs, risk.rs, tests_rec.rs}`. Public API unchanged. Internal visibility tightened (`pub(super) fn test_sibling_exists` is the only cross-submodule dep).
+- `crates/storage/src/db.rs` (1230 lines) split into `db/{mod.rs, structural.rs, semantic.rs, git_hist.rs}` via `impl Database` blocks per concern. Public API unchanged. Inline tests stay in `db/mod.rs` since they span all three concerns through the shared `Database` type.
+- MCP tool responses now use the structured `CallToolResult` shape (`isError: true` on failure per MCP spec, `structured_content` on success alongside the pretty-printed text). MCP clients can programmatically distinguish errors from successful results instead of regexing "Error: " strings.
+- `ImpactTarget::from_hint` and `ExportRequest::from_target` in the protocol crate centralize the CLI↔MCP classification/construction helpers. Previously duplicated (with slight shape differences) between `cli::main` and `cli::mcp`.
+- CLI + library crates now log via the `tracing` crate instead of raw `eprintln!`. `tracing_subscriber` initializes at binary startup writing to stderr (keeps stdout clean for the MCP transport and CLI JSON output). Log level follows `RUST_LOG`, defaults to `info`.
+- Hand-rolled `DistRow` newtype + BinaryHeap in the multi-language search merge path replaced by a simpler `sort_by` on the merged vec. No behavior change; fewer moving parts.
+- Duplicated `format_bytes` / `git_common_dir` helpers in `cli::main` and `cli::doctor` pulled into `cli::util`. `format_bytes` now uses GiB/MiB/KiB consistently (doctor previously reported GB/MB/KB powers-of-1024 with different labels).
+- Deleted obsolete shims `git_history_index_with_excludes` and `default_excludes`. `git_history_index` remains as a test-friendly shorthand that calls `git_history_index_with_options` directly.
+- CLAUDE.md no longer references FTS5/BM25 infrastructure (removed in an earlier release; the doc claim was stale).
+
 ## [0.3.3] - 2026-04-15
 
 Test discovery for Laravel/Symfony mirror-tree projects + test backfill.

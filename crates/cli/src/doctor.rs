@@ -99,7 +99,16 @@ fn check_config(root: &Path) -> Check {
             message: format!("missing {}", config_path.display()),
         };
     }
-    let config = load_project_config(root);
+    let config = match load_project_config(root) {
+        Ok(c) => c,
+        Err(e) => {
+            return Check {
+                name: "config",
+                status: Status::Fail,
+                message: format!("{e:#}"),
+            };
+        }
+    };
     let emb = config.embedding.unwrap_or_default();
     let reranker = emb
         .reranker
@@ -154,7 +163,7 @@ fn check_disk(root: &Path) -> Check {
 fn check_cuda(project: Option<&Path>) -> Check {
     let want_gpu = project
         .and_then(|root| {
-            let config = load_project_config(root);
+            let config = load_project_config(root).ok()?;
             config
                 .embedding
                 .map(|e| e.device == "gpu" || e.device == "cuda")
@@ -196,11 +205,11 @@ fn check_cuda(project: Option<&Path>) -> Check {
 
 fn check_models(project: Option<&Path>) -> Check {
     let cache = hf_cache_dir();
-    let (embed_model, rerank_model) = project
-        .map(|root| {
-            let c = load_project_config(root);
+    let (embed_model, rerank_model): (String, Option<String>) = project
+        .and_then(|root| {
+            let c = load_project_config(root).ok()?;
             let e = c.embedding.unwrap_or_default();
-            (e.model, e.reranker)
+            Some((e.model, e.reranker))
         })
         .unwrap_or_else(|| {
             (
@@ -375,28 +384,7 @@ fn check_mcp() -> Check {
     }
 }
 
-fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
-    let out = std::process::Command::new("git")
-        .arg("rev-parse")
-        .arg("--git-common-dir")
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8(out.stdout).ok()?;
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    let p = std::path::Path::new(s);
-    Some(if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        cwd.join(p)
-    })
-}
+use crate::util::git_common_dir;
 
 fn hf_cache_dir() -> PathBuf {
     if let Ok(p) = std::env::var("HF_HOME") {
@@ -416,17 +404,4 @@ fn model_in_cache(cache: &Path, model: &str) -> bool {
     dir.is_dir()
 }
 
-fn format_bytes(b: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    if b >= GB {
-        format!("{:.1}GB", b as f64 / GB as f64)
-    } else if b >= MB {
-        format!("{:.1}MB", b as f64 / MB as f64)
-    } else if b >= KB {
-        format!("{:.1}KB", b as f64 / KB as f64)
-    } else {
-        format!("{b}B")
-    }
-}
+use crate::util::format_bytes;

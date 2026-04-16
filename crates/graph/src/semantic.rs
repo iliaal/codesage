@@ -91,26 +91,36 @@ fn semantic_index(
     let config = ChunkConfig::default();
     let mut stats = SemanticIndexStats::default();
 
-    let discovered_paths: HashSet<String> = files.iter().map(|f| f.path.clone()).collect();
+    let discovered_paths: HashSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
     let existing_chunk_paths = db.all_chunk_file_paths()?;
-    for path in &existing_chunk_paths {
-        if !discovered_paths.contains(path) {
-            db.delete_chunks_for_file(path)?;
-            stats.files_removed += 1;
-        }
+    let orphan_chunks: Vec<&str> = existing_chunk_paths
+        .iter()
+        .filter(|p| !discovered_paths.contains(p.as_str()))
+        .map(|p| p.as_str())
+        .collect();
+    if !orphan_chunks.is_empty() {
+        db.execute_batch(|db| {
+            for path in &orphan_chunks {
+                db.delete_chunks_for_file(path)?;
+            }
+            Ok(())
+        })?;
+        stats.files_removed = orphan_chunks.len();
     }
 
     let to_index: Vec<&FileInfo> = match strategy {
         IndexStrategy::Full => files.iter().collect(),
         IndexStrategy::Incremental => {
-            let existing_set: HashSet<String> = existing_chunk_paths.into_iter().collect();
+            // One sequential scan replaces one SELECT per file.
+            let existing_hashes = db.all_file_hashes()?;
+            let existing_chunk_set: HashSet<String> = existing_chunk_paths.into_iter().collect();
             files
                 .iter()
                 .filter(|f| {
-                    if !existing_set.contains(&f.path) {
+                    if !existing_chunk_set.contains(&f.path) {
                         return true;
                     }
-                    !matches!(db.get_file_hash(&f.path), Ok(Some(hash)) if hash == f.content_hash)
+                    existing_hashes.get(&f.path) != Some(&f.content_hash)
                 })
                 .collect()
         }
@@ -129,11 +139,20 @@ fn semantic_index(
         return Ok(stats);
     }
 
-    for cf in &mut chunked {
-        if should_augment(&cf.language)
-            && let Ok(symbols) = db.symbols_for_file(&cf.path)
-        {
-            augment_chunks(cf, &symbols);
+    // Batched symbol lookup for augmentation: one multi-path query instead of N.
+    let augment_paths: Vec<String> = chunked
+        .iter()
+        .filter(|cf| should_augment(&cf.language))
+        .map(|cf| cf.path.clone())
+        .collect();
+    if !augment_paths.is_empty() {
+        let by_file = db.symbols_for_files(&augment_paths)?;
+        for cf in &mut chunked {
+            if should_augment(&cf.language)
+                && let Some(symbols) = by_file.get(&cf.path)
+            {
+                augment_chunks(cf, symbols);
+            }
         }
     }
 
@@ -148,13 +167,16 @@ fn semantic_index(
     db.execute_batch(|db| {
         for cf in &chunked {
             db.delete_chunks_for_file(&cf.path)?;
-            let mut chunk_data = Vec::with_capacity(cf.chunks.len());
-            for (text, start, end) in &cf.chunks {
-                chunk_data.push((text.clone(), *start, *end, all_embeddings[emb_idx].clone()));
-                emb_idx += 1;
-            }
+            let n = cf.chunks.len();
+            let chunk_data: Vec<(&str, u32, u32, &[f32])> = cf
+                .chunks
+                .iter()
+                .zip(&all_embeddings[emb_idx..emb_idx + n])
+                .map(|((text, start, end), emb)| (text.as_str(), *start, *end, emb.as_slice()))
+                .collect();
+            emb_idx += n;
             db.insert_chunks(&cf.path, &cf.language, &chunk_data)?;
-            stats.chunks_created += chunk_data.len();
+            stats.chunks_created += n;
         }
         Ok(())
     })?;
