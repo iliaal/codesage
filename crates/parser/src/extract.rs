@@ -75,9 +75,9 @@ fn go_kind_map(pattern_index: usize) -> Option<SymbolKind> {
     match pattern_index {
         0 => Some(SymbolKind::Function),
         1 => Some(SymbolKind::Method),
-        2 => Some(SymbolKind::Struct),    // placeholder; refined by refine_go_type_kind
-        3 => Some(SymbolKind::Constant),  // type alias (type X = Y)
-        4 => Some(SymbolKind::Constant),  // const
+        2 => Some(SymbolKind::Struct), // placeholder; refined by refine_go_type_kind
+        3 => Some(SymbolKind::Constant), // type alias (type X = Y)
+        4 => Some(SymbolKind::Constant), // const
         _ => None,
     }
 }
