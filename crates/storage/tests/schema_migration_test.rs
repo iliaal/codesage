@@ -202,7 +202,10 @@ fn fresh_db_records_migrations_exactly_once() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(count_after, 1, "second init_db must not re-apply migrations");
+    assert_eq!(
+        count_after, 1,
+        "second init_db must not re-apply migrations"
+    );
 }
 
 #[test]

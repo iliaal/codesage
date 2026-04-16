@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use parking_lot::Mutex;
 use codesage_embed::config::EmbeddingConfig;
 use codesage_embed::model::Embedder;
 use codesage_embed::reranker::Reranker;
@@ -16,6 +15,7 @@ use codesage_protocol::{
     ReferenceKind, SearchRequest, SymbolKind,
 };
 use codesage_storage::Database;
+use parking_lot::Mutex;
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -295,7 +295,6 @@ impl CodeSageServer {
     }
 }
 
-
 /// Token budget for a single MCP tool response. Above ~10k tokens Claude Code starts to
 /// reject results and the agent falls back to multi-call patterns that blow the prompt cache.
 /// 8000 leaves headroom and is the same number repowise's tool_context.py settled on.
@@ -423,8 +422,8 @@ fn load_embedding_config(path: &Path) -> Result<EmbeddingConfig> {
     struct Config {
         embedding: Option<EmbeddingConfig>,
     }
-    let parsed: Config = toml::from_str(&content)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let parsed: Config =
+        toml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
     Ok(parsed.embedding.unwrap_or_default())
 }
 
@@ -466,7 +465,10 @@ impl CodeSageServer {
         name = "find_references",
         description = "Find all references to a symbol across the codebase. Shows where a function, class, or module is called, imported, instantiated, or inherited."
     )]
-    fn find_references_tool(&self, Parameters(params): Parameters<FindReferencesParams>) -> CallToolResult {
+    fn find_references_tool(
+        &self,
+        Parameters(params): Parameters<FindReferencesParams>,
+    ) -> CallToolResult {
         let kind = params.kind.as_deref().and_then(ReferenceKind::parse);
         let req = FindReferencesRequest {
             symbol_name: params.name,
@@ -537,7 +539,10 @@ impl CodeSageServer {
         name = "export_context",
         description = "Build a curated context bundle for a query or symbol. Combines semantic search results, overlapping symbol definitions, and optionally caller/callee code. Output is a structured bundle ready for LLM consumption."
     )]
-    fn export_context_tool(&self, Parameters(params): Parameters<ExportContextParams>) -> CallToolResult {
+    fn export_context_tool(
+        &self,
+        Parameters(params): Parameters<ExportContextParams>,
+    ) -> CallToolResult {
         let req = ExportRequest::from_target(
             params.target,
             params.is_symbol.unwrap_or(false),
@@ -582,7 +587,10 @@ impl CodeSageServer {
         name = "assess_risk_diff",
         description = "Aggregate risk for a SET of files (the file list of a patch or PR). Returns per-file decomposition plus rollups: max_score, mean_score, max_risk_file, and lists of files in each risk category (test_gap, hotspot, fix-heavy, wide blast radius). Use BEFORE submitting a patch: if max_score is high or any test_gap_files exist, add tests, split the patch, or flag concerns. summary_notes are paste-ready for a PR description."
     )]
-    fn assess_risk_diff_tool(&self, Parameters(params): Parameters<RiskDiffParams>) -> CallToolResult {
+    fn assess_risk_diff_tool(
+        &self,
+        Parameters(params): Parameters<RiskDiffParams>,
+    ) -> CallToolResult {
         let file_paths = params.file_paths.clone();
         render_with_kind(
             self.with_project_db(&params.project, |db| assess_risk_diff(db, &file_paths)),
@@ -594,7 +602,10 @@ impl CodeSageServer {
         name = "recommend_tests",
         description = "Tests an agent should run after editing the given files. Returns `primary` (sibling tests resolved by language convention — FooTest.php, foo.test.ts, test_foo.py, foo_test.go — high confidence, always run these) and `coupled` (tests that historically change with the input files via git co-change history — medium confidence, catches integration tests that don't follow naming conventions). Empty result means no test files in the index for these paths. Use AFTER making a change to know which subset of tests to actually run."
     )]
-    fn recommend_tests_tool(&self, Parameters(params): Parameters<TestsForParams>) -> CallToolResult {
+    fn recommend_tests_tool(
+        &self,
+        Parameters(params): Parameters<TestsForParams>,
+    ) -> CallToolResult {
         let file_paths = params.file_paths.clone();
         render_with_kind(
             self.with_project_db(&params.project, |db| recommend_tests(db, &file_paths)),

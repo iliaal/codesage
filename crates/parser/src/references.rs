@@ -38,12 +38,8 @@ static RUST_REF: LazyLock<RefQuerySpec> =
     LazyLock::new(|| compile_ref_query(tree_sitter_rust::LANGUAGE.into(), RUST_REF_QUERY));
 static JS_REF: LazyLock<RefQuerySpec> =
     LazyLock::new(|| compile_ref_query(tree_sitter_javascript::LANGUAGE.into(), JS_REF_QUERY));
-static TS_REF: LazyLock<RefQuerySpec> = LazyLock::new(|| {
-    compile_ref_query(
-        tree_sitter_typescript::LANGUAGE_TSX.into(),
-        TS_REF_QUERY,
-    )
-});
+static TS_REF: LazyLock<RefQuerySpec> =
+    LazyLock::new(|| compile_ref_query(tree_sitter_typescript::LANGUAGE_TSX.into(), TS_REF_QUERY));
 static GO_REF: LazyLock<RefQuerySpec> =
     LazyLock::new(|| compile_ref_query(tree_sitter_go::LANGUAGE.into(), GO_REF_QUERY));
 

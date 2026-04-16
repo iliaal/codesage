@@ -71,7 +71,7 @@ codesage doctor
 
 ## Recipes
 
-Common pipelines using `codesage` with `git`. Each is one shell line plus what the output tells you.
+Common pipelines using `codesage` with `git`. Each is one shell line and how to read the output.
 
 ### Risk check before committing
 
@@ -79,7 +79,7 @@ Common pipelines using `codesage` with `git`. Each is one shell line plus what t
 git diff --cached --name-only | codesage risk-diff
 ```
 
-Pipes the staged file list through `assess_risk_diff`. Output shows the max risk score, files in each risk bucket (hotspot, fix-heavy, test-gap, wide blast radius), and paste-ready summary notes for the commit message or PR description. If `max_score >= 0.6` or any `test_gap_files` appear, consider adding tests, splitting the patch, or flagging concerns.
+Pipes the staged file list through `assess_risk_diff`. Output shows the max risk score, files in each risk bucket (hotspot, fix-heavy, test-gap, wide blast radius), and paste-ready summary notes for the commit message or PR description. If `max_score >= 0.6` or `test_gap_files` is non-empty, add tests, split the patch, or call it out in the PR description.
 
 ### Tests to run after editing
 

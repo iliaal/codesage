@@ -274,9 +274,7 @@ fn run_incremental(
             // Surface a pair if either it already exists in DB (accumulate onto it) or
             // its delta alone cleared the min-count filter. Sub-threshold pairs that
             // straddle the boundary will be caught by the next full rescan.
-            let pair_exists = existing_pairs
-                .get(a)
-                .is_some_and(|rhs| rhs.contains(b));
+            let pair_exists = existing_pairs.get(a).is_some_and(|rhs| rhs.contains(b));
             if stats.count >= MIN_CO_CHANGE_COUNT || pair_exists {
                 db.incr_git_co_change(a, b, stats.weight, stats.count, stats.last_observed_at)?;
                 co_change_kept += 1;

@@ -216,11 +216,9 @@ impl Database {
             .conn
             .prepare("SELECT file_a, file_b FROM git_co_changes")?;
         let mut out: HashMap<String, HashSet<String>> = HashMap::new();
-        for row in stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-        {
+        for row in stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
             let (a, b) = row?;
             out.entry(a).or_default().insert(b);
         }

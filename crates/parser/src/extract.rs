@@ -48,9 +48,8 @@ static RUST_SYM: LazyLock<SymbolQuerySpec> =
     LazyLock::new(|| compile_symbol_query(tree_sitter_rust::LANGUAGE.into(), RUST_QUERY));
 static JS_SYM: LazyLock<SymbolQuerySpec> =
     LazyLock::new(|| compile_symbol_query(tree_sitter_javascript::LANGUAGE.into(), JS_QUERY));
-static TS_SYM: LazyLock<SymbolQuerySpec> = LazyLock::new(|| {
-    compile_symbol_query(tree_sitter_typescript::LANGUAGE_TSX.into(), TS_QUERY)
-});
+static TS_SYM: LazyLock<SymbolQuerySpec> =
+    LazyLock::new(|| compile_symbol_query(tree_sitter_typescript::LANGUAGE_TSX.into(), TS_QUERY));
 static GO_SYM: LazyLock<SymbolQuerySpec> =
     LazyLock::new(|| compile_symbol_query(tree_sitter_go::LANGUAGE.into(), GO_QUERY));
 

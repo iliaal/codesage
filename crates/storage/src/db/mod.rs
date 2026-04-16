@@ -297,8 +297,12 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let e_close = make_embedding(0.1);
         let e_far = make_embedding(0.9);
-        db.insert_chunks("close.rs", "rust", &[("close code", 1, 5, e_close.as_slice())])
-            .unwrap();
+        db.insert_chunks(
+            "close.rs",
+            "rust",
+            &[("close code", 1, 5, e_close.as_slice())],
+        )
+        .unwrap();
         db.insert_chunks("far.rs", "rust", &[("far code", 1, 5, e_far.as_slice())])
             .unwrap();
         let query_bytes = embedding_to_bytes(&e_close);
