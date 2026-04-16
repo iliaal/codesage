@@ -8,6 +8,8 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-16
+
 ### Added
 
 - Go language support. Parses functions, methods (with pointer and value receivers), structs, interfaces, type aliases, and constants. Qualified names use `ReceiverType.MethodName` convention. References track imports and function/method calls. Test discovery already recognized `_test.go` convention from v0.3.0; now the parser can index Go source files.
@@ -47,6 +49,8 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 - CLI + library crates now log via the `tracing` crate instead of raw `eprintln!`. `tracing_subscriber` initializes at binary startup writing to stderr (keeps stdout clean for the MCP transport and CLI JSON output). Log level follows `RUST_LOG`, defaults to `info`.
 - Hand-rolled `DistRow` newtype + BinaryHeap in the multi-language search merge path replaced by a `sort_by` on the merged vec. No behavior change.
 - Duplicated `format_bytes` / `git_common_dir` helpers in `cli::main` and `cli::doctor` pulled into `cli::util`. `format_bytes` now uses GiB/MiB/KiB consistently (doctor previously reported GB/MB/KB powers-of-1024 with different labels).
+
+[0.4.0]: https://github.com/iliaal/codesage/releases/tag/v0.4.0
 
 ## [0.3.3] - 2026-04-15
 
