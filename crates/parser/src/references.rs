@@ -9,6 +9,7 @@ static C_REF_QUERY: &str = include_str!("queries/c_refs.scm");
 static RUST_REF_QUERY: &str = include_str!("queries/rust_refs.scm");
 static JS_REF_QUERY: &str = include_str!("queries/javascript_refs.scm");
 static TS_REF_QUERY: &str = include_str!("queries/typescript_refs.scm");
+static GO_REF_QUERY: &str = include_str!("queries/go_refs.scm");
 
 fn php_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
     match pattern_index {
@@ -52,6 +53,14 @@ fn rust_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
     }
 }
 
+fn go_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
+    match pattern_index {
+        0 => Some(ReferenceKind::Import),
+        1 | 2 => Some(ReferenceKind::Call),
+        _ => None,
+    }
+}
+
 fn js_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
     match pattern_index {
         0 => Some(ReferenceKind::Import), // import statement
@@ -75,6 +84,7 @@ pub fn extract_references(
         Language::Rust => tree_sitter_rust::LANGUAGE.into(),
         Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
         Language::TypeScript => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        Language::Go => tree_sitter_go::LANGUAGE.into(),
     };
 
     let (query_src, kind_map): (&str, fn(usize) -> Option<ReferenceKind>) = match language {
@@ -84,6 +94,7 @@ pub fn extract_references(
         Language::Rust => (RUST_REF_QUERY, rust_ref_kind),
         Language::JavaScript => (JS_REF_QUERY, js_ref_kind),
         Language::TypeScript => (TS_REF_QUERY, js_ref_kind), // same ref structure
+        Language::Go => (GO_REF_QUERY, go_ref_kind),
     };
 
     let query = Query::new(&ts_language, query_src).context("failed to compile reference query")?;

@@ -9,6 +9,7 @@ static C_QUERY: &str = include_str!("queries/c.scm");
 static RUST_QUERY: &str = include_str!("queries/rust.scm");
 static JS_QUERY: &str = include_str!("queries/javascript.scm");
 static TS_QUERY: &str = include_str!("queries/typescript.scm");
+static GO_QUERY: &str = include_str!("queries/go.scm");
 
 fn php_kind_map(pattern_index: usize) -> Option<SymbolKind> {
     match pattern_index {
@@ -70,6 +71,17 @@ fn js_kind_map(pattern_index: usize) -> Option<SymbolKind> {
     }
 }
 
+fn go_kind_map(pattern_index: usize) -> Option<SymbolKind> {
+    match pattern_index {
+        0 => Some(SymbolKind::Function),
+        1 => Some(SymbolKind::Method),
+        2 => Some(SymbolKind::Struct),    // placeholder; refined by refine_go_type_kind
+        3 => Some(SymbolKind::Constant),  // type alias (type X = Y)
+        4 => Some(SymbolKind::Constant),  // const
+        _ => None,
+    }
+}
+
 fn ts_kind_map(pattern_index: usize) -> Option<SymbolKind> {
     match pattern_index {
         0 => Some(SymbolKind::Function),
@@ -97,6 +109,7 @@ pub fn extract_symbols(
         Language::Rust => tree_sitter_rust::LANGUAGE.into(),
         Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
         Language::TypeScript => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        Language::Go => tree_sitter_go::LANGUAGE.into(),
     };
 
     let (query_src, kind_map): (&str, fn(usize) -> Option<SymbolKind>) = match language {
@@ -106,6 +119,7 @@ pub fn extract_symbols(
         Language::Rust => (RUST_QUERY, rust_kind_map),
         Language::JavaScript => (JS_QUERY, js_kind_map),
         Language::TypeScript => (TS_QUERY, ts_kind_map),
+        Language::Go => (GO_QUERY, go_kind_map),
     };
 
     let query =
@@ -165,6 +179,10 @@ pub fn extract_symbols(
             && is_inside_impl_or_class(&def_node, language)
         {
             kind = SymbolKind::Method;
+        }
+
+        if language == Language::Go && kind == SymbolKind::Struct {
+            kind = refine_go_type_kind(&def_node);
         }
 
         let qualified_name =
@@ -283,5 +301,49 @@ fn build_qualified_name(
             }
             name.to_string()
         }
+        Language::Go => {
+            if kind == SymbolKind::Method
+                && let Some(receiver_type) = find_go_receiver_type(def_node, source)
+            {
+                return format!("{receiver_type}.{name}");
+            }
+            name.to_string()
+        }
     }
+}
+
+fn refine_go_type_kind(def_node: &Node) -> SymbolKind {
+    let mut cursor = def_node.walk();
+    for child in def_node.children(&mut cursor) {
+        if child.kind() == "type_spec"
+            && let Some(type_child) = child.child_by_field_name("type")
+        {
+            return match type_child.kind() {
+                "struct_type" => SymbolKind::Struct,
+                "interface_type" => SymbolKind::Interface,
+                _ => SymbolKind::Constant,
+            };
+        }
+    }
+    SymbolKind::Constant
+}
+
+fn find_go_receiver_type<'a>(node: &Node, source: &'a [u8]) -> Option<&'a str> {
+    let receiver = node.child_by_field_name("receiver")?;
+    let mut cursor = receiver.walk();
+    for child in receiver.children(&mut cursor) {
+        if child.kind() == "parameter_declaration" {
+            let type_node = child.child_by_field_name("type")?;
+            if type_node.kind() == "pointer_type" {
+                let mut tc = type_node.walk();
+                for inner in type_node.children(&mut tc) {
+                    if inner.kind() == "type_identifier" {
+                        return inner.utf8_text(source).ok();
+                    }
+                }
+            }
+            return type_node.utf8_text(source).ok();
+        }
+    }
+    None
 }

@@ -13,6 +13,7 @@ tree-sitter-c.workspace = true
 tree-sitter-rust.workspace = true
 tree-sitter-javascript.workspace = true
 tree-sitter-typescript.workspace = true
+tree-sitter-go.workspace = true
 ignore.workspace = true
 globset.workspace = true
 anyhow.workspace = true

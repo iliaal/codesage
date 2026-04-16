@@ -11,6 +11,7 @@ pub fn detect_language(path: &Path) -> Option<Language> {
         "rs" => Some(Language::Rust),
         "js" | "mjs" | "cjs" | "jsx" => Some(Language::JavaScript),
         "ts" | "tsx" => Some(Language::TypeScript),
+        "go" => Some(Language::Go),
         _ => None,
     }
 }
@@ -74,6 +75,15 @@ mod tests {
         assert_eq!(
             detect_language(Path::new("App.tsx")),
             Some(Language::TypeScript)
+        );
+    }
+
+    #[test]
+    fn go_extension() {
+        assert_eq!(detect_language(Path::new("main.go")), Some(Language::Go));
+        assert_eq!(
+            detect_language(Path::new("handler_test.go")),
+            Some(Language::Go)
         );
     }
 

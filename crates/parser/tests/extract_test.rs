@@ -209,3 +209,70 @@ fn javascript_does_not_capture_local_consts() {
     let apps: Vec<_> = syms.iter().filter(|s| s.name == "app").collect();
     assert!(apps.is_empty(), "local const 'app' should not be extracted");
 }
+
+#[test]
+fn go_extracts_all_symbol_types() {
+    let syms = symbols_for("sample.go", Language::Go);
+
+    assert!(has_symbol(&syms, "NewConfig", SymbolKind::Function));
+    assert!(has_symbol(&syms, "process", SymbolKind::Function));
+    assert!(has_symbol(&syms, "Config", SymbolKind::Struct));
+    assert!(has_symbol(&syms, "Server", SymbolKind::Struct));
+    assert!(has_symbol(&syms, "Handler", SymbolKind::Interface));
+    assert!(has_symbol(&syms, "Duration", SymbolKind::Constant)); // type alias
+    assert!(has_symbol(&syms, "MaxRetries", SymbolKind::Constant));
+    assert!(has_symbol(&syms, "DefaultPort", SymbolKind::Constant));
+    assert!(has_symbol(&syms, "DefaultHost", SymbolKind::Constant));
+}
+
+#[test]
+fn go_extracts_methods() {
+    let syms = symbols_for("sample.go", Language::Go);
+
+    assert!(has_symbol(&syms, "String", SymbolKind::Method));
+    assert!(has_symbol(&syms, "WithDebug", SymbolKind::Method));
+    assert!(has_symbol(&syms, "Start", SymbolKind::Method));
+}
+
+#[test]
+fn go_qualified_names_pointer_receiver() {
+    let syms = symbols_for("sample.go", Language::Go);
+
+    let string_method = syms.iter().find(|s| s.name == "String").unwrap();
+    assert_eq!(string_method.qualified_name, "Config.String");
+
+    let with_debug = syms.iter().find(|s| s.name == "WithDebug").unwrap();
+    assert_eq!(with_debug.qualified_name, "Config.WithDebug");
+}
+
+#[test]
+fn go_qualified_names_value_receiver() {
+    let syms = symbols_for("sample.go", Language::Go);
+
+    let start = syms.iter().find(|s| s.name == "Start").unwrap();
+    assert_eq!(start.qualified_name, "Server.Start");
+}
+
+#[test]
+fn go_qualified_names_functions_are_plain() {
+    let syms = symbols_for("sample.go", Language::Go);
+
+    let new_config = syms.iter().find(|s| s.name == "NewConfig").unwrap();
+    assert_eq!(new_config.qualified_name, "NewConfig");
+
+    let process_fn = syms.iter().find(|s| s.name == "process").unwrap();
+    assert_eq!(process_fn.qualified_name, "process");
+}
+
+#[test]
+fn go_line_numbers_are_positive() {
+    let syms = symbols_for("sample.go", Language::Go);
+    for s in &syms {
+        assert!(s.line_start > 0, "symbol {} has line_start 0", s.name);
+        assert!(
+            s.line_end >= s.line_start,
+            "symbol {} has bad line range",
+            s.name
+        );
+    }
+}

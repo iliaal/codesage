@@ -22,7 +22,7 @@ CodeSage is a code intelligence engine for AI coding agents. It combines structu
 
 ## Supported languages
 
-PHP, Python, C, Rust, JavaScript, TypeScript.
+PHP, Python, C, Rust, JavaScript, TypeScript, Go.
 
 ## Getting started
 

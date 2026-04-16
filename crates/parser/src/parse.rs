@@ -12,6 +12,7 @@ pub fn parse_file(source: &[u8], language: Language) -> Result<Tree> {
         Language::Rust => tree_sitter_rust::LANGUAGE.into(),
         Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
         Language::TypeScript => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        Language::Go => tree_sitter_go::LANGUAGE.into(),
     };
 
     parser.set_language(&ts_language)?;

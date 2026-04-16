@@ -108,7 +108,7 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps are backward
 
 ## Languages
 
-PHP, Python, C, Rust, JavaScript, TypeScript.
+PHP, Python, C, Rust, JavaScript, TypeScript, Go.
 
 ## MCP tools
 

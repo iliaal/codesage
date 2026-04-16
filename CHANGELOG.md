@@ -8,6 +8,10 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ## [Unreleased]
 
+### Added
+
+- Go language support. Parses functions, methods (with pointer and value receivers), structs, interfaces, type aliases, and constants. Qualified names use `ReceiverType.MethodName` convention. References track imports and function/method calls. Test discovery already recognized `_test.go` convention from v0.3.0; now the parser can index Go source files too.
+
 ## [0.3.3] - 2026-04-15
 
 Test discovery for Laravel/Symfony mirror-tree projects + test backfill.
