@@ -33,12 +33,13 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   build:
-    name: cargo build (release, CPU)
+    name: cargo build (CPU)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Confirm the CPU-only build path still works for contributors without GPUs.
+      # Confirm the CPU-only build path compiles for contributors without GPUs.
       # CUDA is opt-in via --features cuda, never required at build time.
-      - run: cargo build --release -p codesage
+      # Debug profile here; release builds happen in the release workflow.
+      - run: cargo build -p codesage
