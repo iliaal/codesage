@@ -8,6 +8,11 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ## [Unreleased]
 
+### Security
+
+- Bump transitive `openssl` crate to 0.10.78 (from 0.10.77) to pick up fixes for CVE-2026-41676, CVE-2026-41677, CVE-2026-41678, CVE-2026-41681, and GHSA-hppc-g8h3-xhp3. Four of the five are high-severity memory-safety bugs in rust-openssl callbacks and AES key wrap. CodeSage pulls `openssl` transitively via `native-tls` (used by `hf-hub` for model downloads and `ort-sys` at build time), so the exposure is limited to TLS paths exercised during model fetches, but the bump is cheap and closes the Dependabot alerts.
+- Bump transitive `rustls-webpki` to 0.103.13 (from 0.103.12) for RUSTSEC-2026-0104 (reachable panic in CRL parsing). Pulled via `rustls` → `ureq` / `hyper-rustls` / `tokio-rustls` on the same model-download and reqwest paths. Clears the scheduled `cargo audit` workflow failure.
+
 ## [0.4.0] - 2026-04-16
 
 ### Added
