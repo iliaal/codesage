@@ -2,20 +2,25 @@
 
 use anyhow::{Context, Result};
 use codesage_protocol::{
-    ClusteredDirectory, CoChangeEntry, FileCategory, ImpactRequest, ImpactTarget, RiskAssessment,
-    RiskDiffAssessment,
+    ClusteredDirectory, CoChangeEntry, CouplingReport, FileCategory, ImpactRequest, ImpactTarget,
+    RiskAssessment, RiskDiffAssessment,
 };
 use codesage_storage::Database;
 
 use super::tests_rec::test_sibling_exists;
 use crate::query::impact_analysis;
 
-/// Top-N files that historically co-change with `file_path`. Returns the OTHER file in
-/// each pair, weight-sorted descending. Backed by the `git_co_changes` table populated
-/// by `git_history_index`.
-pub fn find_coupling(db: &Database, file_path: &str, limit: usize) -> Result<Vec<CoChangeEntry>> {
+/// Top-N files that historically co-change with `file_path`, wrapped in a
+/// report that explains empty results. See [`CouplingReport`] for the
+/// disambiguation an agent needs: was the file never indexed, does it have
+/// history but no pair above the co-change threshold, or was the path wrong.
+///
+/// Schema change from the pre-0.4.1 `Vec<CoChangeEntry>` return type: callers
+/// that read the MCP `find_coupling` response should now index into
+/// `result.coupled` instead of treating the result as a bare array.
+pub fn find_coupling(db: &Database, file_path: &str, limit: usize) -> Result<CouplingReport> {
     let rows = db.co_changes_for(file_path, limit)?;
-    Ok(rows
+    let coupled: Vec<CoChangeEntry> = rows
         .into_iter()
         .map(|r| CoChangeEntry {
             file: r.file,
@@ -23,7 +28,42 @@ pub fn find_coupling(db: &Database, file_path: &str, limit: usize) -> Result<Vec
             count: r.count,
             last_observed_at: r.last_observed_at,
         })
-        .collect())
+        .collect();
+
+    let git = db.git_file(file_path)?;
+    let file_indexed = git.is_some();
+    let file_commits = git.as_ref().map(|g| g.total_commits).unwrap_or(0);
+
+    // Note is generated only when `coupled` is empty. Distinguishes the three
+    // dominant causes so an agent can decide whether to retry, try a
+    // different tool, or warn the user that the index needs a refresh.
+    let note = if !coupled.is_empty() {
+        None
+    } else if !file_indexed {
+        Some(
+            "file has no git history (not tracked by git, no commits yet, or path shape \
+             does not match the index — verify with `codesage status` or \
+             `codesage git-index --full`)"
+                .to_string(),
+        )
+    } else if file_commits < 3 {
+        Some(format!(
+            "file has only {file_commits} tracked commit(s); co-change pairs need a \
+             count of 3+ to be recorded (see `codesage git-index --full` to rebaseline)"
+        ))
+    } else {
+        Some(format!(
+            "file has {file_commits} commits but no co-change pair crosses the min-count \
+             threshold of 3; this file typically changes in isolation"
+        ))
+    };
+
+    Ok(CouplingReport {
+        coupled,
+        file_indexed,
+        file_commits,
+        note,
+    })
 }
 
 /// Risk score for a single file. Composes:

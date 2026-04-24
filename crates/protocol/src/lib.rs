@@ -421,6 +421,31 @@ pub struct CoChangeEntry {
     pub last_observed_at: Option<i64>,
 }
 
+/// Result envelope for `find_coupling`. Wraps the ranked list with enough
+/// context for an agent to tell apart the three empty-result causes:
+///
+/// - file never indexed (not tracked, or no commits yet) — `file_indexed=false`
+/// - file has history but no co-change pair above the min-count threshold —
+///   `file_indexed=true, file_commits>0, coupled=[]`, note explains
+/// - file-path shape doesn't match the index (wrong case, leading slash,
+///   etc.) — typically surfaces as `file_indexed=false` with a note suggesting
+///   the caller verify the path
+///
+/// Non-empty `coupled` responses still include the indexed-state fields so an
+/// agent can distinguish a thin result (`coupled.len() < limit`) from a full
+/// one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CouplingReport {
+    pub coupled: Vec<CoChangeEntry>,
+    /// True when the file has at least one row in `git_files`.
+    pub file_indexed: bool,
+    /// Total commits tracked for the file. 0 when not indexed.
+    pub file_commits: u32,
+    /// Human-readable hint when `coupled` is empty; `None` otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 /// Risk decomposition for a file. Score is the weighted sum; components let the agent
 /// see WHY a file is risky, not just the magnitude.
 #[derive(Debug, Clone, Serialize, Deserialize)]

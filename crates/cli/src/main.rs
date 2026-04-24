@@ -816,16 +816,21 @@ fn cmd_git_index(json: bool, full: bool, incremental: bool) -> Result<()> {
 fn cmd_coupling(file: &str, limit: usize, json: bool) -> Result<()> {
     let root = find_project_root()?;
     let db = open_db(&root)?;
-    let entries = find_coupling(&db, file, limit)?;
+    let report = find_coupling(&db, file, limit)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&entries)?);
-    } else if entries.is_empty() {
-        println!(
-            "No co-change history for {file}. Run `codesage git-index` if you haven't, or check the path."
-        );
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if report.coupled.is_empty() {
+        let hint = report
+            .note
+            .as_deref()
+            .unwrap_or("no co-change history; run `codesage git-index` or check the path");
+        println!("No co-change history for {file}: {hint}");
     } else {
-        println!("Files that historically change with {file}:");
-        for e in &entries {
+        println!(
+            "Files that historically change with {file} ({} commits tracked):",
+            report.file_commits
+        );
+        for e in &report.coupled {
             println!("  {:>6.2}  {:>4}x  {}", e.weight, e.count, e.file);
         }
     }

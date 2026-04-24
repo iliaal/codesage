@@ -617,7 +617,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "find_coupling",
-        description = "Files that historically change together with the given file, ranked by exponentially-decayed weight (τ=180d). Backed by git history. Use when planning a change to know which OTHER files (especially tests) tend to need updates too. Empty result means no co-change history yet — run `codesage git-index` if you haven't, or the file is too new to have signal."
+        description = "Files that historically change together with the given file, ranked by exponentially-decayed weight (τ=180d). Backed by git history. Use when planning a change to know which OTHER files (especially tests) tend to need updates too. Response is `{coupled: [...], file_indexed: bool, file_commits: u32, note?: string}` — read `coupled` for the ranked list. When `coupled` is empty, `note` disambiguates: file never indexed vs. file has history but no pair above the min-count=3 threshold vs. path shape mismatch. Index into `.coupled`, not the response directly."
     )]
     fn find_coupling_tool(&self, Parameters(params): Parameters<CouplingParams>) -> CallToolResult {
         let limit = params.limit.unwrap_or(10);

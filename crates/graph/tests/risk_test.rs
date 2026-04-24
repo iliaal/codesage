@@ -693,6 +693,84 @@ fn recommend_tests_finds_laravel_test_under_unit_or_feature_too() {
     );
 }
 
+// ----- find_coupling (CouplingReport shape) -----
+
+#[test]
+fn find_coupling_unindexed_file_returns_explanatory_note() {
+    // File has no git_files row at all — path is wrong, brand-new, or
+    // gitignored. CouplingReport must tell the agent so, not `coupled: []`
+    // with no context.
+    let (_dir, db) = setup_project();
+    let r = codesage_graph::find_coupling(&db, "does/not/exist.rs", 5).unwrap();
+    assert!(r.coupled.is_empty());
+    assert!(!r.file_indexed);
+    assert_eq!(r.file_commits, 0);
+    let note = r.note.expect("note must be present when coupled is empty");
+    assert!(
+        note.contains("no git history"),
+        "unindexed file note should call out missing history: {note}"
+    );
+}
+
+#[test]
+fn find_coupling_indexed_but_below_threshold_explains_why() {
+    // File has commits but no co-change pair above the min-count=3 threshold
+    // — "this file changes in isolation." Agent should see the total-commits
+    // count so it can judge whether the verdict is trustworthy.
+    let (_dir, db) = setup_project();
+    db.upsert_git_file("solitary.rs", 1.0, 0, 7, Some(1_700_000_000))
+        .unwrap();
+    let r = codesage_graph::find_coupling(&db, "solitary.rs", 5).unwrap();
+    assert!(r.coupled.is_empty());
+    assert!(r.file_indexed);
+    assert_eq!(r.file_commits, 7);
+    let note = r.note.expect("note required");
+    assert!(
+        note.contains("7 commits") && note.contains("min-count threshold"),
+        "note should quote commit count and threshold reasoning: {note}"
+    );
+}
+
+#[test]
+fn find_coupling_new_file_under_three_commits_has_dedicated_note() {
+    // Low-commit files get a different note pointing at the threshold itself
+    // (they might accumulate signal later).
+    let (_dir, db) = setup_project();
+    db.upsert_git_file("fresh.rs", 0.1, 0, 1, Some(1_700_000_000))
+        .unwrap();
+    let r = codesage_graph::find_coupling(&db, "fresh.rs", 5).unwrap();
+    assert!(r.coupled.is_empty());
+    assert!(r.file_indexed);
+    assert_eq!(r.file_commits, 1);
+    let note = r.note.expect("note required");
+    assert!(
+        note.contains("only 1 tracked commit"),
+        "low-commit note should pluralize correctly: {note}"
+    );
+}
+
+#[test]
+fn find_coupling_populated_result_carries_index_state() {
+    // Non-empty response still carries file_indexed + file_commits so a thin
+    // result (fewer than `limit` entries) is still interpretable.
+    let (_dir, db) = setup_project();
+    db.upsert_git_file("a.rs", 1.0, 0, 10, Some(1_700_000_000))
+        .unwrap();
+    db.upsert_git_file("b.rs", 0.5, 0, 10, Some(1_700_000_000))
+        .unwrap();
+    db.upsert_git_co_change("a.rs", "b.rs", 5.0, 5, Some(1_700_000_000))
+        .unwrap();
+    let r = codesage_graph::find_coupling(&db, "a.rs", 5).unwrap();
+    assert_eq!(r.coupled.len(), 1);
+    assert_eq!(r.coupled[0].file, "b.rs");
+    assert!(r.file_indexed);
+    assert_eq!(r.file_commits, 10);
+    assert!(
+        r.note.is_none(),
+        "note should be None when coupled is non-empty"
+    );
+}
+
 #[test]
 fn recommend_tests_finds_symfony_mirror_tree_tests() {
     let (_dir, db) = setup_project();

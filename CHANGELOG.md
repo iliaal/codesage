@@ -8,6 +8,10 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking**: `find_coupling` (MCP and CLI) now returns `CouplingReport { coupled, file_indexed, file_commits, note? }` instead of a bare `Vec<CoChangeEntry>`. Agents should read `response.coupled` for the ranked list. Motivation: retrospective session analysis showed 59% of `find_coupling` calls returned `[]` with no context, leaving the agent unable to tell apart the three causes — file never indexed, file has history but no co-change pair crosses the min-count=3 threshold, or path shape doesn't match the index. The new `note` field disambiguates each case with a concrete hint (run `codesage git-index`, verify path shape, or accept that this file changes in isolation). `file_indexed` and `file_commits` are always present, so even non-empty results carry enough context for the agent to judge a thin response.
+
 ### Fixed
 
 - MCP tool params now accept integer fields encoded as JSON strings (`"limit": "5"` alongside `"limit": 5`). Strict `Option<usize>` deserialization was failing with `invalid type: string "5", expected usize` on ~10% of `find_coupling` calls; retrospective session-log analysis (`bench/analyze-codesage-quality.py`) found agents occasionally emit stringy numbers, which is standard LLM JSON behavior and not something the protocol should reject. Applies uniformly to `limit`, `offset`, and `depth` across `CouplingParams`, `ImpactParams`, `ExportContextParams`, and `SearchParams`. Genuinely non-numeric strings still error, and the error now quotes the offending value for diagnosability instead of a generic type-mismatch message.
