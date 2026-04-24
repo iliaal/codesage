@@ -310,10 +310,7 @@ pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiff
 /// See [`CycleEntry`] docs for the "cycles the patch touches" vs
 /// "cycles the patch introduces" distinction. We do not have a
 /// pre-patch index to diff against, so this returns both.
-fn find_cycles_touching(
-    db: &Database,
-    patch_files: &[String],
-) -> Result<Vec<CycleEntry>> {
+fn find_cycles_touching(db: &Database, patch_files: &[String]) -> Result<Vec<CycleEntry>> {
     use std::collections::HashSet;
 
     let edges = db
