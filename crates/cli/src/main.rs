@@ -1,5 +1,6 @@
 mod doctor;
 mod drift;
+mod lockfile;
 mod mcp;
 mod util;
 
@@ -594,6 +595,22 @@ fn git_local_exclude_path(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
 
 fn cmd_index(full: bool, no_semantic: bool) -> Result<()> {
     let root = find_project_root()?;
+    // Acquire the project-level indexing lock before loading embedders or
+    // touching the DB. Skips work cleanly (exit 0) if another codesage
+    // indexer is already running on this project — the concurrency-audit
+    // finding from recommendations doc §2.4 said the previous behavior was
+    // "one process wins with rc=0, loser dies with SQLITE_BUSY", which
+    // looks like a failure in hook logs even though no data is at risk.
+    let _lock = match lockfile::try_acquire(&root)? {
+        lockfile::LockOutcome::Acquired(l) => l,
+        lockfile::LockOutcome::AlreadyHeld => {
+            eprintln!(
+                "another codesage indexer is running on {} — skipping",
+                root.display()
+            );
+            return Ok(());
+        }
+    };
     let config = load_project_config(&root)?;
     let excludes = get_exclude_patterns(&config);
 
@@ -793,6 +810,20 @@ fn cmd_dependencies(file: &str, json: bool) -> Result<()> {
 
 fn cmd_git_index(json: bool, full: bool, incremental: bool) -> Result<()> {
     let root = find_project_root()?;
+    // Same lock as `codesage index`: if a structural index is in flight,
+    // the git-history pass would race it and hit SQLITE_BUSY. Skipping
+    // here lets the hook-driven scheduler converge on a single indexer
+    // at a time without the user seeing an error.
+    let _lock = match lockfile::try_acquire(&root)? {
+        lockfile::LockOutcome::Acquired(l) => l,
+        lockfile::LockOutcome::AlreadyHeld => {
+            eprintln!(
+                "another codesage indexer is running on {} — skipping",
+                root.display()
+            );
+            return Ok(());
+        }
+    };
     let db = open_db(&root)?;
     let mode = if full {
         codesage_graph::IndexMode::Full
@@ -993,6 +1024,19 @@ fn cmd_status() -> Result<()> {
 
 fn cmd_cleanup(dry_run: bool) -> Result<()> {
     let root = find_project_root()?;
+    // Cleanup drops orphan vec tables (from prior model switches) — also
+    // a writer-style operation that races with in-flight indexers. Same
+    // lock coordination.
+    let _lock = match lockfile::try_acquire(&root)? {
+        lockfile::LockOutcome::Acquired(l) => l,
+        lockfile::LockOutcome::AlreadyHeld => {
+            eprintln!(
+                "another codesage indexer is running on {} — skipping cleanup",
+                root.display()
+            );
+            return Ok(());
+        }
+    };
     let config = load_project_config(&root)?;
     let emb_config = config.embedding.unwrap_or_default();
 
