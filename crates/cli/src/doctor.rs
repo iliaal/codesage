@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use codesage_storage::Database;
 
+use crate::drift::{DriftKind, check_drift};
 use crate::{DB_FILE, PROJECT_DIR, find_project_root_opt, load_project_config};
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -33,6 +34,7 @@ pub fn run(json: bool) -> Result<()> {
         checks.push(check_db(root));
         checks.push(check_disk(root));
         checks.push(check_hooks(root));
+        checks.push(check_index_drift(root));
     } else {
         checks.push(Check {
             name: "project",
@@ -349,6 +351,44 @@ fn check_hooks(root: &Path) -> Check {
                 missing.join(",")
             ),
         }
+    }
+}
+
+/// Drift telemetry: compares the HEAD SHA stamped at the last successful
+/// `codesage index` against the current `git rev-parse HEAD`. Warning
+/// classification (Pass/Warn/Skip) matches what the drift module classifies —
+/// we surface it here so `codesage doctor` is a single stop for "is my index
+/// trustworthy right now?".
+fn check_index_drift(root: &Path) -> Check {
+    let db_path = root.join(PROJECT_DIR).join(DB_FILE);
+    if !db_path.exists() {
+        return Check {
+            name: "index-drift",
+            status: Status::Skip,
+            message: "no index.db yet (run `codesage index`)".to_string(),
+        };
+    }
+    let db = match Database::open(&db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            return Check {
+                name: "index-drift",
+                status: Status::Fail,
+                message: format!("failed to open index: {e}"),
+            };
+        }
+    };
+    let report = check_drift(root, &db);
+    let status = match report.kind {
+        DriftKind::Fresh => Status::Pass,
+        DriftKind::NotGit | DriftKind::NeverIndexed => Status::Skip,
+        DriftKind::BehindHead | DriftKind::UnrelatedAncestor => Status::Warn,
+        DriftKind::Unknown => Status::Warn,
+    };
+    Check {
+        name: "index-drift",
+        status,
+        message: report.summary(),
     }
 }
 

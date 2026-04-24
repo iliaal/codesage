@@ -198,6 +198,22 @@ impl Database {
         Ok(n as usize)
     }
 
+    /// Chunk count across **every** vec0 chunk table in the DB, not just the
+    /// currently-selected model's. Used by `codesage status` where the caller
+    /// opens via [`Database::open`] (no chunk table selected) and just wants a
+    /// total index size. Returns `Ok(0)` on a DB that has never run a semantic
+    /// index.
+    pub fn total_chunk_count(&self) -> Result<usize> {
+        let tables = self.list_vec_tables()?;
+        let mut total: i64 = 0;
+        for t in &tables {
+            let sql = format!("SELECT COUNT(*) FROM \"{t}\"");
+            let n: i64 = self.conn.query_row(&sql, [], |row| row.get(0))?;
+            total += n;
+        }
+        Ok(total as usize)
+    }
+
     pub fn list_vec_tables(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT name FROM sqlite_master

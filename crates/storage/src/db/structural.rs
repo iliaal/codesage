@@ -9,6 +9,40 @@ use crate::schema::name_tail;
 use super::{Database, row_reference_kind, row_symbol_kind};
 
 impl Database {
+    /// Return `(last_sha, last_indexed_at_unix)` for the structural index if a
+    /// stamp exists. Mirrors [`Database::get_git_index_state`] but tracks the
+    /// structural/semantic layer — not the git history layer. Used by drift
+    /// instrumentation (see `codesage doctor`) to detect cases where git hooks
+    /// failed to trigger a reindex.
+    pub fn get_structural_index_state(&self) -> Result<Option<(String, i64)>> {
+        let row = self.conn.query_row(
+            "SELECT last_sha, last_indexed_at FROM structural_index_state WHERE id = 1",
+            [],
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?)),
+        );
+        match row {
+            Ok((Some(sha), at)) if !sha.is_empty() => Ok(Some((sha, at))),
+            Ok(_) => Ok(None),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Stamp the HEAD SHA that the structural index was just built against.
+    /// `indexed_at` is set to `unixepoch()` at the DB. Callers must only pass
+    /// real SHAs — the "not a git repo" case is the caller's to skip.
+    pub fn set_structural_index_state(&self, sha: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO structural_index_state (id, last_sha, last_indexed_at)
+             VALUES (1, ?1, unixepoch())
+             ON CONFLICT(id) DO UPDATE SET
+                 last_sha = excluded.last_sha,
+                 last_indexed_at = excluded.last_indexed_at",
+            params![sha],
+        )?;
+        Ok(())
+    }
+
     pub fn upsert_file(&self, file: &FileInfo) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO files (path, language, content_hash, indexed_at)

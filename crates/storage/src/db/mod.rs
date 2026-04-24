@@ -355,4 +355,57 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].language, "python");
     }
+
+    #[test]
+    fn structural_index_state_roundtrip() {
+        let db = Database::open_in_memory().unwrap();
+        assert!(db.get_structural_index_state().unwrap().is_none());
+
+        db.set_structural_index_state("abc123").unwrap();
+        let (sha, at) = db.get_structural_index_state().unwrap().unwrap();
+        assert_eq!(sha, "abc123");
+        assert!(at > 0, "last_indexed_at should be stamped with unixepoch");
+
+        // Second stamp replaces rather than stacking (single-row table, id=1).
+        db.set_structural_index_state("def456").unwrap();
+        let (sha2, _) = db.get_structural_index_state().unwrap().unwrap();
+        assert_eq!(sha2, "def456");
+    }
+
+    #[test]
+    fn total_chunk_count_zero_on_fresh_db_open() {
+        // A DB opened via `Database::open` has no chunk_table selected. Before
+        // the total_chunk_count helper landed, `codesage status` would error
+        // with "no such table: " because `chunk_count()` interpolated the
+        // empty chunk_table. The replacement must tolerate the no-model case.
+        use std::path::PathBuf;
+        let tmp = std::env::temp_dir().join(format!(
+            "codesage-total-chunk-test-{}.db",
+            std::process::id()
+        ));
+        let tmp = PathBuf::from(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        // Materialize a DB with schema but no chunk tables. Using open() (no
+        // model) is the code path exercised by `codesage status`.
+        {
+            let db = Database::open(&tmp).unwrap();
+            assert_eq!(db.total_chunk_count().unwrap(), 0);
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn structural_index_state_treats_empty_sha_as_absent() {
+        let db = Database::open_in_memory().unwrap();
+        // Direct INSERT rather than going through set_* so we can exercise the
+        // empty-string branch of get_*.
+        db.conn
+            .execute(
+                "INSERT INTO structural_index_state (id, last_sha, last_indexed_at)
+                 VALUES (1, '', 0)",
+                [],
+            )
+            .unwrap();
+        assert!(db.get_structural_index_state().unwrap().is_none());
+    }
 }

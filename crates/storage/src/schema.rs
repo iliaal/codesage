@@ -69,6 +69,12 @@ CREATE TABLE IF NOT EXISTS git_index_state (
     last_sha TEXT,
     last_indexed_at INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS structural_index_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    last_sha TEXT,
+    last_indexed_at INTEGER
+);
 "#;
 
 pub fn semantic_schema(table_name: &str, dim: usize) -> String {
@@ -130,7 +136,13 @@ pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
 /// neither does.
 type MigrationUp = fn(&Connection) -> rusqlite::Result<()>;
 
-const MIGRATIONS: &[(&str, MigrationUp)] = &[("0001_refs_name_tail", migrate_0001_refs_name_tail)];
+const MIGRATIONS: &[(&str, MigrationUp)] = &[
+    ("0001_refs_name_tail", migrate_0001_refs_name_tail),
+    (
+        "0002_structural_index_state",
+        migrate_0002_structural_index_state,
+    ),
+];
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
@@ -207,6 +219,20 @@ fn migrate_0001_refs_name_tail(conn: &Connection) -> rusqlite::Result<()> {
         }
     }
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_refs_to_name_tail ON refs(to_name_tail);")?;
+    Ok(())
+}
+
+/// Adds `structural_index_state` for tracking the last HEAD SHA the structural
+/// index was built against. Parallel shape to `git_index_state` and safe on a
+/// current schema (guarded by `IF NOT EXISTS`).
+fn migrate_0002_structural_index_state(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS structural_index_state (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             last_sha TEXT,
+             last_indexed_at INTEGER
+         );",
+    )?;
     Ok(())
 }
 

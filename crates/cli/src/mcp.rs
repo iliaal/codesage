@@ -205,11 +205,25 @@ impl CodeSageServer {
         }
         let embedding_config = load_embedding_config(&codesage_dir.join("config.toml"))?;
         let state = ProjectState {
-            db_path,
+            db_path: db_path.clone(),
             embedding_config,
         };
-        let mut guard = self.projects.lock();
-        guard.entry(canonical).or_insert(state.clone());
+        let newly_registered = {
+            let mut guard = self.projects.lock();
+            if guard.contains_key(&canonical) {
+                false
+            } else {
+                guard.insert(canonical.clone(), state.clone());
+                true
+            }
+        };
+        // Drift telemetry: on first resolution of a project in this MCP
+        // session, append one JSON line to `.codesage/drift.log`. Non-fatal —
+        // telemetry errors stay in tracing so a drift write never blocks a
+        // tool call.
+        if newly_registered && let Err(e) = write_drift_log_for_project(&canonical, &db_path) {
+            tracing::debug!(error = %e, "drift log append failed");
+        }
         Ok(state)
     }
 
@@ -612,6 +626,17 @@ impl CodeSageServer {
             "recommend_tests",
         )
     }
+}
+
+/// Opens the project DB read-only-enough to compute a drift snapshot and
+/// append one JSON line to `.codesage/drift.log`. Returns quickly — the DB
+/// handle drops at the end of this call. Failures propagate so the caller
+/// can log them; drift telemetry never kills a tool call.
+fn write_drift_log_for_project(project_root: &Path, db_path: &Path) -> Result<()> {
+    let db = Database::open(db_path)?;
+    let report = crate::drift::check_drift(project_root, &db);
+    crate::drift::append_drift_log(project_root, ".codesage", &report)?;
+    Ok(())
 }
 
 pub async fn run_mcp_server() -> Result<()> {

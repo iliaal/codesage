@@ -8,6 +8,18 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ## [Unreleased]
 
+### Fixed
+
+- `codesage status` no longer errors with `no such table:` on projects opened without a selected embedding model. Root cause: `cmd_status` opened the DB via `Database::open()` (which leaves `chunk_table` empty) and then called `chunk_count()`, which interpolated the empty table name into its SQL. Status now calls a new `total_chunk_count()` that sums across every vec0 chunk table in the DB — a more useful number anyway, since DBs that have been benchmarked across multiple models carry orphan chunk tables cleanup hasn't dropped. Zero vec tables returns 0 instead of failing.
+
+### Added
+
+- Drift instrumentation for the structural/semantic index. New `structural_index_state` table (migration `0002`) records the HEAD SHA each successful `codesage index` run built against. `codesage status` and `codesage doctor` now show an `index-drift` indicator (`fresh`, `N commits behind HEAD`, `not an ancestor of HEAD` for rebases, or `never indexed`). The MCP server appends one JSON line to `<project>/.codesage/drift.log` the first time it resolves a project in a session — bounded to the last 10,000 lines. No auto-reindex behavior: this is pure measurement so we can characterize how often git-hook drift happens in real usage before deciding whether to build the content-hash backstop (recommendations doc §1.3).
+
+### Changed
+
+- `bench/codesage-bench-runner` scorecard output now includes a full metadata header: project HEAD SHA, repo size (file + LoC counts), corpus + case count + top-N, codesage version, embedding model + device, reranker, explicit baseline-for-comparison slot, and ISO run timestamp. Adds a "measured quantities" / "NOT measured" block so the honesty gap (no agent tool-call counts, no wall-clock-vs-grep) is visible in the output itself. New trailing "Quotable one-liner" copies all metadata into a single sentence suitable for external communication; the machine-parseable `METRICS` HTML comment gains the new fields for downstream tooling. Optional `--baseline "ripgrep 14.1.0 (grep -rn)"` flag (or `CODESAGE_BENCH_BASELINE` env) fills the baseline slot — informational only, does not run a comparison tool. Template shape follows landscape-sweep item 1.6 in `notes/20260424-reference-tool-recommendations.md`.
+
 ### Security
 
 - Bump transitive `openssl` crate to 0.10.78 (from 0.10.77) to pick up fixes for CVE-2026-41676, CVE-2026-41677, CVE-2026-41678, CVE-2026-41681, and GHSA-hppc-g8h3-xhp3. Four of the five are high-severity memory-safety bugs in rust-openssl callbacks and AES key wrap. CodeSage pulls `openssl` transitively via `native-tls` (used by `hf-hub` for model downloads and `ort-sys` at build time), so the exposure is limited to TLS paths exercised during model fetches, but the bump is cheap and closes the Dependabot alerts.

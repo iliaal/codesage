@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """
 Benchmark CodeSage semantic search against ground-truth YAML corpora.
-Mirrors ccc-bench-runner methodology for direct comparison.
+
+Emits a scorecard in the "named repo + named model + named baseline + named
+quantities" shape adopted from the external landscape sweep (see
+notes/20260424-reference-tool-recommendations.md, item 1.6). Every public
+claim derived from this runner should be quotable verbatim from the output.
 
 Usage:
   codesage-bench-runner <corpus.yaml> [--limit 10] [--verbose] [--codesage-bin PATH]
 """
 
 import argparse
+import datetime as _dt
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +24,107 @@ try:
 except ImportError:
     sys.exit("pyyaml required: pip install pyyaml")
 
+
+# ---------------------------------------------------------------------------
+# Scorecard metadata collection
+# ---------------------------------------------------------------------------
+
+def _run(cmd: list[str], cwd: Path | None = None) -> str:
+    try:
+        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            return r.stdout.strip()
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+    return ""
+
+
+def codesage_version(codesage_bin: str) -> str:
+    out = _run([codesage_bin, "--version"])
+    # Typical output is `codesage X.Y.Z`. Strip the bin name so headers that
+    # prefix with "CodeSage:" don't double up ("CodeSage: codesage 0.4.0").
+    if out.lower().startswith("codesage "):
+        out = out[len("codesage "):].strip()
+    return out or "unknown"
+
+
+def project_head_sha(project_root: Path) -> str:
+    sha = _run(["git", "rev-parse", "--short=12", "HEAD"], cwd=project_root)
+    return sha or "not-a-git-repo"
+
+
+def project_size(project_root: Path) -> tuple[int, int]:
+    """Return (file_count, total_lines) across tracked source extensions.
+
+    Intentionally conservative — we're shaping a public claim, not computing
+    a precise LoC. Matches what `cloc` or `wc` would produce on a tracked
+    subset, minus binary and generated noise. If git is unavailable, returns
+    (0, 0) and the header simply omits the size.
+    """
+    files = _run(["git", "ls-files"], cwd=project_root)
+    if not files:
+        return 0, 0
+    extensions = {
+        ".rs", ".py", ".ts", ".tsx", ".js", ".jsx",
+        ".c", ".h", ".cpp", ".hpp", ".cc", ".cxx",
+        ".php", ".go", ".rb", ".java", ".kt", ".swift",
+        ".scala", ".cs",
+    }
+    paths = [
+        project_root / p
+        for p in files.splitlines()
+        if Path(p).suffix in extensions
+    ]
+    file_count = 0
+    line_count = 0
+    for p in paths:
+        try:
+            if not p.is_file():
+                continue
+            with p.open("rb") as f:
+                # Count newline bytes — faster than decoding and close enough
+                # for a scorecard header.
+                line_count += sum(1 for _ in f)
+            file_count += 1
+        except OSError:
+            continue
+    return file_count, line_count
+
+
+def codesage_config(project_root: Path) -> dict:
+    """Parse `.codesage/config.toml` for embedding model / reranker / device."""
+    cfg = project_root / ".codesage" / "config.toml"
+    if not cfg.is_file():
+        return {}
+    # Minimal TOML subset parser for the keys we need — avoid adding a
+    # dependency to the bench script. Handles `key = "value"` under section
+    # headers, ignores comments.
+    out: dict[str, dict[str, str]] = {}
+    section = ""
+    try:
+        for raw in cfg.read_text().splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1].strip()
+                out.setdefault(section, {})
+                continue
+            if "=" in line and section:
+                k, v = line.split("=", 1)
+                out[section][k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        return {}
+    return out
+
+
+def now_iso_utc() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------------------------------------------------------------------------
+# Retrieval runner (unchanged core logic)
+# ---------------------------------------------------------------------------
 
 def run_codesage_search(codesage_bin: str, project_root: Path, query: str, limit: int) -> str:
     cmd = [codesage_bin, "search", "--json", "--limit", str(limit), query]
@@ -35,10 +142,9 @@ def run_codesage_search(codesage_bin: str, project_root: Path, query: str, limit
 
 def parse_result_paths(output: str) -> list[str]:
     """Extract ordered file paths from codesage search --json output."""
-    seen = set()
+    seen: set[str] = set()
     ordered: list[str] = []
-    # Skip stderr lines (model loading messages)
-    lines = []
+    lines: list[str] = []
     for line in output.splitlines():
         line = line.strip()
         if line.startswith("[") or line.startswith("{"):
@@ -86,12 +192,83 @@ def score_case(expected: list[str], returned: list[str], k_values: list[int]) ->
     }
 
 
+# ---------------------------------------------------------------------------
+# Scorecard formatter
+# ---------------------------------------------------------------------------
+
+def format_size(file_count: int, line_count: int) -> str:
+    if file_count == 0:
+        return "size unknown"
+    return f"{file_count:,} files, {line_count:,} LoC"
+
+
+def format_header(
+    *,
+    project_root: Path,
+    head_sha: str,
+    size_str: str,
+    corpus_name: str,
+    case_count: int,
+    limit: int,
+    k_values: list[int],
+    cs_version: str,
+    embedding_model: str,
+    embedding_device: str,
+    embedding_dim: str,
+    reranker: str,
+    baseline: str,
+    run_ts: str,
+) -> list[str]:
+    """Build the "named everything" header.
+
+    If a line here is missing (`unknown`, `not configured`), that is itself
+    information — the template shows exactly which fact is absent instead
+    of hiding it behind a vague claim.
+    """
+    lines: list[str] = []
+    lines.append("# CodeSage retrieval scorecard")
+    lines.append("")
+    lines.append(f"- **Project**: `{project_root}` (HEAD `{head_sha}`, {size_str})")
+    case_word = "case" if case_count == 1 else "cases"
+    lines.append(f"- **Corpus**: `{corpus_name}` — {case_count} {case_word}, top-{limit}, k={k_values}")
+    lines.append(f"- **CodeSage**: {cs_version}")
+    model_line = f"- **Embedding model**: {embedding_model}"
+    if embedding_dim:
+        model_line += f" ({embedding_dim}d"
+        if embedding_device:
+            model_line += f", {embedding_device}"
+        model_line += ")"
+    elif embedding_device:
+        model_line += f" ({embedding_device})"
+    lines.append(model_line)
+    lines.append(f"- **Reranker**: {reranker}")
+    lines.append(f"- **Baseline for comparison**: {baseline}")
+    lines.append(f"- **Run at**: {run_ts}")
+    lines.append("")
+    lines.append("**Measured quantities**: miss rate (no ground-truth file in top-N), "
+                 "median first-hit rank, mean recall@5, mean recall@10. Per-case rows "
+                 "show `first_hit_rank`, `noise_before_first_hit`, recall@5, recall@10.")
+    lines.append("")
+    lines.append("**Not measured** (flagged so nothing reads in that we didn't test): "
+                 "agent tool-call counts, end-to-end task-completion rate, token usage, "
+                 "wall-clock vs grep/ripgrep. Add those separately when claiming them.")
+    return lines
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("corpus", type=Path)
     ap.add_argument("--limit", type=int, default=10)
     ap.add_argument("--verbose", "-v", action="store_true")
     ap.add_argument("--codesage-bin", default="codesage")
+    ap.add_argument(
+        "--baseline",
+        default=os.environ.get("CODESAGE_BENCH_BASELINE", "not configured"),
+        help="Named baseline for comparison (informational header field). "
+             "E.g. 'ripgrep 14.1.0 (grep -rn)'. Does not run the baseline; "
+             "fill in what the numbers are being compared against when "
+             "quoting the scorecard externally.",
+    )
     args = ap.parse_args()
 
     corpus = yaml.safe_load(args.corpus.read_text())
@@ -102,6 +279,21 @@ def main() -> int:
     if not project_root.exists():
         sys.exit(f"project_root does not exist: {project_root}")
 
+    # --- Metadata collection ---
+    cs_version = codesage_version(args.codesage_bin)
+    head_sha = project_head_sha(project_root)
+    file_count, line_count = project_size(project_root)
+    size_str = format_size(file_count, line_count)
+    cfg = codesage_config(project_root)
+    emb_section = cfg.get("embedding", {})
+    embedding_model = emb_section.get("model", "unknown")
+    embedding_device = emb_section.get("device", "")
+    reranker = emb_section.get("reranker", "none")
+    # Dim isn't in config; leave blank and let the header format gracefully.
+    embedding_dim = emb_section.get("dimensions", "")
+    run_ts = now_iso_utc()
+
+    # --- Run cases ---
     results = []
     for case in cases:
         cid = case["id"]
@@ -123,11 +315,28 @@ def main() -> int:
             print(f"  expected: {expected}", file=sys.stderr)
             print(f"  returned[:5]: {returned[:5]}", file=sys.stderr)
 
-    print(f"# CodeSage retrieval scorecard")
-    print(f"\n**Project:** `{project_root}`  ")
-    print(f"**Corpus:** `{args.corpus.name}`  ")
-    print(f"**Cases:** {len(results)}  ")
-    print(f"**k values:** {k_values}")
+    # --- Emit scorecard ---
+    header = format_header(
+        project_root=project_root,
+        head_sha=head_sha,
+        size_str=size_str,
+        corpus_name=args.corpus.name,
+        case_count=len(results),
+        limit=args.limit,
+        k_values=k_values,
+        cs_version=cs_version,
+        embedding_model=embedding_model,
+        embedding_device=embedding_device,
+        embedding_dim=embedding_dim,
+        reranker=reranker,
+        baseline=args.baseline,
+        run_ts=run_ts,
+    )
+    for line in header:
+        print(line)
+
+    print()
+    print("## Per-case results")
     print()
     print("| id | src | first hit | noise | r@5 | r@10 |")
     print("|---|---|---:|---:|---:|---:|")
@@ -137,9 +346,9 @@ def main() -> int:
               f"| {r['recall@5']:.2f} | {r['recall@10']:.2f} |")
 
     hits = [r for r in results if r["first_hit_rank"] is not None]
-    miss_rate = 1.0 - len(hits) / len(results)
-    avg_r5 = sum(r["recall@5"] for r in results) / len(results)
-    avg_r10 = sum(r["recall@10"] for r in results) / len(results)
+    miss_rate = 1.0 - len(hits) / len(results) if results else 0.0
+    avg_r5 = sum(r["recall@5"] for r in results) / len(results) if results else 0.0
+    avg_r10 = sum(r["recall@10"] for r in results) / len(results) if results else 0.0
     median_first = (
         sorted(r["first_hit_rank"] for r in hits)[len(hits) // 2] if hits else None
     )
@@ -152,8 +361,24 @@ def main() -> int:
     print(f"- **Mean recall@10:** {avg_r10:.2f}")
 
     print()
-    print(f"<!-- METRICS: miss_rate={miss_rate:.4f} median_first={median_first or 'MISS'} "
-          f"r5={avg_r5:.4f} r10={avg_r10:.4f} cases={len(results)} -->")
+    print("## Quotable one-liner")
+    pct = f"{int(round((1 - miss_rate) * 100))}%"
+    median_str = f"median first-hit rank {median_first}" if median_first is not None else "no hits"
+    case_word_q = "case" if len(results) == 1 else "cases"
+    print(f"> CodeSage {cs_version} hits {pct} of {len(results)} ground-truth {case_word_q} on "
+          f"`{project_root.name}` (HEAD `{head_sha}`, {size_str}) with "
+          f"{embedding_model}"
+          + (f" + {reranker}" if reranker and reranker != "none" else "")
+          + f", {median_str}, mean recall@10 {avg_r10:.2f}. "
+          f"Baseline for comparison: {args.baseline}. Run {run_ts}.")
+
+    print()
+    print(f"<!-- METRICS: miss_rate={miss_rate:.4f} "
+          f"median_first={median_first if median_first is not None else 'MISS'} "
+          f"r5={avg_r5:.4f} r10={avg_r10:.4f} cases={len(results)} "
+          f"project={project_root.name} head={head_sha} "
+          f"model={embedding_model} reranker={reranker} baseline={args.baseline} "
+          f"run_at={run_ts} codesage={cs_version} -->")
 
     return 0
 

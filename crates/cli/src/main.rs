@@ -1,4 +1,5 @@
 mod doctor;
+mod drift;
 mod mcp;
 mod util;
 
@@ -646,6 +647,15 @@ fn cmd_index(full: bool, no_semantic: bool) -> Result<()> {
         }
     }
 
+    // Stamp the HEAD SHA we just indexed against. Skipped in non-git dirs.
+    // Failures here only degrade drift telemetry, so they warn rather than
+    // propagate — the index itself is already durable on disk.
+    if let Some(sha) = drift::git_head_sha(&root)
+        && let Err(e) = db.set_structural_index_state(&sha)
+    {
+        tracing::warn!(error = %e, "failed to stamp structural_index_state");
+    }
+
     Ok(())
 }
 
@@ -971,7 +981,8 @@ fn cmd_status() -> Result<()> {
     println!("Files:      {}", db.file_count()?);
     println!("Symbols:    {}", db.symbol_count()?);
     println!("References: {}", db.reference_count()?);
-    println!("Chunks:     {}", db.chunk_count()?);
+    println!("Chunks:     {}", db.total_chunk_count()?);
+    println!("Drift:      {}", drift::check_drift(&root, &db).summary());
     Ok(())
 }
 
