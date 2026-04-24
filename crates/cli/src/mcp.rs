@@ -25,6 +25,44 @@ use rmcp::{
 
 const PROJECT_ARG_DESC: &str = "Absolute path to the project root. Must be an onboarded CodeSage project (contains .codesage/index.db).";
 
+/// Accept integer numeric params from agents that occasionally JSON-encode
+/// numbers as strings (`{"limit": "5"}` instead of `{"limit": 5}`). The
+/// default `Option<usize>` serde derive rejects the string form with
+/// `invalid type: string "5", expected usize` — a hard error at the MCP
+/// protocol layer that leaves the caller guessing. Retrospective session
+/// analysis (`bench/analyze-codesage-quality.py`) found this was 100% of
+/// the `find_coupling` error results, so the fix applies across every
+/// integer param: `limit`, `offset`, `depth`.
+fn deser_optional_usize<'de, D>(d: D) -> std::result::Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum UsizeOrString {
+        U(usize),
+        S(String),
+    }
+
+    match Option::<UsizeOrString>::deserialize(d)? {
+        None => Ok(None),
+        Some(UsizeOrString::U(n)) => Ok(Some(n)),
+        Some(UsizeOrString::S(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            trimmed.parse::<usize>().map(Some).map_err(|e| {
+                serde::de::Error::custom(format!(
+                    "expected integer or integer-as-string, got {s:?}: {e}"
+                ))
+            })
+        }
+    }
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct FindSymbolParams {
     #[schemars(description = PROJECT_ARG_DESC)]
@@ -64,6 +102,7 @@ pub struct CouplingParams {
     #[schemars(description = "Repo-relative file path to look up co-change history for")]
     pub file_path: String,
     #[schemars(description = "Max results (default 10)")]
+    #[serde(default, deserialize_with = "deser_optional_usize")]
     pub limit: Option<usize>,
 }
 
@@ -102,6 +141,7 @@ pub struct ImpactParams {
     #[schemars(description = "Treat target as file path (auto-detected if path-like)")]
     pub is_file: Option<bool>,
     #[schemars(description = "Recursion depth for transitive impact (default 2)")]
+    #[serde(default, deserialize_with = "deser_optional_usize")]
     pub depth: Option<usize>,
     #[schemars(description = "Exclude test and config files from results")]
     pub source_only: Option<bool>,
@@ -116,6 +156,7 @@ pub struct ExportContextParams {
     #[schemars(description = "Treat target as a symbol name instead of a semantic query")]
     pub is_symbol: Option<bool>,
     #[schemars(description = "Max primary results to include (default 5)")]
+    #[serde(default, deserialize_with = "deser_optional_usize")]
     pub limit: Option<usize>,
     #[schemars(description = "Include caller code in the bundle")]
     pub include_callers: Option<bool>,
@@ -132,8 +173,10 @@ pub struct SearchParams {
     )]
     pub query: String,
     #[schemars(description = "Maximum results to return (default 10)")]
+    #[serde(default, deserialize_with = "deser_optional_usize")]
     pub limit: Option<usize>,
     #[schemars(description = "Results offset for pagination")]
+    #[serde(default, deserialize_with = "deser_optional_usize")]
     pub offset: Option<usize>,
     #[schemars(description = "Filter by language: php, python, c, rust, javascript, typescript")]
     pub language: Option<String>,
@@ -660,6 +703,81 @@ mod tests {
 
     fn fat_string(n: usize) -> String {
         "x".repeat(n)
+    }
+
+    #[test]
+    fn coupling_params_accept_int_limit() {
+        let p: CouplingParams = serde_json::from_value(json!({
+            "project": "/p",
+            "file_path": "a.rs",
+            "limit": 5,
+        }))
+        .unwrap();
+        assert_eq!(p.limit, Some(5));
+    }
+
+    #[test]
+    fn coupling_params_accept_stringy_limit() {
+        // Session logs showed 100% of find_coupling MCP -32602 errors were
+        // agents sending `"limit": "5"` as a JSON string. Must parse.
+        let p: CouplingParams = serde_json::from_value(json!({
+            "project": "/p",
+            "file_path": "a.rs",
+            "limit": "5",
+        }))
+        .unwrap();
+        assert_eq!(p.limit, Some(5));
+    }
+
+    #[test]
+    fn coupling_params_accept_missing_limit() {
+        let p: CouplingParams = serde_json::from_value(json!({
+            "project": "/p",
+            "file_path": "a.rs",
+        }))
+        .unwrap();
+        assert_eq!(p.limit, None);
+    }
+
+    #[test]
+    fn coupling_params_reject_non_numeric_string() {
+        let r: Result<CouplingParams, _> = serde_json::from_value(json!({
+            "project": "/p",
+            "file_path": "a.rs",
+            "limit": "not-a-number",
+        }));
+        assert!(r.is_err(), "non-numeric string must still error");
+        // Error should name the offending value rather than be a generic
+        // "expected usize" so the agent can fix its request.
+        let msg = r.unwrap_err().to_string();
+        assert!(
+            msg.contains("not-a-number"),
+            "error must quote offending value, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn impact_params_coerce_depth_string() {
+        let p: ImpactParams = serde_json::from_value(json!({
+            "project": "/p",
+            "target": "Foo",
+            "depth": "3",
+        }))
+        .unwrap();
+        assert_eq!(p.depth, Some(3));
+    }
+
+    #[test]
+    fn search_params_coerce_limit_and_offset_strings() {
+        let p: SearchParams = serde_json::from_value(json!({
+            "project": "/p",
+            "query": "auth",
+            "limit": "10",
+            "offset": "20",
+        }))
+        .unwrap();
+        assert_eq!(p.limit, Some(10));
+        assert_eq!(p.offset, Some(20));
     }
 
     #[test]

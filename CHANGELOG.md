@@ -8,6 +8,10 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ## [Unreleased]
 
+### Fixed
+
+- MCP tool params now accept integer fields encoded as JSON strings (`"limit": "5"` alongside `"limit": 5`). Strict `Option<usize>` deserialization was failing with `invalid type: string "5", expected usize` on ~10% of `find_coupling` calls; retrospective session-log analysis (`bench/analyze-codesage-quality.py`) found agents occasionally emit stringy numbers, which is standard LLM JSON behavior and not something the protocol should reject. Applies uniformly to `limit`, `offset`, and `depth` across `CouplingParams`, `ImpactParams`, `ExportContextParams`, and `SearchParams`. Genuinely non-numeric strings still error, and the error now quotes the offending value for diagnosability instead of a generic type-mismatch message.
+
 ### Added
 
 - `assess_risk_diff` now clusters per-file detail when a patch touches ≥5 files from one directory. The crowded directory's entries move from `files[]` into a new top-level `clustered_directories[]` field (top-3 files by score preserved in full detail, the rest listed by name as `omitted_files`). Rollup arrays (`test_gap_files`, `wide_blast_files`, `fix_heavy_files`, `hotspot_files`) still list every clustered file, so cross-referencing a cluster back to a specific concern still works. Small patches (≤4 files per directory) keep the original flat shape, so agent prompts written against the prior schema keep working without changes. Addresses recommendations doc §1.5 after retrospective session-log analysis measured this as the real cost center (p95 24 KB responses on this tool alone).
