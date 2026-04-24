@@ -33,6 +33,13 @@ pub fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
 }
 
 impl Database {
+    /// FTS5 sidecar name for the active chunk table. Kept private to the
+    /// storage layer — callers should go through `search_bm25` /
+    /// `token_doc_frequency` rather than querying by name directly.
+    fn fts_table(&self) -> String {
+        crate::schema::fts_table_name(&self.chunk_table)
+    }
+
     pub fn insert_chunks(
         &self,
         file_path: &str,
@@ -44,12 +51,25 @@ impl Database {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             self.chunk_table
         );
+        let fts = self.fts_table();
+        let fts_sql = format!(
+            "INSERT INTO \"{fts}\"(rowid, content, file_path, language, start_line, end_line)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+        );
         let mut vec_stmt = self.conn.prepare(&sql)?;
+        let mut fts_stmt = self.conn.prepare(&fts_sql)?;
 
         for (content, start_line, end_line, embedding) in chunks {
             let bytes = embedding_to_bytes(embedding);
             vec_stmt.execute(params![
                 file_path, language, content, start_line, end_line, bytes
+            ])?;
+            let rowid = self.conn.last_insert_rowid();
+            // Keep FTS5 rowid == vec0 id so the two tables join trivially on
+            // rowid / id. If the FTS insert fails, surface the error rather
+            // than silently diverging from the vec0 state.
+            fts_stmt.execute(params![
+                rowid, content, file_path, language, start_line, end_line
             ])?;
         }
         Ok(())
@@ -58,6 +78,13 @@ impl Database {
     pub fn delete_chunks_for_file(&self, file_path: &str) -> Result<usize> {
         let sql = format!("DELETE FROM \"{}\" WHERE file_path = ?1", self.chunk_table);
         let count = self.conn.execute(&sql, params![file_path])?;
+        let fts = self.fts_table();
+        let fts_sql = format!("DELETE FROM \"{fts}\" WHERE file_path = ?1");
+        // FTS5 DELETE by file_path relies on UNINDEXED columns being queryable
+        // by value; unicode61 tokenizer persists the column verbatim so this
+        // works. Errors bubble — silent FTS drift is the problem we're
+        // preventing.
+        let _ = self.conn.execute(&fts_sql, params![file_path])?;
         Ok(count)
     }
 
@@ -196,6 +223,86 @@ impl Database {
         let sql = format!("SELECT COUNT(*) FROM \"{}\"", self.chunk_table);
         let n: i64 = self.conn.query_row(&sql, [], |row| row.get(0))?;
         Ok(n as usize)
+    }
+
+    /// BM25 search over the FTS5 sidecar of the active chunk table. Returns
+    /// the top-N rows by FTS5's built-in BM25 ranking (lower = better), in
+    /// the same `RawSearchRow` shape as `search_knn` for easy RRF fusion.
+    /// `distance` carries the raw BM25 score; consumers should convert via
+    /// rank-position when fusing, not raw value.
+    ///
+    /// Query must be an FTS5 MATCH expression; pass pre-escaped. Callers that
+    /// build a query from user input should go through a helper like
+    /// `build_fts_match_query` to quote identifiers safely.
+    pub fn search_bm25(
+        &self,
+        match_expr: &str,
+        k: usize,
+        language: Option<&str>,
+    ) -> Result<Vec<RawSearchRow>> {
+        let t = self.fts_table();
+        let sql = if language.is_some() {
+            format!(
+                "SELECT file_path, language, content, start_line, end_line, bm25(\"{t}\") AS score
+                 FROM \"{t}\"
+                 WHERE \"{t}\" MATCH ?1 AND language = ?2
+                 ORDER BY score LIMIT ?3"
+            )
+        } else {
+            format!(
+                "SELECT file_path, language, content, start_line, end_line, bm25(\"{t}\") AS score
+                 FROM \"{t}\"
+                 WHERE \"{t}\" MATCH ?1
+                 ORDER BY score LIMIT ?2"
+            )
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let row_fn = |row: &rusqlite::Row<'_>| {
+            Ok(RawSearchRow {
+                file_path: row.get(0)?,
+                language: row.get(1)?,
+                content: row.get(2)?,
+                start_line: row.get(3)?,
+                end_line: row.get(4)?,
+                distance: row.get::<_, f64>(5)? as f32,
+            })
+        };
+        let rows: Vec<RawSearchRow> = if let Some(lang) = language {
+            stmt.query_map(params![match_expr, lang, k as i64], row_fn)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            stmt.query_map(params![match_expr, k as i64], row_fn)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(rows)
+    }
+
+    /// Doc frequency of `token` in the active FTS5 sidecar, as a fraction
+    /// `(docs_with_token, total_docs)`. Used by the hybrid query gate to
+    /// decide whether a query contains a "rare" literal worth a BM25 boost.
+    /// Returns `(0, total)` when the token is absent or FTS is empty.
+    ///
+    /// Uses the `fts5vocab` table in `row` mode: rows are one per term with
+    /// `doc` counting the number of distinct docs containing the term.
+    pub fn token_doc_frequency(&self, token: &str) -> Result<(u64, u64)> {
+        let total = self.chunk_count()? as u64;
+        if total == 0 {
+            return Ok((0, 0));
+        }
+        let vocab = format!("{}_vocab", self.fts_table());
+        // Create the vocab shadow if it doesn't exist. FTS5 vocab tables are
+        // virtual; creating them is idempotent and only records the shape,
+        // no data copy.
+        self.conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS \"{vocab}\" USING fts5vocab(\"{}\", row);",
+            self.fts_table()
+        ))?;
+        let sql = format!("SELECT doc FROM \"{vocab}\" WHERE term = ?1");
+        let doc: Option<i64> = self
+            .conn
+            .query_row(&sql, params![token.to_lowercase()], |r| r.get(0))
+            .ok();
+        Ok((doc.unwrap_or(0) as u64, total))
     }
 
     /// Chunk count across **every** vec0 chunk table in the DB, not just the

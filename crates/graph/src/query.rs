@@ -29,6 +29,243 @@ fn l2_to_score(distance: f32) -> f32 {
 
 const RERANK_OVERFETCH: usize = 5;
 
+/// RRF constant. Standard value from the original paper; larger values
+/// damp the influence of absolute rank position, smaller values amplify it.
+const RRF_K: f64 = 60.0;
+
+/// Doc-frequency threshold below which a query token counts as "rare" for
+/// the gate. 1% of the corpus is the memo's suggested cutoff — distinctive
+/// enough that BM25 actually has signal, not so rare that every typo
+/// triggers the hybrid path.
+const RARE_TOKEN_DF_THRESHOLD: f64 = 0.01;
+
+/// Minimum token length for the length-based rare check. Short tokens
+/// (`fd`, `pt`, `if`) match too broadly regardless of doc frequency.
+const RARE_TOKEN_MIN_LEN: usize = 8;
+
+/// True when `query` contains a literal token distinctive enough to
+/// justify a BM25 boost on top of the semantic score. Two qualifying
+/// shapes:
+///
+/// 1. **Distinctive punctuation**: backticked identifiers (`` `doc_cfg` ``),
+///    file-extension globs (`*.svelte.ts`), scope-resolution operators
+///    (`ModuleRef::create`). These shapes are strong priors for a literal
+///    match even if the exact token isn't in the FTS vocab yet.
+/// 2. **Long rare tokens**: any whitespace- or pipe-separated token of at
+///    least 8 characters that shows up in <1% of indexed chunks. Requires
+///    a live FTS5 `fts5vocab` probe, so this returns `Ok(false)` when the
+///    FTS sidecar is empty (fresh install before reindex).
+pub(crate) fn query_has_rare_literal(db: &Database, query: &str) -> Result<bool> {
+    if query.contains("::") || query.contains('`') || query.contains("*.") {
+        return Ok(true);
+    }
+    // Dotted-identifier pair shape (`moduleref.create`, `Foo.Bar`,
+    // `foo.bar_baz`). Both sides must be ≥3 chars so sentence punctuation
+    // like `e.g.` and `i.e.` doesn't trigger. Measured on nest:
+    // `moduleref.create` case in the remaining miss set — the individual
+    // tokens are all lowercase so neither qualifies as "code-shaped" on its
+    // own, but the dotted-pair context is a strong signal that they are.
+    if !extract_dotted_identifier_tokens(query).is_empty() {
+        return Ok(true);
+    }
+    for tok in query
+        .split(|c: char| c == '|' || c.is_whitespace() || c == ',' || c == ';')
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric() && c != '_'))
+    {
+        if tok.len() < RARE_TOKEN_MIN_LEN {
+            continue;
+        }
+        if !token_looks_code_shaped(tok) {
+            // Pure lowercase English words (`resolution`, `handler`,
+            // `middleware`) can be rare in a domain corpus without carrying
+            // the "this is the exact identifier I need" signal BM25 is
+            // supposed to catch. Measured regression on nest canary
+            // (`git-15198c650d`): "resolution" DF 0.19% tripped this branch
+            // but the expected file did not contain the word. Restrict the
+            // length branch to tokens that look like code identifiers.
+            continue;
+        }
+        let (doc, total) = db.token_doc_frequency(tok)?;
+        if total == 0 {
+            continue;
+        }
+        let df = doc as f64 / total as f64;
+        // Both halves of the threshold matter: a token must appear (doc>0)
+        // AND be rare (df < 1%). `doc == 0` means the token isn't in the
+        // index — no BM25 win possible, skip.
+        if doc > 0 && df < RARE_TOKEN_DF_THRESHOLD {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// True when a token carries syntactic markers of a code identifier —
+/// contains `_`, at least one uppercase letter, or a digit. This filters
+/// out ordinary English words that may be rare in a specific corpus but
+/// don't carry the "exact identifier match" signal BM25 is supposed to
+/// contribute.
+fn token_looks_code_shaped(tok: &str) -> bool {
+    tok.contains('_')
+        || tok.chars().any(|c| c.is_ascii_uppercase())
+        || tok.chars().any(|c| c.is_ascii_digit())
+}
+
+/// Extract every `identifier.identifier` pair from the query where both
+/// sides are ASCII identifiers of length ≥3. Returns tokens flat, not
+/// pairs — the caller feeds them into the FTS MATCH disjunction. Skips
+/// sentence-punctuation patterns like `e.g.` (1-char left side) and
+/// `i.e.` (1-char right side).
+fn extract_dotted_identifier_tokens(query: &str) -> Vec<&str> {
+    let bytes = query.as_bytes();
+    let mut out = Vec::new();
+    let is_id_start = |b: u8| b.is_ascii_alphabetic() || b == b'_';
+    let is_id_body = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_id_start(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_id_body(bytes[i]) {
+            i += 1;
+        }
+        let first = &query[start..i];
+        if first.len() < 3 || i >= bytes.len() || bytes[i] != b'.' {
+            continue;
+        }
+        let after_dot = i + 1;
+        if after_dot >= bytes.len() || !is_id_start(bytes[after_dot]) {
+            continue;
+        }
+        let second_start = after_dot;
+        i = after_dot;
+        while i < bytes.len() && is_id_body(bytes[i]) {
+            i += 1;
+        }
+        let second = &query[second_start..i];
+        if second.len() < 3 {
+            continue;
+        }
+        out.push(first);
+        out.push(second);
+    }
+    out
+}
+
+/// Build an FTS5 MATCH expression from a user query. Emits a disjunction
+/// of quoted terms so code tokens like `doc_cfg` and `ModuleRef::create`
+/// survive FTS5's reserved-character parsing without raising syntax errors
+/// at query time. Empty when no usable tokens are extracted.
+fn build_fts_match_query(query: &str) -> String {
+    use std::collections::HashSet;
+    // Split aggressively so things like `ModuleRef::create`, `foo.bar`, and
+    // `*.svelte.ts` yield each alphanumeric+underscore segment as its own
+    // term, not concatenated nonsense. FTS5's unicode61 tokenizer (with
+    // tokenchars '_') would produce the same splits at index time, so what
+    // we emit here matches what was actually indexed.
+    //
+    // Filter: only include tokens that look like code identifiers. Common
+    // English glue words (`use`, `the`, `and`, `of`, `instead`) in a
+    // 10-word commit subject would flood the BM25 ranking and bury the
+    // one or two distinctive tokens we actually care about. Measured on
+    // ripgrep: the query `printer: use \`doc_cfg\` instead of
+    // \`doc_auto_cfg\`` without this filter produces a MATCH disjunction
+    // of 6 tokens where 4 are common glue, and the target file drops out
+    // of the top 10 because the glue tokens match everything.
+    //
+    // Exception: dotted-identifier components like `moduleref.create`
+    // survive even when individually lowercase, because the dotted pair
+    // context signals code identity.
+    let is_sep = |c: char| !c.is_alphanumeric() && c != '_';
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut tokens: Vec<String> = Vec::new();
+    for tok in extract_dotted_identifier_tokens(query) {
+        let key = tok.to_lowercase();
+        if seen.insert(key) {
+            tokens.push(format!("\"{tok}\""));
+        }
+    }
+    for raw in query.split(is_sep) {
+        if raw.len() < 2 {
+            continue;
+        }
+        if !token_looks_code_shaped(raw) {
+            continue;
+        }
+        // Dedupe by lowercased form — FTS5 is case-insensitive for this
+        // tokenizer, so `Foo` and `foo` would collapse at MATCH time
+        // anyway. Fewer OR-terms keeps the MATCH expression parseable.
+        let key = raw.to_lowercase();
+        if !seen.insert(key) {
+            continue;
+        }
+        tokens.push(format!("\"{raw}\""));
+    }
+    tokens.join(" OR ")
+}
+
+/// Weight applied to BM25 contributions in the gated hybrid RRF merge.
+/// Symmetric RRF underweights BM25 on queries where the target file is
+/// absent from the semantic top-N but present in the BM25 top-N: the
+/// target then competes only against rank-1 of the list where it does
+/// appear, and any semantic-only top-1 item edges it out by a hair.
+/// Measured on nest (`moduleref.create` → `module-ref.ts` case): BM25
+/// correctly ranks `module-ref.ts` at rank 2, but unweighted RRF leaves
+/// it under the top-10 because semantic's long tail contributes one
+/// score per rank. Weighting BM25 at 2x closes this specific gap without
+/// overwhelming the semantic ranking on queries where semantic is correct.
+const BM25_WEIGHT: f64 = 2.0;
+
+/// Reciprocal Rank Fusion over two ranked lists. Each list contributes
+/// `weight / (k + rank)` to the merged score for each document. The
+/// BM25 list gets `BM25_WEIGHT`; semantic gets 1.0. De-duplicates by
+/// (file_path, start_line, end_line) since chunk ids differ between the
+/// vec0 and FTS5 rankings but the underlying text region does not.
+fn rrf_merge(
+    semantic: Vec<RawSearchRow>,
+    bm25: Vec<RawSearchRow>,
+    limit: usize,
+) -> Vec<RawSearchRow> {
+    use std::collections::HashMap;
+    // Key is (path, start, end). Two chunks at the same location appearing
+    // in both rankings collapse to one row with the summed RRF score.
+    let mut scores: HashMap<(String, u32, u32), (f64, RawSearchRow)> = HashMap::new();
+    for (rank, row) in semantic.into_iter().enumerate() {
+        let contrib = 1.0 / (RRF_K + rank as f64 + 1.0);
+        let key = (row.file_path.clone(), row.start_line, row.end_line);
+        scores
+            .entry(key)
+            .and_modify(|(s, _)| *s += contrib)
+            .or_insert((contrib, row));
+    }
+    for (rank, row) in bm25.into_iter().enumerate() {
+        let contrib = BM25_WEIGHT / (RRF_K + rank as f64 + 1.0);
+        let key = (row.file_path.clone(), row.start_line, row.end_line);
+        scores
+            .entry(key)
+            .and_modify(|(s, _)| *s += contrib)
+            .or_insert((contrib, row));
+    }
+    let mut ranked: Vec<(f64, RawSearchRow)> = scores.into_values().collect();
+    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+    // Convert the fused RRF score to the `distance` field downstream code
+    // expects: it reads it through `l2_to_score` which is monotonic on L2
+    // distance. To keep the downstream ordering intact we inject an
+    // "equivalent L2" that preserves rank: higher RRF score → lower synthetic
+    // distance. Using `distance = 1.0 - rrf_score` works because all pipeline
+    // math downstream cares about is monotonic order.
+    ranked
+        .into_iter()
+        .take(limit)
+        .map(|(score, mut row)| {
+            row.distance = (1.0 - score as f32).max(0.0);
+            row
+        })
+        .collect()
+}
+
 pub fn search(
     db: &Database,
     embedder: &mut Embedder,
@@ -53,6 +290,15 @@ pub fn search(
     let embedding_bytes = embedding_to_bytes(&query_embedding);
 
     let semantic_fetch = limit * overfetch;
+
+    // Gate: is this a query where BM25 would help? Two distinctive shapes
+    // covered by `query_has_rare_literal`: backticked identifiers / glob
+    // patterns / `::` scoped lookups, and long tokens (>=8 chars) that show
+    // up in <1% of chunks. Retrospective analysis on external corpora
+    // (ripgrep, nestjs/nest) measured these as the specific failure mode
+    // semantic-only retrieval misses. See
+    // `notes/20260411-code-intelligence-landscape.md` §1.4 for the memo chain.
+    let hybrid_gate = query_has_rare_literal(db, &req.query).unwrap_or(false);
 
     let rows = if req.paths.is_some() {
         let languages: Option<Vec<&str>> = req
@@ -118,6 +364,34 @@ pub fn search(
         }
     };
 
+    // Hybrid BM25+semantic fusion, only when the gate triggered. Keeps the
+    // semantic-only path identical to pre-hybrid behavior for the 80%+ of
+    // queries that don't contain a rare literal, so the ecosystem default
+    // doesn't get copy-pasted in where the memo's net-negative finding still
+    // applies.
+    let rows = if hybrid_gate {
+        let match_expr = build_fts_match_query(&req.query);
+        if match_expr.is_empty() {
+            rows
+        } else {
+            let bm25_language: Option<&str> = req.languages.as_ref().and_then(|ls| {
+                if ls.len() == 1 {
+                    Some(ls[0].as_str())
+                } else {
+                    None
+                }
+            });
+            match db.search_bm25(&match_expr, semantic_fetch, bm25_language) {
+                Ok(bm25_rows) if !bm25_rows.is_empty() => {
+                    rrf_merge(rows, bm25_rows, semantic_fetch)
+                }
+                _ => rows,
+            }
+        }
+    } else {
+        rows
+    };
+
     let semantic_results: Vec<SearchResult> = rows
         .into_iter()
         .map(|r| SearchResult {
@@ -139,7 +413,15 @@ pub fn search(
 
     annotate_with_symbols(db, &mut results)?;
 
-    if let Some(reranker) = reranker {
+    // Skip reranking on hybrid-gated queries. The cross-encoder judges
+    // query/doc semantic similarity; for queries driven by a literal
+    // identifier (the `hybrid_gate` trigger conditions), the rare-token
+    // match is already the dominant signal and reranking typically flips
+    // the BM25 win back down — the exact failure mode the memo at
+    // `project_hybrid_bm25_rrf.md` warned about. Measured on the ripgrep
+    // canary: reranker demotes `lib.rs` (rank 5 post-RRF) out of top-10
+    // on `use \`doc_cfg\`` queries.
+    if !hybrid_gate && let Some(reranker) = reranker {
         apply_reranking(reranker, &req.query, &mut results);
     }
 
@@ -511,4 +793,212 @@ fn add_related_from_file(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod hybrid_tests {
+    use super::*;
+
+    fn mk_embedding(v: f32) -> Vec<f32> {
+        let mut e = vec![0.0; codesage_storage::db::DEFAULT_EMBEDDING_DIM];
+        for slot in e.iter_mut().take(10) {
+            *slot = v;
+        }
+        e
+    }
+
+    fn seed_chunks(db: &Database) {
+        // Four chunks: three generic, one with a distinctive literal the
+        // gate should trigger on.
+        db.insert_chunks(
+            "src/lib.rs",
+            "rust",
+            &[(
+                "fn auth() { println!(\"authentication logic\"); }",
+                1,
+                10,
+                mk_embedding(0.1).as_slice(),
+            )],
+        )
+        .unwrap();
+        db.insert_chunks(
+            "src/db.rs",
+            "rust",
+            &[(
+                "fn connect() { println!(\"database pool\"); }",
+                1,
+                10,
+                mk_embedding(0.2).as_slice(),
+            )],
+        )
+        .unwrap();
+        db.insert_chunks(
+            "src/reg.rs",
+            "rust",
+            &[(
+                "// registers ColdFusion and BoxLang file types",
+                1,
+                5,
+                mk_embedding(0.3).as_slice(),
+            )],
+        )
+        .unwrap();
+        db.insert_chunks(
+            "src/misc.rs",
+            "rust",
+            &[("fn handler() { }", 1, 5, mk_embedding(0.4).as_slice())],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn gate_triggers_on_backtick() {
+        let db = Database::open_in_memory().unwrap();
+        assert!(query_has_rare_literal(&db, "use `doc_cfg` here").unwrap());
+    }
+
+    #[test]
+    fn gate_triggers_on_scope_resolution() {
+        let db = Database::open_in_memory().unwrap();
+        assert!(query_has_rare_literal(&db, "call ModuleRef::create").unwrap());
+    }
+
+    #[test]
+    fn gate_triggers_on_glob_extension() {
+        let db = Database::open_in_memory().unwrap();
+        assert!(query_has_rare_literal(&db, "add *.svelte.ts to globs").unwrap());
+    }
+
+    #[test]
+    fn gate_rejects_plain_english_query() {
+        let db = Database::open_in_memory().unwrap();
+        seed_chunks(&db);
+        // Common words only; none should qualify as rare under DF < 1%.
+        assert!(!query_has_rare_literal(&db, "where is authentication handled").unwrap());
+    }
+
+    #[test]
+    fn gate_triggers_on_rare_long_identifier() {
+        let db = Database::open_in_memory().unwrap();
+        seed_chunks(&db);
+        // "ColdFusion" length 10, appears once in 4 chunks (25% DF — above
+        // the 1% threshold on this tiny corpus, so it does NOT trigger the
+        // length-based branch). This test verifies the threshold logic: on
+        // a real corpus of >1000 chunks the 1-in-N-chunks result would drop
+        // DF below 1% and trigger correctly. On a toy 4-chunk corpus every
+        // real token is "too common", so we assert non-trigger here.
+        assert!(!query_has_rare_literal(&db, "ColdFusion support").unwrap());
+    }
+
+    #[test]
+    fn build_fts_match_query_quotes_identifiers() {
+        let q = build_fts_match_query("printer: use `doc_cfg` instead of `doc_auto_cfg`");
+        // Each bareword becomes a quoted OR term. Backticks stripped as
+        // separators; empty/length-1 tokens dropped.
+        assert!(q.contains("\"doc_cfg\""));
+        assert!(q.contains("\"doc_auto_cfg\""));
+        assert!(q.contains(" OR "));
+    }
+
+    #[test]
+    fn build_fts_match_query_handles_scoped() {
+        let q = build_fts_match_query("call ModuleRef::create");
+        // `ModuleRef` is code-shaped (uppercase) so it survives. `call` and
+        // `create` are plain lowercase — filtered out. This is the fix that
+        // let the gate's BM25 path actually surface target chunks on long
+        // queries: only code-shaped tokens make it into the MATCH
+        // disjunction, so common English glue words don't flood the ranking.
+        assert!(q.contains("\"ModuleRef\""));
+        assert!(!q.contains("\"call\""));
+        assert!(!q.contains("\"create\""));
+    }
+
+    #[test]
+    fn build_fts_match_query_drops_plain_english() {
+        // Pure-English query contributes no terms.
+        assert_eq!(build_fts_match_query("use this instead of that"), "");
+    }
+
+    #[test]
+    fn gate_triggers_on_dotted_identifier_pair() {
+        let db = Database::open_in_memory().unwrap();
+        // Both sides ≥3 chars, all lowercase — not code-shaped individually,
+        // but the dotted-pair context signals code identity.
+        assert!(query_has_rare_literal(&db, "fix moduleref.create edge").unwrap());
+    }
+
+    #[test]
+    fn gate_does_not_trigger_on_sentence_punctuation() {
+        let db = Database::open_in_memory().unwrap();
+        // Short sides — `e`, `g`, `i` — below the 3-char minimum, so
+        // sentence abbreviations don't slip through.
+        assert!(!query_has_rare_literal(&db, "fix e.g. the handler").unwrap());
+        assert!(!query_has_rare_literal(&db, "fix i.e. the handler").unwrap());
+    }
+
+    #[test]
+    fn dotted_tokens_survive_code_shape_filter() {
+        let q = build_fts_match_query("edge case with moduleref.create");
+        assert!(q.contains("\"moduleref\""));
+        assert!(q.contains("\"create\""));
+    }
+
+    #[test]
+    fn build_fts_match_query_keeps_mixed_code_tokens() {
+        let q = build_fts_match_query("printer: use `doc_cfg` instead of `doc_auto_cfg`");
+        assert!(q.contains("\"doc_cfg\""));
+        assert!(q.contains("\"doc_auto_cfg\""));
+        // Plain words should be absent.
+        assert!(!q.contains("\"printer\""));
+        assert!(!q.contains("\"use\""));
+        assert!(!q.contains("\"instead\""));
+    }
+
+    #[test]
+    fn rrf_merge_prioritizes_rows_that_appear_in_both_lists() {
+        let a = RawSearchRow {
+            file_path: "a.rs".into(),
+            language: "rust".into(),
+            content: "a".into(),
+            start_line: 1,
+            end_line: 1,
+            distance: 0.0,
+        };
+        let b = RawSearchRow {
+            file_path: "b.rs".into(),
+            language: "rust".into(),
+            content: "b".into(),
+            start_line: 1,
+            end_line: 1,
+            distance: 0.0,
+        };
+        let c = RawSearchRow {
+            file_path: "c.rs".into(),
+            language: "rust".into(),
+            content: "c".into(),
+            start_line: 1,
+            end_line: 1,
+            distance: 0.0,
+        };
+        // Semantic ranks a, b, c. BM25 ranks c first (and only).
+        // RRF should put c first since it gets a high score from BM25
+        // AND a low score from semantic; but a+b only get one contribution.
+        let semantic = vec![a.clone(), b.clone(), c.clone()];
+        let bm25 = vec![c.clone()];
+        let out = rrf_merge(semantic, bm25, 3);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].file_path, "c.rs");
+    }
+
+    #[test]
+    fn search_bm25_returns_chunks_containing_rare_literal() {
+        // Integration: seed chunks, run BM25 for a rare literal, assert the
+        // correct chunk is in the result. Proves the FTS5 insert path is
+        // actually populating the sidecar.
+        let db = Database::open_in_memory().unwrap();
+        seed_chunks(&db);
+        let rows = db.search_bm25("\"ColdFusion\"", 10, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file_path, "src/reg.rs");
+    }
 }

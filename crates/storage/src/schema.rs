@@ -90,6 +90,30 @@ pub fn semantic_schema(table_name: &str, dim: usize) -> String {
     )
 }
 
+/// Name of the FTS5 sidecar for a given chunk table. Synced row-for-row with
+/// the vec0 table during `insert_chunks`; used by the gated hybrid BM25 path.
+/// Keeping the name a mechanical suffix means one `ensure_chunk_table` call
+/// provisions both sides together.
+pub fn fts_table_name(chunk_table: &str) -> String {
+    format!("{chunk_table}_fts")
+}
+
+/// DDL for the FTS5 sidecar. `tokenchars '_'` keeps identifiers like
+/// `doc_cfg`, `mb_convert_case`, `moduleref` intact instead of splitting
+/// them into half-useful tokens. No Porter stemmer — we match code
+/// identifiers verbatim, not English.
+pub fn fts_schema(table_name: &str) -> String {
+    format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS \"{table_name}\" USING fts5(\
+         content, \
+         file_path UNINDEXED, \
+         language UNINDEXED, \
+         start_line UNINDEXED, \
+         end_line UNINDEXED, \
+         tokenize = \"unicode61 remove_diacritics 1 tokenchars '_'\");"
+    )
+}
+
 pub fn model_table_name(model: &str, dim: usize) -> String {
     let sanitized: String = model
         .chars()
@@ -237,5 +261,8 @@ fn migrate_0002_structural_index_state(conn: &Connection) -> rusqlite::Result<()
 }
 
 pub fn ensure_chunk_table(conn: &Connection, table_name: &str, dim: usize) -> rusqlite::Result<()> {
-    conn.execute_batch(&semantic_schema(table_name, dim))
+    conn.execute_batch(&semantic_schema(table_name, dim))?;
+    let fts = fts_table_name(table_name);
+    conn.execute_batch(&fts_schema(&fts))?;
+    Ok(())
 }
