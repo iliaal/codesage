@@ -24,6 +24,26 @@ CodeSage is a code intelligence engine for AI coding agents. It combines structu
 
 PHP, Python, C, Rust, JavaScript, TypeScript, Go.
 
+## Benchmarks
+
+Ground-truth retrieval on git-mined corpora, 30 cases per repo, `search` top-10:
+
+| repo | miss rate | mean recall@10 |
+|---|---:|---:|
+| BurntSushi/ripgrep @ `4519153e5e46` (101 files, 52K LoC) | 13% | 0.79 |
+| nestjs/nest @ `8eec029772fa` (1,672 files, 110K LoC) | 3% | 0.94 |
+
+Head-to-head against code-review-graph 2.3.2 (same corpora, same queries, code-review-graph configured with matching test-directory exclusions for fairness):
+
+| repo | CodeSage miss | code-review-graph miss | CodeSage per-query wall-clock | code-review-graph per-query wall-clock |
+|---|---:|---:|---:|---:|
+| ripgrep | **13%** | 17% | ~0.25 s | 0.80 s |
+| nest | **3%** | 40% | ~0.25 s | 1.10 s |
+
+The nest gap is architectural: CodeSage embeds chunks (~50-line regions), code-review-graph embeds nodes (functions). Commit-style queries that describe behavior spanning multiple functions match chunks more reliably than individual function bodies.
+
+Run yourself with `bench/codesage-bench-runner <corpus.yaml>` (corpus format: `project_root` + `cases` list of `{id, query, expected_files}`). Scorecards from these runs live under `bench/history/`; corpora are not bundled so private-repo names don't leak by accident. Not a statement about every workload; bring your own corpus for your codebase.
+
 ## Getting started
 
 ```bash
