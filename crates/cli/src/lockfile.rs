@@ -78,8 +78,9 @@ pub fn try_acquire(project_root: &Path) -> Result<LockOutcome> {
     match file.try_lock() {
         Ok(()) => Ok(LockOutcome::Acquired(IndexLock { _file: file })),
         Err(std::fs::TryLockError::WouldBlock) => Ok(LockOutcome::AlreadyHeld),
-        Err(std::fs::TryLockError::Error(e)) => Err(anyhow::Error::from(e)
-            .context(format!("try_lock on {}", path.display()))),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(anyhow::Error::from(e).context(format!("try_lock on {}", path.display())))
+        }
     }
 }
 
