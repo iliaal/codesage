@@ -24,6 +24,12 @@ CodeSage is a code intelligence engine for AI coding agents. It combines structu
 
 PHP, Python, C, Rust, JavaScript, TypeScript, Go.
 
+## Why a single Rust binary
+
+CodeSage ships as one static Rust binary plus a local SQLite database under `.codesage/` per project. No Docker container, no external vector DB server, no embedding service, no daemon. On first use it downloads the embedding and reranker ONNX models (~500 MB combined) and reuses the Hugging Face cache forever after.
+
+The trade-off: CUDA-accelerated embeddings need the `nvidia-*-cu12` pip packages on the host (see [CUDA setup](#cuda-setup) below). In exchange, install once, run everywhere, no orchestration layer, no systemd unit to manage. Tools in the same category that take the other side of this trade — SocratiCode with managed Qdrant + Ollama, GitNexus with external Qdrant — are valid for different user profiles. If your team already runs Docker Compose for everything, use those. If you want `cargo install` and `codesage init` and nothing else to debug, use CodeSage.
+
 ## Benchmarks
 
 Ground-truth retrieval on git-mined corpora, 30 cases per repo, `search` top-10:
@@ -250,6 +256,27 @@ Storage is a single SQLite database per project at `.codesage/index.db`: structu
 - `extract-eval-cases.py` mines eval cases from Claude Code session transcripts and git commit history.
 
 Corpora aren't bundled. Bring your own, or point the plugin at `$CODESAGE_BENCH_CORPUS_DIR`.
+
+## Known limitations
+
+Honest inventory of what CodeSage does not do well, measured on our canary corpora and from 30 days of real Claude Code session logs (the harness in `bench/analyze-codesage-quality.py` produces the same numbers locally).
+
+**Language surface is narrower than competitors'.** Seven languages today. Graphify ships 25, code-review-graph 23, SocratiCode 18+. The gap matters most if your stack is Ruby, Java, Kotlin, Swift, or Scala — the tree-sitter query files live under `crates/parser/src/queries/` and contributions there are the cleanest way to extend coverage.
+
+**Retrieval misses on cross-file refactor queries.** On the ripgrep corpus, 13% of cases miss top-10; four of those six misses are commit subjects like *printer: drop dependency on serde_derive* that describe a rename spanning multiple files without a distinctive literal signal. Single-identifier lookups (`find_symbol`, `find_references`) are reliable. Pure semantic searches (`search`) are reliable. Diffuse multi-file refactor descriptions expressed in prose are the failure mode.
+
+**`impact_analysis` biases toward over-prediction.** The tool walks reference edges up to a configurable depth and reports every reachable file. Agents get false positives but almost never false negatives (short of a stale index). We picked that side of the precision/recall trade because an agent can filter a list of 20 candidates faster than it can recover from a missed dependency that bites in review. If you want high precision at the cost of recall, drop `--depth` to 1 and `--source-only`.
+
+**MCP tool-selection rate is low today.** When CodeSage MCP tools are available in a Claude Code session alongside `Grep`, the agent picks `Grep` reflexively on code-identifier queries — 1.1% CodeSage-pick rate over 30 days of sessions, 0/10 on a controlled active harness. Tool descriptions and per-project CLAUDE.md guidance were sharpened to call this out; the next measurement cycle will show whether the intervention landed. For a hook-level workaround today, see the LSP enforcement kit in the [Complementary tools](#complementary-tools) section.
+
+**`find_coupling` returns empty on young files.** Measured 59% empty-response rate in real usage. Each empty result now carries a `note` field (`"no commits tracked"`, `"below min-count=3 threshold"`, `"path shape mismatch"`) so the agent can tell the cause. The underlying data just doesn't exist for recently-added files; the tool reports that honestly instead of inventing signal.
+
+## Complementary tools
+
+These address different layers than CodeSage and work well alongside it:
+
+- **[rtk](https://github.com/rtk-ai/rtk)** — static compression proxy for noisy CLI output (`git diff`, `pytest`, `cargo build`). Different layer than CodeSage: CodeSage narrows *what the agent reads* for code questions, rtk compresses *how much it reads* for command output. Token-reduction claims from the two tools are additive, not overlapping — measure them separately when quoting.
+- **[claude-code-lsp-enforcement-kit](https://github.com/nesaminua/claude-code-lsp-enforcement-kit)** — hook pack that blocks `Grep` on code-symbol patterns and steers agents toward LSP / MCP tool calls. Provider-agnostic; auto-detects CodeSage's MCP alongside cclsp and Serena. Worth pairing if your tool-selection-rate numbers (see `bench/analyze-codesage-quality.py`) stay low after description-level interventions.
 
 ## Contributing
 
