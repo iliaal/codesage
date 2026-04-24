@@ -13,6 +13,12 @@ cargo clippy --workspace                       # lint
 
 > Always build with `--features cuda` when targeting GPU. Without it, CUDA silently falls back to CPU. The binary will error out if GPU is requested in config but the cuda feature is missing.
 
+## Sanity check before pushing
+
+Run `bash scripts/sanity-check.sh` before `git push` when you've made code changes. Chains `cargo fmt --all -- --check` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace`, in that order, stopping on the first failure. Pass `--fast` to skip tests (CI runs them) when you just want the fmt/clippy gate.
+
+The "fmt then edit then forget to re-fmt" class of break is real (commit `a43c51d` is its monument); `cargo fmt --all` applies changes in place, but `cargo fmt --all -- --check` only reports the diff and exits nonzero — CI runs the latter. Using the script means you catch it locally.
+
 ## Crate map
 
 | Crate | Role | Depends on |
