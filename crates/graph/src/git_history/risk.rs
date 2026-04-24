@@ -2,8 +2,8 @@
 
 use anyhow::{Context, Result};
 use codesage_protocol::{
-    ClusteredDirectory, CoChangeEntry, CouplingReport, FileCategory, ImpactRequest, ImpactTarget,
-    RiskAssessment, RiskDiffAssessment,
+    ClusteredDirectory, CoChangeEntry, CouplingReport, CycleEntry, FileCategory, ImpactRequest,
+    ImpactTarget, RiskAssessment, RiskDiffAssessment,
 };
 use codesage_storage::Database;
 
@@ -261,6 +261,31 @@ pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiff
         ));
     }
 
+    // Cycles that the patch files participate in. Computed before
+    // directory clustering so the cycle membership is a full list of
+    // repo-relative paths, not cluster stubs. Errors here are
+    // best-effort: failing to compute the SCCs shouldn't kill the
+    // risk report. We log and continue with an empty list.
+    let cycles_touching_patch = match find_cycles_touching(db, file_paths) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "cycle detection failed; omitting cycles_touching_patch");
+            Vec::new()
+        }
+    };
+    if !cycles_touching_patch.is_empty() {
+        let biggest = cycles_touching_patch
+            .iter()
+            .map(|c| c.size)
+            .max()
+            .unwrap_or(0);
+        summary_notes.push(format!(
+            "{} import cycle(s) involve patch files (largest: {} files)",
+            cycles_touching_patch.len(),
+            biggest
+        ));
+    }
+
     let (files, clustered_directories) = cluster_by_directory(files, DIR_CLUSTER_THRESHOLD);
 
     Ok(RiskDiffAssessment {
@@ -274,7 +299,169 @@ pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiff
         hotspot_files,
         summary_notes,
         clustered_directories,
+        cycles_touching_patch,
     })
+}
+
+/// Find strongly-connected components in the file-level import graph
+/// that contain at least one file from `patch_files`. Returns `CycleEntry`
+/// rows sorted by (descending size, then alphabetical) for stable output.
+///
+/// See [`CycleEntry`] docs for the "cycles the patch touches" vs
+/// "cycles the patch introduces" distinction. We do not have a
+/// pre-patch index to diff against, so this returns both.
+fn find_cycles_touching(
+    db: &Database,
+    patch_files: &[String],
+) -> Result<Vec<CycleEntry>> {
+    use std::collections::HashSet;
+
+    let edges = db
+        .enumerate_file_import_edges()
+        .with_context(|| "enumerate_file_import_edges")?;
+    if edges.is_empty() {
+        return Ok(Vec::new());
+    }
+    let patch: HashSet<&str> = patch_files.iter().map(|s| s.as_str()).collect();
+    let components = tarjan_scc(&edges);
+    let mut out: Vec<CycleEntry> = Vec::new();
+    for component in components {
+        // Trivial SCCs (single-node, no self-edge) aren't cycles.
+        if component.len() < 2 {
+            continue;
+        }
+        if !component.iter().any(|f| patch.contains(f.as_str())) {
+            continue;
+        }
+        let max_churn_file = pick_max_churn(db, &component)?;
+        let mut members = component;
+        members.sort();
+        let size = members.len() as u32;
+        out.push(CycleEntry {
+            members,
+            size,
+            max_churn_file,
+        });
+    }
+    // Largest cycles first — most useful for an agent scanning the output.
+    out.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.members.cmp(&b.members)));
+    Ok(out)
+}
+
+/// Return the member with the highest `churn_score` in `git_files`, or
+/// `None` if none of the members have a git history row. Best-effort
+/// heuristic: the most-modified member tends to be the most-crosscut
+/// and is usually the right refactor site to break the cycle.
+fn pick_max_churn(db: &Database, members: &[String]) -> Result<Option<String>> {
+    let mut best: Option<(f64, String)> = None;
+    for m in members {
+        if let Some(row) = db.git_file(m)? {
+            match &best {
+                Some((score, _)) if row.churn_score <= *score => {}
+                _ => best = Some((row.churn_score, m.clone())),
+            }
+        }
+    }
+    Ok(best.map(|(_, f)| f))
+}
+
+/// Iterative Tarjan's strongly-connected-components algorithm.
+///
+/// Standard recursive Tarjan risks a stack overflow on deep import
+/// chains (php-src has some really deep include webs). The iterative
+/// form is marginally more code but bounded in stack usage by the
+/// explicit work-queue size.
+///
+/// Input: edge list `(from, to)`. Output: list of SCCs, each a `Vec<String>`
+/// of node names. Nodes not in any edge are omitted (they can't be part
+/// of a multi-node cycle). Order within each SCC matches finish-order
+/// from the DFS; callers that need stable output should sort.
+fn tarjan_scc(edges: &[(String, String)]) -> Vec<Vec<String>> {
+    use std::collections::HashMap;
+
+    // Build adjacency and a stable node list (0-indexed).
+    let mut idx_of: HashMap<&str, usize> = HashMap::new();
+    let mut nodes: Vec<&str> = Vec::new();
+    for (a, b) in edges {
+        for n in [a.as_str(), b.as_str()] {
+            if !idx_of.contains_key(n) {
+                idx_of.insert(n, nodes.len());
+                nodes.push(n);
+            }
+        }
+    }
+    let n = nodes.len();
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (a, b) in edges {
+        let u = idx_of[a.as_str()];
+        let v = idx_of[b.as_str()];
+        adj[u].push(v);
+    }
+
+    // Tarjan state.
+    const UNVISITED: i32 = -1;
+    let mut index_counter: i32 = 0;
+    let mut index: Vec<i32> = vec![UNVISITED; n];
+    let mut lowlink: Vec<i32> = vec![0; n];
+    let mut on_stack: Vec<bool> = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut components: Vec<Vec<String>> = Vec::new();
+
+    // Work queue entries: (node, next-child-index-to-visit). The second
+    // element encodes "how far through adj[node] we've gotten" so we can
+    // resume after a recursive descent without the actual call stack.
+    for start in 0..n {
+        if index[start] != UNVISITED {
+            continue;
+        }
+        let mut work: Vec<(usize, usize)> = Vec::new();
+        // Visit `start`.
+        index[start] = index_counter;
+        lowlink[start] = index_counter;
+        index_counter += 1;
+        stack.push(start);
+        on_stack[start] = true;
+        work.push((start, 0));
+
+        while let Some(&(v, i)) = work.last() {
+            if i < adj[v].len() {
+                let w = adj[v][i];
+                // Advance the parent's child cursor before descending so that
+                // when we pop back we continue from the next child.
+                work.last_mut().unwrap().1 = i + 1;
+                if index[w] == UNVISITED {
+                    index[w] = index_counter;
+                    lowlink[w] = index_counter;
+                    index_counter += 1;
+                    stack.push(w);
+                    on_stack[w] = true;
+                    work.push((w, 0));
+                } else if on_stack[w] {
+                    lowlink[v] = lowlink[v].min(index[w]);
+                }
+            } else {
+                // All children visited. If v is an SCC root, pop off the
+                // component. Otherwise propagate its lowlink to the parent.
+                if lowlink[v] == index[v] {
+                    let mut component: Vec<String> = Vec::new();
+                    loop {
+                        let w = stack.pop().expect("stack underflow");
+                        on_stack[w] = false;
+                        component.push(nodes[w].to_string());
+                        if w == v {
+                            break;
+                        }
+                    }
+                    components.push(component);
+                }
+                work.pop();
+                if let Some(&(parent, _)) = work.last() {
+                    lowlink[parent] = lowlink[parent].min(lowlink[v]);
+                }
+            }
+        }
+    }
+    components
 }
 
 /// When a patch touches at least this many files in a single directory, the

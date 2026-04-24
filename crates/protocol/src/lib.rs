@@ -509,6 +509,35 @@ pub struct RiskDiffAssessment {
     /// working without changes).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub clustered_directories: Vec<ClusteredDirectory>,
+    /// Strongly-connected components in the file-level import graph that
+    /// include at least one file from the patch. See [`CycleEntry`] docs
+    /// for the "touches a cycle vs. introduces a cycle" distinction.
+    /// Empty when no cycle overlaps the patch file set.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub cycles_touching_patch: Vec<CycleEntry>,
+}
+
+/// A strongly-connected component in the file-level import graph that
+/// contains at least one file from a patch. Reported by `assess_risk_diff`
+/// as `cycles_touching_patch` when any member of the patch participates
+/// in a cycle. Members are mutually reachable through `import`,
+/// `include`, `inheritance`, or `trait_use` references — i.e. they can't
+/// be compiled / type-checked / loaded independently. `max_churn_file`
+/// is a heuristic pointer at the best refactor target: the historically
+/// most-modified file usually accumulates the most cross-cutting
+/// dependencies and extracting it tends to break the cycle.
+///
+/// Honest caveat: we do not compute "cycles newly introduced by the
+/// patch". We report cycles that *include* a patch file, some of which
+/// are pre-existing. Agents should frame PR guidance as "this patch
+/// touches an existing cycle" unless they can confirm the cycle didn't
+/// exist on the base branch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CycleEntry {
+    pub members: Vec<String>,
+    pub size: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_churn_file: Option<String>,
 }
 
 /// A directory that contributed ≥5 files to a patch. The top-3 files by

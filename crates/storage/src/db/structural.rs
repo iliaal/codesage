@@ -239,6 +239,36 @@ impl Database {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// All distinct file → file import edges across the whole index.
+    ///
+    /// An edge `(a, b)` exists when file `a` has at least one `ref` of
+    /// kind `import` / `include` / `inheritance` / `trait_use` whose
+    /// `to_name` matches a symbol defined in file `b` (by short name or
+    /// by qualified name — PHP fully-qualified, Python dotted, Rust
+    /// path-style all land in `qualified_name`). Self-edges excluded.
+    ///
+    /// Used by the cycle-detection pass in `assess_risk_diff` and kept
+    /// as a standalone method so other consumers (future RFC'd cross-repo
+    /// graph merge, for instance) can reuse it. Scales with the refs
+    /// table size: a typical mid-size TS project (~13k refs, ~1300 files)
+    /// returns in tens of ms on a warm cache.
+    pub fn enumerate_file_import_edges(&self) -> Result<Vec<(String, String)>> {
+        let sql = r#"
+            SELECT DISTINCT f_from.path, f_to.path
+            FROM refs r
+            JOIN files f_from ON r.from_file_id = f_from.id
+            JOIN symbols s ON (s.name = r.to_name OR s.qualified_name = r.to_name)
+            JOIN files f_to ON s.file_id = f_to.id
+            WHERE r.kind IN ('import', 'include', 'inheritance', 'trait_use')
+              AND f_from.path <> f_to.path
+        "#;
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn list_file_dependencies(&self, file_path: &str) -> Result<DependencyEntry> {
         let mut imports_stmt = self.conn.prepare(
             "SELECT DISTINCT r.to_name

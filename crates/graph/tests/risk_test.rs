@@ -381,6 +381,149 @@ fn risk_diff_summary_includes_max_score_warning_when_high() {
     );
 }
 
+// ----- assess_risk_diff: cycles_touching_patch -----
+
+#[test]
+fn risk_diff_finds_two_file_cycle_touching_patch() {
+    // A uses Repository (defined in B); B uses Controller (defined in A).
+    // The structural indexer turns that into a file-level A <-> B cycle.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("A.php"),
+        b"<?php\nnamespace App;\nuse App\\Repository;\nclass Controller { public function x(Repository $r) { return $r->y(); } }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("B.php"),
+        b"<?php\nnamespace App;\nuse App\\Controller;\nclass Repository { public function y(Controller $c) { return $c->x(null); } }\n",
+    )
+    .unwrap();
+    let db = Database::open_in_memory().unwrap();
+    codesage_graph::full_index(root, &db, &[]).unwrap();
+    // Seed enough git_files so the risk pass has a distribution.
+    for f in ["A.php", "B.php"] {
+        db.upsert_git_file(f, 1.0, 0, 5, Some(1_700_000_000))
+            .unwrap();
+    }
+    let r = codesage_graph::assess_risk_diff(&db, &["A.php".to_string()]).unwrap();
+    assert_eq!(
+        r.cycles_touching_patch.len(),
+        1,
+        "expected one cycle, got {:?}",
+        r.cycles_touching_patch
+    );
+    let c = &r.cycles_touching_patch[0];
+    assert_eq!(c.size, 2);
+    assert!(c.members.contains(&"A.php".to_string()));
+    assert!(c.members.contains(&"B.php".to_string()));
+    assert!(
+        r.summary_notes.iter().any(|n| n.contains("import cycle")),
+        "expected import-cycle summary note, got {:?}",
+        r.summary_notes
+    );
+}
+
+#[test]
+fn risk_diff_skips_cycles_not_involving_patch_files() {
+    // A <-> B cycle, but the patch only touches C (which is not in the cycle).
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("A.php"),
+        b"<?php\nnamespace App;\nuse App\\Repository;\nclass Controller { public function x(Repository $r) { return $r->y(); } }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("B.php"),
+        b"<?php\nnamespace App;\nuse App\\Controller;\nclass Repository { public function y(Controller $c) { return $c->x(null); } }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("C.php"),
+        b"<?php\nnamespace App;\nclass Unrelated { public function z() { return 1; } }\n",
+    )
+    .unwrap();
+    let db = Database::open_in_memory().unwrap();
+    codesage_graph::full_index(root, &db, &[]).unwrap();
+    db.upsert_git_file("C.php", 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+    let r = codesage_graph::assess_risk_diff(&db, &["C.php".to_string()]).unwrap();
+    assert!(
+        r.cycles_touching_patch.is_empty(),
+        "cycle exists but doesn't touch C; should not be reported: {:?}",
+        r.cycles_touching_patch
+    );
+    assert!(
+        !r.summary_notes.iter().any(|n| n.contains("import cycle")),
+        "should not mention cycles in summary_notes when none touch the patch"
+    );
+}
+
+#[test]
+fn risk_diff_cycle_pick_max_churn_points_at_hottest_member() {
+    // A <-> B cycle; B has much higher churn. `max_churn_file` should
+    // name B as the refactor target rather than A.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("A.php"),
+        b"<?php\nnamespace App;\nuse App\\Repository;\nclass Controller { public function x(Repository $r) { return $r->y(); } }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("B.php"),
+        b"<?php\nnamespace App;\nuse App\\Controller;\nclass Repository { public function y(Controller $c) { return $c->x(null); } }\n",
+    )
+    .unwrap();
+    let db = Database::open_in_memory().unwrap();
+    codesage_graph::full_index(root, &db, &[]).unwrap();
+    db.upsert_git_file("A.php", 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+    db.upsert_git_file("B.php", 99.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+    let r = codesage_graph::assess_risk_diff(&db, &["A.php".to_string()]).unwrap();
+    assert_eq!(r.cycles_touching_patch.len(), 1);
+    assert_eq!(
+        r.cycles_touching_patch[0].max_churn_file.as_deref(),
+        Some("B.php"),
+        "max_churn_file should name the highest-churn member, got {:?}",
+        r.cycles_touching_patch[0].max_churn_file
+    );
+}
+
+#[test]
+fn risk_diff_no_cycles_in_trivially_acyclic_codebase() {
+    // Linear import chain A -> B -> C, no cycles.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("C.php"),
+        b"<?php\nnamespace App;\nclass Leaf { public function z() { return 1; } }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("B.php"),
+        b"<?php\nnamespace App;\nuse App\\Leaf;\nclass Mid { public function y(Leaf $l) { return $l->z(); } }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("A.php"),
+        b"<?php\nnamespace App;\nuse App\\Mid;\nclass Top { public function x(Mid $m) { return $m->y(null); } }\n",
+    )
+    .unwrap();
+    let db = Database::open_in_memory().unwrap();
+    codesage_graph::full_index(root, &db, &[]).unwrap();
+    db.upsert_git_file("A.php", 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+    let r = codesage_graph::assess_risk_diff(&db, &["A.php".to_string()]).unwrap();
+    assert!(
+        r.cycles_touching_patch.is_empty(),
+        "linear chain has no cycles: {:?}",
+        r.cycles_touching_patch
+    );
+}
+
 // ----- recommend_tests -----
 
 #[test]
