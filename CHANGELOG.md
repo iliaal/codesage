@@ -8,6 +8,11 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ## [Unreleased]
 
+### Added
+
+- `assess_risk_diff` now clusters per-file detail when a patch touches ≥5 files from one directory. The crowded directory's entries move from `files[]` into a new top-level `clustered_directories[]` field (top-3 files by score preserved in full detail, the rest listed by name as `omitted_files`). Rollup arrays (`test_gap_files`, `wide_blast_files`, `fix_heavy_files`, `hotspot_files`) still list every clustered file, so cross-referencing a cluster back to a specific concern still works. Small patches (≤4 files per directory) keep the original flat shape, so agent prompts written against the prior schema keep working without changes. Addresses recommendations doc §1.5 after retrospective session-log analysis measured this as the real cost center (p95 24 KB responses on this tool alone).
+- Stronger MCP tool descriptions for `find_symbol`, `find_references`, and `search` that explicitly say "prefer over Grep for code-symbol lookups" and call out the specific disambiguation failure modes (grep mixing definitions, comments, and string literals). Session-log analysis showed the agent was reflexively reaching for Grep on patterns codesage answers in one call; sharper descriptions are the first intervention.
+
 ### Fixed
 
 - `codesage status` no longer errors with `no such table:` on projects opened without a selected embedding model. Root cause: `cmd_status` opened the DB via `Database::open()` (which leaves `chunk_table` empty) and then called `chunk_count()`, which interpolated the empty table name into its SQL. Status now calls a new `total_chunk_count()` that sums across every vec0 chunk table in the DB — a more useful number anyway, since DBs that have been benchmarked across multiple models carry orphan chunk tables cleanup hasn't dropped. Zero vec tables returns 0 instead of failing.

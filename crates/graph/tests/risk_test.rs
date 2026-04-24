@@ -270,6 +270,100 @@ fn risk_diff_aggregates_max_and_mean_across_files() {
 }
 
 #[test]
+fn risk_diff_clusters_directories_past_threshold() {
+    let (_dir, db) = setup_project();
+    // Seed 6 files in one directory and 2 in another. Only the crowded dir
+    // should cluster; the other keeps per-file detail.
+    let crowded: Vec<String> = (0..6)
+        .map(|i| format!("app/Actions/Foo/File{i}.php"))
+        .collect();
+    for p in &crowded {
+        db.upsert_git_file(p, 2.0, 0, 5, Some(1_700_000_000))
+            .unwrap();
+    }
+    let others = ["app/Http/Other.php".to_string(), "README.md".to_string()];
+    for p in &others {
+        db.upsert_git_file(p, 0.5, 0, 5, Some(1_700_000_000))
+            .unwrap();
+    }
+
+    let mut input = crowded.clone();
+    input.extend_from_slice(&others);
+    let r = codesage_graph::assess_risk_diff(&db, &input).unwrap();
+
+    // Crowded dir collapses; other two files stay verbatim.
+    assert_eq!(r.files.len(), 2, "expected 2 un-clustered files");
+    assert_eq!(
+        r.clustered_directories.len(),
+        1,
+        "expected one cluster for the crowded dir"
+    );
+    let cluster = &r.clustered_directories[0];
+    assert_eq!(cluster.directory, "app/Actions/Foo");
+    assert_eq!(cluster.count, 6);
+    assert_eq!(cluster.top_files.len(), 3, "top-3 preserved in detail");
+    assert_eq!(cluster.omitted_files.len(), 3, "rest listed by name");
+}
+
+#[test]
+fn risk_diff_below_threshold_keeps_flat_shape() {
+    // 4 files in one dir is below the 5-file threshold; shape stays flat so
+    // existing agent prompts that assume `files` holds everything don't
+    // break on typical small patches.
+    let (_dir, db) = setup_project();
+    let files: Vec<String> = (0..4).map(|i| format!("app/Foo/File{i}.php")).collect();
+    for p in &files {
+        db.upsert_git_file(p, 1.0, 0, 5, Some(1_700_000_000))
+            .unwrap();
+    }
+    let r = codesage_graph::assess_risk_diff(&db, &files).unwrap();
+    assert_eq!(r.files.len(), 4);
+    assert!(r.clustered_directories.is_empty());
+}
+
+#[test]
+fn risk_diff_cluster_preserves_rollup_coverage() {
+    // A clustered file that trips a rollup (e.g. hotspot, test_gap) must
+    // still appear in the rollup arrays even though its per-file detail was
+    // omitted. That is how an agent cross-references clusters back to
+    // specific concerns.
+    let (_dir, db) = setup_project();
+    // 5 files in the same dir: one hot, four cool, plus some other repo
+    // files so the hot one actually percentiles.
+    db.upsert_git_file("app/Risk/Hot.php", 100.0, 10, 40, Some(1_700_000_000))
+        .unwrap();
+    for p in [
+        "app/Risk/B.php",
+        "app/Risk/C.php",
+        "app/Risk/D.php",
+        "app/Risk/E.php",
+    ] {
+        db.upsert_git_file(p, 0.1, 0, 5, Some(1_700_000_000))
+            .unwrap();
+    }
+    // A few cool files elsewhere to pull Hot.php's percentile high.
+    for p in ["unrelated_a.php", "unrelated_b.php", "unrelated_c.php"] {
+        db.upsert_git_file(p, 0.05, 0, 5, Some(1_700_000_000))
+            .unwrap();
+    }
+
+    let input = vec![
+        "app/Risk/Hot.php".to_string(),
+        "app/Risk/B.php".to_string(),
+        "app/Risk/C.php".to_string(),
+        "app/Risk/D.php".to_string(),
+        "app/Risk/E.php".to_string(),
+    ];
+    let r = codesage_graph::assess_risk_diff(&db, &input).unwrap();
+
+    assert_eq!(r.clustered_directories.len(), 1);
+    assert!(
+        r.hotspot_files.contains(&"app/Risk/Hot.php".to_string()),
+        "rollup must still list Hot.php even though it was clustered"
+    );
+}
+
+#[test]
 fn risk_diff_summary_includes_max_score_warning_when_high() {
     let (_dir, db) = setup_project();
     db.upsert_git_file("Repository.php", 100.0, 40, 80, Some(1_700_000_000))

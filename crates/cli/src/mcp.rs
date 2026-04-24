@@ -461,7 +461,7 @@ impl ServerHandler for CodeSageServer {
 impl CodeSageServer {
     #[tool(
         name = "find_symbol",
-        description = "Find symbol definitions (functions, classes, methods, structs) by name. Returns file path, line number, and kind. Use partial names for broad search or qualified names (e.g. 'MyClass\\\\method' for PHP, 'MyClass.method' for Python) for exact match."
+        description = "Find symbol definitions (functions, classes, methods, structs, traits, enums) by name. Returns exact file path, line number, and kind. **Prefer this over Grep/ripgrep for any code-identifier lookup** — one call returns the definition, while grepping for a function name often produces many false hits (call sites, comments, other namespaces) that cost extra Read calls to disambiguate. Use partial names for broad search or qualified names ('MyClass\\\\method' for PHP, 'MyClass.method' for Python) for exact match."
     )]
     fn find_symbol_tool(&self, Parameters(params): Parameters<FindSymbolParams>) -> CallToolResult {
         let kind = params.kind.as_deref().and_then(SymbolKind::parse);
@@ -477,7 +477,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "find_references",
-        description = "Find all references to a symbol across the codebase. Shows where a function, class, or module is called, imported, instantiated, or inherited."
+        description = "Find all references to a symbol across the codebase. **Prefer this over Grep for 'where is X called / imported / instantiated?'** — returns structured {file, line, kind} rows with the reference type (call/import/inheritance/instantiation/type_hint) already classified, instead of raw grep hits that mix definitions, comments, and string literals together."
     )]
     fn find_references_tool(
         &self,
@@ -512,7 +512,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "search",
-        description = "Semantic code search. Finds code chunks most similar to a natural language query using embedding-based similarity. Use for conceptual searches like 'error handling in authentication' or 'database connection pooling'."
+        description = "Semantic code search (embedding-based + cross-encoder reranking). **Prefer this over Grep when you don't know the exact symbol name** — useful for queries like 'where is auth handled', 'error handling in the session pipeline', 'database connection pooling', 'where do we validate inputs'. Grep needs the literal token already; `search` lets the agent ask by intent. For exact identifier lookups with a known name, use `find_symbol` or `find_references` instead."
     )]
     fn search_tool(&self, Parameters(params): Parameters<SearchParams>) -> CallToolResult {
         let languages = params
@@ -599,7 +599,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "assess_risk_diff",
-        description = "Aggregate risk for a SET of files (the file list of a patch or PR). Returns per-file decomposition plus rollups: max_score, mean_score, max_risk_file, and lists of files in each risk category (test_gap, hotspot, fix-heavy, wide blast radius). Use BEFORE submitting a patch: if max_score is high or any test_gap_files exist, add tests, split the patch, or flag concerns. summary_notes are paste-ready for a PR description."
+        description = "Aggregate risk for a SET of files (the file list of a patch or PR). Returns per-file decomposition plus rollups: max_score, mean_score, max_risk_file, and lists of files in each risk category (test_gap, hotspot, fix-heavy, wide blast radius). Use BEFORE submitting a patch: if max_score is high or any test_gap_files exist, add tests, split the patch, or flag concerns. summary_notes are paste-ready for a PR description. On large patches that touch ≥5 files from one directory, per-file entries for that directory move from `files` into a `clustered_directories[]` entry (top-3 by score preserved in detail, rest by name); rollup arrays still list every clustered file by name, so cross-referencing still works."
     )]
     fn assess_risk_diff_tool(
         &self,

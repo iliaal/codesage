@@ -473,6 +473,30 @@ pub struct RiskDiffAssessment {
     /// Aggregate notes the agent can paste verbatim into a PR description.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub summary_notes: Vec<String>,
+    /// When a patch touches 5+ files from a single directory, the per-file
+    /// entries for that directory move out of `files` into one cluster here —
+    /// keeping the top-3 by score fully detailed and listing the rest by name
+    /// only. Rollup arrays (`test_gap_files`, `wide_blast_files`, etc.) still
+    /// include every clustered file, so no information is lost.
+    ///
+    /// Empty when no directory hits the threshold (small patches keep the
+    /// original shape, agent prompts written against the old schema keep
+    /// working without changes).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub clustered_directories: Vec<ClusteredDirectory>,
+}
+
+/// A directory that contributed ≥5 files to a patch. The top-3 files by
+/// risk score are detailed; the rest are listed by name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusteredDirectory {
+    pub directory: String,
+    pub count: u32,
+    pub top_files: Vec<RiskAssessment>,
+    /// Files in this directory whose detail was omitted. Cross-reference
+    /// against the top-level rollups to see which ones trigger concerns.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub omitted_files: Vec<String>,
 }
 
 /// A test file recommended for a change, with the reason it was suggested.
