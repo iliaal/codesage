@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""
+Head-to-head adapter for code-review-graph (tirth8205/code-review-graph).
+
+Mirrors the scorecard shape of `bench/codesage-bench-runner` so the two
+tools can be compared apples-to-apples on the same YAML corpora. Drives
+crg's MCP server over stdio, calls `semantic_search_nodes_tool`, and
+computes miss rate / first-hit rank / recall@5 / recall@10 the same way
+the codesage runner does.
+
+Output format is identical to codesage-bench-runner so diffs and
+quotable one-liners are directly comparable.
+
+Usage:
+  code-review-graph-bench-runner <corpus.yaml> [--limit 10] [--verbose]
+
+Assumes `code-review-graph` CLI is on PATH and the project at
+`corpus["project_root"]` has been built + embedded (run
+`code-review-graph build` then trigger `embed_graph_tool` via MCP, or
+this runner will fail with empty results).
+
+Stdlib + pyyaml. No network. No embedding models in-proc.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    sys.exit("pyyaml required: pip install pyyaml")
+
+
+# ---------------------------------------------------------------------------
+# MCP driver
+# ---------------------------------------------------------------------------
+
+
+class CrgMcpSession:
+    """One MCP stdio session with the code-review-graph server. Keeps the
+    process alive so repeated queries reuse the loaded graph + embeddings
+    — spinning up a fresh `serve` per query would add 10+ seconds of
+    startup cost to each bench case."""
+
+    def __init__(self, cwd: Path) -> None:
+        self._proc = subprocess.Popen(
+            ["code-review-graph", "serve"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            cwd=str(cwd),
+        )
+        self._id = 0
+        self._init()
+
+    def _send(self, obj: dict) -> None:
+        self._proc.stdin.write((json.dumps(obj) + "\n").encode())
+        self._proc.stdin.flush()
+
+    def _recv(self) -> dict | None:
+        while True:
+            line = self._proc.stdout.readline().decode()
+            if not line:
+                return None
+            line = line.strip()
+            if line.startswith("{"):
+                return json.loads(line)
+
+    def _next_id(self) -> int:
+        self._id += 1
+        return self._id
+
+    def _init(self) -> None:
+        self._send({
+            "jsonrpc": "2.0",
+            "id": self._next_id(),
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "crg-bench", "version": "0"},
+            },
+        })
+        self._recv()
+        self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def search(self, query: str, limit: int) -> list[str]:
+        """Call `semantic_search_nodes_tool` and return ranked file paths."""
+        self._send({
+            "jsonrpc": "2.0",
+            "id": self._next_id(),
+            "method": "tools/call",
+            "params": {
+                "name": "semantic_search_nodes_tool",
+                "arguments": {"query": query, "limit": limit},
+            },
+        })
+        resp = self._recv()
+        if not resp or "result" not in resp:
+            return []
+        content = resp["result"].get("content") or []
+        if not content:
+            return []
+        text = content[0].get("text", "")
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return []
+        results = data.get("results") or []
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for r in results:
+            fp = r.get("file_path") or ""
+            if not fp or fp in seen:
+                continue
+            seen.add(fp)
+            ordered.append(fp)
+        return ordered
+
+    def close(self) -> None:
+        try:
+            self._proc.terminate()
+            self._proc.wait(timeout=5)
+        except Exception:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Scoring (mirrors codesage-bench-runner)
+# ---------------------------------------------------------------------------
+
+
+def score_case(expected: list[str], returned: list[str], k_values: list[int]) -> dict:
+    expected_set = set(expected)
+    first_rank = None
+    for i, r in enumerate(returned, start=1):
+        if r in expected_set:
+            first_rank = i
+            break
+    noise_before = (first_rank - 1) if first_rank else len(returned)
+    recalls = {}
+    for k in k_values:
+        topk = set(returned[:k])
+        hits = len(topk & expected_set)
+        recalls[k] = hits / len(expected_set) if expected_set else 0.0
+    return {
+        "first_hit_rank": first_rank,
+        "noise_before_first_hit": noise_before,
+        **{f"recall@{k}": recalls[k] for k in k_values},
+        "returned_count": len(returned),
+    }
+
+
+def percentiles(xs: list[int]) -> tuple[int, int, int, int]:
+    if not xs:
+        return 0, 0, 0, 0
+    s = sorted(xs)
+    return (
+        s[len(s) // 2],
+        s[int(len(s) * 0.95)] if len(s) >= 20 else s[-1],
+        s[int(len(s) * 0.99)] if len(s) >= 100 else s[-1],
+        s[-1],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def crg_version() -> str:
+    try:
+        r = subprocess.run(
+            ["code-review-graph", "--version"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return (r.stdout or r.stderr).strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def project_head_sha(project_root: Path) -> str:
+    r = subprocess.run(
+        ["git", "rev-parse", "--short=12", "HEAD"],
+        cwd=str(project_root), capture_output=True, text=True,
+    )
+    return r.stdout.strip() if r.returncode == 0 else "not-a-git-repo"
+
+
+def project_size(project_root: Path) -> tuple[int, int]:
+    r = subprocess.run(
+        ["git", "ls-files"], cwd=str(project_root), capture_output=True, text=True,
+    )
+    if r.returncode != 0 or not r.stdout:
+        return 0, 0
+    extensions = {".rs", ".py", ".ts", ".tsx", ".js", ".jsx",
+                  ".c", ".h", ".cpp", ".hpp", ".cc", ".cxx",
+                  ".php", ".go", ".rb", ".java", ".kt", ".swift",
+                  ".scala", ".cs"}
+    paths = [project_root / p for p in r.stdout.splitlines() if Path(p).suffix in extensions]
+    files = 0
+    lines = 0
+    for p in paths:
+        try:
+            if p.is_file():
+                with p.open("rb") as f:
+                    lines += sum(1 for _ in f)
+                files += 1
+        except OSError:
+            continue
+    return files, lines
+
+
+def now_iso_utc() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def normalize_path(fp: str, project_root: Path) -> str:
+    """crg returns absolute file paths; our corpora use repo-relative. Strip
+    the project_root prefix so match checks compare apples to apples."""
+    root_str = str(project_root).rstrip("/") + "/"
+    if fp.startswith(root_str):
+        return fp[len(root_str):]
+    return fp
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("corpus", type=Path)
+    ap.add_argument("--limit", type=int, default=10)
+    ap.add_argument("--verbose", "-v", action="store_true")
+    args = ap.parse_args()
+
+    corpus = yaml.safe_load(args.corpus.read_text())
+    project_root = Path(corpus["project_root"]).expanduser().resolve()
+    k_values = corpus.get("scoring", {}).get("k_values", [5, 10])
+    cases = corpus["cases"]
+    if not project_root.exists():
+        sys.exit(f"project_root does not exist: {project_root}")
+
+    version = crg_version()
+    head_sha = project_head_sha(project_root)
+    file_count, line_count = project_size(project_root)
+    run_ts = now_iso_utc()
+
+    # One session, many queries — avoid per-query startup cost.
+    session = CrgMcpSession(project_root)
+    results = []
+    wall_total = 0.0
+    for case in cases:
+        cid = case["id"]
+        query = case["query"]
+        expected = case["expected_files"]
+        t0 = time.time()
+        returned_abs = session.search(query, args.limit)
+        wall_total += (time.time() - t0)
+        returned = [normalize_path(fp, project_root) for fp in returned_abs]
+        scored = score_case(expected, returned, k_values)
+        scored["id"] = cid
+        scored["source"] = case.get("source", "?")
+        scored["returned"] = returned
+        scored["expected"] = expected
+        results.append(scored)
+        if args.verbose:
+            print(f"[{cid}] first_hit={scored['first_hit_rank']} "
+                  f"noise={scored['noise_before_first_hit']} "
+                  f"r@5={scored['recall@5']:.2f} r@10={scored['recall@10']:.2f}",
+                  file=sys.stderr)
+    session.close()
+
+    # Header — same shape as codesage-bench-runner so diffs line up.
+    size_str = f"{file_count:,} files, {line_count:,} LoC" if file_count else "size unknown"
+    case_word = "case" if len(cases) == 1 else "cases"
+    print("# code-review-graph retrieval scorecard")
+    print()
+    print(f"- **Project**: `{project_root}` (HEAD `{head_sha}`, {size_str})")
+    print(f"- **Corpus**: `{args.corpus.name}` — {len(results)} {case_word}, top-{args.limit}, k={k_values}")
+    print(f"- **code-review-graph**: {version}")
+    print(f"- **Retrieval mode**: semantic_search_nodes_tool (hybrid keyword+vector, default config)")
+    print(f"- **Baseline for comparison**: CodeSage (run bench/codesage-bench-runner on the same corpus)")
+    print(f"- **Run at**: {run_ts}")
+    print(f"- **Wall-clock (total, search only)**: {wall_total:.2f}s ({wall_total / max(1, len(results)):.2f}s/case)")
+    print()
+
+    print("## Per-case results")
+    print()
+    print("| id | src | first hit | noise | r@5 | r@10 |")
+    print("|---|---|---:|---:|---:|---:|")
+    for r in results:
+        fh = r["first_hit_rank"] if r["first_hit_rank"] else "MISS"
+        print(f"| {r['id']} | {r['source']} | {fh} | {r['noise_before_first_hit']} "
+              f"| {r['recall@5']:.2f} | {r['recall@10']:.2f} |")
+
+    hits = [r for r in results if r["first_hit_rank"] is not None]
+    miss_rate = 1.0 - len(hits) / len(results) if results else 0.0
+    avg_r5 = sum(r["recall@5"] for r in results) / len(results) if results else 0.0
+    avg_r10 = sum(r["recall@10"] for r in results) / len(results) if results else 0.0
+    median_first = (
+        sorted(r["first_hit_rank"] for r in hits)[len(hits) // 2] if hits else None
+    )
+
+    print()
+    print("## Aggregate")
+    print(f"- **Miss rate (no ground-truth file in top-{args.limit}):** {miss_rate:.0%}")
+    print(f"- **Median first-hit rank (hits only):** {median_first}")
+    print(f"- **Mean recall@5:** {avg_r5:.2f}")
+    print(f"- **Mean recall@10:** {avg_r10:.2f}")
+
+    print()
+    print("## Quotable one-liner")
+    pct = f"{int(round((1 - miss_rate) * 100))}%"
+    median_str = f"median first-hit rank {median_first}" if median_first is not None else "no hits"
+    print(f"> code-review-graph {version} hits {pct} of {len(results)} ground-truth "
+          f"{case_word} on `{project_root.name}` (HEAD `{head_sha}`, {size_str}) via "
+          f"semantic_search_nodes_tool (hybrid keyword+vector), {median_str}, mean recall@10 "
+          f"{avg_r10:.2f}. Wall-clock {wall_total:.1f}s for {len(results)} queries. Run {run_ts}.")
+
+    print()
+    print(f"<!-- METRICS: miss_rate={miss_rate:.4f} "
+          f"median_first={median_first if median_first is not None else 'MISS'} "
+          f"r5={avg_r5:.4f} r10={avg_r10:.4f} cases={len(results)} "
+          f"project={project_root.name} head={head_sha} tool=code-review-graph "
+          f"version={version} wall_total={wall_total:.2f}s run_at={run_ts} -->")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
