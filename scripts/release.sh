@@ -11,6 +11,9 @@
 #   4. Build the release binary with `--features cuda` so Cargo.lock is up to date.
 #   5. Prompt, then commit + tag.
 #   6. Prompt, then push master + tag.
+#   7. Refresh whichever `codesage` is on PATH so the maintainer's local install
+#      jumps to the new version. Skipped silently if no install is found or the
+#      binary path is not writable.
 #
 # The two prompts are deliberate: every hard-to-reverse step stops and asks.
 # Pass `-y` / `--yes` to auto-confirm both prompts when driving the script from
@@ -145,4 +148,28 @@ if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
 else
     echo "Skipped push. Run manually when ready:"
     echo "  git push origin master && git push origin v$VERSION"
+fi
+
+# Refresh the local install if there's already a `codesage` on PATH.
+# The mv-then-cp dance avoids "Text file busy" when an MCP server (or any
+# other long-running `codesage` process) is holding the old binary's inode:
+# the running process keeps the old inode alive until exit, the new binary
+# lands at the original path, and the next session picks it up.
+local_install="$(command -v codesage 2>/dev/null || true)"
+if [[ -n "$local_install" && -w "$local_install" ]]; then
+    backup="${local_install}.old-pre-${VERSION}"
+    echo
+    echo "Refreshing local install at $local_install ..."
+    mv "$local_install" "$backup"
+    cp target/release/codesage "$local_install"
+    rm -f "$backup"
+    installed_version="$("$local_install" --version 2>/dev/null || echo '?')"
+    echo "Local install: $installed_version"
+elif [[ -n "$local_install" ]]; then
+    echo
+    echo "Found $local_install on PATH but it is not writable; skipping local install."
+    echo "Run: cp target/release/codesage $local_install"
+else
+    echo
+    echo "No 'codesage' on PATH; skipping local install."
 fi
