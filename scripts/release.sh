@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Release ceremony for codesage.
 #
-#   scripts/release.sh X.Y.Z
+#   scripts/release.sh [-y|--yes] X.Y.Z
 #
 # Does:
 #   1. Pre-flight checks (on master, clean tree, in sync with origin, tag free)
@@ -13,14 +13,26 @@
 #   6. Prompt, then push master + tag.
 #
 # The two prompts are deliberate: every hard-to-reverse step stops and asks.
+# Pass `-y` / `--yes` to auto-confirm both prompts when driving the script from
+# a non-interactive context (e.g. an agent that has already run the lint/tests
+# gate via `.claude/commands/release.md`).
 # Pre-release lint/tests are the wrapper's job (see `.claude/commands/release.md`).
 
 set -euo pipefail
 
 die() { echo "release: $*" >&2; exit 1; }
 
+ASSUME_YES=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -y|--yes) ASSUME_YES=1; shift ;;
+        -*) die "unknown flag: $1" ;;
+        *) break ;;
+    esac
+done
+
 VERSION="${1:-}"
-[[ -n "$VERSION" ]] || die "usage: scripts/release.sh X.Y.Z"
+[[ -n "$VERSION" ]] || die "usage: scripts/release.sh [-y|--yes] X.Y.Z"
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "version must be X.Y.Z (got: $VERSION)"
 
 ROOT="$(git rev-parse --show-toplevel)"
@@ -100,7 +112,12 @@ echo
 echo "Ready to commit + tag:"
 echo "  commit message: release: v$VERSION"
 echo "  tag:            v$VERSION  (annotated: 'codesage $VERSION')"
-read -r -p "Proceed? [y/N] " ans
+if [[ "$ASSUME_YES" -eq 1 ]]; then
+    echo "Proceed? [y/N] y  (--yes)"
+    ans=y
+else
+    read -r -p "Proceed? [y/N] " ans
+fi
 [[ "$ans" == "y" || "$ans" == "Y" ]] || die "aborted before commit"
 
 git commit -am "release: v$VERSION"
@@ -112,7 +129,12 @@ git --no-pager log -1 --oneline
 git --no-pager tag -v "v$VERSION" 2>/dev/null | head -5 || git --no-pager show "v$VERSION" --no-patch --oneline
 
 echo
-read -r -p "Push master + v$VERSION to origin? [y/N] " ans
+if [[ "$ASSUME_YES" -eq 1 ]]; then
+    echo "Push master + v$VERSION to origin? [y/N] y  (--yes)"
+    ans=y
+else
+    read -r -p "Push master + v$VERSION to origin? [y/N] " ans
+fi
 if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
     git push origin master
     git push origin "v$VERSION"
