@@ -8,6 +8,7 @@ use tree_sitter::{Query, QueryCursor, Tree};
 static PHP_REF_QUERY: &str = include_str!("queries/php_refs.scm");
 static PYTHON_REF_QUERY: &str = include_str!("queries/python_refs.scm");
 static C_REF_QUERY: &str = include_str!("queries/c_refs.scm");
+static CPP_REF_QUERY: &str = include_str!("queries/cpp_refs.scm");
 static RUST_REF_QUERY: &str = include_str!("queries/rust_refs.scm");
 static JS_REF_QUERY: &str = include_str!("queries/javascript_refs.scm");
 static TS_REF_QUERY: &str = include_str!("queries/typescript_refs.scm");
@@ -34,6 +35,8 @@ static PY_REF: LazyLock<RefQuerySpec> =
     LazyLock::new(|| compile_ref_query(tree_sitter_python::LANGUAGE.into(), PYTHON_REF_QUERY));
 static C_REF: LazyLock<RefQuerySpec> =
     LazyLock::new(|| compile_ref_query(tree_sitter_c::LANGUAGE.into(), C_REF_QUERY));
+static CPP_REF: LazyLock<RefQuerySpec> =
+    LazyLock::new(|| compile_ref_query(tree_sitter_cpp::LANGUAGE.into(), CPP_REF_QUERY));
 static RUST_REF: LazyLock<RefQuerySpec> =
     LazyLock::new(|| compile_ref_query(tree_sitter_rust::LANGUAGE.into(), RUST_REF_QUERY));
 static JS_REF: LazyLock<RefQuerySpec> =
@@ -48,6 +51,7 @@ fn ref_query_for(lang: Language) -> &'static RefQuerySpec {
         Language::Php => &PHP_REF,
         Language::Python => &PY_REF,
         Language::C => &C_REF,
+        Language::Cpp => &CPP_REF,
         Language::Rust => &RUST_REF,
         Language::JavaScript => &JS_REF,
         Language::TypeScript => &TS_REF,
@@ -84,6 +88,17 @@ fn c_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
     match pattern_index {
         0 | 1 => Some(ReferenceKind::Include), // preproc_include (system_lib_string, string_literal)
         2 => Some(ReferenceKind::Call),        // call_expression
+        _ => None,
+    }
+}
+
+fn cpp_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
+    match pattern_index {
+        0 | 1 => Some(ReferenceKind::Include),       // preproc_include
+        2..=5 => Some(ReferenceKind::Call), // bare / qualified / member / template-fn calls
+        6..=8 => Some(ReferenceKind::Instantiation), // new T / new ns::T / new T<U>
+        9..=11 => Some(ReferenceKind::Inheritance), // base class clauses
+        12 | 13 => Some(ReferenceKind::Import), // using-declaration
         _ => None,
     }
 }
@@ -125,6 +140,7 @@ pub fn extract_references(
         Language::Php => php_ref_kind,
         Language::Python => python_ref_kind,
         Language::C => c_ref_kind,
+        Language::Cpp => cpp_ref_kind,
         Language::Rust => rust_ref_kind,
         Language::JavaScript => js_ref_kind,
         Language::TypeScript => js_ref_kind, // same ref structure

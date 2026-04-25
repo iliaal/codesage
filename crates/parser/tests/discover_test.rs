@@ -59,6 +59,47 @@ fn discovers_only_supported_languages() {
 }
 
 #[test]
+fn h_files_default_to_c_when_no_cpp_present() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    std::fs::write(root.join("util.c"), "int x;\n").unwrap();
+    std::fs::write(root.join("util.h"), "int x;\n").unwrap();
+
+    let files = discover_files_with_excludes(root, &[]).unwrap();
+    let h = files.iter().find(|f| f.path == "util.h").unwrap();
+    assert_eq!(h.language, Language::C);
+}
+
+#[test]
+fn h_files_route_to_cpp_when_project_has_cpp() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    std::fs::write(root.join("util.h"), "int x;\n").unwrap();
+    std::fs::write(root.join("main.cpp"), "int main(){}\n").unwrap();
+
+    let files = discover_files_with_excludes(root, &[]).unwrap();
+    let h = files.iter().find(|f| f.path == "util.h").unwrap();
+    assert_eq!(h.language, Language::Cpp);
+    let cpp = files.iter().find(|f| f.path == "main.cpp").unwrap();
+    assert_eq!(cpp.language, Language::Cpp);
+}
+
+#[test]
+fn c_files_stay_c_even_in_cpp_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    std::fs::write(root.join("legacy.c"), "int x;\n").unwrap();
+    std::fs::write(root.join("main.cpp"), "int main(){}\n").unwrap();
+
+    let files = discover_files_with_excludes(root, &[]).unwrap();
+    let c = files.iter().find(|f| f.path == "legacy.c").unwrap();
+    assert_eq!(c.language, Language::C);
+}
+
+#[test]
 fn respects_gitignore() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
