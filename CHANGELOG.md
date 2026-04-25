@@ -8,6 +8,8 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-04-25
+
 ### Added
 
 - C++ as a supported language. New `Language::Cpp` variant, `tree-sitter-cpp` dependency, `cpp.scm` symbol query, and `cpp_refs.scm` reference query. Symbol coverage: free functions, in-class methods (declared and defined), out-of-line method definitions (`void Foo::bar() {}` resolved to `Foo::bar`), constructors / destructors, operator overloads (including reference-return forms like `Foo& operator=`), classes / structs / unions, plain enums + `enum class`, typedefs, `using` aliases, C++20 concepts, and `#define` macros. Template-wrapped definitions are captured automatically (the inner definition node still matches its pattern regardless of the `template_declaration` wrapper). Reference coverage: `#include`, bare / qualified / member / template-function calls, `new T` / `new ns::T` / `new T<U>` instantiations, base-class clauses (bare, qualified, and template-typed), and `using` declarations. Qualified names walk enclosing namespaces (including the C++17 `namespace A::B` form). Honest caveat: tree-sitter does not expand macros, so libraries that hide `class`/`namespace` behind project-specific macros (e.g. nlohmann/json's `NLOHMANN_BASIC_JSON_TPL_DECLARATION` and `NLOHMANN_JSON_NAMESPACE_BEGIN`) lose those symbols. The macro turns the surrounding declaration into an `ERROR` node and the structural query finds nothing. File source recognition: `.cpp`, `.cc`, `.cxx`, `.c++`, `.cppm`, `.ixx`, `.hpp`, `.hh`, `.hxx`, `.h++`, `.tpp`, `.ipp` are always C++. `.h` defaults to C; the discovery layer auto-flips it to C++ for any project that also contains an unambiguous C++ extension (no config knob). `.c` always stays C, even in a C++ project.
@@ -32,6 +34,8 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 - Bumped transitive `openssl` crate to 0.10.78 (from 0.10.77) to pick up fixes for CVE-2026-41676, CVE-2026-41677, CVE-2026-41678, CVE-2026-41681, and GHSA-hppc-g8h3-xhp3. Four of the five are high-severity memory-safety bugs in rust-openssl callbacks and AES key wrap. CodeSage pulls `openssl` transitively via `native-tls` (used by `hf-hub` for model downloads and `ort-sys` at build time), so the exposure is limited to TLS paths exercised during model fetches, but the bump is cheap and closes the Dependabot alerts.
 - Bumped transitive `rustls-webpki` to 0.103.13 (from 0.103.12) for RUSTSEC-2026-0104 (reachable panic in CRL parsing). Pulled via `rustls` → `ureq` / `hyper-rustls` / `tokio-rustls` on the same model-download and reqwest paths. Clears the scheduled `cargo audit` workflow failure.
+
+[0.4.5]: https://github.com/iliaal/codesage/releases/tag/v0.4.5
 
 ## [0.4.0] - 2026-04-16
 
