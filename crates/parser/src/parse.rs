@@ -9,6 +9,7 @@ pub fn parse_file(source: &[u8], language: Language) -> Result<Tree> {
         Language::Php => tree_sitter_php::LANGUAGE_PHP.into(),
         Language::Python => tree_sitter_python::LANGUAGE.into(),
         Language::C => tree_sitter_c::LANGUAGE.into(),
+        Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         Language::Rust => tree_sitter_rust::LANGUAGE.into(),
         Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
         Language::TypeScript => tree_sitter_typescript::LANGUAGE_TSX.into(),

@@ -111,6 +111,95 @@ fn c_qualified_names_are_plain() {
 }
 
 #[test]
+fn cpp_extracts_all_symbol_types() {
+    let syms = symbols_for("sample.cpp", Language::Cpp);
+
+    assert!(has_symbol(&syms, "free_function", SymbolKind::Function));
+    assert!(has_symbol(&syms, "Connection", SymbolKind::Class));
+    assert!(has_symbol(&syms, "Endpoint", SymbolKind::Struct));
+    assert!(has_symbol(&syms, "Tag", SymbolKind::Struct)); // union -> Struct
+    assert!(has_symbol(&syms, "State", SymbolKind::Enum));
+    assert!(has_symbol(&syms, "ulong", SymbolKind::Constant)); // typedef
+    assert!(has_symbol(&syms, "Bytes", SymbolKind::Constant)); // using-alias
+    assert!(has_symbol(&syms, "Hashable", SymbolKind::Constant)); // concept
+    assert!(has_symbol(&syms, "CPP_MAX", SymbolKind::Macro));
+    assert!(has_symbol(&syms, "Buffer", SymbolKind::Class)); // template-wrapped class
+}
+
+#[test]
+fn cpp_methods_inside_class() {
+    let syms = symbols_for("sample.cpp", Language::Cpp);
+
+    // In-class method definitions refined to Method via parent walk.
+    assert!(has_symbol(&syms, "send", SymbolKind::Method));
+    assert!(has_symbol(&syms, "push", SymbolKind::Method));
+    // Out-of-line method defs (`void Foo::bar() {}`) -> Method directly.
+    assert!(has_symbol(&syms, "open", SymbolKind::Method));
+    assert!(has_symbol(&syms, "close", SymbolKind::Method));
+    // Out-of-line template method (`T Buffer<T>::pop() {}`) -> Method.
+    assert!(has_symbol(&syms, "pop", SymbolKind::Method));
+}
+
+#[test]
+fn cpp_constructor_destructor_operator() {
+    let syms = symbols_for("sample.cpp", Language::Cpp);
+
+    // Out-of-line ctor/dtor (Method) -- the in-class declarations have no body
+    // so they don't surface as function_definitions.
+    let ctors: Vec<_> = syms.iter().filter(|s| s.name == "Connection").collect();
+    // One Class + one Method (ctor). Destructor name is `~Connection`.
+    assert!(ctors.iter().any(|s| s.kind == SymbolKind::Method));
+    assert!(has_symbol(&syms, "~Connection", SymbolKind::Method));
+    // Operator overload defined in-class -> Method.
+    let op = syms
+        .iter()
+        .find(|s| s.name == "operator=")
+        .expect("operator= should be captured");
+    assert_eq!(op.kind, SymbolKind::Method);
+}
+
+#[test]
+fn cpp_qualified_names_with_namespace() {
+    let syms = symbols_for("sample.cpp", Language::Cpp);
+
+    // Free function inside `namespace app { namespace net { ... } }`.
+    let ff = syms
+        .iter()
+        .find(|s| s.name == "free_function")
+        .expect("free_function symbol");
+    assert_eq!(ff.qualified_name, "app::net::free_function");
+
+    // In-class method definition.
+    let send = syms.iter().find(|s| s.name == "send").expect("send symbol");
+    assert_eq!(send.qualified_name, "app::net::Connection::send");
+
+    // Class symbol carries namespace prefix.
+    let conn_class = syms
+        .iter()
+        .find(|s| s.name == "Connection" && s.kind == SymbolKind::Class)
+        .expect("Connection class");
+    assert_eq!(conn_class.qualified_name, "app::net::Connection");
+
+    // Out-of-line method: captured name `app::net::Connection::open` is used
+    // as-is for qualified_name.
+    let open = syms.iter().find(|s| s.name == "open").expect("open method");
+    assert_eq!(open.qualified_name, "app::net::Connection::open");
+}
+
+#[test]
+fn cpp_line_numbers_are_positive() {
+    let syms = symbols_for("sample.cpp", Language::Cpp);
+    for s in &syms {
+        assert!(s.line_start > 0, "symbol {} has line_start 0", s.name);
+        assert!(
+            s.line_end >= s.line_start,
+            "symbol {} has bad line range",
+            s.name
+        );
+    }
+}
+
+#[test]
 fn rust_extracts_all_symbol_types() {
     let syms = symbols_for("sample.rs", Language::Rust);
 

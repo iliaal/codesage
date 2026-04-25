@@ -8,6 +8,7 @@ use tree_sitter::{Node, Query, QueryCursor, Tree};
 static PHP_QUERY: &str = include_str!("queries/php.scm");
 static PYTHON_QUERY: &str = include_str!("queries/python.scm");
 static C_QUERY: &str = include_str!("queries/c.scm");
+static CPP_QUERY: &str = include_str!("queries/cpp.scm");
 static RUST_QUERY: &str = include_str!("queries/rust.scm");
 static JS_QUERY: &str = include_str!("queries/javascript.scm");
 static TS_QUERY: &str = include_str!("queries/typescript.scm");
@@ -44,6 +45,8 @@ static PY_SYM: LazyLock<SymbolQuerySpec> =
     LazyLock::new(|| compile_symbol_query(tree_sitter_python::LANGUAGE.into(), PYTHON_QUERY));
 static C_SYM: LazyLock<SymbolQuerySpec> =
     LazyLock::new(|| compile_symbol_query(tree_sitter_c::LANGUAGE.into(), C_QUERY));
+static CPP_SYM: LazyLock<SymbolQuerySpec> =
+    LazyLock::new(|| compile_symbol_query(tree_sitter_cpp::LANGUAGE.into(), CPP_QUERY));
 static RUST_SYM: LazyLock<SymbolQuerySpec> =
     LazyLock::new(|| compile_symbol_query(tree_sitter_rust::LANGUAGE.into(), RUST_QUERY));
 static JS_SYM: LazyLock<SymbolQuerySpec> =
@@ -58,6 +61,7 @@ fn symbol_query_for(lang: Language) -> &'static SymbolQuerySpec {
         Language::Php => &PHP_SYM,
         Language::Python => &PY_SYM,
         Language::C => &C_SYM,
+        Language::Cpp => &CPP_SYM,
         Language::Rust => &RUST_SYM,
         Language::JavaScript => &JS_SYM,
         Language::TypeScript => &TS_SYM,
@@ -94,6 +98,28 @@ fn c_kind_map(pattern_index: usize) -> Option<SymbolKind> {
         4 => Some(SymbolKind::Enum),
         5 => Some(SymbolKind::Constant), // typedef
         6 => Some(SymbolKind::Macro),
+        _ => None,
+    }
+}
+
+fn cpp_kind_map(pattern_index: usize) -> Option<SymbolKind> {
+    match pattern_index {
+        // 0..=2 free/in-class function defs (refined to Method when inside a class body).
+        0..=2 => Some(SymbolKind::Function),
+        // 3 out-of-line method def (Foo::bar). Already a Method.
+        3 => Some(SymbolKind::Method),
+        // 4 destructor, 5 operator. Refined to Method when inside a class body, else stay Function.
+        4 | 5 => Some(SymbolKind::Function),
+        6 => Some(SymbolKind::Class),
+        7 => Some(SymbolKind::Struct),
+        8 => Some(SymbolKind::Struct), // union -> Struct (no Union variant)
+        9 => Some(SymbolKind::Enum),
+        10 => Some(SymbolKind::Constant), // typedef
+        11 => Some(SymbolKind::Constant), // using-alias
+        12 => Some(SymbolKind::Constant), // concept (no Concept variant)
+        13 => Some(SymbolKind::Macro),
+        14..=18 => Some(SymbolKind::Method), // in-class declarations (no body)
+        19..=22 => Some(SymbolKind::Function), // in-class definitions (refined to Method)
         _ => None,
     }
 }
@@ -160,6 +186,7 @@ pub fn extract_symbols(
         Language::Php => php_kind_map,
         Language::Python => python_kind_map,
         Language::C => c_kind_map,
+        Language::Cpp => cpp_kind_map,
         Language::Rust => rust_kind_map,
         Language::JavaScript => js_kind_map,
         Language::TypeScript => ts_kind_map,
@@ -203,8 +230,8 @@ pub fn extract_symbols(
             continue;
         }
 
-        let name = name_node.utf8_text(source).unwrap_or("").to_string();
-        if name.is_empty() {
+        let captured_name = name_node.utf8_text(source).unwrap_or("").to_string();
+        if captured_name.is_empty() {
             continue;
         }
 
@@ -214,18 +241,34 @@ pub fn extract_symbols(
 
         let mut kind = kind;
         if kind == SymbolKind::Function
-            && (language == Language::Python || language == Language::Rust)
+            && (language == Language::Python
+                || language == Language::Rust
+                || language == Language::Cpp)
             && is_inside_impl_or_class(&def_node, language)
         {
             kind = SymbolKind::Method;
+        }
+
+        // C++ captures `Foo::bar` for out-of-line methods; the bare `bar` lives
+        // in `name`, the full path in `qualified_name`.
+        let name = if language == Language::Cpp {
+            cpp_bare_name(&captured_name)
+        } else {
+            captured_name.clone()
+        };
+        if name.is_empty() {
+            continue;
         }
 
         if language == Language::Go && kind == SymbolKind::Struct {
             kind = refine_go_type_kind(&def_node);
         }
 
-        let qualified_name =
-            build_qualified_name(&name, kind, &def_node, source, language, &namespace);
+        let qualified_name = if language == Language::Cpp {
+            cpp_qualified_name(&name, &captured_name, kind, &def_node, source)
+        } else {
+            build_qualified_name(&name, kind, &def_node, source, language, &namespace)
+        };
 
         let start = def_node.start_position();
         let end = def_node.end_position();
@@ -265,10 +308,104 @@ fn is_inside_impl_or_class(node: &Node, language: Language) -> bool {
                 return true;
             }
             "impl_item" if language == Language::Rust => return true,
+            "class_specifier" | "struct_specifier" | "union_specifier"
+                if language == Language::Cpp =>
+            {
+                return true;
+            }
             _ => current = parent.parent(),
         }
     }
     false
+}
+
+/// Extract the bare identifier from a captured C++ name.
+///
+/// Most captures already are the bare identifier (e.g. `bar` for an in-class
+/// method, `Foo` for a class). Patterns that capture `qualified_identifier`
+/// (out-of-line `void Foo::bar() {}`) yield `Foo::bar`; this helper returns
+/// `bar` in that case so symbol-name search hits the same way it does for
+/// in-class definitions. Destructors (`~Foo`) and operators (`operator+`) are
+/// returned as-is because the leading marker is part of the conventional
+/// search term.
+fn cpp_bare_name(captured: &str) -> String {
+    captured.rsplit("::").next().unwrap_or(captured).to_string()
+}
+
+/// Walk up from a definition collecting every enclosing C++ namespace name.
+/// Outermost first, joined with `::`. Returns `None` when the def is at file
+/// scope. Handles both `namespace ns { ... }` (single name) and the C++17
+/// `namespace ns1::ns2 { ... }` form (nested_namespace_specifier).
+fn find_cpp_namespace(node: &Node, source: &[u8]) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "namespace_definition"
+            && let Some(name_node) = parent.child_by_field_name("name")
+        {
+            match name_node.kind() {
+                "namespace_identifier" => {
+                    if let Ok(text) = name_node.utf8_text(source) {
+                        parts.push(text.to_string());
+                    }
+                }
+                "nested_namespace_specifier" => {
+                    let mut walker = name_node.walk();
+                    let mut nested_parts: Vec<String> = Vec::new();
+                    for child in name_node.named_children(&mut walker) {
+                        if child.kind() == "namespace_identifier"
+                            && let Ok(text) = child.utf8_text(source)
+                        {
+                            nested_parts.push(text.to_string());
+                        }
+                    }
+                    // nested specifier is left-to-right; we'll reverse the whole
+                    // chain at the end so push as-is.
+                    for part in nested_parts.into_iter().rev() {
+                        parts.push(part);
+                    }
+                }
+                _ => {}
+            }
+        }
+        current = parent.parent();
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        parts.reverse();
+        Some(parts.join("::"))
+    }
+}
+
+/// Build the qualified name for a C++ symbol: `ns1::ns2::Class::member`.
+/// Out-of-line method captures (`Foo::bar`) carry their own scope prefix;
+/// in-class definitions get their class via `find_parent_class_name`.
+fn cpp_qualified_name(
+    bare_name: &str,
+    captured_name: &str,
+    kind: SymbolKind,
+    def_node: &Node,
+    source: &[u8],
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(ns) = find_cpp_namespace(def_node, source) {
+        parts.push(ns);
+    }
+    if captured_name.contains("::") {
+        // Out-of-line definition: the captured text already contains the class
+        // scope (e.g. `Foo::bar`). Use it verbatim instead of walking parents,
+        // since these defs live at namespace scope, not inside the class body.
+        parts.push(captured_name.to_string());
+    } else {
+        if (kind == SymbolKind::Method || kind == SymbolKind::Constant)
+            && let Some(class_name) = find_parent_class_name(def_node, source)
+        {
+            parts.push(class_name.to_string());
+        }
+        parts.push(bare_name.to_string());
+    }
+    parts.join("::")
 }
 
 fn find_parent_class_name<'a>(node: &Node, source: &'a [u8]) -> Option<&'a str> {
@@ -279,7 +416,10 @@ fn find_parent_class_name<'a>(node: &Node, source: &'a [u8]) -> Option<&'a str> 
             | "class_declaration"
             | "trait_declaration"
             | "interface_declaration"
-            | "enum_declaration" => {
+            | "enum_declaration"
+            | "class_specifier"
+            | "struct_specifier"
+            | "union_specifier" => {
                 let name_node = parent.child_by_field_name("name")?;
                 return name_node.utf8_text(source).ok();
             }
@@ -324,6 +464,10 @@ fn build_qualified_name(
             name.to_string()
         }
         Language::C => name.to_string(),
+        // Cpp goes through `cpp_qualified_name` in extract_symbols. This arm
+        // exists only to keep the match exhaustive; the dispatcher never
+        // reaches here for Cpp.
+        Language::Cpp => name.to_string(),
         Language::Rust => {
             if kind == SymbolKind::Method
                 && let Some(type_name) = find_parent_class_name(def_node, source)

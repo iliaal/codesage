@@ -1,11 +1,11 @@
 use std::path::Path;
 
 use anyhow::Result;
-use codesage_protocol::FileInfo;
+use codesage_protocol::{FileInfo, Language};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use sha2::{Digest, Sha256};
 
-use crate::detect::detect_language;
+use crate::detect::{detect_language_with_dialect, is_unambiguous_cpp_extension};
 
 pub fn build_exclude_set(patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
@@ -31,6 +31,14 @@ pub fn discover_files_with_excludes(
         .git_ignore(true)
         .build();
 
+    // First pass: collect every relevant file with a tentative language. We
+    // tentatively treat `.h` as C; a second pass flips `.h` to C++ when the
+    // project also contains an unambiguous C++ extension. This single-walk
+    // structure keeps FS pressure flat while still letting header routing
+    // be project-aware.
+    let mut saw_cpp = false;
+    let mut h_file_indices = Vec::new();
+
     for entry in walker {
         let entry = entry?;
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
@@ -38,7 +46,7 @@ pub fn discover_files_with_excludes(
         }
 
         let path = entry.path();
-        let Some(language) = detect_language(path) else {
+        let Some(language) = detect_language_with_dialect(path, false) else {
             continue;
         };
 
@@ -54,6 +62,14 @@ pub fn discover_files_with_excludes(
             continue;
         }
 
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if is_unambiguous_cpp_extension(ext) {
+            saw_cpp = true;
+        }
+        if ext == "h" {
+            h_file_indices.push(files.len());
+        }
+
         let content = std::fs::read(path)?;
         let hash = hex::encode(Sha256::digest(&content));
 
@@ -62,6 +78,12 @@ pub fn discover_files_with_excludes(
             language,
             content_hash: hash,
         });
+    }
+
+    if saw_cpp {
+        for idx in h_file_indices {
+            files[idx].language = Language::Cpp;
+        }
     }
 
     files.sort_by(|a, b| a.path.cmp(&b.path));

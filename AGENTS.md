@@ -113,7 +113,9 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps are backward
 
 ## Languages
 
-PHP, Python, C, Rust, JavaScript, TypeScript, Go.
+PHP, Python, C, C++, Rust, JavaScript, TypeScript, Go.
+
+`.h` files default to C. The discovery layer auto-flips them to C++ for any project that also contains an unambiguous C++ extension (`.cpp`, `.cc`, `.cxx`, `.hpp`, etc.). `.c` always stays C. No config knob — if you need to override on a project that mixes both styles awkwardly, raise an issue.
 
 ## MCP tools
 
