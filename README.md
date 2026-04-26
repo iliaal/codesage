@@ -7,9 +7,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Follow @iliaa](https://img.shields.io/badge/Follow-@iliaa-000000?style=flat&logo=x&logoColor=white)](https://x.com/intent/follow?screen_name=iliaa)
 
-CodeSage is a code intelligence engine for AI coding agents. It combines structural graph queries (symbols, references, dependencies) and semantic search (embedding retrieval with cross-encoder reranking) in a single Rust binary, usable as a CLI or over MCP.
+![CodeSage: structural and semantic code intelligence for AI agents](images/codesage-hero.jpg)
 
-## What you can do with it
+CodeSage is a code intelligence engine for AI coding agents. It combines structural graph queries (symbols, references, dependencies) and semantic search (embedding retrieval with cross-encoder reranking) in a single Rust binary, usable as a CLI or over MCP. Eight languages today (PHP, Python, C, C++, Rust, JavaScript, TypeScript, Go), ~250ms median query latency, ~50K-LoC PHP repos indexed in seconds.
+
+## 🔍 What you can do with it
 
 - Find code by natural-language query: "where does auth happen?", "error handling in the GC".
 - Look up symbol definitions by name across a codebase.
@@ -30,7 +32,7 @@ CodeSage ships as one static Rust binary plus a local SQLite database under `.co
 
 The trade-off: CUDA-accelerated embeddings need the `nvidia-*-cu12` pip packages on the host (see [CUDA setup](#cuda-setup) below). In exchange, install once, run everywhere, no orchestration layer, no systemd unit to manage. Tools in the same category that take the other side of this trade (SocratiCode with managed Qdrant + Ollama, GitNexus with external Qdrant) are valid for different user profiles. If your team already runs Docker Compose for everything, use those. If you want `cargo install` and `codesage init` and nothing else to debug, use CodeSage.
 
-## Benchmarks
+## 📊 Benchmarks
 
 Ground-truth retrieval on git-mined corpora, 30 cases per repo, `search` top-10:
 
@@ -50,7 +52,7 @@ The nest gap is architectural: CodeSage embeds chunks (~50-line regions), code-r
 
 Run yourself with `bench/codesage-bench-runner <corpus.yaml>` (corpus format: `project_root` + `cases` list of `{id, query, expected_files}`). Scorecards from these runs live under `bench/history/`; corpora are not bundled so private-repo names don't leak by accident. Not a statement about every workload; bring your own corpus for your codebase.
 
-## Getting started
+## 🚀 Getting started
 
 ```bash
 # Build with GPU support
@@ -95,7 +97,7 @@ codesage install-hooks
 codesage doctor
 ```
 
-## Recipes
+## ⚙️ Recipes
 
 Common pipelines using `codesage` with `git`. Each is one shell line and how to read the output.
 
@@ -141,7 +143,7 @@ codesage coupling path/to/file.rs --limit 5
 
 When you're about to dive into one specific file. Risk score, suggested tests, and what historically co-changes calibrate caution before you start editing.
 
-## Claude Code plugin
+## 🔌 Claude Code plugin
 
 `plugins/codesage-tools/` wraps everything above into one command per task. The marketplace manifest lives at the repo root.
 
@@ -214,7 +216,7 @@ exclude_patterns = [
 
 Models download from HuggingFace the first time you use them.
 
-## Architecture
+## 🏗️ Architecture
 
 A Rust workspace with six crates:
 
@@ -257,7 +259,7 @@ Storage is a single SQLite database per project at `.codesage/index.db`: structu
 
 Corpora aren't bundled. Bring your own, or point the plugin at `$CODESAGE_BENCH_CORPUS_DIR`.
 
-## Known limitations
+## ⚠️ Known limitations
 
 Honest inventory of what CodeSage does not do well, measured on our canary corpora and from 30 days of real Claude Code session logs (the harness in `bench/analyze-codesage-quality.py` produces the same numbers locally).
 
@@ -270,6 +272,10 @@ Honest inventory of what CodeSage does not do well, measured on our canary corpo
 **MCP tool-selection rate is low today.** When CodeSage MCP tools are available in a Claude Code session alongside `Grep`, the agent picks `Grep` on code-identifier queries: 1.1% CodeSage-pick rate over 30 days of sessions, 0/10 on a controlled active harness. We sharpened tool descriptions and per-project CLAUDE.md guidance to call this out; the next measurement cycle will show whether the intervention landed. For a hook-level workaround today, see the LSP enforcement kit in the [Complementary tools](#complementary-tools) section.
 
 **`find_coupling` returns empty on young files.** Measured 59% empty-response rate in real usage. Each empty result now carries a `note` field (`"no commits tracked"`, `"below min-count=3 threshold"`, `"path shape mismatch"`) so the agent can tell the cause. The underlying data just doesn't exist for recently-added files; the tool reports that honestly instead of inventing signal.
+
+## 🔗 Pairs with
+
+- **[compound-engineering-plugin](https://github.com/iliaal/compound-engineering-plugin)**: agents, commands, and skills that tell coding agents *how* to work. CodeSage is the intelligence layer (what the code is); compound-engineering-plugin is the discipline layer (how to investigate, review, and ship). Install both for the full stack.
 
 ## Complementary tools
 
@@ -285,3 +291,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). In short: file an issue first, add a tes
 ## License
 
 MIT
+
+---
+
+[Follow @iliaa on X](https://x.com/iliaa) • [Blog](https://ilia.ws) • If this gave your AI agent a real model of your code, ⭐ star it!
