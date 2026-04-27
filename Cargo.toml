@@ -38,7 +38,7 @@ globset = "0.4"
 
 clap = { version = "4", features = ["derive"] }
 
-rmcp = { version = "1.4", features = ["server", "transport-io", "macros"] }
+rmcp = { version = "1.5", features = ["server", "transport-io", "macros"] }
 tokio = { version = "1", features = ["full"] }
 schemars = "1.2"
 
