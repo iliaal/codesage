@@ -69,9 +69,10 @@ pub fn find_coupling(db: &Database, file_path: &str, limit: usize) -> Result<Cou
 /// Risk score for a single file. Composes:
 /// - churn percentile (0..1) — weight 0.35
 /// - fix ratio (fix_count / total_commits, capped at 1.0) — weight 0.20
-/// - dependent file pressure (capped via 20 dependents) — weight 0.15
-/// - coupled file pressure (capped via 10 coupled) — weight 0.15
+/// - dependent file pressure (capped via 20 dependents) — weight 0.10
+/// - coupled file pressure (capped via 10 coupled) — weight 0.10
 /// - test gap (no test among coupled or as adjacent file) — weight 0.15
+/// - cycle membership ((cycle_size - 1) / 4, capped at size 5) — weight 0.10
 ///
 /// Output includes the decomposition so the agent can quote specific signals
 /// in PR descriptions or risk callouts. Empty git history → score=0 with a note.
@@ -126,11 +127,44 @@ pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
     let coup_pressure = (coupled_files as f64 / 10.0).min(1.0);
     let test_gap_term = if test_gap { 1.0 } else { 0.0 };
 
+    // Cycle membership: best-effort. If SCC computation fails (DB-level
+    // edge enumeration error), we log and continue with no cycle data
+    // rather than failing the whole risk call. The structural sensor is
+    // additive to the existing git/coupling signals, not load-bearing.
+    let (in_cycle, cycle_size, cycle_files) = match find_cycles_touching(
+        db,
+        &[file_path.to_string()],
+    ) {
+        Ok(cycles) => match cycles.into_iter().next() {
+            Some(c) => {
+                let others: Vec<String> = c
+                    .members
+                    .iter()
+                    .filter(|m| m.as_str() != file_path)
+                    .cloned()
+                    .collect();
+                (true, c.size, others)
+            }
+            None => (false, 0, Vec::new()),
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, file = %file_path, "cycle detection failed; omitting cycle signal from risk score");
+            (false, 0, Vec::new())
+        }
+    };
+    // (cycle_size - 1) / 4 clamped: 2-file cycle → 0.25, 5+ → 1.0.
+    let cycle_term = if in_cycle {
+        (cycle_size.saturating_sub(1) as f64 / 4.0).min(1.0)
+    } else {
+        0.0
+    };
+
     let score = 0.35 * churn_percentile
         + 0.20 * fix_ratio
-        + 0.15 * dep_pressure
-        + 0.15 * coup_pressure
-        + 0.15 * test_gap_term;
+        + 0.10 * dep_pressure
+        + 0.10 * coup_pressure
+        + 0.15 * test_gap_term
+        + 0.10 * cycle_term;
 
     let mut notes = Vec::new();
     if git.is_none() {
@@ -164,6 +198,27 @@ pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
     if test_gap {
         notes.push("test gap: no obvious test file (sibling or co-changer)".to_string());
     }
+    if in_cycle {
+        // Sample up to 5 other members for the rationale line so the note
+        // stays short on big cycles; the full list is in `cycle_files`.
+        const NOTE_SAMPLE: usize = 5;
+        let sample: Vec<&str> = cycle_files
+            .iter()
+            .take(NOTE_SAMPLE)
+            .map(|s| s.as_str())
+            .collect();
+        let extra = cycle_files.len().saturating_sub(NOTE_SAMPLE);
+        let suffix = if extra > 0 {
+            format!(" (+{extra} more)")
+        } else {
+            String::new()
+        };
+        notes.push(format!(
+            "in import cycle of {} files: {}{suffix}",
+            cycle_size,
+            sample.join(", ")
+        ));
+    }
 
     Ok(RiskAssessment {
         file: file_path.to_string(),
@@ -176,6 +231,9 @@ pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
         dependent_files,
         coupled_files,
         test_gap,
+        in_cycle,
+        cycle_size,
+        cycle_files,
         top_coupled,
         notes,
     })

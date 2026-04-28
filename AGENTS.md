@@ -126,13 +126,14 @@ PHP, Python, C, C++, Rust, JavaScript, TypeScript, Go.
 - `impact_analysis` -- files affected by changing a symbol or file, with distance and reasons
 - `export_context` -- curated code bundle for a query or symbol, optionally with callers/callees
 - `find_coupling` -- files that historically change with a given file (V2b)
-- `assess_risk` -- risk score for a single file (V2b slice 1)
+- `assess_risk` -- risk score for a single file (V2b slice 1; now blends import-cycle membership alongside churn / fix / blast / coupling / test-gap)
 - `assess_risk_diff` -- aggregate risk for a patch / set of files (V2b slice 2)
 - `recommend_tests` -- tests an agent should run after editing a set of files (V2b slice 2)
+- `session_start` / `session_end` -- snapshot structural state at the start of an editing session, diff at the end. Returns `pass: bool` plus new/resolved cycles, per-file risk regressions on the top-50 baseline, and added/removed files.
 
 ## CLI commands
 
-`init`, `index`, `search`, `find-symbol`, `find-references`, `dependencies`, `impact`, `export`, `status`, `mcp`, `install-hooks`, `cleanup`, `git-index`, `coupling`, `risk`, `risk-diff`, `tests-for`, `doctor`.
+`init`, `index`, `search`, `find-symbol`, `find-references`, `dependencies`, `impact`, `export`, `status`, `mcp`, `install-hooks`, `cleanup`, `git-index`, `coupling`, `risk`, `risk-diff`, `tests-for`, `session-start`, `session-end`, `doctor`.
 
 `cleanup` drops orphaned vec tables from previous model switches, keeping only the active model. Use after benchmarking multiple models. Runs VACUUM automatically.
 

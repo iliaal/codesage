@@ -463,6 +463,22 @@ pub struct RiskAssessment {
     pub dependent_files: u32,
     pub coupled_files: u32,
     pub test_gap: bool,
+    /// True when the file participates in a non-trivial import cycle (SCC of
+    /// size ≥ 2 in the file-level import graph). Cycle membership is a strong
+    /// structural signal that a change here can ripple unexpectedly through
+    /// the cycle's other members; included as a 0.10-weighted input to `score`.
+    #[serde(default)]
+    pub in_cycle: bool,
+    /// Number of files in the SCC this file belongs to (including this file).
+    /// Zero when `in_cycle` is false. Larger cycles get a larger contribution
+    /// to `score`, capped at size 5.
+    #[serde(default)]
+    pub cycle_size: u32,
+    /// Other members of the import cycle (excluding this file), so the agent
+    /// can name them in PR descriptions or follow up to assess whether the
+    /// cycle should be broken. Empty when `in_cycle` is false.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub cycle_files: Vec<String>,
     /// Top co-changers, useful for the agent to know which tests/files to also touch.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub top_coupled: Vec<CoChangeEntry>,
@@ -582,6 +598,105 @@ pub struct TestRecommendations {
     /// Human-readable rationale.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub notes: Vec<String>,
+}
+
+/// One file in `SessionSnapshot.top_risk_files`. Captured at session start
+/// so `session_end` can compute per-file risk-score deltas without needing
+/// to re-derive the snapshot's risk inputs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRiskEntry {
+    pub file: String,
+    pub score: f64,
+}
+
+/// Snapshot of repo structural state captured at `session_start`. Persisted
+/// as JSON under `.codesage/sessions/<session_id>.json` and consumed by the
+/// matching `session_end` call to compute a `SessionDiff`. The snapshot is
+/// intentionally compact (no per-symbol detail) so even large monorepos
+/// produce ≤ a few MB per session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSnapshot {
+    pub session_id: String,
+    /// Unix epoch seconds.
+    pub created_at: i64,
+    pub file_count: u32,
+    pub symbol_count: u32,
+    /// Sorted full list of indexed file paths. Required to detect new /
+    /// removed files in the diff. On a 10k-file repo this serializes to
+    /// ~500 KB; sessions GC is deferred to a follow-up.
+    pub files: Vec<String>,
+    /// Cycles in the file-level import graph. Each inner Vec is sorted;
+    /// the outer Vec is sorted by (descending size, members) for stable
+    /// equality across snapshot/recompute cycles.
+    pub cycles: Vec<Vec<String>>,
+    /// Top-N highest-risk files at snapshot time. Used as the baseline set
+    /// for `risk_regressions` in the diff. Files outside this set don't
+    /// get a per-file risk delta even if their risk goes up — keeps the
+    /// snapshot bounded on big repos.
+    pub top_risk_files: Vec<SessionRiskEntry>,
+    /// Best-effort `git rev-parse HEAD` at snapshot time. None when not in
+    /// a git repo or git isn't on PATH.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_head: Option<String>,
+}
+
+/// Per-file risk regression observed between `session_start` and `session_end`.
+/// Only emitted for files that appeared in `SessionSnapshot.top_risk_files`
+/// (the baseline set) and whose risk score went up by at least 0.05.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRiskRegression {
+    pub file: String,
+    pub before: f64,
+    pub after: f64,
+    pub delta: f64,
+}
+
+/// Diff between a `SessionSnapshot` and the current state of the repo,
+/// returned by `session_end`. The headline `pass` flag closes the loop: an
+/// agent that calls session_start before edits and session_end after sees
+/// `pass=false` when its work introduced cycles or regressed top-risk
+/// files materially.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionDiff {
+    pub session_id: String,
+    /// Wall-clock seconds between snapshot creation and diff computation.
+    pub duration_seconds: i64,
+    /// Pass when no new cycles were introduced AND no top-risk file
+    /// regressed by ≥ 0.10. Conservative; tune after running on real
+    /// session traces.
+    pub pass: bool,
+    pub file_count_before: u32,
+    pub file_count_after: u32,
+    pub symbol_count_before: u32,
+    pub symbol_count_after: u32,
+    /// Files indexed at session_end that were not in the snapshot.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub new_files: Vec<String>,
+    /// Files in the snapshot that are not in the index at session_end.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub removed_files: Vec<String>,
+    /// Cycles that exist now and didn't at snapshot time. Each inner Vec
+    /// is the sorted member list. Single new cycle is enough to fail.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub new_cycles: Vec<Vec<String>>,
+    /// Cycles that existed at snapshot time and don't now (broken by
+    /// the agent's edits). Reported for completeness; doesn't affect pass.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub resolved_cycles: Vec<Vec<String>>,
+    /// Per-file risk-score regressions (delta ≥ 0.05) for files in the
+    /// snapshot's top-risk baseline.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub risk_regressions: Vec<SessionRiskRegression>,
+    /// Largest delta in `risk_regressions`. Zero when none.
+    pub max_risk_regression: f64,
+    /// Aggregate notes the agent can paste into a PR description or a
+    /// session-end report.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub summary_notes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_head_before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_head_after: Option<String>,
 }
 
 /// Stats from a git history indexing pass. Mirrors IndexStats shape.

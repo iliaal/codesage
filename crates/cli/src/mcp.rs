@@ -8,7 +8,7 @@ use codesage_embed::model::Embedder;
 use codesage_embed::reranker::Reranker;
 use codesage_graph::{
     assess_risk, assess_risk_diff, export_context, find_coupling, find_references, find_symbol,
-    impact_analysis, list_dependencies, recommend_tests, search,
+    impact_analysis, list_dependencies, recommend_tests, search, session_end, session_start,
 };
 use codesage_protocol::{
     ExportRequest, FindReferencesRequest, FindSymbolRequest, ImpactRequest, ImpactTarget, Language,
@@ -130,6 +130,16 @@ pub struct TestsForParams {
     pub project: String,
     #[schemars(description = "Repo-relative file paths whose tests should be recommended")]
     pub file_paths: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SessionParams {
+    #[schemars(description = PROJECT_ARG_DESC)]
+    pub project: String,
+    #[schemars(
+        description = "Session identifier (alphanumerics, '-', '_', '.', max 128 chars). Use the same id for the matching session_start and session_end. Defaults to \"default\" when omitted."
+    )]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -328,6 +338,24 @@ impl CodeSageServer {
         let state = self.resolve_project(project)?;
         let db = self.open_db_for(&state)?;
         f(&db)
+    }
+
+    /// Variant of `with_project_db` that also passes the canonical project
+    /// root path. Used by tools like `session_start` that need to write
+    /// alongside `.codesage/index.db` (e.g. `.codesage/sessions/<id>.json`).
+    fn with_project_root_db<F, R>(&self, project: &str, f: F) -> Result<R>
+    where
+        F: FnOnce(&Path, &Database) -> Result<R>,
+    {
+        let state = self.resolve_project(project)?;
+        let db = self.open_db_for(&state)?;
+        // db_path = <project_root>/.codesage/index.db; pop twice to recover root.
+        let root = state
+            .db_path
+            .parent()
+            .and_then(|p| p.parent())
+            .ok_or_else(|| anyhow::anyhow!("could not derive project root from db path"))?;
+        f(root, &db)
     }
 
     /// Same as `with_project_db` but also acquires the project's embedder and
@@ -630,7 +658,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "assess_risk",
-        description = "Risk score for changing a file: combines churn percentile, fix ratio, blast radius (depth-2 reverse deps), historical coupling, and a test-gap signal. Output includes the decomposition and human-readable notes you can quote in PR descriptions or risk callouts. Use BEFORE writing a patch to calibrate caution and BEFORE submitting to flag concerns."
+        description = "Risk score for changing a file: combines churn percentile, fix ratio, blast radius (depth-2 reverse deps), historical coupling, a test-gap signal, and import-cycle membership. Response carries `in_cycle` / `cycle_size` / `cycle_files` so the agent can name the other members of the cycle. Output includes the decomposition and human-readable notes you can quote in PR descriptions or risk callouts. Use BEFORE writing a patch to calibrate caution and BEFORE submitting to flag concerns."
     )]
     fn assess_risk_tool(&self, Parameters(params): Parameters<RiskParams>) -> CallToolResult {
         let file_path = params.file_path.clone();
@@ -667,6 +695,40 @@ impl CodeSageServer {
         render_with_kind(
             self.with_project_db(&params.project, |db| recommend_tests(db, &file_paths)),
             "recommend_tests",
+        )
+    }
+
+    #[tool(
+        name = "session_start",
+        description = "Snapshot the project's structural state at the START of an editing session. Persists file count, symbol count, the full file list, all import cycles, and the top-50 highest-risk files (with their scores) to `.codesage/sessions/<session_id>.json`. Pair with `session_end` using the same `session_id` to detect new cycles, removed/added files, or risk regressions on hot files introduced during the session. `session_id` defaults to \"default\" — use a distinct id when running multiple parallel sessions. Re-running `session_start` overwrites the snapshot (useful for resetting a baseline mid-session)."
+    )]
+    fn session_start_tool(&self, Parameters(params): Parameters<SessionParams>) -> CallToolResult {
+        let session_id = params
+            .session_id
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        render_with_kind(
+            self.with_project_root_db(&params.project, |root, db| {
+                session_start(root, db, &session_id)
+            }),
+            "session_start",
+        )
+    }
+
+    #[tool(
+        name = "session_end",
+        description = "Diff the current structural state against the snapshot saved by `session_start` (matched by `session_id`, default \"default\"). Returns `pass: bool` (true when no new import cycles were introduced AND no top-risk file regressed by ≥ 0.10), plus `new_cycles`, `resolved_cycles`, `risk_regressions` (per-file before/after/delta), `new_files`, `removed_files`, and `summary_notes` ready to paste into a PR description. Errors when the snapshot file is missing — call `session_start` first. Snapshot file is left in place after the diff so the same id can be re-diffed."
+    )]
+    fn session_end_tool(&self, Parameters(params): Parameters<SessionParams>) -> CallToolResult {
+        let session_id = params
+            .session_id
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        render_with_kind(
+            self.with_project_root_db(&params.project, |root, db| {
+                session_end(root, db, &session_id)
+            }),
+            "session_end",
         )
     }
 }

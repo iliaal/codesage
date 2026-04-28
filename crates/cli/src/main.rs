@@ -204,6 +204,29 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Snapshot the project's structural state as a session baseline.
+    /// Persists to .codesage/sessions/<session-id>.json. Pair with
+    /// `session-end` using the same id to detect regressions.
+    SessionStart {
+        /// Session id (alphanumerics, '-', '_', '.', max 128 chars).
+        #[arg(long, default_value = "default")]
+        session_id: String,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Diff the current structural state against a session_start snapshot.
+    /// Reports new cycles, removed/added files, and per-file risk regressions.
+    /// Exits non-zero when the session fails the gate (new cycles or
+    /// max risk regression >= 0.10).
+    SessionEnd {
+        /// Session id matching the prior `session-start`.
+        #[arg(long, default_value = "default")]
+        session_id: String,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn find_project_root() -> Result<PathBuf> {
@@ -334,6 +357,8 @@ fn main() -> Result<()> {
         Commands::Risk { file, json } => cmd_risk(&file, json),
         Commands::RiskDiff { files, json } => cmd_risk_diff(files, json),
         Commands::TestsFor { files, json } => cmd_tests_for(files, json),
+        Commands::SessionStart { session_id, json } => cmd_session_start(&session_id, json),
+        Commands::SessionEnd { session_id, json } => cmd_session_end(&session_id, json),
     }
 }
 
@@ -1001,6 +1026,94 @@ fn cmd_tests_for(files: Vec<String>, json: bool) -> Result<()> {
                 println!("# {n}");
             }
         }
+    }
+    Ok(())
+}
+
+fn cmd_session_start(session_id: &str, json: bool) -> Result<()> {
+    let root = find_project_root()?;
+    let db = open_db(&root)?;
+    let snap = codesage_graph::session_start(&root, &db, session_id)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&snap)?);
+    } else {
+        let snapshot_path = root
+            .join(PROJECT_DIR)
+            .join("sessions")
+            .join(format!("{session_id}.json"));
+        println!("Session baseline saved: {}", snapshot_path.display());
+        println!(
+            "  files={}  symbols={}  cycles={}  top_risk_files={}",
+            snap.file_count,
+            snap.symbol_count,
+            snap.cycles.len(),
+            snap.top_risk_files.len()
+        );
+        if let Some(head) = &snap.git_head {
+            println!("  git HEAD: {head}");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_session_end(session_id: &str, json: bool) -> Result<()> {
+    let root = find_project_root()?;
+    let db = open_db(&root)?;
+    let diff = codesage_graph::session_end(&root, &db, session_id)?;
+    let pass = diff.pass;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&diff)?);
+    } else {
+        let verdict = if diff.pass { "PASS" } else { "FAIL" };
+        println!(
+            "Session {}: {} ({}s)",
+            diff.session_id, verdict, diff.duration_seconds
+        );
+        println!(
+            "  files: {} → {}  ({} added, {} removed)",
+            diff.file_count_before,
+            diff.file_count_after,
+            diff.new_files.len(),
+            diff.removed_files.len(),
+        );
+        println!(
+            "  symbols: {} → {}",
+            diff.symbol_count_before, diff.symbol_count_after
+        );
+        if !diff.new_cycles.is_empty() {
+            println!("  NEW cycles ({}):", diff.new_cycles.len());
+            for c in diff.new_cycles.iter().take(5) {
+                println!("    - {} files: {}", c.len(), c.join(", "));
+            }
+            if diff.new_cycles.len() > 5 {
+                println!("    (+{} more)", diff.new_cycles.len() - 5);
+            }
+        }
+        if !diff.resolved_cycles.is_empty() {
+            println!("  resolved cycles: {}", diff.resolved_cycles.len());
+        }
+        if !diff.risk_regressions.is_empty() {
+            println!(
+                "  risk regressions ({}, max delta {:.2}):",
+                diff.risk_regressions.len(),
+                diff.max_risk_regression
+            );
+            for r in diff.risk_regressions.iter().take(10) {
+                println!(
+                    "    {:>5.2} → {:>5.2}  (Δ{:+.2})  {}",
+                    r.before, r.after, r.delta, r.file
+                );
+            }
+        }
+        if !diff.summary_notes.is_empty() {
+            println!("  Notes:");
+            for n in &diff.summary_notes {
+                println!("    - {n}");
+            }
+        }
+    }
+    if !pass {
+        std::process::exit(1);
     }
     Ok(())
 }

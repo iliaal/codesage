@@ -8,6 +8,14 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ## [Unreleased]
 
+### Added
+
+- `session_start` and `session_end` MCP tools (and matching `codesage session-start` / `codesage session-end` CLI subcommands). `session_start` snapshots the current structural state of the index — file count, symbol count, full file list, all import cycles, and the top-50 highest-risk files with their scores — to `.codesage/sessions/<session_id>.json`. `session_end` reloads that snapshot, recomputes current state, and returns a `SessionDiff`: `pass: bool` (true when no new cycles were introduced AND no top-risk file regressed by ≥ 0.10), `new_cycles` / `resolved_cycles` (each as sorted member lists), `risk_regressions` (per-file before/after/delta for files in the snapshot's top-risk baseline that moved by ≥ 0.05), `new_files` / `removed_files`, file/symbol counts before-and-after, best-effort `git_head_before` / `git_head_after`, and `summary_notes` ready to paste into a PR description. CLI exits non-zero on FAIL so the workflow composes with shell pipelines and `&&`. Session ids are validated (alphanumerics, `-`, `_`, `.`; max 128 chars) so they can't escape the sessions/ directory. Re-running `session_start` overwrites the prior snapshot for that id (resets the baseline mid-session). Pattern borrowed from sentrux's `session_start` / `session_end` tools, reimplemented around CodeSage's existing risk + cycle infrastructure. 6 integration tests cover clean pass, new-cycle fail, resolved-cycle pass, missing-snapshot error, baseline overwrite, and id-validation rejection.
+
+### Changed
+
+- `assess_risk` score now includes import-cycle membership as a sixth signal. New fields on `RiskAssessment`: `in_cycle: bool`, `cycle_size: u32`, `cycle_files: Vec<String>` (other members of the SCC, excluding the file itself). The score blend rebalances to make room for the new term: churn 0.35 (unchanged), fix 0.20 (unchanged), dependents 0.10 (was 0.15), coupling 0.10 (was 0.15), test_gap 0.15 (unchanged), cycle 0.10 (new). Cycle term value: `(cycle_size - 1) / 4` clamped to 1.0, so a 2-file cycle contributes 0.025, a 3-file 0.05, a 4-file 0.075, and 5+ file 0.10. When `in_cycle` is true, a new note like `"in import cycle of 4 files: B.php, C.php, D.php"` joins the existing decomposition notes. Reuses the iterative Tarjan SCC machinery already powering `assess_risk_diff.cycles_touching_patch`, so no new graph code. Donor pattern from sentrux's structural acyclicity metric, reimplemented per-file. Three new tests cover the cycle signal, the no-cycle case, and the score-lift on a quiet file in a cycle; all 34 prior risk tests pass with the rebalanced weights.
+
 ## [0.4.5] - 2026-04-25
 
 ### Added

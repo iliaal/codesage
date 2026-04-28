@@ -381,6 +381,129 @@ fn risk_diff_summary_includes_max_score_warning_when_high() {
     );
 }
 
+// ----- assess_risk: per-file cycle membership -----
+
+#[test]
+fn assess_risk_flags_file_in_two_file_cycle() {
+    // A <-> B cycle. Per-file assess_risk should set in_cycle=true,
+    // cycle_size=2, and list the other member in cycle_files.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("A.php"),
+        b"<?php\nnamespace App;\nuse App\\Repository;\nclass Controller { public function x(Repository $r) { return $r->y(); } }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("B.php"),
+        b"<?php\nnamespace App;\nuse App\\Controller;\nclass Repository { public function y(Controller $c) { return $c->x(null); } }\n",
+    )
+    .unwrap();
+    let db = Database::open_in_memory().unwrap();
+    codesage_graph::full_index(root, &db, &[]).unwrap();
+    db.upsert_git_file("A.php", 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+    db.upsert_git_file("B.php", 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+
+    let r = assess_risk(&db, "A.php").unwrap();
+    assert!(
+        r.in_cycle,
+        "A.php is in the A<->B cycle, in_cycle should be true"
+    );
+    assert_eq!(r.cycle_size, 2);
+    assert_eq!(r.cycle_files, vec!["B.php".to_string()]);
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.contains("in import cycle of 2 files: B.php")),
+        "expected cycle note, got {:?}",
+        r.notes
+    );
+}
+
+#[test]
+fn assess_risk_no_cycle_signal_in_acyclic_codebase() {
+    // Linear A -> B -> C. Touching A: in_cycle should stay false.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("C.php"),
+        b"<?php\nnamespace App;\nclass Leaf { public function z() { return 1; } }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("B.php"),
+        b"<?php\nnamespace App;\nuse App\\Leaf;\nclass Mid { public function y(Leaf $l) { return $l->z(); } }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("A.php"),
+        b"<?php\nnamespace App;\nuse App\\Mid;\nclass Top { public function x(Mid $m) { return $m->y(null); } }\n",
+    )
+    .unwrap();
+    let db = Database::open_in_memory().unwrap();
+    codesage_graph::full_index(root, &db, &[]).unwrap();
+    db.upsert_git_file("A.php", 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+
+    let r = assess_risk(&db, "A.php").unwrap();
+    assert!(!r.in_cycle);
+    assert_eq!(r.cycle_size, 0);
+    assert!(r.cycle_files.is_empty());
+    assert!(
+        !r.notes.iter().any(|n| n.contains("import cycle")),
+        "should not mention cycle when none, got {:?}",
+        r.notes
+    );
+}
+
+#[test]
+fn assess_risk_cycle_term_lifts_score_for_otherwise_quiet_file() {
+    // Two files with no churn, no fix history, no test gap (sibling tests
+    // present), and no other risk inputs — the only signal that should fire
+    // is cycle membership. Score should be small but strictly above the
+    // baseline (0.0) thanks to the 0.10-weighted cycle term.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("A.php"),
+        b"<?php\nnamespace App;\nuse App\\Repository;\nclass Controller { public function x(Repository $r) { return $r->y(); } }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("B.php"),
+        b"<?php\nnamespace App;\nuse App\\Controller;\nclass Repository { public function y(Controller $c) { return $c->x(null); } }\n",
+    )
+    .unwrap();
+    // Sibling test files close the test_gap so test_gap_term doesn't dominate.
+    std::fs::write(root.join("ATest.php"), b"<?php\nclass ATest {}\n").unwrap();
+    std::fs::write(root.join("BTest.php"), b"<?php\nclass BTest {}\n").unwrap();
+    let db = Database::open_in_memory().unwrap();
+    codesage_graph::full_index(root, &db, &[]).unwrap();
+    // Seed sibling tests in git_files so test_sibling_exists picks them up.
+    db.upsert_git_file("ATest.php", 0.1, 0, 1, Some(1_700_000_000))
+        .unwrap();
+    db.upsert_git_file("BTest.php", 0.1, 0, 1, Some(1_700_000_000))
+        .unwrap();
+    db.upsert_git_file("A.php", 0.1, 0, 1, Some(1_700_000_000))
+        .unwrap();
+    db.upsert_git_file("B.php", 0.1, 0, 1, Some(1_700_000_000))
+        .unwrap();
+
+    let r = assess_risk(&db, "A.php").unwrap();
+    assert!(r.in_cycle, "A.php is in cycle");
+    assert!(!r.test_gap, "sibling test seeded, test_gap should be false");
+    // Cycle of size 2 contributes 0.10 * 0.25 = 0.025; churn percentile is
+    // ~0 across uniform churn. We just want to confirm the cycle term moves
+    // the needle above zero.
+    assert!(
+        r.score > 0.0,
+        "cycle membership should lift score above 0, got {}",
+        r.score
+    );
+}
+
 // ----- assess_risk_diff: cycles_touching_patch -----
 
 #[test]

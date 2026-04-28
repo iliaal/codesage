@@ -13,6 +13,7 @@ rayon.workspace = true
 anyhow.workspace = true
 globset.workspace = true
 tracing.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
