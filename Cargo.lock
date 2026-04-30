@@ -350,6 +350,7 @@ dependencies = [
  "cc",
  "codesage-protocol",
  "rusqlite",
+ "tempfile",
 ]
 
 [[package]]

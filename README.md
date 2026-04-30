@@ -22,6 +22,30 @@ CodeSage is a code intelligence engine for AI coding agents. It combines structu
 - Read per-file git history: churn, fix ratio, historical co-change, risk score.
 - Expose all of the above over MCP so Claude Code, Codex, or Cursor can call them.
 
+## Capability summary
+
+Concrete answers to the questions a code-intelligence tool earns its keep on. The axes are the ones the broader ecosystem (GitNexus, SocratiCode, code-review-graph, claude-context, repowise) converges on; the right-hand column is what CodeSage actually ships.
+
+| Capability | CodeSage |
+|---|---|
+| Natural-language semantic search | ✓ MiniLM embeddings + cross-encoder reranker, sub-100 ms warm |
+| Symbol-level lookup (definitions, references, callers/callees, inheritance) | ✓ tree-sitter, 8 languages, exact line/column ranges |
+| File-level dependency mapping (imports / imported-by) | ✓ via `list_dependencies` |
+| Change impact / blast-radius analysis | ✓ via `impact_analysis`, configurable depth, symbol or file target |
+| Call-flow / "who-touches-X" tracing | ✓ via `find_references` + `impact_analysis` composition |
+| Per-file risk score (churn, fix ratio, blast radius, coupling, test gap, cycles) | ✓ via `assess_risk`, six-signal blend |
+| Patch-level risk aggregation (max/mean, hotspots, test-gap files) | ✓ via `assess_risk_diff`; per-file batch via `assess_risk_batch` |
+| Historical co-change / coupling | ✓ via `find_coupling`, decay-weighted with τ=180d |
+| Test-recommendation for a changed file set | ✓ via `recommend_tests`, sibling conventions for 7 frameworks + co-change |
+| Curated context bundle for downstream LLM | ✓ via `export_context`, callers + callees optional |
+| Session-baseline diff (did this session decay the index?) | ✓ via `session_start` / `session_end`, cycle + risk regressions |
+| Cycle / SCC detection in the import graph | ✓ folded into `assess_risk` and `assess_risk_diff.cycles_touching_patch` |
+| Host-agnostic deployment (no Docker, no managed services) | ✓ single static Rust binary + one SQLite file per project |
+| Auto-refresh on commit/merge/checkout/rebase | ✓ git hooks installed by `codesage install-hooks` |
+| Symbol-level edits (rename, move, replace_symbol_body) | — read-only by design; pair with Serena or your editor |
+| Multimodal ingest (images / audio / video / PDFs) | — out of scope, code-intel only |
+| Cross-repo queries | — single-project routing today; on the roadmap, not shipped |
+
 ## Supported languages
 
 PHP, Python, C, C++, Rust, JavaScript, TypeScript, Go.

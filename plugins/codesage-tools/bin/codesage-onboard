@@ -205,10 +205,11 @@ Pass that on every call. The server uses it to route to the right index.
 
 Per-file (slice 1):
 - \`assess_risk\`: BEFORE writing a patch, query risk for the file. Score combines churn, fix ratio, blast radius, coupling, and test gap. Hot+fix-heavy file means smaller patch + broader test sweep. Quote the notes in PR descriptions so reviewers see your calibration.
+- \`assess_risk_batch\`: per-file risk for N files in one call, no aggregation. Use when you have a list of files (impact analysis output, coupling neighbours) and want each individual score — saves per-file MCP round-trips. For patch-level aggregation use \`assess_risk_diff\`.
 - \`find_coupling\`: when planning the test sweep, ask which files have historically changed with the file you're touching. Replaces "consider running tests in X" guesses with named files.
 
 Patch-level (slice 2, added in 0.3.0):
-- \`assess_risk_diff\`: aggregate risk for a SET of files (the file list of a patch). Returns max/mean scores, the highest-risk file, and bucketed lists (hotspot, fix-heavy, test-gap, wide blast radius). Use BEFORE submitting: if max_score is high or any test_gap_files exist, add tests, split the patch, or flag concerns. \`summary_notes\` are paste-ready for a PR description.
+- \`assess_risk_diff\`: aggregate risk for a SET of files (the file list of a patch). Returns max/mean scores, the highest-risk file, and bucketed lists (hotspot, fix-heavy, test-gap, wide blast radius). Use BEFORE submitting: if max_score is high or any test_gap_files exist, add tests, split the patch, or flag concerns. \`summary_notes\` are paste-ready for a PR description. When ≥3 files share a categorical note, per-file \`notes[]\` carries short codes (\`"T"\`, \`"NG"\`) — resolve via the top-level \`_legend\` map.
 - \`recommend_tests\`: tests an agent should run after editing a set of files. \`primary\` resolves siblings by language convention; \`coupled\` adds tests from co-change history. Replaces "I'll run all tests" hedging with a focused list. Sibling conventions covered:
   - PHP/Laravel: \`FooTest.php\` flat siblings; mirror-tree \`tests/{Unit,Feature,Integration,Browser}/<rest>/<file>Test.php\` for \`app/<rest>/<file>.php\` sources.
   - PHP/Symfony: mirror-tree \`tests/<rest>/<file>Test.php\` for \`src/<rest>/<file>.php\` sources.
@@ -225,7 +226,7 @@ All four require git history indexed. Initial \`codesage git-index\` runs at onb
 - Structural + semantic index auto-refreshes on commit/merge/checkout via installed git hooks.
 - Git history index auto-refreshes incrementally on commit/merge/checkout/rebase via the same hooks. Weekly \`codesage git-index --full\` to rebaseline is still good hygiene.
 - Manual refresh: \`codesage index\`, or \`/codesage-reindex\`. Force a full git-history rescan with \`codesage git-index --full\`.
-- CLI: \`codesage search --limit 5 'query'\`, \`codesage coupling <file>\`, \`codesage risk <file>\`, \`codesage risk-diff <files...>\`, \`codesage tests-for <files...>\` (both accept stdin too: \`git diff --name-only | codesage risk-diff\`).
+- CLI: \`codesage search --limit 5 'query'\`, \`codesage coupling <file>\`, \`codesage risk <file>\`, \`codesage risk-batch <files...>\`, \`codesage risk-diff <files...>\`, \`codesage tests-for <files...>\` (all the multi-file commands accept stdin too: \`git diff --name-only | codesage risk-diff\`).
 HINT
         # Keep the local hint out of the project's commit history.
         if [ -e "$project/.git" ]; then

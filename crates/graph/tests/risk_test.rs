@@ -1038,6 +1038,153 @@ fn find_coupling_populated_result_carries_index_state() {
 }
 
 #[test]
+fn risk_diff_legend_aliases_repeated_test_gap_notes() {
+    // 4 files with no co-located test → all get the same "test gap: …" note.
+    // Threshold for aliasing is 3 occurrences, so this should fire and produce
+    // a single `_legend` entry with the 4 per-file notes replaced by `"T"`.
+    let (_dir, db) = setup_project();
+    let files = ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"];
+    for p in &files {
+        db.upsert_git_file(p, 1.0, 0, 5, Some(1_700_000_000))
+            .unwrap();
+    }
+    let input: Vec<String> = files.iter().map(|s| s.to_string()).collect();
+    let r = codesage_graph::assess_risk_diff(&db, &input).unwrap();
+
+    assert_eq!(
+        r.legend.len(),
+        1,
+        "expected exactly one aliased note, got {:?}",
+        r.legend
+    );
+    let resolved = r.legend.get("T").expect("T code in legend");
+    assert!(
+        resolved.contains("test gap"),
+        "T resolves to test-gap, got {resolved}"
+    );
+
+    let aliased: usize = r
+        .files
+        .iter()
+        .map(|f| f.notes.iter().filter(|n| *n == "T").count())
+        .sum();
+    assert_eq!(aliased, 4, "all 4 test-gap notes should be replaced by `T`");
+    let raw_test_gap: usize = r
+        .files
+        .iter()
+        .map(|f| f.notes.iter().filter(|n| n.contains("test gap")).count())
+        .sum();
+    assert_eq!(
+        raw_test_gap, 0,
+        "no verbatim 'test gap' string should remain after aliasing"
+    );
+}
+
+#[test]
+fn risk_diff_legend_does_not_fire_below_threshold() {
+    // 2 test-gap files: under the ≥3 threshold, so no aliasing. Notes stay
+    // verbatim; legend is empty.
+    let (_dir, db) = setup_project();
+    let files = ["src/a.rs", "src/b.rs"];
+    for p in &files {
+        db.upsert_git_file(p, 1.0, 0, 5, Some(1_700_000_000))
+            .unwrap();
+    }
+    let input: Vec<String> = files.iter().map(|s| s.to_string()).collect();
+    let r = codesage_graph::assess_risk_diff(&db, &input).unwrap();
+
+    assert!(
+        r.legend.is_empty(),
+        "legend should be empty below threshold, got {:?}",
+        r.legend
+    );
+    let raw_test_gap: usize = r
+        .files
+        .iter()
+        .map(|f| f.notes.iter().filter(|n| n.contains("test gap")).count())
+        .sum();
+    assert_eq!(
+        raw_test_gap, 2,
+        "verbatim notes should remain when no aliasing"
+    );
+}
+
+#[test]
+fn risk_batch_returns_per_file_in_input_order() {
+    let (_dir, db) = setup_project();
+    db.upsert_git_file("Repository.php", 100.0, 40, 80, Some(1_700_000_000))
+        .unwrap();
+    db.upsert_git_file("Controller.php", 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+    db.upsert_git_file("Service.php", 0.5, 0, 5, Some(1_700_000_000))
+        .unwrap();
+
+    let input = vec![
+        "Service.php".to_string(),
+        "Repository.php".to_string(),
+        "Controller.php".to_string(),
+    ];
+    let r = codesage_graph::assess_risk_batch(&db, &input).unwrap();
+
+    assert_eq!(r.files.len(), 3);
+    assert_eq!(r.files[0].file, "Service.php");
+    assert_eq!(r.files[1].file, "Repository.php");
+    assert_eq!(r.files[2].file, "Controller.php");
+    // Repository (the hot fix-heavy file) should out-score the cooler ones.
+    assert!(
+        r.files[1].score > r.files[0].score,
+        "Repository.php should score higher than Service.php"
+    );
+}
+
+#[test]
+fn risk_batch_empty_returns_default() {
+    let (_dir, db) = setup_project();
+    let r = codesage_graph::assess_risk_batch(&db, &[]).unwrap();
+    assert!(r.files.is_empty());
+    assert!(r.legend.is_empty());
+}
+
+#[test]
+fn risk_batch_legend_aliases_no_git_history_at_threshold() {
+    // 4 files with no git history at all → each gets the categorical
+    // "no git history…" note. Should alias to `NG`.
+    let (_dir, db) = setup_project();
+    let input = vec![
+        "x/1.rs".to_string(),
+        "x/2.rs".to_string(),
+        "x/3.rs".to_string(),
+        "x/4.rs".to_string(),
+    ];
+    let r = codesage_graph::assess_risk_batch(&db, &input).unwrap();
+
+    // 4 files with no git history also have no test sibling, so both
+    // categorical notes (NG and T) fire on every file. Both should alias.
+    assert!(
+        r.legend.contains_key("NG"),
+        "NG missing in legend, got {:?}",
+        r.legend
+    );
+    assert!(
+        r.legend.contains_key("T"),
+        "T missing in legend, got {:?}",
+        r.legend
+    );
+    let ng_aliased: usize = r
+        .files
+        .iter()
+        .map(|f| f.notes.iter().filter(|n| *n == "NG").count())
+        .sum();
+    let t_aliased: usize = r
+        .files
+        .iter()
+        .map(|f| f.notes.iter().filter(|n| *n == "T").count())
+        .sum();
+    assert_eq!(ng_aliased, 4);
+    assert_eq!(t_aliased, 4);
+}
+
+#[test]
 fn recommend_tests_finds_symfony_mirror_tree_tests() {
     let (_dir, db) = setup_project();
     // Symfony convention: src/<rest>/<stem>.php pairs with tests/<rest>/<stem>Test.php

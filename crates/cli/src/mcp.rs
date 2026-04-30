@@ -7,8 +7,9 @@ use codesage_embed::config::EmbeddingConfig;
 use codesage_embed::model::Embedder;
 use codesage_embed::reranker::Reranker;
 use codesage_graph::{
-    assess_risk, assess_risk_diff, export_context, find_coupling, find_references, find_symbol,
-    impact_analysis, list_dependencies, recommend_tests, search, session_end, session_start,
+    assess_risk, assess_risk_batch, assess_risk_diff, export_context, find_coupling,
+    find_references, find_symbol, impact_analysis, list_dependencies, recommend_tests, search,
+    session_end, session_start,
 };
 use codesage_protocol::{
     ExportRequest, FindReferencesRequest, FindSymbolRequest, ImpactRequest, ImpactTarget, Language,
@@ -120,6 +121,16 @@ pub struct RiskDiffParams {
     pub project: String,
     #[schemars(
         description = "Repo-relative file paths in the patch (typically the output of `git diff --name-only`)"
+    )]
+    pub file_paths: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RiskBatchParams {
+    #[schemars(description = PROJECT_ARG_DESC)]
+    pub project: String,
+    #[schemars(
+        description = "Repo-relative file paths to score individually. Returns one RiskAssessment per path, in input order. Use when you have a list of files (e.g. from impact analysis or coupling) and want each one's individual risk decomposition — saves the per-file MCP round-trip overhead vs N separate `assess_risk` calls. For patch-level aggregation (max/mean, summary_notes, cycles), use `assess_risk_diff` instead."
     )]
     pub file_paths: Vec<String>,
 }
@@ -256,7 +267,7 @@ impl CodeSageServer {
                 canonical.display()
             );
         }
-        let embedding_config = load_embedding_config(&codesage_dir.join("config.toml"))?;
+        let embedding_config = load_embedding_config(&codesage_dir.join("config.toml"));
         let state = ProjectState {
             db_path: db_path.clone(),
             embedding_config,
@@ -492,24 +503,49 @@ fn truncate_array(items: Vec<serde_json::Value>, budget_chars: usize) -> Vec<ser
     kept
 }
 
-fn load_embedding_config(path: &Path) -> Result<EmbeddingConfig> {
+/// Load the per-project embedding config for the MCP server.
+///
+/// MCP serves multiple projects through one process; a malformed
+/// `.codesage/config.toml` in one project must not poison every tool call
+/// against that project. Read or parse failures fall back to defaults with
+/// a one-line warning so structural tools (`assess_risk`, `find_coupling`,
+/// `find_symbol`, …) keep working. `search` will then fail at vec-table
+/// lookup if the embedder defaults don't match the indexed model — a
+/// narrower, clearer failure than a TOML parse error on every tool call.
+///
+/// The CLI path (`load_project_config` in `main.rs`) deliberately keeps
+/// the loud-fail behavior: a user running `codesage index` interactively
+/// wants to know their config is broken.
+fn load_embedding_config(path: &Path) -> EmbeddingConfig {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(EmbeddingConfig::default());
+            return EmbeddingConfig::default();
         }
         Err(e) => {
-            return Err(anyhow::Error::from(e))
-                .with_context(|| format!("reading {}", path.display()));
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "could not read project config; falling back to embedding defaults",
+            );
+            return EmbeddingConfig::default();
         }
     };
     #[derive(serde::Deserialize)]
     struct Config {
         embedding: Option<EmbeddingConfig>,
     }
-    let parsed: Config =
-        toml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
-    Ok(parsed.embedding.unwrap_or_default())
+    match toml::from_str::<Config>(&content) {
+        Ok(parsed) => parsed.embedding.unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "could not parse project config; falling back to embedding defaults",
+            );
+            EmbeddingConfig::default()
+        }
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -680,6 +716,21 @@ impl CodeSageServer {
         render_with_kind(
             self.with_project_db(&params.project, |db| assess_risk_diff(db, &file_paths)),
             "assess_risk_diff",
+        )
+    }
+
+    #[tool(
+        name = "assess_risk_batch",
+        description = "Risk score for EACH of N files, returned per-file with no patch-level aggregation. Use when you have a list of files (impact analysis output, coupling neighbours, the files of a feature you're touching one-by-one) and want each individual score — cuts the per-file MCP round-trip overhead vs calling `assess_risk` N times. Each entry is a full RiskAssessment with the same shape as `assess_risk`. The response also includes a top-level `_legend` short-code map: when ≥3 files in the batch share a categorical note (test-gap, no-git-history), per-file `notes[]` entries are aliased to short codes (e.g. `\"T\"`, `\"NG\"`) and the legend resolves them. For patch-level aggregation (max/mean, hotspot/test-gap rollups, cycles), use `assess_risk_diff` instead — they answer different questions."
+    )]
+    fn assess_risk_batch_tool(
+        &self,
+        Parameters(params): Parameters<RiskBatchParams>,
+    ) -> CallToolResult {
+        let file_paths = params.file_paths.clone();
+        render_with_kind(
+            self.with_project_db(&params.project, |db| assess_risk_batch(db, &file_paths)),
+            "assess_risk_batch",
         )
     }
 
@@ -931,5 +982,57 @@ mod tests {
     fn truncate_array_handles_empty() {
         let kept = truncate_array(vec![], 100);
         assert!(kept.is_empty());
+    }
+
+    fn write_tmp(name: &str, content: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("codesage-mcp-test-{}-{}", std::process::id(), name));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn malformed_config_falls_back_to_defaults() {
+        // One bad project must not poison every tool call against it. The
+        // MCP server keeps serving structural tools; only `search` will
+        // fail at vec-table lookup if defaults don't match the indexed
+        // model.
+        let path = write_tmp("malformed", "embedding = { this is not valid toml ===");
+        let config = load_embedding_config(&path);
+        assert_eq!(config.model, EmbeddingConfig::default().model);
+    }
+
+    #[test]
+    fn missing_config_returns_defaults() {
+        let path = std::env::temp_dir().join(format!(
+            "codesage-mcp-test-missing-{}.toml",
+            std::process::id()
+        ));
+        // ensure path doesn't exist
+        let _ = std::fs::remove_file(&path);
+        let config = load_embedding_config(&path);
+        assert_eq!(config.model, EmbeddingConfig::default().model);
+    }
+
+    #[test]
+    fn well_formed_config_parses() {
+        let path = write_tmp(
+            "valid",
+            "[embedding]\nmodel = \"sentence-transformers/all-MiniLM-L6-v2\"\ndevice = \"cpu\"\n",
+        );
+        let config = load_embedding_config(&path);
+        assert_eq!(config.model, "sentence-transformers/all-MiniLM-L6-v2");
+        assert_eq!(config.device, "cpu");
+    }
+
+    #[test]
+    fn config_without_embedding_section_returns_defaults() {
+        // A valid TOML that just doesn't have an `[embedding]` table — the
+        // file is fine, the embedding section is absent, defaults apply.
+        let path = write_tmp("no-embedding", "[project]\nname = \"foo\"\n");
+        let config = load_embedding_config(&path);
+        assert_eq!(config.model, EmbeddingConfig::default().model);
     }
 }

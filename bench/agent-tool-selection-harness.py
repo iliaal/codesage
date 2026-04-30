@@ -89,11 +89,17 @@ def run_task(
     with_codesage: bool,
     max_turns: int = 10,
     timeout_s: int = 180,
+    append_system_prompt_file: Path | None = None,
 ) -> dict[str, Any]:
     """Run one `claude -p` task and return a structured summary.
 
     Returns {first_tool, tool_calls, used_codesage, duration_s,
              cost_usd, result_text, codesage_count, grep_count, error}.
+
+    `append_system_prompt_file` lets the caller measure whether a
+    system-prompt-level steering fragment moves tool selection. Used by
+    the §2.3 follow-up that ships the codesage prompt-override (see
+    plugins/codesage-tools/bin/codesage-prompt-override).
     """
     tools = list(BASE_TOOLS)
     if with_codesage:
@@ -106,6 +112,8 @@ def run_task(
         "--verbose",
         "--max-turns", str(max_turns),
     ]
+    if append_system_prompt_file is not None:
+        cmd.extend(["--append-system-prompt-file", str(append_system_prompt_file)])
     t0 = time.time()
     try:
         r = subprocess.run(
@@ -188,13 +196,20 @@ def render_scorecard(
     corpus_name: str,
     rows: list[dict[str, Any]],
     run_ts: str,
+    append_system_prompt_file: Path | None = None,
+    label: str | None = None,
 ) -> str:
     out: list[str] = []
-    out.append(f"# Agent tool-selection harness — {condition}")
+    title = f"Agent tool-selection harness — {condition}"
+    if label:
+        title += f" ({label})"
+    out.append(f"# {title}")
     out.append("")
     out.append(f"- **Project**: `{project_root}`")
     out.append(f"- **Corpus**: `{corpus_name}` — {len(rows)} tasks")
     out.append(f"- **Condition**: {condition}")
+    if append_system_prompt_file is not None:
+        out.append(f"- **Append-system-prompt**: `{append_system_prompt_file}`")
     out.append(f"- **Run at**: {run_ts}")
     total_cost = sum(r.get("cost_usd") or 0.0 for r in rows)
     total_duration = sum(r.get("duration_s") or 0.0 for r in rows)
@@ -244,7 +259,24 @@ def main() -> int:
                     help="Which toolset the agent sees. `both` runs each task twice.")
     ap.add_argument("--output-dir", type=Path, default=None)
     ap.add_argument("--max-turns", type=int, default=10)
+    ap.add_argument(
+        "--append-system-prompt-file",
+        type=Path,
+        default=None,
+        help="Append the contents of FILE to the agent's system prompt on every task. "
+             "Used to measure whether system-prompt-level steering moves tool selection "
+             "(see plugins/codesage-tools/bin/codesage-prompt-override).",
+    )
+    ap.add_argument(
+        "--label",
+        type=str,
+        default=None,
+        help="Optional suffix on the output filename (e.g. 'override') so reruns "
+             "with different conditions don't overwrite each other.",
+    )
     args = ap.parse_args()
+    if args.append_system_prompt_file is not None and not args.append_system_prompt_file.exists():
+        sys.exit(f"--append-system-prompt-file: {args.append_system_prompt_file} does not exist")
 
     corpus = yaml.safe_load(args.corpus.read_text())
     project_root = Path(corpus["project_root"]).expanduser().resolve()
@@ -264,6 +296,7 @@ def main() -> int:
                 prompt,
                 with_codesage=(cond == "with"),
                 max_turns=args.max_turns,
+                append_system_prompt_file=args.append_system_prompt_file,
             )
             scored = score_task(r, case["expected_files"])
             scored["id"] = case["id"]
@@ -283,11 +316,14 @@ def main() -> int:
             corpus_name=args.corpus.name,
             rows=rows,
             run_ts=run_ts,
+            append_system_prompt_file=args.append_system_prompt_file,
+            label=args.label,
         )
         all_reports.append((cond, report))
         if args.output_dir:
             args.output_dir.mkdir(parents=True, exist_ok=True)
-            out_path = args.output_dir / f"{args.corpus.stem}-tool-selection-{cond}.md"
+            suffix = f"-{args.label}" if args.label else ""
+            out_path = args.output_dir / f"{args.corpus.stem}-tool-selection-{cond}{suffix}.md"
             out_path.write_text(report, encoding="utf-8")
             print(f"wrote {out_path}", file=sys.stderr)
         print(report)

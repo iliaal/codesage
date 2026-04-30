@@ -1,9 +1,11 @@
 //! Query-side risk + coupling over the `git_files` / `git_co_changes` tables.
 
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result};
 use codesage_protocol::{
     ClusteredDirectory, CoChangeEntry, CouplingReport, CycleEntry, FileCategory, ImpactRequest,
-    ImpactTarget, RiskAssessment, RiskDiffAssessment,
+    ImpactTarget, RiskAssessment, RiskBatchAssessment, RiskDiffAssessment,
 };
 use codesage_storage::Database;
 
@@ -344,7 +346,20 @@ pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiff
         ));
     }
 
-    let (files, clustered_directories) = cluster_by_directory(files, DIR_CLUSTER_THRESHOLD);
+    let (mut files, clustered_directories) = cluster_by_directory(files, DIR_CLUSTER_THRESHOLD);
+
+    // Alias categorical notes that repeat across files into short codes.
+    // The clustered files have already been demoted to `omitted_files` (no
+    // notes there), so we only alias the kept `files[]` entries plus the
+    // detail kept inside each cluster's `top_files`.
+    let mut all_for_alias: Vec<&mut RiskAssessment> = files.iter_mut().collect();
+    let mut clustered_directories = clustered_directories;
+    for cd in clustered_directories.iter_mut() {
+        for f in cd.top_files.iter_mut() {
+            all_for_alias.push(f);
+        }
+    }
+    let legend = alias_categorical_notes_in_place(&mut all_for_alias);
 
     Ok(RiskDiffAssessment {
         files,
@@ -358,7 +373,79 @@ pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiff
         summary_notes,
         clustered_directories,
         cycles_touching_patch,
+        legend,
     })
+}
+
+/// `assess_risk` over a list of files, returning per-file decomposition
+/// without patch-level aggregation. See [`RiskBatchAssessment`] for the
+/// design distinction vs [`assess_risk_diff`].
+///
+/// Retrospective session analysis (recommendations doc §1.7, 30-day
+/// window) found 230 individual `assess_risk` MCP calls vs 13
+/// `assess_risk_diff` — the agent's dominant pattern is per-file scoring,
+/// not patch aggregation. This batch variant cuts the per-call MCP
+/// protocol overhead for that pattern: one round-trip for N files.
+pub fn assess_risk_batch(db: &Database, file_paths: &[String]) -> Result<RiskBatchAssessment> {
+    if file_paths.is_empty() {
+        return Ok(RiskBatchAssessment::default());
+    }
+    let mut files: Vec<RiskAssessment> = file_paths
+        .iter()
+        .map(|p| assess_risk(db, p))
+        .collect::<Result<Vec<_>>>()?;
+    let mut refs: Vec<&mut RiskAssessment> = files.iter_mut().collect();
+    let legend = alias_categorical_notes_in_place(&mut refs);
+    Ok(RiskBatchAssessment { files, legend })
+}
+
+/// Categorical notes eligible for aliasing into a top-level `_legend`.
+/// Templated notes (those with formatted percentages, counts, or file
+/// lists) are not eligible because they collide across files. Order
+/// here is also the deterministic short-code order: the first eligible
+/// match gets `T`, next gets `NG`, etc., so output is stable.
+const ALIASABLE_NOTES: &[(&str, &str)] = &[
+    (
+        "T",
+        "test gap: no obvious test file (sibling or co-changer)",
+    ),
+    (
+        "NG",
+        "no git history for this file (file too new, or `codesage git-index` hasn't been run)",
+    ),
+];
+
+/// In-place alias of categorical notes that appear in ≥3 files of the
+/// input, returning the resulting short-code → full-string legend.
+///
+/// Threshold reasoning: the `_legend` entry itself costs ~75-95 bytes;
+/// each replaced note saves ~50-90 bytes minus the 3-byte code. Net
+/// savings turn positive at 3 occurrences for the longer note, 2 for
+/// the shorter. Picking 3 as the floor for both keeps the rule simple
+/// and ensures the worst case is still net-positive.
+fn alias_categorical_notes_in_place(files: &mut [&mut RiskAssessment]) -> BTreeMap<String, String> {
+    let mut legend = BTreeMap::new();
+    if files.len() < 3 {
+        return legend;
+    }
+    for (code, full) in ALIASABLE_NOTES {
+        let count = files
+            .iter()
+            .filter(|f| f.notes.iter().any(|n| n == full))
+            .count();
+        if count < 3 {
+            continue;
+        }
+        legend.insert((*code).to_string(), (*full).to_string());
+        for f in files.iter_mut() {
+            for note in f.notes.iter_mut() {
+                if note == full {
+                    *note = (*code).to_string();
+                }
+            }
+        }
+    }
+    legend
 }
 
 /// Find strongly-connected components in the file-level import graph

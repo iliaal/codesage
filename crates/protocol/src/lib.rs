@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_EMBEDDING_DIM: usize = 384;
@@ -534,6 +536,52 @@ pub struct RiskDiffAssessment {
     /// Empty when no cycle overlaps the patch file set.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub cycles_touching_patch: Vec<CycleEntry>,
+    /// Short-code legend for repeated categorical notes. When a note
+    /// string repeats verbatim in ≥3 files of a single response, the
+    /// per-file `notes[]` entries are replaced with a short code
+    /// (e.g. `"T"`, `"NG"`); this map resolves each code back to its
+    /// full string. Saves bytes on patches that touch many files in
+    /// similar states (e.g. a refactor where every touched file lacks
+    /// a co-located test). Templated notes (`"hotspot: churn 80%"`,
+    /// `"in import cycle of 4 files: …"`) are not aliased — only
+    /// non-templated categorical notes are eligible. Empty when no
+    /// note repeated enough to trigger aliasing.
+    #[serde(
+        skip_serializing_if = "BTreeMap::is_empty",
+        default,
+        rename = "_legend"
+    )]
+    pub legend: BTreeMap<String, String>,
+}
+
+/// Result of `assess_risk_batch`: per-file decomposition for a list of
+/// files, no patch-level aggregation. Use when the agent has a list of
+/// files (e.g. from impact analysis or coupling) and wants individual
+/// risk scores for each in one round-trip — avoids the per-file MCP
+/// protocol overhead that retrospective session analysis showed
+/// dominates `assess_risk` call volume.
+///
+/// Differs from [`RiskDiffAssessment`] in that it does *not* compute
+/// max/mean across the set, rollup arrays, summary notes, cycles, or
+/// directory clustering — those are patch-aggregate concerns. If the
+/// agent wants "is this patch risky as a whole?", use `assess_risk_diff`
+/// instead. If it wants "give me each of these files' scores", use
+/// `assess_risk_batch`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RiskBatchAssessment {
+    /// Per-file decomposition, in the order of the request's `file_paths`.
+    /// One [`RiskAssessment`] per input path. Ordering preserved so the
+    /// agent can zip with its own list.
+    pub files: Vec<RiskAssessment>,
+    /// Same shape and semantics as [`RiskDiffAssessment::legend`]: short
+    /// codes for categorical notes that repeated in ≥3 files. Empty when
+    /// no aliasing fired.
+    #[serde(
+        skip_serializing_if = "BTreeMap::is_empty",
+        default,
+        rename = "_legend"
+    )]
+    pub legend: BTreeMap<String, String>,
 }
 
 /// A strongly-connected component in the file-level import graph that
@@ -790,5 +838,60 @@ mod tests {
         let json = serde_json::to_string(&file).unwrap();
         assert!(json.contains("\"type\":\"file\""));
         assert!(json.contains("\"path\":\"src/a.rs\""));
+    }
+
+    /// Regression trap: the `legend` field on RiskDiffAssessment / RiskBatchAssessment
+    /// is serialized as `_legend` (not `legend`). Agent prompts and downstream
+    /// docs reference the underscore form. If the `serde(rename = "_legend")`
+    /// annotation is dropped, the JSON key changes silently and every prompt
+    /// that mentions `_legend` becomes wrong.
+    #[test]
+    fn risk_diff_assessment_legend_serializes_with_underscore_prefix() {
+        let mut a = RiskDiffAssessment::default();
+        a.legend.insert("T".to_string(), "test gap: …".to_string());
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(
+            json.contains("\"_legend\""),
+            "expected `_legend` key in JSON, got {json}"
+        );
+        assert!(
+            !json.contains("\"legend\""),
+            "the unprefixed `legend` key must NOT leak into JSON, got {json}"
+        );
+    }
+
+    #[test]
+    fn risk_batch_assessment_legend_serializes_with_underscore_prefix() {
+        let mut a = RiskBatchAssessment::default();
+        a.legend
+            .insert("NG".to_string(), "no git history…".to_string());
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(
+            json.contains("\"_legend\""),
+            "expected `_legend` key in JSON, got {json}"
+        );
+        assert!(
+            !json.contains("\"legend\""),
+            "the unprefixed `legend` key must NOT leak into JSON, got {json}"
+        );
+    }
+
+    #[test]
+    fn empty_legend_is_omitted_from_json() {
+        // Empty BTreeMap is gated by `skip_serializing_if = "BTreeMap::is_empty"`.
+        // Confirms no spurious `_legend: {}` lands in responses with no aliasing.
+        let a = RiskDiffAssessment::default();
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(
+            !json.contains("_legend"),
+            "empty legend must be omitted, got {json}"
+        );
+
+        let b = RiskBatchAssessment::default();
+        let json = serde_json::to_string(&b).unwrap();
+        assert!(
+            !json.contains("_legend"),
+            "empty legend must be omitted, got {json}"
+        );
     }
 }

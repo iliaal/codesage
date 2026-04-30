@@ -104,9 +104,14 @@ def flatten_result(content: Any) -> str:
 
 
 def extract_events(transcript: Path) -> list[dict[str, Any]]:
-    """Return an ordered list of tool_use / tool_result events for one
+    """Return an ordered list of user / tool_use / tool_result events for one
     transcript. Each event carries enough context to compute the metrics
     without re-parsing.
+
+    `user` events carry plain text from the user's typed prompt (excluding
+    `tool_result` wrapper messages that also carry role=user). They are
+    used by the §2.3 question-shape breakdown to attribute each retrieval
+    decision back to the user question that prompted it.
     """
     try:
         fp = transcript.open("r", encoding="utf-8", errors="replace")
@@ -121,8 +126,36 @@ def extract_events(transcript: Path) -> list[dict[str, Any]]:
             except json.JSONDecodeError:
                 continue
             msg = obj.get("message") if isinstance(obj, dict) else None
-            content = msg.get("content") if isinstance(msg, dict) else None
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            content = msg.get("content")
             ts = obj.get("timestamp") if isinstance(obj, dict) else None
+
+            # User text turn: role=user with string content, or role=user
+            # with a list whose entries are plain text (not tool_result).
+            if role == "user":
+                user_text = ""
+                if isinstance(content, str):
+                    user_text = content
+                elif isinstance(content, list):
+                    parts = []
+                    has_tool_result = False
+                    for c in content:
+                        if not isinstance(c, dict):
+                            continue
+                        if c.get("type") == "tool_result":
+                            has_tool_result = True
+                            break
+                        t = c.get("text")
+                        if isinstance(t, str):
+                            parts.append(t)
+                    if not has_tool_result:
+                        user_text = "\n".join(parts).strip()
+                if user_text:
+                    events.append({"kind": "user", "text": user_text, "ts": ts})
+                continue
+
             if not isinstance(content, list):
                 continue
             for c in content:
@@ -201,6 +234,107 @@ def classify_codesage_result(text: str) -> str:
         if not has_content:
             return "empty"
     return "ok"
+
+
+# Tighter than the first draft after sampling real transcripts:
+# the broad keyword list (`auth|config|...`) over-matched conversational
+# messages, and pasted slash-command bodies were being treated as user
+# questions. Now we require an actual question shape AND filter out
+# pasted bodies / task notifications before classifying.
+SEMANTIC_QUESTION_RES = [
+    # Formal "where does X happen?" / "how does X work?" phrasings.
+    re.compile(r"\bwhere\s+(does|is|are|do\s+we)\b.*\b(handle|happen|live|loaded|defined|managed|stored|implemented|done|fire|trigger)",
+               re.IGNORECASE),
+    re.compile(r"\bhow\s+(does|do\s+we|is)\b.*\b(work|handle|implement|done|done\b)", re.IGNORECASE),
+    re.compile(r"\bfind\s+(the\s+)?(file|place|spot|code|spot)\s+(that|where)\b", re.IGNORECASE),
+    re.compile(r"\bwhich\s+file\s+(handles|implements|contains|holds|owns)", re.IGNORECASE),
+    re.compile(r"\bwhat\s+(handles|implements|does)\b", re.IGNORECASE),
+    # Implementation-request shapes that imply retrieval first ("look at the
+    # auth flow", "show me where config is loaded", "fix the search code").
+    # These are the way real users actually phrase concept-shaped requests
+    # in conversational sessions — formal "where does X?" phrasing is rare.
+    re.compile(r"\b(look|take\s+a\s+look)\s+at\s+(the\s+)?\w+\s+(flow|module|code|pipeline|logic|path|handler|system|layer)",
+               re.IGNORECASE),
+    re.compile(r"\bshow\s+me\s+(where|the|how)\s+\w+", re.IGNORECASE),
+    re.compile(r"\bin\s+the\s+\w+\s+(flow|module|pipeline|handler|layer|system)\b", re.IGNORECASE),
+    re.compile(r"\bfix\s+(the\s+)?\w+\s+(flow|code|logic|pipeline|handler|bug)", re.IGNORECASE),
+    re.compile(r"\bexplain\s+(the\s+|how\s+)?\w+\s+(flow|works|module|code|logic)", re.IGNORECASE),
+]
+IDENTIFIER_QUESTION_RES = [
+    # Backtick-quoted identifiers: `Foo`, `do_the_thing`, `Foo::bar`.
+    re.compile(r"`[A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)*`"),
+    # "where is Foo defined / declared / called / used"
+    re.compile(r"\bwhere\s+is\s+[A-Za-z_][A-Za-z0-9_]{3,}\s+(defined|declared|called|used|implemented)",
+               re.IGNORECASE),
+    # "find references to Foo" / "find callers of Foo"
+    re.compile(r"\bfind\s+(all\s+)?(references?|callers?|callees?)\s+(to|of)\s+[A-Za-z_]"),
+    # "what calls X" / "who calls X"
+    re.compile(r"\b(what|who)\s+calls\s+[A-Za-z_]"),
+]
+LITERAL_QUESTION_RES = [
+    re.compile(r"\b(TODO|FIXME|XXX|HACK)\b"),
+    re.compile(r"\bgrep(\s+for)?\s+[\"']", re.IGNORECASE),
+    re.compile(r"\bsearch\s+for\s+[\"']", re.IGNORECASE),
+    re.compile(r"\b(error|warning|log)\s+message\b", re.IGNORECASE),
+]
+# Skip-patterns: these aren't real user questions, they're pasted text
+# from slash-command bodies, hook events, or system notifications that
+# happen to arrive on a `role=user` envelope. Bucketing them inflates
+# every shape and dilutes the rate.
+NON_QUESTION_RES = [
+    re.compile(r"<task-notification>", re.IGNORECASE),
+    re.compile(r"<command-(name|args|message)>", re.IGNORECASE),
+    re.compile(r"^\s*#\s*\w[\w\s]+\n+##", re.MULTILINE),  # markdown body with multi-heading
+    re.compile(r"<wiki-hint>", re.IGNORECASE),
+    re.compile(r"<system-reminder>", re.IGNORECASE),
+    re.compile(r"^\s*---\s*\nname:", re.MULTILINE),  # frontmatter — pasted skill/command body
+    re.compile(r"\[Request\s+interrupted\s+by\s+user\]"),
+]
+
+
+def is_real_user_question(text: str) -> bool:
+    """Filter out pasted slash-command bodies, system reminders, hook
+    events, and task notifications that arrive on `role=user` but aren't
+    actual user-typed questions.
+    """
+    if not text or not text.strip():
+        return False
+    if len(text) > 2000:
+        # Real user questions are short. Long bodies are almost always
+        # pasted command/skill text.
+        return False
+    for r in NON_QUESTION_RES:
+        if r.search(text):
+            return False
+    return True
+
+
+def classify_user_question(text: str) -> str:
+    """Bucket a user message into a retrieval question shape.
+
+    Returns one of: `semantic`, `identifier`, `literal`, `other`. The
+    classifier is conservative — it errs toward `other` rather than
+    mis-categorize, because the §2.3 question is "what fraction of
+    *clearly* semantic-shaped questions go to CodeSage's `search`",
+    not "what fraction of every user message".
+
+    Precedence: identifier > literal > semantic > other. Identifier wins
+    when both fire because a backticked symbol is a stronger signal
+    than concept words appearing in the surrounding sentence.
+    """
+    if not text:
+        return "other"
+    snippet = text.strip()[:500]
+    for r in IDENTIFIER_QUESTION_RES:
+        if r.search(snippet):
+            return "identifier"
+    for r in LITERAL_QUESTION_RES:
+        if r.search(snippet):
+            return "literal"
+    for r in SEMANTIC_QUESTION_RES:
+        if r.search(snippet):
+            return "semantic"
+    return "other"
 
 
 def identifier_shaped_grep(pattern: str) -> bool:
@@ -302,6 +436,98 @@ def aggregate(events_per_transcript: list[list[dict[str, Any]]]) -> dict[str, An
     # non-Read, non-Grep event? Accumulated as a list for distribution stats.
     reads_after_codesage: list[int] = []
 
+    # Per-question-shape breakdown (recommendations doc §2.3 path-(b) follow-up,
+    # 2026-04-30 — option (2) of "do agents skip CodeSage on questions where
+    # it would actually win?"). Each user message that prompts a retrieval-
+    # shape first action is bucketed by its question shape (semantic /
+    # identifier / literal / other). The "first retrieval action" is the
+    # first tool_use of {Grep, Read, Glob, mcp__codesage__*} after the
+    # user message and before the next user message — this is the agent's
+    # tool-selection decision in response to the question.
+    # Counters: per shape, count first tools chosen.
+    shape_counts: dict[str, dict[str, int]] = defaultdict(
+        lambda: {
+            "questions": 0,
+            "first_codesage_retrieval": 0,
+            "first_codesage_search": 0,  # subset: specifically `search`
+            "first_grep": 0,
+            "first_read": 0,
+            "first_glob": 0,
+            "first_other_or_none": 0,
+        }
+    )
+
+    # Retrieval-class first tools: these are the ones we count as a
+    # "retrieval decision". Read counts because the agent may have
+    # decided to read a specific file rather than search — that's still
+    # a retrieval choice, just one CodeSage doesn't compete with directly
+    # (Read needs a known path).
+    def first_retrieval_tool(events: list[dict[str, Any]], start: int) -> tuple[str | None, int]:
+        """From `start`, scan forward until the first tool_use OR the
+        next user message, whichever comes first. Return (tool_name, idx)
+        or (None, end-of-window-idx). Tool name returned verbatim; the
+        caller decides whether it counts as retrieval-shape.
+        """
+        n = len(events)
+        j = start
+        while j < n:
+            e = events[j]
+            if e.get("kind") == "user":
+                return None, j
+            if e.get("kind") == "tool_use":
+                return (e.get("tool") or ""), j
+            j += 1
+        return None, n
+
+    def shape_walk(events: list[dict[str, Any]], session_had_codesage: bool) -> None:
+        """For each *real* user question (excluding pasted command bodies
+        and system notifications), classify by shape and record the
+        first tool the agent reached for in response. Only sessions
+        where codesage was available are counted.
+
+        The denominator the rendered output cares about is
+        `retrieval_decisions` per shape — questions that resulted in a
+        retrieval-class first action. That excludes turns where the
+        agent immediately wrote code, ran a Bash command, or reasoned
+        without a tool — none of which are retrieval choices.
+        """
+        if not session_had_codesage:
+            return
+        n = len(events)
+        i = 0
+        while i < n:
+            ev = events[i]
+            if ev.get("kind") != "user":
+                i += 1
+                continue
+            text = ev.get("text") or ""
+            if not is_real_user_question(text):
+                i += 1
+                continue
+            shape = classify_user_question(text)
+            shape_counts[shape]["questions"] += 1
+            first_tool, _next = first_retrieval_tool(events, i + 1)
+            bucket = shape_counts[shape]
+            if first_tool is None:
+                bucket["first_other_or_none"] += 1
+            elif first_tool.startswith(TOOL_PREFIX):
+                suffix = first_tool[len(TOOL_PREFIX):]
+                if suffix in RETRIEVAL_CODESAGE_TOOLS:
+                    bucket["first_codesage_retrieval"] += 1
+                    if suffix == "search":
+                        bucket["first_codesage_search"] += 1
+                else:
+                    bucket["first_other_or_none"] += 1
+            elif first_tool == "Grep":
+                bucket["first_grep"] += 1
+            elif first_tool == "Read":
+                bucket["first_read"] += 1
+            elif first_tool == "Glob":
+                bucket["first_glob"] += 1
+            else:
+                bucket["first_other_or_none"] += 1
+            i += 1
+
     for events in events_per_transcript:
         sessions_total += 1
         # Detect whether codesage was registered in this session at all.
@@ -314,6 +540,11 @@ def aggregate(events_per_transcript: list[list[dict[str, Any]]]) -> dict[str, An
         )
         if had_codesage:
             sessions_with_codesage_available += 1
+
+        # Question-shape pass (does not depend on the streaming detail walk
+        # below — keeps the new code self-contained and easier to remove if
+        # the metric is rotated out later).
+        shape_walk(events, had_codesage)
 
         # Track recent codesage subject-sets with a tiny buffer. A follow-up
         # Grep within 5 subsequent tool_uses on any tracked subject counts
@@ -399,6 +630,7 @@ def aggregate(events_per_transcript: list[list[dict[str, Any]]]) -> dict[str, An
         "sessions_with_codesage_available": sessions_with_codesage_available,
         "identifier_grep_in_codesage_sessions": identifier_grep_in_codesage_sessions,
         "codesage_retrieval_in_codesage_sessions": codesage_retrieval_in_codesage_sessions,
+        "question_shape_counts": {k: dict(v) for k, v in shape_counts.items()},
     }
 
 
@@ -624,6 +856,101 @@ def render(
     for n in notes:
         out.append(f"- {n}")
     out.append("")
+
+    # ----- Per-question-shape breakdown (§2.3 path-(b) follow-up, option 2)
+    shape_counts: dict[str, dict[str, int]] = agg.get("question_shape_counts") or {}
+    if shape_counts:
+        out.append("## Tool selection by user-question shape")
+        out.append("")
+        out.append(
+            "Each user message in a session that had codesage available is bucketed by "
+            "question shape (`semantic`, `identifier`, `literal`, `other`). "
+            "The first tool the agent reached for in response is recorded. "
+            "Classifier rules in `classify_user_question`."
+        )
+        out.append("")
+        out.append(
+            "**Question this answers**: do agents skip CodeSage *on the question shapes "
+            "where it would actually win* (semantic / paraphrase / concept queries), or "
+            "is the 1.1% retrospective rate dominated by identifier-shaped questions "
+            "where Grep is genuinely fine?"
+        )
+        out.append("")
+        out.append(
+            "Two denominators per shape: total user questions of that shape, and the "
+            "subset that triggered a *retrieval-class* first action (Grep / Read / Glob "
+            "/ codesage retrieval). The CS-rate is computed against the retrieval "
+            "subset — that's the one that reflects 'when the agent actually had a "
+            "retrieval decision, what did it pick?', which is the question §2.3 cares "
+            "about. Questions whose first action wasn't retrieval-class (`other/none` "
+            "column) usually mean the agent answered from context or wrote code "
+            "directly; those aren't tool-selection decisions."
+        )
+        out.append("")
+        out.append("| shape | total | retrieval-decisions | first=codesage | first=`search` | first=Grep | first=Read | first=Glob | other/none | CS-rate |")
+        out.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        order = ["semantic", "identifier", "literal", "other"]
+        for shape in order:
+            row = shape_counts.get(shape) or {}
+            q = row.get("questions", 0)
+            cs = row.get("first_codesage_retrieval", 0)
+            cs_search = row.get("first_codesage_search", 0)
+            gp = row.get("first_grep", 0)
+            rd = row.get("first_read", 0)
+            gl = row.get("first_glob", 0)
+            other = row.get("first_other_or_none", 0)
+            decisions = cs + gp + rd + gl  # retrieval-class subset
+            rate = pct(cs, decisions)
+            out.append(
+                f"| {shape} | {q} | {decisions} | {cs} | {cs_search} | {gp} | {rd} | {gl} | {other} | {rate} |"
+            )
+        out.append("")
+
+        # Explicit interpretation note: the metric that decides path (c).
+        sem = shape_counts.get("semantic") or {}
+        sem_q = sem.get("questions", 0)
+        sem_cs = sem.get("first_codesage_retrieval", 0)
+        sem_decisions = (
+            sem.get("first_codesage_retrieval", 0)
+            + sem.get("first_grep", 0)
+            + sem.get("first_read", 0)
+            + sem.get("first_glob", 0)
+        )
+        if sem_decisions >= 5:
+            sem_rate = 100.0 * sem_cs / sem_decisions
+            if sem_rate >= 30:
+                verdict = (
+                    f"**CodeSage is reaching semantic-shaped questions: {sem_rate:.0f}%.** "
+                    "The 1.1% aggregate retrospective rate was dominated by identifier-"
+                    "shaped questions where Grep is genuinely fine. The system-prompt "
+                    "override mechanism is working on the cases that matter; do **not** "
+                    "escalate to enforcement hooks (path c)."
+                )
+            elif sem_rate >= 10:
+                verdict = (
+                    f"**CodeSage rate on semantic questions is partial: {sem_rate:.0f}%.** "
+                    "The override is helping but not winning. Watch the trend; if it "
+                    "doesn't climb past 30% in the next sweep, consider hardening the "
+                    "override text before escalating to hooks."
+                )
+            else:
+                verdict = (
+                    f"**CodeSage is *also* skipped on semantic questions: {sem_rate:.0f}%.** "
+                    "The override mechanism isn't winning where it has the strongest "
+                    "argument. Path (c) — enforcement hooks — is justified."
+                )
+        else:
+            verdict = (
+                f"**Sample too small ({sem_decisions} semantic-shape retrieval decisions "
+                f"in window, {sem_q} total semantic-shape questions).** "
+                "Either widen the window with `--window-days`, or wait for more sessions "
+                "before drawing a conclusion. Note that the harness corpora "
+                "(`bench/corpora/{ripgrep,nest}-eval.yaml`) are also a source of "
+                "retrieval decisions — those don't count here because they're driven "
+                "by the harness, not by real user questions."
+            )
+        out.append(f"- {verdict}")
+        out.append("")
 
     return "\n".join(out)
 

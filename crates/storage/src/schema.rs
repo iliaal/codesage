@@ -141,6 +141,12 @@ pub fn init_vec_extension() {
 pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch("PRAGMA journal_mode=WAL;")?;
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    // Wait up to 5s for a competing writer instead of failing immediately
+    // with `SQLITE_BUSY`. The advisory lockfile (see graph::indexing) already
+    // serializes writers, but a second MCP session reading mid-index would
+    // otherwise hit instant-busy on the brief WAL-checkpoint windows. Match
+    // repowise's posture (see notes/2026-04-29 sweep, §1.8).
+    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
     conn.execute_batch(SCHEMA)?;
     run_migrations(conn)?;
     Ok(())
@@ -265,4 +271,63 @@ pub fn ensure_chunk_table(conn: &Connection, table_name: &str, dim: usize) -> ru
     let fts = fts_table_name(table_name);
     conn.execute_batch(&fts_schema(&fts))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_initialized() -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        init_db(&conn).expect("init_db");
+        conn
+    }
+
+    fn pragma_string(conn: &Connection, name: &str) -> String {
+        conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get::<_, String>(0))
+            .unwrap_or_else(|e| panic!("PRAGMA {name}: {e}"))
+    }
+
+    fn pragma_int(conn: &Connection, name: &str) -> i64 {
+        conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get::<_, i64>(0))
+            .unwrap_or_else(|e| panic!("PRAGMA {name}: {e}"))
+    }
+
+    #[test]
+    fn init_db_sets_wal_journal_mode() {
+        let conn = open_initialized();
+        // In-memory DBs report "memory" not "wal" — only file-backed DBs
+        // honor journal_mode=WAL. Verify the file-backed path separately.
+        let mode = pragma_string(&conn, "journal_mode");
+        assert_eq!(mode, "memory", "in-memory db journal_mode is 'memory'");
+    }
+
+    #[test]
+    fn init_db_sets_wal_on_file_backed_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("idx.db");
+        let conn = Connection::open(&path).expect("open file db");
+        init_db(&conn).expect("init_db");
+        let mode = pragma_string(&conn, "journal_mode");
+        assert_eq!(mode.to_lowercase(), "wal", "expected WAL journal mode");
+    }
+
+    #[test]
+    fn init_db_sets_foreign_keys_on() {
+        let conn = open_initialized();
+        assert_eq!(pragma_int(&conn, "foreign_keys"), 1);
+    }
+
+    #[test]
+    fn init_db_sets_busy_timeout() {
+        // Repowise alignment (sweep §1.8): a non-zero busy_timeout means a
+        // second MCP session reading mid-index waits briefly instead of
+        // failing instantly with SQLITE_BUSY. Default is 0.
+        let conn = open_initialized();
+        let timeout_ms = pragma_int(&conn, "busy_timeout");
+        assert!(
+            timeout_ms >= 5000,
+            "expected busy_timeout >= 5000ms, got {timeout_ms}",
+        );
+    }
 }

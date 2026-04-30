@@ -195,6 +195,16 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Per-file risk for N files (no patch-level aggregation). Reads file paths from stdin or
+    /// positional args. Use when you have a list of files and want individual scores;
+    /// for patch aggregation use `risk-diff`.
+    RiskBatch {
+        /// Repo-relative file paths. If empty, read newline-separated paths from stdin.
+        files: Vec<String>,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Tests that should run after editing the given files: sibling tests + co-change history.
     /// Reads file paths from stdin (one per line) or from positional args. (V2b slice 2)
     TestsFor {
@@ -356,6 +366,7 @@ fn main() -> Result<()> {
         Commands::Coupling { file, limit, json } => cmd_coupling(&file, limit, json),
         Commands::Risk { file, json } => cmd_risk(&file, json),
         Commands::RiskDiff { files, json } => cmd_risk_diff(files, json),
+        Commands::RiskBatch { files, json } => cmd_risk_batch(files, json),
         Commands::TestsFor { files, json } => cmd_tests_for(files, json),
         Commands::SessionStart { session_id, json } => cmd_session_start(&session_id, json),
         Commands::SessionEnd { session_id, json } => cmd_session_end(&session_id, json),
@@ -986,6 +997,31 @@ fn cmd_risk_diff(files: Vec<String>, json: bool) -> Result<()> {
             println!("  Notes:");
             for n in &assessment.summary_notes {
                 println!("    - {n}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_risk_batch(files: Vec<String>, json: bool) -> Result<()> {
+    let root = find_project_root()?;
+    let db = open_db(&root)?;
+    let files = resolve_file_list(files)?;
+    if files.is_empty() {
+        bail!("no file paths provided (pass as args or pipe via stdin)");
+    }
+    let assessment = codesage_graph::assess_risk_batch(&db, &files)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&assessment)?);
+    } else {
+        println!("Per-file risk: {} file(s)", assessment.files.len());
+        for f in &assessment.files {
+            println!("  {:>5.2}  {}", f.score, f.file);
+        }
+        if !assessment.legend.is_empty() {
+            println!("  Legend:");
+            for (code, full) in &assessment.legend {
+                println!("    {code} = {full}");
             }
         }
     }

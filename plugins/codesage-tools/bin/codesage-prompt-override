@@ -1,0 +1,48 @@
+#!/bin/bash
+# codesage-prompt-override
+#
+# Print a system-prompt fragment that steers Claude Code to prefer
+# CodeSage's MCP tools over Grep for retrieval-shape tasks. Pipe into
+# `claude --append-system-prompt-file -` or paste into a `~/.claude/
+# settings.json` `appendSystemPrompt` slot.
+#
+# Pattern adopted from Serena's `cc-system-prompt-override` (see
+# notes/20260429-reference-tool-recommendations.md §1.7 / §2.3
+# rerun 2026-04-30: prompt-level hardening of tool descriptions did
+# not move tool-selection rate from 0%, so the system-prompt slot is
+# the next lever).
+
+cat <<'EOF'
+
+# CodeSage MCP tool selection
+
+When the active project has a `.codesage/index.db` directory, the
+`mcp__codesage__*` tools answer retrieval and code-graph questions
+faster and more precisely than `Grep`. Pick the right tool by the
+shape of the question:
+
+| Question shape | Tool |
+|---|---|
+| "Where is <Identifier> defined?" (function, class, struct, enum, constant, macro) | `mcp__codesage__find_symbol` |
+| "Where is <Identifier> called / imported / inherited from / instantiated?" | `mcp__codesage__find_references` |
+| "Where does <concept> happen?" / "Where is auth, config, retries, logging handled?" / paraphrase queries | `mcp__codesage__search` |
+| "What does `path/file.rs` import, and who imports it?" | `mcp__codesage__list_dependencies` |
+| "What files break if I rename / change <Symbol>?" | `mcp__codesage__impact_analysis` |
+| "Bundle code for this concept for another LLM." | `mcp__codesage__export_context` |
+| "What's the risk of this patch?" / "What tests should I run?" / "What files co-change with this one?" | `mcp__codesage__assess_risk` / `mcp__codesage__assess_risk_diff` / `mcp__codesage__recommend_tests` / `mcp__codesage__find_coupling` |
+
+Use `Grep` / `Glob` / `Bash` only when the target is a non-identifier
+literal: error messages, log text, config keys, TODO/FIXME markers,
+quoted strings, cross-cutting English ("deprecated", "FIXME"). If the
+pattern matches `[A-Za-z_][A-Za-z0-9_]*` or is a `|`-joined list of
+such tokens, the question is symbol-shaped and the CodeSage tools win
+in one call where Grep would take 3-5.
+
+CodeSage tools all require an absolute `project` argument. Read it
+from the project's `.claude/CLAUDE.md` (the codesage onboarder writes
+the path there) or use the current working directory's absolute form.
+
+If a CodeSage tool returns an empty or "not onboarded" result for a
+project, fall back to Grep — but state which tool you tried first and
+why it didn't fit, so the user can spot a missing index.
+EOF
