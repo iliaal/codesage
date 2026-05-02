@@ -541,6 +541,11 @@ const DEFINITION_BOOST_MULTIPLIER: f32 = 3.0;
 // LoginController) — the file is almost certainly the canonical home of
 // this symbol, so push it harder.
 const DEFINITION_FILE_STEM_BONUS: f32 = 1.5;
+// Half-strength when the symbol is embedded in an NL query rather than the
+// whole query ("how does StateManager initialize?" vs bare `StateManager`).
+// The user is asking *about* the symbol but may want explanatory context, so
+// the definition chunk is still a strong signal — just not the dominant one.
+const EMBEDDED_SYMBOL_BOOST_SCALE: f32 = 0.5;
 
 static SYMBOL_QUERY_RE: OnceLock<Regex> = OnceLock::new();
 
@@ -562,6 +567,33 @@ fn symbol_query_re() -> &'static Regex {
 fn is_symbol_query(query: &str) -> bool {
     let q = query.trim();
     !q.is_empty() && symbol_query_re().is_match(q)
+}
+
+static EMBEDDED_SYMBOL_RE: OnceLock<Regex> = OnceLock::new();
+
+fn embedded_symbol_re() -> &'static Regex {
+    EMBEDDED_SYMBOL_RE.get_or_init(|| {
+        // CamelCase or PascalCase tokens embedded in otherwise-NL text.
+        // Requires an internal capital so plain words ("session") don't
+        // match. Excludes pure acronyms (XML, HTTP) — those would be matched
+        // by `[A-Z][a-z][a-zA-Z0-9]*[A-Z]` only if a lowercase letter follows
+        // the leading capital.
+        //   PascalCase: StateManager, LoginController, XmlParser
+        //   camelCase:  getCurrentUser, isLoggedIn
+        Regex::new(
+            r"\b(?:[A-Z][a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*|[a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]+)\b",
+        )
+        .expect("embedded symbol regex compile")
+    })
+}
+
+fn extract_embedded_symbols(query: &str) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for m in embedded_symbol_re().find_iter(query) {
+        seen.insert(m.as_str().to_string());
+    }
+    seen.into_iter().collect()
 }
 
 fn extract_symbol_name(query: &str) -> String {
@@ -595,16 +627,9 @@ fn build_definition_pattern(symbol_name: &str) -> Option<Regex> {
 }
 
 fn apply_definition_boost(results: &mut [SearchResult], query: &str) {
-    if results.is_empty() || !is_symbol_query(query) {
+    if results.is_empty() {
         return;
     }
-    let symbol_name = extract_symbol_name(query);
-    if symbol_name.len() < 2 {
-        return;
-    }
-    let Some(pattern) = build_definition_pattern(&symbol_name) else {
-        return;
-    };
     let max_score = results
         .iter()
         .map(|r| r.score)
@@ -612,25 +637,54 @@ fn apply_definition_boost(results: &mut [SearchResult], query: &str) {
     if !max_score.is_finite() || max_score <= 0.0 {
         return;
     }
-    let boost_unit = max_score * DEFINITION_BOOST_MULTIPLIER;
-    let symbol_lower = symbol_name.to_lowercase();
 
-    for r in results.iter_mut() {
-        if !pattern.is_match(&r.content) {
+    // Two paths:
+    //  - bare symbol query: full-strength boost on the symbol name itself.
+    //  - NL query: half-strength boost on each CamelCase token embedded in
+    //    the NL ("how does StateManager initialize?" -> StateManager).
+    let symbols: Vec<String> = if is_symbol_query(query) {
+        let name = extract_symbol_name(query);
+        if name.len() < 2 {
+            Vec::new()
+        } else {
+            vec![name]
+        }
+    } else {
+        extract_embedded_symbols(query)
+    };
+    if symbols.is_empty() {
+        return;
+    }
+
+    let scale = if is_symbol_query(query) {
+        1.0
+    } else {
+        EMBEDDED_SYMBOL_BOOST_SCALE
+    };
+    let boost_unit = max_score * DEFINITION_BOOST_MULTIPLIER * scale;
+
+    for symbol_name in &symbols {
+        let Some(pattern) = build_definition_pattern(symbol_name) else {
             continue;
-        }
-        let mut boost = boost_unit;
-        if let Some(stem) = std::path::Path::new(&r.file_path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-        {
-            let stem_lower = stem.to_lowercase();
-            let stem_norm = stem_lower.replace('_', "");
-            if stem_lower == symbol_lower || stem_norm == symbol_lower {
-                boost *= DEFINITION_FILE_STEM_BONUS;
+        };
+        let symbol_lower = symbol_name.to_lowercase();
+        for r in results.iter_mut() {
+            if !pattern.is_match(&r.content) {
+                continue;
             }
+            let mut boost = boost_unit;
+            if let Some(stem) = std::path::Path::new(&r.file_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+            {
+                let stem_lower = stem.to_lowercase();
+                let stem_norm = stem_lower.replace('_', "");
+                if stem_lower == symbol_lower || stem_norm == symbol_lower {
+                    boost *= DEFINITION_FILE_STEM_BONUS;
+                }
+            }
+            r.score += boost;
         }
-        r.score += boost;
     }
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 }
@@ -1620,7 +1674,7 @@ mod definition_boost_tests {
     }
 
     #[test]
-    fn nl_query_does_not_trigger_boost() {
+    fn nl_query_without_embedded_symbol_does_not_trigger_boost() {
         let original_score = 0.5;
         let mut rs = vec![mk(
             "src/foo.rs",
@@ -1629,6 +1683,49 @@ mod definition_boost_tests {
         )];
         apply_definition_boost(&mut rs, "how does foo work");
         assert_eq!(rs[0].score, original_score);
+    }
+
+    #[test]
+    fn nl_query_with_embedded_camelcase_triggers_half_strength_boost() {
+        // Query contains "StateManager"; embedded path applies 0.5x
+        // strength. Definition chunk should overtake reference chunk.
+        let mut rs = vec![
+            mk("src/uses.rs", "let x = StateManager::new();", 1.0),
+            mk("src/state.rs", "pub struct StateManager { v: u32 }", 0.5),
+        ];
+        apply_definition_boost(&mut rs, "how does StateManager initialize?");
+        assert_eq!(rs[0].file_path, "src/state.rs");
+        assert!(rs[0].score > rs[1].score);
+    }
+
+    #[test]
+    fn embedded_symbol_extraction_skips_acronyms_and_words() {
+        use super::extract_embedded_symbols;
+        // Pure acronyms (HTTP, XML) excluded; plain words excluded.
+        let syms = extract_embedded_symbols("HTTP request and XML parser handle login");
+        assert!(syms.is_empty(), "got: {syms:?}");
+        // XmlParser matches PascalCase; HTTP does not.
+        let syms = extract_embedded_symbols("how does XmlParser work for HTTP requests");
+        assert_eq!(syms, vec!["XmlParser"]);
+        // camelCase tokens both match.
+        let syms = extract_embedded_symbols("call getCurrentUser before isLoggedIn");
+        assert_eq!(syms, vec!["getCurrentUser", "isLoggedIn"]);
+    }
+
+    #[test]
+    fn embedded_path_promotes_definition_files_over_unrelated_chunk() {
+        let mut rs = vec![
+            mk("src/state.rs", "pub struct StateManager { v: u32 }", 0.4),
+            mk(
+                "src/login.rs",
+                "pub struct LoginController { u: User }",
+                0.4,
+            ),
+            mk("src/other.rs", "fn unrelated() {}", 0.5),
+        ];
+        apply_definition_boost(&mut rs, "how do StateManager and LoginController interact?");
+        // Both definition chunks should now lead; the unrelated one trails.
+        assert_eq!(rs[2].file_path, "src/other.rs");
     }
 
     #[test]
