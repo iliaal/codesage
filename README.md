@@ -299,7 +299,7 @@ Honest inventory of what CodeSage does not do well, measured on our canary corpo
 
 ## 🔗 Pairs with
 
-- **[compound-engineering-plugin](https://github.com/iliaal/compound-engineering-plugin)**: agents, commands, and skills that tell coding agents *how* to work. CodeSage is the intelligence layer (what the code is); compound-engineering-plugin is the discipline layer (how to investigate, review, and ship). Install both for the full stack.
+- **[whetstone](https://github.com/iliaal/whetstone)**: agents, commands, and skills that tell coding agents *how* to work. CodeSage is the intelligence layer (what the code is); whetstone is the discipline layer (how to investigate, review, and ship). Install both for the full stack.
 
 ## Complementary tools
 
