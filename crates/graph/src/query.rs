@@ -442,6 +442,10 @@ pub fn search(
         apply_reranking(reranker, &req.query, &mut results);
     }
 
+    if file_saturation_enabled() {
+        apply_file_saturation(&mut results);
+    }
+
     apply_offset_and_limit(&mut results, offset, limit);
     Ok(results)
 }
@@ -568,6 +572,47 @@ fn path_penalty_enabled() -> bool {
     *PATH_PENALTY_ENABLED.get_or_init(|| {
         !matches!(
             std::env::var("CODESAGE_PATH_PENALTY").as_deref(),
+            Ok("0") | Ok("false")
+        )
+    })
+}
+
+// File saturation decay: ranking the same file's Nth chunk gets multiplied by
+// 0.5^(N-1) so a single file can't monopolize the top-K. Walks results in
+// score order, counts per-file occurrences, decays subsequent chunks, then
+// re-sorts. Pattern from Semble's penalties.py rerank_topk file_saturation
+// branch. Threshold = 1: the second chunk from a file is the first to decay.
+const FILE_SATURATION_THRESHOLD: usize = 1;
+const FILE_SATURATION_DECAY: f32 = 0.5;
+
+fn apply_file_saturation(results: &mut [SearchResult]) {
+    if results.is_empty() {
+        return;
+    }
+    // Pre-sort by current score so per-file count reflects rank order. The
+    // caller (search()) re-sorts after every score-mutating step, so this is
+    // usually redundant — but cheap and protects against future reorderings.
+    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+
+    let mut per_file: HashMap<String, usize> = HashMap::new();
+    for result in results.iter_mut() {
+        let already = per_file.get(&result.file_path).copied().unwrap_or(0);
+        if already >= FILE_SATURATION_THRESHOLD {
+            let excess = (already - FILE_SATURATION_THRESHOLD + 1) as i32;
+            result.score *= FILE_SATURATION_DECAY.powi(excess);
+        }
+        *per_file.entry(result.file_path.clone()).or_insert(0) += 1;
+    }
+    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+}
+
+// Default-on; opt-out via CODESAGE_FILE_SATURATION=0 (or "false").
+static FILE_SATURATION_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn file_saturation_enabled() -> bool {
+    *FILE_SATURATION_ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("CODESAGE_FILE_SATURATION").as_deref(),
             Ok("0") | Ok("false")
         )
     })
@@ -1233,5 +1278,90 @@ mod path_penalty_tests {
         assert_eq!(path_penalty("src/examplesite/index.ts"), 1.0);
         // "test_helpers" file in src/ should NOT trigger (no test-like glob match).
         assert_eq!(path_penalty("src/utilities.rs"), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod file_saturation_tests {
+    use super::{SearchResult, apply_file_saturation};
+
+    fn mk(file: &str, score: f32) -> SearchResult {
+        SearchResult {
+            file_path: file.to_string(),
+            language: "rust".to_string(),
+            content: String::new(),
+            start_line: 0,
+            end_line: 0,
+            score,
+            symbols: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn single_chunk_per_file_unchanged() {
+        let mut rs = vec![mk("a.rs", 1.0), mk("b.rs", 0.9), mk("c.rs", 0.8)];
+        apply_file_saturation(&mut rs);
+        assert_eq!(rs[0].file_path, "a.rs");
+        assert_eq!(rs[0].score, 1.0);
+        assert_eq!(rs[1].file_path, "b.rs");
+        assert_eq!(rs[1].score, 0.9);
+        assert_eq!(rs[2].file_path, "c.rs");
+        assert_eq!(rs[2].score, 0.8);
+    }
+
+    #[test]
+    fn second_chunk_from_same_file_decays_50pct() {
+        // a.rs has two chunks; second one decays 0.5x → 0.45
+        let mut rs = vec![mk("a.rs", 1.0), mk("a.rs", 0.9), mk("b.rs", 0.7)];
+        apply_file_saturation(&mut rs);
+        assert_eq!(rs[0].file_path, "a.rs");
+        assert_eq!(rs[0].score, 1.0);
+        assert_eq!(rs[1].file_path, "b.rs");
+        assert_eq!(rs[1].score, 0.7);
+        assert_eq!(rs[2].file_path, "a.rs");
+        assert!((rs[2].score - 0.45).abs() < 1e-6);
+    }
+
+    #[test]
+    fn third_chunk_from_same_file_decays_25pct() {
+        let mut rs = vec![
+            mk("a.rs", 1.0),
+            mk("a.rs", 0.9), // → 0.45
+            mk("a.rs", 0.8), // → 0.20
+            mk("b.rs", 0.5),
+        ];
+        apply_file_saturation(&mut rs);
+        // After decay+sort: a(1.0), b(0.5), a(0.45), a(0.20)
+        assert_eq!(rs[0].file_path, "a.rs");
+        assert_eq!(rs[0].score, 1.0);
+        assert_eq!(rs[1].file_path, "b.rs");
+        assert_eq!(rs[1].score, 0.5);
+        assert_eq!(rs[2].file_path, "a.rs");
+        assert!((rs[2].score - 0.45).abs() < 1e-6);
+        assert_eq!(rs[3].file_path, "a.rs");
+        assert!((rs[3].score - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn diversity_promotes_lower_scored_distinct_file() {
+        // Without saturation: a, a, a, b. With: a, b, a, a.
+        let mut rs = vec![
+            mk("a.rs", 1.0),
+            mk("a.rs", 0.9),
+            mk("a.rs", 0.8),
+            mk("b.rs", 0.6),
+        ];
+        apply_file_saturation(&mut rs);
+        assert_eq!(rs[0].file_path, "a.rs");
+        assert_eq!(rs[1].file_path, "b.rs");
+        assert_eq!(rs[2].file_path, "a.rs");
+        assert_eq!(rs[3].file_path, "a.rs");
+    }
+
+    #[test]
+    fn empty_input_is_noop() {
+        let mut rs: Vec<SearchResult> = Vec::new();
+        apply_file_saturation(&mut rs);
+        assert!(rs.is_empty());
     }
 }
