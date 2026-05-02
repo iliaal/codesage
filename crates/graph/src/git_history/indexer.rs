@@ -126,13 +126,8 @@ pub fn git_history_index_with_options(
 ///   `assess_risk` test-gap detection can find them) but are dropped from
 ///   co-change pair generation. Tests, benches.
 fn compile_excludes(extra: &[String]) -> Result<(GlobSet, GlobSet)> {
-    use std::collections::HashSet;
-
-    let test_like_set: HashSet<&&str> = TEST_LIKE_EXCLUDE_PATTERNS.iter().collect();
-
     let mut hard: Vec<String> = DEFAULT_EXCLUDE_PATTERNS
         .iter()
-        .filter(|p| !test_like_set.contains(p))
         .map(|s| s.to_string())
         .collect();
     hard.extend(extra.iter().cloned());

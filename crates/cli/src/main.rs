@@ -624,9 +624,10 @@ fn cmd_init() -> Result<()> {
             "[project]\nname = \"{dir_name}\"\n\n\
              [embedding]\nmodel = \"sentence-transformers/all-MiniLM-L6-v2\"\ndevice = \"cpu\"\nreranker = \"cross-encoder/ms-marco-MiniLM-L6-v2\"\n\n\
              [index]\n\
-             # Built-in defaults always apply (tests, vendored deps, build outputs, lock files,\n\
-             # caches, IDE state). See DEFAULT_EXCLUDE_PATTERNS in crates/parser/src/discover.rs.\n\
-             # Patterns listed here ADD to the defaults; they do not replace them.\n\
+             # Built-in defaults always apply (vendored deps, build outputs, lock files,\n\
+             # caches, IDE state). Test files are indexed structurally and semantically,\n\
+             # then demoted at search time. See DEFAULT_EXCLUDE_PATTERNS in\n\
+             # crates/parser/src/discover.rs. Patterns listed here ADD to the defaults.\n\
              exclude_patterns = []\n",
         ),
     )?;

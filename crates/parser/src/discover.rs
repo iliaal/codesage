@@ -90,15 +90,11 @@ pub fn discover_files_with_excludes(
     Ok(files)
 }
 
-/// Always-applied defaults. User config in `[index].exclude_patterns` extends this list.
-/// Most build outputs live under top-level gitignore on real projects already; these defaults
-/// catch the cases where they do not (vendored repos, sandboxed checkouts) and add language /
-/// IDE / cache patterns that gitignore alone misses.
-/// Subset of `DEFAULT_EXCLUDE_PATTERNS` that identifies test and bench files.
-/// Used by `git_history` to keep these files in `git_files` (so `recommend_tests`
-/// and `assess_risk`'s test-gap check can find them) while still dropping them
-/// from co-change pair generation (where they'd pair with everything they cover
-/// and skew coupling rankings).
+/// Test and benchmark files. These ARE indexed structurally and semantically
+/// (so `find_references` can see test callsites and `find_symbol` can find test
+/// fixtures), but the search ranker demotes them via path-based penalties and
+/// the git-history layer drops them from co-change pair generation (where they'd
+/// pair with everything they cover and skew coupling rankings).
 pub const TEST_LIKE_EXCLUDE_PATTERNS: &[&str] = &[
     "**/tests/**",
     "**/test/**",
@@ -123,29 +119,12 @@ pub const TEST_LIKE_EXCLUDE_PATTERNS: &[&str] = &[
     "**/benchmarks/**",
 ];
 
-pub const DEFAULT_EXCLUDE_PATTERNS: &[&str] = &[
-    // ----- tests (excluded from semantic search; structural pass still sees test code) -----
-    "**/tests/**",
-    "**/test/**",
-    "**/__tests__/**",
-    "**/Tests/**",
-    "**/*Test.php",
-    "**/*_test.php",
-    "**/*.test.ts",
-    "**/*.test.tsx",
-    "**/*.test.js",
-    "**/*.test.jsx",
-    "**/*.spec.ts",
-    "**/*.spec.tsx",
-    "**/*.spec.js",
-    "**/*.spec.jsx",
-    "**/test_*.py",
-    "**/*_test.py",
-    "**/*_test.rs",
-    "**/*_test.go",
-    "**/*.phpt",
-    "**/benches/**",
-    "**/benchmarks/**",
+/// Files that never enter any index — third-party code, build outputs, generated
+/// artifacts, lockfiles, docs/changelogs, IDE state. Dropped at file discovery
+/// time. Most live under project gitignore already; these defaults catch the
+/// cases where they don't (vendored repos, sandboxed checkouts) and add
+/// language/IDE/cache patterns that gitignore alone misses.
+pub const HARD_EXCLUDE_PATTERNS: &[&str] = &[
     // ----- third-party / vendored code -----
     "**/vendor/**",
     "**/node_modules/**",
@@ -250,3 +229,10 @@ pub const DEFAULT_EXCLUDE_PATTERNS: &[&str] = &[
     "**/*.swo",
     "**/.DS_Store",
 ];
+
+/// Excludes applied at file discovery time. User config in
+/// `[index].exclude_patterns` extends this list. Equals `HARD_EXCLUDE_PATTERNS`;
+/// `TEST_LIKE_EXCLUDE_PATTERNS` are intentionally NOT excluded here so that the
+/// structural graph stays correct on test code (callsites, fixtures) and the
+/// search ranker can demote them at rank time instead.
+pub const DEFAULT_EXCLUDE_PATTERNS: &[&str] = HARD_EXCLUDE_PATTERNS;
