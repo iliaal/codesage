@@ -8,12 +8,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use codesage_embed::config::ProjectConfig;
+use codesage_embed::config::{EmbeddingConfig, ProjectConfig};
 use codesage_embed::model::Embedder;
 use codesage_graph::{
-    assess_risk, export_context, find_coupling, find_references, find_symbol, full_index,
-    impact_analysis, incremental_index, list_dependencies, search, semantic_full_index,
-    semantic_incremental_index,
+    assess_risk, export_context, export_context_for_symbol, find_coupling, find_references,
+    find_symbol, full_index, impact_analysis, incremental_index, list_dependencies, search,
+    semantic_full_index, semantic_incremental_index,
 };
 use codesage_parser::discover::DEFAULT_EXCLUDE_PATTERNS;
 use codesage_protocol::{
@@ -267,6 +267,16 @@ fn open_db_for_model(root: &Path, model: &str, dim: usize) -> Result<Database> {
     Database::open_for_model(&db_path, model, dim).context("failed to open index database")
 }
 
+fn open_db_for_model_rebuild(root: &Path, model: &str, dim: usize) -> Result<Database> {
+    let db_path = root.join(PROJECT_DIR).join(DB_FILE);
+    Database::open_for_model_rebuild(&db_path, model, dim).context("failed to open index database")
+}
+
+fn open_context_db_for_existing_model(root: &Path, model: &str) -> Result<Database> {
+    let db_path = root.join(PROJECT_DIR).join(DB_FILE);
+    Database::open_for_existing_model(&db_path, model).context("failed to open index database")
+}
+
 pub(crate) fn load_project_config(root: &Path) -> Result<ProjectConfig> {
     let config_path = root.join(PROJECT_DIR).join("config.toml");
     let content = match std::fs::read_to_string(&config_path) {
@@ -316,6 +326,23 @@ fn load_query_stack(
         .map(|model| codesage_embed::reranker::Reranker::new(model, &emb_config.device))
         .transpose()?;
     Ok((db, embedder, reranker))
+}
+
+fn load_symbol_context_db(root: &Path) -> Result<Database> {
+    let config = load_project_config(root)?;
+    let emb_config = config.embedding.unwrap_or_default();
+    open_context_db_for_existing_model(root, &emb_config.model)
+}
+
+fn load_index_embedder(
+    no_semantic: bool,
+    emb_config: &EmbeddingConfig,
+) -> Result<Option<Embedder>> {
+    if no_semantic {
+        Ok(None)
+    } else {
+        Ok(Some(Embedder::new(emb_config)?))
+    }
 }
 
 fn main() -> Result<()> {
@@ -651,17 +678,13 @@ fn cmd_index(full: bool, no_semantic: bool) -> Result<()> {
     let excludes = get_exclude_patterns(&config);
 
     let emb_config = config.embedding.unwrap_or_default();
-    let embedder_result = if !no_semantic {
-        Some(Embedder::new(&emb_config))
-    } else {
-        None
-    };
+    let mut embedder = load_index_embedder(no_semantic, &emb_config)?;
 
-    let (model_name, dim) = match &embedder_result {
-        Some(Ok(e)) => (emb_config.model.as_str(), e.dim()),
-        _ => ("default", codesage_storage::db::DEFAULT_EMBEDDING_DIM),
+    let db = match embedder.as_ref() {
+        Some(e) if full => open_db_for_model_rebuild(&root, &emb_config.model, e.dim())?,
+        Some(e) => open_db_for_model(&root, &emb_config.model, e.dim())?,
+        None => open_db(&root)?,
     };
-    let db = open_db_for_model(&root, model_name, dim)?;
 
     let stats = if full {
         full_index(&root, &db, &excludes)?
@@ -678,26 +701,19 @@ fn cmd_index(full: bool, no_semantic: bool) -> Result<()> {
         stats.references_found
     );
 
-    if let Some(embedder_result) = embedder_result {
-        match embedder_result {
-            Ok(mut embedder) => {
-                let sem_stats = if full {
-                    semantic_full_index(&root, &db, &mut embedder, &excludes)?
-                } else {
-                    semantic_incremental_index(&root, &db, &mut embedder, &excludes)?
-                };
-                println!(
-                    "Semantic: {} files ({} skipped, {} removed), {} chunks",
-                    sem_stats.files_processed,
-                    sem_stats.files_skipped,
-                    sem_stats.files_removed,
-                    sem_stats.chunks_created
-                );
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "semantic indexing skipped");
-            }
-        }
+    if let Some(embedder) = embedder.as_mut() {
+        let sem_stats = if full {
+            semantic_full_index(&root, &db, embedder, &excludes)?
+        } else {
+            semantic_incremental_index(&root, &db, embedder, &excludes)?
+        };
+        println!(
+            "Semantic: {} files ({} skipped, {} removed), {} chunks",
+            sem_stats.files_processed,
+            sem_stats.files_skipped,
+            sem_stats.files_removed,
+            sem_stats.chunks_created
+        );
     }
 
     // Stamp the HEAD SHA we just indexed against. Skipped in non-git dirs.
@@ -1193,7 +1209,7 @@ fn cmd_cleanup(dry_run: bool) -> Result<()> {
     let active_dim = embedder.dim();
     let active_table = codesage_storage::schema::model_table_name(&emb_config.model, active_dim);
 
-    let db = open_db_for_model(&root, &emb_config.model, active_dim)?;
+    let db = open_db(&root)?;
 
     let db_path = root.join(PROJECT_DIR).join(DB_FILE);
     let size_before = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
@@ -1309,11 +1325,15 @@ fn cmd_export(
     format: &str,
 ) -> Result<()> {
     let root = find_project_root()?;
-    let (db, mut embedder, mut reranker) = load_query_stack(&root)?;
-
     let req = ExportRequest::from_target(target.to_string(), is_symbol, limit, callers, callees);
 
-    let bundle = export_context(&db, &mut embedder, reranker.as_mut(), &req)?;
+    let bundle = if is_symbol {
+        let db = load_symbol_context_db(&root)?;
+        export_context_for_symbol(&db, target, &req)?
+    } else {
+        let (db, mut embedder, mut reranker) = load_query_stack(&root)?;
+        export_context(&db, &mut embedder, reranker.as_mut(), &req)?
+    };
 
     match format {
         "json" => println!("{}", serde_json::to_string_pretty(&bundle)?),
@@ -1604,5 +1624,61 @@ mod tests {
         };
         let patterns = get_exclude_patterns(&cfg);
         assert_eq!(patterns.len(), DEFAULT_EXCLUDE_PATTERNS.len());
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn index_embedder_setup_errors_when_gpu_requested_without_cuda() {
+        let cfg = EmbeddingConfig {
+            model: "codesage-test/does-not-matter".to_string(),
+            device: "gpu".to_string(),
+            reranker: None,
+        };
+
+        let err = match load_index_embedder(false, &cfg) {
+            Ok(_) => panic!("expected gpu setup to fail without cuda feature"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("without cuda feature"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn index_embedder_setup_skips_model_when_no_semantic() {
+        let cfg = EmbeddingConfig {
+            model: "codesage-test/does-not-exist".to_string(),
+            device: "gpu".to_string(),
+            reranker: None,
+        };
+
+        assert!(load_index_embedder(true, &cfg).unwrap().is_none());
+    }
+
+    #[test]
+    fn symbol_context_db_does_not_load_embedding_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let codesage_dir = root.join(PROJECT_DIR);
+        std::fs::create_dir_all(&codesage_dir).unwrap();
+        let model = "codesage-test/does-not-exist";
+        std::fs::write(
+            codesage_dir.join("config.toml"),
+            format!("[embedding]\nmodel = \"{model}\"\ndevice = \"gpu\"\n"),
+        )
+        .unwrap();
+        let db_path = codesage_dir.join(DB_FILE);
+        Database::open_for_model(&db_path, model, codesage_storage::db::DEFAULT_EMBEDDING_DIM)
+            .unwrap();
+
+        let db = load_symbol_context_db(root).unwrap();
+
+        assert_eq!(
+            db.chunk_table_name(),
+            "chunks_codesage_test_does_not_exist_384"
+        );
     }
 }

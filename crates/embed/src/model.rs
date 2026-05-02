@@ -218,6 +218,16 @@ impl Embedder {
         init_ort_dylib();
         tracing::info!(model = %config.model, "loading embedding model");
 
+        let want_cuda = config.device == "gpu" || config.device == "cuda";
+        if want_cuda {
+            #[cfg(not(feature = "cuda"))]
+            {
+                anyhow::bail!(
+                    "GPU requested but binary built without cuda feature. Rebuild with: cargo build --features cuda"
+                );
+            }
+        }
+
         let api =
             hf_hub::api::sync::Api::new().context("failed to create HuggingFace API client")?;
         let repo = api.model(config.model.clone());
@@ -245,7 +255,6 @@ impl Embedder {
 
         let mut builder = Session::builder()?;
 
-        let want_cuda = config.device == "gpu" || config.device == "cuda";
         if want_cuda {
             #[cfg(feature = "cuda")]
             {
@@ -257,12 +266,6 @@ impl Embedder {
                             .error_on_failure(),
                     ])
                     .map_err(|e| anyhow::anyhow!("CUDA provider failed to register: {e}"))?;
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                anyhow::bail!(
-                    "GPU requested but binary built without cuda feature. Rebuild with: cargo build --features cuda"
-                );
             }
         }
 

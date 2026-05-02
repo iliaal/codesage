@@ -6,7 +6,7 @@ use codesage_storage::Database;
 use crate::drift::{DriftKind, check_drift};
 use crate::{DB_FILE, PROJECT_DIR, find_project_root_opt, load_project_config};
 
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Status {
     Pass,
@@ -21,6 +21,8 @@ struct Check {
     status: Status,
     message: String,
 }
+
+const REQUIRED_HOOKS: &[&str] = &["post-commit", "post-merge", "post-checkout", "post-rewrite"];
 
 pub fn run(json: bool) -> Result<()> {
     let mut checks = Vec::new();
@@ -313,7 +315,7 @@ fn check_hooks(root: &Path) -> Check {
 
     let mut installed = Vec::new();
     let mut missing = Vec::new();
-    for name in &["post-commit", "post-merge", "post-checkout"] {
+    for name in REQUIRED_HOOKS {
         let p = hooks_dir.join(name);
         let codesage = p.exists()
             && std::fs::read_to_string(&p)
@@ -326,11 +328,15 @@ fn check_hooks(root: &Path) -> Check {
         }
     }
 
-    if installed.len() == 3 {
+    if installed.len() == REQUIRED_HOOKS.len() {
         Check {
             name: "hooks",
             status: Status::Pass,
-            message: format!("{kind}: all three installed at {}", hooks_dir.display()),
+            message: format!(
+                "{kind}: all {} installed at {}",
+                REQUIRED_HOOKS.len(),
+                hooks_dir.display()
+            ),
         }
     } else if installed.is_empty() {
         Check {
@@ -445,3 +451,58 @@ fn model_in_cache(cache: &Path, model: &str) -> bool {
 }
 
 use crate::util::format_bytes;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn init_git_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed");
+        dir
+    }
+
+    fn write_codesage_hook(root: &Path, name: &str) {
+        let hooks = root.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(
+            hooks.join(name),
+            "#!/bin/sh\n# installed by codesage install-hooks\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn check_hooks_requires_post_rewrite() {
+        let dir = init_git_repo();
+        for hook in ["post-commit", "post-merge", "post-checkout"] {
+            write_codesage_hook(dir.path(), hook);
+        }
+
+        let check = check_hooks(dir.path());
+
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check.message.contains("post-rewrite"),
+            "message should name missing post-rewrite hook: {}",
+            check.message
+        );
+    }
+
+    #[test]
+    fn check_hooks_passes_when_all_required_hooks_are_present() {
+        let dir = init_git_repo();
+        for hook in REQUIRED_HOOKS {
+            write_codesage_hook(dir.path(), hook);
+        }
+
+        let check = check_hooks(dir.path());
+
+        assert_eq!(check.status, Status::Pass);
+    }
+}

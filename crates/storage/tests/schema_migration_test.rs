@@ -142,7 +142,12 @@ fn init_db_adds_v2b_git_tables_to_legacy_db() {
     // Legacy DB has files/symbols/refs but no git_files/git_co_changes.
     init_db(&conn).expect("init_db must succeed on legacy schema");
 
-    for table in &["git_files", "git_co_changes"] {
+    for table in &[
+        "git_files",
+        "git_co_changes",
+        "semantic_files",
+        "semantic_models",
+    ] {
         let exists: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?1",
@@ -156,6 +161,7 @@ fn init_db_adds_v2b_git_tables_to_legacy_db() {
         "idx_git_files_churn",
         "idx_git_co_changes_file_a",
         "idx_git_co_changes_file_b",
+        "idx_semantic_models_model",
     ] {
         let exists: i64 = conn
             .query_row(
@@ -184,26 +190,30 @@ fn fresh_db_records_migrations_exactly_once() {
     assert_eq!(has_table, 1);
 
     // Each migration name must be present exactly once after first init.
-    let count_0001: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM schema_migrations WHERE name = '0001_refs_name_tail'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(count_0001, 1, "0001 recorded on fresh DB");
+    for migration in [
+        "0001_refs_name_tail",
+        "0002_structural_index_state",
+        "0003_semantic_files",
+        "0004_semantic_files_chunk_table",
+        "0005_semantic_models",
+    ] {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE name = ?1",
+                rusqlite::params![migration],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "{migration} recorded on fresh DB");
+    }
 
     // Running init_db again must be a no-op: count stays at 1.
     init_db(&conn).expect("second init_db");
     let count_after: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM schema_migrations WHERE name = '0001_refs_name_tail'",
-            [],
-            |r| r.get(0),
-        )
+        .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
-        count_after, 1,
+        count_after, 5,
         "second init_db must not re-apply migrations"
     );
 }
@@ -224,15 +234,75 @@ fn legacy_db_records_migration_after_upgrade() {
 
     init_db(&conn).expect("init_db on legacy DB");
 
-    // schema_migrations exists with 0001 recorded.
-    let count_0001: i64 = conn
+    for migration in [
+        "0001_refs_name_tail",
+        "0002_structural_index_state",
+        "0003_semantic_files",
+        "0004_semantic_files_chunk_table",
+        "0005_semantic_models",
+    ] {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE name = ?1",
+                rusqlite::params![migration],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "{migration} recorded after legacy upgrade");
+    }
+}
+
+#[test]
+fn migrates_path_only_semantic_files_to_chunk_table_scoped_shape() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_db(&conn).expect("initial current schema");
+
+    conn.execute_batch(
+        "DELETE FROM schema_migrations WHERE name = '0004_semantic_files_chunk_table';
+         DROP TABLE semantic_files;
+         CREATE TABLE semantic_files (
+             path TEXT PRIMARY KEY,
+             content_hash TEXT NOT NULL,
+             indexed_at INTEGER NOT NULL DEFAULT (unixepoch())
+         );
+         INSERT INTO semantic_files (path, content_hash) VALUES ('a.rs', 'old');",
+    )
+    .unwrap();
+
+    init_db(&conn).expect("init_db migrates path-only semantic_files");
+
+    let has_chunk_table: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM schema_migrations WHERE name = '0001_refs_name_tail'",
+            "SELECT COUNT(*) FROM pragma_table_info('semantic_files') WHERE name = 'chunk_table'",
             [],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(count_0001, 1);
+    assert_eq!(has_chunk_table, 1);
+
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM semantic_files", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "path-only freshness rows must be discarded");
+
+    let index_table: String = conn
+        .query_row(
+            "SELECT tbl_name FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_semantic_files_path'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(index_table, "semantic_files");
+
+    let migration_recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE name = '0004_semantic_files_chunk_table'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(migration_recorded, 1);
 }
 
 #[test]

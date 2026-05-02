@@ -374,6 +374,8 @@ impl Database {
     pub fn remove_file(&self, path: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM files WHERE path = ?1", params![path])?;
+        self.conn
+            .execute("DELETE FROM semantic_files WHERE path = ?1", params![path])?;
         // git tables are path-keyed (not FK'd to `files`, because git-index can run
         // without a structural index), so cascade manually. Without this, deleted
         // files stay visible in `find_coupling` / `assess_risk` / future hotspots.

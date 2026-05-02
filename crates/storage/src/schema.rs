@@ -75,6 +75,25 @@ CREATE TABLE IF NOT EXISTS structural_index_state (
     last_sha TEXT,
     last_indexed_at INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS semantic_files (
+    chunk_table TEXT NOT NULL,
+    path TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    indexed_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (chunk_table, path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_semantic_files_path ON semantic_files(path);
+
+CREATE TABLE IF NOT EXISTS semantic_models (
+    chunk_table TEXT PRIMARY KEY,
+    model TEXT NOT NULL,
+    dim INTEGER NOT NULL,
+    indexed_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE INDEX IF NOT EXISTS idx_semantic_models_model ON semantic_models(model);
 "#;
 
 pub fn semantic_schema(table_name: &str, dim: usize) -> String {
@@ -114,12 +133,48 @@ pub fn fts_schema(table_name: &str) -> String {
     )
 }
 
+fn quote_ident(identifier: &str) -> String {
+    identifier.replace('"', "\"\"")
+}
+
+fn table_row_count(conn: &Connection, table_name: &str) -> rusqlite::Result<i64> {
+    let sql = format!("SELECT COUNT(*) FROM \"{}\"", quote_ident(table_name));
+    conn.query_row(&sql, [], |row| row.get(0))
+}
+
+fn repair_fts_sidecar(
+    conn: &Connection,
+    chunk_table: &str,
+    fts_table: &str,
+) -> rusqlite::Result<()> {
+    let chunk_count = table_row_count(conn, chunk_table)?;
+    let fts_count = table_row_count(conn, fts_table)?;
+    if chunk_count == fts_count {
+        return Ok(());
+    }
+
+    let chunk_table = quote_ident(chunk_table);
+    let fts_table = quote_ident(fts_table);
+    conn.execute_batch(&format!(
+        "DELETE FROM \"{fts_table}\";
+         INSERT INTO \"{fts_table}\"(rowid, content, file_path, language, start_line, end_line)
+         SELECT id, content, file_path, language, start_line, end_line
+         FROM \"{chunk_table}\"
+         ORDER BY id;"
+    ))?;
+    Ok(())
+}
+
 pub fn model_table_name(model: &str, dim: usize) -> String {
+    format!("{}{dim}", model_table_prefix(model))
+}
+
+pub fn model_table_prefix(model: &str) -> String {
     let sanitized: String = model
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
         .collect();
-    format!("chunks_{sanitized}_{dim}")
+    format!("chunks_{sanitized}_")
 }
 
 unsafe extern "C" {
@@ -172,6 +227,12 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
         "0002_structural_index_state",
         migrate_0002_structural_index_state,
     ),
+    ("0003_semantic_files", migrate_0003_semantic_files),
+    (
+        "0004_semantic_files_chunk_table",
+        migrate_0004_semantic_files_chunk_table,
+    ),
+    ("0005_semantic_models", migrate_0005_semantic_models),
 ];
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
@@ -266,10 +327,80 @@ fn migrate_0002_structural_index_state(conn: &Connection) -> rusqlite::Result<()
     Ok(())
 }
 
+/// Adds per-file semantic freshness state. Structural indexing can run with
+/// `--no-semantic`; semantic indexing therefore needs its own content hashes
+/// so a later incremental semantic pass does not skip structurally-current but
+/// semantically-stale files.
+fn migrate_0003_semantic_files(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS semantic_files (
+             chunk_table TEXT NOT NULL,
+             path TEXT NOT NULL,
+             content_hash TEXT NOT NULL,
+             indexed_at INTEGER NOT NULL DEFAULT (unixepoch()),
+             PRIMARY KEY (chunk_table, path)
+         );",
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_semantic_files_path ON semantic_files(path);",
+    )?;
+    Ok(())
+}
+
+/// `semantic_files` was introduced as path-only state during the 0.4.6
+/// development cycle. Freshness is actually per chunk table because each
+/// embedding model has its own vec0 table, so upgrade any path-only table by
+/// discarding freshness rows and forcing the next semantic pass to re-index.
+fn migrate_0004_semantic_files_chunk_table(conn: &Connection) -> rusqlite::Result<()> {
+    let has_chunk_table: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('semantic_files') WHERE name = 'chunk_table'",
+        [],
+        |row| row.get(0),
+    )?;
+
+    if has_chunk_table == 0 {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS semantic_files_path_only_backup;
+             ALTER TABLE semantic_files RENAME TO semantic_files_path_only_backup;
+             CREATE TABLE semantic_files (
+                 chunk_table TEXT NOT NULL,
+                 path TEXT NOT NULL,
+                 content_hash TEXT NOT NULL,
+                 indexed_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                 PRIMARY KEY (chunk_table, path)
+             );
+             DROP TABLE semantic_files_path_only_backup;
+             CREATE INDEX IF NOT EXISTS idx_semantic_files_path ON semantic_files(path);",
+        )?;
+    } else {
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_semantic_files_path ON semantic_files(path);",
+        )?;
+    }
+    Ok(())
+}
+
+/// Records the exact original model name and dimension for each vec0 chunk
+/// table. Chunk table names are sanitized for SQLite identifiers, so the exact
+/// metadata is the authoritative lookup key for no-embedder contexts.
+fn migrate_0005_semantic_models(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS semantic_models (
+             chunk_table TEXT PRIMARY KEY,
+             model TEXT NOT NULL,
+             dim INTEGER NOT NULL,
+             indexed_at INTEGER NOT NULL DEFAULT (unixepoch())
+         );
+         CREATE INDEX IF NOT EXISTS idx_semantic_models_model ON semantic_models(model);",
+    )?;
+    Ok(())
+}
+
 pub fn ensure_chunk_table(conn: &Connection, table_name: &str, dim: usize) -> rusqlite::Result<()> {
     conn.execute_batch(&semantic_schema(table_name, dim))?;
     let fts = fts_table_name(table_name);
     conn.execute_batch(&fts_schema(&fts))?;
+    repair_fts_sidecar(conn, table_name, &fts)?;
     Ok(())
 }
 

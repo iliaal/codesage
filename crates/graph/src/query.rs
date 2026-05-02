@@ -266,6 +266,25 @@ fn rrf_merge(
         .collect()
 }
 
+fn apply_offset_and_limit<T>(rows: &mut Vec<T>, offset: usize, limit: usize) {
+    if offset >= rows.len() {
+        rows.clear();
+    } else if offset > 0 {
+        rows.drain(..offset);
+    }
+    rows.truncate(limit);
+}
+
+fn bm25_search_candidates(
+    db: &Database,
+    match_expr: &str,
+    fetch_limit: usize,
+    language: Option<&str>,
+    paths: Option<&[&str]>,
+) -> Result<Vec<RawSearchRow>> {
+    db.search_bm25(match_expr, fetch_limit, language, paths)
+}
+
 pub fn search(
     db: &Database,
     embedder: &mut Embedder,
@@ -289,7 +308,8 @@ pub fn search(
     let query_embedding = embedder.embed_one(&req.query)?;
     let embedding_bytes = embedding_to_bytes(&query_embedding);
 
-    let semantic_fetch = limit * overfetch;
+    let page_window = limit.saturating_add(offset);
+    let semantic_fetch = page_window.saturating_mul(overfetch);
 
     // Gate: is this a query where BM25 would help? Two distinctive shapes
     // covered by `query_has_rare_literal`: backticked identifiers / glob
@@ -312,34 +332,17 @@ pub fn search(
         db.search_fullscan(
             &embedding_bytes,
             semantic_fetch,
-            offset,
+            0,
             languages.as_deref(),
             paths.as_deref(),
         )?
     } else {
         match &req.languages {
-            None => {
-                let mut rows = db.search_knn(&embedding_bytes, semantic_fetch + offset, None)?;
-                if offset > 0 && offset < rows.len() {
-                    rows.drain(..offset);
-                }
-                rows.truncate(semantic_fetch);
-                rows
-            }
+            None => db.search_knn(&embedding_bytes, semantic_fetch, None)?,
             Some(langs) if langs.len() == 1 => {
-                let mut rows = db.search_knn(
-                    &embedding_bytes,
-                    semantic_fetch + offset,
-                    Some(langs[0].as_str()),
-                )?;
-                if offset > 0 && offset < rows.len() {
-                    rows.drain(..offset);
-                }
-                rows.truncate(semantic_fetch);
-                rows
+                db.search_knn(&embedding_bytes, semantic_fetch, Some(langs[0].as_str()))?
             }
             Some(langs) => {
-                let fetch_k = semantic_fetch + offset;
                 // Fan-out per language (sqlite-vec's partition key forces
                 // per-value queries) and merge in-memory. sort+truncate is
                 // simpler than a bounded BinaryHeap and fetch_k stays small
@@ -347,7 +350,7 @@ pub fn search(
                 let mut merged: Vec<RawSearchRow> = Vec::new();
                 for lang in langs {
                     let lang_rows =
-                        db.search_knn(&embedding_bytes, fetch_k, Some(lang.as_str()))?;
+                        db.search_knn(&embedding_bytes, semantic_fetch, Some(lang.as_str()))?;
                     merged.extend(lang_rows);
                 }
                 merged.sort_by(|a, b| {
@@ -355,9 +358,6 @@ pub fn search(
                         .partial_cmp(&b.distance)
                         .unwrap_or(Ordering::Equal)
                 });
-                if offset > 0 && offset < merged.len() {
-                    merged.drain(..offset);
-                }
                 merged.truncate(semantic_fetch);
                 merged
             }
@@ -381,7 +381,17 @@ pub fn search(
                     None
                 }
             });
-            match db.search_bm25(&match_expr, semantic_fetch, bm25_language) {
+            let bm25_paths: Option<Vec<&str>> = req
+                .paths
+                .as_ref()
+                .map(|p| p.iter().map(|s| s.as_str()).collect());
+            match bm25_search_candidates(
+                db,
+                &match_expr,
+                semantic_fetch,
+                bm25_language,
+                bm25_paths.as_deref(),
+            ) {
                 Ok(bm25_rows) if !bm25_rows.is_empty() => {
                     rrf_merge(rows, bm25_rows, semantic_fetch)
                 }
@@ -425,7 +435,7 @@ pub fn search(
         apply_reranking(reranker, &req.query, &mut results);
     }
 
-    results.truncate(limit);
+    apply_offset_and_limit(&mut results, offset, limit);
     Ok(results)
 }
 
@@ -991,13 +1001,63 @@ mod hybrid_tests {
     }
 
     #[test]
+    fn apply_offset_and_limit_clears_rows_when_offset_reaches_end() {
+        let mut rows = vec![1, 2, 3];
+        apply_offset_and_limit(&mut rows, 3, 10);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn apply_offset_and_limit_clears_rows_when_offset_exceeds_end() {
+        let mut rows = vec![1, 2, 3];
+        apply_offset_and_limit(&mut rows, 9, 10);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn apply_offset_and_limit_keeps_requested_page() {
+        let mut rows = vec![1, 2, 3, 4, 5];
+        apply_offset_and_limit(&mut rows, 2, 2);
+        assert_eq!(rows, vec![3, 4]);
+    }
+
+    #[test]
     fn search_bm25_returns_chunks_containing_rare_literal() {
         // Integration: seed chunks, run BM25 for a rare literal, assert the
         // correct chunk is in the result. Proves the FTS5 insert path is
         // actually populating the sidecar.
         let db = Database::open_in_memory().unwrap();
         seed_chunks(&db);
-        let rows = db.search_bm25("\"ColdFusion\"", 10, None).unwrap();
+        let rows = db.search_bm25("\"ColdFusion\"", 10, None, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file_path, "src/reg.rs");
+    }
+
+    #[test]
+    fn search_bm25_respects_path_filters() {
+        let db = Database::open_in_memory().unwrap();
+        seed_chunks(&db);
+
+        let rows = db
+            .search_bm25("\"ColdFusion\"", 10, None, Some(&["src/lib.rs"]))
+            .unwrap();
+        assert!(rows.is_empty());
+
+        let rows = db
+            .search_bm25("\"ColdFusion\"", 10, None, Some(&["src/reg.rs"]))
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file_path, "src/reg.rs");
+    }
+
+    #[test]
+    fn bm25_candidate_fetch_keeps_rows_for_final_offset_page() {
+        let db = Database::open_in_memory().unwrap();
+        seed_chunks(&db);
+
+        let rows =
+            bm25_search_candidates(&db, "\"ColdFusion\"", 10, None, Some(&["src/reg.rs"])).unwrap();
+
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].file_path, "src/reg.rs");
     }

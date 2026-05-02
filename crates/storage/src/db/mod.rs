@@ -16,9 +16,12 @@ use std::path::Path;
 
 use anyhow::Result;
 use codesage_protocol::{ReferenceKind, SymbolKind};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::schema::{ensure_chunk_table, init_db, init_vec_extension, model_table_name};
+use crate::schema::{
+    ensure_chunk_table, fts_table_name, init_db, init_vec_extension, model_table_name,
+    model_table_prefix,
+};
 
 pub use codesage_protocol::DEFAULT_EMBEDDING_DIM;
 
@@ -58,6 +61,155 @@ pub struct Database {
     pub(super) chunk_table: String,
 }
 
+fn quote_ident(identifier: &str) -> String {
+    identifier.replace('"', "\"\"")
+}
+
+fn existing_chunk_table_name(conn: &Connection, chunk_table: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT m.name FROM sqlite_master m
+         WHERE m.type = 'table' AND lower(m.name) = lower(?1)
+           AND EXISTS (
+               SELECT 1 FROM sqlite_master aux
+               WHERE aux.type = 'table' AND lower(aux.name) = lower(?1 || '_info')
+           )",
+            params![chunk_table],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+fn chunk_table_exists(conn: &Connection, chunk_table: &str) -> Result<bool> {
+    Ok(existing_chunk_table_name(conn, chunk_table)?.is_some())
+}
+
+fn chunk_table_count(conn: &Connection, chunk_table: &str) -> Result<i64> {
+    let sql = format!("SELECT COUNT(*) FROM \"{}\"", quote_ident(chunk_table));
+    Ok(conn.query_row(&sql, [], |row| row.get(0))?)
+}
+
+fn semantic_model_metadata(conn: &Connection, chunk_table: &str) -> Result<Option<(String, i64)>> {
+    Ok(conn
+        .query_row(
+            "SELECT model, dim FROM semantic_models
+             WHERE lower(chunk_table) = lower(?1)
+             ORDER BY CASE WHEN chunk_table = ?1 THEN 0 ELSE 1 END, chunk_table
+             LIMIT 1",
+            params![chunk_table],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
+}
+
+fn legacy_chunk_table_candidates(conn: &Connection, model: &str) -> Result<Vec<String>> {
+    let prefix = model_table_prefix(model);
+    let mut stmt = conn.prepare(
+        "SELECT m.name FROM sqlite_master m
+         LEFT JOIN semantic_models sm ON lower(sm.chunk_table) = lower(m.name)
+         WHERE m.type = 'table'
+           AND lower(m.name) GLOB lower(?1)
+           AND sm.chunk_table IS NULL
+           AND EXISTS (
+               SELECT 1 FROM sqlite_master aux
+               WHERE aux.type = 'table' AND aux.name = m.name || '_info'
+           )
+         ORDER BY m.name",
+    )?;
+    let rows = stmt
+        .query_map(params![format!("{prefix}*")], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut populated = Vec::new();
+    for table in rows {
+        let lower_table = table.to_lowercase();
+        let lower_prefix = prefix.to_lowercase();
+        let Some(dim_suffix) = lower_table.strip_prefix(&lower_prefix) else {
+            continue;
+        };
+        if !dim_suffix.is_empty()
+            && dim_suffix.bytes().all(|b| b.is_ascii_digit())
+            && chunk_table_count(conn, &table)? > 0
+        {
+            populated.push(table);
+        }
+    }
+    Ok(populated)
+}
+
+pub(super) fn drop_chunk_table_group(conn: &Connection, table_name: &str) -> Result<()> {
+    if !table_name.starts_with("chunks_") {
+        anyhow::bail!("refusing to drop non-chunks table: {table_name}");
+    }
+    let fts_table = fts_table_name(table_name);
+    let vocab_table = format!("{fts_table}_vocab");
+    let vocab_sql = format!("DROP TABLE IF EXISTS \"{}\"", quote_ident(&vocab_table));
+    conn.execute(&vocab_sql, [])?;
+    let fts_sql = format!("DROP TABLE IF EXISTS \"{}\"", quote_ident(&fts_table));
+    conn.execute(&fts_sql, [])?;
+    conn.execute(
+        "DELETE FROM semantic_files WHERE chunk_table = ?1",
+        params![table_name],
+    )?;
+    conn.execute(
+        "DELETE FROM semantic_models WHERE chunk_table = ?1",
+        params![table_name],
+    )?;
+    let sql = format!("DROP TABLE IF EXISTS \"{}\"", quote_ident(table_name));
+    conn.execute(&sql, [])?;
+    Ok(())
+}
+
+fn ensure_semantic_model_compatible(
+    conn: &Connection,
+    chunk_table: &str,
+    model: &str,
+    dim: usize,
+) -> Result<()> {
+    let existing = semantic_model_metadata(conn, chunk_table)?;
+
+    if let Some((existing_model, existing_dim)) = existing.as_ref()
+        && (existing_model != model || *existing_dim != dim as i64)
+    {
+        anyhow::bail!(
+            "chunk table {chunk_table:?} is already recorded for model {existing_model:?} dim {existing_dim}, cannot reuse for model {model:?} dim {dim}"
+        );
+    }
+
+    if existing.is_none() && chunk_table_exists(conn, chunk_table)? {
+        let rows = chunk_table_count(conn, chunk_table)?;
+        if rows > 0 {
+            anyhow::bail!(
+                "chunk table {chunk_table:?} exists with {rows} chunks but has no exact semantic model metadata; run `codesage index --full` with this CodeSage version to rebuild it before using model {model:?} dim {dim}"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn record_semantic_model_table(
+    conn: &Connection,
+    chunk_table: &str,
+    model: &str,
+    dim: usize,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM semantic_models
+         WHERE lower(chunk_table) = lower(?1) AND chunk_table <> ?1",
+        params![chunk_table],
+    )?;
+    conn.execute(
+        "INSERT INTO semantic_models (chunk_table, model, dim, indexed_at)
+         VALUES (?1, ?2, ?3, unixepoch())
+         ON CONFLICT(chunk_table) DO UPDATE SET
+             model = excluded.model,
+             dim = excluded.dim,
+             indexed_at = excluded.indexed_at",
+        params![chunk_table, model, dim as i64],
+    )?;
+    Ok(())
+}
+
 impl Database {
     /// Open a DB for read-only (structural) queries. No chunk/vec table is created;
     /// semantic queries will fail until `open_for_model` is used instead.
@@ -75,8 +227,78 @@ impl Database {
         init_vec_extension();
         let conn = Connection::open(path)?;
         init_db(&conn)?;
-        let chunk_table = model_table_name(model, dim);
+        let requested_table = model_table_name(model, dim);
+        let chunk_table =
+            existing_chunk_table_name(&conn, &requested_table)?.unwrap_or(requested_table);
+        ensure_semantic_model_compatible(&conn, &chunk_table, model, dim)?;
         ensure_chunk_table(&conn, &chunk_table, dim)?;
+        record_semantic_model_table(&conn, &chunk_table, model, dim)?;
+        Ok(Database { conn, chunk_table })
+    }
+
+    pub fn open_for_model_rebuild(path: &Path, model: &str, dim: usize) -> Result<Self> {
+        init_vec_extension();
+        let conn = Connection::open(path)?;
+        init_db(&conn)?;
+        let requested_table = model_table_name(model, dim);
+        let chunk_table =
+            existing_chunk_table_name(&conn, &requested_table)?.unwrap_or(requested_table);
+        if chunk_table_exists(&conn, &chunk_table)? {
+            match semantic_model_metadata(&conn, &chunk_table)? {
+                Some((existing_model, existing_dim))
+                    if existing_model == model && existing_dim == dim as i64 => {}
+                _ => drop_chunk_table_group(&conn, &chunk_table)?,
+            }
+        }
+        ensure_chunk_table(&conn, &chunk_table, dim)?;
+        record_semantic_model_table(&conn, &chunk_table, model, dim)?;
+        Ok(Database { conn, chunk_table })
+    }
+
+    /// Open a DB for structural queries plus best-effort chunk reads for an
+    /// already-indexed model. This selects a single existing vec0 table by
+    /// configured model name without constructing the embedder just to discover
+    /// dimension. If no matching table exists, chunk reads degrade to empty
+    /// results; if multiple tables match, the caller must resolve the ambiguity.
+    pub fn open_for_existing_model(path: &Path, model: &str) -> Result<Self> {
+        init_vec_extension();
+        let conn = Connection::open(path)?;
+        init_db(&conn)?;
+        let matches = {
+            let mut stmt = conn.prepare(
+                "SELECT sm.chunk_table FROM semantic_models sm
+                 JOIN sqlite_master m
+                   ON m.type = 'table' AND lower(m.name) = lower(sm.chunk_table)
+                 WHERE sm.model = ?1
+                   AND EXISTS (
+                       SELECT 1 FROM sqlite_master aux
+                       WHERE aux.type = 'table'
+                         AND lower(aux.name) = lower(sm.chunk_table || '_info')
+                   )
+                 ORDER BY sm.dim, sm.chunk_table",
+            )?;
+            stmt.query_map(params![model], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let chunk_table = match matches.as_slice() {
+            [] => {
+                let legacy = legacy_chunk_table_candidates(&conn, model)?;
+                if !legacy.is_empty() {
+                    anyhow::bail!(
+                        "chunk table(s) match model {model:?} but lack exact semantic model metadata: {}; run `codesage index --full` with this CodeSage version to rebuild them",
+                        legacy.join(", ")
+                    );
+                }
+                String::new()
+            }
+            [table] => table.clone(),
+            tables => {
+                anyhow::bail!(
+                    "multiple chunk tables recorded for model {model:?}: {}",
+                    tables.join(", ")
+                );
+            }
+        };
         Ok(Database { conn, chunk_table })
     }
 
@@ -85,7 +307,9 @@ impl Database {
         let conn = Connection::open_in_memory()?;
         init_db(&conn)?;
         let chunk_table = model_table_name("default", DEFAULT_EMBEDDING_DIM);
+        ensure_semantic_model_compatible(&conn, &chunk_table, "default", DEFAULT_EMBEDDING_DIM)?;
         ensure_chunk_table(&conn, &chunk_table, DEFAULT_EMBEDDING_DIM)?;
+        record_semantic_model_table(&conn, &chunk_table, "default", DEFAULT_EMBEDDING_DIM)?;
         Ok(Database { conn, chunk_table })
     }
 
@@ -263,6 +487,28 @@ mod tests {
         v
     }
 
+    fn create_legacy_chunk_table(path: &Path, model: &str, dim: usize, with_chunk: bool) -> String {
+        init_vec_extension();
+        let conn = Connection::open(path).unwrap();
+        init_db(&conn).unwrap();
+        let table = model_table_name(model, dim);
+        ensure_chunk_table(&conn, &table, dim).unwrap();
+        let db = Database {
+            conn,
+            chunk_table: table.clone(),
+        };
+        if with_chunk {
+            let embedding = make_embedding(0.1);
+            db.insert_chunks(
+                "src/lib.rs",
+                "rust",
+                &[("fn target() {}", 1, 1, embedding.as_slice())],
+            )
+            .unwrap();
+        }
+        table
+    }
+
     #[test]
     fn insert_and_count_chunks() {
         let db = Database::open_in_memory().unwrap();
@@ -392,6 +638,363 @@ mod tests {
             assert_eq!(db.total_chunk_count().unwrap(), 0);
         }
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn list_vec_tables_excludes_fts_sidecars() {
+        let db = Database::open_in_memory().unwrap();
+        let tables = db.list_vec_tables().unwrap();
+        assert_eq!(tables, vec![db.chunk_table_name().to_string()]);
+    }
+
+    #[test]
+    fn drop_vec_table_removes_matching_fts_sidecar() {
+        let db = Database::open_in_memory().unwrap();
+        let table = db.chunk_table_name().to_string();
+        let fts = crate::schema::fts_table_name(&table);
+        let vocab = format!("{fts}_vocab");
+        let embedding = make_embedding(0.1);
+        db.insert_chunks(
+            "src/lib.rs",
+            "rust",
+            &[("fn target() {}", 1, 1, embedding.as_slice())],
+        )
+        .unwrap();
+        db.token_doc_frequency("target").unwrap();
+
+        let fts_before: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?1",
+                rusqlite::params![fts],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_before, 1);
+        let vocab_before: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?1",
+                rusqlite::params![vocab],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(vocab_before, 1);
+
+        db.drop_vec_table(&table).unwrap();
+
+        assert!(db.list_vec_tables().unwrap().is_empty());
+        let fts_after: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?1",
+                rusqlite::params![crate::schema::fts_table_name(&table)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_after, 0);
+        let vocab_after: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?1",
+                rusqlite::params![format!("{}_vocab", crate::schema::fts_table_name(&table))],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(vocab_after, 0);
+    }
+
+    #[test]
+    fn open_for_model_repairs_missing_fts_sidecar_from_vec_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let model = "codesage-test/model";
+        let table;
+        {
+            let db = Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+            table = db.chunk_table_name().to_string();
+            let embedding = make_embedding(0.1);
+            db.insert_chunks(
+                "src/lib.rs",
+                "rust",
+                &[(
+                    "fn target() { let ColdFusion = true; }",
+                    1,
+                    1,
+                    embedding.as_slice(),
+                )],
+            )
+            .unwrap();
+            let fts = crate::schema::fts_table_name(&table);
+            let sql = format!("DROP TABLE \"{}\"", quote_ident(&fts));
+            db.conn.execute(&sql, []).unwrap();
+        }
+
+        let db = Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+        let rows = db.search_bm25("\"ColdFusion\"", 10, None, None).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file_path, "src/lib.rs");
+    }
+
+    #[test]
+    fn semantic_file_hashes_roundtrip_and_delete() {
+        let db = Database::open_in_memory().unwrap();
+        assert!(db.all_semantic_file_hashes().unwrap().is_empty());
+
+        db.upsert_semantic_file_hash("a.rs", "h1").unwrap();
+        db.upsert_semantic_file_hash("b.rs", "h2").unwrap();
+        db.upsert_semantic_file_hash("a.rs", "h3").unwrap();
+
+        let hashes = db.all_semantic_file_hashes().unwrap();
+        assert_eq!(hashes.get("a.rs").map(String::as_str), Some("h3"));
+        assert_eq!(hashes.get("b.rs").map(String::as_str), Some("h2"));
+
+        db.delete_semantic_file_hash("a.rs").unwrap();
+        let hashes = db.all_semantic_file_hashes().unwrap();
+        assert!(!hashes.contains_key("a.rs"));
+        assert!(hashes.contains_key("b.rs"));
+    }
+
+    #[test]
+    fn semantic_file_hashes_are_scoped_to_chunk_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+
+        {
+            let db = Database::open_for_model(&path, "model/a", DEFAULT_EMBEDDING_DIM).unwrap();
+            db.upsert_semantic_file_hash("same.rs", "hash-a").unwrap();
+        }
+        {
+            let db = Database::open_for_model(&path, "model/b", DEFAULT_EMBEDDING_DIM).unwrap();
+            assert!(db.all_semantic_file_hashes().unwrap().is_empty());
+            db.upsert_semantic_file_hash("same.rs", "hash-b").unwrap();
+        }
+        {
+            let db = Database::open_for_model(&path, "model/a", DEFAULT_EMBEDDING_DIM).unwrap();
+            let hashes = db.all_semantic_file_hashes().unwrap();
+            assert_eq!(hashes.get("same.rs").map(String::as_str), Some("hash-a"));
+        }
+    }
+
+    #[test]
+    fn open_for_existing_model_selects_existing_chunk_table_without_creating_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let embedding = vec![0.0; DEFAULT_EMBEDDING_DIM];
+
+        {
+            let db = Database::open_for_model(&path, "codesage-test/model", DEFAULT_EMBEDDING_DIM)
+                .unwrap();
+            db.insert_chunks(
+                "src/lib.rs",
+                "rust",
+                &[("fn target() {}", 1, 1, embedding.as_slice())],
+            )
+            .unwrap();
+        }
+
+        let db = Database::open_for_existing_model(&path, "codesage-test/model").unwrap();
+        assert_eq!(db.chunks_for_file("src/lib.rs").unwrap().len(), 1);
+
+        let db = Database::open_for_existing_model(&path, "codesage-test/missing").unwrap();
+        assert!(db.chunks_for_file("src/lib.rs").unwrap().is_empty());
+        assert_eq!(db.list_vec_tables().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn open_for_existing_model_requires_exact_model_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let indexed_model = "codesage-test/foo-bar";
+        let colliding_model = "codesage-test/foo_bar";
+        let table = model_table_name(indexed_model, DEFAULT_EMBEDDING_DIM);
+
+        assert_eq!(
+            table,
+            model_table_name(colliding_model, DEFAULT_EMBEDDING_DIM),
+            "test setup needs sanitized table-name collision"
+        );
+
+        Database::open_for_model(&path, indexed_model, DEFAULT_EMBEDDING_DIM).unwrap();
+
+        let db = Database::open_for_existing_model(&path, indexed_model).unwrap();
+        assert_eq!(db.chunk_table_name(), table.as_str());
+
+        let db = Database::open_for_existing_model(&path, colliding_model).unwrap();
+        assert_eq!(db.chunk_table_name(), "");
+    }
+
+    #[test]
+    fn open_for_existing_model_ignores_legacy_prefix_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let requested_model = "codesage-test/foo";
+        let legacy_model = "codesage-test/foo-bar";
+        let legacy_table =
+            create_legacy_chunk_table(&path, legacy_model, DEFAULT_EMBEDDING_DIM, true);
+
+        assert!(legacy_table.starts_with(&model_table_prefix(requested_model)));
+
+        let db = Database::open_for_existing_model(&path, requested_model).unwrap();
+
+        assert_eq!(db.chunk_table_name(), "");
+    }
+
+    #[test]
+    fn open_for_existing_model_rejects_legacy_chunk_table_without_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let model = "codesage-test/model";
+        let table = create_legacy_chunk_table(&path, model, DEFAULT_EMBEDDING_DIM, true);
+
+        let err = match Database::open_for_existing_model(&path, model) {
+            Ok(_) => panic!("expected legacy metadata error"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("lack exact semantic model metadata"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            err.to_string().contains(&table),
+            "error should name legacy table {table}: {err:#}"
+        );
+    }
+
+    #[test]
+    fn open_for_model_rejects_populated_legacy_chunk_table_without_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let model = "codesage-test/model";
+        create_legacy_chunk_table(&path, model, DEFAULT_EMBEDDING_DIM, true);
+
+        let err = match Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM) {
+            Ok(_) => panic!("expected populated legacy table error"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("has no exact semantic model metadata"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn open_for_model_rebuild_replaces_populated_legacy_chunk_table_without_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let model = "codesage-test/model";
+        let table = create_legacy_chunk_table(&path, model, DEFAULT_EMBEDDING_DIM, true);
+
+        let db = Database::open_for_model_rebuild(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+
+        assert_eq!(db.chunk_table_name(), table.as_str());
+        assert_eq!(db.chunk_count().unwrap(), 0);
+        drop(db);
+
+        let db = Database::open_for_existing_model(&path, model).unwrap();
+        assert_eq!(db.chunk_table_name(), table.as_str());
+    }
+
+    #[test]
+    fn open_for_model_rebuild_preserves_compatible_metadata_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let model = "codesage-test/model";
+        let embedding = make_embedding(0.1);
+
+        {
+            let db = Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+            db.insert_chunks(
+                "src/lib.rs",
+                "rust",
+                &[("fn target() {}", 1, 1, embedding.as_slice())],
+            )
+            .unwrap();
+        }
+
+        let db = Database::open_for_model_rebuild(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+
+        assert_eq!(db.chunk_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn open_for_model_rejects_sanitized_model_table_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let indexed_model = "codesage-test/foo-bar";
+        let colliding_model = "codesage-test/foo_bar";
+
+        Database::open_for_model(&path, indexed_model, DEFAULT_EMBEDDING_DIM).unwrap();
+        let err = match Database::open_for_model(&path, colliding_model, DEFAULT_EMBEDDING_DIM) {
+            Ok(_) => panic!("expected sanitized model table collision error"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("already recorded for model"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn open_for_model_rejects_case_only_model_table_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let indexed_model = "codesage-test/Foo";
+        let colliding_model = "codesage-test/foo";
+
+        Database::open_for_model(&path, indexed_model, DEFAULT_EMBEDDING_DIM).unwrap();
+        let err = match Database::open_for_model(&path, colliding_model, DEFAULT_EMBEDDING_DIM) {
+            Ok(_) => panic!("expected case-only model table collision error"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("already recorded for model"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn open_for_existing_model_rejects_ambiguous_chunk_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let model = "codesage-test/model";
+
+        Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+        Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM + 1).unwrap();
+
+        let err = match Database::open_for_existing_model(&path, model) {
+            Ok(_) => panic!("expected ambiguous chunk table error"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("multiple chunk tables recorded for model"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn drop_vec_table_removes_model_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let model = "codesage-test/model";
+
+        {
+            let db = Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+            let table = db.chunk_table_name().to_string();
+            db.drop_vec_table(&table).unwrap();
+        }
+
+        let db = Database::open_for_existing_model(&path, model).unwrap();
+        assert_eq!(db.chunk_table_name(), "");
     }
 
     #[test]

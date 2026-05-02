@@ -3,7 +3,7 @@
 use anyhow::Result;
 use rusqlite::params;
 
-use super::Database;
+use super::{Database, drop_chunk_table_group};
 
 #[derive(Debug, Clone)]
 pub struct RawSearchRow {
@@ -225,6 +225,41 @@ impl Database {
         Ok(n as usize)
     }
 
+    pub fn all_semantic_file_hashes(&self) -> Result<std::collections::HashMap<String, String>> {
+        if self.chunk_table.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, content_hash FROM semantic_files WHERE chunk_table = ?1")?;
+        let rows = stmt
+            .query_map(params![&self.chunk_table], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?;
+        Ok(rows)
+    }
+
+    pub fn upsert_semantic_file_hash(&self, path: &str, content_hash: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO semantic_files (chunk_table, path, content_hash, indexed_at)
+             VALUES (?1, ?2, ?3, unixepoch())
+             ON CONFLICT(chunk_table, path) DO UPDATE SET
+                 content_hash = excluded.content_hash,
+                 indexed_at = excluded.indexed_at",
+            params![&self.chunk_table, path, content_hash],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_semantic_file_hash(&self, path: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM semantic_files WHERE chunk_table = ?1 AND path = ?2",
+            params![&self.chunk_table, path],
+        )?;
+        Ok(())
+    }
+
     /// BM25 search over the FTS5 sidecar of the active chunk table. Returns
     /// the top-N rows by FTS5's built-in BM25 ranking (lower = better), in
     /// the same `RawSearchRow` shape as `search_knn` for easy RRF fusion.
@@ -239,23 +274,45 @@ impl Database {
         match_expr: &str,
         k: usize,
         language: Option<&str>,
+        paths: Option<&[&str]>,
     ) -> Result<Vec<RawSearchRow>> {
         let t = self.fts_table();
-        let sql = if language.is_some() {
-            format!(
-                "SELECT file_path, language, content, start_line, end_line, bm25(\"{t}\") AS score
-                 FROM \"{t}\"
-                 WHERE \"{t}\" MATCH ?1 AND language = ?2
-                 ORDER BY score LIMIT ?3"
-            )
-        } else {
-            format!(
-                "SELECT file_path, language, content, start_line, end_line, bm25(\"{t}\") AS score
-                 FROM \"{t}\"
-                 WHERE \"{t}\" MATCH ?1
-                 ORDER BY score LIMIT ?2"
-            )
-        };
+        let mut conditions = vec![format!("\"{t}\" MATCH ?1")];
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(match_expr.to_string())];
+
+        if let Some(lang) = language {
+            let idx = param_values.len() + 1;
+            conditions.push(format!("language = ?{idx}"));
+            param_values.push(Box::new(lang.to_string()));
+        }
+
+        if let Some(path_patterns) = paths
+            && !path_patterns.is_empty()
+        {
+            let clauses: Vec<String> = path_patterns
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("file_path GLOB ?{}", param_values.len() + i + 1))
+                .collect();
+            conditions.push(format!("({})", clauses.join(" OR ")));
+            for p in path_patterns {
+                param_values.push(Box::new(p.to_string()));
+            }
+        }
+
+        let limit_idx = param_values.len() + 1;
+        let sql = format!(
+            "SELECT file_path, language, content, start_line, end_line, bm25(\"{t}\") AS score
+             FROM \"{t}\"
+             WHERE {}
+             ORDER BY score LIMIT ?{limit_idx}",
+            conditions.join(" AND ")
+        );
+        param_values.push(Box::new(k as i64));
+
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
         let mut stmt = self.conn.prepare(&sql)?;
         let row_fn = |row: &rusqlite::Row<'_>| {
             Ok(RawSearchRow {
@@ -267,13 +324,9 @@ impl Database {
                 distance: row.get::<_, f64>(5)? as f32,
             })
         };
-        let rows: Vec<RawSearchRow> = if let Some(lang) = language {
-            stmt.query_map(params![match_expr, lang, k as i64], row_fn)?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        } else {
-            stmt.query_map(params![match_expr, k as i64], row_fn)?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
+        let rows: Vec<RawSearchRow> = stmt
+            .query_map(params_refs.as_slice(), row_fn)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -323,15 +376,14 @@ impl Database {
 
     pub fn list_vec_tables(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name FROM sqlite_master
-             WHERE type = 'table'
-               AND name LIKE 'chunks\\_%' ESCAPE '\\'
-               AND name NOT LIKE '%\\_auxiliary' ESCAPE '\\'
-               AND name NOT LIKE '%\\_rowids' ESCAPE '\\'
-               AND name NOT LIKE '%\\_info' ESCAPE '\\'
-               AND name NOT LIKE '%\\_chunks' ESCAPE '\\'
-               AND name NOT LIKE '%\\_vector\\_chunks%' ESCAPE '\\'
-             ORDER BY name",
+            "SELECT m.name FROM sqlite_master m
+             WHERE m.type = 'table'
+               AND m.name LIKE 'chunks\\_%' ESCAPE '\\'
+               AND EXISTS (
+                   SELECT 1 FROM sqlite_master aux
+                   WHERE aux.type = 'table' AND aux.name = m.name || '_info'
+               )
+             ORDER BY m.name",
         )?;
         let rows = stmt
             .query_map([], |row| row.get::<_, String>(0))?
@@ -340,12 +392,7 @@ impl Database {
     }
 
     pub fn drop_vec_table(&self, table_name: &str) -> Result<()> {
-        if !table_name.starts_with("chunks_") {
-            anyhow::bail!("refusing to drop non-chunks table: {table_name}");
-        }
-        let sql = format!("DROP TABLE IF EXISTS \"{table_name}\"");
-        self.conn.execute(&sql, [])?;
-        Ok(())
+        drop_chunk_table_group(&self.conn, table_name)
     }
 
     pub fn vacuum(&self) -> Result<()> {
@@ -354,6 +401,9 @@ impl Database {
     }
 
     pub fn chunks_for_file(&self, file_path: &str) -> Result<Vec<RawSearchRow>> {
+        if self.chunk_table.is_empty() {
+            return Ok(Vec::new());
+        }
         let sql = format!(
             "SELECT file_path, language, content, start_line, end_line
              FROM \"{}\"

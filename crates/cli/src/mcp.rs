@@ -7,9 +7,9 @@ use codesage_embed::config::EmbeddingConfig;
 use codesage_embed::model::Embedder;
 use codesage_embed::reranker::Reranker;
 use codesage_graph::{
-    assess_risk, assess_risk_batch, assess_risk_diff, export_context, find_coupling,
-    find_references, find_symbol, impact_analysis, list_dependencies, recommend_tests, search,
-    session_end, session_start,
+    assess_risk, assess_risk_batch, assess_risk_diff, export_context, export_context_for_symbol,
+    find_coupling, find_references, find_symbol, impact_analysis, list_dependencies,
+    recommend_tests, search, session_end, session_start,
 };
 use codesage_protocol::{
     ExportRequest, FindReferencesRequest, FindSymbolRequest, ImpactRequest, ImpactTarget, Language,
@@ -340,6 +340,14 @@ impl CodeSageServer {
         )
     }
 
+    fn open_structural_db_for(&self, state: &ProjectState) -> Result<Database> {
+        Database::open(&state.db_path)
+    }
+
+    fn open_context_db_for(&self, state: &ProjectState) -> Result<Database> {
+        Database::open_for_existing_model(&state.db_path, &state.embedding_config.model)
+    }
+
     /// Resolve project, open its DB, run `f` with the DB. Error handling funnel:
     /// each handler's body lives under this so the tool dispatch stays one-liner.
     fn with_project_db<F, R>(&self, project: &str, f: F) -> Result<R>
@@ -347,7 +355,7 @@ impl CodeSageServer {
         F: FnOnce(&Database) -> Result<R>,
     {
         let state = self.resolve_project(project)?;
-        let db = self.open_db_for(&state)?;
+        let db = self.open_structural_db_for(&state)?;
         f(&db)
     }
 
@@ -359,7 +367,7 @@ impl CodeSageServer {
         F: FnOnce(&Path, &Database) -> Result<R>,
     {
         let state = self.resolve_project(project)?;
-        let db = self.open_db_for(&state)?;
+        let db = self.open_structural_db_for(&state)?;
         // db_path = <project_root>/.codesage/index.db; pop twice to recover root.
         let root = state
             .db_path
@@ -367,6 +375,15 @@ impl CodeSageServer {
             .and_then(|p| p.parent())
             .ok_or_else(|| anyhow::anyhow!("could not derive project root from db path"))?;
         f(root, &db)
+    }
+
+    fn with_project_context_db<F, R>(&self, project: &str, f: F) -> Result<R>
+    where
+        F: FnOnce(&Database) -> Result<R>,
+    {
+        let state = self.resolve_project(project)?;
+        let db = self.open_context_db_for(&state)?;
+        f(&db)
     }
 
     /// Same as `with_project_db` but also acquires the project's embedder and
@@ -671,6 +688,14 @@ impl CodeSageServer {
             params.include_callers.unwrap_or(false),
             params.include_callees.unwrap_or(false),
         );
+        if let Some(sym_name) = req.symbol.clone() {
+            return render_with_kind(
+                self.with_project_context_db(&params.project, |db| {
+                    export_context_for_symbol(db, &sym_name, &req)
+                }),
+                "export_context",
+            );
+        }
         render_with_kind(
             self.with_project_search(&params.project, |db, emb, rr| {
                 export_context(db, emb, rr, &req)
@@ -1034,5 +1059,88 @@ mod tests {
         let path = write_tmp("no-embedding", "[project]\nname = \"foo\"\n");
         let config = load_embedding_config(&path);
         assert_eq!(config.model, EmbeddingConfig::default().model);
+    }
+
+    #[test]
+    fn structural_project_db_does_not_load_embedding_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let codesage_dir = root.join(".codesage");
+        std::fs::create_dir_all(&codesage_dir).unwrap();
+        std::fs::write(
+            codesage_dir.join("config.toml"),
+            "[embedding]\nmodel = \"codesage-test/does-not-exist\"\ndevice = \"cpu\"\n",
+        )
+        .unwrap();
+        let db_path = codesage_dir.join("index.db");
+        Database::open(&db_path).unwrap();
+
+        let server = CodeSageServer::new();
+        let count = server
+            .with_project_db(root.to_str().unwrap(), |db| db.file_count())
+            .unwrap();
+
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn symbol_export_uses_existing_chunks_without_loading_embedding_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let codesage_dir = root.join(".codesage");
+        std::fs::create_dir_all(&codesage_dir).unwrap();
+        let model = "codesage-test/does-not-exist";
+        std::fs::write(
+            codesage_dir.join("config.toml"),
+            format!("[embedding]\nmodel = \"{model}\"\ndevice = \"cpu\"\n"),
+        )
+        .unwrap();
+        let db_path = codesage_dir.join("index.db");
+        let db =
+            Database::open_for_model(&db_path, model, codesage_storage::db::DEFAULT_EMBEDDING_DIM)
+                .unwrap();
+        let file_id = db
+            .upsert_file(&codesage_protocol::FileInfo {
+                path: "src/lib.rs".to_string(),
+                language: codesage_protocol::Language::Rust,
+                content_hash: "h1".to_string(),
+            })
+            .unwrap();
+        db.insert_symbols(
+            file_id,
+            &[codesage_protocol::Symbol {
+                name: "target".to_string(),
+                qualified_name: "target".to_string(),
+                kind: SymbolKind::Function,
+                file_path: "src/lib.rs".to_string(),
+                line_start: 1,
+                line_end: 1,
+                col_start: 0,
+                col_end: 0,
+            }],
+        )
+        .unwrap();
+        let embedding = vec![0.0; codesage_storage::db::DEFAULT_EMBEDDING_DIM];
+        db.insert_chunks(
+            "src/lib.rs",
+            "rust",
+            &[("fn target() {}", 1, 1, embedding.as_slice())],
+        )
+        .unwrap();
+
+        let server = CodeSageServer::new();
+        let result = server.export_context_tool(Parameters(ExportContextParams {
+            project: root.to_str().unwrap().to_string(),
+            target: "target".to_string(),
+            is_symbol: Some(true),
+            limit: Some(5),
+            include_callers: Some(false),
+            include_callees: Some(false),
+        }));
+
+        assert_ne!(result.is_error, Some(true));
+        let value = result.structured_content.expect("structured content");
+        assert_eq!(value["symbol_definitions"].as_array().unwrap().len(), 1);
+        assert_eq!(value["primary"].as_array().unwrap().len(), 1);
     }
 }
