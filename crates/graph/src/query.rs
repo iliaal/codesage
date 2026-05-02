@@ -13,6 +13,7 @@ use codesage_protocol::{
 };
 use codesage_storage::{Database, RawSearchRow, embedding_to_bytes};
 use globset::GlobSet;
+use regex::Regex;
 
 pub fn find_symbol(db: &Database, req: &FindSymbolRequest) -> Result<Vec<Symbol>> {
     db.find_symbols(&req.name, req.kind)
@@ -426,6 +427,10 @@ pub fn search(
 
     annotate_with_symbols(db, &mut results)?;
 
+    if definition_boost_enabled() {
+        apply_definition_boost(&mut results, &req.query);
+    }
+
     if path_penalty_enabled() {
         apply_path_penalties(&mut results);
     }
@@ -491,6 +496,160 @@ fn apply_symbol_boost(results: &mut [SearchResult], known_symbols: &[String]) {
         result.score += boost;
     }
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+}
+
+// Definition boost: when the query is a bare symbol (CamelCase, snake_case,
+// namespace-qualified), strongly promote candidate chunks that contain a
+// language-keyword + symbol_name match (e.g. `class FooBar`, `fn foo_bar`,
+// `defmodule My.FooBar`). Pattern from Semble's boosting.py
+// _boost_symbol_definitions: additive boost = 3 * max_score, with a 1.5x
+// multiplier when the file stem also matches the symbol. Applied after the
+// existing apply_symbol_boost (which only does +0.1 per known-symbol token)
+// and BEFORE path_penalty (so a definition in a test file is still boosted,
+// then discounted by 0.3x — the correct net signal for "this IS the
+// definition, but it's the test version, not the production one").
+const DEFINITION_KEYWORDS: &[&str] = &[
+    // Order matters for regex alternation: longest-first so `abstract class`
+    // matches before `class`. Same trick for `data class`.
+    "abstract class",
+    "data class",
+    "defmodule", // Elixir
+    "function",
+    "interface",
+    "namespace",
+    "package",
+    "protocol", // Swift
+    // typedef intentionally omitted: C/C++ typedef has the type between the
+    // keyword and the symbol name (`typedef unsigned long size_t`), which the
+    // namespace-prefix regex can't represent. find_symbol covers it.
+    "module",
+    "object",
+    "record", // C# 9+, Java 16+
+    "struct",
+    "trait",
+    "class",
+    "enum",
+    "func",
+    "type",
+    "def",
+    "fun", // Kotlin
+    "fn",
+];
+
+const DEFINITION_BOOST_MULTIPLIER: f32 = 3.0;
+// File stem matches the symbol name (e.g. login_controller.rs for
+// LoginController) — the file is almost certainly the canonical home of
+// this symbol, so push it harder.
+const DEFINITION_FILE_STEM_BONUS: f32 = 1.5;
+
+static SYMBOL_QUERY_RE: OnceLock<Regex> = OnceLock::new();
+
+fn symbol_query_re() -> &'static Regex {
+    SYMBOL_QUERY_RE.get_or_init(|| {
+        // Four shapes accepted:
+        //  1. namespace-qualified: Foo::Bar, foo.bar, foo->bar, Foo\Bar
+        //  2. leading underscore:  _foo, _Foo, _
+        //  3. contains uppercase or underscore in body: fooBar, my_func, Foo
+        //  4. starts with uppercase: Foo, FOO
+        // Plain lowercase words (e.g. "session", "login") are NL, not symbols.
+        Regex::new(
+            r"^(?:[A-Za-z_][A-Za-z0-9_]*(?:(?:::|\\|->|\.)[A-Za-z_][A-Za-z0-9_]*)+|_[A-Za-z0-9_]*|[A-Za-z][A-Za-z0-9]*[A-Z_][A-Za-z0-9_]*|[A-Z][A-Za-z0-9]*)$",
+        )
+        .expect("symbol query regex compile")
+    })
+}
+
+fn is_symbol_query(query: &str) -> bool {
+    let q = query.trim();
+    !q.is_empty() && symbol_query_re().is_match(q)
+}
+
+fn extract_symbol_name(query: &str) -> String {
+    let q = query.trim();
+    for sep in ["::", "\\", "->", "."] {
+        if let Some(idx) = q.rfind(sep) {
+            return q[idx + sep.len()..].to_string();
+        }
+    }
+    q.to_string()
+}
+
+fn build_definition_pattern(symbol_name: &str) -> Option<Regex> {
+    if symbol_name.is_empty() {
+        return None;
+    }
+    let escaped = regex::escape(symbol_name);
+    let kw_alts = DEFINITION_KEYWORDS
+        .iter()
+        .map(|k| regex::escape(k))
+        .collect::<Vec<_>>()
+        .join("|");
+    // Match: optional start-of-line/whitespace + keyword + whitespace +
+    // (optional namespace prefix `foo.` or `Foo::`)* + symbol_name +
+    // (whitespace, opening paren/brace/bracket, `<`, `:`, `;`, or end-of-line).
+    // (?m) so `^` and `$` anchor to line boundaries inside chunk content.
+    let pattern = format!(
+        r"(?m)(?:^|\s)(?:{kw_alts})\s+(?:[A-Za-z_]\w*(?:\.|::))*{escaped}(?:\s|[<({{:\[;]|$)"
+    );
+    Regex::new(&pattern).ok()
+}
+
+fn apply_definition_boost(results: &mut [SearchResult], query: &str) {
+    if results.is_empty() || !is_symbol_query(query) {
+        return;
+    }
+    let symbol_name = extract_symbol_name(query);
+    if symbol_name.len() < 2 {
+        return;
+    }
+    let Some(pattern) = build_definition_pattern(&symbol_name) else {
+        return;
+    };
+    let max_score = results
+        .iter()
+        .map(|r| r.score)
+        .fold(f32::NEG_INFINITY, f32::max);
+    if !max_score.is_finite() || max_score <= 0.0 {
+        return;
+    }
+    let boost_unit = max_score * DEFINITION_BOOST_MULTIPLIER;
+    let symbol_lower = symbol_name.to_lowercase();
+
+    for r in results.iter_mut() {
+        if !pattern.is_match(&r.content) {
+            continue;
+        }
+        let mut boost = boost_unit;
+        if let Some(stem) = std::path::Path::new(&r.file_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+        {
+            let stem_lower = stem.to_lowercase();
+            let stem_norm = stem_lower.replace('_', "");
+            if stem_lower == symbol_lower || stem_norm == symbol_lower {
+                boost *= DEFINITION_FILE_STEM_BONUS;
+            }
+        }
+        r.score += boost;
+    }
+    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+}
+
+// Default-on; opt-out via CODESAGE_DEFINITION_BOOST=0 (or "false"). The
+// `is_symbol_query` gate makes this provably inert on NL queries (commit
+// subjects, "how does X work" prose); manual A/B on bare-symbol queries
+// against the nest index showed the definition chunk surfaces over reference
+// / method-body chunks (ApplicationConfig: rank-1 score 0.76 → def chunk
+// 1.45; MicroservicesModule: 0.65 → 2.57).
+static DEFINITION_BOOST_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn definition_boost_enabled() -> bool {
+    *DEFINITION_BOOST_ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("CODESAGE_DEFINITION_BOOST").as_deref(),
+            Ok("0") | Ok("false")
+        )
+    })
 }
 
 // Path-penalty multipliers, ported from Semble's ranking/penalties.py. Applied
@@ -1364,4 +1523,150 @@ mod file_saturation_tests {
         apply_file_saturation(&mut rs);
         assert!(rs.is_empty());
     }
+}
+
+#[cfg(test)]
+mod definition_boost_tests {
+    use super::{
+        SearchResult, apply_definition_boost, build_definition_pattern, extract_symbol_name,
+        is_symbol_query,
+    };
+
+    fn mk(file: &str, content: &str, score: f32) -> SearchResult {
+        SearchResult {
+            file_path: file.to_string(),
+            language: "rust".to_string(),
+            content: content.to_string(),
+            start_line: 1,
+            end_line: 10,
+            score,
+            symbols: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn is_symbol_query_accepts_camelcase_snake_namespace() {
+        assert!(is_symbol_query("FooBar"));
+        assert!(is_symbol_query("fooBar"));
+        assert!(is_symbol_query("foo_bar"));
+        assert!(is_symbol_query("FOO_CONSTANT"));
+        assert!(is_symbol_query("Foo::Bar"));
+        assert!(is_symbol_query("namespace.method"));
+        assert!(is_symbol_query("Sinatra::Base"));
+        assert!(is_symbol_query("_private"));
+        assert!(is_symbol_query("Foo"));
+    }
+
+    #[test]
+    fn is_symbol_query_rejects_plain_words_and_phrases() {
+        assert!(!is_symbol_query("session"));
+        assert!(!is_symbol_query("login"));
+        assert!(!is_symbol_query("how does auth work"));
+        assert!(!is_symbol_query(""));
+        assert!(!is_symbol_query("   "));
+        assert!(!is_symbol_query("fix(common): accept zero timestamp"));
+    }
+
+    #[test]
+    fn extract_symbol_name_strips_namespace_prefix() {
+        assert_eq!(extract_symbol_name("Foo::Bar"), "Bar");
+        assert_eq!(extract_symbol_name("a.b.c"), "c");
+        assert_eq!(extract_symbol_name("Foo\\Bar"), "Bar");
+        assert_eq!(extract_symbol_name("ptr->method"), "method");
+        assert_eq!(extract_symbol_name("FooBar"), "FooBar");
+    }
+
+    #[test]
+    fn definition_pattern_matches_rust_struct() {
+        let pat = build_definition_pattern("FooBar").unwrap();
+        assert!(pat.is_match("pub struct FooBar { x: i32 }"));
+        assert!(pat.is_match("    struct FooBar;"));
+    }
+
+    #[test]
+    fn definition_pattern_matches_python_class_and_def() {
+        let pat = build_definition_pattern("FooBar").unwrap();
+        assert!(pat.is_match("class FooBar:\n    pass"));
+        assert!(pat.is_match("def FooBar(x):\n    return x"));
+    }
+
+    #[test]
+    fn definition_pattern_matches_namespace_qualified() {
+        let pat = build_definition_pattern("Router").unwrap();
+        assert!(pat.is_match("defmodule Phoenix.Router do\nend"));
+        assert!(pat.is_match("class Foo::Router; end"));
+    }
+
+    #[test]
+    fn definition_pattern_does_not_match_references() {
+        let pat = build_definition_pattern("FooBar").unwrap();
+        assert!(!pat.is_match("let x = FooBar::new();"));
+        assert!(!pat.is_match("call_something(FooBar)"));
+        assert!(!pat.is_match("FooBar.method()"));
+        // Must be preceded by a definition keyword.
+        assert!(!pat.is_match("// FooBar is a struct"));
+    }
+
+    #[test]
+    fn boost_promotes_definition_chunk_over_reference_chunk() {
+        let mut rs = vec![
+            mk("src/uses.rs", "let x = FooBar::new();", 1.0),
+            mk("src/foo_bar.rs", "pub struct FooBar { x: i32 }", 0.5),
+        ];
+        apply_definition_boost(&mut rs, "FooBar");
+        // Definition chunk + file-stem-bonus should now lead.
+        assert_eq!(rs[0].file_path, "src/foo_bar.rs");
+        assert!(rs[0].score > rs[1].score);
+    }
+
+    #[test]
+    fn nl_query_does_not_trigger_boost() {
+        let original_score = 0.5;
+        let mut rs = vec![mk(
+            "src/foo.rs",
+            "pub struct FooBar { x: i32 }",
+            original_score,
+        )];
+        apply_definition_boost(&mut rs, "how does foo work");
+        assert_eq!(rs[0].score, original_score);
+    }
+
+    #[test]
+    fn file_stem_bonus_applies_with_underscore_normalization() {
+        // login_controller.rs (stem "login_controller", normalized "logincontroller")
+        // should match symbol "LoginController".
+        let mut rs = vec![
+            mk(
+                "src/login_controller.rs",
+                "pub struct LoginController;",
+                0.5,
+            ),
+            mk("src/other.rs", "pub struct LoginController;", 0.5),
+        ];
+        apply_definition_boost(&mut rs, "LoginController");
+        // Both got the base boost; login_controller.rs got the 1.5x file-stem bonus.
+        assert_eq!(rs[0].file_path, "src/login_controller.rs");
+        assert!(rs[0].score > rs[1].score);
+    }
+
+    #[test]
+    fn empty_results_is_noop() {
+        let mut rs: Vec<SearchResult> = Vec::new();
+        apply_definition_boost(&mut rs, "FooBar");
+        assert!(rs.is_empty());
+    }
+
+    #[test]
+    fn elixir_defmodule_keyword_is_recognised() {
+        let pat = build_definition_pattern("Router").unwrap();
+        assert!(pat.is_match("defmodule Phoenix.Router do"));
+    }
+
+    #[test]
+    fn kotlin_fun_keyword_is_recognised() {
+        let pat = build_definition_pattern("doStuff").unwrap();
+        assert!(pat.is_match("    fun doStuff(): Unit { }"));
+    }
+
+    // typedef intentionally not supported (see DEFINITION_KEYWORDS comment).
 }

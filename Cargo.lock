@@ -306,6 +306,7 @@ dependencies = [
  "codesage-storage",
  "globset",
  "rayon",
+ "regex",
  "serde_json",
  "tempfile",
  "tracing",
