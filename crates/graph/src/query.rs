@@ -1,15 +1,18 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use anyhow::Result;
 use codesage_embed::model::Embedder;
 use codesage_embed::reranker::Reranker;
+use codesage_parser::discover::{TEST_LIKE_EXCLUDE_PATTERNS, build_exclude_set};
 use codesage_protocol::{
     ContextBundle, DependencyEntry, ExportRequest, FileCategory, FindReferencesRequest,
     FindSymbolRequest, ImpactEntry, ImpactReason, ImpactRequest, ImpactTarget, Reference,
     SearchRequest, SearchResult, Symbol, SymbolSummary,
 };
 use codesage_storage::{Database, RawSearchRow, embedding_to_bytes};
+use globset::GlobSet;
 
 pub fn find_symbol(db: &Database, req: &FindSymbolRequest) -> Result<Vec<Symbol>> {
     db.find_symbols(&req.name, req.kind)
@@ -423,6 +426,10 @@ pub fn search(
 
     annotate_with_symbols(db, &mut results)?;
 
+    if path_penalty_enabled() {
+        apply_path_penalties(&mut results);
+    }
+
     // Skip reranking on hybrid-gated queries. The cross-encoder judges
     // query/doc semantic similarity; for queries driven by a literal
     // identifier (the `hybrid_gate` trigger conditions), the rare-token
@@ -480,6 +487,90 @@ fn apply_symbol_boost(results: &mut [SearchResult], known_symbols: &[String]) {
         result.score += boost;
     }
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+}
+
+// Path-penalty multipliers, ported from Semble's ranking/penalties.py. Applied
+// multiplicatively after symbol boost and before cross-encoder reranking, so
+// the reranker sees demoted scores and the post-rerank merge respects the
+// prior. Tests/benches/compat/examples are still indexed (see
+// HARD_EXCLUDE_PATTERNS vs TEST_LIKE_EXCLUDE_PATTERNS in parser/discover.rs)
+// so find_references / find_symbol remain accurate; this only down-weights
+// them in semantic `search` results where they're rarely the right answer.
+const SOFT_PENALTY_STRONG: f32 = 0.3; // tests, benches, compat, legacy, examples
+const SOFT_PENALTY_MODERATE: f32 = 0.5; // re-export barrels (__init__.py, package-info.java)
+const SOFT_PENALTY_MILD: f32 = 0.7; // .d.ts type declaration stubs
+
+const COMPAT_DIR_NAMES: &[&str] = &["compat", "_compat", "legacy", "_legacy"];
+// Only plural forms — "example" (singular) collides with the `com.example.*`
+// Java/Kotlin package namespace, which is production code, not sample code.
+const EXAMPLES_DIR_NAMES: &[&str] = &["examples", "_examples"];
+const REEXPORT_BASENAMES: &[&str] = &["__init__.py", "package-info.java"];
+
+static TEST_LIKE_GLOBSET: OnceLock<GlobSet> = OnceLock::new();
+
+fn test_like_globset() -> &'static GlobSet {
+    TEST_LIKE_GLOBSET.get_or_init(|| {
+        let patterns: Vec<String> = TEST_LIKE_EXCLUDE_PATTERNS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        // Patterns are static and known-good; an unwrap here would only fire
+        // on a code edit that breaks them, which the workspace tests catch.
+        build_exclude_set(&patterns).expect("TEST_LIKE_EXCLUDE_PATTERNS compile")
+    })
+}
+
+fn has_dir_segment(path: &str, names: &[&str]) -> bool {
+    path.split('/').any(|seg| names.contains(&seg))
+}
+
+pub(crate) fn path_penalty(path: &str) -> f32 {
+    let normalized = if path.contains('\\') {
+        path.replace('\\', "/")
+    } else {
+        path.to_string()
+    };
+    let mut penalty = 1.0f32;
+
+    if test_like_globset().is_match(&normalized) {
+        penalty *= SOFT_PENALTY_STRONG;
+    }
+    if has_dir_segment(&normalized, COMPAT_DIR_NAMES) {
+        penalty *= SOFT_PENALTY_STRONG;
+    }
+    if has_dir_segment(&normalized, EXAMPLES_DIR_NAMES) {
+        penalty *= SOFT_PENALTY_STRONG;
+    }
+
+    let basename = normalized.rsplit('/').next().unwrap_or(&normalized);
+    if REEXPORT_BASENAMES.contains(&basename) {
+        penalty *= SOFT_PENALTY_MODERATE;
+    }
+    if normalized.ends_with(".d.ts") {
+        penalty *= SOFT_PENALTY_MILD;
+    }
+
+    penalty
+}
+
+fn apply_path_penalties(results: &mut [SearchResult]) {
+    for result in results.iter_mut() {
+        result.score *= path_penalty(&result.file_path);
+    }
+    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+}
+
+// Cached gate: opt-out via CODESAGE_PATH_PENALTY=0 (or "false"). Default on.
+// Cached so we don't getenv on every search call.
+static PATH_PENALTY_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn path_penalty_enabled() -> bool {
+    *PATH_PENALTY_ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("CODESAGE_PATH_PENALTY").as_deref(),
+            Ok("0") | Ok("false")
+        )
+    })
 }
 
 const RERANK_WEIGHT: f32 = 0.5;
@@ -1060,5 +1151,87 @@ mod hybrid_tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].file_path, "src/reg.rs");
+    }
+}
+
+#[cfg(test)]
+mod path_penalty_tests {
+    use super::path_penalty;
+
+    #[test]
+    fn production_code_keeps_full_score() {
+        assert_eq!(path_penalty("src/auth/login.rs"), 1.0);
+        assert_eq!(path_penalty("crates/graph/src/query.rs"), 1.0);
+        assert_eq!(
+            path_penalty("packages/common/pipes/parse-date.pipe.ts"),
+            1.0
+        );
+    }
+
+    #[test]
+    fn test_files_get_strong_penalty() {
+        assert_eq!(path_penalty("tests/integration.rs"), 0.3);
+        assert_eq!(path_penalty("crates/graph/tests/risk.rs"), 0.3);
+        assert_eq!(path_penalty("packages/core/test/auth.spec.ts"), 0.3);
+        assert_eq!(path_penalty("src/__tests__/login.test.ts"), 0.3);
+        assert_eq!(path_penalty("ext/standard/tests/string/foo.phpt"), 0.3);
+        assert_eq!(path_penalty("tests/test_login.py"), 0.3);
+        assert_eq!(path_penalty("foo/bar/something_test.go"), 0.3);
+        assert_eq!(path_penalty("src/Login/LoginTest.php"), 0.3);
+    }
+
+    #[test]
+    fn bench_files_get_strong_penalty() {
+        assert_eq!(path_penalty("benches/throughput.rs"), 0.3);
+        assert_eq!(path_penalty("benchmarks/end_to_end.py"), 0.3);
+    }
+
+    #[test]
+    fn compat_legacy_dirs_get_strong_penalty() {
+        assert_eq!(path_penalty("src/compat/php7.php"), 0.3);
+        assert_eq!(path_penalty("src/_compat/legacy_api.rs"), 0.3);
+        assert_eq!(path_penalty("packages/legacy/v1/foo.ts"), 0.3);
+    }
+
+    #[test]
+    fn examples_dirs_get_strong_penalty() {
+        assert_eq!(path_penalty("examples/quickstart.rs"), 0.3);
+        assert_eq!(path_penalty("packages/sdk/examples/main.go"), 0.3);
+        assert_eq!(path_penalty("src/_examples/demo.py"), 0.3);
+    }
+
+    #[test]
+    fn reexport_barrels_get_moderate_penalty() {
+        assert_eq!(path_penalty("src/auth/__init__.py"), 0.5);
+        // `com.example.*` Java/Kotlin namespace must NOT trigger the examples
+        // penalty; we only match plural forms.
+        assert_eq!(path_penalty("com/example/foo/package-info.java"), 0.5);
+    }
+
+    #[test]
+    fn type_declarations_get_mild_penalty() {
+        assert!((path_penalty("types/express.d.ts") - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn penalties_compose_multiplicatively() {
+        // Test in compat/ — strong test penalty AND strong compat penalty stack.
+        // 0.3 * 0.3 = 0.09
+        assert!((path_penalty("compat/tests/old_api_test.go") - 0.09).abs() < 1e-6);
+    }
+
+    #[test]
+    fn windows_separators_normalize() {
+        assert_eq!(path_penalty(r"tests\integration.rs"), 0.3);
+    }
+
+    #[test]
+    fn substring_match_does_not_trigger_dir_penalty() {
+        // "compatibility" should not match "compat" as a directory segment.
+        assert_eq!(path_penalty("src/compatibility/check.rs"), 1.0);
+        // "examplesite" should not match "examples".
+        assert_eq!(path_penalty("src/examplesite/index.ts"), 1.0);
+        // "test_helpers" file in src/ should NOT trigger (no test-like glob match).
+        assert_eq!(path_penalty("src/utilities.rs"), 1.0);
     }
 }
