@@ -24,6 +24,26 @@ try:
 except ImportError:
     sys.exit("pyyaml required: pip install pyyaml")
 
+# Optional. When present we report token-efficiency metrics (Semble-style:
+# expected tokens consumed before reaching the first relevant hit). When
+# absent we omit those columns and continue — cl100k_base is just one of
+# several reasonable token-counters and we don't want to hard-fail bench
+# runs over a missing dev dep.
+try:
+    import tiktoken
+    _ENCODING = tiktoken.get_encoding("cl100k_base")
+    def _count_tokens(text: str) -> int:
+        return len(_ENCODING.encode(text or ""))
+except ImportError:
+    _ENCODING = None
+    def _count_tokens(_text: str) -> int:
+        return 0
+
+
+# Misses charge a fixed budget: Semble uses 32k. Sets a ceiling so a
+# pathological miss rate doesn't make the average meaningless.
+_MISS_TOKEN_PENALTY = 32_000
+
 
 # ---------------------------------------------------------------------------
 # Scorecard metadata collection
@@ -141,9 +161,20 @@ def run_codesage_search(codesage_bin: str, project_root: Path, query: str, limit
 
 
 def parse_result_paths(output: str) -> list[str]:
-    """Extract ordered file paths from codesage search --json output."""
-    seen: set[str] = set()
-    ordered: list[str] = []
+    """Extract ordered file paths from codesage search --json output.
+
+    Wraps `parse_results` for callers that only need paths.
+    """
+    return [p for p, _content in parse_results(output)]
+
+
+def parse_results(output: str) -> list[tuple[str, str]]:
+    """Extract ordered (file_path, chunk_content) pairs.
+
+    The path-only `parse_result_paths` deduplicates by file_path; this version
+    keeps every chunk row in order so token-budget calculations see the chunks
+    an agent would actually consume rank-by-rank. Same JSON-extraction logic.
+    """
     lines: list[str] = []
     for line in output.splitlines():
         line = line.strip()
@@ -161,32 +192,49 @@ def parse_result_paths(output: str) -> list[str]:
     except json.JSONDecodeError:
         return []
 
+    seen: set[str] = set()
+    ordered: list[tuple[str, str]] = []
     for r in results:
         path = r.get("file_path", "")
-        if path and path not in seen:
-            seen.add(path)
-            ordered.append(path)
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        ordered.append((path, r.get("content", "")))
     return ordered
 
 
-def score_case(expected: list[str], returned: list[str], k_values: list[int]) -> dict:
+def score_case(
+    expected: list[str],
+    returned: list[tuple[str, str]],
+    k_values: list[int],
+) -> dict:
     expected_set = set(expected)
     first_rank = None
-    for i, r in enumerate(returned, start=1):
-        if r in expected_set:
+    tokens_to_first_hit = 0
+    for i, (path, content) in enumerate(returned, start=1):
+        tokens_to_first_hit += _count_tokens(content)
+        if path in expected_set:
             first_rank = i
             break
+
+    paths_only = [p for p, _ in returned]
     noise_before = (first_rank - 1) if first_rank else len(returned)
 
     recalls = {}
     for k in k_values:
-        topk = set(returned[:k])
+        topk = set(paths_only[:k])
         hits = len(topk & expected_set)
         recalls[k] = hits / len(expected_set) if expected_set else 0.0
+
+    # Misses are charged a fixed budget so the average isn't dominated by a
+    # single un-bounded outlier (matches Semble's methodology).
+    if first_rank is None:
+        tokens_to_first_hit = _MISS_TOKEN_PENALTY
 
     return {
         "first_hit_rank": first_rank,
         "noise_before_first_hit": noise_before,
+        "tokens_to_first_hit": tokens_to_first_hit,
         **{f"recall@{k}": recalls[k] for k in k_values},
         "returned_count": len(returned),
     }
@@ -246,11 +294,14 @@ def format_header(
     lines.append(f"- **Run at**: {run_ts}")
     lines.append("")
     lines.append("**Measured quantities**: miss rate (no ground-truth file in top-N), "
-                 "median first-hit rank, mean recall@5, mean recall@10. Per-case rows "
-                 "show `first_hit_rank`, `noise_before_first_hit`, recall@5, recall@10.")
+                 "median first-hit rank, mean recall@5, mean recall@10, mean tokens "
+                 "to first relevant hit (cl100k_base, when tiktoken is installed; "
+                 "misses are charged a 32k penalty so the average isn't dominated "
+                 "by a single un-bounded outlier). Per-case rows show `first_hit_rank`, "
+                 "`noise_before_first_hit`, recall@5, recall@10, and tokens-to-hit.")
     lines.append("")
     lines.append("**Not measured** (flagged so nothing reads in that we didn't test): "
-                 "agent tool-call counts, end-to-end task-completion rate, token usage, "
+                 "agent tool-call counts, end-to-end task-completion rate, "
                  "wall-clock vs grep/ripgrep. Add those separately when claiming them.")
     return lines
 
@@ -300,11 +351,11 @@ def main() -> int:
         query = case["query"]
         expected = case["expected_files"]
         raw = run_codesage_search(args.codesage_bin, project_root, query, args.limit)
-        returned = parse_result_paths(raw)
+        returned = parse_results(raw)
         scored = score_case(expected, returned, k_values)
         scored["id"] = cid
         scored["source"] = case.get("source", "?")
-        scored["returned"] = returned
+        scored["returned"] = [p for p, _ in returned]
         scored["expected"] = expected
         results.append(scored)
         if args.verbose:
@@ -338,12 +389,23 @@ def main() -> int:
     print()
     print("## Per-case results")
     print()
-    print("| id | src | first hit | noise | r@5 | r@10 |")
-    print("|---|---|---:|---:|---:|---:|")
+    if _ENCODING is not None:
+        print("| id | src | first hit | noise | r@5 | r@10 | tokens→hit |")
+        print("|---|---|---:|---:|---:|---:|---:|")
+    else:
+        print("| id | src | first hit | noise | r@5 | r@10 |")
+        print("|---|---|---:|---:|---:|---:|")
     for r in results:
         fh = r["first_hit_rank"] if r["first_hit_rank"] else "MISS"
-        print(f"| {r['id']} | {r['source']} | {fh} | {r['noise_before_first_hit']} "
-              f"| {r['recall@5']:.2f} | {r['recall@10']:.2f} |")
+        line = (
+            f"| {r['id']} | {r['source']} | {fh} | {r['noise_before_first_hit']} "
+            f"| {r['recall@5']:.2f} | {r['recall@10']:.2f} "
+        )
+        if _ENCODING is not None:
+            ttf = r["tokens_to_first_hit"]
+            ttf_str = f"{ttf:,}" if r["first_hit_rank"] else f"MISS ({_MISS_TOKEN_PENALTY:,})"
+            line += f"| {ttf_str} "
+        print(line + "|")
 
     hits = [r for r in results if r["first_hit_rank"] is not None]
     miss_rate = 1.0 - len(hits) / len(results) if results else 0.0
@@ -353,12 +415,22 @@ def main() -> int:
         sorted(r["first_hit_rank"] for r in hits)[len(hits) // 2] if hits else None
     )
 
+    if _ENCODING is not None and results:
+        avg_tokens = sum(r["tokens_to_first_hit"] for r in results) / len(results)
+    else:
+        avg_tokens = None
+
     print()
     print("## Aggregate")
     print(f"- **Miss rate (no ground-truth file in top-{args.limit}):** {miss_rate:.0%}")
     print(f"- **Median first-hit rank (hits only):** {median_first}")
     print(f"- **Mean recall@5:** {avg_r5:.2f}")
     print(f"- **Mean recall@10:** {avg_r10:.2f}")
+    if avg_tokens is not None:
+        print(
+            f"- **Mean tokens to first relevant hit (cl100k_base, miss penalty {_MISS_TOKEN_PENALTY:,}):** "
+            f"{int(round(avg_tokens)):,}"
+        )
 
     print()
     print("## Quotable one-liner")
@@ -373,12 +445,17 @@ def main() -> int:
           f"Baseline for comparison: {args.baseline}. Run {run_ts}.")
 
     print()
-    print(f"<!-- METRICS: miss_rate={miss_rate:.4f} "
-          f"median_first={median_first if median_first is not None else 'MISS'} "
-          f"r5={avg_r5:.4f} r10={avg_r10:.4f} cases={len(results)} "
-          f"project={project_root.name} head={head_sha} "
-          f"model={embedding_model} reranker={reranker} baseline={args.baseline} "
-          f"run_at={run_ts} codesage={cs_version} -->")
+    metrics = (
+        f"miss_rate={miss_rate:.4f} "
+        f"median_first={median_first if median_first is not None else 'MISS'} "
+        f"r5={avg_r5:.4f} r10={avg_r10:.4f} cases={len(results)} "
+        f"project={project_root.name} head={head_sha} "
+        f"model={embedding_model} reranker={reranker} baseline={args.baseline} "
+        f"run_at={run_ts} codesage={cs_version}"
+    )
+    if avg_tokens is not None:
+        metrics += f" mean_tokens_to_hit={int(round(avg_tokens))}"
+    print(f"<!-- METRICS: {metrics} -->")
 
     return 0
 
