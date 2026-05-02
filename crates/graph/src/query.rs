@@ -425,6 +425,10 @@ pub fn search(
         apply_symbol_boost(&mut results, &known_symbols);
     }
 
+    if stem_scan_enabled() {
+        apply_non_candidate_stem_scan(db, &mut results, &req.query)?;
+    }
+
     annotate_with_symbols(db, &mut results)?;
 
     if definition_boost_enabled() {
@@ -596,6 +600,15 @@ fn extract_embedded_symbols(query: &str) -> Vec<String> {
     seen.into_iter().collect()
 }
 
+// Lowercase + strip `_` (snake_case) and `-` (kebab-case, common in JS/TS),
+// so `ModuleRef` matches both `module_ref.py` and `module-ref.ts`.
+fn normalize_stem(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .collect()
+}
+
 fn extract_symbol_name(query: &str) -> String {
     let q = query.trim();
     for sep in ["::", "\\", "->", "."] {
@@ -678,7 +691,7 @@ fn apply_definition_boost(results: &mut [SearchResult], query: &str) {
                 .and_then(|s| s.to_str())
             {
                 let stem_lower = stem.to_lowercase();
-                let stem_norm = stem_lower.replace('_', "");
+                let stem_norm = normalize_stem(stem);
                 if stem_lower == symbol_lower || stem_norm == symbol_lower {
                     boost *= DEFINITION_FILE_STEM_BONUS;
                 }
@@ -701,6 +714,89 @@ fn definition_boost_enabled() -> bool {
     *DEFINITION_BOOST_ENABLED.get_or_init(|| {
         !matches!(
             std::env::var("CODESAGE_DEFINITION_BOOST").as_deref(),
+            Ok("0") | Ok("false")
+        )
+    })
+}
+
+// Non-candidate stem scan: when a bare-symbol query (e.g. "FooBar") didn't
+// surface the file with a matching stem (`foo_bar.rs`, `FooBar.java`), scan
+// it directly for a definition match and inject the chunk into the pool.
+// Backstop for embedding misses on small / oddly-chunked files where the
+// definition is the right answer but didn't crack top-50 candidates.
+// Pattern from Semble's boosting.py `_scan_non_candidates`.
+fn apply_non_candidate_stem_scan(
+    db: &Database,
+    results: &mut Vec<SearchResult>,
+    query: &str,
+) -> Result<()> {
+    if results.is_empty() || !is_symbol_query(query) {
+        return Ok(());
+    }
+    let symbol_name = extract_symbol_name(query);
+    // Min length 3 keeps short identifiers from matching every stem in the
+    // repo and triggering N file scans.
+    if symbol_name.len() < 3 {
+        return Ok(());
+    }
+    let Some(pattern) = build_definition_pattern(&symbol_name) else {
+        return Ok(());
+    };
+    let symbol_lower = symbol_name.to_lowercase();
+    let symbol_norm = normalize_stem(&symbol_name);
+
+    let candidate_set: HashSet<String> = results.iter().map(|r| r.file_path.clone()).collect();
+
+    let all_files = db.all_chunk_file_paths()?;
+    let mut injected: Vec<SearchResult> = Vec::new();
+    for file_path in all_files {
+        if candidate_set.contains(&file_path) {
+            continue;
+        }
+        let Some(stem_str) = std::path::Path::new(&file_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+        else {
+            continue;
+        };
+        let stem_lower = stem_str.to_lowercase();
+        let stem_norm = normalize_stem(stem_str);
+        if stem_lower != symbol_lower && stem_norm != symbol_norm {
+            continue;
+        }
+        // Stem matches; scan this file's chunks for the definition.
+        let chunks = db.chunks_for_file(&file_path)?;
+        for chunk in chunks {
+            if pattern.is_match(&chunk.content) {
+                // Inject with score=0; downstream definition_boost adds
+                // 3 * max_score * 1.5 (file-stem bonus). Path penalty and
+                // reranker then judge it on its merits.
+                injected.push(SearchResult {
+                    file_path: chunk.file_path,
+                    language: chunk.language,
+                    content: chunk.content,
+                    start_line: chunk.start_line,
+                    end_line: chunk.end_line,
+                    score: 0.0,
+                    symbols: Vec::new(),
+                });
+                break;
+            }
+        }
+    }
+
+    results.extend(injected);
+    Ok(())
+}
+
+// Default-on; opt-out via CODESAGE_STEM_SCAN=0. Same gate concept as the
+// definition-boost flag.
+static STEM_SCAN_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn stem_scan_enabled() -> bool {
+    *STEM_SCAN_ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("CODESAGE_STEM_SCAN").as_deref(),
             Ok("0") | Ok("false")
         )
     })
@@ -1766,4 +1862,116 @@ mod definition_boost_tests {
     }
 
     // typedef intentionally not supported (see DEFINITION_KEYWORDS comment).
+}
+
+#[cfg(test)]
+mod stem_scan_tests {
+    use super::apply_non_candidate_stem_scan;
+    use codesage_protocol::SearchResult;
+    use codesage_storage::Database;
+
+    fn mk(file: &str, content: &str, score: f32) -> SearchResult {
+        SearchResult {
+            file_path: file.to_string(),
+            language: "rust".to_string(),
+            content: content.to_string(),
+            start_line: 1,
+            end_line: 10,
+            score,
+            symbols: Vec::new(),
+        }
+    }
+
+    fn seed(db: &Database) {
+        let zero = vec![0.0f32; codesage_storage::db::DEFAULT_EMBEDDING_DIM];
+        db.insert_chunks(
+            "src/foo_bar.rs",
+            "rust",
+            &[("pub struct FooBar { x: i32 }", 1, 10, zero.as_slice())],
+        )
+        .unwrap();
+        db.insert_chunks(
+            "src/login.rs",
+            "rust",
+            &[(
+                "pub struct LoginController { u: User }",
+                1,
+                10,
+                zero.as_slice(),
+            )],
+        )
+        .unwrap();
+        db.insert_chunks(
+            "src/uses_foo.rs",
+            "rust",
+            &[("let x = FooBar::new();", 1, 10, zero.as_slice())],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn injects_stem_matched_definition_when_not_in_candidates() {
+        let db = Database::open_in_memory().unwrap();
+        seed(&db);
+        // Candidate pool only has the reference chunk; the definition file
+        // (foo_bar.rs) is NOT in the candidates.
+        let mut results = vec![mk("src/uses_foo.rs", "let x = FooBar::new();", 0.6)];
+        apply_non_candidate_stem_scan(&db, &mut results, "FooBar").unwrap();
+        let injected = results
+            .iter()
+            .find(|r| r.file_path == "src/foo_bar.rs")
+            .expect("stem-matched definition should be injected");
+        assert!(injected.content.contains("struct FooBar"));
+        // Score is 0.0; downstream definition_boost will lift it.
+        assert_eq!(injected.score, 0.0);
+    }
+
+    #[test]
+    fn does_not_inject_when_definition_already_in_candidates() {
+        let db = Database::open_in_memory().unwrap();
+        seed(&db);
+        // foo_bar.rs IS already a candidate. Should NOT be re-injected.
+        let mut results = vec![mk("src/foo_bar.rs", "pub struct FooBar { x: i32 }", 0.7)];
+        let before = results.len();
+        apply_non_candidate_stem_scan(&db, &mut results, "FooBar").unwrap();
+        assert_eq!(results.len(), before);
+    }
+
+    #[test]
+    fn skips_stem_match_without_definition_keyword() {
+        let db = Database::open_in_memory().unwrap();
+        let zero = vec![0.0f32; codesage_storage::db::DEFAULT_EMBEDDING_DIM];
+        db.insert_chunks(
+            "src/foo_bar.rs",
+            "rust",
+            // No `struct`/`fn`/etc. keyword preceding FooBar.
+            &[("// FooBar is documented elsewhere", 1, 5, zero.as_slice())],
+        )
+        .unwrap();
+        let mut results = vec![mk("src/other.rs", "let x = FooBar::new();", 0.6)];
+        apply_non_candidate_stem_scan(&db, &mut results, "FooBar").unwrap();
+        // foo_bar.rs has no definition keyword → not injected.
+        assert!(!results.iter().any(|r| r.file_path == "src/foo_bar.rs"));
+    }
+
+    #[test]
+    fn nl_query_does_not_trigger_scan() {
+        let db = Database::open_in_memory().unwrap();
+        seed(&db);
+        let mut results = vec![mk("src/uses_foo.rs", "let x = FooBar::new();", 0.6)];
+        let before = results.len();
+        apply_non_candidate_stem_scan(&db, &mut results, "how does foo work").unwrap();
+        assert_eq!(results.len(), before);
+    }
+
+    #[test]
+    fn short_symbol_does_not_trigger_scan() {
+        let db = Database::open_in_memory().unwrap();
+        seed(&db);
+        let mut results = vec![mk("src/uses_foo.rs", "use Fb;", 0.6)];
+        let before = results.len();
+        // 2-letter symbol is below MIN_LEN; no scan.
+        apply_non_candidate_stem_scan(&db, &mut results, "Fb").unwrap();
+        assert_eq!(results.len(), before);
+    }
 }
