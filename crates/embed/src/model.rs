@@ -90,6 +90,48 @@ fn probe_python_site_packages() -> Vec<PathBuf> {
     Vec::new()
 }
 
+/// Verifies that the current Linux process has the CUDA runtime + cuDNN +
+/// cuBLAS libraries actually mapped, after a session has been built with
+/// `device = "gpu"`. The reason for this check, from a 2026-05-02 incident:
+/// ORT can register a CUDA execution provider successfully (logs "Successfully
+/// registered CUDAExecutionProvider") and still run inference entirely on CPU
+/// when the underlying CUDA loader couldn't bind the shared libraries — and
+/// it does so silently. The visible symptom was a 10+ minute reindex on a
+/// 256-file project that should have taken ~10s on GPU. This check makes
+/// that failure mode loud.
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn require_cuda_libs_mapped() -> anyhow::Result<()> {
+    let maps = std::fs::read_to_string("/proc/self/maps")
+        .context("reading /proc/self/maps to verify CUDA libraries are loaded")?;
+    let has_libcuda = maps.contains("libcuda.so");
+    let has_cudart = maps.contains("libcudart.so");
+    // Either cuDNN or cuBLAS is enough evidence the CUDA EP is functional;
+    // they get pulled in by the first GPU op, not at session-create time.
+    let has_dnn_or_blas = maps.contains("libcudnn") || maps.contains("libcublas");
+
+    if !has_libcuda || !has_cudart {
+        anyhow::bail!(
+            "GPU was requested (device = \"gpu\") but CUDA runtime libraries are not loaded \
+             into this process — ORT silently fell back to CPU. Refusing to continue.\n\
+             Missing: libcuda={missing_libcuda}, libcudart={missing_cudart}\n\
+             Fixes: (1) confirm the binary was built with `--features cuda`; \
+             (2) install nvidia-*-cu12 pip packages (cuda-runtime, cudnn, cublas, cudart, \
+             nvrtc); (3) set CODESAGE_NVIDIA_LIBS to the directory containing them; \
+             (4) check `codesage doctor` for nvidia-lib discovery details. \
+             To override (e.g. for tests), set CODESAGE_ALLOW_CPU_FALLBACK=1.",
+            missing_libcuda = !has_libcuda,
+            missing_cudart = !has_cudart,
+        );
+    }
+    if !has_dnn_or_blas {
+        tracing::warn!(
+            "CUDA runtime is mapped but neither libcudnn nor libcublas were found in /proc/self/maps. \
+             Inference may fall back to CPU on attention ops."
+        );
+    }
+    Ok(())
+}
+
 pub fn preload_cuda_libs() {
     CUDA_PRELOAD.call_once(|| {
         let lib_dirs = discover_nvidia_lib_dirs();
@@ -270,6 +312,25 @@ impl Embedder {
         }
 
         let session = builder.commit_from_file(&model_path)?;
+
+        // Hard-fail when device = "gpu" was requested but ORT silently fell
+        // back to CPU. Failure mode observed 2026-05-02 on a flip-all script:
+        // CUDA registration logged "Successfully registered" but the process
+        // had ZERO cuda libs mapped per /proc/self/maps and ran for 10+
+        // minutes on a 256-file project. Rather than time-based heuristics,
+        // assert that the CUDA loader actually ran by checking that the
+        // process has libcuda + libcudart + (libcudnn OR libcublas) mapped.
+        // No-op on non-Linux. Bypass with CODESAGE_ALLOW_CPU_FALLBACK=1
+        // (e.g. for unit tests).
+        #[cfg(all(feature = "cuda", target_os = "linux"))]
+        if want_cuda
+            && !matches!(
+                std::env::var("CODESAGE_ALLOW_CPU_FALLBACK").as_deref(),
+                Ok("1") | Ok("true")
+            )
+        {
+            require_cuda_libs_mapped()?;
+        }
 
         let has_token_type_ids = session
             .inputs()
