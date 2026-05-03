@@ -5,7 +5,10 @@ use anyhow::{Context, Result};
 use ort::session::Session;
 use tokenizers::Tokenizer;
 
-use crate::config::{BATCH_SIZE, EmbeddingConfig, MAX_SEQ_LENGTH, PoolingStrategy};
+use crate::config::{
+    BATCH_SIZE, EmbeddingBackendKind, EmbeddingConfig, MAX_SEQ_LENGTH, PoolingStrategy,
+};
+use crate::http::HttpEmbedder;
 
 static ORT_INIT: Once = Once::new();
 static CUDA_PRELOAD: Once = Once::new();
@@ -247,16 +250,57 @@ pub(crate) fn init_ort_dylib() {
     });
 }
 
+pub(crate) trait EmbeddingBackend {
+    fn dim(&self) -> usize;
+    fn storage_model_id(&self) -> &str;
+    fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
+}
+
 pub struct Embedder {
+    backend: Box<dyn EmbeddingBackend + Send>,
+}
+
+impl Embedder {
+    pub fn new(config: &EmbeddingConfig) -> Result<Self> {
+        let kind = config.backend_kind()?;
+        let backend: Box<dyn EmbeddingBackend + Send> = match kind {
+            EmbeddingBackendKind::Onnx => Box::new(OnnxEmbedder::new(config)?),
+            EmbeddingBackendKind::Ollama | EmbeddingBackendKind::OpenAiCompatible => {
+                Box::new(HttpEmbedder::new(config, kind)?)
+            }
+        };
+        Ok(Self { backend })
+    }
+
+    pub fn dim(&self) -> usize {
+        self.backend.dim()
+    }
+
+    pub fn storage_model_id(&self) -> &str {
+        self.backend.storage_model_id()
+    }
+
+    pub fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
+        let batch = self.embed_batch(&[text])?;
+        Ok(batch.into_iter().next().unwrap())
+    }
+
+    pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        self.backend.embed_batch(texts)
+    }
+}
+
+struct OnnxEmbedder {
     session: Session,
     tokenizer: Tokenizer,
     dim: usize,
     pooling: PoolingStrategy,
     has_token_type_ids: bool,
+    storage_model_id: String,
 }
 
-impl Embedder {
-    pub fn new(config: &EmbeddingConfig) -> Result<Self> {
+impl OnnxEmbedder {
+    fn new(config: &EmbeddingConfig) -> Result<Self> {
         init_ort_dylib();
         tracing::info!(model = %config.model, "loading embedding model");
 
@@ -353,33 +397,8 @@ impl Embedder {
             dim,
             pooling,
             has_token_type_ids,
+            storage_model_id: config.storage_model_id()?,
         })
-    }
-
-    pub fn dim(&self) -> usize {
-        self.dim
-    }
-
-    pub fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
-        let batch = self.embed_batch(&[text])?;
-        Ok(batch.into_iter().next().unwrap())
-    }
-
-    pub fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut all_embeddings = Vec::with_capacity(texts.len());
-
-        for batch_start in (0..texts.len()).step_by(BATCH_SIZE) {
-            let batch_end = (batch_start + BATCH_SIZE).min(texts.len());
-            let batch = &texts[batch_start..batch_end];
-            let batch_embs = self.embed_batch_inner(batch)?;
-            all_embeddings.extend(batch_embs);
-        }
-
-        Ok(all_embeddings)
     }
 
     fn embed_batch_inner(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
@@ -449,19 +468,48 @@ impl Embedder {
                 }
             };
 
-            let norm: f32 = pooled.iter().map(|v| v * v).sum::<f32>().sqrt();
-            let mut normalized = pooled;
-            if norm > 0.0 {
-                for v in &mut normalized {
-                    *v /= norm;
-                }
-            }
-
-            embeddings.push(normalized);
+            embeddings.push(normalize_embedding(pooled));
         }
 
         Ok(embeddings)
     }
+}
+
+impl EmbeddingBackend for OnnxEmbedder {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn storage_model_id(&self) -> &str {
+        &self.storage_model_id
+    }
+
+    fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut all_embeddings = Vec::with_capacity(texts.len());
+
+        for batch_start in (0..texts.len()).step_by(BATCH_SIZE) {
+            let batch_end = (batch_start + BATCH_SIZE).min(texts.len());
+            let batch = &texts[batch_start..batch_end];
+            let batch_embs = self.embed_batch_inner(batch)?;
+            all_embeddings.extend(batch_embs);
+        }
+
+        Ok(all_embeddings)
+    }
+}
+
+pub(crate) fn normalize_embedding(mut embedding: Vec<f32>) -> Vec<f32> {
+    let norm: f32 = embedding.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for v in &mut embedding {
+            *v /= norm;
+        }
+    }
+    embedding
 }
 
 fn detect_dim(session: &Session) -> Result<usize> {

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use codesage_embed::config::EmbeddingBackendKind;
 use codesage_storage::Database;
 
 use crate::drift::{DriftKind, check_drift};
@@ -115,15 +116,32 @@ fn check_config(root: &Path) -> Check {
         }
     };
     let emb = config.embedding.unwrap_or_default();
+    let backend = match emb.backend_kind() {
+        Ok(kind) => kind,
+        Err(e) => {
+            return Check {
+                name: "config",
+                status: Status::Fail,
+                message: format!("{e:#}"),
+            };
+        }
+    };
     let reranker = emb
         .reranker
         .as_deref()
         .map(|r| format!(" reranker={r}"))
         .unwrap_or_default();
+    let base_url = match backend {
+        EmbeddingBackendKind::Onnx => String::new(),
+        kind => format!(" base_url={}", emb.provider_base_url(kind)),
+    };
     Check {
         name: "config",
         status: Status::Pass,
-        message: format!("model={} device={}{reranker}", emb.model, emb.device),
+        message: format!(
+            "backend={} model={} device={}{}{reranker}",
+            emb.backend, emb.model, emb.device, base_url
+        ),
     }
 }
 
@@ -166,12 +184,28 @@ fn check_disk(root: &Path) -> Check {
 }
 
 fn check_cuda(project: Option<&Path>) -> Check {
-    let want_gpu = project
-        .and_then(|root| {
-            let config = load_project_config(root).ok()?;
-            config
-                .embedding
-                .map(|e| e.device == "gpu" || e.device == "cuda")
+    let embedding = project.and_then(|root| {
+        let config = load_project_config(root).ok()?;
+        let e = config.embedding.unwrap_or_default();
+        let backend = e.backend_kind().ok()?;
+        let has_reranker = e.reranker.is_some();
+        Some((backend, e.device, has_reranker))
+    });
+    if let Some((backend, _device, has_reranker)) = embedding.as_ref()
+        && *backend != EmbeddingBackendKind::Onnx
+        && !has_reranker
+    {
+        return Check {
+            name: "cuda",
+            status: Status::Pass,
+            message: "HTTP embedding backend has no local reranker; CodeSage CUDA not required"
+                .to_string(),
+        };
+    }
+    let want_gpu = embedding
+        .map(|(backend, device, has_reranker)| {
+            (device == "gpu" || device == "cuda")
+                && (backend == EmbeddingBackendKind::Onnx || has_reranker)
         })
         .unwrap_or(false);
     let built_with_cuda = cfg!(feature = "cuda");
@@ -210,20 +244,33 @@ fn check_cuda(project: Option<&Path>) -> Check {
 
 fn check_models(project: Option<&Path>) -> Check {
     let cache = hf_cache_dir();
-    let (embed_model, rerank_model): (String, Option<String>) = project
+    let (backend, embed_model, rerank_model, base_url): (
+        EmbeddingBackendKind,
+        String,
+        Option<String>,
+        Option<String>,
+    ) = project
         .and_then(|root| {
             let c = load_project_config(root).ok()?;
             let e = c.embedding.unwrap_or_default();
-            Some((e.model, e.reranker))
+            let backend = e.backend_kind().ok()?;
+            let base_url = match backend {
+                EmbeddingBackendKind::Onnx => None,
+                kind => Some(e.provider_base_url(kind)),
+            };
+            Some((backend, e.model, e.reranker, base_url))
         })
         .unwrap_or_else(|| {
             (
+                EmbeddingBackendKind::Onnx,
                 "sentence-transformers/all-MiniLM-L6-v2".to_string(),
                 Some("cross-encoder/ms-marco-MiniLM-L6-v2".to_string()),
+                None,
             )
         });
 
-    let embed_present = model_in_cache(&cache, &embed_model);
+    let embed_present =
+        backend != EmbeddingBackendKind::Onnx || model_in_cache(&cache, &embed_model);
     let rerank_present = rerank_model
         .as_ref()
         .map(|m| model_in_cache(&cache, m))
@@ -234,15 +281,26 @@ fn check_models(project: Option<&Path>) -> Check {
     } else {
         Status::Warn
     };
-    let mut parts = vec![format!(
-        "{}: {}",
-        embed_model,
-        if embed_present {
-            "cached"
-        } else {
-            "MISSING (will download on first use)"
-        }
-    )];
+    let mut parts = match backend {
+        EmbeddingBackendKind::Onnx => vec![format!(
+            "{}: {}",
+            embed_model,
+            if embed_present {
+                "cached"
+            } else {
+                "MISSING (will download on first use)"
+            }
+        )],
+        EmbeddingBackendKind::Ollama | EmbeddingBackendKind::OpenAiCompatible => vec![format!(
+            "{embed_model}: served by {} at {}; HuggingFace embedding cache not required",
+            match backend {
+                EmbeddingBackendKind::Ollama => "ollama",
+                EmbeddingBackendKind::OpenAiCompatible => "openai-compatible",
+                EmbeddingBackendKind::Onnx => unreachable!(),
+            },
+            base_url.as_deref().unwrap_or("")
+        )],
+    };
     if let Some(m) = &rerank_model {
         parts.push(format!(
             "{}: {}",
@@ -419,7 +477,18 @@ fn check_semantic_freshness(root: &Path) -> Check {
             };
         }
     };
-    let model = config.embedding.unwrap_or_default().model;
+    let emb_config = config.embedding.unwrap_or_default();
+    let model = match emb_config.storage_model_id() {
+        Ok(model) => model,
+        Err(e) => {
+            return Check {
+                name: "semantic",
+                status: Status::Fail,
+                message: format!("{e:#}"),
+            };
+        }
+    };
+    let display_model = emb_config.model;
     let db = match Database::open_for_existing_model(&db_path, &model) {
         Ok(db) => db,
         Err(e) => {
@@ -434,7 +503,7 @@ fn check_semantic_freshness(root: &Path) -> Check {
         return Check {
             name: "semantic",
             status: Status::Warn,
-            message: format!("no semantic chunks for model {model}; run `codesage index`"),
+            message: format!("no semantic chunks for model {display_model}; run `codesage index`"),
         };
     }
 
@@ -443,7 +512,7 @@ fn check_semantic_freshness(root: &Path) -> Check {
             name: "semantic",
             status: Status::Pass,
             message: format!(
-                "fresh for model {model}; {} files tracked",
+                "fresh for model {display_model}; {} files tracked",
                 freshness.indexed_files
             ),
         },
@@ -451,14 +520,14 @@ fn check_semantic_freshness(root: &Path) -> Check {
             name: "semantic",
             status: Status::Warn,
             message: format!(
-                "{} stale file(s), {} missing file(s) for model {model}; run `codesage index`",
+                "{} stale file(s), {} missing file(s) for model {display_model}; run `codesage index`",
                 freshness.stale_files, freshness.missing_files
             ),
         },
         Ok(None) => Check {
             name: "semantic",
             status: Status::Warn,
-            message: format!("semantic freshness unavailable for model {model}"),
+            message: format!("semantic freshness unavailable for model {display_model}"),
         },
         Err(e) => Check {
             name: "semantic",
@@ -559,6 +628,14 @@ mod tests {
         dir
     }
 
+    fn init_codesage_project_with_config(config: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let codesage_dir = dir.path().join(PROJECT_DIR);
+        std::fs::create_dir_all(&codesage_dir).unwrap();
+        std::fs::write(codesage_dir.join("config.toml"), config).unwrap();
+        dir
+    }
+
     #[test]
     fn check_hooks_requires_post_rewrite() {
         let dir = init_git_repo();
@@ -586,6 +663,57 @@ mod tests {
         let check = check_hooks(dir.path());
 
         assert_eq!(check.status, Status::Pass);
+    }
+
+    #[test]
+    fn cuda_check_skips_codesage_cuda_for_http_embedding_backend() {
+        let dir = init_codesage_project_with_config(
+            "[embedding]\nbackend = \"ollama\"\nmodel = \"embeddinggemma\"\ndevice = \"gpu\"\n",
+        );
+
+        let check = check_cuda(Some(dir.path()));
+
+        assert_eq!(check.status, Status::Pass);
+        assert!(
+            check.message.contains("CodeSage CUDA not required"),
+            "message should explain why CUDA is skipped: {}",
+            check.message
+        );
+    }
+
+    #[test]
+    fn model_check_skips_huggingface_embedding_cache_for_http_backend() {
+        let dir = init_codesage_project_with_config(
+            "[embedding]\nbackend = \"openai-compatible\"\nmodel = \"local-embed\"\ndevice = \"cpu\"\nbase_url = \"http://localhost:8080\"\n",
+        );
+
+        let check = check_models(Some(dir.path()));
+
+        assert_eq!(check.status, Status::Pass);
+        assert!(
+            check
+                .message
+                .contains("HuggingFace embedding cache not required"),
+            "message should explain cache skip: {}",
+            check.message
+        );
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn cuda_check_still_applies_to_gpu_reranker_with_http_embedding_backend() {
+        let dir = init_codesage_project_with_config(
+            "[embedding]\nbackend = \"ollama\"\nmodel = \"embeddinggemma\"\ndevice = \"gpu\"\nreranker = \"cross-encoder/ms-marco-MiniLM-L6-v2\"\n",
+        );
+
+        let check = check_cuda(Some(dir.path()));
+
+        assert_eq!(check.status, Status::Fail);
+        assert!(
+            check.message.contains("device=gpu"),
+            "message should explain GPU config failure: {}",
+            check.message
+        );
     }
 
     #[test]

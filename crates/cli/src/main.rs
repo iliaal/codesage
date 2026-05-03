@@ -348,7 +348,7 @@ fn load_query_stack(
     let config = load_project_config(root)?;
     let emb_config = config.embedding.unwrap_or_default();
     let embedder = Embedder::new(&emb_config)?;
-    let db = open_db_for_model(root, &emb_config.model, embedder.dim())?;
+    let db = open_db_for_model(root, embedder.storage_model_id(), embedder.dim())?;
     let reranker = emb_config
         .reranker
         .as_ref()
@@ -360,7 +360,7 @@ fn load_query_stack(
 fn load_symbol_context_db(root: &Path) -> Result<Database> {
     let config = load_project_config(root)?;
     let emb_config = config.embedding.unwrap_or_default();
-    open_context_db_for_existing_model(root, &emb_config.model)
+    open_context_db_for_existing_model(root, &emb_config.storage_model_id()?)
 }
 
 fn load_index_embedder(
@@ -713,8 +713,8 @@ fn cmd_index(full: bool, no_semantic: bool) -> Result<()> {
     let mut embedder = load_index_embedder(no_semantic, &emb_config)?;
 
     let db = match embedder.as_ref() {
-        Some(e) if full => open_db_for_model_rebuild(&root, &emb_config.model, e.dim())?,
-        Some(e) => open_db_for_model(&root, &emb_config.model, e.dim())?,
+        Some(e) if full => open_db_for_model_rebuild(&root, e.storage_model_id(), e.dim())?,
+        Some(e) => open_db_for_model(&root, e.storage_model_id(), e.dim())?,
         None => open_db(&root)?,
     };
 
@@ -1224,25 +1224,27 @@ fn cmd_status() -> Result<()> {
 
 fn print_semantic_status(root: &Path) -> Result<()> {
     let config = load_project_config(root)?;
-    let model = config.embedding.unwrap_or_default().model;
+    let emb_config = config.embedding.unwrap_or_default();
+    let model = emb_config.storage_model_id()?;
+    let display_model = emb_config.model;
     let db = open_context_db_for_existing_model(root, &model)?;
     if db.chunk_table_name().is_empty() {
-        println!("Semantic:   missing for model {model} (run `codesage index`)");
+        println!("Semantic:   missing for model {display_model} (run `codesage index`)");
         return Ok(());
     }
 
     let Some(freshness) = db.semantic_freshness()? else {
-        println!("Semantic:   unavailable for model {model}");
+        println!("Semantic:   unavailable for model {display_model}");
         return Ok(());
     };
     if freshness.is_fresh() {
         println!(
-            "Semantic:   fresh for model {model} ({} files)",
+            "Semantic:   fresh for model {display_model} ({} files)",
             freshness.indexed_files
         );
     } else {
         println!(
-            "Semantic:   stale for model {model} ({} stale, {} missing; run `codesage index`)",
+            "Semantic:   stale for model {display_model} ({} stale, {} missing; run `codesage index`)",
             freshness.stale_files, freshness.missing_files
         );
     }
@@ -1269,7 +1271,8 @@ fn cmd_cleanup(dry_run: bool) -> Result<()> {
 
     let embedder = Embedder::new(&emb_config)?;
     let active_dim = embedder.dim();
-    let active_table = codesage_storage::schema::model_table_name(&emb_config.model, active_dim);
+    let active_model_id = embedder.storage_model_id().to_string();
+    let active_table = codesage_storage::schema::model_table_name(&active_model_id, active_dim);
 
     let db = open_db(&root)?;
 
@@ -1280,6 +1283,7 @@ fn cmd_cleanup(dry_run: bool) -> Result<()> {
     let mut dropped = 0;
 
     println!("Active model:  {}", emb_config.model);
+    println!("Storage model: {active_model_id}");
     println!("Active table:  {active_table}");
     println!("DB size before: {}", format_bytes(size_before));
     println!();
@@ -1726,6 +1730,7 @@ mod tests {
             model: "codesage-test/does-not-matter".to_string(),
             device: "gpu".to_string(),
             reranker: None,
+            ..EmbeddingConfig::default()
         };
 
         let err = match load_index_embedder(false, &cfg) {
@@ -1746,6 +1751,7 @@ mod tests {
             model: "codesage-test/does-not-exist".to_string(),
             device: "gpu".to_string(),
             reranker: None,
+            ..EmbeddingConfig::default()
         };
 
         assert!(load_index_embedder(true, &cfg).unwrap().is_none());
@@ -1772,6 +1778,37 @@ mod tests {
         assert_eq!(
             db.chunk_table_name(),
             "chunks_codesage_test_does_not_exist_384"
+        );
+    }
+
+    #[test]
+    fn symbol_context_db_uses_http_storage_model_id_without_loading_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let codesage_dir = root.join(PROJECT_DIR);
+        std::fs::create_dir_all(&codesage_dir).unwrap();
+        let storage_model = "ollama:http://localhost:11434:embeddinggemma";
+        std::fs::write(
+            codesage_dir.join("config.toml"),
+            "[embedding]\nbackend = \"ollama\"\nmodel = \"embeddinggemma\"\ndevice = \"gpu\"\nbase_url = \"http://localhost:11434/\"\n",
+        )
+        .unwrap();
+        let db_path = codesage_dir.join(DB_FILE);
+        Database::open_for_model(
+            &db_path,
+            storage_model,
+            codesage_storage::db::DEFAULT_EMBEDDING_DIM,
+        )
+        .unwrap();
+
+        let db = load_symbol_context_db(root).unwrap();
+
+        assert_eq!(
+            db.chunk_table_name(),
+            codesage_storage::schema::model_table_name(
+                storage_model,
+                codesage_storage::db::DEFAULT_EMBEDDING_DIM
+            )
         );
     }
 }

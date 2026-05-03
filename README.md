@@ -28,7 +28,7 @@ Concrete answers to the questions a code-intelligence tool earns its keep on. Th
 
 | Capability | CodeSage |
 |---|---|
-| Natural-language semantic search | ✓ MiniLM embeddings + cross-encoder reranker, sub-100 ms warm |
+| Natural-language semantic search | ✓ local ONNX embeddings by default; optional Ollama / OpenAI-compatible HTTP embedding backends |
 | Symbol-level lookup (definitions, references, callers/callees, inheritance) | ✓ tree-sitter, 8 languages, exact line/column ranges |
 | File-level dependency mapping (imports / imported-by) | ✓ via `list_dependencies` |
 | Change impact / blast-radius analysis | ✓ via `impact_analysis`, configurable depth, symbol or file target |
@@ -52,7 +52,7 @@ PHP, Python, C, C++, Rust, JavaScript, TypeScript, Go.
 
 ## Why a single Rust binary
 
-CodeSage ships as one static Rust binary plus a local SQLite database under `.codesage/` per project. No Docker container, no external vector DB server, no embedding service, no daemon. On first use it downloads the embedding and reranker ONNX models (~500 MB combined) and reuses the Hugging Face cache forever after.
+CodeSage ships as one static Rust binary plus a local SQLite database under `.codesage/` per project. No Docker container, no external vector DB server, no daemon. By default, embeddings run in-process through ONNX Runtime: first use downloads the embedding and reranker ONNX models (~500 MB combined) and reuses the Hugging Face cache forever after. If you already run Ollama or a llama.cpp/OpenAI-compatible embedding server, CodeSage can call that local HTTP provider instead.
 
 The trade-off: CUDA-accelerated embeddings need the `nvidia-*-cu12` pip packages on the host (see [CUDA setup](#cuda-setup) below). In exchange, install once, run everywhere, no orchestration layer, no systemd unit to manage. Tools in the same category that take the other side of this trade (SocratiCode with managed Qdrant + Ollama, GitNexus with external Qdrant) are valid for different user profiles. If your team already runs Docker Compose for everything, use those. If you want `cargo install` and `codesage init` and nothing else to debug, use CodeSage.
 
@@ -190,8 +190,8 @@ flowchart LR
     C --> D[Extract symbols<br/>and references]
     C --> E[Chunk text<br/>recursive splitter]
     D --> F[(SQLite<br/>files, symbols, refs)]
-    E --> G[Embed via ONNX<br/>MiniLM-L6-v2]
-    G --> H[(sqlite-vec<br/>chunks_minilm_384)]
+    E --> G[Embed<br/>ONNX or HTTP provider]
+    G --> H[(sqlite-vec<br/>chunks_model_dim)]
 ```
 
 Parsing happens in parallel via Rayon; SQLite writes are batched. Re-running `codesage index` is incremental: only files whose content hash changed are re-parsed and re-embedded.
@@ -202,7 +202,7 @@ A query flows through five stages:
 
 ```mermaid
 flowchart LR
-    Q[Query string] --> E[Embed<br/>MiniLM-L6-v2]
+    Q[Query string] --> E[Embed<br/>configured backend]
     E --> K[KNN retrieval<br/>sqlite-vec<br/>overfetch 5x]
     K --> B[Symbol boost<br/>+0.1 per token match]
     B --> R[Cross-encoder rerank<br/>ms-marco<br/>blend 50/50]
@@ -210,7 +210,7 @@ flowchart LR
     A --> T[Top-N results]
 ```
 
-1. Embed the query with MiniLM-L6-v2 (22M params, 384d) via ONNX Runtime.
+1. Embed the query with the configured backend: ONNX Runtime, Ollama, or an OpenAI-compatible local embedding server.
 2. Prepend file path and symbol context to chunks before embedding.
 3. Boost chunks whose content matches known symbol names.
 4. Re-score the top candidates with ms-marco-MiniLM-L6-v2 and blend 50/50 with the semantic score.
@@ -228,6 +228,7 @@ name = "my-project"
 
 [embedding]
 model = "sentence-transformers/all-MiniLM-L6-v2"
+backend = "onnx"                                    # "onnx", "ollama", or "openai-compatible"
 device = "gpu"                                        # "gpu" or "cpu"
 reranker = "cross-encoder/ms-marco-MiniLM-L6-v2"     # optional, remove to disable
 
@@ -239,6 +240,31 @@ exclude_patterns = [
 ```
 
 Models download from HuggingFace the first time you use them.
+
+For Ollama embeddings:
+
+```toml
+[embedding]
+backend = "ollama"
+model = "embeddinggemma"
+base_url = "http://localhost:11434"
+device = "cpu"                    # HTTP embeddings ignore this; reranker still uses it
+reranker = "cross-encoder/ms-marco-MiniLM-L6-v2"
+```
+
+For llama.cpp or another OpenAI-compatible embedding server:
+
+```toml
+[embedding]
+backend = "openai-compatible"
+model = "local-embed"
+base_url = "http://localhost:8080"
+dimensions = 768                  # optional; fails fast if provider returns a different size
+api_key_env = "EMBEDDINGS_API_KEY" # optional Bearer token source
+device = "cpu"                     # still used by the optional reranker
+```
+
+HTTP embedding backends store vectors in provider-specific tables, so you can switch between ONNX, Ollama, and OpenAI-compatible providers without mixing embeddings. `dimensions` is optional, but setting it makes table identity and provider mistakes easier to diagnose.
 
 ## 🏗️ Architecture
 

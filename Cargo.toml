@@ -58,3 +58,4 @@ tree-sitter-go = "0.25"
 ort = { version = "2.0.0-rc.12", features = ["load-dynamic", "preload-dylibs"] }
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 hf-hub = "0.5"
+ureq = { version = "3.3", features = ["json"] }

@@ -294,7 +294,7 @@ impl CodeSageServer {
     }
 
     fn get_or_load_embedder(&self, config: &EmbeddingConfig) -> Result<Arc<Mutex<Embedder>>> {
-        let key = format!("{}|{}", config.model, config.device);
+        let key = config.cache_key()?;
         {
             let guard = self.embedders.lock();
             if let Some(arc) = guard.get(&key) {
@@ -303,8 +303,8 @@ impl CodeSageServer {
         }
         let embedder = Embedder::new(config).with_context(|| {
             format!(
-                "loading embedding model '{}' on device '{}'",
-                config.model, config.device
+                "loading embedding model '{}' with backend '{}' on device '{}'",
+                config.model, config.backend, config.device
             )
         })?;
         let arc = Arc::new(Mutex::new(embedder));
@@ -335,11 +335,7 @@ impl CodeSageServer {
     fn open_db_for(&self, state: &ProjectState) -> Result<Database> {
         let embedder_arc = self.get_or_load_embedder(&state.embedding_config)?;
         let embedder = embedder_arc.lock();
-        Database::open_for_model(
-            &state.db_path,
-            &state.embedding_config.model,
-            embedder.dim(),
-        )
+        Database::open_for_model(&state.db_path, embedder.storage_model_id(), embedder.dim())
     }
 
     fn open_structural_db_for(&self, state: &ProjectState) -> Result<Database> {
@@ -347,7 +343,10 @@ impl CodeSageServer {
     }
 
     fn open_context_db_for(&self, state: &ProjectState) -> Result<Database> {
-        Database::open_for_existing_model(&state.db_path, &state.embedding_config.model)
+        Database::open_for_existing_model(
+            &state.db_path,
+            &state.embedding_config.storage_model_id()?,
+        )
     }
 
     /// Resolve project, open its DB, run `f` with the DB. Error handling funnel:

@@ -291,8 +291,10 @@ dependencies = [
  "hf-hub",
  "ort",
  "serde",
+ "serde_json",
  "tokenizers",
  "tracing",
+ "ureq",
 ]
 
 [[package]]

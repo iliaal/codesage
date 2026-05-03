@@ -8,6 +8,10 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ## [Unreleased]
 
+### Added
+
+- Added configurable embedding backends: the default `onnx` backend keeps existing HuggingFace/ONNX Runtime behavior, while `ollama` and `openai-compatible` call local HTTP embedding providers such as Ollama or llama.cpp. New `[embedding]` config keys are `backend`, `base_url`, `dimensions`, and `api_key_env`; provider-specific storage model IDs keep vector tables isolated across backend switches.
+
 ### Fixed
 
 - Fixed `codesage status` and `codesage doctor` to report semantic index freshness for the configured model, including stale or missing semantic-file hashes that structural HEAD drift alone cannot detect.

@@ -1,5 +1,6 @@
 pub mod chunk;
 pub mod config;
+mod http;
 pub mod model;
 pub mod reranker;
 
