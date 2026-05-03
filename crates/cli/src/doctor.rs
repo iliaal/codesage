@@ -37,6 +37,7 @@ pub fn run(json: bool) -> Result<()> {
         checks.push(check_disk(root));
         checks.push(check_hooks(root));
         checks.push(check_index_drift(root));
+        checks.push(check_semantic_freshness(root));
     } else {
         checks.push(Check {
             name: "project",
@@ -398,6 +399,75 @@ fn check_index_drift(root: &Path) -> Check {
     }
 }
 
+fn check_semantic_freshness(root: &Path) -> Check {
+    let db_path = root.join(PROJECT_DIR).join(DB_FILE);
+    if !db_path.exists() {
+        return Check {
+            name: "semantic",
+            status: Status::Skip,
+            message: "no index.db yet (run `codesage index`)".to_string(),
+        };
+    }
+
+    let config = match load_project_config(root) {
+        Ok(config) => config,
+        Err(e) => {
+            return Check {
+                name: "semantic",
+                status: Status::Fail,
+                message: format!("{e:#}"),
+            };
+        }
+    };
+    let model = config.embedding.unwrap_or_default().model;
+    let db = match Database::open_for_existing_model(&db_path, &model) {
+        Ok(db) => db,
+        Err(e) => {
+            return Check {
+                name: "semantic",
+                status: Status::Fail,
+                message: format!("failed to open semantic index: {e}"),
+            };
+        }
+    };
+    if db.chunk_table_name().is_empty() {
+        return Check {
+            name: "semantic",
+            status: Status::Warn,
+            message: format!("no semantic chunks for model {model}; run `codesage index`"),
+        };
+    }
+
+    match db.semantic_freshness() {
+        Ok(Some(freshness)) if freshness.is_fresh() => Check {
+            name: "semantic",
+            status: Status::Pass,
+            message: format!(
+                "fresh for model {model}; {} files tracked",
+                freshness.indexed_files
+            ),
+        },
+        Ok(Some(freshness)) => Check {
+            name: "semantic",
+            status: Status::Warn,
+            message: format!(
+                "{} stale file(s), {} missing file(s) for model {model}; run `codesage index`",
+                freshness.stale_files, freshness.missing_files
+            ),
+        },
+        Ok(None) => Check {
+            name: "semantic",
+            status: Status::Warn,
+            message: format!("semantic freshness unavailable for model {model}"),
+        },
+        Err(e) => Check {
+            name: "semantic",
+            status: Status::Fail,
+            message: format!("failed to check semantic freshness: {e}"),
+        },
+    }
+}
+
 fn check_mcp() -> Check {
     let out = std::process::Command::new("claude")
         .arg("mcp")
@@ -477,6 +547,18 @@ mod tests {
         .unwrap();
     }
 
+    fn init_codesage_project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let codesage_dir = dir.path().join(PROJECT_DIR);
+        std::fs::create_dir_all(&codesage_dir).unwrap();
+        std::fs::write(
+            codesage_dir.join("config.toml"),
+            "[embedding]\nmodel = \"codesage-test/model\"\ndevice = \"cpu\"\n",
+        )
+        .unwrap();
+        dir
+    }
+
     #[test]
     fn check_hooks_requires_post_rewrite() {
         let dir = init_git_repo();
@@ -504,5 +586,33 @@ mod tests {
         let check = check_hooks(dir.path());
 
         assert_eq!(check.status, Status::Pass);
+    }
+
+    #[test]
+    fn semantic_freshness_warns_when_hashes_are_stale() {
+        let dir = init_codesage_project();
+        let db_path = dir.path().join(PROJECT_DIR).join(DB_FILE);
+        let db = Database::open_for_model(
+            &db_path,
+            "codesage-test/model",
+            codesage_storage::db::DEFAULT_EMBEDDING_DIM,
+        )
+        .unwrap();
+        db.upsert_file(&codesage_protocol::FileInfo {
+            path: "src/lib.rs".to_string(),
+            language: codesage_protocol::Language::Rust,
+            content_hash: "new".to_string(),
+        })
+        .unwrap();
+        db.upsert_semantic_file_hash("src/lib.rs", "old").unwrap();
+
+        let check = check_semantic_freshness(dir.path());
+
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check.message.contains("1 stale"),
+            "message should name stale semantic files: {}",
+            check.message
+        );
     }
 }

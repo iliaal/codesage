@@ -10,6 +10,10 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ### Fixed
 
+- Fixed `codesage status` and `codesage doctor` to report semantic index freshness for the configured model, including stale or missing semantic-file hashes that structural HEAD drift alone cannot detect.
+- Fixed `export_context` / `codesage export` callee handling so `include_callees` returns referenced callee/dependency code instead of being ignored for symbol targets or duplicating the definition chunk for query targets.
+- Fixed `codesage export --symbol --limit` to cap returned symbol definitions and primary chunks, preventing common names from exceeding the requested context budget.
+- Fixed `scripts/leak-check.sh` invalid-regex diagnostics so the underlying `grep` error is shown instead of an empty detail block.
 - Fixed `impact_analysis` target handling and precision: dotted symbols such as `Repository.find` now stay symbol targets by default, `codesage impact --symbol` can force symbol interpretation from the CLI, and qualified-symbol impact/export caller lookup now uses exact qualified references instead of broad same-tail matches.
 - Fixed PHP structural references so instance (`$object->method()`), nullsafe (`$object?->method()`), and static method names are indexed as call references.
 - Fixed `scripts/leak-check.sh --range A..B` to scan file content at the range endpoint instead of the current `HEAD`.

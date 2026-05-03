@@ -9,7 +9,7 @@ use codesage_parser::discover::{TEST_LIKE_EXCLUDE_PATTERNS, build_exclude_set};
 use codesage_protocol::{
     ContextBundle, DependencyEntry, ExportRequest, FileCategory, FindReferencesRequest,
     FindSymbolRequest, ImpactEntry, ImpactReason, ImpactRequest, ImpactTarget, Reference,
-    SearchRequest, SearchResult, Symbol, SymbolSummary,
+    ReferenceKind, SearchRequest, SearchResult, Symbol, SymbolSummary,
 };
 use codesage_storage::{Database, RawSearchRow, embedding_to_bytes};
 use globset::GlobSet;
@@ -1149,29 +1149,16 @@ pub fn export_context(
     }
 
     if req.include_callees || req.include_callers {
-        for sym in symbol_defs.clone().iter().take(5) {
-            if req.include_callers {
-                let refs = references_for_symbol(db, sym)?;
-                for r in refs.into_iter().take(3) {
-                    add_related_from_file(
-                        db,
-                        &r.from_file,
-                        r.line,
-                        &mut related,
-                        &mut related_keys,
-                    )?;
-                }
-            }
-            if req.include_callees {
-                add_related_from_file(
-                    db,
-                    &sym.file_path,
-                    sym.line_start,
-                    &mut related,
-                    &mut related_keys,
-                )?;
-            }
-        }
+        let related_symbols: Vec<Symbol> = symbol_defs.iter().take(5).cloned().collect();
+        add_related_for_symbols(
+            db,
+            &related_symbols,
+            req.include_callers,
+            req.include_callees,
+            req.limit,
+            &mut related,
+            &mut related_keys,
+        )?;
     }
 
     Ok(ContextBundle {
@@ -1216,9 +1203,13 @@ pub fn export_context_for_symbol(
         });
     }
 
+    let defs: Vec<Symbol> = defs.into_iter().take(req.limit).collect();
     let mut primary: Vec<SearchResult> = Vec::new();
     let mut primary_keys: HashSet<(String, u32)> = HashSet::new();
     for def in &defs {
+        if primary.len() >= req.limit {
+            break;
+        }
         add_related_from_file(
             db,
             &def.file_path,
@@ -1231,17 +1222,16 @@ pub fn export_context_for_symbol(
     let mut related: Vec<SearchResult> = Vec::new();
     let mut related_keys: HashSet<(String, u32)> = primary_keys.clone();
 
-    if req.include_callers {
-        for sym in &defs {
-            let remaining = req.limit.saturating_sub(related.len());
-            if remaining == 0 {
-                break;
-            }
-            let refs = references_for_symbol(db, sym)?;
-            for r in refs.into_iter().take(remaining) {
-                add_related_from_file(db, &r.from_file, r.line, &mut related, &mut related_keys)?;
-            }
-        }
+    if req.include_callers || req.include_callees {
+        add_related_for_symbols(
+            db,
+            &defs,
+            req.include_callers,
+            req.include_callees,
+            req.limit,
+            &mut related,
+            &mut related_keys,
+        )?;
     }
 
     Ok(ContextBundle {
@@ -1250,6 +1240,97 @@ pub fn export_context_for_symbol(
         related,
         symbol_definitions: defs,
     })
+}
+
+fn add_related_for_symbols(
+    db: &Database,
+    symbols: &[Symbol],
+    include_callers: bool,
+    include_callees: bool,
+    limit: usize,
+    related: &mut Vec<SearchResult>,
+    related_keys: &mut HashSet<(String, u32)>,
+) -> Result<()> {
+    let mut seen_callee_defs: HashSet<(String, String, u32)> = HashSet::new();
+    for sym in symbols {
+        if include_callers {
+            add_callers_for_symbol(db, sym, limit, related, related_keys)?;
+        }
+        if related.len() >= limit {
+            break;
+        }
+        if include_callees {
+            add_callees_for_symbol(db, sym, limit, related, related_keys, &mut seen_callee_defs)?;
+        }
+        if related.len() >= limit {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn add_callers_for_symbol(
+    db: &Database,
+    sym: &Symbol,
+    limit: usize,
+    related: &mut Vec<SearchResult>,
+    related_keys: &mut HashSet<(String, u32)>,
+) -> Result<()> {
+    let refs = references_for_symbol(db, sym)?;
+    for r in refs {
+        if related.len() >= limit {
+            break;
+        }
+        add_related_from_file(db, &r.from_file, r.line, related, related_keys)?;
+    }
+    Ok(())
+}
+
+fn add_callees_for_symbol(
+    db: &Database,
+    sym: &Symbol,
+    limit: usize,
+    related: &mut Vec<SearchResult>,
+    related_keys: &mut HashSet<(String, u32)>,
+    seen_defs: &mut HashSet<(String, String, u32)>,
+) -> Result<()> {
+    let refs = db.references_in_file_range(&sym.file_path, sym.line_start, sym.line_end)?;
+    for r in refs {
+        if related.len() >= limit {
+            break;
+        }
+        if !is_callee_reference(r.kind) {
+            continue;
+        }
+        for def in db.find_symbols(&r.to_name, None)? {
+            let key = (
+                def.file_path.clone(),
+                def.qualified_name.clone(),
+                def.line_start,
+            );
+            if !seen_defs.insert(key) {
+                continue;
+            }
+            add_related_from_file(db, &def.file_path, def.line_start, related, related_keys)?;
+            if related.len() >= limit {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_callee_reference(kind: ReferenceKind) -> bool {
+    matches!(
+        kind,
+        ReferenceKind::Call
+            | ReferenceKind::Instantiation
+            | ReferenceKind::Import
+            | ReferenceKind::Include
+            | ReferenceKind::Inheritance
+            | ReferenceKind::TraitUse
+            | ReferenceKind::TypeHint
+    )
 }
 
 fn add_related_from_file(

@@ -67,6 +67,11 @@ test_leak_check_invalid_regex_fails_closed() {
 		cat "$tmp/leak-check-invalid-regex.out" >&2
 		return 1
 	fi
+	if ! grep -Eq '^  .+' "$tmp/leak-check-invalid-regex.out"; then
+		printf 'expected grep to explain the invalid regex\n' >&2
+		cat "$tmp/leak-check-invalid-regex.out" >&2
+		return 1
+	fi
 	cd "$repo_root"
 }
 

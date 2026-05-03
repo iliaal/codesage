@@ -80,7 +80,7 @@ if [ -z "$patterns" ]; then
 fi
 
 set +e
-regex_error="$(grep -E -e "$patterns" </dev/null >/dev/null 2>&1)"
+regex_error="$(grep -E -e "$patterns" </dev/null 2>&1 >/dev/null)"
 regex_status=$?
 set -e
 if [ "$regex_status" -gt 1 ]; then

@@ -219,6 +219,21 @@ impl Database {
         Ok(refs)
     }
 
+    pub fn references_in_file_range(
+        &self,
+        file_path: &str,
+        line_start: u32,
+        line_end: u32,
+    ) -> Result<Vec<Reference>> {
+        self.query_refs(
+            "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col
+             FROM refs r JOIN files f ON r.from_file_id = f.id
+             WHERE f.path = ?1 AND r.line BETWEEN ?2 AND ?3
+             ORDER BY r.line, r.col",
+            params![file_path, line_start, line_end],
+        )
+    }
+
     fn query_refs(&self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<Reference>> {
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map(params, |row| {

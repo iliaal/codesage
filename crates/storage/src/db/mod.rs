@@ -30,7 +30,7 @@ mod semantic;
 mod structural;
 
 pub use git_hist::{CoChangeRow, GitFileRow};
-pub use semantic::{RawSearchRow, embedding_to_bytes};
+pub use semantic::{RawSearchRow, SemanticFreshness, embedding_to_bytes};
 
 /// Parse a SymbolKind from a stored DB row, surfacing unknown variants as a typed
 /// rusqlite error rather than silently relabeling them. Loud failure is the right
@@ -444,6 +444,38 @@ mod tests {
     }
 
     #[test]
+    fn references_in_file_range_returns_only_refs_inside_lines() {
+        let db = Database::open_in_memory().unwrap();
+        let file_id = db.upsert_file(&make_file("test.php")).unwrap();
+        db.insert_references(
+            file_id,
+            &[
+                Reference {
+                    line: 1,
+                    col: 0,
+                    ..make_reference("Before", ReferenceKind::Call)
+                },
+                Reference {
+                    line: 3,
+                    col: 0,
+                    ..make_reference("Inside", ReferenceKind::Call)
+                },
+                Reference {
+                    line: 8,
+                    col: 0,
+                    ..make_reference("After", ReferenceKind::Call)
+                },
+            ],
+        )
+        .unwrap();
+
+        let found = db.references_in_file_range("test.php", 2, 5).unwrap();
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].to_name, "Inside");
+    }
+
+    #[test]
     fn upsert_clears_old_data() {
         let db = Database::open_in_memory().unwrap();
         let file_id = db.upsert_file(&make_file("test.php")).unwrap();
@@ -825,6 +857,41 @@ mod tests {
             let hashes = db.all_semantic_file_hashes().unwrap();
             assert_eq!(hashes.get("same.rs").map(String::as_str), Some("hash-a"));
         }
+    }
+
+    #[test]
+    fn semantic_freshness_reports_missing_and_stale_files() {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_file(&FileInfo {
+            path: "fresh.rs".to_string(),
+            language: codesage_protocol::Language::Rust,
+            content_hash: "fresh".to_string(),
+        })
+        .unwrap();
+        db.upsert_file(&FileInfo {
+            path: "stale.rs".to_string(),
+            language: codesage_protocol::Language::Rust,
+            content_hash: "new".to_string(),
+        })
+        .unwrap();
+        db.upsert_file(&FileInfo {
+            path: "missing.rs".to_string(),
+            language: codesage_protocol::Language::Rust,
+            content_hash: "missing".to_string(),
+        })
+        .unwrap();
+        db.upsert_semantic_file_hash("fresh.rs", "fresh").unwrap();
+        db.upsert_semantic_file_hash("stale.rs", "old").unwrap();
+
+        let freshness = db
+            .semantic_freshness()
+            .unwrap()
+            .expect("active chunk table");
+
+        assert_eq!(freshness.indexed_files, 2);
+        assert_eq!(freshness.missing_files, 1);
+        assert_eq!(freshness.stale_files, 1);
+        assert!(!freshness.is_fresh());
     }
 
     #[test]

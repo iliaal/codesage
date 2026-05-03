@@ -148,6 +148,30 @@ fn setup_qualified_rust_project() -> (tempfile::TempDir, Database) {
     (dir, db)
 }
 
+fn setup_callee_rust_project() -> (tempfile::TempDir, Database) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    std::fs::write(root.join("helpers.rs"), b"pub fn helper() {}\n").unwrap();
+    std::fs::write(
+        root.join("service.rs"),
+        b"use crate::helpers::helper;\npub fn run() { helper(); }\n",
+    )
+    .unwrap();
+
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[]).unwrap();
+    insert_chunk(&db, "helpers.rs", "rust", "pub fn helper() {}\n", 1);
+    insert_chunk(
+        &db,
+        "service.rs",
+        "rust",
+        "use crate::helpers::helper;\npub fn run() { helper(); }\n",
+        2,
+    );
+    (dir, db)
+}
+
 #[test]
 fn impact_by_symbol_finds_direct_callers() {
     let (_dir, db) = setup_project();
@@ -351,6 +375,45 @@ fn export_context_for_qualified_symbol_uses_exact_callers() {
         !related_paths.iter().any(|p| p.ends_with("conn_user.rs")),
         "Connection::open caller must not be included for Database::open: {related_paths:?}"
     );
+}
+
+#[test]
+fn export_context_for_symbol_includes_callees() {
+    let (_dir, db) = setup_callee_rust_project();
+
+    let req = ExportRequest {
+        query: None,
+        symbol: Some("run".to_string()),
+        limit: 10,
+        include_callers: false,
+        include_callees: true,
+    };
+
+    let bundle = codesage_graph::query::export_context_for_symbol(&db, "run", &req).unwrap();
+    let related_paths: Vec<String> = bundle.related.iter().map(|r| r.file_path.clone()).collect();
+
+    assert!(
+        related_paths.iter().any(|p| p.ends_with("helpers.rs")),
+        "helper callee should be included, got {related_paths:?}"
+    );
+}
+
+#[test]
+fn export_context_for_symbol_respects_limit_for_definitions_and_primary() {
+    let (_dir, db) = setup_qualified_rust_project();
+
+    let req = ExportRequest {
+        query: None,
+        symbol: Some("open".to_string()),
+        limit: 1,
+        include_callers: false,
+        include_callees: false,
+    };
+
+    let bundle = codesage_graph::query::export_context_for_symbol(&db, "open", &req).unwrap();
+
+    assert_eq!(bundle.symbol_definitions.len(), 1);
+    assert_eq!(bundle.primary.len(), 1);
 }
 
 #[test]

@@ -1218,6 +1218,34 @@ fn cmd_status() -> Result<()> {
     println!("References: {}", db.reference_count()?);
     println!("Chunks:     {}", db.total_chunk_count()?);
     println!("Drift:      {}", drift::check_drift(&root, &db).summary());
+    print_semantic_status(&root)?;
+    Ok(())
+}
+
+fn print_semantic_status(root: &Path) -> Result<()> {
+    let config = load_project_config(root)?;
+    let model = config.embedding.unwrap_or_default().model;
+    let db = open_context_db_for_existing_model(root, &model)?;
+    if db.chunk_table_name().is_empty() {
+        println!("Semantic:   missing for model {model} (run `codesage index`)");
+        return Ok(());
+    }
+
+    let Some(freshness) = db.semantic_freshness()? else {
+        println!("Semantic:   unavailable for model {model}");
+        return Ok(());
+    };
+    if freshness.is_fresh() {
+        println!(
+            "Semantic:   fresh for model {model} ({} files)",
+            freshness.indexed_files
+        );
+    } else {
+        println!(
+            "Semantic:   stale for model {model} ({} stale, {} missing; run `codesage index`)",
+            freshness.stale_files, freshness.missing_files
+        );
+    }
     Ok(())
 }
 

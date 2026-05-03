@@ -15,6 +15,19 @@ pub struct RawSearchRow {
     pub distance: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SemanticFreshness {
+    pub indexed_files: usize,
+    pub missing_files: usize,
+    pub stale_files: usize,
+}
+
+impl SemanticFreshness {
+    pub fn is_fresh(&self) -> bool {
+        self.missing_files == 0 && self.stale_files == 0
+    }
+}
+
 pub fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
     // LE-only: one memcpy instead of a per-element `to_le_bytes` loop. f32 has
     // no padding, so its byte layout is exactly `len * 4`. A compile_error on
@@ -258,6 +271,37 @@ impl Database {
             params![&self.chunk_table, path],
         )?;
         Ok(())
+    }
+
+    pub fn semantic_freshness(&self) -> Result<Option<SemanticFreshness>> {
+        if self.chunk_table.is_empty() {
+            return Ok(None);
+        }
+
+        let indexed_files: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM semantic_files WHERE chunk_table = ?1",
+            params![&self.chunk_table],
+            |row| row.get(0),
+        )?;
+        let (missing_files, stale_files): (i64, i64) = self.conn.query_row(
+            "SELECT
+                 COALESCE(SUM(CASE WHEN sf.path IS NULL THEN 1 ELSE 0 END), 0),
+                 COALESCE(SUM(CASE
+                     WHEN sf.path IS NOT NULL AND sf.content_hash <> f.content_hash THEN 1
+                     ELSE 0
+                 END), 0)
+             FROM files f
+             LEFT JOIN semantic_files sf
+               ON sf.chunk_table = ?1 AND sf.path = f.path",
+            params![&self.chunk_table],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+
+        Ok(Some(SemanticFreshness {
+            indexed_files: indexed_files as usize,
+            missing_files: missing_files as usize,
+            stale_files: stale_files as usize,
+        }))
     }
 
     /// BM25 search over the FTS5 sidecar of the active chunk table. Returns
