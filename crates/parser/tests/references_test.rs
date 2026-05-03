@@ -35,3 +35,21 @@ fn go_keeps_selector_call_references() {
     assert!(println_refs.iter().any(|r| r.line == 49));
     assert!(println_refs.iter().any(|r| r.line == 54));
 }
+
+#[test]
+fn php_extracts_instance_nullsafe_and_static_method_calls() {
+    let refs = references_for("sample.php", Language::Php);
+
+    assert!(
+        refs.iter()
+            .any(|r| r.to_name == "show" && r.kind == ReferenceKind::Call && r.line == 36)
+    );
+    assert!(
+        refs.iter()
+            .any(|r| r.to_name == "index" && r.kind == ReferenceKind::Call && r.line == 37)
+    );
+    assert!(
+        refs.iter()
+            .any(|r| r.to_name == "show" && r.kind == ReferenceKind::Call && r.line == 38)
+    );
+}

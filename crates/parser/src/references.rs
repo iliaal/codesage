@@ -66,9 +66,10 @@ fn php_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
         2 => Some(ReferenceKind::Call),   // function_call_expression
         3 => Some(ReferenceKind::Instantiation), // object_creation_expression
         4 => Some(ReferenceKind::Call),   // scoped_call_expression
-        5 => Some(ReferenceKind::Inheritance), // class extends
-        6 => Some(ReferenceKind::Inheritance), // class implements
-        7 => Some(ReferenceKind::TraitUse), // use_declaration inside class
+        5..=7 => Some(ReferenceKind::Call), // static / instance / nullsafe method names
+        8 => Some(ReferenceKind::Inheritance), // class extends
+        9 => Some(ReferenceKind::Inheritance), // class implements
+        10 => Some(ReferenceKind::TraitUse), // use_declaration inside class
         _ => None,
     }
 }

@@ -31,6 +31,36 @@ fn setup_project() -> (tempfile::TempDir, Database) {
     (dir, db)
 }
 
+fn setup_qualified_rust_project() -> (tempfile::TempDir, Database) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("db.rs"),
+        b"pub struct Database;\nimpl Database {\n    pub fn open() -> Self { Database }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("conn.rs"),
+        b"pub struct Connection;\nimpl Connection {\n    pub fn open() -> Self { Connection }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("db_user.rs"),
+        b"use crate::db::Database;\npub fn make_db() { let _ = Database::open(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("conn_user.rs"),
+        b"use crate::conn::Connection;\npub fn make_conn() { let _ = Connection::open(); }\n",
+    )
+    .unwrap();
+
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[]).unwrap();
+    (dir, db)
+}
+
 #[test]
 fn impact_by_symbol_finds_direct_callers() {
     let (_dir, db) = setup_project();
@@ -58,6 +88,31 @@ fn impact_by_symbol_finds_direct_callers() {
         assert_eq!(e.distance, 1, "{} should be distance 1", e.file_path);
         assert!(!e.reasons.is_empty());
     }
+}
+
+#[test]
+fn impact_by_qualified_symbol_does_not_include_same_tail_references() {
+    let (_dir, db) = setup_qualified_rust_project();
+
+    let req = ImpactRequest {
+        target: ImpactTarget::Symbol {
+            name: "Database::open".to_string(),
+        },
+        depth: 1,
+        source_only: false,
+    };
+
+    let entries = impact_analysis(&db, &req).unwrap();
+    let paths: Vec<String> = entries.iter().map(|e| e.file_path.clone()).collect();
+
+    assert!(
+        paths.iter().any(|p| p.ends_with("db_user.rs")),
+        "Database::open caller should be reported, got {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p.ends_with("conn_user.rs")),
+        "Connection::open caller must not be reported for Database::open: {entries:?}"
+    );
 }
 
 #[test]

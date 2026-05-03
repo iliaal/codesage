@@ -1019,7 +1019,7 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
             if !visited_symbols.insert(sym.qualified_name.clone()) {
                 continue;
             }
-            let refs = db.find_references(&sym.name, None)?;
+            let refs = references_for_impact_symbol(db, sym)?;
             for r in refs {
                 if origin_files.contains(&r.from_file) {
                     continue;
@@ -1095,6 +1095,17 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
             .then_with(|| b.reasons.len().cmp(&a.reasons.len()))
     });
     Ok(entries)
+}
+
+fn references_for_impact_symbol(db: &Database, sym: &Symbol) -> Result<Vec<Reference>> {
+    if sym.qualified_name != sym.name {
+        let refs = db.find_references(&sym.qualified_name, None)?;
+        if !refs.is_empty() {
+            return Ok(refs);
+        }
+    }
+
+    db.find_references(&sym.name, None)
 }
 
 pub fn export_context(

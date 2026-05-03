@@ -82,10 +82,15 @@ if not body:
 new_block = (
     f"## [Unreleased]\n\n"
     f"## [{version}] - {date}\n\n"
-    f"{body}\n\n"
-    f"[{version}]: https://github.com/iliaal/codesage/releases/tag/v{version}\n"
+    f"{body}\n"
 )
 text = text.replace(m.group(0), new_block, 1)
+text = re.sub(r'\n?\[Unreleased\]: [^\n]*\n?', '\n', text)
+text = re.sub(rf'\n?\[{re.escape(version)}\]: [^\n]*\n?', '\n', text)
+text = text.rstrip() + (
+    f"\n\n[Unreleased]: https://github.com/iliaal/codesage/compare/v{version}...HEAD\n"
+    f"[{version}]: https://github.com/iliaal/codesage/releases/tag/v{version}\n"
+)
 cl.write_text(text)
 
 ct = pathlib.Path("Cargo.toml")

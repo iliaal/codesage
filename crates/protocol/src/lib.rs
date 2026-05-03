@@ -319,18 +319,57 @@ pub enum ImpactTarget {
 
 impl ImpactTarget {
     /// Build from a user-supplied hint. `is_file=Some(true|false)` honors the explicit flag;
-    /// `None` falls back to a heuristic: a `/` or `.` in the target string means file path.
+    /// `None` falls back to a conservative path heuristic. Dotted method symbols are common
+    /// in Python/Go/JS, so a bare `.` is not enough to classify a target as a file.
     /// Callers with a CLI-style bool flag should pass `Some(true)` only when the user set it,
     /// else `None` (so an unset-false doesn't force a Symbol classification).
     pub fn from_hint(target: String, is_file: Option<bool>) -> Self {
-        let looks_like_file =
-            is_file.unwrap_or_else(|| target.contains('/') || target.contains('.'));
+        let looks_like_file = is_file.unwrap_or_else(|| looks_like_file_target(&target));
         if looks_like_file {
             ImpactTarget::File { path: target }
         } else {
             ImpactTarget::Symbol { name: target }
         }
     }
+}
+
+fn looks_like_file_target(target: &str) -> bool {
+    if target.contains('/') {
+        return true;
+    }
+
+    let Some((_, ext)) = target.rsplit_once('.') else {
+        return false;
+    };
+    let ext = ext.to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "c" | "cc"
+            | "cpp"
+            | "cxx"
+            | "h"
+            | "hh"
+            | "hpp"
+            | "hxx"
+            | "go"
+            | "js"
+            | "jsx"
+            | "mjs"
+            | "cjs"
+            | "ts"
+            | "tsx"
+            | "php"
+            | "py"
+            | "rs"
+            | "toml"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "ini"
+            | "conf"
+            | "env"
+            | "md"
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -838,6 +877,37 @@ mod tests {
         let json = serde_json::to_string(&file).unwrap();
         assert!(json.contains("\"type\":\"file\""));
         assert!(json.contains("\"path\":\"src/a.rs\""));
+    }
+
+    #[test]
+    fn impact_target_heuristic_keeps_dotted_symbols_as_symbols() {
+        match ImpactTarget::from_hint("Repository.find".into(), None) {
+            ImpactTarget::Symbol { name } => assert_eq!(name, "Repository.find"),
+            other => panic!("dotted method target must stay a symbol, got {other:?}"),
+        }
+
+        match ImpactTarget::from_hint("fmt.Println".into(), None) {
+            ImpactTarget::Symbol { name } => assert_eq!(name, "fmt.Println"),
+            other => panic!("Go selector target must stay a symbol, got {other:?}"),
+        }
+
+        match ImpactTarget::from_hint("App\\Repository\\find".into(), None) {
+            ImpactTarget::Symbol { name } => assert_eq!(name, "App\\Repository\\find"),
+            other => panic!("PHP qualified target must stay a symbol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn impact_target_heuristic_still_detects_file_like_targets() {
+        match ImpactTarget::from_hint("src/main.rs".into(), None) {
+            ImpactTarget::File { path } => assert_eq!(path, "src/main.rs"),
+            other => panic!("slash path must be a file target, got {other:?}"),
+        }
+
+        match ImpactTarget::from_hint("Cargo.toml".into(), None) {
+            ImpactTarget::File { path } => assert_eq!(path, "Cargo.toml"),
+            other => panic!("known file extension must be a file target, got {other:?}"),
+        }
     }
 
     /// Regression trap: the `legend` field on RiskDiffAssessment / RiskBatchAssessment

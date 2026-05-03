@@ -30,6 +30,13 @@ class UserController
     {
         return ['id' => $id];
     }
+
+    public function calls(UserController $other): void
+    {
+        $this->show(1);
+        $other?->index();
+        self::show(2);
+    }
 }
 
 enum Status: string

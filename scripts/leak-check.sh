@@ -17,6 +17,7 @@ set -eu
 
 mode="staged"
 range=""
+range_tip=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -80,7 +81,12 @@ case "$mode" in
         ;;
     range)
         files="$(git diff --name-only --diff-filter=AM "$range")"
-        content_ref="HEAD"   # use working HEAD content for changed files
+        range_tip="${range##*..}"
+        if [ -z "$range_tip" ] || [ "$range_tip" = "$range" ]; then
+            echo "leak-check: --range must be A..B or A...B (got: $range)" >&2
+            exit 2
+        fi
+        content_ref="$(git rev-parse --verify "${range_tip}^{commit}")"
         ;;
     all)
         files="$(git ls-files)"
@@ -93,18 +99,18 @@ if [ -z "$files" ]; then
 fi
 
 # Resolve the content source per file. In `staged` mode the blob is at `:FILE`;
-# in `range` and `all` modes it's at `HEAD:FILE`.
+# in `range` mode it's at the range endpoint; in `all` mode it's at `HEAD:FILE`.
 content_source() {
     local file="$1"
     if [ "$mode" = "staged" ]; then
         git show ":$file" 2>/dev/null
     else
-        git show "HEAD:$file" 2>/dev/null
+        git show "$content_ref:$file" 2>/dev/null
     fi
 }
 
-# Detect binary additions in staged mode via numstat. In other modes, fall back
-# to a heuristic: if the file contains a NUL byte in the first 8KB, treat as binary.
+# Detect binary additions in staged mode via numstat. In other modes, let GNU
+# grep classify binary streams as non-text.
 is_binary() {
     local file="$1"
     if [ "$mode" = "staged" ]; then
@@ -112,7 +118,7 @@ is_binary() {
         added="$(git diff --cached --numstat -- "$file" | awk 'NR==1{print $1}')"
         [ "$added" = "-" ]
     else
-        content_source "$file" | head -c 8192 | grep -q $'\x00'
+        ! content_source "$file" | grep -I . >/dev/null
     fi
 }
 
@@ -132,7 +138,7 @@ while IFS= read -r file; do
         continue
     fi
 
-    matches="$(content_source "$file" | grep -nE -e "$patterns" || true)"
+    matches="$(content_source "$file" | grep -nI -E -e "$patterns" || true)"
     if [ -n "$matches" ]; then
         echo "leak-check: $file contains a forbidden pattern:" >&2
         printf '%s\n' "$matches" | head -5 | sed "s|^|  $file:|" >&2

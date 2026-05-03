@@ -159,7 +159,9 @@ pub struct ImpactParams {
     pub project: String,
     #[schemars(description = "Symbol name or file path to analyze")]
     pub target: String,
-    #[schemars(description = "Treat target as file path (auto-detected if path-like)")]
+    #[schemars(
+        description = "Treat target as file path (auto-detected if path-like); pass false to force symbol interpretation"
+    )]
     pub is_file: Option<bool>,
     #[schemars(description = "Recursion depth for transitive impact (default 2)")]
     #[serde(default, deserialize_with = "deser_optional_usize")]

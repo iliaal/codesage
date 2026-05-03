@@ -10,6 +10,10 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ### Fixed
 
+- Fixed `impact_analysis` target handling and precision: dotted symbols such as `Repository.find` now stay symbol targets by default, `codesage impact --symbol` can force symbol interpretation from the CLI, and qualified-symbol impact uses exact qualified references when they exist instead of broad same-tail matches.
+- Fixed PHP structural references so instance (`$object->method()`), nullsafe (`$object?->method()`), and static method names are indexed as call references.
+- Fixed `scripts/leak-check.sh --range A..B` to scan file content at the range endpoint instead of the current `HEAD`.
+- Fixed `scripts/release.sh` to refresh the `[Unreleased]` changelog compare link when cutting a release.
 - Fixed structural lookup and context export edge cases: Rust/C++ `::` qualified symbols now resolve through `find_symbol`, dotted call references such as Go `fmt.Println` can be found by their bare tail, Python attribute calls are indexed as call references, and `export_context` binds symbol summaries back to exact qualified definitions instead of the first matching short name.
 - Fixed git-history indexing to honor project `exclude_patterns` from `.codesage/config.toml` and to decay existing churn/co-change weights even when an incremental run finds HEAD unchanged.
 - Fixed `codesage init` TOML generation for project directory names containing quotes, backslashes, or control characters.
@@ -180,7 +184,7 @@ V2b slice 2: tools that change agent behavior per-task instead of just informing
 
 - `codesage git-index` now keeps test and bench files in `git_files` so `recommend_tests` and `assess_risk` test-gap detection can find them. Test files remain dropped from co-change pair generation, so coupling rankings stay focused on production code. Re-run `codesage git-index --full` after upgrading to populate test files.
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.5.0...HEAD
 [0.3.0]: https://github.com/iliaal/codesage/releases/tag/v0.3.0
 
 ## [0.2.1] - 2026-04-15

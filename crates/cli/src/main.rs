@@ -104,8 +104,11 @@ enum Commands {
         /// Symbol name or file path (auto-detected)
         target: String,
         /// Treat target as a file path explicitly
-        #[arg(long)]
+        #[arg(long, conflicts_with = "symbol")]
         file: bool,
+        /// Treat target as a symbol explicitly
+        #[arg(long, conflicts_with = "file")]
+        symbol: bool,
         /// Recursion depth (how many hops to trace)
         #[arg(long, default_value = "2")]
         depth: usize,
@@ -394,10 +397,11 @@ fn main() -> Result<()> {
         Commands::Impact {
             target,
             file,
+            symbol,
             depth,
             source_only,
             json,
-        } => cmd_impact(&target, file, depth, source_only, json),
+        } => cmd_impact(&target, file, symbol, depth, source_only, json),
         Commands::Export {
             target,
             symbol,
@@ -1293,6 +1297,7 @@ fn cmd_cleanup(dry_run: bool) -> Result<()> {
 fn cmd_impact(
     target: &str,
     is_file: bool,
+    is_symbol: bool,
     depth: usize,
     source_only: bool,
     json: bool,
@@ -1302,7 +1307,13 @@ fn cmd_impact(
 
     // Pass Some(true) only when the user explicitly set --file; an unset false
     // would force Symbol classification and break the heuristic fallback.
-    let hint = if is_file { Some(true) } else { None };
+    let hint = if is_file {
+        Some(true)
+    } else if is_symbol {
+        Some(false)
+    } else {
+        None
+    };
     let req = ImpactRequest {
         target: ImpactTarget::from_hint(target.to_string(), hint),
         depth,

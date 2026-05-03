@@ -8,7 +8,7 @@
 # any failure so you can chain it in a pre-push or wrap it in an alias.
 #
 # Usage:
-#   bash scripts/sanity-check.sh          # fmt + clippy + tests
+#   bash scripts/sanity-check.sh          # fmt + clippy + tests + script regressions
 #   bash scripts/sanity-check.sh --fast   # fmt + clippy only (skip tests)
 
 set -euo pipefail
@@ -41,6 +41,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 if [[ $FAST -eq 0 ]]; then
     step "cargo test --workspace"
     cargo test --workspace
+
+    step "bash scripts/regression-tests.sh"
+    bash scripts/regression-tests.sh
 else
     echo
     echo "skipping tests (--fast); CI will run them"
