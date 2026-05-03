@@ -10,6 +10,7 @@
 //! see the unit tests in git_history::tests and the seeded-DB tests in risk_test.
 
 use std::path::PathBuf;
+use std::process::Command;
 
 use codesage_graph::{IndexMode, find_coupling, git_history_index, git_history_index_with_options};
 use codesage_storage::Database;
@@ -22,6 +23,15 @@ fn codesage_repo_root() -> PathBuf {
         .parent()
         .unwrap()
         .to_path_buf()
+}
+
+fn run_git(root: &std::path::Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .status()
+        .expect("git command starts");
+    assert!(status.success(), "git {:?} failed", args);
 }
 
 #[test]
@@ -141,4 +151,28 @@ fn auto_mode_matches_full_on_fresh_db() {
     assert_eq!(full.commits_scanned, auto.commits_scanned);
     assert_eq!(full.files_tracked, auto.files_tracked);
     assert_eq!(full.co_change_pairs, auto.co_change_pairs);
+}
+
+#[test]
+fn extra_excludes_skip_git_history_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    run_git(root, &["init", "-q"]);
+    run_git(root, &["config", "user.email", "review@example.invalid"]);
+    run_git(root, &["config", "user.name", "Review"]);
+
+    std::fs::create_dir_all(root.join("keep")).unwrap();
+    std::fs::create_dir_all(root.join("skip")).unwrap();
+    std::fs::write(root.join("keep/a.rs"), "fn keep() {}\n").unwrap();
+    std::fs::write(root.join("skip/b.rs"), "fn skip() {}\n").unwrap();
+    run_git(root, &["add", "."]);
+    run_git(root, &["commit", "-qm", "initial"]);
+
+    let db = Database::open_in_memory().unwrap();
+    let excludes = vec!["skip/**".to_string()];
+    let stats = git_history_index_with_options(&db, root, &excludes, IndexMode::Full).unwrap();
+
+    assert_eq!(stats.files_tracked, 1);
+    assert!(db.git_file("keep/a.rs").unwrap().is_some());
+    assert!(db.git_file("skip/b.rs").unwrap().is_none());
 }

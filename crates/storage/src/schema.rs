@@ -233,6 +233,7 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
         migrate_0004_semantic_files_chunk_table,
     ),
     ("0005_semantic_models", migrate_0005_semantic_models),
+    ("0006_refs_name_tail_dot", migrate_0006_refs_name_tail_dot),
 ];
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
@@ -269,14 +270,17 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Extract the trailing segment of a qualified name past the last `\`, `/`, or `::`.
-/// PHP `App\Http\Controllers\Foo` → `Foo`; Rust `mod::sub::bar` → `bar`; path `a/b/c` → `c`.
+/// Extract the trailing segment of a qualified name past the last `\`, `/`, `.`, or `::`.
+/// PHP `App\Http\Controllers\Foo` → `Foo`; Rust `mod::sub::bar` → `bar`; Go `fmt.Println` → `Println`.
 pub fn name_tail(s: &str) -> &str {
     let mut best: Option<usize> = None;
     if let Some(p) = s.rfind('\\') {
         best = Some(p + 1);
     }
     if let Some(p) = s.rfind('/') {
+        best = Some(best.map_or(p + 1, |b| b.max(p + 1)));
+    }
+    if let Some(p) = s.rfind('.') {
         best = Some(best.map_or(p + 1, |b| b.max(p + 1)));
     }
     if let Some(p) = s.rfind("::") {
@@ -310,6 +314,28 @@ fn migrate_0001_refs_name_tail(conn: &Connection) -> rusqlite::Result<()> {
         }
     }
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_refs_to_name_tail ON refs(to_name_tail);")?;
+    Ok(())
+}
+
+fn migrate_0006_refs_name_tail_dot(conn: &Connection) -> rusqlite::Result<()> {
+    let has_column: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('refs') WHERE name = 'to_name_tail'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_column == 0 {
+        return Ok(());
+    }
+
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare("SELECT id, to_name FROM refs")?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut update = conn.prepare("UPDATE refs SET to_name_tail = ?1 WHERE id = ?2")?;
+    for (id, to_name) in &rows {
+        update.execute(rusqlite::params![name_tail(to_name), id])?;
+    }
     Ok(())
 }
 

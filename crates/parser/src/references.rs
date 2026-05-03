@@ -75,11 +75,11 @@ fn php_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
 
 fn python_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
     match pattern_index {
-        0 => Some(ReferenceKind::Import), // import statement
-        1 => Some(ReferenceKind::Import), // from X import (module)
-        2 => Some(ReferenceKind::Import), // from X import Y (specific name)
-        3 => Some(ReferenceKind::Import), // from X import Y as Z (aliased)
-        4 => Some(ReferenceKind::Call),   // call expression
+        0 => Some(ReferenceKind::Import),   // import statement
+        1 => Some(ReferenceKind::Import),   // from X import (module)
+        2 => Some(ReferenceKind::Import),   // from X import Y (specific name)
+        3 => Some(ReferenceKind::Import),   // from X import Y as Z (aliased)
+        4 | 5 => Some(ReferenceKind::Call), // call expression
         _ => None,
     }
 }

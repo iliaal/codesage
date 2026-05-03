@@ -79,9 +79,11 @@ pub fn git_history_index_with_options(
     let effective_mode = match mode {
         IndexMode::Full => IndexMode::Full,
         IndexMode::Incremental | IndexMode::Auto => match db.get_git_index_state()? {
-            Some((last_sha, _)) if last_sha == head_sha => {
-                // Already up to date. Refresh indexed_at so decay stays anchored to now.
-                db.set_git_index_state(&head_sha)?;
+            Some((last_sha, last_indexed_at)) if last_sha == head_sha => {
+                db.execute_batch(|db| {
+                    decay_git_history_to_now(db, last_indexed_at, unix_now())?;
+                    db.set_git_index_state(&head_sha)
+                })?;
                 return Ok(GitIndexStats {
                     commits_scanned: 0,
                     files_tracked: 0,
@@ -251,11 +253,7 @@ fn run_incremental(
     // not-incremented rows.
     let mut co_change_kept = 0usize;
     db.execute_batch(|db| {
-        let delta_seconds = (now - last_indexed_at).max(0) as f64;
-        if delta_seconds > 0.0 {
-            let factor = (-delta_seconds / (DECAY_HALFLIFE_DAYS * SECONDS_PER_DAY)).exp();
-            db.scale_git_decay(factor)?;
-        }
+        decay_git_history_to_now(db, last_indexed_at, now)?;
         for (path, stats) in &files {
             db.incr_git_file(
                 path,
@@ -284,6 +282,15 @@ fn run_incremental(
         files_tracked: files.len(),
         co_change_pairs: co_change_kept,
     })
+}
+
+fn decay_git_history_to_now(db: &Database, last_indexed_at: i64, now: i64) -> Result<()> {
+    let delta_seconds = (now - last_indexed_at).max(0) as f64;
+    if delta_seconds > 0.0 {
+        let factor = (-delta_seconds / (DECAY_HALFLIFE_DAYS * SECONDS_PER_DAY)).exp();
+        db.scale_git_decay(factor)?;
+    }
+    Ok(())
 }
 
 fn filter_kept<'a>(commit: &'a Commit, exclude_set: &GlobSet) -> Option<Vec<&'a FileChange>> {
@@ -696,5 +703,25 @@ mod tests {
             pairs.contains_key(&("Repository.php".into(), "Service.php".into())),
             "source-source pair must always be kept"
         );
+    }
+
+    #[test]
+    fn decay_git_history_to_now_scales_existing_weights() {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_git_file("src/a.rs", 10.0, 0, 1, None).unwrap();
+        db.upsert_git_co_change("src/a.rs", "src/b.rs", 6.0, 3, None)
+            .unwrap();
+
+        let now = (DECAY_HALFLIFE_DAYS * SECONDS_PER_DAY) as i64;
+        decay_git_history_to_now(&db, 0, now).unwrap();
+
+        let file = db.git_file("src/a.rs").unwrap().expect("git file");
+        assert!(file.churn_score < 10.0);
+        assert!(file.churn_score > 3.0);
+
+        let pair = db.co_changes_for("src/a.rs", 1).unwrap();
+        assert_eq!(pair.len(), 1);
+        assert!(pair[0].weight < 6.0);
+        assert!(pair[0].weight > 2.0);
     }
 }

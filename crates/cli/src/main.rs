@@ -297,14 +297,40 @@ fn get_exclude_patterns(config: &ProjectConfig) -> Vec<String> {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    if let Some(user) = config
-        .index
-        .as_ref()
-        .and_then(|i| i.exclude_patterns.clone())
-    {
+    let user = get_user_exclude_patterns(config);
+    if !user.is_empty() {
         patterns.extend(user);
     }
     patterns
+}
+
+fn get_user_exclude_patterns(config: &ProjectConfig) -> Vec<String> {
+    config
+        .index
+        .as_ref()
+        .and_then(|i| i.exclude_patterns.clone())
+        .unwrap_or_default()
+}
+
+fn toml_basic_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch <= '\u{1f}' || ch == '\u{7f}' => {
+                use std::fmt::Write as _;
+                write!(out, "\\u{:04X}", ch as u32).expect("writing to String cannot fail");
+            }
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Load config, construct embedder, open DB for its model, and optionally load a reranker.
@@ -621,7 +647,7 @@ fn cmd_init() -> Result<()> {
     std::fs::write(
         project_dir.join("config.toml"),
         format!(
-            "[project]\nname = \"{dir_name}\"\n\n\
+            "[project]\nname = {}\n\n\
              [embedding]\nmodel = \"jinaai/jina-embeddings-v2-base-code\"\ndevice = \"gpu\"\nreranker = \"cross-encoder/ms-marco-MiniLM-L6-v2\"\n\n\
              [index]\n\
              # Built-in defaults always apply (vendored deps, build outputs, lock files,\n\
@@ -629,6 +655,7 @@ fn cmd_init() -> Result<()> {
              # then demoted at search time. See DEFAULT_EXCLUDE_PATTERNS in\n\
              # crates/parser/src/discover.rs. Patterns listed here ADD to the defaults.\n\
              exclude_patterns = []\n",
+            toml_basic_string(&dir_name),
         ),
     )?;
 
@@ -878,6 +905,8 @@ fn cmd_git_index(json: bool, full: bool, incremental: bool) -> Result<()> {
         }
     };
     let db = open_db(&root)?;
+    let config = load_project_config(&root)?;
+    let excludes = get_user_exclude_patterns(&config);
     let mode = if full {
         codesage_graph::IndexMode::Full
     } else if incremental {
@@ -885,7 +914,7 @@ fn cmd_git_index(json: bool, full: bool, incremental: bool) -> Result<()> {
     } else {
         codesage_graph::IndexMode::Auto
     };
-    let stats = codesage_graph::git_history_index_with_options(&db, &root, &[], mode)?;
+    let stats = codesage_graph::git_history_index_with_options(&db, &root, &excludes, mode)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&stats)?);
     } else {
@@ -1625,6 +1654,30 @@ mod tests {
         };
         let patterns = get_exclude_patterns(&cfg);
         assert_eq!(patterns.len(), DEFAULT_EXCLUDE_PATTERNS.len());
+    }
+
+    #[test]
+    fn user_exclude_patterns_returns_only_configured_patterns() {
+        let cfg = ProjectConfig {
+            project: None,
+            embedding: None,
+            index: Some(IndexConfig {
+                exclude_patterns: Some(vec!["skip/**".to_string()]),
+            }),
+        };
+
+        assert_eq!(get_user_exclude_patterns(&cfg), vec!["skip/**"]);
+    }
+
+    #[test]
+    fn toml_basic_string_escapes_project_names() {
+        assert_eq!(toml_basic_string("plain"), "\"plain\"");
+        assert_eq!(
+            toml_basic_string("quote\"and\\slash"),
+            "\"quote\\\"and\\\\slash\""
+        );
+        assert_eq!(toml_basic_string("line\nfeed"), "\"line\\nfeed\"");
+        assert_eq!(toml_basic_string("del\u{7f}"), "\"del\\u007F\"");
     }
 
     #[cfg(not(feature = "cuda"))]

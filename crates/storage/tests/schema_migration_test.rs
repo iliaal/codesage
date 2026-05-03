@@ -196,6 +196,7 @@ fn fresh_db_records_migrations_exactly_once() {
         "0003_semantic_files",
         "0004_semantic_files_chunk_table",
         "0005_semantic_models",
+        "0006_refs_name_tail_dot",
     ] {
         let count: i64 = conn
             .query_row(
@@ -213,7 +214,7 @@ fn fresh_db_records_migrations_exactly_once() {
         .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
-        count_after, 5,
+        count_after, 6,
         "second init_db must not re-apply migrations"
     );
 }
@@ -240,6 +241,7 @@ fn legacy_db_records_migration_after_upgrade() {
         "0003_semantic_files",
         "0004_semantic_files_chunk_table",
         "0005_semantic_models",
+        "0006_refs_name_tail_dot",
     ] {
         let count: i64 = conn
             .query_row(
@@ -309,10 +311,46 @@ fn migrates_path_only_semantic_files_to_chunk_table_scoped_shape() {
 fn name_tail_handles_separators() {
     assert_eq!(name_tail("App\\Http\\Controllers\\Foo"), "Foo");
     assert_eq!(name_tail("mod::sub::bar"), "bar");
+    assert_eq!(name_tail("fmt.Println"), "Println");
+    assert_eq!(name_tail("UserService.findAll"), "findAll");
     assert_eq!(name_tail("a/b/c"), "c");
     assert_eq!(name_tail("PlainName"), "PlainName");
     assert_eq!(name_tail(""), "");
     // Mixed separators: rightmost wins
     assert_eq!(name_tail("a/b::c"), "c");
     assert_eq!(name_tail("a::b/c"), "c");
+    assert_eq!(name_tail("a.b::c"), "c");
+}
+
+#[test]
+fn dot_tail_migration_backfills_existing_refs() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_db(&conn).expect("initial current schema");
+
+    conn.execute_batch(
+        "DELETE FROM schema_migrations WHERE name = '0006_refs_name_tail_dot';
+         INSERT INTO files (id, path, language, content_hash)
+         VALUES (1, 'sample.go', 'go', 'h');
+         INSERT INTO refs (id, from_file_id, from_symbol, to_name, to_name_tail, kind, line, col)
+         VALUES (1, 1, NULL, 'fmt.Println', 'fmt.Println', 'call', 49, 1);",
+    )
+    .unwrap();
+
+    init_db(&conn).expect("init_db reruns dot-tail migration");
+
+    let tail: String = conn
+        .query_row("SELECT to_name_tail FROM refs WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(tail, "Println");
+
+    let migration_recorded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE name = '0006_refs_name_tail_dot'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(migration_recorded, 1);
 }

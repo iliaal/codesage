@@ -8,6 +8,12 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed structural lookup and context export edge cases: Rust/C++ `::` qualified symbols now resolve through `find_symbol`, dotted call references such as Go `fmt.Println` can be found by their bare tail, Python attribute calls are indexed as call references, and `export_context` binds symbol summaries back to exact qualified definitions instead of the first matching short name.
+- Fixed git-history indexing to honor project `exclude_patterns` from `.codesage/config.toml` and to decay existing churn/co-change weights even when an incremental run finds HEAD unchanged.
+- Fixed `codesage init` TOML generation for project directory names containing quotes, backslashes, or control characters.
+
 ## [0.5.0] - 2026-05-02
 
 ### Added

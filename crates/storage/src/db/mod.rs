@@ -358,6 +358,19 @@ mod tests {
         }
     }
 
+    fn make_qualified_symbol(name: &str, qualified_name: &str, kind: SymbolKind) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            qualified_name: qualified_name.to_string(),
+            kind,
+            file_path: "test.php".to_string(),
+            line_start: 1,
+            line_end: 5,
+            col_start: 0,
+            col_end: 0,
+        }
+    }
+
     fn make_reference(to_name: &str, kind: ReferenceKind) -> Reference {
         Reference {
             from_file: "test.php".to_string(),
@@ -384,6 +397,26 @@ mod tests {
     }
 
     #[test]
+    fn qualified_symbol_lookup_treats_scope_resolution_as_qualified() {
+        let db = Database::open_in_memory().unwrap();
+        let file_id = db.upsert_file(&make_file("db.rs")).unwrap();
+        db.insert_symbols(
+            file_id,
+            &[make_qualified_symbol(
+                "open",
+                "Database::open",
+                SymbolKind::Method,
+            )],
+        )
+        .unwrap();
+
+        let found = db.find_symbols("Database::open", None).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].qualified_name, "Database::open");
+        assert!(db.symbol_exists("Database::open").unwrap());
+    }
+
+    #[test]
     fn insert_and_query_references() {
         let db = Database::open_in_memory().unwrap();
         let file_id = db.upsert_file(&make_file("test.php")).unwrap();
@@ -391,6 +424,23 @@ mod tests {
         db.insert_references(file_id, &refs).unwrap();
         let found = db.find_references("SomeClass", None).unwrap();
         assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn references_match_dotted_tail() {
+        let db = Database::open_in_memory().unwrap();
+        let file_id = db.upsert_file(&make_file("test.go")).unwrap();
+        db.insert_references(
+            file_id,
+            &[make_reference("fmt.Println", ReferenceKind::Call)],
+        )
+        .unwrap();
+
+        let found = db
+            .find_references("Println", Some(ReferenceKind::Call))
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].to_name, "fmt.Println");
     }
 
     #[test]

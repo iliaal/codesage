@@ -1134,8 +1134,7 @@ pub fn export_context(
             if !seen_sym.insert(sum.qualified_name.clone()) {
                 continue;
             }
-            let defs = db.find_symbols(&sum.name, None)?;
-            for d in defs.into_iter().take(1) {
+            if let Some(d) = find_definition_for_summary(db, sum, &result.file_path)? {
                 symbol_defs.push(d);
             }
         }
@@ -1173,6 +1172,25 @@ pub fn export_context(
         related,
         symbol_definitions: symbol_defs,
     })
+}
+
+fn find_definition_for_summary(
+    db: &Database,
+    summary: &SymbolSummary,
+    file_path: &str,
+) -> Result<Option<Symbol>> {
+    let kind = codesage_protocol::SymbolKind::parse(&summary.kind);
+    let candidates: Vec<Symbol> = db
+        .find_symbols(&summary.name, kind)?
+        .into_iter()
+        .filter(|d| d.qualified_name == summary.qualified_name)
+        .collect();
+
+    if let Some(same_file) = candidates.iter().find(|d| d.file_path == file_path) {
+        return Ok(Some(same_file.clone()));
+    }
+
+    Ok(candidates.into_iter().next())
 }
 
 pub fn export_context_for_symbol(
@@ -1973,5 +1991,66 @@ mod stem_scan_tests {
         // 2-letter symbol is below MIN_LEN; no scan.
         apply_non_candidate_stem_scan(&db, &mut results, "Fb").unwrap();
         assert_eq!(results.len(), before);
+    }
+}
+
+#[cfg(test)]
+mod context_export_tests {
+    use super::*;
+    use codesage_protocol::{FileInfo, Language, SymbolKind};
+
+    fn symbol(name: &str, qualified_name: &str, file_path: &str) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            qualified_name: qualified_name.to_string(),
+            kind: SymbolKind::Method,
+            file_path: file_path.to_string(),
+            line_start: 1,
+            line_end: 1,
+            col_start: 0,
+            col_end: 0,
+        }
+    }
+
+    #[test]
+    fn summary_definition_lookup_uses_qualified_name_and_file() {
+        let db = Database::open_in_memory().unwrap();
+        let cpp_file = db
+            .upsert_file(&FileInfo {
+                path: "fixtures/sample.cpp".to_string(),
+                language: Language::Cpp,
+                content_hash: "cpp".to_string(),
+            })
+            .unwrap();
+        let rust_file = db
+            .upsert_file(&FileInfo {
+                path: "src/db.rs".to_string(),
+                language: Language::Rust,
+                content_hash: "rust".to_string(),
+            })
+            .unwrap();
+        db.insert_symbols(
+            cpp_file,
+            &[symbol(
+                "open",
+                "app::net::Connection::open",
+                "fixtures/sample.cpp",
+            )],
+        )
+        .unwrap();
+        db.insert_symbols(rust_file, &[symbol("open", "Database::open", "src/db.rs")])
+            .unwrap();
+
+        let summary = SymbolSummary {
+            name: "open".to_string(),
+            qualified_name: "Database::open".to_string(),
+            kind: "method".to_string(),
+        };
+        let found = find_definition_for_summary(&db, &summary, "src/db.rs")
+            .unwrap()
+            .expect("definition should match the summary");
+
+        assert_eq!(found.qualified_name, "Database::open");
+        assert_eq!(found.file_path, "src/db.rs");
     }
 }

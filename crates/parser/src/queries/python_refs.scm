@@ -12,3 +12,6 @@
 
 ; Pattern 4: function/method call
 (call function: (identifier) @ref)
+
+; Pattern 5: attribute method call (self.db.find(...))
+(call function: (attribute attribute: (identifier) @ref))

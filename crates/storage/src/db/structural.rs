@@ -141,7 +141,7 @@ impl Database {
     /// goes against `qualified_name`, bare goes against `name`) and uses exact
     /// match in both — the boost heuristic over-triggers on substrings.
     pub fn symbol_exists(&self, name: &str) -> Result<bool> {
-        let sql = if name.contains('\\') || name.contains('.') {
+        let sql = if name.contains('\\') || name.contains('.') || name.contains("::") {
             "SELECT 1 FROM symbols WHERE qualified_name = ?1 LIMIT 1"
         } else {
             "SELECT 1 FROM symbols WHERE name = ?1 LIMIT 1"
@@ -155,21 +155,17 @@ impl Database {
     }
 
     pub fn find_symbols(&self, name: &str, kind: Option<SymbolKind>) -> Result<Vec<Symbol>> {
-        let (sql, is_qualified) = if name.contains('\\') || name.contains('.') {
-            ("SELECT s.name, s.qualified_name, s.kind, f.path, s.line_start, s.line_end, s.col_start, s.col_end
+        let sql = if name.contains('\\') || name.contains('.') || name.contains("::") {
+            "SELECT s.name, s.qualified_name, s.kind, f.path, s.line_start, s.line_end, s.col_start, s.col_end
               FROM symbols s JOIN files f ON s.file_id = f.id
-              WHERE s.qualified_name LIKE ?1", true)
+              WHERE s.qualified_name = ?1"
         } else {
-            ("SELECT s.name, s.qualified_name, s.kind, f.path, s.line_start, s.line_end, s.col_start, s.col_end
+            "SELECT s.name, s.qualified_name, s.kind, f.path, s.line_start, s.line_end, s.col_start, s.col_end
               FROM symbols s JOIN files f ON s.file_id = f.id
-              WHERE s.name = ?1", false)
+              WHERE s.name = ?1"
         };
 
-        let search_term = if is_qualified {
-            format!("%{name}%")
-        } else {
-            name.to_string()
-        };
+        let search_term = name.to_string();
 
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map(params![search_term], |row| {
