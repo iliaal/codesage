@@ -622,7 +622,7 @@ fn cmd_init() -> Result<()> {
         project_dir.join("config.toml"),
         format!(
             "[project]\nname = \"{dir_name}\"\n\n\
-             [embedding]\nmodel = \"sentence-transformers/all-MiniLM-L6-v2\"\ndevice = \"cpu\"\nreranker = \"cross-encoder/ms-marco-MiniLM-L6-v2\"\n\n\
+             [embedding]\nmodel = \"jinaai/jina-embeddings-v2-base-code\"\ndevice = \"gpu\"\nreranker = \"cross-encoder/ms-marco-MiniLM-L6-v2\"\n\n\
              [index]\n\
              # Built-in defaults always apply (vendored deps, build outputs, lock files,\n\
              # caches, IDE state). Test files are indexed structurally and semantically,\n\
