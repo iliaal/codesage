@@ -10,9 +10,10 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ### Fixed
 
-- Fixed `impact_analysis` target handling and precision: dotted symbols such as `Repository.find` now stay symbol targets by default, `codesage impact --symbol` can force symbol interpretation from the CLI, and qualified-symbol impact uses exact qualified references when they exist instead of broad same-tail matches.
+- Fixed `impact_analysis` target handling and precision: dotted symbols such as `Repository.find` now stay symbol targets by default, `codesage impact --symbol` can force symbol interpretation from the CLI, and qualified-symbol impact/export caller lookup now uses exact qualified references instead of broad same-tail matches.
 - Fixed PHP structural references so instance (`$object->method()`), nullsafe (`$object?->method()`), and static method names are indexed as call references.
 - Fixed `scripts/leak-check.sh --range A..B` to scan file content at the range endpoint instead of the current `HEAD`.
+- Fixed `scripts/leak-check.sh` to fail closed on invalid forbidden-pattern regexes, and added CI coverage for shell linting plus maintenance-script regressions.
 - Fixed `scripts/release.sh` to refresh the `[Unreleased]` changelog compare link when cutting a release.
 - Fixed structural lookup and context export edge cases: Rust/C++ `::` qualified symbols now resolve through `find_symbol`, dotted call references such as Go `fmt.Println` can be found by their bare tail, Python attribute calls are indexed as call references, and `export_context` binds symbol summaries back to exact qualified definitions instead of the first matching short name.
 - Fixed git-history indexing to honor project `exclude_patterns` from `.codesage/config.toml` and to decay existing churn/co-change weights even when an incremental run finds HEAD unchanged.

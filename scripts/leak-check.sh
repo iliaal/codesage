@@ -20,33 +20,36 @@ range=""
 range_tip=""
 
 while [ $# -gt 0 ]; do
-    case "$1" in
-        --range)
-            shift
-            [ $# -gt 0 ] || { echo "leak-check: --range needs an argument" >&2; exit 2; }
-            range="$1"
-            mode="range"
-            ;;
-        --all)
-            mode="all"
-            ;;
-        -h|--help)
-            sed -n '2,12p' "$0" >&2
-            exit 0
-            ;;
-        *)
-            echo "leak-check: unknown option: $1" >&2
-            exit 2
-            ;;
-    esac
-    shift
+	case "$1" in
+	--range)
+		shift
+		[ $# -gt 0 ] || {
+			echo "leak-check: --range needs an argument" >&2
+			exit 2
+		}
+		range="$1"
+		mode="range"
+		;;
+	--all)
+		mode="all"
+		;;
+	-h | --help)
+		sed -n '2,12p' "$0" >&2
+		exit 0
+		;;
+	*)
+		echo "leak-check: unknown option: $1" >&2
+		exit 2
+		;;
+	esac
+	shift
 done
 
 repo_root="$(git rev-parse --show-toplevel)"
 git_dir="$(git rev-parse --git-dir)"
 case "$git_dir" in
-    /*) ;;
-    *) git_dir="$repo_root/$git_dir" ;;
+/*) ;;
+*) git_dir="$repo_root/$git_dir" ;;
 esac
 
 shared_patterns="$repo_root/scripts/leak-patterns.txt"
@@ -58,111 +61,134 @@ FILENAME_BLOCK_RE='(^|/)\.env$|(^|/)\.env\..+|(^|/)\.secret$|(^|/)\.secrets$|(^|
 FILENAME_ALLOW_RE='(^|/)\.env\.(example|template|sample)$|(^|/)id_(rsa|dsa|ecdsa|ed25519)\.pub$'
 
 collect_patterns() {
-    local file="$1"
-    [ -f "$file" ] || return 0
-    sed -E 's/[[:space:]]*#.*$//; s/^[[:space:]]+//; s/[[:space:]]+$//' "$file" \
-        | grep -v '^$' || true
+	local file="$1"
+	[ -f "$file" ] || return 0
+	sed -E 's/[[:space:]]*#.*$//; s/^[[:space:]]+//; s/[[:space:]]+$//' "$file" |
+		grep -v '^$' || true
 }
 
 patterns="$(
-    { collect_patterns "$shared_patterns"; collect_patterns "$local_patterns"; } \
-        | paste -sd '|' -
+	{
+		collect_patterns "$shared_patterns"
+		collect_patterns "$local_patterns"
+	} |
+		paste -sd '|' -
 )"
 
 if [ -z "$patterns" ]; then
-    exit 0
+	exit 0
+fi
+
+set +e
+regex_error="$(grep -E -e "$patterns" </dev/null >/dev/null 2>&1)"
+regex_status=$?
+set -e
+if [ "$regex_status" -gt 1 ]; then
+	echo "leak-check: invalid forbidden pattern regex in $shared_patterns or $local_patterns:" >&2
+	printf '%s\n' "$regex_error" | sed 's/^/  /' >&2
+	exit 2
 fi
 
 # Discover files to scan and the source for their content.
 case "$mode" in
-    staged)
-        files="$(git diff --cached --name-only --diff-filter=AM)"
-        content_ref=""   # ":FILE" syntax for staged content
-        ;;
-    range)
-        files="$(git diff --name-only --diff-filter=AM "$range")"
-        range_tip="${range##*..}"
-        if [ -z "$range_tip" ] || [ "$range_tip" = "$range" ]; then
-            echo "leak-check: --range must be A..B or A...B (got: $range)" >&2
-            exit 2
-        fi
-        content_ref="$(git rev-parse --verify "${range_tip}^{commit}")"
-        ;;
-    all)
-        files="$(git ls-files)"
-        content_ref="HEAD"
-        ;;
+staged)
+	files="$(git diff --cached --name-only --diff-filter=AM)"
+	content_ref="" # ":FILE" syntax for staged content
+	;;
+range)
+	files="$(git diff --name-only --diff-filter=AM "$range")"
+	range_tip="${range##*..}"
+	if [ -z "$range_tip" ] || [ "$range_tip" = "$range" ]; then
+		echo "leak-check: --range must be A..B or A...B (got: $range)" >&2
+		exit 2
+	fi
+	content_ref="$(git rev-parse --verify "${range_tip}^{commit}")"
+	;;
+all)
+	files="$(git ls-files)"
+	content_ref="HEAD"
+	;;
 esac
 
 if [ -z "$files" ]; then
-    exit 0
+	exit 0
 fi
 
 # Resolve the content source per file. In `staged` mode the blob is at `:FILE`;
 # in `range` mode it's at the range endpoint; in `all` mode it's at `HEAD:FILE`.
 content_source() {
-    local file="$1"
-    if [ "$mode" = "staged" ]; then
-        git show ":$file" 2>/dev/null
-    else
-        git show "$content_ref:$file" 2>/dev/null
-    fi
+	local file="$1"
+	if [ "$mode" = "staged" ]; then
+		git show ":$file" 2>/dev/null
+	else
+		git show "$content_ref:$file" 2>/dev/null
+	fi
 }
 
 # Detect binary additions in staged mode via numstat. In other modes, let GNU
 # grep classify binary streams as non-text.
 is_binary() {
-    local file="$1"
-    if [ "$mode" = "staged" ]; then
-        local added
-        added="$(git diff --cached --numstat -- "$file" | awk 'NR==1{print $1}')"
-        [ "$added" = "-" ]
-    else
-        ! content_source "$file" | grep -I . >/dev/null
-    fi
+	local file="$1"
+	if [ "$mode" = "staged" ]; then
+		local added
+		added="$(git diff --cached --numstat -- "$file" | awk 'NR==1{print $1}')"
+		[ "$added" = "-" ]
+	else
+		if content_source "$file" | grep -I . >/dev/null; then
+			return 1
+		fi
+		return 0
+	fi
 }
 
 found=0
 while IFS= read -r file; do
-    [ -z "$file" ] && continue
+	[ -z "$file" ] && continue
 
-    if echo "$file" | grep -qE -- "$FILENAME_ALLOW_RE"; then
-        : # explicitly allowed, fall through to content scan
-    elif echo "$file" | grep -qE -- "$FILENAME_BLOCK_RE"; then
-        echo "leak-check: $file is denied by filename policy (secret/credential pattern)" >&2
-        found=1
-        continue
-    fi
+	if echo "$file" | grep -qE -- "$FILENAME_ALLOW_RE"; then
+		: # explicitly allowed, fall through to content scan
+	elif echo "$file" | grep -qE -- "$FILENAME_BLOCK_RE"; then
+		echo "leak-check: $file is denied by filename policy (secret/credential pattern)" >&2
+		found=1
+		continue
+	fi
 
-    if is_binary "$file"; then
-        continue
-    fi
+	if is_binary "$file"; then
+		continue
+	fi
 
-    matches="$(content_source "$file" | grep -nI -E -e "$patterns" || true)"
-    if [ -n "$matches" ]; then
-        echo "leak-check: $file contains a forbidden pattern:" >&2
-        printf '%s\n' "$matches" | head -5 | sed "s|^|  $file:|" >&2
-        found=1
-    fi
+	set +e
+	matches="$(content_source "$file" | grep -nI -E -e "$patterns")"
+	grep_status=$?
+	set -e
+	if [ "$grep_status" -gt 1 ]; then
+		echo "leak-check: grep failed while scanning $file" >&2
+		exit 2
+	fi
+	if [ -n "$matches" ]; then
+		echo "leak-check: $file contains a forbidden pattern:" >&2
+		printf '%s\n' "$matches" | head -5 | sed "s|^|  $file:|" >&2
+		found=1
+	fi
 done <<EOF
 $files
 EOF
 
 if [ "$found" -eq 1 ]; then
-    echo >&2
-    case "$mode" in
-        staged)
-            echo "leak-check: commit blocked. Options:" >&2
-            echo "  1. Remove the flagged content from the staged files." >&2
-            echo "  2. Refine the pattern in .git/info/leak-patterns.txt if it's a false positive." >&2
-            echo "  3. Bypass with 'git commit --no-verify' (use with intent)." >&2
-            ;;
-        range|all)
-            echo "leak-check: scan failed in $mode mode." >&2
-            echo "Either remove the flagged content, or refine the pattern in scripts/leak-patterns.txt." >&2
-            ;;
-    esac
-    exit 1
+	echo >&2
+	case "$mode" in
+	staged)
+		echo "leak-check: commit blocked. Options:" >&2
+		echo "  1. Remove the flagged content from the staged files." >&2
+		echo "  2. Refine the pattern in .git/info/leak-patterns.txt if it's a false positive." >&2
+		echo "  3. Bypass with 'git commit --no-verify' (use with intent)." >&2
+		;;
+	range | all)
+		echo "leak-check: scan failed in $mode mode." >&2
+		echo "Either remove the flagged content, or refine the pattern in scripts/leak-patterns.txt." >&2
+		;;
+	esac
+	exit 1
 fi
 
 exit 0

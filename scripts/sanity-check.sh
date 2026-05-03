@@ -17,17 +17,17 @@ cd "$(git rev-parse --show-toplevel)"
 
 FAST=0
 for arg in "$@"; do
-    case "$arg" in
-        --fast) FAST=1 ;;
-        -h|--help)
-            sed -n '2,16p' "$0"
-            exit 0
-            ;;
-        *)
-            echo "unknown flag: $arg" >&2
-            exit 2
-            ;;
-    esac
+	case "$arg" in
+	--fast) FAST=1 ;;
+	-h | --help)
+		sed -n '2,16p' "$0"
+		exit 0
+		;;
+	*)
+		echo "unknown flag: $arg" >&2
+		exit 2
+		;;
+	esac
 done
 
 step() { printf '\n── %s ──\n' "$1"; }
@@ -38,15 +38,21 @@ cargo fmt --all -- --check
 step "cargo clippy --workspace --all-targets -- -D warnings"
 cargo clippy --workspace --all-targets -- -D warnings
 
-if [[ $FAST -eq 0 ]]; then
-    step "cargo test --workspace"
-    cargo test --workspace
+step "shellcheck scripts/*.sh"
+shellcheck scripts/*.sh
 
-    step "bash scripts/regression-tests.sh"
-    bash scripts/regression-tests.sh
+step "shfmt -d scripts/*.sh"
+shfmt -d scripts/*.sh
+
+if [[ $FAST -eq 0 ]]; then
+	step "cargo test --workspace"
+	cargo test --workspace
+
+	step "bash scripts/regression-tests.sh"
+	bash scripts/regression-tests.sh
 else
-    echo
-    echo "skipping tests (--fast); CI will run them"
+	echo
+	echo "skipping tests (--fast); CI will run them"
 fi
 
 echo

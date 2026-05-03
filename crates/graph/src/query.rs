@@ -1019,7 +1019,7 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
             if !visited_symbols.insert(sym.qualified_name.clone()) {
                 continue;
             }
-            let refs = references_for_impact_symbol(db, sym)?;
+            let refs = references_for_symbol(db, sym)?;
             for r in refs {
                 if origin_files.contains(&r.from_file) {
                     continue;
@@ -1097,12 +1097,9 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
     Ok(entries)
 }
 
-fn references_for_impact_symbol(db: &Database, sym: &Symbol) -> Result<Vec<Reference>> {
+fn references_for_symbol(db: &Database, sym: &Symbol) -> Result<Vec<Reference>> {
     if sym.qualified_name != sym.name {
-        let refs = db.find_references(&sym.qualified_name, None)?;
-        if !refs.is_empty() {
-            return Ok(refs);
-        }
+        return db.find_references(&sym.qualified_name, None);
     }
 
     db.find_references(&sym.name, None)
@@ -1154,7 +1151,7 @@ pub fn export_context(
     if req.include_callees || req.include_callers {
         for sym in symbol_defs.clone().iter().take(5) {
             if req.include_callers {
-                let refs = db.find_references(&sym.name, None)?;
+                let refs = references_for_symbol(db, sym)?;
                 for r in refs.into_iter().take(3) {
                     add_related_from_file(
                         db,
@@ -1235,9 +1232,15 @@ pub fn export_context_for_symbol(
     let mut related_keys: HashSet<(String, u32)> = primary_keys.clone();
 
     if req.include_callers {
-        let refs = db.find_references(sym_name, None)?;
-        for r in refs.into_iter().take(req.limit) {
-            add_related_from_file(db, &r.from_file, r.line, &mut related, &mut related_keys)?;
+        for sym in &defs {
+            let remaining = req.limit.saturating_sub(related.len());
+            if remaining == 0 {
+                break;
+            }
+            let refs = references_for_symbol(db, sym)?;
+            for r in refs.into_iter().take(remaining) {
+                add_related_from_file(db, &r.from_file, r.line, &mut related, &mut related_keys)?;
+            }
         }
     }
 
@@ -2008,7 +2011,7 @@ mod stem_scan_tests {
 #[cfg(test)]
 mod context_export_tests {
     use super::*;
-    use codesage_protocol::{FileInfo, Language, SymbolKind};
+    use codesage_protocol::{FileInfo, Language, Reference, ReferenceKind, SymbolKind};
 
     fn symbol(name: &str, qualified_name: &str, file_path: &str) -> Symbol {
         Symbol {
@@ -2021,6 +2024,48 @@ mod context_export_tests {
             col_start: 0,
             col_end: 0,
         }
+    }
+
+    fn reference(to_name: &str, file_path: &str) -> Reference {
+        Reference {
+            from_file: file_path.to_string(),
+            from_symbol: None,
+            to_name: to_name.to_string(),
+            kind: ReferenceKind::Call,
+            line: 5,
+            col: 12,
+        }
+    }
+
+    #[test]
+    fn qualified_symbol_without_exact_refs_does_not_fallback_to_bare_tail() {
+        let db = Database::open_in_memory().unwrap();
+        let repo_file = db
+            .upsert_file(&FileInfo {
+                path: "app/repo_controller.py".to_string(),
+                language: Language::Python,
+                content_hash: "repo".to_string(),
+            })
+            .unwrap();
+        let cache_file = db
+            .upsert_file(&FileInfo {
+                path: "app/cache_controller.py".to_string(),
+                language: Language::Python,
+                content_hash: "cache".to_string(),
+            })
+            .unwrap();
+        db.insert_references(repo_file, &[reference("find", "app/repo_controller.py")])
+            .unwrap();
+        db.insert_references(cache_file, &[reference("find", "app/cache_controller.py")])
+            .unwrap();
+
+        let refs = references_for_symbol(&db, &symbol("find", "Repository.find", "app/models.py"))
+            .unwrap();
+
+        assert!(
+            refs.is_empty(),
+            "qualified method without exact refs must not fall back to all bare `find` references: {refs:?}"
+        );
     }
 
     #[test]
