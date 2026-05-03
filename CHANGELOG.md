@@ -8,6 +8,11 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ## [Unreleased]
 
+### Changed
+
+- `codesage git-index` now passes `--since=@<2-years-ago>` to `git log`, capping the history walk to the window where decay weight stays meaningfully above zero. With τ=180d half-life, commits older than 2 years contribute ≤ 0.017 per commit (≤ 0.0025 by 3 years, ~zero by 5 years), so a longer walk just inflates first-onboard time without moving churn or coupling scores. Trims walk by ~7× on long-history projects (php-src: 146k → ~10k commits, ~90s → ~10s on a fresh `--full`). Slow-coupling pairs that co-change once every 8-12 months still accumulate `count >= 3` within the window. Constant `HISTORY_WINDOW_DAYS = 730` in `crates/graph/src/git_history/indexer.rs`.
+- `codesage install-hooks` now wraps the background indexer invocations in `nice -n 19` and (Linux-only, gated on `command -v ionice`) `ionice -c 3` so a hook-triggered indexer can't soak foreground CPU or block disk I/O. Existing installs need to re-run `codesage install-hooks` to pick up the niced template; new installs get it automatically.
+
 ### Fixed
 
 - Fixed `codesage index` losing all in-flight progress when killed mid-pass. The semantic indexer previously wrapped the entire write pass in one SQLite transaction, so a SIGKILL / OOM / terminal close between embedding and final commit rolled back every file's hash, even files whose embeddings had already been computed. `select_semantic_files` then reselected those files on the next run, so the same backlog was re-embedded indefinitely. Observed on `~/php-src` with Jina v2 base: a 572-file hole persisted across many post-merge hook fires (~10 min/run) until one uninterrupted run was allowed to finish. Writes are now committed in batches of 50 files; an aborted run preserves all files committed up to the last batch boundary.

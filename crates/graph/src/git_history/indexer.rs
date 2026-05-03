@@ -27,6 +27,13 @@ const SECONDS_PER_DAY: f64 = 86_400.0;
 const CHURN_CLAMP: f64 = 3.0;
 const CHURN_DIVISOR: f64 = 100.0;
 const MIN_CO_CHANGE_COUNT: u32 = 3;
+/// Walk only the last ~2 years of history. With τ=180d, commits older than
+/// ~3-4 half-lives contribute weight below the rounding floor (~0.017 at 2y);
+/// pre-window commits are essentially zero-weight and just inflate first-onboard
+/// time. On long-history projects (php-src: 146k commits back to 1999) this
+/// trims the walk by ~7×. Slow-coupling pairs that only co-change once every
+/// 8-12 months still accumulate count ≥ 3 within the window.
+const HISTORY_WINDOW_DAYS: f64 = 730.0;
 /// Avoid building O(n²) pair sets for sweeping refactor commits. Anything bigger than this
 /// is almost certainly a vendored update or auto-formatter, not a meaningful co-change.
 const MAX_FILES_PER_COMMIT_FOR_COCHANGE: usize = 30;
@@ -154,7 +161,7 @@ fn run_full(
     head_sha: &str,
 ) -> Result<GitIndexStats> {
     let now = unix_now();
-    let raw = run_git_log(root, None)?;
+    let raw = run_git_log(root, None, history_window_cutoff(now))?;
     let commits = parse_log(&raw);
 
     let mut files: HashMap<String, FileStats> = HashMap::new();
@@ -220,7 +227,7 @@ fn run_incremental(
 ) -> Result<GitIndexStats> {
     let now = unix_now();
     let range = format!("{last_sha}..{head_sha}");
-    let raw = run_git_log(root, Some(&range))?;
+    let raw = run_git_log(root, Some(&range), history_window_cutoff(now))?;
     let commits = parse_log(&raw);
 
     let mut files: HashMap<String, FileStats> = HashMap::new();
@@ -282,6 +289,10 @@ fn run_incremental(
         files_tracked: files.len(),
         co_change_pairs: co_change_kept,
     })
+}
+
+fn history_window_cutoff(now: i64) -> i64 {
+    now - (HISTORY_WINDOW_DAYS * SECONDS_PER_DAY) as i64
 }
 
 fn decay_git_history_to_now(db: &Database, last_indexed_at: i64, now: i64) -> Result<()> {
@@ -414,12 +425,15 @@ struct FileChange {
     deleted: u32,
 }
 
-fn run_git_log(root: &Path, range: Option<&str>) -> Result<String> {
+fn run_git_log(root: &Path, range: Option<&str>, since_epoch: i64) -> Result<String> {
+    // `@<unix>` is git's epoch-format specifier; locale-independent.
+    let since_arg = format!("--since=@{since_epoch}");
     let mut args: Vec<&str> = vec![
         "log",
         "--no-merges",
         "--numstat",
         "--pretty=format:commit\x09%H\x09%ct\x09%s",
+        &since_arg,
     ];
     if let Some(r) = range {
         args.push(r);

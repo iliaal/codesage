@@ -448,12 +448,18 @@ fn cmd_install_hooks() -> Result<()> {
         std::env::current_exe().context("resolving current_exe for git hook body")?;
     let codesage_path = codesage_bin.display();
 
+    // Background indexers run niced + ionice'd so they can't soak the foreground.
+    // `nice` is portable; `ionice` is Linux-only (util-linux), gated on `command -v`
+    // so the hook stays a no-op on macOS / *BSD instead of failing.
     let hook_body = format!(
         "#!/bin/sh\n\
          # installed by codesage install-hooks\n\
          root=\"$(git rev-parse --show-toplevel 2>/dev/null)\" || exit 0\n\
-         [ -d \"$root/.codesage\" ] && ( cd \"$root\" && \"{bin}\" index ) >/dev/null 2>&1 &\n\
-         [ -d \"$root/.codesage\" ] && ( cd \"$root\" && \"{bin}\" git-index --incremental ) >/dev/null 2>&1 &\n\
+         NICE=\"nice -n 19\"\n\
+         IONICE=\"\"\n\
+         command -v ionice >/dev/null 2>&1 && IONICE=\"ionice -c 3\"\n\
+         [ -d \"$root/.codesage\" ] && ( cd \"$root\" && $IONICE $NICE \"{bin}\" index ) >/dev/null 2>&1 &\n\
+         [ -d \"$root/.codesage\" ] && ( cd \"$root\" && $IONICE $NICE \"{bin}\" git-index --incremental ) >/dev/null 2>&1 &\n\
          exit 0\n",
         bin = codesage_path,
     );
