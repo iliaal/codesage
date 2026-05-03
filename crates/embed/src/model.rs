@@ -100,7 +100,7 @@ fn probe_python_site_packages() -> Vec<PathBuf> {
 /// 256-file project that should have taken ~10s on GPU. This check makes
 /// that failure mode loud.
 #[cfg(all(feature = "cuda", target_os = "linux"))]
-fn require_cuda_libs_mapped() -> anyhow::Result<()> {
+pub(crate) fn require_cuda_libs_mapped() -> anyhow::Result<()> {
     let maps = std::fs::read_to_string("/proc/self/maps")
         .context("reading /proc/self/maps to verify CUDA libraries are loaded")?;
     let has_libcuda = maps.contains("libcuda.so");

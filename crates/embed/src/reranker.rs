@@ -66,6 +66,20 @@ impl Reranker {
 
         let session = builder.commit_from_file(&model_path)?;
 
+        // Same silent-CPU-fallback guard as Embedder::new — see
+        // crates/embed/src/model.rs `require_cuda_libs_mapped` for the
+        // failure-mode rationale.
+        #[cfg(all(feature = "cuda", target_os = "linux"))]
+        if (device == "gpu" || device == "cuda")
+            && !matches!(
+                std::env::var("CODESAGE_ALLOW_CPU_FALLBACK").as_deref(),
+                Ok("1") | Ok("true")
+            )
+        {
+            super::model::require_cuda_libs_mapped()
+                .context("reranker silently fell back to CPU after CUDA registered")?;
+        }
+
         let has_token_type_ids = session
             .inputs()
             .iter()
