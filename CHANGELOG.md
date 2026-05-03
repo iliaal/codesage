@@ -8,6 +8,8 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-02
+
 ### Added
 
 - `assess_risk_batch` MCP tool (and matching `codesage risk-batch <files...>` CLI subcommand). Takes a list of repo-relative file paths and returns one `RiskAssessment` per path in the request order, with no patch-level aggregation. Use when you have N files (e.g. from impact analysis or coupling) and want each individual score — cuts N MCP round-trips down to one. Retrospective session analysis (recommendations doc §1.7) found 230 individual `assess_risk` calls per 30-day window vs 13 `assess_risk_diff` — per-file scoring is the agent's dominant pattern, and this is the matching batch primitive. For patch-level aggregation (max/mean, rollups, summary_notes, cycles) keep using `assess_risk_diff` — the two answer different questions. CLI accepts stdin too: `git diff --name-only | codesage risk-batch`. Response includes a top-level `_legend` short-code map (same shape as the new field on `RiskDiffAssessment` below). Three integration tests cover input ordering, empty input, and the legend behaviour at threshold.
@@ -41,6 +43,8 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 - Hybrid BM25+semantic search now applies requested path filters to BM25 candidates before RRF fusion, preventing exact literal matches outside the requested path set from leaking into filtered results.
 - Search pagination now returns an empty result page when `offset` is at or beyond the result count instead of falling back to the first page, and applies pagination after BM25 fusion, symbol boosts, and reranking so pages reflect the final ranked order.
 - `codesage doctor` now verifies the `post-rewrite` hook in addition to `post-commit`, `post-merge`, and `post-checkout`, matching the hook set installed by `codesage install-hooks`.
+
+[0.5.0]: https://github.com/iliaal/codesage/releases/tag/v0.5.0
 
 ## [0.4.5] - 2026-04-25
 
