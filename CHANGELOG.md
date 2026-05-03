@@ -10,6 +10,7 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ### Fixed
 
+- Fixed `codesage index` losing all in-flight progress when killed mid-pass. The semantic indexer previously wrapped the entire write pass in one SQLite transaction, so a SIGKILL / OOM / terminal close between embedding and final commit rolled back every file's hash, even files whose embeddings had already been computed. `select_semantic_files` then reselected those files on the next run, so the same backlog was re-embedded indefinitely. Observed on `~/php-src` with Jina v2 base: a 572-file hole persisted across many post-merge hook fires (~10 min/run) until one uninterrupted run was allowed to finish. Writes are now committed in batches of 50 files; an aborted run preserves all files committed up to the last batch boundary.
 - Fixed `codesage status` and `codesage doctor` to report semantic index freshness for the configured model, including stale or missing semantic-file hashes that structural HEAD drift alone cannot detect.
 - Fixed `export_context` / `codesage export` callee handling so `include_callees` returns referenced callee/dependency code instead of being ignored for symbol targets or duplicating the definition chunk for query targets.
 - Fixed `codesage export --symbol --limit` to cap returned symbol definitions and primary chunks, preventing common names from exceeding the requested context budget.

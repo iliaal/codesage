@@ -103,12 +103,36 @@ fn count_removed_paths(orphan_chunks: &[&str], orphan_semantic_paths: &[&str]) -
         .len()
 }
 
+/// Files committed per transaction. Smaller value = more transaction
+/// overhead, less progress lost on abort. 50 is a balance: at typical
+/// per-file embedding cost the transaction overhead is negligible, and
+/// a killed run loses at most ~50 files of work instead of thousands.
+const COMMIT_BATCH_SIZE: usize = 50;
+
 fn write_semantic_updates(
     db: &Database,
     selected: &[&FileInfo],
     chunked: &[ChunkedFile],
     all_embeddings: &[Vec<f32>],
     stats: &mut SemanticIndexStats,
+) -> Result<()> {
+    write_semantic_updates_with_batch(
+        db,
+        selected,
+        chunked,
+        all_embeddings,
+        stats,
+        COMMIT_BATCH_SIZE,
+    )
+}
+
+fn write_semantic_updates_with_batch(
+    db: &Database,
+    selected: &[&FileInfo],
+    chunked: &[ChunkedFile],
+    all_embeddings: &[Vec<f32>],
+    stats: &mut SemanticIndexStats,
+    batch_size: usize,
 ) -> Result<()> {
     let total_chunks: usize = chunked.iter().map(|cf| cf.chunks.len()).sum();
     ensure!(
@@ -117,28 +141,43 @@ fn write_semantic_updates(
         total_chunks,
         all_embeddings.len()
     );
+    ensure!(batch_size > 0, "batch_size must be > 0");
 
+    // Bind each chunked file to its embedding slice so per-file commits
+    // can look up data without re-walking the flat embedding vector.
+    let mut by_path: HashMap<&str, (&ChunkedFile, &[Vec<f32>])> =
+        HashMap::with_capacity(chunked.len());
     let mut emb_idx = 0;
-    db.execute_batch(|db| {
-        for f in selected {
-            db.delete_chunks_for_file(&f.path)?;
-            db.upsert_semantic_file_hash(&f.path, &f.content_hash)?;
-        }
+    for cf in chunked {
+        let n = cf.chunks.len();
+        by_path.insert(
+            cf.path.as_str(),
+            (cf, &all_embeddings[emb_idx..emb_idx + n]),
+        );
+        emb_idx += n;
+    }
 
-        for cf in chunked {
-            let n = cf.chunks.len();
-            let chunk_data: Vec<(&str, u32, u32, &[f32])> = cf
-                .chunks
-                .iter()
-                .zip(&all_embeddings[emb_idx..emb_idx + n])
-                .map(|((text, start, end), emb)| (text.as_str(), *start, *end, emb.as_slice()))
-                .collect();
-            emb_idx += n;
-            db.insert_chunks(&cf.path, &cf.language, &chunk_data)?;
-            stats.chunks_created += n;
-        }
-        Ok(())
-    })?;
+    for batch in selected.chunks(batch_size) {
+        db.execute_batch(|db| {
+            for f in batch {
+                db.delete_chunks_for_file(&f.path)?;
+                if let Some((cf, embs)) = by_path.get(f.path.as_str()) {
+                    let chunk_data: Vec<(&str, u32, u32, &[f32])> = cf
+                        .chunks
+                        .iter()
+                        .zip(embs.iter())
+                        .map(|((text, start, end), emb)| {
+                            (text.as_str(), *start, *end, emb.as_slice())
+                        })
+                        .collect();
+                    db.insert_chunks(&cf.path, &cf.language, &chunk_data)?;
+                    stats.chunks_created += cf.chunks.len();
+                }
+                db.upsert_semantic_file_hash(&f.path, &f.content_hash)?;
+            }
+            Ok(())
+        })?;
+    }
     stats.files_processed = selected.len();
     Ok(())
 }
@@ -314,6 +353,36 @@ mod tests {
                 .map(String::as_str),
             Some("new")
         );
+    }
+
+    #[test]
+    fn semantic_update_commits_in_chunks() {
+        let db = Database::open_in_memory().unwrap();
+        let files: Vec<FileInfo> = (0..5).map(|i| file(&format!("f{i}.rs"), "h")).collect();
+        let selected: Vec<&FileInfo> = files.iter().collect();
+        let chunked: Vec<ChunkedFile> = files
+            .iter()
+            .map(|f| ChunkedFile {
+                path: f.path.clone(),
+                language: "rust".to_string(),
+                chunks: vec![(format!("// {}", f.path), 1, 1)],
+            })
+            .collect();
+        let embeddings: Vec<Vec<f32>> = (0..5).map(|i| embedding(0.1 * (i + 1) as f32)).collect();
+        let mut stats = SemanticIndexStats::default();
+
+        // batch_size=2 forces 3 separate transactions (2 + 2 + 1).
+        write_semantic_updates_with_batch(&db, &selected, &chunked, &embeddings, &mut stats, 2)
+            .unwrap();
+
+        let hashes = db.all_semantic_file_hashes().unwrap();
+        assert_eq!(hashes.len(), 5);
+        for f in &files {
+            assert_eq!(hashes.get(&f.path).map(String::as_str), Some("h"));
+            assert_eq!(db.chunks_for_file(&f.path).unwrap().len(), 1);
+        }
+        assert_eq!(stats.files_processed, 5);
+        assert_eq!(stats.chunks_created, 5);
     }
 
     #[test]
