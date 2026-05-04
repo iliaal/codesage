@@ -341,7 +341,15 @@ impl Embedder {
         let model_path = repo
             .get("onnx/model.onnx")
             .context("failed to download onnx/model.onnx")?;
-        let _ = repo.get("onnx/model.onnx_data"); // some models have external data
+        // External-weights sidecar (>2GB models like Jina v2 base, BGE-large).
+        // Most models don't have this file — a 404 is the expected outcome and
+        // not worth surfacing. A real failure (network, disk, permission) is
+        // worth a debug-level breadcrumb so users running with RUST_LOG=debug
+        // don't have to guess when commit_from_file later errors with an
+        // opaque ORT external-data load failure.
+        if let Err(e) = repo.get("onnx/model.onnx_data") {
+            tracing::debug!(error = %e, "onnx/model.onnx_data not fetched (normal for small models)");
+        }
 
         let mut tokenizer =
             Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
