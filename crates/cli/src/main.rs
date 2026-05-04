@@ -376,6 +376,14 @@ fn load_index_embedder(
 
 fn main() -> Result<()> {
     init_tracing();
+    // Resolve ONNX Runtime + NVIDIA library locations now, while we are still
+    // single-threaded. The discovery code calls `std::env::set_var` for
+    // `LD_LIBRARY_PATH` / `ORT_DYLIB_PATH`, which is `unsafe` under Rust 2024
+    // because concurrent `getenv` from another thread is UB. Doing it here
+    // (before clap, before any tokio runtime, before any thread spawn)
+    // keeps the writes race-free even though the calls themselves remain
+    // marked unsafe.
+    codesage_embed::model::init_for_main();
     let cli = Cli::parse();
 
     match cli.command {

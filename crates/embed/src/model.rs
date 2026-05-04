@@ -1,9 +1,12 @@
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Once, OnceLock};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ort::session::Session;
 use tokenizers::Tokenizer;
+use wait_timeout::ChildExt;
 
 use crate::config::{BATCH_SIZE, EmbeddingConfig, MAX_SEQ_LENGTH, PoolingStrategy};
 
@@ -60,34 +63,73 @@ fn discover_nvidia_lib_dirs() -> &'static Vec<PathBuf> {
     })
 }
 
+/// Maximum time to wait for the Python site-packages probe before killing the
+/// child and falling back. The probe runs inside `OnceLock::get_or_init`, so a
+/// hung interpreter would block every thread waiting on `Embedder::new` /
+/// `Reranker::new` indefinitely.
+const PROBE_PYTHON_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Best-effort probe of Python `site-packages` directories. Does not fail on
-/// missing Python; just returns an empty Vec.
+/// missing Python; just returns an empty Vec. Bounded by `PROBE_PYTHON_TIMEOUT`
+/// so a wedged interpreter can't deadlock the whole process.
 fn probe_python_site_packages() -> Vec<PathBuf> {
     let candidates = ["python3", "python"];
     for py in &candidates {
-        let Ok(output) = std::process::Command::new(py)
-            .args([
-                "-c",
-                "import site, sys; \
-                 paths = list(site.getsitepackages()); \
-                 paths.append(site.getusersitepackages()); \
-                 print('\\n'.join(paths))",
-            ])
-            .output()
-        else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
+        match probe_one(py) {
+            Some(paths) => return paths,
+            None => continue,
         }
-        return String::from_utf8_lossy(&output.stdout)
+    }
+    Vec::new()
+}
+
+fn probe_one(py: &str) -> Option<Vec<PathBuf>> {
+    let mut child = std::process::Command::new(py)
+        .args([
+            "-c",
+            "import site, sys; \
+             paths = list(site.getsitepackages()); \
+             paths.append(site.getusersitepackages()); \
+             print('\\n'.join(paths))",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let status = match child.wait_timeout(PROBE_PYTHON_TIMEOUT) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            tracing::warn!(
+                interpreter = py,
+                timeout_ms = PROBE_PYTHON_TIMEOUT.as_millis() as u64,
+                "python site-packages probe timed out; killing child and skipping"
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(interpreter = py, error = %e, "python probe wait failed");
+            return None;
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let mut stdout = String::new();
+    if let Some(mut out) = child.stdout.take()
+        && out.read_to_string(&mut stdout).is_err()
+    {
+        return None;
+    }
+    Some(
+        stdout
             .lines()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
-            .collect();
-    }
-    Vec::new()
+            .collect(),
+    )
 }
 
 /// Verifies that the current Linux process has the CUDA runtime + cuDNN +
@@ -130,6 +172,25 @@ pub(crate) fn require_cuda_libs_mapped() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// One-shot startup hook: must be called from `main` before any tokio runtime
+/// or background thread is spawned. Resolves the ONNX Runtime + NVIDIA library
+/// locations and writes `LD_LIBRARY_PATH` / `ORT_DYLIB_PATH`. The underlying
+/// `std::env::set_var` calls are `unsafe` under Rust 2024 because concurrent
+/// `getenv` from another thread is UB; pinning the work to single-threaded
+/// startup eliminates the race even though the syntactic `unsafe` remains.
+///
+/// `Embedder::new` / `Reranker::new` still call these helpers under
+/// `Once::call_once` as a defensive fallback (so direct library users aren't
+/// silently broken), but in the bin path the work has already happened by
+/// then and the call is a cheap no-op.
+pub fn init_for_main() {
+    init_ort_dylib();
+    #[cfg(feature = "cuda")]
+    {
+        preload_cuda_libs();
+    }
 }
 
 pub fn preload_cuda_libs() {
@@ -222,7 +283,7 @@ fn discover_ort_dylib() -> Option<PathBuf> {
     None
 }
 
-pub(crate) fn init_ort_dylib() {
+pub fn init_ort_dylib() {
     ORT_INIT.call_once(|| {
         if std::env::var("ORT_DYLIB_PATH").is_ok() {
             // Caller took control. Still prepend discovered NVIDIA dirs so CUDA loads.

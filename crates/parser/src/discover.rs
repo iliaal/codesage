@@ -1,4 +1,7 @@
 use std::path::Path;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 
 use anyhow::Result;
 use codesage_protocol::{FileInfo, Language};
@@ -27,89 +30,125 @@ pub fn discover_files_with_excludes(
     root: &Path,
     exclude_patterns: &[String],
 ) -> Result<Vec<FileInfo>> {
-    let mut files = Vec::new();
     let excludes = if exclude_patterns.is_empty() {
         None
     } else {
         Some(build_exclude_set(exclude_patterns)?)
     };
 
+    // Parallel walk + read + hash. The previous serial version was the
+    // dominant indexing bottleneck on monorepos: SHA-256 hashing every source
+    // file in series is CPU-bound and reads block on `fs::read`. Fan-out is
+    // bounded by `WalkParallel`'s default thread count (logical CPUs).
+    //
+    // First pass collects every relevant file with a tentative language;
+    // `.h` defaults to C and a second pass flips it to C++ when the project
+    // contains an unambiguous C++ extension. We track the C++ signal across
+    // workers via `AtomicBool` and drain finished file rows through an mpsc
+    // channel — single-producer-single-consumer per thread, no shared Vec
+    // contention.
     let walker = ignore::WalkBuilder::new(root)
         .hidden(true)
         .git_ignore(true)
-        .build();
+        .build_parallel();
 
-    // First pass: collect every relevant file with a tentative language. We
-    // tentatively treat `.h` as C; a second pass flips `.h` to C++ when the
-    // project also contains an unambiguous C++ extension. This single-walk
-    // structure keeps FS pressure flat while still letting header routing
-    // be project-aware.
-    let mut saw_cpp = false;
-    let mut h_file_indices = Vec::new();
+    let saw_cpp = AtomicBool::new(false);
+    let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    let (tx, rx) = mpsc::channel::<FileInfo>();
+    let root = root.to_path_buf();
 
-    for entry in walker {
-        let entry = entry?;
-        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-            continue;
-        }
-
-        let path = entry.path();
-        let Some(language) = detect_language_with_dialect(path, false) else {
-            continue;
-        };
-
-        let rel_path = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .into_owned();
-
-        if let Some(ref exc) = excludes
-            && exc.is_match(&rel_path)
-        {
-            continue;
-        }
-
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if is_unambiguous_cpp_extension(ext) {
-            saw_cpp = true;
-        }
-        if ext == "h" {
-            h_file_indices.push(files.len());
-        }
-
-        // Cap file size before `read` to bound worst-case allocation. A 400MB
-        // SQL dump or vendored data file slipping past `HARD_EXCLUDE_PATTERNS`
-        // would otherwise fill the indexer's heap.
-        match entry.metadata() {
-            Ok(meta) if meta.len() > MAX_INDEXABLE_FILE_BYTES => {
+    walker.run(|| {
+        let tx = tx.clone();
+        let excludes = excludes.clone();
+        let saw_cpp = &saw_cpp;
+        let first_err = &first_err;
+        let root = root.clone();
+        Box::new(move |entry| {
+            use ignore::WalkState;
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    let mut slot = first_err.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(anyhow::Error::new(e));
+                    }
+                    return WalkState::Quit;
+                }
+            };
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                return WalkState::Continue;
+            }
+            let path = entry.path();
+            let Some(language) = detect_language_with_dialect(path, false) else {
+                return WalkState::Continue;
+            };
+            let rel_path = path
+                .strip_prefix(&root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned();
+            if let Some(ref exc) = excludes
+                && exc.is_match(&rel_path)
+            {
+                return WalkState::Continue;
+            }
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if is_unambiguous_cpp_extension(ext) {
+                saw_cpp.store(true, Ordering::Relaxed);
+            }
+            if let Ok(meta) = entry.metadata()
+                && meta.len() > MAX_INDEXABLE_FILE_BYTES
+            {
                 tracing::warn!(
                     path = %rel_path,
                     bytes = meta.len(),
                     cap = MAX_INDEXABLE_FILE_BYTES,
                     "skipping oversized file"
                 );
-                continue;
+                return WalkState::Continue;
             }
-            _ => {}
-        }
+            let content = match std::fs::read(path) {
+                Ok(c) => c,
+                Err(e) => {
+                    let mut slot = first_err.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(
+                            anyhow::Error::new(e)
+                                .context(format!("reading file at {}", path.display())),
+                        );
+                    }
+                    return WalkState::Quit;
+                }
+            };
+            let hash = hex::encode(Sha256::digest(&content));
+            // Receiver drop is fine — just bail.
+            if tx
+                .send(FileInfo {
+                    path: rel_path,
+                    language,
+                    content_hash: hash,
+                })
+                .is_err()
+            {
+                return WalkState::Quit;
+            }
+            WalkState::Continue
+        })
+    });
+    drop(tx);
 
-        let content = std::fs::read(path)?;
-        let hash = hex::encode(Sha256::digest(&content));
-
-        files.push(FileInfo {
-            path: rel_path,
-            language,
-            content_hash: hash,
-        });
+    if let Some(err) = first_err.lock().unwrap().take() {
+        return Err(err);
     }
 
-    if saw_cpp {
-        for idx in h_file_indices {
-            files[idx].language = Language::Cpp;
+    let mut files: Vec<FileInfo> = rx.iter().collect();
+    if saw_cpp.load(Ordering::Relaxed) {
+        for f in &mut files {
+            if f.path.ends_with(".h") {
+                f.language = Language::Cpp;
+            }
         }
     }
-
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
 }
