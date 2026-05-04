@@ -472,5 +472,15 @@ fn detect_dim(session: &Session) -> Result<usize> {
     {
         return Ok(d as usize);
     }
-    Ok(crate::config::DEFAULT_EMBEDDING_DIM)
+    // Refuse to guess. A silent fallback to 384 stores wrong-dimension
+    // vectors (or the right dimension by coincidence with MiniLM-L6),
+    // and `search_knn` then returns either an error or noise — either way,
+    // the failure shows up far from the cause. Better to fail at load time.
+    anyhow::bail!(
+        "could not infer embedding dimension from model output shape; \
+         the model's first output tensor has no static last-dimension. \
+         Refusing to fall back to a default — index would store \
+         wrong-dimension vectors. Set the model explicitly in \
+         .codesage/config.toml to one with a static output shape."
+    )
 }

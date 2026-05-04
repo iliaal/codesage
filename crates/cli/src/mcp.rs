@@ -511,15 +511,51 @@ fn cap_to_budget(value: serde_json::Value, kind: &str) -> serde_json::Value {
 fn truncate_array(items: Vec<serde_json::Value>, budget_chars: usize) -> Vec<serde_json::Value> {
     let mut kept = Vec::new();
     let mut used = 0;
-    for item in items {
+    for mut item in items {
         let s = serde_json::to_string(&item).map(|s| s.len()).unwrap_or(0);
-        if used + s > budget_chars && !kept.is_empty() {
+        if used + s > budget_chars {
+            if !kept.is_empty() {
+                break;
+            }
+            // First item alone overflows: try to shrink its `content` field
+            // before giving up. Without this, a single 50KB chunk blows past
+            // the 32KB token budget. If the item has no `content` string, we
+            // surrender and keep the oversized item — refusing to return
+            // anything is worse than a slightly over-budget response.
+            shrink_content_field(&mut item, budget_chars.saturating_sub(used));
+            kept.push(item);
             break;
         }
         used += s;
         kept.push(item);
     }
     kept
+}
+
+/// Best-effort: if `item` is an object with a `content: String` field,
+/// truncate that string so the serialized item fits roughly within
+/// `budget_chars`. Marks the truncation visibly so an agent reading the
+/// payload knows it's incomplete.
+fn shrink_content_field(item: &mut serde_json::Value, budget_chars: usize) {
+    let serde_json::Value::Object(map) = item else {
+        return;
+    };
+    let Some(serde_json::Value::String(content)) = map.get_mut("content") else {
+        return;
+    };
+    if content.len() <= budget_chars {
+        return;
+    }
+    // Reserve a few hundred bytes for the rest of the JSON envelope.
+    let target = budget_chars.saturating_sub(256);
+    let cut = content
+        .char_indices()
+        .nth(target)
+        .map(|(i, _)| i)
+        .unwrap_or(target.min(content.len()));
+    let mut shrunk = content[..cut].to_string();
+    shrunk.push_str("\n…[truncated by MCP budget]");
+    *content = shrunk;
 }
 
 /// Load the per-project embedding config for the MCP server.

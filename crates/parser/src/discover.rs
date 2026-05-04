@@ -7,6 +7,14 @@ use sha2::{Digest, Sha256};
 
 use crate::detect::{detect_language_with_dialect, is_unambiguous_cpp_extension};
 
+/// Skip files larger than this at discovery time. `HARD_EXCLUDE_PATTERNS`
+/// catches the common offenders (lockfiles, minified JS, build outputs), but
+/// a stray large generated SQL dump or vendored data file in the project
+/// root would otherwise be `fs::read` into memory and OOM the indexer. 10MB
+/// is well above any real source file (php-src's biggest .c hovers ~1.5MB)
+/// while bounding worst-case allocation per file.
+pub const MAX_INDEXABLE_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
 pub fn build_exclude_set(patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
@@ -68,6 +76,22 @@ pub fn discover_files_with_excludes(
         }
         if ext == "h" {
             h_file_indices.push(files.len());
+        }
+
+        // Cap file size before `read` to bound worst-case allocation. A 400MB
+        // SQL dump or vendored data file slipping past `HARD_EXCLUDE_PATTERNS`
+        // would otherwise fill the indexer's heap.
+        match entry.metadata() {
+            Ok(meta) if meta.len() > MAX_INDEXABLE_FILE_BYTES => {
+                tracing::warn!(
+                    path = %rel_path,
+                    bytes = meta.len(),
+                    cap = MAX_INDEXABLE_FILE_BYTES,
+                    "skipping oversized file"
+                );
+                continue;
+            }
+            _ => {}
         }
 
         let content = std::fs::read(path)?;
