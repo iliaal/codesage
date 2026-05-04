@@ -111,14 +111,14 @@ impl std::fmt::Display for SymbolKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileInfo {
     pub path: String,
     pub language: Language,
     pub content_hash: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Symbol {
     pub name: String,
     pub qualified_name: String,
@@ -175,7 +175,7 @@ impl std::fmt::Display for ReferenceKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reference {
     pub from_file: String,
     pub from_symbol: Option<String>,
@@ -234,7 +234,7 @@ pub struct SearchRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub file_path: String,
-    pub language: String,
+    pub language: Language,
     pub content: String,
     pub start_line: u32,
     pub end_line: u32,
@@ -247,7 +247,7 @@ pub struct SearchResult {
 pub struct SymbolSummary {
     pub name: String,
     pub qualified_name: String,
-    pub kind: String,
+    pub kind: SymbolKind,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -258,7 +258,7 @@ pub struct SemanticIndexStats {
     pub chunks_created: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FileCategory {
     Source,

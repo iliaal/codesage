@@ -8,12 +8,19 @@ use codesage_embed::reranker::Reranker;
 use codesage_parser::discover::{TEST_LIKE_EXCLUDE_PATTERNS, build_exclude_set};
 use codesage_protocol::{
     ContextBundle, DependencyEntry, ExportRequest, FileCategory, FindReferencesRequest,
-    FindSymbolRequest, ImpactEntry, ImpactReason, ImpactRequest, ImpactTarget, Reference,
+    FindSymbolRequest, ImpactEntry, ImpactReason, ImpactRequest, ImpactTarget, Language, Reference,
     ReferenceKind, SearchRequest, SearchResult, Symbol, SymbolSummary,
 };
 use codesage_storage::{Database, RawSearchRow, embedding_to_bytes};
 use globset::GlobSet;
 use regex::Regex;
+
+/// Parse a `Language` value out of a DB-stored language string. Every row was
+/// written by `Language::as_str()`, so an unknown value indicates DB corruption
+/// or a schema mismatch — fail loudly rather than producing garbage results.
+fn parse_db_language(s: &str) -> Language {
+    Language::parse(s).unwrap_or_else(|| panic!("unknown language string in DB: {s:?}"))
+}
 
 pub fn find_symbol(db: &Database, req: &FindSymbolRequest) -> Result<Vec<Symbol>> {
     db.find_symbols(&req.name, req.kind)
@@ -410,7 +417,7 @@ pub fn search(
         .into_iter()
         .map(|r| SearchResult {
             file_path: r.file_path,
-            language: r.language,
+            language: parse_db_language(&r.language),
             content: r.content,
             start_line: r.start_line,
             end_line: r.end_line,
@@ -773,7 +780,7 @@ fn apply_non_candidate_stem_scan(
                 // reranker then judge it on its merits.
                 injected.push(SearchResult {
                     file_path: chunk.file_path,
-                    language: chunk.language,
+                    language: parse_db_language(&chunk.language),
                     content: chunk.content,
                     start_line: chunk.start_line,
                     end_line: chunk.end_line,
@@ -979,7 +986,7 @@ fn annotate_with_symbols(db: &Database, results: &mut [SearchResult]) -> Result<
             .map(|s| SymbolSummary {
                 name: s.name.clone(),
                 qualified_name: s.qualified_name.clone(),
-                kind: s.kind.as_str().to_string(),
+                kind: s.kind,
             })
             .collect();
 
@@ -1174,9 +1181,8 @@ fn find_definition_for_summary(
     summary: &SymbolSummary,
     file_path: &str,
 ) -> Result<Option<Symbol>> {
-    let kind = codesage_protocol::SymbolKind::parse(&summary.kind);
     let candidates: Vec<Symbol> = db
-        .find_symbols(&summary.name, kind)?
+        .find_symbols(&summary.name, Some(summary.kind))?
         .into_iter()
         .filter(|d| d.qualified_name == summary.qualified_name)
         .collect();
@@ -1349,7 +1355,7 @@ fn add_related_from_file(
         if seen.insert(key) {
             let mut result = SearchResult {
                 file_path: c.file_path,
-                language: c.language,
+                language: parse_db_language(&c.language),
                 content: c.content,
                 start_line: c.start_line,
                 end_line: c.end_line,
@@ -1710,7 +1716,7 @@ mod file_saturation_tests {
     fn mk(file: &str, score: f32) -> SearchResult {
         SearchResult {
             file_path: file.to_string(),
-            language: "rust".to_string(),
+            language: codesage_protocol::Language::Rust,
             content: String::new(),
             start_line: 0,
             end_line: 0,
@@ -1798,7 +1804,7 @@ mod definition_boost_tests {
     fn mk(file: &str, content: &str, score: f32) -> SearchResult {
         SearchResult {
             file_path: file.to_string(),
-            language: "rust".to_string(),
+            language: codesage_protocol::Language::Rust,
             content: content.to_string(),
             start_line: 1,
             end_line: 10,
@@ -1986,7 +1992,7 @@ mod stem_scan_tests {
     fn mk(file: &str, content: &str, score: f32) -> SearchResult {
         SearchResult {
             file_path: file.to_string(),
-            language: "rust".to_string(),
+            language: codesage_protocol::Language::Rust,
             content: content.to_string(),
             start_line: 1,
             end_line: 10,
@@ -2181,7 +2187,7 @@ mod context_export_tests {
         let summary = SymbolSummary {
             name: "open".to_string(),
             qualified_name: "Database::open".to_string(),
-            kind: "method".to_string(),
+            kind: codesage_protocol::SymbolKind::Method,
         };
         let found = find_definition_for_summary(&db, &summary, "src/db.rs")
             .unwrap()
