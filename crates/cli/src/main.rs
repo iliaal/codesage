@@ -1732,6 +1732,7 @@ mod tests {
             model: "codesage-test/does-not-matter".to_string(),
             device: "gpu".to_string(),
             reranker: None,
+            pooling: None,
         };
 
         let err = match load_index_embedder(false, &cfg) {
@@ -1752,6 +1753,7 @@ mod tests {
             model: "codesage-test/does-not-exist".to_string(),
             device: "gpu".to_string(),
             reranker: None,
+            pooling: None,
         };
 
         assert!(load_index_embedder(true, &cfg).unwrap().is_none());

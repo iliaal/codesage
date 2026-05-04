@@ -8,6 +8,10 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ## [Unreleased]
 
+### Added
+
+- `[embedding].pooling` config field (`"mean"` or `"cls"`) overrides the model-name heuristic that previously decided pooling strategy from a substring match on `bge-`. The heuristic is silent and wrong for any non-`bge-` CLS model (intfloat/e5-*, etc.) and any `bge-` mean-pooling variant — both produce semantically wrong vectors with no error message. Existing configs keep working: when the field is omitted, the heuristic still applies. Set explicitly when picking a model the heuristic doesn't know about.
+
 ### Changed
 
 - Tightened protocol types: `SearchResult.language` is now a `Language` enum (was a free-form `String`) and `SymbolSummary.kind` is a `SymbolKind` enum (was `String`). JSON serialization is unchanged (both serialize as the same lowercase strings), but Rust consumers that build `SearchResult` / `SymbolSummary` literals or `match` on the fields directly will need to swap string literals for the enum values. Closes the silent-typo class of bug where a hand-written `"functon"` would compile.
