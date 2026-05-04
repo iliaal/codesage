@@ -2,7 +2,16 @@ use serde::{Deserialize, Serialize};
 
 pub use codesage_protocol::DEFAULT_EMBEDDING_DIM;
 
-pub const MAX_SEQ_LENGTH: usize = 256;
+// Embed-time max tokens per sequence. Most code embedders we target
+// (Jina v2 base-code, MiniLM, MS-MARCO MiniLM) accept ≥512 natively.
+// The previous value (256) was chosen at a time when the index used
+// MiniLM-L6 with a smaller default; it created a silent-truncation gap
+// versus the char-based chunker (DEFAULT_CHUNK_SIZE=1000 ≈ 250–330
+// tokens for code), so dense chunks at the long tail had their right
+// edge dropped before pooling. Raising to 512 closes that gap and lets
+// chunks grow to ~1500 chars with no truncation. The bench A/B that
+// validated this lives in `bench/history/cap512-1500-2026-05-04.md`.
+pub const MAX_SEQ_LENGTH: usize = 512;
 pub const BATCH_SIZE: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,8 +1,14 @@
 use codesage_protocol::Chunk;
 
-pub const DEFAULT_CHUNK_SIZE: usize = 1000;
-pub const DEFAULT_MIN_CHUNK_SIZE: usize = 250;
-pub const DEFAULT_CHUNK_OVERLAP: usize = 150;
+// 1500 chars ≈ 380–500 tokens for typical code (3–4 chars/token), which
+// stays under the 512-token embed-time cap (MAX_SEQ_LENGTH) with slack
+// for the ~30-token augmentation header and special tokens. The earlier
+// 1000-char value paired with a 256-token cap caused silent truncation
+// on dense chunks; the cap-and-chunk pair was raised together. See
+// `bench/history/cap512-1500-2026-05-04.md` for the validating bench.
+pub const DEFAULT_CHUNK_SIZE: usize = 1500;
+pub const DEFAULT_MIN_CHUNK_SIZE: usize = 350;
+pub const DEFAULT_CHUNK_OVERLAP: usize = 200;
 
 #[derive(Debug, Clone)]
 pub struct ChunkConfig {
