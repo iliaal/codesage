@@ -320,10 +320,18 @@ impl Database {
     pub fn execute_batch(&self, f: impl FnOnce(&Self) -> Result<()>) -> Result<()> {
         self.conn.execute_batch("BEGIN")?;
         match f(self) {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
+            Ok(()) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(()),
+                // SQLITE_BUSY or an I/O error during COMMIT can leave the
+                // connection inside an open transaction; without an explicit
+                // rollback every subsequent statement on this connection
+                // fails with "cannot start a transaction within a
+                // transaction" and poisons the long-lived MCP connection.
+                Err(commit_err) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(commit_err.into())
+                }
+            },
             Err(e) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
                 Err(e)

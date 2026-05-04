@@ -155,13 +155,23 @@ fn repair_fts_sidecar(
 
     let chunk_table = quote_ident(chunk_table);
     let fts_table = quote_ident(fts_table);
-    conn.execute_batch(&format!(
-        "DELETE FROM \"{fts_table}\";
+    // Wrap DELETE + INSERT…SELECT in one transaction. Without it, a crash
+    // between the two statements leaves the FTS sidecar empty while the
+    // chunk table still has data; BM25 search returns zero results until
+    // the next process start re-runs the repair.
+    let sql = format!(
+        "BEGIN;
+         DELETE FROM \"{fts_table}\";
          INSERT INTO \"{fts_table}\"(rowid, content, file_path, language, start_line, end_line)
          SELECT id, content, file_path, language, start_line, end_line
          FROM \"{chunk_table}\"
-         ORDER BY id;"
-    ))?;
+         ORDER BY id;
+         COMMIT;"
+    );
+    if let Err(e) = conn.execute_batch(&sql) {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(e);
+    }
     Ok(())
 }
 

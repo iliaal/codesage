@@ -59,33 +59,51 @@ impl Database {
         language: &str,
         chunks: &[(&str, u32, u32, &[f32])],
     ) -> Result<()> {
-        let sql = format!(
-            "INSERT INTO \"{}\"(file_path, language, content, start_line, end_line, embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            self.chunk_table
-        );
-        let fts = self.fts_table();
-        let fts_sql = format!(
-            "INSERT INTO \"{fts}\"(rowid, content, file_path, language, start_line, end_line)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
-        );
-        let mut vec_stmt = self.conn.prepare(&sql)?;
-        let mut fts_stmt = self.conn.prepare(&fts_sql)?;
+        // Each chunk inserts a vec0 row and a matching FTS5 row, keyed by the
+        // same rowid. A failure between the two leaves vec0 with an orphaned
+        // row that has no FTS sidecar entry — `repair_fts_sidecar` heals this
+        // on the next open, but until then BM25 search misses the row. All
+        // current callers wrap in `execute_batch`, but pulling the BEGIN /
+        // COMMIT in here keeps the function safe against future direct use.
+        // The savepoint is a no-op when the caller already opened a tx.
+        self.conn.execute_batch("SAVEPOINT insert_chunks")?;
+        let result = (|| -> Result<()> {
+            let sql = format!(
+                "INSERT INTO \"{}\"(file_path, language, content, start_line, end_line, embedding)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                self.chunk_table
+            );
+            let fts = self.fts_table();
+            let fts_sql = format!(
+                "INSERT INTO \"{fts}\"(rowid, content, file_path, language, start_line, end_line)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+            );
+            let mut vec_stmt = self.conn.prepare(&sql)?;
+            let mut fts_stmt = self.conn.prepare(&fts_sql)?;
 
-        for (content, start_line, end_line, embedding) in chunks {
-            let bytes = embedding_to_bytes(embedding);
-            vec_stmt.execute(params![
-                file_path, language, content, start_line, end_line, bytes
-            ])?;
-            let rowid = self.conn.last_insert_rowid();
-            // Keep FTS5 rowid == vec0 id so the two tables join trivially on
-            // rowid / id. If the FTS insert fails, surface the error rather
-            // than silently diverging from the vec0 state.
-            fts_stmt.execute(params![
-                rowid, content, file_path, language, start_line, end_line
-            ])?;
+            for (content, start_line, end_line, embedding) in chunks {
+                let bytes = embedding_to_bytes(embedding);
+                vec_stmt.execute(params![
+                    file_path, language, content, start_line, end_line, bytes
+                ])?;
+                let rowid = self.conn.last_insert_rowid();
+                fts_stmt.execute(params![
+                    rowid, content, file_path, language, start_line, end_line
+                ])?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("RELEASE insert_chunks")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK TO insert_chunks");
+                let _ = self.conn.execute_batch("RELEASE insert_chunks");
+                Err(e)
+            }
         }
-        Ok(())
     }
 
     pub fn delete_chunks_for_file(&self, file_path: &str) -> Result<usize> {
