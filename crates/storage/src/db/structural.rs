@@ -1,12 +1,22 @@
 //! Files / symbols / refs / dependencies.
 
 use anyhow::Result;
-use codesage_protocol::{DependencyEntry, FileInfo, Reference, ReferenceKind, Symbol, SymbolKind};
+use codesage_protocol::{
+    DependencyEntry, FileInfo, RationaleEntry, Reference, ReferenceKind, Symbol, SymbolKind,
+};
 use rusqlite::params;
 
 use crate::schema::name_tail;
 
 use super::{Database, row_reference_kind, row_symbol_kind};
+
+/// Decode the JSON-encoded `rationale` column. A malformed value (manual DB
+/// edit, schema drift, etc.) becomes an empty Vec rather than failing the
+/// row read — rationale is auxiliary metadata and a corrupt entry must not
+/// break `find_symbol`.
+fn deserialize_rationale(s: &str) -> Vec<RationaleEntry> {
+    serde_json::from_str(s).unwrap_or_default()
+}
 
 impl Database {
     /// Return `(last_sha, last_indexed_at_unix)` for the structural index if a
@@ -70,11 +80,17 @@ impl Database {
 
     pub fn insert_symbols(&self, file_id: i64, symbols: &[Symbol]) -> Result<()> {
         let mut stmt = self.conn.prepare(
-            "INSERT INTO symbols (file_id, name, qualified_name, kind, line_start, line_end, col_start, col_end)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO symbols (file_id, name, qualified_name, kind, line_start, line_end, col_start, col_end, rationale)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )?;
 
         for s in symbols {
+            // Empty rationale serializes to "[]"; non-empty serializes the
+            // full Vec. Failure here would mean a serde bug, not a data
+            // problem — fall back to the empty marker rather than aborting
+            // the whole insert pass.
+            let rationale_json =
+                serde_json::to_string(&s.rationale).unwrap_or_else(|_| "[]".to_string());
             stmt.execute(params![
                 file_id,
                 s.name,
@@ -84,6 +100,7 @@ impl Database {
                 s.line_end,
                 s.col_start,
                 s.col_end,
+                rationale_json,
             ])?;
         }
         Ok(())
@@ -156,11 +173,11 @@ impl Database {
 
     pub fn find_symbols(&self, name: &str, kind: Option<SymbolKind>) -> Result<Vec<Symbol>> {
         let sql = if name.contains('\\') || name.contains('.') || name.contains("::") {
-            "SELECT s.name, s.qualified_name, s.kind, f.path, s.line_start, s.line_end, s.col_start, s.col_end
+            "SELECT s.name, s.qualified_name, s.kind, f.path, s.line_start, s.line_end, s.col_start, s.col_end, s.rationale
               FROM symbols s JOIN files f ON s.file_id = f.id
               WHERE s.qualified_name = ?1"
         } else {
-            "SELECT s.name, s.qualified_name, s.kind, f.path, s.line_start, s.line_end, s.col_start, s.col_end
+            "SELECT s.name, s.qualified_name, s.kind, f.path, s.line_start, s.line_end, s.col_start, s.col_end, s.rationale
               FROM symbols s JOIN files f ON s.file_id = f.id
               WHERE s.name = ?1"
         };
@@ -170,6 +187,7 @@ impl Database {
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map(params![search_term], |row| {
             let kind_str: String = row.get(2)?;
+            let rationale_json: String = row.get(8)?;
             Ok(Symbol {
                 name: row.get(0)?,
                 qualified_name: row.get(1)?,
@@ -179,6 +197,7 @@ impl Database {
                 line_end: row.get(5)?,
                 col_start: row.get(6)?,
                 col_end: row.get(7)?,
+                rationale: deserialize_rationale(&rationale_json),
             })
         })?;
 
@@ -325,7 +344,7 @@ impl Database {
         let placeholders: Vec<String> = (1..=file_paths.len()).map(|i| format!("?{i}")).collect();
         let sql = format!(
             "SELECT s.name, s.qualified_name, s.kind, f.path,
-                    s.line_start, s.line_end, s.col_start, s.col_end
+                    s.line_start, s.line_end, s.col_start, s.col_end, s.rationale
              FROM symbols s JOIN files f ON s.file_id = f.id
              WHERE f.path IN ({})
              ORDER BY s.line_start",
@@ -338,6 +357,7 @@ impl Database {
             .collect();
         let rows = stmt.query_map(params.as_slice(), |row| {
             let kind_str: String = row.get(2)?;
+            let rationale_json: String = row.get(8)?;
             Ok(Symbol {
                 name: row.get(0)?,
                 qualified_name: row.get(1)?,
@@ -347,6 +367,7 @@ impl Database {
                 line_end: row.get(5)?,
                 col_start: row.get(6)?,
                 col_end: row.get(7)?,
+                rationale: deserialize_rationale(&rationale_json),
             })
         })?;
         for sym_res in rows {
@@ -359,7 +380,7 @@ impl Database {
     pub fn symbols_for_file(&self, file_path: &str) -> Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.name, s.qualified_name, s.kind, f.path,
-                    s.line_start, s.line_end, s.col_start, s.col_end
+                    s.line_start, s.line_end, s.col_start, s.col_end, s.rationale
              FROM symbols s JOIN files f ON s.file_id = f.id
              WHERE f.path = ?1
              ORDER BY s.line_start",
@@ -367,6 +388,7 @@ impl Database {
         let rows = stmt
             .query_map(params![file_path], |row| {
                 let kind_str: String = row.get(2)?;
+                let rationale_json: String = row.get(8)?;
                 Ok(Symbol {
                     name: row.get(0)?,
                     qualified_name: row.get(1)?,
@@ -376,6 +398,7 @@ impl Database {
                     line_end: row.get(5)?,
                     col_start: row.get(6)?,
                     col_end: row.get(7)?,
+                    rationale: deserialize_rationale(&rationale_json),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

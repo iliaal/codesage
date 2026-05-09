@@ -2110,6 +2110,7 @@ mod context_export_tests {
             line_end: 1,
             col_start: 0,
             col_end: 0,
+            rationale: vec![],
         }
     }
 

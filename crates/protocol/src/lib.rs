@@ -128,6 +128,78 @@ pub struct Symbol {
     pub line_end: u32,
     pub col_start: u32,
     pub col_end: u32,
+    /// Decision-shape comments attached to this symbol's definition: lines
+    /// the author wrote to explain WHY this code exists or NOTE-worthy
+    /// constraints. Extracted from comments immediately adjacent to the
+    /// symbol's definition range, filtered to lines whose first token is
+    /// a recognized rationale marker (`WHY:`, `NOTE:`, `IMPORTANT:`,
+    /// `FIXME:`, `HACK:`, `XXX:`, `TODO:`).
+    ///
+    /// **Two limitations callers should know about:**
+    /// 1. Rationale rots when code changes. We extract whatever the source
+    ///    says at index time; we cannot verify it's still accurate. Treat
+    ///    as "what the author said at write-time", not ground truth.
+    /// 2. Populated only on definitions, not on callsites/references.
+    ///    Rationale is a property of where the code lives.
+    ///
+    /// Empty when the symbol has no rationale-shape comments. Skipped on
+    /// JSON serialization in that case so existing consumers see no diff.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub rationale: Vec<RationaleEntry>,
+}
+
+/// Marker class for a rationale comment. Lower-case JSON for stable
+/// agent-facing strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RationaleKind {
+    Why,
+    Note,
+    Important,
+    Fixme,
+    Hack,
+    Xxx,
+    Todo,
+}
+
+impl RationaleKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RationaleKind::Why => "why",
+            RationaleKind::Note => "note",
+            RationaleKind::Important => "important",
+            RationaleKind::Fixme => "fixme",
+            RationaleKind::Hack => "hack",
+            RationaleKind::Xxx => "xxx",
+            RationaleKind::Todo => "todo",
+        }
+    }
+
+    /// Recognize a marker keyword (case-insensitive). The trailing colon is
+    /// not part of the input — callers split it off before calling.
+    pub fn from_marker(marker: &str) -> Option<Self> {
+        match marker.to_ascii_uppercase().as_str() {
+            "WHY" => Some(RationaleKind::Why),
+            "NOTE" => Some(RationaleKind::Note),
+            "IMPORTANT" => Some(RationaleKind::Important),
+            "FIXME" => Some(RationaleKind::Fixme),
+            "HACK" => Some(RationaleKind::Hack),
+            "XXX" => Some(RationaleKind::Xxx),
+            "TODO" => Some(RationaleKind::Todo),
+            _ => None,
+        }
+    }
+}
+
+/// A single rationale comment attached to a symbol. `text` has the marker
+/// stripped and is trimmed; `line_start`/`line_end` are the comment's
+/// span in the source file (1-based, matching `Symbol`'s convention).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RationaleEntry {
+    pub kind: RationaleKind,
+    pub text: String,
+    pub line_start: u32,
+    pub line_end: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

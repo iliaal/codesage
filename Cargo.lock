@@ -353,6 +353,7 @@ dependencies = [
  "cc",
  "codesage-protocol",
  "rusqlite",
+ "serde_json",
  "tempfile",
 ]
 

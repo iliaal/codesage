@@ -273,6 +273,12 @@ pub fn extract_symbols(
         let (start_row, col_start) = crate::position::node_start_utf8(&def_node, source);
         let (end_row, col_end) = crate::position::node_end_utf8(&def_node, source);
 
+        let rationale = if language == Language::Rust {
+            crate::rationale::extract_rust_rationale(&def_node, source)
+        } else {
+            Vec::new()
+        };
+
         symbols.push(Symbol {
             name,
             qualified_name,
@@ -282,6 +288,7 @@ pub fn extract_symbols(
             line_end: end_row + 1,
             col_start,
             col_end,
+            rationale,
         });
     }
 

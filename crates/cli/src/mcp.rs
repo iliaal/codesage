@@ -623,7 +623,7 @@ impl ServerHandler for CodeSageServer {
 impl CodeSageServer {
     #[tool(
         name = "find_symbol",
-        description = "Find symbol definitions (functions, classes, methods, structs, traits, enums) by name. Returns exact file path, line number, and kind. **Prefer this over Grep/ripgrep for any code-identifier lookup** — one call returns the definition, while grepping for a function name often produces many false hits (call sites, comments, other namespaces) that cost extra Read calls to disambiguate. Use partial names for broad search or qualified names ('MyClass\\\\method' for PHP, 'MyClass.method' for Python) for exact match."
+        description = "Find symbol definitions (functions, classes, methods, structs, traits, enums) by name. Returns exact file path, line number, and kind. **Prefer this over Grep/ripgrep for any code-identifier lookup** — one call returns the definition, while grepping for a function name often produces many false hits (call sites, comments, other namespaces) that cost extra Read calls to disambiguate. Use partial names for broad search or qualified names ('MyClass\\\\method' for PHP, 'MyClass.method' for Python) for exact match. When present, `rationale[]` carries `WHY:` / `NOTE:` / `IMPORTANT:` / `FIXME:` / `HACK:` / `XXX:` / `TODO:` comments attached to the definition — read these before refactoring or renaming so the agent doesn't drop a constraint the author wrote down. Currently extracted for Rust only."
     )]
     fn find_symbol_tool(&self, Parameters(params): Parameters<FindSymbolParams>) -> CallToolResult {
         let kind = params.kind.as_deref().and_then(SymbolKind::parse);
@@ -713,7 +713,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "export_context",
-        description = "Build a curated context bundle for a query or symbol. Combines semantic search results, overlapping symbol definitions, and optionally caller/callee code. Output is a structured bundle ready for LLM consumption."
+        description = "Build a curated context bundle for a query or symbol. Combines semantic search results, overlapping symbol definitions, and optionally caller/callee code. Output is a structured bundle ready for LLM consumption. Symbol entries inside the bundle carry `rationale[]` when the author left `WHY:` / `NOTE:` / `IMPORTANT:` / `FIXME:` / `HACK:` / `XXX:` / `TODO:` comments — preserve these in any synthesis the agent performs from the bundle. Currently extracted for Rust only."
     )]
     fn export_context_tool(
         &self,
@@ -1177,6 +1177,7 @@ mod tests {
                 line_end: 1,
                 col_start: 0,
                 col_end: 0,
+                rationale: vec![],
             }],
         )
         .unwrap();

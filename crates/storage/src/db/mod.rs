@@ -363,6 +363,7 @@ mod tests {
             line_end: 5,
             col_start: 0,
             col_end: 0,
+            rationale: vec![],
         }
     }
 
@@ -376,6 +377,7 @@ mod tests {
             line_end: 5,
             col_start: 0,
             col_end: 0,
+            rationale: vec![],
         }
     }
 

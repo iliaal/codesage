@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS symbols (
     line_start INTEGER NOT NULL,
     line_end INTEGER NOT NULL,
     col_start INTEGER NOT NULL,
-    col_end INTEGER NOT NULL
+    col_end INTEGER NOT NULL,
+    rationale TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
@@ -244,6 +245,7 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
     ),
     ("0005_semantic_models", migrate_0005_semantic_models),
     ("0006_refs_name_tail_dot", migrate_0006_refs_name_tail_dot),
+    ("0007_symbols_rationale", migrate_0007_symbols_rationale),
 ];
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
@@ -324,6 +326,22 @@ fn migrate_0001_refs_name_tail(conn: &Connection) -> rusqlite::Result<()> {
         }
     }
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_refs_to_name_tail ON refs(to_name_tail);")?;
+    Ok(())
+}
+
+/// Adds `symbols.rationale` (JSON-encoded `Vec<RationaleEntry>`) for storing
+/// decision-shape comments attached to symbol definitions. Defaults to `'[]'`
+/// so existing rows behave like "no rationale extracted yet"; the next
+/// indexer pass over a file refreshes its symbols and writes real values.
+fn migrate_0007_symbols_rationale(conn: &Connection) -> rusqlite::Result<()> {
+    let has_column: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('symbols') WHERE name = 'rationale'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_column == 0 {
+        conn.execute_batch("ALTER TABLE symbols ADD COLUMN rationale TEXT NOT NULL DEFAULT '[]';")?;
+    }
     Ok(())
 }
 
