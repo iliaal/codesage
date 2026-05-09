@@ -8,6 +8,8 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-09
+
 ### Changed
 
 - Raised `MAX_SEQ_LENGTH` from 256 to 512 tokens and `DEFAULT_CHUNK_SIZE` from 1000 to 1500 chars (`DEFAULT_MIN_CHUNK_SIZE` 250 → 350, `DEFAULT_CHUNK_OVERLAP` 150 → 200). The previous pair caused silent embed-time truncation on dense chunks: char-1000 chunks averaged 250–330 tokens for code, so the long tail of the distribution had its right edge dropped before pooling. Raising both together closes the truncation gap and lets each chunk carry more cross-cutting context. Measured on 30 ground-truth cases across webpack + prometheus + home-assistant-core: aggregate miss rate 6.7% → 3.3%, mean recall@10 0.89 → 0.93, recall@5 0.86 → 0.89; webpack alone went miss% 20% → 0% and r@10 0.60 → 0.83. Existing indexes continue to work but get the truncation benefit only after a full re-index (`codesage index --full`); incremental hooks pick it up file-by-file as edits land. Indexing wall-clock rises moderately (per-file token count drops, per-token compute rises with longer sequences). Full A/B at `bench/history/cap512-1500-2026-05-04.md`. Validates the "raise the cap, not shrink the chunk" thesis from the prior null-result attempt at this same fix (token-200 chunking, reverted).
@@ -212,7 +214,6 @@ V2b slice 2: tools that change agent behavior per-task instead of just informing
 
 - `codesage git-index` now keeps test and bench files in `git_files` so `recommend_tests` and `assess_risk` test-gap detection can find them. Test files remain dropped from co-change pair generation, so coupling rankings stay focused on production code. Re-run `codesage git-index --full` after upgrading to populate test files.
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.5.0...HEAD
 [0.3.0]: https://github.com/iliaal/codesage/releases/tag/v0.3.0
 
 ## [0.2.1] - 2026-04-15
@@ -257,3 +258,6 @@ Initial public release.
 
 [0.2.1]: https://github.com/iliaal/codesage/releases/tag/v0.2.1
 [0.2.0]: https://github.com/iliaal/codesage/releases/tag/v0.2.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/iliaal/codesage/releases/tag/v0.6.0
