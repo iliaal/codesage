@@ -1024,6 +1024,28 @@ mod tests {
     }
 
     #[test]
+    fn truncate_array_shrinks_oversized_first_content_field() {
+        // Regression for CR-020: when the first item has a `content: String`
+        // that alone exceeds budget, shrink_content_field must trim it
+        // instead of letting the whole 50KB blob through verbatim.
+        let huge = json!({"file_path": "src/big.rs", "content": fat_string(50_000)});
+        let kept = truncate_array(vec![huge], 4_000);
+        assert_eq!(kept.len(), 1);
+        let s = serde_json::to_string(&kept[0]).unwrap();
+        assert!(
+            s.len() < 5_000,
+            "shrunk item still oversized: {} bytes",
+            s.len()
+        );
+        let content = kept[0].get("content").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            content.contains("[truncated by MCP budget]"),
+            "expected truncation marker, got tail: …{}",
+            &content[content.len().saturating_sub(80)..]
+        );
+    }
+
+    #[test]
     fn truncate_array_keeps_prefix_that_fits() {
         let items: Vec<Value> = (0..10)
             .map(|i| json!({"i": i, "blob": fat_string(100)}))

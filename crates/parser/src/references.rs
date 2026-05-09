@@ -182,14 +182,14 @@ pub fn extract_references(
             }
         }
 
-        let pos = ref_node.start_position();
+        let (row, col) = crate::position::node_start_utf8(&ref_node, source);
         refs.push(Reference {
             from_file: file_path.to_string(),
             from_symbol: None,
             to_name,
             kind,
-            line: pos.row as u32 + 1,
-            col: pos.column as u32,
+            line: row + 1,
+            col,
         });
     }
 

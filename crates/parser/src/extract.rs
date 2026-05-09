@@ -270,18 +270,18 @@ pub fn extract_symbols(
             build_qualified_name(&name, kind, &def_node, source, language, &namespace)
         };
 
-        let start = def_node.start_position();
-        let end = def_node.end_position();
+        let (start_row, col_start) = crate::position::node_start_utf8(&def_node, source);
+        let (end_row, col_end) = crate::position::node_end_utf8(&def_node, source);
 
         symbols.push(Symbol {
             name,
             qualified_name,
             kind,
             file_path: file_path.to_string(),
-            line_start: start.row as u32 + 1,
-            line_end: end.row as u32 + 1,
-            col_start: start.column as u32,
-            col_end: end.column as u32,
+            line_start: start_row + 1,
+            line_end: end_row + 1,
+            col_start,
+            col_end,
         });
     }
 
