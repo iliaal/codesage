@@ -1224,7 +1224,9 @@ mod tests {
         let result = render_with_kind(r, "find_symbol");
         assert_ne!(result.is_error, Some(true));
         let value = result.structured_content.expect("structured content");
-        let obj = value.as_object().expect("structuredContent must be an object");
+        let obj = value
+            .as_object()
+            .expect("structuredContent must be an object");
         let items = obj["results"].as_array().expect("results is an array");
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["name"], json!("foo"));
@@ -1252,7 +1254,9 @@ mod tests {
         let r: Result<Vec<Value>> = Ok(vec![]);
         let result = render_with_kind(r, "find_symbol");
         let value = result.structured_content.expect("structured content");
-        let obj = value.as_object().expect("structuredContent must be an object");
+        let obj = value
+            .as_object()
+            .expect("structuredContent must be an object");
         assert_eq!(obj["results"].as_array().unwrap().len(), 0);
     }
 
@@ -1267,7 +1271,9 @@ mod tests {
         let r: Result<Vec<Value>> = Ok(items);
         let result = render_with_kind(r, "search");
         let value = result.structured_content.expect("structured content");
-        let obj = value.as_object().expect("structuredContent must be an object");
+        let obj = value
+            .as_object()
+            .expect("structuredContent must be an object");
         assert!(obj.contains_key("results"));
         let meta = &obj["_meta"];
         assert_eq!(meta["truncated"], json!(true));
