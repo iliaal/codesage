@@ -429,8 +429,18 @@ fn render_with_kind<T: serde::Serialize>(r: Result<T>, kind: &str) -> CallToolRe
         Ok(v) => {
             let value = serde_json::to_value(&v).unwrap_or(serde_json::Value::Null);
             let capped = cap_to_budget(value, kind);
-            let text = serde_json::to_string_pretty(&capped).unwrap_or_default();
-            let mut result = CallToolResult::structured(capped);
+            // MCP requires structuredContent to be a JSON object. Tools that
+            // return bare arrays (find_symbol, find_references, search) get
+            // wrapped in {"results": [...]} so Claude's validator accepts the
+            // response. cap_to_budget already wraps over-budget arrays into
+            // {"results": ..., "_meta": {...}}; this covers the under-budget
+            // path so the shape is consistent regardless of size.
+            let structured = match capped {
+                serde_json::Value::Array(items) => serde_json::json!({ "results": items }),
+                other => other,
+            };
+            let text = serde_json::to_string_pretty(&structured).unwrap_or_default();
+            let mut result = CallToolResult::structured(structured);
             // `CallToolResult::structured` defaults content to a compact
             // `value.to_string()`; replace with pretty JSON for transcript use.
             result.content = vec![Content::text(text)];
@@ -1203,5 +1213,75 @@ mod tests {
         let value = result.structured_content.expect("structured content");
         assert_eq!(value["symbol_definitions"].as_array().unwrap().len(), 1);
         assert_eq!(value["primary"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn render_wraps_under_budget_array_as_results_object() {
+        // Tools like find_symbol return Result<Vec<T>>. Without the wrap,
+        // structuredContent ships as a bare JSON array and Claude's MCP
+        // client rejects it with `expected record, received array`.
+        let r: Result<Vec<Value>> = Ok(vec![json!({"name": "foo"}), json!({"name": "bar"})]);
+        let result = render_with_kind(r, "find_symbol");
+        assert_ne!(result.is_error, Some(true));
+        let value = result.structured_content.expect("structured content");
+        let obj = value.as_object().expect("structuredContent must be an object");
+        let items = obj["results"].as_array().expect("results is an array");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["name"], json!("foo"));
+        // No truncation under budget: _meta must be absent.
+        assert!(!obj.contains_key("_meta"));
+    }
+
+    #[test]
+    fn render_passes_object_through_unchanged() {
+        // list_dependencies returns a struct (object); the wrap must not
+        // mutate it into a nested {"results": {...}}.
+        let r: Result<Value> = Ok(json!({"file_path": "a.rs", "imports": ["b.rs"]}));
+        let result = render_with_kind(r, "list_dependencies");
+        let value = result.structured_content.expect("structured content");
+        let obj = value.as_object().expect("object preserved");
+        assert_eq!(obj["file_path"], json!("a.rs"));
+        assert!(!obj.contains_key("results"));
+    }
+
+    #[test]
+    fn render_wraps_empty_array() {
+        // Empty array is still an array; must wrap so the response stays a
+        // valid record (empty find_symbol / find_references is the common
+        // miss case and would otherwise ship `[]`).
+        let r: Result<Vec<Value>> = Ok(vec![]);
+        let result = render_with_kind(r, "find_symbol");
+        let value = result.structured_content.expect("structured content");
+        let obj = value.as_object().expect("structuredContent must be an object");
+        assert_eq!(obj["results"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn render_over_budget_array_keeps_results_and_meta_shape() {
+        // cap_to_budget already wraps oversized arrays as {results, _meta}.
+        // Verify render_with_kind passes that wrapped object through without
+        // double-nesting it.
+        let items: Vec<Value> = (0..50)
+            .map(|i| json!({"i": i, "blob": fat_string(1000)}))
+            .collect();
+        let r: Result<Vec<Value>> = Ok(items);
+        let result = render_with_kind(r, "search");
+        let value = result.structured_content.expect("structured content");
+        let obj = value.as_object().expect("structuredContent must be an object");
+        assert!(obj.contains_key("results"));
+        let meta = &obj["_meta"];
+        assert_eq!(meta["truncated"], json!(true));
+        assert_eq!(meta["kind"], json!("search"));
+        assert_eq!(meta["total_results"], json!(50));
+        // No double-wrapping: results sits directly under the top object.
+        assert!(obj["results"].is_array());
+    }
+
+    #[test]
+    fn render_error_preserves_is_error() {
+        let r: Result<Vec<Value>> = Err(anyhow::anyhow!("bad path"));
+        let result = render_with_kind(r, "find_symbol");
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.structured_content.is_none());
     }
 }
