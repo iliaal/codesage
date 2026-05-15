@@ -297,11 +297,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "codesage-features"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "codesage-parser",
+ "codesage-protocol",
+ "codesage-storage",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "codesage-graph"
 version = "0.6.0"
 dependencies = [
  "anyhow",
  "codesage-embed",
+ "codesage-features",
  "codesage-parser",
  "codesage-protocol",
  "codesage-storage",

@@ -95,6 +95,15 @@ CREATE TABLE IF NOT EXISTS semantic_models (
 );
 
 CREATE INDEX IF NOT EXISTS idx_semantic_models_model ON semantic_models(model);
+
+CREATE TABLE IF NOT EXISTS file_trust_boundaries (
+    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    boundary TEXT NOT NULL,
+    PRIMARY KEY (file_id, boundary)
+);
+
+CREATE INDEX IF NOT EXISTS idx_file_trust_boundaries_boundary
+    ON file_trust_boundaries(boundary);
 "#;
 
 pub fn semantic_schema(table_name: &str, dim: usize) -> String {
@@ -246,6 +255,10 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
     ("0005_semantic_models", migrate_0005_semantic_models),
     ("0006_refs_name_tail_dot", migrate_0006_refs_name_tail_dot),
     ("0007_symbols_rationale", migrate_0007_symbols_rationale),
+    (
+        "0008_file_trust_boundaries",
+        migrate_0008_file_trust_boundaries,
+    ),
 ];
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
@@ -326,6 +339,28 @@ fn migrate_0001_refs_name_tail(conn: &Connection) -> rusqlite::Result<()> {
         }
     }
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_refs_to_name_tail ON refs(to_name_tail);")?;
+    Ok(())
+}
+
+/// Adds `file_trust_boundaries` table for per-file trust-boundary tags (the
+/// new term feeding `assess_risk`). Idempotent via `IF NOT EXISTS`; existing
+/// indexes pick up boundary rows on the next file-touch + reindex (or via
+/// `features::derive_for_index` against the live DB). No backfill in the
+/// migration body itself — the next index pass writes real rows and the risk
+/// score reads them; a file with no row simply contributes a zero
+/// trust-boundary term, preserving the prior behavior until rederivation.
+fn migrate_0008_file_trust_boundaries(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS file_trust_boundaries (
+             file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+             boundary TEXT NOT NULL,
+             PRIMARY KEY (file_id, boundary)
+         );",
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_file_trust_boundaries_boundary
+             ON file_trust_boundaries(boundary);",
+    )?;
     Ok(())
 }
 

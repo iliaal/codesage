@@ -217,6 +217,16 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Trust-boundary tags derived from a file's imports/includes/calls (network, filesystem,
+    /// secrets, process-exec, etc.). Composes into `assess_risk` as a new signal. Empty
+    /// when the file has no recognized boundary signal or has not yet been re-indexed since 0.7.0.
+    TrustBoundaries {
+        /// Repo-relative file path
+        file: String,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Snapshot the project's structural state as a session baseline.
     /// Persists to .codesage/sessions/<session-id>.json. Pair with
     /// `session-end` using the same id to detect regressions.
@@ -433,6 +443,7 @@ fn main() -> Result<()> {
         Commands::RiskDiff { files, json } => cmd_risk_diff(files, json),
         Commands::RiskBatch { files, json } => cmd_risk_batch(files, json),
         Commands::TestsFor { files, json } => cmd_tests_for(files, json),
+        Commands::TrustBoundaries { file, json } => cmd_trust_boundaries(&file, json),
         Commands::SessionStart { session_id, json } => cmd_session_start(&session_id, json),
         Commands::SessionEnd { session_id, json } => cmd_session_end(&session_id, json),
     }
@@ -990,6 +1001,14 @@ fn cmd_risk(file: &str, json: bool) -> Result<()> {
             assessment.coupled_files,
             assessment.test_gap,
         );
+        if !assessment.trust_boundaries.is_empty() {
+            let names: Vec<&str> = assessment
+                .trust_boundaries
+                .iter()
+                .map(|b| b.as_str())
+                .collect();
+            println!("  trust_boundaries: {}", names.join(", "));
+        }
         if !assessment.notes.is_empty() {
             println!("  Notes:");
             for n in &assessment.notes {
@@ -1062,6 +1081,32 @@ fn cmd_risk_diff(files: Vec<String>, json: bool) -> Result<()> {
             for n in &assessment.summary_notes {
                 println!("    - {n}");
             }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_trust_boundaries(file: &str, json: bool) -> Result<()> {
+    let root = find_project_root()?;
+    let db = open_db(&root)?;
+    let tags = db.trust_boundaries_for_file_path(file)?;
+    if json {
+        let names: Vec<&str> = tags.iter().map(|b| b.as_str()).collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "file": file,
+                "trust_boundaries": names,
+            }))?
+        );
+    } else if tags.is_empty() {
+        println!(
+            "Trust boundaries: {file} -> (none; file may not be indexed or has no recognized boundary signal)"
+        );
+    } else {
+        println!("Trust boundaries: {file}");
+        for t in &tags {
+            println!("  - {}", t.as_str());
         }
     }
     Ok(())

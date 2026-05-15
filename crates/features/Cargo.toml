@@ -1,5 +1,5 @@
 [package]
-name = "codesage-graph"
+name = "codesage-features"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,13 +8,10 @@ license.workspace = true
 codesage-protocol.workspace = true
 codesage-parser.workspace = true
 codesage-storage.workspace = true
-codesage-embed.workspace = true
-codesage-features.workspace = true
-rayon.workspace = true
 anyhow.workspace = true
-globset.workspace = true
 regex.workspace = true
 tracing.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]

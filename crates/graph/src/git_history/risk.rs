@@ -69,15 +69,21 @@ pub fn find_coupling(db: &Database, file_path: &str, limit: usize) -> Result<Cou
 }
 
 /// Risk score for a single file. Composes:
-/// - churn percentile (0..1) — weight 0.35
-/// - fix ratio (fix_count / total_commits, capped at 1.0) — weight 0.20
-/// - dependent file pressure (capped via 20 dependents) — weight 0.10
-/// - coupled file pressure (capped via 10 coupled) — weight 0.10
-/// - test gap (no test among coupled or as adjacent file) — weight 0.15
-/// - cycle membership ((cycle_size - 1) / 4, capped at size 5) — weight 0.10
+/// - churn percentile (0..1) — weight 0.32
+/// - fix ratio (fix_count / total_commits, capped at 1.0) — weight 0.18
+/// - dependent file pressure (capped via 20 dependents) — weight 0.09
+/// - coupled file pressure (capped via 10 coupled) — weight 0.09
+/// - test gap (no test among coupled or as adjacent file) — weight 0.13
+/// - cycle membership ((cycle_size - 1) / 4, capped at size 5) — weight 0.09
+/// - trust boundary count (capped at 5 distinct boundaries) — weight 0.10
 ///
 /// Output includes the decomposition so the agent can quote specific signals
 /// in PR descriptions or risk callouts. Empty git history → score=0 with a note.
+///
+/// The 0.7.0 release rebalanced the prior six weights (0.35/0.20/0.10/0.10/
+/// 0.15/0.10 = 1.00) to free a 0.10 slot for `trust_boundary_term` without
+/// inflating the max score above 1.0. Each prior weight shrank by ~10%; the
+/// relative shape of the score's signals is preserved.
 pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
     let git = db.git_file(file_path)?;
     let churn_score = git.as_ref().map(|g| g.churn_score).unwrap_or(0.0);
@@ -161,12 +167,24 @@ pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
         0.0
     };
 
-    let score = 0.35 * churn_percentile
-        + 0.20 * fix_ratio
-        + 0.10 * dep_pressure
-        + 0.10 * coup_pressure
-        + 0.15 * test_gap_term
-        + 0.10 * cycle_term;
+    // Trust boundaries are a security-shaped signal: a file that talks to the
+    // network AND reads secrets AND exec()s subprocesses is meaningfully more
+    // risky than one that does none of those, even if its churn and tests are
+    // identical. We cap at 5 distinct boundaries so a few extreme files
+    // (legitimately broad infra glue) don't get pinned at the top of the
+    // ranking solely on this term.
+    let trust_boundaries = db
+        .trust_boundaries_for_file_path(file_path)
+        .with_context(|| format!("loading trust boundaries for risk({file_path})"))?;
+    let trust_boundary_term = (trust_boundaries.len() as f64 / 5.0).min(1.0);
+
+    let score = 0.32 * churn_percentile
+        + 0.18 * fix_ratio
+        + 0.09 * dep_pressure
+        + 0.09 * coup_pressure
+        + 0.13 * test_gap_term
+        + 0.09 * cycle_term
+        + 0.10 * trust_boundary_term;
 
     let mut notes = Vec::new();
     if git.is_none() {
@@ -221,6 +239,14 @@ pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
             sample.join(", ")
         ));
     }
+    if trust_boundaries.len() >= 3 {
+        let names: Vec<&str> = trust_boundaries.iter().map(|b| b.as_str()).collect();
+        notes.push(format!(
+            "crosses {} trust boundaries ({}) — security review recommended",
+            trust_boundaries.len(),
+            names.join(", ")
+        ));
+    }
 
     Ok(RiskAssessment {
         file: file_path.to_string(),
@@ -237,6 +263,7 @@ pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
         cycle_size,
         cycle_files,
         top_coupled,
+        trust_boundaries,
         notes,
     })
 }
@@ -315,7 +342,13 @@ pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiff
             wide_blast_files.len()
         ));
     }
-    if max_score >= 0.6 {
+    // 0.7.0: threshold dropped from 0.6 to 0.50 to track the score deflation
+    // every existing signal saw when the weights were rebalanced to make
+    // room for the trust-boundary term. A 0.50 max under the new weights
+    // signals roughly the same calibrated concern as 0.6 did under the
+    // prior weights — a hotspot+fix-heavy+test-gap file with no trust
+    // boundaries hits the new range's ceiling at ~0.54.
+    if max_score >= 0.50 {
         summary_notes.push(format!(
             "max risk score {max_score:.2}; consider smaller patch and broader test sweep"
         ));

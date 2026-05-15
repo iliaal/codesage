@@ -2,7 +2,8 @@
 
 use anyhow::Result;
 use codesage_protocol::{
-    DependencyEntry, FileInfo, RationaleEntry, Reference, ReferenceKind, Symbol, SymbolKind,
+    DependencyEntry, FileInfo, Language, RationaleEntry, Reference, ReferenceKind, Symbol,
+    SymbolKind, TrustBoundary,
 };
 use rusqlite::params;
 
@@ -449,5 +450,102 @@ impl Database {
             .conn
             .query_row("SELECT COUNT(*) FROM refs", [], |row| row.get(0))?;
         Ok(n as usize)
+    }
+
+    /// Enumerate all indexed files with their database id and parsed language,
+    /// in stable `path` order. Used by re-derivation passes (trust boundaries,
+    /// feature mappers) that need to walk every file without touching symbols
+    /// or refs first.
+    pub fn all_files_with_id_and_language(&self) -> Result<Vec<(i64, String, Language)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, path, language FROM files ORDER BY path")?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                let path: String = row.get(1)?;
+                let lang_str: String = row.get(2)?;
+                let language = Language::parse(&lang_str).ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        format!("unknown Language in row: {lang_str:?}").into(),
+                    )
+                })?;
+                Ok((id, path, language))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Outgoing references for one file: `(to_name, kind)` rows from `refs`
+    /// where `from_file_id = ?`. Used by the trust-boundary derivation pass
+    /// to re-classify a file's boundaries from its already-extracted refs
+    /// without re-parsing the source.
+    pub fn refs_outgoing_for_file_id(&self, file_id: i64) -> Result<Vec<(String, ReferenceKind)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT to_name, kind FROM refs WHERE from_file_id = ?1")?;
+        let rows = stmt
+            .query_map(params![file_id], |row| {
+                let to_name: String = row.get(0)?;
+                let kind_str: String = row.get(1)?;
+                let kind = row_reference_kind(&kind_str)?;
+                Ok((to_name, kind))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Replace every `file_trust_boundaries` row for `file_id` with `tags`.
+    /// Idempotent (writing the same set twice yields the same DB state). Use
+    /// inside an `execute_batch` for indexer-time writes; the wrapper opens
+    /// its own transaction so a partial failure rolls back cleanly.
+    pub fn replace_file_trust_boundaries(
+        &self,
+        file_id: i64,
+        tags: &[TrustBoundary],
+    ) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM file_trust_boundaries WHERE file_id = ?1",
+            params![file_id],
+        )?;
+        if tags.is_empty() {
+            return Ok(());
+        }
+        let mut stmt = self.conn.prepare(
+            "INSERT OR IGNORE INTO file_trust_boundaries (file_id, boundary) VALUES (?1, ?2)",
+        )?;
+        for t in tags {
+            stmt.execute(params![file_id, t.as_str()])?;
+        }
+        Ok(())
+    }
+
+    /// Trust boundaries for one file identified by repo-relative path. Empty
+    /// when the file has no row (never derived, or genuinely no boundary
+    /// signal). Sorted by enum discriminant for stable output.
+    pub fn trust_boundaries_for_file_path(&self, path: &str) -> Result<Vec<TrustBoundary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT b.boundary FROM file_trust_boundaries b
+             JOIN files f ON f.id = b.file_id
+             WHERE f.path = ?1",
+        )?;
+        let rows: Vec<TrustBoundary> = stmt
+            .query_map(params![path], |row| {
+                let s: String = row.get(0)?;
+                TrustBoundary::parse(&s).ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        format!("unknown TrustBoundary in row: {s:?}").into(),
+                    )
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut tags = rows;
+        tags.sort();
+        tags.dedup();
+        Ok(tags)
     }
 }

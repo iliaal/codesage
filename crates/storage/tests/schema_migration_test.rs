@@ -198,6 +198,7 @@ fn fresh_db_records_migrations_exactly_once() {
         "0005_semantic_models",
         "0006_refs_name_tail_dot",
         "0007_symbols_rationale",
+        "0008_file_trust_boundaries",
     ] {
         let count: i64 = conn
             .query_row(
@@ -215,7 +216,7 @@ fn fresh_db_records_migrations_exactly_once() {
         .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
-        count_after, 7,
+        count_after, 8,
         "second init_db must not re-apply migrations"
     );
 }
@@ -244,6 +245,7 @@ fn legacy_db_records_migration_after_upgrade() {
         "0005_semantic_models",
         "0006_refs_name_tail_dot",
         "0007_symbols_rationale",
+        "0008_file_trust_boundaries",
     ] {
         let count: i64 = conn
             .query_row(

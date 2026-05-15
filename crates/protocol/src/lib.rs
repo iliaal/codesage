@@ -202,6 +202,100 @@ pub struct RationaleEntry {
     pub line_end: u32,
 }
 
+/// A trust-boundary tag attached to a file (or aggregated to a feature). One
+/// tag per kind of capability the file actually exercises through its imports
+/// or calls. Used by `assess_risk` to add a security-shaped term to the score
+/// (a file talking to the network + reading secrets is meaningfully more
+/// risky than one that only touches strings).
+///
+/// Derivation is heuristic: a per-language rule table maps known module/symbol
+/// names to tags (e.g. Rust `reqwest::*` → [Network, ExternalApi]; PHP `exec`
+/// → [ProcessExec]). False positives are possible (a file that imports
+/// `reqwest` but only uses its types, not its client). For the risk signal,
+/// boundary count is more important than perfect attribution.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum TrustBoundary {
+    /// Crosses the network (HTTP clients, raw sockets, gRPC, etc.).
+    Network,
+    /// Reads or writes the filesystem beyond compile-time embedded data.
+    Filesystem,
+    /// Spawns or controls processes (exec, fork, child_process, popen, system).
+    ProcessExec,
+    /// Reads environment variables, credentials, secret stores, or interacts
+    /// with cryptography primitives.
+    Secrets,
+    /// Talks to a database (SQL drivers, ORMs, key-value stores with auth).
+    Database,
+    /// Accepts user-controlled input directly (CLI argv, HTTP request bodies,
+    /// stdin parsers).
+    UserInput,
+    /// Calls a third-party external API (a more specific Network signal —
+    /// e.g. AWS SDK, Stripe, OpenAI client).
+    ExternalApi,
+    /// Performs serialization that crosses a trust boundary (XML, YAML
+    /// loaders, pickle, deserialization of untrusted input).
+    Serialization,
+    /// Hand-rolled authentication / authorization paths (token validators,
+    /// permission checks).
+    Auth,
+    /// Concurrency primitives that historically host data races (locks,
+    /// atomics with non-trivial protocol, channels).
+    Concurrency,
+}
+
+impl TrustBoundary {
+    /// Stable lowercase-kebab string used in DB rows, JSON, and CLI output.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TrustBoundary::Network => "network",
+            TrustBoundary::Filesystem => "filesystem",
+            TrustBoundary::ProcessExec => "process-exec",
+            TrustBoundary::Secrets => "secrets",
+            TrustBoundary::Database => "database",
+            TrustBoundary::UserInput => "user-input",
+            TrustBoundary::ExternalApi => "external-api",
+            TrustBoundary::Serialization => "serialization",
+            TrustBoundary::Auth => "auth",
+            TrustBoundary::Concurrency => "concurrency",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "network" => Some(TrustBoundary::Network),
+            "filesystem" => Some(TrustBoundary::Filesystem),
+            "process-exec" => Some(TrustBoundary::ProcessExec),
+            "secrets" => Some(TrustBoundary::Secrets),
+            "database" => Some(TrustBoundary::Database),
+            "user-input" => Some(TrustBoundary::UserInput),
+            "external-api" => Some(TrustBoundary::ExternalApi),
+            "serialization" => Some(TrustBoundary::Serialization),
+            "auth" => Some(TrustBoundary::Auth),
+            "concurrency" => Some(TrustBoundary::Concurrency),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for TrustBoundary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ReferenceKind {
@@ -595,6 +689,14 @@ pub struct RiskAssessment {
     /// Top co-changers, useful for the agent to know which tests/files to also touch.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub top_coupled: Vec<CoChangeEntry>,
+    /// Trust-boundary tags derived from this file's imports/includes/calls.
+    /// Each tag denotes a capability the file's structural dependencies imply
+    /// it exercises (network, filesystem, secrets, process-exec, etc.).
+    /// Contributes a `0.10 * min(count/5, 1.0)` term to `score`. Sorted by
+    /// enum discriminant; empty when the file has no recognized boundary
+    /// signal or has not yet been re-indexed since 0.7.0.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub trust_boundaries: Vec<TrustBoundary>,
     /// Human-readable rationale lines so the agent can quote them in PR descriptions.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub notes: Vec<String>,

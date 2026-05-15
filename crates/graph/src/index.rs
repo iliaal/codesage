@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::Result;
+use codesage_features::trust_boundary::derive_from_refs;
 use codesage_protocol::{FileInfo, IndexStats, Reference, Symbol};
 use codesage_storage::Database;
 use rayon::prelude::*;
@@ -89,6 +90,12 @@ fn index(
             let file_id = db.upsert_file(&p.info)?;
             db.insert_symbols(file_id, &p.symbols)?;
             db.insert_references(file_id, &p.refs)?;
+            // Trust-boundary derivation runs against the in-memory refs we
+            // just inserted — no DB round-trip to re-read them. Replace
+            // whatever was stored previously so re-index keeps the set
+            // current as imports change.
+            let boundaries = derive_from_refs(&p.refs, p.info.language);
+            db.replace_file_trust_boundaries(file_id, &boundaries)?;
         }
         Ok(())
     })?;

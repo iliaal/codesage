@@ -66,9 +66,14 @@ fn hotspot_fix_heavy_file_scores_high_and_emits_notes() {
     }
 
     let r = assess_risk(&db, "Repository.php").unwrap();
+    // Threshold updated for 0.7.0 weights (0.32 churn + 0.18 fix + 0.13
+    // test-gap = 0.54 floor on a hotspot+fix-heavy file with no tests).
+    // Prior weights (0.35/0.20/0.15) hit 0.6 on the same fixture; the
+    // rebalance to make room for the trust-boundary term shifts the
+    // ceiling down by roughly 10% for all signals.
     assert!(
-        r.score >= 0.6,
-        "hotspot+fix-heavy should score >= 0.6, got {}",
+        r.score >= 0.5,
+        "hotspot+fix-heavy should score >= 0.5, got {}",
         r.score
     );
     assert!(r.churn_percentile >= 0.99);
@@ -250,8 +255,9 @@ fn risk_diff_aggregates_max_and_mean_across_files() {
 
     assert_eq!(r.files.len(), 2);
     assert_eq!(r.max_risk_file.as_deref(), Some("Repository.php"));
+    // See note on threshold change in `hotspot_fix_heavy_file_scores_high_and_emits_notes`.
     assert!(
-        r.max_score >= 0.6,
+        r.max_score >= 0.5,
         "max should reflect the hot file, got {}",
         r.max_score
     );
@@ -373,7 +379,8 @@ fn risk_diff_summary_includes_max_score_warning_when_high() {
             .unwrap();
     }
     let r = codesage_graph::assess_risk_diff(&db, &["Repository.php".to_string()]).unwrap();
-    assert!(r.max_score >= 0.6);
+    // See note on threshold change in `hotspot_fix_heavy_file_scores_high_and_emits_notes`.
+    assert!(r.max_score >= 0.5);
     assert!(
         r.summary_notes.iter().any(|n| n.contains("max risk score")),
         "expected explicit max-score warning, got {:?}",
@@ -1198,4 +1205,53 @@ fn recommend_tests_finds_symfony_mirror_tree_tests() {
 
     let r = codesage_graph::recommend_tests(&db, &[src.to_string()]).unwrap();
     assert_eq!(r.primary, vec![test.to_string()]);
+}
+
+#[test]
+fn trust_boundaries_populate_via_indexer_and_feed_risk_score() {
+    use codesage_protocol::TrustBoundary;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // PHP file that imports a network namespace AND calls exec — distinct
+    // boundary tags should land in file_trust_boundaries after indexing,
+    // and the trust_boundary_term contributes to the score.
+    std::fs::write(
+        root.join("Risky.php"),
+        b"<?php\nuse GuzzleHttp\\Client;\nclass Risky {\n  public function run() {\n    exec('ls');\n  }\n}\n",
+    )
+    .unwrap();
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[]).unwrap();
+
+    let tags = db.trust_boundaries_for_file_path("Risky.php").unwrap();
+    assert!(tags.contains(&TrustBoundary::ProcessExec), "got {:?}", tags);
+    assert!(tags.contains(&TrustBoundary::Network), "got {:?}", tags);
+
+    let r = assess_risk(&db, "Risky.php").unwrap();
+    assert!(
+        r.trust_boundaries.contains(&TrustBoundary::ProcessExec),
+        "RiskAssessment must carry the tags, got {:?}",
+        r.trust_boundaries
+    );
+    // 3 boundaries (network, external-api, process-exec) — Guzzle's
+    // network+external-api plus exec's process-exec. The aggregate-notes
+    // line fires at >=3 boundaries.
+    assert!(
+        r.notes.iter().any(|n| n.contains("trust boundaries")),
+        "expected trust-boundary note, got {:?}",
+        r.notes
+    );
+}
+
+#[test]
+fn trust_boundaries_field_empty_when_file_has_no_signal() {
+    let (_dir, db) = setup_project();
+    // Repository.php has no risky imports/calls in the fixture; trust_boundaries
+    // should be an empty Vec, not None, and contribute 0 to the score.
+    let r = assess_risk(&db, "Repository.php").unwrap();
+    assert!(
+        r.trust_boundaries.is_empty(),
+        "fixture has no boundary signal, got {:?}",
+        r.trust_boundaries
+    );
 }
