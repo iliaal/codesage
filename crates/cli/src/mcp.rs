@@ -12,11 +12,11 @@ use codesage_graph::{
     recommend_tests, search, session_end, session_start,
 };
 use codesage_protocol::{
-    ContextBundle, CouplingReport, DependencyEntry, ExportRequest, FindReferencesRequest,
-    FindReferencesResults, FindSymbolRequest, FindSymbolResults, ImpactAnalysisResults,
-    ImpactRequest, ImpactTarget, Language, ReferenceKind, RiskAssessment, RiskBatchAssessment,
-    RiskDiffAssessment, SearchRequest, SearchResults, SessionDiff, SessionSnapshot, SymbolKind,
-    TestRecommendations,
+    ContextBundle, CouplingReport, DependencyEntry, ExportRequest, FeatureKind, FeatureListResults,
+    FindReferencesRequest, FindReferencesResults, FindSymbolRequest, FindSymbolResults,
+    ImpactAnalysisResults, ImpactRequest, ImpactTarget, Language, ReferenceKind, RiskAssessment,
+    RiskBatchAssessment, RiskDiffAssessment, SearchRequest, SearchResults, SessionDiff,
+    SessionSnapshot, SymbolKind, TestRecommendations,
 };
 use codesage_storage::Database;
 use parking_lot::Mutex;
@@ -208,6 +208,33 @@ pub struct SearchParams {
     pub language: Option<String>,
     #[schemars(description = "Filter by file path glob patterns")]
     pub paths: Option<Vec<String>>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ListFeaturesParams {
+    #[schemars(description = PROJECT_ARG_DESC)]
+    pub project: String,
+    #[schemars(
+        description = "Filter by feature kind: cli-command, route, service, library, test-suite, config, job, unknown"
+    )]
+    pub kind: Option<String>,
+    #[schemars(
+        description = "Filter by language: php, python, c, cpp, rust, javascript, typescript, go"
+    )]
+    pub language: Option<String>,
+    #[schemars(description = "Filter by tag substring (e.g. \"framework:laravel\", \"library\")")]
+    pub tag: Option<String>,
+    #[schemars(description = "Max results (default 100, 0 = no limit)")]
+    #[serde(default, deserialize_with = "deser_optional_usize")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct FindFeatureParams {
+    #[schemars(description = PROJECT_ARG_DESC)]
+    pub project: String,
+    #[schemars(description = "Repo-relative file path to look up")]
+    pub file_path: String,
 }
 
 #[derive(Clone)]
@@ -851,6 +878,43 @@ impl CodeSageServer {
                 session_start(root, db, &session_id)
             }),
             "session_start",
+        )
+    }
+
+    #[tool(
+        name = "list_features",
+        description = "List feature slices in the project, optionally filtered by kind, language, or tag. A feature is a behavior-keyed bundle (entrypoint + owned files + context + tests + trust boundaries) — e.g. \"Laravel route POST /api/login\", \"Rust binary `codesage`\", \"php-src extension `iconv`\", \"CMake binary `myapp`\". Use this to discover the agent-facing surface area of the project before deep-diving into a specific slice. Pair with `find_feature` (file → features) and `assess_risk` (per-file scoring inside a feature).",
+        output_schema = schema_for_type::<FeatureListResults>()
+    )]
+    fn list_features_tool(
+        &self,
+        Parameters(params): Parameters<ListFeaturesParams>,
+    ) -> CallToolResult {
+        let kind = params.kind.as_deref().and_then(FeatureKind::parse);
+        let language = params.language.as_deref().and_then(Language::parse);
+        let tag = params.tag.clone();
+        let limit = params.limit.unwrap_or(100);
+        render_with_kind(
+            self.with_project_db(&params.project, |db| {
+                db.list_features(kind, language, tag.as_deref(), limit)
+            }),
+            "list_features",
+        )
+    }
+
+    #[tool(
+        name = "find_feature",
+        description = "Features that include the given file in any role (entry, owned, context, or test). Use to answer \"what feature owns src/auth/login.php?\" — returns the matching feature records with their full file lists, tags, and trust boundaries. Empty result means no mapped feature claims this file (common: not every file belongs to a feature slice).",
+        output_schema = schema_for_type::<FeatureListResults>()
+    )]
+    fn find_feature_tool(
+        &self,
+        Parameters(params): Parameters<FindFeatureParams>,
+    ) -> CallToolResult {
+        let file = params.file_path.clone();
+        render_with_kind(
+            self.with_project_db(&params.project, |db| db.features_for_file(&file)),
+            "find_feature",
         )
     }
 

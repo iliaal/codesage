@@ -104,6 +104,43 @@ CREATE TABLE IF NOT EXISTS file_trust_boundaries (
 
 CREATE INDEX IF NOT EXISTS idx_file_trust_boundaries_boundary
     ON file_trust_boundaries(boundary);
+
+CREATE TABLE IF NOT EXISTS features (
+    feature_id    TEXT PRIMARY KEY,
+    title         TEXT NOT NULL,
+    summary       TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    source        TEXT NOT NULL,
+    confidence    TEXT NOT NULL,
+    entry_path    TEXT NOT NULL,
+    entry_symbol  TEXT,
+    entry_route   TEXT,
+    entry_command TEXT,
+    language      TEXT NOT NULL,
+    tags          TEXT NOT NULL DEFAULT '[]',
+    created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at    INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE INDEX IF NOT EXISTS idx_features_kind     ON features(kind);
+CREATE INDEX IF NOT EXISTS idx_features_language ON features(language);
+CREATE INDEX IF NOT EXISTS idx_features_source   ON features(source);
+
+CREATE TABLE IF NOT EXISTS feature_files (
+    feature_id TEXT NOT NULL REFERENCES features(feature_id) ON DELETE CASCADE,
+    path       TEXT NOT NULL,
+    role       TEXT NOT NULL,
+    reason     TEXT,
+    PRIMARY KEY (feature_id, path, role)
+);
+
+CREATE INDEX IF NOT EXISTS idx_feature_files_path ON feature_files(path);
+
+CREATE TABLE IF NOT EXISTS feature_trust_boundaries (
+    feature_id TEXT NOT NULL REFERENCES features(feature_id) ON DELETE CASCADE,
+    boundary   TEXT NOT NULL,
+    PRIMARY KEY (feature_id, boundary)
+);
 "#;
 
 pub fn semantic_schema(table_name: &str, dim: usize) -> String {
@@ -259,6 +296,7 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
         "0008_file_trust_boundaries",
         migrate_0008_file_trust_boundaries,
     ),
+    ("0009_feature_tables", migrate_0009_feature_tables),
 ];
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
@@ -339,6 +377,55 @@ fn migrate_0001_refs_name_tail(conn: &Connection) -> rusqlite::Result<()> {
         }
     }
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_refs_to_name_tail ON refs(to_name_tail);")?;
+    Ok(())
+}
+
+/// Adds the three feature-mapping tables: `features` (one row per
+/// behavior-keyed slice), `feature_files` (junction with role tag), and
+/// `feature_trust_boundaries` (aggregated boundary tags per feature).
+/// Idempotent via `IF NOT EXISTS`; existing indexes get the tables empty
+/// and pick up real rows on the next `codesage map` pass.
+fn migrate_0009_feature_tables(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS features (
+             feature_id    TEXT PRIMARY KEY,
+             title         TEXT NOT NULL,
+             summary       TEXT NOT NULL,
+             kind          TEXT NOT NULL,
+             source        TEXT NOT NULL,
+             confidence    TEXT NOT NULL,
+             entry_path    TEXT NOT NULL,
+             entry_symbol  TEXT,
+             entry_route   TEXT,
+             entry_command TEXT,
+             language      TEXT NOT NULL,
+             tags          TEXT NOT NULL DEFAULT '[]',
+             created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+             updated_at    INTEGER NOT NULL DEFAULT (unixepoch())
+         );",
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_features_kind     ON features(kind);
+         CREATE INDEX IF NOT EXISTS idx_features_language ON features(language);
+         CREATE INDEX IF NOT EXISTS idx_features_source   ON features(source);",
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS feature_files (
+             feature_id TEXT NOT NULL REFERENCES features(feature_id) ON DELETE CASCADE,
+             path       TEXT NOT NULL,
+             role       TEXT NOT NULL,
+             reason     TEXT,
+             PRIMARY KEY (feature_id, path, role)
+         );
+         CREATE INDEX IF NOT EXISTS idx_feature_files_path ON feature_files(path);",
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS feature_trust_boundaries (
+             feature_id TEXT NOT NULL REFERENCES features(feature_id) ON DELETE CASCADE,
+             boundary   TEXT NOT NULL,
+             PRIMARY KEY (feature_id, boundary)
+         );",
+    )?;
     Ok(())
 }
 

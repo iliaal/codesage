@@ -266,6 +266,7 @@ dependencies = [
  "anyhow",
  "clap",
  "codesage-embed",
+ "codesage-features",
  "codesage-graph",
  "codesage-parser",
  "codesage-protocol",
@@ -304,11 +305,16 @@ dependencies = [
  "codesage-parser",
  "codesage-protocol",
  "codesage-storage",
+ "hex",
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tracing",
+ "tree-sitter",
+ "tree-sitter-c",
+ "tree-sitter-cpp",
 ]
 
 [[package]]

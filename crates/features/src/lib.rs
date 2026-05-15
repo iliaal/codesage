@@ -13,7 +13,12 @@
 //!   Per-language mappers (PHP, C, C++, Rust, Python, JS/TS, Go) seed
 //!   deterministic `FeatureRecord`s. See `crates/features/src/mappers/`.
 
+pub mod feature_id;
+pub mod mapper;
+pub mod mappers;
+pub mod nearby_tests;
 pub mod trust_boundary;
 pub mod trust_boundary_rules;
 
+pub use mapper::map_features;
 pub use trust_boundary::{derive_for_file, derive_for_index, store_for_file};

@@ -227,6 +227,48 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Run the feature mapper: scan the repo for behavior-keyed slices
+    /// (CLI commands, routes, libraries, test suites) across PHP, C, C++,
+    /// Rust, Python, JS/TS, Go. Persists results into `.codesage/index.db`.
+    Map {
+        /// Emit JSON stats
+        #[arg(long)]
+        json: bool,
+    },
+    /// List features in the project, optionally filtered.
+    FeaturesList {
+        /// Filter by feature kind (cli-command, route, library, test-suite, etc.)
+        #[arg(long)]
+        kind: Option<String>,
+        /// Filter by language (rust, php, c, cpp, python, javascript, typescript, go)
+        #[arg(long)]
+        lang: Option<String>,
+        /// Filter by tag substring (e.g. "framework:laravel", "library")
+        #[arg(long)]
+        tag: Option<String>,
+        /// Limit (0 = no limit)
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show full feature record by id (including files and trust boundaries).
+    FeatureShow {
+        /// Feature id (e.g. feat_abc123)
+        id: String,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Find features that include the given file path in any role.
+    FeatureFor {
+        /// Repo-relative file path
+        file: String,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Snapshot the project's structural state as a session baseline.
     /// Persists to .codesage/sessions/<session-id>.json. Pair with
     /// `session-end` using the same id to detect regressions.
@@ -444,6 +486,22 @@ fn main() -> Result<()> {
         Commands::RiskBatch { files, json } => cmd_risk_batch(files, json),
         Commands::TestsFor { files, json } => cmd_tests_for(files, json),
         Commands::TrustBoundaries { file, json } => cmd_trust_boundaries(&file, json),
+        Commands::Map { json } => cmd_map(json),
+        Commands::FeaturesList {
+            kind,
+            lang,
+            tag,
+            limit,
+            json,
+        } => cmd_features_list(
+            kind.as_deref(),
+            lang.as_deref(),
+            tag.as_deref(),
+            limit,
+            json,
+        ),
+        Commands::FeatureShow { id, json } => cmd_feature_show(&id, json),
+        Commands::FeatureFor { file, json } => cmd_feature_for(&file, json),
         Commands::SessionStart { session_id, json } => cmd_session_start(&session_id, json),
         Commands::SessionEnd { session_id, json } => cmd_session_end(&session_id, json),
     }
@@ -757,6 +815,17 @@ fn cmd_index(full: bool, no_semantic: bool) -> Result<()> {
         stats.symbols_found,
         stats.references_found
     );
+
+    // Feature mapping runs after structural (which populated `refs` and
+    // `file_trust_boundaries`) and before semantic so the aggregated
+    // trust-boundary tags on each feature are fresh.
+    match codesage_features::map_features(&root, &db) {
+        Ok(map_stats) => println!(
+            "Features:   created={} updated={} removed={} total={}",
+            map_stats.created, map_stats.updated, map_stats.removed, map_stats.total_features
+        ),
+        Err(e) => eprintln!("feature mapping failed: {e:#}"),
+    }
 
     if let Some(embedder) = embedder.as_mut() {
         let sem_stats = if full {
@@ -1081,6 +1150,142 @@ fn cmd_risk_diff(files: Vec<String>, json: bool) -> Result<()> {
             for n in &assessment.summary_notes {
                 println!("    - {n}");
             }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_map(json: bool) -> Result<()> {
+    let root = find_project_root()?;
+    let db = open_db(&root)?;
+    let stats = codesage_features::map_features(&root, &db)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+    } else {
+        println!(
+            "Features mapped: created={} updated={} removed={} total={}",
+            stats.created, stats.updated, stats.removed, stats.total_features
+        );
+    }
+    Ok(())
+}
+
+fn cmd_features_list(
+    kind: Option<&str>,
+    lang: Option<&str>,
+    tag: Option<&str>,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
+    use codesage_protocol::{FeatureKind, Language};
+    let root = find_project_root()?;
+    let db = open_db(&root)?;
+    let kind = match kind {
+        None => None,
+        Some(k) => Some(
+            FeatureKind::parse(k).ok_or_else(|| anyhow::anyhow!("unknown feature kind: {k}"))?,
+        ),
+    };
+    let language = match lang {
+        None => None,
+        Some(l) => {
+            Some(Language::parse(l).ok_or_else(|| anyhow::anyhow!("unknown language: {l}"))?)
+        }
+    };
+    let features = db.list_features(kind, language, tag, limit)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&codesage_protocol::FeatureListResults {
+                results: features,
+            })?
+        );
+    } else if features.is_empty() {
+        println!("No features matched.");
+    } else {
+        println!("Features ({}):", features.len());
+        for f in &features {
+            let disc = f
+                .entry_command
+                .as_deref()
+                .or(f.entry_route.as_deref())
+                .or(f.entry_symbol.as_deref())
+                .unwrap_or("");
+            println!(
+                "  {:<22} {:<14} {:<10} {:<12} {}",
+                f.feature_id,
+                f.kind.as_str(),
+                f.language.as_str(),
+                disc,
+                f.title
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_feature_show(id: &str, json: bool) -> Result<()> {
+    let root = find_project_root()?;
+    let db = open_db(&root)?;
+    let feature = match db.load_feature(id)? {
+        Some(f) => f,
+        None => bail!("no feature with id `{id}` in this project"),
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&feature)?);
+    } else {
+        println!("{} ({})", feature.title, feature.feature_id);
+        println!("  kind: {}", feature.kind.as_str());
+        println!("  source: {}", feature.source);
+        println!("  language: {}", feature.language.as_str());
+        println!("  confidence: {}", feature.confidence.as_str());
+        println!("  entry: {}", feature.entry_path);
+        if let Some(s) = &feature.entry_symbol {
+            println!("  entry_symbol: {s}");
+        }
+        if let Some(r) = &feature.entry_route {
+            println!("  entry_route: {r}");
+        }
+        if let Some(c) = &feature.entry_command {
+            println!("  entry_command: {c}");
+        }
+        if !feature.tags.is_empty() {
+            println!("  tags: {}", feature.tags.join(", "));
+        }
+        if !feature.trust_boundaries.is_empty() {
+            let names: Vec<&str> = feature
+                .trust_boundaries
+                .iter()
+                .map(|b| b.as_str())
+                .collect();
+            println!("  trust_boundaries: {}", names.join(", "));
+        }
+        println!("  files ({}):", feature.files.len());
+        for f in &feature.files {
+            let reason = f.reason.as_deref().unwrap_or("");
+            println!("    {:<8} {} ({reason})", f.role.as_str(), f.path);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_feature_for(file: &str, json: bool) -> Result<()> {
+    let root = find_project_root()?;
+    let db = open_db(&root)?;
+    let features = db.features_for_file(file)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&codesage_protocol::FeatureListResults {
+                results: features,
+            })?
+        );
+    } else if features.is_empty() {
+        println!("No mapped feature owns or contexts `{file}`.");
+    } else {
+        println!("Features for {file}:");
+        for f in &features {
+            println!("  {} {} {}", f.feature_id, f.kind.as_str(), f.title);
         }
     }
     Ok(())

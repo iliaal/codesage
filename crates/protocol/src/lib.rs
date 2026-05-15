@@ -968,6 +968,234 @@ pub struct GitIndexStats {
     pub co_change_pairs: usize,
 }
 
+/// The "shape" of a feature slice. Maps to the agent-facing reason the
+/// feature exists — what someone would call the entrypoint when describing
+/// what it does.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum FeatureKind {
+    /// Executable command (CLI tool, `main()`, package bin). Run-it shape.
+    CliCommand,
+    /// HTTP/RPC route. Request-response shape.
+    Route,
+    /// Long-running service or daemon.
+    Service,
+    /// Library / module surface (no top-level entrypoint, importable API).
+    Library,
+    /// Test target (test suite, integration tests, .phpt fixture set).
+    TestSuite,
+    /// Build/release/config artifact (Cargo.toml, composer.json, CMakeLists.txt).
+    Config,
+    /// Background job / queue worker / scheduled task.
+    Job,
+    /// Catch-all for shapes the mapper can't classify confidently.
+    Unknown,
+}
+
+impl FeatureKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FeatureKind::CliCommand => "cli-command",
+            FeatureKind::Route => "route",
+            FeatureKind::Service => "service",
+            FeatureKind::Library => "library",
+            FeatureKind::TestSuite => "test-suite",
+            FeatureKind::Config => "config",
+            FeatureKind::Job => "job",
+            FeatureKind::Unknown => "unknown",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "cli-command" => Some(FeatureKind::CliCommand),
+            "route" => Some(FeatureKind::Route),
+            "service" => Some(FeatureKind::Service),
+            "library" => Some(FeatureKind::Library),
+            "test-suite" => Some(FeatureKind::TestSuite),
+            "config" => Some(FeatureKind::Config),
+            "job" => Some(FeatureKind::Job),
+            "unknown" => Some(FeatureKind::Unknown),
+            _ => None,
+        }
+    }
+}
+
+/// Confidence that the mapper got this feature right. `High` means the
+/// signal is unambiguous (a `[[bin]]` in Cargo.toml, a `composer.json`
+/// `bin` entry). `Medium` is heuristic (a top-level `main.go`). `Low` is
+/// best-effort (a directory pattern match).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum FeatureConfidence {
+    High,
+    Medium,
+    Low,
+}
+
+impl FeatureConfidence {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FeatureConfidence::High => "high",
+            FeatureConfidence::Medium => "medium",
+            FeatureConfidence::Low => "low",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "high" => Some(FeatureConfidence::High),
+            "medium" => Some(FeatureConfidence::Medium),
+            "low" => Some(FeatureConfidence::Low),
+            _ => None,
+        }
+    }
+}
+
+/// Role of a file within a feature.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum FeatureFileRole {
+    /// The entrypoint file itself (always exactly one).
+    Entry,
+    /// Files directly implementing the feature.
+    Owned,
+    /// Supporting files: imports, shared helpers, configs the feature reads.
+    Context,
+    /// Test files associated with this feature.
+    Test,
+}
+
+impl FeatureFileRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FeatureFileRole::Entry => "entry",
+            FeatureFileRole::Owned => "owned",
+            FeatureFileRole::Context => "context",
+            FeatureFileRole::Test => "test",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "entry" => Some(FeatureFileRole::Entry),
+            "owned" => Some(FeatureFileRole::Owned),
+            "context" => Some(FeatureFileRole::Context),
+            "test" => Some(FeatureFileRole::Test),
+            _ => None,
+        }
+    }
+}
+
+/// A file attached to a feature with its role and optional reason. `reason`
+/// is a short human-readable note ("entrypoint", "nearby test", "imported
+/// by entry") the mapper recorded when including this file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FeatureFileRef {
+    pub path: String,
+    pub role: FeatureFileRole,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// One behavior-keyed slice of the repository. Produced deterministically by
+/// per-language mappers (no LLM in the seed path). The `feature_id` is
+/// stable across re-runs as long as the entrypoint and kind don't change,
+/// so an agent can quote it in conversation and have the same record
+/// surface in the next session.
+///
+/// Designed as a *retrieval surface*, not a workflow object: `find_feature`
+/// answers "what feature owns this file?", `feature_bundle` returns the
+/// curated context an agent would want before reviewing or modifying the
+/// slice. Mapping is deliberately conservative — a file may appear in
+/// multiple features (a shared helper imported by two routes) and that's
+/// fine; the goal is recall, not partition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FeatureRecord {
+    /// Stable blake3-derived id. Format: `feat_<16-hex>`. Computed from
+    /// `(kind, source, entry_path, command|route|symbol)` so renaming an
+    /// entry file regenerates the id, but the same file producing the
+    /// same feature across re-runs keeps it.
+    pub feature_id: String,
+    /// Human-readable title ("Rust binary `codesage`", "PHP route `GET /login`").
+    pub title: String,
+    /// One-line summary suitable for listing.
+    pub summary: String,
+    pub kind: FeatureKind,
+    /// Mapper-defined source token: `cargo-bin`, `composer-bin`,
+    /// `laravel-route`, `php-ext`, `c-main`, `cmake-target`, etc. Lets the
+    /// caller filter by detection source without parsing the title.
+    pub source: String,
+    pub confidence: FeatureConfidence,
+    pub entry_path: String,
+    /// Symbol the entrypoint anchors on (Rust `main`, C `main`, Python
+    /// `if __name__`, etc.). `None` for features without a code-level
+    /// entry symbol (config files, route registrations).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_symbol: Option<String>,
+    /// HTTP route, queue topic, or URL template (Laravel `GET /users/{id}`,
+    /// Express `/api/login`). `None` for non-route features.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_route: Option<String>,
+    /// CLI command/subcommand name (`codesage`, `composer install`, the
+    /// argv[0]-shape token). `None` for non-CLI features.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_command: Option<String>,
+    pub language: Language,
+    /// Free-form taxonomy tags the mapper attached (`["rust", "cli"]`,
+    /// `["php", "framework:laravel"]`). Sorted, deduped.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub tags: Vec<String>,
+    /// Trust boundaries aggregated across the feature's owned files. Same
+    /// shape as `RiskAssessment.trust_boundaries`; sorted dedupe.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub trust_boundaries: Vec<TrustBoundary>,
+    /// Files attached to the feature with role classification. Always
+    /// non-empty (contains at least the entry).
+    pub files: Vec<FeatureFileRef>,
+}
+
+/// Envelope around `Vec<FeatureRecord>` for the `list_features` and
+/// `find_feature` MCP tools — same `{"results": [...]}` shape
+/// `render_with_kind` produces.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FeatureListResults {
+    pub results: Vec<FeatureRecord>,
+}
+
+/// Returned by `codesage map`. Counts mirror the prior indexing-stats shape.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FeatureMapStats {
+    pub created: usize,
+    pub updated: usize,
+    pub removed: usize,
+    pub total_features: usize,
+}
+
 /// `{"results": [...]}` envelope around `Vec<Symbol>`. Exists only to back the
 /// MCP `outputSchema` for `find_symbol`. The MCP server wraps bare-array
 /// responses into this shape in `render_with_kind` (see commit `dc66de6`);
