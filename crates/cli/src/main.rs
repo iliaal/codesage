@@ -269,6 +269,25 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Curated code bundle for one feature_id: chunks of owned/entry files,
+    /// tests and context as related, plus the entry symbol's definition.
+    /// Same shape as `export` but anchored on the feature's curated file list.
+    FeatureBundle {
+        /// Feature id (e.g. feat_abc123)
+        id: String,
+        /// Include caller chunks for the entry symbol
+        #[arg(long)]
+        include_callers: bool,
+        /// Include callee chunks reached from the entry symbol
+        #[arg(long)]
+        include_callees: bool,
+        /// Max chunks per section (primary, related)
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Snapshot the project's structural state as a session baseline.
     /// Persists to .codesage/sessions/<session-id>.json. Pair with
     /// `session-end` using the same id to detect regressions.
@@ -502,6 +521,13 @@ fn main() -> Result<()> {
         ),
         Commands::FeatureShow { id, json } => cmd_feature_show(&id, json),
         Commands::FeatureFor { file, json } => cmd_feature_for(&file, json),
+        Commands::FeatureBundle {
+            id,
+            include_callers,
+            include_callees,
+            limit,
+            json,
+        } => cmd_feature_bundle(&id, include_callers, include_callees, limit, json),
         Commands::SessionStart { session_id, json } => cmd_session_start(&session_id, json),
         Commands::SessionEnd { session_id, json } => cmd_session_end(&session_id, json),
     }
@@ -1264,6 +1290,58 @@ fn cmd_feature_show(id: &str, json: bool) -> Result<()> {
         for f in &feature.files {
             let reason = f.reason.as_deref().unwrap_or("");
             println!("    {:<8} {} ({reason})", f.role.as_str(), f.path);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_feature_bundle(
+    id: &str,
+    include_callers: bool,
+    include_callees: bool,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
+    let root = find_project_root()?;
+    let db = open_db(&root)?;
+    let bundle = codesage_graph::feature_bundle(&db, id, include_callers, include_callees, limit)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&bundle)?);
+    } else {
+        println!("{}", bundle.target_description);
+        println!("  primary ({}):", bundle.primary.len());
+        for r in &bundle.primary {
+            println!(
+                "    {}:{}-{} ({:.0} chars)",
+                r.file_path,
+                r.start_line,
+                r.end_line,
+                r.content.chars().count()
+            );
+        }
+        if !bundle.related.is_empty() {
+            println!("  related ({}):", bundle.related.len());
+            for r in &bundle.related {
+                println!(
+                    "    {}:{}-{} ({:.0} chars)",
+                    r.file_path,
+                    r.start_line,
+                    r.end_line,
+                    r.content.chars().count()
+                );
+            }
+        }
+        if !bundle.symbol_definitions.is_empty() {
+            println!("  symbols ({}):", bundle.symbol_definitions.len());
+            for s in &bundle.symbol_definitions {
+                println!(
+                    "    {} ({}) @ {}:{}",
+                    s.qualified_name,
+                    s.kind.as_str(),
+                    s.file_path,
+                    s.line_start
+                );
+            }
         }
     }
     Ok(())

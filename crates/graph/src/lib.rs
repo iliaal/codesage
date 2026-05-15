@@ -10,8 +10,8 @@ pub use git_history::{
 };
 pub use index::{full_index, incremental_index};
 pub use query::{
-    export_context, export_context_for_symbol, find_references, find_symbol, impact_analysis,
-    list_dependencies, search,
+    export_context, export_context_for_symbol, feature_bundle, find_references, find_symbol,
+    impact_analysis, list_dependencies, search,
 };
 pub use semantic::{semantic_full_index, semantic_incremental_index};
 pub use session::{session_end, session_start};

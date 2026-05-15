@@ -8,8 +8,8 @@ use codesage_embed::model::Embedder;
 use codesage_embed::reranker::Reranker;
 use codesage_graph::{
     assess_risk, assess_risk_batch, assess_risk_diff, export_context, export_context_for_symbol,
-    find_coupling, find_references, find_symbol, impact_analysis, list_dependencies,
-    recommend_tests, search, session_end, session_start,
+    feature_bundle, find_coupling, find_references, find_symbol, impact_analysis,
+    list_dependencies, recommend_tests, search, session_end, session_start,
 };
 use codesage_protocol::{
     ContextBundle, CouplingReport, DependencyEntry, ExportRequest, FeatureKind, FeatureListResults,
@@ -235,6 +235,27 @@ pub struct FindFeatureParams {
     pub project: String,
     #[schemars(description = "Repo-relative file path to look up")]
     pub file_path: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct FeatureBundleParams {
+    #[schemars(description = PROJECT_ARG_DESC)]
+    pub project: String,
+    #[schemars(
+        description = "Feature id (e.g. feat_abc123) from `list_features` / `find_feature`"
+    )]
+    pub feature_id: String,
+    #[schemars(
+        description = "Include caller chunks for the feature's entry symbol (default false)"
+    )]
+    pub include_callers: Option<bool>,
+    #[schemars(
+        description = "Include callee chunks reached from the feature's entry symbol (default false)"
+    )]
+    pub include_callees: Option<bool>,
+    #[schemars(description = "Max chunks per section (primary, related). Default 5.")]
+    #[serde(default, deserialize_with = "deser_optional_usize")]
+    pub limit: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -915,6 +936,27 @@ impl CodeSageServer {
         render_with_kind(
             self.with_project_db(&params.project, |db| db.features_for_file(&file)),
             "find_feature",
+        )
+    }
+
+    #[tool(
+        name = "feature_bundle",
+        description = "Curated code bundle for one feature_id. Same shape as `export_context` but anchored on the feature's already-resolved file list (entry + owned + tests + context) instead of semantic search results. `primary[]` carries chunks from owned/entry files, `related[]` carries tests and context. Set `include_callers` / `include_callees` to also expand the entry symbol's callers/callees into `related[]` (reuses the symbol graph used by `export_context`). Use after `list_features` / `find_feature` to get all the code an agent needs to review or modify the slice in one MCP call — avoids fan-out Read calls per file. Empty bundle with `target_description` ending `(not found)` means the feature_id doesn't exist; empty bundle with non-empty title means the feature exists but no files have been semantically indexed yet (run `codesage index`).",
+        output_schema = schema_for_type::<ContextBundle>()
+    )]
+    fn feature_bundle_tool(
+        &self,
+        Parameters(params): Parameters<FeatureBundleParams>,
+    ) -> CallToolResult {
+        let feature_id = params.feature_id.clone();
+        let include_callers = params.include_callers.unwrap_or(false);
+        let include_callees = params.include_callees.unwrap_or(false);
+        let limit = params.limit.unwrap_or(5);
+        render_with_kind(
+            self.with_project_db(&params.project, |db| {
+                feature_bundle(db, &feature_id, include_callers, include_callees, limit)
+            }),
+            "feature_bundle",
         )
     }
 

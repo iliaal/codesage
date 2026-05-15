@@ -1248,6 +1248,170 @@ pub fn export_context_for_symbol(
     })
 }
 
+/// Build a curated [`ContextBundle`] for one feature_id. Composes the
+/// feature's already-curated file list (entry + owned + tests + context)
+/// with the existing chunk store and symbol graph, so an agent doesn't
+/// have to fan out per-file `Read` calls after `find_feature` / `list_features`.
+///
+/// Layout:
+/// - `primary[]` — chunks from owned + entry files, capped at `limit`.
+/// - `related[]` — chunks from tests first, then context files. Caller/
+///   callee expansion of the entry symbol (when `include_callers` /
+///   `include_callees` is set and the feature has a real entry symbol)
+///   joins this list, capped by `limit`.
+/// - `symbol_definitions[]` — entry-symbol definition (when present) +
+///   any symbol definitions discovered while building primary chunks.
+/// - `target_description` — `"feature: <title> (<feature_id>)"`.
+///
+/// When the feature_id doesn't resolve, returns an empty bundle with a
+/// `not found` marker in `target_description` (mirrors
+/// `export_context_for_symbol`'s missing-symbol behavior).
+pub fn feature_bundle(
+    db: &Database,
+    feature_id: &str,
+    include_callers: bool,
+    include_callees: bool,
+    limit: usize,
+) -> Result<ContextBundle> {
+    use codesage_protocol::FeatureFileRole;
+    let limit = if limit == 0 { 5 } else { limit };
+
+    let feature = match db.load_feature(feature_id)? {
+        Some(f) => f,
+        None => {
+            return Ok(ContextBundle {
+                target_description: format!("feature: {feature_id} (not found)"),
+                primary: Vec::new(),
+                related: Vec::new(),
+                symbol_definitions: Vec::new(),
+            });
+        }
+    };
+
+    let mut primary: Vec<SearchResult> = Vec::new();
+    let mut primary_keys: HashSet<(String, u32)> = HashSet::new();
+    // Entry first so it's the first chunk in primary order.
+    for f in feature
+        .files
+        .iter()
+        .filter(|f| matches!(f.role, FeatureFileRole::Entry | FeatureFileRole::Owned))
+    {
+        if primary.len() >= limit {
+            break;
+        }
+        add_first_chunk_of_file(db, &f.path, &mut primary, &mut primary_keys)?;
+    }
+
+    let mut related: Vec<SearchResult> = Vec::new();
+    let mut related_keys: HashSet<(String, u32)> = primary_keys.clone();
+    // Tests next (run-this-after-review signal), then context.
+    for role in [FeatureFileRole::Test, FeatureFileRole::Context] {
+        for f in feature.files.iter().filter(|f| f.role == role) {
+            if related.len() >= limit {
+                break;
+            }
+            add_first_chunk_of_file(db, &f.path, &mut related, &mut related_keys)?;
+        }
+        if related.len() >= limit {
+            break;
+        }
+    }
+
+    // Symbol definitions: entry symbol (if any) + symbols overlapping the
+    // primary chunks (annotated already by add_first_chunk_of_file).
+    // Filter entry-symbol matches to definitions that live in the
+    // feature's entry file when possible — `main` is a common-enough
+    // name that an unqualified lookup pulls in unrelated definitions
+    // (e.g. Python `if __name__ == "__main__"` modules share the same
+    // entry_symbol = "main" string as Rust binaries).
+    let mut symbol_definitions: Vec<Symbol> = Vec::new();
+    let mut seen_sym: HashSet<String> = HashSet::new();
+    if let Some(entry_sym) = &feature.entry_symbol {
+        let all_defs = db.find_symbols(entry_sym, None)?;
+        let in_entry_file: Vec<Symbol> = all_defs
+            .iter()
+            .filter(|d| d.file_path == feature.entry_path)
+            .cloned()
+            .collect();
+        let preferred = if in_entry_file.is_empty() {
+            all_defs
+        } else {
+            in_entry_file
+        };
+        for def in preferred {
+            if seen_sym.insert(def.qualified_name.clone()) {
+                symbol_definitions.push(def);
+            }
+        }
+    }
+    for r in &primary {
+        for sum in &r.symbols {
+            if !seen_sym.insert(sum.qualified_name.clone()) {
+                continue;
+            }
+            if let Some(d) = find_definition_for_summary(db, sum, &r.file_path)? {
+                symbol_definitions.push(d);
+            }
+        }
+    }
+
+    // Caller/callee expansion of the entry symbol when requested.
+    if (include_callers || include_callees) && !symbol_definitions.is_empty() {
+        // Use the entry symbol's definition(s) as the anchor — limited to
+        // the first few so the bundle stays bounded.
+        let anchors: Vec<Symbol> = symbol_definitions.iter().take(3).cloned().collect();
+        add_related_for_symbols(
+            db,
+            &anchors,
+            include_callers,
+            include_callees,
+            limit,
+            &mut related,
+            &mut related_keys,
+        )?;
+    }
+
+    Ok(ContextBundle {
+        target_description: format!("feature: {} ({})", feature.title, feature.feature_id),
+        primary,
+        related,
+        symbol_definitions,
+    })
+}
+
+/// Insert the first chunk of `file_path` into `out` (deduped by
+/// `(path, start_line)`). Skips files that haven't been semantically
+/// indexed yet — their chunks just don't exist. Used by `feature_bundle`
+/// where we always want a deterministic per-file entry, not best-match
+/// search semantics.
+fn add_first_chunk_of_file(
+    db: &Database,
+    file_path: &str,
+    out: &mut Vec<SearchResult>,
+    seen: &mut HashSet<(String, u32)>,
+) -> Result<()> {
+    let chunks = db.chunks_for_file(file_path)?;
+    let Some(c) = chunks.into_iter().min_by_key(|c| c.start_line) else {
+        return Ok(());
+    };
+    let key = (c.file_path.clone(), c.start_line);
+    if !seen.insert(key) {
+        return Ok(());
+    }
+    let mut result = SearchResult {
+        file_path: c.file_path,
+        language: parse_db_language(&c.language),
+        content: c.content,
+        start_line: c.start_line,
+        end_line: c.end_line,
+        score: 0.0,
+        symbols: Vec::new(),
+    };
+    annotate_with_symbols(db, std::slice::from_mut(&mut result))?;
+    out.push(result);
+    Ok(())
+}
+
 fn add_related_for_symbols(
     db: &Database,
     symbols: &[Symbol],
