@@ -8,6 +8,10 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps stay backwar
 
 ## [Unreleased]
 
+### Added
+
+- Every MCP tool now advertises an `outputSchema` (MCP spec field). Tool definitions in `crates/cli/src/mcp.rs` pass `output_schema = schema_for_type::<T>()` to the `#[tool(...)]` macro; protocol return types (`Symbol`, `Reference`, `SearchResult`, `DependencyEntry`, `ImpactEntry`, `ContextBundle`, `CouplingReport`, `RiskAssessment`, `RiskDiffAssessment`, `RiskBatchAssessment`, `TestRecommendations`, `SessionSnapshot`, `SessionDiff`, and their nested types) derive `schemars::JsonSchema`. Schema derives respect existing `#[serde(rename_all = "lowercase")]` attributes automatically. Three explicit wrapper structs (`FindSymbolResults`, `FindReferencesResults`, `SearchResults`, `ImpactAnalysisResults`) describe the `{"results": [...]}` envelope that `render_with_kind` produces for the four tools whose graph functions return bare arrays — agents see the wrapped shape, so the schema must too. A new `every_tool_advertises_an_output_schema` test asserts every router tool carries a valid object-shaped schema; catches the regression where a tool ships without one and agents have to guess the response shape.
+
 ## [0.6.0] - 2026-05-09
 
 ### Changed

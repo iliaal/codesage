@@ -341,6 +341,7 @@ dependencies = [
 name = "codesage-protocol"
 version = "0.6.0"
 dependencies = [
+ "schemars",
  "serde",
  "serde_json",
 ]

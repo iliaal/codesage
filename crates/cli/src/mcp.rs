@@ -12,14 +12,17 @@ use codesage_graph::{
     recommend_tests, search, session_end, session_start,
 };
 use codesage_protocol::{
-    ExportRequest, FindReferencesRequest, FindSymbolRequest, ImpactRequest, ImpactTarget, Language,
-    ReferenceKind, SearchRequest, SymbolKind,
+    ContextBundle, CouplingReport, DependencyEntry, ExportRequest, FindReferencesRequest,
+    FindReferencesResults, FindSymbolRequest, FindSymbolResults, ImpactAnalysisResults,
+    ImpactRequest, ImpactTarget, Language, ReferenceKind, RiskAssessment, RiskBatchAssessment,
+    RiskDiffAssessment, SearchRequest, SearchResults, SessionDiff, SessionSnapshot, SymbolKind,
+    TestRecommendations,
 };
 use codesage_storage::Database;
 use parking_lot::Mutex;
 use rmcp::{
     ServerHandler, ServiceExt,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::{router::tool::ToolRouter, tool::schema_for_type, wrapper::Parameters},
     model::{CallToolResult, Content, ServerInfo},
     schemars, tool, tool_handler, tool_router,
 };
@@ -633,7 +636,8 @@ impl ServerHandler for CodeSageServer {
 impl CodeSageServer {
     #[tool(
         name = "find_symbol",
-        description = "Find symbol definitions (functions, classes, methods, structs, traits, enums) by name. Returns exact file path, line number, and kind. **Prefer this over Grep/ripgrep for any code-identifier lookup** — one call returns the definition, while grepping for a function name often produces many false hits (call sites, comments, other namespaces) that cost extra Read calls to disambiguate. Use partial names for broad search or qualified names ('MyClass\\\\method' for PHP, 'MyClass.method' for Python) for exact match. When present, `rationale[]` carries `WHY:` / `NOTE:` / `IMPORTANT:` / `FIXME:` / `HACK:` / `XXX:` / `TODO:` comments attached to the definition — read these before refactoring or renaming so the agent doesn't drop a constraint the author wrote down. Currently extracted for Rust only."
+        description = "Find symbol definitions (functions, classes, methods, structs, traits, enums) by name. Returns exact file path, line number, and kind. **Prefer this over Grep/ripgrep for any code-identifier lookup** — one call returns the definition, while grepping for a function name often produces many false hits (call sites, comments, other namespaces) that cost extra Read calls to disambiguate. Use partial names for broad search or qualified names ('MyClass\\\\method' for PHP, 'MyClass.method' for Python) for exact match. When present, `rationale[]` carries `WHY:` / `NOTE:` / `IMPORTANT:` / `FIXME:` / `HACK:` / `XXX:` / `TODO:` comments attached to the definition — read these before refactoring or renaming so the agent doesn't drop a constraint the author wrote down. Currently extracted for Rust only.",
+        output_schema = schema_for_type::<FindSymbolResults>()
     )]
     fn find_symbol_tool(&self, Parameters(params): Parameters<FindSymbolParams>) -> CallToolResult {
         let kind = params.kind.as_deref().and_then(SymbolKind::parse);
@@ -649,7 +653,8 @@ impl CodeSageServer {
 
     #[tool(
         name = "find_references",
-        description = "Find all references to a symbol across the codebase. **Prefer this over Grep for 'where is X called / imported / instantiated?'** — returns structured {file, line, kind} rows with the reference type (call/import/inheritance/instantiation/type_hint) already classified, instead of raw grep hits that mix definitions, comments, and string literals together."
+        description = "Find all references to a symbol across the codebase. **Prefer this over Grep for 'where is X called / imported / instantiated?'** — returns structured {file, line, kind} rows with the reference type (call/import/inheritance/instantiation/type_hint) already classified, instead of raw grep hits that mix definitions, comments, and string literals together.",
+        output_schema = schema_for_type::<FindReferencesResults>()
     )]
     fn find_references_tool(
         &self,
@@ -668,7 +673,8 @@ impl CodeSageServer {
 
     #[tool(
         name = "list_dependencies",
-        description = "List import/include dependencies for a file. Shows what the file imports and which other files import it."
+        description = "List import/include dependencies for a file. Shows what the file imports and which other files import it.",
+        output_schema = schema_for_type::<DependencyEntry>()
     )]
     fn list_dependencies_tool(
         &self,
@@ -684,7 +690,8 @@ impl CodeSageServer {
 
     #[tool(
         name = "search",
-        description = "Semantic code search (embedding-based + cross-encoder reranking). **Prefer this over Grep when you don't know the exact symbol name** — useful for queries like 'where is auth handled', 'error handling in the session pipeline', 'database connection pooling', 'where do we validate inputs'. Grep needs the literal token already; `search` lets the agent ask by intent. For exact identifier lookups with a known name, use `find_symbol` or `find_references` instead."
+        description = "Semantic code search (embedding-based + cross-encoder reranking). **Prefer this over Grep when you don't know the exact symbol name** — useful for queries like 'where is auth handled', 'error handling in the session pipeline', 'database connection pooling', 'where do we validate inputs'. Grep needs the literal token already; `search` lets the agent ask by intent. For exact identifier lookups with a known name, use `find_symbol` or `find_references` instead.",
+        output_schema = schema_for_type::<SearchResults>()
     )]
     fn search_tool(&self, Parameters(params): Parameters<SearchParams>) -> CallToolResult {
         let languages = params
@@ -707,7 +714,8 @@ impl CodeSageServer {
 
     #[tool(
         name = "impact_analysis",
-        description = "Estimate which files are affected by changing a symbol or file. Walks the reference graph up to `depth` hops, reports affected files ranked by distance and reference count. Use before making changes to understand blast radius."
+        description = "Estimate which files are affected by changing a symbol or file. Walks the reference graph up to `depth` hops, reports affected files ranked by distance and reference count. Use before making changes to understand blast radius.",
+        output_schema = schema_for_type::<ImpactAnalysisResults>()
     )]
     fn impact_analysis_tool(&self, Parameters(params): Parameters<ImpactParams>) -> CallToolResult {
         let req = ImpactRequest {
@@ -723,7 +731,8 @@ impl CodeSageServer {
 
     #[tool(
         name = "export_context",
-        description = "Build a curated context bundle for a query or symbol. Combines semantic search results, overlapping symbol definitions, and optionally caller/callee code. Output is a structured bundle ready for LLM consumption. Symbol entries inside the bundle carry `rationale[]` when the author left `WHY:` / `NOTE:` / `IMPORTANT:` / `FIXME:` / `HACK:` / `XXX:` / `TODO:` comments — preserve these in any synthesis the agent performs from the bundle. Currently extracted for Rust only."
+        description = "Build a curated context bundle for a query or symbol. Combines semantic search results, overlapping symbol definitions, and optionally caller/callee code. Output is a structured bundle ready for LLM consumption. Symbol entries inside the bundle carry `rationale[]` when the author left `WHY:` / `NOTE:` / `IMPORTANT:` / `FIXME:` / `HACK:` / `XXX:` / `TODO:` comments — preserve these in any synthesis the agent performs from the bundle. Currently extracted for Rust only.",
+        output_schema = schema_for_type::<ContextBundle>()
     )]
     fn export_context_tool(
         &self,
@@ -754,7 +763,8 @@ impl CodeSageServer {
 
     #[tool(
         name = "find_coupling",
-        description = "Files that historically change together with the given file, ranked by exponentially-decayed weight (τ=180d). Backed by git history. Use when planning a change to know which OTHER files (especially tests) tend to need updates too. Response is `{coupled: [...], file_indexed: bool, file_commits: u32, note?: string}` — read `coupled` for the ranked list. When `coupled` is empty, `note` disambiguates: file never indexed vs. file has history but no pair above the min-count=3 threshold vs. path shape mismatch. Index into `.coupled`, not the response directly."
+        description = "Files that historically change together with the given file, ranked by exponentially-decayed weight (τ=180d). Backed by git history. Use when planning a change to know which OTHER files (especially tests) tend to need updates too. Response is `{coupled: [...], file_indexed: bool, file_commits: u32, note?: string}` — read `coupled` for the ranked list. When `coupled` is empty, `note` disambiguates: file never indexed vs. file has history but no pair above the min-count=3 threshold vs. path shape mismatch. Index into `.coupled`, not the response directly.",
+        output_schema = schema_for_type::<CouplingReport>()
     )]
     fn find_coupling_tool(&self, Parameters(params): Parameters<CouplingParams>) -> CallToolResult {
         let limit = params.limit.unwrap_or(10);
@@ -767,7 +777,8 @@ impl CodeSageServer {
 
     #[tool(
         name = "assess_risk",
-        description = "Risk score for changing a file: combines churn percentile, fix ratio, blast radius (depth-2 reverse deps), historical coupling, a test-gap signal, and import-cycle membership. Response carries `in_cycle` / `cycle_size` / `cycle_files` so the agent can name the other members of the cycle. Output includes the decomposition and human-readable notes you can quote in PR descriptions or risk callouts. Use BEFORE writing a patch to calibrate caution and BEFORE submitting to flag concerns."
+        description = "Risk score for changing a file: combines churn percentile, fix ratio, blast radius (depth-2 reverse deps), historical coupling, a test-gap signal, and import-cycle membership. Response carries `in_cycle` / `cycle_size` / `cycle_files` so the agent can name the other members of the cycle. Output includes the decomposition and human-readable notes you can quote in PR descriptions or risk callouts. Use BEFORE writing a patch to calibrate caution and BEFORE submitting to flag concerns.",
+        output_schema = schema_for_type::<RiskAssessment>()
     )]
     fn assess_risk_tool(&self, Parameters(params): Parameters<RiskParams>) -> CallToolResult {
         let file_path = params.file_path.clone();
@@ -779,7 +790,8 @@ impl CodeSageServer {
 
     #[tool(
         name = "assess_risk_diff",
-        description = "Aggregate risk for a SET of files (the file list of a patch or PR). Returns per-file decomposition plus rollups: max_score, mean_score, max_risk_file, and lists of files in each risk category (test_gap, hotspot, fix-heavy, wide blast radius). Use BEFORE submitting a patch: if max_score is high or any test_gap_files exist, add tests, split the patch, or flag concerns. summary_notes are paste-ready for a PR description. On large patches that touch ≥5 files from one directory, per-file entries for that directory move from `files` into a `clustered_directories[]` entry (top-3 by score preserved in detail, rest by name); rollup arrays still list every clustered file by name, so cross-referencing still works. `cycles_touching_patch[]` lists import cycles (files that mutually depend via import/include/inheritance/trait_use) that include at least one patch file, each with `members`, `size`, and `max_churn_file` (best refactor target). Honest caveat: we can't distinguish cycles the patch introduced from cycles that already existed; phrase PR feedback as 'this patch touches an existing cycle' unless you've verified the base branch."
+        description = "Aggregate risk for a SET of files (the file list of a patch or PR). Returns per-file decomposition plus rollups: max_score, mean_score, max_risk_file, and lists of files in each risk category (test_gap, hotspot, fix-heavy, wide blast radius). Use BEFORE submitting a patch: if max_score is high or any test_gap_files exist, add tests, split the patch, or flag concerns. summary_notes are paste-ready for a PR description. On large patches that touch ≥5 files from one directory, per-file entries for that directory move from `files` into a `clustered_directories[]` entry (top-3 by score preserved in detail, rest by name); rollup arrays still list every clustered file by name, so cross-referencing still works. `cycles_touching_patch[]` lists import cycles (files that mutually depend via import/include/inheritance/trait_use) that include at least one patch file, each with `members`, `size`, and `max_churn_file` (best refactor target). Honest caveat: we can't distinguish cycles the patch introduced from cycles that already existed; phrase PR feedback as 'this patch touches an existing cycle' unless you've verified the base branch.",
+        output_schema = schema_for_type::<RiskDiffAssessment>()
     )]
     fn assess_risk_diff_tool(
         &self,
@@ -794,7 +806,8 @@ impl CodeSageServer {
 
     #[tool(
         name = "assess_risk_batch",
-        description = "Risk score for EACH of N files, returned per-file with no patch-level aggregation. Use when you have a list of files (impact analysis output, coupling neighbours, the files of a feature you're touching one-by-one) and want each individual score — cuts the per-file MCP round-trip overhead vs calling `assess_risk` N times. Each entry is a full RiskAssessment with the same shape as `assess_risk`. The response also includes a top-level `_legend` short-code map: when ≥3 files in the batch share a categorical note (test-gap, no-git-history), per-file `notes[]` entries are aliased to short codes (e.g. `\"T\"`, `\"NG\"`) and the legend resolves them. For patch-level aggregation (max/mean, hotspot/test-gap rollups, cycles), use `assess_risk_diff` instead — they answer different questions."
+        description = "Risk score for EACH of N files, returned per-file with no patch-level aggregation. Use when you have a list of files (impact analysis output, coupling neighbours, the files of a feature you're touching one-by-one) and want each individual score — cuts the per-file MCP round-trip overhead vs calling `assess_risk` N times. Each entry is a full RiskAssessment with the same shape as `assess_risk`. The response also includes a top-level `_legend` short-code map: when ≥3 files in the batch share a categorical note (test-gap, no-git-history), per-file `notes[]` entries are aliased to short codes (e.g. `\"T\"`, `\"NG\"`) and the legend resolves them. For patch-level aggregation (max/mean, hotspot/test-gap rollups, cycles), use `assess_risk_diff` instead — they answer different questions.",
+        output_schema = schema_for_type::<RiskBatchAssessment>()
     )]
     fn assess_risk_batch_tool(
         &self,
@@ -809,7 +822,8 @@ impl CodeSageServer {
 
     #[tool(
         name = "recommend_tests",
-        description = "Tests an agent should run after editing the given files. Returns `primary` (sibling tests resolved by language convention — FooTest.php, foo.test.ts, test_foo.py, foo_test.go — high confidence, always run these) and `coupled` (tests that historically change with the input files via git co-change history — medium confidence, catches integration tests that don't follow naming conventions). Empty result means no test files in the index for these paths. Use AFTER making a change to know which subset of tests to actually run."
+        description = "Tests an agent should run after editing the given files. Returns `primary` (sibling tests resolved by language convention — FooTest.php, foo.test.ts, test_foo.py, foo_test.go — high confidence, always run these) and `coupled` (tests that historically change with the input files via git co-change history — medium confidence, catches integration tests that don't follow naming conventions). Empty result means no test files in the index for these paths. Use AFTER making a change to know which subset of tests to actually run.",
+        output_schema = schema_for_type::<TestRecommendations>()
     )]
     fn recommend_tests_tool(
         &self,
@@ -824,7 +838,8 @@ impl CodeSageServer {
 
     #[tool(
         name = "session_start",
-        description = "Snapshot the project's structural state at the START of an editing session. Persists file count, symbol count, the full file list, all import cycles, and the top-50 highest-risk files (with their scores) to `.codesage/sessions/<session_id>.json`. Pair with `session_end` using the same `session_id` to detect new cycles, removed/added files, or risk regressions on hot files introduced during the session. `session_id` defaults to \"default\" — use a distinct id when running multiple parallel sessions. Re-running `session_start` overwrites the snapshot (useful for resetting a baseline mid-session)."
+        description = "Snapshot the project's structural state at the START of an editing session. Persists file count, symbol count, the full file list, all import cycles, and the top-50 highest-risk files (with their scores) to `.codesage/sessions/<session_id>.json`. Pair with `session_end` using the same `session_id` to detect new cycles, removed/added files, or risk regressions on hot files introduced during the session. `session_id` defaults to \"default\" — use a distinct id when running multiple parallel sessions. Re-running `session_start` overwrites the snapshot (useful for resetting a baseline mid-session).",
+        output_schema = schema_for_type::<SessionSnapshot>()
     )]
     fn session_start_tool(&self, Parameters(params): Parameters<SessionParams>) -> CallToolResult {
         let session_id = params
@@ -841,7 +856,8 @@ impl CodeSageServer {
 
     #[tool(
         name = "session_end",
-        description = "Diff the current structural state against the snapshot saved by `session_start` (matched by `session_id`, default \"default\"). Returns `pass: bool` (true when no new import cycles were introduced AND no top-risk file regressed by ≥ 0.10), plus `new_cycles`, `resolved_cycles`, `risk_regressions` (per-file before/after/delta), `new_files`, `removed_files`, and `summary_notes` ready to paste into a PR description. Errors when the snapshot file is missing — call `session_start` first. Snapshot file is left in place after the diff so the same id can be re-diffed."
+        description = "Diff the current structural state against the snapshot saved by `session_start` (matched by `session_id`, default \"default\"). Returns `pass: bool` (true when no new import cycles were introduced AND no top-risk file regressed by ≥ 0.10), plus `new_cycles`, `resolved_cycles`, `risk_regressions` (per-file before/after/delta), `new_files`, `removed_files`, and `summary_notes` ready to paste into a PR description. Errors when the snapshot file is missing — call `session_start` first. Snapshot file is left in place after the diff so the same id can be re-diffed.",
+        output_schema = schema_for_type::<SessionDiff>()
     )]
     fn session_end_tool(&self, Parameters(params): Parameters<SessionParams>) -> CallToolResult {
         let session_id = params
@@ -1289,5 +1305,39 @@ mod tests {
         let result = render_with_kind(r, "find_symbol");
         assert_eq!(result.is_error, Some(true));
         assert!(result.structured_content.is_none());
+    }
+
+    /// Every registered MCP tool must carry a valid output schema. Catches
+    /// the regression where a tool ships without `output_schema = ...` (then
+    /// agents have to guess the response shape) and where the schema's root
+    /// is not a JSON object (which the MCP spec requires; rmcp rejects it
+    /// at registration time but the assertion here makes the contract
+    /// explicit in test output).
+    #[test]
+    fn every_tool_advertises_an_output_schema() {
+        let server = CodeSageServer::new();
+        let tools = server.tool_router.list_all();
+        assert!(!tools.is_empty(), "router should expose at least one tool");
+        for tool in &tools {
+            let schema = tool
+                .output_schema
+                .as_ref()
+                .unwrap_or_else(|| panic!("tool `{}` is missing output_schema", tool.name));
+            let root_type = schema.get("type").and_then(|v| v.as_str());
+            assert_eq!(
+                root_type,
+                Some("object"),
+                "tool `{}` output schema root must be `object`, got {:?}",
+                tool.name,
+                root_type
+            );
+            assert!(
+                schema.contains_key("properties")
+                    || schema.contains_key("$ref")
+                    || schema.contains_key("$defs"),
+                "tool `{}` output schema has no properties/$ref/$defs",
+                tool.name
+            );
+        }
     }
 }

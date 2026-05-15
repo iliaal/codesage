@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_EMBEDDING_DIM: usize = 384;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Language {
     Php,
@@ -54,7 +54,7 @@ impl std::fmt::Display for Language {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SymbolKind {
     Function,
@@ -111,14 +111,14 @@ impl std::fmt::Display for SymbolKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FileInfo {
     pub path: String,
     pub language: Language,
     pub content_hash: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Symbol {
     pub name: String,
     pub qualified_name: String,
@@ -150,7 +150,7 @@ pub struct Symbol {
 
 /// Marker class for a rationale comment. Lower-case JSON for stable
 /// agent-facing strings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum RationaleKind {
     Why,
@@ -194,7 +194,7 @@ impl RationaleKind {
 /// A single rationale comment attached to a symbol. `text` has the marker
 /// stripped and is trimmed; `line_start`/`line_end` are the comment's
 /// span in the source file (1-based, matching `Symbol`'s convention).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RationaleEntry {
     pub kind: RationaleKind,
     pub text: String,
@@ -202,7 +202,7 @@ pub struct RationaleEntry {
     pub line_end: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ReferenceKind {
     Import,
@@ -247,7 +247,7 @@ impl std::fmt::Display for ReferenceKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Reference {
     pub from_file: String,
     pub from_symbol: Option<String>,
@@ -257,26 +257,26 @@ pub struct Reference {
     pub col: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FindSymbolRequest {
     pub name: String,
     pub kind: Option<SymbolKind>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FindReferencesRequest {
     pub symbol_name: String,
     pub kind: Option<ReferenceKind>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DependencyEntry {
     pub file_path: String,
     pub imports: Vec<String>,
     pub imported_by: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct IndexStats {
     pub files_indexed: usize,
     pub files_skipped: usize,
@@ -285,7 +285,7 @@ pub struct IndexStats {
     pub references_found: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Chunk {
     pub text: String,
     pub start_line: u32,
@@ -294,7 +294,7 @@ pub struct Chunk {
     pub end_byte: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SearchRequest {
     pub query: String,
     pub limit: Option<usize>,
@@ -303,7 +303,7 @@ pub struct SearchRequest {
     pub paths: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SearchResult {
     pub file_path: String,
     pub language: Language,
@@ -315,14 +315,14 @@ pub struct SearchResult {
     pub symbols: Vec<SymbolSummary>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SymbolSummary {
     pub name: String,
     pub qualified_name: String,
     pub kind: SymbolKind,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SemanticIndexStats {
     pub files_processed: usize,
     pub files_skipped: usize,
@@ -330,7 +330,7 @@ pub struct SemanticIndexStats {
     pub chunks_created: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum FileCategory {
     Source,
@@ -382,7 +382,7 @@ impl FileCategory {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ImpactTarget {
     Symbol { name: String },
@@ -444,7 +444,7 @@ fn looks_like_file_target(target: &str) -> bool {
     )
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ImpactRequest {
     pub target: ImpactTarget,
     #[serde(default = "default_impact_depth")]
@@ -457,14 +457,14 @@ fn default_impact_depth() -> usize {
     2
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ImpactReason {
     pub via_symbol: String,
     pub kind: ReferenceKind,
     pub line: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ImpactEntry {
     pub file_path: String,
     pub distance: u32,
@@ -472,7 +472,7 @@ pub struct ImpactEntry {
     pub reasons: Vec<ImpactReason>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExportRequest {
     pub query: Option<String>,
     pub symbol: Option<String>,
@@ -518,7 +518,7 @@ fn default_export_limit() -> usize {
     5
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ContextBundle {
     pub target_description: String,
     pub primary: Vec<SearchResult>,
@@ -529,7 +529,7 @@ pub struct ContextBundle {
 }
 
 /// One co-changing file pair, ranked by exponentially-decayed weight.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CoChangeEntry {
     pub file: String,
     pub weight: f64,
@@ -550,7 +550,7 @@ pub struct CoChangeEntry {
 /// Non-empty `coupled` responses still include the indexed-state fields so an
 /// agent can distinguish a thin result (`coupled.len() < limit`) from a full
 /// one.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CouplingReport {
     pub coupled: Vec<CoChangeEntry>,
     /// True when the file has at least one row in `git_files`.
@@ -564,7 +564,7 @@ pub struct CouplingReport {
 
 /// Risk decomposition for a file. Score is the weighted sum; components let the agent
 /// see WHY a file is risky, not just the magnitude.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RiskAssessment {
     pub file: String,
     pub score: f64,
@@ -603,7 +603,7 @@ pub struct RiskAssessment {
 /// Aggregate risk for a set of files (typically the file list of a patch or PR).
 /// Lets an agent ask one question — "how risky is this change?" — instead of
 /// per-file round-trips and manual aggregation.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RiskDiffAssessment {
     /// Per-file decomposition. Same shape as a single `assess_risk` call.
     pub files: Vec<RiskAssessment>,
@@ -678,7 +678,7 @@ pub struct RiskDiffAssessment {
 /// agent wants "is this patch risky as a whole?", use `assess_risk_diff`
 /// instead. If it wants "give me each of these files' scores", use
 /// `assess_risk_batch`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RiskBatchAssessment {
     /// Per-file decomposition, in the order of the request's `file_paths`.
     /// One [`RiskAssessment`] per input path. Ordering preserved so the
@@ -710,7 +710,7 @@ pub struct RiskBatchAssessment {
 /// are pre-existing. Agents should frame PR guidance as "this patch
 /// touches an existing cycle" unless they can confirm the cycle didn't
 /// exist on the base branch.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CycleEntry {
     pub members: Vec<String>,
     pub size: u32,
@@ -720,7 +720,7 @@ pub struct CycleEntry {
 
 /// A directory that contributed ≥5 files to a patch. The top-3 files by
 /// risk score are detailed; the rest are listed by name.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ClusteredDirectory {
     pub directory: String,
     pub count: u32,
@@ -732,7 +732,7 @@ pub struct ClusteredDirectory {
 }
 
 /// A test file recommended for a change, with the reason it was suggested.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CoupledTestEntry {
     pub file: String,
     pub weight: f64,
@@ -745,7 +745,7 @@ pub struct CoupledTestEntry {
 /// Tests an agent should run after editing a set of files. Splits into
 /// sibling-convention matches (high confidence) and historical co-change
 /// (medium confidence; surfaces tests that other test heuristics miss).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TestRecommendations {
     /// Sibling tests resolved by language conventions (FooTest.php,
     /// foo.test.ts, test_foo.py, foo_test.go). Always run these.
@@ -762,7 +762,7 @@ pub struct TestRecommendations {
 /// One file in `SessionSnapshot.top_risk_files`. Captured at session start
 /// so `session_end` can compute per-file risk-score deltas without needing
 /// to re-derive the snapshot's risk inputs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SessionRiskEntry {
     pub file: String,
     pub score: f64,
@@ -773,7 +773,7 @@ pub struct SessionRiskEntry {
 /// matching `session_end` call to compute a `SessionDiff`. The snapshot is
 /// intentionally compact (no per-symbol detail) so even large monorepos
 /// produce ≤ a few MB per session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SessionSnapshot {
     pub session_id: String,
     /// Unix epoch seconds.
@@ -802,7 +802,7 @@ pub struct SessionSnapshot {
 /// Per-file risk regression observed between `session_start` and `session_end`.
 /// Only emitted for files that appeared in `SessionSnapshot.top_risk_files`
 /// (the baseline set) and whose risk score went up by at least 0.05.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SessionRiskRegression {
     pub file: String,
     pub before: f64,
@@ -815,7 +815,7 @@ pub struct SessionRiskRegression {
 /// agent that calls session_start before edits and session_end after sees
 /// `pass=false` when its work introduced cycles or regressed top-risk
 /// files materially.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SessionDiff {
     pub session_id: String,
     /// Wall-clock seconds between snapshot creation and diff computation.
@@ -859,11 +859,38 @@ pub struct SessionDiff {
 }
 
 /// Stats from a git history indexing pass. Mirrors IndexStats shape.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GitIndexStats {
     pub commits_scanned: usize,
     pub files_tracked: usize,
     pub co_change_pairs: usize,
+}
+
+/// `{"results": [...]}` envelope around `Vec<Symbol>`. Exists only to back the
+/// MCP `outputSchema` for `find_symbol`. The MCP server wraps bare-array
+/// responses into this shape in `render_with_kind` (see commit `dc66de6`);
+/// the schema simply describes what the agent actually receives.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FindSymbolResults {
+    pub results: Vec<Symbol>,
+}
+
+/// `{"results": [...]}` envelope around `Vec<Reference>`. See [`FindSymbolResults`].
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FindReferencesResults {
+    pub results: Vec<Reference>,
+}
+
+/// `{"results": [...]}` envelope around `Vec<SearchResult>`. See [`FindSymbolResults`].
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SearchResults {
+    pub results: Vec<SearchResult>,
+}
+
+/// `{"results": [...]}` envelope around `Vec<ImpactEntry>`. See [`FindSymbolResults`].
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ImpactAnalysisResults {
+    pub results: Vec<ImpactEntry>,
 }
 
 #[cfg(test)]
