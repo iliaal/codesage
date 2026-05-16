@@ -17,7 +17,6 @@
 //! intentionally NOT ported per the LLM-utility filter — browse-only rows
 //! dilute `list_features` without unlocking a new agent action.
 
-use std::collections::BTreeSet;
 use std::fs;
 
 use anyhow::Result;
@@ -85,34 +84,28 @@ fn read_pyproject(root: &std::path::Path) -> Option<String> {
     fs::read_to_string(&path).ok()
 }
 
-/// Detect the project's test driver. Priority order matches what most
-/// Python toolchains install in practice: uv → poetry → pdm → hatch → bare
-/// pytest. The lockfile probe alone is a strong signal; a `[tool.uv]` /
-/// `[tool.poetry]` / `[tool.pdm]` / `[tool.hatch]` section in pyproject.toml
-/// is a secondary probe for projects that publish the manifest without the
-/// lockfile (common for libraries).
+/// Detect the project's test driver. Priority order: uv → poetry → pdm →
+/// hatch → bare pytest, keyed off the **lockfile** only. A `[tool.X]`
+/// section in `pyproject.toml` was previously also accepted but produced
+/// false positives — projects that declare uv/poetry/pdm metadata in
+/// pyproject for dev-dep management while still running `pytest` directly.
+/// The lockfile is the higher-precision signal (the team committed to that
+/// driver). When no lockfile exists, return bare `pytest` so an agent gets
+/// a runnable command rather than nothing.
 fn detect_python_test_command(root: &std::path::Path, pyproject: Option<&str>) -> Option<String> {
     let probe_lock = |name: &str| -> bool { is_safe_file(root, &root.join(name)) };
-    let has_tool = |section: &str| -> bool {
-        let Some(raw) = pyproject else { return false };
-        let body = strip_line_comments(raw, '#');
-        body.lines().any(|l| l.trim_start().starts_with(section))
-    };
-    if probe_lock("uv.lock") || has_tool("[tool.uv]") {
+    if probe_lock("uv.lock") {
         return Some("uv run pytest".to_string());
     }
-    if probe_lock("poetry.lock") || has_tool("[tool.poetry]") {
+    if probe_lock("poetry.lock") {
         return Some("poetry run pytest".to_string());
     }
-    if probe_lock("pdm.lock") || has_tool("[tool.pdm]") {
+    if probe_lock("pdm.lock") {
         return Some("pdm run pytest".to_string());
     }
-    if has_tool("[tool.hatch]") {
-        return Some("hatch run pytest".to_string());
-    }
-    // Bare pytest is the only fallback worth emitting. If the project has
-    // no pyproject/setup.py and no tests dir, the test-suite mapper returns
-    // no seeds anyway, so this string only surfaces on real Python projects.
+    // No hatch.lock convention exists; hatch is purely lockfile-less, so we
+    // don't have a precise way to detect it post-CR-005. Fall through to
+    // bare `pytest` for hatch users — still runnable in the hatch shell.
     if pyproject.is_some()
         || is_safe_file(root, &root.join("setup.py"))
         || is_safe_file(root, &root.join("setup.cfg"))
@@ -161,13 +154,15 @@ fn python_project_seed(
             });
         }
     }
-    let tests = match test_cmd {
-        Some(cmd) => vec![SeedTest {
-            path: manifest.to_string(),
-            command: Some(cmd.to_string()),
-        }],
-        None => Vec::new(),
-    };
+    // NOTE: the inferred test command is surfaced via the summary string
+    // (and via `entry_command`) only. Earlier drafts populated `tests`
+    // with a SeedTest entry pointing at the manifest just to attach the
+    // command — but `SeedTest.path` is documented as a test FILE, and the
+    // mapper orchestrator inserts every `seed.tests[]` row as a
+    // `role: Test` `FeatureFileRef`. That would surface `pyproject.toml`
+    // as a "test" in `feature_bundle` output, which is wrong. Leaving
+    // tests empty here lets the orchestrator's `nearby_tests` discovery
+    // attach real test files instead.
     Ok(vec![FeatureSeed {
         title: format!("Python project `{project_name}`"),
         summary: match test_cmd {
@@ -180,7 +175,7 @@ fn python_project_seed(
         entry_path: manifest.to_string(),
         entry_symbol: Some(project_name),
         entry_route: None,
-        entry_command: None,
+        entry_command: test_cmd.map(String::from),
         language: Language::Python,
         tags: vec!["python".to_string(), "package".to_string()],
         owned_files: vec![SeedFile {
@@ -188,7 +183,7 @@ fn python_project_seed(
             reason: "package manifest".to_string(),
         }],
         context_files,
-        tests,
+        tests: Vec::new(),
         test_prefixes: vec!["tests".to_string(), "test".to_string()],
     }])
 }
@@ -203,68 +198,29 @@ fn pyproject_project_name(pyproject: Option<&str>) -> Option<String> {
 }
 
 fn pyproject_scripts(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
-    let root = ctx.root;
-    let mut out = Vec::new();
-    let path = root.join("pyproject.toml");
-    if !is_safe_file(root, &path) {
-        return Ok(out);
-    }
-    let raw = match fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(_) => return Ok(out),
-    };
-    let body = strip_line_comments(&raw, '#');
-    let Some(scripts_body) = extract_section(&body, "project.scripts") else {
-        return Ok(out);
-    };
-    let line_re = Regex::new(r#"(?m)^\s*([A-Za-z_][\w\-]*)\s*=\s*"([^"]+)""#)?;
-    for cap in line_re.captures_iter(&scripts_body) {
-        let name = cap
-            .get(1)
-            .map(|m| m.as_str().to_string())
-            .unwrap_or_default();
-        let target = cap
-            .get(2)
-            .map(|m| m.as_str().to_string())
-            .unwrap_or_default();
-        if name.is_empty() {
-            continue;
-        }
-        // Target shape: `module.path:fn_name`. Resolve the dotted module
-        // to a real `.py` file so `codesage feature-for <module.py>` can
-        // find the script — recording `pyproject.toml` as entry_path
-        // makes the file-→-feature contract a lie (the user's question
-        // "what feature owns acme/cli.py?" returns nothing).
-        let module = target.split(':').next().unwrap_or(&target).to_string();
-        let resolved = resolve_script_module_path(ctx, &module);
-        let entry_path = resolved
-            .clone()
-            .unwrap_or_else(|| "pyproject.toml".to_string());
-        out.push(FeatureSeed {
-            title: format!("Python script `{name}`"),
-            summary: format!("pyproject.toml `[project.scripts]` entry `{name} = \"{target}\"`"),
-            kind: FeatureKind::CliCommand,
-            source: "pyproject-script",
-            confidence: FeatureConfidence::High,
-            entry_path,
-            entry_symbol: Some(module),
-            entry_route: None,
-            entry_command: Some(name),
-            language: Language::Python,
-            tags: vec!["python".to_string(), "cli".to_string()],
-            owned_files: Vec::new(),
-            context_files: vec![SeedFile {
-                path: "pyproject.toml".to_string(),
-                reason: "package manifest".to_string(),
-            }],
-            tests: Vec::new(),
-            test_prefixes: vec!["tests".to_string()],
-        });
-    }
-    Ok(out)
+    pyproject_scripts_section(ctx, "project.scripts", "pyproject-script", |name| {
+        format!("Python script `{name}`")
+    })
 }
 
 fn pyproject_poetry_scripts(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
+    pyproject_scripts_section(
+        ctx,
+        "tool.poetry.scripts",
+        "pyproject-poetry-script",
+        |name| format!("Python script `{name}` (poetry)"),
+    )
+}
+
+/// Shared parser for `[project.scripts]` and `[tool.poetry.scripts]` (PEP 621
+/// vs Poetry conventions). Both sections share `name = "module:fn"` syntax;
+/// only the section header, the `source` tag, and the title format differ.
+fn pyproject_scripts_section(
+    ctx: &MapperContext,
+    section: &str,
+    source: &'static str,
+    title_for: impl Fn(&str) -> String,
+) -> Result<Vec<FeatureSeed>> {
     let root = ctx.root;
     let mut out = Vec::new();
     let path = root.join("pyproject.toml");
@@ -275,7 +231,7 @@ fn pyproject_poetry_scripts(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
         return Ok(out);
     };
     let body = strip_line_comments(&raw, '#');
-    let Some(scripts_body) = extract_section(&body, "tool.poetry.scripts") else {
+    let Some(scripts_body) = extract_section(&body, section) else {
         return Ok(out);
     };
     let line_re = Regex::new(r#"(?m)^\s*([A-Za-z_][\w\-]*)\s*=\s*"([^"]+)""#)?;
@@ -291,18 +247,21 @@ fn pyproject_poetry_scripts(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
         if name.is_empty() {
             continue;
         }
+        // Target shape: `module.path:fn_name`. Resolve the dotted module to
+        // a real `.py` file so `codesage feature-for <module.py>` can find
+        // the script — recording `pyproject.toml` as entry_path makes the
+        // file→feature contract a lie ("what feature owns acme/cli.py?"
+        // would return nothing).
         let module = target.split(':').next().unwrap_or(&target).to_string();
         let resolved = resolve_script_module_path(ctx, &module);
         let entry_path = resolved
             .clone()
             .unwrap_or_else(|| "pyproject.toml".to_string());
         out.push(FeatureSeed {
-            title: format!("Python script `{name}` (poetry)"),
-            summary: format!(
-                "pyproject.toml `[tool.poetry.scripts]` entry `{name} = \"{target}\"`"
-            ),
+            title: title_for(&name),
+            summary: format!("pyproject.toml `[{section}]` entry `{name} = \"{target}\"`"),
             kind: FeatureKind::CliCommand,
-            source: "pyproject-poetry-script",
+            source,
             confidence: FeatureConfidence::High,
             entry_path,
             entry_symbol: Some(module),
@@ -472,21 +431,23 @@ fn main_guard_modules(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
 fn pytest_test_suites(ctx: &MapperContext, test_cmd: Option<&str>) -> Result<Vec<FeatureSeed>> {
     let root = ctx.root;
     let scan_dirs = ["tests", "test", "src"];
+    const PYTEST_FILE_CAP: usize = 200;
     let mut test_files: Vec<String> = Vec::new();
-    let mut roots_seen: BTreeSet<String> = BTreeSet::new();
-    for dir in scan_dirs {
+    'outer: for dir in scan_dirs {
         let abs = root.join(dir);
         if !is_safe_dir(root, &abs) {
             continue;
         }
-        roots_seen.insert(dir.to_string());
         for rel in walk_files(root, &abs, 5_000, ctx.excludes) {
             if !is_pytest_file(&rel) {
                 continue;
             }
             test_files.push(rel);
-            if test_files.len() >= 200 {
-                break;
+            if test_files.len() >= PYTEST_FILE_CAP {
+                // The cap is global, not per-scan-dir; once 200 pytest
+                // files have been collected from any combination of
+                // tests/, test/, and src/, bail entirely.
+                break 'outer;
             }
         }
     }
@@ -588,6 +549,7 @@ fn is_pytest_file(rel: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::path::Path;
     use tempfile::tempdir;
 

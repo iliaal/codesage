@@ -240,21 +240,40 @@ fn is_generated_go_file(abs: &Path, file_name: &str) -> bool {
     }
     // Header sniff: first ~2 KB for a "Code generated ... DO NOT EDIT"
     // marker. Cheap (capped read) and catches generated files that don't
-    // follow the naming convention (e.g. go-bindata output).
-    let Ok(mut raw) = fs::read_to_string(abs) else {
+    // follow the naming convention (e.g. go-bindata output). Truncate by
+    // walking back to the nearest UTF-8 char boundary — `String::truncate`
+    // panics on a multibyte split, which a Go source with a BOM or kanji
+    // comment at offset ~2000 would trigger.
+    let Ok(raw) = fs::read_to_string(abs) else {
         return false;
     };
-    if raw.len() > 2_000 {
-        raw.truncate(2_000);
+    let mut end = raw.len().min(2_000);
+    while end > 0 && !raw.is_char_boundary(end) {
+        end -= 1;
     }
+    let head = &raw[..end];
     let header_re = Regex::new(r"(?i)Code generated .* DO NOT EDIT\.|DO NOT EDIT: generated")
         .expect("static regex");
-    header_re.is_match(&raw)
+    header_re.is_match(head)
 }
 
 // ---- Same-repo import context (capped) ---------------------------------
 
-const IMPORT_CONTEXT_CAP: usize = 24;
+const IMPORT_CONTEXT_CAP_DEFAULT: usize = 24;
+
+// Env-overridable for per-project tuning (`CODESAGE_GO_IMPORT_CONTEXT_CAP`).
+// Cached on first read; values < 1 fall back to the default.
+fn import_context_cap() -> usize {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<usize> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("CODESAGE_GO_IMPORT_CONTEXT_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(IMPORT_CONTEXT_CAP_DEFAULT)
+    })
+}
 
 fn collect_import_context(
     root: &Path,
@@ -289,7 +308,7 @@ fn collect_import_context(
                     path: ctx_file,
                     reason: format!("imported package {imported}"),
                 });
-                if refs.len() >= IMPORT_CONTEXT_CAP {
+                if refs.len() >= import_context_cap() {
                     return Ok(refs);
                 }
             }

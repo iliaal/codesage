@@ -20,7 +20,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::mappers::shared::{is_safe_dir, is_safe_file, should_skip, walk_files};
-use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile, SeedTest};
+use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile};
 
 pub struct JsMapper;
 
@@ -109,7 +109,6 @@ fn language_for_entry(entry: &str) -> Language {
 /// seeds, because per-package `bin` is the routing-actionable surface.
 fn package_seeds_for(root: &Path, info: &PackageInfo, pm: NodePm) -> Vec<FeatureSeed> {
     let mut out = Vec::new();
-    let package_name = package_display_name(info);
     let pkg = &info.pkg;
     let has_test_script = package_scripts(pkg).contains_key("test");
     let test_cmd = if has_test_script {
@@ -243,6 +242,7 @@ fn package_seeds_for(root: &Path, info: &PackageInfo, pm: NodePm) -> Vec<Feature
     // ONLY for workspace members so the root repo's existing per-script
     // seeds remain the agent-facing surface there.
     if !info.is_root() {
+        let package_name = package_display_name(info);
         let mut context_files = Vec::new();
         for candidate in ["README.md", "AGENTS.md", "tsconfig.json"] {
             let rel = package_relative_path(&info.root_rel, candidate);
@@ -256,14 +256,14 @@ fn package_seeds_for(root: &Path, info: &PackageInfo, pm: NodePm) -> Vec<Feature
                 });
             }
         }
-        let tests = if let Some(cmd) = &test_cmd {
-            vec![SeedTest {
-                path: info.manifest_rel.clone(),
-                command: Some(cmd.clone()),
-            }]
-        } else {
-            Vec::new()
-        };
+        // NOTE: the inferred test command surfaces via the summary string and
+        // via `entry_command` only. Earlier drafts populated `tests` with a
+        // SeedTest entry pointing at `package.json` to attach the command —
+        // but `SeedTest.path` is documented as a test FILE, and the
+        // orchestrator inserts `seed.tests[]` rows as `role: Test`. That
+        // would surface `packages/api/package.json` as a test file in
+        // `feature_bundle` output. Leave tests empty so nearby_tests
+        // discovery attaches real test files.
         let summary = match &test_cmd {
             Some(cmd) => format!(
                 "Node workspace package `{package_name}` at {} (test: `{cmd}`)",
@@ -283,7 +283,7 @@ fn package_seeds_for(root: &Path, info: &PackageInfo, pm: NodePm) -> Vec<Feature
             entry_path: info.manifest_rel.clone(),
             entry_symbol: Some(package_name),
             entry_route: None,
-            entry_command: None,
+            entry_command: test_cmd.clone(),
             language: Language::JavaScript,
             tags: vec![
                 "javascript".to_string(),
@@ -295,7 +295,7 @@ fn package_seeds_for(root: &Path, info: &PackageInfo, pm: NodePm) -> Vec<Feature
                 reason: "package manifest".to_string(),
             }],
             context_files,
-            tests,
+            tests: Vec::new(),
             test_prefixes: vec!["__tests__".to_string(), "tests".to_string()],
         });
     }
@@ -639,6 +639,13 @@ fn discover_into(root: &Path, prefix: &str, remaining_depth: usize, out: &mut Ve
     }
 }
 
+/// Enumerate immediate child directories under `<root>/<prefix>`, honoring
+/// `.gitignore`. Workspace discovery (`packages/*`, `apps/*`, …) drives
+/// `find_feature` routing, so a gitignored workspace must NOT be surfaced
+/// as a feature — it'd point at files the structural indexer skipped.
+/// Uses `ignore::WalkBuilder` with `max_depth(1)` to get gitignore-aware
+/// listing in one shot. Falls back to plain `fs::read_dir` only if the
+/// walker fails to construct.
 fn safe_directory_entries(root: &Path, prefix: &str) -> Vec<String> {
     let dir = if prefix.is_empty() {
         root.to_path_buf()
@@ -648,12 +655,25 @@ fn safe_directory_entries(root: &Path, prefix: &str) -> Vec<String> {
     if !is_safe_dir(root, &dir) {
         return Vec::new();
     }
-    let Ok(read) = fs::read_dir(&dir) else {
-        return Vec::new();
-    };
+    let walker = ignore::WalkBuilder::new(&dir)
+        .max_depth(Some(1))
+        .hidden(true)
+        .git_ignore(true)
+        .require_git(false)
+        .build();
     let mut out: Vec<String> = Vec::new();
-    for entry in read.flatten() {
-        let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
+    for entry in walker.flatten() {
+        // WalkBuilder yields the root dir itself at depth 0; skip it.
+        if entry.path() == dir {
+            continue;
+        }
+        let Some(ft) = entry.file_type() else {
+            continue;
+        };
+        if !ft.is_dir() || ft.is_symlink() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(String::from) else {
             continue;
         };
         let rel = if prefix.is_empty() {
@@ -664,12 +684,7 @@ fn safe_directory_entries(root: &Path, prefix: &str) -> Vec<String> {
         if should_skip(&rel) {
             continue;
         }
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        if meta.is_dir() && !meta.file_type().is_symlink() {
-            out.push(name);
-        }
+        out.push(name);
     }
     out.sort();
     out
@@ -684,16 +699,15 @@ fn package_scripts(pkg: &Value) -> serde_json::Map<String, Value> {
         .unwrap_or_default()
 }
 
+/// Caller contract: only invoked for workspace members (`!info.is_root()`).
+/// The root package never emits a `node-package` seed, so the root branch
+/// is unreachable and intentionally absent.
 fn package_display_name(info: &PackageInfo) -> String {
+    debug_assert!(!info.is_root(), "package_display_name called for root info");
     if let Some(name) = info.pkg.get("name").and_then(|v| v.as_str())
         && !name.is_empty()
     {
         return name.to_string();
-    }
-    if info.is_root() {
-        // Best-effort: take the repo dir basename. We don't have it here
-        // without re-reading the path; fall back to "package".
-        return "package".to_string();
     }
     info.root_rel
         .rsplit_once('/')
@@ -755,9 +769,13 @@ fn resolve_package_bin_entry(root: &Path, package_root: &str, path: &str) -> Str
 }
 
 fn source_candidate_for_generated_bin(path: &str) -> Option<String> {
+    // Three common output dirs: `dist/` (TS / Rollup / esbuild), `build/`
+    // (Babel default), `lib/` (older Babel / TypeScript libraries that
+    // publish via `lib/`). Each one maps back to `src/<stem>.ts`.
     let stripped = path
         .strip_prefix("dist/")
-        .or_else(|| path.strip_prefix("build/"))?;
+        .or_else(|| path.strip_prefix("build/"))
+        .or_else(|| path.strip_prefix("lib/"))?;
     let dot = stripped.rfind('.')?;
     let (stem, ext) = stripped.split_at(dot);
     if !matches!(ext, ".js" | ".mjs" | ".cjs") {
@@ -1162,15 +1180,23 @@ const App = () => (
             "expected @acme/web workspace seed, got {names:?}"
         );
 
-        // The api workspace seed should carry a per-package test command on
-        // its tests Vec, not the root npm command.
+        // The api workspace seed carries a per-package test command on
+        // `entry_command` (post-CR-003 fix: no bogus SeedTest with the
+        // manifest as a "test file"; the test command is the entry-level
+        // command for the package feature).
         let api = pkg_seeds
             .iter()
             .find(|s| s.entry_symbol.as_deref() == Some("@acme/api"))
             .unwrap();
         assert_eq!(api.entry_path, "packages/api/package.json");
-        let cmd = api.tests.first().and_then(|t| t.command.as_deref());
-        assert_eq!(cmd, Some("npm --prefix packages/api run test"));
+        assert!(
+            api.tests.is_empty(),
+            "node-package seed must not populate tests[] with the manifest (CR-003)"
+        );
+        assert_eq!(
+            api.entry_command.as_deref(),
+            Some("npm --prefix packages/api run test")
+        );
     }
 
     #[test]
@@ -1204,13 +1230,16 @@ const App = () => (
         assert!(names.contains(&"@acme/admin"));
         assert!(names.contains(&"@acme/util"));
 
-        // pnpm package-manager detection drives the test-command formatting.
+        // pnpm package-manager detection drives the test-command formatting,
+        // surfaced on `entry_command` (CR-003 fix).
         let admin = seeds
             .iter()
             .find(|s| s.entry_symbol.as_deref() == Some("@acme/admin"))
             .unwrap();
-        let cmd = admin.tests.first().and_then(|t| t.command.as_deref());
-        assert_eq!(cmd, Some("pnpm --dir apps/admin test"));
+        assert_eq!(
+            admin.entry_command.as_deref(),
+            Some("pnpm --dir apps/admin test")
+        );
     }
 
     #[test]
@@ -1325,6 +1354,43 @@ const App = () => (
         );
         // But the script seed should still be there.
         assert!(seeds.iter().any(|s| s.source == "package-json-script"));
+    }
+
+    #[test]
+    fn gitignored_workspace_is_excluded() {
+        // CR-004 regression: a workspace matching `packages/*` but listed in
+        // .gitignore must NOT be discovered as a feature. The structural
+        // indexer skips its files via gitignore; surfacing a feature whose
+        // entry_path points at gitignored content would route `find_feature`
+        // to files that don't exist in the project's index.
+        let dir = tempdir().unwrap();
+        write(dir.path(), ".gitignore", "packages/internal-only/\n");
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"monorepo","workspaces":["packages/*"]}"#,
+        );
+        write(
+            dir.path(),
+            "packages/visible/package.json",
+            r#"{"name":"@acme/visible"}"#,
+        );
+        write(
+            dir.path(),
+            "packages/internal-only/package.json",
+            r#"{"name":"@acme/internal"}"#,
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let names: Vec<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "node-package")
+            .filter_map(|s| s.entry_symbol.as_deref())
+            .collect();
+        assert!(names.contains(&"@acme/visible"));
+        assert!(
+            !names.contains(&"@acme/internal"),
+            "gitignored workspace leaked into mapper output: {names:?}"
+        );
     }
 
     #[test]
