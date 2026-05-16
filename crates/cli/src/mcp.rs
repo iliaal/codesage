@@ -762,7 +762,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "impact_analysis",
-        description = "Estimate which files are affected by changing a symbol or file. Walks the reference graph up to `depth` hops (default 2), reports affected files ranked by distance and reference count. **Multi-hop blast radius** — use BEFORE making changes to know what else needs review/testing. For single-hop dependencies (just direct importers/importees of one file) use `list_dependencies` instead; for raw call sites of a specific symbol use `find_references`.",
+        description = "Estimate which files are affected by changing a symbol or file. Walks the **reverse** reference graph up to `depth` hops (default 2) — i.e., callers/importers of the target and transitively their callers/importers — reports affected files ranked by distance and reference count. **Multi-hop blast radius from the target outward to its dependents.** Returns `[]` for leaf files nothing imports/calls. Does NOT include same-file symbols, does NOT include what the target itself depends on (use `list_dependencies` for the target's own forward dependencies). Use BEFORE making changes to know what else needs review/testing. For single-hop importer/importee of one file use `list_dependencies`; for raw call sites of a specific symbol use `find_references`.",
         output_schema = schema_for_type::<ImpactAnalysisResults>()
     )]
     fn impact_analysis_tool(&self, Parameters(params): Parameters<ImpactParams>) -> CallToolResult {
