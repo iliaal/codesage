@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Added
+
+- **Subagent-driven review workflow in the `codesage-tools` plugin.** Four new slash commands plus one subagent definition: `/codesage-review` (orchestrator — fans out feature-slice reviews in parallel via the new `codesage-feature-reviewer` subagent, persists findings to `.codesage/findings/<feature_id>.json` with run records under `.codesage/reviews/`), `/codesage-triage` (pure local state edit — mark a finding `open` / `false-positive` / `wont-fix` / `fixed` with an audit-trail history), `/codesage-revalidate` (re-runs the subagent against the slice to confirm a finding is fixed or still applies; auto-flips `open` → `fixed` when the defect no longer surfaces), `/codesage-report` (deterministic Markdown render of the findings JSON; no LLM call). Subagent runs read-only (`autoApprove: read`), consumes the existing codesage MCP surface (`feature_bundle`, `assess_risk`, `find_references`, `find_coupling`), inherits the host session's model, and returns strict JSON findings the orchestrator parses by fenced block. Architectural choice: codesage stays a read-only intelligence engine; the review workflow lives in the plugin and produces findings the rest of the toolchain can read. Plugin version bumped 0.1.0 → 0.2.0.
+
 ## [0.7.0] - 2026-05-16
 
 ### Added
