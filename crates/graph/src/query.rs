@@ -443,7 +443,7 @@ pub fn search(
     }
 
     if path_penalty_enabled() {
-        apply_path_penalties(&mut results);
+        apply_path_penalties(&mut results, &req.query);
     }
 
     // Skip reranking on hybrid-gated queries. The cross-encoder judges
@@ -848,7 +848,49 @@ fn has_dir_segment(path: &str, names: &[&str]) -> bool {
     path.split('/').any(|seg| names.contains(&seg))
 }
 
+// Test-like demote intensity, by query shape. The non-test default below is
+// the §2.11-motivated harder demote (0.15x total); the legacy variant (0.3x)
+// is preserved for the no-query `path_penalty(path)` callers (unit tests).
+#[derive(Clone, Copy)]
+enum TestPathDemote {
+    /// Legacy: 0.3x for test-like paths regardless of query shape. Only used
+    /// by the no-query `path_penalty(path)` wrapper, which is itself only
+    /// reachable from unit tests in release builds — kept to preserve the
+    /// pre-§1.22 contract for any future external callers.
+    #[allow(dead_code)]
+    Legacy,
+    /// Non-test-shaped query: extra demote on top of legacy (0.15x total).
+    /// §2.11 motivation — 0.3x alone wasn't enough to surface
+    /// `InterceptorManager.js` over 9 sibling `*.test.js` files on the
+    /// axios "request and response interceptors" query.
+    NonTestQuery,
+    /// Test-shaped query ("test for X", "X spec", "login fixtures"): no
+    /// test-like demote. Test files compete on merit so "find the test for X"
+    /// surfaces them above the production file.
+    TestQuery,
+}
+
+#[allow(dead_code)]
 pub(crate) fn path_penalty(path: &str) -> f32 {
+    path_penalty_with(path, TestPathDemote::Legacy)
+}
+
+// Query-aware path penalty. `query_is_test_shaped` tells the function whether
+// the user query mentions test/spec/fixture intent — when true, we skip the
+// test-like demote so legitimate test-intent queries surface test files.
+// Compat/examples/d.ts/re-export demotes are query-independent.
+pub(crate) fn path_penalty_for_query(path: &str, query_is_test_shaped: bool) -> f32 {
+    path_penalty_with(
+        path,
+        if query_is_test_shaped {
+            TestPathDemote::TestQuery
+        } else {
+            TestPathDemote::NonTestQuery
+        },
+    )
+}
+
+fn path_penalty_with(path: &str, test_demote: TestPathDemote) -> f32 {
     let normalized = if path.contains('\\') {
         path.replace('\\', "/")
     } else {
@@ -857,7 +899,13 @@ pub(crate) fn path_penalty(path: &str) -> f32 {
     let mut penalty = 1.0f32;
 
     if test_like_globset().is_match(&normalized) {
-        penalty *= SOFT_PENALTY_STRONG;
+        match test_demote {
+            TestPathDemote::Legacy => penalty *= SOFT_PENALTY_STRONG,
+            TestPathDemote::NonTestQuery => {
+                penalty *= SOFT_PENALTY_STRONG * EXTRA_TEST_DEMOTE_NON_TEST_QUERY
+            }
+            TestPathDemote::TestQuery => {}
+        }
     }
     if has_dir_segment(&normalized, COMPAT_DIR_NAMES) {
         penalty *= SOFT_PENALTY_STRONG;
@@ -877,9 +925,54 @@ pub(crate) fn path_penalty(path: &str) -> f32 {
     penalty
 }
 
-fn apply_path_penalties(results: &mut [SearchResult]) {
+// Extra multiplier applied to test-like paths when the query is non-test-shaped.
+// Stacks on top of SOFT_PENALTY_STRONG, so total = 0.3 * 0.5 = 0.15x.
+// 0.15x is empirically motivated: the §2.11 axios case had 9 test files at
+// ~0.3x dominating top-10. A 0.5x extra demote (→ 0.15x total) was the smallest
+// nudge that surfaced the conceptual target in a follow-up spot check.
+const EXTRA_TEST_DEMOTE_NON_TEST_QUERY: f32 = 0.5;
+
+// Test-intent keywords for query classification. Whole-token match against the
+// query (case-insensitive). Tokens checked are alphanumeric runs split out of
+// the query — so "Login.test.js" → ["login", "test", "js"] which would
+// (correctly) classify as a test-shaped query, while "interceptors" doesn't
+// match.
+const TEST_INTENT_KEYWORDS: &[&str] = &[
+    "test", "tests", "testing", "spec", "specs", "fixture", "fixtures",
+    "phpt", // PHP testing convention
+];
+
+fn query_is_test_shaped(query: &str) -> bool {
+    if !test_query_aware_enabled() {
+        return false;
+    }
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .any(|tok| {
+            let lowered = tok.to_ascii_lowercase();
+            TEST_INTENT_KEYWORDS.contains(&lowered.as_str())
+        })
+}
+
+// Default-on; opt-out via CODESAGE_TEST_QUERY_AWARE=0 (or "false").
+// When disabled, query_is_test_shaped always returns false → path_penalty
+// behaves as the pre-§1.22 fixed 0.3x for test-like paths regardless of query.
+static TEST_QUERY_AWARE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn test_query_aware_enabled() -> bool {
+    *TEST_QUERY_AWARE_ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("CODESAGE_TEST_QUERY_AWARE").as_deref(),
+            Ok("0") | Ok("false")
+        )
+    })
+}
+
+fn apply_path_penalties(results: &mut [SearchResult], query: &str) {
+    let is_test_query = query_is_test_shaped(query);
     for result in results.iter_mut() {
-        result.score *= path_penalty(&result.file_path);
+        result.score *= path_penalty_for_query(&result.file_path, is_test_query);
     }
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 }
@@ -926,8 +1019,44 @@ fn apply_file_saturation(results: &mut [SearchResult]) {
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 }
 
-const DIR_SATURATION_THRESHOLD: usize = 3;
-const DIR_SATURATION_DECAY: f32 = 0.85;
+// Defaults retuned 2026-05-16 (was threshold=3, decay=0.85). A/B harness at
+// /tmp/dir-saturation-ab.py across laravel-framework + redux + flask showed
+// (2, 0.75) consistently wins or ties: laravel-framework NDCG@10 0.773 → 0.779,
+// flask 0.906 → 0.909, redux unchanged at 0.957, no recall regressions.
+// Earlier 0.85 decay was a guess; the §2.11 finding (laravel still surfaced
+// QueueManager.php only at rank 5) suggested room for a steeper decay, and
+// dropping the threshold from 3 to 2 cuts the noise earlier without
+// over-demoting clean repos.
+const DIR_SATURATION_THRESHOLD_DEFAULT: usize = 2;
+const DIR_SATURATION_DECAY_DEFAULT: f32 = 0.75;
+
+// Env overrides for tuning without rebuilds. Cached on first read.
+// `CODESAGE_DIR_SATURATION_THRESHOLD` accepts a positive integer; values < 1
+// fall back to the default. `CODESAGE_DIR_SATURATION_DECAY` accepts a float in
+// (0.0, 1.0]; values outside that range fall back to the default. A decay of
+// 1.0 effectively disables the signal (no decrement past threshold).
+static DIR_SATURATION_THRESHOLD: OnceLock<usize> = OnceLock::new();
+static DIR_SATURATION_DECAY: OnceLock<f32> = OnceLock::new();
+
+fn dir_saturation_threshold() -> usize {
+    *DIR_SATURATION_THRESHOLD.get_or_init(|| {
+        std::env::var("CODESAGE_DIR_SATURATION_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(DIR_SATURATION_THRESHOLD_DEFAULT)
+    })
+}
+
+fn dir_saturation_decay() -> f32 {
+    *DIR_SATURATION_DECAY.get_or_init(|| {
+        std::env::var("CODESAGE_DIR_SATURATION_DECAY")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|&v| v > 0.0 && v <= 1.0)
+            .unwrap_or(DIR_SATURATION_DECAY_DEFAULT)
+    })
+}
 
 /// Penalize chunks past threshold from the same parent directory, after
 /// `file_saturation` handles same-file. Motivated by the §2.10 semble-
@@ -945,13 +1074,15 @@ fn apply_directory_saturation(results: &mut [SearchResult]) {
     }
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 
+    let threshold = dir_saturation_threshold();
+    let decay = dir_saturation_decay();
     let mut per_dir: HashMap<String, usize> = HashMap::new();
     for result in results.iter_mut() {
         let dir = parent_dir_for_saturation(&result.file_path);
         let already = per_dir.get(&dir).copied().unwrap_or(0);
-        if already >= DIR_SATURATION_THRESHOLD {
-            let excess = (already - DIR_SATURATION_THRESHOLD + 1) as i32;
-            result.score *= DIR_SATURATION_DECAY.powi(excess);
+        if already >= threshold {
+            let excess = (already - threshold + 1) as i32;
+            result.score *= decay.powi(excess);
         }
         *per_dir.entry(dir).or_insert(0) += 1;
     }
@@ -2064,6 +2195,131 @@ mod path_penalty_tests {
 }
 
 #[cfg(test)]
+mod test_query_aware_penalty_tests {
+    use super::{
+        SearchResult, apply_path_penalties, path_penalty, path_penalty_for_query,
+        query_is_test_shaped,
+    };
+
+    fn mk(file: &str, score: f32) -> SearchResult {
+        SearchResult {
+            file_path: file.to_string(),
+            language: codesage_protocol::Language::JavaScript,
+            content: String::new(),
+            start_line: 0,
+            end_line: 0,
+            score,
+            symbols: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn classifier_detects_test_intent() {
+        assert!(query_is_test_shaped("test for InterceptorManager"));
+        assert!(query_is_test_shaped("InterceptorManager test"));
+        assert!(query_is_test_shaped("Authentication spec"));
+        assert!(query_is_test_shaped("login fixtures"));
+        assert!(query_is_test_shaped("phpt for string"));
+        assert!(query_is_test_shaped("UPPERCASE TEST query")); // case-insensitive
+    }
+
+    #[test]
+    fn classifier_skips_production_intent() {
+        assert!(!query_is_test_shaped("request and response interceptors"));
+        assert!(!query_is_test_shaped("queue connection resolution"));
+        assert!(!query_is_test_shaped("authentication handler"));
+        // "testimony" contains "test" as a prefix but is not a whole token.
+        assert!(!query_is_test_shaped("testimony"));
+        // "contest" similarly.
+        assert!(!query_is_test_shaped("contest results"));
+    }
+
+    #[test]
+    fn non_test_query_demotes_tests_harder() {
+        // 0.3 (baseline) * 0.5 (extra) = 0.15
+        let p = path_penalty_for_query("tests/integration.rs", false);
+        assert!((p - 0.15).abs() < 1e-6, "got {}", p);
+        let p = path_penalty_for_query("src/__tests__/login.test.ts", false);
+        assert!((p - 0.15).abs() < 1e-6, "got {}", p);
+    }
+
+    #[test]
+    fn test_query_lifts_test_penalty() {
+        // Test-shaped query → no test-like demote (compete on merit).
+        assert_eq!(path_penalty_for_query("tests/integration.rs", true), 1.0);
+        assert_eq!(
+            path_penalty_for_query("src/__tests__/login.test.ts", true),
+            1.0
+        );
+        // Compat/examples/d.ts demotes still apply regardless (query-independent).
+        assert!(
+            (path_penalty_for_query("src/compat/php7.php", true) - 0.3).abs() < 1e-6,
+            "compat dir should still demote on test queries"
+        );
+    }
+
+    #[test]
+    fn legacy_path_penalty_preserved() {
+        // path_penalty(...) is the no-query wrapper. It must keep the legacy
+        // 0.3x for test-like paths (independent of query shape) so existing
+        // unit tests and external callers see the pre-§1.22 contract. The new
+        // query-aware split lives in path_penalty_for_query.
+        assert_eq!(path_penalty("tests/integration.rs"), 0.3);
+        assert!((path_penalty_for_query("tests/integration.rs", false) - 0.15).abs() < 1e-6);
+        assert_eq!(path_penalty_for_query("tests/integration.rs", true), 1.0);
+    }
+
+    #[test]
+    fn axios_interceptor_failure_mode_repro() {
+        // §2.11 finding: query "request and response interceptors" surfaced
+        // 9 test files in top-10, all with "interceptor" in path. Even
+        // post-0.3x demote they beat the production target. With the new
+        // 0.15x extra-demote on non-test queries the production file should
+        // surface above the test cluster.
+        //
+        // Synthetic candidate set: production target with mediocre similarity
+        // (0.65), test files with strong similarity (0.85) because they
+        // contain "interceptor" in path and body.
+        let mut results = vec![
+            mk("tests/browser/interceptors.browser.test.js", 0.85),
+            mk("tests/smoke/esm/tests/interceptors.smoke.test.js", 0.84),
+            mk("tests/smoke/cjs/tests/interceptors.smoke.test.cjs", 0.83),
+            mk("lib/core/InterceptorManager.js", 0.65),
+            mk("tests/unit/regression.test.js", 0.60),
+        ];
+
+        apply_path_penalties(&mut results, "request and response interceptors");
+
+        // After query-aware demote: tests → 0.85*0.15=0.1275 etc., production
+        // stays at 0.65. Production target should now be rank 1.
+        assert_eq!(results[0].file_path, "lib/core/InterceptorManager.js");
+    }
+
+    #[test]
+    fn test_query_does_not_regress_test_for_x_case() {
+        // Inverse: user asks "test for InterceptorManager". Test files
+        // should NOT be demoted; the test file with the strongest match
+        // should win.
+        let mut results = vec![
+            mk("tests/browser/interceptors.browser.test.js", 0.85),
+            mk("lib/core/InterceptorManager.js", 0.80),
+            mk("tests/unit/regression.test.js", 0.60),
+        ];
+
+        apply_path_penalties(&mut results, "test for InterceptorManager");
+
+        // Test file stays at rank 1; production target stays at rank 2.
+        // Without the lift, the production file (0.80) would beat the
+        // demoted test file (0.85*0.3=0.255).
+        assert_eq!(
+            results[0].file_path,
+            "tests/browser/interceptors.browser.test.js"
+        );
+        assert_eq!(results[1].file_path, "lib/core/InterceptorManager.js");
+    }
+}
+
+#[cfg(test)]
 mod file_saturation_tests {
     use super::{SearchResult, apply_file_saturation};
 
@@ -2556,14 +2812,17 @@ mod context_export_tests {
 #[cfg(test)]
 mod adaptive_rerank_tests {
     use super::{
-        adaptive_rerank_weight, RERANK_WEIGHT_DEFAULT, RERANK_WEIGHT_NATLANG,
-        RERANK_WEIGHT_SHORT_ID,
+        RERANK_WEIGHT_DEFAULT, RERANK_WEIGHT_NATLANG, RERANK_WEIGHT_SHORT_ID,
+        adaptive_rerank_weight,
     };
 
     #[test]
     fn short_identifier_leans_semantic() {
         assert_eq!(adaptive_rerank_weight("FooBar"), RERANK_WEIGHT_SHORT_ID);
-        assert_eq!(adaptive_rerank_weight("parse_config"), RERANK_WEIGHT_SHORT_ID);
+        assert_eq!(
+            adaptive_rerank_weight("parse_config"),
+            RERANK_WEIGHT_SHORT_ID
+        );
         assert_eq!(adaptive_rerank_weight("Middleware"), RERANK_WEIGHT_SHORT_ID);
     }
 
@@ -2620,8 +2879,9 @@ mod dir_saturation_tests {
     #[test]
     fn penalizes_chunks_past_threshold_from_same_directory() {
         // 5 chunks all from `Queue/Connectors/` mimicking the
-        // laravel-framework failure mode. First 3 keep their scores;
-        // chunks 4-5 decay by 0.85^excess.
+        // laravel-framework failure mode. With default threshold=2 and
+        // decay=0.75, the first 2 keep their scores and chunks 3-5 decay
+        // by 0.75^excess.
         let mut results = vec![
             mk("Queue/Connectors/AConnector.php", 0.95),
             mk("Queue/Connectors/BConnector.php", 0.94),
@@ -2632,15 +2892,15 @@ mod dir_saturation_tests {
         ];
         apply_directory_saturation(&mut results);
 
-        // First 3 in the cluster keep their scores.
         let by_path: std::collections::HashMap<_, _> = results
             .iter()
             .map(|r| (r.file_path.clone(), r.score))
             .collect();
+        // First 2 chunks at the threshold keep their scores.
         assert!((by_path["Queue/Connectors/AConnector.php"] - 0.95).abs() < 1e-6);
         assert!((by_path["Queue/Connectors/BConnector.php"] - 0.94).abs() < 1e-6);
-        assert!((by_path["Queue/Connectors/CConnector.php"] - 0.93).abs() < 1e-6);
-        // 4th and 5th decay; absolute value < pre-decay.
+        // Chunks 3-5 decay; absolute value strictly < pre-decay.
+        assert!(by_path["Queue/Connectors/CConnector.php"] < 0.93);
         assert!(by_path["Queue/Connectors/DConnector.php"] < 0.92);
         assert!(by_path["Queue/Connectors/EConnector.php"] < 0.91);
         // QueueManager untouched (different dir).
@@ -2649,20 +2909,16 @@ mod dir_saturation_tests {
 
     #[test]
     fn no_penalty_below_threshold() {
-        let mut results = vec![
-            mk("src/a.rs", 0.9),
-            mk("src/b.rs", 0.8),
-            mk("src/c.rs", 0.7),
-        ];
+        let mut results = vec![mk("src/a.rs", 0.9), mk("src/b.rs", 0.8)];
         let before: Vec<f32> = results.iter().map(|r| r.score).collect();
         apply_directory_saturation(&mut results);
-        // All 3 chunks from `src/` is at threshold — no decay yet
-        // (decay starts at `already >= THRESHOLD`, i.e. on the 4th).
+        // 2 chunks from `src/` is at threshold — no decay (decay starts when
+        // `already >= THRESHOLD`, i.e. on the 3rd chunk).
         let by_path: std::collections::HashMap<_, _> = results
             .iter()
             .map(|r| (r.file_path.clone(), r.score))
             .collect();
-        for (i, p) in ["src/a.rs", "src/b.rs", "src/c.rs"].iter().enumerate() {
+        for (i, p) in ["src/a.rs", "src/b.rs"].iter().enumerate() {
             assert!((by_path[*p] - before[i]).abs() < 1e-6);
         }
     }

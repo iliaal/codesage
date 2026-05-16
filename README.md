@@ -79,6 +79,23 @@ Head-to-head against code-review-graph 2.3.2 (same corpora, same queries, code-r
 
 The nest gap is architectural: CodeSage embeds chunks (~50-line regions), code-review-graph embeds nodes (functions). Commit-style queries that describe behavior spanning multiple functions match chunks more reliably than individual function bodies.
 
+### External-corpus benchmark (semble)
+
+[semble](https://github.com/MinishLab/semble) ships a published retrieval-evaluation corpus — 1,251 queries × 63 repos × 19 languages with file-level ground truth in `benchmarks/annotations/`. Cleaner than the git-mined "files-changed-in-same-commit" proxy, and an externally-defined target codesage's authors did not write.
+
+Running codesage `search` (`jina-embeddings-v2-base-code` + `ms-marco-MiniLM-L6-v2` reranker, GPU) on the corpus at its pinned SHAs:
+
+| Sample | n queries | recall@10 (primary) | NDCG@10 | mean first-hit rank |
+|---|--:|--:|--:|--:|
+| Supported-language repos (30 of 63) | 602 | **0.932** | **0.788** | 1.79 |
+| Full corpus (63 repos, missing parsers = miss) | 1,251 | 0.448 | 0.379 | — |
+
+The headline number is the 602-query / 8-language slice — that's what compares apples-to-apples against the languages codesage actually parses. The full-corpus number reflects the parser-coverage gap (36% of corpus targets Java, Ruby, Kotlin, Scala, C#, Swift, Elixir, Haskell, Lua, Zig, or Bash — none currently supported); it is a language-coverage number, not a retrieval-quality number.
+
+By-language headline (8 supported): JavaScript 0.892, Go 0.887, PHP 0.885 lead; TypeScript 0.595 trails (zod + vitest specifically — test-file flood dominates top-10 on phrase-matched queries).
+
+This is **not** a "codesage > semble" claim. A head-to-head would require running semble end-to-end on the same 63 repos under matched conditions, which is out of scope here. The number is codesage measured against semble's published ground truth.
+
 Run yourself with `bench/codesage-bench-runner <corpus.yaml>` (corpus format: `project_root` + `cases` list of `{id, query, expected_files}`). Scorecards from these runs live under `bench/history/`; corpora are not bundled so private-repo names don't leak by accident. Not a statement about every workload; bring your own corpus for your codebase.
 
 ## 🚀 Getting started
@@ -312,7 +329,7 @@ Corpora aren't bundled. Bring your own, or point the plugin at `$CODESAGE_BENCH_
 
 Honest inventory of what CodeSage does not do well, measured on our canary corpora and from 30 days of real Claude Code session logs (the harness in `bench/analyze-codesage-quality.py` produces the same numbers locally).
 
-**Language surface is narrower than competitors'.** Eight languages today (added C++ in 0.4.5). Graphify ships 25, code-review-graph 23, SocratiCode 18+. The gap matters most if your stack is Ruby, Java, Kotlin, Swift, or Scala. The tree-sitter query files live under `crates/parser/src/queries/` and contributions there are the cleanest way to extend coverage.
+**Language surface is narrower than competitors'.** Eight languages today (added C++ in 0.4.5). Graphify ships 25, code-review-graph 23, SocratiCode 18+. The gap matters most if your stack is Ruby, Java, Kotlin, Swift, or Scala. Measured cost: on the semble retrieval corpus (1,251 queries × 63 repos × 19 languages), 36% of queries target a language codesage does not parse — zero recall on those. The tree-sitter query files live under `crates/parser/src/queries/` and contributions there are the cleanest way to extend coverage.
 
 **Retrieval misses on cross-file refactor queries.** On the ripgrep corpus, 13% of cases miss top-10; four of those six misses are commit subjects like *printer: drop dependency on serde_derive* that describe a rename spanning multiple files without a distinctive literal signal. Single-identifier lookups (`find_symbol`, `find_references`) are reliable. Pure semantic searches (`search`) are reliable. Diffuse multi-file refactor descriptions expressed in prose are the failure mode.
 
