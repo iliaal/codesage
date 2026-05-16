@@ -1,15 +1,31 @@
-//! Python mapper: `pyproject.toml` `[project.scripts]` entry points,
-//! `setup.py` `entry_points` (best-effort regex fallback), and top-level
-//! files containing `if __name__ == "__main__":`.
+//! Python mapper. Emits:
+//! - `python-project` library seed for any project with a manifest
+//!   (`pyproject.toml`/`setup.py`/`setup.cfg`/`requirements.txt`), so
+//!   `find_feature("src/foo.py")` resolves to the package even without an
+//!   explicit script entry.
+//! - `pyproject.toml` `[project.scripts]` and `[tool.poetry.scripts]` entry
+//!   points as `cli-command` seeds.
+//! - `setup.py` `entry_points={'console_scripts': [...]}` as `cli-command`
+//!   seeds (best-effort regex fallback).
+//! - Files containing top-level `if __name__ == "__main__":` as
+//!   `cli-command` seeds (test-shaped files filtered out).
+//! - `python-test-suite` seeds per suite-root with pytest files, with a
+//!   package-manager-aware test command (uv/poetry/pdm/hatch/bare pytest)
+//!   attached per test.
+//!
+//! Source-group partitioning (clawpatch's `python-source-group`) is
+//! intentionally NOT ported per the LLM-utility filter — browse-only rows
+//! dilute `list_features` without unlocking a new agent action.
 
+use std::collections::BTreeSet;
 use std::fs;
 
 use anyhow::Result;
 use codesage_protocol::{FeatureConfidence, FeatureKind, Language};
 use regex::Regex;
 
-use crate::mappers::shared::{is_safe_file, strip_line_comments, walk_files};
-use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile};
+use crate::mappers::shared::{is_safe_dir, is_safe_file, strip_line_comments, walk_files};
+use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile, SeedTest};
 
 /// Extract the body of a `[name]` section from a TOML-like document
 /// (returns until the next `[...]` header or EOF). Avoids look-around
@@ -44,12 +60,146 @@ impl FeatureMapper for PythonMapper {
     }
     fn map(&self, ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
         let mut seeds: Vec<FeatureSeed> = Vec::new();
+        let pyproject_raw = read_pyproject(ctx.root);
+        let test_cmd = detect_python_test_command(ctx.root, pyproject_raw.as_deref());
+        seeds.extend(python_project_seed(
+            ctx,
+            pyproject_raw.as_deref(),
+            test_cmd.as_deref(),
+        )?);
         seeds.extend(pyproject_scripts(ctx)?);
+        seeds.extend(pyproject_poetry_scripts(ctx)?);
         seeds.extend(setup_py_entry_points(ctx)?);
         seeds.extend(main_guard_modules(ctx)?);
+        seeds.extend(pytest_test_suites(ctx, test_cmd.as_deref())?);
         seeds.retain(|s| ctx.allowed(&s.entry_path));
         Ok(seeds)
     }
+}
+
+fn read_pyproject(root: &std::path::Path) -> Option<String> {
+    let path = root.join("pyproject.toml");
+    if !is_safe_file(root, &path) {
+        return None;
+    }
+    fs::read_to_string(&path).ok()
+}
+
+/// Detect the project's test driver. Priority order matches what most
+/// Python toolchains install in practice: uv → poetry → pdm → hatch → bare
+/// pytest. The lockfile probe alone is a strong signal; a `[tool.uv]` /
+/// `[tool.poetry]` / `[tool.pdm]` / `[tool.hatch]` section in pyproject.toml
+/// is a secondary probe for projects that publish the manifest without the
+/// lockfile (common for libraries).
+fn detect_python_test_command(root: &std::path::Path, pyproject: Option<&str>) -> Option<String> {
+    let probe_lock = |name: &str| -> bool { is_safe_file(root, &root.join(name)) };
+    let has_tool = |section: &str| -> bool {
+        let Some(raw) = pyproject else { return false };
+        let body = strip_line_comments(raw, '#');
+        body.lines().any(|l| l.trim_start().starts_with(section))
+    };
+    if probe_lock("uv.lock") || has_tool("[tool.uv]") {
+        return Some("uv run pytest".to_string());
+    }
+    if probe_lock("poetry.lock") || has_tool("[tool.poetry]") {
+        return Some("poetry run pytest".to_string());
+    }
+    if probe_lock("pdm.lock") || has_tool("[tool.pdm]") {
+        return Some("pdm run pytest".to_string());
+    }
+    if has_tool("[tool.hatch]") {
+        return Some("hatch run pytest".to_string());
+    }
+    // Bare pytest is the only fallback worth emitting. If the project has
+    // no pyproject/setup.py and no tests dir, the test-suite mapper returns
+    // no seeds anyway, so this string only surfaces on real Python projects.
+    if pyproject.is_some()
+        || is_safe_file(root, &root.join("setup.py"))
+        || is_safe_file(root, &root.join("setup.cfg"))
+        || is_safe_file(root, &root.join("requirements.txt"))
+    {
+        return Some("pytest".to_string());
+    }
+    None
+}
+
+/// One project-level library seed for projects with any Python manifest.
+/// Routes `find_feature("src/foo.py")` to the project even when no script
+/// entry resolves to it — clawpatch's `python-project` shape.
+fn python_project_seed(
+    ctx: &MapperContext,
+    pyproject: Option<&str>,
+    test_cmd: Option<&str>,
+) -> Result<Vec<FeatureSeed>> {
+    let root = ctx.root;
+    let manifest = [
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "requirements.txt",
+    ]
+    .into_iter()
+    .find(|name| is_safe_file(root, &root.join(name)));
+    let Some(manifest) = manifest else {
+        return Ok(Vec::new());
+    };
+    let project_name = pyproject_project_name(pyproject).unwrap_or_else(|| {
+        root.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("python-project")
+            .to_string()
+    });
+    let mut context_files = vec![SeedFile {
+        path: manifest.to_string(),
+        reason: "package manifest".to_string(),
+    }];
+    for extra in ["README.md", "AGENTS.md"] {
+        if is_safe_file(root, &root.join(extra)) {
+            context_files.push(SeedFile {
+                path: extra.to_string(),
+                reason: "project context".to_string(),
+            });
+        }
+    }
+    let tests = match test_cmd {
+        Some(cmd) => vec![SeedTest {
+            path: manifest.to_string(),
+            command: Some(cmd.to_string()),
+        }],
+        None => Vec::new(),
+    };
+    Ok(vec![FeatureSeed {
+        title: format!("Python project `{project_name}`"),
+        summary: match test_cmd {
+            Some(cmd) => format!("Python project rooted at {manifest} (test: `{cmd}`)"),
+            None => format!("Python project rooted at {manifest}"),
+        },
+        kind: FeatureKind::Library,
+        source: "python-project",
+        confidence: FeatureConfidence::Medium,
+        entry_path: manifest.to_string(),
+        entry_symbol: Some(project_name),
+        entry_route: None,
+        entry_command: None,
+        language: Language::Python,
+        tags: vec!["python".to_string(), "package".to_string()],
+        owned_files: vec![SeedFile {
+            path: manifest.to_string(),
+            reason: "package manifest".to_string(),
+        }],
+        context_files,
+        tests,
+        test_prefixes: vec!["tests".to_string(), "test".to_string()],
+    }])
+}
+
+fn pyproject_project_name(pyproject: Option<&str>) -> Option<String> {
+    let raw = pyproject?;
+    let body = strip_line_comments(raw, '#');
+    let project_body = extract_section(&body, "project")?;
+    let re = Regex::new(r#"(?m)^\s*name\s*=\s*"([^"]+)""#).ok()?;
+    re.captures(&project_body)
+        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
 }
 
 fn pyproject_scripts(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
@@ -95,6 +245,64 @@ fn pyproject_scripts(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
             summary: format!("pyproject.toml `[project.scripts]` entry `{name} = \"{target}\"`"),
             kind: FeatureKind::CliCommand,
             source: "pyproject-script",
+            confidence: FeatureConfidence::High,
+            entry_path,
+            entry_symbol: Some(module),
+            entry_route: None,
+            entry_command: Some(name),
+            language: Language::Python,
+            tags: vec!["python".to_string(), "cli".to_string()],
+            owned_files: Vec::new(),
+            context_files: vec![SeedFile {
+                path: "pyproject.toml".to_string(),
+                reason: "package manifest".to_string(),
+            }],
+            tests: Vec::new(),
+            test_prefixes: vec!["tests".to_string()],
+        });
+    }
+    Ok(out)
+}
+
+fn pyproject_poetry_scripts(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
+    let root = ctx.root;
+    let mut out = Vec::new();
+    let path = root.join("pyproject.toml");
+    if !is_safe_file(root, &path) {
+        return Ok(out);
+    }
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return Ok(out);
+    };
+    let body = strip_line_comments(&raw, '#');
+    let Some(scripts_body) = extract_section(&body, "tool.poetry.scripts") else {
+        return Ok(out);
+    };
+    let line_re = Regex::new(r#"(?m)^\s*([A-Za-z_][\w\-]*)\s*=\s*"([^"]+)""#)?;
+    for cap in line_re.captures_iter(&scripts_body) {
+        let name = cap
+            .get(1)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+        let target = cap
+            .get(2)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let module = target.split(':').next().unwrap_or(&target).to_string();
+        let resolved = resolve_script_module_path(ctx, &module);
+        let entry_path = resolved
+            .clone()
+            .unwrap_or_else(|| "pyproject.toml".to_string());
+        out.push(FeatureSeed {
+            title: format!("Python script `{name}` (poetry)"),
+            summary: format!(
+                "pyproject.toml `[tool.poetry.scripts]` entry `{name} = \"{target}\"`"
+            ),
+            kind: FeatureKind::CliCommand,
+            source: "pyproject-poetry-script",
             confidence: FeatureConfidence::High,
             entry_path,
             entry_symbol: Some(module),
@@ -249,6 +457,132 @@ fn main_guard_modules(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
         });
     }
     Ok(out)
+}
+
+// ---- pytest test-suite mapping ----------------------------------------
+
+/// Per-suite-root pytest seeds. Walks `tests/`, `test/`, and any source-
+/// root the project declares (`src/`, top-level packages); filters to
+/// `test_*.py` / `*_test.py`; skips `__fixtures__` / `fixtures` /
+/// `testdata` directories; caps at 200 files per project; groups files by
+/// their suite root (the top-level dir containing the test). One seed per
+/// suite root keeps `list_features` clean — a project with `tests/api/`
+/// and `tests/unit/` produces ONE `python-test-suite` for `tests`, not
+/// two, matching how a developer thinks about pytest runs.
+fn pytest_test_suites(ctx: &MapperContext, test_cmd: Option<&str>) -> Result<Vec<FeatureSeed>> {
+    let root = ctx.root;
+    let scan_dirs = ["tests", "test", "src"];
+    let mut test_files: Vec<String> = Vec::new();
+    let mut roots_seen: BTreeSet<String> = BTreeSet::new();
+    for dir in scan_dirs {
+        let abs = root.join(dir);
+        if !is_safe_dir(root, &abs) {
+            continue;
+        }
+        roots_seen.insert(dir.to_string());
+        for rel in walk_files(root, &abs, 5_000, ctx.excludes) {
+            if !is_pytest_file(&rel) {
+                continue;
+            }
+            test_files.push(rel);
+            if test_files.len() >= 200 {
+                break;
+            }
+        }
+    }
+    if test_files.is_empty() {
+        return Ok(Vec::new());
+    }
+    test_files.sort();
+    test_files.dedup();
+
+    // Bucket by suite root (top-level dir). `tests/api/test_x.py` and
+    // `tests/unit/test_y.py` both go under `tests/`. A top-level
+    // `test_something.py` (no dir) buckets under `""` and gets a single
+    // umbrella seed.
+    let mut by_root: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for file in test_files {
+        let suite_root = file
+            .split_once('/')
+            .map(|(head, _)| head.to_string())
+            .unwrap_or_default();
+        by_root.entry(suite_root).or_default().push(file);
+    }
+
+    let mut out = Vec::new();
+    for (suite_root, files) in by_root {
+        let label = if suite_root.is_empty() {
+            "tests".to_string()
+        } else {
+            suite_root.clone()
+        };
+        let entry = files.first().cloned().unwrap_or_else(|| label.clone());
+        let tests: Vec<SeedTest> = files
+            .iter()
+            .map(|p| SeedTest {
+                path: p.clone(),
+                command: test_cmd.map(String::from),
+            })
+            .collect();
+        let owned: Vec<SeedFile> = files
+            .iter()
+            .filter(|p| **p != entry)
+            .map(|p| SeedFile {
+                path: p.clone(),
+                reason: "pytest test file".to_string(),
+            })
+            .collect();
+        let summary = match test_cmd {
+            Some(cmd) => format!(
+                "Pytest suite at `{label}` ({} files, run with `{cmd}`)",
+                files.len()
+            ),
+            None => format!("Pytest suite at `{label}` ({} files)", files.len()),
+        };
+        out.push(FeatureSeed {
+            title: format!("Python tests `{label}`"),
+            summary,
+            kind: FeatureKind::TestSuite,
+            source: "python-test-suite",
+            confidence: FeatureConfidence::High,
+            entry_path: entry,
+            entry_symbol: Some(label.clone()),
+            entry_route: None,
+            entry_command: test_cmd.map(String::from),
+            language: Language::Python,
+            tags: vec!["python".to_string(), "tests".to_string()],
+            owned_files: owned,
+            context_files: Vec::new(),
+            tests,
+            test_prefixes: if suite_root.is_empty() {
+                Vec::new()
+            } else {
+                vec![suite_root]
+            },
+        });
+    }
+    Ok(out)
+}
+
+/// Match `test_*.py` and `*_test.py`. Excludes fixture/testdata paths and
+/// generated python (`*_pb2.py`, `*.gen.py`) — even when they live under a
+/// test root, they're not the test files an agent runs.
+fn is_pytest_file(rel: &str) -> bool {
+    let lower = rel.to_ascii_lowercase();
+    if !lower.ends_with(".py") {
+        return false;
+    }
+    if lower.ends_with("_pb2.py") || lower.ends_with(".gen.py") {
+        return false;
+    }
+    for segment in rel.split('/') {
+        if matches!(segment, "__fixtures__" | "fixtures" | "testdata") {
+            return false;
+        }
+    }
+    let basename = rel.rsplit_once('/').map(|(_, tail)| tail).unwrap_or(rel);
+    basename.starts_with("test_") || basename.ends_with("_test.py")
 }
 
 #[cfg(test)]
@@ -475,5 +809,244 @@ acme = "acme.cli:main"
             .expect("setup-py seed");
         assert_eq!(s.entry_command.as_deref(), Some("acme"));
         assert_eq!(s.entry_path, "acme/cli.py");
+    }
+
+    // ---- Python-project + pytest + test-command -------------------------
+
+    #[test]
+    fn python_project_seed_emitted_with_pyproject() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "pyproject.toml",
+            r#"[project]
+name = "acme"
+"#,
+        );
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "python-project")
+            .expect("python-project seed");
+        assert_eq!(s.entry_symbol.as_deref(), Some("acme"));
+        assert_eq!(s.entry_path, "pyproject.toml");
+        assert_eq!(s.kind, FeatureKind::Library);
+    }
+
+    #[test]
+    fn python_project_seed_falls_back_to_setup_py() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "setup.py",
+            "from setuptools import setup\nsetup(name='legacy')\n",
+        );
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "python-project")
+            .expect("python-project seed");
+        assert_eq!(s.entry_path, "setup.py");
+    }
+
+    #[test]
+    fn no_python_project_seed_without_any_manifest() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "random.py", "# nothing\n");
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        assert!(!seeds.iter().any(|s| s.source == "python-project"));
+    }
+
+    #[test]
+    fn poetry_scripts_section_extracted() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "pyproject.toml",
+            r#"[tool.poetry]
+name = "acme"
+
+[tool.poetry.scripts]
+acme = "acme.cli:main"
+"#,
+        );
+        write(dir.path(), "acme/cli.py", "def main(): pass\n");
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "pyproject-poetry-script")
+            .expect("poetry script seed");
+        assert_eq!(s.entry_command.as_deref(), Some("acme"));
+        assert_eq!(s.entry_path, "acme/cli.py");
+    }
+
+    #[test]
+    fn pytest_test_suite_grouped_by_root() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname = \"acme\"\n");
+        write(
+            dir.path(),
+            "tests/api/test_users.py",
+            "def test_x(): pass\n",
+        );
+        write(
+            dir.path(),
+            "tests/unit/test_helpers.py",
+            "def test_y(): pass\n",
+        );
+        write(
+            dir.path(),
+            "tests/integration/something_test.py",
+            "def test_z(): pass\n",
+        );
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let suite_seeds: Vec<&FeatureSeed> = seeds
+            .iter()
+            .filter(|s| s.source == "python-test-suite")
+            .collect();
+        // ONE seed per top-level suite root (`tests`), not three.
+        assert_eq!(
+            suite_seeds.len(),
+            1,
+            "expected 1 test-suite seed (per suite root), got {}",
+            suite_seeds.len()
+        );
+        let s = suite_seeds[0];
+        assert_eq!(s.entry_symbol.as_deref(), Some("tests"));
+        assert_eq!(s.kind, FeatureKind::TestSuite);
+        // All three test files attach to the seed.
+        let test_paths: BTreeSet<&str> = s.tests.iter().map(|t| t.path.as_str()).collect();
+        assert!(test_paths.contains("tests/api/test_users.py"));
+        assert!(test_paths.contains("tests/unit/test_helpers.py"));
+        assert!(test_paths.contains("tests/integration/something_test.py"));
+    }
+
+    #[test]
+    fn pytest_test_suite_uses_uv_command_when_uv_lock_present() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname = \"acme\"\n");
+        write(dir.path(), "uv.lock", "version = 1\n");
+        write(dir.path(), "tests/test_x.py", "def test_x(): pass\n");
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "python-test-suite")
+            .expect("test-suite seed");
+        let cmd = s.tests.first().and_then(|t| t.command.as_deref());
+        assert_eq!(cmd, Some("uv run pytest"));
+    }
+
+    #[test]
+    fn pytest_test_suite_uses_poetry_command_when_poetry_lock_present() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname = \"acme\"\n");
+        write(dir.path(), "poetry.lock", "# poetry\n");
+        write(dir.path(), "tests/test_x.py", "def test_x(): pass\n");
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "python-test-suite")
+            .expect("test-suite seed");
+        let cmd = s.tests.first().and_then(|t| t.command.as_deref());
+        assert_eq!(cmd, Some("poetry run pytest"));
+    }
+
+    #[test]
+    fn pytest_test_suite_bare_pytest_when_no_pm_detected() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname = \"acme\"\n");
+        write(dir.path(), "tests/test_x.py", "def test_x(): pass\n");
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "python-test-suite")
+            .expect("test-suite seed");
+        let cmd = s.tests.first().and_then(|t| t.command.as_deref());
+        assert_eq!(cmd, Some("pytest"));
+    }
+
+    #[test]
+    fn pytest_skips_fixtures_and_generated() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname = \"acme\"\n");
+        write(dir.path(), "tests/test_real.py", "def test_real(): pass\n");
+        write(
+            dir.path(),
+            "tests/__fixtures__/test_fixture.py",
+            "# fixture, not a runnable test\n",
+        );
+        write(dir.path(), "tests/fixtures/data.py", "# fixture\n");
+        write(
+            dir.path(),
+            "tests/test_messages_pb2.py",
+            "# generated protobuf stub\n",
+        );
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "python-test-suite")
+            .expect("test-suite seed");
+        let paths: BTreeSet<&str> = s.tests.iter().map(|t| t.path.as_str()).collect();
+        assert!(paths.contains("tests/test_real.py"));
+        assert!(
+            !paths.iter().any(|p| p.contains("__fixtures__")),
+            "fixtures leaked: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains("/fixtures/")),
+            "fixtures/ leaked: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.ends_with("_pb2.py")),
+            "generated pb2 leaked: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn no_test_suite_seed_when_no_tests_exist() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname = \"acme\"\n");
+        write(dir.path(), "src/acme/__init__.py", "");
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        assert!(!seeds.iter().any(|s| s.source == "python-test-suite"));
+    }
+
+    #[test]
+    fn project_seed_summary_includes_test_command() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname = \"acme\"\n");
+        write(dir.path(), "poetry.lock", "# poetry\n");
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "python-project")
+            .expect("python-project seed");
+        assert!(
+            s.summary.contains("poetry run pytest"),
+            "summary should include the inferred test command: {}",
+            s.summary
+        );
     }
 }
