@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.7.5] - 2026-05-16
+
 ### Added
 
 - **Subagent-driven review workflow in the `codesage-tools` plugin.** Four new slash commands plus one subagent definition: `/codesage-review` (orchestrator — fans out feature-slice reviews in parallel via the new `codesage-feature-reviewer` subagent, persists findings to `.codesage/findings/<feature_id>.json` with run records under `.codesage/reviews/`), `/codesage-triage` (pure local state edit — mark a finding `open` / `false-positive` / `wont-fix` / `fixed` with an audit-trail history), `/codesage-revalidate` (re-runs the subagent against the slice to confirm a finding is fixed or still applies; auto-flips `open` → `fixed` when the defect no longer surfaces), `/codesage-report` (deterministic Markdown render of the findings JSON; no LLM call). Subagent runs read-only (`autoApprove: read`), consumes the existing codesage MCP surface (`feature_bundle`, `assess_risk`, `find_references`, `find_coupling`), inherits the host session's model, and returns JSON findings the orchestrator parses out of a fenced code block. Architectural choice: codesage's core remains read-only; the review workflow lives in the plugin and writes findings to gitignored JSON files that other tooling can consume. Plugin version bumped 0.1.0 → 0.2.0.
@@ -320,5 +322,7 @@ Initial public release.
 
 [0.6.0]: https://github.com/iliaal/codesage/releases/tag/v0.6.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.7.0...HEAD
 [0.7.0]: https://github.com/iliaal/codesage/releases/tag/v0.7.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.7.5...HEAD
+[0.7.5]: https://github.com/iliaal/codesage/releases/tag/v0.7.5
