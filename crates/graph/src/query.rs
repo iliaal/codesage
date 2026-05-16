@@ -462,6 +462,10 @@ pub fn search(
         apply_file_saturation(&mut results);
     }
 
+    if dir_saturation_enabled() {
+        apply_directory_saturation(&mut results);
+    }
+
     apply_offset_and_limit(&mut results, offset, limit);
     Ok(results)
 }
@@ -922,6 +926,60 @@ fn apply_file_saturation(results: &mut [SearchResult]) {
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 }
 
+const DIR_SATURATION_THRESHOLD: usize = 3;
+const DIR_SATURATION_DECAY: f32 = 0.85;
+
+/// Penalize chunks past threshold from the same parent directory, after
+/// `file_saturation` handles same-file. Motivated by the §2.10 semble-
+/// corpus laravel-framework finding: the query "queue connection
+/// resolution and connectors" returned 10 top results all from
+/// `Queue/Connectors/*Connector.php` (10 different files, same dir),
+/// pushing the conceptual target `QueueManager.php` off the page.
+/// Per-file saturation didn't catch it because each Connector is a
+/// distinct file. This signal applies after file_saturation so the two
+/// stack naturally — a file that's also in an oversaturated dir gets
+/// hit twice.
+fn apply_directory_saturation(results: &mut [SearchResult]) {
+    if results.is_empty() {
+        return;
+    }
+    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+
+    let mut per_dir: HashMap<String, usize> = HashMap::new();
+    for result in results.iter_mut() {
+        let dir = parent_dir_for_saturation(&result.file_path);
+        let already = per_dir.get(&dir).copied().unwrap_or(0);
+        if already >= DIR_SATURATION_THRESHOLD {
+            let excess = (already - DIR_SATURATION_THRESHOLD + 1) as i32;
+            result.score *= DIR_SATURATION_DECAY.powi(excess);
+        }
+        *per_dir.entry(dir).or_insert(0) += 1;
+    }
+    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+}
+
+/// Return the parent-directory key used for saturation grouping. Repo-
+/// root files (no `/`) bucket together under `""`; everything else uses
+/// the dirname.
+fn parent_dir_for_saturation(file_path: &str) -> String {
+    match file_path.rsplit_once('/') {
+        Some((dir, _)) => dir.to_string(),
+        None => String::new(),
+    }
+}
+
+/// Default-on; opt-out via `CODESAGE_DIR_SATURATION=0` (or "false").
+static DIR_SATURATION_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn dir_saturation_enabled() -> bool {
+    *DIR_SATURATION_ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("CODESAGE_DIR_SATURATION").as_deref(),
+            Ok("0") | Ok("false")
+        )
+    })
+}
+
 // Default-on; opt-out via CODESAGE_FILE_SATURATION=0 (or "false").
 static FILE_SATURATION_ENABLED: OnceLock<bool> = OnceLock::new();
 
@@ -934,7 +992,64 @@ fn file_saturation_enabled() -> bool {
     })
 }
 
-const RERANK_WEIGHT: f32 = 0.5;
+const RERANK_WEIGHT_DEFAULT: f32 = 0.5;
+const RERANK_WEIGHT_SHORT_ID: f32 = 0.35;
+const RERANK_WEIGHT_NATLANG: f32 = 0.6;
+
+/// Pick the rerank/semantic blend weight based on query shape. Adopted
+/// from semble's adaptive-α signal — see `notes/20260516-semble-
+/// classification.md`. Codesage's pipeline has no BM25 stage, so the
+/// natural mapping is to vary the **rerank vs semantic** blend instead
+/// of the **BM25 vs dense** blend.
+///
+/// - **Short identifier queries** (`FooBar`, `parse_config`,
+///   `Middleware`): trust the cross-encoder less. Symbol-boost and
+///   definition-boost already promote the right candidates; the
+///   cross-encoder's semantic judgement adds noise on bare identifiers.
+///   Weight: `RERANK_WEIGHT_SHORT_ID = 0.35`.
+/// - **Natural-language queries** (≥3 alphabetic words, e.g. "queue
+///   connection resolution and connectors"): trust the cross-encoder
+///   more. Semantic-only retrieval can over-cluster on sibling files;
+///   the cross-encoder's query/doc relevance scoring untangles them.
+///   Weight: `RERANK_WEIGHT_NATLANG = 0.6`.
+/// - **Mixed / fallback**: keep the historical 0.5.
+fn adaptive_rerank_weight(query: &str) -> f32 {
+    if !adaptive_rerank_weight_enabled() {
+        return RERANK_WEIGHT_DEFAULT;
+    }
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return RERANK_WEIGHT_DEFAULT;
+    }
+    // Short identifier shape: single token, looks like an identifier
+    // (CamelCase / snake_case / kebab-case with 3+ chars, no whitespace).
+    let single_token = !trimmed.chars().any(char::is_whitespace);
+    if single_token && looks_like_identifier(trimmed) {
+        return RERANK_WEIGHT_SHORT_ID;
+    }
+    // Natural language: 3+ alphabetic words, none of them looking like
+    // a hard identifier.
+    let alpha_words: Vec<&str> = trimmed
+        .split(|c: char| c.is_whitespace() || c == ',' || c == '.' || c == ';')
+        .filter(|s| s.chars().all(|c| c.is_alphabetic()) && s.len() >= 2)
+        .collect();
+    if alpha_words.len() >= 3 {
+        return RERANK_WEIGHT_NATLANG;
+    }
+    RERANK_WEIGHT_DEFAULT
+}
+
+/// Default-on; opt-out via `CODESAGE_ADAPTIVE_RERANK=0` (or "false").
+static ADAPTIVE_RERANK_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn adaptive_rerank_weight_enabled() -> bool {
+    *ADAPTIVE_RERANK_ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("CODESAGE_ADAPTIVE_RERANK").as_deref(),
+            Ok("0") | Ok("false")
+        )
+    })
+}
 
 fn apply_reranking(reranker: &mut Reranker, query: &str, results: &mut [SearchResult]) {
     if results.is_empty() {
@@ -951,13 +1066,14 @@ fn apply_reranking(reranker: &mut Reranker, query: &str, results: &mut [SearchRe
     let ce_max = ce_scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let ce_range = ce_max - ce_min;
 
+    let weight = adaptive_rerank_weight(query);
     for (result, &ce_raw) in results.iter_mut().zip(ce_scores.iter()) {
         let ce_norm = if ce_range > 1e-6 {
             (ce_raw - ce_min) / ce_range
         } else {
             0.5
         };
-        result.score = (1.0 - RERANK_WEIGHT) * result.score + RERANK_WEIGHT * ce_norm;
+        result.score = (1.0 - weight) * result.score + weight * ce_norm;
     }
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 }
@@ -2434,5 +2550,133 @@ mod context_export_tests {
 
         assert_eq!(found.qualified_name, "Database::open");
         assert_eq!(found.file_path, "src/db.rs");
+    }
+}
+
+#[cfg(test)]
+mod adaptive_rerank_tests {
+    use super::{
+        adaptive_rerank_weight, RERANK_WEIGHT_DEFAULT, RERANK_WEIGHT_NATLANG,
+        RERANK_WEIGHT_SHORT_ID,
+    };
+
+    #[test]
+    fn short_identifier_leans_semantic() {
+        assert_eq!(adaptive_rerank_weight("FooBar"), RERANK_WEIGHT_SHORT_ID);
+        assert_eq!(adaptive_rerank_weight("parse_config"), RERANK_WEIGHT_SHORT_ID);
+        assert_eq!(adaptive_rerank_weight("Middleware"), RERANK_WEIGHT_SHORT_ID);
+    }
+
+    #[test]
+    fn natural_language_leans_reranker() {
+        // 5-word natural-language phrase (the laravel-framework
+        // failure case from the §2.10 semble-corpus bench).
+        assert_eq!(
+            adaptive_rerank_weight("queue connection resolution and connectors"),
+            RERANK_WEIGHT_NATLANG
+        );
+        assert_eq!(
+            adaptive_rerank_weight("where does authentication happen"),
+            RERANK_WEIGHT_NATLANG
+        );
+    }
+
+    #[test]
+    fn mixed_short_queries_use_default() {
+        // Two words isn't enough for the natlang branch; not a single
+        // identifier either. Fall back to default.
+        assert_eq!(adaptive_rerank_weight("http server"), RERANK_WEIGHT_DEFAULT);
+        // Identifier-shaped but two tokens → not the short_id branch.
+        assert_eq!(
+            adaptive_rerank_weight("FooBar BarBaz"),
+            RERANK_WEIGHT_DEFAULT
+        );
+    }
+
+    #[test]
+    fn empty_query_uses_default() {
+        assert_eq!(adaptive_rerank_weight(""), RERANK_WEIGHT_DEFAULT);
+        assert_eq!(adaptive_rerank_weight("   "), RERANK_WEIGHT_DEFAULT);
+    }
+}
+
+#[cfg(test)]
+mod dir_saturation_tests {
+    use super::apply_directory_saturation;
+    use codesage_protocol::SearchResult;
+
+    fn mk(file: &str, score: f32) -> SearchResult {
+        SearchResult {
+            file_path: file.to_string(),
+            language: codesage_protocol::Language::Rust,
+            content: String::new(),
+            start_line: 1,
+            end_line: 10,
+            score,
+            symbols: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn penalizes_chunks_past_threshold_from_same_directory() {
+        // 5 chunks all from `Queue/Connectors/` mimicking the
+        // laravel-framework failure mode. First 3 keep their scores;
+        // chunks 4-5 decay by 0.85^excess.
+        let mut results = vec![
+            mk("Queue/Connectors/AConnector.php", 0.95),
+            mk("Queue/Connectors/BConnector.php", 0.94),
+            mk("Queue/Connectors/CConnector.php", 0.93),
+            mk("Queue/Connectors/DConnector.php", 0.92),
+            mk("Queue/Connectors/EConnector.php", 0.91),
+            mk("Queue/QueueManager.php", 0.80),
+        ];
+        apply_directory_saturation(&mut results);
+
+        // First 3 in the cluster keep their scores.
+        let by_path: std::collections::HashMap<_, _> = results
+            .iter()
+            .map(|r| (r.file_path.clone(), r.score))
+            .collect();
+        assert!((by_path["Queue/Connectors/AConnector.php"] - 0.95).abs() < 1e-6);
+        assert!((by_path["Queue/Connectors/BConnector.php"] - 0.94).abs() < 1e-6);
+        assert!((by_path["Queue/Connectors/CConnector.php"] - 0.93).abs() < 1e-6);
+        // 4th and 5th decay; absolute value < pre-decay.
+        assert!(by_path["Queue/Connectors/DConnector.php"] < 0.92);
+        assert!(by_path["Queue/Connectors/EConnector.php"] < 0.91);
+        // QueueManager untouched (different dir).
+        assert!((by_path["Queue/QueueManager.php"] - 0.80).abs() < 1e-6);
+    }
+
+    #[test]
+    fn no_penalty_below_threshold() {
+        let mut results = vec![
+            mk("src/a.rs", 0.9),
+            mk("src/b.rs", 0.8),
+            mk("src/c.rs", 0.7),
+        ];
+        let before: Vec<f32> = results.iter().map(|r| r.score).collect();
+        apply_directory_saturation(&mut results);
+        // All 3 chunks from `src/` is at threshold — no decay yet
+        // (decay starts at `already >= THRESHOLD`, i.e. on the 4th).
+        let by_path: std::collections::HashMap<_, _> = results
+            .iter()
+            .map(|r| (r.file_path.clone(), r.score))
+            .collect();
+        for (i, p) in ["src/a.rs", "src/b.rs", "src/c.rs"].iter().enumerate() {
+            assert!((by_path[*p] - before[i]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn repo_root_files_bucket_together() {
+        // No `/` in the path means parent_dir is `""`. All three are
+        // in the same bucket; only the 4th would decay.
+        let mut results = vec![
+            mk("README.md", 0.9),
+            mk("Cargo.toml", 0.8),
+            mk("Makefile", 0.7),
+        ];
+        apply_directory_saturation(&mut results);
+        assert_eq!(results.len(), 3); // sanity
     }
 }
