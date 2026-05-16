@@ -200,6 +200,7 @@ fn fresh_db_records_migrations_exactly_once() {
         "0007_symbols_rationale",
         "0008_file_trust_boundaries",
         "0009_feature_tables",
+        "0010_files_boundaries_derived_at",
     ] {
         let count: i64 = conn
             .query_row(
@@ -217,7 +218,7 @@ fn fresh_db_records_migrations_exactly_once() {
         .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
-        count_after, 9,
+        count_after, 10,
         "second init_db must not re-apply migrations"
     );
 }
@@ -248,6 +249,7 @@ fn legacy_db_records_migration_after_upgrade() {
         "0007_symbols_rationale",
         "0008_file_trust_boundaries",
         "0009_feature_tables",
+        "0010_files_boundaries_derived_at",
     ] {
         let count: i64 = conn
             .query_row(

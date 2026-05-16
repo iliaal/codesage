@@ -510,6 +510,15 @@ impl Database {
             "DELETE FROM file_trust_boundaries WHERE file_id = ?1",
             params![file_id],
         )?;
+        // Always stamp `boundaries_derived_at`, including when `tags` is
+        // empty. The marker lets the CR-003 backfill distinguish
+        // "rule-clean file" from "never-derived file" — without it, every
+        // index run would re-derive against files that have no rule
+        // matches because we can't tell them apart from upgrade leftovers.
+        self.conn.execute(
+            "UPDATE files SET boundaries_derived_at = unixepoch() WHERE id = ?1",
+            params![file_id],
+        )?;
         if tags.is_empty() {
             return Ok(());
         }
@@ -520,6 +529,34 @@ impl Database {
             stmt.execute(params![file_id, t.as_str()])?;
         }
         Ok(())
+    }
+
+    /// Files that have never had their trust boundaries derived (or were
+    /// indexed before the migration added the marker column). Empty when
+    /// every indexed file has been derived at least once. Used by the
+    /// CR-003 targeted backfill to catch partial-upgrade states.
+    pub fn files_pending_boundary_derivation(&self) -> Result<Vec<(i64, String, Language)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, language FROM files
+             WHERE boundaries_derived_at = 0
+             ORDER BY path",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                let path: String = row.get(1)?;
+                let lang_str: String = row.get(2)?;
+                let language = Language::parse(&lang_str).ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        format!("unknown Language in row: {lang_str:?}").into(),
+                    )
+                })?;
+                Ok((id, path, language))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Count rows in `file_trust_boundaries` across the whole project.

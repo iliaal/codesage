@@ -8,7 +8,13 @@ CREATE TABLE IF NOT EXISTS files (
     path TEXT NOT NULL UNIQUE,
     language TEXT NOT NULL,
     content_hash TEXT NOT NULL,
-    indexed_at INTEGER NOT NULL DEFAULT (unixepoch())
+    indexed_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    -- Unix epoch of the last trust-boundary derivation for this file, or 0
+    -- when never derived. Lets the CR-003 backfill run targeted catch-up
+    -- on files that were indexed pre-0.7.0 (or by an indexer that crashed
+    -- before deriving), without confusing "rule-clean empty set" with
+    -- "never-derived empty set". Updated by `replace_file_trust_boundaries`.
+    boundaries_derived_at INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS symbols (
@@ -297,6 +303,10 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
         migrate_0008_file_trust_boundaries,
     ),
     ("0009_feature_tables", migrate_0009_feature_tables),
+    (
+        "0010_files_boundaries_derived_at",
+        migrate_0010_files_boundaries_derived_at,
+    ),
 ];
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
@@ -377,6 +387,28 @@ fn migrate_0001_refs_name_tail(conn: &Connection) -> rusqlite::Result<()> {
         }
     }
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_refs_to_name_tail ON refs(to_name_tail);")?;
+    Ok(())
+}
+
+/// Adds `files.boundaries_derived_at` (epoch seconds; 0 = never derived).
+/// CR-003 refinement: the row-count-based backfill only catches the
+/// uniformly-empty-table case. A partial-upgrade state where some files
+/// got their boundaries derived inline by 0.7.0's indexer but others
+/// didn't would otherwise stay broken — an empty `file_trust_boundaries`
+/// rowset for a file is indistinguishable from a "rule-clean" file
+/// without this marker. Existing rows default to 0, so they'll be
+/// targeted by the next `cmd_index` backfill pass.
+fn migrate_0010_files_boundaries_derived_at(conn: &Connection) -> rusqlite::Result<()> {
+    let has_column: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name = 'boundaries_derived_at'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_column == 0 {
+        conn.execute_batch(
+            "ALTER TABLE files ADD COLUMN boundaries_derived_at INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
     Ok(())
 }
 

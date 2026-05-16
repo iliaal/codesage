@@ -106,9 +106,25 @@ pub fn derive_for_file(
 /// invalidate previously-computed boundaries. O(refs_total).
 pub fn derive_for_index(db: &Database) -> Result<usize> {
     let files = db.all_files_with_id_and_language()?;
+    derive_for_files(db, &files)
+}
+
+/// Targeted version of `derive_for_index`: derive boundaries only for the
+/// given `(file_id, path, language)` tuples. Used by the CR-003
+/// partial-upgrade backfill — the `files.boundaries_derived_at` marker
+/// identifies files that need work, and feeding only those into the
+/// derivation pass avoids redoing rule-clean files that were already
+/// stamped on a prior run.
+pub fn derive_for_files(
+    db: &Database,
+    files: &[(i64, String, codesage_protocol::Language)],
+) -> Result<usize> {
+    if files.is_empty() {
+        return Ok(0);
+    }
     let mut updated = 0usize;
     db.execute_batch(|db| {
-        for (file_id, _path, language) in &files {
+        for (file_id, _path, language) in files {
             let refs = db.refs_outgoing_for_file_id(*file_id)?;
             let in_memory: Vec<Reference> = refs
                 .into_iter()

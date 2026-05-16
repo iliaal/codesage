@@ -842,20 +842,27 @@ fn cmd_index(full: bool, no_semantic: bool) -> Result<()> {
         stats.references_found
     );
 
-    // CR-003: one-shot trust-boundary backfill on upgrade. The 0.7.0
-    // structural indexer derives boundaries inline for files it actually
-    // parses; an incremental run after upgrade skips unchanged files and
-    // leaves the table empty. When we see `files > 0` but
-    // `file_trust_boundaries` is empty, run the catch-up pass so
-    // `assess_risk` doesn't silently report zero boundary signal until
-    // every file gets edited.
-    let total_files = db.file_count().unwrap_or(0);
-    let boundary_rows = db.file_trust_boundary_count().unwrap_or(0);
-    if total_files > 0 && boundary_rows == 0 {
-        match codesage_features::trust_boundary::derive_for_index(&db) {
-            Ok(n) => println!("Trust boundaries: backfilled {n} files (upgrade catch-up)"),
-            Err(e) => eprintln!("trust-boundary backfill failed: {e:#}"),
+    // CR-003 refinement: targeted trust-boundary backfill. The original
+    // row-count guard (`total_files > 0 && boundary_rows == 0`) only
+    // caught the uniformly-empty case; a partial-upgrade state where
+    // some files got their boundaries derived inline by 0.7.0's indexer
+    // but others didn't would stay broken silently because an empty
+    // `file_trust_boundaries` rowset for a file is indistinguishable
+    // from a "rule-clean" file. The `files.boundaries_derived_at`
+    // marker (migration 0010) closes that gap: it's stamped on every
+    // `replace_file_trust_boundaries` call, so the query below returns
+    // exactly the files that have never been derived (or were indexed
+    // before the marker column existed).
+    match db.files_pending_boundary_derivation() {
+        Ok(pending) if !pending.is_empty() => {
+            let n_pending = pending.len();
+            match codesage_features::derive_for_files(&db, &pending) {
+                Ok(n) => println!("Trust boundaries: backfilled {n}/{n_pending} pending files"),
+                Err(e) => eprintln!("trust-boundary backfill failed: {e:#}"),
+            }
         }
+        Ok(_) => {}
+        Err(e) => eprintln!("trust-boundary pending-list query failed: {e:#}"),
     }
 
     // Feature mapping runs after structural (which populated `refs` and
