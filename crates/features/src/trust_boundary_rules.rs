@@ -68,6 +68,9 @@ const SECRETS: &[TrustBoundary] = &[TrustBoundary::Secrets];
 const SECRETS_NET: &[TrustBoundary] = &[TrustBoundary::Secrets, TrustBoundary::Network];
 const DB: &[TrustBoundary] = &[TrustBoundary::Database];
 const USER_INPUT: &[TrustBoundary] = &[TrustBoundary::UserInput];
+const USER_INPUT_FS: &[TrustBoundary] = &[TrustBoundary::UserInput, TrustBoundary::Filesystem];
+const AUTH: &[TrustBoundary] = &[TrustBoundary::Auth];
+const AUTH_SECRETS: &[TrustBoundary] = &[TrustBoundary::Auth, TrustBoundary::Secrets];
 const SERIALIZATION: &[TrustBoundary] = &[TrustBoundary::Serialization];
 const CONCURRENCY: &[TrustBoundary] = &[TrustBoundary::Concurrency];
 
@@ -183,6 +186,39 @@ const PHP_RULES: &[TrustBoundaryRule] = &[
     rule("fsockopen", MatchMode::Exact, NETWORK),
     rule("stream_socket_client", MatchMode::Exact, NETWORK),
     rule("socket_create", MatchMode::Exact, NETWORK),
+    // Laravel network facades: Http (Guzzle wrapper), Mail (SMTP/sendmail),
+    // Notification (channels), Broadcasting (websocket/pusher).
+    rule(
+        "Illuminate\\Support\\Facades\\Http",
+        MatchMode::PrefixBackslash,
+        NETWORK_API,
+    ),
+    rule(
+        "Illuminate\\Support\\Facades\\Mail",
+        MatchMode::PrefixBackslash,
+        NETWORK,
+    ),
+    rule(
+        "Illuminate\\Support\\Facades\\Notification",
+        MatchMode::PrefixBackslash,
+        NETWORK,
+    ),
+    rule(
+        "Illuminate\\Support\\Facades\\Broadcast",
+        MatchMode::PrefixBackslash,
+        NETWORK,
+    ),
+    rule(
+        "Illuminate\\Notifications",
+        MatchMode::PrefixBackslash,
+        NETWORK,
+    ),
+    rule("Illuminate\\Mail", MatchMode::PrefixBackslash, NETWORK),
+    rule(
+        "Symfony\\Component\\Mailer",
+        MatchMode::PrefixBackslash,
+        NETWORK,
+    ),
     // filesystem
     rule("fopen", MatchMode::Exact, FS),
     rule("fread", MatchMode::Exact, FS),
@@ -200,6 +236,29 @@ const PHP_RULES: &[TrustBoundaryRule] = &[
         MatchMode::PrefixBackslash,
         FS,
     ),
+    // Laravel filesystem facades: Storage (S3, local, etc.), File (sync).
+    rule(
+        "Illuminate\\Support\\Facades\\Storage",
+        MatchMode::PrefixBackslash,
+        FS,
+    ),
+    rule(
+        "Illuminate\\Support\\Facades\\File",
+        MatchMode::PrefixBackslash,
+        FS,
+    ),
+    rule("Illuminate\\Filesystem", MatchMode::PrefixBackslash, FS),
+    // File-shaped uploads carry both user-input AND filesystem semantics.
+    rule(
+        "Illuminate\\Http\\UploadedFile",
+        MatchMode::PrefixBackslash,
+        USER_INPUT_FS,
+    ),
+    rule(
+        "Symfony\\Component\\HttpFoundation\\File",
+        MatchMode::PrefixBackslash,
+        USER_INPUT_FS,
+    ),
     // process-exec
     rule("exec", MatchMode::Exact, EXEC),
     rule("system", MatchMode::Exact, EXEC),
@@ -213,6 +272,34 @@ const PHP_RULES: &[TrustBoundaryRule] = &[
         MatchMode::PrefixBackslash,
         EXEC,
     ),
+    // Laravel process-exec: Process (shell), Artisan (subcommands), Queue
+    // and Bus (dispatching jobs that run elsewhere), Console\\Command
+    // (artisan command surface area itself).
+    rule(
+        "Illuminate\\Support\\Facades\\Process",
+        MatchMode::PrefixBackslash,
+        EXEC,
+    ),
+    rule(
+        "Illuminate\\Support\\Facades\\Artisan",
+        MatchMode::PrefixBackslash,
+        EXEC,
+    ),
+    rule(
+        "Illuminate\\Support\\Facades\\Queue",
+        MatchMode::PrefixBackslash,
+        EXEC,
+    ),
+    rule(
+        "Illuminate\\Support\\Facades\\Bus",
+        MatchMode::PrefixBackslash,
+        EXEC,
+    ),
+    rule(
+        "Illuminate\\Console\\Command",
+        MatchMode::PrefixBackslash,
+        EXEC,
+    ),
     // secrets / env
     rule("getenv", MatchMode::Exact, SECRETS),
     rule("password_hash", MatchMode::Exact, SECRETS),
@@ -222,6 +309,54 @@ const PHP_RULES: &[TrustBoundaryRule] = &[
     rule("openssl_sign", MatchMode::Exact, SECRETS),
     rule("hash_hmac", MatchMode::Exact, SECRETS),
     rule("sodium_crypto", MatchMode::Contains, SECRETS),
+    // Laravel secret/crypto facades. Config + env() read .env values
+    // (Hash/Crypt/Auth handle credentials directly). Session carries
+    // session ids that act as bearer tokens.
+    rule(
+        "Illuminate\\Support\\Facades\\Hash",
+        MatchMode::PrefixBackslash,
+        SECRETS,
+    ),
+    rule(
+        "Illuminate\\Support\\Facades\\Crypt",
+        MatchMode::PrefixBackslash,
+        SECRETS,
+    ),
+    rule(
+        "Illuminate\\Support\\Facades\\Config",
+        MatchMode::PrefixBackslash,
+        SECRETS,
+    ),
+    rule(
+        "Illuminate\\Support\\Facades\\Session",
+        MatchMode::PrefixBackslash,
+        SECRETS,
+    ),
+    rule(
+        "Illuminate\\Encryption",
+        MatchMode::PrefixBackslash,
+        SECRETS,
+    ),
+    rule("Illuminate\\Hashing", MatchMode::PrefixBackslash, SECRETS),
+    rule("env", MatchMode::Exact, SECRETS),
+    rule("config", MatchMode::Exact, SECRETS),
+    // Laravel auth facades + Symfony Security: real auth boundaries.
+    rule(
+        "Illuminate\\Support\\Facades\\Auth",
+        MatchMode::PrefixBackslash,
+        AUTH_SECRETS,
+    ),
+    rule(
+        "Illuminate\\Support\\Facades\\Gate",
+        MatchMode::PrefixBackslash,
+        AUTH,
+    ),
+    rule("Illuminate\\Auth", MatchMode::PrefixBackslash, AUTH_SECRETS),
+    rule(
+        "Symfony\\Component\\Security",
+        MatchMode::PrefixBackslash,
+        AUTH_SECRETS,
+    ),
     // database
     rule("PDO", MatchMode::Exact, DB),
     rule("mysqli", MatchMode::Exact, DB),
@@ -234,6 +369,35 @@ const PHP_RULES: &[TrustBoundaryRule] = &[
     rule("Doctrine\\ORM", MatchMode::PrefixBackslash, DB),
     rule("Illuminate\\Database", MatchMode::PrefixBackslash, DB),
     rule("Cake\\Database", MatchMode::PrefixBackslash, DB),
+    // Laravel database / cache facades. DB facade is the query-builder
+    // entry point used outside Eloquent. Schema is migration scaffolding.
+    // Redis and Cache front KV stores that hold authoritative app state
+    // for our purposes (a security review still wants to see them).
+    rule(
+        "Illuminate\\Support\\Facades\\DB",
+        MatchMode::PrefixBackslash,
+        DB,
+    ),
+    rule(
+        "Illuminate\\Support\\Facades\\Schema",
+        MatchMode::PrefixBackslash,
+        DB,
+    ),
+    rule(
+        "Illuminate\\Support\\Facades\\Cache",
+        MatchMode::PrefixBackslash,
+        DB,
+    ),
+    rule(
+        "Illuminate\\Support\\Facades\\Redis",
+        MatchMode::PrefixBackslash,
+        DB,
+    ),
+    rule(
+        "Illuminate\\Database\\Eloquent",
+        MatchMode::PrefixBackslash,
+        DB,
+    ),
     // user-input (request superglobals + framework request bags)
     rule("filter_input", MatchMode::Exact, USER_INPUT),
     rule(
@@ -248,6 +412,28 @@ const PHP_RULES: &[TrustBoundaryRule] = &[
     ),
     rule(
         "Psr\\Http\\Message\\ServerRequestInterface",
+        MatchMode::PrefixBackslash,
+        USER_INPUT,
+    ),
+    // Laravel form-request classes and the FormRequest base — every
+    // request DTO that extends this is by definition user-controlled.
+    rule(
+        "Illuminate\\Foundation\\Http\\FormRequest",
+        MatchMode::PrefixBackslash,
+        USER_INPUT,
+    ),
+    rule(
+        "Illuminate\\Support\\Facades\\Request",
+        MatchMode::PrefixBackslash,
+        USER_INPUT,
+    ),
+    rule(
+        "Illuminate\\Support\\Facades\\Input",
+        MatchMode::PrefixBackslash,
+        USER_INPUT,
+    ),
+    rule(
+        "Illuminate\\Support\\Facades\\Route",
         MatchMode::PrefixBackslash,
         USER_INPUT,
     ),
@@ -587,6 +773,90 @@ mod tests {
         assert!(rule_matches(reqwest, "reqwest::header::HeaderMap"));
         assert!(!rule_matches(reqwest, "reqwest_middleware"));
         assert!(!rule_matches(reqwest, "not_reqwest"));
+    }
+
+    #[test]
+    fn laravel_facades_cover_the_common_boundary_categories() {
+        // Real Laravel apps abstract auth/storage/queue/env behind facades
+        // rather than calling getenv/exec/openssl_* directly. Without these
+        // rules a release-smoke run against a Laravel codebase registered
+        // 0 secrets, 0 process-exec, and only sparse filesystem rows even
+        // across thousands of files. Each row below names a facade plus
+        // the boundary it should fire — keeps the rule table honest as a
+        // checklist.
+        let table = rules_for(Language::Php)[0];
+        let cases: &[(&str, TrustBoundary)] = &[
+            ("Illuminate\\Support\\Facades\\Hash", TrustBoundary::Secrets),
+            (
+                "Illuminate\\Support\\Facades\\Config",
+                TrustBoundary::Secrets,
+            ),
+            (
+                "Illuminate\\Support\\Facades\\Crypt",
+                TrustBoundary::Secrets,
+            ),
+            (
+                "Illuminate\\Support\\Facades\\Session",
+                TrustBoundary::Secrets,
+            ),
+            ("Illuminate\\Support\\Facades\\Auth", TrustBoundary::Auth),
+            ("Illuminate\\Support\\Facades\\Gate", TrustBoundary::Auth),
+            (
+                "Illuminate\\Support\\Facades\\Storage",
+                TrustBoundary::Filesystem,
+            ),
+            (
+                "Illuminate\\Support\\Facades\\File",
+                TrustBoundary::Filesystem,
+            ),
+            (
+                "Illuminate\\Support\\Facades\\Process",
+                TrustBoundary::ProcessExec,
+            ),
+            (
+                "Illuminate\\Support\\Facades\\Artisan",
+                TrustBoundary::ProcessExec,
+            ),
+            (
+                "Illuminate\\Support\\Facades\\Queue",
+                TrustBoundary::ProcessExec,
+            ),
+            (
+                "Illuminate\\Support\\Facades\\Bus",
+                TrustBoundary::ProcessExec,
+            ),
+            ("Illuminate\\Support\\Facades\\Http", TrustBoundary::Network),
+            ("Illuminate\\Support\\Facades\\Mail", TrustBoundary::Network),
+            ("Illuminate\\Support\\Facades\\DB", TrustBoundary::Database),
+            (
+                "Illuminate\\Support\\Facades\\Cache",
+                TrustBoundary::Database,
+            ),
+            (
+                "Illuminate\\Support\\Facades\\Schema",
+                TrustBoundary::Database,
+            ),
+            (
+                "Illuminate\\Support\\Facades\\Redis",
+                TrustBoundary::Database,
+            ),
+            (
+                "Illuminate\\Support\\Facades\\Request",
+                TrustBoundary::UserInput,
+            ),
+            (
+                "Illuminate\\Foundation\\Http\\FormRequest",
+                TrustBoundary::UserInput,
+            ),
+            ("env", TrustBoundary::Secrets),
+            ("config", TrustBoundary::Secrets),
+        ];
+        for (name, expected) in cases {
+            let matched = table
+                .iter()
+                .any(|r| rule_matches(r, name) && r.boundaries.contains(expected));
+            assert!(matched, "no Php rule fires {expected:?} for `{name}`");
+        }
     }
 
     #[test]
