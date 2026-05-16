@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-16
+
 ### Added
 
 
@@ -312,5 +314,7 @@ Initial public release.
 [0.2.1]: https://github.com/iliaal/codesage/releases/tag/v0.2.1
 [0.2.0]: https://github.com/iliaal/codesage/releases/tag/v0.2.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.6.0...HEAD
 [0.6.0]: https://github.com/iliaal/codesage/releases/tag/v0.6.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/iliaal/codesage/releases/tag/v0.7.0
