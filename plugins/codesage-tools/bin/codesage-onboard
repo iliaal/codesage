@@ -27,6 +27,8 @@ Options:
   --no-mcp                Skip global MCP registration
   --no-hooks              Skip git hook installation
   --no-hint               Skip writing .claude/CLAUDE.md hint file
+  --refresh-hint          Overwrite an existing .claude/CLAUDE.md hint
+                          (default: skip when present, preserve user edits)
   -h, --help              This help
 EOF
     exit 2
@@ -38,6 +40,7 @@ codesage_bin=""
 skip_mcp=0
 skip_hooks=0
 skip_hint=0
+refresh_hint=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -46,6 +49,7 @@ while [ $# -gt 0 ]; do
         --no-mcp)       skip_mcp=1 ;;
         --no-hooks)     skip_hooks=1 ;;
         --no-hint)      skip_hint=1 ;;
+        --refresh-hint) refresh_hint=1 ;;
         -h|--help)      usage ;;
         --*)            echo "unknown option: $1" >&2; usage ;;
         *)              [ -z "$project" ] && project="$1" || usage ;;
@@ -172,12 +176,17 @@ fi
 # --- Step 7: .claude/CLAUDE.md hint ---
 if [ "$skip_hint" -eq 0 ]; then
     hint_file="$project/.claude/CLAUDE.md"
-    if [ -f "$hint_file" ]; then
-        echo "==> [7/7] $hint_file already exists, skipping"
+    if [ -f "$hint_file" ] && [ "$refresh_hint" -eq 0 ]; then
+        echo "==> [7/7] $hint_file already exists, skipping (pass --refresh-hint to overwrite)"
     else
-        echo "==> [7/7] writing $hint_file"
+        if [ -f "$hint_file" ]; then
+            echo "==> [7/7] refreshing $hint_file (--refresh-hint)"
+        else
+            echo "==> [7/7] writing $hint_file"
+        fi
         mkdir -p "$project/.claude"
         cat > "$hint_file" <<HINT
+<!-- codesage-onboard-hint-version: 0.7.0 -->
 # Local: code intelligence (CodeSage)
 
 Global MCP server \`codesage\` provides semantic search and structural graph queries for this project.
@@ -198,14 +207,23 @@ Pass that on every call. The server uses it to route to the right index.
 - \`search\`: "where does X happen?", debugging by symptom, intent queries spanning files, when you don't know the symbol name.
 - \`find_symbol\` / \`find_references\`: exact symbol lookups, callers/callees, dependency mapping.
 - \`impact_analysis\`: before renaming a symbol or modifying a widely-used class or function. Identifies tests to run.
-- \`export_context\`: package code for another LLM or focused prompt about a specific concept.
+- \`export_context\`: package code for another LLM around a free-form query or a single named symbol. For an already-mapped feature slice, use \`feature_bundle\` instead — it avoids re-running semantic search.
 - grep / ripgrep: exact strings, constants, error messages; when you already have the exact symbol name.
+
+### Feature slices and trust boundaries (0.7.0)
+
+A feature slice is a behavior-keyed bundle: entrypoint + owned files + context files + tests + crossed trust boundaries + tags. Mapped deterministically (no LLM) from build manifests, framework routing, and source-level signals across PHP/Laravel, C/C++, Rust, Python, JS/TS, Go.
+
+- \`list_features\`: enumerate feature slices, filter by \`kind\` (\`route\`, \`cli-command\`, \`library\`, \`test-suite\`, \`service\`, \`config\`, \`infra\`), \`language\`, or \`tag\`. Use to discover the agent-facing surface area before deep-diving.
+- \`find_feature\`: given a file path, return the feature(s) that own it. Answers "what slice owns app/Http/Controllers/UserController.php?" without scanning by hand.
+- \`feature_bundle\`: curated code bundle for one \`feature_id\`. Same shape as \`export_context\` but anchored on the feature's pre-resolved file list (entry + owned + tests + context) — avoids fan-out Read calls per file when reviewing or modifying a whole slice. Optionally expand the entry symbol's callers/callees.
+- Trust-boundary signal: each file in the index carries a derived tag set (\`network\`, \`filesystem\`, \`process-exec\`, \`secrets\`, \`database\`, \`user-input\`, \`external-api\`, \`serialization\`, \`auth\`, \`concurrency\`). The same signal feeds \`assess_risk\` and surfaces a \`"crosses N trust boundaries (X, Y, Z) — security review recommended"\` note when ≥3 are crossed. Quote that note in PR descriptions for security-sensitive patches.
 
 ### Risk and history (V2b)
 
 Per-file (slice 1):
-- \`assess_risk\`: BEFORE writing a patch, query risk for the file. Score combines churn, fix ratio, blast radius, coupling, and test gap. Hot+fix-heavy file means smaller patch + broader test sweep. Quote the notes in PR descriptions so reviewers see your calibration.
-- \`assess_risk_batch\`: per-file risk for N files in one call, no aggregation. Use when you have a list of files (impact analysis output, coupling neighbours) and want each individual score — saves per-file MCP round-trips. For patch-level aggregation use \`assess_risk_diff\`.
+- \`assess_risk\`: BEFORE writing a patch, query risk for the file. Score combines churn, fix ratio, blast radius, coupling, test gap, import-cycle membership, and trust-boundary count. Hot+fix-heavy file means smaller patch + broader test sweep. Quote the notes in PR descriptions so reviewers see your calibration.
+- \`assess_risk_batch\`: per-file risk for N files in one call, no aggregation. Use when you have a list of files (impact analysis output, coupling neighbours, the files of a feature you're touching one-by-one) and want each individual score — saves per-file MCP round-trips. For patch-level aggregation use \`assess_risk_diff\`.
 - \`find_coupling\`: when planning the test sweep, ask which files have historically changed with the file you're touching. Replaces "consider running tests in X" guesses with named files.
 
 Patch-level (slice 2, added in 0.3.0):
@@ -223,10 +241,11 @@ All four require git history indexed. Initial \`codesage git-index\` runs at onb
 
 ## Operations
 
-- Structural + semantic index auto-refreshes on commit/merge/checkout via installed git hooks.
+- Structural + semantic + feature mapping + trust-boundary derivation all auto-refresh on commit/merge/checkout via installed git hooks (\`codesage index\` runs the whole pipeline).
 - Git history index auto-refreshes incrementally on commit/merge/checkout/rebase via the same hooks. Weekly \`codesage git-index --full\` to rebaseline is still good hygiene.
 - Manual refresh: \`codesage index\`, or \`/codesage-reindex\`. Force a full git-history rescan with \`codesage git-index --full\`.
 - CLI: \`codesage search --limit 5 'query'\`, \`codesage coupling <file>\`, \`codesage risk <file>\`, \`codesage risk-batch <files...>\`, \`codesage risk-diff <files...>\`, \`codesage tests-for <files...>\` (all the multi-file commands accept stdin too: \`git diff --name-only | codesage risk-diff\`).
+- Feature CLI: \`codesage map\`, \`codesage features-list [--kind --lang --tag --json]\`, \`codesage feature-show <id>\`, \`codesage feature-for <file>\`, \`codesage feature-bundle <id>\`, \`codesage trust-boundaries <file>\`.
 HINT
         # Keep the local hint out of the project's commit history.
         if [ -e "$project/.git" ]; then
