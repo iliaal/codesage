@@ -1,19 +1,54 @@
-//! JavaScript / TypeScript mapper: `package.json` `bin` and selected
-//! scripts (`start`/`build`/`test`/`lint`/`typecheck`/`format`), plus
-//! Next.js `app/**/{page,route}.{ts,tsx,js,jsx}` and `pages/**/*.{ts,tsx}`.
+//! JavaScript / TypeScript mapper: workspace-aware `package.json` decomposition
+//! (npm / yarn / pnpm `workspaces`, `pnpm-workspace.yaml`, fallback prefixes),
+//! per-package `bin` and selected scripts (`start`/`build`/`test`/`lint`/
+//! `typecheck`/`format`), Next.js `app/**/{page,route}.{ts,tsx,js,jsx}` and
+//! `pages/**/*.{ts,tsx}`, React Router `<Route>` declarations.
+//!
+//! Workspace decomposition is the per-package surface ported from clawpatch
+//! (`src/mappers/node.ts`). Source-group partitioning is intentionally NOT
+//! ported — it produces browse-only `list_features` rows without an actionable
+//! downstream consumer (LLM-utility-filter, codified in
+//! `feedback_llm_utility_filter.md`).
 
+use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use codesage_protocol::{FeatureConfidence, FeatureKind, Language};
 use regex::Regex;
 use serde_json::Value;
 
-use crate::mappers::shared::{is_safe_dir, is_safe_file, walk_files};
-use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile};
+use crate::mappers::shared::{is_safe_dir, is_safe_file, should_skip, walk_files};
+use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile, SeedTest};
 
 pub struct JsMapper;
+
+/// One Node/TypeScript package discovered in the repo. `root_rel` is the
+/// workspace-relative directory (`""` for the repo root, `packages/api` for a
+/// workspace member); `manifest_rel` is the repo-relative `package.json` path.
+struct PackageInfo {
+    root_rel: String,
+    manifest_rel: String,
+    pkg: Value,
+}
+
+impl PackageInfo {
+    fn is_root(&self) -> bool {
+        self.root_rel.is_empty() || self.root_rel == "."
+    }
+}
+
+/// Detected package manager. Drives the `testCommand` formatting on per-package
+/// bin seeds so an agent gets a runnable command directly from the feature
+/// record instead of having to inspect `package.json` + lockfile separately.
+#[derive(Clone, Copy)]
+enum NodePm {
+    Pnpm,
+    Yarn,
+    Bun,
+    Npm,
+}
 
 impl FeatureMapper for JsMapper {
     fn name(&self) -> &'static str {
@@ -30,8 +65,10 @@ impl FeatureMapper for JsMapper {
         } else {
             None
         };
-        if let Some(pkg) = &pkg_at_root {
-            seeds.extend(package_seeds(root, pkg));
+        let packages = discover_packages(root, pkg_at_root.as_ref());
+        let pm = detect_node_package_manager(root);
+        for info in &packages {
+            seeds.extend(package_seeds_for(root, info, pm));
         }
         seeds.extend(next_app_routes(ctx)?);
         seeds.extend(next_pages_routes(ctx)?);
@@ -65,9 +102,23 @@ fn language_for_entry(entry: &str) -> Language {
     }
 }
 
-fn package_seeds(root: &Path, pkg: &Value) -> Vec<FeatureSeed> {
+/// Build the per-package seed set. `is_root` flips on the "common scripts"
+/// gate (clawpatch's `includeCommonScripts`): only the root package emits
+/// `start`/`build`/`test`/etc. as standalone seeds so a monorepo doesn't get
+/// N copies of those entries. Workspace packages still emit their own bin
+/// seeds, because per-package `bin` is the routing-actionable surface.
+fn package_seeds_for(root: &Path, info: &PackageInfo, pm: NodePm) -> Vec<FeatureSeed> {
     let mut out = Vec::new();
-    // bin: string or { name: path } map.
+    let package_name = package_display_name(info);
+    let pkg = &info.pkg;
+    let has_test_script = package_scripts(pkg).contains_key("test");
+    let test_cmd = if has_test_script {
+        Some(script_command(pm, &info.root_rel, "test"))
+    } else {
+        None
+    };
+
+    // bin: string or { name: path } map. Each bin emits a cli-command seed.
     if let Some(bin_val) = pkg.get("bin") {
         let entries: Vec<(String, String)> = match bin_val {
             Value::String(s) => {
@@ -85,35 +136,50 @@ fn package_seeds(root: &Path, pkg: &Value) -> Vec<FeatureSeed> {
             _ => Vec::new(),
         };
         for (cmd, path) in entries {
-            let entry = path.trim_start_matches("./").to_string();
-            let abs = root.join(&entry);
+            // Source-back resolution: dist/foo.js → src/foo.ts when that
+            // source file exists. Lets `feature-for src/foo.ts` route to
+            // the bin feature instead of the build artifact (which an
+            // agent should not be editing).
+            let entry_rel = resolve_package_bin_entry(root, &info.root_rel, &path);
+            let abs = root.join(&entry_rel);
             if !is_safe_file(root, &abs) {
                 continue;
             }
-            let language = language_for_entry(&entry);
+            let language = language_for_entry(&entry_rel);
+            let summary = if entry_rel
+                == package_relative_path(&info.root_rel, &normalize_package_path(&path))
+            {
+                format!("package.json bin `{cmd}` at {entry_rel}")
+            } else {
+                format!("package.json bin `{cmd}` at {path}, source resolved to {entry_rel}")
+            };
+            let mut tags = vec![
+                if language == Language::TypeScript {
+                    "typescript"
+                } else {
+                    "javascript"
+                }
+                .to_string(),
+                "cli".to_string(),
+            ];
+            if !info.is_root() {
+                tags.push("workspace".to_string());
+            }
             out.push(FeatureSeed {
                 title: format!("npm bin `{cmd}`"),
-                summary: format!("package.json bin entry at {entry}"),
+                summary,
                 kind: FeatureKind::CliCommand,
                 source: "package-json-bin",
                 confidence: FeatureConfidence::High,
-                entry_path: entry,
+                entry_path: entry_rel,
                 entry_symbol: None,
                 entry_route: None,
                 entry_command: Some(cmd),
                 language,
-                tags: vec![
-                    if language == Language::TypeScript {
-                        "typescript"
-                    } else {
-                        "javascript"
-                    }
-                    .to_string(),
-                    "cli".to_string(),
-                ],
+                tags,
                 owned_files: Vec::new(),
                 context_files: vec![SeedFile {
-                    path: "package.json".to_string(),
+                    path: info.manifest_rel.clone(),
                     reason: "package manifest".to_string(),
                 }],
                 tests: Vec::new(),
@@ -125,8 +191,13 @@ fn package_seeds(root: &Path, pkg: &Value) -> Vec<FeatureSeed> {
             });
         }
     }
-    // scripts: subset of known names.
-    if let Some(scripts) = pkg.get("scripts").and_then(|v| v.as_object()) {
+
+    // Common scripts: only emit standalone seeds for the root package.
+    // Workspace packages get the package seed below instead so a Turborepo
+    // doesn't produce 30 copies of "npm script `build`".
+    if info.is_root()
+        && let Some(scripts) = pkg.get("scripts").and_then(|v| v.as_object())
+    {
         for (name, value) in scripts {
             if !matches!(
                 name.as_str(),
@@ -149,7 +220,7 @@ fn package_seeds(root: &Path, pkg: &Value) -> Vec<FeatureSeed> {
                 kind,
                 source: "package-json-script",
                 confidence: FeatureConfidence::Medium,
-                entry_path: "package.json".to_string(),
+                entry_path: info.manifest_rel.clone(),
                 entry_symbol: Some(name.clone()),
                 entry_route: None,
                 entry_command: Some(name.clone()),
@@ -157,7 +228,7 @@ fn package_seeds(root: &Path, pkg: &Value) -> Vec<FeatureSeed> {
                 tags: vec!["javascript".to_string(), "package-script".to_string()],
                 owned_files: Vec::new(),
                 context_files: vec![SeedFile {
-                    path: "package.json".to_string(),
+                    path: info.manifest_rel.clone(),
                     reason: "package manifest".to_string(),
                 }],
                 tests: Vec::new(),
@@ -165,7 +236,548 @@ fn package_seeds(root: &Path, pkg: &Value) -> Vec<FeatureSeed> {
             });
         }
     }
+
+    // Workspace package manifest seed. Routes `find_feature(packages/api/...)`
+    // to the local manifest + test command so an agent gets the right `pnpm
+    // --dir packages/api test` instead of the root-level fallback. Emitted
+    // ONLY for workspace members so the root repo's existing per-script
+    // seeds remain the agent-facing surface there.
+    if !info.is_root() {
+        let mut context_files = Vec::new();
+        for candidate in ["README.md", "AGENTS.md", "tsconfig.json"] {
+            let rel = package_relative_path(&info.root_rel, candidate);
+            if rel == info.manifest_rel {
+                continue;
+            }
+            if is_safe_file(root, &root.join(&rel)) {
+                context_files.push(SeedFile {
+                    path: rel,
+                    reason: "package context".to_string(),
+                });
+            }
+        }
+        let tests = if let Some(cmd) = &test_cmd {
+            vec![SeedTest {
+                path: info.manifest_rel.clone(),
+                command: Some(cmd.clone()),
+            }]
+        } else {
+            Vec::new()
+        };
+        let summary = match &test_cmd {
+            Some(cmd) => format!(
+                "Node workspace package `{package_name}` at {} (test: `{cmd}`)",
+                info.root_rel
+            ),
+            None => format!(
+                "Node workspace package `{package_name}` at {}",
+                info.root_rel
+            ),
+        };
+        out.push(FeatureSeed {
+            title: format!("Node package `{package_name}`"),
+            summary,
+            kind: FeatureKind::Library,
+            source: "node-package",
+            confidence: FeatureConfidence::Medium,
+            entry_path: info.manifest_rel.clone(),
+            entry_symbol: Some(package_name),
+            entry_route: None,
+            entry_command: None,
+            language: Language::JavaScript,
+            tags: vec![
+                "javascript".to_string(),
+                "package".to_string(),
+                "workspace".to_string(),
+            ],
+            owned_files: vec![SeedFile {
+                path: info.manifest_rel.clone(),
+                reason: "package manifest".to_string(),
+            }],
+            context_files,
+            tests,
+            test_prefixes: vec!["__tests__".to_string(), "tests".to_string()],
+        });
+    }
+
     out
+}
+
+// ---- Workspace discovery ------------------------------------------------
+
+fn discover_packages(root: &Path, root_pkg: Option<&Value>) -> Vec<PackageInfo> {
+    let mut roots: BTreeSet<String> = BTreeSet::new();
+    if root_pkg.is_some() {
+        roots.insert(String::new()); // "" represents repo root
+    }
+    let patterns = workspace_patterns(root, root_pkg);
+    let excludes: Vec<String> = patterns
+        .iter()
+        .filter(|p| p.starts_with('!'))
+        .filter_map(|p| normalize_workspace_pattern(&p[1..]))
+        .collect();
+    for include in patterns.iter().filter(|p| !p.starts_with('!')) {
+        for package_root in expand_workspace_pattern(root, include) {
+            roots.insert(package_root);
+        }
+    }
+    let mut out: Vec<PackageInfo> = Vec::new();
+    for r in roots
+        .into_iter()
+        .filter(|p| !is_excluded_workspace(p, &excludes))
+    {
+        let manifest_rel = if r.is_empty() {
+            "package.json".to_string()
+        } else {
+            format!("{r}/package.json")
+        };
+        let abs = root.join(&manifest_rel);
+        if !is_safe_file(root, &abs) {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&abs) else {
+            continue;
+        };
+        let Ok(pkg) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        if !pkg.is_object() {
+            continue;
+        }
+        out.push(PackageInfo {
+            root_rel: r,
+            manifest_rel,
+            pkg,
+        });
+    }
+    out
+}
+
+fn workspace_patterns(root: &Path, root_pkg: Option<&Value>) -> Vec<String> {
+    let mut patterns: BTreeSet<String> = BTreeSet::new();
+    if let Some(pkg) = root_pkg {
+        for p in package_workspace_patterns(pkg) {
+            patterns.insert(p);
+        }
+    }
+    let pnpm_ws = root.join("pnpm-workspace.yaml");
+    if is_safe_file(root, &pnpm_ws)
+        && let Ok(raw) = fs::read_to_string(&pnpm_ws)
+    {
+        for p in parse_pnpm_workspace(&raw) {
+            patterns.insert(p);
+        }
+    }
+    // Convention fallback: when no explicit workspace declaration exists but
+    // a `packages/`-shaped directory does, treat each child as a workspace.
+    // Mirrors clawpatch's fallback list.
+    for fallback in ["packages", "apps", "extensions", "plugins"] {
+        if is_safe_dir(root, &root.join(fallback)) {
+            patterns.insert(format!("{fallback}/*"));
+        }
+    }
+    patterns.into_iter().collect()
+}
+
+fn package_workspace_patterns(pkg: &Value) -> Vec<String> {
+    let workspaces = match pkg.get("workspaces") {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    if let Some(arr) = workspaces.as_array() {
+        return arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+    }
+    if let Some(obj) = workspaces.as_object()
+        && let Some(arr) = obj.get("packages").and_then(|v| v.as_array())
+    {
+        return arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+    }
+    Vec::new()
+}
+
+/// Hand-rolled `pnpm-workspace.yaml` parser. Avoids pulling a YAML crate for
+/// a 5-line file. Reads the top-level `packages:` block and returns the
+/// `- <path>` entries (quoted or unquoted). Mirrors clawpatch's `parsePnpmWorkspace`.
+fn parse_pnpm_workspace(source: &str) -> Vec<String> {
+    let mut patterns = Vec::new();
+    let mut in_packages = false;
+    let key_re = Regex::new(r"^\s*-\s*['\x22]?([^'\x22\s]+)['\x22]?\s*$").unwrap();
+    for raw_line in source.lines() {
+        let line = match raw_line.find('#') {
+            Some(i) => &raw_line[..i],
+            None => raw_line,
+        };
+        // Top-level key changes when the first column is non-whitespace.
+        if line.starts_with(|c: char| !c.is_whitespace() && c != '\u{FEFF}') {
+            in_packages = line.trim_start().starts_with("packages:");
+            continue;
+        }
+        if !in_packages {
+            continue;
+        }
+        if let Some(cap) = key_re.captures(line)
+            && let Some(m) = cap.get(1)
+        {
+            patterns.push(m.as_str().to_string());
+        }
+    }
+    patterns
+}
+
+fn normalize_workspace_pattern(pattern: &str) -> Option<String> {
+    let trimmed = pattern.trim();
+    let stripped = trimmed
+        .strip_suffix("/package.json")
+        .unwrap_or(trimmed)
+        .trim_end_matches('/');
+    let normalized = stripped.replace('\\', "/");
+    if normalized.starts_with('/') || normalized.split('/').any(|seg| seg == "..") {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn is_excluded_workspace(package_root: &str, excludes: &[String]) -> bool {
+    excludes
+        .iter()
+        .any(|p| workspace_pattern_matches(p, package_root))
+}
+
+fn workspace_pattern_matches(pattern: &str, package_root: &str) -> bool {
+    if pattern == package_root {
+        return true;
+    }
+    if has_workspace_glob(pattern) {
+        return glob_segments_match(
+            &pattern.split('/').collect::<Vec<_>>(),
+            &package_root.split('/').collect::<Vec<_>>(),
+        );
+    }
+    if let Some(parent) = pattern.strip_suffix("/**") {
+        return path_matches_prefix(package_root, parent);
+    }
+    if let Some(parent) = pattern.strip_suffix("/*") {
+        if !path_matches_prefix(package_root, parent) {
+            return false;
+        }
+        return package_root[parent.len() + 1..].split('/').count() == 1;
+    }
+    false
+}
+
+fn path_matches_prefix(path: &str, prefix: &str) -> bool {
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+fn has_workspace_glob(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?')
+}
+
+fn glob_segments_match(pattern: &[&str], candidate: &[&str]) -> bool {
+    let Some((segment, remaining_pattern)) = pattern.split_first() else {
+        return candidate.is_empty();
+    };
+    if *segment == "**" {
+        if glob_segments_match(remaining_pattern, candidate) {
+            return true;
+        }
+        if !candidate.is_empty() && glob_segments_match(pattern, &candidate[1..]) {
+            return true;
+        }
+        return false;
+    }
+    let Some((candidate_segment, remaining_candidate)) = candidate.split_first() else {
+        return false;
+    };
+    if !glob_segment_matches(segment, candidate_segment) {
+        return false;
+    }
+    glob_segments_match(remaining_pattern, remaining_candidate)
+}
+
+fn glob_segment_matches(segment: &str, candidate: &str) -> bool {
+    // Build a tiny regex for each segment. `*` → `[^/]*`, `?` → `[^/]`,
+    // everything else literal.
+    let mut re = String::from("^");
+    for c in segment.chars() {
+        match c {
+            '*' => re.push_str("[^/]*"),
+            '?' => re.push_str("[^/]"),
+            '.' | '+' | '^' | '$' | '{' | '}' | '(' | ')' | '|' | '[' | ']' | '\\' => {
+                re.push('\\');
+                re.push(c);
+            }
+            _ => re.push(c),
+        }
+    }
+    re.push('$');
+    Regex::new(&re).ok().is_some_and(|r| r.is_match(candidate))
+}
+
+fn expand_workspace_pattern(root: &Path, pattern: &str) -> Vec<String> {
+    let Some(normalized) = normalize_workspace_pattern(pattern) else {
+        return Vec::new();
+    };
+    if normalized.is_empty() || normalized == "." {
+        return vec![String::new()];
+    }
+    if let Some(prefix) = normalized.strip_suffix("/**")
+        && !has_workspace_glob(prefix)
+    {
+        return discover_package_roots(root, prefix, 4);
+    }
+    if let Some(parent) = normalized.strip_suffix("/*")
+        && !has_workspace_glob(parent)
+    {
+        let mut out: Vec<String> = Vec::new();
+        for entry in safe_directory_entries(root, parent) {
+            let candidate = format!("{parent}/{entry}");
+            if is_safe_file(root, &root.join(&candidate).join("package.json")) {
+                out.push(candidate);
+            }
+        }
+        out.sort();
+        return out;
+    }
+    if has_workspace_glob(&normalized) {
+        return expand_workspace_glob(root, &normalized);
+    }
+    if is_safe_dir(root, &root.join(&normalized))
+        && is_safe_file(root, &root.join(&normalized).join("package.json"))
+    {
+        return vec![normalized];
+    }
+    Vec::new()
+}
+
+fn expand_workspace_glob(root: &Path, pattern: &str) -> Vec<String> {
+    let segments: Vec<&str> = pattern.split('/').collect();
+    let mut out: Vec<String> = Vec::new();
+    visit_glob(root, "", &segments, &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn visit_glob(root: &Path, base: &str, remaining: &[&str], out: &mut Vec<String>) {
+    let Some((segment, rest)) = remaining.split_first() else {
+        if !base.is_empty()
+            && is_safe_dir(root, &root.join(base))
+            && is_safe_file(root, &root.join(base).join("package.json"))
+        {
+            out.push(base.to_string());
+        }
+        return;
+    };
+    if !has_workspace_glob(segment) {
+        let next_base = if base.is_empty() {
+            segment.to_string()
+        } else {
+            format!("{base}/{segment}")
+        };
+        visit_glob(root, &next_base, rest, out);
+        return;
+    }
+    if *segment == "**" {
+        // ** matches zero segments here…
+        visit_glob(root, base, rest, out);
+        // …or one segment that recurses with the same pattern.
+        for entry in safe_directory_entries(root, base) {
+            let next_base = if base.is_empty() {
+                entry.clone()
+            } else {
+                format!("{base}/{entry}")
+            };
+            visit_glob(root, &next_base, remaining, out);
+        }
+        return;
+    }
+    for entry in safe_directory_entries(root, base) {
+        if !glob_segment_matches(segment, &entry) {
+            continue;
+        }
+        let next_base = if base.is_empty() {
+            entry
+        } else {
+            format!("{base}/{entry}")
+        };
+        visit_glob(root, &next_base, rest, out);
+    }
+}
+
+fn discover_package_roots(root: &Path, prefix: &str, max_depth: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    discover_into(root, prefix, max_depth, &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn discover_into(root: &Path, prefix: &str, remaining_depth: usize, out: &mut Vec<String>) {
+    if should_skip(prefix) {
+        return;
+    }
+    if is_safe_file(root, &root.join(prefix).join("package.json")) {
+        out.push(prefix.to_string());
+    }
+    if remaining_depth == 0 {
+        return;
+    }
+    for entry in safe_directory_entries(root, prefix) {
+        let next = if prefix.is_empty() {
+            entry
+        } else {
+            format!("{prefix}/{entry}")
+        };
+        discover_into(root, &next, remaining_depth - 1, out);
+    }
+}
+
+fn safe_directory_entries(root: &Path, prefix: &str) -> Vec<String> {
+    let dir = if prefix.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(prefix)
+    };
+    if !is_safe_dir(root, &dir) {
+        return Vec::new();
+    }
+    let Ok(read) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for entry in read.flatten() {
+        let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
+            continue;
+        };
+        let rel = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if should_skip(&rel) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_dir() && !meta.file_type().is_symlink() {
+            out.push(name);
+        }
+    }
+    out.sort();
+    out
+}
+
+// ---- Per-package helpers ------------------------------------------------
+
+fn package_scripts(pkg: &Value) -> serde_json::Map<String, Value> {
+    pkg.get("scripts")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn package_display_name(info: &PackageInfo) -> String {
+    if let Some(name) = info.pkg.get("name").and_then(|v| v.as_str())
+        && !name.is_empty()
+    {
+        return name.to_string();
+    }
+    if info.is_root() {
+        // Best-effort: take the repo dir basename. We don't have it here
+        // without re-reading the path; fall back to "package".
+        return "package".to_string();
+    }
+    info.root_rel
+        .rsplit_once('/')
+        .map(|(_, tail)| tail.to_string())
+        .unwrap_or_else(|| info.root_rel.clone())
+}
+
+fn detect_node_package_manager(root: &Path) -> NodePm {
+    if is_safe_file(root, &root.join("pnpm-lock.yaml"))
+        || is_safe_file(root, &root.join("pnpm-workspace.yaml"))
+    {
+        return NodePm::Pnpm;
+    }
+    if is_safe_file(root, &root.join("yarn.lock")) {
+        return NodePm::Yarn;
+    }
+    if is_safe_file(root, &root.join("bun.lockb")) {
+        return NodePm::Bun;
+    }
+    NodePm::Npm
+}
+
+fn script_command(pm: NodePm, package_root: &str, script: &str) -> String {
+    if package_root.is_empty() || package_root == "." {
+        return match pm {
+            NodePm::Npm => format!("npm run {script}"),
+            NodePm::Pnpm => format!("pnpm {script}"),
+            NodePm::Yarn => format!("yarn {script}"),
+            NodePm::Bun => format!("bun run {script}"),
+        };
+    }
+    match pm {
+        NodePm::Pnpm => format!("pnpm --dir {package_root} {script}"),
+        NodePm::Yarn => format!("yarn --cwd {package_root} {script}"),
+        NodePm::Bun => format!("bun --cwd {package_root} run {script}"),
+        NodePm::Npm => format!("npm --prefix {package_root} run {script}"),
+    }
+}
+
+/// Resolve a `bin` entry path, mapping `dist/foo.js` → `src/foo.ts` when the
+/// TypeScript source exists. Falls back to the declared dist path when no
+/// source candidate exists on disk. Lets agents edit the source instead of
+/// the build artifact.
+fn resolve_package_bin_entry(root: &Path, package_root: &str, path: &str) -> String {
+    let normalized = normalize_package_path(path);
+    let source_candidate = source_candidate_for_generated_bin(&normalized);
+    let candidate = package_relative_path(
+        package_root,
+        source_candidate.as_deref().unwrap_or(&normalized),
+    );
+    if source_candidate.is_none() {
+        return candidate;
+    }
+    if is_safe_file(root, &root.join(&candidate)) {
+        candidate
+    } else {
+        package_relative_path(package_root, &normalized)
+    }
+}
+
+fn source_candidate_for_generated_bin(path: &str) -> Option<String> {
+    let stripped = path
+        .strip_prefix("dist/")
+        .or_else(|| path.strip_prefix("build/"))?;
+    let dot = stripped.rfind('.')?;
+    let (stem, ext) = stripped.split_at(dot);
+    if !matches!(ext, ".js" | ".mjs" | ".cjs") {
+        return None;
+    }
+    Some(format!("src/{stem}.ts"))
+}
+
+fn normalize_package_path(path: &str) -> String {
+    let p: PathBuf = PathBuf::from(path);
+    let s = p.to_string_lossy().into_owned();
+    s.replace('\\', "/").trim_start_matches("./").to_string()
+}
+
+fn package_relative_path(package_root: &str, path: &str) -> String {
+    let stripped = path.trim_start_matches("./");
+    if package_root.is_empty() || package_root == "." {
+        return stripped.to_string();
+    }
+    format!("{package_root}/{stripped}")
 }
 
 fn next_app_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
@@ -504,5 +1116,244 @@ const App = () => (
             .expect("next app page");
         assert_eq!(s.entry_route.as_deref(), Some("/dashboard"));
         assert_eq!(s.language, Language::TypeScript);
+    }
+
+    // ---- Workspace decomposition ----------------------------------------
+
+    #[test]
+    fn npm_workspaces_array_emits_per_package_seeds() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"monorepo","workspaces":["packages/*"]}"#,
+        );
+        write(
+            dir.path(),
+            "packages/api/package.json",
+            r#"{"name":"@acme/api","scripts":{"test":"jest"}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/web/package.json",
+            r#"{"name":"@acme/web","bin":{"acme-web":"./bin/run.js"},"scripts":{"test":"vitest"}}"#,
+        );
+        write(
+            dir.path(),
+            "packages/web/bin/run.js",
+            "#!/usr/bin/env node\n",
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+
+        let pkg_seeds: Vec<&FeatureSeed> = seeds
+            .iter()
+            .filter(|s| s.source == "node-package")
+            .collect();
+        let names: Vec<&str> = pkg_seeds
+            .iter()
+            .filter_map(|s| s.entry_symbol.as_deref())
+            .collect();
+        assert!(
+            names.contains(&"@acme/api"),
+            "expected @acme/api workspace seed, got {names:?}"
+        );
+        assert!(
+            names.contains(&"@acme/web"),
+            "expected @acme/web workspace seed, got {names:?}"
+        );
+
+        // The api workspace seed should carry a per-package test command on
+        // its tests Vec, not the root npm command.
+        let api = pkg_seeds
+            .iter()
+            .find(|s| s.entry_symbol.as_deref() == Some("@acme/api"))
+            .unwrap();
+        assert_eq!(api.entry_path, "packages/api/package.json");
+        let cmd = api.tests.first().and_then(|t| t.command.as_deref());
+        assert_eq!(cmd, Some("npm --prefix packages/api run test"));
+    }
+
+    #[test]
+    fn pnpm_workspace_yaml_parsed() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "package.json", r#"{"name":"monorepo"}"#);
+        write(
+            dir.path(),
+            "pnpm-workspace.yaml",
+            "packages:\n  - 'apps/*'\n  - \"libs/*\"\n",
+        );
+        write(
+            dir.path(),
+            "apps/admin/package.json",
+            r#"{"name":"@acme/admin","scripts":{"test":"vitest"}}"#,
+        );
+        write(
+            dir.path(),
+            "libs/util/package.json",
+            r#"{"name":"@acme/util"}"#,
+        );
+        // pnpm-lock.yaml flips pm detection.
+        write(dir.path(), "pnpm-lock.yaml", "lockfileVersion: '9'\n");
+
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let names: Vec<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "node-package")
+            .filter_map(|s| s.entry_symbol.as_deref())
+            .collect();
+        assert!(names.contains(&"@acme/admin"));
+        assert!(names.contains(&"@acme/util"));
+
+        // pnpm package-manager detection drives the test-command formatting.
+        let admin = seeds
+            .iter()
+            .find(|s| s.entry_symbol.as_deref() == Some("@acme/admin"))
+            .unwrap();
+        let cmd = admin.tests.first().and_then(|t| t.command.as_deref());
+        assert_eq!(cmd, Some("pnpm --dir apps/admin test"));
+    }
+
+    #[test]
+    fn fallback_workspace_prefixes_discovered() {
+        // No explicit `workspaces` declaration; a `packages/` directory with
+        // child manifests should still produce per-package seeds.
+        let dir = tempdir().unwrap();
+        write(dir.path(), "package.json", r#"{"name":"monorepo"}"#);
+        write(
+            dir.path(),
+            "packages/lib/package.json",
+            r#"{"name":"@acme/lib"}"#,
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let names: Vec<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "node-package")
+            .filter_map(|s| s.entry_symbol.as_deref())
+            .collect();
+        assert!(
+            names.contains(&"@acme/lib"),
+            "fallback packages/ prefix not discovered, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn bin_source_back_resolves_to_typescript() {
+        // package.json points at dist/cli.js, but a src/cli.ts exists. The
+        // bin seed's entry path should resolve to the source, not the dist.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"acme","bin":{"acme":"./dist/cli.js"}}"#,
+        );
+        write(dir.path(), "src/cli.ts", "// source\n");
+        write(dir.path(), "dist/cli.js", "// generated\n");
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "package-json-bin")
+            .expect("npm bin seed");
+        assert_eq!(s.entry_path, "src/cli.ts");
+        assert_eq!(s.language, Language::TypeScript);
+    }
+
+    #[test]
+    fn bin_source_back_falls_back_when_no_typescript() {
+        // dist/foo.js with no src/foo.ts → keep the dist path. We don't
+        // skip the seed; the bin is still real, we just don't have a
+        // better entry to point at.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"acme","bin":{"acme":"./dist/cli.js"}}"#,
+        );
+        write(dir.path(), "dist/cli.js", "// only artifact\n");
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "package-json-bin")
+            .expect("npm bin seed");
+        assert_eq!(s.entry_path, "dist/cli.js");
+    }
+
+    #[test]
+    fn workspace_excludes_negation_pattern() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"monorepo","workspaces":["packages/*","!packages/legacy"]}"#,
+        );
+        write(
+            dir.path(),
+            "packages/api/package.json",
+            r#"{"name":"@acme/api"}"#,
+        );
+        write(
+            dir.path(),
+            "packages/legacy/package.json",
+            r#"{"name":"@acme/legacy"}"#,
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let names: Vec<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "node-package")
+            .filter_map(|s| s.entry_symbol.as_deref())
+            .collect();
+        assert!(names.contains(&"@acme/api"));
+        assert!(
+            !names.contains(&"@acme/legacy"),
+            "negation pattern not honored, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn root_package_does_not_emit_node_package_seed() {
+        // node-package seed is workspace-only. The root keeps the existing
+        // per-script and per-bin behavior; one less list_features row.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"acme","scripts":{"build":"tsc"}}"#,
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        assert!(
+            !seeds.iter().any(|s| s.source == "node-package"),
+            "root-only repo should not produce a node-package seed"
+        );
+        // But the script seed should still be there.
+        assert!(seeds.iter().any(|s| s.source == "package-json-script"));
+    }
+
+    #[test]
+    fn workspace_packages_skip_common_scripts() {
+        // Per the includeCommonScripts gate: only the root emits standalone
+        // `npm script `build`` seeds. Workspace packages produce a single
+        // `node-package` seed instead so a Turborepo doesn't get 30 build
+        // seeds.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"monorepo","workspaces":["packages/*"]}"#,
+        );
+        write(
+            dir.path(),
+            "packages/api/package.json",
+            r#"{"name":"@acme/api","scripts":{"build":"tsc","test":"jest"}}"#,
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let api_scripts: Vec<&FeatureSeed> = seeds
+            .iter()
+            .filter(|s| s.source == "package-json-script")
+            .filter(|s| s.entry_path == "packages/api/package.json")
+            .collect();
+        assert!(
+            api_scripts.is_empty(),
+            "workspace package leaked script seeds: {:?}",
+            api_scripts.iter().map(|s| &s.title).collect::<Vec<_>>()
+        );
     }
 }
