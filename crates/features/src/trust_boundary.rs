@@ -38,11 +38,32 @@ pub fn derive_from_refs(refs: &[Reference], language: Language) -> Vec<TrustBoun
         if !ref_kind_signals_boundary(r.kind) {
             continue;
         }
+        let name = normalize_ref_name(&r.to_name, r.kind);
         for table in tables {
-            apply_rules(table, &r.to_name, &mut acc);
+            apply_rules(table, &name, &mut acc);
         }
     }
     acc.into_iter().collect()
+}
+
+/// Strip the angle-bracket / quote framing that the C parser preserves
+/// around `#include` directives. The parser records `<sys/socket.h>` and
+/// `"local.h"` verbatim; the rule patterns are written against the bare
+/// path, so without this normalization every C include-shaped rule
+/// silently misses on real source. (Discovered during the 0.7.0 php-src
+/// smoke test — `ext/curl/interface.c` was returning an empty boundary
+/// set despite including `<curl/curl.h>`.)
+fn normalize_ref_name(name: &str, kind: ReferenceKind) -> String {
+    if kind != ReferenceKind::Include {
+        return name.to_string();
+    }
+    let trimmed = name.trim();
+    let inner = trimmed
+        .strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+        .or_else(|| trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+        .unwrap_or(trimmed);
+    inner.to_string()
 }
 
 fn ref_kind_signals_boundary(kind: ReferenceKind) -> bool {
@@ -137,6 +158,29 @@ mod tests {
             kind: ReferenceKind::Include,
             ..imp(to)
         }
+    }
+
+    #[test]
+    fn c_include_strips_angle_brackets_and_quotes() {
+        // Regression: the C parser preserves `<...>` / `"..."` framing around
+        // includes; rules are written against the bare path. Without the
+        // strip, every C include rule misses silently.
+        let refs = vec![
+            inc("<sys/socket.h>"),
+            inc("<curl/curl.h>"),
+            inc("\"local.h\""),
+        ];
+        let b = derive_from_refs(&refs, Language::C);
+        assert!(
+            b.contains(&TrustBoundary::Network),
+            "bracketed sys/socket.h must still match the C rule, got {:?}",
+            b
+        );
+        assert!(
+            b.contains(&TrustBoundary::ExternalApi),
+            "bracketed curl/curl.h must yield ExternalApi, got {:?}",
+            b
+        );
     }
 
     fn call(to: &str) -> Reference {

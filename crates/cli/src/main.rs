@@ -1303,7 +1303,11 @@ fn cmd_feature_bundle(
     json: bool,
 ) -> Result<()> {
     let root = find_project_root()?;
-    let db = open_db(&root)?;
+    // Open against the configured embedding model so `primary` / `related`
+    // resolve real chunks. The default-model `open_db` points at the
+    // MiniLM 384-dim chunk table and returns empty content on projects
+    // configured for a different model (e.g. php-src uses jina v2 768-dim).
+    let db = load_symbol_context_db(&root)?;
     let bundle = codesage_graph::feature_bundle(&db, id, include_callers, include_callees, limit)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&bundle)?);

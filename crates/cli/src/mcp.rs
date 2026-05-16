@@ -952,8 +952,13 @@ impl CodeSageServer {
         let include_callers = params.include_callers.unwrap_or(false);
         let include_callees = params.include_callees.unwrap_or(false);
         let limit = params.limit.unwrap_or(5);
+        // Use the context DB (binds to the configured embedding model's
+        // chunk table) so `primary`/`related` resolve real chunks. The
+        // structural-only db variant points at the default chunk table
+        // and returns empty content on projects using a non-default
+        // model (php-src uses jina v2 768-dim, MiniLM is the default).
         render_with_kind(
-            self.with_project_db(&params.project, |db| {
+            self.with_project_context_db(&params.project, |db| {
                 feature_bundle(db, &feature_id, include_callers, include_callees, limit)
             }),
             "feature_bundle",
