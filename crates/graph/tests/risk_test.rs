@@ -1252,3 +1252,248 @@ fn trust_boundaries_field_empty_when_file_has_no_signal() {
         r.trust_boundaries
     );
 }
+
+// ----- top_symbols breakdown (§1.15) -----
+
+/// Unit test: with three symbols of different sizes and ref counts, the
+/// ranking must reflect the heuristic ln(1 + line_count) + ref_count.
+/// Seeds the structural tables directly so the math is the only variable.
+#[test]
+fn top_symbols_rank_by_line_count_and_ref_count() {
+    use codesage_protocol::{FileInfo, Language, Reference, ReferenceKind, Symbol, SymbolKind};
+
+    let db = Database::open_in_memory().unwrap();
+    // Caller file that hosts the refs to our three symbols.
+    let caller_id = db
+        .upsert_file(&FileInfo {
+            path: "caller.rs".into(),
+            language: Language::Rust,
+            content_hash: "c".into(),
+        })
+        .unwrap();
+    // Target file: three symbols of different shapes.
+    let target_id = db
+        .upsert_file(&FileInfo {
+            path: "target.rs".into(),
+            language: Language::Rust,
+            content_hash: "t".into(),
+        })
+        .unwrap();
+
+    let mk = |name: &str, ls: u32, le: u32| Symbol {
+        name: name.into(),
+        qualified_name: name.into(),
+        kind: SymbolKind::Function,
+        file_path: "target.rs".into(),
+        line_start: ls,
+        line_end: le,
+        col_start: 0,
+        col_end: 0,
+        rationale: Vec::new(),
+    };
+
+    // big: 100 lines, no callers → score = ln(101) + 0 = ~4.62
+    // small_hot: 5 lines, 20 callers → score = ln(6) + 20 = ~21.79
+    // tiny: 1 line, 1 caller → score = ln(2) + 1 = ~1.69
+    db.insert_symbols(
+        target_id,
+        &[
+            mk("big", 1, 100),
+            mk("small_hot", 110, 114),
+            mk("tiny", 120, 120),
+        ],
+    )
+    .unwrap();
+
+    let mk_ref = |to: &str, line: u32| Reference {
+        from_file: "caller.rs".into(),
+        from_symbol: None,
+        to_name: to.into(),
+        kind: ReferenceKind::Call,
+        line,
+        col: 0,
+    };
+    let mut refs: Vec<Reference> = (0..20).map(|i| mk_ref("small_hot", 10 + i)).collect();
+    refs.push(mk_ref("tiny", 200));
+    db.insert_references(caller_id, &refs).unwrap();
+
+    // No git history seeded — assess_risk still runs with score=0 inputs;
+    // we only care about top_symbols ordering, which is independent of churn.
+    let r = assess_risk(&db, "target.rs").unwrap();
+
+    assert_eq!(
+        r.top_symbols.len(),
+        3,
+        "expected all three symbols ranked, got {:?}",
+        r.top_symbols
+    );
+    // Ranking: small_hot (refs dominate) > big (length wins over tiny) > tiny.
+    assert_eq!(r.top_symbols[0].name, "small_hot");
+    assert_eq!(r.top_symbols[1].name, "big");
+    assert_eq!(r.top_symbols[2].name, "tiny");
+
+    // Cycle is false for this fixture (no import edges); `why` should not
+    // mention a cycle clause.
+    for t in &r.top_symbols {
+        assert!(
+            !t.why.contains("cycle"),
+            "no cycle in fixture, got why={:?}",
+            t.why
+        );
+        assert!(
+            t.why.starts_with("hot:"),
+            "unexpected why prefix: {:?}",
+            t.why
+        );
+    }
+    // Spot-check the small_hot rendering captures both the line and ref count.
+    let hot = &r.top_symbols[0];
+    assert_eq!(hot.line, 110);
+    assert_eq!(hot.kind, "function");
+    assert!(
+        hot.why.contains("5 lines") && hot.why.contains("20 refs"),
+        "small_hot why should reference its actual stats, got {:?}",
+        hot.why
+    );
+}
+
+/// Integration test: on a known-hot file (high churn + fix history) the
+/// `top_symbols` list is populated, sorted descending, every entry has a
+/// non-empty `why` of the documented shape, and the cap is honored.
+#[test]
+fn top_symbols_populates_on_known_hot_file_and_caps_at_five() {
+    use codesage_protocol::{FileInfo, Language, Reference, ReferenceKind, Symbol, SymbolKind};
+
+    let db = Database::open_in_memory().unwrap();
+    let caller_id = db
+        .upsert_file(&FileInfo {
+            path: "caller.rs".into(),
+            language: Language::Rust,
+            content_hash: "c".into(),
+        })
+        .unwrap();
+    let hot_id = db
+        .upsert_file(&FileInfo {
+            path: "hot.rs".into(),
+            language: Language::Rust,
+            content_hash: "h".into(),
+        })
+        .unwrap();
+
+    // Seed 8 symbols, ascending in size. Largest should win on length alone.
+    let mut syms: Vec<Symbol> = Vec::new();
+    for i in 0..8u32 {
+        let line_count = (i + 1) * 10;
+        let line_start = 1 + i * 100;
+        let line_end = line_start + line_count - 1;
+        syms.push(Symbol {
+            name: format!("sym_{i:02}"),
+            qualified_name: format!("sym_{i:02}"),
+            kind: SymbolKind::Function,
+            file_path: "hot.rs".into(),
+            line_start,
+            line_end,
+            col_start: 0,
+            col_end: 0,
+            rationale: Vec::new(),
+        });
+    }
+    db.insert_symbols(hot_id, &syms).unwrap();
+
+    // A handful of refs into the smallest symbol so it sneaks into the top via
+    // ref_count, proving ranking isn't pure length.
+    let refs: Vec<Reference> = (0..30)
+        .map(|i| Reference {
+            from_file: "caller.rs".into(),
+            from_symbol: None,
+            to_name: "sym_00".into(),
+            kind: ReferenceKind::Call,
+            line: 10 + i,
+            col: 0,
+        })
+        .collect();
+    db.insert_references(caller_id, &refs).unwrap();
+
+    // Hot churn + fix-heavy so the file scores meaningfully.
+    db.upsert_git_file("hot.rs", 100.0, 40, 80, Some(1_700_000_000))
+        .unwrap();
+    for (p, c) in [
+        ("caller.rs", 1.0_f64),
+        ("a.rs", 0.5),
+        ("b.rs", 0.7),
+        ("c.rs", 0.3),
+    ] {
+        db.upsert_git_file(p, c, 0, 5, Some(1_700_000_000)).unwrap();
+    }
+
+    let r = assess_risk(&db, "hot.rs").unwrap();
+
+    // Cap honored: 8 symbols in, 5 out.
+    assert_eq!(
+        r.top_symbols.len(),
+        5,
+        "top_symbols must be capped at 5, got {}",
+        r.top_symbols.len()
+    );
+
+    // Descending by score (we re-derive the same heuristic here as a guard
+    // against silent ordering regressions).
+    let mut prev = f64::INFINITY;
+    for t in &r.top_symbols {
+        let sym = syms
+            .iter()
+            .find(|s| s.name == t.name)
+            .expect("known symbol");
+        let line_count = sym.line_end.saturating_sub(sym.line_start) + 1;
+        let ref_count = if t.name == "sym_00" { 30.0 } else { 0.0 };
+        let score = (1.0 + line_count as f64).ln() + ref_count;
+        assert!(
+            score <= prev + 1e-9,
+            "top_symbols must be sorted descending: {} scored {} after {}",
+            t.name,
+            score,
+            prev
+        );
+        prev = score;
+    }
+
+    // The 30-ref small symbol must be ranked first; pure ref_count dominance.
+    assert_eq!(r.top_symbols[0].name, "sym_00");
+
+    // `why` shape: "hot: N lines, M refs" — and no cycle clause on this fixture.
+    for t in &r.top_symbols {
+        assert!(
+            t.why.starts_with("hot: ") && t.why.contains("lines") && t.why.contains("refs"),
+            "unexpected why shape: {:?}",
+            t.why
+        );
+        assert!(
+            !t.why.contains("cycle"),
+            "no cycle in fixture, got why={:?}",
+            t.why
+        );
+    }
+}
+
+/// Edge case: a file with zero indexed symbols (text file, generated file,
+/// unindexed shape) must produce an empty `top_symbols` Vec — no panic, no
+/// error, and the field disappears from JSON via the serde skip-if-empty
+/// attribute.
+#[test]
+fn top_symbols_empty_when_file_has_no_symbols() {
+    let (_dir, db) = setup_project();
+    db.upsert_git_file("README.md", 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+    let r = assess_risk(&db, "README.md").unwrap();
+    assert!(
+        r.top_symbols.is_empty(),
+        "files with no indexed symbols must return empty top_symbols, got {:?}",
+        r.top_symbols
+    );
+    // Schema discipline: empty Vec must not surface in JSON.
+    let json = serde_json::to_string(&r).unwrap();
+    assert!(
+        !json.contains("top_symbols"),
+        "empty top_symbols must be omitted from JSON, got {json}"
+    );
+}

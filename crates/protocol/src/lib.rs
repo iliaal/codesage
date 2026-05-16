@@ -656,6 +656,23 @@ pub struct CouplingReport {
     pub note: Option<String>,
 }
 
+/// One symbol inside a file that contributes to its risk score, ranked by
+/// the heuristic `ln(1 + line_count) + ref_count + (in_cycle ? 1.0 : 0.0)`.
+/// The `why` string is a one-line human-readable explanation the agent can
+/// quote in a PR description (e.g. `"hot: 142 lines, 38 refs, in 7-file cycle"`).
+/// Capped at five entries per file in the producing pipeline so a heavy file
+/// doesn't drown the response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TopSymbol {
+    pub name: String,
+    pub line: u32,
+    /// Lowercase symbol kind ("function", "class", "struct", …). Kept as a
+    /// raw string rather than the typed `SymbolKind` enum so consumers can
+    /// pattern-match on it without depending on the protocol enum.
+    pub kind: String,
+    pub why: String,
+}
+
 /// Risk decomposition for a file. Score is the weighted sum; components let the agent
 /// see WHY a file is risky, not just the magnitude.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -700,6 +717,14 @@ pub struct RiskAssessment {
     /// Human-readable rationale lines so the agent can quote them in PR descriptions.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub notes: Vec<String>,
+    /// Top symbols inside this file ranked by a heuristic that blends symbol
+    /// length, reference count, and cycle membership. Answers the agent
+    /// follow-up "the file scored high — which symbols inside it drive that?"
+    /// in one round-trip. Capped at 5. Empty when the file has no indexed
+    /// symbols (text files, generated files, files not yet indexed) — omitted
+    /// from JSON in that case so older agents see no schema churn.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub top_symbols: Vec<TopSymbol>,
 }
 
 /// Aggregate risk for a set of files (typically the file list of a patch or PR).

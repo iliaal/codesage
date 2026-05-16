@@ -1135,6 +1135,12 @@ fn cmd_risk(file: &str, json: bool) -> Result<()> {
                 println!("    {:>5.2}  {}", c.weight, c.file);
             }
         }
+        if !assessment.top_symbols.is_empty() {
+            println!("  Top symbols:");
+            for s in &assessment.top_symbols {
+                println!("    L{:<5} {} ({}) — {}", s.line, s.name, s.kind, s.why);
+            }
+        }
     }
     Ok(())
 }

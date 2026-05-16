@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use codesage_protocol::{
     ClusteredDirectory, CoChangeEntry, CouplingReport, CycleEntry, FileCategory, ImpactRequest,
-    ImpactTarget, RiskAssessment, RiskBatchAssessment, RiskDiffAssessment,
+    ImpactTarget, RiskAssessment, RiskBatchAssessment, RiskDiffAssessment, TopSymbol,
 };
 use codesage_storage::Database;
 
@@ -247,6 +247,16 @@ pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
         ));
     }
 
+    let top_symbols = match compute_top_symbols(db, file_path, in_cycle, cycle_size) {
+        Ok(v) => v,
+        Err(e) => {
+            // Failing to fetch symbols shouldn't fail the whole risk call; the
+            // top-symbol breakdown is additive context, not load-bearing.
+            tracing::warn!(error = %e, file = %file_path, "top-symbols computation failed; omitting from risk");
+            Vec::new()
+        }
+    };
+
     Ok(RiskAssessment {
         file: file_path.to_string(),
         score,
@@ -264,7 +274,88 @@ pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
         top_coupled,
         trust_boundaries,
         notes,
+        top_symbols,
     })
+}
+
+/// Maximum symbols returned per file. Burn-budget protection: a file with 200
+/// methods still returns 5 entries — agents asking "what drives this file's
+/// score" don't need the long tail.
+const TOP_SYMBOLS_CAP: usize = 5;
+
+/// Rank symbols inside `file_path` by the heuristic
+/// `ln(1 + line_count) + ref_count + (in_cycle ? 1.0 : 0.0)` and return the
+/// top [`TOP_SYMBOLS_CAP`] with a one-line `why`. Cycle membership is a
+/// file-level signal: every symbol in a file participating in an import cycle
+/// gets the same +1.0 bump, which is the intended behaviour — the cycle term
+/// promotes hot files into the top-symbols breakdown without distorting the
+/// intra-file ordering.
+///
+/// Empty when the file has no indexed symbols. Not an error.
+fn compute_top_symbols(
+    db: &codesage_storage::Database,
+    file_path: &str,
+    in_cycle: bool,
+    cycle_size: u32,
+) -> Result<Vec<TopSymbol>> {
+    let symbols = db
+        .symbols_for_file(file_path)
+        .with_context(|| format!("loading symbols for top-symbols breakdown of {file_path}"))?;
+    if symbols.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // One batched ref-count query for every symbol in the file. Refs match by
+    // short name (and tail-name fallback for qualified callsites) — same shape
+    // as `find_references`.
+    let names: Vec<String> = symbols.iter().map(|s| s.name.clone()).collect();
+    let counts = db
+        .reference_counts_for_names(&names)
+        .with_context(|| format!("counting refs for top-symbols breakdown of {file_path}"))?;
+
+    let cycle_bonus = if in_cycle { 1.0_f64 } else { 0.0 };
+
+    let mut scored: Vec<(f64, &codesage_protocol::Symbol, u32)> = symbols
+        .iter()
+        .map(|s| {
+            let line_count = s.line_end.saturating_sub(s.line_start).saturating_add(1);
+            let ref_count = counts.get(&s.name).copied().unwrap_or(0);
+            let score = (1.0 + line_count as f64).ln() + ref_count as f64 + cycle_bonus;
+            (score, s, ref_count)
+        })
+        .collect();
+
+    // Descending by score. Stable sort keeps insertion order (=source order)
+    // as a deterministic tiebreaker so two equal-scored symbols always come
+    // out in the same order.
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.line_start.cmp(&b.1.line_start))
+    });
+
+    Ok(scored
+        .into_iter()
+        .take(TOP_SYMBOLS_CAP)
+        .map(|(_, sym, ref_count)| {
+            let line_count = sym
+                .line_end
+                .saturating_sub(sym.line_start)
+                .saturating_add(1);
+            let cycle_clause = if in_cycle {
+                format!(", in {cycle_size}-file cycle")
+            } else {
+                String::new()
+            };
+            let why = format!("hot: {line_count} lines, {ref_count} refs{cycle_clause}");
+            TopSymbol {
+                name: sym.name.clone(),
+                line: sym.line_start,
+                kind: sym.kind.as_str().to_string(),
+                why,
+            }
+        })
+        .collect())
 }
 
 /// Aggregate `assess_risk` across the file list of a patch. Lets an agent

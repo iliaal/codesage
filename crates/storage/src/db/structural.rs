@@ -452,6 +452,58 @@ impl Database {
         Ok(n as usize)
     }
 
+    /// Count refs targeting each of the given short names in a single query.
+    /// Matches against both `to_name` and `to_name_tail` so language-qualified
+    /// callsites (`App\Foo::bar`, `pkg.foo.bar`) still resolve back to a
+    /// short-name lookup — mirrors the unqualified branch of `find_references`.
+    /// Names with no matching refs are returned with a count of 0 so the caller
+    /// can rely on a complete keyset.
+    pub fn reference_counts_for_names(
+        &self,
+        names: &[String],
+    ) -> Result<std::collections::HashMap<String, u32>> {
+        use std::collections::HashMap;
+        let mut out: HashMap<String, u32> = HashMap::with_capacity(names.len());
+        if names.is_empty() {
+            return Ok(out);
+        }
+        for n in names {
+            out.entry(n.clone()).or_insert(0);
+        }
+        let placeholders: Vec<String> = (1..=names.len()).map(|i| format!("?{i}")).collect();
+        // Each ref contributes once per (name, count) — we resolve by short
+        // name. A ref whose `to_name_tail` matches the queried short name
+        // counts the same as a direct `to_name` match (the indexer keeps
+        // tail in sync via `name_tail()`).
+        let sql = format!(
+            "SELECT name, c FROM (
+                SELECT to_name AS name, COUNT(*) AS c FROM refs
+                WHERE to_name IN ({ph}) GROUP BY to_name
+                UNION ALL
+                SELECT to_name_tail AS name, COUNT(*) AS c FROM refs
+                WHERE to_name_tail IN ({ph}) AND to_name_tail <> to_name GROUP BY to_name_tail
+            )",
+            ph = placeholders.join(",")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        // Bind the same name list once: SQLite reuses the param indices across
+        // both halves of the UNION because we use positional `?N` references.
+        let params: Vec<&dyn rusqlite::types::ToSql> = names
+            .iter()
+            .map(|p| p as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            let name: String = row.get(0)?;
+            let c: i64 = row.get(1)?;
+            Ok((name, c))
+        })?;
+        for r in rows {
+            let (name, c) = r?;
+            *out.entry(name).or_insert(0) += c.max(0) as u32;
+        }
+        Ok(out)
+    }
+
     /// Enumerate all indexed files with their database id and parsed language,
     /// in stable `path` order. Used by re-derivation passes (trust boundaries,
     /// feature mappers) that need to walk every file without touching symbols
