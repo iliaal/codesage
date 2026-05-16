@@ -173,19 +173,52 @@ else
     echo "==> [6/7] not a git repo, skipping git history index"
 fi
 
-# --- Step 7: .claude/CLAUDE.md hint ---
+# --- Step 7: agent context hint ---
+#
+# Target selection: if AGENTS.md exists at the repo root AND is gitignored,
+# we treat it as the canonical local-only context file and manage a marked
+# block inside it. Otherwise we write to .claude/CLAUDE.md (the fallback for
+# tracked AGENTS.md repos — keeps machine-specific paths out of git).
+#
+# The marked block is bounded by:
+#   <!-- codesage-onboard-hint-begin -->
+#   <!-- codesage-onboard-hint-end -->
+# Replacing in place between these sentinels is idempotent across
+# --refresh-hint invocations.
+hint_mode="claude"
+hint_file="$project/.claude/CLAUDE.md"
+if [ -f "$project/AGENTS.md" ] && [ -e "$project/.git" ]; then
+    if git -C "$project" check-ignore -q AGENTS.md 2>/dev/null; then
+        hint_mode="agents"
+        hint_file="$project/AGENTS.md"
+    fi
+fi
+
 if [ "$skip_hint" -eq 0 ]; then
-    hint_file="$project/.claude/CLAUDE.md"
-    if [ -f "$hint_file" ] && [ "$refresh_hint" -eq 0 ]; then
+    if [ "$hint_mode" = "claude" ] && [ -f "$hint_file" ] && [ "$refresh_hint" -eq 0 ]; then
         echo "==> [7/7] $hint_file already exists, skipping (pass --refresh-hint to overwrite)"
     else
-        if [ -f "$hint_file" ]; then
-            echo "==> [7/7] refreshing $hint_file (--refresh-hint)"
-        else
-            echo "==> [7/7] writing $hint_file"
-        fi
-        mkdir -p "$project/.claude"
-        cat > "$hint_file" <<HINT
+        case "$hint_mode" in
+            agents)
+                if grep -q '^<!-- codesage-onboard-hint-begin' "$hint_file" 2>/dev/null; then
+                    echo "==> [7/7] updating marked codesage block in $hint_file"
+                else
+                    echo "==> [7/7] appending marked codesage block to $hint_file"
+                fi
+                ;;
+            claude)
+                if [ -f "$hint_file" ]; then
+                    echo "==> [7/7] refreshing $hint_file (--refresh-hint)"
+                else
+                    echo "==> [7/7] writing $hint_file"
+                fi
+                ;;
+        esac
+
+        hint_tmp="$(mktemp)"
+        trap 'rm -f "$hint_tmp"' EXIT
+        cat > "$hint_tmp" <<HINT
+<!-- codesage-onboard-hint-begin -->
 <!-- codesage-onboard-hint-version: 0.7.1 -->
 # Local: code intelligence (CodeSage)
 
@@ -257,26 +290,62 @@ The \`codesage-tools\` plugin ships four slash commands that drive a subagent-ba
 - \`/codesage-report <project> [--status s] [--severity s] [--category c] [--feature <id>]\`: deterministic Markdown render, no LLM call.
 
 When working on a file that the feature mapper owns, check \`.codesage/findings/<feature_id>.json\` for prior open findings before re-raising the same concern. Findings carry stable IDs (\`fnd_<hex>\`) so they can be referenced in commit messages and PR comments.
+<!-- codesage-onboard-hint-end -->
 HINT
-        # Keep the local hint out of the project's commit history.
-        if [ -e "$project/.git" ]; then
-            exclude_file="$(git -C "$project" rev-parse --git-path info/exclude 2>/dev/null)"
-            if [ -n "$exclude_file" ]; then
-                # git rev-parse may return a path relative to $project
-                case "$exclude_file" in
-                    /*) ;;
-                    *) exclude_file="$project/$exclude_file" ;;
-                esac
-                mkdir -p "$(dirname "$exclude_file")"
-                if ! grep -qxF ".claude/CLAUDE.md" "$exclude_file" 2>/dev/null; then
-                    echo ".claude/CLAUDE.md" >> "$exclude_file"
-                    echo "    added to $exclude_file (local-only, not committed)"
+
+        case "$hint_mode" in
+            agents)
+                # Replace existing marked block in AGENTS.md, or append if not present.
+                if grep -q '^<!-- codesage-onboard-hint-begin' "$hint_file" 2>/dev/null; then
+                    awk -v block_file="$hint_tmp" '
+                        BEGIN { in_block = 0; injected = 0 }
+                        /^<!-- codesage-onboard-hint-begin/ {
+                            in_block = 1
+                            while ((getline line < block_file) > 0) print line
+                            close(block_file)
+                            injected = 1
+                            next
+                        }
+                        /^<!-- codesage-onboard-hint-end/ && in_block { in_block = 0; next }
+                        in_block { next }
+                        { print }
+                    ' "$hint_file" > "${hint_file}.new"
+                    mv "${hint_file}.new" "$hint_file"
+                else
+                    # Append with a separator if AGENTS.md doesn't end with a blank line.
+                    if [ -s "$hint_file" ] && [ "$(tail -c 1 "$hint_file" | wc -l)" -eq 0 ]; then
+                        printf '\n' >> "$hint_file"
+                    fi
+                    printf '\n---\n\n' >> "$hint_file"
+                    cat "$hint_tmp" >> "$hint_file"
                 fi
-            fi
-        fi
+                ;;
+            claude)
+                mkdir -p "$project/.claude"
+                cp "$hint_tmp" "$hint_file"
+                # Keep the local hint out of the project's commit history.
+                if [ -e "$project/.git" ]; then
+                    exclude_file="$(git -C "$project" rev-parse --git-path info/exclude 2>/dev/null)"
+                    if [ -n "$exclude_file" ]; then
+                        case "$exclude_file" in
+                            /*) ;;
+                            *) exclude_file="$project/$exclude_file" ;;
+                        esac
+                        mkdir -p "$(dirname "$exclude_file")"
+                        if ! grep -qxF ".claude/CLAUDE.md" "$exclude_file" 2>/dev/null; then
+                            echo ".claude/CLAUDE.md" >> "$exclude_file"
+                            echo "    added to $exclude_file (local-only, not committed)"
+                        fi
+                    fi
+                fi
+                ;;
+        esac
+
+        rm -f "$hint_tmp"
+        trap - EXIT
     fi
 else
-    echo "==> [6/6] hint file skipped (--no-hint)"
+    echo "==> [7/7] hint file skipped (--no-hint)"
 fi
 
 echo
