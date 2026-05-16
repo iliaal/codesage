@@ -10,7 +10,7 @@ use codesage_protocol::{FeatureConfidence, FeatureKind, Language};
 use serde_json::Value;
 
 use crate::mappers::shared::{is_safe_dir, is_safe_file, walk_files};
-use crate::mappers::types::{FeatureMapper, FeatureSeed, SeedFile};
+use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile};
 
 pub struct JsMapper;
 
@@ -18,7 +18,8 @@ impl FeatureMapper for JsMapper {
     fn name(&self) -> &'static str {
         "js"
     }
-    fn map(&self, root: &Path) -> Result<Vec<FeatureSeed>> {
+    fn map(&self, ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
+        let root = ctx.root;
         let mut seeds: Vec<FeatureSeed> = Vec::new();
         let pkg_path = root.join("package.json");
         if is_safe_file(root, &pkg_path)
@@ -27,8 +28,9 @@ impl FeatureMapper for JsMapper {
         {
             seeds.extend(package_seeds(root, &pkg));
         }
-        seeds.extend(next_app_routes(root)?);
-        seeds.extend(next_pages_routes(root)?);
+        seeds.extend(next_app_routes(ctx)?);
+        seeds.extend(next_pages_routes(ctx)?);
+        seeds.retain(|s| !ctx.excluded(&s.entry_path));
         Ok(seeds)
     }
 }
@@ -144,13 +146,14 @@ fn package_seeds(root: &Path, pkg: &Value) -> Vec<FeatureSeed> {
     out
 }
 
-fn next_app_routes(root: &Path) -> Result<Vec<FeatureSeed>> {
+fn next_app_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
+    let root = ctx.root;
     let mut out = Vec::new();
     let app_dir = root.join("app");
     if !is_safe_dir(root, &app_dir) {
         return Ok(out);
     }
-    for rel in walk_files(root, &app_dir, 5_000) {
+    for rel in walk_files(root, &app_dir, 5_000, ctx.excludes) {
         let is_page = ends_with_any(&rel, &["/page.tsx", "/page.ts", "/page.jsx", "/page.js"]);
         let is_route = ends_with_any(
             &rel,
@@ -204,13 +207,14 @@ fn next_app_routes(root: &Path) -> Result<Vec<FeatureSeed>> {
     Ok(out)
 }
 
-fn next_pages_routes(root: &Path) -> Result<Vec<FeatureSeed>> {
+fn next_pages_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
+    let root = ctx.root;
     let mut out = Vec::new();
     let pages_dir = root.join("pages");
     if !is_safe_dir(root, &pages_dir) {
         return Ok(out);
     }
-    for rel in walk_files(root, &pages_dir, 5_000) {
+    for rel in walk_files(root, &pages_dir, 5_000, ctx.excludes) {
         if !ends_with_any(&rel, &[".tsx", ".ts", ".jsx", ".js"]) {
             continue;
         }
@@ -284,7 +288,7 @@ mod tests {
             r#"{"name":"acme","bin":{"acme":"./bin/cli.js"}}"#,
         );
         write(dir.path(), "bin/cli.js", "#!/usr/bin/env node\n");
-        let seeds = JsMapper.map(dir.path()).unwrap();
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
         let s = seeds
             .iter()
             .find(|s| s.source == "package-json-bin")
@@ -300,7 +304,7 @@ mod tests {
             "app/dashboard/page.tsx",
             "export default function Page() { return null }",
         );
-        let seeds = JsMapper.map(dir.path()).unwrap();
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
         let s = seeds
             .iter()
             .find(|s| s.source == "next-app-page")

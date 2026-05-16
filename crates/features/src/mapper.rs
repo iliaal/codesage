@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::Result;
+use codesage_parser::discover::build_exclude_set;
 use codesage_protocol::{
     FeatureFileRef, FeatureFileRole, FeatureMapStats, FeatureRecord, TrustBoundary,
 };
@@ -14,13 +15,25 @@ use codesage_storage::Database;
 
 use crate::feature_id;
 use crate::mappers::{
-    c::CCppMapper, go::GoMapper, js::JsMapper, php::PhpMapper, python::PythonMapper,
-    rust::RustMapper, shared::walk_files, types::FeatureMapper, types::FeatureSeed,
+    c::CCppMapper,
+    go::GoMapper,
+    js::JsMapper,
+    php::PhpMapper,
+    python::PythonMapper,
+    rust::RustMapper,
+    shared::walk_files,
+    types::{FeatureMapper, FeatureSeed, MapperContext},
 };
 use crate::nearby_tests::nearby_tests;
 
 /// Run every registered mapper, build `FeatureRecord`s from seeds, persist
 /// them, and remove stale features. Returns stats for the caller.
+///
+/// `exclude_patterns` is the project's `[index].exclude_patterns` list. It
+/// is compiled into a `GlobSet` once and threaded into every mapper through
+/// `MapperContext` so feature output honors the same file-filter contract
+/// as the structural indexer — no ghost features for files the rest of the
+/// pipeline never sees.
 ///
 /// When **any** mapper errors mid-collection, the orchestrator still
 /// persists the seeds it did collect but **skips the garbage-collect
@@ -28,8 +41,21 @@ use crate::nearby_tests::nearby_tests;
 /// unreadable Cargo.toml, etc.) could silently delete every feature
 /// owned by that language. Stale-feature debt is reconciled on the
 /// next clean run.
-pub fn map_features(root: &Path, db: &Database) -> Result<FeatureMapStats> {
-    let collected = collect_seeds(root)?;
+pub fn map_features(
+    root: &Path,
+    db: &Database,
+    exclude_patterns: &[String],
+) -> Result<FeatureMapStats> {
+    let excludes = if exclude_patterns.is_empty() {
+        None
+    } else {
+        Some(build_exclude_set(exclude_patterns)?)
+    };
+    let ctx = MapperContext {
+        root,
+        excludes: excludes.as_ref(),
+    };
+    let collected = collect_seeds(&ctx)?;
     let seeds = collected.seeds;
     let any_mapper_errored = collected.any_errored;
     let mut keep_ids: Vec<String> = Vec::with_capacity(seeds.len());
@@ -37,7 +63,7 @@ pub fn map_features(root: &Path, db: &Database) -> Result<FeatureMapStats> {
     let mut updated = 0usize;
     // Snapshot of repo files for the nearby-test walker. Capped to keep
     // big repos under a couple seconds of wall-time.
-    let all_files = walk_files(root, root, 50_000);
+    let all_files = walk_files(root, root, 50_000, ctx.excludes);
     db.execute_batch(|db| {
         for seed in &seeds {
             let record = build_record(db, root, seed, &all_files)?;
@@ -76,7 +102,7 @@ struct CollectedSeeds {
 /// Collect seeds from every mapper, deduped by `(kind, source, entry_path,
 /// command|route|symbol)`. The `any_errored` flag lets the caller skip
 /// destructive cleanup when a mapper failed mid-pass.
-fn collect_seeds(root: &Path) -> Result<CollectedSeeds> {
+fn collect_seeds(ctx: &MapperContext) -> Result<CollectedSeeds> {
     let mappers: Vec<Box<dyn FeatureMapper>> = vec![
         Box::new(RustMapper),
         Box::new(PhpMapper),
@@ -88,7 +114,7 @@ fn collect_seeds(root: &Path) -> Result<CollectedSeeds> {
     let mut all: Vec<FeatureSeed> = Vec::new();
     let mut any_errored = false;
     for m in mappers {
-        match m.map(root) {
+        match m.map(ctx) {
             Ok(s) => all.extend(s),
             Err(e) => {
                 any_errored = true;
@@ -244,7 +270,7 @@ mod tests {
         );
         write(root, "src/main.rs", "fn main() {}");
         let db = Database::open_in_memory().unwrap();
-        let stats = map_features(root, &db).unwrap();
+        let stats = map_features(root, &db, &[]).unwrap();
         assert!(stats.created >= 1, "expected ≥1 created, got {stats:?}");
         let features = db
             .list_features(Some(FeatureKind::CliCommand), None, None, 100)
@@ -263,14 +289,14 @@ mod tests {
         );
         write(root, "src/main.rs", "fn main() {}");
         let db = Database::open_in_memory().unwrap();
-        let first = map_features(root, &db).unwrap();
+        let first = map_features(root, &db, &[]).unwrap();
         let ids_before: Vec<String> = db
             .list_features(None, None, None, 1000)
             .unwrap()
             .into_iter()
             .map(|f| f.feature_id)
             .collect();
-        let second = map_features(root, &db).unwrap();
+        let second = map_features(root, &db, &[]).unwrap();
         let ids_after: Vec<String> = db
             .list_features(None, None, None, 1000)
             .unwrap()
@@ -281,6 +307,41 @@ mod tests {
         assert_eq!(first.total_features, second.total_features);
         assert_eq!(second.created, 0);
         assert!(second.updated >= 1);
+    }
+
+    #[test]
+    fn map_features_respects_index_exclude_patterns() {
+        // A Python script under `scripts/` would normally produce a
+        // `python-main-guard` feature. With `scripts/**` in
+        // `exclude_patterns`, the feature must be dropped — otherwise the
+        // features pipeline emits rows whose entry_path is invisible to
+        // the structural indexer (the "ghost feature" failure mode).
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "scripts/run.py",
+            "if __name__ == '__main__':\n    pass\n",
+        );
+        write(
+            root,
+            "real_cli.py",
+            "if __name__ == '__main__':\n    pass\n",
+        );
+        let db = Database::open_in_memory().unwrap();
+        let stats = map_features(root, &db, &["scripts/**".to_string()]).unwrap();
+        assert!(stats.created >= 1, "expected real_cli.py to map");
+        let features = db.list_features(None, None, None, 100).unwrap();
+        assert!(
+            features.iter().any(|f| f.entry_path == "real_cli.py"),
+            "expected real_cli.py feature, got {features:?}"
+        );
+        assert!(
+            !features
+                .iter()
+                .any(|f| f.entry_path.starts_with("scripts/")),
+            "scripts/** exclude not applied, got {features:?}"
+        );
     }
 
     #[test]
@@ -295,10 +356,10 @@ mod tests {
         write(root, "src/main.rs", "fn main() {}");
         write(root, "src/bin/extra.rs", "fn main() {}");
         let db = Database::open_in_memory().unwrap();
-        map_features(root, &db).unwrap();
+        map_features(root, &db, &[]).unwrap();
         let before = db.feature_count().unwrap();
         std::fs::remove_file(root.join("src/bin/extra.rs")).unwrap();
-        let stats = map_features(root, &db).unwrap();
+        let stats = map_features(root, &db, &[]).unwrap();
         assert!(stats.removed >= 1, "expected ≥1 removal, got {stats:?}");
         let after = db.feature_count().unwrap();
         assert!(after < before);

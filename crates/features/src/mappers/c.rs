@@ -14,7 +14,7 @@ use regex::Regex;
 use tree_sitter::Parser;
 
 use crate::mappers::shared::{is_safe_file, walk_files};
-use crate::mappers::types::{FeatureMapper, FeatureSeed, SeedFile};
+use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile};
 
 /// Single mapper that emits both C and C++ seeds; the language tag is
 /// chosen per-file based on extension. Run only once per repo, regardless
@@ -25,9 +25,10 @@ impl FeatureMapper for CCppMapper {
     fn name(&self) -> &'static str {
         "c-cpp"
     }
-    fn map(&self, root: &Path) -> Result<Vec<FeatureSeed>> {
+    fn map(&self, ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
+        let root = ctx.root;
         // Skip work if the repo has no C/C++ files at all.
-        let files: Vec<String> = walk_files(root, root, 50_000)
+        let files: Vec<String> = walk_files(root, root, 50_000, ctx.excludes)
             .into_iter()
             .filter(|p| is_c_or_cpp_source(p) || is_makefile(p) || is_cmake(p))
             .collect();
@@ -568,7 +569,9 @@ mod tests {
             "src/hello.c",
             "#include <stdio.h>\nint main(int argc, char **argv) { return 0; }\n",
         );
-        let seeds = CCppMapper.map(dir.path()).unwrap();
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
         let s = seeds
             .iter()
             .find(|s| s.entry_path == "src/hello.c")
@@ -582,7 +585,9 @@ mod tests {
     fn detects_main_in_cpp_file_and_tags_as_cpp() {
         let dir = tempdir().unwrap();
         write(dir.path(), "src/app.cpp", "int main() { return 0; }\n");
-        let seeds = CCppMapper.map(dir.path()).unwrap();
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
         let s = seeds
             .iter()
             .find(|s| s.entry_path == "src/app.cpp")
@@ -601,7 +606,9 @@ mod tests {
         );
         write(dir.path(), "src/main.cpp", "int main() { return 0; }\n");
         write(dir.path(), "src/util.cpp", "");
-        let seeds = CCppMapper.map(dir.path()).unwrap();
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
         let s = seeds
             .iter()
             .find(|s| s.source == "cmake-bin" && s.entry_command.as_deref() == Some("myapp"))
@@ -619,7 +626,9 @@ mod tests {
         );
         write(dir.path(), "src/lib.c", "int x;\n");
         write(dir.path(), "src/util.c", "int y;\n");
-        let seeds = CCppMapper.map(dir.path()).unwrap();
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
         let s = seeds
             .iter()
             .find(|s| s.source == "cmake-lib")
@@ -638,7 +647,9 @@ mod tests {
         );
         write(dir.path(), "thing.c", "int main(){return 0;}\n");
         write(dir.path(), "util.c", "");
-        let seeds = CCppMapper.map(dir.path()).unwrap();
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
         let s = seeds
             .iter()
             .find(|s| s.source == "autotools-bin")
@@ -659,7 +670,9 @@ mod tests {
             "add_executable(myapp src/main.c)\n",
         );
         write(dir.path(), "src/main.c", "int main(){return 0;}\n");
-        let seeds = CCppMapper.map(dir.path()).unwrap();
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
         let cli_seeds: Vec<&FeatureSeed> = seeds
             .iter()
             .filter(|s| s.kind == FeatureKind::CliCommand && s.entry_path == "src/main.c")
@@ -686,7 +699,9 @@ mod tests {
             "bin_PROGRAMS = thing\nthing_SOURCES = thing.c\n",
         );
         write(dir.path(), "thing.c", "int main(){return 0;}\n");
-        let seeds = CCppMapper.map(dir.path()).unwrap();
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
         let cli_seeds: Vec<&FeatureSeed> = seeds
             .iter()
             .filter(|s| s.kind == FeatureKind::CliCommand && s.entry_path == "thing.c")

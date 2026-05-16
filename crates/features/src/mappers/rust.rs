@@ -11,7 +11,7 @@ use codesage_protocol::{FeatureConfidence, FeatureKind, Language};
 use regex::Regex;
 
 use crate::mappers::shared::{is_safe_dir, is_safe_file, rel_path, strip_line_comments};
-use crate::mappers::types::{FeatureMapper, FeatureSeed, SeedFile};
+use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile};
 
 pub struct RustMapper;
 
@@ -19,20 +19,21 @@ impl FeatureMapper for RustMapper {
     fn name(&self) -> &'static str {
         "rust"
     }
-    fn map(&self, root: &Path) -> Result<Vec<FeatureSeed>> {
+    fn map(&self, ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
+        let root = ctx.root;
         let manifest = root.join("Cargo.toml");
         if !is_safe_file(root, &manifest) {
             return Ok(Vec::new());
         }
         let mut seeds = Vec::new();
-        seed_for_package(root, root, &mut seeds, "cargo-root")?;
+        seed_for_package(ctx, root, &mut seeds, "cargo-root")?;
         // Workspace members.
         for member_dir in cargo_workspace_members(root, &manifest)? {
             let full = root.join(&member_dir);
             if !is_safe_dir(root, &full) {
                 continue;
             }
-            seed_for_package(root, &full, &mut seeds, "cargo-workspace-member")?;
+            seed_for_package(ctx, &full, &mut seeds, "cargo-workspace-member")?;
         }
         // Conventional `crates/*` even when not declared in workspace.
         let crates_dir = root.join("crates");
@@ -45,7 +46,7 @@ impl FeatureMapper for RustMapper {
                 if !is_safe_file(root, &p.join("Cargo.toml")) {
                     continue;
                 }
-                seed_for_package(root, &p, &mut seeds, "cargo-workspace-member")?;
+                seed_for_package(ctx, &p, &mut seeds, "cargo-workspace-member")?;
             }
         }
         Ok(seeds)
@@ -53,13 +54,17 @@ impl FeatureMapper for RustMapper {
 }
 
 fn seed_for_package(
-    root: &Path,
+    ctx: &MapperContext,
     pkg_dir: &Path,
     seeds: &mut Vec<FeatureSeed>,
     source: &'static str,
 ) -> Result<()> {
+    let root = ctx.root;
     let manifest = pkg_dir.join("Cargo.toml");
     if !is_safe_file(root, &manifest) {
+        return Ok(());
+    }
+    if ctx.excluded(&rel_path(root, &manifest)) {
         return Ok(());
     }
     let pkg_name = read_package_name(&manifest).unwrap_or_else(|| {
@@ -297,7 +302,9 @@ mod tests {
         );
         write(dir.path(), "src/main.rs", "fn main() {}");
         write(dir.path(), "src/lib.rs", "pub fn hi() {}");
-        let seeds = RustMapper.map(dir.path()).unwrap();
+        let seeds = RustMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
         let titles: Vec<&str> = seeds.iter().map(|s| s.title.as_str()).collect();
         assert!(titles.iter().any(|t| t.contains("Rust binary `acme`")));
         assert!(titles.iter().any(|t| t.contains("Rust library `acme`")));
@@ -313,7 +320,9 @@ mod tests {
         );
         write(dir.path(), "src/main.rs", "fn main() {}");
         write(dir.path(), "src/bin/aux.rs", "fn main() {}");
-        let seeds = RustMapper.map(dir.path()).unwrap();
+        let seeds = RustMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
         let aux = seeds
             .iter()
             .find(|s| s.entry_command.as_deref() == Some("aux"))
@@ -342,7 +351,9 @@ mod tests {
             "[package]\nname = \"b\"\nversion = \"0.1.0\"\n",
         );
         write(dir.path(), "crates/b/src/main.rs", "fn main() {}");
-        let seeds = RustMapper.map(dir.path()).unwrap();
+        let seeds = RustMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
         let library_a = seeds.iter().any(|s| s.title == "Rust library `a`");
         let binary_b = seeds.iter().any(|s| s.title == "Rust binary `b`");
         assert!(library_a, "member `a` library seed missing: {seeds:?}");
@@ -359,7 +370,9 @@ mod tests {
         );
         write(dir.path(), "src/lib.rs", "");
         write(dir.path(), "tests/integration.rs", "#[test] fn x() {}");
-        let seeds = RustMapper.map(dir.path()).unwrap();
+        let seeds = RustMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
         let test = seeds
             .iter()
             .find(|s| s.source == "rust-integration-test")

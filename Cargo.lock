@@ -305,6 +305,7 @@ dependencies = [
  "codesage-parser",
  "codesage-protocol",
  "codesage-storage",
+ "globset",
  "hex",
  "ignore",
  "regex",

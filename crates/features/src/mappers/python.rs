@@ -10,7 +10,7 @@ use codesage_protocol::{FeatureConfidence, FeatureKind, Language};
 use regex::Regex;
 
 use crate::mappers::shared::{is_safe_file, strip_line_comments, walk_files};
-use crate::mappers::types::{FeatureMapper, FeatureSeed, SeedFile};
+use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile};
 
 /// Extract the body of a `[name]` section from a TOML-like document
 /// (returns until the next `[...]` header or EOF). Avoids look-around
@@ -43,11 +43,13 @@ impl FeatureMapper for PythonMapper {
     fn name(&self) -> &'static str {
         "python"
     }
-    fn map(&self, root: &Path) -> Result<Vec<FeatureSeed>> {
+    fn map(&self, ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
+        let root = ctx.root;
         let mut seeds: Vec<FeatureSeed> = Vec::new();
         seeds.extend(pyproject_scripts(root)?);
         seeds.extend(setup_py_entry_points(root)?);
-        seeds.extend(main_guard_modules(root)?);
+        seeds.extend(main_guard_modules(ctx)?);
+        seeds.retain(|s| !ctx.excluded(&s.entry_path));
         Ok(seeds)
     }
 }
@@ -157,11 +159,12 @@ fn setup_py_entry_points(root: &Path) -> Result<Vec<FeatureSeed>> {
     Ok(out)
 }
 
-fn main_guard_modules(root: &Path) -> Result<Vec<FeatureSeed>> {
+fn main_guard_modules(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
     use codesage_protocol::FileCategory;
+    let root = ctx.root;
     let mut out = Vec::new();
     let guard_re = Regex::new(r#"(?m)^if\s+__name__\s*==\s*['"]__main__['"]"#)?;
-    let files = walk_files(root, root, 30_000);
+    let files = walk_files(root, root, 30_000, ctx.excludes);
     for rel in files.iter().filter(|p| p.ends_with(".py")) {
         // Test files with `if __name__ == "__main__":` are ad-hoc test
         // runners, not CLI commands. They're often excluded by the
@@ -230,7 +233,9 @@ name = "acme"
 acme = "acme.cli:main"
 "#,
         );
-        let seeds = PythonMapper.map(dir.path()).unwrap();
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
         let s = seeds
             .iter()
             .find(|s| s.source == "pyproject-script")
@@ -247,7 +252,9 @@ acme = "acme.cli:main"
             "run.py",
             "import sys\nif __name__ == '__main__':\n    sys.exit(0)\n",
         );
-        let seeds = PythonMapper.map(dir.path()).unwrap();
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
         assert!(seeds.iter().any(|s| s.source == "python-main-guard"));
     }
 
@@ -276,7 +283,9 @@ acme = "acme.cli:main"
             "real_cli.py",
             "if __name__ == '__main__':\n    pass\n",
         );
-        let seeds = PythonMapper.map(dir.path()).unwrap();
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
         let entries: Vec<&str> = seeds
             .iter()
             .filter(|s| s.source == "python-main-guard")
@@ -298,7 +307,9 @@ acme = "acme.cli:main"
             "setup.py",
             "from setuptools import setup\nsetup(\n  name='acme',\n  entry_points={\n    'console_scripts': [\n        'acme=acme.cli:main',\n    ],\n  }\n)\n",
         );
-        let seeds = PythonMapper.map(dir.path()).unwrap();
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
         let s = seeds
             .iter()
             .find(|s| s.source == "setup-py-script")

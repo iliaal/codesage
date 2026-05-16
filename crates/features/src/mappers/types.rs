@@ -7,6 +7,34 @@ use std::path::Path;
 
 use anyhow::Result;
 use codesage_protocol::{FeatureConfidence, FeatureKind, Language};
+use globset::GlobSet;
+
+/// Context handed to every mapper. Bundles the project root with a
+/// pre-compiled `GlobSet` of the project's `[index].exclude_patterns`, so
+/// every walker honors the same exclusion contract as the structural
+/// indexer. Pass `&MapperContext::for_root(root)` when no excludes apply
+/// (tests, narrow programmatic callers).
+pub struct MapperContext<'a> {
+    pub root: &'a Path,
+    pub excludes: Option<&'a GlobSet>,
+}
+
+impl<'a> MapperContext<'a> {
+    /// Context with no exclusion globs. Equivalent to mapper behavior
+    /// before `[index].exclude_patterns` was plumbed.
+    pub fn for_root(root: &'a Path) -> Self {
+        Self {
+            root,
+            excludes: None,
+        }
+    }
+
+    /// Test the supplied repo-relative path against the configured
+    /// excludes. Returns `false` when no excludes are set.
+    pub fn excluded(&self, rel: &str) -> bool {
+        self.excludes.is_some_and(|g| g.is_match(rel))
+    }
+}
 
 /// A file the mapper attaches to the seed with an explicit role hint and
 /// a one-line reason. The orchestrator later folds these into the
@@ -60,8 +88,10 @@ pub struct FeatureSeed {
 }
 
 /// One mapper module. `name` is the language/source tag used in logs;
-/// `map` returns deterministic seeds.
+/// `map` returns deterministic seeds. The `ctx` carries the repo root
+/// plus the project's exclude globs so every walker honors the same
+/// filter contract.
 pub trait FeatureMapper: Send + Sync {
     fn name(&self) -> &'static str;
-    fn map(&self, root: &Path) -> Result<Vec<FeatureSeed>>;
+    fn map(&self, ctx: &MapperContext) -> Result<Vec<FeatureSeed>>;
 }

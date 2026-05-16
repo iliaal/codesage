@@ -864,7 +864,7 @@ fn cmd_index(full: bool, no_semantic: bool) -> Result<()> {
     // trust-boundary tags are fresh. Errors here are fatal: a mid-run
     // failure must surface as command failure, not a silent eprintln
     // with feature tables left in a partial state.
-    match codesage_features::map_features(&root, &db) {
+    match codesage_features::map_features(&root, &db, &excludes) {
         Ok(map_stats) => println!(
             "Features:   created={} updated={} removed={} total={}",
             map_stats.created, map_stats.updated, map_stats.removed, map_stats.total_features
@@ -1203,7 +1203,9 @@ fn cmd_risk_diff(files: Vec<String>, json: bool) -> Result<()> {
 fn cmd_map(json: bool) -> Result<()> {
     let root = find_project_root()?;
     let db = open_db(&root)?;
-    let stats = codesage_features::map_features(&root, &db)?;
+    let config = load_project_config(&root)?;
+    let excludes = get_exclude_patterns(&config);
+    let stats = codesage_features::map_features(&root, &db, &excludes)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&stats)?);
     } else {

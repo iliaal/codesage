@@ -4,13 +4,12 @@
 //! intentionally avoid to keep the mapper hermetic.
 
 use std::fs;
-use std::path::Path;
 
 use anyhow::Result;
 use codesage_protocol::{FeatureConfidence, FeatureKind, Language};
 
 use crate::mappers::shared::{is_safe_dir, is_safe_file, rel_path};
-use crate::mappers::types::{FeatureMapper, FeatureSeed};
+use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext};
 
 pub struct GoMapper;
 
@@ -18,7 +17,8 @@ impl FeatureMapper for GoMapper {
     fn name(&self) -> &'static str {
         "go"
     }
-    fn map(&self, root: &Path) -> Result<Vec<FeatureSeed>> {
+    fn map(&self, ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
+        let root = ctx.root;
         let mut seeds = Vec::new();
         // cmd/<name>/main.go
         let cmd_dir = root.join("cmd");
@@ -86,6 +86,7 @@ impl FeatureMapper for GoMapper {
                 });
             }
         }
+        seeds.retain(|s| !ctx.excluded(&s.entry_path));
         Ok(seeds)
     }
 }
@@ -93,6 +94,7 @@ impl FeatureMapper for GoMapper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use tempfile::tempdir;
 
     fn write(root: &Path, rel: &str, content: &str) {
@@ -111,7 +113,7 @@ mod tests {
             "cmd/server/main.go",
             "package main\nfunc main() {}\n",
         );
-        let seeds = GoMapper.map(dir.path()).unwrap();
+        let seeds = GoMapper.map(&MapperContext::for_root(dir.path())).unwrap();
         let s = seeds
             .iter()
             .find(|s| s.source == "go-cmd")
@@ -123,7 +125,7 @@ mod tests {
     fn root_main_go_only_when_package_main() {
         let dir = tempdir().unwrap();
         write(dir.path(), "main.go", "package main\nfunc main() {}\n");
-        let seeds = GoMapper.map(dir.path()).unwrap();
+        let seeds = GoMapper.map(&MapperContext::for_root(dir.path())).unwrap();
         assert!(seeds.iter().any(|s| s.source == "go-root-main"));
     }
 
@@ -131,7 +133,7 @@ mod tests {
     fn root_main_go_skipped_when_not_package_main() {
         let dir = tempdir().unwrap();
         write(dir.path(), "main.go", "package other\n");
-        let seeds = GoMapper.map(dir.path()).unwrap();
+        let seeds = GoMapper.map(&MapperContext::for_root(dir.path())).unwrap();
         assert!(!seeds.iter().any(|s| s.source == "go-root-main"));
     }
 }

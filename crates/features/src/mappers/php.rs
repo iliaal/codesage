@@ -13,7 +13,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::mappers::shared::{is_safe_dir, is_safe_file, rel_path};
-use crate::mappers::types::{FeatureMapper, FeatureSeed, SeedFile, SeedTest};
+use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile, SeedTest};
 
 pub struct PhpMapper;
 
@@ -21,16 +21,17 @@ impl FeatureMapper for PhpMapper {
     fn name(&self) -> &'static str {
         "php"
     }
-    fn map(&self, root: &Path) -> Result<Vec<FeatureSeed>> {
+    fn map(&self, ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
+        let root = ctx.root;
         let mut seeds: Vec<FeatureSeed> = Vec::new();
-        // Composer.
         if let Some(composer) = read_composer(root) {
             seeds.extend(composer_seeds(root, &composer));
         }
-        // php-src style ext/<name>/config.m4.
         seeds.extend(php_src_extensions(root)?);
-        // Laravel route registrations.
         seeds.extend(laravel_routes(root)?);
+        // Apply project excludes uniformly on the way out so framework
+        // detectors don't need to thread `ctx` through every helper.
+        seeds.retain(|s| !ctx.excluded(&s.entry_path));
         Ok(seeds)
     }
 }
@@ -340,7 +341,7 @@ mod tests {
             r#"{"name":"acme/cli","bin":["bin/acme"]}"#,
         );
         write(dir.path(), "bin/acme", "#!/usr/bin/env php\n<?php\n");
-        let seeds = PhpMapper.map(dir.path()).unwrap();
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
         let s = seeds
             .iter()
             .find(|s| s.entry_command.as_deref() == Some("acme"))
@@ -362,7 +363,7 @@ mod tests {
             "src/Foo.php",
             "<?php\nnamespace Acme;\nclass Foo {}\n",
         );
-        let seeds = PhpMapper.map(dir.path()).unwrap();
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
         let s = seeds
             .iter()
             .find(|s| s.source == "composer-psr4")
@@ -381,7 +382,7 @@ mod tests {
             "ext/iconv/tests/bug001.phpt",
             "--TEST--\nbug\n--FILE--\n<?php\n?>",
         );
-        let seeds = PhpMapper.map(dir.path()).unwrap();
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
         let s = seeds
             .iter()
             .find(|s| s.source == "php-ext")
@@ -398,7 +399,7 @@ mod tests {
         // entry_path must anchor on the file that actually exists.
         let dir = tempdir().unwrap();
         write(dir.path(), "ext/wincache/config.w32", "// MSBuild config\n");
-        let seeds = PhpMapper.map(dir.path()).unwrap();
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
         let s = seeds
             .iter()
             .find(|s| s.source == "php-ext")
@@ -421,7 +422,7 @@ Route::get('/', fn() => 'home');
 Route::post('/api/login', [LoginController::class, 'store']);
 "#,
         );
-        let seeds = PhpMapper.map(dir.path()).unwrap();
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
         let routes: Vec<&str> = seeds
             .iter()
             .filter(|s| s.source == "laravel-route")

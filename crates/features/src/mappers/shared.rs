@@ -5,6 +5,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::Result;
+use globset::GlobSet;
 
 /// Returns true if `candidate` is inside `root` after symlink resolution.
 /// Used to defend mappers against repos that contain symlinks pointing
@@ -48,27 +49,23 @@ pub fn rel_path(root: &Path, abs: &Path) -> String {
 }
 
 /// Walk a directory subtree under `start`, yielding repo-relative file
-/// paths. **Honors `.gitignore` and follows the same hard-exclude posture
-/// as the parser's structural discovery** — i.e. ignored sibling worktrees
-/// (`.worktrees/<branch>/...`), vendored deps, build output, and editor
-/// caches don't leak into mapper output. Symlinks are skipped (default
-/// `WalkBuilder` posture). Bounded by `max_files` so a mapper run on a
-/// monorepo never grinds forever; returns the partial set when exceeded.
-pub fn walk_files(root: &Path, start: &Path, max_files: usize) -> Vec<String> {
+/// paths. **Honors `.gitignore`, the project's `[index].exclude_patterns`
+/// when supplied, and a built-in hard-exclude list** — i.e. ignored
+/// sibling worktrees, vendored deps, build output, and editor caches
+/// don't leak into mapper output. Symlinks are skipped. Bounded by
+/// `max_files`; returns the partial set when exceeded.
+pub fn walk_files(
+    root: &Path,
+    start: &Path,
+    max_files: usize,
+    excludes: Option<&GlobSet>,
+) -> Vec<String> {
     if !is_safe_dir(root, start) {
         return Vec::new();
     }
     if should_skip(&rel_path(root, start)) {
         return Vec::new();
     }
-    // WalkBuilder reads `.gitignore` from the repo root automatically
-    // when `git_ignore(true)` (default). Path filtering is applied
-    // against the walked path's repo-relative form, so a walk starting
-    // inside `start` (not `root`) still sees ignore rules anchored at
-    // `root` — but only when WalkBuilder is constructed with `root` as
-    // the gitignore-search start. We construct with `start` for tighter
-    // walks and add explicit guards for absolute-anchored ignore patterns
-    // by re-checking `should_skip` against every yielded path.
     let walker = ignore::WalkBuilder::new(start)
         .hidden(true)
         .git_ignore(true)
@@ -89,6 +86,9 @@ pub fn walk_files(root: &Path, start: &Path, max_files: usize) -> Vec<String> {
         }
         let rel = rel_path(root, path);
         if should_skip(&rel) {
+            continue;
+        }
+        if excludes.is_some_and(|g| g.is_match(&rel)) {
             continue;
         }
         out.push(rel);
@@ -220,7 +220,7 @@ mod tests {
         fs::write(root.join(".worktrees/feature/src/leak.rs"), b"// leak").unwrap();
         fs::create_dir_all(root.join("ignored_lib")).unwrap();
         fs::write(root.join("ignored_lib/leak.rs"), b"// leak").unwrap();
-        let walked = walk_files(root, root, 100);
+        let walked = walk_files(root, root, 100, None);
         assert!(walked.iter().any(|p| p == "src.rs"));
         assert!(
             !walked.iter().any(|p| p.starts_with(".worktrees/")),
@@ -242,11 +242,32 @@ mod tests {
         fs::write(root.join("real.rs"), b"fn main() {}").unwrap();
         // symlink pointing outside the root should not be walked.
         let _ = symlink(outside.path(), root.join("escape"));
-        let walked = walk_files(root, root, 100);
+        let walked = walk_files(root, root, 100, None);
         assert!(walked.iter().any(|p| p == "real.rs"));
         assert!(
             walked.iter().all(|p| !p.starts_with("escape")),
             "got {:?}",
+            walked
+        );
+    }
+
+    #[test]
+    fn walk_filters_against_exclude_globset() {
+        // Project-level `[index].exclude_patterns` are honored in addition
+        // to gitignore and the hardcoded should_skip list.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("keep.rs"), b"// keep").unwrap();
+        fs::create_dir_all(root.join("migrations")).unwrap();
+        fs::write(root.join("migrations/0001.rs"), b"// drop").unwrap();
+        let mut builder = globset::GlobSetBuilder::new();
+        builder.add(globset::Glob::new("**/migrations/**").unwrap());
+        let excludes = builder.build().unwrap();
+        let walked = walk_files(root, root, 100, Some(&excludes));
+        assert!(walked.iter().any(|p| p == "keep.rs"));
+        assert!(
+            !walked.iter().any(|p| p.starts_with("migrations/")),
+            "exclude pattern not applied: {:?}",
             walked
         );
     }
