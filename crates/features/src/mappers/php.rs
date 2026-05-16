@@ -28,10 +28,22 @@ impl FeatureMapper for PhpMapper {
             seeds.extend(composer_seeds(root, &composer));
         }
         seeds.extend(php_src_extensions(root)?);
-        seeds.extend(laravel_routes(root)?);
+        let routes = parse_laravel_routes(root)?;
+        seeds.extend(laravel_route_seeds(&routes));
+        // Laravel application-layer slices: controllers (resolved back to
+        // their routes via the parsed route table), form requests, Artisan
+        // commands. These add coarser feature_ids than the
+        // route-per-registration shape so agents can ask "what slice owns
+        // app/Http/Controllers/UserController.php?" without paging through
+        // every route registration.
+        if is_laravel_project(root) {
+            seeds.extend(laravel_controllers(root, &routes)?);
+            seeds.extend(laravel_form_requests(root)?);
+            seeds.extend(laravel_artisan_commands(root)?);
+        }
         // Apply project excludes uniformly on the way out so framework
         // detectors don't need to thread `ctx` through every helper.
-        seeds.retain(|s| !ctx.excluded(&s.entry_path));
+        seeds.retain(|s| ctx.allowed(&s.entry_path));
         Ok(seeds)
     }
 }
@@ -260,18 +272,42 @@ fn list_phpt_files(root: &Path, dir: &Path, max: usize) -> Vec<String> {
     out
 }
 
-/// Laravel's `routes/{web,api,console,channels}.php` files contain a flat
-/// list of `Route::<verb>(...)` registrations. We extract each registration
-/// as its own feature so an agent can ask "what handles POST /api/login?"
-/// and get the right feature back.
-fn laravel_routes(root: &Path) -> Result<Vec<FeatureSeed>> {
+/// One Laravel route registration extracted from `routes/*.php`.
+/// `controller_class` is `None` when the route registers a closure or a
+/// non-class-resolved target — those still produce a per-registration
+/// seed but can't be bridged back to a controller file.
+#[derive(Debug, Clone)]
+struct LaravelRoute {
+    file: String,
+    verb: String,
+    pattern: String,
+    /// Class name as written at the call site, normalized for FQCN
+    /// comparison: leading `\` stripped, namespace separators preserved
+    /// (`App\Http\Controllers\UserController`). When the route source
+    /// only references a short name (`UserController::class` with a
+    /// `use App\Http\Controllers\UserController` import), the short
+    /// name is recorded here and `laravel_controllers` falls back to
+    /// matching by `class basename`.
+    controller_class: Option<String>,
+    action: Option<String>,
+}
+
+fn parse_laravel_routes(root: &Path) -> Result<Vec<LaravelRoute>> {
     let mut out = Vec::new();
     let routes_dir = root.join("routes");
     if !is_safe_dir(root, &routes_dir) {
         return Ok(out);
     }
+    // The verb_re alternative captures verb + URI without controller
+    // info — kept for closure-style and `Route::match([...])` calls. The
+    // controller_re adds the `, ControllerClass::class` arm separately
+    // so the existing seed shape stays intact when the controller half
+    // is missing.
     let verb_re = Regex::new(
         r#"(?m)Route::(get|post|put|patch|delete|options|any|match)\s*\(\s*(?:\[[^\]]*\]\s*,\s*)?['"]([^'"]+)['"]"#,
+    )?;
+    let controller_re = Regex::new(
+        r#"(?m)Route::(get|post|put|patch|delete|options|any|match|resource|apiResource)\s*\(\s*(?:\[[^\]]*\]\s*,\s*)?['"]([^'"]+)['"]\s*,\s*(?:\[\s*)?(\\?[A-Za-z_][A-Za-z0-9_\\]*)::class(?:\s*,\s*['"]([^'"]+)['"])?"#,
     )?;
     for file in ["web.php", "api.php", "console.php", "channels.php"] {
         let path = routes_dir.join(file);
@@ -280,6 +316,29 @@ fn laravel_routes(root: &Path) -> Result<Vec<FeatureSeed>> {
         }
         let rel = rel_path(root, &path);
         let raw = fs::read_to_string(&path).unwrap_or_default();
+        // Collect (verb, pattern) → (controller_class, action) from the
+        // richer regex so we can attach controller info to base matches.
+        let mut by_key: std::collections::HashMap<(String, String), (String, Option<String>)> =
+            std::collections::HashMap::new();
+        for cap in controller_re.captures_iter(&raw) {
+            let verb = cap
+                .get(1)
+                .map(|m| m.as_str().to_uppercase())
+                .unwrap_or_default();
+            let pattern = cap
+                .get(2)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
+            let class = cap
+                .get(3)
+                .map(|m| m.as_str().trim_start_matches('\\').to_string())
+                .unwrap_or_default();
+            let action = cap.get(4).map(|m| m.as_str().to_string());
+            if verb.is_empty() || pattern.is_empty() || class.is_empty() {
+                continue;
+            }
+            by_key.insert((verb, pattern), (class, action));
+        }
         for cap in verb_re.captures_iter(&raw) {
             let verb = cap
                 .get(1)
@@ -292,16 +351,48 @@ fn laravel_routes(root: &Path) -> Result<Vec<FeatureSeed>> {
             if verb.is_empty() || pattern.is_empty() {
                 continue;
             }
-            let route = format!("{verb} {pattern}");
-            out.push(FeatureSeed {
+            let (controller_class, action) = match by_key.remove(&(verb.clone(), pattern.clone())) {
+                Some((c, a)) => (Some(c), a),
+                None => (None, None),
+            };
+            out.push(LaravelRoute {
+                file: rel.clone(),
+                verb,
+                pattern,
+                controller_class,
+                action,
+            });
+        }
+        // Any controller-only matches left in `by_key` had no plain
+        // verb_re hit (e.g. `Route::resource` + `apiResource`); emit
+        // them so resources surface as features too.
+        for ((verb, pattern), (class, action)) in by_key.drain() {
+            out.push(LaravelRoute {
+                file: rel.clone(),
+                verb,
+                pattern,
+                controller_class: Some(class),
+                action,
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn laravel_route_seeds(routes: &[LaravelRoute]) -> Vec<FeatureSeed> {
+    routes
+        .iter()
+        .map(|r| {
+            let route = format!("{} {}", r.verb, r.pattern);
+            FeatureSeed {
                 title: format!("Laravel route `{route}`"),
-                summary: format!("Route registered in {rel}"),
+                summary: format!("Route registered in {}", r.file),
                 kind: FeatureKind::Route,
                 source: "laravel-route",
                 confidence: FeatureConfidence::High,
-                entry_path: rel.clone(),
+                entry_path: r.file.clone(),
                 entry_symbol: None,
-                entry_route: Some(route.clone()),
+                entry_route: Some(route),
                 entry_command: None,
                 language: Language::Php,
                 tags: vec![
@@ -313,10 +404,276 @@ fn laravel_routes(root: &Path) -> Result<Vec<FeatureSeed>> {
                 context_files: Vec::new(),
                 tests: Vec::new(),
                 test_prefixes: vec!["tests/Feature".to_string(), "tests".to_string()],
-            });
+            }
+        })
+        .collect()
+}
+
+/// Heuristic: a project is "Laravel" if it has a `composer.json` listing
+/// `laravel/framework` or it has an `artisan` script at the root. Kept
+/// loose to catch real Laravel apps that don't pin the framework dep
+/// directly (workspace setups, modular monoliths).
+fn is_laravel_project(root: &Path) -> bool {
+    if is_safe_file(root, &root.join("artisan")) {
+        return true;
+    }
+    let Some(composer) = read_composer(root) else {
+        return false;
+    };
+    for field in ["require", "require-dev"] {
+        if let Some(map) = composer.get(field).and_then(|v| v.as_object())
+            && map.contains_key("laravel/framework")
+        {
+            return true;
         }
     }
+    false
+}
+
+/// One feature per `app/Http/Controllers/**/*.php`, bridging back to
+/// the routes that hit it through `parse_laravel_routes`'s class info.
+/// Trust boundaries are seeded coarsely (auth+user-input+database+
+/// serialization) since every HTTP controller crosses those by default;
+/// the file-level `file_trust_boundaries` table refines per-file.
+fn laravel_controllers(root: &Path, routes: &[LaravelRoute]) -> Result<Vec<FeatureSeed>> {
+    let controllers_dir = root.join("app/Http/Controllers");
+    if !is_safe_dir(root, &controllers_dir) {
+        return Ok(Vec::new());
+    }
+    let files = walk_php_files(root, &controllers_dir, 500);
+    let mut out = Vec::with_capacity(files.len());
+    for rel in files {
+        let abs = root.join(&rel);
+        let raw = fs::read_to_string(&abs).unwrap_or_default();
+        let class_short = rel
+            .rsplit('/')
+            .next()
+            .and_then(|f| f.strip_suffix(".php"))
+            .unwrap_or("Controller")
+            .to_string();
+        let class_fqcn = php_declared_class_fqcn(&raw).unwrap_or_else(|| class_short.clone());
+        // Match by FQCN when the route call site used a fully-qualified
+        // `\App\Http\Controllers\Foo::class`; fall back to short name
+        // when the route used a `use`-imported `Foo::class`.
+        let owned_routes: Vec<&LaravelRoute> = routes
+            .iter()
+            .filter(|r| match &r.controller_class {
+                Some(c) if c.contains('\\') => c == &class_fqcn,
+                Some(c) => c == &class_short,
+                None => false,
+            })
+            .collect();
+        let route_summary = if owned_routes.is_empty() {
+            format!("Laravel HTTP controller {class_short}.")
+        } else {
+            let rendered: Vec<String> = owned_routes
+                .iter()
+                .take(6)
+                .map(|r| {
+                    if let Some(a) = &r.action {
+                        format!("{} {}#{}", r.verb, r.pattern, a)
+                    } else {
+                        format!("{} {}", r.verb, r.pattern)
+                    }
+                })
+                .collect();
+            format!(
+                "Laravel HTTP controller for {} ({} routes).",
+                rendered.join(", "),
+                owned_routes.len()
+            )
+        };
+        let context_files: Vec<SeedFile> = owned_routes
+            .iter()
+            .map(|r| SeedFile {
+                path: r.file.clone(),
+                reason: "route definition".to_string(),
+            })
+            .collect();
+        let entry_route = owned_routes
+            .first()
+            .map(|r| format!("{} {}", r.verb, r.pattern));
+        out.push(FeatureSeed {
+            title: format!("Laravel controller `{class_short}`"),
+            summary: route_summary,
+            kind: FeatureKind::Route,
+            source: "laravel-controller",
+            confidence: FeatureConfidence::High,
+            entry_path: rel.clone(),
+            entry_symbol: Some(class_short),
+            entry_route,
+            entry_command: None,
+            language: Language::Php,
+            tags: vec![
+                "php".to_string(),
+                "framework:laravel".to_string(),
+                "controller".to_string(),
+                "http".to_string(),
+            ],
+            owned_files: vec![SeedFile {
+                path: rel,
+                reason: "controller".to_string(),
+            }],
+            context_files: dedup_seed_files(context_files),
+            tests: Vec::new(),
+            test_prefixes: vec!["tests/Feature".to_string(), "tests/Unit".to_string()],
+        });
+    }
     Ok(out)
+}
+
+/// `app/Http/Requests/**/*.php` — Laravel FormRequest classes carrying
+/// validation rules. One feature per request class. The request *is*
+/// the user-input gate, so we tag the user-input + auth boundaries
+/// coarsely at the seed level (refined by file_trust_boundaries).
+fn laravel_form_requests(root: &Path) -> Result<Vec<FeatureSeed>> {
+    let requests_dir = root.join("app/Http/Requests");
+    if !is_safe_dir(root, &requests_dir) {
+        return Ok(Vec::new());
+    }
+    let files = walk_php_files(root, &requests_dir, 500);
+    let mut out = Vec::with_capacity(files.len());
+    for rel in files {
+        let class_short = rel
+            .rsplit('/')
+            .next()
+            .and_then(|f| f.strip_suffix(".php"))
+            .unwrap_or("Request")
+            .to_string();
+        out.push(FeatureSeed {
+            title: format!("Laravel request `{class_short}`"),
+            summary: format!("Laravel FormRequest {class_short} in {rel}"),
+            kind: FeatureKind::Route,
+            source: "laravel-request",
+            confidence: FeatureConfidence::Medium,
+            entry_path: rel.clone(),
+            entry_symbol: Some(class_short),
+            entry_route: None,
+            entry_command: None,
+            language: Language::Php,
+            tags: vec![
+                "php".to_string(),
+                "framework:laravel".to_string(),
+                "request".to_string(),
+                "validation".to_string(),
+            ],
+            owned_files: vec![SeedFile {
+                path: rel,
+                reason: "form request".to_string(),
+            }],
+            context_files: Vec::new(),
+            tests: Vec::new(),
+            test_prefixes: vec!["tests/Feature".to_string(), "tests/Unit".to_string()],
+        });
+    }
+    Ok(out)
+}
+
+/// `app/Console/Commands/**/*.php` — Artisan command classes. We pull
+/// `$signature = 'cmd:name {arg}'` out of the source so the seed's
+/// `entry_command` resolves to the Artisan invocation name, not the
+/// PHP class name. Falls back to class name when the signature is
+/// dynamic or absent.
+fn laravel_artisan_commands(root: &Path) -> Result<Vec<FeatureSeed>> {
+    let commands_dir = root.join("app/Console/Commands");
+    if !is_safe_dir(root, &commands_dir) {
+        return Ok(Vec::new());
+    }
+    let signature_re =
+        Regex::new(r#"\$signature\s*=\s*['"]([^'"\s{]+)"#).expect("signature regex must compile");
+    let files = walk_php_files(root, &commands_dir, 500);
+    let mut out = Vec::with_capacity(files.len());
+    for rel in files {
+        let abs = root.join(&rel);
+        let raw = fs::read_to_string(&abs).unwrap_or_default();
+        let class_short = rel
+            .rsplit('/')
+            .next()
+            .and_then(|f| f.strip_suffix(".php"))
+            .unwrap_or("Command")
+            .to_string();
+        let signature = signature_re
+            .captures(&raw)
+            .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
+        let cmd_name = signature.clone().unwrap_or_else(|| class_short.clone());
+        out.push(FeatureSeed {
+            title: format!("Laravel command `{cmd_name}`"),
+            summary: match &signature {
+                Some(s) => format!("Laravel Artisan command '{s}' in {rel}"),
+                None => format!("Laravel Artisan command {class_short}."),
+            },
+            kind: FeatureKind::CliCommand,
+            source: "laravel-artisan-command",
+            confidence: FeatureConfidence::High,
+            entry_path: rel.clone(),
+            entry_symbol: Some(class_short),
+            entry_route: None,
+            entry_command: Some(cmd_name),
+            language: Language::Php,
+            tags: vec![
+                "php".to_string(),
+                "framework:laravel".to_string(),
+                "artisan".to_string(),
+                "cli".to_string(),
+            ],
+            owned_files: vec![SeedFile {
+                path: rel,
+                reason: "Artisan command".to_string(),
+            }],
+            context_files: Vec::new(),
+            tests: Vec::new(),
+            test_prefixes: vec!["tests/Feature".to_string(), "tests/Unit".to_string()],
+        });
+    }
+    Ok(out)
+}
+
+fn php_declared_class_fqcn(source: &str) -> Option<String> {
+    let namespace_re = Regex::new(r"(?m)^\s*namespace\s+([A-Za-z_\\][A-Za-z0-9_\\]*)\s*;").ok()?;
+    let class_re =
+        Regex::new(r"(?m)^\s*(?:abstract\s+|final\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)").ok()?;
+    let ns = namespace_re.captures(source)?.get(1)?.as_str().to_string();
+    let class = class_re.captures(source)?.get(1)?.as_str().to_string();
+    Some(format!("{ns}\\{class}"))
+}
+
+fn walk_php_files(root: &Path, dir: &Path, max: usize) -> Vec<String> {
+    fn recurse(root: &Path, dir: &Path, max: usize, out: &mut Vec<String>) {
+        if out.len() >= max {
+            return;
+        }
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for entry in rd.flatten() {
+            if out.len() >= max {
+                return;
+            }
+            let p = entry.path();
+            if let Ok(meta) = fs::symlink_metadata(&p) {
+                if meta.file_type().is_symlink() {
+                    continue;
+                }
+                if meta.is_dir() {
+                    recurse(root, &p, max, out);
+                } else if meta.is_file()
+                    && p.extension().and_then(|s| s.to_str()) == Some("php")
+                    && is_safe_file(root, &p)
+                {
+                    out.push(rel_path(root, &p));
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    recurse(root, dir, max, &mut out);
+    out.sort();
+    out
+}
+
+fn dedup_seed_files(mut v: Vec<SeedFile>) -> Vec<SeedFile> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<String> = HashSet::new();
+    v.retain(|f| seen.insert(f.path.clone()));
+    v
 }
 
 #[cfg(test)]
@@ -430,5 +787,126 @@ Route::post('/api/login', [LoginController::class, 'store']);
             .collect();
         assert!(routes.iter().any(|r| r.starts_with("GET ")));
         assert!(routes.contains(&"POST /api/login"));
+    }
+
+    #[test]
+    fn laravel_controller_seed_resolves_back_to_routes() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "composer.json",
+            r#"{"name":"acme/app","require":{"laravel/framework":"^11.0"}}"#,
+        );
+        write(
+            dir.path(),
+            "routes/web.php",
+            r#"<?php
+use App\Http\Controllers\UserController;
+Route::get('/users', [UserController::class, 'index']);
+Route::post('/users', [UserController::class, 'store']);
+"#,
+        );
+        write(
+            dir.path(),
+            "app/Http/Controllers/UserController.php",
+            r#"<?php
+namespace App\Http\Controllers;
+class UserController { public function index() {} public function store() {} }
+"#,
+        );
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let c = seeds
+            .iter()
+            .find(|s| s.source == "laravel-controller")
+            .expect("expected laravel-controller seed");
+        assert_eq!(c.entry_path, "app/Http/Controllers/UserController.php");
+        assert_eq!(c.entry_symbol.as_deref(), Some("UserController"));
+        assert!(
+            c.summary.contains("GET /users") || c.summary.contains("POST /users"),
+            "controller summary should mention bridged routes, got {}",
+            c.summary
+        );
+        let ctx_paths: Vec<&str> = c.context_files.iter().map(|f| f.path.as_str()).collect();
+        assert!(
+            ctx_paths.contains(&"routes/web.php"),
+            "expected routes/web.php in context, got {ctx_paths:?}"
+        );
+    }
+
+    #[test]
+    fn laravel_form_request_emitted() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "composer.json",
+            r#"{"name":"acme/app","require":{"laravel/framework":"^11.0"}}"#,
+        );
+        write(
+            dir.path(),
+            "app/Http/Requests/StoreUserRequest.php",
+            r#"<?php
+namespace App\Http\Requests;
+class StoreUserRequest { public function rules() { return []; } }
+"#,
+        );
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let r = seeds
+            .iter()
+            .find(|s| s.source == "laravel-request")
+            .expect("expected laravel-request seed");
+        assert_eq!(r.entry_path, "app/Http/Requests/StoreUserRequest.php");
+        assert_eq!(r.entry_symbol.as_deref(), Some("StoreUserRequest"));
+    }
+
+    #[test]
+    fn laravel_artisan_command_extracts_signature() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "composer.json",
+            r#"{"name":"acme/app","require":{"laravel/framework":"^11.0"}}"#,
+        );
+        write(dir.path(), "artisan", "#!/usr/bin/env php\n");
+        write(
+            dir.path(),
+            "app/Console/Commands/SyncUsers.php",
+            r#"<?php
+namespace App\Console\Commands;
+use Illuminate\Console\Command;
+class SyncUsers extends Command {
+    protected $signature = 'users:sync {--force}';
+    public function handle() {}
+}
+"#,
+        );
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let c = seeds
+            .iter()
+            .find(|s| s.source == "laravel-artisan-command")
+            .expect("expected laravel-artisan-command seed");
+        assert_eq!(c.entry_command.as_deref(), Some("users:sync"));
+        assert_eq!(c.entry_path, "app/Console/Commands/SyncUsers.php");
+    }
+
+    #[test]
+    fn laravel_application_layer_skipped_for_non_laravel_projects() {
+        // A repo with `app/Http/Controllers/*.php` but no Laravel
+        // dependency must not produce laravel-controller seeds.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "composer.json",
+            r#"{"name":"acme/app","require":{"symfony/console":"^7.0"}}"#,
+        );
+        write(
+            dir.path(),
+            "app/Http/Controllers/Whatever.php",
+            "<?php namespace App\\Http\\Controllers; class Whatever {}",
+        );
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        assert!(
+            !seeds.iter().any(|s| s.source == "laravel-controller"),
+            "non-Laravel project must not emit laravel-controller seeds"
+        );
     }
 }

@@ -34,6 +34,18 @@ impl<'a> MapperContext<'a> {
     pub fn excluded(&self, rel: &str) -> bool {
         self.excludes.is_some_and(|g| g.is_match(rel))
     }
+
+    /// Inverse of [`excluded`]; convenience for filter chains where the
+    /// affirmative read ("is this candidate allowed?") is clearer than
+    /// the negated form. Empty path is treated as allowed — the seed-
+    /// level entry_path check is the only consumer of empty paths and a
+    /// blank entry already gets dropped further downstream.
+    pub fn allowed(&self, rel: &str) -> bool {
+        if rel.is_empty() {
+            return true;
+        }
+        !self.excluded(rel)
+    }
 }
 
 /// A file the mapper attaches to the seed with an explicit role hint and

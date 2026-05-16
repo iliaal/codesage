@@ -66,7 +66,14 @@ pub fn map_features(
     let all_files = walk_files(root, root, 50_000, ctx.excludes);
     db.execute_batch(|db| {
         for seed in &seeds {
-            let record = build_record(db, root, seed, &all_files)?;
+            if !ctx.allowed(&seed.entry_path) {
+                continue;
+            }
+            let mut record = build_record(db, root, seed, &all_files)?;
+            // Final safety net: even when a mapper forgets to filter, no
+            // FeatureFileRef should reference a path the structural
+            // indexer excludes. Drop any leaked refs before persisting.
+            record.files.retain(|f| ctx.allowed(&f.path));
             let exists = db.load_feature(&record.feature_id)?.is_some();
             db.upsert_feature(&record)?;
             keep_ids.push(record.feature_id.clone());
@@ -341,6 +348,114 @@ mod tests {
                 .iter()
                 .any(|f| f.entry_path.starts_with("scripts/")),
             "scripts/** exclude not applied, got {features:?}"
+        );
+    }
+
+    #[test]
+    fn rust_bin_under_exclude_is_dropped() {
+        // CR-001 reproduction: a `src/bin/<name>.rs` that matches
+        // `[index].exclude_patterns` must not produce a cargo-bin
+        // feature, otherwise the row references a path the structural
+        // indexer ignored.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "Cargo.toml",
+            "[package]\nname = \"acme\"\nversion = \"0.1.0\"\n",
+        );
+        write(root, "src/main.rs", "fn main() {}");
+        write(root, "src/bin/visible.rs", "fn main() {}");
+        write(root, "src/bin/hidden.rs", "fn main() {}");
+        let db = Database::open_in_memory().unwrap();
+        map_features(root, &db, &["**/hidden.rs".to_string()]).unwrap();
+        let features = db.list_features(None, None, None, 100).unwrap();
+        let entries: Vec<&str> = features.iter().map(|f| f.entry_path.as_str()).collect();
+        assert!(
+            entries.iter().any(|e| e == &"src/bin/visible.rs"),
+            "expected visible bin feature, got {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|e| e == &"src/bin/hidden.rs"),
+            "hidden.rs was emitted as a feature despite **/hidden.rs exclude, got {entries:?}"
+        );
+    }
+
+    #[test]
+    fn rust_integration_test_under_exclude_is_dropped() {
+        // CR-001: integration tests under `tests/` must respect
+        // `**/tests/**` excludes.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "Cargo.toml",
+            "[package]\nname = \"acme\"\nversion = \"0.1.0\"\n",
+        );
+        write(root, "src/main.rs", "fn main() {}");
+        write(root, "tests/integration.rs", "#[test] fn t() {}");
+        let db = Database::open_in_memory().unwrap();
+        map_features(root, &db, &["**/tests/**".to_string()]).unwrap();
+        let features = db.list_features(None, None, None, 100).unwrap();
+        assert!(
+            !features.iter().any(|f| f.entry_path.starts_with("tests/")),
+            "tests/** exclude not applied to integration tests, got {features:?}"
+        );
+    }
+
+    #[test]
+    fn cmake_target_under_exclude_is_dropped() {
+        // CR-001 reproduction: a CMake target whose entry resolves to an
+        // excluded path must not emit a feature.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "CMakeLists.txt",
+            "add_executable(visible visible.c)\nadd_executable(hidden hidden.c)\n",
+        );
+        write(root, "visible.c", "int main(){return 0;}\n");
+        write(root, "hidden.c", "int main(){return 0;}\n");
+        let db = Database::open_in_memory().unwrap();
+        map_features(root, &db, &["**/hidden.c".to_string()]).unwrap();
+        let features = db.list_features(None, None, None, 100).unwrap();
+        let entries: Vec<&str> = features.iter().map(|f| f.entry_path.as_str()).collect();
+        assert!(
+            entries.iter().any(|e| e == &"visible.c"),
+            "expected visible.c feature, got {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|e| e == &"hidden.c"),
+            "hidden.c was emitted despite **/hidden.c exclude, got {entries:?}"
+        );
+    }
+
+    #[test]
+    fn cmake_owned_files_under_exclude_are_dropped() {
+        // CR-001: even if the target's entry is allowed, sources listed
+        // under `add_executable(target src1 src2)` that are themselves
+        // excluded must not show up as owned/context refs on the
+        // emitted feature.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "CMakeLists.txt",
+            "add_executable(svc main.c helper_generated.c)\n",
+        );
+        write(root, "main.c", "int main(){return 0;}\n");
+        write(root, "helper_generated.c", "void h(){}\n");
+        let db = Database::open_in_memory().unwrap();
+        map_features(root, &db, &["**/*_generated.c".to_string()]).unwrap();
+        let features = db.list_features(None, None, None, 100).unwrap();
+        let svc = features
+            .iter()
+            .find(|f| f.entry_path == "main.c")
+            .expect("expected main.c feature");
+        let owned_paths: Vec<&str> = svc.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(
+            !owned_paths.iter().any(|p| p == &"helper_generated.c"),
+            "generated source leaked as owned file despite exclude, got {owned_paths:?}"
         );
     }
 

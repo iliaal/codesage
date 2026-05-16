@@ -36,8 +36,8 @@ impl FeatureMapper for CCppMapper {
             return Ok(Vec::new());
         }
         let mut seeds: Vec<FeatureSeed> = Vec::new();
-        seeds.extend(autotools_targets(root, &files)?);
-        seeds.extend(cmake_targets(root, &files)?);
+        seeds.extend(autotools_targets(ctx, &files)?);
+        seeds.extend(cmake_targets(ctx, &files)?);
         // Build-target seeds win over generic main() detection: skip
         // main()-anchored seeds for paths a CMake/autotools target
         // already claims, otherwise the same binary shows up twice with
@@ -47,7 +47,7 @@ impl FeatureMapper for CCppMapper {
             .filter(|s| s.kind == FeatureKind::CliCommand)
             .map(|s| s.entry_path.clone())
             .collect();
-        seeds.extend(main_function_targets(root, &files, &already_seeded_paths)?);
+        seeds.extend(main_function_targets(ctx, &files, &already_seeded_paths)?);
         Ok(dedup_by_entry(seeds))
     }
 }
@@ -89,7 +89,8 @@ fn lang_for_path(rel: &str) -> Language {
     }
 }
 
-fn autotools_targets(root: &Path, files: &[String]) -> Result<Vec<FeatureSeed>> {
+fn autotools_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSeed>> {
+    let root = ctx.root;
     let mut out: Vec<FeatureSeed> = Vec::new();
     let makefile_am_files: Vec<&String> = files
         .iter()
@@ -130,7 +131,12 @@ fn autotools_targets(root: &Path, files: &[String]) -> Result<Vec<FeatureSeed>> 
                         mf.rsplit('/').next().unwrap_or(mf)
                     )
                 });
+                if !ctx.allowed(&entry) {
+                    continue;
+                }
                 let language = lang_for_path(&entry);
+                let owned_files = filter_target_sources(ctx, &dir, &sources);
+                let context_files = filter_target_context(ctx, mf, "build target declaration");
                 out.push(FeatureSeed {
                     title: format!("Autotools binary `{name}`"),
                     summary: format!("Makefile.am `bin_PROGRAMS` target declared in {mf}"),
@@ -151,17 +157,8 @@ fn autotools_targets(root: &Path, files: &[String]) -> Result<Vec<FeatureSeed>> 
                         .to_string(),
                         "cli".to_string(),
                     ],
-                    owned_files: sources
-                        .iter()
-                        .map(|s| SeedFile {
-                            path: prefix_dir(&dir, s),
-                            reason: "target source".to_string(),
-                        })
-                        .collect(),
-                    context_files: vec![SeedFile {
-                        path: mf.to_string(),
-                        reason: "build target declaration".to_string(),
-                    }],
+                    owned_files,
+                    context_files,
                     tests: Vec::new(),
                     test_prefixes: vec![format!("{}tests", dir)],
                 });
@@ -187,7 +184,12 @@ fn autotools_targets(root: &Path, files: &[String]) -> Result<Vec<FeatureSeed>> 
                     .collect::<Vec<_>>();
                 let entry = pick_entry(root, &dir, &entry_candidates, &name)
                     .unwrap_or_else(|| mf.to_string());
+                if !ctx.allowed(&entry) {
+                    continue;
+                }
                 let language = lang_for_path(&entry);
+                let owned_files = filter_target_sources(ctx, &dir, &sources);
+                let context_files = filter_target_context(ctx, mf, "build target declaration");
                 out.push(FeatureSeed {
                     title: format!("Autotools library `{name}`"),
                     summary: format!("Makefile.am `lib_LTLIBRARIES` target declared in {mf}"),
@@ -208,17 +210,8 @@ fn autotools_targets(root: &Path, files: &[String]) -> Result<Vec<FeatureSeed>> 
                         .to_string(),
                         "library".to_string(),
                     ],
-                    owned_files: sources
-                        .iter()
-                        .map(|s| SeedFile {
-                            path: prefix_dir(&dir, s),
-                            reason: "target source".to_string(),
-                        })
-                        .collect(),
-                    context_files: vec![SeedFile {
-                        path: mf.to_string(),
-                        reason: "build target declaration".to_string(),
-                    }],
+                    owned_files,
+                    context_files,
                     tests: Vec::new(),
                     test_prefixes: vec![format!("{}tests", dir)],
                 });
@@ -228,7 +221,8 @@ fn autotools_targets(root: &Path, files: &[String]) -> Result<Vec<FeatureSeed>> 
     Ok(out)
 }
 
-fn cmake_targets(root: &Path, files: &[String]) -> Result<Vec<FeatureSeed>> {
+fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSeed>> {
+    let root = ctx.root;
     let mut out: Vec<FeatureSeed> = Vec::new();
     let cmake_files: Vec<&String> = files.iter().filter(|f| is_cmake(f)).collect();
     if cmake_files.is_empty() {
@@ -260,7 +254,12 @@ fn cmake_targets(root: &Path, files: &[String]) -> Result<Vec<FeatureSeed>> {
                 .map(|s| s.to_string())
                 .collect();
             let entry = pick_entry(root, &dir, &sources, &name).unwrap_or_else(|| cm.to_string());
+            if !ctx.allowed(&entry) {
+                continue;
+            }
             let language = lang_for_path(&entry);
+            let owned_files = filter_target_sources(ctx, &dir, &sources);
+            let context_files = filter_target_context(ctx, cm, "CMake target declaration");
             out.push(FeatureSeed {
                 title: format!("CMake binary `{name}`"),
                 summary: format!("CMake `add_executable({name})` declared in {cm}"),
@@ -281,17 +280,8 @@ fn cmake_targets(root: &Path, files: &[String]) -> Result<Vec<FeatureSeed>> {
                     .to_string(),
                     "cli".to_string(),
                 ],
-                owned_files: sources
-                    .iter()
-                    .map(|s| SeedFile {
-                        path: prefix_dir(&dir, s),
-                        reason: "target source".to_string(),
-                    })
-                    .collect(),
-                context_files: vec![SeedFile {
-                    path: cm.to_string(),
-                    reason: "CMake target declaration".to_string(),
-                }],
+                owned_files,
+                context_files,
                 tests: Vec::new(),
                 test_prefixes: vec![format!("{}tests", dir)],
             });
@@ -314,7 +304,12 @@ fn cmake_targets(root: &Path, files: &[String]) -> Result<Vec<FeatureSeed>> {
                 .map(|s| s.to_string())
                 .collect();
             let entry = pick_entry(root, &dir, &sources, &name).unwrap_or_else(|| cm.to_string());
+            if !ctx.allowed(&entry) {
+                continue;
+            }
             let language = lang_for_path(&entry);
+            let owned_files = filter_target_sources(ctx, &dir, &sources);
+            let context_files = filter_target_context(ctx, cm, "CMake target declaration");
             out.push(FeatureSeed {
                 title: format!("CMake library `{name}`"),
                 summary: format!("CMake `add_library({name})` declared in {cm}"),
@@ -335,17 +330,8 @@ fn cmake_targets(root: &Path, files: &[String]) -> Result<Vec<FeatureSeed>> {
                     .to_string(),
                     "library".to_string(),
                 ],
-                owned_files: sources
-                    .iter()
-                    .map(|s| SeedFile {
-                        path: prefix_dir(&dir, s),
-                        reason: "target source".to_string(),
-                    })
-                    .collect(),
-                context_files: vec![SeedFile {
-                    path: cm.to_string(),
-                    reason: "CMake target declaration".to_string(),
-                }],
+                owned_files,
+                context_files,
                 tests: Vec::new(),
                 test_prefixes: vec![format!("{}tests", dir)],
             });
@@ -355,10 +341,11 @@ fn cmake_targets(root: &Path, files: &[String]) -> Result<Vec<FeatureSeed>> {
 }
 
 fn main_function_targets(
-    root: &Path,
+    ctx: &MapperContext,
     files: &[String],
     already_seeded: &BTreeSet<String>,
 ) -> Result<Vec<FeatureSeed>> {
+    let root = ctx.root;
     let mut out: Vec<FeatureSeed> = Vec::new();
     let mut c_parser = Parser::new();
     let mut cpp_parser = Parser::new();
@@ -366,6 +353,9 @@ fn main_function_targets(
     cpp_parser.set_language(&tree_sitter_cpp::LANGUAGE.into())?;
     for rel in files.iter().filter(|p| is_c_or_cpp_compilable(p)) {
         if already_seeded.contains(rel) {
+            continue;
+        }
+        if !ctx.allowed(rel) {
             continue;
         }
         let abs = root.join(rel);
@@ -514,6 +504,36 @@ fn prefix_dir(dir: &str, file: &str) -> String {
     } else {
         format!("{}{}", dir, file)
     }
+}
+
+/// Build the `owned_files` set for a build-system target while honoring
+/// the configured exclude patterns: a source listed in
+/// `bin_PROGRAMS_SOURCES` / `add_executable(... a.c b.c ...)` but caught
+/// by `[index].exclude_patterns` must not appear in the feature record,
+/// otherwise the row references a file the structural indexer ignored.
+fn filter_target_sources(ctx: &MapperContext, dir: &str, sources: &[String]) -> Vec<SeedFile> {
+    sources
+        .iter()
+        .map(|s| prefix_dir(dir, s))
+        .filter(|path| ctx.allowed(path))
+        .map(|path| SeedFile {
+            path,
+            reason: "target source".to_string(),
+        })
+        .collect()
+}
+
+/// Same allow-check for the single build-system manifest pointed at by
+/// `context_files`. Empty result when the manifest itself is excluded —
+/// rare, but it would otherwise leak a phantom file ref.
+fn filter_target_context(ctx: &MapperContext, manifest: &str, reason: &str) -> Vec<SeedFile> {
+    if !ctx.allowed(manifest) {
+        return Vec::new();
+    }
+    vec![SeedFile {
+        path: manifest.to_string(),
+        reason: reason.to_string(),
+    }]
 }
 
 fn parent_dir(rel: &str) -> String {

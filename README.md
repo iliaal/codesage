@@ -20,6 +20,8 @@ CodeSage is a code intelligence engine for AI coding agents. It combines structu
 - Estimate which files a change breaks (change impact analysis).
 - Build curated code bundles for LLM consumption in JSON, markdown, or flat-text (gitingest-style) form.
 - Read per-file git history: churn, fix ratio, historical co-change, risk score.
+- Browse the project as **behavior-keyed feature slices**: each slice bundles an entrypoint + owned files + context files + tests + crossed trust boundaries, mapped deterministically from build manifests and framework routing (Cargo bins, Laravel routes, php-src `ext/*`, Next.js `app/**`, Python `__main__`, Go `cmd/*`, etc.).
+- Inspect **trust boundaries** per file (`network`, `filesystem`, `process-exec`, `secrets`, `database`, `user-input`, `external-api`, `serialization`, `auth`, `concurrency`) derived from imports/includes/calls; same signal folds into `assess_risk` and surfaces as security-review notes when ≥3 boundaries are crossed.
 - Expose all of the above over MCP so Claude Code, Codex, or Cursor can call them.
 
 ## Capability summary
@@ -40,6 +42,9 @@ Concrete answers to the questions a code-intelligence tool earns its keep on. Th
 | Curated context bundle for downstream LLM | ✓ via `export_context`, callers + callees optional |
 | Session-baseline diff (did this session decay the index?) | ✓ via `session_start` / `session_end`, cycle + risk regressions |
 | Cycle / SCC detection in the import graph | ✓ folded into `assess_risk` and `assess_risk_diff.cycles_touching_patch` |
+| Feature-slice mapping (behavior-keyed bundles) | ✓ via `codesage map` / `features-list` / `feature-show` / `feature-for`, MCP `list_features` / `find_feature` |
+| Curated feature bundle (entry + owned + tests + context for one slice) | ✓ via `codesage feature-bundle <id>` and MCP `feature_bundle` |
+| Trust-boundary derivation (network / fs / secrets / process-exec / db / etc.) | ✓ per-file table from imports/includes/calls, aggregated per feature, feeds `assess_risk` |
 | Host-agnostic deployment (no Docker, no managed services) | ✓ single static Rust binary + one SQLite file per project |
 | Auto-refresh on commit/merge/checkout/rebase | ✓ git hooks installed by `codesage install-hooks` |
 | Symbol-level edits (rename, move, replace_symbol_body) | — read-only by design; pair with Serena or your editor |
@@ -166,6 +171,26 @@ codesage coupling path/to/file.rs --limit 5
 ```
 
 When you're about to dive into one specific file. Risk score, suggested tests, and what historically co-changes calibrate caution before you start editing.
+
+### Browse the project as feature slices
+
+```bash
+codesage map                                 # populate feature tables
+codesage features-list --kind route --json   # all HTTP/router routes
+codesage feature-for app/Http/Controllers/UserController.php
+codesage feature-show feat_<id> --json       # one slice + its file refs + trust boundaries
+codesage feature-bundle feat_<id> --json     # bundle the slice's code for an LLM
+```
+
+Use when answering "what slice owns this file?" or "give me the whole flow behind /users". The bundle is the same shape as `export_context` but anchored on the feature's curated file list instead of semantic search results.
+
+### Trust-boundary inspection
+
+```bash
+codesage trust-boundaries crates/cli/src/main.rs --json
+```
+
+Per-file capability tags (network, filesystem, process-exec, secrets, database, user-input, external-api, serialization, auth, concurrency) derived from imports / includes / calls. The same signal contributes to `assess_risk` and surfaces a "crosses N trust boundaries — security review recommended" note when a file touches three or more.
 
 ## 🔌 Claude Code plugin
 

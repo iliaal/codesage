@@ -721,7 +721,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "list_dependencies",
-        description = "List import/include dependencies for a file. Shows what the file imports and which other files import it.",
+        description = "List immediate (single-hop) import/include dependencies for a file: what THIS file imports and which other files import THIS file. Use when the question is 'what does this file depend on?' or 'who imports this file?'. For 'what breaks if I change this?' use `impact_analysis` (walks multiple hops, ranks by distance). For per-symbol callers/callees use `find_references` (per-symbol grain, not per-file).",
         output_schema = schema_for_type::<DependencyEntry>()
     )]
     fn list_dependencies_tool(
@@ -762,7 +762,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "impact_analysis",
-        description = "Estimate which files are affected by changing a symbol or file. Walks the reference graph up to `depth` hops, reports affected files ranked by distance and reference count. Use before making changes to understand blast radius.",
+        description = "Estimate which files are affected by changing a symbol or file. Walks the reference graph up to `depth` hops (default 2), reports affected files ranked by distance and reference count. **Multi-hop blast radius** — use BEFORE making changes to know what else needs review/testing. For single-hop dependencies (just direct importers/importees of one file) use `list_dependencies` instead; for raw call sites of a specific symbol use `find_references`.",
         output_schema = schema_for_type::<ImpactAnalysisResults>()
     )]
     fn impact_analysis_tool(&self, Parameters(params): Parameters<ImpactParams>) -> CallToolResult {
@@ -779,7 +779,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "export_context",
-        description = "Build a curated context bundle for a query or symbol. Combines semantic search results, overlapping symbol definitions, and optionally caller/callee code. Output is a structured bundle ready for LLM consumption. Symbol entries inside the bundle carry `rationale[]` when the author left `WHY:` / `NOTE:` / `IMPORTANT:` / `FIXME:` / `HACK:` / `XXX:` / `TODO:` comments — preserve these in any synthesis the agent performs from the bundle. Currently extracted for Rust only.",
+        description = "Build a curated context bundle for a free-form **query** or a single **symbol**: semantic search results, overlapping symbol definitions, and optionally caller/callee code, all wrapped as a structured bundle ready for LLM consumption. Use when the anchor is a phrase ('error handling in the parser') or one named symbol. For an already-mapped feature slice (entrypoint + owned files + tests + context already resolved), use `feature_bundle` instead — that anchors on `feature_id` and avoids re-running semantic search. Symbol entries inside the bundle carry `rationale[]` when the author left `WHY:` / `NOTE:` / `IMPORTANT:` / `FIXME:` / `HACK:` / `XXX:` / `TODO:` comments — preserve these in any synthesis the agent performs from the bundle. Currently extracted for Rust only.",
         output_schema = schema_for_type::<ContextBundle>()
     )]
     fn export_context_tool(

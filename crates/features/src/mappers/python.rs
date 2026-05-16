@@ -3,7 +3,6 @@
 //! files containing `if __name__ == "__main__":`.
 
 use std::fs;
-use std::path::Path;
 
 use anyhow::Result;
 use codesage_protocol::{FeatureConfidence, FeatureKind, Language};
@@ -44,17 +43,17 @@ impl FeatureMapper for PythonMapper {
         "python"
     }
     fn map(&self, ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
-        let root = ctx.root;
         let mut seeds: Vec<FeatureSeed> = Vec::new();
-        seeds.extend(pyproject_scripts(root)?);
-        seeds.extend(setup_py_entry_points(root)?);
+        seeds.extend(pyproject_scripts(ctx)?);
+        seeds.extend(setup_py_entry_points(ctx)?);
         seeds.extend(main_guard_modules(ctx)?);
-        seeds.retain(|s| !ctx.excluded(&s.entry_path));
+        seeds.retain(|s| ctx.allowed(&s.entry_path));
         Ok(seeds)
     }
 }
 
-fn pyproject_scripts(root: &Path) -> Result<Vec<FeatureSeed>> {
+fn pyproject_scripts(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
+    let root = ctx.root;
     let mut out = Vec::new();
     let path = root.join("pyproject.toml");
     if !is_safe_file(root, &path) {
@@ -81,17 +80,23 @@ fn pyproject_scripts(root: &Path) -> Result<Vec<FeatureSeed>> {
         if name.is_empty() {
             continue;
         }
-        // Target shape: `module.path:fn_name`. Module → src/<module>.py or
-        // module/__init__.py; we record the dotted module as entry_symbol
-        // and pyproject.toml as the entry file.
+        // Target shape: `module.path:fn_name`. Resolve the dotted module
+        // to a real `.py` file so `codesage feature-for <module.py>` can
+        // find the script — recording `pyproject.toml` as entry_path
+        // makes the file-→-feature contract a lie (the user's question
+        // "what feature owns acme/cli.py?" returns nothing).
         let module = target.split(':').next().unwrap_or(&target).to_string();
+        let resolved = resolve_script_module_path(ctx, &module);
+        let entry_path = resolved
+            .clone()
+            .unwrap_or_else(|| "pyproject.toml".to_string());
         out.push(FeatureSeed {
             title: format!("Python script `{name}`"),
             summary: format!("pyproject.toml `[project.scripts]` entry `{name} = \"{target}\"`"),
             kind: FeatureKind::CliCommand,
             source: "pyproject-script",
             confidence: FeatureConfidence::High,
-            entry_path: "pyproject.toml".to_string(),
+            entry_path,
             entry_symbol: Some(module),
             entry_route: None,
             entry_command: Some(name),
@@ -109,7 +114,8 @@ fn pyproject_scripts(root: &Path) -> Result<Vec<FeatureSeed>> {
     Ok(out)
 }
 
-fn setup_py_entry_points(root: &Path) -> Result<Vec<FeatureSeed>> {
+fn setup_py_entry_points(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
+    let root = ctx.root;
     let mut out = Vec::new();
     let path = root.join("setup.py");
     if !is_safe_file(root, &path) {
@@ -135,13 +141,15 @@ fn setup_py_entry_points(root: &Path) -> Result<Vec<FeatureSeed>> {
             continue;
         }
         let module = target.split(':').next().unwrap_or(&target).to_string();
+        let resolved = resolve_script_module_path(ctx, &module);
+        let entry_path = resolved.clone().unwrap_or_else(|| "setup.py".to_string());
         out.push(FeatureSeed {
             title: format!("Python script `{name}` (setup.py)"),
             summary: format!("setup.py console_scripts entry `{name}={target}`"),
             kind: FeatureKind::CliCommand,
             source: "setup-py-script",
             confidence: FeatureConfidence::High,
-            entry_path: "setup.py".to_string(),
+            entry_path,
             entry_symbol: Some(module),
             entry_route: None,
             entry_command: Some(name),
@@ -157,6 +165,42 @@ fn setup_py_entry_points(root: &Path) -> Result<Vec<FeatureSeed>> {
         });
     }
     Ok(out)
+}
+
+/// Convert a dotted module path (`acme.cli`) into a repo-relative file
+/// path (`acme/cli.py` or `src/acme/cli.py` or `acme/__init__.py`).
+/// Falls back to `None` when no candidate resolves to an existing file
+/// or every candidate is filtered out by `[index].exclude_patterns` —
+/// callers should then record the manifest as `entry_path` so the seed
+/// still emits.
+fn resolve_script_module_path(ctx: &MapperContext, module: &str) -> Option<String> {
+    let root = ctx.root;
+    let parts: Vec<&str> = module.split('.').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let joined = parts.join("/");
+    // Probe `<module>.py`, `<module>/__init__.py`, and the same shapes
+    // under `src/`. Order matters: a top-level `<module>.py` beats a
+    // namespace-package `<module>/__init__.py`, because real projects
+    // most commonly have the former.
+    let candidates = [
+        format!("{joined}.py"),
+        format!("{joined}/__init__.py"),
+        format!("src/{joined}.py"),
+        format!("src/{joined}/__init__.py"),
+    ];
+    for rel in candidates {
+        let abs = root.join(&rel);
+        if !is_safe_file(root, &abs) {
+            continue;
+        }
+        if !ctx.allowed(&rel) {
+            continue;
+        }
+        return Some(rel);
+    }
+    None
 }
 
 fn main_guard_modules(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
@@ -210,6 +254,7 @@ fn main_guard_modules(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use tempfile::tempdir;
 
     fn write(root: &Path, rel: &str, content: &str) {
@@ -233,6 +278,7 @@ name = "acme"
 acme = "acme.cli:main"
 "#,
         );
+        // No module file on disk → entry falls back to the manifest.
         let seeds = PythonMapper
             .map(&MapperContext::for_root(dir.path()))
             .unwrap();
@@ -242,6 +288,118 @@ acme = "acme.cli:main"
             .expect("script seed");
         assert_eq!(s.entry_command.as_deref(), Some("acme"));
         assert_eq!(s.entry_symbol.as_deref(), Some("acme.cli"));
+        assert_eq!(s.entry_path, "pyproject.toml");
+    }
+
+    #[test]
+    fn pyproject_script_entry_resolves_to_module_file() {
+        // The advertised contract: `codesage feature-for acme/cli.py`
+        // must find this feature. That requires entry_path to be the
+        // module file, not the manifest.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "pyproject.toml",
+            r#"[project]
+name = "acme"
+
+[project.scripts]
+acme = "acme.cli:main"
+"#,
+        );
+        write(dir.path(), "acme/cli.py", "def main(): pass\n");
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "pyproject-script")
+            .expect("script seed");
+        assert_eq!(s.entry_path, "acme/cli.py");
+        assert_eq!(s.entry_symbol.as_deref(), Some("acme.cli"));
+    }
+
+    #[test]
+    fn pyproject_script_entry_resolves_src_layout() {
+        // `src/<pkg>/<mod>.py` is the other common Python layout.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "pyproject.toml",
+            r#"[project]
+name = "acme"
+
+[project.scripts]
+acme = "acme.cli:main"
+"#,
+        );
+        write(dir.path(), "src/acme/cli.py", "def main(): pass\n");
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "pyproject-script")
+            .expect("script seed");
+        assert_eq!(s.entry_path, "src/acme/cli.py");
+    }
+
+    #[test]
+    fn pyproject_script_entry_resolves_package_init() {
+        // Namespace/package script: target `acme:main` → `acme/__init__.py`.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "pyproject.toml",
+            r#"[project]
+name = "acme"
+
+[project.scripts]
+acme = "acme:main"
+"#,
+        );
+        write(dir.path(), "acme/__init__.py", "def main(): pass\n");
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "pyproject-script")
+            .expect("script seed");
+        assert_eq!(s.entry_path, "acme/__init__.py");
+    }
+
+    #[test]
+    fn pyproject_script_entry_falls_back_when_excluded() {
+        // If the resolved module file is excluded by [index].exclude_patterns,
+        // we can't ship a feature pointing at a file the rest of the
+        // pipeline ignores. Fall back to the manifest so the seed at
+        // least exists with a valid entry_path.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "pyproject.toml",
+            r#"[project]
+name = "acme"
+
+[project.scripts]
+acme = "acme.cli:main"
+"#,
+        );
+        write(dir.path(), "acme/cli.py", "def main(): pass\n");
+        let mut builder = globset::GlobSetBuilder::new();
+        builder.add(globset::Glob::new("acme/**").unwrap());
+        let excludes = builder.build().unwrap();
+        let ctx = MapperContext {
+            root: dir.path(),
+            excludes: Some(&excludes),
+        };
+        let seeds = PythonMapper.map(&ctx).unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "pyproject-script")
+            .expect("script seed");
+        assert_eq!(s.entry_path, "pyproject.toml");
     }
 
     #[test]
@@ -307,6 +465,7 @@ acme = "acme.cli:main"
             "setup.py",
             "from setuptools import setup\nsetup(\n  name='acme',\n  entry_points={\n    'console_scripts': [\n        'acme=acme.cli:main',\n    ],\n  }\n)\n",
         );
+        write(dir.path(), "acme/cli.py", "def main(): pass\n");
         let seeds = PythonMapper
             .map(&MapperContext::for_root(dir.path()))
             .unwrap();
@@ -315,5 +474,6 @@ acme = "acme.cli:main"
             .find(|s| s.source == "setup-py-script")
             .expect("setup-py seed");
         assert_eq!(s.entry_command.as_deref(), Some("acme"));
+        assert_eq!(s.entry_path, "acme/cli.py");
     }
 }

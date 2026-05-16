@@ -7,6 +7,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use codesage_protocol::{FeatureConfidence, FeatureKind, Language};
+use regex::Regex;
 use serde_json::Value;
 
 use crate::mappers::shared::{is_safe_dir, is_safe_file, walk_files};
@@ -22,17 +23,38 @@ impl FeatureMapper for JsMapper {
         let root = ctx.root;
         let mut seeds: Vec<FeatureSeed> = Vec::new();
         let pkg_path = root.join("package.json");
-        if is_safe_file(root, &pkg_path)
-            && let Ok(raw) = fs::read_to_string(&pkg_path)
-            && let Ok(pkg) = serde_json::from_str::<Value>(&raw)
-        {
-            seeds.extend(package_seeds(root, &pkg));
+        let pkg_at_root = if is_safe_file(root, &pkg_path) {
+            fs::read_to_string(&pkg_path)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        } else {
+            None
+        };
+        if let Some(pkg) = &pkg_at_root {
+            seeds.extend(package_seeds(root, pkg));
         }
         seeds.extend(next_app_routes(ctx)?);
         seeds.extend(next_pages_routes(ctx)?);
-        seeds.retain(|s| !ctx.excluded(&s.entry_path));
+        // React Router `<Route path element>` declarations. Only run
+        // when the root package.json declares a react dep — keeps the
+        // tree-walk cost off non-React repos.
+        if pkg_at_root.as_ref().is_some_and(has_react_dependency) {
+            seeds.extend(react_router_routes(ctx)?);
+        }
+        seeds.retain(|s| ctx.allowed(&s.entry_path));
         Ok(seeds)
     }
+}
+
+fn has_react_dependency(pkg: &Value) -> bool {
+    for field in ["dependencies", "devDependencies"] {
+        if let Some(map) = pkg.get(field).and_then(|v| v.as_object())
+            && map.contains_key("react")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn language_for_entry(entry: &str) -> Language {
@@ -266,6 +288,110 @@ fn ends_with_any(s: &str, suffixes: &[&str]) -> bool {
     suffixes.iter().any(|sfx| s.ends_with(sfx))
 }
 
+/// Scan `src/` and `app/` for React Router `<Route path="..." element={<C/>}>`
+/// declarations. Each matched `<Route>` becomes a `route` feature, keyed
+/// by the path. The entry file is the route-declaration source — we
+/// don't resolve the component back to its import here; that would
+/// require parsing TS/JSX imports, and the route declaration is the
+/// most reliable single anchor for "what handles /users?" agent
+/// questions.
+fn react_router_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
+    let root = ctx.root;
+    let mut out = Vec::new();
+    // <Route path="..." ... element={<Component
+    let route_re = Regex::new(
+        r#"<Route\s+[^>]*path=(?:["']([^"']+)["'])[^>]*element=\{\s*<([A-Z][A-Za-z0-9_]*)"#,
+    )?;
+    let mut framework_components: std::collections::HashSet<&'static str> =
+        std::collections::HashSet::new();
+    framework_components.insert("Navigate");
+    framework_components.insert("Outlet");
+    framework_components.insert("Fragment");
+    framework_components.insert("Suspense");
+
+    for prefix in ["src", "app"] {
+        let scan_dir = root.join(prefix);
+        if !is_safe_dir(root, &scan_dir) {
+            continue;
+        }
+        let files = walk_files(root, &scan_dir, 10_000, ctx.excludes);
+        for rel in files {
+            if !(rel.ends_with(".tsx")
+                || rel.ends_with(".ts")
+                || rel.ends_with(".jsx")
+                || rel.ends_with(".js"))
+            {
+                continue;
+            }
+            // Skip test/declaration files — agents asking "what route
+            // handles /users?" want the real declaration site.
+            if rel.ends_with(".test.tsx")
+                || rel.ends_with(".test.ts")
+                || rel.ends_with(".test.jsx")
+                || rel.ends_with(".test.js")
+                || rel.ends_with(".spec.tsx")
+                || rel.ends_with(".spec.ts")
+                || rel.ends_with(".spec.jsx")
+                || rel.ends_with(".spec.js")
+                || rel.ends_with(".d.ts")
+            {
+                continue;
+            }
+            let abs = root.join(&rel);
+            let Ok(raw) = fs::read_to_string(&abs) else {
+                continue;
+            };
+            if !raw.contains("<Route") {
+                continue;
+            }
+            for cap in route_re.captures_iter(&raw) {
+                let path = match cap.get(1).map(|m| m.as_str()) {
+                    Some(p) if !p.is_empty() => p.to_string(),
+                    _ => continue,
+                };
+                let component = cap
+                    .get(2)
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_default();
+                if component.is_empty() || framework_components.contains(component.as_str()) {
+                    continue;
+                }
+                let language = language_for_entry(&rel);
+                out.push(FeatureSeed {
+                    title: format!("React route `{path}`"),
+                    summary: format!(
+                        "React Router route '{path}' rendered by <{component}/> (declared in {rel})"
+                    ),
+                    kind: FeatureKind::Route,
+                    source: "react-router-route",
+                    confidence: FeatureConfidence::High,
+                    entry_path: rel.clone(),
+                    entry_symbol: Some(component),
+                    entry_route: Some(path),
+                    entry_command: None,
+                    language,
+                    tags: vec![
+                        if language == Language::TypeScript {
+                            "typescript"
+                        } else {
+                            "javascript"
+                        }
+                        .to_string(),
+                        "framework:react-router".to_string(),
+                        "react".to_string(),
+                        "route".to_string(),
+                    ],
+                    owned_files: Vec::new(),
+                    context_files: Vec::new(),
+                    tests: Vec::new(),
+                    test_prefixes: vec!["__tests__".to_string(), "tests".to_string()],
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +420,73 @@ mod tests {
             .find(|s| s.source == "package-json-bin")
             .expect("npm bin seed");
         assert_eq!(s.entry_command.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn react_router_routes_extracted() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"acme","dependencies":{"react":"^18.0.0","react-router-dom":"^6.0.0"}}"#,
+        );
+        write(
+            dir.path(),
+            "src/App.tsx",
+            r#"import { Route, Routes } from "react-router-dom";
+const App = () => (
+  <Routes>
+    <Route path="/users" element={<UsersPage />} />
+    <Route path="/settings" element={<SettingsPage />} />
+    <Route index element={<Outlet />} />
+  </Routes>
+);
+"#,
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let react_seeds: Vec<&FeatureSeed> = seeds
+            .iter()
+            .filter(|s| s.source == "react-router-route")
+            .collect();
+        let routes: Vec<&str> = react_seeds
+            .iter()
+            .filter_map(|s| s.entry_route.as_deref())
+            .collect();
+        assert!(
+            routes.contains(&"/users"),
+            "expected /users route, got {routes:?}"
+        );
+        assert!(
+            routes.contains(&"/settings"),
+            "expected /settings route, got {routes:?}"
+        );
+        // Framework components (Outlet etc.) must not produce features.
+        let bad: Vec<&str> = react_seeds
+            .iter()
+            .filter_map(|s| s.entry_symbol.as_deref())
+            .filter(|s| matches!(*s, "Outlet" | "Navigate" | "Fragment" | "Suspense"))
+            .collect();
+        assert!(bad.is_empty(), "framework component leaked, got {bad:?}");
+    }
+
+    #[test]
+    fn react_router_skipped_when_react_missing() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"acme","dependencies":{}}"#,
+        );
+        write(
+            dir.path(),
+            "src/App.tsx",
+            r#"<Route path="/x" element={<X />} />"#,
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        assert!(
+            !seeds.iter().any(|s| s.source == "react-router-route"),
+            "react-router mapper ran without a react dep"
+        );
     }
 
     #[test]

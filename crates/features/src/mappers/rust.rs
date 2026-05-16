@@ -79,45 +79,49 @@ fn seed_for_package(
     let main_rs = pkg_dir.join("src/main.rs");
     if is_safe_file(root, &main_rs) {
         let entry = rel_path(root, &main_rs);
-        seeds.push(FeatureSeed {
-            title: format!("Rust binary `{pkg_name}`"),
-            summary: format!("Cargo binary entrypoint at {entry}"),
-            kind: FeatureKind::CliCommand,
-            source,
-            confidence: FeatureConfidence::High,
-            entry_path: entry.clone(),
-            entry_symbol: Some("main".to_string()),
-            entry_route: None,
-            entry_command: Some(pkg_name.clone()),
-            language: Language::Rust,
-            tags: vec!["rust".to_string(), "cli".to_string()],
-            owned_files: lib_rs_as_owned(root, pkg_dir),
-            context_files: cargo_toml_context(root, pkg_dir),
-            tests: Vec::new(),
-            test_prefixes: vec![rel_path(root, &pkg_dir.join("tests"))],
-        });
+        if ctx.allowed(&entry) {
+            seeds.push(FeatureSeed {
+                title: format!("Rust binary `{pkg_name}`"),
+                summary: format!("Cargo binary entrypoint at {entry}"),
+                kind: FeatureKind::CliCommand,
+                source,
+                confidence: FeatureConfidence::High,
+                entry_path: entry.clone(),
+                entry_symbol: Some("main".to_string()),
+                entry_route: None,
+                entry_command: Some(pkg_name.clone()),
+                language: Language::Rust,
+                tags: vec!["rust".to_string(), "cli".to_string()],
+                owned_files: lib_rs_as_owned(ctx, pkg_dir),
+                context_files: cargo_toml_context(ctx, pkg_dir),
+                tests: Vec::new(),
+                test_prefixes: vec![rel_path(root, &pkg_dir.join("tests"))],
+            });
+        }
     }
     // Library entrypoint: src/lib.rs (separate feature even if main.rs exists).
     let lib_rs = pkg_dir.join("src/lib.rs");
     if is_safe_file(root, &lib_rs) {
         let entry = rel_path(root, &lib_rs);
-        seeds.push(FeatureSeed {
-            title: format!("Rust library `{pkg_name}`"),
-            summary: format!("Cargo library crate at {entry}"),
-            kind: FeatureKind::Library,
-            source,
-            confidence: FeatureConfidence::High,
-            entry_path: entry.clone(),
-            entry_symbol: None,
-            entry_route: None,
-            entry_command: None,
-            language: Language::Rust,
-            tags: vec!["rust".to_string(), "library".to_string()],
-            owned_files: Vec::new(),
-            context_files: cargo_toml_context(root, pkg_dir),
-            tests: Vec::new(),
-            test_prefixes: vec![rel_path(root, &pkg_dir.join("tests"))],
-        });
+        if ctx.allowed(&entry) {
+            seeds.push(FeatureSeed {
+                title: format!("Rust library `{pkg_name}`"),
+                summary: format!("Cargo library crate at {entry}"),
+                kind: FeatureKind::Library,
+                source,
+                confidence: FeatureConfidence::High,
+                entry_path: entry.clone(),
+                entry_symbol: None,
+                entry_route: None,
+                entry_command: None,
+                language: Language::Rust,
+                tags: vec!["rust".to_string(), "library".to_string()],
+                owned_files: Vec::new(),
+                context_files: cargo_toml_context(ctx, pkg_dir),
+                tests: Vec::new(),
+                test_prefixes: vec![rel_path(root, &pkg_dir.join("tests"))],
+            });
+        }
     }
     // Additional bins under src/bin/*.rs (one feature each).
     let bin_dir = pkg_dir.join("src/bin");
@@ -130,6 +134,9 @@ fn seed_for_package(
             {
                 let bin_name = file_name.trim_end_matches(".rs").to_string();
                 let entry_rel = rel_path(root, &p);
+                if !ctx.allowed(&entry_rel) {
+                    continue;
+                }
                 seeds.push(FeatureSeed {
                     title: format!("Rust binary `{bin_name}` ({pkg_name})"),
                     summary: format!("Cargo bin target at {entry_rel}"),
@@ -143,7 +150,7 @@ fn seed_for_package(
                     language: Language::Rust,
                     tags: vec!["rust".to_string(), "cli".to_string()],
                     owned_files: Vec::new(),
-                    context_files: cargo_toml_context(root, pkg_dir),
+                    context_files: cargo_toml_context(ctx, pkg_dir),
                     tests: Vec::new(),
                     test_prefixes: vec![rel_path(root, &pkg_dir.join("tests"))],
                 });
@@ -161,6 +168,9 @@ fn seed_for_package(
             {
                 let test_name = file_name.trim_end_matches(".rs").to_string();
                 let entry_rel = rel_path(root, &p);
+                if !ctx.allowed(&entry_rel) {
+                    continue;
+                }
                 seeds.push(FeatureSeed {
                     title: format!("Rust integration test `{test_name}` ({pkg_name})"),
                     summary: format!("Integration test file at {entry_rel}"),
@@ -184,28 +194,36 @@ fn seed_for_package(
     Ok(())
 }
 
-fn lib_rs_as_owned(root: &Path, pkg_dir: &Path) -> Vec<SeedFile> {
+fn lib_rs_as_owned(ctx: &MapperContext, pkg_dir: &Path) -> Vec<SeedFile> {
+    let root = ctx.root;
     let lib = pkg_dir.join("src/lib.rs");
-    if is_safe_file(root, &lib) {
-        vec![SeedFile {
-            path: rel_path(root, &lib),
-            reason: "package library entry adjacent to binary".to_string(),
-        }]
-    } else {
-        Vec::new()
+    if !is_safe_file(root, &lib) {
+        return Vec::new();
     }
+    let rel = rel_path(root, &lib);
+    if !ctx.allowed(&rel) {
+        return Vec::new();
+    }
+    vec![SeedFile {
+        path: rel,
+        reason: "package library entry adjacent to binary".to_string(),
+    }]
 }
 
-fn cargo_toml_context(root: &Path, pkg_dir: &Path) -> Vec<SeedFile> {
+fn cargo_toml_context(ctx: &MapperContext, pkg_dir: &Path) -> Vec<SeedFile> {
+    let root = ctx.root;
     let m = pkg_dir.join("Cargo.toml");
-    if is_safe_file(root, &m) {
-        vec![SeedFile {
-            path: rel_path(root, &m),
-            reason: "package manifest".to_string(),
-        }]
-    } else {
-        Vec::new()
+    if !is_safe_file(root, &m) {
+        return Vec::new();
     }
+    let rel = rel_path(root, &m);
+    if !ctx.allowed(&rel) {
+        return Vec::new();
+    }
+    vec![SeedFile {
+        path: rel,
+        reason: "package manifest".to_string(),
+    }]
 }
 
 fn read_package_name(manifest_path: &Path) -> Option<String> {

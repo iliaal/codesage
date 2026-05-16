@@ -131,10 +131,17 @@ PHP, Python, C, C++, Rust, JavaScript, TypeScript, Go.
 - `assess_risk_diff` -- aggregate risk for a patch / set of files (V2b slice 2). Per-file `notes[]` may contain short codes (`"T"`, `"NG"`); resolve via the top-level `_legend` map.
 - `recommend_tests` -- tests an agent should run after editing a set of files (V2b slice 2)
 - `session_start` / `session_end` -- snapshot structural state at the start of an editing session, diff at the end. Returns `pass: bool` plus new/resolved cycles, per-file risk regressions on the top-50 baseline, and added/removed files.
+- `list_features` -- list mapped feature slices, filterable by `kind` (`route`, `cli-command`, `library`, `test-suite`, `service`, `config`, `infra`), `language`, or `tag` (0.7.0).
+- `find_feature` -- given a file path, return the feature(s) that own it. Routes "what slice owns this file?" without scanning by hand.
+- `feature_bundle` -- curated code bundle for one feature slice (entry + owned + tests + context as primary/related chunks, plus the entry symbol's definition and optionally its callers/callees). Same shape as `export_context` but anchored on the feature's pre-curated file list. Returns `not found` marker when the `feature_id` is unknown.
+
+Every MCP tool advertises an `outputSchema` (0.7.0); agents that consult it know the result shape before they call.
 
 ## CLI commands
 
-`init`, `index`, `search`, `find-symbol`, `find-references`, `dependencies`, `impact`, `export`, `status`, `mcp`, `install-hooks`, `cleanup`, `git-index`, `coupling`, `risk`, `risk-batch`, `risk-diff`, `tests-for`, `session-start`, `session-end`, `doctor`.
+`init`, `index`, `search`, `find-symbol`, `find-references`, `dependencies`, `impact`, `export`, `status`, `mcp`, `install-hooks`, `cleanup`, `git-index`, `coupling`, `risk`, `risk-batch`, `risk-diff`, `tests-for`, `session-start`, `session-end`, `doctor`, `map`, `features-list`, `feature-show`, `feature-for`, `feature-bundle`, `trust-boundaries`.
+
+`map` runs the feature mappers (Cargo workspace, composer + Laravel routes, php-src `ext/*`, CMake / autotools, Python `pyproject` / `setup.py` / `__main__`, `package.json` bin + Next.js routes, Go `cmd/*`) and persists features. `codesage index` calls `map` between the structural and semantic passes; `--no-features` skips. `features-list` / `feature-show` / `feature-for` / `feature-bundle` are read-side query commands matching the new MCP tools. `trust-boundaries <file>` is the debugging surface for the per-file boundary tags that feed `assess_risk`.
 
 `cleanup` drops orphaned vec tables from previous model switches, keeping only the active model. Use after benchmarking multiple models. Runs VACUUM automatically.
 
@@ -171,11 +178,38 @@ Two MCP tools consume the tables:
 
 The indexer filters the same `DEFAULT_EXCLUDE_PATTERNS` as the structural indexer, plus NEWS/UPGRADING/CHANGELOG variants (they touch every commit so they pollute coupling).
 
+## Feature mapping + trust boundaries (shipped 0.7.0)
+
+`crates/features/` runs after structural and before semantic indexing on every `codesage index`. It maps the project into **behavior-keyed slices** (entrypoint + owned files + context files + tests + aggregated trust boundaries + tags) and derives **per-file trust boundaries** from imports/includes/calls.
+
+Mappers are deterministic (no LLM) and language-local:
+
+| Mapper | Detects |
+|---|---|
+| Rust | `src/main.rs`, `src/bin/*.rs`, `src/lib.rs`, Cargo workspace members, `crates/*`, integration tests under `tests/*.rs` |
+| PHP | `composer.json` bins + scripts, PSR-4 autoload roots, php-src `ext/*/config.{m4,w32}`, Laravel `routes/{web,api,console,channels}.php` |
+| C / C++ | tree-sitter `main()` detection, `bin_PROGRAMS` / `lib_LTLIBRARIES` from autotools, `add_executable` / `add_library` from CMake |
+| Python | `pyproject.toml [project.scripts]` (module-resolved entry path), `setup.py` `entry_points`, top-level `if __name__ == "__main__":` modules |
+| JS / TS | `package.json` `bin` + selected scripts (`start`, `build`, `test`, `lint`, `typecheck`, `format`), Next.js `app/**` and `pages/**` routes |
+| Go | `cmd/<name>/main.go` and a repo-root `main.go` when declared `package main` |
+
+Tables (schema migration `0009_feature_tables`): `features`, `feature_files` (per-feature path×role refs), `feature_trust_boundaries` (per-feature boundary set).
+
+Trust-boundary rule tables (`crates/features/src/trust_boundary_rules.rs`) cover all eight supported languages plus Laravel facades. Boundaries are: `network`, `filesystem`, `process-exec`, `secrets`, `database`, `user-input`, `external-api`, `serialization`, `auth`, `concurrency`. Per-file rows live in `file_trust_boundaries` (migration `0008`), with a `boundaries_derived_at` marker (migration `0010`) used by the indexer's targeted backfill to avoid re-running derivation on rule-clean files.
+
+`assess_risk` consumes the per-file rows: `0.10 * min(boundary_count/5, 1.0)` adds to the composite score, capped at 5 boundaries. The `notes[]` line `"crosses N trust boundaries (X, Y, Z) — security review recommended"` fires when ≥3 boundaries are crossed. The signal lands in `RiskAssessment.trust_boundaries: Vec<TrustBoundary>`.
+
+`[index].exclude_patterns` from the project's `.codesage/config.toml` are honored throughout the mapper crate via `MapperContext.excludes`. Mappers emit candidate seeds, the orchestrator filters entry paths and per-record file refs against the globset, so feature output matches the structural indexer's file-set contract.
+
+The MCP surface — `list_features`, `find_feature`, `feature_bundle` — sits on top of these tables. The CLI surface — `map`, `features-list`, `feature-show`, `feature-for`, `feature-bundle`, `trust-boundaries` — mirrors it for terminal use.
+
 ## Roadmap
 
 V1: semantic retrieval + structural graph + MCP interface, change impact analysis, context export, plugin-based deployment.
 
 V2b slice 1 (shipped 0.2.0): git history intelligence — `find_coupling` + `assess_risk` MCP tools, `codesage git-index` CLI with incremental hooks.
+
+V2b shipped (0.7.0): feature-slice mapping + trust-boundary derivation + `outputSchema` on every MCP tool. `crates/features/`, the `list_features` / `find_feature` / `feature_bundle` MCP tools, the per-language mappers, and the `file_trust_boundaries` signal feeding `assess_risk`. Ports the clawpatch (`openclaw/clawpatch`) feature-slice donor patterns into Rust.
 
 V2b slice 2 (next): `bus_factor`, `change_pattern`, `find_hotspots` MCP tools. Conditional on slice 1 validating on large real codebases.
 
