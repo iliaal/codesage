@@ -194,6 +194,13 @@ if [ -f "$project/AGENTS.md" ] && [ -e "$project/.git" ]; then
     fi
 fi
 
+# Per-repo opt-out: `.codesage/no-agent-hint` marks a repo as indexed-only
+# (e.g. a worktree that's queried from a different orchestration directory).
+# When present, step 7 is skipped regardless of --refresh-hint.
+if [ -f "$project/.codesage/no-agent-hint" ]; then
+    skip_hint=1
+fi
+
 if [ "$skip_hint" -eq 0 ]; then
     if [ "$hint_mode" = "claude" ] && [ -f "$hint_file" ] && [ "$refresh_hint" -eq 0 ]; then
         echo "==> [7/7] $hint_file already exists, skipping (pass --refresh-hint to overwrite)"
@@ -345,7 +352,11 @@ HINT
         trap - EXIT
     fi
 else
-    echo "==> [7/7] hint file skipped (--no-hint)"
+    if [ -f "$project/.codesage/no-agent-hint" ]; then
+        echo "==> [7/7] hint skipped (.codesage/no-agent-hint sentinel present — repo is indexed-only)"
+    else
+        echo "==> [7/7] hint file skipped (--no-hint)"
+    fi
 fi
 
 echo
