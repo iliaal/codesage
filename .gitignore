@@ -15,6 +15,7 @@
 /bench/history/
 /bench/private/
 /bench/*.scorecard.md
+/bench/analyze-*.py
 
 # Secrets and credentials. Never track these. The pre-commit leak check
 # enforces the same policy with filename + content regex; this list is
