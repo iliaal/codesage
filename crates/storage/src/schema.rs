@@ -306,6 +306,10 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
         "0010_files_boundaries_derived_at",
         migrate_0010_files_boundaries_derived_at,
     ),
+    (
+        "0011_features_test_command",
+        migrate_0011_features_test_command,
+    ),
 ];
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
@@ -405,6 +409,26 @@ fn migrate_0010_files_boundaries_derived_at(conn: &Connection) -> rusqlite::Resu
         conn.execute_batch(
             "ALTER TABLE files ADD COLUMN boundaries_derived_at INTEGER NOT NULL DEFAULT 0;",
         )?;
+    }
+    Ok(())
+}
+
+/// Adds `features.test_command` as a free-form shell-command column. Lets
+/// the mapper surface a runnable test invocation (e.g. `pnpm --dir
+/// packages/api test`, `go test ./pkg/util/...`, `uv run pytest`) without
+/// abusing `entry_command` — which is documented as an argv[0]-shape
+/// token and contributes to the feature-id hash. Test commands routinely
+/// change as the project's package-manager / lockfile evolves, so they
+/// must not destabilize feature identity. Existing rows default to NULL
+/// and get populated on the next `codesage index` mapper pass.
+fn migrate_0011_features_test_command(conn: &Connection) -> rusqlite::Result<()> {
+    let has_column: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('features') WHERE name = 'test_command'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_column == 0 {
+        conn.execute_batch("ALTER TABLE features ADD COLUMN test_command TEXT;")?;
     }
     Ok(())
 }

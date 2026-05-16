@@ -75,8 +75,8 @@ impl Database {
             "INSERT INTO features (
                 feature_id, title, summary, kind, source, confidence,
                 entry_path, entry_symbol, entry_route, entry_command,
-                language, tags, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, unixepoch(), unixepoch())
+                language, tags, test_command, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, unixepoch(), unixepoch())
              ON CONFLICT(feature_id) DO UPDATE SET
                 title         = excluded.title,
                 summary       = excluded.summary,
@@ -89,6 +89,7 @@ impl Database {
                 entry_command = excluded.entry_command,
                 language      = excluded.language,
                 tags          = excluded.tags,
+                test_command  = excluded.test_command,
                 updated_at    = unixepoch()",
             params![
                 feature.feature_id,
@@ -103,6 +104,7 @@ impl Database {
                 feature.entry_command,
                 feature.language.as_str(),
                 tags_json,
+                feature.test_command,
             ],
         )?;
         // Replace file refs.
@@ -180,7 +182,7 @@ impl Database {
         let head = self.conn.query_row(
             "SELECT feature_id, title, summary, kind, source, confidence,
                     entry_path, entry_symbol, entry_route, entry_command,
-                    language, tags
+                    language, tags, test_command
              FROM features WHERE feature_id = ?1",
             params![feature_id],
             row_to_feature_head,
@@ -208,7 +210,7 @@ impl Database {
         let mut sql = String::from(
             "SELECT feature_id, title, summary, kind, source, confidence,
                     entry_path, entry_symbol, entry_route, entry_command,
-                    language, tags
+                    language, tags, test_command
              FROM features WHERE 1=1",
         );
         let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -253,7 +255,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT f.feature_id, f.title, f.summary, f.kind, f.source, f.confidence,
                     f.entry_path, f.entry_symbol, f.entry_route, f.entry_command,
-                    f.language, f.tags
+                    f.language, f.tags, f.test_command
              FROM features f
              JOIN feature_files ff ON ff.feature_id = f.feature_id
              WHERE ff.path = ?1
@@ -321,6 +323,7 @@ fn row_to_feature_head(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeatureRecor
     let entry_command: Option<String> = row.get(9)?;
     let language_str: String = row.get(10)?;
     let tags_json: String = row.get(11)?;
+    let test_command: Option<String> = row.get(12)?;
     let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
     Ok(FeatureRecord {
         feature_id,
@@ -333,6 +336,7 @@ fn row_to_feature_head(row: &rusqlite::Row<'_>) -> rusqlite::Result<FeatureRecor
         entry_symbol,
         entry_route,
         entry_command,
+        test_command,
         language: parse_language_loose(&language_str)?,
         tags,
         trust_boundaries: Vec::new(),

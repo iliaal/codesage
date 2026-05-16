@@ -197,7 +197,12 @@ fn python_project_seed(
         entry_path: manifest.to_string(),
         entry_symbol: Some(project_name),
         entry_route: None,
-        entry_command: test_cmd.map(String::from),
+        // entry_command stays None on library features — it's part of the
+        // feature_id hash and would destabilize identity whenever the
+        // project's test runner changed. The runnable test invocation
+        // goes in test_command instead.
+        entry_command: None,
+        test_command: test_cmd.map(String::from),
         language: Language::Python,
         tags: vec!["python".to_string(), "package".to_string()],
         owned_files,
@@ -343,6 +348,7 @@ fn pyproject_scripts_section(
             entry_symbol: Some(module),
             entry_route: None,
             entry_command: Some(name),
+            test_command: None,
             language: Language::Python,
             tags: vec!["python".to_string(), "cli".to_string()],
             owned_files: Vec::new(),
@@ -396,6 +402,7 @@ fn setup_py_entry_points(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
             entry_symbol: Some(module),
             entry_route: None,
             entry_command: Some(name),
+            test_command: None,
             language: Language::Python,
             tags: vec!["python".to_string(), "cli".to_string()],
             owned_files: Vec::new(),
@@ -483,6 +490,7 @@ fn main_guard_modules(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
             entry_symbol: Some("__main__".to_string()),
             entry_route: None,
             entry_command: Some(stem.to_string()),
+            test_command: None,
             language: Language::Python,
             tags: vec!["python".to_string(), "cli".to_string()],
             owned_files: Vec::new(),
@@ -586,7 +594,12 @@ fn pytest_test_suites(ctx: &MapperContext, test_cmd: Option<&str>) -> Result<Vec
             entry_path: entry,
             entry_symbol: Some(label.clone()),
             entry_route: None,
-            entry_command: test_cmd.map(String::from),
+            // Test-suite features identify by the suite label (`tests` /
+            // `test` / source-root name). The runnable command goes in
+            // test_command, keeping entry_command free for the argv[0]-
+            // shape contract (this seed has no such command).
+            entry_command: None,
+            test_command: test_cmd.map(String::from),
             language: Language::Python,
             tags: vec!["python".to_string(), "tests".to_string()],
             owned_files: owned,

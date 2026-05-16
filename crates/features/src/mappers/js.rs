@@ -175,6 +175,7 @@ fn package_seeds_for(ctx: &MapperContext, info: &PackageInfo, pm: NodePm) -> Vec
                 entry_symbol: None,
                 entry_route: None,
                 entry_command: Some(cmd),
+                test_command: None,
                 language,
                 tags,
                 owned_files: Vec::new(),
@@ -224,6 +225,7 @@ fn package_seeds_for(ctx: &MapperContext, info: &PackageInfo, pm: NodePm) -> Vec
                 entry_symbol: Some(name.clone()),
                 entry_route: None,
                 entry_command: Some(name.clone()),
+                test_command: None,
                 language: Language::JavaScript,
                 tags: vec!["javascript".to_string(), "package-script".to_string()],
                 owned_files: Vec::new(),
@@ -303,7 +305,12 @@ fn package_seeds_for(ctx: &MapperContext, info: &PackageInfo, pm: NodePm) -> Vec
             entry_path: info.manifest_rel.clone(),
             entry_symbol: Some(package_name),
             entry_route: None,
-            entry_command: test_cmd.clone(),
+            // entry_command stays None on library features — it's part of
+            // the feature_id hash and would destabilize identity whenever
+            // the project's test script (or package manager) changed.
+            // The runnable test invocation goes in test_command instead.
+            entry_command: None,
+            test_command: test_cmd.clone(),
             language: Language::JavaScript,
             tags: vec![
                 "javascript".to_string(),
@@ -945,6 +952,7 @@ fn next_app_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
             entry_symbol: None,
             entry_route: Some(url),
             entry_command: None,
+            test_command: None,
             language,
             tags: vec![
                 if language == Language::TypeScript {
@@ -1000,6 +1008,7 @@ fn next_pages_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
             entry_symbol: None,
             entry_route: Some(url),
             entry_command: None,
+            test_command: None,
             language,
             tags: vec![
                 if language == Language::TypeScript {
@@ -1105,6 +1114,7 @@ fn react_router_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
                     entry_symbol: Some(component),
                     entry_route: Some(path),
                     entry_command: None,
+                    test_command: None,
                     language,
                     tags: vec![
                         if language == Language::TypeScript {
@@ -1301,8 +1311,13 @@ const App = () => (
             api.tests.is_empty(),
             "node-package seed must not populate tests[] with the manifest"
         );
+        // Library features keep entry_command empty (argv[0]-shape only)
+        // so feature IDs stay stable across test-script changes; the
+        // runnable invocation surfaces on the dedicated test_command
+        // field.
+        assert!(api.entry_command.is_none());
         assert_eq!(
-            api.entry_command.as_deref(),
+            api.test_command.as_deref(),
             Some("npm --prefix packages/api run test")
         );
     }
@@ -1339,13 +1354,15 @@ const App = () => (
         assert!(names.contains(&"@acme/util"));
 
         // pnpm package-manager detection drives the test-command formatting,
-        // surfaced on `entry_command`.
+        // surfaced on the dedicated `test_command` field (entry_command
+        // stays None on library features).
         let admin = seeds
             .iter()
             .find(|s| s.entry_symbol.as_deref() == Some("@acme/admin"))
             .unwrap();
+        assert!(admin.entry_command.is_none());
         assert_eq!(
-            admin.entry_command.as_deref(),
+            admin.test_command.as_deref(),
             Some("pnpm --dir apps/admin test")
         );
     }

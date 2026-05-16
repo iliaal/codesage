@@ -1334,6 +1334,9 @@ fn cmd_feature_show(id: &str, json: bool) -> Result<()> {
         if let Some(c) = &feature.entry_command {
             println!("  entry_command: {c}");
         }
+        if let Some(c) = &feature.test_command {
+            println!("  test_command: {c}");
+        }
         if !feature.tags.is_empty() {
             println!("  tags: {}", feature.tags.join(", "));
         }

@@ -81,6 +81,13 @@ pub struct FeatureSeed {
     pub entry_symbol: Option<String>,
     pub entry_route: Option<String>,
     pub entry_command: Option<String>,
+    /// Free-form shell command to exercise this feature's tests (e.g.
+    /// `pnpm --dir packages/api test`, `go test ./pkg/util/...`, `uv run
+    /// pytest`). Surfaced on the `FeatureRecord.test_command` field — kept
+    /// out of `entry_command` because that's used in the feature-id hash
+    /// and must not change when the project's test config evolves. `None`
+    /// when the mapper has no test runner to recommend.
+    pub test_command: Option<String>,
     pub language: Language,
     pub tags: Vec<String>,
     /// Files that *implement* this feature beyond the entry path itself.

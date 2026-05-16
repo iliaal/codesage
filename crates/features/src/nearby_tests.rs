@@ -214,6 +214,7 @@ mod tests {
             entry_symbol: None,
             entry_route: None,
             entry_command: None,
+            test_command: None,
             language,
             tags: Vec::new(),
             owned_files: Vec::new(),

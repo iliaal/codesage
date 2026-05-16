@@ -201,6 +201,7 @@ fn fresh_db_records_migrations_exactly_once() {
         "0008_file_trust_boundaries",
         "0009_feature_tables",
         "0010_files_boundaries_derived_at",
+        "0011_features_test_command",
     ] {
         let count: i64 = conn
             .query_row(
@@ -212,13 +213,13 @@ fn fresh_db_records_migrations_exactly_once() {
         assert_eq!(count, 1, "{migration} recorded on fresh DB");
     }
 
-    // Running init_db again must be a no-op: count stays at 1.
+    // Running init_db again must be a no-op: count stays at 11.
     init_db(&conn).expect("second init_db");
     let count_after: i64 = conn
         .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
-        count_after, 10,
+        count_after, 11,
         "second init_db must not re-apply migrations"
     );
 }
@@ -250,6 +251,7 @@ fn legacy_db_records_migration_after_upgrade() {
         "0008_file_trust_boundaries",
         "0009_feature_tables",
         "0010_files_boundaries_derived_at",
+        "0011_features_test_command",
     ] {
         let count: i64 = conn
             .query_row(

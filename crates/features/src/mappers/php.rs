@@ -85,6 +85,7 @@ fn composer_seeds(root: &Path, composer: &Value) -> Vec<FeatureSeed> {
                 entry_symbol: None,
                 entry_route: None,
                 entry_command: Some(command),
+                test_command: None,
                 language: Language::Php,
                 tags: vec!["php".to_string(), "cli".to_string()],
                 owned_files: Vec::new(),
@@ -131,6 +132,7 @@ fn composer_seeds(root: &Path, composer: &Value) -> Vec<FeatureSeed> {
                 entry_symbol: Some(ns_clean.to_string()),
                 entry_route: None,
                 entry_command: None,
+                test_command: None,
                 language: Language::Php,
                 tags: vec!["php".to_string(), "library".to_string()],
                 owned_files: Vec::new(),
@@ -205,6 +207,7 @@ fn php_src_extensions(root: &Path) -> Result<Vec<FeatureSeed>> {
             entry_symbol: None,
             entry_route: None,
             entry_command: None,
+            test_command: None,
             language: Language::Php,
             tags: vec![
                 "php".to_string(),
@@ -357,6 +360,7 @@ fn php_extension_at_root(root: &Path) -> Result<Vec<FeatureSeed>> {
         entry_symbol: Some(ext_name.clone()),
         entry_route: None,
         entry_command: None,
+        test_command: None,
         language: Language::Php,
         tags: vec![
             "php".to_string(),
@@ -431,6 +435,7 @@ fn php_extension_at_root(root: &Path) -> Result<Vec<FeatureSeed>> {
             entry_symbol: Some(stem),
             entry_route: None,
             entry_command: None,
+            test_command: None,
             language,
             tags: vec![
                 "php".to_string(),
@@ -614,6 +619,7 @@ fn laravel_route_seeds(routes: &[LaravelRoute]) -> Vec<FeatureSeed> {
                 entry_symbol: None,
                 entry_route: Some(route),
                 entry_command: None,
+                test_command: None,
                 language: Language::Php,
                 tags: vec![
                     "php".to_string(),
@@ -723,6 +729,7 @@ fn laravel_controllers(root: &Path, routes: &[LaravelRoute]) -> Result<Vec<Featu
             entry_symbol: Some(class_short),
             entry_route,
             entry_command: None,
+            test_command: None,
             language: Language::Php,
             tags: vec![
                 "php".to_string(),
@@ -770,6 +777,7 @@ fn laravel_form_requests(root: &Path) -> Result<Vec<FeatureSeed>> {
             entry_symbol: Some(class_short),
             entry_route: None,
             entry_command: None,
+            test_command: None,
             language: Language::Php,
             tags: vec![
                 "php".to_string(),
@@ -829,6 +837,7 @@ fn laravel_artisan_commands(root: &Path) -> Result<Vec<FeatureSeed>> {
             entry_symbol: Some(class_short),
             entry_route: None,
             entry_command: Some(cmd_name),
+            test_command: None,
             language: Language::Php,
             tags: vec![
                 "php".to_string(),

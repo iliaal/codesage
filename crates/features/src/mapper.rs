@@ -245,6 +245,7 @@ fn build_record(
         entry_symbol: seed.entry_symbol.clone(),
         entry_route: seed.entry_route.clone(),
         entry_command: seed.entry_command.clone(),
+        test_command: seed.test_command.clone(),
         language: seed.language,
         tags,
         trust_boundaries: tb.into_iter().collect(),
@@ -477,5 +478,65 @@ mod tests {
         assert!(stats.removed >= 1, "expected ≥1 removal, got {stats:?}");
         let after = db.feature_count().unwrap();
         assert!(after < before);
+    }
+
+    #[test]
+    fn feature_id_stable_when_test_command_changes() {
+        // Regression: feature_id hashes (kind, source, entry_path,
+        // command|route|symbol). The test command (e.g. `pnpm --dir api
+        // test`) must NOT contribute — projects edit their test script /
+        // package manager often, and cross-session IDs should survive
+        // that. Verifies by changing the package's lock file (npm →
+        // pnpm) and asserting the feature_id is unchanged.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "package.json",
+            r#"{"name":"monorepo","workspaces":["packages/*"]}"#,
+        );
+        write(
+            root,
+            "packages/api/package.json",
+            r#"{"name":"@acme/api","scripts":{"test":"jest"}}"#,
+        );
+        write(root, "packages/api/src/index.ts", "export const x = 1;\n");
+
+        let db = Database::open_in_memory().unwrap();
+        map_features(root, &db, &[]).unwrap();
+        let before = db
+            .features_for_file("packages/api/src/index.ts")
+            .unwrap()
+            .into_iter()
+            .find(|f| f.source == "node-package")
+            .expect("api package feature before lock swap");
+
+        // Add a pnpm-lock.yaml so the detected package manager flips
+        // from npm → pnpm, changing the inferred test command.
+        write(root, "pnpm-lock.yaml", "lockfileVersion: '9'\n");
+        map_features(root, &db, &[]).unwrap();
+        let after = db
+            .features_for_file("packages/api/src/index.ts")
+            .unwrap()
+            .into_iter()
+            .find(|f| f.source == "node-package")
+            .expect("api package feature after lock swap");
+
+        assert_eq!(
+            before.feature_id, after.feature_id,
+            "feature_id must be stable when test_command changes"
+        );
+        assert_ne!(
+            before.test_command, after.test_command,
+            "sanity: test_command actually changed across the swap"
+        );
+        assert!(
+            after.entry_command.is_none(),
+            "library feature must not put the test command in entry_command"
+        );
+        assert_eq!(
+            after.test_command.as_deref(),
+            Some("pnpm --dir packages/api test")
+        );
     }
 }

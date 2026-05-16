@@ -147,6 +147,7 @@ fn autotools_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<Featur
                     entry_symbol: Some("main".to_string()),
                     entry_route: None,
                     entry_command: Some(name.to_string()),
+                    test_command: None,
                     language,
                     tags: vec![
                         if language == Language::Cpp {
@@ -200,6 +201,7 @@ fn autotools_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<Featur
                     entry_symbol: None,
                     entry_route: None,
                     entry_command: None,
+                    test_command: None,
                     language,
                     tags: vec![
                         if language == Language::Cpp {
@@ -270,6 +272,7 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
                 entry_symbol: Some("main".to_string()),
                 entry_route: None,
                 entry_command: Some(name),
+                test_command: None,
                 language,
                 tags: vec![
                     if language == Language::Cpp {
@@ -320,6 +323,7 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
                 entry_symbol: None,
                 entry_route: None,
                 entry_command: None,
+                test_command: None,
                 language,
                 tags: vec![
                     if language == Language::Cpp {
@@ -398,6 +402,7 @@ fn main_function_targets(
             entry_symbol: Some("main".to_string()),
             entry_route: None,
             entry_command: Some(bin_name),
+            test_command: None,
             language,
             tags: vec![
                 if language == Language::Cpp {

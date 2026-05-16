@@ -1190,6 +1190,15 @@ pub struct FeatureRecord {
     /// argv[0]-shape token). `None` for non-CLI features.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_command: Option<String>,
+    /// Full shell command an agent should run to exercise this feature's
+    /// tests (e.g. `pnpm --dir packages/api test`, `go test ./pkg/util/...`,
+    /// `uv run pytest`). `None` when no test runner is detectable for the
+    /// feature's language/manifest. Distinct from `entry_command`: that's
+    /// an argv[0]-shape token used in feature-ID hashing; this is a free-
+    /// form shell command that may change as the project's test config
+    /// evolves without affecting feature identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_command: Option<String>,
     pub language: Language,
     /// Free-form taxonomy tags the mapper attached (`["rust", "cli"]`,
     /// `["php", "framework:laravel"]`). Sorted, deduped.

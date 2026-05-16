@@ -488,6 +488,16 @@ fn make_seed(
         },
         entry_route: None,
         entry_command: command_name,
+        // Scoped `go test ./<dir>/...` is the runnable test invocation for
+        // every Go package feature. Lives on test_command so feature IDs
+        // stay stable when test config evolves; lives separately from any
+        // per-test SeedTest.command since the FeatureFileRef table doesn't
+        // carry per-file command columns.
+        test_command: if files.tests.is_empty() {
+            None
+        } else {
+            Some(test_command.clone())
+        },
         language: Language::Go,
         tags,
         owned_files,
