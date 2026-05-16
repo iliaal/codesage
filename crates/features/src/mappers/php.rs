@@ -28,6 +28,7 @@ impl FeatureMapper for PhpMapper {
             seeds.extend(composer_seeds(root, &composer));
         }
         seeds.extend(php_src_extensions(root)?);
+        seeds.extend(php_extension_at_root(root)?);
         let routes = parse_laravel_routes(root)?;
         seeds.extend(laravel_route_seeds(&routes));
         // Laravel application-layer slices: controllers (resolved back to
@@ -270,6 +271,225 @@ fn list_phpt_files(root: &Path, dir: &Path, max: usize) -> Vec<String> {
     }
     out.sort();
     out
+}
+
+/// PHP extensions distributed via Composer/PIE live at the repo root
+/// rather than under `ext/<name>/` (the php-src convention). Detect them
+/// by the combination of `config.m4` / `config.w32` AND a `php_<name>.h`
+/// header at the project root, then emit:
+///
+/// 1. **One umbrella** `php-ext-root` seed for the extension as a whole.
+///    Entry = the build config file, owned = the public header + main
+///    `<name>.c|.cpp` if either exists.
+///
+/// 2. **One per-module** `php-ext-module` seed for each
+///    `<name>_<part>.{c,cpp,cc}` at the root, with the sibling header
+///    (same stem, `.h`) attached as owned. On extensions that organize
+///    themselves by component file (fastchart's per-chart-type files,
+///    mdparser's per-renderer files), this is the granularity that
+///    matches how agents reason about the code.
+///
+/// Skips repos that have `config.m4` but no `php_<name>.h` (generic
+/// autotools projects, the PHP interpreter itself) so the heuristic
+/// doesn't false-positive on non-extension trees.
+fn php_extension_at_root(root: &Path) -> Result<Vec<FeatureSeed>> {
+    let has_config_m4 = is_safe_file(root, &root.join("config.m4"));
+    let has_config_w32 = is_safe_file(root, &root.join("config.w32"));
+    if !has_config_m4 && !has_config_w32 {
+        return Ok(Vec::new());
+    }
+    let Some(ext_name) = detect_root_extension_name(root) else {
+        return Ok(Vec::new());
+    };
+    let entry_config = if has_config_m4 {
+        "config.m4"
+    } else {
+        "config.w32"
+    };
+    let header_path = format!("php_{ext_name}.h");
+    let mut seeds = Vec::new();
+
+    // Umbrella feature: the extension as a whole.
+    let mut umbrella_owned: Vec<SeedFile> = Vec::new();
+    for cand in [
+        format!("{ext_name}.c"),
+        format!("{ext_name}.cpp"),
+        format!("{ext_name}.cc"),
+    ] {
+        if is_safe_file(root, &root.join(&cand)) {
+            umbrella_owned.push(SeedFile {
+                path: cand,
+                reason: "module entry source".to_string(),
+            });
+            break;
+        }
+    }
+    if is_safe_file(root, &root.join(&header_path)) {
+        umbrella_owned.push(SeedFile {
+            path: header_path.clone(),
+            reason: "extension public header".to_string(),
+        });
+    }
+    let mut umbrella_ctx: Vec<SeedFile> = Vec::new();
+    for cand in [
+        "composer.json".to_string(),
+        format!("{ext_name}.stub.php"),
+        "config.w32".to_string(),
+        "config.m4".to_string(),
+    ] {
+        if cand == entry_config {
+            continue;
+        }
+        if is_safe_file(root, &root.join(&cand)) {
+            umbrella_ctx.push(SeedFile {
+                path: cand,
+                reason: "extension metadata".to_string(),
+            });
+        }
+    }
+    seeds.push(FeatureSeed {
+        title: format!("PHP extension `{ext_name}`"),
+        summary: format!("PHP extension `{ext_name}` declared by {entry_config} (root-level)"),
+        kind: FeatureKind::Library,
+        source: "php-ext-root",
+        confidence: FeatureConfidence::High,
+        entry_path: entry_config.to_string(),
+        entry_symbol: Some(ext_name.clone()),
+        entry_route: None,
+        entry_command: None,
+        language: Language::Php,
+        tags: vec![
+            "php".to_string(),
+            "php-extension".to_string(),
+            "library".to_string(),
+        ],
+        owned_files: umbrella_owned,
+        context_files: umbrella_ctx,
+        tests: Vec::new(),
+        test_prefixes: vec!["tests".to_string()],
+    });
+
+    // Per-module seeds: `<name>_<part>.{c,cpp,cc}` files at root.
+    let prefix = format!("{ext_name}_");
+    let Ok(rd) = fs::read_dir(root) else {
+        return Ok(seeds);
+    };
+    let mut module_files: Vec<(String, String)> = Vec::new(); // (filename, stem)
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let Some(fname) = p.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !fname.starts_with(&prefix) {
+            continue;
+        }
+        let Some(stem) = fname
+            .strip_suffix(".cpp")
+            .or_else(|| fname.strip_suffix(".cc"))
+            .or_else(|| fname.strip_suffix(".c"))
+        else {
+            continue;
+        };
+        // Skip generated arginfo files.
+        if stem.ends_with("_arginfo") {
+            continue;
+        }
+        if !is_safe_file(root, &p) {
+            continue;
+        }
+        module_files.push((fname.to_string(), stem.to_string()));
+    }
+    module_files.sort();
+    for (fname, stem) in module_files {
+        let part = stem.strip_prefix(&prefix).unwrap_or(&stem).to_string();
+        if part.is_empty() {
+            continue;
+        }
+        let language = if fname.ends_with(".c") {
+            Language::C
+        } else {
+            Language::Cpp
+        };
+        let mut owned = vec![SeedFile {
+            path: fname.clone(),
+            reason: "module source".to_string(),
+        }];
+        let sibling_header = format!("{stem}.h");
+        if is_safe_file(root, &root.join(&sibling_header)) {
+            owned.push(SeedFile {
+                path: sibling_header,
+                reason: "module header".to_string(),
+            });
+        }
+        seeds.push(FeatureSeed {
+            title: format!("`{ext_name}` extension module `{part}`"),
+            summary: format!("PHP extension `{ext_name}` module file {fname}"),
+            kind: FeatureKind::Library,
+            source: "php-ext-module",
+            confidence: FeatureConfidence::High,
+            entry_path: fname,
+            entry_symbol: Some(stem),
+            entry_route: None,
+            entry_command: None,
+            language,
+            tags: vec![
+                "php".to_string(),
+                "php-extension".to_string(),
+                "module".to_string(),
+            ],
+            owned_files: owned,
+            context_files: vec![SeedFile {
+                path: header_path.clone(),
+                reason: "extension public header".to_string(),
+            }],
+            tests: Vec::new(),
+            test_prefixes: vec!["tests".to_string()],
+        });
+    }
+    Ok(seeds)
+}
+
+/// Find the extension's canonical short name from its `php_<name>.h`
+/// header. Preference order: a header matching the directory name (the
+/// dominant convention), then the first `php_*.h` in alphabetical order.
+/// Skips generated `_arginfo.h` / `_internal.h` headers.
+fn detect_root_extension_name(root: &Path) -> Option<String> {
+    let dir_name = root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.trim_start_matches("php_").to_string())
+        .unwrap_or_default();
+    if !dir_name.is_empty() {
+        let cand = root.join(format!("php_{dir_name}.h"));
+        if is_safe_file(root, &cand) {
+            return Some(dir_name);
+        }
+    }
+    let rd = fs::read_dir(root).ok()?;
+    let mut candidates: Vec<String> = Vec::new();
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let Some(fname) = p.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !fname.starts_with("php_") || !fname.ends_with(".h") {
+            continue;
+        }
+        if fname.contains("_arginfo") || fname.contains("_internal") {
+            continue;
+        }
+        if !is_safe_file(root, &p) {
+            continue;
+        }
+        if let Some(stem) = fname
+            .strip_prefix("php_")
+            .and_then(|s| s.strip_suffix(".h"))
+        {
+            candidates.push(stem.to_string());
+        }
+    }
+    candidates.sort();
+    candidates.into_iter().next()
 }
 
 /// One Laravel route registration extracted from `routes/*.php`.
@@ -908,5 +1128,162 @@ class SyncUsers extends Command {
             !seeds.iter().any(|s| s.source == "laravel-controller"),
             "non-Laravel project must not emit laravel-controller seeds"
         );
+    }
+
+    #[test]
+    fn php_ext_root_emits_umbrella_and_per_module_seeds() {
+        // Mirrors the fastchart layout: config.m4 + php_<name>.h + main
+        // <name>.c + several <name>_<part>.c files (one per module).
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "config.m4",
+            "PHP_NEW_EXTENSION(acme, acme.c, $ext_shared)\n",
+        );
+        write(
+            dir.path(),
+            "php_acme.h",
+            "#ifndef PHP_ACME_H\n#define PHP_ACME_H\n#endif\n",
+        );
+        write(dir.path(), "acme.c", "/* main module */\n");
+        write(dir.path(), "acme_pie.c", "/* pie chart */\n");
+        write(dir.path(), "acme_pie.h", "/* pie header */\n");
+        write(dir.path(), "acme_bar.c", "/* bar chart */\n");
+        write(dir.path(), "composer.json", r#"{"name":"acme/ext"}"#);
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+
+        // Umbrella seed.
+        let umbrella = seeds
+            .iter()
+            .find(|s| s.source == "php-ext-root")
+            .expect("expected php-ext-root umbrella seed");
+        assert_eq!(umbrella.entry_path, "config.m4");
+        assert_eq!(umbrella.entry_symbol.as_deref(), Some("acme"));
+        let owned_paths: Vec<&str> = umbrella
+            .owned_files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert!(
+            owned_paths.contains(&"acme.c"),
+            "umbrella should own main module .c"
+        );
+        assert!(
+            owned_paths.contains(&"php_acme.h"),
+            "umbrella should own public header"
+        );
+
+        // Per-module seeds.
+        let modules: Vec<&FeatureSeed> = seeds
+            .iter()
+            .filter(|s| s.source == "php-ext-module")
+            .collect();
+        let module_entries: Vec<&str> = modules.iter().map(|s| s.entry_path.as_str()).collect();
+        assert!(
+            module_entries.contains(&"acme_pie.c"),
+            "expected acme_pie.c module seed"
+        );
+        assert!(
+            module_entries.contains(&"acme_bar.c"),
+            "expected acme_bar.c module seed"
+        );
+
+        // Sibling header attached when present.
+        let pie_seed = modules
+            .iter()
+            .find(|s| s.entry_path == "acme_pie.c")
+            .unwrap();
+        let pie_owned: Vec<&str> = pie_seed
+            .owned_files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert!(
+            pie_owned.contains(&"acme_pie.h"),
+            "expected sibling header acme_pie.h owned by acme_pie.c seed, got {pie_owned:?}"
+        );
+
+        // Module without a sibling header (acme_bar.h doesn't exist).
+        let bar_seed = modules
+            .iter()
+            .find(|s| s.entry_path == "acme_bar.c")
+            .unwrap();
+        assert_eq!(
+            bar_seed.owned_files.len(),
+            1,
+            "no sibling header for acme_bar"
+        );
+    }
+
+    #[test]
+    fn php_ext_root_handles_cpp_extension() {
+        // Mirrors the php_clickhouse layout: config.m4 + php_<name>.h + a
+        // main .cpp, no per-module split. Only the umbrella seed fires.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "config.m4",
+            "PHP_NEW_EXTENSION(clickhouse, clickhouse.cpp)\n",
+        );
+        write(
+            dir.path(),
+            "php_clickhouse.h",
+            "#ifndef PHP_CLICKHOUSE_H\n#endif\n",
+        );
+        write(dir.path(), "clickhouse.cpp", "/* main */\n");
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let umbrella = seeds
+            .iter()
+            .find(|s| s.source == "php-ext-root")
+            .expect("expected umbrella");
+        let owned: Vec<&str> = umbrella
+            .owned_files
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert!(
+            owned.contains(&"clickhouse.cpp"),
+            "expected clickhouse.cpp owned"
+        );
+        assert!(
+            !seeds.iter().any(|s| s.source == "php-ext-module"),
+            "no per-module seeds when no <name>_*.{{c,cpp}} files exist"
+        );
+    }
+
+    #[test]
+    fn php_ext_root_skips_when_no_extension_header() {
+        // `config.m4` exists but `php_<name>.h` does not — generic
+        // autotools project, must not fire as a PHP extension.
+        let dir = tempdir().unwrap();
+        write(dir.path(), "config.m4", "AC_INIT([foo], [1.0])\n");
+        write(dir.path(), "foo.c", "int main(){return 0;}\n");
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        assert!(
+            !seeds
+                .iter()
+                .any(|s| matches!(s.source, "php-ext-root" | "php-ext-module")),
+            "must not fire on a non-extension autotools repo"
+        );
+    }
+
+    #[test]
+    fn php_ext_root_skips_generated_arginfo_modules() {
+        // Generated `<name>_arginfo.h` (and an unlikely `<name>_arginfo.c`)
+        // should not turn into per-module features — they're machine-
+        // generated and not what an agent reasons about.
+        let dir = tempdir().unwrap();
+        write(dir.path(), "config.m4", "PHP_NEW_EXTENSION(acme, acme.c)\n");
+        write(dir.path(), "php_acme.h", "#endif\n");
+        write(dir.path(), "acme.c", "/* main */\n");
+        write(dir.path(), "acme_arginfo.h", "/* generated */\n");
+        write(dir.path(), "acme_real.c", "/* real module */\n");
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let module_entries: Vec<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "php-ext-module")
+            .map(|s| s.entry_path.as_str())
+            .collect();
+        assert_eq!(module_entries, vec!["acme_real.c"]);
     }
 }
