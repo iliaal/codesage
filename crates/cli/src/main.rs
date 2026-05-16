@@ -445,7 +445,7 @@ fn load_index_embedder(
     }
 }
 
-fn main() -> Result<()> {
+fn main() {
     init_tracing();
     // Resolve ONNX Runtime + NVIDIA library locations now, while we are still
     // single-threaded. The discovery code calls `std::env::set_var` for
@@ -457,6 +457,38 @@ fn main() -> Result<()> {
     codesage_embed::model::init_for_main();
     let cli = Cli::parse();
 
+    let result = run(cli);
+
+    // Flush stdio explicitly so the explicit `process::exit` below doesn't
+    // drop buffered output.
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+
+    let code = match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            1
+        }
+    };
+
+    // Skip Drop glue. ORT Session teardown interacts with sqlite-vec's
+    // extension destructors in a way that intermittently aborts at
+    // process exit with "corrupted double-linked list" (glibc heap-
+    // corruption diagnostic). The crash was observed at ~1.1% rate in
+    // the §2.10 semble-corpus benchmark run (2 SIGABRT out of 177 read-
+    // only `codesage search` queries) — the query results were always
+    // correct; only the teardown faulted. For a CLI command the OS
+    // reclaims memory on exit and every write path commits explicitly
+    // via execute_batch, so there's nothing useful for Drop to do.
+    // Explicit exit avoids the race entirely. The MCP server path
+    // (`codesage mcp`) loops indefinitely and never reaches this exit;
+    // when it terminates via signal, the same skip applies.
+    std::process::exit(code);
+}
+
+fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Init => cmd_init(),
         Commands::Index { full, no_semantic } => cmd_index(full, no_semantic),
