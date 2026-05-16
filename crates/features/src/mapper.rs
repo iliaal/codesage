@@ -21,8 +21,18 @@ use crate::nearby_tests::nearby_tests;
 
 /// Run every registered mapper, build `FeatureRecord`s from seeds, persist
 /// them, and remove stale features. Returns stats for the caller.
+///
+/// When **any** mapper errors mid-collection, the orchestrator still
+/// persists the seeds it did collect but **skips the garbage-collect
+/// pass**. The earlier "warn-and-continue + GC anything not in
+/// keep_ids" path could silently delete every PHP feature when the PHP
+/// mapper happened to fail on a corrupt composer.json (CR-004). Skipping
+/// GC trades a small amount of stale-feature debt for not nuking valid
+/// rows; the next clean run reconciles.
 pub fn map_features(root: &Path, db: &Database) -> Result<FeatureMapStats> {
-    let seeds = collect_seeds(root)?;
+    let collected = collect_seeds(root)?;
+    let seeds = collected.seeds;
+    let any_mapper_errored = collected.any_errored;
     let mut keep_ids: Vec<String> = Vec::with_capacity(seeds.len());
     let mut created = 0usize;
     let mut updated = 0usize;
@@ -43,7 +53,14 @@ pub fn map_features(root: &Path, db: &Database) -> Result<FeatureMapStats> {
         }
         Ok(())
     })?;
-    let removed = db.remove_features_not_in(&keep_ids)?;
+    let removed = if any_mapper_errored {
+        tracing::warn!(
+            "one or more mappers errored — skipping stale-feature GC to avoid deleting valid rows from an incomplete pass"
+        );
+        0
+    } else {
+        db.remove_features_not_in(&keep_ids)?
+    };
     Ok(FeatureMapStats {
         created,
         updated,
@@ -52,9 +69,15 @@ pub fn map_features(root: &Path, db: &Database) -> Result<FeatureMapStats> {
     })
 }
 
+struct CollectedSeeds {
+    seeds: Vec<FeatureSeed>,
+    any_errored: bool,
+}
+
 /// Collect seeds from every mapper, deduped by `(kind, source, entry_path,
-/// command|route|symbol)`.
-fn collect_seeds(root: &Path) -> Result<Vec<FeatureSeed>> {
+/// command|route|symbol)`. The `any_errored` flag lets the caller skip
+/// destructive cleanup when a mapper failed mid-pass.
+fn collect_seeds(root: &Path) -> Result<CollectedSeeds> {
     let mappers: Vec<Box<dyn FeatureMapper>> = vec![
         Box::new(RustMapper),
         Box::new(PhpMapper),
@@ -64,10 +87,14 @@ fn collect_seeds(root: &Path) -> Result<Vec<FeatureSeed>> {
         Box::new(GoMapper),
     ];
     let mut all: Vec<FeatureSeed> = Vec::new();
+    let mut any_errored = false;
     for m in mappers {
         match m.map(root) {
             Ok(s) => all.extend(s),
-            Err(e) => tracing::warn!(mapper = m.name(), error = %e, "mapper failed"),
+            Err(e) => {
+                any_errored = true;
+                tracing::warn!(mapper = m.name(), error = %e, "mapper failed");
+            }
         }
     }
     let mut seen: BTreeSet<(String, String, String, String)> = BTreeSet::new();
@@ -89,7 +116,10 @@ fn collect_seeds(root: &Path) -> Result<Vec<FeatureSeed>> {
             out.push(s);
         }
     }
-    Ok(out)
+    Ok(CollectedSeeds {
+        seeds: out,
+        any_errored,
+    })
 }
 
 fn build_record(

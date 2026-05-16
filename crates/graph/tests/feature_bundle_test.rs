@@ -111,6 +111,77 @@ fn returns_bundle_with_curated_files_after_map() {
 }
 
 #[test]
+fn entry_chunk_overlaps_entry_symbol_not_first_chunk() {
+    // Regression: real codesage binary main.rs has 447 lines of `use`
+    // statements before `fn main()`. The bundle's entry chunk must
+    // overlap the symbol, not just be the file's first chunk — otherwise
+    // an agent reviewing the feature gets imports instead of the body.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"acme\"\nversion = \"0.1.0\"\n",
+    );
+    // Synthesize a large entry file: 100 import lines, then main() at L101.
+    let mut content = String::new();
+    for _ in 0..100 {
+        content.push_str("use std::path::Path;\n");
+    }
+    content.push_str("fn main() { println!(\"hi\"); }\n");
+    write(root, "src/main.rs", &content);
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[]).unwrap();
+    map_features(root, &db).unwrap();
+    // Seed two chunks: imports L1-50, body L51-101. Without the fix, the
+    // bundle would pick L1-50; with the fix it picks the L51-101 chunk
+    // because that's where `fn main` sits.
+    let imports = content.lines().take(50).collect::<Vec<_>>().join("\n");
+    let body = content.lines().skip(50).collect::<Vec<_>>().join("\n");
+    db.insert_chunks(
+        "src/main.rs",
+        "rust",
+        &[
+            (
+                imports.as_str(),
+                1,
+                50,
+                vec![0.0; DEFAULT_EMBEDDING_DIM].as_slice(),
+            ),
+            (
+                body.as_str(),
+                51,
+                101,
+                vec![0.0; DEFAULT_EMBEDDING_DIM].as_slice(),
+            ),
+        ],
+    )
+    .unwrap();
+    let features = db.features_for_file("src/main.rs").unwrap();
+    let main_feature = features
+        .iter()
+        .find(|f| f.entry_path == "src/main.rs")
+        .expect("main feature");
+    let bundle = feature_bundle(&db, &main_feature.feature_id, false, false, 5).unwrap();
+    let entry_chunk = bundle
+        .primary
+        .iter()
+        .find(|r| r.file_path == "src/main.rs")
+        .expect("entry chunk present");
+    assert!(
+        entry_chunk.start_line <= 101 && entry_chunk.end_line >= 101,
+        "entry chunk must cover `fn main` at line 101, got {}..{}",
+        entry_chunk.start_line,
+        entry_chunk.end_line
+    );
+    assert!(
+        entry_chunk.content.contains("fn main"),
+        "entry chunk must contain the function body, got first 80 chars: {:?}",
+        &entry_chunk.content[..entry_chunk.content.len().min(80)]
+    );
+}
+
+#[test]
 fn missing_chunks_yield_empty_primary_but_keep_metadata() {
     // Feature mapped but never semantically indexed: the bundle returns
     // metadata + the entry symbol definition (loaded from the symbol

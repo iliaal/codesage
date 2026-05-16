@@ -9,6 +9,7 @@ codesage-protocol.workspace = true
 codesage-parser.workspace = true
 codesage-storage.workspace = true
 anyhow.workspace = true
+ignore.workspace = true
 regex.workspace = true
 tracing.workspace = true
 serde.workspace = true

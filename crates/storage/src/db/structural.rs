@@ -522,6 +522,21 @@ impl Database {
         Ok(())
     }
 
+    /// Count rows in `file_trust_boundaries` across the whole project.
+    /// Used by the upgrade-path backfill check: when this is zero but
+    /// `file_count() > 0`, the indexer triggers a one-shot
+    /// `derive_for_index` pass to populate boundaries against existing
+    /// files (the structural-only `--full` path that 0.7.0's incremental
+    /// hook would otherwise skip).
+    pub fn file_trust_boundary_count(&self) -> Result<usize> {
+        let n: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM file_trust_boundaries", [], |r| {
+                    r.get(0)
+                })?;
+        Ok(n as usize)
+    }
+
     /// Trust boundaries for one file identified by repo-relative path. Empty
     /// when the file has no row (never derived, or genuinely no boundary
     /// signal). Sorted by enum discriminant for stable output.

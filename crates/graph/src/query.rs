@@ -1290,7 +1290,18 @@ pub fn feature_bundle(
 
     let mut primary: Vec<SearchResult> = Vec::new();
     let mut primary_keys: HashSet<(String, u32)> = HashSet::new();
-    // Entry first so it's the first chunk in primary order.
+    // Entry first so it's the first chunk in primary order. For the entry
+    // file itself, prefer the chunk overlapping the feature's entry symbol
+    // — `crates/cli/src/main.rs` opens with 400 lines of `use` statements
+    // before `fn main()` starts, and an agent reviewing the feature wants
+    // the body, not the imports. Fall back to first-chunk when the entry
+    // symbol can't be located (no entry_symbol on the feature, or symbol
+    // line is outside any chunk).
+    let entry_line = feature.entry_symbol.as_ref().and_then(|sym| {
+        entry_symbol_line(db, sym, &feature.entry_path)
+            .ok()
+            .flatten()
+    });
     for f in feature
         .files
         .iter()
@@ -1299,7 +1310,18 @@ pub fn feature_bundle(
         if primary.len() >= limit {
             break;
         }
-        add_first_chunk_of_file(db, &f.path, &mut primary, &mut primary_keys)?;
+        if f.role == FeatureFileRole::Entry
+            && let Some(line) = entry_line
+        {
+            add_chunk_at_line(db, &f.path, line, &mut primary, &mut primary_keys)?;
+            // Fall back to first-chunk only when the symbol-overlap path
+            // produced nothing (no chunk covers that line yet).
+            if primary.is_empty() {
+                add_first_chunk_of_file(db, &f.path, &mut primary, &mut primary_keys)?;
+            }
+        } else {
+            add_first_chunk_of_file(db, &f.path, &mut primary, &mut primary_keys)?;
+        }
     }
 
     let mut related: Vec<SearchResult> = Vec::new();
@@ -1377,6 +1399,58 @@ pub fn feature_bundle(
         related,
         symbol_definitions,
     })
+}
+
+/// Insert the chunk of `file_path` whose `[start_line, end_line]` covers
+/// `line` (the entry symbol's `line_start`). Falls back silently when no
+/// chunk covers that line — the outer caller then drops back to
+/// `add_first_chunk_of_file`. Mirrors `add_related_from_file`'s
+/// covering-chunk lookup but stays in the primary-chunk track for
+/// feature_bundle.
+fn add_chunk_at_line(
+    db: &Database,
+    file_path: &str,
+    line: u32,
+    out: &mut Vec<SearchResult>,
+    seen: &mut HashSet<(String, u32)>,
+) -> Result<()> {
+    let chunks = db.chunks_for_file(file_path)?;
+    let Some(c) = chunks
+        .into_iter()
+        .find(|c| c.start_line <= line && c.end_line >= line)
+    else {
+        return Ok(());
+    };
+    let key = (c.file_path.clone(), c.start_line);
+    if !seen.insert(key) {
+        return Ok(());
+    }
+    let mut result = SearchResult {
+        file_path: c.file_path,
+        language: parse_db_language(&c.language),
+        content: c.content,
+        start_line: c.start_line,
+        end_line: c.end_line,
+        score: 0.0,
+        symbols: Vec::new(),
+    };
+    annotate_with_symbols(db, std::slice::from_mut(&mut result))?;
+    out.push(result);
+    Ok(())
+}
+
+/// Resolve the `line_start` of `entry_symbol` in `entry_path`. Used by
+/// `feature_bundle` to pick the chunk that holds the entry symbol's
+/// definition rather than the file's first chunk (which is usually
+/// imports/use statements). Returns `Ok(None)` when the symbol can't be
+/// uniquely placed inside the entry file — the caller falls back to
+/// first-chunk lookup.
+fn entry_symbol_line(db: &Database, entry_symbol: &str, entry_path: &str) -> Result<Option<u32>> {
+    let defs = db.find_symbols(entry_symbol, None)?;
+    Ok(defs
+        .into_iter()
+        .find(|d| d.file_path == entry_path)
+        .map(|d| d.line_start))
 }
 
 /// Insert the first chunk of `file_path` into `out` (deduped by

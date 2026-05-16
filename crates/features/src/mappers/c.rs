@@ -35,9 +35,20 @@ impl FeatureMapper for CCppMapper {
             return Ok(Vec::new());
         }
         let mut seeds: Vec<FeatureSeed> = Vec::new();
-        let already_seeded_paths: BTreeSet<String> = BTreeSet::new();
         seeds.extend(autotools_targets(root, &files)?);
         seeds.extend(cmake_targets(root, &files)?);
+        // Populate the seen-set from already-declared build targets BEFORE
+        // running main() detection. Without this, a binary declared in
+        // CMakeLists.txt (or Makefile.am) AND containing `main()` produces
+        // two duplicate features — same entry, same kind, different
+        // `source`. The `dedup_by_entry` pass keyed on source preserved
+        // both; populate the seen-set so main() detection skips paths
+        // already claimed by a build-system target (CR-005).
+        let already_seeded_paths: BTreeSet<String> = seeds
+            .iter()
+            .filter(|s| s.kind == FeatureKind::CliCommand)
+            .map(|s| s.entry_path.clone())
+            .collect();
         seeds.extend(main_function_targets(root, &files, &already_seeded_paths)?);
         Ok(dedup_by_entry(seeds))
     }
@@ -523,11 +534,18 @@ fn is_valid_target_name(s: &str) -> bool {
         && !s.contains('#')
 }
 
+/// Dedup keyed on `(entry_path, kind)`. The earlier key included `source`,
+/// so two seeds emitted by different mappers (cmake-bin vs c-main) for the
+/// same entry survived as separate features. The orchestrator stored both
+/// under different `feature_id`s and `assess_risk` ended up double-counting
+/// the file in feature listings. First seed wins — autotools/CMake run
+/// before main() detection so the high-confidence build-target seed is
+/// preserved when both fire (CR-005).
 fn dedup_by_entry(seeds: Vec<FeatureSeed>) -> Vec<FeatureSeed> {
-    let mut seen: BTreeSet<(String, String, FeatureKind)> = BTreeSet::new();
+    let mut seen: BTreeSet<(String, FeatureKind)> = BTreeSet::new();
     let mut out = Vec::with_capacity(seeds.len());
     for s in seeds {
-        let key = (s.entry_path.clone(), s.source.to_string(), s.kind);
+        let key = (s.entry_path.clone(), s.kind);
         if seen.insert(key) {
             out.push(s);
         }
@@ -633,5 +651,61 @@ mod tests {
             .expect("autotools-bin seed");
         assert_eq!(s.entry_command.as_deref(), Some("thing"));
         assert_eq!(s.kind, FeatureKind::CliCommand);
+    }
+
+    #[test]
+    fn cmake_bin_with_main_function_emits_single_feature() {
+        // CR-005 regression: a binary declared in CMakeLists.txt that
+        // also contains `int main()` was previously seeded twice — once
+        // as `cmake-bin`, once as `c-main` — because the seen-set wasn't
+        // populated from build-target paths and the dedup key included
+        // `source`. The build-target seed must win.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "CMakeLists.txt",
+            "add_executable(myapp src/main.c)\n",
+        );
+        write(dir.path(), "src/main.c", "int main(){return 0;}\n");
+        let seeds = CCppMapper.map(dir.path()).unwrap();
+        let cli_seeds: Vec<&FeatureSeed> = seeds
+            .iter()
+            .filter(|s| s.kind == FeatureKind::CliCommand && s.entry_path == "src/main.c")
+            .collect();
+        assert_eq!(
+            cli_seeds.len(),
+            1,
+            "expected exactly one cli-command for src/main.c, got {:#?}",
+            cli_seeds
+        );
+        assert_eq!(
+            cli_seeds[0].source, "cmake-bin",
+            "build-target seed must win over c-main"
+        );
+    }
+
+    #[test]
+    fn autotools_bin_with_main_function_emits_single_feature() {
+        // CR-005 regression for the autotools path: same scenario as
+        // CMake but anchored on Makefile.am.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "Makefile.am",
+            "bin_PROGRAMS = thing\nthing_SOURCES = thing.c\n",
+        );
+        write(dir.path(), "thing.c", "int main(){return 0;}\n");
+        let seeds = CCppMapper.map(dir.path()).unwrap();
+        let cli_seeds: Vec<&FeatureSeed> = seeds
+            .iter()
+            .filter(|s| s.kind == FeatureKind::CliCommand && s.entry_path == "thing.c")
+            .collect();
+        assert_eq!(
+            cli_seeds.len(),
+            1,
+            "expected exactly one cli-command for thing.c, got {:#?}",
+            cli_seeds
+        );
+        assert_eq!(cli_seeds[0].source, "autotools-bin");
     }
 }

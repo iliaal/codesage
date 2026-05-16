@@ -147,11 +147,18 @@ fn php_src_extensions(root: &Path) -> Result<Vec<FeatureSeed>> {
         if !is_safe_dir(root, &p) {
             continue;
         }
-        let has_config =
-            is_safe_file(root, &p.join("config.m4")) || is_safe_file(root, &p.join("config.w32"));
-        if !has_config {
+        let has_m4 = is_safe_file(root, &p.join("config.m4"));
+        let has_w32 = is_safe_file(root, &p.join("config.w32"));
+        if !has_m4 && !has_w32 {
             continue;
         }
+        // Pick whichever config actually exists. Windows-only extensions
+        // (rare in upstream php-src but real in third-party bundles) ship
+        // only `config.w32`; pinning entry_path to `config.m4` regardless
+        // produced a feature whose entry file didn't exist (CR-006). When
+        // both are present, prefer `config.m4` to keep IDs stable for the
+        // dominant POSIX case.
+        let config_basename = if has_m4 { "config.m4" } else { "config.w32" };
         let name = match p.file_name().and_then(|s| s.to_str()) {
             Some(s) => s.to_string(),
             None => continue,
@@ -181,7 +188,7 @@ fn php_src_extensions(root: &Path) -> Result<Vec<FeatureSeed>> {
             kind: FeatureKind::Library,
             source: "php-ext",
             confidence: FeatureConfidence::High,
-            entry_path: format!("{ext_rel}/config.m4"),
+            entry_path: format!("{ext_rel}/{config_basename}"),
             entry_symbol: None,
             entry_route: None,
             entry_command: None,
@@ -193,7 +200,7 @@ fn php_src_extensions(root: &Path) -> Result<Vec<FeatureSeed>> {
             ],
             owned_files,
             context_files: vec![SeedFile {
-                path: format!("{ext_rel}/config.m4"),
+                path: format!("{ext_rel}/{config_basename}"),
                 reason: "extension build config".to_string(),
             }],
             tests,
@@ -382,6 +389,27 @@ mod tests {
             .expect("php-ext seed");
         assert!(s.title.contains("iconv"));
         assert!(s.tests.iter().any(|t| t.path.contains("bug001.phpt")));
+        // entry_path must point at the file that actually exists.
+        assert_eq!(s.entry_path, "ext/iconv/config.m4");
+    }
+
+    #[test]
+    fn windows_only_php_ext_uses_config_w32_entry() {
+        // CR-006: Windows-only extensions (only `config.w32` present) were
+        // recorded with `entry_path = .../config.m4` because the entry was
+        // hardcoded. The feature pointed at a file that doesn't exist.
+        let dir = tempdir().unwrap();
+        write(dir.path(), "ext/wincache/config.w32", "// MSBuild config\n");
+        let seeds = PhpMapper.map(dir.path()).unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "php-ext")
+            .expect("php-ext seed");
+        assert_eq!(
+            s.entry_path, "ext/wincache/config.w32",
+            "windows-only ext should anchor on config.w32, got {:?}",
+            s.entry_path
+        );
     }
 
     #[test]

@@ -842,15 +842,35 @@ fn cmd_index(full: bool, no_semantic: bool) -> Result<()> {
         stats.references_found
     );
 
+    // CR-003: one-shot trust-boundary backfill on upgrade. The 0.7.0
+    // structural indexer derives boundaries inline for files it actually
+    // parses; an incremental run after upgrade skips unchanged files and
+    // leaves the table empty. When we see `files > 0` but
+    // `file_trust_boundaries` is empty, run the catch-up pass so
+    // `assess_risk` doesn't silently report zero boundary signal until
+    // every file gets edited.
+    let total_files = db.file_count().unwrap_or(0);
+    let boundary_rows = db.file_trust_boundary_count().unwrap_or(0);
+    if total_files > 0 && boundary_rows == 0 {
+        match codesage_features::trust_boundary::derive_for_index(&db) {
+            Ok(n) => println!("Trust boundaries: backfilled {n} files (upgrade catch-up)"),
+            Err(e) => eprintln!("trust-boundary backfill failed: {e:#}"),
+        }
+    }
+
     // Feature mapping runs after structural (which populated `refs` and
     // `file_trust_boundaries`) and before semantic so the aggregated
-    // trust-boundary tags on each feature are fresh.
+    // trust-boundary tags on each feature are fresh. CR-004: errors here
+    // are fatal so `codesage index` reports failure instead of silently
+    // succeeding while leaving feature tables in a partial state (and
+    // potentially garbage-collecting valid existing rows the way the
+    // earlier swallow-and-continue path could).
     match codesage_features::map_features(&root, &db) {
         Ok(map_stats) => println!(
             "Features:   created={} updated={} removed={} total={}",
             map_stats.created, map_stats.updated, map_stats.removed, map_stats.total_features
         ),
-        Err(e) => eprintln!("feature mapping failed: {e:#}"),
+        Err(e) => return Err(e.context("feature mapping failed during `codesage index`")),
     }
 
     if let Some(embedder) = embedder.as_mut() {

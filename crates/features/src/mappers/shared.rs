@@ -1,9 +1,8 @@
 //! Shared helpers for per-language mappers: safe directory walks (realpath
 //! + escape detection), normalized path strings, and glob-style listing.
 
-use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::Result;
 
@@ -48,71 +47,75 @@ pub fn rel_path(root: &Path, abs: &Path) -> String {
     s.replace('\\', "/")
 }
 
-/// Walk a directory subtree, yielding all regular-file repo-relative paths
-/// inside `root` that aren't symlinks and don't sit under common ignore
-/// directories. Bounded by `max_files` to keep mapper scans cheap on big
-/// repos; returns the partial set when exceeded.
+/// Walk a directory subtree under `start`, yielding repo-relative file
+/// paths. **Honors `.gitignore` and follows the same hard-exclude posture
+/// as the parser's structural discovery** — i.e. ignored sibling worktrees
+/// (`.worktrees/<branch>/...`), vendored deps, build output, and editor
+/// caches don't leak into mapper output. Symlinks are skipped (default
+/// `WalkBuilder` posture). Bounded by `max_files` so a mapper run on a
+/// monorepo never grinds forever; returns the partial set when exceeded.
+///
+/// The original `walk_files` used a hand-rolled walker that only matched
+/// a small hardcoded directory-name list and ignored `.gitignore`
+/// entirely. A code-review against the codesage repo itself caught that
+/// `codesage map` was indexing `.worktrees/<branch>/...` even though
+/// `git check-ignore` reports the directory as ignored (CR-001 in the
+/// 0.7.0 review). This rewrite delegates to `ignore::WalkBuilder` and
+/// adds an explicit hardcoded-name fallback to catch projects without a
+/// matching gitignore entry.
 pub fn walk_files(root: &Path, start: &Path, max_files: usize) -> Vec<String> {
+    if !is_safe_dir(root, start) {
+        return Vec::new();
+    }
+    if should_skip(&rel_path(root, start)) {
+        return Vec::new();
+    }
+    // WalkBuilder reads `.gitignore` from the repo root automatically
+    // when `git_ignore(true)` (default). Path filtering is applied
+    // against the walked path's repo-relative form, so a walk starting
+    // inside `start` (not `root`) still sees ignore rules anchored at
+    // `root` — but only when WalkBuilder is constructed with `root` as
+    // the gitignore-search start. We construct with `start` for tighter
+    // walks and add explicit guards for absolute-anchored ignore patterns
+    // by re-checking `should_skip` against every yielded path.
+    let walker = ignore::WalkBuilder::new(start)
+        .hidden(true)
+        .git_ignore(true)
+        .require_git(false)
+        .build();
+
     let mut out: Vec<String> = Vec::new();
-    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
-    walk_inner(root, start, max_files, &mut out, &mut seen);
+    for entry in walker.flatten() {
+        if out.len() >= max_files {
+            break;
+        }
+        let path = entry.path();
+        let Some(ft) = entry.file_type() else {
+            continue;
+        };
+        if !ft.is_file() || ft.is_symlink() {
+            continue;
+        }
+        let rel = rel_path(root, path);
+        if should_skip(&rel) {
+            continue;
+        }
+        out.push(rel);
+    }
     out.sort();
     out.dedup();
     out
 }
 
-fn walk_inner(
-    root: &Path,
-    dir: &Path,
-    max_files: usize,
-    out: &mut Vec<String>,
-    seen: &mut BTreeSet<PathBuf>,
-) {
-    if out.len() >= max_files {
-        return;
-    }
-    if !is_safe_dir(root, dir) {
-        return;
-    }
-    if should_skip(&rel_path(root, dir)) {
-        return;
-    }
-    let canonical = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    if !seen.insert(canonical) {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let meta = match fs::symlink_metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if meta.file_type().is_symlink() {
-            continue;
-        }
-        if meta.is_dir() {
-            walk_inner(root, &path, max_files, out, seen);
-            if out.len() >= max_files {
-                return;
-            }
-        } else if meta.is_file() {
-            let rel = rel_path(root, &path);
-            if !should_skip(&rel) {
-                out.push(rel);
-                if out.len() >= max_files {
-                    return;
-                }
-            }
-        }
-    }
-}
-
-/// Directory- or file-relative ignore predicate. Mirrors the
-/// `DEFAULT_EXCLUDE_PATTERNS` policy at the parser layer plus mapper-specific
-/// additions (target/, .build/, .codesage/, vendor/).
+/// Directory- or file-relative ignore predicate. Belt-and-suspenders to
+/// `ignore::WalkBuilder`'s gitignore support: catches the directory names
+/// that appear in mapper output even on repos whose gitignore is empty or
+/// missing a relevant entry (vendored sandboxes, sandbox checkouts).
+///
+/// `.worktrees` is included specifically because the user-flow for git
+/// worktrees in this repo plants them at `.worktrees/<branch>/...` and
+/// they shouldn't surface as their own feature slices — they're the same
+/// codebase at a different commit.
 pub fn should_skip(rel: &str) -> bool {
     if rel.is_empty() || rel == "." {
         return false;
@@ -121,7 +124,8 @@ pub fn should_skip(rel: &str) -> bool {
     for part in parts {
         match part {
             "node_modules" | "dist" | "build" | "coverage" | ".git" | ".codesage" | "vendor"
-            | "target" | ".build" | ".next" | "__pycache__" | ".venv" | "venv" => return true,
+            | "target" | ".build" | ".next" | "__pycache__" | ".venv" | "venv" | ".worktrees"
+            | "worktrees" => return true,
             _ => {}
         }
     }
@@ -201,6 +205,42 @@ mod tests {
         assert!(should_skip("vendor/lib/file.php"));
         assert!(!should_skip("src/main.rs"));
         assert!(!should_skip("crates/foo/src/main.rs"));
+    }
+
+    #[test]
+    fn should_skip_hard_excludes_worktrees() {
+        // CR-001: `.worktrees/<branch>/...` was leaking into mapper output
+        // even though git check-ignore confirms it's gitignored. Belt-and-
+        // suspenders to the gitignore-aware walker.
+        assert!(should_skip(".worktrees/feature-x/src/main.rs"));
+        assert!(should_skip("worktrees/feature-x/src/main.rs"));
+        assert!(should_skip("some/nested/.worktrees/feature/file.rs"));
+    }
+
+    #[test]
+    fn walk_honors_gitignore_entries() {
+        // CR-001 regression: gitignore'd directories must not show up in
+        // mapper output. WalkBuilder reads .gitignore at the walk root.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join(".gitignore"), b".worktrees/\nignored_lib/\n").unwrap();
+        fs::write(root.join("src.rs"), b"fn main() {}").unwrap();
+        fs::create_dir_all(root.join(".worktrees/feature/src")).unwrap();
+        fs::write(root.join(".worktrees/feature/src/leak.rs"), b"// leak").unwrap();
+        fs::create_dir_all(root.join("ignored_lib")).unwrap();
+        fs::write(root.join("ignored_lib/leak.rs"), b"// leak").unwrap();
+        let walked = walk_files(root, root, 100);
+        assert!(walked.iter().any(|p| p == "src.rs"));
+        assert!(
+            !walked.iter().any(|p| p.starts_with(".worktrees/")),
+            ".worktrees/ leaked into walk despite gitignore: {:?}",
+            walked
+        );
+        assert!(
+            !walked.iter().any(|p| p.starts_with("ignored_lib/")),
+            "ignored_lib/ leaked into walk despite gitignore: {:?}",
+            walked
+        );
     }
 
     #[test]
