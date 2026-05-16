@@ -80,10 +80,9 @@ pub fn find_coupling(db: &Database, file_path: &str, limit: usize) -> Result<Cou
 /// Output includes the decomposition so the agent can quote specific signals
 /// in PR descriptions or risk callouts. Empty git history → score=0 with a note.
 ///
-/// The 0.7.0 release rebalanced the prior six weights (0.35/0.20/0.10/0.10/
-/// 0.15/0.10 = 1.00) to free a 0.10 slot for `trust_boundary_term` without
-/// inflating the max score above 1.0. Each prior weight shrank by ~10%; the
-/// relative shape of the score's signals is preserved.
+/// The seven weights sum to 1.0 so the maximum score is bounded; relative
+/// shape is preserved when tuning so the structural signals (churn, fix
+/// ratio) keep dominating over the security-shaped trust-boundary term.
 pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
     let git = db.git_file(file_path)?;
     let churn_score = git.as_ref().map(|g| g.churn_score).unwrap_or(0.0);
@@ -342,12 +341,9 @@ pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiff
             wide_blast_files.len()
         ));
     }
-    // 0.7.0: threshold dropped from 0.6 to 0.50 to track the score deflation
-    // every existing signal saw when the weights were rebalanced to make
-    // room for the trust-boundary term. A 0.50 max under the new weights
-    // signals roughly the same calibrated concern as 0.6 did under the
-    // prior weights — a hotspot+fix-heavy+test-gap file with no trust
-    // boundaries hits the new range's ceiling at ~0.54.
+    // A hotspot+fix-heavy+test-gap file with no trust boundaries hits the
+    // weight ceiling at ~0.54, so 0.50 catches "worth flagging" without
+    // firing on every mid-tier file.
     if max_score >= 0.50 {
         summary_notes.push(format!(
             "max risk score {max_score:.2}; consider smaller patch and broader test sweep"

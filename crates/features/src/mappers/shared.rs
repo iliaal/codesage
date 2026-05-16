@@ -54,15 +54,6 @@ pub fn rel_path(root: &Path, abs: &Path) -> String {
 /// caches don't leak into mapper output. Symlinks are skipped (default
 /// `WalkBuilder` posture). Bounded by `max_files` so a mapper run on a
 /// monorepo never grinds forever; returns the partial set when exceeded.
-///
-/// The original `walk_files` used a hand-rolled walker that only matched
-/// a small hardcoded directory-name list and ignored `.gitignore`
-/// entirely. A code-review against the codesage repo itself caught that
-/// `codesage map` was indexing `.worktrees/<branch>/...` even though
-/// `git check-ignore` reports the directory as ignored (CR-001 in the
-/// 0.7.0 review). This rewrite delegates to `ignore::WalkBuilder` and
-/// adds an explicit hardcoded-name fallback to catch projects without a
-/// matching gitignore entry.
 pub fn walk_files(root: &Path, start: &Path, max_files: usize) -> Vec<String> {
     if !is_safe_dir(root, start) {
         return Vec::new();
@@ -209,9 +200,9 @@ mod tests {
 
     #[test]
     fn should_skip_hard_excludes_worktrees() {
-        // CR-001: `.worktrees/<branch>/...` was leaking into mapper output
-        // even though git check-ignore confirms it's gitignored. Belt-and-
-        // suspenders to the gitignore-aware walker.
+        // Belt-and-suspenders: even when `.gitignore` doesn't list
+        // `.worktrees/`, the mapper must not surface sibling worktrees
+        // as their own feature slices.
         assert!(should_skip(".worktrees/feature-x/src/main.rs"));
         assert!(should_skip("worktrees/feature-x/src/main.rs"));
         assert!(should_skip("some/nested/.worktrees/feature/file.rs"));
@@ -219,8 +210,8 @@ mod tests {
 
     #[test]
     fn walk_honors_gitignore_entries() {
-        // CR-001 regression: gitignore'd directories must not show up in
-        // mapper output. WalkBuilder reads .gitignore at the walk root.
+        // gitignore'd directories must not show up in mapper output —
+        // WalkBuilder reads .gitignore at the walk root.
         let dir = tempdir().unwrap();
         let root = dir.path();
         fs::write(root.join(".gitignore"), b".worktrees/\nignored_lib/\n").unwrap();

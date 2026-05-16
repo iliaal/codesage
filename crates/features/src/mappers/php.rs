@@ -1,8 +1,8 @@
 //! PHP mapper: composer.json bins + scripts, PSR-4 autoload roots,
 //! `**/*.phpt` test fixtures (php-src convention), `ext/<name>/config.{m4,w32}`
 //! extension slices (php-src), and Laravel `routes/{web,api,console,channels}.php`
-//! route extraction. Designed to cover the user's two smoke-test repos
-//! (php-src + a Laravel app) without framework-detection cliff edges.
+//! route extraction. Covers framework-agnostic Composer, php-src internals,
+//! and Laravel without per-app config.
 
 use std::fs;
 use std::path::Path;
@@ -152,12 +152,11 @@ fn php_src_extensions(root: &Path) -> Result<Vec<FeatureSeed>> {
         if !has_m4 && !has_w32 {
             continue;
         }
-        // Pick whichever config actually exists. Windows-only extensions
-        // (rare in upstream php-src but real in third-party bundles) ship
-        // only `config.w32`; pinning entry_path to `config.m4` regardless
-        // produced a feature whose entry file didn't exist (CR-006). When
-        // both are present, prefer `config.m4` to keep IDs stable for the
-        // dominant POSIX case.
+        // Anchor entry_path on the config file that actually exists.
+        // Windows-only extensions ship only `config.w32`; pin to that
+        // when `config.m4` is absent so the feature's entry_path is
+        // never a missing file. Prefer `.m4` when both are present for
+        // ID stability on POSIX trees.
         let config_basename = if has_m4 { "config.m4" } else { "config.w32" };
         let name = match p.file_name().and_then(|s| s.to_str()) {
             Some(s) => s.to_string(),
@@ -395,9 +394,8 @@ mod tests {
 
     #[test]
     fn windows_only_php_ext_uses_config_w32_entry() {
-        // CR-006: Windows-only extensions (only `config.w32` present) were
-        // recorded with `entry_path = .../config.m4` because the entry was
-        // hardcoded. The feature pointed at a file that doesn't exist.
+        // Windows-only extensions ship only `config.w32`; the feature's
+        // entry_path must anchor on the file that actually exists.
         let dir = tempdir().unwrap();
         write(dir.path(), "ext/wincache/config.w32", "// MSBuild config\n");
         let seeds = PhpMapper.map(dir.path()).unwrap();

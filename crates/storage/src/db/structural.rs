@@ -510,11 +510,10 @@ impl Database {
             "DELETE FROM file_trust_boundaries WHERE file_id = ?1",
             params![file_id],
         )?;
-        // Always stamp `boundaries_derived_at`, including when `tags` is
-        // empty. The marker lets the CR-003 backfill distinguish
-        // "rule-clean file" from "never-derived file" — without it, every
-        // index run would re-derive against files that have no rule
-        // matches because we can't tell them apart from upgrade leftovers.
+        // Stamp `boundaries_derived_at` on every write — including when
+        // the derived set is empty — so a rule-clean file (no matches)
+        // stays distinguishable from a never-derived one (zero matches
+        // because derivation never ran).
         self.conn.execute(
             "UPDATE files SET boundaries_derived_at = unixepoch() WHERE id = ?1",
             params![file_id],
@@ -532,9 +531,9 @@ impl Database {
     }
 
     /// Files that have never had their trust boundaries derived (or were
-    /// indexed before the migration added the marker column). Empty when
-    /// every indexed file has been derived at least once. Used by the
-    /// CR-003 targeted backfill to catch partial-upgrade states.
+    /// indexed before the marker column existed). Empty when every
+    /// indexed file has been derived at least once. Pair with
+    /// `derive_for_files` for a targeted catch-up pass.
     pub fn files_pending_boundary_derivation(&self) -> Result<Vec<(i64, String, Language)>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, path, language FROM files
@@ -560,11 +559,8 @@ impl Database {
     }
 
     /// Count rows in `file_trust_boundaries` across the whole project.
-    /// Used by the upgrade-path backfill check: when this is zero but
-    /// `file_count() > 0`, the indexer triggers a one-shot
-    /// `derive_for_index` pass to populate boundaries against existing
-    /// files (the structural-only `--full` path that 0.7.0's incremental
-    /// hook would otherwise skip).
+    /// Cheap COUNT(*) for diagnostics; the targeted backfill uses
+    /// `files_pending_boundary_derivation` instead.
     pub fn file_trust_boundary_count(&self) -> Result<usize> {
         let n: i64 =
             self.conn

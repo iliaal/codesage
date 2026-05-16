@@ -777,13 +777,11 @@ mod tests {
 
     #[test]
     fn laravel_facades_cover_the_common_boundary_categories() {
-        // Real Laravel apps abstract auth/storage/queue/env behind facades
-        // rather than calling getenv/exec/openssl_* directly. Without these
-        // rules a release-smoke run against a Laravel codebase registered
-        // 0 secrets, 0 process-exec, and only sparse filesystem rows even
-        // across thousands of files. Each row below names a facade plus
-        // the boundary it should fire — keeps the rule table honest as a
-        // checklist.
+        // Laravel code abstracts auth/storage/queue/env behind facades
+        // rather than calling getenv/exec/openssl_* directly. Each row
+        // below names a facade plus the boundary it must fire so the
+        // rule table stays honest as a checklist when entries are
+        // added or removed.
         let table = rules_for(Language::Php)[0];
         let cases: &[(&str, TrustBoundary)] = &[
             ("Illuminate\\Support\\Facades\\Hash", TrustBoundary::Secrets),

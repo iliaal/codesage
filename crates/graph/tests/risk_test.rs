@@ -66,11 +66,8 @@ fn hotspot_fix_heavy_file_scores_high_and_emits_notes() {
     }
 
     let r = assess_risk(&db, "Repository.php").unwrap();
-    // Threshold updated for 0.7.0 weights (0.32 churn + 0.18 fix + 0.13
-    // test-gap = 0.54 floor on a hotspot+fix-heavy file with no tests).
-    // Prior weights (0.35/0.20/0.15) hit 0.6 on the same fixture; the
-    // rebalance to make room for the trust-boundary term shifts the
-    // ceiling down by roughly 10% for all signals.
+    // hotspot+fix-heavy+test-gap with no trust boundaries:
+    // 0.32 churn + 0.18 fix + 0.13 test-gap ≈ 0.54.
     assert!(
         r.score >= 0.5,
         "hotspot+fix-heavy should score >= 0.5, got {}",

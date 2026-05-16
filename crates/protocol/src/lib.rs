@@ -693,8 +693,8 @@ pub struct RiskAssessment {
     /// Each tag denotes a capability the file's structural dependencies imply
     /// it exercises (network, filesystem, secrets, process-exec, etc.).
     /// Contributes a `0.10 * min(count/5, 1.0)` term to `score`. Sorted by
-    /// enum discriminant; empty when the file has no recognized boundary
-    /// signal or has not yet been re-indexed since 0.7.0.
+    /// enum discriminant; empty when the file matches no boundary rule or
+    /// has never been derived (run `codesage index` to populate).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub trust_boundaries: Vec<TrustBoundary>,
     /// Human-readable rationale lines so the agent can quote them in PR descriptions.

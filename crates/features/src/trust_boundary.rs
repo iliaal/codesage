@@ -50,9 +50,7 @@ pub fn derive_from_refs(refs: &[Reference], language: Language) -> Vec<TrustBoun
 /// around `#include` directives. The parser records `<sys/socket.h>` and
 /// `"local.h"` verbatim; the rule patterns are written against the bare
 /// path, so without this normalization every C include-shaped rule
-/// silently misses on real source. (Discovered during the 0.7.0 php-src
-/// smoke test — `ext/curl/interface.c` was returning an empty boundary
-/// set despite including `<curl/curl.h>`.)
+/// silently misses on real source.
 fn normalize_ref_name(name: &str, kind: ReferenceKind) -> String {
     if kind != ReferenceKind::Include {
         return name.to_string();
@@ -109,12 +107,10 @@ pub fn derive_for_index(db: &Database) -> Result<usize> {
     derive_for_files(db, &files)
 }
 
-/// Targeted version of `derive_for_index`: derive boundaries only for the
-/// given `(file_id, path, language)` tuples. Used by the CR-003
-/// partial-upgrade backfill — the `files.boundaries_derived_at` marker
-/// identifies files that need work, and feeding only those into the
-/// derivation pass avoids redoing rule-clean files that were already
-/// stamped on a prior run.
+/// Targeted version of `derive_for_index`: derive boundaries only for
+/// the given `(file_id, path, language)` tuples. Pair with
+/// `Database::files_pending_boundary_derivation` to backfill exactly
+/// the files that need work without reprocessing already-stamped ones.
 pub fn derive_for_files(
     db: &Database,
     files: &[(i64, String, codesage_protocol::Language)],

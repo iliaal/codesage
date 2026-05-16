@@ -24,11 +24,10 @@ use crate::nearby_tests::nearby_tests;
 ///
 /// When **any** mapper errors mid-collection, the orchestrator still
 /// persists the seeds it did collect but **skips the garbage-collect
-/// pass**. The earlier "warn-and-continue + GC anything not in
-/// keep_ids" path could silently delete every PHP feature when the PHP
-/// mapper happened to fail on a corrupt composer.json (CR-004). Skipping
-/// GC trades a small amount of stale-feature debt for not nuking valid
-/// rows; the next clean run reconciles.
+/// pass** — otherwise a single mapper failure (corrupted composer.json,
+/// unreadable Cargo.toml, etc.) could silently delete every feature
+/// owned by that language. Stale-feature debt is reconciled on the
+/// next clean run.
 pub fn map_features(root: &Path, db: &Database) -> Result<FeatureMapStats> {
     let collected = collect_seeds(root)?;
     let seeds = collected.seeds;

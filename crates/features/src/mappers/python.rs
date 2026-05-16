@@ -163,14 +163,11 @@ fn main_guard_modules(root: &Path) -> Result<Vec<FeatureSeed>> {
     let guard_re = Regex::new(r#"(?m)^if\s+__name__\s*==\s*['"]__main__['"]"#)?;
     let files = walk_files(root, root, 30_000);
     for rel in files.iter().filter(|p| p.ends_with(".py")) {
-        // Skip `test_*.py` / `*_test.py` / files under `tests/`. Many such
-        // files carry `if __name__ == "__main__":` for ad-hoc local
-        // execution but they're test runners, not CLI commands. Indexing
-        // them produced feature rows pointing at paths the structural
-        // indexer excludes via `[index].exclude_patterns`, leaving ghost
-        // features whose entry_path doesn't exist in the `files` table
-        // (a Python-service smoke caught 36 ghosts out of 85 features —
-        // all were test_*.py with main-guards).
+        // Test files with `if __name__ == "__main__":` are ad-hoc test
+        // runners, not CLI commands. They're often excluded by the
+        // project's `[index].exclude_patterns`, so emitting features
+        // for them produces rows whose entry_path isn't in the `files`
+        // table.
         if matches!(FileCategory::classify(rel), FileCategory::Test) {
             continue;
         }
@@ -256,11 +253,8 @@ acme = "acme.cli:main"
 
     #[test]
     fn main_guard_skips_test_files() {
-        // Ghost-feature regression: test_*.py with `if __name__ ==
-        // "__main__":` was emitting a cli-command feature even though
-        // the structural indexer excluded those paths via
-        // `[index].exclude_patterns`. A release-smoke run against a
-        // Python service surfaced 36 such ghosts.
+        // `test_*.py` / `*_test.py` / files under `tests/` with a
+        // `__main__` guard must not produce cli-command features.
         let dir = tempdir().unwrap();
         write(
             dir.path(),

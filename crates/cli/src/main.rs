@@ -218,8 +218,8 @@ enum Commands {
         json: bool,
     },
     /// Trust-boundary tags derived from a file's imports/includes/calls (network, filesystem,
-    /// secrets, process-exec, etc.). Composes into `assess_risk` as a new signal. Empty
-    /// when the file has no recognized boundary signal or has not yet been re-indexed since 0.7.0.
+    /// secrets, process-exec, etc.). Composes into `assess_risk`. Empty when the file
+    /// matches no boundary rule or has never been derived (run `codesage index`).
     TrustBoundaries {
         /// Repo-relative file path
         file: String,
@@ -842,17 +842,11 @@ fn cmd_index(full: bool, no_semantic: bool) -> Result<()> {
         stats.references_found
     );
 
-    // CR-003 refinement: targeted trust-boundary backfill. The original
-    // row-count guard (`total_files > 0 && boundary_rows == 0`) only
-    // caught the uniformly-empty case; a partial-upgrade state where
-    // some files got their boundaries derived inline by 0.7.0's indexer
-    // but others didn't would stay broken silently because an empty
-    // `file_trust_boundaries` rowset for a file is indistinguishable
-    // from a "rule-clean" file. The `files.boundaries_derived_at`
-    // marker (migration 0010) closes that gap: it's stamped on every
-    // `replace_file_trust_boundaries` call, so the query below returns
-    // exactly the files that have never been derived (or were indexed
-    // before the marker column existed).
+    // Targeted trust-boundary backfill. `files_pending_boundary_derivation`
+    // returns files that have never been derived (or were indexed before
+    // the marker column existed); the structural indexer only derives
+    // inline for files it parses this pass, so the catch-up here picks
+    // up the rest without reprocessing rule-clean files.
     match db.files_pending_boundary_derivation() {
         Ok(pending) if !pending.is_empty() => {
             let n_pending = pending.len();
@@ -866,12 +860,10 @@ fn cmd_index(full: bool, no_semantic: bool) -> Result<()> {
     }
 
     // Feature mapping runs after structural (which populated `refs` and
-    // `file_trust_boundaries`) and before semantic so the aggregated
-    // trust-boundary tags on each feature are fresh. CR-004: errors here
-    // are fatal so `codesage index` reports failure instead of silently
-    // succeeding while leaving feature tables in a partial state (and
-    // potentially garbage-collecting valid existing rows the way the
-    // earlier swallow-and-continue path could).
+    // `file_trust_boundaries`) and before semantic so per-feature
+    // trust-boundary tags are fresh. Errors here are fatal: a mid-run
+    // failure must surface as command failure, not a silent eprintln
+    // with feature tables left in a partial state.
     match codesage_features::map_features(&root, &db) {
         Ok(map_stats) => println!(
             "Features:   created={} updated={} removed={} total={}",

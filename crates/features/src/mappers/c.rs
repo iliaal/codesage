@@ -37,13 +37,10 @@ impl FeatureMapper for CCppMapper {
         let mut seeds: Vec<FeatureSeed> = Vec::new();
         seeds.extend(autotools_targets(root, &files)?);
         seeds.extend(cmake_targets(root, &files)?);
-        // Populate the seen-set from already-declared build targets BEFORE
-        // running main() detection. Without this, a binary declared in
-        // CMakeLists.txt (or Makefile.am) AND containing `main()` produces
-        // two duplicate features — same entry, same kind, different
-        // `source`. The `dedup_by_entry` pass keyed on source preserved
-        // both; populate the seen-set so main() detection skips paths
-        // already claimed by a build-system target (CR-005).
+        // Build-target seeds win over generic main() detection: skip
+        // main()-anchored seeds for paths a CMake/autotools target
+        // already claims, otherwise the same binary shows up twice with
+        // different `source` tags.
         let already_seeded_paths: BTreeSet<String> = seeds
             .iter()
             .filter(|s| s.kind == FeatureKind::CliCommand)
@@ -534,13 +531,10 @@ fn is_valid_target_name(s: &str) -> bool {
         && !s.contains('#')
 }
 
-/// Dedup keyed on `(entry_path, kind)`. The earlier key included `source`,
-/// so two seeds emitted by different mappers (cmake-bin vs c-main) for the
-/// same entry survived as separate features. The orchestrator stored both
-/// under different `feature_id`s and `assess_risk` ended up double-counting
-/// the file in feature listings. First seed wins — autotools/CMake run
-/// before main() detection so the high-confidence build-target seed is
-/// preserved when both fire (CR-005).
+/// Dedup keyed on `(entry_path, kind)`. First seed wins, so the order
+/// callers extend `seeds` in matters: autotools and CMake run before
+/// main() detection so the higher-confidence build-target seed survives
+/// when both fire on the same file.
 fn dedup_by_entry(seeds: Vec<FeatureSeed>) -> Vec<FeatureSeed> {
     let mut seen: BTreeSet<(String, FeatureKind)> = BTreeSet::new();
     let mut out = Vec::with_capacity(seeds.len());
@@ -655,11 +649,9 @@ mod tests {
 
     #[test]
     fn cmake_bin_with_main_function_emits_single_feature() {
-        // CR-005 regression: a binary declared in CMakeLists.txt that
-        // also contains `int main()` was previously seeded twice — once
-        // as `cmake-bin`, once as `c-main` — because the seen-set wasn't
-        // populated from build-target paths and the dedup key included
-        // `source`. The build-target seed must win.
+        // A binary declared in CMakeLists.txt that also contains `int main()`
+        // must produce exactly one cli-command seed — the build-target
+        // one — not duplicates under both `cmake-bin` and `c-main`.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -686,8 +678,7 @@ mod tests {
 
     #[test]
     fn autotools_bin_with_main_function_emits_single_feature() {
-        // CR-005 regression for the autotools path: same scenario as
-        // CMake but anchored on Makefile.am.
+        // Same dedup contract as the CMake test, anchored on Makefile.am.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
