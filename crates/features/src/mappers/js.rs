@@ -68,7 +68,7 @@ impl FeatureMapper for JsMapper {
         let packages = discover_packages(root, pkg_at_root.as_ref());
         let pm = detect_node_package_manager(root);
         for info in &packages {
-            seeds.extend(package_seeds_for(root, info, pm));
+            seeds.extend(package_seeds_for(ctx, info, pm));
         }
         seeds.extend(next_app_routes(ctx)?);
         seeds.extend(next_pages_routes(ctx)?);
@@ -107,7 +107,8 @@ fn language_for_entry(entry: &str) -> Language {
 /// `start`/`build`/`test`/etc. as standalone seeds so a monorepo doesn't get
 /// N copies of those entries. Workspace packages still emit their own bin
 /// seeds, because per-package `bin` is the routing-actionable surface.
-fn package_seeds_for(root: &Path, info: &PackageInfo, pm: NodePm) -> Vec<FeatureSeed> {
+fn package_seeds_for(ctx: &MapperContext, info: &PackageInfo, pm: NodePm) -> Vec<FeatureSeed> {
+    let root = ctx.root;
     let mut out = Vec::new();
     let pkg = &info.pkg;
     let has_test_script = package_scripts(pkg).contains_key("test");
@@ -274,6 +275,25 @@ fn package_seeds_for(root: &Path, info: &PackageInfo, pm: NodePm) -> Vec<Feature
                 info.root_rel
             ),
         };
+        // Enumerate the workspace's source files (cap 2_000) and attach as
+        // owned_files so `feature-for packages/api/src/auth.ts` actually
+        // routes to this seed. Without this, the storage exact-match query
+        // `feature_files.path = ?1` returned empty for any file under the
+        // workspace — the routing-by-workspace contract advertised in
+        // CHANGELOG was a no-op.
+        let mut owned_files = vec![SeedFile {
+            path: info.manifest_rel.clone(),
+            reason: "package manifest".to_string(),
+        }];
+        for path in workspace_source_files(ctx, &info.root_rel) {
+            if path == info.manifest_rel {
+                continue;
+            }
+            owned_files.push(SeedFile {
+                path,
+                reason: "workspace source".to_string(),
+            });
+        }
         out.push(FeatureSeed {
             title: format!("Node package `{package_name}`"),
             summary,
@@ -290,10 +310,7 @@ fn package_seeds_for(root: &Path, info: &PackageInfo, pm: NodePm) -> Vec<Feature
                 "package".to_string(),
                 "workspace".to_string(),
             ],
-            owned_files: vec![SeedFile {
-                path: info.manifest_rel.clone(),
-                reason: "package manifest".to_string(),
-            }],
+            owned_files,
             context_files,
             tests: Vec::new(),
             test_prefixes: vec!["__tests__".to_string(), "tests".to_string()],
@@ -368,12 +385,18 @@ fn workspace_patterns(root: &Path, root_pkg: Option<&Value>) -> Vec<String> {
             patterns.insert(p);
         }
     }
-    // Convention fallback: when no explicit workspace declaration exists but
-    // a `packages/`-shaped directory does, treat each child as a workspace.
-    // Mirrors clawpatch's fallback list.
-    for fallback in ["packages", "apps", "extensions", "plugins"] {
-        if is_safe_dir(root, &root.join(fallback)) {
-            patterns.insert(format!("{fallback}/*"));
+    // Convention fallback: ONLY when no explicit workspace declaration
+    // exists (either as `workspaces` in package.json or in pnpm-workspace.yaml).
+    // An incidental `packages/stray/package.json` in a repo that declares
+    // `workspaces: ["apps/*"]` should NOT be treated as a workspace — that
+    // would inflate `list_features` with seeds for sidecar directories the
+    // author didn't opt in to.
+    let has_explicit = patterns.iter().any(|p| !p.starts_with('!'));
+    if !has_explicit {
+        for fallback in ["packages", "apps", "extensions", "plugins"] {
+            if is_safe_dir(root, &root.join(fallback)) {
+                patterns.insert(format!("{fallback}/*"));
+            }
         }
     }
     patterns.into_iter().collect()
@@ -798,6 +821,89 @@ fn package_relative_path(package_root: &str, path: &str) -> String {
     format!("{package_root}/{stripped}")
 }
 
+/// Walk a workspace's directory and return its source files (cap 2_000).
+/// Used to populate the `node-package` seed's `owned_files` so storage's
+/// exact-match `features_for_file` query resolves any workspace-member
+/// file to the package feature. Honors `.gitignore` and project
+/// `[index].exclude_patterns` via `walk_files`. Filters out test/spec
+/// files, type declarations, and generated bundles — those belong on
+/// other seeds (or not at all). Excludes the manifest itself; callers
+/// dedupe it back in.
+fn workspace_source_files(ctx: &MapperContext, workspace_root: &str) -> Vec<String> {
+    const CAP: usize = 2_000;
+    let root = ctx.root;
+    let dir = if workspace_root.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(workspace_root)
+    };
+    if !is_safe_dir(root, &dir) {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for rel in walk_files(root, &dir, 10_000, ctx.excludes) {
+        if !is_reviewable_node_source(&rel) {
+            continue;
+        }
+        out.push(rel);
+        if out.len() >= CAP {
+            break;
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Match what clawpatch's `isReviewableNodeSourceFile` accepts but without
+/// porting the source-group seeds. Used by `workspace_source_files` to
+/// attach a sensible owned-file set to each workspace feature for routing.
+fn is_reviewable_node_source(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let has_source_ext = ends_with_any(
+        &lower,
+        &[".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"],
+    );
+    if !has_source_ext {
+        return false;
+    }
+    if ends_with_any(
+        &lower,
+        &[
+            ".test.ts",
+            ".test.tsx",
+            ".test.js",
+            ".test.jsx",
+            ".test.mts",
+            ".test.cts",
+            ".test.mjs",
+            ".test.cjs",
+            ".spec.ts",
+            ".spec.tsx",
+            ".spec.js",
+            ".spec.jsx",
+            ".spec.mts",
+            ".spec.cts",
+            ".spec.mjs",
+            ".spec.cjs",
+        ],
+    ) {
+        return false;
+    }
+    if lower.ends_with(".d.ts") || lower.ends_with(".d.cts") || lower.ends_with(".d.mts") {
+        return false;
+    }
+    for segment in path.split('/') {
+        if matches!(segment, "__fixtures__" | "fixtures" | "testdata") {
+            return false;
+        }
+    }
+    let basename = path.rsplit_once('/').map(|(_, tail)| tail).unwrap_or(path);
+    if basename.contains(".generated.") || basename.contains(".gen.") {
+        return false;
+    }
+    true
+}
+
 fn next_app_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
     let root = ctx.root;
     let mut out = Vec::new();
@@ -1181,9 +1287,11 @@ const App = () => (
         );
 
         // The api workspace seed carries a per-package test command on
-        // `entry_command` (post-CR-003 fix: no bogus SeedTest with the
-        // manifest as a "test file"; the test command is the entry-level
-        // command for the package feature).
+        // `entry_command`. The manifest must NOT appear in tests[] —
+        // `SeedTest.path` is documented as a test FILE and the orchestrator
+        // inserts every tests[] row as `role: Test`; populating it with the
+        // package.json would surface the manifest as a test in
+        // `feature_bundle` output.
         let api = pkg_seeds
             .iter()
             .find(|s| s.entry_symbol.as_deref() == Some("@acme/api"))
@@ -1191,7 +1299,7 @@ const App = () => (
         assert_eq!(api.entry_path, "packages/api/package.json");
         assert!(
             api.tests.is_empty(),
-            "node-package seed must not populate tests[] with the manifest (CR-003)"
+            "node-package seed must not populate tests[] with the manifest"
         );
         assert_eq!(
             api.entry_command.as_deref(),
@@ -1231,7 +1339,7 @@ const App = () => (
         assert!(names.contains(&"@acme/util"));
 
         // pnpm package-manager detection drives the test-command formatting,
-        // surfaced on `entry_command` (CR-003 fix).
+        // surfaced on `entry_command`.
         let admin = seeds
             .iter()
             .find(|s| s.entry_symbol.as_deref() == Some("@acme/admin"))
@@ -1357,8 +1465,107 @@ const App = () => (
     }
 
     #[test]
+    fn workspace_seed_owns_source_files_for_routing() {
+        // Regression: `find_feature("packages/api/src/auth.ts")` had no
+        // chance because the node-package seed only persisted the
+        // manifest. The workspace walk now attaches .ts/.js/.tsx files as
+        // owned so the storage exact-match query resolves any workspace
+        // member to its package feature.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"monorepo","workspaces":["packages/*"]}"#,
+        );
+        write(
+            dir.path(),
+            "packages/api/package.json",
+            r#"{"name":"@acme/api"}"#,
+        );
+        write(
+            dir.path(),
+            "packages/api/src/auth.ts",
+            "export const auth = 1;\n",
+        );
+        write(
+            dir.path(),
+            "packages/api/src/helpers.ts",
+            "export const helper = 1;\n",
+        );
+        // Spec/test files belong on a future test-suite surface, not the
+        // package seed; .d.ts files are type-declaration stubs.
+        write(
+            dir.path(),
+            "packages/api/src/auth.test.ts",
+            "test('x', () => {});\n",
+        );
+        write(
+            dir.path(),
+            "packages/api/src/types.d.ts",
+            "export interface X {}\n",
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.entry_symbol.as_deref() == Some("@acme/api"))
+            .expect("api workspace seed");
+        let owned: std::collections::BTreeSet<&str> =
+            s.owned_files.iter().map(|f| f.path.as_str()).collect();
+        assert!(
+            owned.contains("packages/api/src/auth.ts"),
+            "src/auth.ts missing from owned_files: {owned:?}"
+        );
+        assert!(owned.contains("packages/api/src/helpers.ts"));
+        assert!(owned.contains("packages/api/package.json"));
+        assert!(
+            !owned.contains("packages/api/src/auth.test.ts"),
+            "test files must not bleed into workspace owned set"
+        );
+        assert!(
+            !owned.contains("packages/api/src/types.d.ts"),
+            ".d.ts files must not bleed into workspace owned set"
+        );
+    }
+
+    #[test]
+    fn fallback_prefixes_skipped_when_explicit_workspaces_declared() {
+        // Regression: an incidental `packages/stray/package.json` sitting
+        // in a repo that declares `workspaces: ["apps/*"]` must NOT be
+        // discovered as a workspace. The fallback prefix list
+        // (`packages/`, `apps/`, …) only applies when no explicit
+        // declaration was made.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"monorepo","workspaces":["apps/*"]}"#,
+        );
+        write(
+            dir.path(),
+            "apps/web/package.json",
+            r#"{"name":"@acme/web"}"#,
+        );
+        write(
+            dir.path(),
+            "packages/stray/package.json",
+            r#"{"name":"@acme/stray"}"#,
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let names: Vec<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "node-package")
+            .filter_map(|s| s.entry_symbol.as_deref())
+            .collect();
+        assert!(names.contains(&"@acme/web"));
+        assert!(
+            !names.contains(&"@acme/stray"),
+            "fallback prefix leaked when explicit workspaces declared: {names:?}"
+        );
+    }
+
+    #[test]
     fn gitignored_workspace_is_excluded() {
-        // CR-004 regression: a workspace matching `packages/*` but listed in
+        // Regression: a workspace matching `packages/*` but listed in
         // .gitignore must NOT be discovered as a feature. The structural
         // indexer skips its files via gitignore; surfacing a feature whose
         // entry_path points at gitignored content would route `find_feature`

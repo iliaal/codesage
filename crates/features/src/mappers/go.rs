@@ -69,12 +69,12 @@ impl FeatureMapper for GoMapper {
 
         let mut seeds = Vec::new();
         for pkg in &packages {
-            let files = collect_package_files(root, &pkg.dir_rel)?;
+            let files = collect_package_files(ctx, &pkg.dir_rel)?;
             if files.owned.is_empty() {
                 continue;
             }
             let imported_context =
-                collect_import_context(root, module_path.as_deref(), &by_import, &files.owned)?;
+                collect_import_context(ctx, module_path.as_deref(), &by_import, &files.owned)?;
             seeds.push(make_seed(pkg, files, imported_context));
         }
         seeds.retain(|s| !ctx.excluded(&s.entry_path));
@@ -188,7 +188,8 @@ fn read_go_package_name(root: &Path, dir_rel: &str) -> Option<String> {
 
 // ---- Per-package file classification -----------------------------------
 
-fn collect_package_files(root: &Path, dir_rel: &str) -> Result<GoPackageFiles> {
+fn collect_package_files(ctx: &MapperContext, dir_rel: &str) -> Result<GoPackageFiles> {
+    let root = ctx.root;
     let dir = if dir_rel.is_empty() {
         root.to_path_buf()
     } else {
@@ -213,6 +214,13 @@ fn collect_package_files(root: &Path, dir_rel: &str) -> Result<GoPackageFiles> {
         } else {
             format!("{dir_rel}/{name}")
         };
+        // Honor project excludes inside the per-package classifier too. If
+        // an excluded file happened to sort first, it would have ended up
+        // as entry_path and the post-map `seeds.retain(...excluded)` would
+        // drop the whole package — losing every non-excluded sibling.
+        if !ctx.allowed(&rel) {
+            continue;
+        }
         if name.ends_with("_test.go") {
             files.tests.push(rel);
             continue;
@@ -238,20 +246,36 @@ fn is_generated_go_file(abs: &Path, file_name: &str) -> bool {
     if suffix_re.is_match(file_name) {
         return true;
     }
-    // Header sniff: first ~2 KB for a "Code generated ... DO NOT EDIT"
-    // marker. Cheap (capped read) and catches generated files that don't
-    // follow the naming convention (e.g. go-bindata output). Truncate by
-    // walking back to the nearest UTF-8 char boundary — `String::truncate`
-    // panics on a multibyte split, which a Go source with a BOM or kanji
-    // comment at offset ~2000 would trigger.
-    let Ok(raw) = fs::read_to_string(abs) else {
-        return false;
-    };
-    let mut end = raw.len().min(2_000);
-    while end > 0 && !raw.is_char_boundary(end) {
-        end -= 1;
+    // Bounded header sniff: take the first ~2 KB of the file rather than
+    // reading it whole. go-bindata can emit MB-scale generated files
+    // without a recognized suffix; reading the entire thing just to check
+    // the comment header allocates the full buffer. Drop bytes past the
+    // last valid UTF-8 char boundary so a multibyte sequence split at the
+    // cap doesn't reject a real marker. ASCII files (the common case) are
+    // unaffected.
+    let mut head_bytes = Vec::with_capacity(2_000);
+    {
+        use std::io::Read;
+        let Ok(file) = std::fs::File::open(abs) else {
+            return false;
+        };
+        let mut take = file.take(2_000);
+        if take.read_to_end(&mut head_bytes).is_err() {
+            return false;
+        }
     }
-    let head = &raw[..end];
+    let mut end = head_bytes.len();
+    let head = loop {
+        match std::str::from_utf8(&head_bytes[..end]) {
+            Ok(s) => break s,
+            Err(e) => {
+                end = e.valid_up_to();
+                if end == 0 {
+                    return false;
+                }
+            }
+        }
+    };
     let header_re = Regex::new(r"(?i)Code generated .* DO NOT EDIT\.|DO NOT EDIT: generated")
         .expect("static regex");
     header_re.is_match(head)
@@ -276,7 +300,7 @@ fn import_context_cap() -> usize {
 }
 
 fn collect_import_context(
-    root: &Path,
+    ctx: &MapperContext,
     module_path: Option<&str>,
     by_import: &HashMap<String, GoPackage>,
     owned_files: &[String],
@@ -284,6 +308,7 @@ fn collect_import_context(
     let Some(module) = module_path else {
         return Ok(Vec::new());
     };
+    let root = ctx.root;
     let module_prefix = format!("{module}/");
     let mut refs: Vec<SeedFile> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -298,7 +323,7 @@ fn collect_import_context(
             let Some(pkg) = by_import.get(&imported) else {
                 continue;
             };
-            let pkg_files = collect_package_files(root, &pkg.dir_rel)?;
+            let pkg_files = collect_package_files(ctx, &pkg.dir_rel)?;
             for ctx_file in pkg_files.owned {
                 if seen.contains(&ctx_file) {
                     continue;
@@ -793,6 +818,45 @@ mod tests {
         assert_eq!(
             imported_count, 24,
             "import context must be capped at 24, got {imported_count}"
+        );
+    }
+
+    #[test]
+    fn excluded_file_does_not_drop_whole_package() {
+        // Regression: prior to the fix, `collect_package_files` ignored
+        // ctx.excludes. If the alphabetically-first .go file in a dir was
+        // excluded, it became entry_path; then the post-map
+        // `seeds.retain(|s| !ctx.excluded(&s.entry_path))` dropped the
+        // entire package, losing every non-excluded sibling.
+        use globset::{Glob, GlobSetBuilder};
+        let dir = tempdir().unwrap();
+        write(dir.path(), "go.mod", "module example.com/acme\n");
+        write(
+            dir.path(),
+            "pkg/util/a_excluded.go",
+            "package util\nfunc Excluded() {}\n",
+        );
+        write(
+            dir.path(),
+            "pkg/util/z_kept.go",
+            "package util\nfunc Kept() {}\n",
+        );
+        let mut builder = GlobSetBuilder::new();
+        builder.add(Glob::new("**/a_excluded.go").unwrap());
+        let excludes = builder.build().unwrap();
+        let ctx = MapperContext {
+            root: dir.path(),
+            excludes: Some(&excludes),
+        };
+        let seeds = GoMapper.map(&ctx).unwrap();
+        let entry_paths: Vec<&str> = seeds.iter().map(|s| s.entry_path.as_str()).collect();
+        assert!(
+            entry_paths.contains(&"pkg/util/z_kept.go"),
+            "package was dropped when excluded file sorted first: got {entry_paths:?}"
+        );
+        assert!(
+            !entry_paths.contains(&"pkg/util/a_excluded.go"),
+            "excluded file leaked into seed: {entry_paths:?}"
         );
     }
 }

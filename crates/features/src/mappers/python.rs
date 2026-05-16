@@ -17,6 +17,7 @@
 //! intentionally NOT ported per the LLM-utility filter — browse-only rows
 //! dilute `list_features` without unlocking a new agent action.
 
+use std::collections::BTreeSet;
 use std::fs;
 
 use anyhow::Result;
@@ -104,8 +105,8 @@ fn detect_python_test_command(root: &std::path::Path, pyproject: Option<&str>) -
         return Some("pdm run pytest".to_string());
     }
     // No hatch.lock convention exists; hatch is purely lockfile-less, so we
-    // don't have a precise way to detect it post-CR-005. Fall through to
-    // bare `pytest` for hatch users — still runnable in the hatch shell.
+    // don't have a precise way to detect it. Fall through to bare `pytest`
+    // for hatch users — still runnable in the hatch shell.
     if pyproject.is_some()
         || is_safe_file(root, &root.join("setup.py"))
         || is_safe_file(root, &root.join("setup.cfg"))
@@ -154,6 +155,14 @@ fn python_project_seed(
             });
         }
     }
+    // Source-file ownership for `find_feature` routing. Without these
+    // entries, `feature-for src/acme/foo.py` returned nothing — the storage
+    // query is an exact `feature_files.path = ?` lookup and the only files
+    // attached previously were the manifest + README / AGENTS / tsconfig.
+    // Walk the project's Python source roots (cap 2_000 to keep the
+    // feature_files table bounded for monolithic monorepos) and tag each
+    // hit as `project source`.
+    let project_files = python_project_source_files(ctx);
     // NOTE: the inferred test command is surfaced via the summary string
     // (and via `entry_command`) only. Earlier drafts populated `tests`
     // with a SeedTest entry pointing at the manifest just to attach the
@@ -163,6 +172,19 @@ fn python_project_seed(
     // as a "test" in `feature_bundle` output, which is wrong. Leaving
     // tests empty here lets the orchestrator's `nearby_tests` discovery
     // attach real test files instead.
+    let mut owned_files = vec![SeedFile {
+        path: manifest.to_string(),
+        reason: "package manifest".to_string(),
+    }];
+    for path in project_files {
+        if path == manifest {
+            continue;
+        }
+        owned_files.push(SeedFile {
+            path,
+            reason: "project source".to_string(),
+        });
+    }
     Ok(vec![FeatureSeed {
         title: format!("Python project `{project_name}`"),
         summary: match test_cmd {
@@ -178,14 +200,68 @@ fn python_project_seed(
         entry_command: test_cmd.map(String::from),
         language: Language::Python,
         tags: vec!["python".to_string(), "package".to_string()],
-        owned_files: vec![SeedFile {
-            path: manifest.to_string(),
-            reason: "package manifest".to_string(),
-        }],
+        owned_files,
         context_files,
         tests: Vec::new(),
         test_prefixes: vec!["tests".to_string(), "test".to_string()],
     }])
+}
+
+/// Walk the project's source roots and collect `.py` files (cap 2_000 to keep
+/// the routing-only `feature_files` rows bounded). Honors `.gitignore` and
+/// `[index].exclude_patterns` via `walk_files`. Skips test/fixture files —
+/// those land on the `python-test-suite` feature instead — and generated
+/// stubs (`*_pb2.py`, `*.gen.py`).
+fn python_project_source_files(ctx: &MapperContext) -> Vec<String> {
+    const CAP: usize = 2_000;
+    let root = ctx.root;
+    let scan_dirs: Vec<&str> = ["src", "lib"]
+        .into_iter()
+        .filter(|d| is_safe_dir(root, &root.join(d)))
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let consider = |rel: String, out: &mut Vec<String>, seen: &mut BTreeSet<String>| {
+        if !rel.ends_with(".py") {
+            return false;
+        }
+        if is_pytest_file(&rel) {
+            return false;
+        }
+        if rel.ends_with("_pb2.py") || rel.ends_with(".gen.py") {
+            return false;
+        }
+        if !seen.insert(rel.clone()) {
+            return false;
+        }
+        out.push(rel);
+        out.len() >= CAP
+    };
+    if scan_dirs.is_empty() {
+        // Project keeps its source at the repo root (no `src/` layout).
+        // Walk the whole root, bounded.
+        for rel in walk_files(root, root, 10_000, ctx.excludes) {
+            if consider(rel, &mut out, &mut seen) {
+                break;
+            }
+        }
+    } else {
+        for dir in scan_dirs {
+            let abs = root.join(dir);
+            let mut hit_cap = false;
+            for rel in walk_files(root, &abs, 5_000, ctx.excludes) {
+                if consider(rel, &mut out, &mut seen) {
+                    hit_cap = true;
+                    break;
+                }
+            }
+            if hit_cap {
+                break;
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 fn pyproject_project_name(pyproject: Option<&str>) -> Option<String> {
@@ -549,7 +625,6 @@ fn is_pytest_file(rel: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -1009,6 +1084,41 @@ acme = "acme.cli:main"
             s.summary.contains("poetry run pytest"),
             "summary should include the inferred test command: {}",
             s.summary
+        );
+    }
+
+    #[test]
+    fn python_project_seed_owns_source_files_for_routing() {
+        // Regression: `find_feature("src/acme/foo.py")` had no chance
+        // because the project seed only persisted the manifest. Walking the
+        // source root and attaching the .py files lets the storage exact-
+        // match query (`feature_files.path = ?1`) resolve any project file.
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname = \"acme\"\n");
+        write(dir.path(), "src/acme/__init__.py", "");
+        write(dir.path(), "src/acme/foo.py", "def foo(): pass\n");
+        write(dir.path(), "src/acme/bar.py", "def bar(): pass\n");
+        // Test files belong on the python-test-suite seed, not the project
+        // seed; verify they don't bleed in.
+        write(dir.path(), "tests/test_foo.py", "def test_foo(): pass\n");
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "python-project")
+            .expect("python-project seed");
+        let owned_paths: std::collections::BTreeSet<&str> =
+            s.owned_files.iter().map(|f| f.path.as_str()).collect();
+        assert!(
+            owned_paths.contains("src/acme/foo.py"),
+            "src/acme/foo.py must be in owned_files for routing, got {owned_paths:?}"
+        );
+        assert!(owned_paths.contains("src/acme/bar.py"));
+        assert!(owned_paths.contains("pyproject.toml"));
+        assert!(
+            !owned_paths.contains("tests/test_foo.py"),
+            "test files must NOT be on the project seed: got {owned_paths:?}"
         );
     }
 }

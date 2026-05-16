@@ -1162,9 +1162,9 @@ mod tests {
 
     #[test]
     fn truncate_array_shrinks_oversized_first_content_field() {
-        // Regression for CR-020: when the first item has a `content: String`
-        // that alone exceeds budget, shrink_content_field must trim it
-        // instead of letting the whole 50KB blob through verbatim.
+        // Regression: when the first item has a `content: String` that
+        // alone exceeds budget, shrink_content_field must trim it instead
+        // of letting the whole 50KB blob through verbatim.
         let huge = json!({"file_path": "src/big.rs", "content": fat_string(50_000)});
         let kept = truncate_array(vec![huge], 4_000);
         assert_eq!(kept.len(), 1);

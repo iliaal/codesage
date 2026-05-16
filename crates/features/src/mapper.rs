@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn rust_bin_under_exclude_is_dropped() {
-        // CR-001 reproduction: a `src/bin/<name>.rs` that matches
+        // Regression: a `src/bin/<name>.rs` that matches
         // `[index].exclude_patterns` must not produce a cargo-bin
         // feature, otherwise the row references a path the structural
         // indexer ignored.
@@ -383,8 +383,8 @@ mod tests {
 
     #[test]
     fn rust_integration_test_under_exclude_is_dropped() {
-        // CR-001: integration tests under `tests/` must respect
-        // `**/tests/**` excludes.
+        // Integration tests under `tests/` must respect `**/tests/**`
+        // excludes.
         let dir = tempdir().unwrap();
         let root = dir.path();
         write(
@@ -405,8 +405,8 @@ mod tests {
 
     #[test]
     fn cmake_target_under_exclude_is_dropped() {
-        // CR-001 reproduction: a CMake target whose entry resolves to an
-        // excluded path must not emit a feature.
+        // Regression: a CMake target whose entry resolves to an excluded
+        // path must not emit a feature.
         let dir = tempdir().unwrap();
         let root = dir.path();
         write(
@@ -432,10 +432,9 @@ mod tests {
 
     #[test]
     fn cmake_owned_files_under_exclude_are_dropped() {
-        // CR-001: even if the target's entry is allowed, sources listed
-        // under `add_executable(target src1 src2)` that are themselves
-        // excluded must not show up as owned/context refs on the
-        // emitted feature.
+        // Even if the target's entry is allowed, sources listed under
+        // `add_executable(target src1 src2)` that are themselves excluded
+        // must not show up as owned/context refs on the emitted feature.
         let dir = tempdir().unwrap();
         let root = dir.path();
         write(
