@@ -24,23 +24,30 @@ impl FeatureMapper for PhpMapper {
     fn map(&self, ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
         let root = ctx.root;
         let mut seeds: Vec<FeatureSeed> = Vec::new();
-        if let Some(composer) = read_composer(root) {
-            seeds.extend(composer_seeds(root, &composer));
+        let composer = read_composer(root);
+        if let Some(c) = &composer {
+            seeds.extend(composer_seeds(root, c));
+            seeds.extend(composer_script_seeds(c));
         }
         seeds.extend(php_src_extensions(root)?);
         seeds.extend(php_extension_at_root(root)?);
         let routes = parse_laravel_routes(root)?;
         seeds.extend(laravel_route_seeds(&routes));
-        // Laravel application-layer slices: controllers (resolved back to
-        // their routes via the parsed route table), form requests, Artisan
-        // commands. These add coarser feature_ids than the
-        // route-per-registration shape so agents can ask "what slice owns
-        // app/Http/Controllers/UserController.php?" without paging through
-        // every route registration.
+        // Laravel application-layer slices: controllers + the expanded
+        // surface from clawpatch PR #5. These add coarser feature_ids
+        // than per-route registrations so agents can ask
+        // "what slice owns app/Jobs/SendInvoice.php?" cleanly.
         if is_laravel_project(root) {
+            seeds.extend(laravel_project_seed(root, composer.as_ref())?);
             seeds.extend(laravel_controllers(root, &routes)?);
             seeds.extend(laravel_form_requests(root)?);
             seeds.extend(laravel_artisan_commands(root)?);
+            seeds.extend(laravel_jobs(root)?);
+            seeds.extend(laravel_services(root)?);
+            seeds.extend(laravel_models(root)?);
+            seeds.extend(laravel_migrations(root)?);
+            seeds.extend(laravel_seeders(root)?);
+            seeds.extend(laravel_test_suites(root)?);
         }
         // Apply project excludes uniformly on the way out so framework
         // detectors don't need to thread `ctx` through every helper.
@@ -857,6 +864,378 @@ fn laravel_artisan_commands(root: &Path) -> Result<Vec<FeatureSeed>> {
     Ok(out)
 }
 
+/// Composer `scripts` entries — `composer test`, `composer setup`, etc.
+/// Mirrors the npm-script slice on the JS side. We only emit a slice
+/// for the script names clawpatch promotes (the ones an agent would
+/// run during review/fix) plus any `deploy*` entries. Skipping unknown
+/// scripts keeps `list_features` clean — Composer projects routinely
+/// ship a dozen one-off pipeline scripts that aren't agent-actionable.
+fn composer_script_seeds(composer: &Value) -> Vec<FeatureSeed> {
+    let mut out = Vec::new();
+    let Some(scripts) = composer.get("scripts").and_then(|v| v.as_object()) else {
+        return out;
+    };
+    let allow = [
+        "setup",
+        "dev",
+        "test",
+        "typecheck",
+        "lint",
+        "format",
+        "analyse",
+        "analyze",
+    ];
+    for (name, val) in scripts {
+        if !allow.contains(&name.as_str()) && !name.starts_with("deploy") {
+            continue;
+        }
+        let command = match val {
+            Value::String(s) => s.clone(),
+            Value::Array(arr) => arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(" && "),
+            _ => continue,
+        };
+        let kind = if name == "test" {
+            FeatureKind::TestSuite
+        } else {
+            FeatureKind::CliCommand
+        };
+        let tests = if name == "test" {
+            vec![SeedTest {
+                path: "composer.json".to_string(),
+                command: Some("composer test".to_string()),
+            }]
+        } else {
+            Vec::new()
+        };
+        out.push(FeatureSeed {
+            title: format!("Composer script `{name}`"),
+            summary: format!("Composer script '{name}': {command}"),
+            kind,
+            source: "composer-script",
+            confidence: FeatureConfidence::Medium,
+            entry_path: "composer.json".to_string(),
+            entry_symbol: Some(name.clone()),
+            entry_route: None,
+            entry_command: Some(name.clone()),
+            test_command: None,
+            language: Language::Php,
+            tags: vec![
+                "php".to_string(),
+                "composer".to_string(),
+                "script".to_string(),
+            ],
+            owned_files: vec![SeedFile {
+                path: "composer.json".to_string(),
+                reason: "composer script".to_string(),
+            }],
+            context_files: Vec::new(),
+            tests,
+            test_prefixes: Vec::new(),
+        });
+    }
+    out
+}
+
+/// Laravel project metadata slice. Single `service` feature that
+/// bundles composer.json + artisan + bootstrap/app.php + key config
+/// files into one anchor — so `find_feature("composer.json")` resolves
+/// to the project rather than only to the more-specific composer-bin
+/// or composer-psr4 seeds.
+fn laravel_project_seed(root: &Path, composer: Option<&Value>) -> Result<Vec<FeatureSeed>> {
+    let mut owned: Vec<SeedFile> = Vec::new();
+    for (name, reason) in [
+        ("composer.json", "Laravel project metadata"),
+        ("composer.lock", "Laravel project metadata"),
+        ("artisan", "Artisan entrypoint"),
+        ("bootstrap/app.php", "application bootstrap"),
+    ] {
+        if is_safe_file(root, &root.join(name)) {
+            owned.push(SeedFile {
+                path: name.to_string(),
+                reason: reason.to_string(),
+            });
+        }
+    }
+    if owned.is_empty() {
+        return Ok(Vec::new());
+    }
+    let project_name = composer
+        .and_then(|c| c.get("name").and_then(|n| n.as_str()))
+        .and_then(|s| s.split('/').next_back().map(|s| s.to_string()))
+        .unwrap_or_else(|| {
+            root.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("laravel-app")
+                .to_string()
+        });
+    let mut context = Vec::new();
+    for (name, reason) in [
+        ("phpunit.xml", "Laravel test configuration"),
+        (".env.example", "environment contract"),
+        ("config/app.php", "application config"),
+        ("config/database.php", "database config"),
+        ("routes/web.php", "HTTP routes"),
+        ("routes/api.php", "API routes"),
+        ("routes/console.php", "scheduled commands"),
+    ] {
+        if is_safe_file(root, &root.join(name)) {
+            context.push(SeedFile {
+                path: name.to_string(),
+                reason: reason.to_string(),
+            });
+        }
+    }
+    let entry_path = owned[0].path.clone();
+    Ok(vec![FeatureSeed {
+        title: format!("Laravel project `{project_name}`"),
+        summary: format!(
+            "Laravel project metadata in {}",
+            owned
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        kind: FeatureKind::Service,
+        source: "laravel-project",
+        confidence: FeatureConfidence::High,
+        entry_path,
+        entry_symbol: Some(project_name),
+        entry_route: None,
+        entry_command: None,
+        test_command: None,
+        language: Language::Php,
+        tags: vec![
+            "php".to_string(),
+            "framework:laravel".to_string(),
+            "project".to_string(),
+        ],
+        owned_files: owned,
+        context_files: context,
+        tests: Vec::new(),
+        test_prefixes: vec!["tests".to_string()],
+    }])
+}
+
+/// Common shape used by Jobs / Services / Models. Each `.php` file in
+/// the directory becomes a separate feature whose `entry_symbol` is the
+/// PHP class short name. Source + kind + tags + summary template are
+/// passed in so the three callers stay parameter-driven instead of
+/// duplicating 30-line emit blocks.
+fn laravel_class_dir_seeds(
+    root: &Path,
+    dir: &str,
+    source: &'static str,
+    kind: FeatureKind,
+    title_prefix: &str,
+    summary_prefix: &str,
+    tags: &[&str],
+) -> Result<Vec<FeatureSeed>> {
+    let base = root.join(dir);
+    if !is_safe_dir(root, &base) {
+        return Ok(Vec::new());
+    }
+    let files = walk_php_files(root, &base, 1000);
+    let mut out = Vec::with_capacity(files.len());
+    for rel in files {
+        let class_short = rel
+            .rsplit('/')
+            .next()
+            .and_then(|f| f.strip_suffix(".php"))
+            .unwrap_or("Class")
+            .to_string();
+        out.push(FeatureSeed {
+            title: format!("{title_prefix} `{class_short}`"),
+            summary: format!("{summary_prefix} {class_short} in {rel}"),
+            kind,
+            source,
+            confidence: FeatureConfidence::Medium,
+            entry_path: rel.clone(),
+            entry_symbol: Some(class_short),
+            entry_route: None,
+            entry_command: None,
+            test_command: None,
+            language: Language::Php,
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+            owned_files: vec![SeedFile {
+                path: rel,
+                reason: title_prefix.to_lowercase(),
+            }],
+            context_files: Vec::new(),
+            tests: Vec::new(),
+            test_prefixes: vec!["tests/Feature".to_string(), "tests/Unit".to_string()],
+        });
+    }
+    Ok(out)
+}
+
+fn laravel_jobs(root: &Path) -> Result<Vec<FeatureSeed>> {
+    laravel_class_dir_seeds(
+        root,
+        "app/Jobs",
+        "laravel-job",
+        FeatureKind::Job,
+        "Laravel job",
+        "Laravel queueable job",
+        &["php", "framework:laravel", "job", "async"],
+    )
+}
+
+fn laravel_services(root: &Path) -> Result<Vec<FeatureSeed>> {
+    laravel_class_dir_seeds(
+        root,
+        "app/Services",
+        "laravel-service",
+        FeatureKind::Service,
+        "Laravel service",
+        "Laravel application service",
+        &["php", "framework:laravel", "service"],
+    )
+}
+
+fn laravel_models(root: &Path) -> Result<Vec<FeatureSeed>> {
+    laravel_class_dir_seeds(
+        root,
+        "app/Models",
+        "laravel-model",
+        FeatureKind::Service,
+        "Laravel model",
+        "Laravel Eloquent model",
+        &["php", "framework:laravel", "model", "eloquent", "database"],
+    )
+}
+
+/// Grouped seed for `database/migrations/**/*.php`. Migrations rarely
+/// stand alone — agents reason about "the migration set" as a whole.
+/// One Config feature anchored on the directory keeps `list_features`
+/// clean.
+fn laravel_migrations(root: &Path) -> Result<Vec<FeatureSeed>> {
+    laravel_grouped_dir_seed(
+        root,
+        "database/migrations",
+        "laravel-migration",
+        "Laravel migrations",
+        "schema migration",
+        &[
+            "php",
+            "framework:laravel",
+            "migration",
+            "database",
+            "schema",
+        ],
+    )
+}
+
+fn laravel_seeders(root: &Path) -> Result<Vec<FeatureSeed>> {
+    laravel_grouped_dir_seed(
+        root,
+        "database/seeders",
+        "laravel-seeder",
+        "Laravel seeders",
+        "database seeder",
+        &["php", "framework:laravel", "seeder", "database"],
+    )
+}
+
+fn laravel_grouped_dir_seed(
+    root: &Path,
+    dir: &str,
+    source: &'static str,
+    title: &str,
+    file_reason: &str,
+    tags: &[&str],
+) -> Result<Vec<FeatureSeed>> {
+    let base = root.join(dir);
+    if !is_safe_dir(root, &base) {
+        return Ok(Vec::new());
+    }
+    let files = walk_php_files(root, &base, 500);
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let owned_files: Vec<SeedFile> = files
+        .iter()
+        .take(50)
+        .map(|p| SeedFile {
+            path: p.clone(),
+            reason: file_reason.to_string(),
+        })
+        .collect();
+    Ok(vec![FeatureSeed {
+        title: format!("{title} (`{dir}`)"),
+        summary: format!("{title} grouped from {dir} ({} files)", files.len()),
+        kind: FeatureKind::Config,
+        source,
+        confidence: FeatureConfidence::Medium,
+        entry_path: dir.to_string(),
+        entry_symbol: Some(dir.to_string()),
+        entry_route: None,
+        entry_command: None,
+        test_command: None,
+        language: Language::Php,
+        tags: tags.iter().map(|s| s.to_string()).collect(),
+        owned_files,
+        context_files: Vec::new(),
+        tests: Vec::new(),
+        test_prefixes: Vec::new(),
+    }])
+}
+
+/// PHPUnit / Pest test-suite slices for `tests/Unit`, `tests/Feature`,
+/// `tests/Integration`, `tests/Browser`. One slice per directory that
+/// actually exists. Matches the Laravel convention so an agent can ask
+/// "what tests exist for the Feature suite?" without grep.
+fn laravel_test_suites(root: &Path) -> Result<Vec<FeatureSeed>> {
+    let mut out = Vec::new();
+    for suite in ["Unit", "Feature", "Integration", "Browser"] {
+        let rel = format!("tests/{suite}");
+        let base = root.join(&rel);
+        if !is_safe_dir(root, &base) {
+            continue;
+        }
+        let files = walk_php_files(root, &base, 500);
+        if files.is_empty() {
+            continue;
+        }
+        let owned_files: Vec<SeedFile> = files
+            .iter()
+            .take(50)
+            .map(|p| SeedFile {
+                path: p.clone(),
+                reason: "test file".to_string(),
+            })
+            .collect();
+        out.push(FeatureSeed {
+            title: format!("Laravel {suite} tests"),
+            summary: format!("PHPUnit / Pest {suite} suite ({} files)", files.len()),
+            kind: FeatureKind::TestSuite,
+            source: "laravel-test-suite",
+            confidence: FeatureConfidence::High,
+            entry_path: rel.clone(),
+            entry_symbol: Some(format!("tests/{suite}")),
+            entry_route: None,
+            entry_command: None,
+            test_command: Some("composer test".to_string()),
+            language: Language::Php,
+            tags: vec![
+                "php".to_string(),
+                "framework:laravel".to_string(),
+                "test-suite".to_string(),
+                suite.to_lowercase(),
+            ],
+            owned_files,
+            context_files: Vec::new(),
+            tests: Vec::new(),
+            test_prefixes: Vec::new(),
+        });
+    }
+    Ok(out)
+}
+
 fn php_declared_class_fqcn(source: &str) -> Option<String> {
     let namespace_re = Regex::new(r"(?m)^\s*namespace\s+([A-Za-z_\\][A-Za-z0-9_\\]*)\s*;").ok()?;
     let class_re =
@@ -1294,5 +1673,188 @@ class SyncUsers extends Command {
             .map(|s| s.entry_path.as_str())
             .collect();
         assert_eq!(module_entries, vec!["acme_real.c"]);
+    }
+
+    // ---------- Laravel slice expansion (clawpatch PR #5) ----------
+
+    fn laravel_composer() -> &'static str {
+        r#"{"name":"acme/app","require":{"laravel/framework":"^11.0"},"scripts":{"test":"phpunit","lint":"phpcs","deploy-prod":"deploy.sh","unknown":"x"}}"#
+    }
+
+    #[test]
+    fn composer_scripts_emit_allowlisted_only() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "composer.json", laravel_composer());
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let scripts: Vec<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "composer-script")
+            .filter_map(|s| s.entry_command.as_deref())
+            .collect();
+        assert!(scripts.contains(&"test"), "test missing in {scripts:?}");
+        assert!(scripts.contains(&"lint"), "lint missing");
+        assert!(
+            scripts.contains(&"deploy-prod"),
+            "deploy-prod missing (deploy* prefix)"
+        );
+        assert!(
+            !scripts.contains(&"unknown"),
+            "non-allowlisted 'unknown' leaked"
+        );
+        // The `test` script gets TestSuite kind, not CliCommand.
+        let test_seed = seeds
+            .iter()
+            .find(|s| s.source == "composer-script" && s.entry_command.as_deref() == Some("test"))
+            .unwrap();
+        assert_eq!(test_seed.kind, FeatureKind::TestSuite);
+    }
+
+    #[test]
+    fn laravel_project_seed_emits_for_laravel_app() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "composer.json", laravel_composer());
+        write(dir.path(), "artisan", "#!/usr/bin/env php\n");
+        write(dir.path(), "bootstrap/app.php", "<?php return null;");
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "laravel-project")
+            .expect("laravel-project seed");
+        assert_eq!(s.kind, FeatureKind::Service);
+        let owned_paths: std::collections::BTreeSet<&str> =
+            s.owned_files.iter().map(|f| f.path.as_str()).collect();
+        assert!(owned_paths.contains("composer.json"));
+        assert!(owned_paths.contains("artisan"));
+        assert!(owned_paths.contains("bootstrap/app.php"));
+        assert_eq!(s.entry_symbol.as_deref(), Some("app"));
+    }
+
+    #[test]
+    fn laravel_jobs_models_services_emit_per_class() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "composer.json", laravel_composer());
+        write(dir.path(), "artisan", "");
+        write(
+            dir.path(),
+            "app/Jobs/SendInvoice.php",
+            "<?php namespace App\\Jobs; class SendInvoice {}",
+        );
+        write(
+            dir.path(),
+            "app/Services/Billing.php",
+            "<?php namespace App\\Services; class Billing {}",
+        );
+        write(
+            dir.path(),
+            "app/Models/User.php",
+            "<?php namespace App\\Models; class User extends \\Illuminate\\Database\\Eloquent\\Model {}",
+        );
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let by_source: std::collections::BTreeMap<&str, &FeatureSeed> = seeds
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.source,
+                    "laravel-job" | "laravel-service" | "laravel-model"
+                )
+            })
+            .map(|s| (s.source, s))
+            .collect();
+        let job = by_source.get("laravel-job").expect("job seed");
+        assert_eq!(job.kind, FeatureKind::Job);
+        assert_eq!(job.entry_symbol.as_deref(), Some("SendInvoice"));
+        let svc = by_source.get("laravel-service").expect("service seed");
+        assert_eq!(svc.entry_symbol.as_deref(), Some("Billing"));
+        let model = by_source.get("laravel-model").expect("model seed");
+        assert_eq!(model.entry_symbol.as_deref(), Some("User"));
+    }
+
+    #[test]
+    fn laravel_migrations_grouped_into_one_config_seed() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "composer.json", laravel_composer());
+        write(dir.path(), "artisan", "");
+        write(
+            dir.path(),
+            "database/migrations/2024_01_01_create_users.php",
+            "<?php return new class {};",
+        );
+        write(
+            dir.path(),
+            "database/migrations/2024_01_02_add_email.php",
+            "<?php return new class {};",
+        );
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let mig: Vec<&FeatureSeed> = seeds
+            .iter()
+            .filter(|s| s.source == "laravel-migration")
+            .collect();
+        assert_eq!(
+            mig.len(),
+            1,
+            "expected one grouped migration seed, got {}",
+            mig.len()
+        );
+        assert_eq!(mig[0].kind, FeatureKind::Config);
+        assert_eq!(mig[0].owned_files.len(), 2);
+    }
+
+    #[test]
+    fn laravel_test_suites_per_directory() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "composer.json", laravel_composer());
+        write(dir.path(), "artisan", "");
+        write(
+            dir.path(),
+            "tests/Unit/UserTest.php",
+            "<?php class UserTest {}",
+        );
+        write(
+            dir.path(),
+            "tests/Feature/AuthTest.php",
+            "<?php class AuthTest {}",
+        );
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let suites: std::collections::BTreeSet<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "laravel-test-suite")
+            .map(|s| s.entry_path.as_str())
+            .collect();
+        assert!(suites.contains("tests/Unit"));
+        assert!(suites.contains("tests/Feature"));
+        for s in seeds.iter().filter(|s| s.source == "laravel-test-suite") {
+            assert_eq!(s.kind, FeatureKind::TestSuite);
+            assert_eq!(s.test_command.as_deref(), Some("composer test"));
+        }
+    }
+
+    #[test]
+    fn non_laravel_project_skips_application_layer_seeds() {
+        // Pure Composer package (no laravel/framework dep, no artisan
+        // file) must not emit laravel-project / -job / -service / etc.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "composer.json",
+            r#"{"name":"acme/pkg","autoload":{"psr-4":{"Acme\\":"src/"}}}"#,
+        );
+        write(dir.path(), "src/Foo.php", "<?php class Foo {}");
+        // Even with an app/Jobs directory present, no jobs should emit.
+        write(dir.path(), "app/Jobs/Sneaky.php", "<?php class Sneaky {}");
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        for src in [
+            "laravel-project",
+            "laravel-job",
+            "laravel-service",
+            "laravel-model",
+            "laravel-migration",
+            "laravel-seeder",
+            "laravel-test-suite",
+        ] {
+            assert!(
+                !seeds.iter().any(|s| s.source == src),
+                "{src} leaked into non-Laravel project"
+            );
+        }
     }
 }
