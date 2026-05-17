@@ -114,6 +114,10 @@ fn java_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
         1..=3 => Some(ReferenceKind::Instantiation), // object_creation_expression
         4..=9 => Some(ReferenceKind::Inheritance),   // extends / implements
         10 | 11 => Some(ReferenceKind::Import),      // import_declaration
+        // Annotation usages (`@Override`, `@Test(...)`, `@pkg.Foo`). Filed as
+        // Call to match Python decorator handling — agents querying
+        // `find_references("Test", kind="call")` get the decoration sites.
+        12..=15 => Some(ReferenceKind::Call),
         _ => None,
     }
 }

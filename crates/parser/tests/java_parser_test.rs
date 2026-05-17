@@ -102,6 +102,44 @@ fn java_enum_and_record_symbols_and_references() {
 }
 
 #[test]
+fn java_annotations_and_annotation_type_and_multi_declarator_fields() {
+    // Three gaps the first slice missed:
+    //   1. Annotation usages (`@Override`, `@Test`, `@Component(...)`) carry
+    //      type references that `find_references` should surface — Spring /
+    //      JUnit / JPA routing depends on this.
+    //   2. `@interface` declarations (`annotation_type_declaration`) should
+    //      produce an Interface symbol, same as a plain `interface`.
+    //   3. Multi-declarator fields (`String x, y, z;`) should emit one symbol
+    //      per declarator, not just the first.
+    let syms = symbols_for("annotations_and_fields.java");
+
+    // @interface MyMarker -> Interface
+    assert!(has_symbol(&syms, "MyMarker", SymbolKind::Interface));
+    // Annotation-type elements (`String value() default "x";`) are a distinct
+    // grammar node (`annotation_type_element_declaration`) and intentionally
+    // not captured — they're rarely the target of a cross-file lookup. Follow-
+    // on PRs can add the pattern if real usage shows a need.
+    // The class itself
+    assert!(has_symbol(&syms, "AnnotatedService", SymbolKind::Class));
+    // All three declarators of `String firstName, lastName, email;`
+    assert!(has_symbol(&syms, "firstName", SymbolKind::Constant));
+    assert!(has_symbol(&syms, "lastName", SymbolKind::Constant));
+    assert!(has_symbol(&syms, "email", SymbolKind::Constant));
+    // Method on the class
+    assert!(has_symbol(&syms, "run", SymbolKind::Method));
+
+    let refs = references_for("annotations_and_fields.java");
+
+    // Annotation usages — both `marker_annotation` (no args) and `annotation`
+    // (with args) shapes should surface as Call-kind references.
+    assert!(has_ref(&refs, "FunctionalInterface", ReferenceKind::Call));
+    assert!(has_ref(&refs, "Component", ReferenceKind::Call));
+    assert!(has_ref(&refs, "Deprecated", ReferenceKind::Call));
+    assert!(has_ref(&refs, "Override", ReferenceKind::Call));
+    assert!(has_ref(&refs, "Test", ReferenceKind::Call));
+}
+
+#[test]
 fn java_nested_types_are_captured() {
     let syms = symbols_for("nested_types.java");
     assert_eq!(syms.len(), 11);

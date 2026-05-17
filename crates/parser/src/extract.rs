@@ -135,8 +135,9 @@ fn java_kind_map(pattern_index: usize) -> Option<SymbolKind> {
         2 => Some(SymbolKind::Enum),
         3 => Some(SymbolKind::Class), // record
         4 => Some(SymbolKind::Method),
-        5 => Some(SymbolKind::Method),   // constructor
-        6 => Some(SymbolKind::Constant), // field
+        5 => Some(SymbolKind::Method),    // constructor
+        6 => Some(SymbolKind::Constant),  // field
+        7 => Some(SymbolKind::Interface), // @interface (annotation type)
         _ => None,
     }
 }
@@ -244,7 +245,16 @@ pub fn extract_symbols(
         let name_node = name_cap.node;
         let def_node = def_cap.node;
 
-        let def_id = (def_node.start_byte(), def_node.end_byte());
+        // Dedup key includes the name node so multi-declarator field
+        // declarations (`String x, y, z;` in Java; the same shape exists in
+        // C/C++) emit one symbol per name. Without the name in the key, the
+        // first declarator wins and the rest are silently dropped because
+        // tree-sitter produces N matches all sharing the same def_node.
+        let def_id = (
+            def_node.start_byte(),
+            def_node.end_byte(),
+            name_node.start_byte(),
+        );
         if !seen_defs.insert(def_id) {
             continue;
         }

@@ -54,3 +54,26 @@
 ; Pattern 11: import Type -> Import
 (import_declaration
   (identifier) @ref)
+
+; Pattern 12: @Override -> annotation type usage (Call). Bare marker form
+; (no arguments). Spring/JUnit/JPA route off these — `find_references` on
+; the annotation type needs to surface decoration sites.
+(marker_annotation
+  name: (identifier) @ref)
+
+; Pattern 13: @Test(timeout = 1000) -> annotation type usage (Call). With-args
+; form. Same intent as pattern 12.
+(annotation
+  name: (identifier) @ref)
+
+; Pattern 14: @pkg.Foo (qualified annotation name) -> Call. The scoped form
+; surfaces the final identifier so `find_references("Foo")` matches whether
+; the user wrote `@Foo` or `@pkg.Foo`.
+(marker_annotation
+  name: (scoped_identifier
+    name: (identifier) @ref))
+
+; Pattern 15: @pkg.Foo(...) qualified form with args.
+(annotation
+  name: (scoped_identifier
+    name: (identifier) @ref))
