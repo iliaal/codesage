@@ -1,3 +1,4 @@
+mod daemon;
 mod doctor;
 mod drift;
 mod lockfile;
@@ -142,7 +143,20 @@ enum Commands {
     /// Show project index status
     Status,
     /// Run MCP server on stdio
-    Mcp,
+    Mcp {
+        /// Run the MCP server directly in this process instead of using the shared daemon
+        #[arg(long)]
+        direct: bool,
+        /// Override the daemon runtime directory
+        #[arg(long, hide = true)]
+        runtime_dir: Option<PathBuf>,
+    },
+    /// Run the shared MCP daemon on a Unix socket
+    Daemon {
+        /// Override the daemon runtime directory
+        #[arg(long, hide = true)]
+        runtime_dir: Option<PathBuf>,
+    },
     /// Install git hooks for automatic reindexing
     InstallHooks,
     /// Drop orphaned model-specific vec tables (keeps only the active model)
@@ -522,7 +536,11 @@ fn run(cli: Cli) -> Result<()> {
             format,
         } => cmd_export(&target, symbol, limit, callers, callees, &format),
         Commands::Status => cmd_status(),
-        Commands::Mcp => cmd_mcp(),
+        Commands::Mcp {
+            direct,
+            runtime_dir,
+        } => cmd_mcp(direct, runtime_dir),
+        Commands::Daemon { runtime_dir } => cmd_daemon(runtime_dir),
         Commands::InstallHooks => cmd_install_hooks(),
         Commands::Cleanup { dry_run } => cmd_cleanup(dry_run),
         Commands::Doctor { json } => doctor::run(json),
@@ -565,9 +583,18 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn cmd_mcp() -> Result<()> {
+fn cmd_mcp(direct: bool, runtime_dir: Option<PathBuf>) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(mcp::run_mcp_server())
+    if direct {
+        rt.block_on(mcp::run_mcp_server())
+    } else {
+        rt.block_on(daemon::run_mcp_shim(runtime_dir))
+    }
+}
+
+fn cmd_daemon(runtime_dir: Option<PathBuf>) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(daemon::run_daemon(runtime_dir))
 }
 
 fn cmd_install_hooks() -> Result<()> {

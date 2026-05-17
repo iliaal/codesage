@@ -23,7 +23,7 @@ use parking_lot::Mutex;
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, tool::schema_for_type, wrapper::Parameters},
-    model::{CallToolResult, Content, ServerInfo},
+    model::{CallToolResult, Content, Implementation, ServerInfo},
     schemars, tool, tool_handler, tool_router,
 };
 
@@ -264,10 +264,24 @@ struct ProjectState {
     embedding_config: EmbeddingConfig,
 }
 
-pub struct CodeSageServer {
+pub(crate) struct CodeSageServerState {
     projects: Mutex<HashMap<PathBuf, ProjectState>>,
     embedders: Mutex<HashMap<String, Arc<Mutex<Embedder>>>>,
     rerankers: Mutex<HashMap<String, Arc<Mutex<Reranker>>>>,
+}
+
+impl CodeSageServerState {
+    pub(crate) fn new() -> Self {
+        Self {
+            projects: Mutex::new(HashMap::new()),
+            embedders: Mutex::new(HashMap::new()),
+            rerankers: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+pub struct CodeSageServer {
+    state: Arc<CodeSageServerState>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -285,10 +299,12 @@ impl Default for CodeSageServer {
 
 impl CodeSageServer {
     pub fn new() -> Self {
+        Self::with_state(Arc::new(CodeSageServerState::new()))
+    }
+
+    pub(crate) fn with_state(state: Arc<CodeSageServerState>) -> Self {
         Self {
-            projects: Mutex::new(HashMap::new()),
-            embedders: Mutex::new(HashMap::new()),
-            rerankers: Mutex::new(HashMap::new()),
+            state,
             tool_router: Self::tool_router(),
         }
     }
@@ -305,7 +321,7 @@ impl CodeSageServer {
             .canonicalize()
             .map_err(|e| anyhow::anyhow!("project path `{}` does not exist: {}", project, e))?;
         {
-            let guard = self.projects.lock();
+            let guard = self.state.projects.lock();
             if let Some(state) = guard.get(&canonical) {
                 return Ok(state.clone());
             }
@@ -326,7 +342,7 @@ impl CodeSageServer {
             embedding_config,
         };
         let newly_registered = {
-            let mut guard = self.projects.lock();
+            let mut guard = self.state.projects.lock();
             if guard.contains_key(&canonical) {
                 false
             } else {
@@ -347,7 +363,7 @@ impl CodeSageServer {
     fn get_or_load_embedder(&self, config: &EmbeddingConfig) -> Result<Arc<Mutex<Embedder>>> {
         let key = format!("{}|{}", config.model, config.device);
         {
-            let guard = self.embedders.lock();
+            let guard = self.state.embedders.lock();
             if let Some(arc) = guard.get(&key) {
                 return Ok(arc.clone());
             }
@@ -359,7 +375,7 @@ impl CodeSageServer {
             )
         })?;
         let arc = Arc::new(Mutex::new(embedder));
-        let mut guard = self.embedders.lock();
+        let mut guard = self.state.embedders.lock();
         Ok(guard.entry(key).or_insert(arc).clone())
     }
 
@@ -370,7 +386,7 @@ impl CodeSageServer {
     ) -> Result<Arc<Mutex<Reranker>>> {
         let key = format!("{}|{}", reranker_model, device);
         {
-            let guard = self.rerankers.lock();
+            let guard = self.state.rerankers.lock();
             if let Some(arc) = guard.get(&key) {
                 return Ok(arc.clone());
             }
@@ -379,7 +395,7 @@ impl CodeSageServer {
             format!("loading reranker model '{reranker_model}' on device '{device}'")
         })?;
         let arc = Arc::new(Mutex::new(reranker));
-        let mut guard = self.rerankers.lock();
+        let mut guard = self.state.rerankers.lock();
         Ok(guard.entry(key).or_insert(arc).clone())
     }
 
@@ -668,15 +684,17 @@ fn load_embedding_config(path: &Path) -> EmbeddingConfig {
 impl ServerHandler for CodeSageServer {
     fn get_info(&self) -> ServerInfo {
         use rmcp::model::ServerCapabilities;
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Structural and semantic code intelligence across multiple projects. \
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("codesage", env!("CARGO_PKG_VERSION")))
+            .with_instructions(
+                "Structural and semantic code intelligence across multiple projects. \
                  Every tool requires an absolute `project` path pointing at an onboarded \
                  CodeSage project (one containing .codesage/index.db). \
                  Use find_symbol to locate definitions, find_references to trace callers \
                  and imports, list_dependencies for file-level dependency mapping, search \
                  for natural-language semantic code search, impact_analysis to estimate \
                  blast radius of a change, and export_context to bundle code for an LLM.",
-        )
+            )
     }
 }
 
@@ -1256,6 +1274,15 @@ mod tests {
         let path = write_tmp("no-embedding", "[project]\nname = \"foo\"\n");
         let config = load_embedding_config(&path);
         assert_eq!(config.model, EmbeddingConfig::default().model);
+    }
+
+    #[test]
+    fn server_instances_can_share_cache_state() {
+        let state = Arc::new(CodeSageServerState::new());
+        let first = CodeSageServer::with_state(state.clone());
+        let second = CodeSageServer::with_state(state.clone());
+
+        assert!(Arc::ptr_eq(&first.state, &second.state));
     }
 
     #[test]
