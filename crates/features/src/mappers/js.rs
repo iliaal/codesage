@@ -1383,11 +1383,7 @@ fn extract_route_tag_bodies(source: &str) -> Vec<String> {
         while j < bytes.len() {
             match bytes[j] {
                 b'{' => depth += 1,
-                b'}' => {
-                    if depth > 0 {
-                        depth -= 1;
-                    }
-                }
+                b'}' if depth > 0 => depth -= 1,
                 b'>' if depth == 0 => break,
                 _ => {}
             }
