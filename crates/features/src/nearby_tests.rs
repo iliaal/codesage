@@ -15,6 +15,7 @@
 //! - JS / TS: sibling `*.{test,spec}.{ts,tsx,js,jsx}` and `__tests__/*`.
 //! - Go: `*_test.go` in the same directory.
 //! - C / C++: `tests/<stem>.c` or `tests/<stem>_test.c` (best-effort).
+//! - Java: `*Test.java` / `*Tests.java` siblings and standard `src/test/` paths.
 
 use crate::mappers::types::FeatureSeed;
 use codesage_protocol::Language;
@@ -93,6 +94,7 @@ fn file_relates_to(seed: &FeatureSeed, stem: &str, dir: &str, candidate: &str) -
         Language::Php => &["tests", "test"],
         Language::Python => &["tests", "test"],
         Language::Go => &[],
+        Language::Java => &["src/test", "test", "tests"],
         Language::JavaScript | Language::TypeScript => &["__tests__", "tests"],
         Language::C | Language::Cpp => &["tests", "test"],
     };
@@ -125,6 +127,7 @@ fn matches_language(path: &str, language: Language) -> bool {
         Language::Php => path.ends_with(".php") || path.ends_with(".phpt"),
         Language::Python => path.ends_with(".py"),
         Language::Go => path.ends_with(".go"),
+        Language::Java => path.ends_with(".java"),
         Language::JavaScript => {
             path.ends_with(".js") || path.ends_with(".jsx") || path.ends_with(".mjs")
         }
@@ -162,6 +165,14 @@ fn is_test_file(path: &str, language: Language) -> bool {
                 || path.contains("/tests/")
         }
         Language::Go => path.ends_with("_test.go"),
+        Language::Java => {
+            path.ends_with("Test.java")
+                || path.ends_with("Tests.java")
+                || path.starts_with("src/test/")
+                || path.contains("/src/test/")
+                || path.starts_with("test/")
+                || path.starts_with("tests/")
+        }
         Language::JavaScript | Language::TypeScript => {
             path.ends_with(".test.ts")
                 || path.ends_with(".test.tsx")

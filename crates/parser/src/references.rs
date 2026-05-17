@@ -9,6 +9,7 @@ static PHP_REF_QUERY: &str = include_str!("queries/php_refs.scm");
 static PYTHON_REF_QUERY: &str = include_str!("queries/python_refs.scm");
 static C_REF_QUERY: &str = include_str!("queries/c_refs.scm");
 static CPP_REF_QUERY: &str = include_str!("queries/cpp_refs.scm");
+static JAVA_REF_QUERY: &str = include_str!("queries/java_refs.scm");
 static RUST_REF_QUERY: &str = include_str!("queries/rust_refs.scm");
 static JS_REF_QUERY: &str = include_str!("queries/javascript_refs.scm");
 static TS_REF_QUERY: &str = include_str!("queries/typescript_refs.scm");
@@ -37,6 +38,8 @@ static C_REF: LazyLock<RefQuerySpec> =
     LazyLock::new(|| compile_ref_query(tree_sitter_c::LANGUAGE.into(), C_REF_QUERY));
 static CPP_REF: LazyLock<RefQuerySpec> =
     LazyLock::new(|| compile_ref_query(tree_sitter_cpp::LANGUAGE.into(), CPP_REF_QUERY));
+static JAVA_REF: LazyLock<RefQuerySpec> =
+    LazyLock::new(|| compile_ref_query(tree_sitter_java::LANGUAGE.into(), JAVA_REF_QUERY));
 static RUST_REF: LazyLock<RefQuerySpec> =
     LazyLock::new(|| compile_ref_query(tree_sitter_rust::LANGUAGE.into(), RUST_REF_QUERY));
 static JS_REF: LazyLock<RefQuerySpec> =
@@ -52,6 +55,7 @@ fn ref_query_for(lang: Language) -> &'static RefQuerySpec {
         Language::Python => &PY_REF,
         Language::C => &C_REF,
         Language::Cpp => &CPP_REF,
+        Language::Java => &JAVA_REF,
         Language::Rust => &RUST_REF,
         Language::JavaScript => &JS_REF,
         Language::TypeScript => &TS_REF,
@@ -104,6 +108,16 @@ fn cpp_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
     }
 }
 
+fn java_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
+    match pattern_index {
+        0 => Some(ReferenceKind::Call),              // method_invocation
+        1..=3 => Some(ReferenceKind::Instantiation), // object_creation_expression
+        4..=9 => Some(ReferenceKind::Inheritance),   // extends / implements
+        10 | 11 => Some(ReferenceKind::Import),      // import_declaration
+        _ => None,
+    }
+}
+
 fn rust_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
     match pattern_index {
         0 | 1 => Some(ReferenceKind::Import), // use_declaration
@@ -142,6 +156,7 @@ pub fn extract_references(
         Language::Python => python_ref_kind,
         Language::C => c_ref_kind,
         Language::Cpp => cpp_ref_kind,
+        Language::Java => java_ref_kind,
         Language::Rust => rust_ref_kind,
         Language::JavaScript => js_ref_kind,
         Language::TypeScript => js_ref_kind, // same ref structure

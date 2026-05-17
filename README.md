@@ -9,7 +9,7 @@
 
 ![CodeSage: structural and semantic code intelligence for AI agents](images/codesage-hero.jpg)
 
-CodeSage is a code intelligence engine for AI coding agents. It combines structural graph queries (symbols, references, dependencies) and semantic search (embedding retrieval with cross-encoder reranking) in a single Rust binary, usable as a CLI or over MCP. Eight languages today (PHP, Python, C, C++, Rust, JavaScript, TypeScript, Go), ~250ms median query latency, ~50K-LoC PHP repos indexed in seconds.
+CodeSage is a code intelligence engine for AI coding agents. It combines structural graph queries (symbols, references, dependencies) and semantic search (embedding retrieval with cross-encoder reranking) in a single Rust binary, usable as a CLI or over MCP. Nine languages today (PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go), ~250ms median query latency, ~50K-LoC PHP repos indexed in seconds.
 
 ## 🔍 What you can do with it
 
@@ -53,7 +53,7 @@ Concrete answers to the questions a code-intelligence tool earns its keep on. Th
 
 ## Supported languages
 
-PHP, Python, C, C++, Rust, JavaScript, TypeScript, Go.
+PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go.
 
 ## Why a single Rust binary
 
@@ -417,7 +417,7 @@ Corpora aren't bundled. Bring your own, or point the plugin at `$CODESAGE_BENCH_
 
 Honest inventory of what CodeSage does not do well, measured on our canary corpora and from 30 days of real Claude Code session logs (the harness in `bench/analyze-codesage-quality.py` produces the same numbers locally).
 
-**Language surface is narrower than competitors'.** Eight languages today (added C++ in 0.4.5). Graphify ships 25, code-review-graph 23, SocratiCode 18+. The gap matters most if your stack is Ruby, Java, Kotlin, Swift, or Scala. Measured cost: on the semble retrieval corpus (1,251 queries × 63 repos × 19 languages), 36% of queries target a language codesage does not parse — zero recall on those. The tree-sitter query files live under `crates/parser/src/queries/` and contributions there are the cleanest way to extend coverage.
+**Language surface is narrower than competitors'.** Nine languages today (Java added after C++ in 0.4.5). Graphify ships 25, code-review-graph 23, SocratiCode 18+. The gap matters most if your stack is Ruby, Kotlin, Swift, or Scala. Measured cost: on the semble retrieval corpus (1,251 queries × 63 repos × 19 languages), 36% of queries target a language codesage does not parse — zero recall on those. The tree-sitter query files live under `crates/parser/src/queries/` and contributions there are the cleanest way to extend coverage.
 
 **Retrieval misses on cross-file refactor queries.** On the ripgrep corpus, 13% of cases miss top-10; four of those six misses are commit subjects like *printer: drop dependency on serde_derive* that describe a rename spanning multiple files without a distinctive literal signal. Single-identifier lookups (`find_symbol`, `find_references`) are reliable. Pure semantic searches (`search`) are reliable. Diffuse multi-file refactor descriptions expressed in prose are the failure mode.
 

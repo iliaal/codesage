@@ -28,6 +28,7 @@ pub fn detect_language_with_dialect(path: &Path, header_is_cpp: bool) -> Option<
         // Unambiguous C++ source / header / module extensions.
         "cpp" | "cc" | "cxx" | "c++" | "cppm" | "ixx" | "hpp" | "hh" | "hxx" | "h++" | "tpp"
         | "ipp" => Some(Language::Cpp),
+        "java" => Some(Language::Java),
         "rs" => Some(Language::Rust),
         "js" | "mjs" | "cjs" | "jsx" => Some(Language::JavaScript),
         "ts" | "tsx" => Some(Language::TypeScript),
@@ -127,6 +128,14 @@ mod tests {
     fn rust_extension() {
         assert_eq!(detect_language(Path::new("lib.rs")), Some(Language::Rust));
         assert_eq!(detect_language(Path::new("main.rs")), Some(Language::Rust));
+    }
+
+    #[test]
+    fn java_extension() {
+        assert_eq!(
+            detect_language(Path::new("Example.java")),
+            Some(Language::Java)
+        );
     }
 
     #[test]

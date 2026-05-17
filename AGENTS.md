@@ -113,7 +113,7 @@ Pre-1.0 rule: minor bumps may include breaking changes, patch bumps are backward
 
 ## Languages
 
-PHP, Python, C, C++, Rust, JavaScript, TypeScript, Go.
+PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go.
 
 `.h` files default to C. The discovery layer auto-flips them to C++ for any project that also contains an unambiguous C++ extension (`.cpp`, `.cc`, `.cxx`, `.hpp`, etc.). `.c` always stays C. No config knob — if you need to override on a project that mixes both styles awkwardly, raise an issue.
 
@@ -195,7 +195,7 @@ Mappers are deterministic (no LLM) and language-local:
 
 Tables (schema migration `0009_feature_tables`): `features`, `feature_files` (per-feature path×role refs), `feature_trust_boundaries` (per-feature boundary set).
 
-Trust-boundary rule tables (`crates/features/src/trust_boundary_rules.rs`) cover all eight supported languages plus Laravel facades. Boundaries are: `network`, `filesystem`, `process-exec`, `secrets`, `database`, `user-input`, `external-api`, `serialization`, `auth`, `concurrency`. Per-file rows live in `file_trust_boundaries` (migration `0008`), with a `boundaries_derived_at` marker (migration `0010`) used by the indexer's targeted backfill to avoid re-running derivation on rule-clean files.
+Trust-boundary rule tables (`crates/features/src/trust_boundary_rules.rs`) cover Rust, PHP, C/C++, Python, Go, JavaScript/TypeScript plus Laravel facades; Java currently parses structurally without dedicated trust-boundary rules. Boundaries are: `network`, `filesystem`, `process-exec`, `secrets`, `database`, `user-input`, `external-api`, `serialization`, `auth`, `concurrency`. Per-file rows live in `file_trust_boundaries` (migration `0008`), with a `boundaries_derived_at` marker (migration `0010`) used by the indexer's targeted backfill to avoid re-running derivation on rule-clean files.
 
 `assess_risk` consumes the per-file rows: `0.10 * min(boundary_count/5, 1.0)` adds to the composite score, capped at 5 boundaries. The `notes[]` line `"crosses N trust boundaries (X, Y, Z) — security review recommended"` fires when ≥3 boundaries are crossed. The signal lands in `RiskAssessment.trust_boundaries: Vec<TrustBoundary>`.
 

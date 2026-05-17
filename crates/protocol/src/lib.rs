@@ -11,6 +11,7 @@ pub enum Language {
     Python,
     C,
     Cpp,
+    Java,
     Rust,
     JavaScript,
     TypeScript,
@@ -24,6 +25,7 @@ impl Language {
             Language::Python => "python",
             Language::C => "c",
             Language::Cpp => "cpp",
+            Language::Java => "java",
             Language::Rust => "rust",
             Language::JavaScript => "javascript",
             Language::TypeScript => "typescript",
@@ -39,6 +41,7 @@ impl Language {
             "python" => Some(Language::Python),
             "c" => Some(Language::C),
             "cpp" | "c++" | "cxx" => Some(Language::Cpp),
+            "java" => Some(Language::Java),
             "rust" => Some(Language::Rust),
             "javascript" | "js" => Some(Language::JavaScript),
             "typescript" | "ts" => Some(Language::TypeScript),
@@ -451,6 +454,8 @@ impl FileCategory {
             || lower.ends_with(".spec.js")
             || lower.ends_with(".spec.jsx")
             || lower.ends_with("test.php")
+            || lower.ends_with("test.java")
+            || lower.ends_with("tests.java")
             || lower.ends_with("_test.py")
             || lower.ends_with("_test.go")
             || lower.ends_with(".phpt")
@@ -1286,6 +1291,10 @@ mod tests {
         );
         assert_eq!(
             FileCategory::classify("pkg/auth_test.py"),
+            FileCategory::Test
+        );
+        assert_eq!(
+            FileCategory::classify("src/test/java/UserServiceTest.java"),
             FileCategory::Test
         );
         assert_eq!(
