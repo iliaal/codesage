@@ -122,13 +122,23 @@ def generate_query(file_path: Path, project_root: Path) -> str | None:
         rel_path=rel, lang=lang_for(file_path.suffix), content=content
     )
 
-    proc = subprocess.run(
-        ["codex", "exec", "--skip-git-repo-check"],
-        input=prompt,
-        text=True,
-        capture_output=True,
-        timeout=180,
-    )
+    try:
+        proc = subprocess.run(
+            ["codex", "exec", "--skip-git-repo-check"],
+            input=prompt,
+            text=True,
+            capture_output=True,
+            timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        # A single hung codex call used to bubble out of the per-file
+        # loop and discard every case produced so far (real-money API
+        # calls). Match the rc!=0 path: log, skip, let the loop keep
+        # writing the YAML at the end. fnd_fe9e8a5a.
+        print("  ! codex exec timed out, skipping", file=sys.stderr)
+        return None
+    except FileNotFoundError:
+        sys.exit("codex binary not on PATH; install codex or rerun without --num-cases > 0")
     if proc.returncode != 0:
         print(f"  ! codex exec rc={proc.returncode}: {proc.stderr.strip()[:200]}",
               file=sys.stderr)

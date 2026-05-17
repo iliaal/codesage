@@ -108,11 +108,25 @@ def is_search_query(text: str) -> bool:
 
 
 def normalize_path(path: str, project_root: str) -> str | None:
-    if path.startswith(project_root):
-        rel = path[len(project_root):].lstrip("/")
-        if rel and not rel.startswith("."):
-            return rel
-    return None
+    # Plain startswith on the raw string lets sibling directories with a
+    # shared prefix slip in (e.g. `<root>-test/foo.py` past `<root>`),
+    # producing malformed leading-separator relative paths that don't
+    # exist under the real project root. Resolve both sides and use
+    # is_relative_to so the comparison is on path segments, not
+    # character offsets. fnd_69176952.
+    try:
+        p = Path(path).expanduser().resolve()
+        root = Path(project_root).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return None
+    try:
+        rel = p.relative_to(root)
+    except ValueError:
+        return None
+    rel_str = rel.as_posix()
+    if not rel_str or rel_str.startswith("."):
+        return None
+    return rel_str
 
 
 def extract_cases(session_dir: Path, project_root: str, min_files: int, max_cases: int) -> list[dict]:

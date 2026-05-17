@@ -498,6 +498,100 @@ fn strip_c_comments_and_strings(input: &str) -> String {
     out
 }
 
+/// Blank out PHP comments (`//`, `#`, `/* */`) but keep string contents
+/// intact. The route regexes need to see the `'/path'` literal verbatim,
+/// so we cannot reuse `strip_c_comments_and_strings` here. State-tracking
+/// strings is still required to avoid mistaking a `//` inside a string
+/// for the start of a comment. Byte offsets are preserved by replacing
+/// every stripped char with a space (newlines stay so line numbers line
+/// up with downstream tools that consume the same offsets).
+fn strip_php_comments_preserving_strings(input: &str) -> String {
+    enum State {
+        Code,
+        LineComment,
+        BlockComment,
+        DoubleString,
+        SingleString,
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut state = State::Code;
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match state {
+            State::Code => match ch {
+                '/' if chars.peek() == Some(&'/') => {
+                    out.push(' ');
+                    chars.next();
+                    out.push(' ');
+                    state = State::LineComment;
+                }
+                '#' if !matches!(chars.peek(), Some(&'[')) => {
+                    // PHP `#` line comment. The `#[Attribute]` syntax is
+                    // attribute-not-comment; preserve it so attributes
+                    // appearing on route definitions still parse.
+                    out.push(' ');
+                    state = State::LineComment;
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    out.push(' ');
+                    chars.next();
+                    out.push(' ');
+                    state = State::BlockComment;
+                }
+                '"' => {
+                    out.push('"');
+                    state = State::DoubleString;
+                }
+                '\'' => {
+                    out.push('\'');
+                    state = State::SingleString;
+                }
+                _ => out.push(ch),
+            },
+            State::LineComment => {
+                if ch == '\n' {
+                    out.push('\n');
+                    state = State::Code;
+                } else {
+                    out.push(' ');
+                }
+            }
+            State::BlockComment => {
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    out.push(' ');
+                    chars.next();
+                    out.push(' ');
+                    state = State::Code;
+                } else {
+                    out.push(if ch == '\n' { '\n' } else { ' ' });
+                }
+            }
+            State::DoubleString => {
+                out.push(ch);
+                if ch == '\\' {
+                    if let Some(next) = chars.next() {
+                        out.push(next);
+                    }
+                } else if ch == '"' {
+                    state = State::Code;
+                }
+            }
+            State::SingleString => {
+                out.push(ch);
+                if ch == '\\' {
+                    if let Some(next) = chars.next() {
+                        out.push(next);
+                    }
+                } else if ch == '\'' {
+                    state = State::Code;
+                }
+            }
+        }
+    }
+    out
+}
+
 fn php_src_api_context(
     root: &Path,
     ext_rel: &str,
@@ -885,6 +979,12 @@ fn parse_laravel_routes(root: &Path) -> Result<Vec<LaravelRoute>> {
         }
         let rel = rel_path(root, &path);
         let raw = fs::read_to_string(&path).unwrap_or_default();
+        // Strip PHP comments before the route regexes so commented-out
+        // `Route::get(...)` lines don't produce phantom feature seeds.
+        // Strings are preserved (route patterns are string literals);
+        // byte offsets are stable so `consumed_spans` cross-pass dedupe
+        // remains valid. fnd_4a2842c3.
+        let scanned = strip_php_comments_preserving_strings(&raw);
         let imports = parse_php_use_imports(&raw);
         let file_prefixes = file_default_route_prefixes(file);
 
@@ -893,7 +993,7 @@ fn parse_laravel_routes(root: &Path) -> Result<Vec<LaravelRoute>> {
         // also remember which byte spans were consumed so the
         // top-level scan in pass 2 doesn't double-emit them.
         let mut consumed_spans: Vec<(usize, usize)> = Vec::new();
-        for cap in controller_group_re.captures_iter(&raw) {
+        for cap in controller_group_re.captures_iter(&scanned) {
             let span = cap.get(0).map(|m| (m.start(), m.end()));
             let outer_chain = cap.get(1).map(|m| m.as_str()).unwrap_or("");
             let raw_class = cap.get(2).map(|m| m.as_str()).unwrap_or("");
@@ -940,7 +1040,7 @@ fn parse_laravel_routes(root: &Path) -> Result<Vec<LaravelRoute>> {
 
         // Pass 2: top-level `Route::<chain>?<verb>('/path' [, X::class])`
         // matches that didn't fall inside a controller-group body.
-        for cap in route_re.captures_iter(&raw) {
+        for cap in route_re.captures_iter(&scanned) {
             if let Some(m) = cap.get(0) {
                 let (start, end) = (m.start(), m.end());
                 if consumed_spans.iter().any(|(s, e)| start >= *s && end <= *e) {
@@ -1861,6 +1961,43 @@ Route::post('/api/login', [LoginController::class, 'store']);
             .collect();
         assert!(routes.iter().any(|r| r.starts_with("GET ")));
         assert!(routes.contains(&"POST /api/login"));
+    }
+
+    #[test]
+    fn laravel_route_ignores_commented_out_routes() {
+        // Regression for fnd_4a2842c3: PHP comments around `Route::*`
+        // calls used to slip through the route regex and produce phantom
+        // laravel-route seeds. Cover `//`, `#`, and `/* */` since all
+        // three are valid PHP comment forms.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "routes/web.php",
+            r#"<?php
+// Route::get('/old-home', fn() => 'home');
+# Route::post('/old-login', [LoginController::class, 'store']);
+/*
+Route::delete('/never', fn() => null);
+*/
+Route::put('/api/profile', [ProfileController::class, 'update']);
+"#,
+        );
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let routes: Vec<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "laravel-route")
+            .filter_map(|s| s.entry_route.as_deref())
+            .collect();
+        assert!(
+            routes.contains(&"PUT /api/profile"),
+            "real route dropped after comment stripping: {routes:?}"
+        );
+        for ghost in ["GET /old-home", "POST /old-login", "DELETE /never"] {
+            assert!(
+                !routes.contains(&ghost),
+                "commented-out route leaked through: {ghost} in {routes:?}"
+            );
+        }
     }
 
     #[test]

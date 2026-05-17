@@ -54,11 +54,24 @@ def backup_db(codesage_dir: Path) -> Path | None:
     # because checkpoints are lazy) were silently dropped on restore.
     # TRUNCATE returns the WAL to zero length so the `.db` snapshot is
     # the entire database state. fnd_9c80fa62.
+    #
+    # Another reader/writer (the per-user codesage daemon, which keeps a
+    # long-lived handle on every routed project's index.db) will cause
+    # the checkpoint to return busy=1 and leave WAL frames behind. Refuse
+    # to proceed in that case — restoring a torn snapshot would re-drop
+    # whatever was supposed to be in those frames. fnd_96b7b163.
     conn = sqlite3.connect(str(src))
     try:
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
     finally:
         conn.close()
+    if row is not None and row[0] != 0:
+        sys.exit(
+            "wal_checkpoint(TRUNCATE) returned busy=1 on "
+            f"{src} — another process holds the database. "
+            "Stop the codesage daemon (`codesage daemon stop`) and any "
+            "running indexer, then re-run this audit."
+        )
     bak = codesage_dir / f"index.db.audit-backup-{int(time.time())}"
     shutil.copy2(src, bak)
     return bak

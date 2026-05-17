@@ -254,11 +254,16 @@ fn daemon_cleans_runtime_files_on_sigterm() {
         .spawn()
         .expect("spawn codesage daemon");
 
-    // Wait for the daemon to bind. Loop on the pid file appearing.
+    // Wait for the daemon to bind. The daemon writes the socket (via
+    // UnixListener::bind) BEFORE writing the pid file, so polling on
+    // the socket alone races: a read_dir scan that lands between the
+    // two operations sees the socket but no pid, exits the loop, and
+    // then `pid_file.expect(...)` panics spuriously. Wait for both.
+    // fnd_84c7bd40.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut socket: Option<PathBuf> = None;
     let mut pid_file: Option<PathBuf> = None;
-    while Instant::now() < deadline && socket.is_none() {
+    while Instant::now() < deadline && (socket.is_none() || pid_file.is_none()) {
         thread::sleep(Duration::from_millis(50));
         for entry in std::fs::read_dir(&runtime_dir)
             .into_iter()

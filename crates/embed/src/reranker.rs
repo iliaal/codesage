@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use ort::session::Session;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokenizers::Tokenizer;
 
 use crate::config::MAX_SEQ_LENGTH;
@@ -11,6 +12,7 @@ pub struct Reranker {
     session: Session,
     tokenizer: Tokenizer,
     has_token_type_ids: bool,
+    shape_logged: AtomicBool,
 }
 
 impl Reranker {
@@ -91,6 +93,7 @@ impl Reranker {
             session,
             tokenizer,
             has_token_type_ids,
+            shape_logged: AtomicBool::new(false),
         })
     }
 
@@ -150,9 +153,76 @@ impl Reranker {
             ])?
         };
 
-        let (_shape, logits) = outputs[0].try_extract_tensor::<f32>()?;
+        let (shape, logits) = outputs[0].try_extract_tensor::<f32>()?;
+        if !self.shape_logged.swap(true, Ordering::Relaxed) {
+            tracing::info!(output_shape = ?&shape[..], "reranker output shape detected");
+        }
+        Ok(extract_relevance_scores(&shape[..], logits, batch_size))
+    }
+}
 
-        let scores: Vec<f32> = (0..batch_size).map(|i| logits[i]).collect();
-        Ok(scores)
+/// Pull one relevance score per query/document pair out of the cross-encoder
+/// output tensor.
+///
+/// Cross-encoders fall into two shapes. `ms-marco-*` regression heads emit
+/// `[batch, 1]` and the single column is the raw relevance score. Two-class
+/// (and occasionally NLI-style three-class) heads emit `[batch, num_labels]`;
+/// the positive-relevant class lives in the last column by convention. The
+/// previous version of this function read `logits[i]` over the flat tensor,
+/// which happens to be correct for `num_labels == 1` and silently scrambles
+/// scores for everything else.
+fn extract_relevance_scores(shape: &[i64], logits: &[f32], batch_size: usize) -> Vec<f32> {
+    let num_labels = shape.last().copied().filter(|n| *n > 0).unwrap_or(1) as usize;
+    if num_labels <= 1 {
+        return (0..batch_size).map(|i| logits[i]).collect();
+    }
+    let mut out = Vec::with_capacity(batch_size);
+    for i in 0..batch_size {
+        let row = &logits[i * num_labels..(i + 1) * num_labels];
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for &x in row {
+            sum += (x - max).exp();
+        }
+        let pos = row[num_labels - 1] - max;
+        out.push(pos.exp() / sum);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_relevance_scores;
+
+    #[test]
+    fn single_label_head_returns_raw_logits() {
+        let logits = vec![0.9, -0.2, 1.3];
+        let scores = extract_relevance_scores(&[3, 1], &logits, 3);
+        assert_eq!(scores, vec![0.9, -0.2, 1.3]);
+    }
+
+    #[test]
+    fn binary_classifier_head_returns_positive_class_softmax() {
+        // Row 0: [neg=2.0, pos=0.0] → very low relevance.
+        // Row 1: [neg=0.0, pos=2.0] → very high relevance.
+        // Previous (buggy) implementation would have returned [2.0, 0.0],
+        // which is row 0's neg logit and row 1's neg logit — both wrong.
+        let logits = vec![2.0, 0.0, 0.0, 2.0];
+        let scores = extract_relevance_scores(&[2, 2], &logits, 2);
+        assert!(scores[0] < 0.15, "expected low pos prob, got {}", scores[0]);
+        assert!(
+            scores[1] > 0.85,
+            "expected high pos prob, got {}",
+            scores[1]
+        );
+    }
+
+    #[test]
+    fn three_class_head_takes_last_column_softmax() {
+        // [contradict=0, neutral=0, entail=3] — the entail column is last by
+        // NLI convention; softmax over the row should dominate.
+        let logits = vec![0.0, 0.0, 3.0];
+        let scores = extract_relevance_scores(&[1, 3], &logits, 1);
+        assert!(scores[0] > 0.85);
     }
 }

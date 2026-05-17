@@ -668,7 +668,14 @@ fn is_test_like_path(rel: &str) -> bool {
 /// equals count) and `# ...` line comments. Order matters: bracket
 /// comments must be detected first so the `#` opener isn't consumed by
 /// the line-comment branch. Newlines inside bracket comments are
-/// preserved as spaces so the line layout isn't compressed.
+/// preserved so the line layout isn't compressed.
+///
+/// The walk is driven by byte indices because the bracket-close marker
+/// (`]=*]`, `\n`, `#`, `[`) is pure ASCII and so can never match inside
+/// a UTF-8 continuation byte (continuation bytes are 0x80..=0xBF). Non-
+/// comment runs are copied through as whole `char`s so multibyte
+/// scalars round-trip — copying byte-by-byte via `b as char` produced
+/// mojibake on any non-ASCII identifier or path in `CMakeLists.txt`.
 fn strip_cmake_comments(body: &str) -> String {
     let bytes = body.as_bytes();
     let mut out = String::with_capacity(bytes.len());
@@ -690,9 +697,6 @@ fn strip_cmake_comments(body: &str) -> String {
                     .windows(close.len())
                     .position(|w| w == close.as_slice())
                 {
-                    // Preserve newlines inside the comment so error
-                    // messages and downstream tools see consistent
-                    // line numbers.
                     for &b in &bytes[i..j + 1 + rel + close.len()] {
                         if b == b'\n' {
                             out.push('\n');
@@ -709,8 +713,13 @@ fn strip_cmake_comments(body: &str) -> String {
             }
             continue;
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        // Copy one Unicode scalar verbatim. For ASCII this is one byte;
+        // for multibyte sequences we slice on the char boundary and
+        // append the full scalar, never `byte as char`.
+        let ch = body[i..].chars().next().expect("byte index inside body");
+        let width = ch.len_utf8();
+        out.push(ch);
+        i += width;
     }
     out
 }
@@ -1136,6 +1145,20 @@ mod tests {
         assert!(
             !seeds.iter().any(|s| s.title == "CMake library `vendored`"),
             "vendored INTERFACE library should drop when its only file is excluded"
+        );
+    }
+
+    #[test]
+    fn strip_cmake_comments_preserves_non_ascii_paths() {
+        // Regression for fnd_2fbb868e: byte-by-byte `b as char` mangled
+        // multibyte UTF-8 source paths into Latin-1 codepoints, so any
+        // CMakeLists.txt with a non-ASCII source path produced mojibake
+        // and the resulting cmake-bin features couldn't be matched back
+        // to the real file.
+        let stripped = super::strip_cmake_comments("add_executable(app src/café.c)\n");
+        assert!(
+            stripped.contains("café"),
+            "non-ASCII path lost UTF-8 round-trip: {stripped:?}"
         );
     }
 }

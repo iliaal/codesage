@@ -113,7 +113,13 @@ def run_task(
         "--max-turns", str(max_turns),
     ]
     if append_system_prompt_file is not None:
-        cmd.extend(["--append-system-prompt-file", str(append_system_prompt_file)])
+        # `claude -p` only exposes `--append-system-prompt <prompt>`. Inline the file's
+        # contents so the harness fails loudly at read time rather than silently when
+        # `claude` rejects an unknown flag and every task records `rc!=0`.
+        cmd.extend([
+            "--append-system-prompt",
+            append_system_prompt_file.read_text(encoding="utf-8"),
+        ])
     t0 = time.time()
     try:
         r = subprocess.run(
@@ -134,6 +140,7 @@ def run_task(
             "grep_count": 0,
             "cost_usd": 0.0,
             "result_text": "",
+            "stderr": "",
         }
     duration = time.time() - t0
 
@@ -163,6 +170,11 @@ def run_task(
     first_tool = tool_uses[0] if tool_uses else None
     codesage_count = sum(1 for t in tool_uses if t.startswith("mcp__codesage__"))
     grep_count = sum(1 for t in tool_uses if t == "Grep")
+    stderr_tail = (r.stderr or "")[-2000:]
+    if r.returncode != 0 and stderr_tail.strip():
+        # Surface the subprocess stderr immediately so a bad flag or auth
+        # failure does not nuke an entire run while looking like "all rc=N".
+        print(f"  ! claude rc={r.returncode}: {stderr_tail.strip()}", file=sys.stderr)
     return {
         "error": None if r.returncode == 0 else f"rc={r.returncode}",
         "duration_s": round(duration, 2),
@@ -173,6 +185,7 @@ def run_task(
         "grep_count": grep_count,
         "cost_usd": cost_usd,
         "result_text": result_text,
+        "stderr": stderr_tail,
     }
 
 

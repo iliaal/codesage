@@ -453,9 +453,14 @@ impl FileCategory {
             || lower.ends_with(".spec.tsx")
             || lower.ends_with(".spec.js")
             || lower.ends_with(".spec.jsx")
-            || lower.ends_with("test.php")
-            || lower.ends_with("test.java")
-            || lower.ends_with("tests.java")
+            // Java / PHPUnit conventions require an uppercase `Test`
+            // boundary (`FooTest.java`, `FooTests.java`, `FooTest.php`).
+            // Matching against the lowercased path here would also catch
+            // unrelated source files like `Latest.java`, `Manifests.java`,
+            // or `latest.php`. fnd_9931a623.
+            || path.ends_with("Test.php")
+            || path.ends_with("Test.java")
+            || path.ends_with("Tests.java")
             || lower.ends_with("_test.py")
             || lower.ends_with("_test.go")
             || lower.ends_with(".phpt")
@@ -522,6 +527,7 @@ fn looks_like_file_target(target: &str) -> bool {
             | "hh"
             | "hpp"
             | "hxx"
+            | "java"
             | "go"
             | "js"
             | "jsx"
@@ -1308,6 +1314,36 @@ mod tests {
     }
 
     #[test]
+    fn file_category_does_not_misclassify_source_files_named_like_tests() {
+        // Regression for fnd_9931a623: the previous Java/PHP arms used
+        // a lowercase-suffix match without a separator, so source files
+        // whose names happen to end in `test.java`/`tests.java`/
+        // `test.php` got classified as tests and dropped from
+        // impact_analysis with source_only=true.
+        assert_eq!(
+            FileCategory::classify("src/main/java/com/acme/Latest.java"),
+            FileCategory::Source
+        );
+        assert_eq!(
+            FileCategory::classify("src/main/java/com/acme/Manifests.java"),
+            FileCategory::Source
+        );
+        assert_eq!(
+            FileCategory::classify("app/Models/Latest.php"),
+            FileCategory::Source
+        );
+        // Sanity: legitimate test conventions still classify as tests.
+        assert_eq!(
+            FileCategory::classify("src/main/java/com/acme/UserServiceTest.java"),
+            FileCategory::Test
+        );
+        assert_eq!(
+            FileCategory::classify("src/main/java/com/acme/UserServiceTests.java"),
+            FileCategory::Test
+        );
+    }
+
+    #[test]
     fn file_category_classifies_configs() {
         assert_eq!(FileCategory::classify("Cargo.toml"), FileCategory::Config);
         assert_eq!(FileCategory::classify(".env"), FileCategory::Config);
@@ -1379,6 +1415,15 @@ mod tests {
         match ImpactTarget::from_hint("Cargo.toml".into(), None) {
             ImpactTarget::File { path } => assert_eq!(path, "Cargo.toml"),
             other => panic!("known file extension must be a file target, got {other:?}"),
+        }
+
+        // Regression for fnd_f736f669: `.java` was missing from the
+        // allow-list after Java was added to `Language`, so bare
+        // `UserService.java` resolved as a symbol name and produced an
+        // empty impact result.
+        match ImpactTarget::from_hint("UserService.java".into(), None) {
+            ImpactTarget::File { path } => assert_eq!(path, "UserService.java"),
+            other => panic!(".java target must be a file target, got {other:?}"),
         }
     }
 
