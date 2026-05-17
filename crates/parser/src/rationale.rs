@@ -58,21 +58,50 @@ pub fn extract_rust_rationale(def_node: &Node, source: &[u8]) -> Vec<RationaleEn
 
 /// Collect Python rationale from line comments immediately above a definition
 /// and from a leading triple-quoted docstring inside the definition body.
+///
+/// Two tree-sitter shapes complicate the walk:
+///   1. **Decorators.** `@foo\ndef bar()` wraps as
+///         decorated_definition
+///           decorator (@foo)
+///           function_definition (bar)
+///      so the rationale comment is a sibling of the wrapper, not of the
+///      inner def. Anchor the walk at the wrapper so `# TODO:` above
+///      `@app.route(...)` / `@property` / `@dataclass` / `@lru_cache` etc.
+///      still attaches — these patterns dominate real Python codebases.
+///   2. **First statement in a class body.** Tree-sitter parks the leading
+///      comment inside a class as a child of `class_definition`, NOT inside
+///      the body `block`. The first method's prev_sibling chain therefore
+///      runs out before reaching the comment. When the anchor is the first
+///      child of a class block, climb to the block and continue the walk
+///      from its prev_siblings inside the class header.
 pub fn extract_python_rationale(def_node: &Node, source: &[u8]) -> Vec<RationaleEntry> {
     let mut entries = Vec::new();
+    let initial_anchor = python_traversal_anchor(def_node);
+    let mut next_start_row = initial_anchor.start_position().row;
 
-    let mut next_start_row = def_node.start_position().row;
-    let mut sib = def_node.prev_sibling();
-    while let Some(node) = sib {
-        if node.kind() != "comment" || node.end_position().row + 1 != next_start_row {
-            break;
-        }
-        if let Some(parsed) = parse_python_comment(&node, source) {
-            entries.push(parsed);
-        }
-        next_start_row = node.start_position().row;
-        sib = node.prev_sibling();
+    let exhausted = walk_python_prev_comments(
+        &initial_anchor,
+        &mut next_start_row,
+        &mut entries,
+        source,
+    );
+
+    // Climb once into the enclosing class header if we ran out of siblings
+    // inside the block without hitting any non-comment node — that's the
+    // "first method in a class" shape where the comment lives at
+    // class_definition level. Restricted to class_definition: climbing
+    // out of a function body would attribute the comment above the outer
+    // function to the inner nested def, which is wrong.
+    if exhausted
+        && let Some(block) = initial_anchor.parent()
+        && block.kind() == "block"
+        && block
+            .parent()
+            .is_some_and(|p| p.kind() == "class_definition")
+    {
+        let _ = walk_python_prev_comments(&block, &mut next_start_row, &mut entries, source);
     }
+
     entries.reverse();
 
     if let Some(parsed) = extract_python_docstring(def_node, source) {
@@ -80,6 +109,49 @@ pub fn extract_python_rationale(def_node: &Node, source: &[u8]) -> Vec<Rationale
     }
 
     entries
+}
+
+/// If `def_node` is a function_definition or class_definition wrapped by
+/// `decorated_definition`, return the wrapper so prev-sibling traversal sees
+/// the comment above the decorators. Otherwise return `def_node`.
+fn python_traversal_anchor<'a>(def_node: &Node<'a>) -> Node<'a> {
+    if let Some(parent) = def_node.parent()
+        && parent.kind() == "decorated_definition"
+    {
+        return parent;
+    }
+    *def_node
+}
+
+/// Walk prev_siblings of `anchor`, attaching adjacent `# MARKER: text`
+/// comments. Skips unnamed tokens (the `:`, `def`, etc.) so they don't
+/// look like break-points. Returns `true` when the sibling chain runs
+/// out cleanly (caller may want to climb); `false` when a non-comment
+/// named node stops the walk (comments past it are definitely not
+/// attached to this def).
+fn walk_python_prev_comments(
+    anchor: &Node,
+    next_start_row: &mut usize,
+    entries: &mut Vec<RationaleEntry>,
+    source: &[u8],
+) -> bool {
+    let mut sib = anchor.prev_sibling();
+    while let Some(node) = sib {
+        if !node.is_named() {
+            sib = node.prev_sibling();
+            continue;
+        }
+        if node.kind() == "comment" && node.end_position().row + 1 == *next_start_row {
+            if let Some(parsed) = parse_python_comment(&node, source) {
+                entries.push(parsed);
+            }
+            *next_start_row = node.start_position().row;
+            sib = node.prev_sibling();
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 /// Strip Rust comment delimiters and any leading `!` (inner doc) so the

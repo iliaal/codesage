@@ -66,3 +66,45 @@ fn ignores_python_non_rationale_comments_and_string_literals() {
             .is_empty()
     );
 }
+
+#[test]
+fn attaches_rationale_above_decorated_python_defs() {
+    // Regression: a rationale comment above a `@decorator`-prefixed def
+    // is a sibling of `decorated_definition`, not of the inner
+    // `function_definition`. Walking prev_sibling from the inner node
+    // hits the `decorator` (non-comment) and breaks before reaching the
+    // comment. This pattern dominates real-world Python (`@app.route`,
+    // `@property`, `@dataclass`, `@lru_cache`, `@staticmethod`) — every
+    // decorated def would silently miss its rationale without the
+    // wrapper-anchored walk.
+    let symbols = python_rationale_symbols();
+
+    let single = symbol(&symbols, "single_decorator_todo");
+    assert_eq!(single.rationale.len(), 1);
+    assert_eq!(single.rationale[0].kind, RationaleKind::Todo);
+    assert_eq!(single.rationale[0].text, "refactor cache key");
+
+    let stacked = symbol(&symbols, "stacked_decorator_fixme");
+    assert_eq!(stacked.rationale.len(), 1);
+    assert_eq!(stacked.rationale[0].kind, RationaleKind::Fixme);
+    assert_eq!(stacked.rationale[0].text, "race on shared state");
+
+    // Decorated methods inside a class body — same wrapper, different
+    // parent (class block instead of module). Verifies the anchor
+    // resolves correctly regardless of containing scope.
+    let cached = symbol(&symbols, "cached_value");
+    assert_eq!(cached.rationale.len(), 1);
+    assert_eq!(cached.rationale[0].kind, RationaleKind::Note);
+    assert_eq!(
+        cached.rationale[0].text,
+        "cached for the lifetime of the instance"
+    );
+
+    let registered = symbol(&symbols, "registered");
+    assert_eq!(registered.rationale.len(), 1);
+    assert_eq!(registered.rationale[0].kind, RationaleKind::Why);
+    assert_eq!(
+        registered.rationale[0].text,
+        "must be a classmethod for the registry"
+    );
+}

@@ -33,3 +33,28 @@ def normal_comment():
 def string_literal_marker():
     s = "# TODO not a comment"
     return s
+
+
+# TODO: refactor cache key
+@some_decorator
+def single_decorator_todo():
+    pass
+
+
+# FIXME: race on shared state
+@first_decorator
+@second_decorator
+def stacked_decorator_fixme():
+    pass
+
+
+class DecoratedMethods:
+    # NOTE: cached for the lifetime of the instance
+    @property
+    def cached_value(self):
+        return 1
+
+    # WHY: must be a classmethod for the registry
+    @classmethod
+    def registered(cls):
+        return cls
