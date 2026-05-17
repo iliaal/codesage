@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Added
+
+- **Node.js server route mapping** (`express-route`, `fastify-route`, `hono-route` seed sources). Ports clawpatch PR #47's deterministic route detection for Express, Fastify, and Hono servers. Two-pass scan per source file: first identify route receivers from local variable declarations matching framework constructors (`const app = express()`, `const router = Router()`, `const router = express.Router()`, `const fastify = Fastify(…)`, `const app = new Hono(…)`); then match `<receiver>.(get|post|put|patch|delete|options|head|all)('/path', handler)` calls against those receivers and emit one `route` feature per match. The walker pre-strips `//` / `/* */` comments and `` ` ` `` template-literal bodies so doc-comment examples and `\`app.get(…)\`` templates don't false-match. Constructor scan additionally blanks regular `"…"` / `'…'` string contents so `"const app = express()"` written inside a string doesn't fabricate a receiver. Gated on the root `package.json` declaring `express`, `fastify`, `hono`, or `@hono/*` in deps/devDeps, so the per-file scan cost stays off non-server JS repos. `entry_route` encodes `"METHOD path"` (matching the existing laravel-route shape) so two methods on the same path don't collapse to a single feature_id. Conservative on purpose: cross-file mount prefixes (Express `app.use('/api', router)`, Fastify `register`, Hono `route`) are NOT resolved — emitting the inferred path would mislead more than it'd inform. Non-literal route paths are skipped. Eight regression tests cover Express direct + Router patterns, Fastify, Hono, comment/string/template false-match avoidance, receiver-must-be-framework-constructor, no-server-dep gate, and test-file exclusion. Smoke-tested on a 3-framework fixture: 6 declared routes → 6 features emitted with correct method+path encoding.
+
 ## [0.7.5] - 2026-05-16
 
 ### Added

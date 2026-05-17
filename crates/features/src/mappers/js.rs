@@ -78,6 +78,13 @@ impl FeatureMapper for JsMapper {
         if pkg_at_root.as_ref().is_some_and(has_react_dependency) {
             seeds.extend(react_router_routes(ctx)?);
         }
+        // Express / Fastify / Hono server routes — gate on root deps
+        // for the same reason as React Router. We accept devDependencies
+        // too because TS-only API servers often pin framework type
+        // packages on the dev side.
+        if pkg_at_root.as_ref().is_some_and(has_node_server_dependency) {
+            seeds.extend(node_server_routes(ctx)?);
+        }
         seeds.retain(|s| ctx.allowed(&s.entry_path));
         Ok(seeds)
     }
@@ -88,6 +95,30 @@ fn has_react_dependency(pkg: &Value) -> bool {
         if let Some(map) = pkg.get(field).and_then(|v| v.as_object())
             && map.contains_key("react")
         {
+            return true;
+        }
+    }
+    false
+}
+
+/// Cheap gate for the node-server-routes walker: only run when the root
+/// package declares Express, Fastify, or Hono in deps or devDeps. Avoids
+/// the per-file scan cost on every non-server JS repo. Includes `@hono/*`
+/// adapter packages because Hono apps often depend only on the adapter
+/// (e.g. `@hono/node-server`) and import `Hono` transitively.
+fn has_node_server_dependency(pkg: &Value) -> bool {
+    let server_deps = [
+        "express",
+        "fastify",
+        "hono",
+        "@hono/node-server",
+        "@hono/zod-validator",
+    ];
+    for field in ["dependencies", "devDependencies"] {
+        let Some(map) = pkg.get(field).and_then(|v| v.as_object()) else {
+            continue;
+        };
+        if server_deps.iter().any(|d| map.contains_key(*d)) {
             return true;
         }
     }
@@ -1138,6 +1169,311 @@ fn react_router_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
     Ok(out)
 }
 
+/// Per-framework label attached to the emitted route seed. Determined
+/// by the constructor that defined the route receiver.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NodeServerFramework {
+    Express,
+    Fastify,
+    Hono,
+}
+
+impl NodeServerFramework {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Express => "framework:express",
+            Self::Fastify => "framework:fastify",
+            Self::Hono => "framework:hono",
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::Express => "Express",
+            Self::Fastify => "Fastify",
+            Self::Hono => "Hono",
+        }
+    }
+    fn source(self) -> &'static str {
+        match self {
+            Self::Express => "express-route",
+            Self::Fastify => "fastify-route",
+            Self::Hono => "hono-route",
+        }
+    }
+}
+
+/// Match `app.get('/path', handler)` / `router.post('/path', handler)` /
+/// `fastify.delete('/path', …)` calls inside Express, Fastify, or Hono
+/// servers. Conservative on purpose: requires the route receiver to be a
+/// local variable initialized from a recognized framework constructor in
+/// the same file, so generic client/helper objects don't pattern-match.
+/// Cross-file mount prefixes (Express `app.use('/api', router)`,
+/// Fastify `register`, Hono `route`) are NOT resolved — emitting the
+/// inferred path would mislead more than it'd inform.
+fn node_server_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
+    let root = ctx.root;
+    let mut out = Vec::new();
+
+    // Constructor patterns. Captures receiver name in group 1, framework
+    // tag derived from which branch matched.
+    let express_ctor = Regex::new(
+        r"(?m)\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:\(\s*\)\s*=>\s*)?(?:new\s+)?(?:express\s*\(\s*\)|express\s*\.\s*Router\s*\(\s*\)|Router\s*\(\s*\))",
+    )?;
+    let fastify_ctor = Regex::new(
+        r"(?mi)\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:await\s+)?Fastify\s*\(",
+    )?;
+    let hono_ctor = Regex::new(
+        r"(?m)\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*new\s+Hono\s*\(",
+    )?;
+
+    // Single root walk avoids the dedup headache of overlapping
+    // prefix scans (`src/` + `.` would otherwise visit the same files
+    // twice).
+    {
+        let files = walk_files(root, root, 10_000, ctx.excludes);
+        for rel in files {
+            if !(rel.ends_with(".ts")
+                || rel.ends_with(".tsx")
+                || rel.ends_with(".mts")
+                || rel.ends_with(".cts")
+                || rel.ends_with(".js")
+                || rel.ends_with(".mjs")
+                || rel.ends_with(".cjs")
+                || rel.ends_with(".jsx"))
+            {
+                continue;
+            }
+            if is_node_test_or_decl(&rel) {
+                continue;
+            }
+            let abs = root.join(&rel);
+            let Ok(raw) = fs::read_to_string(&abs) else {
+                continue;
+            };
+            // Cheap pre-filter: skip the regex/parse cost when none of
+            // the framework names appear at all.
+            if !raw.contains("express")
+                && !raw.contains("Fastify")
+                && !raw.contains("fastify")
+                && !raw.contains("Hono")
+            {
+                continue;
+            }
+            // Two passes: ctor_src has comments + all strings + templates
+            // blanked (constructor regex looks at identifiers only);
+            // route_src has comments + templates blanked but keeps
+            // quoted strings so the path capture still works.
+            let ctor_src = strip_js_comments_strings_and_templates(&raw);
+            let route_src = strip_js_comments_and_templates(&raw);
+            let mut receivers: Vec<(String, NodeServerFramework)> = Vec::new();
+            for cap in express_ctor.captures_iter(&ctor_src) {
+                if let Some(name) = cap.get(1) {
+                    receivers.push((name.as_str().to_string(), NodeServerFramework::Express));
+                }
+            }
+            for cap in fastify_ctor.captures_iter(&ctor_src) {
+                if let Some(name) = cap.get(1) {
+                    receivers.push((name.as_str().to_string(), NodeServerFramework::Fastify));
+                }
+            }
+            for cap in hono_ctor.captures_iter(&ctor_src) {
+                if let Some(name) = cap.get(1) {
+                    receivers.push((name.as_str().to_string(), NodeServerFramework::Hono));
+                }
+            }
+            if receivers.is_empty() {
+                continue;
+            }
+            let mut emitted: BTreeSet<(String, String)> = BTreeSet::new();
+            for (recv, framework) in &receivers {
+                let pattern = format!(
+                    r#"\b{}\s*\.\s*(get|post|put|patch|delete|options|head|all)\s*\(\s*['"]([^'"]+)['"]"#,
+                    regex::escape(recv)
+                );
+                let Ok(re) = Regex::new(&pattern) else {
+                    continue;
+                };
+                for cap in re.captures_iter(&route_src) {
+                    let method = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+                    let path = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+                    if path.is_empty() {
+                        continue;
+                    }
+                    let key = (method.to_uppercase(), path.to_string());
+                    if !emitted.insert(key.clone()) {
+                        continue;
+                    }
+                    let language = language_for_entry(&rel);
+                    // "GET /users" — matches the laravel-route shape so
+                    // two methods on the same path don't collapse to a
+                    // single feature_id (orchestrator keys on entry_route).
+                    let route_label = format!("{} {}", key.0, path);
+                    out.push(FeatureSeed {
+                        title: format!("{} route `{}`", framework.label(), route_label),
+                        summary: format!(
+                            "{} route {} declared in {} (receiver `{}`)",
+                            framework.label(),
+                            route_label,
+                            rel,
+                            recv
+                        ),
+                        kind: FeatureKind::Route,
+                        source: framework.source(),
+                        confidence: FeatureConfidence::High,
+                        entry_path: rel.clone(),
+                        entry_symbol: None,
+                        entry_route: Some(route_label),
+                        entry_command: None,
+                        test_command: None,
+                        language,
+                        tags: vec![
+                            if language == Language::TypeScript {
+                                "typescript"
+                            } else {
+                                "javascript"
+                            }
+                            .to_string(),
+                            framework.tag().to_string(),
+                            "route".to_string(),
+                        ],
+                        owned_files: Vec::new(),
+                        context_files: Vec::new(),
+                        tests: Vec::new(),
+                        test_prefixes: vec!["__tests__".to_string(), "tests".to_string()],
+                    });
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn is_node_test_or_decl(rel: &str) -> bool {
+    let suffixes = [
+        ".test.ts",
+        ".test.tsx",
+        ".test.js",
+        ".test.jsx",
+        ".test.mts",
+        ".test.cts",
+        ".test.mjs",
+        ".test.cjs",
+        ".spec.ts",
+        ".spec.tsx",
+        ".spec.js",
+        ".spec.jsx",
+        ".d.ts",
+    ];
+    suffixes.iter().any(|s| rel.ends_with(s))
+}
+
+/// Blank out the content of `//` / `/* */` comments and `` ` ` ``
+/// template literals, leaving regular `"…"` and `'…'` strings intact.
+/// Used by the route-method scan so the path argument (a quoted string)
+/// is still capturable while a `\`app.get("/x", h)\`` template literal
+/// won't false-match.
+fn strip_js_comments_and_templates(src: &str) -> String {
+    strip_js_impl(src, false)
+}
+
+/// Like [`strip_js_comments_and_templates`] but also blanks `"…"` and
+/// `'…'`. Used by the constructor scan, which is identifier-only and
+/// must not match a `"const app = express()"` string literal.
+fn strip_js_comments_strings_and_templates(src: &str) -> String {
+    strip_js_impl(src, true)
+}
+
+fn strip_js_impl(src: &str, blank_regular_strings: bool) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    // Active quote, and whether its content should be blanked. Regular
+    // `"` / `'` strings always have their delimiters preserved; their
+    // body is blanked only when `blank_regular_strings` is set.
+    let mut quote: Option<(u8, bool)> = None;
+    let mut escape = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some((q, blank)) = quote {
+            if escape {
+                out.push(if blank {
+                    if b == b'\n' { '\n' } else { ' ' }
+                } else {
+                    b as char
+                });
+                escape = false;
+                i += 1;
+                continue;
+            }
+            if b == b'\\' {
+                escape = true;
+                out.push(if blank { ' ' } else { '\\' });
+                i += 1;
+                continue;
+            }
+            if b == q {
+                quote = None;
+                out.push(b as char);
+                i += 1;
+                continue;
+            }
+            out.push(if blank {
+                if b == b'\n' { '\n' } else { ' ' }
+            } else {
+                b as char
+            });
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() {
+            if bytes[i + 1] == b'/' {
+                out.push(' ');
+                out.push(' ');
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    out.push(' ');
+                    i += 1;
+                }
+                continue;
+            }
+            if bytes[i + 1] == b'*' {
+                out.push(' ');
+                out.push(' ');
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    out.push(if bytes[i] == b'\n' { '\n' } else { ' ' });
+                    i += 1;
+                }
+                if i + 1 < bytes.len() {
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                }
+                continue;
+            }
+        }
+        if b == b'`' {
+            // Template literal — always blank, even when keeping
+            // regular strings. Embedded `${ … }` interpolation would
+            // need balanced-brace tracking; for our use the false
+            // negative (lost identifiers inside `${}`) is acceptable.
+            quote = Some((b'`', true));
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            quote = Some((b, blank_regular_strings));
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1645,5 +1981,200 @@ const App = () => (
             "workspace package leaked script seeds: {:?}",
             api_scripts.iter().map(|s| &s.title).collect::<Vec<_>>()
         );
+    }
+
+    // ---------- Node server routes (clawpatch PR #47) ----------
+
+    fn write_pkg_with_dep(dir: &Path, dep: &str) {
+        write(
+            dir,
+            "package.json",
+            &format!(r#"{{"name":"api","dependencies":{{"{dep}":"*"}}}}"#),
+        );
+    }
+
+    #[test]
+    fn express_app_routes_emit_for_get_post_put_patch_delete() {
+        let dir = tempdir().unwrap();
+        write_pkg_with_dep(dir.path(), "express");
+        write(
+            dir.path(),
+            "src/server.ts",
+            r#"
+import express from "express";
+const app = express();
+app.get("/users", (req, res) => res.json([]));
+app.post("/users", (req, res) => res.json({}));
+app.put("/users/:id", (req, res) => res.json({}));
+app.patch("/users/:id", (req, res) => res.json({}));
+app.delete("/users/:id", (req, res) => res.status(204).end());
+"#,
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let routes: BTreeSet<String> = seeds
+            .iter()
+            .filter(|s| s.source == "express-route")
+            .filter_map(|s| s.entry_route.clone())
+            .collect();
+        for expected in [
+            "GET /users",
+            "POST /users",
+            "PUT /users/:id",
+            "PATCH /users/:id",
+            "DELETE /users/:id",
+        ] {
+            assert!(
+                routes.contains(expected),
+                "{expected} missing in {routes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn express_router_receiver_recognized() {
+        let dir = tempdir().unwrap();
+        write_pkg_with_dep(dir.path(), "express");
+        write(
+            dir.path(),
+            "src/routes.ts",
+            r#"
+import { Router } from "express";
+const router = Router();
+router.get("/health", (_, res) => res.send("ok"));
+"#,
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        assert!(seeds.iter().any(
+            |s| s.source == "express-route" && s.entry_route.as_deref() == Some("GET /health")
+        ));
+    }
+
+    #[test]
+    fn fastify_routes_recognized() {
+        let dir = tempdir().unwrap();
+        write_pkg_with_dep(dir.path(), "fastify");
+        write(
+            dir.path(),
+            "src/index.ts",
+            r#"
+import Fastify from "fastify";
+const fastify = Fastify({ logger: true });
+fastify.get("/ping", async () => ({ ok: true }));
+"#,
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        assert!(
+            seeds
+                .iter()
+                .any(|s| s.source == "fastify-route"
+                    && s.entry_route.as_deref() == Some("GET /ping")),
+            "fastify GET /ping missing"
+        );
+    }
+
+    #[test]
+    fn hono_routes_recognized() {
+        let dir = tempdir().unwrap();
+        write_pkg_with_dep(dir.path(), "hono");
+        write(
+            dir.path(),
+            "src/app.ts",
+            r#"
+import { Hono } from "hono";
+const app = new Hono();
+app.get("/", (c) => c.text("hi"));
+app.delete("/items/:id", (c) => c.text("gone"));
+"#,
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let hono: Vec<&FeatureSeed> = seeds.iter().filter(|s| s.source == "hono-route").collect();
+        assert!(
+            hono.iter()
+                .any(|s| s.entry_route.as_deref() == Some("GET /"))
+        );
+        assert!(
+            hono.iter()
+                .any(|s| s.entry_route.as_deref() == Some("DELETE /items/:id"))
+        );
+    }
+
+    #[test]
+    fn route_in_comment_or_string_does_not_match() {
+        let dir = tempdir().unwrap();
+        write_pkg_with_dep(dir.path(), "express");
+        write(
+            dir.path(),
+            "src/server.ts",
+            r#"
+import express from "express";
+const app = express();
+// app.get("/should-not-match", handler)
+const _example = `app.get("/template-literal", handler)`;
+app.get("/real", (_, res) => res.send("ok"));
+"#,
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let routes: Vec<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "express-route")
+            .filter_map(|s| s.entry_route.as_deref())
+            .collect();
+        assert_eq!(routes, vec!["GET /real"], "got: {routes:?}");
+    }
+
+    #[test]
+    fn unrelated_receiver_does_not_emit_routes() {
+        // A `.get()` call on an object that wasn't initialized from a
+        // framework constructor must not be classified as a route.
+        let dir = tempdir().unwrap();
+        write_pkg_with_dep(dir.path(), "express");
+        write(
+            dir.path(),
+            "src/client.ts",
+            r#"
+import axios from "axios";
+const client = axios.create();
+client.get("/api/users");
+"#,
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        assert!(
+            !seeds.iter().any(|s| s.source == "express-route"),
+            "axios .get() must not become an express route"
+        );
+    }
+
+    #[test]
+    fn no_server_dep_skips_scan() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "package.json", r#"{"name":"plain"}"#);
+        write(
+            dir.path(),
+            "src/server.ts",
+            r#"const app = express(); app.get("/x", () => {});"#,
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        assert!(
+            !seeds
+                .iter()
+                .any(|s| matches!(s.source, "express-route" | "fastify-route" | "hono-route"))
+        );
+    }
+
+    #[test]
+    fn test_files_are_skipped() {
+        let dir = tempdir().unwrap();
+        write_pkg_with_dep(dir.path(), "express");
+        write(
+            dir.path(),
+            "src/server.test.ts",
+            r#"
+import express from "express";
+const app = express();
+app.get("/should-not-surface", () => {});
+"#,
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        assert!(!seeds.iter().any(|s| s.source == "express-route"));
     }
 }
