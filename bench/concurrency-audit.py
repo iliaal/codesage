@@ -47,13 +47,20 @@ def backup_db(codesage_dir: Path) -> Path | None:
     src = codesage_dir / "index.db"
     if not src.exists():
         return None
+    # Force WAL → main file before snapshotting. Previously we copied -wal
+    # and -shm siblings under separate audit-backup-* names and the
+    # restore path never read them back — any committed-but-not-yet-
+    # checkpointed transactions (common after a fresh `codesage index`
+    # because checkpoints are lazy) were silently dropped on restore.
+    # TRUNCATE returns the WAL to zero length so the `.db` snapshot is
+    # the entire database state. fnd_9c80fa62.
+    conn = sqlite3.connect(str(src))
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
     bak = codesage_dir / f"index.db.audit-backup-{int(time.time())}"
     shutil.copy2(src, bak)
-    # Also copy WAL/SHM siblings so a restore is fully consistent.
-    for ext in ("-wal", "-shm"):
-        side = codesage_dir / f"index.db{ext}"
-        if side.exists():
-            shutil.copy2(side, codesage_dir / f"index.db{ext}.audit-backup-{int(time.time())}")
     return bak
 
 
@@ -61,7 +68,9 @@ def restore_db(codesage_dir: Path, bak: Path | None) -> None:
     if bak is None:
         return
     src = codesage_dir / "index.db"
-    # Remove WAL/SHM siblings to avoid stale-log confusion after restore.
+    # Remove WAL/SHM siblings so the restored .db (which was checkpointed
+    # to a self-contained state at backup time) isn't shadowed by stale
+    # log frames written during the audit run.
     for ext in ("-wal", "-shm"):
         side = codesage_dir / f"index.db{ext}"
         if side.exists():

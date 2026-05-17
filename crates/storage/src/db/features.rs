@@ -223,8 +223,13 @@ impl Database {
             binds.push(Box::new(l.as_str().to_string()));
         }
         if let Some(t) = tag {
+            // True substring match against the JSON-encoded tags column.
+            // Previously bound `%"{tag}"%`, which only matched the whole
+            // tag string (with quote anchors) — `tag="framework"` would
+            // miss `framework:react-router` even though the doc above
+            // promises "tag substring" semantics.
             sql.push_str(" AND tags LIKE ?");
-            binds.push(Box::new(format!("%\"{t}\"%")));
+            binds.push(Box::new(format!("%{t}%")));
         }
         sql.push_str(" ORDER BY kind, entry_path, feature_id");
         if limit > 0 {

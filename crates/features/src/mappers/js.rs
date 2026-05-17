@@ -85,17 +85,18 @@ impl FeatureMapper for JsMapper {
             seeds.extend(next_app_routes_at(ctx, prefix)?);
             seeds.extend(next_pages_routes_at(ctx, prefix)?);
         }
-        // React Router `<Route path element>` declarations. Only run
-        // when the root package.json declares a react dep — keeps the
-        // tree-walk cost off non-React repos.
-        if pkg_at_root.as_ref().is_some_and(has_react_dependency) {
-            seeds.extend(react_router_routes(ctx)?);
+        // React Router `<Route path element>` declarations. Gate on
+        // *any* discovered package declaring React — a monorepo with
+        // apps/web/package.json declaring react but no root dep would
+        // otherwise miss every React Router slice. Same logic for the
+        // Node-server scanner below.
+        if any_package_has_dep(&packages, pkg_at_root.as_ref(), has_react_dependency) {
+            seeds.extend(react_router_routes(ctx, &packages)?);
         }
-        // Express / Fastify / Hono server routes — gate on root deps
-        // for the same reason as React Router. We accept devDependencies
+        // Express / Fastify / Hono server routes — accept devDependencies
         // too because TS-only API servers often pin framework type
         // packages on the dev side.
-        if pkg_at_root.as_ref().is_some_and(has_node_server_dependency) {
+        if any_package_has_dep(&packages, pkg_at_root.as_ref(), has_node_server_dependency) {
             seeds.extend(node_server_routes(ctx)?);
         }
         // Retag workspace seeds with Turbo-aware test commands when
@@ -109,6 +110,20 @@ impl FeatureMapper for JsMapper {
         seeds.retain(|s| ctx.allowed(&s.entry_path));
         Ok(seeds)
     }
+}
+
+/// True when the predicate fires on the root package OR any discovered
+/// workspace package. Lets the route walkers run for monorepos that put
+/// the framework dep on a workspace member instead of the root.
+fn any_package_has_dep(
+    packages: &[PackageInfo],
+    root_pkg: Option<&Value>,
+    predicate: fn(&Value) -> bool,
+) -> bool {
+    if root_pkg.is_some_and(predicate) {
+        return true;
+    }
+    packages.iter().any(|p| predicate(&p.pkg))
 }
 
 fn has_react_dependency(pkg: &Value) -> bool {
@@ -1222,102 +1237,194 @@ fn ends_with_any(s: &str, suffixes: &[&str]) -> bool {
 /// require parsing TS/JSX imports, and the route declaration is the
 /// most reliable single anchor for "what handles /users?" agent
 /// questions.
-fn react_router_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
+fn react_router_routes(ctx: &MapperContext, packages: &[PackageInfo]) -> Result<Vec<FeatureSeed>> {
     let root = ctx.root;
     let mut out = Vec::new();
-    // <Route path="..." ... element={<Component
-    let route_re = Regex::new(
-        r#"<Route\s+[^>]*path=(?:["']([^"']+)["'])[^>]*element=\{\s*<([A-Z][A-Za-z0-9_]*)"#,
-    )?;
-    let mut framework_components: std::collections::HashSet<&'static str> =
-        std::collections::HashSet::new();
-    framework_components.insert("Navigate");
-    framework_components.insert("Outlet");
-    framework_components.insert("Fragment");
-    framework_components.insert("Suspense");
+    // Extract `<Route …>` attribute bodies with a `{}`-depth-aware
+    // scanner — a single regex with `[^>]*?` fails on JSX like
+    // `element={<UsersPage />}` because the nested `/>` ends the
+    // capture mid-tag. We then locate `path=` and `element=` in the
+    // body independently, so prop order doesn't matter.
+    let path_attr_re = Regex::new(r#"\bpath\s*=\s*["']([^"']+)["']"#)?;
+    let element_attr_re = Regex::new(r"\belement\s*=\s*\{\s*<([A-Z][A-Za-z0-9_]*)")?;
 
-    for prefix in ["src", "app"] {
-        let scan_dir = root.join(prefix);
+    let framework_components: std::collections::HashSet<&'static str> =
+        ["Navigate", "Outlet", "Fragment", "Suspense"]
+            .into_iter()
+            .collect();
+
+    // Scan src/ and app/ relative to each discovered package root
+    // (including the repo root), so a monorepo with apps/web/src/Routes.tsx
+    // gets covered too.
+    let scan_prefixes: Vec<String> = react_router_scan_roots(packages);
+    for prefix in &scan_prefixes {
+        let scan_dir = if prefix.is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(prefix)
+        };
         if !is_safe_dir(root, &scan_dir) {
             continue;
         }
-        let files = walk_files(root, &scan_dir, 10_000, ctx.excludes);
-        for rel in files {
-            if !(rel.ends_with(".tsx")
-                || rel.ends_with(".ts")
-                || rel.ends_with(".jsx")
-                || rel.ends_with(".js"))
-            {
+        // For each pkg root we scan the package's src/ and app/ subdirs.
+        // For the bare repo root we keep the original behavior (top-level
+        // src/, app/).
+        for subdir in ["src", "app"] {
+            let sub_root = scan_dir.join(subdir);
+            if !is_safe_dir(root, &sub_root) {
                 continue;
             }
-            // Skip test/declaration files — agents asking "what route
-            // handles /users?" want the real declaration site.
-            if rel.ends_with(".test.tsx")
-                || rel.ends_with(".test.ts")
-                || rel.ends_with(".test.jsx")
-                || rel.ends_with(".test.js")
-                || rel.ends_with(".spec.tsx")
-                || rel.ends_with(".spec.ts")
-                || rel.ends_with(".spec.jsx")
-                || rel.ends_with(".spec.js")
-                || rel.ends_with(".d.ts")
-            {
-                continue;
-            }
-            let abs = root.join(&rel);
-            let Ok(raw) = fs::read_to_string(&abs) else {
-                continue;
-            };
-            if !raw.contains("<Route") {
-                continue;
-            }
-            for cap in route_re.captures_iter(&raw) {
-                let path = match cap.get(1).map(|m| m.as_str()) {
-                    Some(p) if !p.is_empty() => p.to_string(),
-                    _ => continue,
-                };
-                let component = cap
-                    .get(2)
-                    .map(|m| m.as_str().to_string())
-                    .unwrap_or_default();
-                if component.is_empty() || framework_components.contains(component.as_str()) {
+            let files = walk_files(root, &sub_root, 10_000, ctx.excludes);
+            for rel in files {
+                if !(rel.ends_with(".tsx")
+                    || rel.ends_with(".ts")
+                    || rel.ends_with(".jsx")
+                    || rel.ends_with(".js"))
+                {
                     continue;
                 }
-                let language = language_for_entry(&rel);
-                out.push(FeatureSeed {
-                    title: format!("React route `{path}`"),
-                    summary: format!(
-                        "React Router route '{path}' rendered by <{component}/> (declared in {rel})"
-                    ),
-                    kind: FeatureKind::Route,
-                    source: "react-router-route",
-                    confidence: FeatureConfidence::High,
-                    entry_path: rel.clone(),
-                    entry_symbol: Some(component),
-                    entry_route: Some(path),
-                    entry_command: None,
-                    test_command: None,
-                    language,
-                    tags: vec![
-                        if language == Language::TypeScript {
-                            "typescript"
-                        } else {
-                            "javascript"
-                        }
-                        .to_string(),
-                        "framework:react-router".to_string(),
-                        "react".to_string(),
-                        "route".to_string(),
-                    ],
-                    owned_files: Vec::new(),
-                    context_files: Vec::new(),
-                    tests: Vec::new(),
-                    test_prefixes: vec!["__tests__".to_string(), "tests".to_string()],
-                });
+                if is_node_test_or_decl(&rel) {
+                    continue;
+                }
+                let abs = root.join(&rel);
+                let Ok(raw) = fs::read_to_string(&abs) else {
+                    continue;
+                };
+                if !raw.contains("<Route") {
+                    continue;
+                }
+                for body in extract_route_tag_bodies(&raw) {
+                    let Some(path_cap) = path_attr_re.captures(&body) else {
+                        continue;
+                    };
+                    let Some(elem_cap) = element_attr_re.captures(&body) else {
+                        continue;
+                    };
+                    let path = path_cap
+                        .get(1)
+                        .map(|m| m.as_str().to_string())
+                        .unwrap_or_default();
+                    let component = elem_cap
+                        .get(1)
+                        .map(|m| m.as_str().to_string())
+                        .unwrap_or_default();
+                    if path.is_empty()
+                        || component.is_empty()
+                        || framework_components.contains(component.as_str())
+                    {
+                        continue;
+                    }
+                    let language = language_for_entry(&rel);
+                    out.push(FeatureSeed {
+                        title: format!("React route `{path}`"),
+                        summary: format!(
+                            "React Router route '{path}' rendered by <{component}/> (declared in {rel})"
+                        ),
+                        kind: FeatureKind::Route,
+                        source: "react-router-route",
+                        confidence: FeatureConfidence::High,
+                        entry_path: rel.clone(),
+                        entry_symbol: Some(component),
+                        entry_route: Some(path),
+                        entry_command: None,
+                        test_command: None,
+                        language,
+                        tags: vec![
+                            if language == Language::TypeScript {
+                                "typescript"
+                            } else {
+                                "javascript"
+                            }
+                            .to_string(),
+                            "framework:react-router".to_string(),
+                            "react".to_string(),
+                            "route".to_string(),
+                        ],
+                        owned_files: Vec::new(),
+                        context_files: Vec::new(),
+                        tests: Vec::new(),
+                        test_prefixes: vec!["__tests__".to_string(), "tests".to_string()],
+                    });
+                }
             }
         }
     }
     Ok(out)
+}
+
+/// Walk `source` and yield the attribute body of each `<Route …>` /
+/// `<Route … />` opening tag. Tracks `{` `}` depth so a nested
+/// `element={<UsersPage />}` doesn't end the tag at the inner `/>`.
+/// All structural delimiters (`<`, `>`, `{`, `}`) are ASCII, so the
+/// byte indexing here is safe on UTF-8 input.
+fn extract_route_tag_bodies(source: &str) -> Vec<String> {
+    let bytes = source.as_bytes();
+    let needle = b"<Route";
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let Some(pos) = bytes[i..].windows(needle.len()).position(|w| w == needle) else {
+            break;
+        };
+        let body_start = i + pos + needle.len();
+        // Require whitespace, `/`, or `>` after `<Route` so we don't
+        // match `<Routes>` or `<RouteSwitch>`.
+        if body_start >= bytes.len() {
+            break;
+        }
+        let next = bytes[body_start];
+        if !(next == b' ' || next == b'\t' || next == b'\n' || next == b'/' || next == b'>') {
+            i = body_start;
+            continue;
+        }
+        // Walk to the closing `>` at depth 0.
+        let mut j = body_start;
+        let mut depth: i32 = 0;
+        while j < bytes.len() {
+            match bytes[j] {
+                b'{' => depth += 1,
+                b'}' => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                }
+                b'>' if depth == 0 => break,
+                _ => {}
+            }
+            j += 1;
+        }
+        if j > body_start
+            && let Ok(body) = std::str::from_utf8(&bytes[body_start..j])
+        {
+            out.push(body.to_string());
+        }
+        i = j.max(body_start + 1);
+    }
+    out
+}
+
+/// Per-package roots to search for React Router declarations. Always
+/// includes the repo root (`""`) so single-app layouts keep working;
+/// adds each non-root workspace package so monorepos with React in
+/// `apps/web` are covered.
+fn react_router_scan_roots(packages: &[PackageInfo]) -> Vec<String> {
+    let mut out: Vec<String> = packages
+        .iter()
+        .map(|p| {
+            if p.is_root() {
+                String::new()
+            } else {
+                p.root_rel.clone()
+            }
+        })
+        .collect();
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    if !out.iter().any(|s| s.is_empty()) {
+        out.push(String::new());
+    }
+    out
 }
 
 /// Per-framework label attached to the emitted route seed. Determined
@@ -1535,94 +1642,101 @@ fn strip_js_comments_strings_and_templates(src: &str) -> String {
 }
 
 fn strip_js_impl(src: &str, blank_regular_strings: bool) -> String {
-    let bytes = src.as_bytes();
-    let mut out = String::with_capacity(bytes.len());
-    let mut i = 0;
+    let mut out = String::with_capacity(src.len());
+    let mut chars = src.chars().peekable();
     // Active quote, and whether its content should be blanked. Regular
     // `"` / `'` strings always have their delimiters preserved; their
     // body is blanked only when `blank_regular_strings` is set.
-    let mut quote: Option<(u8, bool)> = None;
+    let mut quote: Option<(char, bool)> = None;
     let mut escape = false;
-    while i < bytes.len() {
-        let b = bytes[i];
+    while let Some(c) = chars.next() {
         if let Some((q, blank)) = quote {
             if escape {
-                out.push(if blank {
-                    if b == b'\n' { '\n' } else { ' ' }
-                } else {
-                    b as char
-                });
+                out.push(blank_or_keep(c, blank));
                 escape = false;
-                i += 1;
                 continue;
             }
-            if b == b'\\' {
+            if c == '\\' {
                 escape = true;
                 out.push(if blank { ' ' } else { '\\' });
-                i += 1;
                 continue;
             }
-            if b == q {
+            if c == q {
                 quote = None;
-                out.push(b as char);
-                i += 1;
+                out.push(c);
                 continue;
             }
-            out.push(if blank {
-                if b == b'\n' { '\n' } else { ' ' }
-            } else {
-                b as char
-            });
-            i += 1;
+            out.push(blank_or_keep(c, blank));
             continue;
         }
-        if b == b'/' && i + 1 < bytes.len() {
-            if bytes[i + 1] == b'/' {
-                out.push(' ');
-                out.push(' ');
-                i += 2;
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    out.push(' ');
-                    i += 1;
-                }
-                continue;
-            }
-            if bytes[i + 1] == b'*' {
-                out.push(' ');
-                out.push(' ');
-                i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    out.push(if bytes[i] == b'\n' { '\n' } else { ' ' });
-                    i += 1;
-                }
-                if i + 1 < bytes.len() {
+        if c == '/' {
+            match chars.peek() {
+                Some('/') => {
+                    chars.next();
                     out.push(' ');
                     out.push(' ');
-                    i += 2;
+                    while let Some(&nc) = chars.peek() {
+                        if nc == '\n' {
+                            break;
+                        }
+                        out.push(' ');
+                        chars.next();
+                    }
+                    continue;
                 }
-                continue;
+                Some('*') => {
+                    chars.next();
+                    out.push(' ');
+                    out.push(' ');
+                    while let Some(nc) = chars.next() {
+                        if nc == '*' {
+                            if chars.peek() == Some(&'/') {
+                                chars.next();
+                                out.push(' ');
+                                out.push(' ');
+                                break;
+                            }
+                            out.push(' ');
+                        } else if nc == '\n' {
+                            out.push('\n');
+                        } else {
+                            out.push(' ');
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
             }
         }
-        if b == b'`' {
+        if c == '`' {
             // Template literal — always blank, even when keeping
             // regular strings. Embedded `${ … }` interpolation would
             // need balanced-brace tracking; for our use the false
             // negative (lost identifiers inside `${}`) is acceptable.
-            quote = Some((b'`', true));
-            out.push(b as char);
-            i += 1;
+            quote = Some(('`', true));
+            out.push(c);
             continue;
         }
-        if b == b'"' || b == b'\'' {
-            quote = Some((b, blank_regular_strings));
-            out.push(b as char);
-            i += 1;
+        if c == '"' || c == '\'' {
+            quote = Some((c, blank_regular_strings));
+            out.push(c);
             continue;
         }
-        out.push(b as char);
-        i += 1;
+        out.push(c);
     }
     out
+}
+
+/// Inside a blanked region, collapse every char to a space except
+/// newlines (preserved so line counts stay roughly aligned). Outside
+/// a blanked region, copy the char through verbatim — full Unicode
+/// scalar, no byte-level mangling.
+fn blank_or_keep(c: char, blank: bool) -> char {
+    if blank {
+        if c == '\n' { '\n' } else { ' ' }
+    } else {
+        c
+    }
 }
 
 #[cfg(test)]
@@ -2327,6 +2441,145 @@ app.get("/should-not-surface", () => {});
         );
         let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
         assert!(!seeds.iter().any(|s| s.source == "express-route"));
+    }
+
+    #[test]
+    fn react_router_matches_element_before_path() {
+        // Regression: prior regex required path= before element=. JSX
+        // prop order isn't significant; element-first is common.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"app","dependencies":{"react":"^18","react-router-dom":"^6"}}"#,
+        );
+        write(
+            dir.path(),
+            "src/Routes.tsx",
+            r#"
+import { Route } from "react-router-dom";
+export const r = (
+    <>
+        <Route element={<UsersPage />} path="/users" />
+        <Route path="/items" element={<ItemsPage />} />
+    </>
+);
+"#,
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let routes: std::collections::BTreeSet<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "react-router-route")
+            .filter_map(|s| s.entry_route.as_deref())
+            .collect();
+        assert!(
+            routes.contains("/users"),
+            "element-before-path missed: {routes:?}"
+        );
+        assert!(
+            routes.contains("/items"),
+            "path-before-element missed: {routes:?}"
+        );
+    }
+
+    #[test]
+    fn react_router_gates_on_workspace_package_dep() {
+        // Regression: gate previously checked only the root package's
+        // deps. A monorepo declaring react in apps/web/package.json
+        // (not at the root) should still trigger the React Router scan.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"monorepo","workspaces":["apps/*"]}"#,
+        );
+        write(
+            dir.path(),
+            "apps/web/package.json",
+            r#"{"name":"@m/web","dependencies":{"react":"^18","react-router-dom":"^6"}}"#,
+        );
+        write(
+            dir.path(),
+            "apps/web/src/Routes.tsx",
+            r#"
+import { Route } from "react-router-dom";
+export const r = <Route path="/users" element={<UsersPage />} />;
+"#,
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        assert!(
+            seeds
+                .iter()
+                .any(|s| s.source == "react-router-route"
+                    && s.entry_route.as_deref() == Some("/users")),
+            "React Router gate didn't fire for workspace-only react dep"
+        );
+    }
+
+    #[test]
+    fn express_routes_gate_on_workspace_package_dep() {
+        // Regression mirror for Express/Fastify/Hono: workspace-declared
+        // server dep should trigger the route scan even without root
+        // package having it.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"monorepo","workspaces":["apps/*"]}"#,
+        );
+        write(
+            dir.path(),
+            "apps/api/package.json",
+            r#"{"name":"@m/api","dependencies":{"express":"^5"}}"#,
+        );
+        write(
+            dir.path(),
+            "apps/api/src/server.ts",
+            r#"
+import express from "express";
+const app = express();
+app.get("/health", (_, res) => res.send("ok"));
+"#,
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        assert!(
+            seeds
+                .iter()
+                .any(|s| s.source == "express-route"
+                    && s.entry_route.as_deref() == Some("GET /health")),
+            "Express gate didn't fire for workspace-only dep"
+        );
+    }
+
+    #[test]
+    fn route_path_preserves_non_ascii_utf8() {
+        // Regression for fnd_b3a1c4e7: byte-level `b as char` mangled
+        // non-ASCII UTF-8 (`é` C3 A9 → `Ã©` C3 83 C2 A9), corrupting
+        // entry_route values and making find_feature(...) miss them.
+        // Char-based walk should round-trip cleanly.
+        let dir = tempdir().unwrap();
+        write_pkg_with_dep(dir.path(), "express");
+        write(
+            dir.path(),
+            "src/server.ts",
+            "import express from \"express\";\nconst app = express();\n\
+             app.get(\"/héllo\", (_, res) => res.send(\"ok\"));\n\
+             app.get(\"/привет\", (_, res) => res.send(\"ok\"));\n",
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let routes: std::collections::BTreeSet<String> = seeds
+            .iter()
+            .filter(|s| s.source == "express-route")
+            .filter_map(|s| s.entry_route.clone())
+            .collect();
+        assert!(
+            routes.contains("GET /héllo"),
+            "non-ASCII Latin (/héllo) corrupted: {routes:?}"
+        );
+        assert!(
+            routes.contains("GET /привет"),
+            "non-ASCII Cyrillic (/привет) corrupted: {routes:?}"
+        );
     }
 
     // ---------- JS monorepo (clawpatch PRs #4 / #18 / #37) ----------

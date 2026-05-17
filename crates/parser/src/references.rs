@@ -168,25 +168,17 @@ pub fn extract_references(
         };
 
         let ref_node = ref_cap.node;
-        let mut to_name = ref_node.utf8_text(source).unwrap_or("").to_string();
+        let raw = ref_node.utf8_text(source).unwrap_or("");
+        let to_name = strip_surrounding_quotes(raw);
         if to_name.is_empty() {
             continue;
-        }
-        // Strip surrounding quotes from string literals (import sources, require args)
-        if (to_name.starts_with('"') && to_name.ends_with('"'))
-            || (to_name.starts_with('\'') && to_name.ends_with('\''))
-        {
-            to_name = to_name[1..to_name.len() - 1].to_string();
-            if to_name.is_empty() {
-                continue;
-            }
         }
 
         let (row, col) = crate::position::node_start_utf8(&ref_node, source);
         refs.push(Reference {
             from_file: file_path.to_string(),
             from_symbol: None,
-            to_name,
+            to_name: to_name.to_string(),
             kind,
             line: row + 1,
             col,
@@ -194,4 +186,69 @@ pub fn extract_references(
     }
 
     Ok(refs)
+}
+
+/// Strip a single pair of matching surrounding `"` or `'` quotes from a
+/// reference token (import source paths, `require()` arguments). Returns
+/// the inner slice on a match, the original on no match.
+///
+/// Length guard avoids a slice panic on a tree-sitter `(string)` capture
+/// of a single bare quote — possible from malformed/truncated source where
+/// the parser still emits a partial node. Without it,
+/// `s[1..s.len() - 1]` on a 1-byte string panics with
+/// `slice index starts at 1 but ends at 0` and aborts the indexer worker
+/// (fnd_87af7e67).
+fn strip_surrounding_quotes(s: &str) -> &str {
+    if s.len() < 2 {
+        return s;
+    }
+    let bytes = s.as_bytes();
+    let first = bytes[0];
+    let last = bytes[bytes.len() - 1];
+    if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_surrounding_quotes;
+
+    #[test]
+    fn strips_balanced_double_quotes() {
+        assert_eq!(strip_surrounding_quotes("\"foo\""), "foo");
+    }
+
+    #[test]
+    fn strips_balanced_single_quotes() {
+        assert_eq!(strip_surrounding_quotes("'foo'"), "foo");
+    }
+
+    #[test]
+    fn leaves_unquoted_unchanged() {
+        assert_eq!(strip_surrounding_quotes("foo"), "foo");
+    }
+
+    #[test]
+    fn does_not_panic_on_single_bare_quote() {
+        // Regression for fnd_87af7e67: the previous inline `[1..len-1]`
+        // slice panicked on `"\""`, aborting the rayon-parallel indexer
+        // worker for the entire run when tree-sitter emitted a 1-byte
+        // string capture on malformed input.
+        assert_eq!(strip_surrounding_quotes("\""), "\"");
+        assert_eq!(strip_surrounding_quotes("'"), "'");
+    }
+
+    #[test]
+    fn leaves_empty_string_unchanged() {
+        assert_eq!(strip_surrounding_quotes(""), "");
+    }
+
+    #[test]
+    fn leaves_mismatched_quotes_unchanged() {
+        assert_eq!(strip_surrounding_quotes("\"foo'"), "\"foo'");
+        assert_eq!(strip_surrounding_quotes("'foo\""), "'foo\"");
+    }
 }

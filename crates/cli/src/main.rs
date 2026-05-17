@@ -581,23 +581,12 @@ fn cmd_install_hooks() -> Result<()> {
 
     let codesage_bin =
         std::env::current_exe().context("resolving current_exe for git hook body")?;
-    let codesage_path = codesage_bin.display();
+    let codesage_path = codesage_bin.display().to_string();
 
     // Background indexers run niced + ionice'd so they can't soak the foreground.
     // `nice` is portable; `ionice` is Linux-only (util-linux), gated on `command -v`
     // so the hook stays a no-op on macOS / *BSD instead of failing.
-    let hook_body = format!(
-        "#!/bin/sh\n\
-         # installed by codesage install-hooks\n\
-         root=\"$(git rev-parse --show-toplevel 2>/dev/null)\" || exit 0\n\
-         NICE=\"nice -n 19\"\n\
-         IONICE=\"\"\n\
-         command -v ionice >/dev/null 2>&1 && IONICE=\"ionice -c 3\"\n\
-         [ -d \"$root/.codesage\" ] && ( cd \"$root\" && $IONICE $NICE \"{bin}\" index ) >/dev/null 2>&1 &\n\
-         [ -d \"$root/.codesage\" ] && ( cd \"$root\" && $IONICE $NICE \"{bin}\" git-index --incremental ) >/dev/null 2>&1 &\n\
-         exit 0\n",
-        bin = codesage_path,
-    );
+    let hook_body = generate_post_commit_hook_body(&codesage_path);
 
     // post-rewrite fires on amend/rebase. It reshapes history, so the stored last_sha may
     // no longer be an ancestor of HEAD — incremental mode detects this and falls back to
@@ -636,6 +625,32 @@ fn cmd_install_hooks() -> Result<()> {
     install_leak_check_hook(&root, &hooks_dir, is_husky, &mut installed)?;
 
     Ok(())
+}
+
+/// Generate the post-commit/post-merge/post-checkout/post-rewrite hook body
+/// that runs structural+semantic index then git-history index sequentially
+/// in one background subshell. Both subcommands take the same project
+/// lock; if launched in parallel one would silently skip on lock
+/// contention, with no log visibility because stdout/stderr are
+/// redirected to /dev/null. Sequencing makes both passes always run.
+fn generate_post_commit_hook_body(bin: &str) -> String {
+    format!(
+        "#!/bin/sh\n\
+         # installed by codesage install-hooks\n\
+         root=\"$(git rev-parse --show-toplevel 2>/dev/null)\" || exit 0\n\
+         NICE=\"nice -n 19\"\n\
+         IONICE=\"\"\n\
+         command -v ionice >/dev/null 2>&1 && IONICE=\"ionice -c 3\"\n\
+         # Run structural+semantic index then git-history index sequentially\n\
+         # in one background subshell. Both subcommands take the same\n\
+         # project lock and would silently skip on contention if launched in\n\
+         # parallel — losing whichever lost the race, with no log visibility\n\
+         # because stdout/stderr are redirected to /dev/null.\n\
+         [ -d \"$root/.codesage\" ] && ( cd \"$root\" && \\\n\
+           $IONICE $NICE \"{bin}\" index && \\\n\
+           $IONICE $NICE \"{bin}\" git-index --incremental ) >/dev/null 2>&1 &\n\
+         exit 0\n",
+    )
 }
 
 /// Install a pre-commit leak-check hook if the repo ships `scripts/leak-check.sh`.
@@ -2024,6 +2039,50 @@ mod tests {
     fn render_file_tree_empty() {
         let out = render_file_tree(&[]);
         assert!(out.is_empty());
+    }
+
+    // ---------- post-commit hook body contract ----------
+
+    #[test]
+    fn post_commit_hook_runs_index_and_git_index_sequentially() {
+        // Regression for the validated finding "hook race between
+        // index and git-index": prior body launched both subcommands
+        // with `&` in parallel; whichever lost the project-lock race
+        // skipped silently because the hook redirects to /dev/null.
+        // The body must chain them with `&&` inside ONE background
+        // subshell so both passes always run after every commit.
+        let body = generate_post_commit_hook_body("/usr/local/bin/codesage");
+        assert!(
+            body.contains("\"/usr/local/bin/codesage\" index &&"),
+            "expected `index` to be chained with `&&`, got:\n{body}"
+        );
+        assert!(
+            body.contains("\"/usr/local/bin/codesage\" git-index --incremental"),
+            "expected `git-index --incremental` invocation, got:\n{body}"
+        );
+        // Only one background `&` should appear at the top level —
+        // we sequence inside one subshell, then background the whole
+        // group. Two `&` (one per command) would re-introduce the race.
+        let backgrounded_lines: Vec<&str> = body
+            .lines()
+            .filter(|l| l.trim_end().ends_with(" &"))
+            .collect();
+        assert_eq!(
+            backgrounded_lines.len(),
+            1,
+            "expected exactly one background `&` line, got {} lines:\n{}",
+            backgrounded_lines.len(),
+            backgrounded_lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn post_commit_hook_skips_when_no_codesage_dir() {
+        let body = generate_post_commit_hook_body("/x");
+        assert!(
+            body.contains("[ -d \"$root/.codesage\" ]"),
+            "expected guard on .codesage directory presence"
+        );
     }
 
     #[test]
