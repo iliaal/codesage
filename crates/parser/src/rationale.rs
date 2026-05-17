@@ -13,8 +13,8 @@
 //!    parent of the path") are not stored — the agent recovers those from
 //!    the symbol name + signature anyway. See `notes/20260509-...md` §1.2
 //!    for the full reasoning.
-//! 2. **Language-specific by design.** This module starts with Rust only.
-//!    Each language needs a deliberate attachment rule because comment
+//! 2. **Language-specific by design.** This module currently covers Rust and
+//!    Python. Each language needs a deliberate attachment rule because comment
 //!    placement varies (Rust `///` precedes the item, Python docstrings
 //!    live inside the body as the first `(string)` statement, PHP `/** */`
 //!    blocks immediately precede, etc.).
@@ -56,6 +56,32 @@ pub fn extract_rust_rationale(def_node: &Node, source: &[u8]) -> Vec<RationaleEn
     entries
 }
 
+/// Collect Python rationale from line comments immediately above a definition
+/// and from a leading triple-quoted docstring inside the definition body.
+pub fn extract_python_rationale(def_node: &Node, source: &[u8]) -> Vec<RationaleEntry> {
+    let mut entries = Vec::new();
+
+    let mut next_start_row = def_node.start_position().row;
+    let mut sib = def_node.prev_sibling();
+    while let Some(node) = sib {
+        if node.kind() != "comment" || node.end_position().row + 1 != next_start_row {
+            break;
+        }
+        if let Some(parsed) = parse_python_comment(&node, source) {
+            entries.push(parsed);
+        }
+        next_start_row = node.start_position().row;
+        sib = node.prev_sibling();
+    }
+    entries.reverse();
+
+    if let Some(parsed) = extract_python_docstring(def_node, source) {
+        entries.push(parsed);
+    }
+
+    entries
+}
+
 /// Strip Rust comment delimiters and any leading `!` (inner doc) so the
 /// returned text contains only the comment body. `///`, `//!`, `//`, and
 /// `/* ... */` / `/** ... */` are all reduced to their inner content.
@@ -83,6 +109,38 @@ fn strip_rust_comment_markers(raw: &str) -> String {
         return rest.trim().to_string();
     }
     trimmed.to_string()
+}
+
+fn parse_python_comment(node: &Node, source: &[u8]) -> Option<RationaleEntry> {
+    let raw = node.utf8_text(source).ok()?;
+    let body = raw.trim_start().strip_prefix('#')?.trim_start();
+    parse_marker_line(body, node)
+}
+
+fn extract_python_docstring(def_node: &Node, source: &[u8]) -> Option<RationaleEntry> {
+    let body = def_node.child_by_field_name("body")?;
+    let mut cursor = body.walk();
+    let first_stmt = body.named_children(&mut cursor).next()?;
+    if first_stmt.kind() != "expression_statement" {
+        return None;
+    }
+
+    let mut cursor = first_stmt.walk();
+    for child in first_stmt.named_children(&mut cursor) {
+        if child.kind() == "string" {
+            return parse_python_docstring(&child, source);
+        }
+    }
+    None
+}
+
+fn parse_python_docstring(node: &Node, source: &[u8]) -> Option<RationaleEntry> {
+    let raw = node.utf8_text(source).ok()?.trim();
+    let body = raw
+        .strip_prefix("\"\"\"")
+        .and_then(|s| s.strip_suffix("\"\"\""))
+        .or_else(|| raw.strip_prefix("'''").and_then(|s| s.strip_suffix("'''")))?;
+    parse_marker_line(body.trim(), node)
 }
 
 /// Parse a comment body's first line for a `MARKER: rest` pattern. Multi-line
