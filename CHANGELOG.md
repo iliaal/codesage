@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Added
+
+- **Laravel slice expansion** — eight new application-layer surfaces ported from clawpatch PR #5, complementing the existing controller / form-request / Artisan-command coverage. New seed sources: `laravel-project` (composer.json + artisan + bootstrap/app.php as a single `Service` anchor with `framework:laravel` tag, plus phpunit.xml / .env.example / config/app.php / config/database.php / routes/{web,api,console}.php as context_files), `laravel-job` (per-class under `app/Jobs/**`, `FeatureKind::Job`, tagged `job` + `async`), `laravel-service` (`app/Services/**`, `FeatureKind::Service`), `laravel-model` (`app/Models/**`, tagged `eloquent` + `database`), `laravel-migration` (grouped `Config` slice over `database/migrations/**`, owning up to 50 files — migrations rarely make sense one-at-a-time), `laravel-seeder` (same grouped shape for `database/seeders/**`), `laravel-test-suite` (one TestSuite per existing `tests/{Unit,Feature,Integration,Browser}` directory, owning up to 50 files each, `test_command = "composer test"`), and `composer-script` (composer.json `scripts` entries restricted to an allowlist — `setup`, `dev`, `test`, `typecheck`, `lint`, `format`, `analyse`, `analyze`, `deploy*` — to keep `list_features` from filling with one-off pipeline scripts; the `test` script lands as `FeatureKind::TestSuite` with the composer-test command attached). Smoke-tested on a real 1670-file Laravel application: 326 newly-created features atop the existing 182 — 208 services, 94 models, 19 jobs, 2 composer scripts, plus one each of project / migration / seeder. Six new regression tests cover composer-script allowlisting, the project seed shape, per-class job/service/model emission, migration grouping, per-directory test suites, and the non-Laravel-project gate.
+
 ## [0.7.5] - 2026-05-16
 
 ### Added
