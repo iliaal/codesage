@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Fixed
+
+- **Laravel route parser hardening** — four longstanding gaps that left real routes mis-attributed or under-prefixed, ported from clawpatch PR #5's route extractor. (1) **`prefix()` fluent chain expansion.** `Route::prefix('admin')->get('/users', …)` now resolves to `/admin/users`; nested chains like `Route::prefix('a')->prefix('b')->get('/c', …)` resolve to `/a/b/c`. (2) **`routes/api.php` implicit `/api` prefix.** Laravel's default route service provider auto-prefixes API routes; the mapper now applies the same default so the recorded URIs match what the framework actually serves. (3) **`use`-import resolution.** `Route::get('/x', [UserController::class, 'show'])` paired with `use App\Http\Controllers\UserController;` (or an `as Alias` rename) now bridges the route back to the controller file via the fully-qualified class name, instead of failing to match because the route stored only the short class name. (4) **`Route::controller(X::class)->group(fn () => { … })` body expansion.** Inner routes inside a controller-group closure now surface as individual route features attributed to the outer controller, with any outer/inner `prefix()` chains applied. A consumed-spans tracker prevents the same registration from emitting twice (once from the group pass, once from the top-level scan). Internal: `parse_laravel_routes` collapsed from two regexes-plus-by-key-map to one route regex + one controller-group regex; new helpers `parse_php_use_imports`, `resolve_imported_class`, `fluent_route_prefixes`, `file_default_route_prefixes`, `route_uri_with_prefixes`. Six new regression tests cover each pattern, plus alias-form imports. Smoke-tested on a real 1670-file Laravel application: 86 routes now carry the previously-missing `/api/` prefix, 89 routes got new feature_ids (URI changed because prefix expansion or controller-group bridging filled in).
+
 ## [0.7.5] - 2026-05-16
 
 ### Added
