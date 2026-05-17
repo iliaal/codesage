@@ -4,7 +4,7 @@
 //! sibling `*.h` files get pulled into the corresponding library feature
 //! as context.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 
@@ -230,37 +230,87 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
     if cmake_files.is_empty() {
         return Ok(out);
     }
-    let exe_re = Regex::new(r"(?ms)add_executable\s*\(\s*([A-Za-z_][\w\-]*)\s+([^)]*)\)")?;
+    // Case-insensitive (CMake commands are): ADD_EXECUTABLE, Add_Library, etc.
+    // Names allow leading digits and dots (`7zip`, `foo.bar`). Source list is
+    // optional so `add_executable(name)` paired with a later `target_sources()`
+    // call still surfaces as a target.
+    let exe_re =
+        Regex::new(r"(?msi)add_executable\s*\(\s*([A-Za-z0-9_][\w\.\-]*)(?:\s+([^)]*))?\)")?;
     let lib_re = Regex::new(
-        r"(?ms)add_library\s*\(\s*([A-Za-z_][\w\-]*)(?:\s+(?:SHARED|STATIC|MODULE|OBJECT|INTERFACE))?\s+([^)]*)\)",
+        r"(?msi)add_library\s*\(\s*([A-Za-z0-9_][\w\.\-]*)(?:\s+(?:SHARED|STATIC|MODULE|OBJECT|INTERFACE))?(?:\s+([^)]*))?\)",
+    )?;
+    let ts_re = Regex::new(
+        r"(?msi)target_sources\s*\(\s*([A-Za-z0-9_][\w\.\-]*)\s+(?:PRIVATE|PUBLIC|INTERFACE)\s+([^)]*)\)",
     )?;
     for cm in cmake_files {
         let path = root.join(cm);
-        let body = fs::read_to_string(&path).unwrap_or_default();
+        let raw = fs::read_to_string(&path).unwrap_or_default();
+        let body = strip_cmake_comments(&raw);
         let dir = parent_dir(cm);
+
+        // Collect late-bound `target_sources(name PRIVATE|PUBLIC|INTERFACE …)`
+        // additions first so the target loop below can merge them when it
+        // sees the matching `add_executable` / `add_library`.
+        let mut extra_sources: HashMap<String, Vec<String>> = HashMap::new();
+        for cap in ts_re.captures_iter(&body) {
+            let name = cap
+                .get(1)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
+            let srcs = cap
+                .get(2)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
+            extra_sources
+                .entry(name)
+                .or_default()
+                .extend(srcs.split_whitespace().map(|s| s.to_string()));
+        }
+
         for cap in exe_re.captures_iter(&body) {
             let name = cap
                 .get(1)
                 .map(|m| m.as_str().to_string())
                 .unwrap_or_default();
-            let sources_str = cap
-                .get(2)
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
             if !is_valid_target_name(&name) {
                 continue;
             }
-            let sources: Vec<String> = sources_str
-                .split_whitespace()
+            let inline = cap
+                .get(2)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
+            let mut all_sources: Vec<String> =
+                inline.split_whitespace().map(|s| s.to_string()).collect();
+            if let Some(extra) = extra_sources.get(&name) {
+                all_sources.extend(extra.iter().cloned());
+            }
+            // Variable substitution (${VAR}) and absolute paths are not
+            // resolvable without a full CMake interpreter; skip the target
+            // rather than emit a misleading seed.
+            if all_sources.iter().any(|s| is_pathological_source(s)) {
+                continue;
+            }
+            let compilable: Vec<String> = all_sources
+                .iter()
                 .filter(|s| is_c_or_cpp_compilable(s))
-                .map(|s| s.to_string())
+                .cloned()
                 .collect();
-            let entry = pick_entry(root, &dir, &sources, &name).unwrap_or_else(|| cm.to_string());
+            // Header-only executables can't actually link as a binary.
+            // Empty `all_sources` after a sourceless declaration with no
+            // matching target_sources() is treated the same.
+            if compilable.is_empty() {
+                continue;
+            }
+            let entry =
+                pick_entry(root, &dir, &compilable, &name).unwrap_or_else(|| cm.to_string());
             if !ctx.allowed(&entry) {
                 continue;
             }
             let language = lang_for_path(&entry);
-            let owned_files = filter_target_sources(ctx, &dir, &sources);
+            let owned_files = filter_target_sources(ctx, &dir, &all_sources);
+            if owned_files.is_empty() {
+                continue;
+            }
             let context_files = filter_target_context(ctx, cm, "CMake target declaration");
             out.push(FeatureSeed {
                 title: format!("CMake binary `{name}`"),
@@ -294,24 +344,49 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
                 .get(1)
                 .map(|m| m.as_str().to_string())
                 .unwrap_or_default();
-            let sources_str = cap
-                .get(2)
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
             if !is_valid_target_name(&name) {
                 continue;
             }
-            let sources: Vec<String> = sources_str
-                .split_whitespace()
+            let inline = cap
+                .get(2)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
+            let mut all_sources: Vec<String> =
+                inline.split_whitespace().map(|s| s.to_string()).collect();
+            if let Some(extra) = extra_sources.get(&name) {
+                all_sources.extend(extra.iter().cloned());
+            }
+            if all_sources.iter().any(|s| is_pathological_source(s)) {
+                continue;
+            }
+            // Libraries can legitimately be header-only (INTERFACE), so we
+            // accept zero compilable sources — but still require something
+            // in the source list, otherwise the target has no files at all.
+            if all_sources.is_empty() {
+                continue;
+            }
+            let compilable: Vec<String> = all_sources
+                .iter()
                 .filter(|s| is_c_or_cpp_compilable(s))
-                .map(|s| s.to_string())
+                .cloned()
                 .collect();
-            let entry = pick_entry(root, &dir, &sources, &name).unwrap_or_else(|| cm.to_string());
+            let entry_candidates: &[String] = if compilable.is_empty() {
+                &all_sources
+            } else {
+                &compilable
+            };
+            let entry =
+                pick_entry(root, &dir, entry_candidates, &name).unwrap_or_else(|| cm.to_string());
             if !ctx.allowed(&entry) {
                 continue;
             }
             let language = lang_for_path(&entry);
-            let owned_files = filter_target_sources(ctx, &dir, &sources);
+            let owned_files = filter_target_sources(ctx, &dir, &all_sources);
+            // Drop the seed if every source was filtered (e.g., a vendored
+            // INTERFACE library whose only file lives under vendor/).
+            if owned_files.is_empty() {
+                continue;
+            }
             let context_files = filter_target_context(ctx, cm, "CMake target declaration");
             out.push(FeatureSeed {
                 title: format!("CMake library `{name}`"),
@@ -360,6 +435,14 @@ fn main_function_targets(
             continue;
         }
         if !ctx.allowed(rel) {
+            continue;
+        }
+        // Test files routinely define their own `main()` (custom harnesses,
+        // googletest with --gtest_main, etc.). Without this guard the c-main
+        // walker emits `C++ binary foo_test` slices that swamp legitimate
+        // CLIs whenever the project's exclude_patterns don't already cover
+        // tests/.
+        if is_test_like_path(rel) {
             continue;
         }
         let abs = root.join(rel);
@@ -557,6 +640,81 @@ fn is_valid_target_name(s: &str) -> bool {
         && !s.contains('#')
 }
 
+/// Sources that the regex layer can extract but the rest of the mapper
+/// can't safely use: variable substitutions (`${APP_SOURCES}`) and
+/// absolute paths (`/src/main.cpp`). Targets containing either get
+/// skipped entirely — emitting them with the unsubstituted string would
+/// produce phantom `owned_files` entries.
+fn is_pathological_source(s: &str) -> bool {
+    s.contains('$') || s.starts_with('/')
+}
+
+/// Heuristic for "this looks like a test file" used to suppress
+/// `c-main` slices. Conservative on purpose: a test runner's `main()`
+/// is not a CLI worth surfacing, but a binary called `mytool_test`
+/// might be — we accept the rare false negative.
+fn is_test_like_path(rel: &str) -> bool {
+    for seg in rel.split('/') {
+        if matches!(seg, "tests" | "test" | "__tests__" | "Tests") {
+            return true;
+        }
+    }
+    let base = rel.rsplit('/').next().unwrap_or(rel);
+    let stem = base.split('.').next().unwrap_or(base);
+    stem.ends_with("_test") || stem.ends_with("Test")
+}
+
+/// Remove CMake bracket comments (`#[[ ... ]]`, `#[=[ ... ]=]` with any
+/// equals count) and `# ...` line comments. Order matters: bracket
+/// comments must be detected first so the `#` opener isn't consumed by
+/// the line-comment branch. Newlines inside bracket comments are
+/// preserved as spaces so the line layout isn't compressed.
+fn strip_cmake_comments(body: &str) -> String {
+    let bytes = body.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'#' && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            let mut j = i + 2;
+            let mut eq = 0;
+            while j < bytes.len() && bytes[j] == b'=' {
+                eq += 1;
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'[' {
+                let close: Vec<u8> = std::iter::once(b']')
+                    .chain(std::iter::repeat_n(b'=', eq))
+                    .chain(std::iter::once(b']'))
+                    .collect();
+                if let Some(rel) = bytes[j + 1..]
+                    .windows(close.len())
+                    .position(|w| w == close.as_slice())
+                {
+                    // Preserve newlines inside the comment so error
+                    // messages and downstream tools see consistent
+                    // line numbers.
+                    for &b in &bytes[i..j + 1 + rel + close.len()] {
+                        if b == b'\n' {
+                            out.push('\n');
+                        }
+                    }
+                    i = j + 1 + rel + close.len();
+                    continue;
+                }
+            }
+        }
+        if bytes[i] == b'#' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 /// Dedup keyed on `(entry_path, kind)`. First seed wins, so the order
 /// callers extend `seeds` in matters: autotools and CMake run before
 /// main() detection so the higher-confidence build-target seed survives
@@ -738,5 +896,246 @@ mod tests {
             cli_seeds
         );
         assert_eq!(cli_seeds[0].source, "autotools-bin");
+    }
+
+    // ---------- regressions ported from clawpatch PR #26 ----------
+
+    #[test]
+    fn c_main_skips_files_under_tests_directory() {
+        // googletest / catch2 / custom harness test files routinely define
+        // their own `main()`; they must not surface as CLI features.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "tests/myapp_test.cpp",
+            "int main() { return 0; }\n",
+        );
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        assert!(
+            !seeds.iter().any(|s| s.source == "c-main"),
+            "tests/* main() must not become a CLI feature, got: {:#?}",
+            seeds
+        );
+    }
+
+    #[test]
+    fn c_main_skips_underscore_test_suffix() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "src/foo_test.c", "int main() { return 0; }\n");
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        assert!(!seeds.iter().any(|s| s.source == "c-main"));
+    }
+
+    #[test]
+    fn cmake_uppercase_keywords_match() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "CMakeLists.txt",
+            "ADD_EXECUTABLE(upper src/upper.c)\nADD_LIBRARY(upperlib STATIC src/upperlib.c)\n",
+        );
+        write(dir.path(), "src/upper.c", "int main(){return 0;}\n");
+        write(dir.path(), "src/upperlib.c", "int x;\n");
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        assert!(
+            seeds
+                .iter()
+                .any(|s| s.source == "cmake-bin" && s.entry_command.as_deref() == Some("upper")),
+            "uppercase ADD_EXECUTABLE not matched: {:#?}",
+            seeds.iter().map(|s| &s.title).collect::<Vec<_>>()
+        );
+        assert!(seeds.iter().any(|s| s.source == "cmake-lib"));
+    }
+
+    #[test]
+    fn cmake_numeric_prefix_and_dotted_target_names() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "CMakeLists.txt",
+            "add_executable(7zip src/seven.c)\nadd_library(foo.bar STATIC src/dot.c)\n",
+        );
+        write(dir.path(), "src/seven.c", "int main(){return 0;}\n");
+        write(dir.path(), "src/dot.c", "int dot(){return 0;}\n");
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        assert!(
+            seeds
+                .iter()
+                .any(|s| s.entry_command.as_deref() == Some("7zip")),
+            "numeric-prefix target name rejected"
+        );
+        assert!(
+            seeds.iter().any(|s| s.title == "CMake library `foo.bar`"),
+            "dotted target name rejected"
+        );
+    }
+
+    #[test]
+    fn cmake_late_bound_target_sources_merge() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "CMakeLists.txt",
+            "add_executable(latebin)\n\
+             target_sources(latebin PRIVATE src/late_main.c src/late_util.c)\n",
+        );
+        write(dir.path(), "src/late_main.c", "int main(){return 0;}\n");
+        write(dir.path(), "src/late_util.c", "int util(){return 0;}\n");
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.entry_command.as_deref() == Some("latebin"))
+            .expect("latebin seed");
+        let owned_paths: Vec<&str> = s.owned_files.iter().map(|f| f.path.as_str()).collect();
+        assert!(owned_paths.contains(&"src/late_main.c"));
+        assert!(owned_paths.contains(&"src/late_util.c"));
+    }
+
+    #[test]
+    fn cmake_bracket_comments_strip_commented_targets() {
+        // Commented-out CMake targets must not surface as cmake-bin
+        // features. The underlying source file is still on disk so
+        // c-main may surface it separately — that's expected and not
+        // what this regression covers.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "CMakeLists.txt",
+            "#[[\nadd_executable(commented src/commented.c)\n]]\n\
+             add_executable(real src/real.c)\n",
+        );
+        write(dir.path(), "src/commented.c", "int main(){return 0;}\n");
+        write(dir.path(), "src/real.c", "int main(){return 0;}\n");
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        assert!(
+            !seeds
+                .iter()
+                .any(|s| s.source == "cmake-bin"
+                    && s.entry_command.as_deref() == Some("commented")),
+            "commented-out CMake target leaked through bracket-comment stripping"
+        );
+        assert!(
+            seeds
+                .iter()
+                .any(|s| s.source == "cmake-bin" && s.entry_command.as_deref() == Some("real")),
+            "real CMake target dropped"
+        );
+    }
+
+    #[test]
+    fn cmake_skips_variable_substituted_sources() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "CMakeLists.txt",
+            "add_executable(varapp ${APP_SOURCES})\n",
+        );
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        assert!(
+            !seeds
+                .iter()
+                .any(|s| s.entry_command.as_deref() == Some("varapp")),
+            "variable-substituted source list must not yield a target"
+        );
+    }
+
+    #[test]
+    fn cmake_skips_absolute_path_sources() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "CMakeLists.txt",
+            "add_executable(absout /src/main.cpp)\n",
+        );
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        assert!(
+            !seeds
+                .iter()
+                .any(|s| s.entry_command.as_deref() == Some("absout")),
+            "absolute path source must not yield a target"
+        );
+    }
+
+    #[test]
+    fn cmake_skips_header_only_executable() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "CMakeLists.txt",
+            "add_executable(headerapp include/headers.hpp)\n",
+        );
+        write(dir.path(), "include/headers.hpp", "void f();\n");
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        assert!(
+            !seeds
+                .iter()
+                .any(|s| s.entry_command.as_deref() == Some("headerapp")),
+            "executable with only header sources is impossible"
+        );
+    }
+
+    #[test]
+    fn cmake_interface_library_with_headers_emits() {
+        // INTERFACE libraries can legitimately have only header sources;
+        // they should still surface so reviewers can see the API surface.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "CMakeLists.txt",
+            "add_library(headers INTERFACE include/headers.hpp)\n",
+        );
+        write(dir.path(), "include/headers.hpp", "void f();\n");
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        assert!(
+            seeds.iter().any(|s| s.title == "CMake library `headers`"),
+            "INTERFACE library with headers dropped: {:#?}",
+            seeds.iter().map(|s| &s.title).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn cmake_skips_vendored_interface_when_excluded() {
+        // A vendored INTERFACE library whose only file lives under
+        // vendor/ should drop because the structural indexer won't
+        // index that file — emitting it would leak a phantom owned_file.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "CMakeLists.txt",
+            "add_library(vendored INTERFACE vendor/dep.hpp)\n",
+        );
+        write(dir.path(), "vendor/dep.hpp", "void f();\n");
+        let mut builder = globset::GlobSetBuilder::new();
+        builder.add(globset::Glob::new("**/vendor/**").unwrap());
+        let excludes = builder.build().unwrap();
+        let ctx = MapperContext {
+            root: dir.path(),
+            excludes: Some(&excludes),
+        };
+        let seeds = CCppMapper.map(&ctx).unwrap();
+        assert!(
+            !seeds.iter().any(|s| s.title == "CMake library `vendored`"),
+            "vendored INTERFACE library should drop when its only file is excluded"
+        );
     }
 }

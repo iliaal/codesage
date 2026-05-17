@@ -209,6 +209,7 @@ pub const HARD_EXCLUDE_PATTERNS: &[&str] = &[
     "**/.angular/**",
     "**/.gradle/**",
     "**/cmake-build-*/**",
+    "**/CMakeFiles/**",
     "**/public/js/**",
     "**/public/build/**",
     "**/storage/framework/views/**",
