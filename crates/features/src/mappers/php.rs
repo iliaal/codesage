@@ -6,6 +6,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use anyhow::Result;
 use codesage_protocol::{FeatureConfidence, FeatureKind, Language};
@@ -229,6 +230,13 @@ fn php_src_extensions(root: &Path) -> Result<Vec<FeatureSeed>> {
             tests,
             test_prefixes: vec![format!("{ext_rel}/tests")],
         });
+        let api_context = php_src_api_context(root, &ext_rel, &name, config_basename);
+        out.extend(php_extension_api_seeds(
+            root,
+            &p,
+            api_context,
+            vec![format!("{ext_rel}/tests")],
+        ));
     }
     Ok(out)
 }
@@ -260,6 +268,319 @@ fn list_c_sources(root: &Path, dir: &Path, max: usize) -> Vec<SeedFile> {
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out
+}
+
+#[derive(Debug, Clone)]
+struct PhpApiEntry {
+    source: &'static str,
+    title: String,
+    summary: String,
+    entry_path: String,
+    entry_symbol: String,
+    tags: Vec<String>,
+}
+
+fn php_extension_api_seeds(
+    root: &Path,
+    dir: &Path,
+    context_files: Vec<SeedFile>,
+    test_prefixes: Vec<String>,
+) -> Vec<FeatureSeed> {
+    php_extension_api_entries(root, dir)
+        .into_iter()
+        .map(|entry| FeatureSeed {
+            title: entry.title,
+            summary: entry.summary,
+            kind: FeatureKind::Library,
+            source: entry.source,
+            confidence: FeatureConfidence::High,
+            entry_path: entry.entry_path,
+            entry_symbol: Some(entry.entry_symbol),
+            entry_route: None,
+            entry_command: None,
+            test_command: None,
+            language: Language::Php,
+            tags: entry.tags,
+            owned_files: Vec::new(),
+            context_files: context_files.clone(),
+            tests: Vec::new(),
+            test_prefixes: test_prefixes.clone(),
+        })
+        .collect()
+}
+
+fn php_extension_api_entries(root: &Path, dir: &Path) -> Vec<PhpApiEntry> {
+    let mut out = Vec::new();
+    for source_path in php_extension_api_source_files(root, dir) {
+        out.extend(php_api_entries_in_file(root, &source_path));
+    }
+    out
+}
+
+fn php_extension_api_source_files(root: &Path, dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let Some(fname) = p.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Some(stem) = fname
+            .strip_suffix(".cpp")
+            .or_else(|| fname.strip_suffix(".cc"))
+            .or_else(|| fname.strip_suffix(".c"))
+        else {
+            continue;
+        };
+        if stem.ends_with("_arginfo") {
+            continue;
+        }
+        if is_safe_file(root, &p) {
+            out.push(rel_path(root, &p));
+        }
+    }
+    out.sort();
+    out
+}
+
+fn php_api_entries_in_file(root: &Path, entry_path: &str) -> Vec<PhpApiEntry> {
+    let path = root.join(entry_path);
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let code = strip_c_comments_and_strings(&raw);
+    let mut out = Vec::new();
+    for caps in php_api_macro_re().captures_iter(&code) {
+        match &caps[1] {
+            "METHOD" => {
+                let Some(method) = caps.get(3) else {
+                    continue;
+                };
+                let class = caps[2].to_string();
+                let method = method.as_str().to_string();
+                let symbol = format!("{class}::{method}");
+                out.push(PhpApiEntry {
+                    source: "php-ext-method",
+                    title: format!("PHP method `{symbol}`"),
+                    summary: format!(
+                        "PHP_METHOD({class}, {method}) implementation in {entry_path}"
+                    ),
+                    entry_path: entry_path.to_string(),
+                    entry_symbol: symbol,
+                    tags: vec![
+                        "php".to_string(),
+                        "php-extension".to_string(),
+                        "method".to_string(),
+                    ],
+                });
+            }
+            "FUNCTION" => {
+                if caps.get(3).is_some() {
+                    continue;
+                }
+                let function = caps[2].to_string();
+                out.push(PhpApiEntry {
+                    source: "php-ext-function",
+                    title: format!("PHP function `{function}`"),
+                    summary: format!("PHP_FUNCTION({function}) implementation in {entry_path}"),
+                    entry_path: entry_path.to_string(),
+                    entry_symbol: function,
+                    tags: vec![
+                        "php".to_string(),
+                        "php-extension".to_string(),
+                        "function".to_string(),
+                    ],
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn php_api_macro_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"\bPHP_(METHOD|FUNCTION)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:,\s*([A-Za-z_][A-Za-z0-9_]*))?\s*\)",
+        )
+        .expect("valid PHP extension API macro regex")
+    })
+}
+
+fn strip_c_comments_and_strings(input: &str) -> String {
+    enum State {
+        Code,
+        LineComment,
+        BlockComment,
+        DoubleString,
+        SingleString,
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut state = State::Code;
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match state {
+            State::Code => match ch {
+                '/' if chars.peek() == Some(&'/') => {
+                    out.push(' ');
+                    chars.next();
+                    out.push(' ');
+                    state = State::LineComment;
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    out.push(' ');
+                    chars.next();
+                    out.push(' ');
+                    state = State::BlockComment;
+                }
+                '"' => {
+                    out.push(' ');
+                    state = State::DoubleString;
+                }
+                '\'' => {
+                    out.push(' ');
+                    state = State::SingleString;
+                }
+                _ => {
+                    out.push(ch);
+                }
+            },
+            State::LineComment => {
+                if ch == '\n' {
+                    out.push('\n');
+                    state = State::Code;
+                } else {
+                    out.push(' ');
+                }
+            }
+            State::BlockComment => {
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    out.push(' ');
+                    chars.next();
+                    out.push(' ');
+                    state = State::Code;
+                } else {
+                    out.push(if ch == '\n' { '\n' } else { ' ' });
+                }
+            }
+            State::DoubleString => {
+                if ch == '\\' {
+                    out.push(' ');
+                    if let Some(next) = chars.next() {
+                        out.push(if next == '\n' { '\n' } else { ' ' });
+                    }
+                } else if ch == '"' {
+                    out.push(' ');
+                    state = State::Code;
+                } else {
+                    out.push(if ch == '\n' { '\n' } else { ' ' });
+                }
+            }
+            State::SingleString => {
+                if ch == '\\' {
+                    out.push(' ');
+                    if let Some(next) = chars.next() {
+                        out.push(if next == '\n' { '\n' } else { ' ' });
+                    }
+                } else if ch == '\'' {
+                    out.push(' ');
+                    state = State::Code;
+                } else {
+                    out.push(if ch == '\n' { '\n' } else { ' ' });
+                }
+            }
+        }
+    }
+    out
+}
+
+fn php_src_api_context(
+    root: &Path,
+    ext_rel: &str,
+    name: &str,
+    config_basename: &str,
+) -> Vec<SeedFile> {
+    let mut context_files = Vec::new();
+    push_seed_file(
+        root,
+        &mut context_files,
+        &format!("{ext_rel}/{config_basename}"),
+        "extension build config",
+    );
+    push_seed_file(
+        root,
+        &mut context_files,
+        &format!("{ext_rel}/php_{name}.h"),
+        "extension public header",
+    );
+    push_seed_file(
+        root,
+        &mut context_files,
+        &format!("{ext_rel}/{name}.h"),
+        "extension header",
+    );
+    context_files
+}
+
+fn root_php_extension_api_context(
+    root: &Path,
+    ext_name: &str,
+    entry_config: &str,
+    header_path: &str,
+) -> Vec<SeedFile> {
+    let mut context_files = Vec::new();
+    push_seed_file(
+        root,
+        &mut context_files,
+        entry_config,
+        "extension build config",
+    );
+    push_seed_file(
+        root,
+        &mut context_files,
+        header_path,
+        "extension public header",
+    );
+    push_seed_file(
+        root,
+        &mut context_files,
+        &format!("{ext_name}.stub.php"),
+        "PHP stub declarations",
+    );
+    push_seed_file(
+        root,
+        &mut context_files,
+        "composer.json",
+        "package manifest",
+    );
+    let alternate_config = if entry_config == "config.m4" {
+        "config.w32"
+    } else {
+        "config.m4"
+    };
+    push_seed_file(
+        root,
+        &mut context_files,
+        alternate_config,
+        "extension build config",
+    );
+    context_files
+}
+
+fn push_seed_file(root: &Path, files: &mut Vec<SeedFile>, path: &str, reason: &str) {
+    if files.iter().any(|f| f.path == path) {
+        return;
+    }
+    if is_safe_file(root, &root.join(path)) {
+        files.push(SeedFile {
+            path: path.to_string(),
+            reason: reason.to_string(),
+        });
+    }
 }
 
 fn list_phpt_files(root: &Path, dir: &Path, max: usize) -> Vec<String> {
@@ -379,6 +700,13 @@ fn php_extension_at_root(root: &Path) -> Result<Vec<FeatureSeed>> {
         tests: Vec::new(),
         test_prefixes: vec!["tests".to_string()],
     });
+    let api_context = root_php_extension_api_context(root, &ext_name, entry_config, &header_path);
+    seeds.extend(php_extension_api_seeds(
+        root,
+        root,
+        api_context,
+        vec!["tests".to_string()],
+    ));
 
     // Per-module seeds: `<name>_<part>.{c,cpp,cc}` files at root.
     let prefix = format!("{ext_name}_");
@@ -1775,6 +2103,105 @@ class SyncUsers extends Command {
             !seeds.iter().any(|s| s.source == "php-ext-module"),
             "no per-module seeds when no <name>_*.{{c,cpp}} files exist"
         );
+    }
+
+    #[test]
+    fn php_ext_root_emits_api_method_and_function_seeds() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "config.m4",
+            "PHP_NEW_EXTENSION(clickhouse, clickhouse.cpp)\n",
+        );
+        write(
+            dir.path(),
+            "php_clickhouse.h",
+            "#ifndef PHP_CLICKHOUSE_H\n#endif\n",
+        );
+        write(
+            dir.path(),
+            "clickhouse.stub.php",
+            "<?php class ClickHouse { public function select(string $sql): array {} }\n",
+        );
+        write(
+            dir.path(),
+            "clickhouse.cpp",
+            r#"
+                PHP_METHOD(ClickHouse, __construct) {}
+                PHP_METHOD(ClickHouse, select) {}
+                /* PHP_METHOD(ClickHouse, commentedOut) */
+                // PHP_FUNCTION(clickhouse_line_comment)
+                const char *example = "PHP_FUNCTION(clickhouse_in_string)";
+                PHP_FUNCTION(clickhouse_escape) {}
+            "#,
+        );
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+
+        let methods: Vec<&FeatureSeed> = seeds
+            .iter()
+            .filter(|s| s.source == "php-ext-method")
+            .collect();
+        let method_symbols: Vec<&str> = methods
+            .iter()
+            .filter_map(|s| s.entry_symbol.as_deref())
+            .collect();
+        assert_eq!(
+            method_symbols,
+            vec!["ClickHouse::__construct", "ClickHouse::select"]
+        );
+        assert!(methods.iter().all(|s| s.entry_path == "clickhouse.cpp"));
+        assert!(methods.iter().all(|s| s.kind == FeatureKind::Library));
+        assert!(methods.iter().all(|s| s.language == Language::Php));
+        assert!(
+            methods.iter().all(|s| s
+                .context_files
+                .iter()
+                .any(|f| f.path == "clickhouse.stub.php")),
+            "method seeds should carry stub context"
+        );
+        assert!(
+            !method_symbols.contains(&"ClickHouse::commentedOut"),
+            "commented PHP_METHOD must not emit a feature"
+        );
+
+        let functions: Vec<&FeatureSeed> = seeds
+            .iter()
+            .filter(|s| s.source == "php-ext-function")
+            .collect();
+        assert_eq!(functions.len(), 1);
+        assert_eq!(
+            functions[0].entry_symbol.as_deref(),
+            Some("clickhouse_escape")
+        );
+        assert_eq!(functions[0].entry_path, "clickhouse.cpp");
+    }
+
+    #[test]
+    fn php_src_ext_emits_api_function_seeds() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "ext/demo/config.m4", "PHP_ARG_ENABLE(demo,,)\n");
+        write(
+            dir.path(),
+            "ext/demo/demo.c",
+            r#"
+                PHP_FUNCTION(demo_hello) {}
+                PHP_METHOD(Demo, run) {}
+            "#,
+        );
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+
+        let symbols: Vec<&str> = seeds
+            .iter()
+            .filter(|s| matches!(s.source, "php-ext-function" | "php-ext-method"))
+            .filter_map(|s| s.entry_symbol.as_deref())
+            .collect();
+        assert_eq!(symbols, vec!["demo_hello", "Demo::run"]);
+        let api_seeds: Vec<&FeatureSeed> = seeds
+            .iter()
+            .filter(|s| matches!(s.source, "php-ext-function" | "php-ext-method"))
+            .collect();
+        assert!(api_seeds.iter().all(|s| s.entry_path == "ext/demo/demo.c"));
+        assert!(api_seeds.iter().all(|s| s.language == Language::Php));
     }
 
     #[test]

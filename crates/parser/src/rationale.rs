@@ -60,31 +60,26 @@ pub fn extract_rust_rationale(def_node: &Node, source: &[u8]) -> Vec<RationaleEn
 /// and from a leading triple-quoted docstring inside the definition body.
 ///
 /// Two tree-sitter shapes complicate the walk:
-///   1. **Decorators.** `@foo\ndef bar()` wraps as
-///         decorated_definition
-///           decorator (@foo)
-///           function_definition (bar)
-///      so the rationale comment is a sibling of the wrapper, not of the
-///      inner def. Anchor the walk at the wrapper so `# TODO:` above
-///      `@app.route(...)` / `@property` / `@dataclass` / `@lru_cache` etc.
-///      still attaches — these patterns dominate real Python codebases.
-///   2. **First statement in a class body.** Tree-sitter parks the leading
-///      comment inside a class as a child of `class_definition`, NOT inside
-///      the body `block`. The first method's prev_sibling chain therefore
-///      runs out before reaching the comment. When the anchor is the first
-///      child of a class block, climb to the block and continue the walk
-///      from its prev_siblings inside the class header.
+///
+/// 1. **Decorators.** `@foo\ndef bar()` wraps as
+///    `decorated_definition[decorator(@foo), function_definition(bar)]`, so
+///    the rationale comment is a sibling of the wrapper, not of the inner
+///    def. Anchor the walk at the wrapper so `# TODO:` above `@app.route`,
+///    `@property`, `@dataclass`, `@lru_cache`, etc. still attaches — these
+///    patterns dominate real Python codebases.
+/// 2. **First statement in a class body.** Tree-sitter parks the leading
+///    comment inside a class as a child of `class_definition`, NOT inside
+///    the body `block`. The first method's prev_sibling chain therefore
+///    runs out before reaching the comment. When the anchor is the first
+///    child of a class block, climb to the block and continue the walk
+///    from its prev_siblings inside the class header.
 pub fn extract_python_rationale(def_node: &Node, source: &[u8]) -> Vec<RationaleEntry> {
     let mut entries = Vec::new();
     let initial_anchor = python_traversal_anchor(def_node);
     let mut next_start_row = initial_anchor.start_position().row;
 
-    let exhausted = walk_python_prev_comments(
-        &initial_anchor,
-        &mut next_start_row,
-        &mut entries,
-        source,
-    );
+    let exhausted =
+        walk_python_prev_comments(&initial_anchor, &mut next_start_row, &mut entries, source);
 
     // Climb once into the enclosing class header if we ran out of siblings
     // inside the block without hitting any non-comment node — that's the

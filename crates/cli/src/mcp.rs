@@ -23,7 +23,7 @@ use parking_lot::Mutex;
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, tool::schema_for_type, wrapper::Parameters},
-    model::{CallToolResult, Content, ServerInfo},
+    model::{CallToolResult, Content, Implementation, ServerInfo},
     schemars, tool, tool_handler, tool_router,
 };
 
@@ -264,10 +264,70 @@ struct ProjectState {
     embedding_config: EmbeddingConfig,
 }
 
-pub struct CodeSageServer {
+/// One model "slot" per key — the outer mutex serializes the cold load
+/// for that key, the inner option holds the loaded model once init
+/// succeeds. Concurrent callers for the same key wait on the per-key
+/// mutex; callers for different keys run in parallel because they
+/// hold different slots. This is the fix for CR-001: previously
+/// `get_or_load_*` checked the map, dropped the lock, called `new()`,
+/// then raced to insert — two concurrent cold misses for the same
+/// model loaded two ORT sessions and the loser was thrown away.
+type ModelSlot<T> = Arc<Mutex<Option<Arc<Mutex<T>>>>>;
+
+/// Find or create the slot for `key` and, if not yet populated, run
+/// `load()` under the slot lock. Returns the shared `Arc<Mutex<T>>`
+/// either way. The map lock is held only long enough to find-or-insert
+/// the slot; the loader runs while only the per-key slot lock is held,
+/// so concurrent calls for *different* keys never wait on each other.
+///
+/// The CR-001 race was `check map → drop → load → insert`: two threads
+/// hitting the same cold key both ran `load()` and the loser's value
+/// got dropped. This helper closes that window — for a single key, the
+/// first thread to reach the slot lock runs `load()` exactly once; the
+/// rest read the populated `Some(arc)` and return immediately.
+fn get_or_load_slot<T, F>(
+    map: &Mutex<HashMap<String, ModelSlot<T>>>,
+    key: String,
+    load: F,
+) -> Result<Arc<Mutex<T>>>
+where
+    F: FnOnce() -> Result<T>,
+{
+    let slot = {
+        let mut guard = map.lock();
+        guard
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .clone()
+    };
+    let mut slot_guard = slot.lock();
+    if let Some(arc) = slot_guard.as_ref() {
+        return Ok(arc.clone());
+    }
+    let value = load()?;
+    let arc = Arc::new(Mutex::new(value));
+    *slot_guard = Some(arc.clone());
+    Ok(arc)
+}
+
+pub(crate) struct CodeSageServerState {
     projects: Mutex<HashMap<PathBuf, ProjectState>>,
-    embedders: Mutex<HashMap<String, Arc<Mutex<Embedder>>>>,
-    rerankers: Mutex<HashMap<String, Arc<Mutex<Reranker>>>>,
+    embedders: Mutex<HashMap<String, ModelSlot<Embedder>>>,
+    rerankers: Mutex<HashMap<String, ModelSlot<Reranker>>>,
+}
+
+impl CodeSageServerState {
+    pub(crate) fn new() -> Self {
+        Self {
+            projects: Mutex::new(HashMap::new()),
+            embedders: Mutex::new(HashMap::new()),
+            rerankers: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+pub struct CodeSageServer {
+    state: Arc<CodeSageServerState>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -285,10 +345,12 @@ impl Default for CodeSageServer {
 
 impl CodeSageServer {
     pub fn new() -> Self {
+        Self::with_state(Arc::new(CodeSageServerState::new()))
+    }
+
+    pub(crate) fn with_state(state: Arc<CodeSageServerState>) -> Self {
         Self {
-            projects: Mutex::new(HashMap::new()),
-            embedders: Mutex::new(HashMap::new()),
-            rerankers: Mutex::new(HashMap::new()),
+            state,
             tool_router: Self::tool_router(),
         }
     }
@@ -305,7 +367,7 @@ impl CodeSageServer {
             .canonicalize()
             .map_err(|e| anyhow::anyhow!("project path `{}` does not exist: {}", project, e))?;
         {
-            let guard = self.projects.lock();
+            let guard = self.state.projects.lock();
             if let Some(state) = guard.get(&canonical) {
                 return Ok(state.clone());
             }
@@ -326,7 +388,7 @@ impl CodeSageServer {
             embedding_config,
         };
         let newly_registered = {
-            let mut guard = self.projects.lock();
+            let mut guard = self.state.projects.lock();
             if guard.contains_key(&canonical) {
                 false
             } else {
@@ -346,21 +408,14 @@ impl CodeSageServer {
 
     fn get_or_load_embedder(&self, config: &EmbeddingConfig) -> Result<Arc<Mutex<Embedder>>> {
         let key = format!("{}|{}", config.model, config.device);
-        {
-            let guard = self.embedders.lock();
-            if let Some(arc) = guard.get(&key) {
-                return Ok(arc.clone());
-            }
-        }
-        let embedder = Embedder::new(config).with_context(|| {
-            format!(
-                "loading embedding model '{}' on device '{}'",
-                config.model, config.device
-            )
-        })?;
-        let arc = Arc::new(Mutex::new(embedder));
-        let mut guard = self.embedders.lock();
-        Ok(guard.entry(key).or_insert(arc).clone())
+        get_or_load_slot(&self.state.embedders, key, || {
+            Embedder::new(config).with_context(|| {
+                format!(
+                    "loading embedding model '{}' on device '{}'",
+                    config.model, config.device
+                )
+            })
+        })
     }
 
     fn get_or_load_reranker(
@@ -369,18 +424,11 @@ impl CodeSageServer {
         device: &str,
     ) -> Result<Arc<Mutex<Reranker>>> {
         let key = format!("{}|{}", reranker_model, device);
-        {
-            let guard = self.rerankers.lock();
-            if let Some(arc) = guard.get(&key) {
-                return Ok(arc.clone());
-            }
-        }
-        let reranker = Reranker::new(reranker_model, device).with_context(|| {
-            format!("loading reranker model '{reranker_model}' on device '{device}'")
-        })?;
-        let arc = Arc::new(Mutex::new(reranker));
-        let mut guard = self.rerankers.lock();
-        Ok(guard.entry(key).or_insert(arc).clone())
+        get_or_load_slot(&self.state.rerankers, key, || {
+            Reranker::new(reranker_model, device).with_context(|| {
+                format!("loading reranker model '{reranker_model}' on device '{device}'")
+            })
+        })
     }
 
     fn open_db_for(&self, state: &ProjectState) -> Result<Database> {
@@ -439,11 +487,21 @@ impl CodeSageServer {
         f(&db)
     }
 
-    /// Same as `with_project_db` but also acquires the project's embedder and
-    /// reranker (if configured). Locks held for the duration of `f`.
-    fn with_project_search<F, R>(&self, project: &str, f: F) -> Result<R>
+    /// Resolve a project, embed `query`, and call `f` with the resulting
+    /// query embedding + a reranker callback that lazily locks the shared
+    /// reranker only when the search pipeline actually invokes it.
+    ///
+    /// The lock scopes are deliberately tight: the embedder mutex is held
+    /// only for the `embed_one` call, the reranker mutex is held only for
+    /// the (single) `score_pairs` call inside `search`. SQLite retrieval
+    /// and result post-processing run lock-free, so concurrent agents on
+    /// the same project can interleave their SQL work while one is in the
+    /// (slow) ORT call. Pre-daemon each shim had a per-process embedder
+    /// pool so calls were already parallel; this preserves that property
+    /// under the shared-daemon model.
+    fn with_project_query<F, R>(&self, project: &str, query: &str, f: F) -> Result<R>
     where
-        F: FnOnce(&Database, &mut Embedder, Option<&mut Reranker>) -> Result<R>,
+        F: FnOnce(&Database, &[f32], Option<codesage_graph::RerankFn<'_>>) -> Result<R>,
     {
         let state = self.resolve_project(project)?;
         let db = self.open_db_for(&state)?;
@@ -454,10 +512,21 @@ impl CodeSageServer {
             .as_deref()
             .map(|m| self.get_or_load_reranker(m, &state.embedding_config.device))
             .transpose()?;
-        let mut embedder_guard = embedder_arc.lock();
-        let mut reranker_guard = reranker_arc.as_ref().map(|a| a.lock());
-        let reranker_opt = reranker_guard.as_deref_mut();
-        f(&db, &mut embedder_guard, reranker_opt)
+
+        let query_embedding = {
+            let mut guard = embedder_arc.lock();
+            guard.embed_one(query)?
+        };
+
+        let rerank_fn: Option<codesage_graph::RerankFn<'_>> = reranker_arc.map(|rr| {
+            // Closure captures the Arc; per-call .lock() means the reranker
+            // mutex is held only across the score_pairs call inside search,
+            // not for the surrounding SQL retrieval and post-processing.
+            Box::new(move |q: &str, docs: &[&str]| rr.lock().score_pairs(q, docs))
+                as Box<dyn FnMut(&str, &[&str]) -> Result<Vec<f32>>>
+        });
+
+        f(&db, &query_embedding, rerank_fn)
     }
 }
 
@@ -668,15 +737,17 @@ fn load_embedding_config(path: &Path) -> EmbeddingConfig {
 impl ServerHandler for CodeSageServer {
     fn get_info(&self) -> ServerInfo {
         use rmcp::model::ServerCapabilities;
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Structural and semantic code intelligence across multiple projects. \
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("codesage", env!("CARGO_PKG_VERSION")))
+            .with_instructions(
+                "Structural and semantic code intelligence across multiple projects. \
                  Every tool requires an absolute `project` path pointing at an onboarded \
                  CodeSage project (one containing .codesage/index.db). \
                  Use find_symbol to locate definitions, find_references to trace callers \
                  and imports, list_dependencies for file-level dependency mapping, search \
                  for natural-language semantic code search, impact_analysis to estimate \
                  blast radius of a change, and export_context to bundle code for an LLM.",
-        )
+            )
     }
 }
 
@@ -754,8 +825,11 @@ impl CodeSageServer {
             languages,
             paths: params.paths,
         };
+        let query_for_embed = req.query.clone();
         render_with_kind(
-            self.with_project_search(&params.project, |db, emb, rr| search(db, emb, rr, &req)),
+            self.with_project_query(&params.project, &query_for_embed, |db, emb, rr| {
+                search(db, emb, rr, &req)
+            }),
             "search",
         )
     }
@@ -801,8 +875,9 @@ impl CodeSageServer {
                 "export_context",
             );
         }
+        let query_for_embed = req.query.clone().unwrap_or_default();
         render_with_kind(
-            self.with_project_search(&params.project, |db, emb, rr| {
+            self.with_project_query(&params.project, &query_for_embed, |db, emb, rr| {
                 export_context(db, emb, rr, &req)
             }),
             "export_context",
@@ -1256,6 +1331,126 @@ mod tests {
         let path = write_tmp("no-embedding", "[project]\nname = \"foo\"\n");
         let config = load_embedding_config(&path);
         assert_eq!(config.model, EmbeddingConfig::default().model);
+    }
+
+    #[test]
+    fn server_instances_can_share_cache_state() {
+        let state = Arc::new(CodeSageServerState::new());
+        let first = CodeSageServer::with_state(state.clone());
+        let second = CodeSageServer::with_state(state.clone());
+
+        assert!(Arc::ptr_eq(&first.state, &second.state));
+    }
+
+    #[test]
+    fn slot_loader_runs_exactly_once_under_concurrent_first_callers() {
+        // CR-001 regression. Pre-fix: check map → drop lock → call new()
+        // → race to insert. Two cold misses for the same key both ran
+        // the loader and the loser's value was thrown away. With the
+        // per-key slot lock, only the first thread runs `load`; the rest
+        // observe Some(arc) and return it.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let map: Arc<Mutex<HashMap<String, ModelSlot<u32>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let load_count = Arc::new(AtomicUsize::new(0));
+
+        // Gate the loader on a shared start signal so all threads are
+        // poised to race, then release them simultaneously.
+        let start = Arc::new(std::sync::Barrier::new(16));
+
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let map = map.clone();
+                let load_count = load_count.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    get_or_load_slot(&map, "shared-key".to_string(), || {
+                        load_count.fetch_add(1, Ordering::SeqCst);
+                        // Brief sleep widens the race window so a buggy
+                        // implementation actually loses.
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        Ok::<u32, anyhow::Error>(42 + i as u32)
+                    })
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        assert_eq!(
+            load_count.load(Ordering::SeqCst),
+            1,
+            "loader must run exactly once across all concurrent callers"
+        );
+
+        // All callers must observe the SAME Arc (pointer equality), not
+        // separate constructions.
+        let first = results[0].as_ref().unwrap().clone();
+        for r in &results {
+            let arc = r.as_ref().unwrap();
+            assert!(Arc::ptr_eq(&first, arc), "all callers should share one Arc");
+        }
+    }
+
+    #[test]
+    fn slot_loader_runs_per_key_in_parallel() {
+        // Distinct keys must hold distinct slots — different cold loads
+        // should not serialize on each other. Verify by measuring that
+        // two loaders that each block for ~80ms complete in well under
+        // 160ms (they run concurrently, not back-to-back).
+        let map: Arc<Mutex<HashMap<String, ModelSlot<u32>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let start = Arc::new(std::sync::Barrier::new(2));
+
+        let t0 = std::time::Instant::now();
+        let h1 = {
+            let map = map.clone();
+            let start = start.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                get_or_load_slot(&map, "k1".to_string(), || {
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                    Ok::<u32, anyhow::Error>(1)
+                })
+            })
+        };
+        let h2 = {
+            let map = map.clone();
+            let start = start.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                get_or_load_slot(&map, "k2".to_string(), || {
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                    Ok::<u32, anyhow::Error>(2)
+                })
+            })
+        };
+        h1.join().unwrap().unwrap();
+        h2.join().unwrap().unwrap();
+        let elapsed = t0.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(140),
+            "distinct keys must load in parallel; elapsed {:?} suggests serialization",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn slot_loader_failure_leaves_slot_retryable() {
+        // A failed load must not poison the slot: the next caller should
+        // be able to retry. Pre-fix code had the same behavior (the
+        // failed value never went into the map); the helper preserves
+        // that property by writing to *slot_guard only on Ok.
+        let map: Arc<Mutex<HashMap<String, ModelSlot<u32>>>> = Arc::new(Mutex::new(HashMap::new()));
+
+        let first: Result<_, anyhow::Error> =
+            get_or_load_slot(&map, "k".to_string(), || anyhow::bail!("boom"));
+        assert!(first.is_err());
+
+        let second = get_or_load_slot(&map, "k".to_string(), || Ok::<u32, anyhow::Error>(99));
+        let arc = second.unwrap();
+        assert_eq!(*arc.lock(), 99);
     }
 
     #[test]
