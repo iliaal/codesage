@@ -530,16 +530,25 @@ fn parse_laravel_routes(root: &Path) -> Result<Vec<LaravelRoute>> {
     if !is_safe_dir(root, &routes_dir) {
         return Ok(out);
     }
-    // The verb_re alternative captures verb + URI without controller
-    // info — kept for closure-style and `Route::match([...])` calls. The
-    // controller_re adds the `, ControllerClass::class` arm separately
-    // so the existing seed shape stays intact when the controller half
-    // is missing.
-    let verb_re = Regex::new(
-        r#"(?m)Route::(get|post|put|patch|delete|options|any|match)\s*\(\s*(?:\[[^\]]*\]\s*,\s*)?['"]([^'"]+)['"]"#,
+    // Single regex: `Route::<chain>?<verb>('/path' [, ClassRef::class [, 'action']])`.
+    // Group 1 captures the fluent chain that precedes the verb call
+    // (e.g. `prefix('admin')->middleware('auth')->`) so we can pull
+    // `prefix(...)` out per registration. The chain is non-greedy
+    // method() segments terminated by `->`.
+    let route_re = Regex::new(
+        r#"(?ms)Route::((?:[A-Za-z_]\w*\s*\([^;]*?\)\s*->\s*)*)(get|post|put|patch|delete|options|any|match|resource|apiResource)\s*\(\s*(?:\[[^\]]*\]\s*,\s*)?['"]([^'"]+)['"](?:\s*,\s*(?:\[\s*)?(\\?[A-Za-z_][A-Za-z0-9_\\]*)::class(?:\s*,\s*['"]([^'"]+)['"])?)?"#,
     )?;
-    let controller_re = Regex::new(
-        r#"(?m)Route::(get|post|put|patch|delete|options|any|match|resource|apiResource)\s*\(\s*(?:\[[^\]]*\]\s*,\s*)?['"]([^'"]+)['"]\s*,\s*(?:\[\s*)?(\\?[A-Za-z_][A-Za-z0-9_\\]*)::class(?:\s*,\s*['"]([^'"]+)['"])?"#,
+    // `Route::<chain>?controller(X::class)<chain>?->group(function (...) { body })`.
+    // Body capture is non-greedy with `(?s)` so a stray `}` inside a
+    // string literal won't truncate the body before its real close.
+    let controller_group_re = Regex::new(
+        r#"(?ms)Route::((?:[A-Za-z_]\w*\s*\([^;]*?\)\s*->\s*)*)controller\s*\(\s*(\\?[A-Za-z_][A-Za-z0-9_\\]*)::class\s*\)\s*->\s*((?:[A-Za-z_]\w*\s*\([^;]*?\)\s*->\s*)*)group\s*\(\s*function\s*\([^)]*\)\s*\{(.*?)\}\s*\)\s*;"#,
+    )?;
+    // Inner route inside a `controller(...)->group(...)` body: the
+    // closing `Route::verb('/path', 'action')` shape (no class — it
+    // comes from the outer controller).
+    let group_inner_re = Regex::new(
+        r#"(?ms)Route::((?:[A-Za-z_]\w*\s*\([^;]*?\)\s*->\s*)*)(get|post|put|patch|delete|options|any)\s*\(\s*['"]([^'"]+)['"](?:\s*,\s*['"]([^'"]+)['"])?"#,
     )?;
     for file in ["web.php", "api.php", "console.php", "channels.php"] {
         let path = routes_dir.join(file);
@@ -548,67 +557,196 @@ fn parse_laravel_routes(root: &Path) -> Result<Vec<LaravelRoute>> {
         }
         let rel = rel_path(root, &path);
         let raw = fs::read_to_string(&path).unwrap_or_default();
-        // Collect (verb, pattern) → (controller_class, action) from the
-        // richer regex so we can attach controller info to base matches.
-        let mut by_key: std::collections::HashMap<(String, String), (String, Option<String>)> =
-            std::collections::HashMap::new();
-        for cap in controller_re.captures_iter(&raw) {
-            let verb = cap
-                .get(1)
-                .map(|m| m.as_str().to_uppercase())
-                .unwrap_or_default();
-            let pattern = cap
-                .get(2)
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-            let class = cap
-                .get(3)
-                .map(|m| m.as_str().trim_start_matches('\\').to_string())
-                .unwrap_or_default();
-            let action = cap.get(4).map(|m| m.as_str().to_string());
-            if verb.is_empty() || pattern.is_empty() || class.is_empty() {
+        let imports = parse_php_use_imports(&raw);
+        let file_prefixes = file_default_route_prefixes(file);
+
+        // Pass 1: Route::controller(X::class)->group(fn () { … })
+        // bodies. Each inner route inherits the outer controller. We
+        // also remember which byte spans were consumed so the
+        // top-level scan in pass 2 doesn't double-emit them.
+        let mut consumed_spans: Vec<(usize, usize)> = Vec::new();
+        for cap in controller_group_re.captures_iter(&raw) {
+            let span = cap.get(0).map(|m| (m.start(), m.end()));
+            let outer_chain = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            let raw_class = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+            let inner_chain = cap.get(3).map(|m| m.as_str()).unwrap_or("");
+            let body = cap.get(4).map(|m| m.as_str()).unwrap_or("");
+            let controller_class = resolve_imported_class(&imports, raw_class);
+            if controller_class.is_none() {
                 continue;
             }
-            by_key.insert((verb, pattern), (class, action));
+            let outer_prefixes: Vec<String> = file_prefixes
+                .iter()
+                .cloned()
+                .chain(fluent_route_prefixes(outer_chain))
+                .chain(fluent_route_prefixes(inner_chain))
+                .collect();
+            for inner in group_inner_re.captures_iter(body) {
+                let inner_chain_local = inner.get(1).map(|m| m.as_str()).unwrap_or("");
+                let verb = inner
+                    .get(2)
+                    .map(|m| m.as_str().to_uppercase())
+                    .unwrap_or_default();
+                let pattern = inner.get(3).map(|m| m.as_str()).unwrap_or("");
+                let action = inner.get(4).map(|m| m.as_str().to_string());
+                if verb.is_empty() || pattern.is_empty() {
+                    continue;
+                }
+                let prefixes: Vec<String> = outer_prefixes
+                    .iter()
+                    .cloned()
+                    .chain(fluent_route_prefixes(inner_chain_local))
+                    .collect();
+                out.push(LaravelRoute {
+                    file: rel.clone(),
+                    verb,
+                    pattern: route_uri_with_prefixes(&prefixes, pattern),
+                    controller_class: controller_class.clone(),
+                    action,
+                });
+            }
+            if let Some(s) = span {
+                consumed_spans.push(s);
+            }
         }
-        for cap in verb_re.captures_iter(&raw) {
+
+        // Pass 2: top-level `Route::<chain>?<verb>('/path' [, X::class])`
+        // matches that didn't fall inside a controller-group body.
+        for cap in route_re.captures_iter(&raw) {
+            if let Some(m) = cap.get(0) {
+                let (start, end) = (m.start(), m.end());
+                if consumed_spans.iter().any(|(s, e)| start >= *s && end <= *e) {
+                    continue;
+                }
+            }
+            let chain = cap.get(1).map(|m| m.as_str()).unwrap_or("");
             let verb = cap
-                .get(1)
+                .get(2)
                 .map(|m| m.as_str().to_uppercase())
                 .unwrap_or_default();
-            let pattern = cap
-                .get(2)
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
+            let pattern = cap.get(3).map(|m| m.as_str()).unwrap_or("");
+            let raw_class = cap.get(4).map(|m| m.as_str()).unwrap_or("");
+            let action = cap.get(5).map(|m| m.as_str().to_string());
             if verb.is_empty() || pattern.is_empty() {
                 continue;
             }
-            let (controller_class, action) = match by_key.remove(&(verb.clone(), pattern.clone())) {
-                Some((c, a)) => (Some(c), a),
-                None => (None, None),
+            let controller_class = if raw_class.is_empty() {
+                None
+            } else {
+                resolve_imported_class(&imports, raw_class)
             };
+            let prefixes: Vec<String> = file_prefixes
+                .iter()
+                .cloned()
+                .chain(fluent_route_prefixes(chain))
+                .collect();
             out.push(LaravelRoute {
                 file: rel.clone(),
                 verb,
-                pattern,
+                pattern: route_uri_with_prefixes(&prefixes, pattern),
                 controller_class,
-                action,
-            });
-        }
-        // Any controller-only matches left in `by_key` had no plain
-        // verb_re hit (e.g. `Route::resource` + `apiResource`); emit
-        // them so resources surface as features too.
-        for ((verb, pattern), (class, action)) in by_key.drain() {
-            out.push(LaravelRoute {
-                file: rel.clone(),
-                verb,
-                pattern,
-                controller_class: Some(class),
                 action,
             });
         }
     }
     Ok(out)
+}
+
+/// Parse `use Some\Class\Name;` and `use Some\Class\Name as Alias;`
+/// lines into a `short_or_alias -> fqcn` map. Used by route parsing to
+/// resolve `UserController::class` to the fully-qualified namespace so
+/// `laravel_controllers` can bridge routes back to the class file.
+fn parse_php_use_imports(source: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let re = Regex::new(
+        r"(?m)^\s*use\s+([A-Za-z_\\][A-Za-z0-9_\\]*)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?\s*;",
+    )
+    .expect("use regex must compile");
+    for cap in re.captures_iter(source) {
+        let Some(fqcn) = cap
+            .get(1)
+            .map(|m| m.as_str().trim_start_matches('\\').to_string())
+        else {
+            continue;
+        };
+        let alias = cap
+            .get(2)
+            .map(|m| m.as_str().to_string())
+            .or_else(|| fqcn.rsplit('\\').next().map(|s| s.to_string()));
+        if let Some(a) = alias {
+            out.insert(a, fqcn);
+        }
+    }
+    out
+}
+
+/// Resolve a class reference written at a route call site to its
+/// fully-qualified namespace, using the `use` map when the reference
+/// is a short name. Returns `None` when the input is empty.
+fn resolve_imported_class(
+    imports: &std::collections::HashMap<String, String>,
+    raw: &str,
+) -> Option<String> {
+    let trimmed = raw.trim_start_matches('\\');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains('\\') {
+        return Some(trimmed.to_string());
+    }
+    // Short name → look up through use imports; fall back to the short
+    // name itself so `laravel_controllers` can still match by basename.
+    Some(
+        imports
+            .get(trimmed)
+            .cloned()
+            .unwrap_or_else(|| trimmed.to_string()),
+    )
+}
+
+/// Pull `prefix('admin')` values from a fluent route chain like
+/// `prefix('admin')->middleware('auth')->`. The chain comes from the
+/// outer regex's capture group; this is the inner pass that picks out
+/// just the prefix calls so the URI can be assembled.
+fn fluent_route_prefixes(chain: &str) -> Vec<String> {
+    let re =
+        Regex::new(r#"\bprefix\s*\(\s*['"]([^'"]*)['"]\s*\)"#).expect("prefix regex must compile");
+    re.captures_iter(chain)
+        .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// Implicit file-level prefix. Laravel's default route service provider
+/// auto-prefixes routes in `routes/api.php` with `api/`; web.php and
+/// the others carry no implicit prefix.
+fn file_default_route_prefixes(file: &str) -> Vec<String> {
+    if file == "api.php" {
+        vec!["api".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Join prefix segments + the raw URI into the final route pattern.
+/// Normalizes leading/trailing slashes so `["api"] + "/users"` →
+/// `"api/users"`, not `"api//users"`.
+fn route_uri_with_prefixes(prefixes: &[String], uri: &str) -> String {
+    let mut parts: Vec<String> = prefixes
+        .iter()
+        .map(|p| p.trim_matches('/').to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    let cleaned = uri.trim_matches('/');
+    if !cleaned.is_empty() {
+        parts.push(cleaned.to_string());
+    }
+    let joined = parts.join("/");
+    if uri.starts_with('/') || joined.is_empty() {
+        format!("/{joined}").trim_end_matches('/').to_string()
+    } else {
+        joined
+    }
 }
 
 fn laravel_route_seeds(routes: &[LaravelRoute]) -> Vec<FeatureSeed> {
@@ -1856,5 +1994,198 @@ class SyncUsers extends Command {
                 "{src} leaked into non-Laravel project"
             );
         }
+    }
+
+    // ---------- Laravel route parser hardening (clawpatch PR #5) ----------
+
+    fn laravel_marker(dir: &Path) {
+        write(
+            dir,
+            "composer.json",
+            r#"{"require":{"laravel/framework":"^11.0"}}"#,
+        );
+        write(dir, "artisan", "");
+    }
+
+    #[test]
+    fn laravel_route_prefix_chain_expands_into_uri() {
+        let dir = tempdir().unwrap();
+        laravel_marker(dir.path());
+        write(
+            dir.path(),
+            "routes/web.php",
+            r#"<?php
+use App\Http\Controllers\AdminController;
+Route::prefix('admin')->get('/users', [AdminController::class, 'index']);
+Route::prefix('admin')->prefix('settings')->get('/general', [AdminController::class, 'general']);
+"#,
+        );
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let routes: Vec<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "laravel-route")
+            .filter_map(|s| s.entry_route.as_deref())
+            .collect();
+        assert!(
+            routes.iter().any(|r| r == &"GET /admin/users"),
+            "prefix not expanded: {routes:?}"
+        );
+        assert!(
+            routes.iter().any(|r| r == &"GET /admin/settings/general"),
+            "nested prefix not expanded: {routes:?}"
+        );
+    }
+
+    #[test]
+    fn laravel_api_php_gets_implicit_api_prefix() {
+        let dir = tempdir().unwrap();
+        laravel_marker(dir.path());
+        write(
+            dir.path(),
+            "routes/api.php",
+            r#"<?php
+use App\Http\Controllers\UserController;
+Route::get('/users', [UserController::class, 'index']);
+"#,
+        );
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let routes: Vec<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "laravel-route")
+            .filter_map(|s| s.entry_route.as_deref())
+            .collect();
+        assert!(
+            routes.iter().any(|r| r == &"GET /api/users"),
+            "api.php route not auto-prefixed with /api: {routes:?}"
+        );
+    }
+
+    #[test]
+    fn laravel_use_import_resolves_short_controller_class() {
+        let dir = tempdir().unwrap();
+        laravel_marker(dir.path());
+        write(
+            dir.path(),
+            "routes/web.php",
+            r#"<?php
+use App\Http\Controllers\UserController;
+Route::get('/users', [UserController::class, 'index']);
+"#,
+        );
+        write(
+            dir.path(),
+            "app/Http/Controllers/UserController.php",
+            "<?php\nnamespace App\\Http\\Controllers;\nclass UserController {}",
+        );
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        // The controller seed should pick up the route via the FQCN
+        // resolved from the use import.
+        let ctrl = seeds
+            .iter()
+            .find(|s| s.source == "laravel-controller")
+            .expect("controller seed");
+        assert!(
+            ctrl.summary.contains("1 routes") || ctrl.entry_route.is_some(),
+            "controller didn't bridge to route through use import: {}",
+            ctrl.summary
+        );
+    }
+
+    #[test]
+    fn laravel_controller_group_body_routes_bridge_to_controller() {
+        let dir = tempdir().unwrap();
+        laravel_marker(dir.path());
+        write(
+            dir.path(),
+            "routes/web.php",
+            r#"<?php
+use App\Http\Controllers\PostController;
+Route::controller(PostController::class)->group(function () {
+    Route::get('/posts', 'index');
+    Route::post('/posts', 'store');
+});
+"#,
+        );
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let routes: Vec<(&str, &str)> = seeds
+            .iter()
+            .filter(|s| s.source == "laravel-route")
+            .filter_map(|s| s.entry_route.as_deref().map(|r| (r, s.summary.as_str())))
+            .collect();
+        // Both inner routes should surface.
+        assert!(
+            routes.iter().any(|(r, _)| r == &"GET /posts"),
+            "GET /posts from group body missing: {routes:?}"
+        );
+        assert!(
+            routes.iter().any(|(r, _)| r == &"POST /posts"),
+            "POST /posts from group body missing: {routes:?}"
+        );
+        // And neither should double-emit at the top level (the consumed-span
+        // tracking should suppress a second pass).
+        let count_posts = routes.iter().filter(|(r, _)| r == &"GET /posts").count();
+        assert_eq!(
+            count_posts, 1,
+            "GET /posts emitted twice (consumed-span tracking failed): {routes:?}"
+        );
+    }
+
+    #[test]
+    fn laravel_controller_group_with_prefix_chain() {
+        let dir = tempdir().unwrap();
+        laravel_marker(dir.path());
+        write(
+            dir.path(),
+            "routes/api.php",
+            r#"<?php
+use App\Http\Controllers\PostController;
+Route::prefix('v1')->controller(PostController::class)->group(function () {
+    Route::get('/posts', 'index');
+});
+"#,
+        );
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let routes: Vec<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "laravel-route")
+            .filter_map(|s| s.entry_route.as_deref())
+            .collect();
+        assert!(
+            routes.iter().any(|r| r == &"GET /api/v1/posts"),
+            "/api + /v1 + /posts not assembled: {routes:?}"
+        );
+    }
+
+    #[test]
+    fn laravel_use_alias_resolves() {
+        let dir = tempdir().unwrap();
+        laravel_marker(dir.path());
+        write(
+            dir.path(),
+            "routes/web.php",
+            r#"<?php
+use App\Http\Controllers\UserController as Users;
+Route::get('/users', [Users::class, 'index']);
+"#,
+        );
+        write(
+            dir.path(),
+            "app/Http/Controllers/UserController.php",
+            "<?php\nnamespace App\\Http\\Controllers;\nclass UserController {}",
+        );
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        // The controller seed for UserController should now own the
+        // route (the alias resolves through the use map).
+        let ctrl = seeds
+            .iter()
+            .find(|s| {
+                s.source == "laravel-controller" && s.entry_path.ends_with("UserController.php")
+            })
+            .expect("UserController seed");
+        assert!(
+            ctrl.summary.contains("1 routes"),
+            "UserController didn't get its alias-resolved route: {}",
+            ctrl.summary
+        );
     }
 }
