@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Added
+
+- **Python web route mapping** (`flask-route`, `fastapi-route` seed sources) and **`setup.cfg` console-script support** (`setup-cfg-script`). Ports clawpatch PRs #11 (Flask), #15 (FastAPI), and #28 (setup.cfg). Flask: scans `.py` files that `import flask` for `@<receiver>.route('/path', methods=[…])` decorators where `receiver` is a local variable initialized from `Flask(…)` or `Blueprint(…)`. Defaults to `GET` when `methods=` is absent. Emits one route feature per (method, path) — `methods=["GET","POST"]` produces two seeds with `entry_route` `"GET /users"` and `"POST /users"` so they don't collapse to a single feature_id. FastAPI: same pattern against `@<receiver>.METHOD('/path')` for `app = FastAPI()` and `router = APIRouter()`. Both walkers require an `import flask` / `from flask import …` (or fastapi equivalent) so a string literal that happens to mention the framework doesn't false-trigger. Known limitations matching clawpatch: blueprint `url_prefix` and `include_router(prefix=…)` mount prefixes are NOT expanded; non-literal paths/methods are intentionally skipped. setup.cfg `[options.entry_points]` `console_scripts = name = module:fn` (INI-style multi-line value) is now parsed into the same shape as `pyproject.toml [project.scripts]` — module path resolves through `resolve_script_module_path` so `entry_path` lands on the real `.py` file (e.g. `acme/cli.py`) rather than the manifest. Seven new regression tests cover Flask GET-default, methods-kwarg expansion, Blueprint receivers, the no-flask-import gate, FastAPI METHOD/APIRouter recognition, and setup.cfg console-scripts with module resolution. Smoke-tested on a 3-file fixture: 2 Flask + 2 FastAPI + 1 setup.cfg → 5 expected features emitted alongside the python-project seed.
+
 ## [0.7.5] - 2026-05-16
 
 ### Added

@@ -70,7 +70,10 @@ impl FeatureMapper for PythonMapper {
         seeds.extend(pyproject_scripts(ctx)?);
         seeds.extend(pyproject_poetry_scripts(ctx)?);
         seeds.extend(setup_py_entry_points(ctx)?);
+        seeds.extend(setup_cfg_entry_points(ctx)?);
         seeds.extend(main_guard_modules(ctx)?);
+        seeds.extend(flask_routes(ctx)?);
+        seeds.extend(fastapi_routes(ctx)?);
         seeds.extend(pytest_test_suites(ctx, test_cmd.as_deref())?);
         seeds.retain(|s| ctx.allowed(&s.entry_path));
         Ok(seeds)
@@ -417,6 +420,113 @@ fn setup_py_entry_points(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
     Ok(out)
 }
 
+/// `setup.cfg` `[options.entry_points]` `console_scripts = …` entries.
+/// Sibling to [`setup_py_entry_points`]; setup.cfg is INI-style and
+/// stores console_scripts as a multi-line `name = module:fn` block under
+/// a single key. Ported from clawpatch PR #28's expansion of Python
+/// packaging support beyond `pyproject.toml` / `setup.py`.
+fn setup_cfg_entry_points(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
+    let root = ctx.root;
+    let mut out = Vec::new();
+    let path = root.join("setup.cfg");
+    if !is_safe_file(root, &path) {
+        return Ok(out);
+    }
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return Ok(out);
+    };
+    let body = strip_line_comments(&raw, '#');
+    let Some(entry_points) = extract_section(&body, "options.entry_points") else {
+        return Ok(out);
+    };
+    // Pull the `console_scripts = …` block. The value is a multi-line
+    // INI continuation: subsequent indented lines belong to the same
+    // key until the next bare-left-column line.
+    let Some(block) = extract_ini_multiline_value(&entry_points, "console_scripts") else {
+        return Ok(out);
+    };
+    let entry_re = Regex::new(r"(?m)^\s*([A-Za-z_][\w\-]*)\s*=\s*([^\s].*?)\s*$")?;
+    for cap in entry_re.captures_iter(&block) {
+        let name = cap
+            .get(1)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+        let target = cap
+            .get(2)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+        if name.is_empty() || target.is_empty() {
+            continue;
+        }
+        let module = target.split(':').next().unwrap_or(&target).to_string();
+        let resolved = resolve_script_module_path(ctx, &module);
+        let entry_path = resolved.clone().unwrap_or_else(|| "setup.cfg".to_string());
+        out.push(FeatureSeed {
+            title: format!("Python script `{name}` (setup.cfg)"),
+            summary: format!(
+                "setup.cfg `[options.entry_points] console_scripts` entry `{name} = {target}`"
+            ),
+            kind: FeatureKind::CliCommand,
+            source: "setup-cfg-script",
+            confidence: FeatureConfidence::High,
+            entry_path,
+            entry_symbol: Some(module),
+            entry_route: None,
+            entry_command: Some(name),
+            test_command: None,
+            language: Language::Python,
+            tags: vec!["python".to_string(), "cli".to_string()],
+            owned_files: Vec::new(),
+            context_files: vec![SeedFile {
+                path: "setup.cfg".to_string(),
+                reason: "package manifest".to_string(),
+            }],
+            tests: Vec::new(),
+            test_prefixes: vec!["tests".to_string()],
+        });
+    }
+    Ok(out)
+}
+
+/// INI-style multi-line value extractor: returns the body of `<key> = …`
+/// in `section_body`, joining indented continuation lines. Stops at the
+/// next unindented key or section header.
+fn extract_ini_multiline_value(section_body: &str, key: &str) -> Option<String> {
+    let mut lines = section_body.lines();
+    let mut out = String::new();
+    let mut in_value = false;
+    let prefix = key.to_string();
+    for line in lines.by_ref() {
+        let trimmed_left = line.trim_start();
+        if !in_value {
+            if trimmed_left.starts_with(&prefix) {
+                let rest = trimmed_left.trim_start_matches(&prefix).trim_start();
+                if let Some(after_eq) = rest.strip_prefix('=') {
+                    in_value = true;
+                    let first = after_eq.trim();
+                    if !first.is_empty() {
+                        out.push_str(first);
+                        out.push('\n');
+                    }
+                }
+            }
+            continue;
+        }
+        // Continuation: indented or blank. A non-empty, non-indented
+        // line ends the value.
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with([' ', '\t']) {
+            out.push_str(line.trim());
+            out.push('\n');
+        } else {
+            break;
+        }
+    }
+    if in_value { Some(out) } else { None }
+}
+
 /// Convert a dotted module path (`acme.cli`) into a repo-relative file
 /// path (`acme/cli.py` or `src/acme/cli.py` or `acme/__init__.py`).
 /// Falls back to `None` when no candidate resolves to an existing file
@@ -500,6 +610,238 @@ fn main_guard_modules(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
         });
     }
     Ok(out)
+}
+
+// ---- Flask / FastAPI route mapping ------------------------------------
+
+/// Flask route detection. Scans `.py` files that import flask for
+/// `@<receiver>.route('/path', methods=['GET','POST'])` decorators where
+/// `receiver` is a local variable initialized from `Flask(...)` or
+/// `Blueprint(...)`. Emits one `route` feature per `(method, path)`.
+/// Defaults to `GET` when `methods=` is absent (Flask's default).
+///
+/// Known limitations matching clawpatch PR #11: blueprint `url_prefix`
+/// is NOT expanded into mounted paths; non-literal paths or method
+/// lists are intentionally skipped rather than guessed.
+fn flask_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
+    python_framework_routes(ctx, PythonFramework::Flask)
+}
+
+/// FastAPI route detection. Scans `.py` files that import fastapi for
+/// `@<receiver>.METHOD('/path')` decorators where `receiver` is a
+/// `FastAPI(...)` or `APIRouter(...)` instance.
+///
+/// Known limitations matching clawpatch PR #15: `include_router(prefix=…)`
+/// mount prefixes are NOT expanded; non-literal paths are skipped.
+fn fastapi_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
+    python_framework_routes(ctx, PythonFramework::FastApi)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PythonFramework {
+    Flask,
+    FastApi,
+}
+
+impl PythonFramework {
+    fn source(self) -> &'static str {
+        match self {
+            Self::Flask => "flask-route",
+            Self::FastApi => "fastapi-route",
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::Flask => "Flask",
+            Self::FastApi => "FastAPI",
+        }
+    }
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Flask => "framework:flask",
+            Self::FastApi => "framework:fastapi",
+        }
+    }
+    fn import_token(self) -> &'static str {
+        match self {
+            Self::Flask => "flask",
+            Self::FastApi => "fastapi",
+        }
+    }
+}
+
+fn python_framework_routes(
+    ctx: &MapperContext,
+    framework: PythonFramework,
+) -> Result<Vec<FeatureSeed>> {
+    let root = ctx.root;
+    let mut out = Vec::new();
+    let files = walk_files(root, root, 30_000, ctx.excludes);
+    let ctor_pattern: &str = match framework {
+        PythonFramework::Flask => {
+            r"(?m)^\s*([A-Za-z_][\w]*)\s*=\s*(?:flask\s*\.\s*)?(?:Flask|Blueprint)\s*\("
+        }
+        PythonFramework::FastApi => {
+            r"(?m)^\s*([A-Za-z_][\w]*)\s*=\s*(?:fastapi\s*\.\s*)?(?:FastAPI|APIRouter)\s*\("
+        }
+    };
+    let ctor_re = Regex::new(ctor_pattern)?;
+    let import_re = Regex::new(&format!(
+        r"(?m)^\s*(?:from\s+{name}(?:\s|\.)|import\s+{name}\b)",
+        name = framework.import_token()
+    ))?;
+
+    for rel in files.iter().filter(|p| p.ends_with(".py")) {
+        let abs = root.join(rel);
+        let Ok(raw) = fs::read_to_string(&abs) else {
+            continue;
+        };
+        // Cheap gates: framework token must appear, and an import line
+        // must confirm it (avoids matching a string literal that
+        // mentions the framework name).
+        if !raw.contains(framework.import_token()) {
+            continue;
+        }
+        let source = strip_line_comments(&raw, '#');
+        if !import_re.is_match(&source) {
+            continue;
+        }
+        let mut receivers: Vec<String> = Vec::new();
+        for cap in ctor_re.captures_iter(&source) {
+            if let Some(name) = cap.get(1) {
+                receivers.push(name.as_str().to_string());
+            }
+        }
+        if receivers.is_empty() {
+            continue;
+        }
+        let mut emitted: BTreeSet<(String, String)> = BTreeSet::new();
+        for recv in &receivers {
+            match framework {
+                PythonFramework::Flask => {
+                    emit_flask_routes_for(&source, rel, recv, framework, &mut emitted, &mut out)?
+                }
+                PythonFramework::FastApi => {
+                    emit_fastapi_routes_for(&source, rel, recv, framework, &mut emitted, &mut out)?
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn emit_flask_routes_for(
+    source: &str,
+    rel: &str,
+    recv: &str,
+    framework: PythonFramework,
+    emitted: &mut BTreeSet<(String, String)>,
+    out: &mut Vec<FeatureSeed>,
+) -> Result<()> {
+    // `@<recv>.route('/path' [, methods=[...]] [, ...])` — captures the
+    // path and the (optional) attribute tail. The `(?s)` flag lets the
+    // attribute list span newlines, which decorator wrapping commonly
+    // uses.
+    let pattern = format!(
+        r#"(?ms)^\s*@\s*{recv}\s*\.\s*route\s*\(\s*['"]([^'"]+)['"](?:\s*,\s*([^)]*))?\)"#,
+        recv = regex::escape(recv)
+    );
+    let re = Regex::new(&pattern)?;
+    let methods_re = Regex::new(r#"methods\s*=\s*\[\s*([^\]]+)\]"#)?;
+    let method_tok_re = Regex::new(r#"['"]\s*([A-Za-z]+)\s*['"]"#)?;
+    for cap in re.captures_iter(source) {
+        let path = cap.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
+        if path.is_empty() {
+            continue;
+        }
+        let extra = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+        let methods = if let Some(m) = methods_re.captures(extra) {
+            let raw = m.get(1).map(|m| m.as_str()).unwrap_or("");
+            let parsed: Vec<String> = method_tok_re
+                .captures_iter(raw)
+                .filter_map(|c| c.get(1).map(|x| x.as_str().to_uppercase()))
+                .collect();
+            if parsed.is_empty() {
+                vec!["GET".to_string()]
+            } else {
+                parsed
+            }
+        } else {
+            vec!["GET".to_string()]
+        };
+        for method in methods {
+            push_python_route_seed(out, emitted, rel, recv, framework, &method, &path);
+        }
+    }
+    Ok(())
+}
+
+fn emit_fastapi_routes_for(
+    source: &str,
+    rel: &str,
+    recv: &str,
+    framework: PythonFramework,
+    emitted: &mut BTreeSet<(String, String)>,
+    out: &mut Vec<FeatureSeed>,
+) -> Result<()> {
+    let pattern = format!(
+        r#"(?ms)^\s*@\s*{recv}\s*\.\s*(get|post|put|patch|delete|options|head)\s*\(\s*['"]([^'"]+)['"]"#,
+        recv = regex::escape(recv)
+    );
+    let re = Regex::new(&pattern)?;
+    for cap in re.captures_iter(source) {
+        let method = cap.get(1).map(|m| m.as_str()).unwrap_or("").to_uppercase();
+        let path = cap.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
+        if path.is_empty() {
+            continue;
+        }
+        push_python_route_seed(out, emitted, rel, recv, framework, &method, &path);
+    }
+    Ok(())
+}
+
+fn push_python_route_seed(
+    out: &mut Vec<FeatureSeed>,
+    emitted: &mut BTreeSet<(String, String)>,
+    rel: &str,
+    recv: &str,
+    framework: PythonFramework,
+    method: &str,
+    path: &str,
+) {
+    let key = (method.to_string(), path.to_string());
+    if !emitted.insert(key.clone()) {
+        return;
+    }
+    let route_label = format!("{method} {path}");
+    out.push(FeatureSeed {
+        title: format!("{} route `{}`", framework.label(), route_label),
+        summary: format!(
+            "{} route {} declared in {} (receiver `{}`)",
+            framework.label(),
+            route_label,
+            rel,
+            recv
+        ),
+        kind: FeatureKind::Route,
+        source: framework.source(),
+        confidence: FeatureConfidence::High,
+        entry_path: rel.to_string(),
+        entry_symbol: None,
+        entry_route: Some(route_label),
+        entry_command: None,
+        test_command: None,
+        language: Language::Python,
+        tags: vec![
+            "python".to_string(),
+            framework.tag().to_string(),
+            "route".to_string(),
+        ],
+        owned_files: Vec::new(),
+        context_files: Vec::new(),
+        tests: Vec::new(),
+        test_prefixes: vec!["tests".to_string()],
+    });
 }
 
 // ---- pytest test-suite mapping ----------------------------------------
@@ -1133,5 +1475,219 @@ acme = "acme.cli:main"
             !owned_paths.contains("tests/test_foo.py"),
             "test files must NOT be on the project seed: got {owned_paths:?}"
         );
+    }
+
+    // ---------- Flask / FastAPI / setup.cfg (clawpatch #11 / #15 / #28) ----------
+
+    #[test]
+    fn flask_basic_route_defaults_to_get() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
+        write(
+            dir.path(),
+            "app.py",
+            r#"
+from flask import Flask
+app = Flask(__name__)
+
+@app.route("/users")
+def list_users():
+    return []
+"#,
+        );
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let routes: Vec<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "flask-route")
+            .filter_map(|s| s.entry_route.as_deref())
+            .collect();
+        assert_eq!(routes, vec!["GET /users"]);
+    }
+
+    #[test]
+    fn flask_methods_kwarg_expands_to_one_route_per_method() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
+        write(
+            dir.path(),
+            "app.py",
+            r#"
+from flask import Flask
+app = Flask(__name__)
+
+@app.route("/users", methods=["GET", "POST"])
+def users():
+    return []
+
+@app.route("/users/<id>", methods=['DELETE'])
+def delete_user(id):
+    return ""
+"#,
+        );
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let routes: std::collections::BTreeSet<String> = seeds
+            .iter()
+            .filter(|s| s.source == "flask-route")
+            .filter_map(|s| s.entry_route.clone())
+            .collect();
+        assert!(routes.contains("GET /users"));
+        assert!(routes.contains("POST /users"));
+        assert!(routes.contains("DELETE /users/<id>"));
+    }
+
+    #[test]
+    fn flask_blueprint_receiver_recognized() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
+        write(
+            dir.path(),
+            "api.py",
+            r#"
+from flask import Blueprint
+bp = Blueprint("api", __name__)
+
+@bp.route("/ping")
+def ping():
+    return "ok"
+"#,
+        );
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        assert!(
+            seeds
+                .iter()
+                .any(|s| s.source == "flask-route" && s.entry_route.as_deref() == Some("GET /ping"))
+        );
+    }
+
+    #[test]
+    fn flask_requires_flask_import() {
+        // No flask import → no route seeds, even if a `@app.route` decorator
+        // happens to be present (could be a different library).
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
+        write(
+            dir.path(),
+            "app.py",
+            r#"
+class App:
+    def route(self, p): return lambda f: f
+
+app = App()
+
+@app.route("/users")
+def users():
+    return []
+"#,
+        );
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        assert!(!seeds.iter().any(|s| s.source == "flask-route"));
+    }
+
+    #[test]
+    fn fastapi_routes_recognized_per_method() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
+        write(
+            dir.path(),
+            "main.py",
+            r#"
+from fastapi import FastAPI
+app = FastAPI()
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
+
+@app.post("/users")
+async def create_user():
+    return {}
+
+@app.delete("/users/{id}")
+async def delete_user(id: int):
+    return None
+"#,
+        );
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let routes: std::collections::BTreeSet<String> = seeds
+            .iter()
+            .filter(|s| s.source == "fastapi-route")
+            .filter_map(|s| s.entry_route.clone())
+            .collect();
+        for expected in ["GET /health", "POST /users", "DELETE /users/{id}"] {
+            assert!(
+                routes.contains(expected),
+                "{expected} missing in {routes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fastapi_apirouter_recognized() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
+        write(
+            dir.path(),
+            "routers.py",
+            r#"
+from fastapi import APIRouter
+router = APIRouter()
+
+@router.get("/v1/ping")
+def ping():
+    return "ok"
+"#,
+        );
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        assert!(seeds.iter().any(
+            |s| s.source == "fastapi-route" && s.entry_route.as_deref() == Some("GET /v1/ping")
+        ));
+    }
+
+    #[test]
+    fn setup_cfg_console_scripts_recognized() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "setup.cfg",
+            r#"
+[metadata]
+name = acme
+
+[options.entry_points]
+console_scripts =
+    acme = acme.cli:main
+    acme-admin = acme.admin:run
+"#,
+        );
+        write(dir.path(), "acme/__init__.py", "");
+        write(dir.path(), "acme/cli.py", "def main(): pass\n");
+        write(dir.path(), "acme/admin.py", "def run(): pass\n");
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let scripts: Vec<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "setup-cfg-script")
+            .filter_map(|s| s.entry_command.as_deref())
+            .collect();
+        assert!(scripts.contains(&"acme"), "got: {scripts:?}");
+        assert!(scripts.contains(&"acme-admin"), "got: {scripts:?}");
+        let acme = seeds
+            .iter()
+            .find(|s| s.source == "setup-cfg-script" && s.entry_command.as_deref() == Some("acme"))
+            .unwrap();
+        assert_eq!(acme.entry_path, "acme/cli.py", "module resolution failed");
     }
 }
