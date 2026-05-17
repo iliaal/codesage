@@ -13,8 +13,8 @@
 //!    parent of the path") are not stored — the agent recovers those from
 //!    the symbol name + signature anyway. See `notes/20260509-...md` §1.2
 //!    for the full reasoning.
-//! 2. **Language-specific by design.** This module starts with Rust only.
-//!    Each language needs a deliberate attachment rule because comment
+//! 2. **Language-specific by design.** This module currently covers Rust and
+//!    Python. Each language needs a deliberate attachment rule because comment
 //!    placement varies (Rust `///` precedes the item, Python docstrings
 //!    live inside the body as the first `(string)` statement, PHP `/** */`
 //!    blocks immediately precede, etc.).
@@ -56,6 +56,99 @@ pub fn extract_rust_rationale(def_node: &Node, source: &[u8]) -> Vec<RationaleEn
     entries
 }
 
+/// Collect Python rationale from line comments immediately above a definition
+/// and from a leading triple-quoted docstring inside the definition body.
+///
+/// Two tree-sitter shapes complicate the walk:
+///
+/// 1. **Decorators.** `@foo\ndef bar()` wraps as
+///    `decorated_definition[decorator(@foo), function_definition(bar)]`, so
+///    the rationale comment is a sibling of the wrapper, not of the inner
+///    def. Anchor the walk at the wrapper so `# TODO:` above `@app.route`,
+///    `@property`, `@dataclass`, `@lru_cache`, etc. still attaches — these
+///    patterns dominate real Python codebases.
+/// 2. **First statement in a class body.** Tree-sitter parks the leading
+///    comment inside a class as a child of `class_definition`, NOT inside
+///    the body `block`. The first method's prev_sibling chain therefore
+///    runs out before reaching the comment. When the anchor is the first
+///    child of a class block, climb to the block and continue the walk
+///    from its prev_siblings inside the class header.
+pub fn extract_python_rationale(def_node: &Node, source: &[u8]) -> Vec<RationaleEntry> {
+    let mut entries = Vec::new();
+    let initial_anchor = python_traversal_anchor(def_node);
+    let mut next_start_row = initial_anchor.start_position().row;
+
+    let exhausted =
+        walk_python_prev_comments(&initial_anchor, &mut next_start_row, &mut entries, source);
+
+    // Climb once into the enclosing class header if we ran out of siblings
+    // inside the block without hitting any non-comment node — that's the
+    // "first method in a class" shape where the comment lives at
+    // class_definition level. Restricted to class_definition: climbing
+    // out of a function body would attribute the comment above the outer
+    // function to the inner nested def, which is wrong.
+    if exhausted
+        && let Some(block) = initial_anchor.parent()
+        && block.kind() == "block"
+        && block
+            .parent()
+            .is_some_and(|p| p.kind() == "class_definition")
+    {
+        let _ = walk_python_prev_comments(&block, &mut next_start_row, &mut entries, source);
+    }
+
+    entries.reverse();
+
+    if let Some(parsed) = extract_python_docstring(def_node, source) {
+        entries.push(parsed);
+    }
+
+    entries
+}
+
+/// If `def_node` is a function_definition or class_definition wrapped by
+/// `decorated_definition`, return the wrapper so prev-sibling traversal sees
+/// the comment above the decorators. Otherwise return `def_node`.
+fn python_traversal_anchor<'a>(def_node: &Node<'a>) -> Node<'a> {
+    if let Some(parent) = def_node.parent()
+        && parent.kind() == "decorated_definition"
+    {
+        return parent;
+    }
+    *def_node
+}
+
+/// Walk prev_siblings of `anchor`, attaching adjacent `# MARKER: text`
+/// comments. Skips unnamed tokens (the `:`, `def`, etc.) so they don't
+/// look like break-points. Returns `true` when the sibling chain runs
+/// out cleanly (caller may want to climb); `false` when a non-comment
+/// named node stops the walk (comments past it are definitely not
+/// attached to this def).
+fn walk_python_prev_comments(
+    anchor: &Node,
+    next_start_row: &mut usize,
+    entries: &mut Vec<RationaleEntry>,
+    source: &[u8],
+) -> bool {
+    let mut sib = anchor.prev_sibling();
+    while let Some(node) = sib {
+        if !node.is_named() {
+            sib = node.prev_sibling();
+            continue;
+        }
+        if node.kind() == "comment" && node.end_position().row + 1 == *next_start_row {
+            if let Some(parsed) = parse_python_comment(&node, source) {
+                entries.push(parsed);
+            }
+            *next_start_row = node.start_position().row;
+            sib = node.prev_sibling();
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
 /// Strip Rust comment delimiters and any leading `!` (inner doc) so the
 /// returned text contains only the comment body. `///`, `//!`, `//`, and
 /// `/* ... */` / `/** ... */` are all reduced to their inner content.
@@ -83,6 +176,38 @@ fn strip_rust_comment_markers(raw: &str) -> String {
         return rest.trim().to_string();
     }
     trimmed.to_string()
+}
+
+fn parse_python_comment(node: &Node, source: &[u8]) -> Option<RationaleEntry> {
+    let raw = node.utf8_text(source).ok()?;
+    let body = raw.trim_start().strip_prefix('#')?.trim_start();
+    parse_marker_line(body, node)
+}
+
+fn extract_python_docstring(def_node: &Node, source: &[u8]) -> Option<RationaleEntry> {
+    let body = def_node.child_by_field_name("body")?;
+    let mut cursor = body.walk();
+    let first_stmt = body.named_children(&mut cursor).next()?;
+    if first_stmt.kind() != "expression_statement" {
+        return None;
+    }
+
+    let mut cursor = first_stmt.walk();
+    for child in first_stmt.named_children(&mut cursor) {
+        if child.kind() == "string" {
+            return parse_python_docstring(&child, source);
+        }
+    }
+    None
+}
+
+fn parse_python_docstring(node: &Node, source: &[u8]) -> Option<RationaleEntry> {
+    let raw = node.utf8_text(source).ok()?.trim();
+    let body = raw
+        .strip_prefix("\"\"\"")
+        .and_then(|s| s.strip_suffix("\"\"\""))
+        .or_else(|| raw.strip_prefix("'''").and_then(|s| s.strip_suffix("'''")))?;
+    parse_marker_line(body.trim(), node)
 }
 
 /// Parse a comment body's first line for a `MARKER: rest` pattern. Multi-line
