@@ -221,6 +221,94 @@ claude plugin install codesage-tools@codesage
 
 Slash commands: `/codesage-onboard`, `/codesage-reset`, `/codesage-reindex`, `/codesage-bench`, `/codesage-eval`. The plugin handles global MCP registration, per-project init, indexing, git hook install (Husky-aware), and writes a `.claude/CLAUDE.md` hint teaching the agent how to route MCP calls.
 
+## 🔍 Feature-slice review
+
+Codesage maps a project into behavior-keyed feature slices (routes, CLIs, libraries, test suites, jobs). The `codesage-tools` plugin ships a four-command workflow that dispatches read-only subagent reviews — one per slice, in parallel batches — and persists findings to gitignored JSON under `.codesage/findings/`. Each finding gets a stable `fnd_<hex>` ID so it can be referenced in commit messages and PR comments. Re-running keeps prior triage (`status` + audit-trail `history`) intact and merges new defects into the same per-feature file.
+
+The subagent is read-only (`autoApprove: read`); it consumes the existing MCP surface (`feature_bundle`, `assess_risk`, `find_references`, `find_coupling`) plus `Read`. Codesage's core stays read-only; findings are output that other tooling can consume.
+
+### `/codesage-review`
+
+Dispatches subagents in parallel batches over the project's mapped feature slices.
+
+```
+/codesage-review <project> [--limit N] [--jobs N] [--feature <id>]
+                           [--kind <k>] [--severity <s>] [--categories <c,c,...>]
+```
+
+- `<project>` — absolute path to an onboarded codesage project (must contain `.codesage/index.db`)
+- `--limit N` — cap the number of features reviewed in one run (default `50`)
+- `--jobs N` — parallel subagents per batch (default `4`, hard ceiling `8`)
+- `--feature <id>` — review one specific `feat_<hex>`, skipping discovery
+- `--kind <k>` — filter features by kind: `route`, `cli-command`, `service`, `library`, `test-suite`, `config`, `job`
+- `--severity <s>` — minimum severity to report: `low` / `medium` / `high` (default `medium`)
+- `--categories <c,c,...>` — comma-separated list (default `bug,security`); other values include `perf`, `maintainability`
+
+Features whose `.codesage/findings/<feature_id>.json` is newer than the feature's `updated_at` AND whose last run was complete are skipped (already up-to-date). Sort order: `route` > `cli-command` > `service` > `library` > rest, then `high` confidence first.
+
+### `/codesage-triage`
+
+Pure local state edit — appends a history entry on the named finding and updates its status. No LLM call, no re-review.
+
+```
+/codesage-triage <project> --finding <fnd_id> --status <open|false-positive|wont-fix|fixed> [--note <text>]
+```
+
+- `--finding <fnd_id>` — the `fnd_<hex>` ID from `.codesage/findings/<feature_id>.json`
+- `--status <s>` — new status: `open`, `false-positive`, `wont-fix`, or `fixed`
+- `--note <text>` — optional free-form note stored alongside the history entry
+
+### `/codesage-revalidate`
+
+Re-runs the subagent against a specific feature slice (or a single finding's owning slice) and reconciles. Auto-flips `open` → `fixed` when the defect no longer surfaces. Never mass-reopens `false-positive` or `wont-fix`.
+
+```
+/codesage-revalidate <project> [--feature <id>] [--finding <fnd_id>]
+```
+
+- `--feature <id>` — re-review one feature slice
+- `--finding <fnd_id>` — re-review the slice that owns this finding (and check whether it's still present)
+
+### `/codesage-report`
+
+Deterministic Markdown render of the findings JSON. No LLM call.
+
+```
+/codesage-report <project> [--status <s>] [--severity <s>] [--category <c>] [--feature <id>]
+```
+
+- `--status <s>` — filter to one status (default: all except `false-positive` and `wont-fix`)
+- `--severity <s>` — minimum severity to render
+- `--category <c>` — filter to one category
+- `--feature <id>` — render findings for a single feature
+
+### State paths
+
+| Path | Content |
+|---|---|
+| `.codesage/findings/<feature_id>.json` | Per-feature findings + audit-trail `history[]` per finding (status, action, run_id, timestamp) |
+| `.codesage/findings/history/<feature_id>-<run_id>.json` | Per-run snapshot of the feature's findings — never modified after write |
+| `.codesage/reviews/<run_id>.json` | Run record: filters used, features planned, completion stats by severity/category, top features by finding count, severity-high list |
+
+Both directories are added to `.gitignore` by `/codesage-onboard` (or its hint).
+
+### Example workflow
+
+```bash
+# Initial sweep over every mapped feature
+/codesage-review /path/to/project
+
+# Look at the result
+/codesage-report /path/to/project
+
+# Triage a false positive
+/codesage-triage /path/to/project --finding fnd_b3a1c4e7 --status false-positive --note "regex is anchored, not exploitable"
+
+# Fix a real bug, then re-check
+$EDITOR src/server.ts
+/codesage-revalidate /path/to/project --finding fnd_9c80fa62
+```
+
 ## Indexing pipeline
 
 `codesage index` walks the project, parses every supported file, extracts structural data and embeddings, and writes both into the same SQLite database.
