@@ -67,11 +67,24 @@ impl FeatureMapper for JsMapper {
         };
         let packages = discover_packages(root, pkg_at_root.as_ref());
         let pm = detect_node_package_manager(root);
+        // Turbo presence is a workspace-wide signal — if turbo.json is
+        // at the repo root, we re-route every workspace test_command
+        // through `turbo run test --filter=<pkg>` so the agent gets the
+        // dependency-aware orchestration that monorepos rely on. See
+        // `compose_turbo_test_command` for the formatting.
+        let turbo = read_turbo_config(root);
         for info in &packages {
             seeds.extend(package_seeds_for(ctx, info, pm));
         }
-        seeds.extend(next_app_routes(ctx)?);
-        seeds.extend(next_pages_routes(ctx)?);
+        // Next.js routes — run per discovered package root so monorepos
+        // with `apps/web/app/...` or `apps/marketing/pages/...` get
+        // their routes mapped. Falls back to repo root when no packages
+        // were discovered (single-app layout).
+        let scan_roots = next_scan_roots(&packages, root);
+        for prefix in &scan_roots {
+            seeds.extend(next_app_routes_at(ctx, prefix)?);
+            seeds.extend(next_pages_routes_at(ctx, prefix)?);
+        }
         // React Router `<Route path element>` declarations. Only run
         // when the root package.json declares a react dep — keeps the
         // tree-walk cost off non-React repos.
@@ -84,6 +97,14 @@ impl FeatureMapper for JsMapper {
         // packages on the dev side.
         if pkg_at_root.as_ref().is_some_and(has_node_server_dependency) {
             seeds.extend(node_server_routes(ctx)?);
+        }
+        // Retag workspace seeds with Turbo-aware test commands when
+        // turbo.json is present and declares a `test` task. Run last
+        // so it sees every prior seed.
+        if let Some(turbo_cfg) = &turbo
+            && turbo_cfg.has_test_task
+        {
+            apply_turbo_test_commands(&mut seeds, &packages);
         }
         seeds.retain(|s| ctx.allowed(&s.entry_path));
         Ok(seeds)
@@ -942,13 +963,23 @@ fn is_reviewable_node_source(path: &str) -> bool {
     true
 }
 
-fn next_app_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
+fn next_app_routes_at(ctx: &MapperContext, package_rel: &str) -> Result<Vec<FeatureSeed>> {
     let root = ctx.root;
     let mut out = Vec::new();
-    let app_dir = root.join("app");
+    let pkg_root = if package_rel.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(package_rel)
+    };
+    let app_dir = pkg_root.join("app");
     if !is_safe_dir(root, &app_dir) {
         return Ok(out);
     }
+    let pkg_path_prefix = if package_rel.is_empty() {
+        "app/".to_string()
+    } else {
+        format!("{}/app/", package_rel.trim_end_matches('/'))
+    };
     for rel in walk_files(root, &app_dir, 5_000, ctx.excludes) {
         let is_page = ends_with_any(&rel, &["/page.tsx", "/page.ts", "/page.jsx", "/page.js"]);
         let is_route = ends_with_any(
@@ -958,7 +989,7 @@ fn next_app_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
         if !is_page && !is_route {
             continue;
         }
-        let inside_app = rel.strip_prefix("app/").unwrap_or(&rel);
+        let inside_app = rel.strip_prefix(&pkg_path_prefix).unwrap_or(&rel);
         let segments: Vec<&str> = inside_app
             .rsplit_once('/')
             .map(|(head, _)| head.split('/').collect())
@@ -969,9 +1000,26 @@ fn next_app_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
             format!("/{}", segments.join("/"))
         };
         let language = language_for_entry(&rel);
+        let mut tags = vec![
+            if language == Language::TypeScript {
+                "typescript"
+            } else {
+                "javascript"
+            }
+            .to_string(),
+            "framework:next".to_string(),
+            "route".to_string(),
+        ];
+        if !package_rel.is_empty() {
+            tags.push("workspace".to_string());
+        }
         out.push(FeatureSeed {
             title: format!("Next.js {} `{url}`", if is_page { "page" } else { "route" }),
-            summary: format!("Next.js app router file at {rel}"),
+            summary: if package_rel.is_empty() {
+                format!("Next.js app router file at {rel}")
+            } else {
+                format!("Next.js app router file at {rel} (package {package_rel})")
+            },
             kind: FeatureKind::Route,
             source: if is_page {
                 "next-app-page"
@@ -985,16 +1033,7 @@ fn next_app_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
             entry_command: None,
             test_command: None,
             language,
-            tags: vec![
-                if language == Language::TypeScript {
-                    "typescript"
-                } else {
-                    "javascript"
-                }
-                .to_string(),
-                "framework:next".to_string(),
-                "route".to_string(),
-            ],
+            tags,
             owned_files: Vec::new(),
             context_files: Vec::new(),
             tests: Vec::new(),
@@ -1004,21 +1043,29 @@ fn next_app_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
     Ok(out)
 }
 
-fn next_pages_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
+fn next_pages_routes_at(ctx: &MapperContext, package_rel: &str) -> Result<Vec<FeatureSeed>> {
     let root = ctx.root;
     let mut out = Vec::new();
-    let pages_dir = root.join("pages");
+    let pkg_root = if package_rel.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(package_rel)
+    };
+    let pages_dir = pkg_root.join("pages");
     if !is_safe_dir(root, &pages_dir) {
         return Ok(out);
     }
+    let pkg_path_prefix = if package_rel.is_empty() {
+        "pages/".to_string()
+    } else {
+        format!("{}/pages/", package_rel.trim_end_matches('/'))
+    };
     for rel in walk_files(root, &pages_dir, 5_000, ctx.excludes) {
         if !ends_with_any(&rel, &[".tsx", ".ts", ".jsx", ".js"]) {
             continue;
         }
         let language = language_for_entry(&rel);
-        // Path is the file path under pages/, stripped of extension and
-        // /index.
-        let inside_pages = rel.strip_prefix("pages/").unwrap_or(&rel);
+        let inside_pages = rel.strip_prefix(&pkg_path_prefix).unwrap_or(&rel);
         let stripped = inside_pages
             .rsplit_once('.')
             .map(|(head, _)| head)
@@ -1029,9 +1076,26 @@ fn next_pages_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
         } else {
             format!("/{url_part}")
         };
+        let mut tags = vec![
+            if language == Language::TypeScript {
+                "typescript"
+            } else {
+                "javascript"
+            }
+            .to_string(),
+            "framework:next".to_string(),
+            "route".to_string(),
+        ];
+        if !package_rel.is_empty() {
+            tags.push("workspace".to_string());
+        }
         out.push(FeatureSeed {
             title: format!("Next.js page `{url}`"),
-            summary: format!("Next.js pages-router file at {rel}"),
+            summary: if package_rel.is_empty() {
+                format!("Next.js pages-router file at {rel}")
+            } else {
+                format!("Next.js pages-router file at {rel} (package {package_rel})")
+            },
             kind: FeatureKind::Route,
             source: "next-pages-route",
             confidence: FeatureConfidence::High,
@@ -1041,16 +1105,7 @@ fn next_pages_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
             entry_command: None,
             test_command: None,
             language,
-            tags: vec![
-                if language == Language::TypeScript {
-                    "typescript"
-                } else {
-                    "javascript"
-                }
-                .to_string(),
-                "framework:next".to_string(),
-                "route".to_string(),
-            ],
+            tags,
             owned_files: Vec::new(),
             context_files: Vec::new(),
             tests: Vec::new(),
@@ -1058,6 +1113,102 @@ fn next_pages_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
         });
     }
     Ok(out)
+}
+
+/// Choose the set of directory prefixes to run Next.js route mapping
+/// against. The default is every discovered workspace package root
+/// (including `""` for the repo root). When no workspaces are declared
+/// AND the repo root has no `app/` or `pages/`, we additionally probe
+/// the conventional nested-frontend dirs (`frontend`, `client`, `web`,
+/// `ui`) so a repo that wraps a Vite/Next app one level down still
+/// gets its routes mapped.
+fn next_scan_roots(packages: &[PackageInfo], root: &Path) -> Vec<String> {
+    let mut out: Vec<String> = packages
+        .iter()
+        .map(|p| {
+            if p.is_root() {
+                String::new()
+            } else {
+                p.root_rel.clone()
+            }
+        })
+        .collect();
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    let root_has_next =
+        is_safe_dir(root, &root.join("app")) || is_safe_dir(root, &root.join("pages"));
+    let root_already_scanned = out.iter().any(|s| s.is_empty());
+    if !root_has_next && root_already_scanned {
+        for guess in ["frontend", "client", "web", "ui"] {
+            let candidate = root.join(guess);
+            if !is_safe_dir(root, &candidate) {
+                continue;
+            }
+            if is_safe_dir(root, &candidate.join("app"))
+                || is_safe_dir(root, &candidate.join("pages"))
+            {
+                let s = guess.to_string();
+                if !out.iter().any(|existing| existing == &s) {
+                    out.push(s);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Trimmed view of a `turbo.json` config — we only care whether a
+/// `test` task is declared, because that's what drives the Turbo-aware
+/// `test_command` substitution for workspace packages.
+struct TurboConfig {
+    has_test_task: bool,
+}
+
+fn read_turbo_config(root: &Path) -> Option<TurboConfig> {
+    let path = root.join("turbo.json");
+    if !is_safe_file(root, &path) {
+        return None;
+    }
+    let raw = fs::read_to_string(&path).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    // Turbo 1.x uses `pipeline`, Turbo 2.x uses `tasks`. Either may
+    // declare a `test` key.
+    let has_test_task = ["pipeline", "tasks"].iter().any(|section| {
+        value
+            .get(section)
+            .and_then(|v| v.as_object())
+            .is_some_and(|m| m.contains_key("test"))
+    });
+    Some(TurboConfig { has_test_task })
+}
+
+/// Rewrite the `test_command` on every workspace package seed to flow
+/// through Turbo so the agent gets dependency-aware orchestration
+/// (build deps run first, cached output reused). Repo-root seeds keep
+/// their plain script command — root tests don't filter to a package.
+fn apply_turbo_test_commands(seeds: &mut [FeatureSeed], packages: &[PackageInfo]) {
+    use std::collections::HashMap;
+    let by_root: HashMap<&str, &Value> = packages
+        .iter()
+        .filter(|p| !p.is_root())
+        .map(|p| (p.root_rel.as_str(), &p.pkg))
+        .collect();
+    for seed in seeds.iter_mut() {
+        if seed.test_command.is_none() {
+            continue;
+        }
+        // Find the package root this seed's entry_path lives under.
+        let owning = by_root
+            .iter()
+            .filter(|(root_rel, _)| seed.entry_path.starts_with(*root_rel))
+            .max_by_key(|(root_rel, _)| root_rel.len());
+        let Some((_, pkg)) = owning else { continue };
+        let Some(name) = pkg.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        seed.test_command = Some(format!("turbo run test --filter={name}"));
+    }
 }
 
 fn ends_with_any(s: &str, suffixes: &[&str]) -> bool {
@@ -2176,5 +2327,146 @@ app.get("/should-not-surface", () => {});
         );
         let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
         assert!(!seeds.iter().any(|s| s.source == "express-route"));
+    }
+
+    // ---------- JS monorepo (clawpatch PRs #4 / #18 / #37) ----------
+
+    #[test]
+    fn next_routes_emitted_per_workspace_package() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"monorepo","workspaces":["apps/*"]}"#,
+        );
+        write(
+            dir.path(),
+            "apps/web/package.json",
+            r#"{"name":"@acme/web","dependencies":{"next":"15.0.0"}}"#,
+        );
+        write(
+            dir.path(),
+            "apps/web/app/page.tsx",
+            "export default function Page() { return null; }\n",
+        );
+        write(
+            dir.path(),
+            "apps/web/app/users/page.tsx",
+            "export default function Users() { return null; }\n",
+        );
+        write(
+            dir.path(),
+            "apps/marketing/package.json",
+            r#"{"name":"@acme/marketing","dependencies":{"next":"15.0.0"}}"#,
+        );
+        write(
+            dir.path(),
+            "apps/marketing/pages/about.tsx",
+            "export default function About() { return null; }\n",
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let next_routes: BTreeSet<(&str, &str)> = seeds
+            .iter()
+            .filter(|s| matches!(s.source, "next-app-page" | "next-pages-route"))
+            .map(|s| {
+                (
+                    s.entry_path.as_str(),
+                    s.entry_route.as_deref().unwrap_or(""),
+                )
+            })
+            .collect();
+        assert!(
+            next_routes.contains(&("apps/web/app/page.tsx", "/")),
+            "missing apps/web root page: {next_routes:?}"
+        );
+        assert!(
+            next_routes.contains(&("apps/web/app/users/page.tsx", "/users")),
+            "missing apps/web /users page: {next_routes:?}"
+        );
+        assert!(
+            next_routes.contains(&("apps/marketing/pages/about.tsx", "/about")),
+            "missing apps/marketing /about page: {next_routes:?}"
+        );
+    }
+
+    #[test]
+    fn nested_frontend_discovered_when_root_has_no_next() {
+        let dir = tempdir().unwrap();
+        // Repo root has no app/ or pages/ — only a Rust workspace
+        // wrapping a Next frontend in a conventional `frontend/` dir.
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"backend\"]\n",
+        );
+        write(
+            dir.path(),
+            "frontend/package.json",
+            r#"{"name":"frontend","dependencies":{"next":"15.0.0"}}"#,
+        );
+        write(
+            dir.path(),
+            "frontend/app/page.tsx",
+            "export default function Page() { return null; }\n",
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        assert!(
+            seeds
+                .iter()
+                .any(|s| s.source == "next-app-page" && s.entry_path == "frontend/app/page.tsx"),
+            "nested frontend/ root not discovered"
+        );
+    }
+
+    #[test]
+    fn turbo_rewrites_workspace_test_command_when_test_task_declared() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"monorepo","workspaces":["packages/*"]}"#,
+        );
+        write(dir.path(), "turbo.json", r#"{"tasks":{"test":{}}}"#);
+        write(
+            dir.path(),
+            "packages/api/package.json",
+            r#"{"name":"@acme/api","scripts":{"test":"jest"}}"#,
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let api_pkg = seeds
+            .iter()
+            .find(|s| s.source == "node-package" && s.entry_path == "packages/api/package.json")
+            .expect("node-package seed");
+        assert_eq!(
+            api_pkg.test_command.as_deref(),
+            Some("turbo run test --filter=@acme/api"),
+            "turbo rewrite missing"
+        );
+    }
+
+    #[test]
+    fn turbo_without_test_task_keeps_plain_test_command() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"monorepo","workspaces":["packages/*"]}"#,
+        );
+        write(dir.path(), "turbo.json", r#"{"tasks":{"build":{}}}"#);
+        write(
+            dir.path(),
+            "packages/api/package.json",
+            r#"{"name":"@acme/api","scripts":{"test":"jest"}}"#,
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let api_pkg = seeds
+            .iter()
+            .find(|s| s.source == "node-package" && s.entry_path == "packages/api/package.json")
+            .expect("node-package seed");
+        let cmd = api_pkg.test_command.as_deref().unwrap_or("");
+        assert!(
+            !cmd.starts_with("turbo "),
+            "turbo prefix applied without test task: {cmd}"
+        );
     }
 }
