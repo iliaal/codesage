@@ -264,10 +264,20 @@ struct ProjectState {
     embedding_config: EmbeddingConfig,
 }
 
+/// One model "slot" per key — the outer mutex serializes the cold load
+/// for that key, the inner option holds the loaded model once init
+/// succeeds. Concurrent callers for the same key wait on the per-key
+/// mutex; callers for different keys run in parallel because they
+/// hold different slots. This is the fix for CR-001: previously
+/// `get_or_load_*` checked the map, dropped the lock, called `new()`,
+/// then raced to insert — two concurrent cold misses for the same
+/// model loaded two ORT sessions and the loser was thrown away.
+type ModelSlot<T> = Arc<Mutex<Option<Arc<Mutex<T>>>>>;
+
 pub(crate) struct CodeSageServerState {
     projects: Mutex<HashMap<PathBuf, ProjectState>>,
-    embedders: Mutex<HashMap<String, Arc<Mutex<Embedder>>>>,
-    rerankers: Mutex<HashMap<String, Arc<Mutex<Reranker>>>>,
+    embedders: Mutex<HashMap<String, ModelSlot<Embedder>>>,
+    rerankers: Mutex<HashMap<String, ModelSlot<Reranker>>>,
 }
 
 impl CodeSageServerState {
@@ -362,11 +372,21 @@ impl CodeSageServer {
 
     fn get_or_load_embedder(&self, config: &EmbeddingConfig) -> Result<Arc<Mutex<Embedder>>> {
         let key = format!("{}|{}", config.model, config.device);
-        {
-            let guard = self.state.embedders.lock();
-            if let Some(arc) = guard.get(&key) {
-                return Ok(arc.clone());
-            }
+        // Map lock is held only long enough to find-or-create the slot.
+        let slot = {
+            let mut guard = self.state.embedders.lock();
+            guard
+                .entry(key)
+                .or_insert_with(|| Arc::new(Mutex::new(None)))
+                .clone()
+        };
+        // Per-key lock serializes loading for THIS model only; concurrent
+        // callers for OTHER models proceed in parallel because they hold
+        // different slots. Loading happens under the slot lock so two
+        // cold misses for the same model can't both run Embedder::new().
+        let mut slot_guard = slot.lock();
+        if let Some(arc) = slot_guard.as_ref() {
+            return Ok(arc.clone());
         }
         let embedder = Embedder::new(config).with_context(|| {
             format!(
@@ -375,8 +395,8 @@ impl CodeSageServer {
             )
         })?;
         let arc = Arc::new(Mutex::new(embedder));
-        let mut guard = self.state.embedders.lock();
-        Ok(guard.entry(key).or_insert(arc).clone())
+        *slot_guard = Some(arc.clone());
+        Ok(arc)
     }
 
     fn get_or_load_reranker(
@@ -385,18 +405,23 @@ impl CodeSageServer {
         device: &str,
     ) -> Result<Arc<Mutex<Reranker>>> {
         let key = format!("{}|{}", reranker_model, device);
-        {
-            let guard = self.state.rerankers.lock();
-            if let Some(arc) = guard.get(&key) {
-                return Ok(arc.clone());
-            }
+        let slot = {
+            let mut guard = self.state.rerankers.lock();
+            guard
+                .entry(key)
+                .or_insert_with(|| Arc::new(Mutex::new(None)))
+                .clone()
+        };
+        let mut slot_guard = slot.lock();
+        if let Some(arc) = slot_guard.as_ref() {
+            return Ok(arc.clone());
         }
         let reranker = Reranker::new(reranker_model, device).with_context(|| {
             format!("loading reranker model '{reranker_model}' on device '{device}'")
         })?;
         let arc = Arc::new(Mutex::new(reranker));
-        let mut guard = self.state.rerankers.lock();
-        Ok(guard.entry(key).or_insert(arc).clone())
+        *slot_guard = Some(arc.clone());
+        Ok(arc)
     }
 
     fn open_db_for(&self, state: &ProjectState) -> Result<Database> {
@@ -455,11 +480,21 @@ impl CodeSageServer {
         f(&db)
     }
 
-    /// Same as `with_project_db` but also acquires the project's embedder and
-    /// reranker (if configured). Locks held for the duration of `f`.
-    fn with_project_search<F, R>(&self, project: &str, f: F) -> Result<R>
+    /// Resolve a project, embed `query`, and call `f` with the resulting
+    /// query embedding + a reranker callback that lazily locks the shared
+    /// reranker only when the search pipeline actually invokes it.
+    ///
+    /// The lock scopes are deliberately tight: the embedder mutex is held
+    /// only for the `embed_one` call, the reranker mutex is held only for
+    /// the (single) `score_pairs` call inside `search`. SQLite retrieval
+    /// and result post-processing run lock-free, so concurrent agents on
+    /// the same project can interleave their SQL work while one is in the
+    /// (slow) ORT call. Pre-daemon each shim had a per-process embedder
+    /// pool so calls were already parallel; this preserves that property
+    /// under the shared-daemon model.
+    fn with_project_query<F, R>(&self, project: &str, query: &str, f: F) -> Result<R>
     where
-        F: FnOnce(&Database, &mut Embedder, Option<&mut Reranker>) -> Result<R>,
+        F: FnOnce(&Database, &[f32], Option<codesage_graph::RerankFn<'_>>) -> Result<R>,
     {
         let state = self.resolve_project(project)?;
         let db = self.open_db_for(&state)?;
@@ -470,10 +505,21 @@ impl CodeSageServer {
             .as_deref()
             .map(|m| self.get_or_load_reranker(m, &state.embedding_config.device))
             .transpose()?;
-        let mut embedder_guard = embedder_arc.lock();
-        let mut reranker_guard = reranker_arc.as_ref().map(|a| a.lock());
-        let reranker_opt = reranker_guard.as_deref_mut();
-        f(&db, &mut embedder_guard, reranker_opt)
+
+        let query_embedding = {
+            let mut guard = embedder_arc.lock();
+            guard.embed_one(query)?
+        };
+
+        let rerank_fn: Option<codesage_graph::RerankFn<'_>> = reranker_arc.map(|rr| {
+            // Closure captures the Arc; per-call .lock() means the reranker
+            // mutex is held only across the score_pairs call inside search,
+            // not for the surrounding SQL retrieval and post-processing.
+            Box::new(move |q: &str, docs: &[&str]| rr.lock().score_pairs(q, docs))
+                as Box<dyn FnMut(&str, &[&str]) -> Result<Vec<f32>>>
+        });
+
+        f(&db, &query_embedding, rerank_fn)
     }
 }
 
@@ -772,8 +818,11 @@ impl CodeSageServer {
             languages,
             paths: params.paths,
         };
+        let query_for_embed = req.query.clone();
         render_with_kind(
-            self.with_project_search(&params.project, |db, emb, rr| search(db, emb, rr, &req)),
+            self.with_project_query(&params.project, &query_for_embed, |db, emb, rr| {
+                search(db, emb, rr, &req)
+            }),
             "search",
         )
     }
@@ -819,8 +868,9 @@ impl CodeSageServer {
                 "export_context",
             );
         }
+        let query_for_embed = req.query.clone().unwrap_or_default();
         render_with_kind(
-            self.with_project_search(&params.project, |db, emb, rr| {
+            self.with_project_query(&params.project, &query_for_embed, |db, emb, rr| {
                 export_context(db, emb, rr, &req)
             }),
             "export_context",

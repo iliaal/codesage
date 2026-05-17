@@ -143,6 +143,20 @@ Every MCP tool advertises an `outputSchema` (0.7.0); agents that consult it know
 
 Use `codesage mcp --direct` only when debugging the old single-process stdio path. Use `codesage daemon` to run the foreground daemon explicitly. Socket state lives under `$CODESAGE_DAEMON_RUNTIME_DIR`, `$XDG_RUNTIME_DIR/codesage`, or `/tmp/codesage-$UID`; the socket name includes the running binary's version and executable metadata so rebuilt binaries don't attach to stale daemons.
 
+### Daemon management
+
+- `codesage daemon` runs the daemon in the foreground (the default action).
+- `codesage daemon status` prints the running daemon's pid, socket path, and log path; exit 1 if not running.
+- `codesage daemon stop` sends SIGTERM, waits up to 10s for cleanup, and reports.
+
+Runtime files per daemon: `mcp-<version>-<key>.sock` (Unix socket, 0o600), `mcp-<version>-<key>.pid` (text pid), `mcp-<version>-<key>.lock` (start-lock during spawn), `mcp-<version>-<key>.log` (daemon stdout + stderr). The log is rotated when it crosses 4 MiB; three generations are retained (`.log`, `.log.1`, `.log.2`).
+
+### Tracing
+
+The daemon inherits the **first** spawning shim's environment, including `RUST_LOG`. Setting `RUST_LOG=codesage=debug` on the initial `codesage mcp` invocation that boots the daemon raises the daemon's log level for its entire lifetime; subsequent shims with different `RUST_LOG` values don't reconfigure the running daemon. To change filters mid-life, `codesage daemon stop` and let the next shim restart it under the new env.
+
+The daemon writes tracing to `mcp-<version>-<key>.log` in the runtime dir; check that file first when a tool call hangs or an MCP session won't initialize. SIGTERM/SIGINT trigger graceful shutdown (socket + pid file removed before exit).
+
 ## CLI commands
 
 `init`, `index`, `search`, `find-symbol`, `find-references`, `dependencies`, `impact`, `export`, `status`, `mcp`, `daemon`, `install-hooks`, `cleanup`, `git-index`, `coupling`, `risk`, `risk-batch`, `risk-diff`, `tests-for`, `session-start`, `session-end`, `doctor`, `map`, `features-list`, `feature-show`, `feature-for`, `feature-bundle`, `trust-boundaries`.
