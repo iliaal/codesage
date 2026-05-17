@@ -9,6 +9,7 @@ static PHP_QUERY: &str = include_str!("queries/php.scm");
 static PYTHON_QUERY: &str = include_str!("queries/python.scm");
 static C_QUERY: &str = include_str!("queries/c.scm");
 static CPP_QUERY: &str = include_str!("queries/cpp.scm");
+static JAVA_QUERY: &str = include_str!("queries/java.scm");
 static RUST_QUERY: &str = include_str!("queries/rust.scm");
 static JS_QUERY: &str = include_str!("queries/javascript.scm");
 static TS_QUERY: &str = include_str!("queries/typescript.scm");
@@ -47,6 +48,8 @@ static C_SYM: LazyLock<SymbolQuerySpec> =
     LazyLock::new(|| compile_symbol_query(tree_sitter_c::LANGUAGE.into(), C_QUERY));
 static CPP_SYM: LazyLock<SymbolQuerySpec> =
     LazyLock::new(|| compile_symbol_query(tree_sitter_cpp::LANGUAGE.into(), CPP_QUERY));
+static JAVA_SYM: LazyLock<SymbolQuerySpec> =
+    LazyLock::new(|| compile_symbol_query(tree_sitter_java::LANGUAGE.into(), JAVA_QUERY));
 static RUST_SYM: LazyLock<SymbolQuerySpec> =
     LazyLock::new(|| compile_symbol_query(tree_sitter_rust::LANGUAGE.into(), RUST_QUERY));
 static JS_SYM: LazyLock<SymbolQuerySpec> =
@@ -62,6 +65,7 @@ fn symbol_query_for(lang: Language) -> &'static SymbolQuerySpec {
         Language::Python => &PY_SYM,
         Language::C => &C_SYM,
         Language::Cpp => &CPP_SYM,
+        Language::Java => &JAVA_SYM,
         Language::Rust => &RUST_SYM,
         Language::JavaScript => &JS_SYM,
         Language::TypeScript => &TS_SYM,
@@ -120,6 +124,20 @@ fn cpp_kind_map(pattern_index: usize) -> Option<SymbolKind> {
         13 => Some(SymbolKind::Macro),
         14..=18 => Some(SymbolKind::Method), // in-class declarations (no body)
         19..=22 => Some(SymbolKind::Function), // in-class definitions (refined to Method)
+        _ => None,
+    }
+}
+
+fn java_kind_map(pattern_index: usize) -> Option<SymbolKind> {
+    match pattern_index {
+        0 => Some(SymbolKind::Class),
+        1 => Some(SymbolKind::Interface),
+        2 => Some(SymbolKind::Enum),
+        3 => Some(SymbolKind::Class), // record
+        4 => Some(SymbolKind::Method),
+        5 => Some(SymbolKind::Method),    // constructor
+        6 => Some(SymbolKind::Constant),  // field
+        7 => Some(SymbolKind::Interface), // @interface (annotation type)
         _ => None,
     }
 }
@@ -187,6 +205,7 @@ pub fn extract_symbols(
         Language::Python => python_kind_map,
         Language::C => c_kind_map,
         Language::Cpp => cpp_kind_map,
+        Language::Java => java_kind_map,
         Language::Rust => rust_kind_map,
         Language::JavaScript => js_kind_map,
         Language::TypeScript => ts_kind_map,
@@ -204,6 +223,7 @@ pub fn extract_symbols(
 
     let namespace = match language {
         Language::Php => find_php_namespace(&root, source),
+        Language::Java => find_java_package(&root, source),
         _ => None,
     };
 
@@ -225,7 +245,16 @@ pub fn extract_symbols(
         let name_node = name_cap.node;
         let def_node = def_cap.node;
 
-        let def_id = (def_node.start_byte(), def_node.end_byte());
+        // Dedup key includes the name node so multi-declarator field
+        // declarations (`String x, y, z;` in Java; the same shape exists in
+        // C/C++) emit one symbol per name. Without the name in the key, the
+        // first declarator wins and the rest are silently dropped because
+        // tree-sitter produces N matches all sharing the same def_node.
+        let def_id = (
+            def_node.start_byte(),
+            def_node.end_byte(),
+            name_node.start_byte(),
+        );
         if !seen_defs.insert(def_id) {
             continue;
         }
@@ -302,6 +331,22 @@ fn find_php_namespace(root: &Node, source: &[u8]) -> Option<String> {
             && let Some(name_node) = child.child_by_field_name("name")
         {
             return Some(name_node.utf8_text(source).ok()?.to_string());
+        }
+    }
+    None
+}
+
+fn find_java_package(root: &Node, source: &[u8]) -> Option<String> {
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() != "package_declaration" {
+            continue;
+        }
+        let mut package_cursor = child.walk();
+        for package_child in child.named_children(&mut package_cursor) {
+            if matches!(package_child.kind(), "identifier" | "scoped_identifier") {
+                return package_child.utf8_text(source).ok().map(str::to_string);
+            }
         }
     }
     None
@@ -424,6 +469,7 @@ fn find_parent_class_name<'a>(node: &Node, source: &'a [u8]) -> Option<&'a str> 
             | "trait_declaration"
             | "interface_declaration"
             | "enum_declaration"
+            | "record_declaration"
             | "class_specifier"
             | "struct_specifier"
             | "union_specifier" => {
@@ -475,6 +521,19 @@ fn build_qualified_name(
         // exists only to keep the match exhaustive; the dispatcher never
         // reaches here for Cpp.
         Language::Cpp => name.to_string(),
+        Language::Java => {
+            let mut parts = Vec::new();
+            if let Some(package) = namespace {
+                parts.push(package.as_str().to_string());
+            }
+            if (kind == SymbolKind::Method || kind == SymbolKind::Constant)
+                && let Some(class_name) = find_parent_class_name(def_node, source)
+            {
+                parts.push(class_name.to_string());
+            }
+            parts.push(name.to_string());
+            parts.join(".")
+        }
         Language::Rust => {
             if kind == SymbolKind::Method
                 && let Some(type_name) = find_parent_class_name(def_node, source)

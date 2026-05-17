@@ -722,6 +722,7 @@ pub fn rules_for(language: Language) -> &'static [&'static [TrustBoundaryRule]] 
         Language::Php => &[PHP_RULES],
         Language::C => &[C_RULES],
         Language::Cpp => &[C_RULES, CPP_EXTRA_RULES],
+        Language::Java => &[],
         Language::Python => &[PYTHON_RULES],
         Language::Go => &[GO_RULES],
         Language::JavaScript | Language::TypeScript => &[JS_RULES],
