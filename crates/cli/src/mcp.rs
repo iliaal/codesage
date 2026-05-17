@@ -274,6 +274,42 @@ struct ProjectState {
 /// model loaded two ORT sessions and the loser was thrown away.
 type ModelSlot<T> = Arc<Mutex<Option<Arc<Mutex<T>>>>>;
 
+/// Find or create the slot for `key` and, if not yet populated, run
+/// `load()` under the slot lock. Returns the shared `Arc<Mutex<T>>`
+/// either way. The map lock is held only long enough to find-or-insert
+/// the slot; the loader runs while only the per-key slot lock is held,
+/// so concurrent calls for *different* keys never wait on each other.
+///
+/// The CR-001 race was `check map → drop → load → insert`: two threads
+/// hitting the same cold key both ran `load()` and the loser's value
+/// got dropped. This helper closes that window — for a single key, the
+/// first thread to reach the slot lock runs `load()` exactly once; the
+/// rest read the populated `Some(arc)` and return immediately.
+fn get_or_load_slot<T, F>(
+    map: &Mutex<HashMap<String, ModelSlot<T>>>,
+    key: String,
+    load: F,
+) -> Result<Arc<Mutex<T>>>
+where
+    F: FnOnce() -> Result<T>,
+{
+    let slot = {
+        let mut guard = map.lock();
+        guard
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .clone()
+    };
+    let mut slot_guard = slot.lock();
+    if let Some(arc) = slot_guard.as_ref() {
+        return Ok(arc.clone());
+    }
+    let value = load()?;
+    let arc = Arc::new(Mutex::new(value));
+    *slot_guard = Some(arc.clone());
+    Ok(arc)
+}
+
 pub(crate) struct CodeSageServerState {
     projects: Mutex<HashMap<PathBuf, ProjectState>>,
     embedders: Mutex<HashMap<String, ModelSlot<Embedder>>>,
@@ -372,31 +408,14 @@ impl CodeSageServer {
 
     fn get_or_load_embedder(&self, config: &EmbeddingConfig) -> Result<Arc<Mutex<Embedder>>> {
         let key = format!("{}|{}", config.model, config.device);
-        // Map lock is held only long enough to find-or-create the slot.
-        let slot = {
-            let mut guard = self.state.embedders.lock();
-            guard
-                .entry(key)
-                .or_insert_with(|| Arc::new(Mutex::new(None)))
-                .clone()
-        };
-        // Per-key lock serializes loading for THIS model only; concurrent
-        // callers for OTHER models proceed in parallel because they hold
-        // different slots. Loading happens under the slot lock so two
-        // cold misses for the same model can't both run Embedder::new().
-        let mut slot_guard = slot.lock();
-        if let Some(arc) = slot_guard.as_ref() {
-            return Ok(arc.clone());
-        }
-        let embedder = Embedder::new(config).with_context(|| {
-            format!(
-                "loading embedding model '{}' on device '{}'",
-                config.model, config.device
-            )
-        })?;
-        let arc = Arc::new(Mutex::new(embedder));
-        *slot_guard = Some(arc.clone());
-        Ok(arc)
+        get_or_load_slot(&self.state.embedders, key, || {
+            Embedder::new(config).with_context(|| {
+                format!(
+                    "loading embedding model '{}' on device '{}'",
+                    config.model, config.device
+                )
+            })
+        })
     }
 
     fn get_or_load_reranker(
@@ -405,23 +424,11 @@ impl CodeSageServer {
         device: &str,
     ) -> Result<Arc<Mutex<Reranker>>> {
         let key = format!("{}|{}", reranker_model, device);
-        let slot = {
-            let mut guard = self.state.rerankers.lock();
-            guard
-                .entry(key)
-                .or_insert_with(|| Arc::new(Mutex::new(None)))
-                .clone()
-        };
-        let mut slot_guard = slot.lock();
-        if let Some(arc) = slot_guard.as_ref() {
-            return Ok(arc.clone());
-        }
-        let reranker = Reranker::new(reranker_model, device).with_context(|| {
-            format!("loading reranker model '{reranker_model}' on device '{device}'")
-        })?;
-        let arc = Arc::new(Mutex::new(reranker));
-        *slot_guard = Some(arc.clone());
-        Ok(arc)
+        get_or_load_slot(&self.state.rerankers, key, || {
+            Reranker::new(reranker_model, device).with_context(|| {
+                format!("loading reranker model '{reranker_model}' on device '{device}'")
+            })
+        })
     }
 
     fn open_db_for(&self, state: &ProjectState) -> Result<Database> {
@@ -1333,6 +1340,117 @@ mod tests {
         let second = CodeSageServer::with_state(state.clone());
 
         assert!(Arc::ptr_eq(&first.state, &second.state));
+    }
+
+    #[test]
+    fn slot_loader_runs_exactly_once_under_concurrent_first_callers() {
+        // CR-001 regression. Pre-fix: check map → drop lock → call new()
+        // → race to insert. Two cold misses for the same key both ran
+        // the loader and the loser's value was thrown away. With the
+        // per-key slot lock, only the first thread runs `load`; the rest
+        // observe Some(arc) and return it.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let map: Arc<Mutex<HashMap<String, ModelSlot<u32>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let load_count = Arc::new(AtomicUsize::new(0));
+
+        // Gate the loader on a shared start signal so all threads are
+        // poised to race, then release them simultaneously.
+        let start = Arc::new(std::sync::Barrier::new(16));
+
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let map = map.clone();
+                let load_count = load_count.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    get_or_load_slot(&map, "shared-key".to_string(), || {
+                        load_count.fetch_add(1, Ordering::SeqCst);
+                        // Brief sleep widens the race window so a buggy
+                        // implementation actually loses.
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        Ok::<u32, anyhow::Error>(42 + i as u32)
+                    })
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        assert_eq!(
+            load_count.load(Ordering::SeqCst),
+            1,
+            "loader must run exactly once across all concurrent callers"
+        );
+
+        // All callers must observe the SAME Arc (pointer equality), not
+        // separate constructions.
+        let first = results[0].as_ref().unwrap().clone();
+        for r in &results {
+            let arc = r.as_ref().unwrap();
+            assert!(Arc::ptr_eq(&first, arc), "all callers should share one Arc");
+        }
+    }
+
+    #[test]
+    fn slot_loader_runs_per_key_in_parallel() {
+        // Distinct keys must hold distinct slots — different cold loads
+        // should not serialize on each other. Verify by measuring that
+        // two loaders that each block for ~80ms complete in well under
+        // 160ms (they run concurrently, not back-to-back).
+        let map: Arc<Mutex<HashMap<String, ModelSlot<u32>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let start = Arc::new(std::sync::Barrier::new(2));
+
+        let t0 = std::time::Instant::now();
+        let h1 = {
+            let map = map.clone();
+            let start = start.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                get_or_load_slot(&map, "k1".to_string(), || {
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                    Ok::<u32, anyhow::Error>(1)
+                })
+            })
+        };
+        let h2 = {
+            let map = map.clone();
+            let start = start.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                get_or_load_slot(&map, "k2".to_string(), || {
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                    Ok::<u32, anyhow::Error>(2)
+                })
+            })
+        };
+        h1.join().unwrap().unwrap();
+        h2.join().unwrap().unwrap();
+        let elapsed = t0.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(140),
+            "distinct keys must load in parallel; elapsed {:?} suggests serialization",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn slot_loader_failure_leaves_slot_retryable() {
+        // A failed load must not poison the slot: the next caller should
+        // be able to retry. Pre-fix code had the same behavior (the
+        // failed value never went into the map); the helper preserves
+        // that property by writing to *slot_guard only on Ok.
+        let map: Arc<Mutex<HashMap<String, ModelSlot<u32>>>> = Arc::new(Mutex::new(HashMap::new()));
+
+        let first: Result<_, anyhow::Error> =
+            get_or_load_slot(&map, "k".to_string(), || anyhow::bail!("boom"));
+        assert!(first.is_err());
+
+        let second = get_or_load_slot(&map, "k".to_string(), || Ok::<u32, anyhow::Error>(99));
+        let arc = second.unwrap();
+        assert_eq!(*arc.lock(), 99);
     }
 
     #[test]
