@@ -57,9 +57,9 @@ PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go.
 
 ## Why a single Rust binary
 
-CodeSage ships as one static Rust binary plus a local SQLite database under `.codesage/` per project. No Docker container, no external vector DB server, no embedding service, no daemon. On first use it downloads the embedding and reranker ONNX models (~500 MB combined) and reuses the Hugging Face cache forever after.
+CodeSage ships as one static Rust binary plus a local SQLite database under `.codesage/` per project. No Docker container, no external vector DB server, no embedding service, and no service manager. CLI commands run directly. MCP clients use `codesage mcp`, a stdio shim that starts or reuses a user-local Unix-socket daemon so concurrent agent sessions share one project cache, embedding model pool, reranker pool, and CUDA context.
 
-The trade-off: CUDA-accelerated embeddings need the `nvidia-*-cu12` pip packages on the host (see [CUDA setup](#cuda-setup) below). In exchange, install once, run everywhere, no orchestration layer, no systemd unit to manage. Tools in the same category that take the other side of this trade (SocratiCode with managed Qdrant + Ollama, GitNexus with external Qdrant) are valid for different user profiles. If your team already runs Docker Compose for everything, use those. If you want `cargo install` and `codesage init` and nothing else to debug, use CodeSage.
+The trade-off: CUDA-accelerated embeddings need the `nvidia-*-cu12` pip packages on the host (see [CUDA setup](#cuda-setup) below). In exchange, install once, run everywhere, no orchestration layer, no systemd unit to manage. Tools in the same category that take the other side of this trade (SocratiCode with managed Qdrant + Ollama, GitNexus with external Qdrant) are valid for different user profiles. If your team already runs Docker Compose for everything, use those. If you want `cargo install`, `codesage init`, and an on-demand local daemon hidden behind stdio MCP, use CodeSage.
 
 ## 📊 Benchmarks
 
@@ -133,7 +133,7 @@ codesage git-index --full                                   # force full rescan 
 codesage coupling src/auth/session.ts --limit 5             # files that historically change with this
 codesage risk src/auth/session.ts                           # score with decomposition
 
-# MCP server for Claude Code / Codex / Cursor (one global server, every onboarded project)
+# MCP for Claude Code / Codex / Cursor (stdio shim starts/reuses one local daemon)
 claude mcp add --scope user codesage -- codesage mcp
 
 # Auto-reindex on git operations
@@ -376,14 +376,17 @@ A Rust workspace with six crates:
 
 ```mermaid
 flowchart TD
-    cli[cli<br/>binary + MCP server]
+    cli[cli<br/>binary + CLI + MCP shim]
+    daemon[MCP daemon<br/>shared project/model pools]
     gr[graph<br/>indexing + query pipeline]
     parser[parser<br/>tree-sitter + discovery]
     storage[storage<br/>SQLite + sqlite-vec + FTS5]
     embed[embed<br/>ONNX + reranker + chunking]
     protocol[protocol<br/>shared types]
 
+    cli --> daemon
     cli --> gr
+    daemon --> gr
     gr --> parser
     gr --> storage
     gr --> embed
@@ -400,7 +403,7 @@ flowchart TD
 | `storage` | SQLite with sqlite-vec KNN and FTS5 |
 | `embed` | ONNX embedding inference, cross-encoder reranking, chunking |
 | `graph` | Indexing orchestration and search pipeline |
-| `cli` | Binary with CLI subcommands and MCP server |
+| `cli` | Binary with CLI subcommands, stdio MCP shim, and Unix-socket MCP daemon |
 
 Storage is a single SQLite database per project at `.codesage/index.db`: structural tables (symbols, refs, files) plus model-specific vector tables for embeddings.
 

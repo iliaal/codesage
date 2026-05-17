@@ -3,8 +3,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use anyhow::Result;
-use codesage_embed::model::Embedder;
-use codesage_embed::reranker::Reranker;
 use codesage_parser::discover::{TEST_LIKE_EXCLUDE_PATTERNS, build_exclude_set};
 use codesage_protocol::{
     ContextBundle, DependencyEntry, ExportRequest, FileCategory, FindReferencesRequest,
@@ -296,10 +294,21 @@ fn bm25_search_candidates(
     db.search_bm25(match_expr, fetch_limit, language, paths)
 }
 
+/// Reranker callback for [`search`] / [`export_context`]. Takes the query
+/// text + candidate documents, returns one cross-encoder score per doc.
+///
+/// Boxed so the caller can hold the reranker behind whatever locking
+/// discipline fits their runtime — `&mut Reranker` for the single-process
+/// CLI, `Arc<Mutex<Reranker>>` for the multi-client MCP daemon. The lock
+/// is acquired only when search() calls back, not for the duration of
+/// the SQL retrieval, so concurrent agents on the same project can
+/// interleave their SQL work while one is in the (slow) ORT call.
+pub type RerankFn<'a> = Box<dyn FnMut(&str, &[&str]) -> Result<Vec<f32>> + 'a>;
+
 pub fn search(
     db: &Database,
-    embedder: &mut Embedder,
-    reranker: Option<&mut Reranker>,
+    query_embedding: &[f32],
+    rerank: Option<RerankFn<'_>>,
     req: &SearchRequest,
 ) -> Result<Vec<SearchResult>> {
     let limit = req.limit.unwrap_or(10);
@@ -307,7 +316,7 @@ pub fn search(
 
     let known_symbols = extract_known_symbols(db, &req.query)?;
     let has_symbols = !known_symbols.is_empty();
-    let has_reranker = reranker.is_some();
+    let has_reranker = rerank.is_some();
     let overfetch = if has_reranker {
         RERANK_OVERFETCH
     } else if has_symbols {
@@ -316,8 +325,7 @@ pub fn search(
         1
     };
 
-    let query_embedding = embedder.embed_one(&req.query)?;
-    let embedding_bytes = embedding_to_bytes(&query_embedding);
+    let embedding_bytes = embedding_to_bytes(query_embedding);
 
     let page_window = limit.saturating_add(offset);
     let semantic_fetch = page_window.saturating_mul(overfetch);
@@ -454,8 +462,8 @@ pub fn search(
     // `project_hybrid_bm25_rrf.md` warned about. Measured on the ripgrep
     // canary: reranker demotes `lib.rs` (rank 5 post-RRF) out of top-10
     // on `use \`doc_cfg\`` queries.
-    if !hybrid_gate && let Some(reranker) = reranker {
-        apply_reranking(reranker, &req.query, &mut results);
+    if !hybrid_gate && let Some(mut rerank) = rerank {
+        apply_reranking(&mut rerank, &req.query, &mut results);
     }
 
     if file_saturation_enabled() {
@@ -1182,13 +1190,13 @@ fn adaptive_rerank_weight_enabled() -> bool {
     })
 }
 
-fn apply_reranking(reranker: &mut Reranker, query: &str, results: &mut [SearchResult]) {
+fn apply_reranking(rerank: &mut RerankFn<'_>, query: &str, results: &mut [SearchResult]) {
     if results.is_empty() {
         return;
     }
 
     let docs: Vec<&str> = results.iter().map(|r| r.content.as_str()).collect();
-    let ce_scores = match reranker.score_pairs(query, &docs) {
+    let ce_scores = match rerank(query, &docs) {
         Ok(s) => s,
         Err(_) => return,
     };
@@ -1361,8 +1369,8 @@ fn references_for_symbol(db: &Database, sym: &Symbol) -> Result<Vec<Reference>> 
 
 pub fn export_context(
     db: &Database,
-    embedder: &mut Embedder,
-    reranker: Option<&mut Reranker>,
+    query_embedding: &[f32],
+    rerank: Option<RerankFn<'_>>,
     req: &ExportRequest,
 ) -> Result<ContextBundle> {
     if let Some(sym_name) = &req.symbol {
@@ -1381,7 +1389,7 @@ pub fn export_context(
         languages: None,
         paths: None,
     };
-    let primary = search(db, embedder, reranker, &search_req)?;
+    let primary = search(db, query_embedding, rerank, &search_req)?;
 
     let mut symbol_defs: Vec<Symbol> = Vec::new();
     let mut seen_sym: HashSet<String> = HashSet::new();

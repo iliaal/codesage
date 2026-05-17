@@ -302,10 +302,10 @@ pub fn extract_symbols(
         let (start_row, col_start) = crate::position::node_start_utf8(&def_node, source);
         let (end_row, col_end) = crate::position::node_end_utf8(&def_node, source);
 
-        let rationale = if language == Language::Rust {
-            crate::rationale::extract_rust_rationale(&def_node, source)
-        } else {
-            Vec::new()
+        let rationale = match language {
+            Language::Rust => crate::rationale::extract_rust_rationale(&def_node, source),
+            Language::Python => crate::rationale::extract_python_rationale(&def_node, source),
+            _ => Vec::new(),
         };
 
         symbols.push(Symbol {

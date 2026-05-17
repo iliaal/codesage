@@ -1,3 +1,4 @@
+mod daemon;
 mod doctor;
 mod drift;
 mod lockfile;
@@ -142,7 +143,25 @@ enum Commands {
     /// Show project index status
     Status,
     /// Run MCP server on stdio
-    Mcp,
+    Mcp {
+        /// Run the MCP server directly in this process instead of using the shared daemon
+        #[arg(long)]
+        direct: bool,
+        /// Override the daemon runtime directory
+        #[arg(long, hide = true)]
+        runtime_dir: Option<PathBuf>,
+    },
+    /// Manage the shared MCP daemon (run in foreground, check status, stop)
+    Daemon {
+        /// Action: omit to run the daemon in the foreground (default), or
+        /// pass `status` / `stop`.
+        #[command(subcommand)]
+        action: Option<DaemonAction>,
+
+        /// Override the daemon runtime directory
+        #[arg(long, hide = true, global = true)]
+        runtime_dir: Option<PathBuf>,
+    },
     /// Install git hooks for automatic reindexing
     InstallHooks,
     /// Drop orphaned model-specific vec tables (keeps only the active model)
@@ -311,6 +330,16 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Run the daemon in the foreground (default if no action is given)
+    Run,
+    /// Print the running daemon's pid + socket, or "not running"
+    Status,
+    /// Send SIGTERM to the running daemon and wait for it to exit
+    Stop,
 }
 
 fn find_project_root() -> Result<PathBuf> {
@@ -522,7 +551,18 @@ fn run(cli: Cli) -> Result<()> {
             format,
         } => cmd_export(&target, symbol, limit, callers, callees, &format),
         Commands::Status => cmd_status(),
-        Commands::Mcp => cmd_mcp(),
+        Commands::Mcp {
+            direct,
+            runtime_dir,
+        } => cmd_mcp(direct, runtime_dir),
+        Commands::Daemon {
+            action,
+            runtime_dir,
+        } => match action.unwrap_or(DaemonAction::Run) {
+            DaemonAction::Run => cmd_daemon(runtime_dir),
+            DaemonAction::Status => cmd_daemon_status(runtime_dir),
+            DaemonAction::Stop => cmd_daemon_stop(runtime_dir),
+        },
         Commands::InstallHooks => cmd_install_hooks(),
         Commands::Cleanup { dry_run } => cmd_cleanup(dry_run),
         Commands::Doctor { json } => doctor::run(json),
@@ -565,9 +605,28 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn cmd_mcp() -> Result<()> {
+fn cmd_mcp(direct: bool, runtime_dir: Option<PathBuf>) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(mcp::run_mcp_server())
+    if direct {
+        rt.block_on(mcp::run_mcp_server())
+    } else {
+        rt.block_on(daemon::run_mcp_shim(runtime_dir))
+    }
+}
+
+fn cmd_daemon(runtime_dir: Option<PathBuf>) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(daemon::run_daemon(runtime_dir))
+}
+
+fn cmd_daemon_status(runtime_dir: Option<PathBuf>) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(daemon::run_daemon_status(runtime_dir))
+}
+
+fn cmd_daemon_stop(runtime_dir: Option<PathBuf>) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(daemon::run_daemon_stop(runtime_dir))
 }
 
 fn cmd_install_hooks() -> Result<()> {
@@ -1024,7 +1083,12 @@ fn cmd_search(
         paths,
     };
 
-    let results = search(&db, &mut embedder, reranker.as_mut(), &req)?;
+    let query_embedding = embedder.embed_one(&req.query)?;
+    let rerank_fn: Option<codesage_graph::RerankFn<'_>> = reranker.as_mut().map(|r| {
+        Box::new(move |q: &str, docs: &[&str]| r.score_pairs(q, docs))
+            as Box<dyn FnMut(&str, &[&str]) -> Result<Vec<f32>>>
+    });
+    let results = search(&db, &query_embedding, rerank_fn, &req)?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&results)?);
@@ -1824,7 +1888,12 @@ fn cmd_export(
         export_context_for_symbol(&db, target, &req)?
     } else {
         let (db, mut embedder, mut reranker) = load_query_stack(&root)?;
-        export_context(&db, &mut embedder, reranker.as_mut(), &req)?
+        let query_embedding = embedder.embed_one(req.query.as_deref().unwrap_or_default())?;
+        let rerank_fn: Option<codesage_graph::RerankFn<'_>> = reranker.as_mut().map(|r| {
+            Box::new(move |q: &str, docs: &[&str]| r.score_pairs(q, docs))
+                as Box<dyn FnMut(&str, &[&str]) -> Result<Vec<f32>>>
+        });
+        export_context(&db, &query_embedding, rerank_fn, &req)?
     };
 
     match format {

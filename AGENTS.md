@@ -28,7 +28,7 @@ The "fmt then edit then forget to re-fmt" class of break is real (commit `a43c51
 | `storage` | SQLite schema, CRUD, sqlite-vec KNN | protocol |
 | `embed` | ONNX embedding inference (Embedder), cross-encoder reranking (Reranker), chunking | ort, tokenizers, hf-hub |
 | `graph` | Indexing orchestration, search pipeline, query API | parser, storage, embed, protocol |
-| `cli` | `codesage` binary: CLI subcommands + MCP server | everything |
+| `cli` | `codesage` binary: CLI subcommands + MCP stdio shim + Unix-socket daemon | everything |
 
 ## Search pipeline
 
@@ -137,9 +137,29 @@ PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go.
 
 Every MCP tool advertises an `outputSchema` (0.7.0); agents that consult it know the result shape before they call.
 
+## MCP runtime
+
+`codesage mcp` is the stable client entrypoint. It runs as a stdio shim, starts or connects to the per-user Unix-socket daemon, and forwards MCP JSON-RPC unchanged. The daemon hosts the real MCP server and owns shared project/model/reranker pools across main sessions and subagents.
+
+Use `codesage mcp --direct` only when debugging the old single-process stdio path. Use `codesage daemon` to run the foreground daemon explicitly. Socket state lives under `$CODESAGE_DAEMON_RUNTIME_DIR`, `$XDG_RUNTIME_DIR/codesage`, or `/tmp/codesage-$UID`; the socket name includes the running binary's version and executable metadata so rebuilt binaries don't attach to stale daemons.
+
+### Daemon management
+
+- `codesage daemon` runs the daemon in the foreground (the default action).
+- `codesage daemon status` prints the running daemon's pid, socket path, and log path; exit 1 if not running.
+- `codesage daemon stop` sends SIGTERM, waits up to 10s for cleanup, and reports.
+
+Runtime files per daemon: `mcp-<version>-<key>.sock` (Unix socket, 0o600), `mcp-<version>-<key>.pid` (text pid), `mcp-<version>-<key>.lock` (start-lock during spawn), `mcp-<version>-<key>.log` (daemon stdout + stderr). The log is rotated when it crosses 4 MiB; three generations are retained (`.log`, `.log.1`, `.log.2`).
+
+### Tracing
+
+The daemon inherits the **first** spawning shim's environment, including `RUST_LOG`. Setting `RUST_LOG=codesage=debug` on the initial `codesage mcp` invocation that boots the daemon raises the daemon's log level for its entire lifetime; subsequent shims with different `RUST_LOG` values don't reconfigure the running daemon. To change filters mid-life, `codesage daemon stop` and let the next shim restart it under the new env.
+
+The daemon writes tracing to `mcp-<version>-<key>.log` in the runtime dir; check that file first when a tool call hangs or an MCP session won't initialize. SIGTERM/SIGINT trigger graceful shutdown (socket + pid file removed before exit).
+
 ## CLI commands
 
-`init`, `index`, `search`, `find-symbol`, `find-references`, `dependencies`, `impact`, `export`, `status`, `mcp`, `install-hooks`, `cleanup`, `git-index`, `coupling`, `risk`, `risk-batch`, `risk-diff`, `tests-for`, `session-start`, `session-end`, `doctor`, `map`, `features-list`, `feature-show`, `feature-for`, `feature-bundle`, `trust-boundaries`.
+`init`, `index`, `search`, `find-symbol`, `find-references`, `dependencies`, `impact`, `export`, `status`, `mcp`, `daemon`, `install-hooks`, `cleanup`, `git-index`, `coupling`, `risk`, `risk-batch`, `risk-diff`, `tests-for`, `session-start`, `session-end`, `doctor`, `map`, `features-list`, `feature-show`, `feature-for`, `feature-bundle`, `trust-boundaries`.
 
 `map` runs the feature mappers (Cargo workspace, composer + Laravel routes, php-src `ext/*`, CMake / autotools, Python `pyproject` / `setup.py` / `__main__`, `package.json` bin + Next.js routes, Go `cmd/*`) and persists features. `codesage index` calls `map` between the structural and semantic passes; `--no-features` skips. `features-list` / `feature-show` / `feature-for` / `feature-bundle` are read-side query commands matching the new MCP tools. `trust-boundaries <file>` is the debugging surface for the per-file boundary tags that feed `assess_risk`.
 
@@ -157,7 +177,7 @@ Corpus YAMLs are not bundled; bring your own. `CODESAGE_BENCH_CORPUS_DIR` (consu
 
 ## Plugin
 
-`plugins/codesage-tools/` ships as a Claude Code plugin: one global `codesage` MCP serves every onboarded project, routed by an absolute `project` argument. Slash commands: `/codesage-onboard`, `/codesage-reset`, `/codesage-reindex`, `/codesage-bench`, `/codesage-eval`. Marketplace manifest at repo root.
+`plugins/codesage-tools/` ships as a Claude Code plugin: one global `codesage` MCP registration serves every onboarded project, routed by an absolute `project` argument. The registered command remains `codesage mcp`; the shim handles daemon startup and reuse. Slash commands: `/codesage-onboard`, `/codesage-reset`, `/codesage-reindex`, `/codesage-bench`, `/codesage-eval`. Marketplace manifest at repo root.
 
 ## Git history intelligence (V2b slice 1)
 
