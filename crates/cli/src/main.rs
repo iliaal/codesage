@@ -483,7 +483,18 @@ fn main() {
     // (before clap, before any tokio runtime, before any thread spawn)
     // keeps the writes race-free even though the calls themselves remain
     // marked unsafe.
-    codesage_embed::model::init_for_main();
+    //
+    // Skipped for the `codesage mcp` stdio shim (no `--direct` flag): the
+    // shim only proxies bytes between stdin and the daemon's Unix socket;
+    // it never constructs an Embedder or Reranker, so eagerly preloading
+    // ORT + the full CUDA/cuDNN stack just to immediately `tokio::io::copy`
+    // pinned ~200 MB RSS per shim and ~1.9 GB virtual into every Claude
+    // Code subagent. The `Once::call_once` fallback inside `Embedder::new`
+    // / `Reranker::new` covers any future shim codepath that grew to
+    // actually run inference (none today).
+    if !is_shim_invocation() {
+        codesage_embed::model::init_for_main();
+    }
     let cli = Cli::parse();
 
     let result = run(cli);
@@ -515,6 +526,47 @@ fn main() {
     // (`codesage mcp`) loops indefinitely and never reaches this exit;
     // when it terminates via signal, the same skip applies.
     std::process::exit(code);
+}
+
+/// Cheap pre-clap detector for the `codesage mcp` stdio-shim case.
+///
+/// Returns true iff argv (ignoring the program name and any leading global
+/// flags consumed by clap) names the `mcp` subcommand without `--direct`.
+/// Matches clap's resolution loosely on purpose — false negatives here just
+/// mean a non-shim invocation pays the unnecessary ORT/CUDA preload cost,
+/// which is the pre-fix status quo. False positives would skip the preload
+/// for a real model-loading codepath; the only way to hit one is to pass
+/// `--direct` as part of a sub-subcommand, and `mcp` has no sub-subcommands.
+fn is_shim_invocation() -> bool {
+    is_shim_argv(std::env::args().skip(1))
+}
+
+fn is_shim_argv<I: IntoIterator<Item = String>>(args: I) -> bool {
+    let mut saw_mcp = false;
+    let mut saw_direct = false;
+    for a in args {
+        if a == "--" {
+            break;
+        }
+        if !saw_mcp {
+            // Skip clap-style global flags that may precede the subcommand.
+            // Today there are none, but a future `-v` / `--verbose` should
+            // not flip this off accidentally.
+            if a.starts_with('-') {
+                continue;
+            }
+            if a == "mcp" {
+                saw_mcp = true;
+                continue;
+            }
+            // First positional that isn't `mcp`: definitely not the shim.
+            return false;
+        }
+        if a == "--direct" {
+            saw_direct = true;
+        }
+    }
+    saw_mcp && !saw_direct
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -2311,5 +2363,56 @@ mod tests {
             db.chunk_table_name(),
             "chunks_codesage_test_does_not_exist_384"
         );
+    }
+
+    // ---------- shim invocation detection (ORT preload skip gate) ----------
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn shim_detector_recognizes_bare_mcp() {
+        assert!(is_shim_argv(argv(&["mcp"])));
+    }
+
+    #[test]
+    fn shim_detector_recognizes_mcp_with_runtime_dir_override() {
+        // The shim still accepts `--runtime-dir <path>` after the subcommand.
+        assert!(is_shim_argv(argv(&["mcp", "--runtime-dir", "/tmp/foo"])));
+    }
+
+    #[test]
+    fn shim_detector_rejects_mcp_direct() {
+        // `--direct` switches to the in-process MCP server which DOES load
+        // models — preload must still happen.
+        assert!(!is_shim_argv(argv(&["mcp", "--direct"])));
+        assert!(!is_shim_argv(argv(&[
+            "mcp",
+            "--direct",
+            "--runtime-dir",
+            "/tmp/foo"
+        ])));
+    }
+
+    #[test]
+    fn shim_detector_rejects_other_subcommands() {
+        for cmd in [
+            "daemon",
+            "index",
+            "search",
+            "find-symbol",
+            "doctor",
+            "git-index",
+            "init",
+        ] {
+            assert!(!is_shim_argv(argv(&[cmd])), "expected non-shim for {cmd}");
+        }
+    }
+
+    #[test]
+    fn shim_detector_rejects_empty_argv() {
+        // No subcommand at all → not the shim (clap will error after).
+        assert!(!is_shim_argv(argv(&[])));
     }
 }
