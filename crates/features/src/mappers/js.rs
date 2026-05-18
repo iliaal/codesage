@@ -92,6 +92,13 @@ impl FeatureMapper for JsMapper {
         // Node-server scanner below.
         if any_package_has_dep(&packages, pkg_at_root.as_ref(), has_react_dependency) {
             seeds.extend(react_router_routes(ctx, &packages)?);
+            // Component slices (one `react-component` feature per .tsx /
+            // .jsx file under conventional component dirs). Pass the
+            // current seed list so the component walker can skip files
+            // already owned by a route seed — a `<Route>` declaration
+            // file shouldn't double-emit as both `react-router-route`
+            // and `react-component`.
+            seeds.extend(react_components(ctx, &packages, &seeds)?);
         }
         // Express / Fastify / Hono server routes — accept devDependencies
         // too because TS-only API servers often pin framework type
@@ -1423,6 +1430,169 @@ fn react_router_scan_roots(packages: &[PackageInfo]) -> Vec<String> {
     out
 }
 
+/// Path looks like a React component file: `.tsx`/`.jsx` extension,
+/// not a test (`.test.tsx` etc.) or type-decl (`.d.ts`), not under a
+/// Storybook / fixtures / testdata directory. Bare `.ts`/`.js` are
+/// excluded — component detection without a JSX extension would
+/// require parsing the file body and produces too many false positives.
+fn is_react_component_file(rel: &str) -> bool {
+    if !(rel.ends_with(".tsx") || rel.ends_with(".jsx")) {
+        return false;
+    }
+    if is_node_test_or_decl(rel) {
+        return false;
+    }
+    is_reviewable_react_support_path(rel)
+}
+
+/// Inverse of clawpatch's `isReactSupportPath` — returns `true` when
+/// the file is NOT under one of the conventional support / fixture
+/// trees. Naming kept consistent with the upstream donor for traceability.
+fn is_reviewable_react_support_path(rel: &str) -> bool {
+    let support_segments = [
+        "/stories/",
+        "/__stories__/",
+        "/.storybook/",
+        "/fixtures/",
+        "/__fixtures__/",
+        "/testdata/",
+    ];
+    if support_segments.iter().any(|s| rel.contains(s)) {
+        return false;
+    }
+    let support_prefixes = [
+        "stories/",
+        "__stories__/",
+        ".storybook/",
+        "fixtures/",
+        "__fixtures__/",
+        "testdata/",
+    ];
+    if support_prefixes.iter().any(|p| rel.starts_with(p)) {
+        return false;
+    }
+    // `Foo.stories.tsx` / `Foo.story.tsx`
+    let base = rel.rsplit('/').next().unwrap_or(rel);
+    if base.contains(".stories.") || base.contains(".story.") {
+        return false;
+    }
+    true
+}
+
+/// Component name from a file path: the basename's stem. `Button.tsx`
+/// → `Button`; `forms/SignUp.tsx` → `SignUp`.
+fn react_component_name(rel: &str) -> String {
+    let base = rel.rsplit('/').next().unwrap_or(rel);
+    base.rsplit_once('.')
+        .map(|(stem, _)| stem.to_string())
+        .unwrap_or_else(|| base.to_string())
+}
+
+/// Map React components into one feature per file. Ports clawpatch
+/// react.ts `componentSeeds` (commit af0ad0e): scan `src/pages` and
+/// `src/components` under each discovered React package, emit one
+/// `react-component` / `FeatureKind::Library` seed per `.tsx` / `.jsx`
+/// file, capped at 100 per package. Files already owned by a
+/// `react-router-route`, `next-app-route`, `next-app-page`, or
+/// `next-pages-route` seed are excluded so a route declaration file
+/// doesn't double-emit. Component seeds give `find_feature` an answer
+/// for unrouted components (Button, Card, FormField) that previously
+/// returned nothing.
+fn react_components(
+    ctx: &MapperContext,
+    packages: &[PackageInfo],
+    existing_seeds: &[FeatureSeed],
+) -> Result<Vec<FeatureSeed>> {
+    let root = ctx.root;
+    let mut out = Vec::new();
+
+    const ROUTE_SOURCES_TO_EXCLUDE: &[&str] = &[
+        "react-router-route",
+        "next-app-route",
+        "next-app-page",
+        "next-pages-route",
+    ];
+    let route_owned: std::collections::HashSet<String> = existing_seeds
+        .iter()
+        .filter(|s| ROUTE_SOURCES_TO_EXCLUDE.contains(&s.source))
+        .map(|s| s.entry_path.clone())
+        .collect();
+
+    const COMPONENTS_CAP_PER_PACKAGE: usize = 100;
+    const COMPONENT_SCAN_DIRS: &[&str] = &["src/pages", "src/components", "components"];
+
+    for prefix in react_router_scan_roots(packages) {
+        let scan_dir = if prefix.is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(&prefix)
+        };
+        if !is_safe_dir(root, &scan_dir) {
+            continue;
+        }
+        let mut per_pkg_count = 0usize;
+        let mut emitted_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for subdir in COMPONENT_SCAN_DIRS {
+            if per_pkg_count >= COMPONENTS_CAP_PER_PACKAGE {
+                break;
+            }
+            let sub_root = scan_dir.join(subdir);
+            if !is_safe_dir(root, &sub_root) {
+                continue;
+            }
+            let files = walk_files(root, &sub_root, 10_000, ctx.excludes);
+            for rel in files {
+                if per_pkg_count >= COMPONENTS_CAP_PER_PACKAGE {
+                    break;
+                }
+                if !is_react_component_file(&rel) {
+                    continue;
+                }
+                if route_owned.contains(&rel) {
+                    continue;
+                }
+                if !emitted_paths.insert(rel.clone()) {
+                    continue;
+                }
+                let component_name = react_component_name(&rel);
+                let language = language_for_entry(&rel);
+                let lang_tag = if language == Language::TypeScript {
+                    "typescript"
+                } else {
+                    "javascript"
+                };
+                out.push(FeatureSeed {
+                    title: format!("React component `{component_name}`"),
+                    summary: format!("React component declared in {rel}"),
+                    kind: FeatureKind::Library,
+                    source: "react-component",
+                    confidence: FeatureConfidence::Medium,
+                    entry_path: rel.clone(),
+                    entry_symbol: Some(component_name),
+                    entry_route: None,
+                    entry_command: None,
+                    test_command: None,
+                    language,
+                    tags: vec![
+                        lang_tag.to_string(),
+                        "react".to_string(),
+                        "react-component".to_string(),
+                    ],
+                    owned_files: vec![SeedFile {
+                        path: rel.clone(),
+                        reason: "component implementation".to_string(),
+                    }],
+                    context_files: Vec::new(),
+                    tests: Vec::new(),
+                    test_prefixes: vec!["__tests__".to_string(), "tests".to_string()],
+                });
+                per_pkg_count += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Per-framework label attached to the emitted route seed. Determined
 /// by the constructor that defined the route receiver.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2717,5 +2887,183 @@ app.get("/health", (_, res) => res.send("ok"));
             !cmd.starts_with("turbo "),
             "turbo prefix applied without test task: {cmd}"
         );
+    }
+
+    #[test]
+    fn react_component_seed_for_each_component_file() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"app","dependencies":{"react":"^18.0.0"}}"#,
+        );
+        write(
+            dir.path(),
+            "src/components/Button.tsx",
+            "export const Button = () => <button/>;",
+        );
+        write(
+            dir.path(),
+            "src/components/Card.tsx",
+            "export const Card = () => <div/>;",
+        );
+        write(
+            dir.path(),
+            "src/pages/Home.tsx",
+            "export default function Home(){ return <h1/>; }",
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let names: std::collections::BTreeSet<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "react-component")
+            .filter_map(|s| s.entry_symbol.as_deref())
+            .collect();
+        for expected in ["Button", "Card", "Home"] {
+            assert!(names.contains(expected), "missing {expected} in {names:?}");
+        }
+        let button = seeds
+            .iter()
+            .find(|s| s.source == "react-component" && s.entry_symbol.as_deref() == Some("Button"))
+            .expect("Button seed missing");
+        assert_eq!(button.kind, FeatureKind::Library);
+        assert!(button.tags.iter().any(|t| t == "react"));
+        assert!(button.tags.iter().any(|t| t == "react-component"));
+    }
+
+    #[test]
+    fn react_component_skips_tests_stories_and_decls() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"app","dependencies":{"react":"^18.0.0"}}"#,
+        );
+        write(
+            dir.path(),
+            "src/components/Real.tsx",
+            "export const Real = () => <div/>;",
+        );
+        write(
+            dir.path(),
+            "src/components/Button.test.tsx",
+            "test('x', () => {});",
+        );
+        write(
+            dir.path(),
+            "src/components/Button.stories.tsx",
+            "export default { title: 'Btn' };",
+        );
+        write(
+            dir.path(),
+            "src/components/types.d.ts",
+            "export type X = number;",
+        );
+        write(dir.path(), "src/components/__stories__/Demo.tsx", "");
+        write(dir.path(), "src/components/fixtures/sample.tsx", "");
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let component_paths: Vec<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "react-component")
+            .map(|s| s.entry_path.as_str())
+            .collect();
+        assert!(
+            component_paths.contains(&"src/components/Real.tsx"),
+            "Real.tsx should be a component: {component_paths:?}"
+        );
+        for skipped in [
+            "src/components/Button.test.tsx",
+            "src/components/Button.stories.tsx",
+            "src/components/types.d.ts",
+            "src/components/__stories__/Demo.tsx",
+            "src/components/fixtures/sample.tsx",
+        ] {
+            assert!(
+                !component_paths.contains(&skipped),
+                "{skipped} should NOT be a component"
+            );
+        }
+    }
+
+    #[test]
+    fn react_component_excludes_files_owned_by_router_seeds() {
+        // `src/pages/Routes.tsx` declares <Route>s — it should be a
+        // `react-router-route` seed, not double-emitted as a component.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"app","dependencies":{"react":"^18.0.0","react-router-dom":"^6.0.0"}}"#,
+        );
+        write(
+            dir.path(),
+            "src/pages/Routes.tsx",
+            r#"import { Route, Routes } from "react-router-dom";
+export default () => (<Routes><Route path="/" element={<Home/>}/></Routes>);"#,
+        );
+        write(
+            dir.path(),
+            "src/components/Card.tsx",
+            "export const Card = () => <div/>;",
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let route_owned: std::collections::BTreeSet<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "react-router-route")
+            .map(|s| s.entry_path.as_str())
+            .collect();
+        assert!(route_owned.contains("src/pages/Routes.tsx"));
+        assert!(
+            !seeds
+                .iter()
+                .any(|s| s.source == "react-component" && s.entry_path == "src/pages/Routes.tsx"),
+            "Routes.tsx should not also emit as react-component"
+        );
+        assert!(
+            seeds.iter().any(|s| s.source == "react-component" && s.entry_path == "src/components/Card.tsx"),
+            "Card.tsx should still emit as a component"
+        );
+    }
+
+    #[test]
+    fn react_component_skipped_when_react_dep_missing() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"plain","dependencies":{"vue":"^3.0.0"}}"#,
+        );
+        write(
+            dir.path(),
+            "src/components/Looks.tsx",
+            "export const Looks = () => null;",
+        );
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        assert!(
+            !seeds.iter().any(|s| s.source == "react-component"),
+            "no react dep → no component seeds"
+        );
+    }
+
+    #[test]
+    fn react_component_cap_enforced_per_package() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"app","dependencies":{"react":"^18.0.0"}}"#,
+        );
+        for i in 0..110 {
+            write(
+                dir.path(),
+                &format!("src/components/Auto{i:03}.tsx"),
+                &format!("export const Auto{i:03} = () => <div/>;\n"),
+            );
+        }
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let count = seeds
+            .iter()
+            .filter(|s| s.source == "react-component")
+            .count();
+        assert_eq!(count, 100, "expected per-package cap of 100, got {count}");
     }
 }
