@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-17
+
 ### Added
 
 - **Java as a supported language.** `.java` files now parse class, interface, enum, record, method, constructor, field, and `@interface` (annotation type) symbols plus method-call, `new` expression, inheritance, import, and annotation-usage references (`@Override`, `@Test`, `@Component`, including `@pkg.Foo` scoped forms). Multi-declarator fields (`String x, y, z;`) emit one symbol per declarator. Bumps the supported-language count from eight to nine.
@@ -364,5 +366,7 @@ Initial public release.
 
 [0.7.0]: https://github.com/iliaal/codesage/releases/tag/v0.7.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.7.5...HEAD
 [0.7.5]: https://github.com/iliaal/codesage/releases/tag/v0.7.5
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/iliaal/codesage/releases/tag/v0.8.0
