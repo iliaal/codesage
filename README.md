@@ -223,7 +223,7 @@ Slash commands: `/codesage-onboard`, `/codesage-reset`, `/codesage-reindex`, `/c
 
 ## 🔍 Feature-slice review
 
-Codesage maps a project into behavior-keyed feature slices (routes, CLIs, libraries, test suites, jobs). The `codesage-tools` plugin ships a four-command workflow that dispatches read-only subagent reviews — one per slice, in parallel batches — and persists findings to gitignored JSON under `.codesage/findings/`. Each finding gets a stable `fnd_<hex>` ID so it can be referenced in commit messages and PR comments. Re-running keeps prior triage (`status` + audit-trail `history`) intact and merges new defects into the same per-feature file.
+Codesage maps a project into behavior-keyed feature slices (routes, CLIs, libraries, test suites, jobs). The `codesage-tools` plugin ships a four-command workflow that dispatches read-only subagent reviews (one per slice, in parallel batches) and persists findings to gitignored JSON under `.codesage/findings/`. Each finding gets a stable `fnd_<hex>` ID so it can be referenced in commit messages and PR comments. Re-running keeps prior triage (`status` + audit-trail `history`) intact and merges new defects into the same per-feature file.
 
 The subagent is read-only (`autoApprove: read`); it consumes the existing MCP surface (`feature_bundle`, `assess_risk`, `find_references`, `find_coupling`) plus `Read`. Codesage's core stays read-only; findings are output that other tooling can consume.
 
@@ -236,27 +236,27 @@ Dispatches subagents in parallel batches over the project's mapped feature slice
                            [--kind <k>] [--severity <s>] [--categories <c,c,...>]
 ```
 
-- `<project>` — absolute path to an onboarded codesage project (must contain `.codesage/index.db`)
-- `--limit N` — cap the number of features reviewed in one run (default `50`)
-- `--jobs N` — parallel subagents per batch (default `4`, hard ceiling `8`)
-- `--feature <id>` — review one specific `feat_<hex>`, skipping discovery
-- `--kind <k>` — filter features by kind: `route`, `cli-command`, `service`, `library`, `test-suite`, `config`, `job`
-- `--severity <s>` — minimum severity to report: `low` / `medium` / `high` (default `medium`)
-- `--categories <c,c,...>` — comma-separated list (default `bug,security`); other values include `perf`, `maintainability`
+- `<project>`: absolute path to an onboarded codesage project (must contain `.codesage/index.db`)
+- `--limit N`: cap the number of features reviewed in one run (default `50`)
+- `--jobs N`: parallel subagents per batch (default `4`, hard ceiling `8`)
+- `--feature <id>`: review one specific `feat_<hex>`, skipping discovery
+- `--kind <k>`: filter features by kind: `route`, `cli-command`, `service`, `library`, `test-suite`, `config`, `job`
+- `--severity <s>`: minimum severity to report: `low` / `medium` / `high` (default `medium`)
+- `--categories <c,c,...>`: comma-separated list (default `bug,security`); other values include `perf`, `maintainability`
 
 Features whose `.codesage/findings/<feature_id>.json` is newer than the feature's `updated_at` AND whose last run was complete are skipped (already up-to-date). Sort order: `route` > `cli-command` > `service` > `library` > rest, then `high` confidence first.
 
 ### `/codesage-triage`
 
-Pure local state edit — appends a history entry on the named finding and updates its status. No LLM call, no re-review.
+Pure local state edit. Appends a history entry on the named finding and updates its status. No LLM call, no re-review.
 
 ```
 /codesage-triage <project> --finding <fnd_id> --status <open|false-positive|wont-fix|fixed> [--note <text>]
 ```
 
-- `--finding <fnd_id>` — the `fnd_<hex>` ID from `.codesage/findings/<feature_id>.json`
-- `--status <s>` — new status: `open`, `false-positive`, `wont-fix`, or `fixed`
-- `--note <text>` — optional free-form note stored alongside the history entry
+- `--finding <fnd_id>`: the `fnd_<hex>` ID from `.codesage/findings/<feature_id>.json`
+- `--status <s>`: new status: `open`, `false-positive`, `wont-fix`, or `fixed`
+- `--note <text>`: optional free-form note stored alongside the history entry
 
 ### `/codesage-revalidate`
 
@@ -266,8 +266,8 @@ Re-runs the subagent against a specific feature slice (or a single finding's own
 /codesage-revalidate <project> [--feature <id>] [--finding <fnd_id>]
 ```
 
-- `--feature <id>` — re-review one feature slice
-- `--finding <fnd_id>` — re-review the slice that owns this finding (and check whether it's still present)
+- `--feature <id>`: re-review one feature slice
+- `--finding <fnd_id>`: re-review the slice that owns this finding (and check whether it's still present)
 
 ### `/codesage-report`
 
@@ -277,17 +277,17 @@ Deterministic Markdown render of the findings JSON. No LLM call.
 /codesage-report <project> [--status <s>] [--severity <s>] [--category <c>] [--feature <id>]
 ```
 
-- `--status <s>` — filter to one status (default: all except `false-positive` and `wont-fix`)
-- `--severity <s>` — minimum severity to render
-- `--category <c>` — filter to one category
-- `--feature <id>` — render findings for a single feature
+- `--status <s>`: filter to one status (default: all except `false-positive` and `wont-fix`)
+- `--severity <s>`: minimum severity to render
+- `--category <c>`: filter to one category
+- `--feature <id>`: render findings for a single feature
 
 ### State paths
 
 | Path | Content |
 |---|---|
 | `.codesage/findings/<feature_id>.json` | Per-feature findings + audit-trail `history[]` per finding (status, action, run_id, timestamp) |
-| `.codesage/findings/history/<feature_id>-<run_id>.json` | Per-run snapshot of the feature's findings — never modified after write |
+| `.codesage/findings/history/<feature_id>-<run_id>.json` | Per-run snapshot of the feature's findings, never modified after write |
 | `.codesage/reviews/<run_id>.json` | Run record: filters used, features planned, completion stats by severity/category, top features by finding count, severity-high list |
 
 Both directories are added to `.gitignore` by `/codesage-onboard` (or its hint).
@@ -420,7 +420,7 @@ Corpora aren't bundled. Bring your own, or point the plugin at `$CODESAGE_BENCH_
 
 Honest inventory of what CodeSage does not do well, measured on our canary corpora and from 30 days of real Claude Code session logs (the harness in `bench/analyze-codesage-quality.py` produces the same numbers locally).
 
-**Language surface is narrower than competitors'.** Nine languages today (Java added after C++ in 0.4.5). Graphify ships 25, code-review-graph 23, SocratiCode 18+. The gap matters most if your stack is Ruby, Kotlin, Swift, or Scala. Measured cost: on the semble retrieval corpus (1,251 queries × 63 repos × 19 languages), 36% of queries target a language codesage does not parse — zero recall on those. The tree-sitter query files live under `crates/parser/src/queries/` and contributions there are the cleanest way to extend coverage.
+**Language surface is narrower than competitors'.** Nine languages today (Java added after C++ in 0.4.5). Graphify ships 25, code-review-graph 23, SocratiCode 18+. The gap matters most if your stack is Ruby, Kotlin, Swift, or Scala. Measured cost: on the semble retrieval corpus (1,251 queries × 63 repos × 19 languages), 36% of queries target a language codesage does not parse, with zero recall on those. The tree-sitter query files live under `crates/parser/src/queries/` and contributions there are the cleanest way to extend coverage.
 
 **Retrieval misses on cross-file refactor queries.** On the ripgrep corpus, 13% of cases miss top-10; four of those six misses are commit subjects like *printer: drop dependency on serde_derive* that describe a rename spanning multiple files without a distinctive literal signal. Single-identifier lookups (`find_symbol`, `find_references`) are reliable. Pure semantic searches (`search`) are reliable. Diffuse multi-file refactor descriptions expressed in prose are the failure mode.
 
