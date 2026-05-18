@@ -620,19 +620,21 @@ fn main_guard_modules(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
 /// `Blueprint(...)`. Emits one `route` feature per `(method, path)`.
 /// Defaults to `GET` when `methods=` is absent (Flask's default).
 ///
-/// Known limitations matching clawpatch PR #11: blueprint `url_prefix`
-/// is NOT expanded into mounted paths; non-literal paths or method
-/// lists are intentionally skipped rather than guessed.
+/// Known limitations: blueprint `url_prefix` is NOT expanded into mounted
+/// paths; non-literal paths or method lists are intentionally skipped
+/// rather than guessed.
 fn flask_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
     python_framework_routes(ctx, PythonFramework::Flask)
 }
 
 /// FastAPI route detection. Scans `.py` files that import fastapi for
-/// `@<receiver>.METHOD('/path')` decorators where `receiver` is a
-/// `FastAPI(...)` or `APIRouter(...)` instance.
+/// `@<receiver>.METHOD('/path')` or `@<receiver>.api_route('/path',
+/// methods=[...])` decorators where `receiver` is a `FastAPI(...)` or
+/// `APIRouter(...)` instance.
 ///
-/// Known limitations matching clawpatch PR #15: `include_router(prefix=…)`
-/// mount prefixes are NOT expanded; non-literal paths are skipped.
+/// Known limitations: `include_router(prefix=…)` mount prefixes are NOT
+/// expanded — upstream clawpatch doesn't expand them either. Non-literal
+/// paths are skipped.
 fn fastapi_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
     python_framework_routes(ctx, PythonFramework::FastApi)
 }
@@ -666,6 +668,25 @@ impl PythonFramework {
         match self {
             Self::Flask => "flask",
             Self::FastApi => "fastapi",
+        }
+    }
+    /// Method tokens accepted on `@<recv>.<token>(`. `api_route` and
+    /// `route` are variadic and pull their methods from a `methods=`
+    /// kwarg; the per-HTTP-verb tokens encode their method directly.
+    fn method_tokens(self) -> &'static [&'static str] {
+        match self {
+            Self::Flask => &["route"],
+            Self::FastApi => &[
+                "api_route",
+                "get",
+                "post",
+                "put",
+                "patch",
+                "delete",
+                "options",
+                "head",
+                "trace",
+            ],
         }
     }
 }
@@ -717,20 +738,28 @@ fn python_framework_routes(
         }
         let mut emitted: BTreeSet<(String, String)> = BTreeSet::new();
         for recv in &receivers {
-            match framework {
-                PythonFramework::Flask => {
-                    emit_flask_routes_for(&source, rel, recv, framework, &mut emitted, &mut out)?
-                }
-                PythonFramework::FastApi => {
-                    emit_fastapi_routes_for(&source, rel, recv, framework, &mut emitted, &mut out)?
-                }
-            }
+            emit_python_routes_for(&source, rel, recv, framework, &mut emitted, &mut out)?;
         }
     }
     Ok(out)
 }
 
-fn emit_flask_routes_for(
+/// Pending decorator captured at scan time, holding the args needed to
+/// emit one or more route seeds once the handler `def` is reached. A
+/// stack of these accumulates while stacked decorators bind to the same
+/// function.
+struct PendingDecorator {
+    path: String,
+    methods: Vec<String>,
+}
+
+/// Line-based scanner for both Flask and FastAPI. Walks the source line
+/// by line, accumulates multi-line decorator argument lists by tracking
+/// paren depth, then attaches a handler function name pulled from the
+/// next `def` line as the seed's `entry_symbol`. Stacked decorators all
+/// resolve to the same function; intervening blank lines / comments /
+/// other decorators don't reset the pending list.
+fn emit_python_routes_for(
     source: &str,
     rel: &str,
     recv: &str,
@@ -738,103 +767,264 @@ fn emit_flask_routes_for(
     emitted: &mut BTreeSet<(String, String)>,
     out: &mut Vec<FeatureSeed>,
 ) -> Result<()> {
-    // `@<recv>.route('/path' [, methods=[...]] [, ...])` — captures the
-    // path and the (optional) attribute tail. The `(?s)` flag lets the
-    // attribute list span newlines, which decorator wrapping commonly
-    // uses.
-    let pattern = format!(
-        r#"(?ms)^\s*@\s*{recv}\s*\.\s*route\s*\(\s*['"]([^'"]+)['"](?:\s*,\s*([^)]*))?\)"#,
-        recv = regex::escape(recv)
-    );
-    let re = Regex::new(&pattern)?;
-    let methods_re = Regex::new(r#"methods\s*=\s*\[\s*([^\]]+)\]"#)?;
-    let method_tok_re = Regex::new(r#"['"]\s*([A-Za-z]+)\s*['"]"#)?;
-    for cap in re.captures_iter(source) {
-        let path = cap.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
-        if path.is_empty() {
+    let start_re = build_decorator_start_re(recv, framework)?;
+    let decorator_re = build_decorator_extract_re(recv, framework)?;
+    let def_re = python_def_re();
+
+    let mut pending: Vec<PendingDecorator> = Vec::new();
+    let mut buf: Option<(String, i32)> = None;
+
+    for line in source.split('\n') {
+        if let Some((accum, depth)) = buf.as_mut() {
+            accum.push(' ');
+            accum.push_str(line.trim());
+            *depth += paren_delta(line);
+            if *depth <= 0 {
+                let full = std::mem::take(accum);
+                buf = None;
+                if let Some(p) = parse_decorator(&full, &decorator_re, framework) {
+                    pending.push(p);
+                }
+            }
             continue;
         }
-        let extra = cap.get(2).map(|m| m.as_str()).unwrap_or("");
-        let methods = if let Some(m) = methods_re.captures(extra) {
-            let raw = m.get(1).map(|m| m.as_str()).unwrap_or("");
-            let parsed: Vec<String> = method_tok_re
-                .captures_iter(raw)
-                .filter_map(|c| c.get(1).map(|x| x.as_str().to_uppercase()))
-                .collect();
-            if parsed.is_empty() {
-                vec!["GET".to_string()]
+        if start_re.is_match(line) {
+            let delta = paren_delta(line);
+            if delta <= 0 {
+                if let Some(p) = parse_decorator(line, &decorator_re, framework) {
+                    pending.push(p);
+                }
             } else {
-                parsed
+                buf = Some((line.to_string(), delta));
             }
-        } else {
-            vec!["GET".to_string()]
-        };
-        for method in methods {
-            push_python_route_seed(out, emitted, rel, recv, framework, &method, &path);
+            continue;
+        }
+        if let Some(fn_name) = def_re
+            .captures(line)
+            .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+        {
+            let mut ctx = RouteEmitCtx {
+                out,
+                emitted,
+                rel,
+                recv,
+                framework,
+            };
+            for p in pending.drain(..) {
+                for method in &p.methods {
+                    push_python_route_seed(&mut ctx, method, &p.path, Some(&fn_name));
+                }
+            }
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if !pending.is_empty()
+            && !trimmed.is_empty()
+            && !trimmed.starts_with('@')
+            && !trimmed.starts_with('#')
+        {
+            pending.clear();
         }
     }
     Ok(())
 }
 
-fn emit_fastapi_routes_for(
-    source: &str,
-    rel: &str,
-    recv: &str,
+fn build_decorator_start_re(recv: &str, framework: PythonFramework) -> Result<Regex> {
+    let methods = framework.method_tokens().join("|");
+    Ok(Regex::new(&format!(
+        r"^\s*@\s*{recv}\s*\.\s*(?:{methods})\s*\(",
+        recv = regex::escape(recv),
+    ))?)
+}
+
+fn build_decorator_extract_re(recv: &str, framework: PythonFramework) -> Result<Regex> {
+    let methods = framework.method_tokens().join("|");
+    Ok(Regex::new(&format!(
+        r#"@\s*{recv}\s*\.\s*({methods})\s*\(\s*(?:path\s*=\s*)?['"]([^'"]+)['"](.*)"#,
+        recv = regex::escape(recv),
+    ))?)
+}
+
+fn python_def_re() -> Regex {
+    Regex::new(r"^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(").expect("static regex")
+}
+
+fn parse_decorator(
+    full: &str,
+    decorator_re: &Regex,
     framework: PythonFramework,
-    emitted: &mut BTreeSet<(String, String)>,
-    out: &mut Vec<FeatureSeed>,
-) -> Result<()> {
-    let pattern = format!(
-        r#"(?ms)^\s*@\s*{recv}\s*\.\s*(get|post|put|patch|delete|options|head)\s*\(\s*['"]([^'"]+)['"]"#,
-        recv = regex::escape(recv)
-    );
-    let re = Regex::new(&pattern)?;
-    for cap in re.captures_iter(source) {
-        let method = cap.get(1).map(|m| m.as_str()).unwrap_or("").to_uppercase();
-        let path = cap.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
-        if path.is_empty() {
+) -> Option<PendingDecorator> {
+    let caps = decorator_re.captures(full)?;
+    let method_token = caps.get(1)?.as_str().to_string();
+    let path = caps.get(2)?.as_str().to_string();
+    if path.is_empty() {
+        return None;
+    }
+    let rest = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+    let methods = match method_token.as_str() {
+        // Flask `route` defaults to GET when no `methods=` kwarg is supplied.
+        "route" => parse_methods_kwarg(rest).unwrap_or_else(|| vec!["GET".to_string()]),
+        // FastAPI `api_route` is variadic and REQUIRES `methods=[...]`; a
+        // missing/unparseable methods list means we can't determine the
+        // method set and drop the decorator rather than guessing.
+        "api_route" => parse_methods_kwarg(rest)?,
+        verb => vec![verb.to_uppercase()],
+    };
+    if methods.is_empty() {
+        return None;
+    }
+    let _ = framework;
+    Some(PendingDecorator { path, methods })
+}
+
+/// Parse `methods=[...]`, `methods=(...)`, or `methods={...}` out of a
+/// decorator argument tail. Quoted method tokens are extracted and
+/// upper-cased. Returns `None` when the kwarg is absent or the literal
+/// can't be matched (e.g. `methods=ALLOWED_METHODS` referencing a name).
+fn parse_methods_kwarg(args: &str) -> Option<Vec<String>> {
+    let idx = args.find("methods")?;
+    let tail = args[idx + "methods".len()..].trim_start();
+    let tail = tail.strip_prefix('=')?.trim_start();
+    let opener = tail.chars().next()?;
+    let closer = match opener {
+        '[' => ']',
+        '(' => ')',
+        '{' => '}',
+        _ => return None,
+    };
+    let chars: Vec<char> = tail.chars().collect();
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut end = None;
+    for (i, &c) in chars.iter().enumerate() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
             continue;
         }
-        push_python_route_seed(out, emitted, rel, recv, framework, &method, &path);
+        if c == '"' || c == '\'' {
+            quote = Some(c);
+            continue;
+        }
+        if c == opener {
+            depth += 1;
+            continue;
+        }
+        if c == closer {
+            depth -= 1;
+            if depth == 0 {
+                end = Some(i);
+                break;
+            }
+        }
     }
-    Ok(())
+    let end = end?;
+    let inner: String = chars[1..end].iter().collect();
+    let token_re = Regex::new(r#"['"]\s*([A-Za-z]+)\s*['"]"#).ok()?;
+    let mut methods: Vec<String> = token_re
+        .captures_iter(&inner)
+        .filter_map(|c| c.get(1).map(|m| m.as_str().to_uppercase()))
+        .collect();
+    if methods.is_empty() {
+        return None;
+    }
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    methods.retain(|m| seen.insert(m.clone()));
+    Some(methods)
+}
+
+/// Net paren count for a line, ignoring `(` and `)` that appear inside
+/// `"..."` / `'...'` string literals. Used to drive multi-line decorator
+/// accumulation: a decorator continues until its paren depth returns to
+/// zero.
+fn paren_delta(line: &str) -> i32 {
+    let mut delta = 0i32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for c in line.chars() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        if c == '"' || c == '\'' {
+            quote = Some(c);
+        } else if c == '(' {
+            delta += 1;
+        } else if c == ')' {
+            delta -= 1;
+        }
+    }
+    delta
+}
+
+/// Per-file scanner state bundle: the output vector, dedup set, and the
+/// file/receiver/framework triple that stays constant across every seed
+/// emitted from the same `(file, receiver)` pair. Lifts the function-arg
+/// count of [`push_python_route_seed`] under the clippy threshold and
+/// keeps each call site focused on what varies (method, path, handler).
+struct RouteEmitCtx<'a> {
+    out: &'a mut Vec<FeatureSeed>,
+    emitted: &'a mut BTreeSet<(String, String)>,
+    rel: &'a str,
+    recv: &'a str,
+    framework: PythonFramework,
 }
 
 fn push_python_route_seed(
-    out: &mut Vec<FeatureSeed>,
-    emitted: &mut BTreeSet<(String, String)>,
-    rel: &str,
-    recv: &str,
-    framework: PythonFramework,
+    ctx: &mut RouteEmitCtx<'_>,
     method: &str,
     path: &str,
+    fn_name: Option<&str>,
 ) {
     let key = (method.to_string(), path.to_string());
-    if !emitted.insert(key.clone()) {
+    if !ctx.emitted.insert(key.clone()) {
         return;
     }
     let route_label = format!("{method} {path}");
-    out.push(FeatureSeed {
-        title: format!("{} route `{}`", framework.label(), route_label),
-        summary: format!(
-            "{} route {} declared in {} (receiver `{}`)",
-            framework.label(),
+    let summary = match fn_name {
+        Some(name) => format!(
+            "{} route {} declared in {} (receiver `{}`, handler `{}`)",
+            ctx.framework.label(),
             route_label,
-            rel,
-            recv
+            ctx.rel,
+            ctx.recv,
+            name,
         ),
+        None => format!(
+            "{} route {} declared in {} (receiver `{}`)",
+            ctx.framework.label(),
+            route_label,
+            ctx.rel,
+            ctx.recv,
+        ),
+    };
+    ctx.out.push(FeatureSeed {
+        title: format!("{} route `{}`", ctx.framework.label(), route_label),
+        summary,
         kind: FeatureKind::Route,
-        source: framework.source(),
+        source: ctx.framework.source(),
         confidence: FeatureConfidence::High,
-        entry_path: rel.to_string(),
-        entry_symbol: None,
+        entry_path: ctx.rel.to_string(),
+        entry_symbol: fn_name.map(String::from),
         entry_route: Some(route_label),
         entry_command: None,
         test_command: None,
         language: Language::Python,
         tags: vec![
             "python".to_string(),
-            framework.tag().to_string(),
+            ctx.framework.tag().to_string(),
             "route".to_string(),
         ],
         owned_files: Vec::new(),
@@ -1653,6 +1843,237 @@ def ping():
         assert!(seeds.iter().any(
             |s| s.source == "fastapi-route" && s.entry_route.as_deref() == Some("GET /v1/ping")
         ));
+    }
+
+    #[test]
+    fn fastapi_api_route_variadic_methods_expand() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
+        write(
+            dir.path(),
+            "main.py",
+            r#"
+from fastapi import FastAPI
+app = FastAPI()
+
+@app.api_route("/anything", methods=["GET", "POST"])
+async def handle_any():
+    return {}
+"#,
+        );
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let routes: std::collections::BTreeSet<String> = seeds
+            .iter()
+            .filter(|s| s.source == "fastapi-route")
+            .filter_map(|s| s.entry_route.clone())
+            .collect();
+        assert!(routes.contains("GET /anything"), "got: {routes:?}");
+        assert!(routes.contains("POST /anything"), "got: {routes:?}");
+    }
+
+    #[test]
+    fn fastapi_api_route_without_methods_kwarg_is_dropped() {
+        // `api_route` without `methods=[...]` has no determinable method
+        // set. We drop it rather than guessing GET (Flask's default
+        // doesn't apply here).
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
+        write(
+            dir.path(),
+            "main.py",
+            r#"
+from fastapi import FastAPI
+app = FastAPI()
+
+@app.api_route("/unknown")
+async def handler():
+    return {}
+"#,
+        );
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        assert!(
+            !seeds.iter().any(|s| s.source == "fastapi-route"),
+            "api_route without methods= should produce no seeds"
+        );
+    }
+
+    #[test]
+    fn fastapi_route_captures_handler_function_name() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
+        write(
+            dir.path(),
+            "main.py",
+            r#"
+from fastapi import FastAPI
+app = FastAPI()
+
+@app.get("/users/{id}")
+async def fetch_user(id: int):
+    return {}
+"#,
+        );
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let seed = seeds
+            .iter()
+            .find(|s| {
+                s.source == "fastapi-route" && s.entry_route.as_deref() == Some("GET /users/{id}")
+            })
+            .expect("route seed missing");
+        assert_eq!(seed.entry_symbol.as_deref(), Some("fetch_user"));
+    }
+
+    #[test]
+    fn flask_route_captures_handler_function_name() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
+        write(
+            dir.path(),
+            "app.py",
+            r#"
+from flask import Flask
+app = Flask(__name__)
+
+@app.route("/users")
+def list_users():
+    return []
+"#,
+        );
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let seed = seeds
+            .iter()
+            .find(|s| s.source == "flask-route" && s.entry_route.as_deref() == Some("GET /users"))
+            .expect("route seed missing");
+        assert_eq!(seed.entry_symbol.as_deref(), Some("list_users"));
+    }
+
+    #[test]
+    fn fastapi_multiline_decorator_recognized() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
+        write(
+            dir.path(),
+            "main.py",
+            r#"
+from fastapi import FastAPI
+app = FastAPI()
+
+@app.post(
+    "/items",
+    response_model=dict,
+    status_code=201,
+)
+async def create_item(payload: dict):
+    return payload
+"#,
+        );
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let seed = seeds
+            .iter()
+            .find(|s| {
+                s.source == "fastapi-route" && s.entry_route.as_deref() == Some("POST /items")
+            })
+            .expect("multi-line decorator missed");
+        assert_eq!(seed.entry_symbol.as_deref(), Some("create_item"));
+    }
+
+    #[test]
+    fn flask_methods_tuple_container_recognized() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
+        write(
+            dir.path(),
+            "app.py",
+            r#"
+from flask import Flask
+app = Flask(__name__)
+
+@app.route("/items", methods=("GET", "POST"))
+def items():
+    return []
+"#,
+        );
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let routes: std::collections::BTreeSet<String> = seeds
+            .iter()
+            .filter(|s| s.source == "flask-route")
+            .filter_map(|s| s.entry_route.clone())
+            .collect();
+        assert!(routes.contains("GET /items"), "got: {routes:?}");
+        assert!(routes.contains("POST /items"), "got: {routes:?}");
+    }
+
+    #[test]
+    fn flask_methods_set_container_recognized() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
+        write(
+            dir.path(),
+            "app.py",
+            r#"
+from flask import Flask
+app = Flask(__name__)
+
+@app.route("/items", methods={"GET", "PUT"})
+def items():
+    return []
+"#,
+        );
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let routes: std::collections::BTreeSet<String> = seeds
+            .iter()
+            .filter(|s| s.source == "flask-route")
+            .filter_map(|s| s.entry_route.clone())
+            .collect();
+        assert!(routes.contains("GET /items"), "got: {routes:?}");
+        assert!(routes.contains("PUT /items"), "got: {routes:?}");
+    }
+
+    #[test]
+    fn fastapi_stacked_decorators_share_handler() {
+        // A second decorator between the route decorator and `def`
+        // must not break the binding — both upstream and our scanner
+        // hold the pending route until any `def` line is reached.
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
+        write(
+            dir.path(),
+            "main.py",
+            r#"
+from fastapi import FastAPI
+app = FastAPI()
+
+def auth_required(fn):
+    return fn
+
+@app.get("/admin")
+@auth_required
+async def admin_panel():
+    return {}
+"#,
+        );
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let seed = seeds
+            .iter()
+            .find(|s| s.source == "fastapi-route" && s.entry_route.as_deref() == Some("GET /admin"))
+            .expect("stacked decorator missed");
+        assert_eq!(seed.entry_symbol.as_deref(), Some("admin_panel"));
     }
 
     #[test]
