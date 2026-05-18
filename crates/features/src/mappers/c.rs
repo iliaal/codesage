@@ -67,6 +67,63 @@ fn is_c_or_cpp_compilable(rel: &str) -> bool {
     rel.ends_with(".c") || rel.ends_with(".cpp") || rel.ends_with(".cc") || rel.ends_with(".cxx")
 }
 
+/// Path looks like a C/C++ test fixture under conventional naming:
+/// directory under `tests/` / `test/` / `__tests__/`; basename prefixed
+/// with `test_` or `test-`; basename suffixed `_tests.cpp` / `-test.c`;
+/// `FooTest.cpp` / `BarTests.cc`. Mirrors clawpatch's `isCOrCppTestPath`
+/// so the same shape we use to skip `main()` detection in `tests/`
+/// drives CMake test-target classification too.
+fn is_c_or_cpp_test_path(rel: &str) -> bool {
+    let base = rel.rsplit('/').next().unwrap_or(rel);
+    let lower = rel.to_ascii_lowercase();
+    if lower.starts_with("test/")
+        || lower.starts_with("tests/")
+        || lower.contains("/test/")
+        || lower.contains("/tests/")
+        || lower.contains("/__tests__/")
+    {
+        return true;
+    }
+    let base_lower = base.to_ascii_lowercase();
+    if base_lower.starts_with("test_") || base_lower.starts_with("test-") {
+        return true;
+    }
+    // foo_test.c / foo-tests.cpp
+    let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base);
+    let stem_lower = stem.to_ascii_lowercase();
+    if stem_lower.ends_with("_test")
+        || stem_lower.ends_with("-test")
+        || stem_lower.ends_with("_tests")
+        || stem_lower.ends_with("-tests")
+    {
+        return true;
+    }
+    // FooTest.cpp / BarTests.cc (case-sensitive Test/Tests suffix on the
+    // *original* stem so `foo_test.c` doesn't double-match here).
+    if stem.ends_with("Test") || stem.ends_with("Tests") {
+        return true;
+    }
+    false
+}
+
+/// Classify a CMake `add_executable(...)` target as a test suite when
+/// either the target name ends in `tests?` (with optional `_` or `-`
+/// separator, case-insensitive) or any of its sources is a test path.
+/// Matches clawpatch commit f21b76c's `isCMakeTestExecutableTarget`.
+fn is_cmake_test_executable(name: &str, sources: &[String]) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let ends_in_tests = lower == "test"
+        || lower == "tests"
+        || lower.ends_with("_test")
+        || lower.ends_with("-test")
+        || lower.ends_with("_tests")
+        || lower.ends_with("-tests");
+    if ends_in_tests {
+        return true;
+    }
+    sources.iter().any(|s| is_c_or_cpp_test_path(s))
+}
+
 fn is_makefile(rel: &str) -> bool {
     rel.ends_with("Makefile.am") || rel.ends_with("Makefile.in")
 }
@@ -312,6 +369,49 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
                 continue;
             }
             let context_files = filter_target_context(ctx, cm, "CMake target declaration");
+            // Test-target classification: name ending in `tests?` (with
+            // optional separator) or any source under a test path means
+            // this `add_executable` is a test harness, not a shippable
+            // CLI. Emit one `cmake-test` test-suite seed in that case so
+            // `recommend_tests` and PR-level risk views pick it up
+            // correctly; otherwise emit the regular `cmake-bin` cli seed.
+            if is_cmake_test_executable(&name, &all_sources) {
+                let lang_tag = if language == Language::Cpp {
+                    "cpp"
+                } else {
+                    "c"
+                };
+                let test_paths: Vec<&SeedFile> = owned_files
+                    .iter()
+                    .filter(|f| is_c_or_cpp_test_path(&f.path))
+                    .collect();
+                let tests: Vec<crate::mappers::types::SeedTest> = test_paths
+                    .iter()
+                    .map(|f| crate::mappers::types::SeedTest {
+                        path: f.path.clone(),
+                        command: None,
+                    })
+                    .collect();
+                out.push(FeatureSeed {
+                    title: format!("CMake test suite `{name}`"),
+                    summary: format!("CMake test executable `{name}` declared in {cm}"),
+                    kind: FeatureKind::TestSuite,
+                    source: "cmake-test",
+                    confidence: FeatureConfidence::High,
+                    entry_path: entry,
+                    entry_symbol: None,
+                    entry_route: None,
+                    entry_command: None,
+                    test_command: None,
+                    language,
+                    tags: vec![lang_tag.to_string(), "test".to_string()],
+                    owned_files,
+                    context_files,
+                    tests,
+                    test_prefixes: vec![format!("{}tests", dir)],
+                });
+                continue;
+            }
             out.push(FeatureSeed {
                 title: format!("CMake binary `{name}`"),
                 summary: format!("CMake `add_executable({name})` declared in {cm}"),
@@ -1146,6 +1246,120 @@ mod tests {
             !seeds.iter().any(|s| s.title == "CMake library `vendored`"),
             "vendored INTERFACE library should drop when its only file is excluded"
         );
+    }
+
+    #[test]
+    fn cmake_test_target_emits_test_suite_not_cli() {
+        // `add_executable(foo_tests test_a.cpp test_b.cpp)` is a unit-test
+        // harness, not a shippable CLI; emit as `cmake-test` /
+        // FeatureKind::TestSuite so it lands in `recommend_tests` and
+        // doesn't pollute `list_features --kind cli-command`.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "CMakeLists.txt",
+            "add_executable(foo_tests test_main.cpp helper_test.cpp)\n",
+        );
+        write(dir.path(), "test_main.cpp", "int main(){return 0;}\n");
+        write(dir.path(), "helper_test.cpp", "void noop(){}\n");
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let test_seed = seeds
+            .iter()
+            .find(|s| s.source == "cmake-test")
+            .expect("cmake-test seed missing");
+        assert_eq!(test_seed.kind, FeatureKind::TestSuite);
+        assert!(test_seed.tags.iter().any(|t| t == "test"));
+        assert!(
+            test_seed.entry_command.is_none(),
+            "test suite has no `command`"
+        );
+        assert!(
+            !seeds.iter().any(|s| s.source == "cmake-bin" && s.entry_command.as_deref() == Some("foo_tests")),
+            "test-named target should not also emit a cli-command seed"
+        );
+    }
+
+    #[test]
+    fn cmake_test_target_by_source_paths_only() {
+        // Even with a neutral target name, sources under `tests/` flip
+        // the classification — `add_executable(runner tests/main.c)` is
+        // a test harness, not a CLI command.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "CMakeLists.txt",
+            "add_executable(runner tests/main.c)\n",
+        );
+        write(dir.path(), "tests/main.c", "int main(){return 0;}\n");
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        assert!(
+            seeds
+                .iter()
+                .any(|s| s.source == "cmake-test" && s.kind == FeatureKind::TestSuite),
+            "neutral name with test-path sources should classify as test-suite; got: {:?}",
+            seeds.iter().map(|s| s.source).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn cmake_non_test_target_remains_cli_command() {
+        // Negative regression: ordinary names with ordinary sources keep
+        // their pre-fix `cmake-bin` classification.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "CMakeLists.txt",
+            "add_executable(server src/main.cpp)\n",
+        );
+        write(dir.path(), "src/main.cpp", "int main(){return 0;}\n");
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        assert!(
+            seeds
+                .iter()
+                .any(|s| s.source == "cmake-bin" && s.kind == FeatureKind::CliCommand),
+            "non-test target should remain cmake-bin"
+        );
+        assert!(
+            !seeds.iter().any(|s| s.source == "cmake-test"),
+            "non-test target must not emit a cmake-test seed"
+        );
+    }
+
+    #[test]
+    fn is_c_or_cpp_test_path_covers_documented_patterns() {
+        // Patterns mirror clawpatch's `isCOrCppTestPath`. Listed here so
+        // a future change that loosens the helper trips the test.
+        for path in [
+            "tests/main.c",
+            "test/main.cpp",
+            "src/__tests__/widget.cpp",
+            "src/test_widget.c",
+            "src/test-widget.c",
+            "src/widget_test.c",
+            "src/widget-test.c",
+            "src/widget_tests.cpp",
+            "src/WidgetTest.cpp",
+            "src/WidgetTests.cc",
+        ] {
+            assert!(super::is_c_or_cpp_test_path(path), "should match: {path}");
+        }
+        for path in [
+            "src/main.c",
+            "src/widget.cpp",
+            "include/widget.h",
+            "src/testimony.c", // `test` prefix but not separator-followed
+        ] {
+            assert!(
+                !super::is_c_or_cpp_test_path(path),
+                "should NOT match: {path}"
+            );
+        }
     }
 
     #[test]
