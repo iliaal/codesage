@@ -843,6 +843,16 @@ fn resolve_hooks_dir(root: &std::path::Path) -> Result<(PathBuf, bool)> {
             } else {
                 root.join(path)
             };
+            // A `core.hooksPath` that resolves to the default `<git_common>/hooks`
+            // is a no-op redundancy; treat it like an unset value rather than
+            // refusing. Seen in the wild on PHP-extension repos that share a
+            // config template.
+            if let Some(common) = git_common_dir(root) {
+                let default_hooks = common.join("hooks");
+                if util::paths_resolve_same(&resolved, &default_hooks) {
+                    return Ok((default_hooks, false));
+                }
+            }
             if resolved.join("h").is_file() || resolved.join("husky.sh").is_file() {
                 let user_dir = resolved
                     .parent()

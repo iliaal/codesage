@@ -1,5 +1,8 @@
 ## [Unreleased]
 
+### Fixed
+- `install-hooks` and `doctor` no longer refuse repos where `core.hooksPath` is set to a path that already resolves to the default `<git_common>/hooks`. The redundant setting (seen on PHP-extension repos that share a config template) is treated as if unset instead of erroring out.
+
 ## [0.8.0] - 2026-05-17
 
 ### Added

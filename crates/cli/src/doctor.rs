@@ -295,7 +295,15 @@ fn check_hooks(root: &Path) -> Check {
             } else {
                 root.join(&p)
             };
-            if path.join("h").is_file() || path.join("husky.sh").is_file() {
+            // Redundant `core.hooksPath` pointing at the default git hooks dir
+            // — treat as unset to match resolve_hooks_dir's behavior.
+            let common = git_common_dir(root);
+            let default_hooks = common.as_ref().map(|c| c.join("hooks"));
+            if let Some(default) = default_hooks.as_ref()
+                && crate::util::paths_resolve_same(&path, default)
+            {
+                (default.clone(), "git")
+            } else if path.join("h").is_file() || path.join("husky.sh").is_file() {
                 let user = path
                     .parent()
                     .map(|p| p.to_path_buf())
