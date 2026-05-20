@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.8.1] - 2026-05-20
+
 ### Added
 - **React component feature slices.** New `react-component` / `FeatureKind::Library` seed source, one feature per `.tsx` / `.jsx` file under conventional component dirs (`src/pages`, `src/components`, top-level `components/`) of every package that declares a React dependency. Capped at 100 components per package. Stories / `.storybook/` / fixtures / `testdata/` / `.d.ts` / `.test.tsx` / `.spec.tsx` files are excluded. Files already owned by a `react-router-route`, `next-app-route`, `next-app-page`, or `next-pages-route` seed are skipped so a route declaration file doesn't double-emit. Gives `find_feature("src/components/Button.tsx")` an answer (previously returned nothing for unrouted components) and `feature_bundle` a single-component target for review. Ports clawpatch react.ts `componentSeeds` (commit af0ad0e). Component name is derived from the basename stem; tags are `[language, "react", "react-component"]`. Five new regression tests cover: per-file emission across both `src/pages` and `src/components`; stories / tests / .d.ts / __stories__ / fixtures exclusion; route-owned file deduplication via the shared exclusion set; the no-React-dependency gate; and the 100-per-package cap enforced at the file walker.
 
@@ -380,5 +382,7 @@ Initial public release.
 
 [0.7.5]: https://github.com/iliaal/codesage/releases/tag/v0.7.5
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.8.0...HEAD
 [0.8.0]: https://github.com/iliaal/codesage/releases/tag/v0.8.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/iliaal/codesage/releases/tag/v0.8.1
