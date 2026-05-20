@@ -287,57 +287,52 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
     if cmake_files.is_empty() {
         return Ok(out);
     }
-    // Case-insensitive (CMake commands are): ADD_EXECUTABLE, Add_Library, etc.
-    // Names allow leading digits and dots (`7zip`, `foo.bar`). Source list is
-    // optional so `add_executable(name)` paired with a later `target_sources()`
-    // call still surfaces as a target.
-    let exe_re =
-        Regex::new(r"(?msi)add_executable\s*\(\s*([A-Za-z0-9_][\w\.\-]*)(?:\s+([^)]*))?\)")?;
-    let lib_re = Regex::new(
-        r"(?msi)add_library\s*\(\s*([A-Za-z0-9_][\w\.\-]*)(?:\s+(?:SHARED|STATIC|MODULE|OBJECT|INTERFACE))?(?:\s+([^)]*))?\)",
-    )?;
-    let ts_re = Regex::new(
-        r"(?msi)target_sources\s*\(\s*([A-Za-z0-9_][\w\.\-]*)\s+(?:PRIVATE|PUBLIC|INTERFACE)\s+([^)]*)\)",
-    )?;
+    // CMake parsing uses an explicit walker (`cmake_command_args` + friends)
+    // rather than regexes. Two reasons: (a) the previous `[^)]*` source-list
+    // capture truncated targets whose quoted args contained `)` (common with
+    // generator expressions like `$<$<CONFIG:Debug>:debug.c>`); (b) the
+    // walker skips `command(...)` text inside quoted strings and bracket
+    // arguments, so `message("add_executable(fake)")` no longer leaks a
+    // spurious feature. Ported from clawpatch commit 162a6fe.
+    //
+    // Target name shape (`[A-Za-z0-9_.\-]+` with no leading `$` / `\\` / `(`
+    // / `=` / `#`) and the case-insensitivity of CMake command names are
+    // enforced by `is_valid_target_name` and `cmake_command_args` rather
+    // than by a regex.
     for cm in cmake_files {
         let path = root.join(cm);
         let raw = fs::read_to_string(&path).unwrap_or_default();
         let body = strip_cmake_comments(&raw);
         let dir = parent_dir(cm);
 
-        // Collect late-bound `target_sources(name PRIVATE|PUBLIC|INTERFACE …)`
+        // Collect late-bound `target_sources(name [PRIVATE|PUBLIC|INTERFACE] …)`
         // additions first so the target loop below can merge them when it
         // sees the matching `add_executable` / `add_library`.
         let mut extra_sources: HashMap<String, Vec<String>> = HashMap::new();
-        for cap in ts_re.captures_iter(&body) {
-            let name = cap
-                .get(1)
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-            let srcs = cap
-                .get(2)
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-            extra_sources
-                .entry(name)
-                .or_default()
-                .extend(srcs.split_whitespace().map(|s| s.to_string()));
+        for args in cmake_command_args(&body, "target_sources") {
+            let mut words = cmake_split_args(&args);
+            if words.is_empty() {
+                continue;
+            }
+            let name = words.remove(0);
+            // Real CMake requires a PRIVATE|PUBLIC|INTERFACE scope keyword
+            // here; tolerate its absence rather than skipping the call, but
+            // drop the keyword if present so a phantom "PRIVATE" source
+            // never lands in `extra_sources`.
+            strip_target_sources_scope(&mut words);
+            extra_sources.entry(name).or_default().extend(words);
         }
 
-        for cap in exe_re.captures_iter(&body) {
-            let name = cap
-                .get(1)
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
+        for args in cmake_command_args(&body, "add_executable") {
+            let mut words = cmake_split_args(&args);
+            if words.is_empty() {
+                continue;
+            }
+            let name = words.remove(0);
             if !is_valid_target_name(&name) {
                 continue;
             }
-            let inline = cap
-                .get(2)
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-            let mut all_sources: Vec<String> =
-                inline.split_whitespace().map(|s| s.to_string()).collect();
+            let mut all_sources: Vec<String> = words;
             if let Some(extra) = extra_sources.get(&name) {
                 all_sources.extend(extra.iter().cloned());
             }
@@ -439,20 +434,19 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
                 test_prefixes: vec![format!("{}tests", dir)],
             });
         }
-        for cap in lib_re.captures_iter(&body) {
-            let name = cap
-                .get(1)
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
+        for args in cmake_command_args(&body, "add_library") {
+            let mut words = cmake_split_args(&args);
+            if words.is_empty() {
+                continue;
+            }
+            let name = words.remove(0);
             if !is_valid_target_name(&name) {
                 continue;
             }
-            let inline = cap
-                .get(2)
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-            let mut all_sources: Vec<String> =
-                inline.split_whitespace().map(|s| s.to_string()).collect();
+            // `add_library(name [SHARED|STATIC|MODULE|OBJECT|INTERFACE] …)`
+            // — the library-type keyword, if present, is not a source.
+            strip_library_type_keyword(&mut words);
+            let mut all_sources: Vec<String> = words;
             if let Some(extra) = extra_sources.get(&name) {
                 all_sources.extend(extra.iter().cloned());
             }
@@ -822,6 +816,248 @@ fn strip_cmake_comments(body: &str) -> String {
         i += width;
     }
     out
+}
+
+/// Walks `body` looking for top-level invocations of `command(...)`. For
+/// each occurrence, returns the unparsed argument slice between the
+/// outer parens. Skips text inside quoted strings and bracket arguments
+/// (`[[...]]`, `[=[...]=]`) so command-like text inside string literals
+/// doesn't produce spurious matches. Handles arbitrarily nested parens
+/// and quoted args that contain `)`. Command match is case-insensitive
+/// and bounded so `add_executables` does not match `add_executable`.
+fn cmake_command_args(body: &str, command: &str) -> Vec<String> {
+    let bytes = body.as_bytes();
+    let cmd = command.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(j) = cmake_skip_string_like(bytes, i) {
+            i = j;
+            continue;
+        }
+        if i + cmd.len() <= bytes.len()
+            && bytes[i..i + cmd.len()].eq_ignore_ascii_case(cmd)
+            && !is_cmake_identifier_byte(if i == 0 { None } else { Some(bytes[i - 1]) })
+            && !is_cmake_identifier_byte(bytes.get(i + cmd.len()).copied())
+        {
+            let mut open = i + cmd.len();
+            while open < bytes.len() && bytes[open].is_ascii_whitespace() {
+                open += 1;
+            }
+            if open < bytes.len()
+                && bytes[open] == b'('
+                && let Some(close) = cmake_find_close_paren(bytes, open)
+            {
+                // open+1 and close are both ASCII byte positions so
+                // slicing the str at those indices stays on char
+                // boundaries.
+                out.push(body[open + 1..close].to_string());
+                i = close + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// If the byte at `i` opens a string-like construct (quoted `"..."` or
+/// bracket `[[...]]` / `[=[...]=]` argument), returns the byte index
+/// just past its close; otherwise `None`. Unterminated openers consume
+/// the rest of the body so the outer walker doesn't get stuck.
+fn cmake_skip_string_like(bytes: &[u8], i: usize) -> Option<usize> {
+    if i >= bytes.len() {
+        return None;
+    }
+    if bytes[i] == b'"' {
+        return Some(cmake_quoted_end(bytes, i));
+    }
+    cmake_bracket_end(bytes, i)
+}
+
+/// `bytes[start] == b'"'`. Returns the index just past the matching
+/// closing `"`. Inside the quote, `\X` escapes the next byte (so `\"`
+/// does not terminate). Falls through to `bytes.len()` on an
+/// unterminated quote.
+fn cmake_quoted_end(bytes: &[u8], start: usize) -> usize {
+    let mut j = start + 1;
+    while j < bytes.len() {
+        if bytes[j] == b'\\' && j + 1 < bytes.len() {
+            j += 2;
+            continue;
+        }
+        if bytes[j] == b'"' {
+            return j + 1;
+        }
+        j += 1;
+    }
+    bytes.len()
+}
+
+/// Recognizes a CMake bracket-argument opener `[=*[` at `start`. Returns
+/// the index just past the matching `]=*]` closer (with the same number
+/// of equals), or `bytes.len()` if unterminated. Returns `None` when
+/// `start` does not point at a valid opener.
+fn cmake_bracket_end(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'[') {
+        return None;
+    }
+    let mut k = start + 1;
+    while bytes.get(k) == Some(&b'=') {
+        k += 1;
+    }
+    if bytes.get(k) != Some(&b'[') {
+        return None;
+    }
+    let eq = k - start - 1;
+    let body_start = k + 1;
+    let closer_len = eq + 2;
+    if body_start >= bytes.len() {
+        return Some(bytes.len());
+    }
+    let mut j = body_start;
+    while j + closer_len <= bytes.len() {
+        if bytes[j] == b']'
+            && bytes[j + closer_len - 1] == b']'
+            && bytes[j + 1..j + 1 + eq].iter().all(|&b| b == b'=')
+        {
+            return Some(j + closer_len);
+        }
+        j += 1;
+    }
+    Some(bytes.len())
+}
+
+/// `bytes[open] == b'('`. Walks forward keeping a paren-depth counter
+/// (skipping string-like spans) and returns the index of the matching
+/// `)`, or `None` if no balancing `)` is found.
+fn cmake_find_close_paren(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth: usize = 1;
+    let mut i = open + 1;
+    while i < bytes.len() {
+        if let Some(j) = cmake_skip_string_like(bytes, i) {
+            i = j;
+            continue;
+        }
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn is_cmake_identifier_byte(b: Option<u8>) -> bool {
+    matches!(b, Some(b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_'))
+}
+
+/// Splits a CMake command-args slice into individual words. Quoted
+/// strings (`"..."`) and bracket arguments (`[[...]]`) survive whitespace
+/// as single tokens — important for source paths that contain spaces.
+/// Unquoted words are then split on `;` (CMake list separator); quoted
+/// values are NOT split that way (per CMake's documented semantics).
+/// Returns each word's unescaped content.
+fn cmake_split_args(args: &str) -> Vec<String> {
+    let bytes = args.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] == b'"' {
+            let end = cmake_quoted_end(bytes, i);
+            let inner_end = end.saturating_sub(1).max(i + 1);
+            let value = unescape_cmake_quoted(&args[i + 1..inner_end]);
+            if !value.is_empty() {
+                out.push(value);
+            }
+            i = end;
+            continue;
+        }
+        if let Some(end) = cmake_bracket_end(bytes, i) {
+            // Recompute the opener length (`[`, `=*`, `[`) to know where
+            // the content starts and the closer length to know where it
+            // ends. Bracket-arg content is raw — no escape processing.
+            let mut k = i + 1;
+            while bytes.get(k) == Some(&b'=') {
+                k += 1;
+            }
+            let opener_len = (k + 1) - i;
+            let closer_len = opener_len;
+            let content_end = end.saturating_sub(closer_len).max(i + opener_len);
+            let inner = &args[i + opener_len..content_end];
+            if !inner.is_empty() {
+                out.push(inner.to_string());
+            }
+            i = end;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'"'
+            && bytes[i] != b'['
+        {
+            i += 1;
+        }
+        let word = &args[start..i];
+        for seg in word.split(';').filter(|s| !s.is_empty()) {
+            out.push(seg.to_string());
+        }
+    }
+    out
+}
+
+/// `\X` → `X` for any single character. CMake's quoted-string rules
+/// allow `\\`, `\"`, `\n`, etc. — we don't expand the special letter
+/// escapes (we keep `\n` as a literal `n`) because the only thing this
+/// mapper does with the result is path resolution, where preserving the
+/// literal beats interpreting it.
+fn unescape_cmake_quoted(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn strip_library_type_keyword(words: &mut Vec<String>) {
+    if let Some(first) = words.first() {
+        let kw = first.to_ascii_uppercase();
+        if matches!(
+            kw.as_str(),
+            "SHARED" | "STATIC" | "MODULE" | "OBJECT" | "INTERFACE"
+        ) {
+            words.remove(0);
+        }
+    }
+}
+
+fn strip_target_sources_scope(words: &mut Vec<String>) {
+    if let Some(first) = words.first() {
+        let kw = first.to_ascii_uppercase();
+        if matches!(kw.as_str(), "PRIVATE" | "PUBLIC" | "INTERFACE") {
+            words.remove(0);
+        }
+    }
 }
 
 /// Dedup keyed on `(entry_path, kind)`. First seed wins, so the order
@@ -1374,5 +1610,163 @@ mod tests {
             stripped.contains("café"),
             "non-ASCII path lost UTF-8 round-trip: {stripped:?}"
         );
+    }
+
+    #[test]
+    fn cmake_ignores_command_text_inside_strings() {
+        // Ported from clawpatch 162a6fe: `message("add_executable(...)")`
+        // and `message([[add_library(...)]])` must not surface as
+        // features. The walker skips command-like text inside quoted
+        // strings and bracket arguments; the old `[^)]*` regex had no
+        // notion of string scope and matched right through them.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "CMakeLists.txt",
+            "message(\"add_executable(fake src/main.c)\")\n\
+             message([[add_library(fake_lib src/lib.c)]])\n\
+             add_executable(real src/real.c)\n",
+        );
+        write(dir.path(), "src/main.c", "int main(){return 0;}\n");
+        write(dir.path(), "src/lib.c", "int lib(){return 0;}\n");
+        write(dir.path(), "src/real.c", "int main(){return 0;}\n");
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        assert!(
+            !seeds
+                .iter()
+                .any(|s| s.entry_command.as_deref() == Some("fake")),
+            "string-embedded add_executable leaked as a feature"
+        );
+        assert!(
+            !seeds.iter().any(|s| s.title == "CMake library `fake_lib`"),
+            "bracket-embedded add_library leaked as a feature"
+        );
+        assert!(
+            seeds
+                .iter()
+                .any(|s| s.source == "cmake-bin" && s.entry_command.as_deref() == Some("real")),
+            "real add_executable was dropped"
+        );
+    }
+
+    #[test]
+    fn cmake_quoted_source_paths_with_spaces() {
+        // Ported from clawpatch 162a6fe: a quoted source path with an
+        // embedded space stays one word, not two. The old regex relied
+        // on `split_whitespace`, which would split "src/main file.cpp"
+        // into "src/main" and "file.cpp" and emit phantom sources.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "CMakeLists.txt",
+            "add_executable(app \"src/main file.cpp\" \"src/helper file.cpp\")\n",
+        );
+        write(dir.path(), "src/main file.cpp", "int main(){return 0;}\n");
+        write(dir.path(), "src/helper file.cpp", "int help(){return 0;}\n");
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "cmake-bin" && s.entry_command.as_deref() == Some("app"))
+            .expect("cmake-bin seed for app");
+        let owned: Vec<&str> = s.owned_files.iter().map(|f| f.path.as_str()).collect();
+        assert!(
+            owned.contains(&"src/main file.cpp"),
+            "quoted space-bearing source dropped: {owned:?}"
+        );
+        assert!(
+            owned.contains(&"src/helper file.cpp"),
+            "second quoted space-bearing source dropped: {owned:?}"
+        );
+    }
+
+    #[test]
+    fn cmake_quoted_source_paths_with_paren() {
+        // The headline regression: the old `[^)]*` capture truncated
+        // the source list at the first `)`, so a quoted path containing
+        // `)` (e.g., a vendored legacy file named `foo(v1).cpp`) made
+        // the regex eat only the prefix and the rest of the line stayed
+        // unparsed. The walker treats the `)` as ordinary content
+        // because it sits inside `"..."`.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "CMakeLists.txt",
+            "add_executable(legacy \"src/foo(v1).cpp\" \"src/main.cpp\")\n",
+        );
+        write(dir.path(), "src/foo(v1).cpp", "int helper(){return 0;}\n");
+        write(dir.path(), "src/main.cpp", "int main(){return 0;}\n");
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "cmake-bin" && s.entry_command.as_deref() == Some("legacy"))
+            .expect("cmake-bin seed for legacy");
+        let owned: Vec<&str> = s.owned_files.iter().map(|f| f.path.as_str()).collect();
+        assert!(
+            owned.contains(&"src/foo(v1).cpp"),
+            "quoted source with embedded `)` was lost: {owned:?}"
+        );
+        assert!(
+            owned.contains(&"src/main.cpp"),
+            "trailing source after `)`-bearing quoted path was lost: {owned:?}"
+        );
+    }
+
+    #[test]
+    fn cmake_add_library_strips_type_keyword() {
+        // `add_library(name SHARED src/a.c)` must not record "SHARED" as
+        // a phantom owned file. The old regex consumed the type keyword
+        // via a non-capturing group; the new walker has to strip it
+        // explicitly after splitting words.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "CMakeLists.txt",
+            "add_library(mylib SHARED src/a.c src/b.c)\n",
+        );
+        write(dir.path(), "src/a.c", "int a(){return 0;}\n");
+        write(dir.path(), "src/b.c", "int b(){return 0;}\n");
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "cmake-lib" && s.title == "CMake library `mylib`")
+            .expect("cmake-lib seed");
+        let owned: Vec<&str> = s.owned_files.iter().map(|f| f.path.as_str()).collect();
+        assert!(
+            !owned.iter().any(|p| p.ends_with("SHARED")),
+            "library type keyword leaked as a source: {owned:?}"
+        );
+        assert!(
+            owned.contains(&"src/a.c") && owned.contains(&"src/b.c"),
+            "real sources missing: {owned:?}"
+        );
+    }
+
+    #[test]
+    fn cmake_command_args_walker_returns_inner_text() {
+        // Direct unit test for the walker so regressions in the parser
+        // primitive can be diagnosed without round-tripping through the
+        // full mapper.
+        let body = "add_executable(a x.c)\nmessage(\"add_executable(fake y.c)\")\n\
+                    add_executable(b \"with )paren.c\")\n";
+        let args = super::cmake_command_args(body, "add_executable");
+        assert_eq!(args.len(), 2, "expected two real matches, got {args:?}");
+        assert_eq!(args[0], "a x.c");
+        assert_eq!(args[1], "b \"with )paren.c\"");
+    }
+
+    #[test]
+    fn cmake_split_args_preserves_quoted_tokens() {
+        // Quoted words survive whitespace and `;`; unquoted words split
+        // on `;` per CMake list semantics.
+        let words = super::cmake_split_args("a \"b c\" d;e [[bracket;arg]]");
+        assert_eq!(words, vec!["a", "b c", "d", "e", "bracket;arg"]);
     }
 }
