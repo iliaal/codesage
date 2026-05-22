@@ -1,5 +1,8 @@
 ## [Unreleased]
 
+### Fixed
+- **MCP daemon runtime-dir fallback treats empty env vars as unset.** The wiki-documented WSL2 workaround for the set-but-unusable `/run/user/$UID` trap injects `XDG_RUNTIME_DIR=""` in the client's MCP env so the shim falls through to `/tmp/codesage-$UID`. The fallback in `default_runtime_dir` was reading both `CODESAGE_DAEMON_RUNTIME_DIR` and `XDG_RUNTIME_DIR` via `std::env::var_os`, which returns `Some("")` for set-but-empty vars rather than `None`. The empty string then collapsed to a relative `codesage/` runtime dir that the daemon tried to create next to whatever the shim's cwd happened to be at spawn — silently littering arbitrary directories with `codesage/mcp-<version>-<hash>.{sock,pid,lock,log}` when cwd was writable, and surfacing `Failed to connect` for directories where it wasn't. Both env reads now treat an empty value as unset so the documented workaround behaves the way the wiki promised; the `/tmp/codesage-$UID` fallback also kicks in for any client that explicitly blanks the var. Regression test in `crates/cli/src/daemon.rs` asserts the resolved path is absolute and rooted under `std::env::temp_dir()` when both vars are empty.
+
 ## [0.8.1] - 2026-05-20
 
 ### Added

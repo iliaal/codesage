@@ -607,16 +607,26 @@ mod unix {
     }
 
     fn default_runtime_dir() -> PathBuf {
-        if let Some(dir) = std::env::var_os("CODESAGE_DAEMON_RUNTIME_DIR") {
+        // Treat set-but-empty env vars as unset. Documented workaround for the
+        // WSL2 `/run/user/$UID` trap is to inject `XDG_RUNTIME_DIR=""` in the
+        // client MCP env so the shim falls through to `/tmp`; without this
+        // guard `PathBuf::from("").join("codesage")` collapses to a relative
+        // `codesage/` that gets created next to whatever cwd the shim was
+        // spawned in.
+        if let Some(dir) = nonempty_env("CODESAGE_DAEMON_RUNTIME_DIR") {
             return PathBuf::from(dir);
         }
-        if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        if let Some(dir) = nonempty_env("XDG_RUNTIME_DIR") {
             return PathBuf::from(dir).join("codesage");
         }
         let suffix = std::env::var("UID")
             .or_else(|_| std::env::var("USER"))
             .unwrap_or_else(|_| "unknown".to_string());
         std::env::temp_dir().join(format!("codesage-{suffix}"))
+    }
+
+    fn nonempty_env(key: &str) -> Option<std::ffi::OsString> {
+        std::env::var_os(key).filter(|v| !v.is_empty())
     }
 
     fn daemon_key_for_exe(exe: &Path) -> Result<String> {
@@ -688,6 +698,47 @@ mod unix {
 
             assert_ne!(first.socket, second.socket);
             assert_eq!(first.runtime_dir, second.runtime_dir);
+        }
+
+        #[test]
+        fn default_runtime_dir_treats_empty_env_vars_as_unset() {
+            // Regression: the WSL2 workaround `XDG_RUNTIME_DIR=""` (and the
+            // analogous override on CODESAGE_DAEMON_RUNTIME_DIR) used to
+            // produce a relative `codesage/` runtime dir because var_os
+            // returns Some("") for set-but-empty vars. The shim then
+            // mkdir'd `codesage/` next to whatever cwd it spawned in.
+            //
+            // Mutating process env in tests is racy with parallel test
+            // threads, so this is wrapped in a Mutex.
+            use std::sync::Mutex;
+            static ENV_LOCK: Mutex<()> = Mutex::new(());
+            let _guard = ENV_LOCK.lock().unwrap();
+
+            // SAFETY: tests in this file may not run in parallel with other
+            // code that reads these vars; ENV_LOCK serializes against the
+            // sibling test that touches the same vars (none today, but the
+            // guard documents the invariant).
+            unsafe {
+                std::env::set_var("CODESAGE_DAEMON_RUNTIME_DIR", "");
+                std::env::set_var("XDG_RUNTIME_DIR", "");
+            }
+
+            let resolved = default_runtime_dir();
+            assert!(
+                resolved.is_absolute(),
+                "empty env vars must fall through to an absolute /tmp fallback, got {}",
+                resolved.display()
+            );
+            assert!(
+                resolved.starts_with(std::env::temp_dir()),
+                "expected /tmp fallback, got {}",
+                resolved.display()
+            );
+
+            unsafe {
+                std::env::remove_var("CODESAGE_DAEMON_RUNTIME_DIR");
+                std::env::remove_var("XDG_RUNTIME_DIR");
+            }
         }
 
         #[test]
