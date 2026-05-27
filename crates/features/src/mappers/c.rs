@@ -106,10 +106,16 @@ fn is_c_or_cpp_test_path(rel: &str) -> bool {
     false
 }
 
-/// Classify a CMake `add_executable(...)` target as a test suite when
-/// either the target name ends in `tests?` (with optional `_` or `-`
-/// separator, case-insensitive) or any of its sources is a test path.
-/// Matches clawpatch commit f21b76c's `isCMakeTestExecutableTarget`.
+/// Classify a CMake `add_executable(...)` target as a test suite when the
+/// target name ends in `tests?` (with optional `_` or `-` separator,
+/// case-insensitive), or — when the name is neutral — every compilable
+/// source matches the test path heuristic.
+///
+/// Target-name match wins outright. Source-path match alone (with a
+/// neutral target name) only flips the classification when *all*
+/// compilable sources are test-shaped: a single helper file named
+/// `test_mode.c` inside a regular binary's source list should not turn
+/// `app` into a test suite. Mirrors clawpatch commit de82d0a.
 fn is_cmake_test_executable(name: &str, sources: &[String]) -> bool {
     let lower = name.to_ascii_lowercase();
     let ends_in_tests = lower == "test"
@@ -121,7 +127,70 @@ fn is_cmake_test_executable(name: &str, sources: &[String]) -> bool {
     if ends_in_tests {
         return true;
     }
-    sources.iter().any(|s| is_c_or_cpp_test_path(s))
+    let compilable: Vec<&String> = sources
+        .iter()
+        .filter(|s| is_c_or_cpp_compilable(s))
+        .collect();
+    if compilable.is_empty() {
+        return false;
+    }
+    compilable.iter().all(|s| is_c_or_cpp_test_path(s))
+}
+
+/// Find the most recent `project(<name> ...)` declaration in a CMake body.
+/// Returns the project name when found. CMake semantics: `${PROJECT_NAME}`
+/// references the most recent `project()` call in scope; we model "in
+/// scope" coarsely as "anywhere earlier in the same CMakeLists.txt." If
+/// no `project()` call appears or the captured name isn't a valid
+/// identifier, returns `None` and the caller leaves `${PROJECT_NAME}`
+/// unresolved (the target will be skipped by `is_valid_target_name`,
+/// preserving the prior behavior). Mirrors clawpatch commit 8550604.
+fn cmake_project_name(body: &str) -> Option<String> {
+    let mut name = None;
+    for args in cmake_command_args(body, "project") {
+        let words = cmake_split_args(&args);
+        if let Some(first) = words.first()
+            && is_valid_target_name(first)
+        {
+            name = Some(first.clone());
+        }
+    }
+    name
+}
+
+/// Resolve a CMake target name that may reference `${PROJECT_NAME}` or
+/// `${CMAKE_PROJECT_NAME}` against the most recent `project()` call.
+/// Returns the resolved name when the substitution is unambiguous;
+/// returns the input unchanged otherwise so the caller can apply the
+/// existing skip-unresolved-variable logic.
+fn resolve_cmake_target_name(raw: &str, project_name: Option<&str>) -> String {
+    if let Some(pn) = project_name
+        && (raw == "${PROJECT_NAME}" || raw == "${CMAKE_PROJECT_NAME}")
+    {
+        return pn.to_string();
+    }
+    raw.to_string()
+}
+
+/// Expand Automake source-directory variables in a path.
+///
+/// Returns a path *relative to the makefile's own directory*, because the
+/// downstream `filter_target_sources` applies `prefix_dir(makefile_dir,
+/// ...)` to every source. `$(srcdir)` and `${srcdir}` reference the
+/// makefile's own directory and are therefore stripped to the empty
+/// prefix; `$(top_srcdir)` / `${top_srcdir}` / `$(top_builddir)` /
+/// `${top_builddir}` reference the project root and are left verbatim
+/// (handling them correctly would require subtracting the makefile-dir
+/// prefix that gets re-added downstream — a normalization pass that's
+/// not worth building until a real user case surfaces). Other variables
+/// (`$(SOMETHING_USER_DEFINED)`) are left verbatim. Mirrors clawpatch
+/// commit 39a2545.
+fn expand_automake_vars(source: &str, _makefile_dir: &str) -> String {
+    let mut result = source.to_string();
+    for var in ["$(srcdir)/", "${srcdir}/"] {
+        result = result.replace(var, "");
+    }
+    result
 }
 
 fn is_makefile(rel: &str) -> bool {
@@ -176,6 +245,10 @@ fn autotools_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<Featur
                     continue;
                 }
                 let sources = read_target_sources(&body, name, sources_re_template);
+                let sources: Vec<String> = sources
+                    .iter()
+                    .map(|s| expand_automake_vars(s, &dir))
+                    .collect();
                 let entry_candidates = sources
                     .iter()
                     .filter(|s| is_c_or_cpp_compilable(s))
@@ -235,6 +308,10 @@ fn autotools_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<Featur
                 let name = raw.trim_end_matches(".la").to_string();
                 let sources =
                     read_target_sources(&body, &raw.replace('.', "_"), sources_re_template);
+                let sources: Vec<String> = sources
+                    .iter()
+                    .map(|s| expand_automake_vars(s, &dir))
+                    .collect();
                 let entry_candidates = sources
                     .iter()
                     .filter(|s| is_c_or_cpp_compilable(s))
@@ -304,6 +381,14 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
         let raw = fs::read_to_string(&path).unwrap_or_default();
         let body = strip_cmake_comments(&raw);
         let dir = parent_dir(cm);
+        // Resolve `${PROJECT_NAME}` references in target declarations against
+        // the most recent `project()` call. CMake's variable model is much
+        // richer than this, but `${PROJECT_NAME}` is the one form common
+        // enough in handwritten CMake that not handling it produces phantom
+        // gaps (`add_executable(${PROJECT_NAME} ...)` was being skipped
+        // because the literal `${PROJECT_NAME}` failed `is_valid_target_name`).
+        // Clawpatch commit 8550604.
+        let project_name = cmake_project_name(&body);
 
         // Collect late-bound `target_sources(name [PRIVATE|PUBLIC|INTERFACE] …)`
         // additions first so the target loop below can merge them when it
@@ -314,7 +399,7 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
             if words.is_empty() {
                 continue;
             }
-            let name = words.remove(0);
+            let name = resolve_cmake_target_name(&words.remove(0), project_name.as_deref());
             // Real CMake requires a PRIVATE|PUBLIC|INTERFACE scope keyword
             // here; tolerate its absence rather than skipping the call, but
             // drop the keyword if present so a phantom "PRIVATE" source
@@ -328,7 +413,7 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
             if words.is_empty() {
                 continue;
             }
-            let name = words.remove(0);
+            let name = resolve_cmake_target_name(&words.remove(0), project_name.as_deref());
             if !is_valid_target_name(&name) {
                 continue;
             }
@@ -439,7 +524,7 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
             if words.is_empty() {
                 continue;
             }
-            let name = words.remove(0);
+            let name = resolve_cmake_target_name(&words.remove(0), project_name.as_deref());
             if !is_valid_target_name(&name) {
                 continue;
             }
@@ -1768,5 +1853,209 @@ mod tests {
         // on `;` per CMake list semantics.
         let words = super::cmake_split_args("a \"b c\" d;e [[bracket;arg]]");
         assert_eq!(words, vec!["a", "b c", "d", "e", "bracket;arg"]);
+    }
+
+    // ---- §2.13 audit gap fixes (clawpatch de82d0a / 39a2545 / 8550604) ----
+
+    #[test]
+    fn cmake_binary_with_test_like_helper_stays_binary() {
+        // Clawpatch de82d0a fixture: target name "app" (non-test), one
+        // helper source named test_mode.c (matches the test-path
+        // heuristic). Target-name match should win; the binary stays a
+        // binary, not a test suite.
+        assert!(!super::is_cmake_test_executable(
+            "app",
+            &["src/main.c".to_string(), "src/test_mode.c".to_string()],
+        ));
+    }
+
+    #[test]
+    fn cmake_target_named_tests_is_test_suite_regardless_of_sources() {
+        // Target name takes precedence over source heuristic: an
+        // `add_executable(my_tests main.c)` is still a test target even
+        // when none of its sources look test-shaped.
+        assert!(super::is_cmake_test_executable(
+            "my_tests",
+            &["main.c".to_string()],
+        ));
+        assert!(super::is_cmake_test_executable(
+            "tests",
+            &["fixture.c".to_string(), "main.c".to_string()],
+        ));
+        // Single-word "test" / "tests" still flip.
+        assert!(super::is_cmake_test_executable("test", &[]));
+        assert!(super::is_cmake_test_executable("tests", &[]));
+    }
+
+    #[test]
+    fn cmake_binary_with_all_test_sources_is_test_suite() {
+        // Neutral target name but every compilable source is test-shaped:
+        // classify as test. Headers don't count toward the all-test-sources
+        // check (they aren't compilable).
+        assert!(super::is_cmake_test_executable(
+            "my_runner",
+            &["test_a.c".to_string(), "test_b.c".to_string()],
+        ));
+        assert!(super::is_cmake_test_executable(
+            "harness",
+            &[
+                "test_a.c".to_string(),
+                "test_b.c".to_string(),
+                "shared.h".to_string(), // header — not compilable, doesn't gate
+            ],
+        ));
+    }
+
+    #[test]
+    fn cmake_binary_with_no_compilable_sources_is_not_test() {
+        // Header-only target list: don't false-flip to test. Upstream
+        // CMake walker would have dropped this target anyway (no compilable
+        // source) but the helper should be defensive on its own.
+        assert!(!super::is_cmake_test_executable(
+            "headerlib",
+            &["foo.h".to_string(), "bar.hpp".to_string()],
+        ));
+    }
+
+    #[test]
+    fn automake_srcdir_strips_to_makefile_relative() {
+        // `expand_automake_vars` returns a path relative to the makefile's
+        // own directory, because the downstream `filter_target_sources`
+        // re-applies `prefix_dir(makefile_dir, ...)`. So `$(srcdir)/foo.c`
+        // strips to `foo.c`, and the eventual project-root path lands at
+        // `<makefile_dir>/foo.c` via the existing pipeline.
+        assert_eq!(
+            super::expand_automake_vars("$(srcdir)/foo.c", "subdir/"),
+            "foo.c"
+        );
+        // Braced form also expands.
+        assert_eq!(
+            super::expand_automake_vars("${srcdir}/bar.cpp", "subdir/nested/"),
+            "bar.cpp"
+        );
+        // At the repo root the result is identical — there's no makefile
+        // dir to prefix, so $(srcdir)/foo.c also lands at `foo.c`.
+        assert_eq!(super::expand_automake_vars("$(srcdir)/foo.c", ""), "foo.c");
+    }
+
+    #[test]
+    fn automake_top_srcdir_left_verbatim() {
+        // `$(top_srcdir)` references the project root, which would need
+        // a "subtract the makefile-dir prefix" normalization to play
+        // nicely with the downstream prefix_dir. We leave such paths
+        // verbatim until a user case demands the work — downstream code
+        // already produces a broken seed for these and that's not worse
+        // than the pre-fix state for the more common $(srcdir) case.
+        assert_eq!(
+            super::expand_automake_vars("$(top_srcdir)/include/foo.h", "subdir/"),
+            "$(top_srcdir)/include/foo.h"
+        );
+    }
+
+    #[test]
+    fn automake_unknown_vars_pass_through() {
+        // User-defined macros stay verbatim.
+        assert_eq!(
+            super::expand_automake_vars("$(SOURCES)/foo.c", "subdir/"),
+            "$(SOURCES)/foo.c"
+        );
+    }
+
+    #[test]
+    fn automake_plain_path_passes_through() {
+        // Sources without Automake variables are unchanged.
+        assert_eq!(
+            super::expand_automake_vars("src/main.c", "subdir/"),
+            "src/main.c"
+        );
+    }
+
+    #[test]
+    fn cmake_project_name_last_call_wins() {
+        // `${PROJECT_NAME}` refers to the most recent `project()`; later
+        // declarations override earlier ones inside the same file.
+        let body =
+            "project(first)\nadd_executable(a a.c)\nproject(second)\nadd_executable(b b.c)\n";
+        assert_eq!(super::cmake_project_name(body).as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn cmake_project_name_absent_returns_none() {
+        // No `project()` call → no resolution; `${PROJECT_NAME}` stays
+        // unresolved and the existing skip-on-invalid-name path drops
+        // the target.
+        let body = "add_executable(${PROJECT_NAME} main.c)\n";
+        assert!(super::cmake_project_name(body).is_none());
+    }
+
+    #[test]
+    fn cmake_project_name_resolves_target_reference() {
+        // Resolve the canonical and CMake-namespaced spellings.
+        assert_eq!(
+            super::resolve_cmake_target_name("${PROJECT_NAME}", Some("myapp")),
+            "myapp"
+        );
+        assert_eq!(
+            super::resolve_cmake_target_name("${CMAKE_PROJECT_NAME}", Some("myapp")),
+            "myapp"
+        );
+        // Unrelated variable forms pass through unchanged.
+        assert_eq!(
+            super::resolve_cmake_target_name("${OTHER}", Some("myapp")),
+            "${OTHER}"
+        );
+        // No project name → input unchanged.
+        assert_eq!(
+            super::resolve_cmake_target_name("${PROJECT_NAME}", None),
+            "${PROJECT_NAME}"
+        );
+    }
+
+    #[test]
+    fn cmake_add_executable_with_project_name_target() {
+        // End-to-end: `add_executable(${PROJECT_NAME} src/main.c)` after a
+        // `project(myapp)` declaration emits a `cmake-bin` seed with the
+        // resolved name. Pre-fix, the target was skipped because
+        // `${PROJECT_NAME}` failed `is_valid_target_name`.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "CMakeLists.txt",
+            "project(myapp)\nadd_executable(${PROJECT_NAME} src/main.c)\n",
+        );
+        write(dir.path(), "src/main.c", "int main() { return 0; }\n");
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "cmake-bin")
+            .expect("cmake-bin seed");
+        assert_eq!(s.entry_command.as_deref(), Some("myapp"));
+        assert_eq!(s.kind, FeatureKind::CliCommand);
+    }
+
+    #[test]
+    fn autotools_bin_programs_expands_srcdir_var() {
+        // End-to-end: $(srcdir)/foo.c in a Makefile.am at subdir/ should
+        // resolve to subdir/foo.c so the source file is actually found.
+        // Pre-fix, the literal `$(srcdir)/foo.c` didn't match any file
+        // and the autotools-bin seed pointed at a non-existent path.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "subdir/Makefile.am",
+            "bin_PROGRAMS = thing\nthing_SOURCES = $(srcdir)/thing.c\n",
+        );
+        write(dir.path(), "subdir/thing.c", "int main(){return 0;}\n");
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "autotools-bin")
+            .expect("autotools-bin seed");
+        assert_eq!(s.entry_path, "subdir/thing.c");
+        assert!(s.owned_files.iter().any(|f| f.path == "subdir/thing.c"));
     }
 }
