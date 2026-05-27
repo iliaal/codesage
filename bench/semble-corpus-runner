@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""
+Run codesage `search` against semble's published per-repo annotation corpus
+in A/B mode (baseline vs `CODESAGE_QUALIFIED_NAME_BOOST=1`).
+
+The semble annotations live as JSON files (one per repo) at
+`~/ai/codesage_ref/semble/benchmarks/annotations/<repo>.json`. Each file is
+a list of `{query, relevant, secondary, category}` records. We score against
+`relevant` only, using semble's published suffix-match rule (the same one the
+prior §2.11 run used — see notes/20260516-codesage-vs-semble-full-corpus.md).
+
+Usage:
+  semble-corpus-runner <repo_root> <annotations.json> \
+      --codesage-bin <path> [--limit 10]
+
+For each query in the annotations file, runs `codesage search --json --limit
+N <query>` twice — once with the gate off (baseline), once with the gate on
+(config 2) — and emits a per-corpus aggregate plus per-query rank deltas.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+def run_search(codesage_bin: str, project_root: Path, query: str, limit: int,
+               env_extra: dict) -> list[str]:
+    """Run one codesage search invocation; return file paths in rank order,
+    deduplicated by path (codesage returns chunk-level results, multiple
+    chunks of the same file share one rank position — the earliest)."""
+    env = os.environ.copy()
+    env.update(env_extra)
+    r = subprocess.run(
+        [codesage_bin, "search", "--json", "--limit", str(limit), query],
+        cwd=project_root, capture_output=True, text=True, env=env, timeout=120,
+    )
+    if r.returncode != 0:
+        return []
+    try:
+        results = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return []
+    seen = set()
+    out = []
+    for row in results:
+        p = row.get("file_path")
+        if p and p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def expected_paths(record: dict) -> list[str]:
+    """Extract the list of expected file paths from a semble annotation
+    record. Items in `relevant` are either bare strings or {path, ...}
+    dicts (the latter when line-span info is attached). We score on the
+    path component only — line-span scoring is not supported here."""
+    out = []
+    for item in record.get("relevant", []):
+        if isinstance(item, str):
+            out.append(item)
+        elif isinstance(item, dict) and "path" in item:
+            out.append(item["path"])
+    return out
+
+
+def first_hit_rank(returned: list[str], expected: list[str]) -> int | None:
+    """Semble's suffix-match rule: a result file matches an expected file
+    when either is a suffix of the other on path-segment boundaries. Reuse
+    of `~/ai/codesage_ref/semble/benchmarks/metrics.py::file_rank` shape."""
+    exp_set = set(expected)
+    for i, p in enumerate(returned, start=1):
+        for e in exp_set:
+            if p == e or p.endswith("/" + e) or e.endswith("/" + p):
+                return i
+    return None
+
+
+def recall_at(returned: list[str], expected: list[str], k: int) -> float:
+    if not expected:
+        return 0.0
+    top = returned[:k]
+    hits = 0
+    for e in expected:
+        for p in top:
+            if p == e or p.endswith("/" + e) or e.endswith("/" + p):
+                hits += 1
+                break
+    return hits / len(expected)
+
+
+def score_corpus(codesage_bin: str, project_root: Path, records: list[dict],
+                 limit: int, env_extra: dict) -> dict:
+    """Score a whole corpus under one env. Returns aggregate stats."""
+    n = len(records)
+    hits = 0
+    rank_sum = 0
+    miss = 0
+    r5_sum = 0.0
+    r10_sum = 0.0
+    rows = []
+    for rec in records:
+        query = rec["query"]
+        expected = expected_paths(rec)
+        if not expected:
+            continue
+        returned = run_search(codesage_bin, project_root, query, limit, env_extra)
+        rank = first_hit_rank(returned, expected)
+        r5 = recall_at(returned, expected, 5)
+        r10 = recall_at(returned, expected, 10)
+        if rank is None:
+            miss += 1
+        else:
+            hits += 1
+            rank_sum += rank
+        r5_sum += r5
+        r10_sum += r10
+        rows.append({
+            "query": query[:60],
+            "expected": expected,
+            "returned_top3": returned[:3],
+            "rank": rank,
+            "r5": r5,
+            "r10": r10,
+        })
+    return {
+        "n": n,
+        "hits": hits,
+        "miss": miss,
+        "miss_rate": miss / n if n else 0.0,
+        "mean_first_hit": (rank_sum / hits) if hits else None,
+        "mean_r5": r5_sum / n if n else 0.0,
+        "mean_r10": r10_sum / n if n else 0.0,
+        "rows": rows,
+    }
+
+
+def fmt_aggregate(label: str, agg: dict) -> str:
+    mfh = f"{agg['mean_first_hit']:.2f}" if agg['mean_first_hit'] is not None else "—"
+    return (
+        f"{label:8s} | n={agg['n']:3d} | miss={agg['miss']:2d} "
+        f"({agg['miss_rate']:.1%}) | mean first-hit {mfh} | "
+        f"r@5 {agg['mean_r5']:.3f} | r@10 {agg['mean_r10']:.3f}"
+    )
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("repo_root")
+    ap.add_argument("annotations")
+    ap.add_argument("--codesage-bin", required=True)
+    ap.add_argument("--limit", type=int, default=10)
+    args = ap.parse_args()
+
+    project_root = Path(args.repo_root)
+    if not (project_root / ".codesage" / "index.db").is_file():
+        sys.exit(f"no codesage index at {project_root}/.codesage/index.db")
+
+    annotations = json.load(open(args.annotations))
+
+    baseline = score_corpus(
+        args.codesage_bin, project_root, annotations, args.limit, env_extra={}
+    )
+    cfg2 = score_corpus(
+        args.codesage_bin, project_root, annotations, args.limit,
+        env_extra={"CODESAGE_QUALIFIED_NAME_BOOST": "1"},
+    )
+
+    # Per-query deltas (only rows that moved).
+    moves = []
+    for b, c in zip(baseline["rows"], cfg2["rows"]):
+        if b["rank"] != c["rank"]:
+            moves.append((b["query"], b["rank"], c["rank"]))
+
+    print(f"# semble corpus A/B — {project_root.name}")
+    print()
+    print(fmt_aggregate("baseline", baseline))
+    print(fmt_aggregate("cfg2", cfg2))
+    print()
+    print(f"per-query rank deltas (moves only): {len(moves)} of {baseline['n']}")
+    for q, bb, cc in moves:
+        before = "miss" if bb is None else str(bb)
+        after = "miss" if cc is None else str(cc)
+        delta = "✓" if cc is not None and (bb is None or cc < bb) else "✗" if bb is not None and (cc is None or cc > bb) else "·"
+        print(f"  {delta} [{before:>4s} → {after:<4s}]  {q}")
+
+    # JSON sidecar for downstream aggregation.
+    sidecar = {
+        "repo": project_root.name,
+        "baseline": {k: v for k, v in baseline.items() if k != "rows"},
+        "cfg2": {k: v for k, v in cfg2.items() if k != "rows"},
+        "moves": [{"query": q, "before": b, "after": c} for q, b, c in moves],
+    }
+    print()
+    print("METRICS_JSON " + json.dumps(sidecar))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
