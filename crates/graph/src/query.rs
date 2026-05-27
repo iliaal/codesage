@@ -446,6 +446,10 @@ pub fn search(
 
     annotate_with_symbols(db, &mut results)?;
 
+    if qualified_name_boost_enabled() && has_symbols {
+        apply_qualified_name_boost(&mut results, &known_symbols);
+    }
+
     if definition_boost_enabled() {
         apply_definition_boost(&mut results, &req.query);
     }
@@ -519,6 +523,123 @@ fn apply_symbol_boost(results: &mut [SearchResult], known_symbols: &[String]) {
         result.score += boost;
     }
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+}
+
+// Multiplicative ×2.0 boost when a query-derived identifier token matches the
+// *qualified name* of a symbol overlapping the chunk. Pattern ported from
+// code-review-graph commit c04af36 ("feat: deterministic eval pipeline,
+// multi-hop benchmark, search lift") as the §2.12 A/B candidate.
+//
+// Different from `apply_symbol_boost`: that one matches tokens against raw
+// chunk *content* (a chunk mentioning `parse_config` in a comment gets the
+// +0.1); this one matches against the chunk's overlapping *symbols*'
+// qualified names. Stronger signal, harder boost.
+//
+// Anti-trigger filter: a previous A/B run (notes/20260526-search-lift-ab-
+// report.md) showed pure lexical matching produces false positives when a
+// query word doubles as a Rust trait/method name. Query "load default
+// command options..." picked up `Mode::default` and bumped the wrong file
+// over the right one. Anti-trigger tokens (common English verbs and Rust
+// trait methods) only fire when the query token matches a NON-LEAF segment
+// of the qualified-name — i.e., the type/module part, not the method part.
+// `default` matching `Mode::default` (leaf-only) is suppressed; `ignore`
+// matching `Ignore::add_child_path` (root match) survives.
+//
+// Idempotent: each result is boosted at most once even if multiple
+// qualified-names match — the goal is "this chunk contains the named
+// symbol, definitively," not "the more names matched, the harder to boost."
+//
+// Default-off; opt-in via `CODESAGE_QUALIFIED_NAME_BOOST=1` for the §2.12
+// A/B. Annotation must have already populated `result.symbols`.
+const QUALIFIED_NAME_BOOST_FACTOR: f32 = 2.0;
+
+// Query words that double as Rust trait methods / common method names. When a
+// query token here matches a qualified-name's LEAF segment only, the boost
+// is suppressed — leaf-only matches are statistically dominated by
+// false-positives (e.g. `Mode::default` matched on the English word "default"
+// in a config-loading query). Stem-based filter still allows the boost when
+// the token matches a non-leaf (type/module) segment of the qualified-name.
+const ANTI_TRIGGER_TOKENS: &[&str] = &[
+    // Rust trait methods
+    "default", "new", "clone", "drop", "from", "into", "as",
+    "eq", "cmp", "hash", "partial_eq", "partial_cmp",
+    // Common accessor patterns
+    "get", "set", "has", "is", "len", "size",
+    // Verbs that double as method names
+    "init", "build", "run", "start", "stop", "open", "close",
+    "load", "save", "parse", "format", "print", "read", "write",
+    "clear", "reset", "update", "delete", "remove",
+    // Iter
+    "next", "iter",
+    // Common but-not-distinctive
+    "test", "config",
+];
+
+fn is_anti_trigger(token: &str) -> bool {
+    ANTI_TRIGGER_TOKENS.contains(&token)
+}
+
+fn qualified_name_segments(qn: &str) -> Vec<&str> {
+    qn.split(['.', ':', '\\'])
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn qualified_name_matches(token: &str, qn: &str, name: &str) -> bool {
+    let segments = qualified_name_segments(qn);
+    if segments.is_empty() {
+        // Empty qn (shouldn't happen in practice) — fall back to bare name.
+        return !is_anti_trigger(token) && name == token;
+    }
+    if is_anti_trigger(token) {
+        // Anti-trigger tokens only fire when matching a NON-LEAF segment.
+        // For `Mode::default` (segments ["mode", "default"]) and token
+        // `default`, non-leaf is ["mode"] — no match, suppress. For
+        // `Config::load` (segments ["config", "load"]) and token `config`,
+        // non-leaf is ["config"] — match, allow.
+        if segments.len() < 2 {
+            // Bare name: the lone segment is the leaf, no non-leaf to check.
+            return false;
+        }
+        segments[..segments.len() - 1].contains(&token)
+    } else {
+        // Non-anti-trigger: any segment match. Matches both root (e.g. token
+        // `ignore` against `Ignore::add_child_path` — the §2.12 win case)
+        // and leaf (e.g. token `login` against `AuthService::login`).
+        segments.contains(&token)
+    }
+}
+
+fn apply_qualified_name_boost(results: &mut [SearchResult], known_symbols: &[String]) {
+    if known_symbols.is_empty() {
+        return;
+    }
+    for result in results.iter_mut() {
+        let hit = result.symbols.iter().any(|s| {
+            let qn = s.qualified_name.to_lowercase();
+            let name = s.name.to_lowercase();
+            known_symbols
+                .iter()
+                .any(|k| qualified_name_matches(k, &qn, &name))
+        });
+        if hit {
+            result.score *= QUALIFIED_NAME_BOOST_FACTOR;
+        }
+    }
+    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+}
+
+// Default-off; opt-in via CODESAGE_QUALIFIED_NAME_BOOST=1 (or "true"). The
+// gate exists to A/B the §2.12 hypothesis without shipping the new boost
+// to existing users. Promote to default-on if the bench shows lift.
+fn qualified_name_boost_enabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        matches!(
+            std::env::var("CODESAGE_QUALIFIED_NAME_BOOST").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE") | Ok("True") | Ok("yes")
+        )
+    })
 }
 
 // Definition boost: when the query is a bare symbol (CamelCase, snake_case,
@@ -2869,7 +2990,7 @@ mod adaptive_rerank_tests {
 
 #[cfg(test)]
 mod dir_saturation_tests {
-    use super::apply_directory_saturation;
+    use super::{apply_directory_saturation, apply_qualified_name_boost, qualified_name_matches};
     use codesage_protocol::SearchResult;
 
     fn mk(file: &str, score: f32) -> SearchResult {
@@ -2942,5 +3063,142 @@ mod dir_saturation_tests {
         ];
         apply_directory_saturation(&mut results);
         assert_eq!(results.len(), 3); // sanity
+    }
+
+    // ---- §2.12 qualified-name boost with anti-trigger filter ----
+
+    fn mk_with_symbols(
+        file: &str,
+        score: f32,
+        symbols: Vec<(&str, &str)>,
+    ) -> SearchResult {
+        SearchResult {
+            file_path: file.to_string(),
+            language: codesage_protocol::Language::Rust,
+            content: String::new(),
+            start_line: 1,
+            end_line: 10,
+            score,
+            symbols: symbols
+                .into_iter()
+                .map(|(name, qn)| codesage_protocol::SymbolSummary {
+                    name: name.to_string(),
+                    qualified_name: qn.to_string(),
+                    kind: codesage_protocol::SymbolKind::Function,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn anti_trigger_leaf_only_match_does_not_boost() {
+        // The §2.12 false-positive case: query "load default command
+        // options..." extracts `default`; chunk has `Mode::default`. The
+        // ×2.0 boost is suppressed because `default` matches only the
+        // leaf segment of `mode::default`.
+        assert!(!qualified_name_matches(
+            "default",
+            "mode::default",
+            "default"
+        ));
+        // Same for plain `default` (bare name, no separator) — the lone
+        // segment is the leaf, no non-leaf to anchor.
+        assert!(!qualified_name_matches("default", "default", "default"));
+    }
+
+    #[test]
+    fn anti_trigger_root_match_does_boost() {
+        // The §2.12 true-positive that should NOT regress: query word
+        // matches a type/module-level qualified-name segment. Even when
+        // the token is in the anti-trigger list (e.g. `config`), a root
+        // match indicates the user is asking about that type/module.
+        assert!(qualified_name_matches(
+            "config",
+            "config::load",
+            "load"
+        ));
+        assert!(qualified_name_matches(
+            "default",
+            "default::clone",
+            "clone"
+        ));
+    }
+
+    #[test]
+    fn non_anti_trigger_any_segment_match_boosts() {
+        // Tokens NOT in the anti-trigger list match any segment (leaf
+        // included) — these are distinctive enough that lexical match
+        // signals real intent. The §2.12 win case (`Ignore::add_child_path`
+        // matched on token `ignore`) survives because `ignore` isn't
+        // in the anti-trigger list, AND would also pass the anti-trigger
+        // stem filter via the root-match path.
+        assert!(qualified_name_matches(
+            "login",
+            "authservice::login",
+            "login"
+        ));
+        assert!(qualified_name_matches(
+            "ignore",
+            "ignore::add_child_path",
+            "add_child_path"
+        ));
+    }
+
+    #[test]
+    fn qualified_name_boost_lifts_matching_chunk() {
+        let mut results = vec![
+            mk_with_symbols("src/auth.rs", 0.5, vec![("login", "AuthService::login")]),
+            mk_with_symbols("src/other.rs", 0.45, vec![("foo", "Other::foo")]),
+        ];
+        apply_qualified_name_boost(&mut results, &["login".to_string()]);
+        assert_eq!(results[0].file_path, "src/auth.rs");
+        assert!((results[0].score - 1.0).abs() < 1e-6);
+        assert!((results[1].score - 0.45).abs() < 1e-6);
+    }
+
+    #[test]
+    fn qualified_name_boost_anti_trigger_regression_blocked() {
+        // End-to-end regression: the original §2.12 A/B regression case.
+        // Query word `default` extracts as known symbol; one chunk has
+        // `Mode::default` (leaf-only); the boost must NOT lift it.
+        let mut results = vec![
+            mk_with_symbols("src/correct.rs", 0.80, vec![]),
+            mk_with_symbols("src/wrong.rs", 0.77, vec![("default", "Mode::default")]),
+        ];
+        apply_qualified_name_boost(&mut results, &["default".to_string()]);
+        // wrong.rs stays at 0.77 (no boost — anti-trigger leaf match);
+        // correct.rs stays at 0.80 — original ranking preserved.
+        assert_eq!(results[0].file_path, "src/correct.rs");
+        assert!((results[1].score - 0.77).abs() < 1e-6);
+    }
+
+    #[test]
+    fn qualified_name_boost_idempotent_per_chunk() {
+        // Two matching symbols in one chunk still get ×2.0 once.
+        let mut results = vec![mk_with_symbols(
+            "src/auth.rs",
+            0.5,
+            vec![
+                ("login", "AuthService::login"),
+                ("logout", "AuthService::logout"),
+            ],
+        )];
+        apply_qualified_name_boost(
+            &mut results,
+            &["login".to_string(), "logout".to_string()],
+        );
+        assert!((results[0].score - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn qualified_name_boost_no_known_symbols_no_op() {
+        let mut results = vec![mk_with_symbols(
+            "src/auth.rs",
+            0.5,
+            vec![("login", "AuthService::login")],
+        )];
+        let before = results[0].score;
+        apply_qualified_name_boost(&mut results, &[]);
+        assert!((results[0].score - before).abs() < 1e-6);
     }
 }
