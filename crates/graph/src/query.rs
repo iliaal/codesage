@@ -561,18 +561,51 @@ const QUALIFIED_NAME_BOOST_FACTOR: f32 = 2.0;
 // the token matches a non-leaf (type/module) segment of the qualified-name.
 const ANTI_TRIGGER_TOKENS: &[&str] = &[
     // Rust trait methods
-    "default", "new", "clone", "drop", "from", "into", "as",
-    "eq", "cmp", "hash", "partial_eq", "partial_cmp",
+    "default",
+    "new",
+    "clone",
+    "drop",
+    "from",
+    "into",
+    "as",
+    "eq",
+    "cmp",
+    "hash",
+    "partial_eq",
+    "partial_cmp",
     // Common accessor patterns
-    "get", "set", "has", "is", "len", "size",
+    "get",
+    "set",
+    "has",
+    "is",
+    "len",
+    "size",
     // Verbs that double as method names
-    "init", "build", "run", "start", "stop", "open", "close",
-    "load", "save", "parse", "format", "print", "read", "write",
-    "clear", "reset", "update", "delete", "remove",
+    "init",
+    "build",
+    "run",
+    "start",
+    "stop",
+    "open",
+    "close",
+    "load",
+    "save",
+    "parse",
+    "format",
+    "print",
+    "read",
+    "write",
+    "clear",
+    "reset",
+    "update",
+    "delete",
+    "remove",
     // Iter
-    "next", "iter",
+    "next",
+    "iter",
     // Common but-not-distinctive
-    "test", "config",
+    "test",
+    "config",
 ];
 
 fn is_anti_trigger(token: &str) -> bool {
@@ -3067,11 +3100,7 @@ mod dir_saturation_tests {
 
     // ---- §2.12 qualified-name boost with anti-trigger filter ----
 
-    fn mk_with_symbols(
-        file: &str,
-        score: f32,
-        symbols: Vec<(&str, &str)>,
-    ) -> SearchResult {
+    fn mk_with_symbols(file: &str, score: f32, symbols: Vec<(&str, &str)>) -> SearchResult {
         SearchResult {
             file_path: file.to_string(),
             language: codesage_protocol::Language::Rust,
@@ -3112,16 +3141,8 @@ mod dir_saturation_tests {
         // matches a type/module-level qualified-name segment. Even when
         // the token is in the anti-trigger list (e.g. `config`), a root
         // match indicates the user is asking about that type/module.
-        assert!(qualified_name_matches(
-            "config",
-            "config::load",
-            "load"
-        ));
-        assert!(qualified_name_matches(
-            "default",
-            "default::clone",
-            "clone"
-        ));
+        assert!(qualified_name_matches("config", "config::load", "load"));
+        assert!(qualified_name_matches("default", "default::clone", "clone"));
     }
 
     #[test]
@@ -3183,10 +3204,7 @@ mod dir_saturation_tests {
                 ("logout", "AuthService::logout"),
             ],
         )];
-        apply_qualified_name_boost(
-            &mut results,
-            &["login".to_string(), "logout".to_string()],
-        );
+        apply_qualified_name_boost(&mut results, &["login".to_string(), "logout".to_string()]);
         assert!((results[0].score - 1.0).abs() < 1e-6);
     }
 
