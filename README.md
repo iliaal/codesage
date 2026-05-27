@@ -9,7 +9,7 @@
 
 ![CodeSage: structural and semantic code intelligence for AI agents](images/codesage-hero.jpg)
 
-CodeSage is a code intelligence engine for AI coding agents. It combines structural graph queries (symbols, references, dependencies) and semantic search (embedding retrieval with cross-encoder reranking) in a single Rust binary, usable as a CLI or over MCP. Nine languages today (PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go), ~250ms median query latency, ~50K-LoC PHP repos indexed in seconds.
+CodeSage is a code intelligence engine for AI coding agents. It combines structural graph queries (symbols, references, dependencies) and semantic search (embedding retrieval with cross-encoder reranking) in a single Rust binary, usable as a CLI or over MCP. Nine languages today (PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go). On the [semble](https://github.com/MinishLab/semble) retrieval corpus, codesage `search` scores **recall@10 = 0.932 / NDCG@10 = 0.788** across 602 queries on the 8 supported-language repos (see [External-corpus benchmark](#external-corpus-benchmark-semble) below).
 
 ## 🔍 What you can do with it
 
@@ -30,12 +30,12 @@ Concrete answers to the questions a code-intelligence tool earns its keep on. Th
 
 | Capability | CodeSage |
 |---|---|
-| Natural-language semantic search | ✓ MiniLM embeddings + cross-encoder reranker, sub-100 ms warm |
-| Symbol-level lookup (definitions, references, callers/callees, inheritance) | ✓ tree-sitter, 8 languages, exact line/column ranges |
+| Natural-language semantic search | ✓ MiniLM embeddings + cross-encoder reranker (jina-embeddings-v2-base-code optional via config) |
+| Symbol-level lookup (definitions, references, callers/callees, inheritance) | ✓ tree-sitter, 9 languages, exact line/column ranges |
 | File-level dependency mapping (imports / imported-by) | ✓ via `list_dependencies` |
 | Change impact / blast-radius analysis | ✓ via `impact_analysis`, configurable depth, symbol or file target |
 | Call-flow / "who-touches-X" tracing | ✓ via `find_references` + `impact_analysis` composition |
-| Per-file risk score (churn, fix ratio, blast radius, coupling, test gap, cycles) | ✓ via `assess_risk`, six-signal blend |
+| Per-file risk score (churn, fix ratio, blast radius, coupling, test gap, cycles, trust boundaries) | ✓ via `assess_risk`, seven-signal blend |
 | Patch-level risk aggregation (max/mean, hotspots, test-gap files) | ✓ via `assess_risk_diff`; per-file batch via `assess_risk_batch` |
 | Historical co-change / coupling | ✓ via `find_coupling`, decay-weighted with τ=180d |
 | Test-recommendation for a changed file set | ✓ via `recommend_tests`, sibling conventions for 7 frameworks + co-change |

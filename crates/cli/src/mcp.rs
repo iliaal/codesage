@@ -755,7 +755,7 @@ impl ServerHandler for CodeSageServer {
 impl CodeSageServer {
     #[tool(
         name = "find_symbol",
-        description = "Find symbol definitions (functions, classes, methods, structs, traits, enums) by name. Returns exact file path, line number, and kind. **Prefer this over Grep/ripgrep for any code-identifier lookup** — one call returns the definition, while grepping for a function name often produces many false hits (call sites, comments, other namespaces) that cost extra Read calls to disambiguate. Use partial names for broad search or qualified names ('MyClass\\\\method' for PHP, 'MyClass.method' for Python) for exact match. When present, `rationale[]` carries `WHY:` / `NOTE:` / `IMPORTANT:` / `FIXME:` / `HACK:` / `XXX:` / `TODO:` comments attached to the definition — read these before refactoring or renaming so the agent doesn't drop a constraint the author wrote down. Currently extracted for Rust and Python.",
+        description = "Find symbol definitions (functions, classes, methods, structs, traits, enums) by name. Returns exact file path, line number, and kind. **Prefer this over Grep/ripgrep for any code-identifier lookup** — one call returns the definition, while grepping for a function name often produces many false hits (call sites, comments, other namespaces) that cost extra Read calls to disambiguate. Use partial names for broad search or qualified names ('MyClass\\\\method' for PHP, 'MyClass.method' for Python) for exact match. For the inverse question (who calls / imports / instantiates this symbol?) use `find_references`. When present, `rationale[]` carries `WHY:` / `NOTE:` / `IMPORTANT:` / `FIXME:` / `HACK:` / `XXX:` / `TODO:` comments attached to the definition — read these before refactoring or renaming so the agent doesn't drop a constraint the author wrote down. Currently extracted for Rust and Python.",
         output_schema = schema_for_type::<FindSymbolResults>()
     )]
     fn find_symbol_tool(&self, Parameters(params): Parameters<FindSymbolParams>) -> CallToolResult {
@@ -772,7 +772,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "find_references",
-        description = "Find all references to a symbol across the codebase. **Prefer this over Grep for 'where is X called / imported / instantiated?'** — returns structured {file, line, kind} rows with the reference type (call/import/inheritance/instantiation/type_hint) already classified, instead of raw grep hits that mix definitions, comments, and string literals together.",
+        description = "Find all references to a symbol across the codebase. **Prefer this over Grep for 'where is X called / imported / instantiated?'** — returns structured {file, line, kind} rows with the reference type (call/import/inheritance/instantiation/type_hint) already classified, instead of raw grep hits that mix definitions, comments, and string literals together. For the definition itself use `find_symbol`; for transitive blast radius (callers of callers) use `impact_analysis`.",
         output_schema = schema_for_type::<FindReferencesResults>()
     )]
     fn find_references_tool(
@@ -886,7 +886,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "find_coupling",
-        description = "Files that historically change together with the given file, ranked by exponentially-decayed weight (τ=180d). Backed by git history. Use when planning a change to know which OTHER files (especially tests) tend to need updates too. Response is `{coupled: [...], file_indexed: bool, file_commits: u32, note?: string}` — read `coupled` for the ranked list. When `coupled` is empty, `note` disambiguates: file never indexed vs. file has history but no pair above the min-count=3 threshold vs. path shape mismatch. Index into `.coupled`, not the response directly.",
+        description = "Files that historically change together with the given file, ranked by exponentially-decayed weight (τ=180d). Backed by git history. Use when planning a change to know which OTHER files (especially tests) tend to need updates too. Response is `{coupled: [...], file_indexed: bool, file_commits: u32, note?: string}` — read `coupled` for the ranked list. When `coupled` is empty, `note` disambiguates: file never indexed vs. file has history but no pair above the min-count=3 threshold vs. path shape mismatch. Index into `.coupled`, not the response directly. For the patch-level question 'which tests should I run after editing these files?' use `recommend_tests` instead (resolves test conventions + co-change in one call). For the single-file risk score that already folds in coupling pressure use `assess_risk`.",
         output_schema = schema_for_type::<CouplingReport>()
     )]
     fn find_coupling_tool(&self, Parameters(params): Parameters<CouplingParams>) -> CallToolResult {
@@ -900,7 +900,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "assess_risk",
-        description = "Risk score for changing a file: combines churn percentile, fix ratio, blast radius (depth-2 reverse deps), historical coupling, a test-gap signal, and import-cycle membership. Response carries `in_cycle` / `cycle_size` / `cycle_files` so the agent can name the other members of the cycle. Output includes the decomposition and human-readable notes you can quote in PR descriptions or risk callouts. Use BEFORE writing a patch to calibrate caution and BEFORE submitting to flag concerns.",
+        description = "Risk score for changing one file: blends seven signals — churn percentile, fix ratio, blast radius (depth-2 reverse deps), historical coupling, test-gap, import-cycle membership, and trust-boundary count — into a 0..1 score. Response also carries `in_cycle` / `cycle_size` / `cycle_files`, the `trust_boundaries[]` list, and `top_symbols[]` (up to 5 symbols inside the file ranked by line count + reference count + cycle membership). Notes are paste-ready for PR descriptions; the `crosses N trust boundaries` line fires when ≥3 boundaries cross. Use BEFORE writing a patch to calibrate caution and BEFORE submitting to flag concerns. For per-file scoring across N files in one call use `assess_risk_batch`; for patch-level aggregation (max/mean, summary_notes, cycles touching the patch) use `assess_risk_diff`.",
         output_schema = schema_for_type::<RiskAssessment>()
     )]
     fn assess_risk_tool(&self, Parameters(params): Parameters<RiskParams>) -> CallToolResult {
@@ -945,7 +945,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "recommend_tests",
-        description = "Tests an agent should run after editing the given files. Returns `primary` (sibling tests resolved by language convention — FooTest.php, foo.test.ts, test_foo.py, foo_test.go — high confidence, always run these) and `coupled` (tests that historically change with the input files via git co-change history — medium confidence, catches integration tests that don't follow naming conventions). Empty result means no test files in the index for these paths. Use AFTER making a change to know which subset of tests to actually run.",
+        description = "Tests an agent should run after editing the given files. Returns `primary` (sibling tests resolved by language convention — FooTest.php, foo.test.ts, test_foo.py, foo_test.go — high confidence, always run these) and `coupled` (tests that historically change with the input files via git co-change history — medium confidence, catches integration tests that don't follow naming conventions). Empty result means no test files in the index for these paths. Use AFTER making a change to know which subset of tests to actually run. Pair with `assess_risk_diff` on the same file list for the patch-level risk rollup (test-gap files, hotspot list, paste-ready summary notes).",
         output_schema = schema_for_type::<TestRecommendations>()
     )]
     fn recommend_tests_tool(
@@ -1000,7 +1000,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "find_feature",
-        description = "Features that include the given file in any role (entry, owned, context, or test). Use to answer \"what feature owns src/auth/login.php?\" — returns the matching feature records with their full file lists, tags, and trust boundaries. Empty result means no mapped feature claims this file (common: not every file belongs to a feature slice).",
+        description = "Features that include the given file in any role (entry, owned, context, or test). Use to answer \"what feature owns src/auth/login.php?\" — returns the matching feature records with their full file lists, tags, and trust boundaries. Empty result means no mapped feature claims this file (common: not every file belongs to a feature slice). For the curated code bundle of a matched feature (entry + owned + tests + context wrapped for LLM consumption) call `feature_bundle` with the `feature_id`.",
         output_schema = schema_for_type::<FeatureListResults>()
     )]
     fn find_feature_tool(
