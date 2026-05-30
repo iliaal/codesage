@@ -45,6 +45,44 @@ pub fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
     bytes.to_vec()
 }
 
+/// Map a `(file_path, language, content, start_line, end_line, distance)` row —
+/// the column order returned by the KNN, fullscan, and BM25 searches — into a
+/// `RawSearchRow`. `distance` is read as `f64` and narrowed so a BM25 `score`
+/// (a REAL) and a vec0 `distance` decode the same way.
+fn row_to_raw_search(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSearchRow> {
+    Ok(RawSearchRow {
+        file_path: row.get(0)?,
+        language: row.get(1)?,
+        content: row.get(2)?,
+        start_line: row.get(3)?,
+        end_line: row.get(4)?,
+        distance: row.get::<_, f64>(5)? as f32,
+    })
+}
+
+/// Append a `(file_path GLOB ?N OR …)` condition for the given path patterns,
+/// binding each as a positional parameter after the ones already in
+/// `param_values`. No-op on an empty slice. Shared by `search_fullscan` and
+/// `search_bm25`, which build the identical clause.
+fn push_path_glob(
+    conditions: &mut Vec<String>,
+    param_values: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+    paths: &[&str],
+) {
+    if paths.is_empty() {
+        return;
+    }
+    let clauses: Vec<String> = paths
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("file_path GLOB ?{}", param_values.len() + i + 1))
+        .collect();
+    conditions.push(format!("({})", clauses.join(" OR ")));
+    for p in paths {
+        param_values.push(Box::new(p.to_string()));
+    }
+}
+
 impl Database {
     /// FTS5 sidecar name for the active chunk table. Kept private to the
     /// storage layer — callers should go through `search_bm25` /
@@ -126,49 +164,26 @@ impl Database {
         language: Option<&str>,
     ) -> Result<Vec<RawSearchRow>> {
         let t = &self.chunk_table;
-        if let Some(lang) = language {
-            let sql = format!(
-                "SELECT file_path, language, content, start_line, end_line, distance
-                 FROM \"{t}\"
-                 WHERE embedding MATCH ?1 AND k = ?2 AND language = ?3
-                 ORDER BY distance"
-            );
-            let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt
-                .query_map(params![embedding_bytes, k as i64, lang], |row| {
-                    Ok(RawSearchRow {
-                        file_path: row.get(0)?,
-                        language: row.get(1)?,
-                        content: row.get(2)?,
-                        start_line: row.get(3)?,
-                        end_line: row.get(4)?,
-                        distance: row.get(5)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
+        let lang_clause = if language.is_some() {
+            " AND language = ?3"
         } else {
-            let sql = format!(
-                "SELECT file_path, language, content, start_line, end_line, distance
-                 FROM \"{t}\"
-                 WHERE embedding MATCH ?1 AND k = ?2
-                 ORDER BY distance"
-            );
-            let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt
-                .query_map(params![embedding_bytes, k as i64], |row| {
-                    Ok(RawSearchRow {
-                        file_path: row.get(0)?,
-                        language: row.get(1)?,
-                        content: row.get(2)?,
-                        start_line: row.get(3)?,
-                        end_line: row.get(4)?,
-                        distance: row.get(5)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        }
+            ""
+        };
+        let sql = format!(
+            "SELECT file_path, language, content, start_line, end_line, distance
+             FROM \"{t}\"
+             WHERE embedding MATCH ?1 AND k = ?2{lang_clause}
+             ORDER BY distance"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = if let Some(lang) = language {
+            stmt.query_map(params![embedding_bytes, k as i64, lang], row_to_raw_search)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            stmt.query_map(params![embedding_bytes, k as i64], row_to_raw_search)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(rows)
     }
 
     pub fn search_fullscan(
@@ -198,18 +213,8 @@ impl Database {
             }
         }
 
-        if let Some(path_patterns) = paths
-            && !path_patterns.is_empty()
-        {
-            let clauses: Vec<String> = path_patterns
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("file_path GLOB ?{}", param_values.len() + i + 1))
-                .collect();
-            conditions.push(format!("({})", clauses.join(" OR ")));
-            for p in path_patterns {
-                param_values.push(Box::new(p.to_string()));
-            }
+        if let Some(path_patterns) = paths {
+            push_path_glob(&mut conditions, &mut param_values, path_patterns);
         }
 
         let where_clause = if conditions.is_empty() {
@@ -236,16 +241,7 @@ impl Database {
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params_refs.as_slice(), |row| {
-                Ok(RawSearchRow {
-                    file_path: row.get(0)?,
-                    language: row.get(1)?,
-                    content: row.get(2)?,
-                    start_line: row.get(3)?,
-                    end_line: row.get(4)?,
-                    distance: row.get(5)?,
-                })
-            })?
+            .query_map(params_refs.as_slice(), row_to_raw_search)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -349,18 +345,8 @@ impl Database {
             param_values.push(Box::new(lang.to_string()));
         }
 
-        if let Some(path_patterns) = paths
-            && !path_patterns.is_empty()
-        {
-            let clauses: Vec<String> = path_patterns
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("file_path GLOB ?{}", param_values.len() + i + 1))
-                .collect();
-            conditions.push(format!("({})", clauses.join(" OR ")));
-            for p in path_patterns {
-                param_values.push(Box::new(p.to_string()));
-            }
+        if let Some(path_patterns) = paths {
+            push_path_glob(&mut conditions, &mut param_values, path_patterns);
         }
 
         let limit_idx = param_values.len() + 1;
@@ -376,18 +362,8 @@ impl Database {
         let params_refs: Vec<&dyn rusqlite::types::ToSql> =
             param_values.iter().map(|p| p.as_ref()).collect();
         let mut stmt = self.conn.prepare(&sql)?;
-        let row_fn = |row: &rusqlite::Row<'_>| {
-            Ok(RawSearchRow {
-                file_path: row.get(0)?,
-                language: row.get(1)?,
-                content: row.get(2)?,
-                start_line: row.get(3)?,
-                end_line: row.get(4)?,
-                distance: row.get::<_, f64>(5)? as f32,
-            })
-        };
         let rows: Vec<RawSearchRow> = stmt
-            .query_map(params_refs.as_slice(), row_fn)?
+            .query_map(params_refs.as_slice(), row_to_raw_search)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }

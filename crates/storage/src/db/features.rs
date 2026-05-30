@@ -11,56 +11,26 @@ use codesage_protocol::{
 };
 use rusqlite::params;
 
-use super::Database;
+use super::{Database, row_enum};
 
 fn parse_feature_kind(s: &str) -> rusqlite::Result<FeatureKind> {
-    FeatureKind::parse(s).ok_or_else(|| {
-        rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            format!("unknown FeatureKind in row: {s:?}").into(),
-        )
-    })
+    row_enum(s, FeatureKind::parse, "FeatureKind")
 }
 
 fn parse_feature_confidence(s: &str) -> rusqlite::Result<FeatureConfidence> {
-    FeatureConfidence::parse(s).ok_or_else(|| {
-        rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            format!("unknown FeatureConfidence in row: {s:?}").into(),
-        )
-    })
+    row_enum(s, FeatureConfidence::parse, "FeatureConfidence")
 }
 
 fn parse_feature_role(s: &str) -> rusqlite::Result<FeatureFileRole> {
-    FeatureFileRole::parse(s).ok_or_else(|| {
-        rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            format!("unknown FeatureFileRole in row: {s:?}").into(),
-        )
-    })
+    row_enum(s, FeatureFileRole::parse, "FeatureFileRole")
 }
 
 fn parse_language_loose(s: &str) -> rusqlite::Result<Language> {
-    Language::parse(s).ok_or_else(|| {
-        rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            format!("unknown Language in row: {s:?}").into(),
-        )
-    })
+    row_enum(s, Language::parse, "Language")
 }
 
 fn parse_trust_boundary(s: &str) -> rusqlite::Result<TrustBoundary> {
-    TrustBoundary::parse(s).ok_or_else(|| {
-        rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            format!("unknown TrustBoundary in row: {s:?}").into(),
-        )
-    })
+    row_enum(s, TrustBoundary::parse, "TrustBoundary")
 }
 
 impl Database {

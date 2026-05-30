@@ -360,24 +360,43 @@ pub(crate) fn find_project_root_opt() -> Option<PathBuf> {
     }
 }
 
+fn db_path(root: &Path) -> PathBuf {
+    root.join(PROJECT_DIR).join(DB_FILE)
+}
+
 fn open_db(root: &Path) -> Result<Database> {
-    let db_path = root.join(PROJECT_DIR).join(DB_FILE);
-    Database::open(&db_path).context("failed to open index database")
+    Database::open(&db_path(root)).context("failed to open index database")
 }
 
 fn open_db_for_model(root: &Path, model: &str, dim: usize) -> Result<Database> {
-    let db_path = root.join(PROJECT_DIR).join(DB_FILE);
-    Database::open_for_model(&db_path, model, dim).context("failed to open index database")
+    Database::open_for_model(&db_path(root), model, dim).context("failed to open index database")
 }
 
 fn open_db_for_model_rebuild(root: &Path, model: &str, dim: usize) -> Result<Database> {
-    let db_path = root.join(PROJECT_DIR).join(DB_FILE);
-    Database::open_for_model_rebuild(&db_path, model, dim).context("failed to open index database")
+    Database::open_for_model_rebuild(&db_path(root), model, dim)
+        .context("failed to open index database")
 }
 
 fn open_context_db_for_existing_model(root: &Path, model: &str) -> Result<Database> {
-    let db_path = root.join(PROJECT_DIR).join(DB_FILE);
-    Database::open_for_existing_model(&db_path, model).context("failed to open index database")
+    Database::open_for_existing_model(&db_path(root), model)
+        .context("failed to open index database")
+}
+
+/// Try to acquire the project indexing lock. On contention, prints the
+/// standard "another indexer is running … {action}" line and returns
+/// `Ok(None)` so the caller can skip work cleanly:
+/// `let Some(_lock) = acquire_index_lock(&root, "skipping")? else { return Ok(()) };`.
+fn acquire_index_lock(root: &Path, action: &str) -> Result<Option<lockfile::IndexLock>> {
+    match lockfile::try_acquire(root)? {
+        lockfile::LockOutcome::Acquired(lock) => Ok(Some(lock)),
+        lockfile::LockOutcome::AlreadyHeld => {
+            eprintln!(
+                "another codesage indexer is running on {} — {action}",
+                root.display()
+            );
+            Ok(None)
+        }
+    }
 }
 
 pub(crate) fn load_project_config(root: &Path) -> Result<ProjectConfig> {
@@ -973,15 +992,8 @@ fn cmd_index(full: bool, no_semantic: bool) -> Result<()> {
     // finding from recommendations doc §2.4 said the previous behavior was
     // "one process wins with rc=0, loser dies with SQLITE_BUSY", which
     // looks like a failure in hook logs even though no data is at risk.
-    let _lock = match lockfile::try_acquire(&root)? {
-        lockfile::LockOutcome::Acquired(l) => l,
-        lockfile::LockOutcome::AlreadyHeld => {
-            eprintln!(
-                "another codesage indexer is running on {} — skipping",
-                root.display()
-            );
-            return Ok(());
-        }
+    let Some(_lock) = acquire_index_lock(&root, "skipping")? else {
+        return Ok(());
     };
     let config = load_project_config(&root)?;
     let excludes = get_exclude_patterns(&config);
@@ -1210,15 +1222,8 @@ fn cmd_git_index(json: bool, full: bool, incremental: bool) -> Result<()> {
     // the git-history pass would race it and hit SQLITE_BUSY. Skipping
     // here lets the hook-driven scheduler converge on a single indexer
     // at a time without the user seeing an error.
-    let _lock = match lockfile::try_acquire(&root)? {
-        lockfile::LockOutcome::Acquired(l) => l,
-        lockfile::LockOutcome::AlreadyHeld => {
-            eprintln!(
-                "another codesage indexer is running on {} — skipping",
-                root.display()
-            );
-            return Ok(());
-        }
+    let Some(_lock) = acquire_index_lock(&root, "skipping")? else {
+        return Ok(());
     };
     let db = open_db(&root)?;
     let config = load_project_config(&root)?;
@@ -1803,15 +1808,8 @@ fn cmd_cleanup(dry_run: bool) -> Result<()> {
     // Cleanup drops orphan vec tables (from prior model switches) — also
     // a writer-style operation that races with in-flight indexers. Same
     // lock coordination.
-    let _lock = match lockfile::try_acquire(&root)? {
-        lockfile::LockOutcome::Acquired(l) => l,
-        lockfile::LockOutcome::AlreadyHeld => {
-            eprintln!(
-                "another codesage indexer is running on {} — skipping cleanup",
-                root.display()
-            );
-            return Ok(());
-        }
+    let Some(_lock) = acquire_index_lock(&root, "skipping cleanup")? else {
+        return Ok(());
     };
     let config = load_project_config(&root)?;
     let emb_config = config.embedding.unwrap_or_default();

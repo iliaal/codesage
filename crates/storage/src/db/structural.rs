@@ -9,7 +9,9 @@ use rusqlite::params;
 
 use crate::schema::name_tail;
 
-use super::{Database, row_reference_kind, row_symbol_kind};
+use super::{
+    Database, get_index_state, row_enum, row_reference_kind, row_symbol_kind, set_index_state,
+};
 
 /// Decode the JSON-encoded `rationale` column. A malformed value (manual DB
 /// edit, schema drift, etc.) becomes an empty Vec rather than failing the
@@ -19,6 +21,35 @@ fn deserialize_rationale(s: &str) -> Vec<RationaleEntry> {
     serde_json::from_str(s).unwrap_or_default()
 }
 
+/// Map a `(name, qualified_name, kind, path, line_start, line_end, col_start,
+/// col_end, rationale)` row — the column order shared by `find_symbols`,
+/// `symbols_for_files`, and `symbols_for_file` — into a `Symbol`.
+fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
+    let kind_str: String = row.get(2)?;
+    let rationale_json: String = row.get(8)?;
+    Ok(Symbol {
+        name: row.get(0)?,
+        qualified_name: row.get(1)?,
+        kind: row_symbol_kind(&kind_str)?,
+        file_path: row.get(3)?,
+        line_start: row.get(4)?,
+        line_end: row.get(5)?,
+        col_start: row.get(6)?,
+        col_end: row.get(7)?,
+        rationale: deserialize_rationale(&rationale_json),
+    })
+}
+
+/// Map an `(id, path, language)` row into its typed triple. Shared by
+/// `all_files_with_id_and_language` and `files_pending_boundary_derivation`,
+/// which differ only in their WHERE clause.
+fn row_to_file_lang(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, String, Language)> {
+    let id: i64 = row.get(0)?;
+    let path: String = row.get(1)?;
+    let lang_str: String = row.get(2)?;
+    Ok((id, path, row_enum(&lang_str, Language::parse, "Language")?))
+}
+
 impl Database {
     /// Return `(last_sha, last_indexed_at_unix)` for the structural index if a
     /// stamp exists. Mirrors [`Database::get_git_index_state`] but tracks the
@@ -26,32 +57,14 @@ impl Database {
     /// instrumentation (see `codesage doctor`) to detect cases where git hooks
     /// failed to trigger a reindex.
     pub fn get_structural_index_state(&self) -> Result<Option<(String, i64)>> {
-        let row = self.conn.query_row(
-            "SELECT last_sha, last_indexed_at FROM structural_index_state WHERE id = 1",
-            [],
-            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?)),
-        );
-        match row {
-            Ok((Some(sha), at)) if !sha.is_empty() => Ok(Some((sha, at))),
-            Ok(_) => Ok(None),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        get_index_state(&self.conn, "structural_index_state")
     }
 
     /// Stamp the HEAD SHA that the structural index was just built against.
     /// `indexed_at` is set to `unixepoch()` at the DB. Callers must only pass
     /// real SHAs — the "not a git repo" case is the caller's to skip.
     pub fn set_structural_index_state(&self, sha: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO structural_index_state (id, last_sha, last_indexed_at)
-             VALUES (1, ?1, unixepoch())
-             ON CONFLICT(id) DO UPDATE SET
-                 last_sha = excluded.last_sha,
-                 last_indexed_at = excluded.last_indexed_at",
-            params![sha],
-        )?;
-        Ok(())
+        set_index_state(&self.conn, "structural_index_state", sha)
     }
 
     pub fn upsert_file(&self, file: &FileInfo) -> Result<i64> {
@@ -183,24 +196,8 @@ impl Database {
               WHERE s.name = ?1"
         };
 
-        let search_term = name.to_string();
-
         let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map(params![search_term], |row| {
-            let kind_str: String = row.get(2)?;
-            let rationale_json: String = row.get(8)?;
-            Ok(Symbol {
-                name: row.get(0)?,
-                qualified_name: row.get(1)?,
-                kind: row_symbol_kind(&kind_str)?,
-                file_path: row.get(3)?,
-                line_start: row.get(4)?,
-                line_end: row.get(5)?,
-                col_start: row.get(6)?,
-                col_end: row.get(7)?,
-                rationale: deserialize_rationale(&rationale_json),
-            })
-        })?;
+        let rows = stmt.query_map(params![name], row_to_symbol)?;
 
         let mut symbols: Vec<Symbol> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         if let Some(k) = kind {
@@ -356,21 +353,7 @@ impl Database {
             .iter()
             .map(|p| p as &dyn rusqlite::types::ToSql)
             .collect();
-        let rows = stmt.query_map(params.as_slice(), |row| {
-            let kind_str: String = row.get(2)?;
-            let rationale_json: String = row.get(8)?;
-            Ok(Symbol {
-                name: row.get(0)?,
-                qualified_name: row.get(1)?,
-                kind: row_symbol_kind(&kind_str)?,
-                file_path: row.get(3)?,
-                line_start: row.get(4)?,
-                line_end: row.get(5)?,
-                col_start: row.get(6)?,
-                col_end: row.get(7)?,
-                rationale: deserialize_rationale(&rationale_json),
-            })
-        })?;
+        let rows = stmt.query_map(params.as_slice(), row_to_symbol)?;
         for sym_res in rows {
             let sym = sym_res?;
             out.entry(sym.file_path.clone()).or_default().push(sym);
@@ -387,21 +370,7 @@ impl Database {
              ORDER BY s.line_start",
         )?;
         let rows = stmt
-            .query_map(params![file_path], |row| {
-                let kind_str: String = row.get(2)?;
-                let rationale_json: String = row.get(8)?;
-                Ok(Symbol {
-                    name: row.get(0)?,
-                    qualified_name: row.get(1)?,
-                    kind: row_symbol_kind(&kind_str)?,
-                    file_path: row.get(3)?,
-                    line_start: row.get(4)?,
-                    line_end: row.get(5)?,
-                    col_start: row.get(6)?,
-                    col_end: row.get(7)?,
-                    rationale: deserialize_rationale(&rationale_json),
-                })
-            })?
+            .query_map(params![file_path], row_to_symbol)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -513,19 +482,7 @@ impl Database {
             .conn
             .prepare("SELECT id, path, language FROM files ORDER BY path")?;
         let rows = stmt
-            .query_map([], |row| {
-                let id: i64 = row.get(0)?;
-                let path: String = row.get(1)?;
-                let lang_str: String = row.get(2)?;
-                let language = Language::parse(&lang_str).ok_or_else(|| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        format!("unknown Language in row: {lang_str:?}").into(),
-                    )
-                })?;
-                Ok((id, path, language))
-            })?
+            .query_map([], row_to_file_lang)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -593,19 +550,7 @@ impl Database {
              ORDER BY path",
         )?;
         let rows = stmt
-            .query_map([], |row| {
-                let id: i64 = row.get(0)?;
-                let path: String = row.get(1)?;
-                let lang_str: String = row.get(2)?;
-                let language = Language::parse(&lang_str).ok_or_else(|| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        format!("unknown Language in row: {lang_str:?}").into(),
-                    )
-                })?;
-                Ok((id, path, language))
-            })?
+            .query_map([], row_to_file_lang)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -634,13 +579,7 @@ impl Database {
         let rows: Vec<TrustBoundary> = stmt
             .query_map(params![path], |row| {
                 let s: String = row.get(0)?;
-                TrustBoundary::parse(&s).ok_or_else(|| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        format!("unknown TrustBoundary in row: {s:?}").into(),
-                    )
-                })
+                row_enum(&s, TrustBoundary::parse, "TrustBoundary")
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut tags = rows;

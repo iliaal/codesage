@@ -4,6 +4,30 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_EMBEDDING_DIM: usize = 384;
 
+/// Generate `as_str` / `parse` / `Display` for a string-keyed enum. The literal
+/// keys are the on-disk / DB representation, which is deliberately distinct from
+/// the serde JSON wire format each enum owns via its own `#[serde(rename_all)]`
+/// (e.g. `ReferenceKind::TraitUse` is `"trait_use"` here but `"traituse"` in
+/// JSON). Extra `| "alias"` literals are accepted by `parse` but never emitted
+/// by `as_str`.
+macro_rules! str_enum {
+    ($name:ident { $($variant:ident => $s:literal $(| $alias:literal)* ),+ $(,)? }) => {
+        impl $name {
+            pub fn as_str(&self) -> &'static str {
+                match self { $( $name::$variant => $s, )+ }
+            }
+            pub fn parse(s: &str) -> Option<Self> {
+                match s { $( $s $(| $alias)* => Some($name::$variant), )+ _ => None }
+            }
+        }
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+    };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Language {
@@ -18,44 +42,17 @@ pub enum Language {
     Go,
 }
 
-impl Language {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Language::Php => "php",
-            Language::Python => "python",
-            Language::C => "c",
-            Language::Cpp => "cpp",
-            Language::Java => "java",
-            Language::Rust => "rust",
-            Language::JavaScript => "javascript",
-            Language::TypeScript => "typescript",
-            Language::Go => "go",
-        }
-    }
-}
-
-impl Language {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "php" => Some(Language::Php),
-            "python" => Some(Language::Python),
-            "c" => Some(Language::C),
-            "cpp" | "c++" | "cxx" => Some(Language::Cpp),
-            "java" => Some(Language::Java),
-            "rust" => Some(Language::Rust),
-            "javascript" | "js" => Some(Language::JavaScript),
-            "typescript" | "ts" => Some(Language::TypeScript),
-            "go" => Some(Language::Go),
-            _ => None,
-        }
-    }
-}
-
-impl std::fmt::Display for Language {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+str_enum!(Language {
+    Php => "php",
+    Python => "python",
+    C => "c",
+    Cpp => "cpp" | "c++" | "cxx",
+    Java => "java",
+    Rust => "rust",
+    JavaScript => "javascript" | "js",
+    TypeScript => "typescript" | "ts",
+    Go => "go",
+});
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -73,46 +70,19 @@ pub enum SymbolKind {
     Namespace,
 }
 
-impl SymbolKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            SymbolKind::Function => "function",
-            SymbolKind::Method => "method",
-            SymbolKind::Class => "class",
-            SymbolKind::Trait => "trait",
-            SymbolKind::Interface => "interface",
-            SymbolKind::Struct => "struct",
-            SymbolKind::Enum => "enum",
-            SymbolKind::Constant => "constant",
-            SymbolKind::Macro => "macro",
-            SymbolKind::Module => "module",
-            SymbolKind::Namespace => "namespace",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "function" => Some(SymbolKind::Function),
-            "method" => Some(SymbolKind::Method),
-            "class" => Some(SymbolKind::Class),
-            "trait" => Some(SymbolKind::Trait),
-            "interface" => Some(SymbolKind::Interface),
-            "struct" => Some(SymbolKind::Struct),
-            "enum" => Some(SymbolKind::Enum),
-            "constant" => Some(SymbolKind::Constant),
-            "macro" => Some(SymbolKind::Macro),
-            "module" => Some(SymbolKind::Module),
-            "namespace" => Some(SymbolKind::Namespace),
-            _ => None,
-        }
-    }
-}
-
-impl std::fmt::Display for SymbolKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+str_enum!(SymbolKind {
+    Function => "function",
+    Method => "method",
+    Class => "class",
+    Trait => "trait",
+    Interface => "interface",
+    Struct => "struct",
+    Enum => "enum",
+    Constant => "constant",
+    Macro => "macro",
+    Module => "module",
+    Namespace => "namespace",
+});
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FileInfo {
@@ -259,45 +229,19 @@ pub enum TrustBoundary {
     Concurrency,
 }
 
-impl TrustBoundary {
-    /// Stable lowercase-kebab string used in DB rows, JSON, and CLI output.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            TrustBoundary::Network => "network",
-            TrustBoundary::Filesystem => "filesystem",
-            TrustBoundary::ProcessExec => "process-exec",
-            TrustBoundary::Secrets => "secrets",
-            TrustBoundary::Database => "database",
-            TrustBoundary::UserInput => "user-input",
-            TrustBoundary::ExternalApi => "external-api",
-            TrustBoundary::Serialization => "serialization",
-            TrustBoundary::Auth => "auth",
-            TrustBoundary::Concurrency => "concurrency",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "network" => Some(TrustBoundary::Network),
-            "filesystem" => Some(TrustBoundary::Filesystem),
-            "process-exec" => Some(TrustBoundary::ProcessExec),
-            "secrets" => Some(TrustBoundary::Secrets),
-            "database" => Some(TrustBoundary::Database),
-            "user-input" => Some(TrustBoundary::UserInput),
-            "external-api" => Some(TrustBoundary::ExternalApi),
-            "serialization" => Some(TrustBoundary::Serialization),
-            "auth" => Some(TrustBoundary::Auth),
-            "concurrency" => Some(TrustBoundary::Concurrency),
-            _ => None,
-        }
-    }
-}
-
-impl std::fmt::Display for TrustBoundary {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+// `as_str` is the stable lowercase-kebab string used in DB rows, JSON, and CLI output.
+str_enum!(TrustBoundary {
+    Network => "network",
+    Filesystem => "filesystem",
+    ProcessExec => "process-exec",
+    Secrets => "secrets",
+    Database => "database",
+    UserInput => "user-input",
+    ExternalApi => "external-api",
+    Serialization => "serialization",
+    Auth => "auth",
+    Concurrency => "concurrency",
+});
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -311,38 +255,15 @@ pub enum ReferenceKind {
     TypeHint,
 }
 
-impl ReferenceKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ReferenceKind::Import => "import",
-            ReferenceKind::Include => "include",
-            ReferenceKind::Call => "call",
-            ReferenceKind::Instantiation => "instantiation",
-            ReferenceKind::Inheritance => "inheritance",
-            ReferenceKind::TraitUse => "trait_use",
-            ReferenceKind::TypeHint => "type_hint",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "import" => Some(ReferenceKind::Import),
-            "include" => Some(ReferenceKind::Include),
-            "call" => Some(ReferenceKind::Call),
-            "instantiation" => Some(ReferenceKind::Instantiation),
-            "inheritance" => Some(ReferenceKind::Inheritance),
-            "trait_use" => Some(ReferenceKind::TraitUse),
-            "type_hint" => Some(ReferenceKind::TypeHint),
-            _ => None,
-        }
-    }
-}
-
-impl std::fmt::Display for ReferenceKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+str_enum!(ReferenceKind {
+    Import => "import",
+    Include => "include",
+    Call => "call",
+    Instantiation => "instantiation",
+    Inheritance => "inheritance",
+    TraitUse => "trait_use",
+    TypeHint => "type_hint",
+});
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Reference {
@@ -1040,34 +961,16 @@ pub enum FeatureKind {
     Unknown,
 }
 
-impl FeatureKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            FeatureKind::CliCommand => "cli-command",
-            FeatureKind::Route => "route",
-            FeatureKind::Service => "service",
-            FeatureKind::Library => "library",
-            FeatureKind::TestSuite => "test-suite",
-            FeatureKind::Config => "config",
-            FeatureKind::Job => "job",
-            FeatureKind::Unknown => "unknown",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "cli-command" => Some(FeatureKind::CliCommand),
-            "route" => Some(FeatureKind::Route),
-            "service" => Some(FeatureKind::Service),
-            "library" => Some(FeatureKind::Library),
-            "test-suite" => Some(FeatureKind::TestSuite),
-            "config" => Some(FeatureKind::Config),
-            "job" => Some(FeatureKind::Job),
-            "unknown" => Some(FeatureKind::Unknown),
-            _ => None,
-        }
-    }
-}
+str_enum!(FeatureKind {
+    CliCommand => "cli-command",
+    Route => "route",
+    Service => "service",
+    Library => "library",
+    TestSuite => "test-suite",
+    Config => "config",
+    Job => "job",
+    Unknown => "unknown",
+});
 
 /// Confidence that the mapper got this feature right. `High` means the
 /// signal is unambiguous (a `[[bin]]` in Cargo.toml, a `composer.json`
@@ -1081,24 +984,11 @@ pub enum FeatureConfidence {
     Low,
 }
 
-impl FeatureConfidence {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            FeatureConfidence::High => "high",
-            FeatureConfidence::Medium => "medium",
-            FeatureConfidence::Low => "low",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "high" => Some(FeatureConfidence::High),
-            "medium" => Some(FeatureConfidence::Medium),
-            "low" => Some(FeatureConfidence::Low),
-            _ => None,
-        }
-    }
-}
+str_enum!(FeatureConfidence {
+    High => "high",
+    Medium => "medium",
+    Low => "low",
+});
 
 /// Role of a file within a feature.
 #[derive(
@@ -1126,26 +1016,12 @@ pub enum FeatureFileRole {
     Test,
 }
 
-impl FeatureFileRole {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            FeatureFileRole::Entry => "entry",
-            FeatureFileRole::Owned => "owned",
-            FeatureFileRole::Context => "context",
-            FeatureFileRole::Test => "test",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "entry" => Some(FeatureFileRole::Entry),
-            "owned" => Some(FeatureFileRole::Owned),
-            "context" => Some(FeatureFileRole::Context),
-            "test" => Some(FeatureFileRole::Test),
-            _ => None,
-        }
-    }
-}
+str_enum!(FeatureFileRole {
+    Entry => "entry",
+    Owned => "owned",
+    Context => "context",
+    Test => "test",
+});
 
 /// A file attached to a feature with its role and optional reason. `reason`
 /// is a short human-readable note ("entrypoint", "nearby test", "imported
@@ -1433,34 +1309,28 @@ mod tests {
     /// annotation is dropped, the JSON key changes silently and every prompt
     /// that mentions `_legend` becomes wrong.
     #[test]
-    fn risk_diff_assessment_legend_serializes_with_underscore_prefix() {
-        let mut a = RiskDiffAssessment::default();
-        a.legend.insert("T".to_string(), "test gap: …".to_string());
-        let json = serde_json::to_string(&a).unwrap();
-        assert!(
-            json.contains("\"_legend\""),
-            "expected `_legend` key in JSON, got {json}"
-        );
-        assert!(
-            !json.contains("\"legend\""),
-            "the unprefixed `legend` key must NOT leak into JSON, got {json}"
-        );
-    }
+    fn legend_serializes_with_underscore_prefix() {
+        let assert_underscored = |json: &str| {
+            assert!(
+                json.contains("\"_legend\""),
+                "expected `_legend` key in JSON, got {json}"
+            );
+            assert!(
+                !json.contains("\"legend\""),
+                "the unprefixed `legend` key must NOT leak into JSON, got {json}"
+            );
+        };
 
-    #[test]
-    fn risk_batch_assessment_legend_serializes_with_underscore_prefix() {
-        let mut a = RiskBatchAssessment::default();
-        a.legend
+        let mut diff = RiskDiffAssessment::default();
+        diff.legend
+            .insert("T".to_string(), "test gap: …".to_string());
+        assert_underscored(&serde_json::to_string(&diff).unwrap());
+
+        let mut batch = RiskBatchAssessment::default();
+        batch
+            .legend
             .insert("NG".to_string(), "no git history…".to_string());
-        let json = serde_json::to_string(&a).unwrap();
-        assert!(
-            json.contains("\"_legend\""),
-            "expected `_legend` key in JSON, got {json}"
-        );
-        assert!(
-            !json.contains("\"legend\""),
-            "the unprefixed `legend` key must NOT leak into JSON, got {json}"
-        );
+        assert_underscored(&serde_json::to_string(&batch).unwrap());
     }
 
     #[test]

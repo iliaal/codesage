@@ -106,6 +106,19 @@ pub struct FeatureSeed {
     pub test_prefixes: Vec<String>,
 }
 
+impl FeatureSeed {
+    /// Discriminator used in both the orchestrator's dedup key and the
+    /// feature-id hash: the entry command, route, or symbol (first present),
+    /// else empty.
+    pub fn discriminator(&self) -> String {
+        self.entry_command
+            .clone()
+            .or_else(|| self.entry_route.clone())
+            .or_else(|| self.entry_symbol.clone())
+            .unwrap_or_default()
+    }
+}
+
 /// One mapper module. `name` is the language/source tag used in logs;
 /// `map` returns deterministic seeds. The `ctx` carries the repo root
 /// plus the project's exclude globs so every walker honors the same

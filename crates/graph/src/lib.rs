@@ -1,6 +1,7 @@
 pub mod git_history;
 pub mod index;
 pub mod query;
+mod scc;
 pub mod semantic;
 pub mod session;
 

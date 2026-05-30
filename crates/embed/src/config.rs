@@ -14,6 +14,11 @@ pub use codesage_protocol::DEFAULT_EMBEDDING_DIM;
 pub const MAX_SEQ_LENGTH: usize = 512;
 pub const BATCH_SIZE: usize = 64;
 
+/// Whether a configured `device` string requests the CUDA / GPU execution path.
+pub fn wants_cuda(device: &str) -> bool {
+    device == "gpu" || device == "cuda"
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingConfig {
     pub model: String,

@@ -7,7 +7,7 @@
 //! reimplemented around CodeSage's existing risk + cycle infrastructure.
 //! Snapshots persist as JSON under `.codesage/sessions/<id>.json`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -215,7 +215,7 @@ fn compute_cycles(db: &Database) -> Result<Vec<Vec<String>>> {
     if edges.is_empty() {
         return Ok(Vec::new());
     }
-    let components = tarjan_scc_local(&edges);
+    let components = crate::scc::tarjan_scc(&edges);
     let mut out: Vec<Vec<String>> = components
         .into_iter()
         .filter(|c| c.len() >= 2)
@@ -327,86 +327,6 @@ fn read_snapshot(project_root: &Path, session_id: &str) -> Result<SessionSnapsho
     let snap: SessionSnapshot =
         serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
     Ok(snap)
-}
-
-/// Local copy of Tarjan's SCC algorithm. Duplicated rather than reused
-/// from `git_history::risk` to keep that module's helper private; the
-/// algorithm is small and the duplication keeps internal API surface
-/// minimal. If a third call site appears, lift it to a shared helper.
-fn tarjan_scc_local(edges: &[(String, String)]) -> Vec<Vec<String>> {
-    let mut idx_of: HashMap<&str, usize> = HashMap::new();
-    let mut nodes: Vec<&str> = Vec::new();
-    for (a, b) in edges {
-        for n in [a.as_str(), b.as_str()] {
-            if !idx_of.contains_key(n) {
-                idx_of.insert(n, nodes.len());
-                nodes.push(n);
-            }
-        }
-    }
-    let n = nodes.len();
-    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (a, b) in edges {
-        let u = idx_of[a.as_str()];
-        let v = idx_of[b.as_str()];
-        adj[u].push(v);
-    }
-
-    const UNVISITED: i32 = -1;
-    let mut index_counter: i32 = 0;
-    let mut index: Vec<i32> = vec![UNVISITED; n];
-    let mut lowlink: Vec<i32> = vec![0; n];
-    let mut on_stack: Vec<bool> = vec![false; n];
-    let mut stack: Vec<usize> = Vec::new();
-    let mut components: Vec<Vec<String>> = Vec::new();
-
-    for start in 0..n {
-        if index[start] != UNVISITED {
-            continue;
-        }
-        let mut work: Vec<(usize, usize)> = Vec::new();
-        index[start] = index_counter;
-        lowlink[start] = index_counter;
-        index_counter += 1;
-        stack.push(start);
-        on_stack[start] = true;
-        work.push((start, 0));
-
-        while let Some(&(v, i)) = work.last() {
-            if i < adj[v].len() {
-                let w = adj[v][i];
-                work.last_mut().unwrap().1 = i + 1;
-                if index[w] == UNVISITED {
-                    index[w] = index_counter;
-                    lowlink[w] = index_counter;
-                    index_counter += 1;
-                    stack.push(w);
-                    on_stack[w] = true;
-                    work.push((w, 0));
-                } else if on_stack[w] {
-                    lowlink[v] = lowlink[v].min(index[w]);
-                }
-            } else {
-                if lowlink[v] == index[v] {
-                    let mut component: Vec<String> = Vec::new();
-                    loop {
-                        let w = stack.pop().expect("stack underflow");
-                        on_stack[w] = false;
-                        component.push(nodes[w].to_string());
-                        if w == v {
-                            break;
-                        }
-                    }
-                    components.push(component);
-                }
-                work.pop();
-                if let Some(&(parent, _)) = work.last() {
-                    lowlink[parent] = lowlink[parent].min(lowlink[v]);
-                }
-            }
-        }
-    }
-    components
 }
 
 #[cfg(test)]

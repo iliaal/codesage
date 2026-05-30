@@ -38,7 +38,7 @@ impl FeatureMapper for PhpMapper {
         // surface from clawpatch PR #5. These add coarser feature_ids
         // than per-route registrations so agents can ask
         // "what slice owns app/Jobs/SendInvoice.php?" cleanly.
-        if is_laravel_project(root) {
+        if is_laravel_project(root, composer.as_ref()) {
             seeds.extend(laravel_project_seed(root, composer.as_ref())?);
             seeds.extend(laravel_controllers(root, &routes)?);
             seeds.extend(laravel_form_requests(root)?);
@@ -1212,11 +1212,11 @@ fn laravel_route_seeds(routes: &[LaravelRoute]) -> Vec<FeatureSeed> {
 /// `laravel/framework` or it has an `artisan` script at the root. Kept
 /// loose to catch real Laravel apps that don't pin the framework dep
 /// directly (workspace setups, modular monoliths).
-fn is_laravel_project(root: &Path) -> bool {
+fn is_laravel_project(root: &Path, composer: Option<&Value>) -> bool {
     if is_safe_file(root, &root.join("artisan")) {
         return true;
     }
-    let Some(composer) = read_composer(root) else {
+    let Some(composer) = composer else {
         return false;
     };
     for field in ["require", "require-dev"] {

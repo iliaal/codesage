@@ -1,10 +1,9 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use ort::session::Session;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokenizers::Tokenizer;
 
-use crate::config::MAX_SEQ_LENGTH;
-use crate::model::init_ort_dylib;
+use crate::model::load_onnx_session;
 
 const RERANK_BATCH: usize = 32;
 
@@ -17,76 +16,8 @@ pub struct Reranker {
 
 impl Reranker {
     pub fn new(model: &str, device: &str) -> Result<Self> {
-        init_ort_dylib();
         tracing::info!(%model, "loading reranker model");
-
-        let api =
-            hf_hub::api::sync::Api::new().context("failed to create HuggingFace API client")?;
-        let repo = api.model(model.to_string());
-
-        let tokenizer_path = repo
-            .get("tokenizer.json")
-            .context("failed to download tokenizer.json")?;
-        let model_path = repo
-            .get("onnx/model.onnx")
-            .context("failed to download onnx/model.onnx")?;
-
-        let mut tokenizer =
-            Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
-        tokenizer
-            .with_truncation(Some(tokenizers::TruncationParams {
-                max_length: MAX_SEQ_LENGTH,
-                ..Default::default()
-            }))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        tokenizer.with_padding(Some(tokenizers::PaddingParams {
-            strategy: tokenizers::PaddingStrategy::BatchLongest,
-            ..Default::default()
-        }));
-
-        let mut builder = Session::builder()?;
-
-        if device == "gpu" || device == "cuda" {
-            #[cfg(feature = "cuda")]
-            {
-                super::model::preload_cuda_libs();
-                builder = builder
-                    .with_execution_providers([
-                        ort::execution_providers::CUDAExecutionProvider::default()
-                            .build()
-                            .error_on_failure(),
-                    ])
-                    .map_err(|e| anyhow::anyhow!("CUDA provider failed to register: {e}"))?;
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                anyhow::bail!(
-                    "GPU requested but binary built without cuda feature. Rebuild with: cargo build --features cuda"
-                );
-            }
-        }
-
-        let session = builder.commit_from_file(&model_path)?;
-
-        // Same silent-CPU-fallback guard as Embedder::new — see
-        // crates/embed/src/model.rs `require_cuda_libs_mapped` for the
-        // failure-mode rationale.
-        #[cfg(all(feature = "cuda", target_os = "linux"))]
-        if (device == "gpu" || device == "cuda")
-            && !matches!(
-                std::env::var("CODESAGE_ALLOW_CPU_FALLBACK").as_deref(),
-                Ok("1") | Ok("true")
-            )
-        {
-            super::model::require_cuda_libs_mapped()
-                .context("reranker silently fell back to CPU after CUDA registered")?;
-        }
-
-        let has_token_type_ids = session
-            .inputs()
-            .iter()
-            .any(|i| i.name() == "token_type_ids");
-
+        let (session, tokenizer, has_token_type_ids) = load_onnx_session(model, device)?;
         tracing::info!(token_type_ids = has_token_type_ids, "reranker loaded");
 
         Ok(Self {
@@ -104,11 +35,8 @@ impl Reranker {
 
         let mut all_scores = Vec::with_capacity(documents.len());
 
-        for batch_start in (0..documents.len()).step_by(RERANK_BATCH) {
-            let batch_end = (batch_start + RERANK_BATCH).min(documents.len());
-            let batch = &documents[batch_start..batch_end];
-            let scores = self.score_batch(query, batch)?;
-            all_scores.extend(scores);
+        for batch in documents.chunks(RERANK_BATCH) {
+            all_scores.extend(self.score_batch(query, batch)?);
         }
 
         Ok(all_scores)

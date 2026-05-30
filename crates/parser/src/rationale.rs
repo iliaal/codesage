@@ -214,7 +214,11 @@ fn parse_python_docstring(node: &Node, source: &[u8]) -> Option<RationaleEntry> 
 /// block comments only have their first line examined for the marker; the
 /// full body is preserved as `text`. This matches author intent: the marker
 /// labels the whole comment, so all of it counts as the rationale.
-fn parse_marker_line(body: &str, node: &Node) -> Option<RationaleEntry> {
+/// Node-free core of marker parsing: find a `MARKER: rest` / `MARKER rest`
+/// pattern in the first token of a comment body. Returns the recognized kind and
+/// the after-marker text. Unit tests exercise this directly so they cover the
+/// shipped path instead of a copy.
+fn parse_marker(body: &str) -> Option<(RationaleKind, String)> {
     let mut iter = body.splitn(2, |c: char| c == ':' || c.is_whitespace());
     let maybe_marker = iter.next()?.trim();
     if maybe_marker.is_empty() {
@@ -233,12 +237,16 @@ fn parse_marker_line(body: &str, node: &Node) -> Option<RationaleEntry> {
             .to_string(),
     };
 
+    Some((kind, after_marker))
+}
+
+fn parse_marker_line(body: &str, node: &Node) -> Option<RationaleEntry> {
+    let (kind, text) = parse_marker(body)?;
     let line_start = node.start_position().row as u32 + 1;
     let line_end = node.end_position().row as u32 + 1;
-
     Some(RationaleEntry {
         kind,
-        text: after_marker,
+        text,
         line_start,
         line_end,
     })
@@ -276,22 +284,8 @@ mod tests {
 
     // Marker parsing — node-independent paths
 
-    fn parse_for_test(body: &str) -> Option<(RationaleKind, String)> {
-        // Build a tiny tree with one comment line so we can call parse_marker_line.
-        // Since RationaleEntry needs a Node, easier to test the logic end-to-end
-        // via the public extract_rust_rationale function in an integration test.
-        // Here we just exercise the matcher.
-        let mut iter = body.splitn(2, |c: char| c == ':' || c.is_whitespace());
-        let marker = iter.next()?.trim();
-        let kind = RationaleKind::from_marker(marker)?;
-        let after = match body.find(':') {
-            Some(idx) if idx == marker.len() => body[idx + 1..].trim().to_string(),
-            _ => body[marker.len()..]
-                .trim_start_matches(|c: char| c.is_whitespace() || c == ':')
-                .to_string(),
-        };
-        Some((kind, after))
-    }
+    // Exercise the shipped node-free marker core directly.
+    use super::parse_marker as parse_for_test;
 
     #[test]
     fn parses_why_marker() {

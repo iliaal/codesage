@@ -82,17 +82,7 @@ impl Database {
 
     /// Return (last_sha, last_indexed_at_unix) if an incremental state exists.
     pub fn get_git_index_state(&self) -> Result<Option<(String, i64)>> {
-        let row = self.conn.query_row(
-            "SELECT last_sha, last_indexed_at FROM git_index_state WHERE id = 1",
-            [],
-            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?)),
-        );
-        match row {
-            Ok((Some(sha), at)) if !sha.is_empty() => Ok(Some((sha, at))),
-            Ok(_) => Ok(None),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        super::get_index_state(&self.conn, "git_index_state")
     }
 
     /// All file paths in `git_files` whose path begins with `prefix`. Used by
@@ -111,15 +101,7 @@ impl Database {
 
     /// Record the commit SHA we just indexed up to. indexed_at stamped with unixepoch().
     pub fn set_git_index_state(&self, sha: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO git_index_state (id, last_sha, last_indexed_at)
-             VALUES (1, ?1, unixepoch())
-             ON CONFLICT(id) DO UPDATE SET
-                 last_sha = excluded.last_sha,
-                 last_indexed_at = excluded.last_indexed_at",
-            rusqlite::params![sha],
-        )?;
-        Ok(())
+        super::set_index_state(&self.conn, "git_index_state", sha)
     }
 
     /// Apply a global multiplicative decay factor to existing churn and co-change weights.

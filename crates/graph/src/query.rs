@@ -881,15 +881,16 @@ fn apply_definition_boost(results: &mut [SearchResult], query: &str) {
 // against the nest index showed the definition chunk surfaces over reference
 // / method-body chunks (ApplicationConfig: rank-1 score 0.76 → def chunk
 // 1.45; MicroservicesModule: 0.65 → 2.57).
+/// True unless the named env var is explicitly set to `0` / `false`. The
+/// default-on gate shape shared by the post-retrieval scoring stages.
+fn env_default_on(var: &str) -> bool {
+    !matches!(std::env::var(var).as_deref(), Ok("0") | Ok("false"))
+}
+
 static DEFINITION_BOOST_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn definition_boost_enabled() -> bool {
-    *DEFINITION_BOOST_ENABLED.get_or_init(|| {
-        !matches!(
-            std::env::var("CODESAGE_DEFINITION_BOOST").as_deref(),
-            Ok("0") | Ok("false")
-        )
-    })
+    *DEFINITION_BOOST_ENABLED.get_or_init(|| env_default_on("CODESAGE_DEFINITION_BOOST"))
 }
 
 // Non-candidate stem scan: when a bare-symbol query (e.g. "FooBar") didn't
@@ -967,12 +968,7 @@ fn apply_non_candidate_stem_scan(
 static STEM_SCAN_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn stem_scan_enabled() -> bool {
-    *STEM_SCAN_ENABLED.get_or_init(|| {
-        !matches!(
-            std::env::var("CODESAGE_STEM_SCAN").as_deref(),
-            Ok("0") | Ok("false")
-        )
-    })
+    *STEM_SCAN_ENABLED.get_or_init(|| env_default_on("CODESAGE_STEM_SCAN"))
 }
 
 // Path-penalty multipliers, ported from Semble's ranking/penalties.py. Applied
@@ -1123,12 +1119,7 @@ fn query_is_test_shaped(query: &str) -> bool {
 static TEST_QUERY_AWARE_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn test_query_aware_enabled() -> bool {
-    *TEST_QUERY_AWARE_ENABLED.get_or_init(|| {
-        !matches!(
-            std::env::var("CODESAGE_TEST_QUERY_AWARE").as_deref(),
-            Ok("0") | Ok("false")
-        )
-    })
+    *TEST_QUERY_AWARE_ENABLED.get_or_init(|| env_default_on("CODESAGE_TEST_QUERY_AWARE"))
 }
 
 fn apply_path_penalties(results: &mut [SearchResult], query: &str) {
@@ -1144,12 +1135,7 @@ fn apply_path_penalties(results: &mut [SearchResult], query: &str) {
 static PATH_PENALTY_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn path_penalty_enabled() -> bool {
-    *PATH_PENALTY_ENABLED.get_or_init(|| {
-        !matches!(
-            std::env::var("CODESAGE_PATH_PENALTY").as_deref(),
-            Ok("0") | Ok("false")
-        )
-    })
+    *PATH_PENALTY_ENABLED.get_or_init(|| env_default_on("CODESAGE_PATH_PENALTY"))
 }
 
 // File saturation decay: ranking the same file's Nth chunk gets multiplied by
@@ -1265,24 +1251,14 @@ fn parent_dir_for_saturation(file_path: &str) -> String {
 static DIR_SATURATION_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn dir_saturation_enabled() -> bool {
-    *DIR_SATURATION_ENABLED.get_or_init(|| {
-        !matches!(
-            std::env::var("CODESAGE_DIR_SATURATION").as_deref(),
-            Ok("0") | Ok("false")
-        )
-    })
+    *DIR_SATURATION_ENABLED.get_or_init(|| env_default_on("CODESAGE_DIR_SATURATION"))
 }
 
 // Default-on; opt-out via CODESAGE_FILE_SATURATION=0 (or "false").
 static FILE_SATURATION_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn file_saturation_enabled() -> bool {
-    *FILE_SATURATION_ENABLED.get_or_init(|| {
-        !matches!(
-            std::env::var("CODESAGE_FILE_SATURATION").as_deref(),
-            Ok("0") | Ok("false")
-        )
-    })
+    *FILE_SATURATION_ENABLED.get_or_init(|| env_default_on("CODESAGE_FILE_SATURATION"))
 }
 
 const RERANK_WEIGHT_DEFAULT: f32 = 0.5;
@@ -1336,12 +1312,7 @@ fn adaptive_rerank_weight(query: &str) -> f32 {
 static ADAPTIVE_RERANK_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn adaptive_rerank_weight_enabled() -> bool {
-    *ADAPTIVE_RERANK_ENABLED.get_or_init(|| {
-        !matches!(
-            std::env::var("CODESAGE_ADAPTIVE_RERANK").as_deref(),
-            Ok("0") | Ok("false")
-        )
-    })
+    *ADAPTIVE_RERANK_ENABLED.get_or_init(|| env_default_on("CODESAGE_ADAPTIVE_RERANK"))
 }
 
 fn apply_reranking(rerank: &mut RerankFn<'_>, query: &str, results: &mut [SearchResult]) {

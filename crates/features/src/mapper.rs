@@ -69,7 +69,7 @@ pub fn map_features(
             if !ctx.allowed(&seed.entry_path) {
                 continue;
             }
-            let mut record = build_record(db, root, seed, &all_files)?;
+            let mut record = build_record(db, seed, &all_files)?;
             // Final safety net: even when a mapper forgets to filter, no
             // FeatureFileRef should reference a path the structural
             // indexer excludes. Drop any leaked refs before persisting.
@@ -132,12 +132,7 @@ fn collect_seeds(ctx: &MapperContext) -> Result<CollectedSeeds> {
     let mut seen: BTreeSet<(String, String, String, String)> = BTreeSet::new();
     let mut out = Vec::with_capacity(all.len());
     for s in all {
-        let disc = s
-            .entry_command
-            .clone()
-            .or_else(|| s.entry_route.clone())
-            .or_else(|| s.entry_symbol.clone())
-            .unwrap_or_default();
+        let disc = s.discriminator();
         let key = (
             s.kind.as_str().to_string(),
             s.source.to_string(),
@@ -154,18 +149,8 @@ fn collect_seeds(ctx: &MapperContext) -> Result<CollectedSeeds> {
     })
 }
 
-fn build_record(
-    db: &Database,
-    root: &Path,
-    seed: &FeatureSeed,
-    all_files: &[String],
-) -> Result<FeatureRecord> {
-    let disc = seed
-        .entry_command
-        .clone()
-        .or_else(|| seed.entry_route.clone())
-        .or_else(|| seed.entry_symbol.clone())
-        .unwrap_or_default();
+fn build_record(db: &Database, seed: &FeatureSeed, all_files: &[String]) -> Result<FeatureRecord> {
+    let disc = seed.discriminator();
     let feature_id = feature_id::build(seed.kind, seed.source, &seed.entry_path, &disc);
 
     // Build the file ref set: entry + owned + context + (seed tests union
@@ -226,7 +211,6 @@ fn build_record(
         .map(|f| f.path.as_str())
         .collect();
     for p in boundary_inputs {
-        let _ = root; // root unused after walking files; keeps the api uniform
         for b in db.trust_boundaries_for_file_path(p)? {
             tb.insert(b);
         }

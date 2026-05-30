@@ -8,7 +8,7 @@ use ort::session::Session;
 use tokenizers::Tokenizer;
 use wait_timeout::ChildExt;
 
-use crate::config::{BATCH_SIZE, EmbeddingConfig, MAX_SEQ_LENGTH, PoolingStrategy};
+use crate::config::{BATCH_SIZE, EmbeddingConfig, MAX_SEQ_LENGTH, PoolingStrategy, wants_cuda};
 
 static ORT_INIT: Once = Once::new();
 static CUDA_PRELOAD: Once = Once::new();
@@ -73,14 +73,18 @@ const PROBE_PYTHON_TIMEOUT: Duration = Duration::from_secs(10);
 /// missing Python; just returns an empty Vec. Bounded by `PROBE_PYTHON_TIMEOUT`
 /// so a wedged interpreter can't deadlock the whole process.
 fn probe_python_site_packages() -> Vec<PathBuf> {
-    let candidates = ["python3", "python"];
-    for py in &candidates {
-        match probe_one(py) {
-            Some(paths) => return paths,
-            None => continue,
-        }
-    }
-    Vec::new()
+    static CACHE: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let candidates = ["python3", "python"];
+            for py in &candidates {
+                if let Some(paths) = probe_one(py) {
+                    return paths;
+                }
+            }
+            Vec::new()
+        })
+        .clone()
 }
 
 fn probe_one(py: &str) -> Option<Vec<PathBuf>> {
@@ -308,6 +312,101 @@ pub fn init_ort_dylib() {
     });
 }
 
+/// Shared model-loading path for [`Embedder`] and [`Reranker`]: downloads the
+/// tokenizer + ONNX model (and the optional external-weights sidecar), builds a
+/// padding/truncating tokenizer, creates an ORT session — registering the CUDA
+/// execution provider when `device` requests the GPU — and asserts the CUDA
+/// libraries actually mapped (the silent-CPU-fallback guard). Returns the
+/// session, tokenizer, and whether the model takes a `token_type_ids` input.
+pub(crate) fn load_onnx_session(model: &str, device: &str) -> Result<(Session, Tokenizer, bool)> {
+    init_ort_dylib();
+
+    let want_cuda = wants_cuda(device);
+    if want_cuda {
+        #[cfg(not(feature = "cuda"))]
+        {
+            anyhow::bail!(
+                "GPU requested but binary built without cuda feature. Rebuild with: cargo build --features cuda"
+            );
+        }
+    }
+
+    let api = hf_hub::api::sync::Api::new().context("failed to create HuggingFace API client")?;
+    let repo = api.model(model.to_string());
+
+    let tokenizer_path = repo
+        .get("tokenizer.json")
+        .context("failed to download tokenizer.json")?;
+    let model_path = repo
+        .get("onnx/model.onnx")
+        .context("failed to download onnx/model.onnx")?;
+    // External-weights sidecar (>2GB models like Jina v2 base, BGE-large).
+    // Most models don't have this file — a 404 is the expected outcome and
+    // not worth surfacing. A real failure (network, disk, permission) is
+    // worth a debug-level breadcrumb so users running with RUST_LOG=debug
+    // don't have to guess when commit_from_file later errors with an
+    // opaque ORT external-data load failure.
+    if let Err(e) = repo.get("onnx/model.onnx_data") {
+        tracing::debug!(error = %e, "onnx/model.onnx_data not fetched (normal for small models)");
+    }
+
+    let mut tokenizer =
+        Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    tokenizer
+        .with_truncation(Some(tokenizers::TruncationParams {
+            max_length: MAX_SEQ_LENGTH,
+            ..Default::default()
+        }))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    tokenizer.with_padding(Some(tokenizers::PaddingParams {
+        strategy: tokenizers::PaddingStrategy::BatchLongest,
+        ..Default::default()
+    }));
+
+    let mut builder = Session::builder()?;
+
+    if want_cuda {
+        #[cfg(feature = "cuda")]
+        {
+            preload_cuda_libs();
+            builder = builder
+                .with_execution_providers([
+                    ort::execution_providers::CUDAExecutionProvider::default()
+                        .build()
+                        .error_on_failure(),
+                ])
+                .map_err(|e| anyhow::anyhow!("CUDA provider failed to register: {e}"))?;
+        }
+    }
+
+    let session = builder.commit_from_file(&model_path)?;
+
+    // Hard-fail when device = "gpu" was requested but ORT silently fell back to
+    // CPU. Failure mode observed 2026-05-02 on a flip-all script: CUDA
+    // registration logged "Successfully registered" but the process had ZERO
+    // cuda libs mapped per /proc/self/maps and ran for 10+ minutes on a
+    // 256-file project. Rather than time-based heuristics, assert the CUDA
+    // loader actually ran by checking the process has libcuda + libcudart +
+    // (libcudnn OR libcublas) mapped. No-op on non-Linux. Bypass with
+    // CODESAGE_ALLOW_CPU_FALLBACK=1 (e.g. for unit tests).
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    if want_cuda
+        && !matches!(
+            std::env::var("CODESAGE_ALLOW_CPU_FALLBACK").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    {
+        require_cuda_libs_mapped()?;
+    }
+
+    let has_token_type_ids = session
+        .inputs()
+        .iter()
+        .any(|i| i.name() == "token_type_ids");
+
+    Ok((session, tokenizer, has_token_type_ids))
+}
+
 pub struct Embedder {
     session: Session,
     tokenizer: Tokenizer,
@@ -318,94 +417,9 @@ pub struct Embedder {
 
 impl Embedder {
     pub fn new(config: &EmbeddingConfig) -> Result<Self> {
-        init_ort_dylib();
         tracing::info!(model = %config.model, "loading embedding model");
-
-        let want_cuda = config.device == "gpu" || config.device == "cuda";
-        if want_cuda {
-            #[cfg(not(feature = "cuda"))]
-            {
-                anyhow::bail!(
-                    "GPU requested but binary built without cuda feature. Rebuild with: cargo build --features cuda"
-                );
-            }
-        }
-
-        let api =
-            hf_hub::api::sync::Api::new().context("failed to create HuggingFace API client")?;
-        let repo = api.model(config.model.clone());
-
-        let tokenizer_path = repo
-            .get("tokenizer.json")
-            .context("failed to download tokenizer.json")?;
-        let model_path = repo
-            .get("onnx/model.onnx")
-            .context("failed to download onnx/model.onnx")?;
-        // External-weights sidecar (>2GB models like Jina v2 base, BGE-large).
-        // Most models don't have this file — a 404 is the expected outcome and
-        // not worth surfacing. A real failure (network, disk, permission) is
-        // worth a debug-level breadcrumb so users running with RUST_LOG=debug
-        // don't have to guess when commit_from_file later errors with an
-        // opaque ORT external-data load failure.
-        if let Err(e) = repo.get("onnx/model.onnx_data") {
-            tracing::debug!(error = %e, "onnx/model.onnx_data not fetched (normal for small models)");
-        }
-
-        let mut tokenizer =
-            Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
-        tokenizer
-            .with_truncation(Some(tokenizers::TruncationParams {
-                max_length: MAX_SEQ_LENGTH,
-                ..Default::default()
-            }))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        tokenizer.with_padding(Some(tokenizers::PaddingParams {
-            strategy: tokenizers::PaddingStrategy::BatchLongest,
-            ..Default::default()
-        }));
-
-        let mut builder = Session::builder()?;
-
-        if want_cuda {
-            #[cfg(feature = "cuda")]
-            {
-                preload_cuda_libs();
-                builder = builder
-                    .with_execution_providers([
-                        ort::execution_providers::CUDAExecutionProvider::default()
-                            .build()
-                            .error_on_failure(),
-                    ])
-                    .map_err(|e| anyhow::anyhow!("CUDA provider failed to register: {e}"))?;
-            }
-        }
-
-        let session = builder.commit_from_file(&model_path)?;
-
-        // Hard-fail when device = "gpu" was requested but ORT silently fell
-        // back to CPU. Failure mode observed 2026-05-02 on a flip-all script:
-        // CUDA registration logged "Successfully registered" but the process
-        // had ZERO cuda libs mapped per /proc/self/maps and ran for 10+
-        // minutes on a 256-file project. Rather than time-based heuristics,
-        // assert that the CUDA loader actually ran by checking that the
-        // process has libcuda + libcudart + (libcudnn OR libcublas) mapped.
-        // No-op on non-Linux. Bypass with CODESAGE_ALLOW_CPU_FALLBACK=1
-        // (e.g. for unit tests).
-        #[cfg(all(feature = "cuda", target_os = "linux"))]
-        if want_cuda
-            && !matches!(
-                std::env::var("CODESAGE_ALLOW_CPU_FALLBACK").as_deref(),
-                Ok("1") | Ok("true")
-            )
-        {
-            require_cuda_libs_mapped()?;
-        }
-
-        let has_token_type_ids = session
-            .inputs()
-            .iter()
-            .any(|i| i.name() == "token_type_ids");
-
+        let (session, tokenizer, has_token_type_ids) =
+            load_onnx_session(&config.model, &config.device)?;
         let dim = detect_dim(&session)?;
         let pooling = config.pooling_strategy();
 
@@ -441,11 +455,8 @@ impl Embedder {
 
         let mut all_embeddings = Vec::with_capacity(texts.len());
 
-        for batch_start in (0..texts.len()).step_by(BATCH_SIZE) {
-            let batch_end = (batch_start + BATCH_SIZE).min(texts.len());
-            let batch = &texts[batch_start..batch_end];
-            let batch_embs = self.embed_batch_inner(batch)?;
-            all_embeddings.extend(batch_embs);
+        for batch in texts.chunks(BATCH_SIZE) {
+            all_embeddings.extend(self.embed_batch_inner(batch)?);
         }
 
         Ok(all_embeddings)

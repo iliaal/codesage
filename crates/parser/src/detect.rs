@@ -25,9 +25,9 @@ pub fn detect_language_with_dialect(path: &Path, header_is_cpp: bool) -> Option<
         } else {
             Language::C
         }),
-        // Unambiguous C++ source / header / module extensions.
-        "cpp" | "cc" | "cxx" | "c++" | "cppm" | "ixx" | "hpp" | "hh" | "hxx" | "h++" | "tpp"
-        | "ipp" => Some(Language::Cpp),
+        // Unambiguous C++ source / header / module extensions. Single source of
+        // truth in `is_unambiguous_cpp_extension`, shared with `.h`-dialect routing.
+        _ if is_unambiguous_cpp_extension(ext) => Some(Language::Cpp),
         "java" => Some(Language::Java),
         "rs" => Some(Language::Rust),
         "js" | "mjs" | "cjs" | "jsx" => Some(Language::JavaScript),

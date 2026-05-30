@@ -33,28 +33,62 @@ mod structural;
 pub use git_hist::{CoChangeRow, GitFileRow};
 pub use semantic::{RawSearchRow, SemanticFreshness, embedding_to_bytes};
 
-/// Parse a SymbolKind from a stored DB row, surfacing unknown variants as a typed
-/// rusqlite error rather than silently relabeling them. Loud failure is the right
-/// default here: an unknown kind almost always means schema/binary skew.
-pub(super) fn row_symbol_kind(s: &str) -> rusqlite::Result<SymbolKind> {
-    SymbolKind::parse(s).ok_or_else(|| {
+/// Decode a stored DB string column into an enum via its `parse`, surfacing an
+/// unknown value as a typed rusqlite error rather than silently relabeling it.
+/// Loud failure is the right default: an unknown value almost always means
+/// schema/binary skew. `label` names the enum in the error.
+pub(super) fn row_enum<T>(
+    s: &str,
+    parse: impl Fn(&str) -> Option<T>,
+    label: &str,
+) -> rusqlite::Result<T> {
+    parse(s).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
             0,
             rusqlite::types::Type::Text,
-            format!("unknown SymbolKind in row: {s:?}").into(),
+            format!("unknown {label} in row: {s:?}").into(),
         )
     })
 }
 
-/// See [`row_symbol_kind`].
+pub(super) fn row_symbol_kind(s: &str) -> rusqlite::Result<SymbolKind> {
+    row_enum(s, SymbolKind::parse, "SymbolKind")
+}
+
 pub(super) fn row_reference_kind(s: &str) -> rusqlite::Result<ReferenceKind> {
-    ReferenceKind::parse(s).ok_or_else(|| {
-        rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            format!("unknown ReferenceKind in row: {s:?}").into(),
-        )
-    })
+    row_enum(s, ReferenceKind::parse, "ReferenceKind")
+}
+
+/// Read a single-row (`id = 1`) index-state table's `(last_sha,
+/// last_indexed_at)`, treating a missing row or an empty SHA as "no state".
+/// Shared by the structural and git-history index-state accessors, which differ
+/// only in the table name. `table` is a hardcoded constant at every call site,
+/// never user input, so interpolation is safe.
+pub(super) fn get_index_state(conn: &Connection, table: &str) -> Result<Option<(String, i64)>> {
+    let sql = format!("SELECT last_sha, last_indexed_at FROM {table} WHERE id = 1");
+    let row = conn.query_row(&sql, [], |r| {
+        Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?))
+    });
+    match row {
+        Ok((Some(sha), at)) if !sha.is_empty() => Ok(Some((sha, at))),
+        Ok(_) => Ok(None),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Stamp `(id = 1, last_sha, last_indexed_at = unixepoch())` on a single-row
+/// index-state table. See [`get_index_state`] for the table-name contract.
+pub(super) fn set_index_state(conn: &Connection, table: &str, sha: &str) -> Result<()> {
+    let sql = format!(
+        "INSERT INTO {table} (id, last_sha, last_indexed_at)
+         VALUES (1, ?1, unixepoch())
+         ON CONFLICT(id) DO UPDATE SET
+             last_sha = excluded.last_sha,
+             last_indexed_at = excluded.last_indexed_at"
+    );
+    conn.execute(&sql, params![sha])?;
+    Ok(())
 }
 
 pub struct Database {

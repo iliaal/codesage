@@ -31,23 +31,35 @@ fn compile_ref_query(lang: tree_sitter::Language, src: &str) -> RefQuerySpec {
 }
 
 static PHP_REF: LazyLock<RefQuerySpec> =
-    LazyLock::new(|| compile_ref_query(tree_sitter_php::LANGUAGE_PHP.into(), PHP_REF_QUERY));
-static PY_REF: LazyLock<RefQuerySpec> =
-    LazyLock::new(|| compile_ref_query(tree_sitter_python::LANGUAGE.into(), PYTHON_REF_QUERY));
+    LazyLock::new(|| compile_ref_query(crate::parse::ts_language(Language::Php), PHP_REF_QUERY));
+static PY_REF: LazyLock<RefQuerySpec> = LazyLock::new(|| {
+    compile_ref_query(
+        crate::parse::ts_language(Language::Python),
+        PYTHON_REF_QUERY,
+    )
+});
 static C_REF: LazyLock<RefQuerySpec> =
-    LazyLock::new(|| compile_ref_query(tree_sitter_c::LANGUAGE.into(), C_REF_QUERY));
+    LazyLock::new(|| compile_ref_query(crate::parse::ts_language(Language::C), C_REF_QUERY));
 static CPP_REF: LazyLock<RefQuerySpec> =
-    LazyLock::new(|| compile_ref_query(tree_sitter_cpp::LANGUAGE.into(), CPP_REF_QUERY));
+    LazyLock::new(|| compile_ref_query(crate::parse::ts_language(Language::Cpp), CPP_REF_QUERY));
 static JAVA_REF: LazyLock<RefQuerySpec> =
-    LazyLock::new(|| compile_ref_query(tree_sitter_java::LANGUAGE.into(), JAVA_REF_QUERY));
+    LazyLock::new(|| compile_ref_query(crate::parse::ts_language(Language::Java), JAVA_REF_QUERY));
 static RUST_REF: LazyLock<RefQuerySpec> =
-    LazyLock::new(|| compile_ref_query(tree_sitter_rust::LANGUAGE.into(), RUST_REF_QUERY));
-static JS_REF: LazyLock<RefQuerySpec> =
-    LazyLock::new(|| compile_ref_query(tree_sitter_javascript::LANGUAGE.into(), JS_REF_QUERY));
-static TS_REF: LazyLock<RefQuerySpec> =
-    LazyLock::new(|| compile_ref_query(tree_sitter_typescript::LANGUAGE_TSX.into(), TS_REF_QUERY));
+    LazyLock::new(|| compile_ref_query(crate::parse::ts_language(Language::Rust), RUST_REF_QUERY));
+static JS_REF: LazyLock<RefQuerySpec> = LazyLock::new(|| {
+    compile_ref_query(
+        crate::parse::ts_language(Language::JavaScript),
+        JS_REF_QUERY,
+    )
+});
+static TS_REF: LazyLock<RefQuerySpec> = LazyLock::new(|| {
+    compile_ref_query(
+        crate::parse::ts_language(Language::TypeScript),
+        TS_REF_QUERY,
+    )
+});
 static GO_REF: LazyLock<RefQuerySpec> =
-    LazyLock::new(|| compile_ref_query(tree_sitter_go::LANGUAGE.into(), GO_REF_QUERY));
+    LazyLock::new(|| compile_ref_query(crate::parse::ts_language(Language::Go), GO_REF_QUERY));
 
 fn ref_query_for(lang: Language) -> &'static RefQuerySpec {
     match lang {

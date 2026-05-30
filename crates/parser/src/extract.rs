@@ -41,23 +41,26 @@ fn compile_symbol_query(lang: tree_sitter::Language, src: &str) -> SymbolQuerySp
 }
 
 static PHP_SYM: LazyLock<SymbolQuerySpec> =
-    LazyLock::new(|| compile_symbol_query(tree_sitter_php::LANGUAGE_PHP.into(), PHP_QUERY));
-static PY_SYM: LazyLock<SymbolQuerySpec> =
-    LazyLock::new(|| compile_symbol_query(tree_sitter_python::LANGUAGE.into(), PYTHON_QUERY));
+    LazyLock::new(|| compile_symbol_query(crate::parse::ts_language(Language::Php), PHP_QUERY));
+static PY_SYM: LazyLock<SymbolQuerySpec> = LazyLock::new(|| {
+    compile_symbol_query(crate::parse::ts_language(Language::Python), PYTHON_QUERY)
+});
 static C_SYM: LazyLock<SymbolQuerySpec> =
-    LazyLock::new(|| compile_symbol_query(tree_sitter_c::LANGUAGE.into(), C_QUERY));
+    LazyLock::new(|| compile_symbol_query(crate::parse::ts_language(Language::C), C_QUERY));
 static CPP_SYM: LazyLock<SymbolQuerySpec> =
-    LazyLock::new(|| compile_symbol_query(tree_sitter_cpp::LANGUAGE.into(), CPP_QUERY));
+    LazyLock::new(|| compile_symbol_query(crate::parse::ts_language(Language::Cpp), CPP_QUERY));
 static JAVA_SYM: LazyLock<SymbolQuerySpec> =
-    LazyLock::new(|| compile_symbol_query(tree_sitter_java::LANGUAGE.into(), JAVA_QUERY));
+    LazyLock::new(|| compile_symbol_query(crate::parse::ts_language(Language::Java), JAVA_QUERY));
 static RUST_SYM: LazyLock<SymbolQuerySpec> =
-    LazyLock::new(|| compile_symbol_query(tree_sitter_rust::LANGUAGE.into(), RUST_QUERY));
-static JS_SYM: LazyLock<SymbolQuerySpec> =
-    LazyLock::new(|| compile_symbol_query(tree_sitter_javascript::LANGUAGE.into(), JS_QUERY));
-static TS_SYM: LazyLock<SymbolQuerySpec> =
-    LazyLock::new(|| compile_symbol_query(tree_sitter_typescript::LANGUAGE_TSX.into(), TS_QUERY));
+    LazyLock::new(|| compile_symbol_query(crate::parse::ts_language(Language::Rust), RUST_QUERY));
+static JS_SYM: LazyLock<SymbolQuerySpec> = LazyLock::new(|| {
+    compile_symbol_query(crate::parse::ts_language(Language::JavaScript), JS_QUERY)
+});
+static TS_SYM: LazyLock<SymbolQuerySpec> = LazyLock::new(|| {
+    compile_symbol_query(crate::parse::ts_language(Language::TypeScript), TS_QUERY)
+});
 static GO_SYM: LazyLock<SymbolQuerySpec> =
-    LazyLock::new(|| compile_symbol_query(tree_sitter_go::LANGUAGE.into(), GO_QUERY));
+    LazyLock::new(|| compile_symbol_query(crate::parse::ts_language(Language::Go), GO_QUERY));
 
 fn symbol_query_for(lang: Language) -> &'static SymbolQuerySpec {
     match lang {
@@ -486,6 +489,31 @@ fn find_parent_class_name<'a>(node: &Node, source: &'a [u8]) -> Option<&'a str> 
     None
 }
 
+/// Build a `namespace<sep>Class<sep>name` qualified name. Shared by the PHP
+/// (`\`) and Java (`.`) arms of `build_qualified_name`, which differ only in the
+/// separator: namespace/package prefix, optional enclosing class for methods and
+/// constants, then the bare name.
+fn join_qualified(
+    name: &str,
+    kind: SymbolKind,
+    def_node: &Node,
+    source: &[u8],
+    namespace: &Option<String>,
+    sep: &str,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(ns) = namespace {
+        parts.push(ns.clone());
+    }
+    if (kind == SymbolKind::Method || kind == SymbolKind::Constant)
+        && let Some(class_name) = find_parent_class_name(def_node, source)
+    {
+        parts.push(class_name.to_string());
+    }
+    parts.push(name.to_string());
+    parts.join(sep)
+}
+
 fn build_qualified_name(
     name: &str,
     kind: SymbolKind,
@@ -495,19 +523,7 @@ fn build_qualified_name(
     namespace: &Option<String>,
 ) -> String {
     match language {
-        Language::Php => {
-            let mut parts = Vec::new();
-            if let Some(ns) = namespace {
-                parts.push(ns.as_str().to_string());
-            }
-            if (kind == SymbolKind::Method || kind == SymbolKind::Constant)
-                && let Some(class_name) = find_parent_class_name(def_node, source)
-            {
-                parts.push(class_name.to_string());
-            }
-            parts.push(name.to_string());
-            parts.join("\\")
-        }
+        Language::Php => join_qualified(name, kind, def_node, source, namespace, "\\"),
         Language::Python => {
             if kind == SymbolKind::Method
                 && let Some(class_name) = find_parent_class_name(def_node, source)
@@ -521,19 +537,7 @@ fn build_qualified_name(
         // exists only to keep the match exhaustive; the dispatcher never
         // reaches here for Cpp.
         Language::Cpp => name.to_string(),
-        Language::Java => {
-            let mut parts = Vec::new();
-            if let Some(package) = namespace {
-                parts.push(package.as_str().to_string());
-            }
-            if (kind == SymbolKind::Method || kind == SymbolKind::Constant)
-                && let Some(class_name) = find_parent_class_name(def_node, source)
-            {
-                parts.push(class_name.to_string());
-            }
-            parts.push(name.to_string());
-            parts.join(".")
-        }
+        Language::Java => join_qualified(name, kind, def_node, source, namespace, "."),
         Language::Rust => {
             if kind == SymbolKind::Method
                 && let Some(type_name) = find_parent_class_name(def_node, source)
