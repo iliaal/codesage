@@ -24,7 +24,10 @@ use anyhow::Result;
 use codesage_protocol::{FeatureConfidence, FeatureKind, Language};
 use regex::Regex;
 
-use crate::mappers::shared::{is_safe_dir, is_safe_file, strip_line_comments, walk_files};
+use crate::mappers::shared::{
+    AUTH_SENSITIVE_TAG, is_safe_dir, is_safe_file, route_is_auth_sensitive, strip_line_comments,
+    walk_files,
+};
 use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile, SeedTest};
 
 /// Extract the body of a `[name]` section from a TOML-like document
@@ -74,6 +77,7 @@ impl FeatureMapper for PythonMapper {
         seeds.extend(main_guard_modules(ctx)?);
         seeds.extend(flask_routes(ctx)?);
         seeds.extend(fastapi_routes(ctx)?);
+        seeds.extend(django_routes(ctx)?);
         seeds.extend(pytest_test_suites(ctx, test_cmd.as_deref())?);
         seeds.retain(|s| ctx.allowed(&s.entry_path));
         Ok(seeds)
@@ -1010,6 +1014,14 @@ fn push_python_route_seed(
             ctx.recv,
         ),
     };
+    let mut tags = vec![
+        "python".to_string(),
+        ctx.framework.tag().to_string(),
+        "route".to_string(),
+    ];
+    if route_is_auth_sensitive(method, path) {
+        tags.push(AUTH_SENSITIVE_TAG.to_string());
+    }
     ctx.out.push(FeatureSeed {
         title: format!("{} route `{}`", ctx.framework.label(), route_label),
         summary,
@@ -1022,16 +1034,399 @@ fn push_python_route_seed(
         entry_command: None,
         test_command: None,
         language: Language::Python,
-        tags: vec![
-            "python".to_string(),
-            ctx.framework.tag().to_string(),
-            "route".to_string(),
-        ],
+        tags,
         owned_files: Vec::new(),
         context_files: Vec::new(),
         tests: Vec::new(),
         test_prefixes: vec!["tests".to_string()],
     });
+}
+
+// ---- Django URLconf route mapping -------------------------------------
+
+/// Django route detection. Scans `.py` files that import from `django.urls`
+/// / `django.conf.urls` and declare a `urlpatterns = [...]` list for
+/// `path()`, `re_path()`, and (legacy) `url()` route entries. Emits one
+/// `route` feature per distinct normalized URL, with the view's symbol as
+/// `entry_symbol` when it can be resolved.
+///
+/// Known limitations (deliberately conservative, matching the Flask /
+/// FastAPI mappers): `include(...)` mounts are NOT expanded into their
+/// sub-URLConf — the mount prefix is dropped rather than guessed, so the
+/// child app's own `urls.py` contributes its routes without the prefix.
+/// Non-literal route patterns (a variable instead of a string) are skipped.
+/// Django binds no HTTP method at the URL layer, so route labels carry the
+/// path only; the `auth-sensitive` tag therefore fires on path shape alone.
+fn django_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
+    let root = ctx.root;
+    let mut out = Vec::new();
+    let files = walk_files(root, root, 30_000, ctx.excludes);
+    let import_re = Regex::new(
+        r"(?m)^\s*(?:from\s+django\.(?:urls|conf\.urls)\s+import\b|import\s+django\.(?:urls|conf\.urls)\b)",
+    )?;
+    // group 1 = the char before the helper (or start), used to reject
+    // attribute access like `views.url(`; group 2 = the helper name.
+    let call_re = Regex::new(r"(^|[^.\w])(path|re_path|url)\s*\(")?;
+
+    for rel in files.iter().filter(|p| p.ends_with(".py")) {
+        let abs = root.join(rel);
+        let Ok(raw) = fs::read_to_string(&abs) else {
+            continue;
+        };
+        // Cheap gates before the comment strip + regex work.
+        if !raw.contains("urlpatterns") || !raw.contains("django") {
+            continue;
+        }
+        let source = strip_line_comments(&raw, '#');
+        if !import_re.is_match(&source) {
+            continue;
+        }
+        let mut emitted: BTreeSet<String> = BTreeSet::new();
+        for body in django_urlpatterns_bodies(&source) {
+            let body_bytes = body.as_bytes();
+            for cap in call_re.captures_iter(&body) {
+                let whole = cap.get(0).expect("group 0");
+                let helper = cap.get(2).expect("helper group").as_str();
+                let open_idx = whole.end() - 1;
+                if body_bytes.get(open_idx) != Some(&b'(') {
+                    continue;
+                }
+                let Some(close) = find_balanced_close(body_bytes, open_idx) else {
+                    continue;
+                };
+                let args = &body[open_idx + 1..close];
+                let Some((route, symbol)) = parse_django_route(helper, args) else {
+                    continue;
+                };
+                if route.is_empty() || !emitted.insert(route.clone()) {
+                    continue;
+                }
+                push_django_route_seed(&mut out, rel, &route, symbol.as_deref());
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn push_django_route_seed(
+    out: &mut Vec<FeatureSeed>,
+    rel: &str,
+    route: &str,
+    symbol: Option<&str>,
+) {
+    let summary = match symbol {
+        Some(s) => format!("Django route {route} handled by `{s}` declared in {rel}"),
+        None => format!("Django route {route} declared in {rel}"),
+    };
+    let mut tags = vec![
+        "python".to_string(),
+        "framework:django".to_string(),
+        "route".to_string(),
+    ];
+    if route_is_auth_sensitive("", route) {
+        tags.push(AUTH_SENSITIVE_TAG.to_string());
+    }
+    out.push(FeatureSeed {
+        title: format!("Django route `{route}`"),
+        summary,
+        kind: FeatureKind::Route,
+        source: "django-route",
+        confidence: FeatureConfidence::High,
+        entry_path: rel.to_string(),
+        entry_symbol: symbol.map(String::from),
+        entry_route: Some(route.to_string()),
+        entry_command: None,
+        test_command: None,
+        language: Language::Python,
+        tags,
+        owned_files: Vec::new(),
+        context_files: Vec::new(),
+        tests: Vec::new(),
+        test_prefixes: vec!["tests".to_string()],
+    });
+}
+
+/// Extract the inner text of every `urlpatterns = [ … ]` (or `+= [ … ]`)
+/// list literal in a source file. The opening `[` must sit on the same
+/// line as the assignment; the matching `]` is found with bracket balance
+/// that skips string literals (so a `]` inside a regex pattern string does
+/// not close the list early).
+fn django_urlpatterns_bodies(source: &str) -> Vec<String> {
+    let re = match Regex::new(r"(?m)^\s*urlpatterns\s*\+?=\s*\[") {
+        Ok(re) => re,
+        Err(_) => return Vec::new(),
+    };
+    let bytes = source.as_bytes();
+    let mut out = Vec::new();
+    for m in re.find_iter(source) {
+        let open_idx = m.end() - 1;
+        if bytes.get(open_idx) != Some(&b'[') {
+            continue;
+        }
+        if let Some(close) = find_balanced_close(bytes, open_idx) {
+            out.push(source[open_idx + 1..close].to_string());
+        }
+    }
+    out
+}
+
+/// Parse one `path()` / `re_path()` / `url()` call's argument string into a
+/// `(normalized_route, view_symbol)` pair. Returns `None` to skip the call:
+/// when the first positional arg isn't a string literal, when the second
+/// positional arg is an `include(...)` mount (not expanded), or when a
+/// regex route can't be normalized.
+fn parse_django_route(helper: &str, args: &str) -> Option<(String, Option<String>)> {
+    let parts = split_top_level_args(args);
+    let raw_route = django_string_literal(parts.first()?)?;
+    let view_raw = parts.get(1).map(|s| s.trim()).unwrap_or("");
+    if view_raw.starts_with("include") {
+        return None;
+    }
+    let route = if helper == "path" {
+        ensure_leading_slash(&strip_django_converters(&raw_route))
+    } else {
+        normalize_django_regex_route(&raw_route)?
+    };
+    let symbol = if view_raw.is_empty() {
+        None
+    } else {
+        django_view_symbol(view_raw)
+    };
+    Some((route, symbol))
+}
+
+/// Strip Django `path()` converter prefixes: `<int:year>` → `<year>`,
+/// `<slug:title>` → `<title>`, while a bare `<year>` is left intact.
+fn strip_django_converters(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '<' {
+            let mut inner = String::new();
+            for d in chars.by_ref() {
+                if d == '>' {
+                    break;
+                }
+                inner.push(d);
+            }
+            let name = inner.rsplit(':').next().unwrap_or(&inner);
+            out.push('<');
+            out.push_str(name);
+            out.push('>');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Normalize a `re_path()` / `url()` regex into a readable path: drop the
+/// `^`/`$` anchors, rewrite named capture groups `(?P<name>…)` to `<name>`,
+/// and unescape `\/` and `\.`. Best-effort — remaining regex metacharacters
+/// are left as-is rather than guessed at.
+fn normalize_django_regex_route(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let no_caret = trimmed.strip_prefix('^').unwrap_or(trimmed);
+    let no_anchor = no_caret.strip_suffix('$').unwrap_or(no_caret);
+    let groups = convert_django_named_groups(no_anchor);
+    let unescaped = groups.replace("\\/", "/").replace("\\.", ".");
+    Some(ensure_leading_slash(&unescaped))
+}
+
+/// Rewrite each `(?P<name>pattern)` named capture group to `<name>`,
+/// discarding the inner pattern. Matching parens are found with bracket
+/// balance so nested groups collapse correctly.
+fn convert_django_named_groups(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if s[i..].starts_with("(?P<")
+            && let Some(gt) = s[i + 4..].find('>')
+            && let Some(close) = find_balanced_close(bytes, i)
+        {
+            let name = &s[i + 4..i + 4 + gt];
+            out.push('<');
+            out.push_str(name);
+            out.push('>');
+            i = close + 1;
+            continue;
+        }
+        let len = utf8_char_len(bytes[i]);
+        out.push_str(&s[i..i + len]);
+        i += len;
+    }
+    out
+}
+
+/// Resolve a Django view argument to a symbol name: `views.article_list`
+/// → `article_list`, `ArticleView.as_view()` → `ArticleView`, a bare
+/// `home` → `home`. Returns `None` when the result isn't a clean
+/// identifier (e.g. a `view=` kwarg or an inline lambda), or when the
+/// argument is a urlconf mount rather than a view: a bare dotted attribute
+/// ending in `.urls` (`admin.site.urls`, `app.urls`) names an included
+/// URLconf, so its leaf (`urls`) is a meaningless "handler" — keep the
+/// route, drop the symbol. (`include('app.urls')` is filtered earlier; this
+/// catches the attribute-style mount Django's own templates use.)
+fn django_view_symbol(raw: &str) -> Option<String> {
+    let head = raw.split('(').next().unwrap_or(raw).trim();
+    // Attribute-style urlconf mount (no call): `x.y.urls` with ≥2 segments.
+    if !head.contains("()") && head.ends_with(".urls") && head.matches('.').count() >= 1 {
+        return None;
+    }
+    let head = head.strip_suffix(".as_view").unwrap_or(head);
+    let last = head.rsplit('.').next().unwrap_or(head).trim();
+    if last.is_empty() {
+        return None;
+    }
+    let mut cs = last.chars();
+    let first_ok = cs.next().is_some_and(|c| c.is_alphabetic() || c == '_');
+    let rest_ok = last.chars().all(|c| c.is_alphanumeric() || c == '_');
+    if first_ok && rest_ok {
+        Some(last.to_string())
+    } else {
+        None
+    }
+}
+
+/// Extract the value of a leading string literal from an argument slice,
+/// tolerating Python string prefixes (`r`, `b`, `u`, `f`). Returns `None`
+/// when the slice doesn't start with a quoted literal.
+fn django_string_literal(arg: &str) -> Option<String> {
+    let s = arg.trim_start();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len()
+        && matches!(
+            bytes[i],
+            b'r' | b'R' | b'b' | b'B' | b'u' | b'U' | b'f' | b'F'
+        )
+    {
+        i += 1;
+    }
+    let quote = *bytes.get(i)?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    i += 1;
+    let start = i;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if escaped {
+            escaped = false;
+        } else if c == b'\\' {
+            escaped = true;
+        } else if c == quote {
+            return Some(s[start..i].to_string());
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Split a call's argument string on top-level commas, respecting string
+/// literals and nested `()`/`[]`/`{}`. Each returned element is trimmed.
+fn split_top_level_args(args: &str) -> Vec<String> {
+    let bytes = args.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+        } else {
+            match c {
+                b'"' | b'\'' => quote = Some(c),
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                b',' if depth == 0 => {
+                    parts.push(args[start..i].trim().to_string());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    let last = args[start..].trim();
+    if !last.is_empty() {
+        parts.push(last.to_string());
+    }
+    parts
+}
+
+/// Find the index of the bracket that closes the one at `open_idx`,
+/// skipping `'…'` / `"…"` string literals. Works for `(`, `[`, `{`.
+fn find_balanced_close(bytes: &[u8], open_idx: usize) -> Option<usize> {
+    let open = *bytes.get(open_idx)?;
+    let close = match open {
+        b'(' => b')',
+        b'[' => b']',
+        b'{' => b'}',
+        _ => return None,
+    };
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    let mut i = open_idx;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+        } else if c == b'"' || c == b'\'' {
+            quote = Some(c);
+        } else if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Width in bytes of the UTF-8 sequence starting with `b` (falls back to 1
+/// for stray continuation bytes so the caller always advances).
+fn utf8_char_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else if b >> 3 == 0b11110 {
+        4
+    } else {
+        1
+    }
+}
+
+fn ensure_leading_slash(p: &str) -> String {
+    if p.starts_with('/') {
+        p.to_string()
+    } else {
+        format!("/{p}")
+    }
 }
 
 // ---- pytest test-suite mapping ----------------------------------------
@@ -2074,6 +2469,229 @@ async def admin_panel():
             .find(|s| s.source == "fastapi-route" && s.entry_route.as_deref() == Some("GET /admin"))
             .expect("stacked decorator missed");
         assert_eq!(seed.entry_symbol.as_deref(), Some("admin_panel"));
+    }
+
+    #[test]
+    fn django_path_routes_recognized() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
+        write(
+            dir.path(),
+            "urls.py",
+            r#"
+from django.urls import path
+from . import views
+
+urlpatterns = [
+    path("", views.home, name="home"),
+    path("articles/<int:year>/", views.year_archive),
+    path("admin/", views.admin_dashboard),
+]
+"#,
+        );
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let routes: std::collections::BTreeSet<String> = seeds
+            .iter()
+            .filter(|s| s.source == "django-route")
+            .filter_map(|s| s.entry_route.clone())
+            .collect();
+        assert!(routes.contains("/"), "got: {routes:?}");
+        assert!(
+            routes.contains("/articles/<year>/"),
+            "converter not stripped: {routes:?}"
+        );
+        assert!(routes.contains("/admin/"), "got: {routes:?}");
+        // view symbol resolved off the `views.` attribute access
+        let home = seeds
+            .iter()
+            .find(|s| s.source == "django-route" && s.entry_route.as_deref() == Some("/"))
+            .unwrap();
+        assert_eq!(home.entry_symbol.as_deref(), Some("home"));
+        // path-shape auth-sensitive tag fires on /admin/
+        let admin = seeds
+            .iter()
+            .find(|s| s.source == "django-route" && s.entry_route.as_deref() == Some("/admin/"))
+            .unwrap();
+        assert!(
+            admin.tags.iter().any(|t| t == "auth-sensitive"),
+            "admin route should be auth-sensitive: {:?}",
+            admin.tags
+        );
+        // a plain GET-shape article route should not be flagged
+        let archive = seeds
+            .iter()
+            .find(|s| {
+                s.source == "django-route" && s.entry_route.as_deref() == Some("/articles/<year>/")
+            })
+            .unwrap();
+        assert!(!archive.tags.iter().any(|t| t == "auth-sensitive"));
+    }
+
+    #[test]
+    fn django_re_path_normalized() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
+        write(
+            dir.path(),
+            "urls.py",
+            r#"
+from django.urls import re_path
+from . import views
+
+urlpatterns = [
+    re_path(r"^articles/(?P<slug>[\w-]+)/$", views.detail),
+]
+"#,
+        );
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let seed = seeds
+            .iter()
+            .find(|s| s.source == "django-route")
+            .expect("re_path route missing");
+        assert_eq!(seed.entry_route.as_deref(), Some("/articles/<slug>/"));
+        assert_eq!(seed.entry_symbol.as_deref(), Some("detail"));
+    }
+
+    #[test]
+    fn django_as_view_symbol_and_include_skipped() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
+        write(
+            dir.path(),
+            "urls.py",
+            r#"
+from django.urls import path, include
+from .views import ArticleList
+
+urlpatterns = [
+    path("articles/", ArticleList.as_view(), name="articles"),
+    path("blog/", include("blog.urls")),
+]
+"#,
+        );
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let routes: std::collections::BTreeSet<String> = seeds
+            .iter()
+            .filter(|s| s.source == "django-route")
+            .filter_map(|s| s.entry_route.clone())
+            .collect();
+        // class-based view resolves to the class name
+        let cbv = seeds
+            .iter()
+            .find(|s| s.source == "django-route" && s.entry_route.as_deref() == Some("/articles/"))
+            .expect("CBV route missing");
+        assert_eq!(cbv.entry_symbol.as_deref(), Some("ArticleList"));
+        // include() mount is NOT emitted as a route of its own
+        assert!(
+            !routes.contains("/blog/"),
+            "include() mount should be skipped: {routes:?}"
+        );
+    }
+
+    #[test]
+    fn django_admin_site_urls_mount_keeps_route_drops_symbol() {
+        // `path('admin/', admin.site.urls)` — the stock Django route present
+        // in every project. It's a urlconf mount, not a view; the route is
+        // real (and auth-sensitive) but `urls` is a junk handler symbol.
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
+        write(
+            dir.path(),
+            "urls.py",
+            r#"
+from django.contrib import admin
+from django.urls import path
+
+urlpatterns = [
+    path("admin/", admin.site.urls),
+]
+"#,
+        );
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let seed = seeds
+            .iter()
+            .find(|s| s.source == "django-route" && s.entry_route.as_deref() == Some("/admin/"))
+            .expect("admin route missing");
+        assert_eq!(
+            seed.entry_symbol, None,
+            "admin.site.urls mount should not yield a handler symbol, got {:?}",
+            seed.entry_symbol
+        );
+        assert!(
+            seed.tags.iter().any(|t| t == "auth-sensitive"),
+            "/admin/ should still be auth-sensitive"
+        );
+    }
+
+    #[test]
+    fn django_ignores_urlpatterns_examples_in_docstring() {
+        // The stock `startproject` urls.py carries example `path(...)` calls
+        // inside its module docstring. The import gate + urlpatterns anchor
+        // must not emit phantom routes from that prose. Real-repo trap
+        // caught in the GitNexus Django fixture smoke test (2026-06-01).
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
+        write(
+            dir.path(),
+            "urls.py",
+            r#"
+"""
+URL configuration.
+Examples:
+    path('', views.home, name='home')
+    path('blog/', include('blog.urls'))
+"""
+from django.contrib import admin
+from django.urls import path
+
+urlpatterns = [
+    path("admin/", admin.site.urls),
+]
+"#,
+        );
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let routes: std::collections::BTreeSet<String> = seeds
+            .iter()
+            .filter(|s| s.source == "django-route")
+            .filter_map(|s| s.entry_route.clone())
+            .collect();
+        assert_eq!(
+            routes,
+            std::collections::BTreeSet::from(["/admin/".to_string()]),
+            "docstring examples leaked as routes: {routes:?}"
+        );
+    }
+
+    #[test]
+    fn django_requires_django_import() {
+        // `urlpatterns` present but no django.urls import → skip (could be a
+        // coincidental variable name).
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
+        write(
+            dir.path(),
+            "urls.py",
+            r#"
+def path(p, v): return (p, v)
+urlpatterns = [
+    path("/users", lambda r: r),
+]
+"#,
+        );
+        let seeds = PythonMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        assert!(!seeds.iter().any(|s| s.source == "django-route"));
     }
 
     #[test]

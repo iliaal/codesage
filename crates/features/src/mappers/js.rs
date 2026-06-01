@@ -19,7 +19,9 @@ use codesage_protocol::{FeatureConfidence, FeatureKind, Language};
 use regex::Regex;
 use serde_json::Value;
 
-use crate::mappers::shared::{is_safe_dir, is_safe_file, should_skip, walk_files};
+use crate::mappers::shared::{
+    AUTH_SENSITIVE_TAG, is_safe_dir, is_safe_file, route_is_auth_sensitive, should_skip, walk_files,
+};
 use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile};
 
 pub struct JsMapper;
@@ -1732,6 +1734,20 @@ fn node_server_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
                     // two methods on the same path don't collapse to a
                     // single feature_id (orchestrator keys on entry_route).
                     let route_label = format!("{} {}", key.0, path);
+                    let mut tags = vec![
+                        if language == Language::TypeScript {
+                            "typescript"
+                        } else {
+                            "javascript"
+                        }
+                        .to_string(),
+                        framework.tag().to_string(),
+                        "route".to_string(),
+                    ];
+                    // `all` binds every verb — treat as state-changing.
+                    if route_is_auth_sensitive(&key.0, path) {
+                        tags.push(AUTH_SENSITIVE_TAG.to_string());
+                    }
                     out.push(FeatureSeed {
                         title: format!("{} route `{}`", framework.label(), route_label),
                         summary: format!(
@@ -1750,16 +1766,7 @@ fn node_server_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
                         entry_command: None,
                         test_command: None,
                         language,
-                        tags: vec![
-                            if language == Language::TypeScript {
-                                "typescript"
-                            } else {
-                                "javascript"
-                            }
-                            .to_string(),
-                            framework.tag().to_string(),
-                            "route".to_string(),
-                        ],
+                        tags,
                         owned_files: Vec::new(),
                         context_files: Vec::new(),
                         tests: Vec::new(),

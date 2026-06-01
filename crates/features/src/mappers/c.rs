@@ -61,10 +61,22 @@ fn is_c_or_cpp_source(rel: &str) -> bool {
         || rel.ends_with(".hpp")
         || rel.ends_with(".hh")
         || rel.ends_with(".hxx")
+        || is_cuda_source(rel)
 }
 
 fn is_c_or_cpp_compilable(rel: &str) -> bool {
-    rel.ends_with(".c") || rel.ends_with(".cpp") || rel.ends_with(".cc") || rel.ends_with(".cxx")
+    rel.ends_with(".c")
+        || rel.ends_with(".cpp")
+        || rel.ends_with(".cc")
+        || rel.ends_with(".cxx")
+        || rel.ends_with(".cu")
+}
+
+/// CUDA source / header: `.cu` is a compilable translation unit, `.cuh` is
+/// a CUDA header. Both classify as C/C++ for mapping purposes (there is no
+/// distinct `Cuda` language); the `cuda` tag on the seed is what marks them.
+fn is_cuda_source(rel: &str) -> bool {
+    rel.ends_with(".cu") || rel.ends_with(".cuh")
 }
 
 /// Path looks like a C/C++ test fixture under conventional naming:
@@ -208,11 +220,32 @@ fn lang_for_path(rel: &str) -> Language {
         || rel.ends_with(".hpp")
         || rel.ends_with(".hh")
         || rel.ends_with(".hxx")
+        || is_cuda_source(rel)
     {
         Language::Cpp
     } else {
         Language::C
     }
+}
+
+/// Build the tag vector for a CMake target seed: the language tag
+/// (`c`/`cpp`), a kind tag (`cli`/`library`/`test`), and `cuda` when the
+/// target was declared via a `cuda_add_*` macro or pulls in any `.cu` /
+/// `.cuh` source.
+fn cmake_target_tags(language: Language, kind_tag: &str, is_cuda: bool) -> Vec<String> {
+    let mut tags = vec![
+        if language == Language::Cpp {
+            "cpp"
+        } else {
+            "c"
+        }
+        .to_string(),
+        kind_tag.to_string(),
+    ];
+    if is_cuda {
+        tags.push("cuda".to_string());
+    }
+    tags
 }
 
 fn autotools_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSeed>> {
@@ -408,7 +441,19 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
             extra_sources.entry(name).or_default().extend(words);
         }
 
-        for args in cmake_command_args(&body, "add_executable") {
+        // `add_executable(...)` plus the legacy FindCUDA `cuda_add_executable(...)`
+        // macro; the latter always marks the target CUDA, the former is CUDA
+        // only if it pulls in a `.cu` / `.cuh` source.
+        let exe_calls: Vec<(String, bool)> = cmake_command_args(&body, "add_executable")
+            .into_iter()
+            .map(|a| (a, false))
+            .chain(
+                cmake_command_args(&body, "cuda_add_executable")
+                    .into_iter()
+                    .map(|a| (a, true)),
+            )
+            .collect();
+        for (args, macro_is_cuda) in exe_calls {
             let mut words = cmake_split_args(&args);
             if words.is_empty() {
                 continue;
@@ -421,6 +466,7 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
             if let Some(extra) = extra_sources.get(&name) {
                 all_sources.extend(extra.iter().cloned());
             }
+            let is_cuda = macro_is_cuda || all_sources.iter().any(|s| is_cuda_source(s));
             // Variable substitution (${VAR}) and absolute paths are not
             // resolvable without a full CMake interpreter; skip the target
             // rather than emit a misleading seed.
@@ -456,11 +502,6 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
             // `recommend_tests` and PR-level risk views pick it up
             // correctly; otherwise emit the regular `cmake-bin` cli seed.
             if is_cmake_test_executable(&name, &all_sources) {
-                let lang_tag = if language == Language::Cpp {
-                    "cpp"
-                } else {
-                    "c"
-                };
                 let test_paths: Vec<&SeedFile> = owned_files
                     .iter()
                     .filter(|f| is_c_or_cpp_test_path(&f.path))
@@ -484,7 +525,7 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
                     entry_command: None,
                     test_command: None,
                     language,
-                    tags: vec![lang_tag.to_string(), "test".to_string()],
+                    tags: cmake_target_tags(language, "test", is_cuda),
                     owned_files,
                     context_files,
                     tests,
@@ -504,22 +545,23 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
                 entry_command: Some(name),
                 test_command: None,
                 language,
-                tags: vec![
-                    if language == Language::Cpp {
-                        "cpp"
-                    } else {
-                        "c"
-                    }
-                    .to_string(),
-                    "cli".to_string(),
-                ],
+                tags: cmake_target_tags(language, "cli", is_cuda),
                 owned_files,
                 context_files,
                 tests: Vec::new(),
                 test_prefixes: vec![format!("{}tests", dir)],
             });
         }
-        for args in cmake_command_args(&body, "add_library") {
+        let lib_calls: Vec<(String, bool)> = cmake_command_args(&body, "add_library")
+            .into_iter()
+            .map(|a| (a, false))
+            .chain(
+                cmake_command_args(&body, "cuda_add_library")
+                    .into_iter()
+                    .map(|a| (a, true)),
+            )
+            .collect();
+        for (args, macro_is_cuda) in lib_calls {
             let mut words = cmake_split_args(&args);
             if words.is_empty() {
                 continue;
@@ -535,6 +577,7 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
             if let Some(extra) = extra_sources.get(&name) {
                 all_sources.extend(extra.iter().cloned());
             }
+            let is_cuda = macro_is_cuda || all_sources.iter().any(|s| is_cuda_source(s));
             if all_sources.iter().any(|s| is_pathological_source(s)) {
                 continue;
             }
@@ -579,15 +622,7 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
                 entry_command: None,
                 test_command: None,
                 language,
-                tags: vec![
-                    if language == Language::Cpp {
-                        "cpp"
-                    } else {
-                        "c"
-                    }
-                    .to_string(),
-                    "library".to_string(),
-                ],
+                tags: cmake_target_tags(language, "library", is_cuda),
                 owned_files,
                 context_files,
                 tests: Vec::new(),
@@ -666,15 +701,7 @@ fn main_function_targets(
             entry_command: Some(bin_name),
             test_command: None,
             language,
-            tags: vec![
-                if language == Language::Cpp {
-                    "cpp"
-                } else {
-                    "c"
-                }
-                .to_string(),
-                "cli".to_string(),
-            ],
+            tags: cmake_target_tags(language, "cli", is_cuda_source(rel)),
             owned_files: Vec::new(),
             context_files: Vec::new(),
             tests: Vec::new(),
@@ -1832,6 +1859,88 @@ mod tests {
             owned.contains(&"src/a.c") && owned.contains(&"src/b.c"),
             "real sources missing: {owned:?}"
         );
+    }
+
+    #[test]
+    fn cmake_cuda_add_executable_tagged_cuda() {
+        // `cuda_add_executable` (legacy FindCUDA) is always a CUDA target.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "CMakeLists.txt",
+            "cuda_add_executable(sim src/sim.cu)\n",
+        );
+        write(dir.path(), "src/sim.cu", "int main(){return 0;}\n");
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "cmake-bin" && s.entry_command.as_deref() == Some("sim"))
+            .expect("cuda_add_executable seed missing");
+        assert!(s.tags.iter().any(|t| t == "cuda"), "tags: {:?}", s.tags);
+    }
+
+    #[test]
+    fn cmake_add_executable_with_cu_source_tagged_cuda() {
+        // Plain `add_executable` becomes a CUDA target when any source is .cu.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "CMakeLists.txt",
+            "add_executable(app src/main.cpp src/kernel.cu)\n",
+        );
+        write(dir.path(), "src/main.cpp", "int main(){return 0;}\n");
+        write(dir.path(), "src/kernel.cu", "__global__ void k(){}\n");
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "cmake-bin" && s.entry_command.as_deref() == Some("app"))
+            .expect("add_executable seed missing");
+        assert!(s.tags.iter().any(|t| t == "cuda"), "tags: {:?}", s.tags);
+        // .cu owned source must be recorded, not filtered out.
+        let owned: Vec<&str> = s.owned_files.iter().map(|f| f.path.as_str()).collect();
+        assert!(owned.contains(&"src/kernel.cu"), "owned: {owned:?}");
+    }
+
+    #[test]
+    fn standalone_cu_main_tagged_cuda() {
+        // A `.cu` file with main() and no build system → c-main seed, cuda tag.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "tool.cu",
+            "#include <cuda_runtime.h>\nint main(){return 0;}\n",
+        );
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "c-main" && s.entry_path == "tool.cu")
+            .expect("c-main seed for .cu missing");
+        assert!(s.tags.iter().any(|t| t == "cuda"), "tags: {:?}", s.tags);
+    }
+
+    #[test]
+    fn non_cuda_target_has_no_cuda_tag() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "CMakeLists.txt",
+            "add_executable(plain src/main.c)\n",
+        );
+        write(dir.path(), "src/main.c", "int main(){return 0;}\n");
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "cmake-bin" && s.entry_command.as_deref() == Some("plain"))
+            .expect("plain seed missing");
+        assert!(!s.tags.iter().any(|t| t == "cuda"), "tags: {:?}", s.tags);
     }
 
     #[test]

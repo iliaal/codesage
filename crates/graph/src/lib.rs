@@ -6,8 +6,8 @@ pub mod semantic;
 pub mod session;
 
 pub use git_history::{
-    IndexMode, assess_risk, assess_risk_batch, assess_risk_diff, find_coupling, git_history_index,
-    git_history_index_with_options, recommend_tests,
+    IndexMode, assess_risk, assess_risk_batch, assess_risk_diff, changed_files_since,
+    find_coupling, git_history_index, git_history_index_with_options, recommend_tests,
 };
 pub use index::{full_index, incremental_index};
 pub use query::{

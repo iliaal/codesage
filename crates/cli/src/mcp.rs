@@ -12,11 +12,11 @@ use codesage_graph::{
     list_dependencies, recommend_tests, search, session_end, session_start,
 };
 use codesage_protocol::{
-    ContextBundle, CouplingReport, DependencyEntry, ExportRequest, FeatureKind, FeatureListResults,
-    FindReferencesRequest, FindReferencesResults, FindSymbolRequest, FindSymbolResults,
-    ImpactAnalysisResults, ImpactRequest, ImpactTarget, Language, ReferenceKind, RiskAssessment,
-    RiskBatchAssessment, RiskDiffAssessment, SearchRequest, SearchResults, SessionDiff,
-    SessionSnapshot, SymbolKind, TestRecommendations,
+    ContextBundle, CouplingReport, DependencyEntry, ExportRequest, FeatureFileRole, FeatureKind,
+    FeatureListResults, FindReferencesRequest, FindReferencesResults, FindSymbolRequest,
+    FindSymbolResults, ImpactAnalysisResults, ImpactRequest, ImpactTarget, Language, ReferenceKind,
+    RiskAssessment, RiskBatchAssessment, RiskDiffAssessment, SearchRequest, SearchResults,
+    SessionDiff, SessionSnapshot, SymbolKind, TestRecommendations,
 };
 use codesage_storage::Database;
 use parking_lot::Mutex;
@@ -224,6 +224,10 @@ pub struct ListFeaturesParams {
     pub language: Option<String>,
     #[schemars(description = "Filter by tag substring (e.g. \"framework:laravel\", \"library\")")]
     pub tag: Option<String>,
+    #[schemars(
+        description = "Keep only features whose entry/owned/context files changed since this git ref (e.g. \"main\", \"HEAD~5\"). Uses `git diff <ref>...HEAD`; errors if the ref is unknown."
+    )]
+    pub since: Option<String>,
     #[schemars(description = "Max results (default 100, 0 = no limit)")]
     #[serde(default, deserialize_with = "deser_optional_usize")]
     pub limit: Option<usize>,
@@ -989,10 +993,32 @@ impl CodeSageServer {
         let kind = params.kind.as_deref().and_then(FeatureKind::parse);
         let language = params.language.as_deref().and_then(Language::parse);
         let tag = params.tag.clone();
+        let since = params.since.clone();
         let limit = params.limit.unwrap_or(100);
+        // With `since`, fetch unbounded then cap after the changed-file
+        // intersection, mirroring the CLI: the SQL LIMIT runs before the
+        // diff filter, so a pre-filter limit would truncate candidates.
+        let query_limit = if since.is_some() { 0 } else { limit };
         render_with_kind(
-            self.with_project_db(&params.project, |db| {
-                db.list_features(kind, language, tag.as_deref(), limit)
+            self.with_project_root_db(&params.project, |root, db| {
+                let mut features = db.list_features(kind, language, tag.as_deref(), query_limit)?;
+                if let Some(git_ref) = since.as_deref() {
+                    let changed = codesage_graph::changed_files_since(root, git_ref)?;
+                    features.retain(|f| {
+                        f.files.iter().any(|file| {
+                            matches!(
+                                file.role,
+                                FeatureFileRole::Entry
+                                    | FeatureFileRole::Owned
+                                    | FeatureFileRole::Context
+                            ) && changed.contains(&file.path)
+                        })
+                    });
+                    if limit > 0 && features.len() > limit {
+                        features.truncate(limit);
+                    }
+                }
+                Ok(features)
             }),
             "list_features",
         )

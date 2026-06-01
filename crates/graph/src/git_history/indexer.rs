@@ -386,6 +386,43 @@ fn resolve_head_sha(root: &Path) -> Result<String> {
         .to_string())
 }
 
+/// Files that changed on `HEAD` since it diverged from `git_ref`, as a set
+/// of repo-relative POSIX paths. Runs `git diff --name-only --relative
+/// <git_ref>...HEAD` — the three-dot form (merge-base symmetric difference),
+/// matching clawpatch's `changedFilesSince`, so the result is "what HEAD
+/// changed relative to where it branched from `git_ref`" rather than every
+/// difference between the two tips. `--relative` yields paths relative to
+/// the repo root (cwd), which is how `feature_files.path` is stored, so the
+/// caller can intersect directly without normalization.
+///
+/// Returns an error if the ref can't be resolved (exit 128) so the caller
+/// can surface a clear "unknown git ref" message rather than silently
+/// treating it as "nothing changed".
+pub fn changed_files_since(
+    root: &Path,
+    git_ref: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let range = format!("{git_ref}...HEAD");
+    let out = Command::new("git")
+        .args(["diff", "--name-only", "--relative", &range])
+        .current_dir(root)
+        .output()
+        .with_context(|| format!("git diff --name-only {range} in {}", root.display()))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "git diff --name-only {range} failed (is `{git_ref}` a valid ref?): {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8(out.stdout).context("git diff output not UTF-8")?;
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| l.replace('\\', "/"))
+        .collect())
+}
+
 fn is_ancestor(root: &Path, old: &str, new: &str) -> Result<bool> {
     // Distinguishes spawn failure (git missing / setup error -> propagate) from a clean
     // exit-1 (genuine "not an ancestor", caller falls back to full rescan). Exit-128

@@ -25,6 +25,12 @@ pub fn detect_language_with_dialect(path: &Path, header_is_cpp: bool) -> Option<
         } else {
             Language::C
         }),
+        // CUDA sources/headers parse as C++ (the tree-sitter-cpp grammar
+        // handles the includes/functions/calls we extract; `__global__` &c.
+        // produce a few error nodes but don't block extraction). Kept OUT of
+        // `is_unambiguous_cpp_extension` so a C project that happens to carry
+        // a `.cu` file doesn't have its `.h` headers re-routed to C++.
+        "cu" | "cuh" => Some(Language::Cpp),
         // Unambiguous C++ source / header / module extensions. Single source of
         // truth in `is_unambiguous_cpp_extension`, shared with `.h`-dialect routing.
         _ if is_unambiguous_cpp_extension(ext) => Some(Language::Cpp),
@@ -122,6 +128,23 @@ mod tests {
                 "{ext} should be C++"
             );
         }
+    }
+
+    #[test]
+    fn cuda_extensions_are_cpp() {
+        assert_eq!(detect_language(Path::new("kernel.cu")), Some(Language::Cpp));
+        assert_eq!(
+            detect_language(Path::new("kernel.cuh")),
+            Some(Language::Cpp)
+        );
+    }
+
+    #[test]
+    fn cuda_extension_does_not_route_c_headers_to_cpp() {
+        // `.cu`/`.cuh` are NOT in is_unambiguous_cpp_extension, so a project
+        // carrying a `.cu` file must not flip its `.h` headers to C++.
+        assert!(!is_unambiguous_cpp_extension("cu"));
+        assert!(!is_unambiguous_cpp_extension("cuh"));
     }
 
     #[test]

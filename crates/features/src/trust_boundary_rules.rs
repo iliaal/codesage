@@ -496,6 +496,13 @@ const C_RULES: &[TrustBoundaryRule] = &[
     rule("stdatomic.h", MatchMode::Exact, CONCURRENCY),
     rule("threads.h", MatchMode::Exact, CONCURRENCY),
     rule("semaphore.h", MatchMode::Exact, CONCURRENCY),
+    // CUDA: device kernels run on the GPU concurrently with the host, so a
+    // CUDA include marks a concurrency boundary. Inherited by C++ (.cu/.cuh
+    // classify as Cpp, which merges C_RULES).
+    rule("cuda.h", MatchMode::Exact, CONCURRENCY),
+    rule("cuda_runtime.h", MatchMode::Exact, CONCURRENCY),
+    rule("cuda_runtime_api.h", MatchMode::Exact, CONCURRENCY),
+    rule("device_launch_parameters.h", MatchMode::Exact, CONCURRENCY),
     // call-site rules (when refs.kind = 'call' captures these)
     rule("getenv", MatchMode::Exact, SECRETS),
     rule("setenv", MatchMode::Exact, SECRETS),

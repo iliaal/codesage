@@ -13,6 +13,8 @@ mod indexer;
 mod risk;
 mod tests_rec;
 
-pub use indexer::{IndexMode, git_history_index, git_history_index_with_options};
+pub use indexer::{
+    IndexMode, changed_files_since, git_history_index, git_history_index_with_options,
+};
 pub use risk::{assess_risk, assess_risk_batch, assess_risk_diff, find_coupling};
 pub use tests_rec::recommend_tests;

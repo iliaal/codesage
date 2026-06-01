@@ -260,6 +260,25 @@ mod tests {
     }
 
     #[test]
+    fn cuda_include_yields_concurrency() {
+        // `.cu`/`.cuh` files are parsed as C++; the CUDA headers live in the
+        // C rule table (inherited by C++) and map to a concurrency boundary.
+        for header in [
+            "cuda.h",
+            "cuda_runtime.h",
+            "cuda_runtime_api.h",
+            "device_launch_parameters.h",
+        ] {
+            let b = derive_from_refs(&[inc(header)], Language::Cpp);
+            assert_eq!(
+                b,
+                vec![TrustBoundary::Concurrency],
+                "{header} should yield concurrency"
+            );
+        }
+    }
+
+    #[test]
     fn python_requests_yields_network_external_api() {
         let refs = vec![imp("requests.get")];
         let b = derive_from_refs(&refs, Language::Python);

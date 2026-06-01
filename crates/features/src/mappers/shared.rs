@@ -181,6 +181,33 @@ fn strip_line_comment(line: &str, marker: char) -> String {
     }
 }
 
+/// Tag attached to route seeds whose shape suggests a privileged or
+/// state-changing surface (see [`route_is_auth_sensitive`]). Kept as a
+/// free-form seed tag rather than a derived trust boundary: the boundary
+/// model stays single-sourced from parsed imports/references, while this
+/// surfaces a route-shape heuristic for humans and agents reviewing the
+/// slice. Ported from clawpatch's per-route boundary heuristic, demoted to
+/// a tag here.
+pub const AUTH_SENSITIVE_TAG: &str = "auth-sensitive";
+
+/// Heuristic: does a route's shape suggest it needs a closer security look?
+/// True when the method is anything other than `GET`/`HEAD` (i.e. it can
+/// mutate state) or when a path segment is one of `admin` / `auth` /
+/// `login` / `token`. `method` may be empty for frameworks that don't bind
+/// a verb at the URL layer (e.g. Django), in which case only the path is
+/// considered. Matching is segment-exact and case-insensitive, so
+/// `/authors` does NOT match `auth` but `/Auth/login` does.
+pub fn route_is_auth_sensitive(method: &str, path: &str) -> bool {
+    let m = method.trim().to_ascii_uppercase();
+    if !m.is_empty() && m != "GET" && m != "HEAD" {
+        return true;
+    }
+    path.split('/').any(|seg| {
+        let seg = seg.trim().to_ascii_lowercase();
+        matches!(seg.as_str(), "admin" | "auth" | "login" | "token")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +312,31 @@ mod tests {
         let src = "name = \"foo # not a comment\" # real comment\n";
         let out = strip_line_comments(src, '#');
         assert_eq!(out, "name = \"foo # not a comment\" \n");
+    }
+
+    #[test]
+    fn auth_sensitive_by_non_get_method() {
+        assert!(route_is_auth_sensitive("POST", "/users"));
+        assert!(route_is_auth_sensitive("delete", "/users/1"));
+        assert!(!route_is_auth_sensitive("GET", "/users"));
+        assert!(!route_is_auth_sensitive("HEAD", "/users"));
+    }
+
+    #[test]
+    fn auth_sensitive_by_path_segment() {
+        assert!(route_is_auth_sensitive("GET", "/admin"));
+        assert!(route_is_auth_sensitive("GET", "/api/auth/refresh"));
+        assert!(route_is_auth_sensitive("GET", "/Auth/login"));
+        assert!(route_is_auth_sensitive("", "/token"));
+        // Substring-only matches must NOT trigger (segment-exact).
+        assert!(!route_is_auth_sensitive("GET", "/authors"));
+        assert!(!route_is_auth_sensitive("GET", "/tokenizer"));
+    }
+
+    #[test]
+    fn auth_sensitive_empty_method_path_only() {
+        // Django-style: no verb at the URL layer, GET-equivalent default.
+        assert!(!route_is_auth_sensitive("", "/articles"));
+        assert!(route_is_auth_sensitive("", "/admin/users"));
     }
 }

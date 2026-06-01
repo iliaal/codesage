@@ -265,6 +265,10 @@ enum Commands {
         /// Filter by tag substring (e.g. "framework:laravel", "library")
         #[arg(long)]
         tag: Option<String>,
+        /// Keep only features whose entry/owned/context files changed since
+        /// this git ref (e.g. "main", "HEAD~5"). Uses `git diff <ref>...HEAD`.
+        #[arg(long)]
+        since: Option<String>,
         /// Limit (0 = no limit)
         #[arg(long, default_value_t = 100)]
         limit: usize,
@@ -653,12 +657,14 @@ fn run(cli: Cli) -> Result<()> {
             kind,
             lang,
             tag,
+            since,
             limit,
             json,
         } => cmd_features_list(
             kind.as_deref(),
             lang.as_deref(),
             tag.as_deref(),
+            since.as_deref(),
             limit,
             json,
         ),
@@ -1405,10 +1411,11 @@ fn cmd_features_list(
     kind: Option<&str>,
     lang: Option<&str>,
     tag: Option<&str>,
+    since: Option<&str>,
     limit: usize,
     json: bool,
 ) -> Result<()> {
-    use codesage_protocol::{FeatureKind, Language};
+    use codesage_protocol::{FeatureFileRole, FeatureKind, Language};
     let root = find_project_root()?;
     let db = open_db(&root)?;
     let kind = match kind {
@@ -1423,7 +1430,31 @@ fn cmd_features_list(
             Some(Language::parse(l).ok_or_else(|| anyhow::anyhow!("unknown language: {l}"))?)
         }
     };
-    let features = db.list_features(kind, language, tag, limit)?;
+    // With `--since`, fetch unbounded then cap after the changed-file
+    // intersection — the SQL LIMIT runs before our filter, so a default
+    // limit would truncate candidates the diff filter hasn't seen yet.
+    let query_limit = if since.is_some() { 0 } else { limit };
+    let mut features = db.list_features(kind, language, tag, query_limit)?;
+    if let Some(git_ref) = since {
+        let changed = codesage_graph::changed_files_since(&root, git_ref)?;
+        // Entry counts alongside Owned/Context: for many slices (Rust crates,
+        // route handlers, C `main()` binaries) the entrypoint IS the source
+        // file, recorded only as Entry. Test-role siblings are excluded —
+        // a feature whose own code is unchanged shouldn't surface because a
+        // neighbouring test moved; the test-suite slice surfaces via its
+        // own Entry instead.
+        features.retain(|f| {
+            f.files.iter().any(|file| {
+                matches!(
+                    file.role,
+                    FeatureFileRole::Entry | FeatureFileRole::Owned | FeatureFileRole::Context
+                ) && changed.contains(&file.path)
+            })
+        });
+        if limit > 0 && features.len() > limit {
+            features.truncate(limit);
+        }
+    }
     if json {
         println!(
             "{}",
