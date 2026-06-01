@@ -12,7 +12,10 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use codesage_graph::{IndexMode, find_coupling, git_history_index, git_history_index_with_options};
+use codesage_graph::{
+    IndexMode, changed_files_since, find_coupling, git_history_index,
+    git_history_index_with_options,
+};
 use codesage_storage::Database;
 
 fn codesage_repo_root() -> PathBuf {
@@ -175,4 +178,56 @@ fn extra_excludes_skip_git_history_files() {
     assert_eq!(stats.files_tracked, 1);
     assert!(db.git_file("keep/a.rs").unwrap().is_some());
     assert!(db.git_file("skip/b.rs").unwrap().is_none());
+}
+
+#[test]
+fn changed_files_since_returns_only_files_touched_after_ref() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    run_git(root, &["init", "-q"]);
+    run_git(root, &["config", "user.email", "review@example.invalid"]);
+    run_git(root, &["config", "user.name", "Review"]);
+
+    // Commit 1: two files, both untouched after this point except `changed.rs`.
+    std::fs::write(root.join("stable.rs"), "fn stable() {}\n").unwrap();
+    std::fs::write(root.join("changed.rs"), "fn before() {}\n").unwrap();
+    run_git(root, &["add", "."]);
+    run_git(root, &["commit", "-qm", "first"]);
+
+    // Commit 2: modify one existing file, add a new one. `stable.rs` is left alone.
+    std::fs::write(root.join("changed.rs"), "fn after() {}\n").unwrap();
+    std::fs::write(root.join("added.rs"), "fn added() {}\n").unwrap();
+    run_git(root, &["add", "."]);
+    run_git(root, &["commit", "-qm", "second"]);
+
+    let changed = changed_files_since(root, "HEAD~1").unwrap();
+    assert!(
+        changed.contains("changed.rs"),
+        "modified file missing: {changed:?}"
+    );
+    assert!(
+        changed.contains("added.rs"),
+        "added file missing: {changed:?}"
+    );
+    assert!(
+        !changed.contains("stable.rs"),
+        "untouched file should not appear: {changed:?}"
+    );
+    assert_eq!(changed.len(), 2, "exactly two changed files: {changed:?}");
+}
+
+#[test]
+fn changed_files_since_errors_on_unknown_ref() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    run_git(root, &["init", "-q"]);
+    run_git(root, &["config", "user.email", "review@example.invalid"]);
+    run_git(root, &["config", "user.name", "Review"]);
+    std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+    run_git(root, &["add", "."]);
+    run_git(root, &["commit", "-qm", "only"]);
+
+    // An unresolvable ref must surface as an error, not a silent empty set —
+    // otherwise `--since typo` would look like "nothing changed".
+    assert!(changed_files_since(root, "no-such-ref").is_err());
 }

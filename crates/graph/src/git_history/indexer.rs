@@ -423,6 +423,29 @@ pub fn changed_files_since(
         .collect())
 }
 
+/// Whether a feature should survive a `--since <ref>` filter: true when any
+/// of its entry / owned / context files is in `changed`. Test-role files are
+/// excluded on purpose — a slice whose own code is untouched shouldn't
+/// resurface just because a neighbouring test moved; the test suite has its
+/// own slice (anchored on the test file as Entry) that surfaces instead.
+///
+/// Entry is included because for many slice kinds (Rust crates, route
+/// handlers, C `main()` binaries) the entrypoint IS the source file and is
+/// recorded only with the `Entry` role; dropping it made `--since` return
+/// nothing for those, the bug this predicate was extracted to guard.
+pub fn feature_touched_since(
+    files: &[codesage_protocol::FeatureFileRef],
+    changed: &std::collections::HashSet<String>,
+) -> bool {
+    use codesage_protocol::FeatureFileRole;
+    files.iter().any(|f| {
+        matches!(
+            f.role,
+            FeatureFileRole::Entry | FeatureFileRole::Owned | FeatureFileRole::Context
+        ) && changed.contains(&f.path)
+    })
+}
+
 fn is_ancestor(root: &Path, old: &str, new: &str) -> Result<bool> {
     // Distinguishes spawn failure (git missing / setup error -> propagate) from a clean
     // exit-1 (genuine "not an ancestor", caller falls back to full rescan). Exit-128
@@ -628,6 +651,45 @@ fn is_excluded(set: &GlobSet, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn feature_touched_since_matches_entry_owned_context_not_test() {
+        use codesage_protocol::{FeatureFileRef, FeatureFileRole};
+        let f = |path: &str, role| FeatureFileRef {
+            path: path.to_string(),
+            role,
+            reason: None,
+        };
+        let changed: std::collections::HashSet<String> =
+            ["src/main.rs".to_string(), "tests/it.rs".to_string()]
+                .into_iter()
+                .collect();
+
+        // Entry-only match (the Rust-crate / route-handler case the bug hit).
+        assert!(feature_touched_since(
+            &[f("src/main.rs", FeatureFileRole::Entry)],
+            &changed
+        ));
+        // Owned and Context also count.
+        assert!(feature_touched_since(
+            &[f("src/main.rs", FeatureFileRole::Owned)],
+            &changed
+        ));
+        assert!(feature_touched_since(
+            &[f("src/main.rs", FeatureFileRole::Context)],
+            &changed
+        ));
+        // A test-only match does NOT surface the slice.
+        assert!(!feature_touched_since(
+            &[f("tests/it.rs", FeatureFileRole::Test)],
+            &changed
+        ));
+        // No file in the changed set -> not touched.
+        assert!(!feature_touched_since(
+            &[f("src/other.rs", FeatureFileRole::Entry)],
+            &changed
+        ));
+    }
 
     #[test]
     fn detects_fix_commits() {

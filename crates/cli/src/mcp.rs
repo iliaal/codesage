@@ -12,11 +12,11 @@ use codesage_graph::{
     list_dependencies, recommend_tests, search, session_end, session_start,
 };
 use codesage_protocol::{
-    ContextBundle, CouplingReport, DependencyEntry, ExportRequest, FeatureFileRole, FeatureKind,
-    FeatureListResults, FindReferencesRequest, FindReferencesResults, FindSymbolRequest,
-    FindSymbolResults, ImpactAnalysisResults, ImpactRequest, ImpactTarget, Language, ReferenceKind,
-    RiskAssessment, RiskBatchAssessment, RiskDiffAssessment, SearchRequest, SearchResults,
-    SessionDiff, SessionSnapshot, SymbolKind, TestRecommendations,
+    ContextBundle, CouplingReport, DependencyEntry, ExportRequest, FeatureKind, FeatureListResults,
+    FindReferencesRequest, FindReferencesResults, FindSymbolRequest, FindSymbolResults,
+    ImpactAnalysisResults, ImpactRequest, ImpactTarget, Language, ReferenceKind, RiskAssessment,
+    RiskBatchAssessment, RiskDiffAssessment, SearchRequest, SearchResults, SessionDiff,
+    SessionSnapshot, SymbolKind, TestRecommendations,
 };
 use codesage_storage::Database;
 use parking_lot::Mutex;
@@ -1004,16 +1004,7 @@ impl CodeSageServer {
                 let mut features = db.list_features(kind, language, tag.as_deref(), query_limit)?;
                 if let Some(git_ref) = since.as_deref() {
                     let changed = codesage_graph::changed_files_since(root, git_ref)?;
-                    features.retain(|f| {
-                        f.files.iter().any(|file| {
-                            matches!(
-                                file.role,
-                                FeatureFileRole::Entry
-                                    | FeatureFileRole::Owned
-                                    | FeatureFileRole::Context
-                            ) && changed.contains(&file.path)
-                        })
-                    });
+                    features.retain(|f| codesage_graph::feature_touched_since(&f.files, &changed));
                     if limit > 0 && features.len() > limit {
                         features.truncate(limit);
                     }

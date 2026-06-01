@@ -1415,7 +1415,7 @@ fn cmd_features_list(
     limit: usize,
     json: bool,
 ) -> Result<()> {
-    use codesage_protocol::{FeatureFileRole, FeatureKind, Language};
+    use codesage_protocol::{FeatureKind, Language};
     let root = find_project_root()?;
     let db = open_db(&root)?;
     let kind = match kind {
@@ -1437,20 +1437,7 @@ fn cmd_features_list(
     let mut features = db.list_features(kind, language, tag, query_limit)?;
     if let Some(git_ref) = since {
         let changed = codesage_graph::changed_files_since(&root, git_ref)?;
-        // Entry counts alongside Owned/Context: for many slices (Rust crates,
-        // route handlers, C `main()` binaries) the entrypoint IS the source
-        // file, recorded only as Entry. Test-role siblings are excluded —
-        // a feature whose own code is unchanged shouldn't surface because a
-        // neighbouring test moved; the test-suite slice surfaces via its
-        // own Entry instead.
-        features.retain(|f| {
-            f.files.iter().any(|file| {
-                matches!(
-                    file.role,
-                    FeatureFileRole::Entry | FeatureFileRole::Owned | FeatureFileRole::Context
-                ) && changed.contains(&file.path)
-            })
-        });
+        features.retain(|f| codesage_graph::feature_touched_since(&f.files, &changed));
         if limit > 0 && features.len() > limit {
             features.truncate(limit);
         }
