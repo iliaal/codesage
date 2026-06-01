@@ -312,7 +312,30 @@ impl Database {
         let mut imported_by_stmt = self.conn.prepare(
             "SELECT DISTINCT f.path
              FROM refs r JOIN files f ON r.from_file_id = f.id
-             WHERE r.to_name = ?1 AND r.kind IN ('import', 'include')",
+             WHERE r.to_name = ?1
+               AND r.kind IN ('import', 'include')
+               AND f.path <> ?1
+             UNION
+             SELECT DISTINCT f_from.path
+             FROM refs r
+             JOIN files f_from ON r.from_file_id = f_from.id
+             JOIN symbols s ON (
+               s.qualified_name = r.to_name
+               OR (
+                 s.name = r.to_name
+                 AND NOT EXISTS (
+                   SELECT 1
+                   FROM symbols s2
+                   WHERE s2.name = r.to_name
+                     AND s2.file_id <> s.file_id
+                 )
+               )
+             )
+             JOIN files f_to ON s.file_id = f_to.id
+             WHERE f_to.path = ?1
+               AND r.kind IN ('import', 'include')
+               AND f_from.path <> f_to.path
+             ORDER BY 1",
         )?;
         let imported_by: Vec<String> = imported_by_stmt
             .query_map(params![file_path], |row| row.get(0))?

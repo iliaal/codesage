@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use codesage_features::trust_boundary::derive_from_refs;
 use codesage_protocol::{FileInfo, IndexStats, Reference, Symbol};
 use codesage_storage::Database;
@@ -11,21 +11,23 @@ use codesage_parser::extract::extract_symbols;
 use codesage_parser::parse::parse_file;
 use codesage_parser::references::extract_references;
 
+#[derive(Debug)]
 struct ParsedFile {
     info: FileInfo,
     symbols: Vec<Symbol>,
     refs: Vec<Reference>,
 }
 
-fn parse_one(root: &Path, file_info: &FileInfo) -> Option<ParsedFile> {
+fn parse_one(root: &Path, file_info: &FileInfo) -> Result<ParsedFile> {
     let abs_path = root.join(&file_info.path);
-    let source = std::fs::read(&abs_path).ok()?;
-    let tree = parse_file(&source, file_info.language).ok()?;
-    let symbols =
-        extract_symbols(&tree, &source, file_info.language, &file_info.path).unwrap_or_default();
-    let refs =
-        extract_references(&tree, &source, file_info.language, &file_info.path).unwrap_or_default();
-    Some(ParsedFile {
+    let source = std::fs::read(&abs_path).with_context(|| format!("reading {}", file_info.path))?;
+    let tree = parse_file(&source, file_info.language)
+        .with_context(|| format!("parsing {}", file_info.path))?;
+    let symbols = extract_symbols(&tree, &source, file_info.language, &file_info.path)
+        .with_context(|| format!("extracting symbols from {}", file_info.path))?;
+    let refs = extract_references(&tree, &source, file_info.language, &file_info.path)
+        .with_context(|| format!("extracting references from {}", file_info.path))?;
+    Ok(ParsedFile {
         info: file_info.clone(),
         symbols,
         refs,
@@ -80,10 +82,18 @@ fn index(
         stats.files_skipped = files.len() - to_parse.len();
     }
 
-    let parsed: Vec<ParsedFile> = to_parse
-        .par_iter()
-        .filter_map(|f| parse_one(root, f))
-        .collect();
+    let parsed_results: Vec<Result<ParsedFile>> =
+        to_parse.par_iter().map(|f| parse_one(root, f)).collect();
+    let mut parsed = Vec::with_capacity(parsed_results.len());
+    for result in parsed_results {
+        match result {
+            Ok(file) => parsed.push(file),
+            Err(e) => {
+                stats.files_failed += 1;
+                tracing::warn!(error = %e, "skipping file during structural index");
+            }
+        }
+    }
 
     db.execute_batch(|db| {
         for p in &parsed {
@@ -118,4 +128,27 @@ pub fn incremental_index(
     exclude_patterns: &[String],
 ) -> Result<IndexStats> {
     index(root, db, exclude_patterns, IndexStrategy::Incremental)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codesage_protocol::Language;
+
+    #[test]
+    fn parse_one_reports_missing_file() {
+        let root = tempfile::tempdir().unwrap();
+        let file = FileInfo {
+            path: "missing.rs".to_string(),
+            language: Language::Rust,
+            content_hash: "h".to_string(),
+        };
+
+        let err = parse_one(root.path(), &file).unwrap_err();
+
+        assert!(
+            err.to_string().contains("reading missing.rs"),
+            "unexpected error: {err:#}"
+        );
+    }
 }

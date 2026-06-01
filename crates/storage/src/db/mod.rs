@@ -472,6 +472,119 @@ mod tests {
     }
 
     #[test]
+    fn list_file_dependencies_resolves_reverse_imports_by_symbol_file() {
+        let db = Database::open_in_memory().unwrap();
+        let protocol_id = db
+            .upsert_file(&make_file("crates/protocol/src/lib.rs"))
+            .unwrap();
+        db.insert_symbols(
+            protocol_id,
+            &[make_qualified_symbol(
+                "DEFAULT_EMBEDDING_DIM",
+                "codesage_protocol::DEFAULT_EMBEDDING_DIM",
+                SymbolKind::Constant,
+            )],
+        )
+        .unwrap();
+        let storage_id = db
+            .upsert_file(&make_file("crates/storage/src/db/mod.rs"))
+            .unwrap();
+        db.insert_references(
+            storage_id,
+            &[Reference {
+                from_file: "crates/storage/src/db/mod.rs".to_string(),
+                to_name: "codesage_protocol::DEFAULT_EMBEDDING_DIM".to_string(),
+                kind: ReferenceKind::Import,
+                ..make_reference("unused", ReferenceKind::Import)
+            }],
+        )
+        .unwrap();
+
+        let deps = db
+            .list_file_dependencies("crates/protocol/src/lib.rs")
+            .unwrap();
+
+        assert_eq!(
+            deps.imported_by,
+            vec!["crates/storage/src/db/mod.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn list_file_dependencies_resolves_unique_short_imports_by_symbol_file() {
+        let db = Database::open_in_memory().unwrap();
+        let target_id = db.upsert_file(&make_file("src/target.rs")).unwrap();
+        db.insert_symbols(
+            target_id,
+            &[make_qualified_symbol(
+                "UniqueConfig",
+                "crate_a::UniqueConfig",
+                SymbolKind::Class,
+            )],
+        )
+        .unwrap();
+        let importer_id = db.upsert_file(&make_file("src/importer.rs")).unwrap();
+        db.insert_references(
+            importer_id,
+            &[Reference {
+                from_file: "src/importer.rs".to_string(),
+                to_name: "UniqueConfig".to_string(),
+                kind: ReferenceKind::Import,
+                ..make_reference("unused", ReferenceKind::Import)
+            }],
+        )
+        .unwrap();
+
+        let deps = db.list_file_dependencies("src/target.rs").unwrap();
+
+        assert_eq!(deps.imported_by, vec!["src/importer.rs".to_string()]);
+    }
+
+    #[test]
+    fn list_file_dependencies_ignores_ambiguous_short_imports() {
+        let db = Database::open_in_memory().unwrap();
+        let target_id = db.upsert_file(&make_file("src/target.rs")).unwrap();
+        db.insert_symbols(
+            target_id,
+            &[make_qualified_symbol(
+                "Config",
+                "crate_a::Config",
+                SymbolKind::Class,
+            )],
+        )
+        .unwrap();
+        let other_id = db.upsert_file(&make_file("src/other.rs")).unwrap();
+        db.insert_symbols(
+            other_id,
+            &[make_qualified_symbol(
+                "Config",
+                "crate_b::Config",
+                SymbolKind::Class,
+            )],
+        )
+        .unwrap();
+        let importer_id = db.upsert_file(&make_file("src/importer.rs")).unwrap();
+        db.insert_references(
+            importer_id,
+            &[Reference {
+                from_file: "src/importer.rs".to_string(),
+                to_name: "Config".to_string(),
+                kind: ReferenceKind::Import,
+                ..make_reference("unused", ReferenceKind::Import)
+            }],
+        )
+        .unwrap();
+
+        let deps = db.list_file_dependencies("src/target.rs").unwrap();
+
+        assert!(
+            deps.imported_by.is_empty(),
+            "ambiguous bare import should not be attributed to target.rs: {:?}",
+            deps.imported_by
+        );
+    }
+
+    #[test]
     fn references_match_dotted_tail() {
         let db = Database::open_in_memory().unwrap();
         let file_id = db.upsert_file(&make_file("test.go")).unwrap();

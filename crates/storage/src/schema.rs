@@ -250,6 +250,9 @@ unsafe extern "C" {
 static VEC_INIT: Once = Once::new();
 
 pub fn init_vec_extension() {
+    // SAFETY: sqlite-vec exposes a valid SQLite extension entrypoint with the
+    // signature required by `sqlite3_auto_extension`, and registration is
+    // process-global/idempotent behind `Once`.
     VEC_INIT.call_once(|| unsafe {
         rusqlite::ffi::sqlite3_auto_extension(Some(sqlite3_vec_init));
     });

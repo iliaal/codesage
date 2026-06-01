@@ -427,6 +427,35 @@ fn assess_risk_flags_file_in_two_file_cycle() {
 }
 
 #[test]
+fn risk_batch_reuses_patch_cycles_for_per_file_cycle_signal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("A.php"),
+        b"<?php\nnamespace App;\nuse App\\Repository;\nclass Controller { public function x(Repository $r) { return $r->y(); } }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("B.php"),
+        b"<?php\nnamespace App;\nuse App\\Controller;\nclass Repository { public function y(Controller $c) { return $c->x(null); } }\n",
+    )
+    .unwrap();
+    let db = Database::open_in_memory().unwrap();
+    codesage_graph::full_index(root, &db, &[]).unwrap();
+    db.upsert_git_file("A.php", 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+    db.upsert_git_file("B.php", 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+
+    let r = codesage_graph::assess_risk_batch(&db, &["A.php".to_string(), "B.php".to_string()])
+        .unwrap();
+
+    assert_eq!(r.files.len(), 2);
+    assert!(r.files.iter().all(|f| f.in_cycle), "{:?}", r.files);
+    assert!(r.files.iter().all(|f| f.cycle_size == 2), "{:?}", r.files);
+}
+
+#[test]
 fn assess_risk_no_cycle_signal_in_acyclic_codebase() {
     // Linear A -> B -> C. Touching A: in_cycle should stay false.
     let tmp = tempfile::tempdir().unwrap();

@@ -1,4 +1,7 @@
-use codesage_protocol::{FeatureConfidence, FeatureKind, FeatureRecord, Language};
+use codesage_protocol::{
+    FeatureConfidence, FeatureFileRef, FeatureFileRole, FeatureKind, FeatureRecord, Language,
+    TrustBoundary,
+};
 use codesage_storage::Database;
 
 fn make_feature(id: &str, tags: &[&str]) -> FeatureRecord {
@@ -70,4 +73,49 @@ fn list_features_tag_filter_matches_substring_within_compound_tags() {
         .list_features(None, None, Some("nonexistent"), 0)
         .unwrap();
     assert!(none.is_empty());
+}
+
+#[test]
+fn list_features_hydrates_files_and_boundaries_for_each_feature() {
+    let db = Database::open_in_memory().expect("open in-memory db");
+    let mut first = make_feature("feat_a", &["framework:react-router"]);
+    first.files = vec![
+        FeatureFileRef {
+            path: "src/a.rs".to_string(),
+            role: FeatureFileRole::Owned,
+            reason: Some("owned".to_string()),
+        },
+        FeatureFileRef {
+            path: "tests/a.rs".to_string(),
+            role: FeatureFileRole::Test,
+            reason: None,
+        },
+    ];
+    first.trust_boundaries = vec![TrustBoundary::Filesystem, TrustBoundary::Secrets];
+    let mut second = make_feature("feat_b", &["library"]);
+    second.files = vec![FeatureFileRef {
+        path: "src/b.rs".to_string(),
+        role: FeatureFileRole::Entry,
+        reason: Some("entry".to_string()),
+    }];
+    second.trust_boundaries = vec![TrustBoundary::Network];
+
+    db.upsert_feature(&first).unwrap();
+    db.upsert_feature(&second).unwrap();
+
+    let features = db.list_features(None, None, None, 0).unwrap();
+    let feat_a = features
+        .iter()
+        .find(|f| f.feature_id == "feat_a")
+        .expect("feat_a listed");
+    let feat_b = features
+        .iter()
+        .find(|f| f.feature_id == "feat_b")
+        .expect("feat_b listed");
+
+    assert_eq!(feat_a.files.len(), 2);
+    assert_eq!(feat_a.trust_boundaries.len(), 2);
+    assert!(feat_a.trust_boundaries.contains(&TrustBoundary::Filesystem));
+    assert_eq!(feat_b.files[0].path, "src/b.rs");
+    assert_eq!(feat_b.trust_boundaries, vec![TrustBoundary::Network]);
 }

@@ -88,6 +88,14 @@ pub fn find_coupling(db: &Database, file_path: &str, limit: usize) -> Result<Cou
 /// shape is preserved when tuning so the structural signals (churn, fix
 /// ratio) keep dominating over the security-shaped trust-boundary term.
 pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
+    assess_risk_with_cycles(db, file_path, None)
+}
+
+fn assess_risk_with_cycles(
+    db: &Database,
+    file_path: &str,
+    precomputed_cycles: Option<&[CycleEntry]>,
+) -> Result<RiskAssessment> {
     let git = db.git_file(file_path)?;
     let churn_score = git.as_ref().map(|g| g.churn_score).unwrap_or(0.0);
     let total_commits = git.as_ref().map(|g| g.total_commits).unwrap_or(0);
@@ -134,25 +142,15 @@ pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
     // edge enumeration error), we log and continue with no cycle data
     // rather than failing the whole risk call. The structural sensor is
     // additive to the existing git/coupling signals, not load-bearing.
-    let (in_cycle, cycle_size, cycle_files) = match find_cycles_touching(
-        db,
-        &[file_path.to_string()],
-    ) {
-        Ok(cycles) => match cycles.into_iter().next() {
-            Some(c) => {
-                let others: Vec<String> = c
-                    .members
-                    .iter()
-                    .filter(|m| m.as_str() != file_path)
-                    .cloned()
-                    .collect();
-                (true, c.size, others)
+    let (in_cycle, cycle_size, cycle_files) = if let Some(cycles) = precomputed_cycles {
+        cycle_membership(cycles, file_path)
+    } else {
+        match find_cycles_touching(db, &[file_path.to_string()]) {
+            Ok(cycles) => cycle_membership(&cycles, file_path),
+            Err(e) => {
+                tracing::warn!(error = %e, file = %file_path, "cycle detection failed; omitting cycle signal from risk score");
+                (false, 0, Vec::new())
             }
-            None => (false, 0, Vec::new()),
-        },
-        Err(e) => {
-            tracing::warn!(error = %e, file = %file_path, "cycle detection failed; omitting cycle signal from risk score");
-            (false, 0, Vec::new())
         }
     };
     // (cycle_size - 1) / 4 clamped: 2-file cycle → 0.25, 5+ → 1.0.
@@ -274,6 +272,22 @@ pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
     })
 }
 
+fn cycle_membership(cycles: &[CycleEntry], file_path: &str) -> (bool, u32, Vec<String>) {
+    cycles
+        .iter()
+        .find(|c| c.members.iter().any(|m| m == file_path))
+        .map(|c| {
+            let others: Vec<String> = c
+                .members
+                .iter()
+                .filter(|m| m.as_str() != file_path)
+                .cloned()
+                .collect();
+            (true, c.size, others)
+        })
+        .unwrap_or((false, 0, Vec::new()))
+}
+
 /// Maximum symbols returned per file. Burn-budget protection: a file with 200
 /// methods still returns 5 entries — agents asking "what drives this file's
 /// score" don't need the long tail.
@@ -363,9 +377,19 @@ pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiff
         return Ok(RiskDiffAssessment::default());
     }
 
+    // Cycles are graph-wide SCCs; compute once for the patch, then reuse the
+    // result for per-file scores and the patch-level cycle list.
+    let cycles_touching_patch = match find_cycles_touching(db, file_paths) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "cycle detection failed; omitting cycles_touching_patch");
+            Vec::new()
+        }
+    };
+
     let files: Vec<RiskAssessment> = file_paths
         .iter()
-        .map(|p| assess_risk(db, p))
+        .map(|p| assess_risk_with_cycles(db, p, Some(&cycles_touching_patch)))
         .collect::<Result<Vec<_>>>()?;
 
     let max_score = files.iter().map(|f| f.score).fold(0.0_f64, f64::max);
@@ -437,18 +461,6 @@ pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiff
         ));
     }
 
-    // Cycles that the patch files participate in. Computed before
-    // directory clustering so the cycle membership is a full list of
-    // repo-relative paths, not cluster stubs. Errors here are
-    // best-effort: failing to compute the SCCs shouldn't kill the
-    // risk report. We log and continue with an empty list.
-    let cycles_touching_patch = match find_cycles_touching(db, file_paths) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, "cycle detection failed; omitting cycles_touching_patch");
-            Vec::new()
-        }
-    };
     if !cycles_touching_patch.is_empty() {
         let biggest = cycles_touching_patch
             .iter()
@@ -506,9 +518,16 @@ pub fn assess_risk_batch(db: &Database, file_paths: &[String]) -> Result<RiskBat
     if file_paths.is_empty() {
         return Ok(RiskBatchAssessment::default());
     }
+    let cycles = match find_cycles_touching(db, file_paths) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "cycle detection failed; omitting batch cycle signal");
+            Vec::new()
+        }
+    };
     let mut files: Vec<RiskAssessment> = file_paths
         .iter()
-        .map(|p| assess_risk(db, p))
+        .map(|p| assess_risk_with_cycles(db, p, Some(&cycles)))
         .collect::<Result<Vec<_>>>()?;
     let mut refs: Vec<&mut RiskAssessment> = files.iter_mut().collect();
     let legend = alias_categorical_notes_in_place(&mut refs);

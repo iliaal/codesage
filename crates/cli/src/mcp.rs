@@ -266,6 +266,13 @@ pub struct FeatureBundleParams {
 struct ProjectState {
     db_path: PathBuf,
     embedding_config: EmbeddingConfig,
+    embedding_config_error: Option<String>,
+}
+
+#[derive(Debug)]
+struct LoadedEmbeddingConfig {
+    config: EmbeddingConfig,
+    semantic_error: Option<String>,
 }
 
 /// One model "slot" per key — the outer mutex serializes the cold load
@@ -389,7 +396,8 @@ impl CodeSageServer {
         let embedding_config = load_embedding_config(&codesage_dir.join("config.toml"));
         let state = ProjectState {
             db_path: db_path.clone(),
-            embedding_config,
+            embedding_config: embedding_config.config,
+            embedding_config_error: embedding_config.semantic_error,
         };
         let newly_registered = {
             let mut guard = self.state.projects.lock();
@@ -435,14 +443,21 @@ impl CodeSageServer {
         })
     }
 
+    fn semantic_embedding_config<'a>(
+        &self,
+        state: &'a ProjectState,
+    ) -> Result<&'a EmbeddingConfig> {
+        if let Some(error) = &state.embedding_config_error {
+            bail!("{error}");
+        }
+        Ok(&state.embedding_config)
+    }
+
     fn open_db_for(&self, state: &ProjectState) -> Result<Database> {
-        let embedder_arc = self.get_or_load_embedder(&state.embedding_config)?;
+        let config = self.semantic_embedding_config(state)?;
+        let embedder_arc = self.get_or_load_embedder(config)?;
         let embedder = embedder_arc.lock();
-        Database::open_for_model(
-            &state.db_path,
-            &state.embedding_config.model,
-            embedder.dim(),
-        )
+        Database::open_for_model(&state.db_path, &config.model, embedder.dim())
     }
 
     fn open_structural_db_for(&self, state: &ProjectState) -> Result<Database> {
@@ -450,7 +465,8 @@ impl CodeSageServer {
     }
 
     fn open_context_db_for(&self, state: &ProjectState) -> Result<Database> {
-        Database::open_for_existing_model(&state.db_path, &state.embedding_config.model)
+        let config = self.semantic_embedding_config(state)?;
+        Database::open_for_existing_model(&state.db_path, &config.model)
     }
 
     /// Resolve project, open its DB, run `f` with the DB. Error handling funnel:
@@ -508,13 +524,13 @@ impl CodeSageServer {
         F: FnOnce(&Database, &[f32], Option<codesage_graph::RerankFn<'_>>) -> Result<R>,
     {
         let state = self.resolve_project(project)?;
+        let config = self.semantic_embedding_config(&state)?;
         let db = self.open_db_for(&state)?;
-        let embedder_arc = self.get_or_load_embedder(&state.embedding_config)?;
-        let reranker_arc = state
-            .embedding_config
+        let embedder_arc = self.get_or_load_embedder(config)?;
+        let reranker_arc = config
             .reranker
             .as_deref()
-            .map(|m| self.get_or_load_reranker(m, &state.embedding_config.device))
+            .map(|m| self.get_or_load_reranker(m, &config.device))
             .transpose()?;
 
         let query_embedding = {
@@ -695,21 +711,23 @@ fn shrink_content_field(item: &mut serde_json::Value, budget_chars: usize) {
 /// Load the per-project embedding config for the MCP server.
 ///
 /// MCP serves multiple projects through one process; a malformed
-/// `.codesage/config.toml` in one project must not poison every tool call
-/// against that project. Read or parse failures fall back to defaults with
-/// a one-line warning so structural tools (`assess_risk`, `find_coupling`,
-/// `find_symbol`, …) keep working. `search` will then fail at vec-table
-/// lookup if the embedder defaults don't match the indexed model — a
-/// narrower, clearer failure than a TOML parse error on every tool call.
+/// `.codesage/config.toml` in one project must not poison structural tools
+/// (`assess_risk`, `find_coupling`, `find_symbol`, ...). Read or parse failures
+/// keep defaults available for those structural paths, but semantic tools fail
+/// before loading a model or creating a default vec table because the indexed
+/// model is no longer trustworthy.
 ///
-/// The CLI path (`load_project_config` in `main.rs`) deliberately keeps
-/// the loud-fail behavior: a user running `codesage index` interactively
-/// wants to know their config is broken.
-fn load_embedding_config(path: &Path) -> EmbeddingConfig {
+/// The CLI path (`load_project_config` in `main.rs`) deliberately keeps the
+/// loud-fail behavior: a user running `codesage index` interactively wants to
+/// know their config is broken.
+fn load_embedding_config(path: &Path) -> LoadedEmbeddingConfig {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return EmbeddingConfig::default();
+            return LoadedEmbeddingConfig {
+                config: EmbeddingConfig::default(),
+                semantic_error: None,
+            };
         }
         Err(e) => {
             tracing::warn!(
@@ -717,7 +735,13 @@ fn load_embedding_config(path: &Path) -> EmbeddingConfig {
                 error = %e,
                 "could not read project config; falling back to embedding defaults",
             );
-            return EmbeddingConfig::default();
+            return LoadedEmbeddingConfig {
+                config: EmbeddingConfig::default(),
+                semantic_error: Some(format!(
+                    "could not read project config `{}`: {e}",
+                    path.display()
+                )),
+            };
         }
     };
     #[derive(serde::Deserialize)]
@@ -725,14 +749,23 @@ fn load_embedding_config(path: &Path) -> EmbeddingConfig {
         embedding: Option<EmbeddingConfig>,
     }
     match toml::from_str::<Config>(&content) {
-        Ok(parsed) => parsed.embedding.unwrap_or_default(),
+        Ok(parsed) => LoadedEmbeddingConfig {
+            config: parsed.embedding.unwrap_or_default(),
+            semantic_error: None,
+        },
         Err(e) => {
             tracing::warn!(
                 path = %path.display(),
                 error = %e,
                 "could not parse project config; falling back to embedding defaults",
             );
-            EmbeddingConfig::default()
+            LoadedEmbeddingConfig {
+                config: EmbeddingConfig::default(),
+                semantic_error: Some(format!(
+                    "could not parse project config `{}`: {e}",
+                    path.display()
+                )),
+            }
         }
     }
 }
@@ -1308,14 +1341,17 @@ mod tests {
     }
 
     #[test]
-    fn malformed_config_falls_back_to_defaults() {
-        // One bad project must not poison every tool call against it. The
-        // MCP server keeps serving structural tools; only `search` will
-        // fail at vec-table lookup if defaults don't match the indexed
-        // model.
+    fn malformed_config_keeps_structural_defaults_and_reports_semantic_error() {
         let path = write_tmp("malformed", "embedding = { this is not valid toml ===");
-        let config = load_embedding_config(&path);
-        assert_eq!(config.model, EmbeddingConfig::default().model);
+        let loaded = load_embedding_config(&path);
+        assert_eq!(loaded.config.model, EmbeddingConfig::default().model);
+        assert!(
+            loaded
+                .semantic_error
+                .as_deref()
+                .is_some_and(|e| e.contains("could not parse project config")),
+            "semantic paths should fail loudly on malformed config: {loaded:?}"
+        );
     }
 
     #[test]
@@ -1326,8 +1362,9 @@ mod tests {
         ));
         // ensure path doesn't exist
         let _ = std::fs::remove_file(&path);
-        let config = load_embedding_config(&path);
-        assert_eq!(config.model, EmbeddingConfig::default().model);
+        let loaded = load_embedding_config(&path);
+        assert_eq!(loaded.config.model, EmbeddingConfig::default().model);
+        assert!(loaded.semantic_error.is_none());
     }
 
     #[test]
@@ -1336,9 +1373,13 @@ mod tests {
             "valid",
             "[embedding]\nmodel = \"sentence-transformers/all-MiniLM-L6-v2\"\ndevice = \"cpu\"\n",
         );
-        let config = load_embedding_config(&path);
-        assert_eq!(config.model, "sentence-transformers/all-MiniLM-L6-v2");
-        assert_eq!(config.device, "cpu");
+        let loaded = load_embedding_config(&path);
+        assert_eq!(
+            loaded.config.model,
+            "sentence-transformers/all-MiniLM-L6-v2"
+        );
+        assert_eq!(loaded.config.device, "cpu");
+        assert!(loaded.semantic_error.is_none());
     }
 
     #[test]
@@ -1346,8 +1387,9 @@ mod tests {
         // A valid TOML that just doesn't have an `[embedding]` table — the
         // file is fine, the embedding section is absent, defaults apply.
         let path = write_tmp("no-embedding", "[project]\nname = \"foo\"\n");
-        let config = load_embedding_config(&path);
-        assert_eq!(config.model, EmbeddingConfig::default().model);
+        let loaded = load_embedding_config(&path);
+        assert_eq!(loaded.config.model, EmbeddingConfig::default().model);
+        assert!(loaded.semantic_error.is_none());
     }
 
     #[test]
@@ -1490,6 +1532,58 @@ mod tests {
             .unwrap();
 
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn structural_project_db_still_opens_with_malformed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let codesage_dir = root.join(".codesage");
+        std::fs::create_dir_all(&codesage_dir).unwrap();
+        std::fs::write(
+            codesage_dir.join("config.toml"),
+            "embedding = { this is not valid toml ===",
+        )
+        .unwrap();
+        let db_path = codesage_dir.join("index.db");
+        Database::open(&db_path).unwrap();
+
+        let server = CodeSageServer::new();
+        let count = server
+            .with_project_db(root.to_str().unwrap(), |db| db.file_count())
+            .unwrap();
+
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn semantic_project_query_rejects_malformed_config_without_creating_default_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let codesage_dir = root.join(".codesage");
+        std::fs::create_dir_all(&codesage_dir).unwrap();
+        std::fs::write(
+            codesage_dir.join("config.toml"),
+            "embedding = { this is not valid toml ===",
+        )
+        .unwrap();
+        let db_path = codesage_dir.join("index.db");
+        Database::open(&db_path).unwrap();
+
+        let server = CodeSageServer::new();
+        let err = server
+            .with_project_query(root.to_str().unwrap(), "query", |_, _, _| Ok(()))
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("could not parse project config"),
+            "unexpected error: {err:#}"
+        );
+        let db = Database::open(&db_path).unwrap();
+        assert!(
+            db.list_vec_tables().unwrap().is_empty(),
+            "semantic query should fail before creating a default vec table"
+        );
     }
 
     #[test]

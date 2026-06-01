@@ -1,5 +1,15 @@
 ## [Unreleased]
 
+### Changed
+- **Semantic indexing now embeds and writes changed files in bounded batches.** Large repositories no longer need every stale chunk and embedding resident in memory before the first semantic write; `codesage index` also reports structural and semantic file failures separately from unchanged skips.
+- **Risk batch tools reuse one import-cycle pass per request.** `assess_risk_batch` and `assess_risk_diff` keep the same output shape but avoid recomputing SCC cycle detection for every file in the input set.
+- **`list_features` hydrates feature files and trust boundaries in batched queries.** Feature listing output is unchanged, but large mapped projects avoid per-feature child-row lookups.
+
+### Fixed
+- **`list_dependencies` reports reverse file importers.** The `imported_by` side now resolves refs through symbols defined in the target file instead of comparing import names to a repo-relative file path, while avoiding ambiguous short-name matches.
+- **Generated git hooks shell-quote the `codesage` binary path.** `codesage install-hooks` now handles install paths containing shell metacharacters such as quotes, dollar signs, or backticks.
+- **MCP semantic tools fail loudly on malformed project config.** Structural tools still work with fallback defaults, but embedding-backed tools no longer load the default model or create a default semantic table when `.codesage/config.toml` cannot be read or parsed.
+
 ## [0.9.0] - 2026-06-01
 
 ### Added

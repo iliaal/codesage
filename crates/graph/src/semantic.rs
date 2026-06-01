@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use codesage_embed::chunk::{ChunkConfig, chunk_text};
 use codesage_embed::model::Embedder;
 use codesage_protocol::{FileInfo, SemanticIndexStats, Symbol};
@@ -10,22 +10,24 @@ use rayon::prelude::*;
 
 use codesage_parser::discover::discover_files_with_excludes;
 
+#[derive(Debug)]
 struct ChunkedFile {
     path: String,
     language: String,
     chunks: Vec<(String, u32, u32)>,
 }
 
-fn chunk_one(root: &Path, f: &FileInfo, config: &ChunkConfig) -> Option<ChunkedFile> {
+fn chunk_one(root: &Path, f: &FileInfo, config: &ChunkConfig) -> Result<Option<ChunkedFile>> {
     let abs = root.join(&f.path);
-    let content = std::fs::read_to_string(&abs).ok()?;
+    let content = std::fs::read_to_string(&abs)
+        .with_context(|| format!("reading {} for semantic chunks", f.path))?;
     if content.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let chunks = chunk_text(&content, config);
     if chunks.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let tuples: Vec<(String, u32, u32)> = chunks
@@ -33,11 +35,11 @@ fn chunk_one(root: &Path, f: &FileInfo, config: &ChunkConfig) -> Option<ChunkedF
         .map(|c| (c.text, c.start_line, c.end_line))
         .collect();
 
-    Some(ChunkedFile {
+    Ok(Some(ChunkedFile {
         path: f.path.clone(),
         language: f.language.as_str().to_string(),
         chunks: tuples,
-    })
+    }))
 }
 
 fn augment_chunks(cf: &mut ChunkedFile, symbols: &[Symbol]) {
@@ -178,7 +180,68 @@ fn write_semantic_updates_with_batch(
             Ok(())
         })?;
     }
-    stats.files_processed = selected.len();
+    stats.files_processed += selected.len();
+    Ok(())
+}
+
+fn process_semantic_batch(
+    root: &Path,
+    db: &Database,
+    embedder: &mut Embedder,
+    config: &ChunkConfig,
+    batch: &[&FileInfo],
+    stats: &mut SemanticIndexStats,
+) -> Result<()> {
+    let chunk_results: Vec<(&FileInfo, Result<Option<ChunkedFile>>)> = batch
+        .par_iter()
+        .map(|f| (*f, chunk_one(root, f, config)))
+        .collect();
+    let mut selected = Vec::with_capacity(batch.len());
+    let mut chunked = Vec::new();
+    for (file, result) in chunk_results {
+        match result {
+            Ok(Some(cf)) => {
+                selected.push(file);
+                chunked.push(cf);
+            }
+            Ok(None) => selected.push(file),
+            Err(e) => {
+                stats.files_failed += 1;
+                tracing::warn!(
+                    file = %file.path,
+                    error = %e,
+                    "skipping file during semantic index"
+                );
+            }
+        }
+    }
+
+    if selected.is_empty() {
+        return Ok(());
+    }
+
+    let augment_paths: Vec<String> = chunked
+        .iter()
+        .filter(|cf| should_augment(&cf.language))
+        .map(|cf| cf.path.clone())
+        .collect();
+    if !augment_paths.is_empty() {
+        let by_file = db.symbols_for_files(&augment_paths)?;
+        for cf in &mut chunked {
+            if should_augment(&cf.language)
+                && let Some(symbols) = by_file.get(&cf.path)
+            {
+                augment_chunks(cf, symbols);
+            }
+        }
+    }
+
+    let all_texts: Vec<&str> = chunked
+        .iter()
+        .flat_map(|f| f.chunks.iter().map(|(text, _, _)| text.as_str()))
+        .collect();
+    let all_embeddings = embedder.embed_batch(&all_texts)?;
+    write_semantic_updates(db, &selected, &chunked, &all_embeddings, stats)?;
     Ok(())
 }
 
@@ -226,39 +289,13 @@ fn semantic_index(
         stats.files_skipped = files.len() - to_index.len();
     }
 
-    let mut chunked: Vec<ChunkedFile> = to_index
-        .par_iter()
-        .filter_map(|f| chunk_one(root, f, &config))
-        .collect();
-
     if to_index.is_empty() {
         return Ok(stats);
     }
 
-    // Batched symbol lookup for augmentation: one multi-path query instead of N.
-    let augment_paths: Vec<String> = chunked
-        .iter()
-        .filter(|cf| should_augment(&cf.language))
-        .map(|cf| cf.path.clone())
-        .collect();
-    if !augment_paths.is_empty() {
-        let by_file = db.symbols_for_files(&augment_paths)?;
-        for cf in &mut chunked {
-            if should_augment(&cf.language)
-                && let Some(symbols) = by_file.get(&cf.path)
-            {
-                augment_chunks(cf, symbols);
-            }
-        }
+    for batch in to_index.chunks(COMMIT_BATCH_SIZE) {
+        process_semantic_batch(root, db, embedder, &config, batch, &mut stats)?;
     }
-
-    let all_texts: Vec<&str> = chunked
-        .iter()
-        .flat_map(|f| f.chunks.iter().map(|(text, _, _)| text.as_str()))
-        .collect();
-
-    let all_embeddings = embedder.embed_batch(&all_texts)?;
-    write_semantic_updates(db, &to_index, &chunked, &all_embeddings, &mut stats)?;
     Ok(stats)
 }
 
@@ -324,6 +361,20 @@ mod tests {
         let count = count_removed_paths(&["gone.rs", "both.rs"], &["stale.rs", "both.rs"]);
 
         assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn chunk_one_reports_read_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let info = file("missing.rs", "h");
+
+        let err = chunk_one(root.path(), &info, &ChunkConfig::default()).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("reading missing.rs for semantic chunks"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]

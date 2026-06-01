@@ -770,6 +770,7 @@ fn cmd_install_hooks() -> Result<()> {
 /// contention, with no log visibility because stdout/stderr are
 /// redirected to /dev/null. Sequencing makes both passes always run.
 fn generate_post_commit_hook_body(bin: &str) -> String {
+    let bin = shell_single_quote(bin);
     format!(
         "#!/bin/sh\n\
          # installed by codesage install-hooks\n\
@@ -783,10 +784,14 @@ fn generate_post_commit_hook_body(bin: &str) -> String {
          # parallel — losing whichever lost the race, with no log visibility\n\
          # because stdout/stderr are redirected to /dev/null.\n\
          [ -d \"$root/.codesage\" ] && ( cd \"$root\" && \\\n\
-           $IONICE $NICE \"{bin}\" index && \\\n\
-           $IONICE $NICE \"{bin}\" git-index --incremental ) >/dev/null 2>&1 &\n\
+           $IONICE $NICE {bin} index && \\\n\
+           $IONICE $NICE {bin} git-index --incremental ) >/dev/null 2>&1 &\n\
          exit 0\n",
     )
+}
+
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
 }
 
 /// Install a pre-commit leak-check hook if the repo ships `scripts/leak-check.sh`.
@@ -1020,9 +1025,10 @@ fn cmd_index(full: bool, no_semantic: bool) -> Result<()> {
     };
 
     println!(
-        "Structural: {} files ({} skipped, {} removed), {} symbols, {} references",
+        "Structural: {} files ({} skipped, {} failed, {} removed), {} symbols, {} references",
         stats.files_indexed,
         stats.files_skipped,
+        stats.files_failed,
         stats.files_removed,
         stats.symbols_found,
         stats.references_found
@@ -1065,9 +1071,10 @@ fn cmd_index(full: bool, no_semantic: bool) -> Result<()> {
             semantic_incremental_index(&root, &db, embedder, &excludes)?
         };
         println!(
-            "Semantic: {} files ({} skipped, {} removed), {} chunks",
+            "Semantic: {} files ({} skipped, {} failed, {} removed), {} chunks",
             sem_stats.files_processed,
             sem_stats.files_skipped,
+            sem_stats.files_failed,
             sem_stats.files_removed,
             sem_stats.chunks_created
         );
@@ -2200,11 +2207,11 @@ mod tests {
         // subshell so both passes always run after every commit.
         let body = generate_post_commit_hook_body("/usr/local/bin/codesage");
         assert!(
-            body.contains("\"/usr/local/bin/codesage\" index &&"),
+            body.contains("'/usr/local/bin/codesage' index &&"),
             "expected `index` to be chained with `&&`, got:\n{body}"
         );
         assert!(
-            body.contains("\"/usr/local/bin/codesage\" git-index --incremental"),
+            body.contains("'/usr/local/bin/codesage' git-index --incremental"),
             "expected `git-index --incremental` invocation, got:\n{body}"
         );
         // Only one background `&` should appear at the top level —
@@ -2221,6 +2228,29 @@ mod tests {
             backgrounded_lines.len(),
             backgrounded_lines.join("\n")
         );
+    }
+
+    #[test]
+    fn post_commit_hook_shell_quotes_codesage_path() {
+        let body = generate_post_commit_hook_body("/tmp/cod\"e$age`bin's/codesage");
+
+        assert!(
+            body.contains("'/tmp/cod\"e$age`bin'\"'\"'s/codesage' index &&"),
+            "expected shell-quoted binary path, got:\n{body}"
+        );
+        assert!(
+            !body.contains("\"/tmp/cod\"e$age`bin's/codesage\""),
+            "double-quoted binary path would still allow shell expansion:\n{body}"
+        );
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_single_quotes() {
+        assert_eq!(
+            shell_single_quote("/tmp/a'b/codesage"),
+            "'/tmp/a'\"'\"'b/codesage'"
+        );
+        assert_eq!(shell_single_quote("/tmp/codesage"), "'/tmp/codesage'");
     }
 
     #[test]

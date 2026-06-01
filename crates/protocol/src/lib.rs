@@ -298,6 +298,8 @@ pub struct DependencyEntry {
 pub struct IndexStats {
     pub files_indexed: usize,
     pub files_skipped: usize,
+    #[serde(default)]
+    pub files_failed: usize,
     pub files_removed: usize,
     pub symbols_found: usize,
     pub references_found: usize,
@@ -344,6 +346,8 @@ pub struct SymbolSummary {
 pub struct SemanticIndexStats {
     pub files_processed: usize,
     pub files_skipped: usize,
+    #[serde(default)]
+    pub files_failed: usize,
     pub files_removed: usize,
     pub chunks_created: usize,
 }

@@ -4,6 +4,8 @@
 //! single `replace_all_features` transaction. No domain logic here; this
 //! module is just SQL plus enum<->string conversions.
 
+use std::collections::HashMap;
+
 use anyhow::Result;
 use codesage_protocol::{
     FeatureConfidence, FeatureFileRef, FeatureFileRole, FeatureKind, FeatureRecord, Language,
@@ -213,12 +215,8 @@ impl Database {
         let heads: Vec<FeatureRecord> = stmt
             .query_map(bind_refs.as_slice(), row_to_feature_head)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut features = Vec::with_capacity(heads.len());
-        for mut f in heads {
-            f.files = self.feature_files_for(&f.feature_id)?;
-            f.trust_boundaries = self.feature_trust_boundaries_for(&f.feature_id)?;
-            features.push(f);
-        }
+        let mut features = heads;
+        self.hydrate_feature_children(&mut features)?;
         Ok(features)
     }
 
@@ -239,13 +237,110 @@ impl Database {
         let heads: Vec<FeatureRecord> = stmt
             .query_map(params![file_path], row_to_feature_head)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut features = Vec::with_capacity(heads.len());
-        for mut f in heads {
-            f.files = self.feature_files_for(&f.feature_id)?;
-            f.trust_boundaries = self.feature_trust_boundaries_for(&f.feature_id)?;
-            features.push(f);
-        }
+        let mut features = heads;
+        self.hydrate_feature_children(&mut features)?;
         Ok(features)
+    }
+
+    fn hydrate_feature_children(&self, features: &mut [FeatureRecord]) -> Result<()> {
+        if features.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<String> = features.iter().map(|f| f.feature_id.clone()).collect();
+        let mut files_by_id = self.feature_files_for_many(&ids)?;
+        let mut boundaries_by_id = self.feature_trust_boundaries_for_many(&ids)?;
+        for feature in features {
+            feature.files = files_by_id.remove(&feature.feature_id).unwrap_or_default();
+            feature.trust_boundaries = boundaries_by_id
+                .remove(&feature.feature_id)
+                .unwrap_or_default();
+        }
+        Ok(())
+    }
+
+    fn feature_files_for_many(
+        &self,
+        feature_ids: &[String],
+    ) -> Result<HashMap<String, Vec<FeatureFileRef>>> {
+        let mut out: HashMap<String, Vec<FeatureFileRef>> = feature_ids
+            .iter()
+            .map(|id| (id.clone(), Vec::new()))
+            .collect();
+        if feature_ids.is_empty() {
+            return Ok(out);
+        }
+        let placeholders: Vec<String> = (1..=feature_ids.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT feature_id, path, role, reason
+             FROM feature_files
+             WHERE feature_id IN ({})
+             ORDER BY feature_id, role, path",
+            placeholders.join(",")
+        );
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = feature_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::ToSql)
+            .collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
+            let feature_id: String = row.get(0)?;
+            let path: String = row.get(1)?;
+            let role_str: String = row.get(2)?;
+            let reason: Option<String> = row.get(3)?;
+            Ok((
+                feature_id,
+                FeatureFileRef {
+                    path,
+                    role: parse_feature_role(&role_str)?,
+                    reason,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (feature_id, file) = row?;
+            out.entry(feature_id).or_default().push(file);
+        }
+        Ok(out)
+    }
+
+    fn feature_trust_boundaries_for_many(
+        &self,
+        feature_ids: &[String],
+    ) -> Result<HashMap<String, Vec<TrustBoundary>>> {
+        let mut out: HashMap<String, Vec<TrustBoundary>> = feature_ids
+            .iter()
+            .map(|id| (id.clone(), Vec::new()))
+            .collect();
+        if feature_ids.is_empty() {
+            return Ok(out);
+        }
+        let placeholders: Vec<String> = (1..=feature_ids.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT feature_id, boundary
+             FROM feature_trust_boundaries
+             WHERE feature_id IN ({})
+             ORDER BY feature_id, boundary",
+            placeholders.join(",")
+        );
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = feature_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::ToSql)
+            .collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(bind_refs.as_slice(), |row| {
+            let feature_id: String = row.get(0)?;
+            let boundary_str: String = row.get(1)?;
+            Ok((feature_id, parse_trust_boundary(&boundary_str)?))
+        })?;
+        for row in rows {
+            let (feature_id, boundary) = row?;
+            out.entry(feature_id).or_default().push(boundary);
+        }
+        for boundaries in out.values_mut() {
+            boundaries.sort();
+            boundaries.dedup();
+        }
+        Ok(out)
     }
 
     fn feature_files_for(&self, feature_id: &str) -> Result<Vec<FeatureFileRef>> {
