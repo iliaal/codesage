@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.9.0] - 2026-06-01
+
 ### Added
 - **Django URL route feature slices.** New `django-route` / `FeatureKind::Route` seed source. The Python mapper now scans `.py` files that import from `django.urls` / `django.conf.urls` and declare a `urlpatterns = [...]` list for `path()`, `re_path()`, and legacy `url()` entries, emitting one `route` feature per distinct normalized URL. `path()` converter prefixes are stripped (`<int:year>` → `<year>`); `re_path()` / `url()` regexes are normalized (drop `^`/`$` anchors, rewrite `(?P<name>…)` named groups to `<name>`, unescape `\/` and `\.`). The view symbol is resolved onto `entry_symbol` where possible (`views.home` → `home`, `ArticleList.as_view()` → `ArticleList`). Tags are `[python, framework:django, route]`. Consistent with the existing Flask / FastAPI conservatism: `include(...)` mounts are NOT expanded (the child URLConf contributes its own routes without the parent prefix) and non-literal route patterns are skipped. Ports clawpatch's Django route mapping (`python.ts` `djangoRouteSeeds`). Closes the most common Python web framework gap, since Flask + FastAPI shipped in 0.7.x. Four regression tests cover `path()` routes with converter stripping, `re_path()` regex normalization, class-based `as_view()` symbols with `include()` skipped, and the django-import gate.
 - **`auth-sensitive` tag on shape-flagged route slices.** Route seeds whose shape suggests a privileged or state-changing surface now carry an `auth-sensitive` tag: the HTTP method is anything other than `GET`/`HEAD`, or a path segment is exactly `admin` / `auth` / `login` / `token` (segment-exact and case-insensitive, so `/authors` does not match). Applied across all route mappers — Flask, FastAPI, Django (path-shape only, no verb at the URL layer), and the Node Express/Fastify/Hono server routes. Surfaces a route-shape heuristic for humans and agents reviewing a slice; filter with `list_features --tag auth-sensitive`. Ported from clawpatch's per-route trust-boundary heuristic, but deliberately demoted to a free-form tag: CodeSage's trust-boundary model stays single-sourced from parsed imports/references (`trust_boundary_rules.rs`), so a file never shows a boundary it didn't earn from a real include/call. `route_is_auth_sensitive` lives in the shared mapper module with three unit tests (method, path-segment, empty-method path-only).
@@ -398,5 +400,7 @@ Initial public release.
 
 [0.8.0]: https://github.com/iliaal/codesage/releases/tag/v0.8.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.8.1...HEAD
 [0.8.1]: https://github.com/iliaal/codesage/releases/tag/v0.8.1
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/iliaal/codesage/releases/tag/v0.9.0
