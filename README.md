@@ -47,9 +47,9 @@ Concrete answers to the questions a code-intelligence tool earns its keep on. Th
 | Trust-boundary derivation (network / fs / secrets / process-exec / db / etc.) | ✓ per-file table from imports/includes/calls, aggregated per feature, feeds `assess_risk` |
 | Host-agnostic deployment (no Docker, no managed services) | ✓ single static Rust binary + one SQLite file per project |
 | Auto-refresh on commit/merge/checkout/rebase | ✓ git hooks installed by `codesage install-hooks` |
-| Symbol-level edits (rename, move, replace_symbol_body) | — read-only by design; pair with Serena or your editor |
-| Multimodal ingest (images / audio / video / PDFs) | — out of scope, code-intel only |
-| Cross-repo queries | — single-project routing today; on the roadmap, not shipped |
+| Symbol-level edits (rename, move, replace_symbol_body) | Not supported: read-only by design; pair with Serena or your editor |
+| Multimodal ingest (images / audio / video / PDFs) | Not supported: out of scope, code-intel only |
+| Cross-repo queries | Not yet: single-project routing today; on the roadmap, not shipped |
 
 ## Supported languages
 
@@ -81,18 +81,18 @@ The nest gap is architectural: CodeSage embeds chunks (~50-line regions), code-r
 
 ### External-corpus benchmark (semble)
 
-[semble](https://github.com/MinishLab/semble) ships a published retrieval-evaluation corpus — 1,251 queries × 63 repos × 19 languages with file-level ground truth in `benchmarks/annotations/`. Cleaner than the git-mined "files-changed-in-same-commit" proxy, and an externally-defined target codesage's authors did not write.
+[semble](https://github.com/MinishLab/semble) ships a published retrieval-evaluation corpus (1,251 queries × 63 repos × 19 languages) with file-level ground truth in `benchmarks/annotations/`. Cleaner than the git-mined "files-changed-in-same-commit" proxy, and an externally-defined target codesage's authors did not write.
 
 Running codesage `search` (`jina-embeddings-v2-base-code` + `ms-marco-MiniLM-L6-v2` reranker, GPU) on the corpus at its pinned SHAs:
 
 | Sample | n queries | recall@10 (primary) | NDCG@10 | mean first-hit rank |
 |---|--:|--:|--:|--:|
 | Supported-language repos (30 of 63) | 602 | **0.932** | **0.788** | 1.79 |
-| Full corpus (63 repos, missing parsers = miss) | 1,251 | 0.448 | 0.379 | — |
+| Full corpus (63 repos, missing parsers = miss) | 1,251 | 0.448 | 0.379 | n/a |
 
-The headline number is the 602-query / 8-language slice — that's what compares apples-to-apples against the languages codesage actually parses. The full-corpus number reflects the parser-coverage gap (36% of corpus targets Java, Ruby, Kotlin, Scala, C#, Swift, Elixir, Haskell, Lua, Zig, or Bash — none currently supported); it is a language-coverage number, not a retrieval-quality number.
+The headline number is the 602-query / 8-language slice. That's what compares apples-to-apples against the languages codesage actually parses. The full-corpus number reflects the parser-coverage gap (36% of corpus targets Java, Ruby, Kotlin, Scala, C#, Swift, Elixir, Haskell, Lua, Zig, or Bash, none currently supported); it is a language-coverage number, not a retrieval-quality number.
 
-By-language headline (8 supported): JavaScript 0.892, Go 0.887, PHP 0.885 lead; TypeScript 0.595 trails (zod + vitest specifically — test-file flood dominates top-10 on phrase-matched queries).
+By-language headline (8 supported): JavaScript 0.892, Go 0.887, PHP 0.885 lead; TypeScript 0.595 trails (zod + vitest specifically, where a test-file flood dominates top-10 on phrase-matched queries).
 
 This is **not** a "codesage > semble" claim. A head-to-head would require running semble end-to-end on the same 63 repos under matched conditions, which is out of scope here. The number is codesage measured against semble's published ground truth.
 
@@ -215,7 +215,7 @@ Use when answering "what slice owns this file?" or "give me the whole flow behin
 codesage trust-boundaries crates/cli/src/main.rs --json
 ```
 
-Per-file capability tags (network, filesystem, process-exec, secrets, database, user-input, external-api, serialization, auth, concurrency) derived from imports / includes / calls. The same signal contributes to `assess_risk` and surfaces a "crosses N trust boundaries — security review recommended" note when a file touches three or more.
+Per-file capability tags (network, filesystem, process-exec, secrets, database, user-input, external-api, serialization, auth, concurrency) derived from imports / includes / calls. The same signal contributes to `assess_risk` and surfaces a "crosses N trust boundaries, security review recommended" note when a file touches three or more.
 
 ## 🔌 Claude Code plugin
 
