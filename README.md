@@ -20,7 +20,7 @@ CodeSage is a code intelligence engine for AI coding agents. It combines structu
 - Estimate which files a change breaks (change impact analysis).
 - Build curated code bundles for LLM consumption in JSON, markdown, or flat-text (gitingest-style) form.
 - Read per-file git history: churn, fix ratio, historical co-change, risk score.
-- Browse the project as **behavior-keyed feature slices**: each slice bundles an entrypoint + owned files + context files + tests + crossed trust boundaries, mapped deterministically from build manifests and framework routing (Cargo bins, Laravel routes, php-src `ext/*`, Next.js `app/**`, Python `__main__`, Go `cmd/*`, etc.).
+- Browse the project as **behavior-keyed feature slices**: each slice bundles an entrypoint + owned files + context files + tests + crossed trust boundaries, mapped deterministically from build manifests and framework routing (Cargo bins, Laravel routes, Flask/FastAPI/Django routes, Express/Fastify/Hono routes, php-src `ext/*`, Next.js `app/**`, CMake/CUDA targets, Python `__main__`, Go `cmd/*`, etc.).
 - Inspect **trust boundaries** per file (`network`, `filesystem`, `process-exec`, `secrets`, `database`, `user-input`, `external-api`, `serialization`, `auth`, `concurrency`) derived from imports/includes/calls; same signal folds into `assess_risk` and surfaces as security-review notes when ≥3 boundaries are crossed.
 - Expose all of the above over MCP so Claude Code, Codex, or Cursor can call them.
 
@@ -178,6 +178,14 @@ git log --since='1 week ago' --name-only --pretty='' | sort -u | codesage risk-d
 ```
 
 Lists high-risk files touched in recent history. Good signal during a retrospective or a "where should we focus refactoring?" discussion.
+
+### Which feature slices a branch touched
+
+```bash
+codesage features-list --since main --json | jq '.results[] | {id: .feature_id, title}'
+```
+
+`--since <ref>` (also on MCP `list_features`) keeps only slices whose entry, owned, or context files changed since the ref, via `git diff <ref>...HEAD`. Scopes a review to the features a branch actually moved instead of the whole map.
 
 ### Trifecta for one file
 
