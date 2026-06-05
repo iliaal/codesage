@@ -1492,6 +1492,97 @@ fn references_for_symbol(db: &Database, sym: &Symbol) -> Result<Vec<Reference>> 
     db.find_references(&sym.name, None)
 }
 
+/// Default-on; opt-out via `CODESAGE_BUNDLE_LINE_NUMBERS=0` (or "false").
+static BUNDLE_LINE_NUMBERS_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn bundle_line_numbers_enabled() -> bool {
+    *BUNDLE_LINE_NUMBERS_ENABLED.get_or_init(|| env_default_on("CODESAGE_BUNDLE_LINE_NUMBERS"))
+}
+
+/// `SymbolKind` render strings, used to recognize a chunk-augmentation
+/// header's `# <name> (<kind>)` lines without mistaking a source comment
+/// like `# cleanup (later)` for one.
+const SYMBOL_KIND_STRS: [&str; 11] = [
+    "function",
+    "method",
+    "class",
+    "trait",
+    "interface",
+    "struct",
+    "enum",
+    "constant",
+    "macro",
+    "module",
+    "namespace",
+];
+
+fn is_symbol_header_line(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("# ") else {
+        return false;
+    };
+    let Some(open) = rest.rfind(" (") else {
+        return false;
+    };
+    let Some(kind) = rest[open + 2..].strip_suffix(')') else {
+        return false;
+    };
+    SYMBOL_KIND_STRS.contains(&kind)
+}
+
+/// Prefix the body lines of a bundle chunk with 1-based file line numbers
+/// (`  12 | code`) starting at `start_line`, so an agent can cite
+/// `file:line` straight from the bundle without re-reading. Applied at read
+/// time only — stored and embedded chunk text is never touched.
+///
+/// The augmentation header (`# <file_path>` plus `# <symbol> (<kind>)`
+/// lines that `semantic.rs` prepends) passes through unnumbered. Detection
+/// is anchored on the chunk's own `file_path` for line 1, so a C/Rust chunk
+/// (no header) or a source line that merely starts with `#` is never
+/// mistaken for header.
+fn number_chunk_lines(content: &str, file_path: &str, start_line: u32) -> String {
+    if content.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let mut idx = 0;
+    let header_anchor = format!("# {file_path}");
+    if lines.first() == Some(&header_anchor.as_str()) {
+        idx = 1;
+        while idx < lines.len() && is_symbol_header_line(lines[idx]) {
+            idx += 1;
+        }
+    }
+    let body_count = lines.len() - idx;
+    let last_no = start_line as usize + body_count.saturating_sub(1);
+    let width = last_no.to_string().len().max(4);
+
+    let mut out = String::with_capacity(content.len() + body_count * (width + 4));
+    for header_line in &lines[..idx] {
+        out.push_str(header_line);
+        out.push('\n');
+    }
+    for (offset, body_line) in lines[idx..].iter().enumerate() {
+        let n = start_line as usize + offset;
+        out.push_str(&format!("{n:>width$} | {body_line}\n"));
+    }
+    // `lines()` drops a trailing newline; we always append one per line.
+    // Restore the original trailing-newline shape so the chunk doesn't grow.
+    if !content.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Apply read-time line numbering to every chunk in a bundle, when enabled.
+fn finalize_bundle(mut bundle: ContextBundle) -> ContextBundle {
+    if bundle_line_numbers_enabled() {
+        for r in bundle.primary.iter_mut().chain(bundle.related.iter_mut()) {
+            r.content = number_chunk_lines(&r.content, &r.file_path, r.start_line);
+        }
+    }
+    bundle
+}
+
 pub fn export_context(
     db: &Database,
     query_embedding: &[f32],
@@ -1548,12 +1639,12 @@ pub fn export_context(
         )?;
     }
 
-    Ok(ContextBundle {
+    Ok(finalize_bundle(ContextBundle {
         target_description: format!("query: {query}"),
         primary,
         related,
         symbol_definitions: symbol_defs,
-    })
+    }))
 }
 
 fn find_definition_for_summary(
@@ -1620,12 +1711,12 @@ pub fn export_context_for_symbol(
         )?;
     }
 
-    Ok(ContextBundle {
+    Ok(finalize_bundle(ContextBundle {
         target_description: format!("symbol: {sym_name}"),
         primary,
         related,
         symbol_definitions: defs,
-    })
+    }))
 }
 
 /// Build a curated [`ContextBundle`] for one feature_id. Composes the
@@ -1773,12 +1864,12 @@ pub fn feature_bundle(
         )?;
     }
 
-    Ok(ContextBundle {
+    Ok(finalize_bundle(ContextBundle {
         target_description: format!("feature: {} ({})", feature.title, feature.feature_id),
         primary,
         related,
         symbol_definitions,
-    })
+    }))
 }
 
 /// Insert the chunk of `file_path` whose `[start_line, end_line]` covers
@@ -1985,6 +2076,73 @@ fn add_related_from_file(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod line_number_tests {
+    use super::*;
+
+    #[test]
+    fn numbers_body_after_augmentation_header() {
+        let content = "# app/Svc.php\n# App\\Svc (class)\n<?php\nclass Svc {}";
+        let out = number_chunk_lines(content, "app/Svc.php", 10);
+        let lines: Vec<&str> = out.lines().collect();
+        // Header lines pass through unnumbered.
+        assert_eq!(lines[0], "# app/Svc.php");
+        assert_eq!(lines[1], "# App\\Svc (class)");
+        // Body numbered from start_line.
+        assert_eq!(lines[2], "  10 | <?php");
+        assert_eq!(lines[3], "  11 | class Svc {}");
+    }
+
+    #[test]
+    fn numbers_from_line_one_when_no_header() {
+        // C/Rust chunks are not augmented — first line is real source.
+        let content = "fn main() {\n    let x = 1;\n}";
+        let out = number_chunk_lines(content, "src/main.rs", 42);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "  42 | fn main() {");
+        assert_eq!(lines[1], "  43 |     let x = 1;");
+        assert_eq!(lines[2], "  44 | }");
+    }
+
+    #[test]
+    fn source_comment_resembling_header_is_not_stripped() {
+        // Python body whose first line is a `# word (word)` comment must
+        // not be mistaken for a symbol-header line: `(later)` is not a
+        // SymbolKind, so numbering still starts at the comment.
+        let content = "# app/x.py\n# cleanup (later)\nx = 1";
+        let out = number_chunk_lines(content, "app/x.py", 5);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "# app/x.py");
+        assert_eq!(lines[1], "   5 | # cleanup (later)");
+        assert_eq!(lines[2], "   6 | x = 1");
+    }
+
+    #[test]
+    fn header_anchor_must_match_this_files_path() {
+        // A `# something` first line that is not THIS chunk's path anchor
+        // is treated as body, not header.
+        let content = "# not a path\ncode";
+        let out = number_chunk_lines(content, "app/x.py", 1);
+        assert_eq!(out.lines().next().unwrap(), "   1 | # not a path");
+    }
+
+    #[test]
+    fn preserves_trailing_newline_shape() {
+        assert!(number_chunk_lines("a\nb\n", "f.rs", 1).ends_with("b\n"));
+        assert!(!number_chunk_lines("a\nb", "f.rs", 1).ends_with('\n'));
+        assert_eq!(number_chunk_lines("", "f.rs", 1), "");
+    }
+
+    #[test]
+    fn is_symbol_header_line_matches_known_kinds_only() {
+        assert!(is_symbol_header_line("# App\\Svc (class)"));
+        assert!(is_symbol_header_line("# foo (function)"));
+        assert!(!is_symbol_header_line("# cleanup (later)"));
+        assert!(!is_symbol_header_line("not a comment"));
+        assert!(!is_symbol_header_line("# no parens here"));
+    }
 }
 
 #[cfg(test)]

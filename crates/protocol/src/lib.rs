@@ -253,6 +253,11 @@ pub enum ReferenceKind {
     Inheritance,
     TraitUse,
     TypeHint,
+    /// Framework routing edge: a route declaration bound to its handler
+    /// method (e.g. Laravel `Route::get('/x', [Ctrl::class, 'show'])`).
+    /// Synthesized by the feature mapper, not the tree-sitter parser, so
+    /// `impact_analysis`/`find_references` traverse routing.
+    RouteHandler,
 }
 
 str_enum!(ReferenceKind {
@@ -263,6 +268,7 @@ str_enum!(ReferenceKind {
     Inheritance => "inheritance",
     TraitUse => "trait_use",
     TypeHint => "type_hint",
+    RouteHandler => "route_handler",
 });
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

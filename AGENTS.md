@@ -141,6 +141,8 @@ Every MCP tool advertises an `outputSchema` (0.7.0); agents that consult it know
 
 `codesage mcp` is the stable client entrypoint. It runs as a stdio shim, starts or connects to the per-user Unix-socket daemon, and forwards MCP JSON-RPC unchanged. The daemon hosts the real MCP server and owns shared project/model/reranker pools across main sessions and subagents.
 
+`codesage mcp --project <abs root>` makes the server default the per-call `project` argument to that root when a `tools/call` omits it. Set automatically by `codesage install` for agents without a CodeSage plugin (Codex, opencode), which otherwise have no way to inject the project path. With no `--project` (the Claude-plugin path) the shim raw-copies stdio with zero overhead.
+
 Use `codesage mcp --direct` only when debugging the old single-process stdio path. Use `codesage daemon` to run the foreground daemon explicitly. Socket state lives under `$CODESAGE_DAEMON_RUNTIME_DIR`, `$XDG_RUNTIME_DIR/codesage`, or `/tmp/codesage-$UID`; the socket name includes the running binary's version and executable metadata so rebuilt binaries don't attach to stale daemons.
 
 ### Daemon management
@@ -159,7 +161,9 @@ The daemon writes tracing to `mcp-<version>-<key>.log` in the runtime dir; check
 
 ## CLI commands
 
-`init`, `index`, `search`, `find-symbol`, `find-references`, `dependencies`, `impact`, `export`, `status`, `mcp`, `daemon`, `install-hooks`, `cleanup`, `git-index`, `coupling`, `risk`, `risk-batch`, `risk-diff`, `tests-for`, `session-start`, `session-end`, `doctor`, `map`, `features-list`, `feature-show`, `feature-for`, `feature-bundle`, `trust-boundaries`.
+`init`, `index`, `search`, `find-symbol`, `find-references`, `dependencies`, `impact`, `export`, `status`, `mcp`, `daemon`, `install-hooks`, `install`, `uninstall`, `cleanup`, `git-index`, `coupling`, `risk`, `risk-batch`, `risk-diff`, `tests-for`, `session-start`, `session-end`, `doctor`, `map`, `features-list`, `feature-show`, `feature-for`, `feature-bundle`, `trust-boundaries`.
+
+`install <codex|opencode|all> [--global]` registers CodeSage as an MCP server in agents that have no CodeSage plugin (Codex CLI, opencode), writing their native MCP config (`toml_edit` / `jsonc-parser` CST, comment-preserving and idempotent). It registers the command `codesage mcp --project <abs root>`; `uninstall` removes only CodeSage's entry. Claude Code is not a target — it keeps its `claude mcp add` / plugin registration.
 
 `map` runs the feature mappers (Cargo workspace, composer + Laravel routes, php-src `ext/*`, CMake / autotools, Python `pyproject` / `setup.py` / `__main__`, `package.json` bin + Next.js routes, Go `cmd/*`) and persists features. `codesage index` calls `map` between the structural and semantic passes; `--no-features` skips. `features-list` / `feature-show` / `feature-for` / `feature-bundle` are read-side query commands matching the new MCP tools. `trust-boundaries <file>` is the debugging surface for the per-file boundary tags that feed `assess_risk`.
 

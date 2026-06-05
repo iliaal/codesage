@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use anyhow::Result;
-use codesage_protocol::{FeatureConfidence, FeatureKind, Language};
+use codesage_protocol::{FeatureConfidence, FeatureKind, Language, Reference, ReferenceKind};
 use regex::Regex;
 use serde_json::Value;
 
@@ -944,6 +944,16 @@ struct LaravelRoute {
     /// matching by `class basename`.
     controller_class: Option<String>,
     action: Option<String>,
+    /// 1-based line of the route registration in `file`, derived from the
+    /// regex match offset. Carried onto synthesized `RouteHandler`
+    /// references so `find_references` points at the declaration.
+    line: u32,
+}
+
+/// 1-based line number of `byte_off` within `text`.
+fn line_at(text: &str, byte_off: usize) -> u32 {
+    let off = byte_off.min(text.len());
+    (text[..off].bytes().filter(|&b| b == b'\n').count() as u32) + 1
 }
 
 fn parse_laravel_routes(root: &Path) -> Result<Vec<LaravelRoute>> {
@@ -999,6 +1009,7 @@ fn parse_laravel_routes(root: &Path) -> Result<Vec<LaravelRoute>> {
             let raw_class = cap.get(2).map(|m| m.as_str()).unwrap_or("");
             let inner_chain = cap.get(3).map(|m| m.as_str()).unwrap_or("");
             let body = cap.get(4).map(|m| m.as_str()).unwrap_or("");
+            let body_base = cap.get(4).map(|m| m.start()).unwrap_or(0);
             let controller_class = resolve_imported_class(&imports, raw_class);
             if controller_class.is_none() {
                 continue;
@@ -1020,6 +1031,10 @@ fn parse_laravel_routes(root: &Path) -> Result<Vec<LaravelRoute>> {
                 if verb.is_empty() || pattern.is_empty() {
                     continue;
                 }
+                let line = inner
+                    .get(0)
+                    .map(|m| line_at(&scanned, body_base + m.start()))
+                    .unwrap_or(1);
                 let prefixes: Vec<String> = outer_prefixes
                     .iter()
                     .cloned()
@@ -1031,6 +1046,7 @@ fn parse_laravel_routes(root: &Path) -> Result<Vec<LaravelRoute>> {
                     pattern: route_uri_with_prefixes(&prefixes, pattern),
                     controller_class: controller_class.clone(),
                     action,
+                    line,
                 });
             }
             if let Some(s) = span {
@@ -1058,6 +1074,10 @@ fn parse_laravel_routes(root: &Path) -> Result<Vec<LaravelRoute>> {
             if verb.is_empty() || pattern.is_empty() {
                 continue;
             }
+            let line = cap
+                .get(0)
+                .map(|m| line_at(&scanned, m.start()))
+                .unwrap_or(1);
             let controller_class = if raw_class.is_empty() {
                 None
             } else {
@@ -1074,6 +1094,7 @@ fn parse_laravel_routes(root: &Path) -> Result<Vec<LaravelRoute>> {
                 pattern: route_uri_with_prefixes(&prefixes, pattern),
                 controller_class,
                 action,
+                line,
             });
         }
     }
@@ -1175,6 +1196,34 @@ fn route_uri_with_prefixes(prefixes: &[String], uri: &str) -> String {
     } else {
         joined
     }
+}
+
+/// Synthesize `RouteHandler` references linking each Laravel route file to
+/// its handler controller method, so `impact_analysis` / `find_references`
+/// traverse routing. `to_name` is the handler's PHP qualified name
+/// (`Namespace\Class\method`, matching how the parser stores method
+/// qualified names) so the qualified-lookup path in `find_references`
+/// resolves it; the cached tail (`method`) covers unqualified lookups.
+///
+/// Routes that register a closure or whose controller class can't be
+/// resolved (`controller_class`/`action` is `None`) produce no edge.
+pub(crate) fn laravel_route_handler_refs(root: &Path) -> Result<Vec<Reference>> {
+    let routes = parse_laravel_routes(root)?;
+    let mut refs = Vec::new();
+    for r in &routes {
+        let (Some(class), Some(action)) = (&r.controller_class, &r.action) else {
+            continue;
+        };
+        refs.push(Reference {
+            from_file: r.file.clone(),
+            from_symbol: None,
+            to_name: format!("{class}\\{action}"),
+            kind: ReferenceKind::RouteHandler,
+            line: r.line,
+            col: 0,
+        });
+    }
+    Ok(refs)
 }
 
 fn laravel_route_seeds(routes: &[LaravelRoute]) -> Vec<FeatureSeed> {

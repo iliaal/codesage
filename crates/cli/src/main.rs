@@ -1,6 +1,7 @@
 mod daemon;
 mod doctor;
 mod drift;
+mod installer;
 mod lockfile;
 mod mcp;
 mod util;
@@ -150,6 +151,11 @@ enum Commands {
         /// Override the daemon runtime directory
         #[arg(long, hide = true)]
         runtime_dir: Option<PathBuf>,
+        /// Default project root to assume when a tool call omits `project`.
+        /// Set by `codesage install` for agents without a CodeSage plugin so
+        /// their tool calls route to this project automatically.
+        #[arg(long)]
+        project: Option<PathBuf>,
     },
     /// Manage the shared MCP daemon (run in foreground, check status, stop)
     Daemon {
@@ -164,6 +170,22 @@ enum Commands {
     },
     /// Install git hooks for automatic reindexing
     InstallHooks,
+    /// Register CodeSage as an MCP server in another agent (codex, opencode)
+    Install {
+        /// Agent to register with: `codex`, `opencode`, or `all`
+        target: String,
+        /// Register globally (user-level) instead of project-local
+        #[arg(long)]
+        global: bool,
+    },
+    /// Remove CodeSage's MCP registration from an agent (codex, opencode)
+    Uninstall {
+        /// Agent to remove from: `codex`, `opencode`, or `all`
+        target: String,
+        /// Target the global (user-level) registration instead of project-local
+        #[arg(long)]
+        global: bool,
+    },
     /// Drop orphaned model-specific vec tables (keeps only the active model)
     Cleanup {
         /// Preview what would be dropped without making changes
@@ -629,7 +651,8 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Mcp {
             direct,
             runtime_dir,
-        } => cmd_mcp(direct, runtime_dir),
+            project,
+        } => cmd_mcp(direct, runtime_dir, project),
         Commands::Daemon {
             action,
             runtime_dir,
@@ -639,6 +662,8 @@ fn run(cli: Cli) -> Result<()> {
             DaemonAction::Stop => cmd_daemon_stop(runtime_dir),
         },
         Commands::InstallHooks => cmd_install_hooks(),
+        Commands::Install { target, global } => cmd_install(&target, global),
+        Commands::Uninstall { target, global } => cmd_uninstall(&target, global),
         Commands::Cleanup { dry_run } => cmd_cleanup(dry_run),
         Commands::Doctor { json } => doctor::run(json),
         Commands::GitIndex {
@@ -682,12 +707,23 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn cmd_mcp(direct: bool, runtime_dir: Option<PathBuf>) -> Result<()> {
+fn cmd_mcp(direct: bool, runtime_dir: Option<PathBuf>, project: Option<PathBuf>) -> Result<()> {
+    // Canonicalize the default project to an absolute path so injected
+    // tool-call args resolve regardless of the agent's cwd.
+    let default_project = match project {
+        Some(p) => Some(
+            std::fs::canonicalize(&p)
+                .with_context(|| format!("resolving --project path {}", p.display()))?
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        None => None,
+    };
     let rt = tokio::runtime::Runtime::new()?;
     if direct {
-        rt.block_on(mcp::run_mcp_server())
+        rt.block_on(mcp::run_mcp_server(default_project))
     } else {
-        rt.block_on(daemon::run_mcp_shim(runtime_dir))
+        rt.block_on(daemon::run_mcp_shim(runtime_dir, default_project))
     }
 }
 
@@ -704,6 +740,86 @@ fn cmd_daemon_status(runtime_dir: Option<PathBuf>) -> Result<()> {
 fn cmd_daemon_stop(runtime_dir: Option<PathBuf>) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(daemon::run_daemon_stop(runtime_dir))
+}
+
+/// Resolve the target list from a CLI argument (`all` or a single id).
+fn resolve_install_targets(target: &str) -> Result<Vec<Box<dyn installer::AgentTarget>>> {
+    if target == "all" {
+        return Ok(installer::all_targets());
+    }
+    match installer::target_by_id(target) {
+        Some(t) => Ok(vec![t]),
+        None => {
+            let ids: Vec<&str> = installer::all_targets().iter().map(|t| t.id()).collect();
+            bail!(
+                "unknown agent '{target}'. Known: {}, or 'all'",
+                ids.join(", ")
+            );
+        }
+    }
+}
+
+fn home_dir() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("$HOME is not set; cannot resolve agent config paths"))
+}
+
+fn cmd_install(target: &str, global: bool) -> Result<()> {
+    let project = find_project_root()?;
+    let project = std::fs::canonicalize(&project).unwrap_or(project);
+    let home = home_dir()?;
+    let targets = resolve_install_targets(target)?;
+    let ctx = installer::InstallCtx {
+        home: &home,
+        project: &project,
+        global,
+    };
+    for t in &targets {
+        let path = t.config_path(&ctx);
+        match t.install(&ctx)? {
+            installer::InstallOutcome::Wrote => {
+                println!("registered {} → {}", t.display_name(), path.display());
+            }
+            installer::InstallOutcome::Unchanged => {
+                println!(
+                    "{} already up to date ({})",
+                    t.display_name(),
+                    path.display()
+                );
+            }
+        }
+    }
+    println!(
+        "\nCodeSage MCP server registered for project: {}",
+        project.display()
+    );
+    Ok(())
+}
+
+fn cmd_uninstall(target: &str, global: bool) -> Result<()> {
+    let project = find_project_root()?;
+    let project = std::fs::canonicalize(&project).unwrap_or(project);
+    let home = home_dir()?;
+    let targets = resolve_install_targets(target)?;
+    let ctx = installer::InstallCtx {
+        home: &home,
+        project: &project,
+        global,
+    };
+    for t in &targets {
+        let path = t.config_path(&ctx);
+        match t.uninstall(&ctx)? {
+            installer::UninstallOutcome::Removed => {
+                println!("removed {} ({})", t.display_name(), path.display());
+            }
+            installer::UninstallOutcome::NotConfigured => {
+                println!("{} was not configured", t.display_name());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn cmd_install_hooks() -> Result<()> {

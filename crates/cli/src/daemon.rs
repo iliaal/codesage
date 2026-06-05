@@ -83,11 +83,14 @@ mod unix {
         }
     }
 
-    pub(crate) async fn run_mcp_shim(runtime_dir: Option<PathBuf>) -> Result<()> {
+    pub(crate) async fn run_mcp_shim(
+        runtime_dir: Option<PathBuf>,
+        default_project: Option<String>,
+    ) -> Result<()> {
         let paths = DaemonPaths::for_current_exe(runtime_dir)?;
         prepare_runtime_dir(&paths.runtime_dir)?;
         let stream = ensure_daemon(&paths).await?;
-        proxy_stdio(stream).await
+        proxy_stdio(stream, default_project).await
     }
 
     /// `codesage daemon status` — print the running daemon's pid + socket
@@ -548,15 +551,22 @@ mod unix {
             .filter(|&p: &i32| p > 0)
     }
 
-    async fn proxy_stdio(stream: UnixStream) -> Result<()> {
+    async fn proxy_stdio(stream: UnixStream, default_project: Option<String>) -> Result<()> {
         let (mut socket_read, mut socket_write) = tokio::io::split(stream);
         let mut stdin = tokio::io::stdin();
         let mut stdout = tokio::io::stdout();
 
         let stdin_to_socket = async {
-            let copy_res = copy(&mut stdin, &mut socket_write).await;
+            // With a default project, rewrite tools/call messages that omit
+            // `project` before forwarding; otherwise raw-copy for zero
+            // overhead (the Claude-plugin path always passes project).
+            let res = if let Some(dp) = default_project.as_ref() {
+                crate::mcp::pump_lines_injecting(&mut stdin, &mut socket_write, dp.clone()).await
+            } else {
+                copy(&mut stdin, &mut socket_write).await.map(|_| ())
+            };
             let _ = socket_write.shutdown().await;
-            copy_res.map(|_| ())
+            res
         };
         let socket_to_stdout = async {
             let copy_res = copy(&mut socket_read, &mut stdout).await;
@@ -903,14 +913,17 @@ mod unix {
 pub(crate) use unix::{run_daemon, run_daemon_status, run_daemon_stop, run_mcp_shim};
 
 #[cfg(not(unix))]
-pub(crate) async fn run_mcp_shim(runtime_dir: Option<PathBuf>) -> Result<()> {
+pub(crate) async fn run_mcp_shim(
+    runtime_dir: Option<PathBuf>,
+    default_project: Option<String>,
+) -> Result<()> {
     // L3: surface the unsupported flag instead of silently ignoring it.
     // Non-Unix has no daemon path; --runtime-dir would have configured
     // a daemon that can't exist, so failing loudly is right.
     if runtime_dir.is_some() {
         bail!("--runtime-dir is Unix-only; codesage MCP daemon is not supported on this platform");
     }
-    crate::mcp::run_mcp_server().await
+    crate::mcp::run_mcp_server(default_project).await
 }
 
 #[cfg(not(unix))]

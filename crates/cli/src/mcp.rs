@@ -480,6 +480,18 @@ impl CodeSageServer {
         f(&db)
     }
 
+    /// Char budget for a context-bundle response, sized to the project's
+    /// indexed file count (see [`mcp_bundle_token_budget`]). Falls back to a
+    /// mid-tier default — still honoring the `CODESAGE_BUNDLE_TOKEN_BUDGET`
+    /// override — when the file count can't be read.
+    fn bundle_budget_chars(&self, project: &str) -> usize {
+        let tokens = match self.with_project_db(project, |db| db.file_count()) {
+            Ok(count) => mcp_bundle_token_budget(count),
+            Err(_) => mcp_bundle_token_budget(1000),
+        };
+        tokens * MCP_CHARS_PER_TOKEN
+    }
+
     /// Variant of `with_project_db` that also passes the canonical project
     /// root path. Used by tools like `session_start` that need to write
     /// alongside `.codesage/index.db` (e.g. `.codesage/sessions/<id>.json`).
@@ -559,16 +571,47 @@ const MCP_TOKEN_BUDGET: usize = 8000;
 const MCP_CHARS_PER_TOKEN: usize = 4;
 const MCP_BUDGET_CHARS: usize = MCP_TOKEN_BUDGET * MCP_CHARS_PER_TOKEN;
 
+/// Per-response token budget for context bundles, scaled by indexed repo
+/// size. Small repos rarely need a fat bundle and a tighter cap keeps the
+/// agent's context lean; large repos get more room because one bundle has to
+/// cover more ground before the agent falls back to multi-call discovery.
+/// Monotonic non-decreasing. `CODESAGE_BUNDLE_TOKEN_BUDGET=<tokens>` forces a
+/// fixed value (escape hatch + test determinism).
+fn mcp_bundle_token_budget(file_count: usize) -> usize {
+    if let Ok(v) = std::env::var("CODESAGE_BUNDLE_TOKEN_BUDGET")
+        && let Ok(n) = v.parse::<usize>()
+        && n > 0
+    {
+        return n;
+    }
+    match file_count {
+        0..=149 => 4000,
+        150..=4999 => 8000,
+        5000..=14999 => 10000,
+        _ => 12000,
+    }
+}
+
 /// Render a handler's `Result<T>` as a structured MCP `CallToolResult`. Successful
 /// responses ship both the pretty-printed JSON (for the transcript) and the raw
 /// `Value` as `structured_content` so clients can parse without re-deserializing.
 /// Failures set `isError: true` per MCP spec; the full anyhow cause chain is
 /// included via `{:#}`.
 fn render_with_kind<T: serde::Serialize>(r: Result<T>, kind: &str) -> CallToolResult {
+    render_with_budget(r, kind, MCP_BUDGET_CHARS)
+}
+
+/// Like [`render_with_kind`] but with an explicit char budget. Used by the
+/// context-bundle tools, which size their budget by indexed repo file count.
+fn render_with_budget<T: serde::Serialize>(
+    r: Result<T>,
+    kind: &str,
+    budget_chars: usize,
+) -> CallToolResult {
     match r {
         Ok(v) => {
             let value = serde_json::to_value(&v).unwrap_or(serde_json::Value::Null);
-            let capped = cap_to_budget(value, kind);
+            let capped = cap_to_budget_with(value, kind, budget_chars);
             // MCP requires structuredContent to be a JSON object. Tools that
             // return bare arrays (find_symbol, find_references, search) get
             // wrapped in {"results": [...]} so Claude's validator accepts the
@@ -594,16 +637,21 @@ fn render_with_kind<T: serde::Serialize>(r: Result<T>, kind: &str) -> CallToolRe
 /// the largest array field (or the whole value if it's already an array) and attach a
 /// top-level `_meta` describing the truncation. Agents pick up the meta and either refine
 /// or paginate via `offset`.
-fn cap_to_budget(value: serde_json::Value, kind: &str) -> serde_json::Value {
+fn cap_to_budget_with(
+    value: serde_json::Value,
+    kind: &str,
+    budget_chars: usize,
+) -> serde_json::Value {
+    let approx_tokens_budget = budget_chars / MCP_CHARS_PER_TOKEN;
     let initial_len = serde_json::to_string(&value).map(|s| s.len()).unwrap_or(0);
-    if initial_len <= MCP_BUDGET_CHARS {
+    if initial_len <= budget_chars {
         return value;
     }
 
     match value {
         serde_json::Value::Array(items) => {
             let total = items.len();
-            let kept = truncate_array(items, MCP_BUDGET_CHARS);
+            let kept = truncate_array(items, budget_chars);
             let returned = kept.len();
             serde_json::json!({
                 "results": kept,
@@ -612,7 +660,7 @@ fn cap_to_budget(value: serde_json::Value, kind: &str) -> serde_json::Value {
                     "kind": kind,
                     "total_results": total,
                     "returned": returned,
-                    "approx_tokens_budget": MCP_TOKEN_BUDGET,
+                    "approx_tokens_budget": approx_tokens_budget,
                     "hint": "output exceeded budget; refine query, narrow scope (paths/language), or call with offset to paginate",
                 }
             })
@@ -635,7 +683,7 @@ fn cap_to_budget(value: serde_json::Value, kind: &str) -> serde_json::Value {
             {
                 let total = items.len();
                 let other_chars = initial_len.saturating_sub(largest_len);
-                let remaining = MCP_BUDGET_CHARS.saturating_sub(other_chars);
+                let remaining = budget_chars.saturating_sub(other_chars);
                 let kept = truncate_array(items, remaining);
                 let returned = kept.len();
                 map.insert(key.clone(), serde_json::Value::Array(kept));
@@ -647,7 +695,7 @@ fn cap_to_budget(value: serde_json::Value, kind: &str) -> serde_json::Value {
                         "field": key,
                         "total_results": total,
                         "returned": returned,
-                        "approx_tokens_budget": MCP_TOKEN_BUDGET,
+                        "approx_tokens_budget": approx_tokens_budget,
                         "hint": "output exceeded budget; refine query or narrow scope",
                     }),
                 );
@@ -904,20 +952,23 @@ impl CodeSageServer {
             params.include_callers.unwrap_or(false),
             params.include_callees.unwrap_or(false),
         );
+        let budget = self.bundle_budget_chars(&params.project);
         if let Some(sym_name) = req.symbol.clone() {
-            return render_with_kind(
+            return render_with_budget(
                 self.with_project_context_db(&params.project, |db| {
                     export_context_for_symbol(db, &sym_name, &req)
                 }),
                 "export_context",
+                budget,
             );
         }
         let query_for_embed = req.query.clone().unwrap_or_default();
-        render_with_kind(
+        render_with_budget(
             self.with_project_query(&params.project, &query_for_embed, |db, emb, rr| {
                 export_context(db, emb, rr, &req)
             }),
             "export_context",
+            budget,
         )
     }
 
@@ -1082,11 +1133,13 @@ impl CodeSageServer {
         // structural-only db variant points at the default chunk table
         // and returns empty content on projects using a non-default
         // model (php-src uses jina v2 768-dim, MiniLM is the default).
-        render_with_kind(
+        let budget = self.bundle_budget_chars(&params.project);
+        render_with_budget(
             self.with_project_context_db(&params.project, |db| {
                 feature_bundle(db, &feature_id, include_callers, include_callees, limit)
             }),
             "feature_bundle",
+            budget,
         )
     }
 
@@ -1120,17 +1173,101 @@ fn write_drift_log_for_project(project_root: &Path, db_path: &Path) -> Result<()
     Ok(())
 }
 
-pub async fn run_mcp_server() -> Result<()> {
-    let server = CodeSageServer::new();
-    let transport = rmcp::transport::io::stdio();
-    let service = server
-        .serve(transport)
-        .await
-        .map_err(|e| anyhow::anyhow!("MCP server error: {e}"))?;
-    service
-        .waiting()
-        .await
-        .map_err(|e| anyhow::anyhow!("MCP server stopped: {e}"))?;
+/// If `line` is a JSON-RPC `tools/call` whose `params.arguments` lacks a
+/// non-empty `project`, inject `default`; otherwise return the line
+/// unchanged. Lets non-Claude agents (registered via `codesage mcp
+/// --project <root>`) call tools without threading the absolute project
+/// path on every call. Non-JSON lines and other methods pass through
+/// untouched.
+pub(crate) fn inject_default_project_line(line: &str, default: &str) -> String {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return line.to_string();
+    }
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return line.to_string();
+    };
+    if v.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return line.to_string();
+    }
+    let Some(args) = v
+        .pointer_mut("/params/arguments")
+        .and_then(|a| a.as_object_mut())
+    else {
+        return line.to_string();
+    };
+    let needs = match args.get("project") {
+        Some(serde_json::Value::String(s)) => s.trim().is_empty(),
+        Some(_) => false, // present but non-string: let the server validate
+        None => true,
+    };
+    if !needs {
+        return line.to_string();
+    }
+    args.insert(
+        "project".to_string(),
+        serde_json::Value::String(default.to_string()),
+    );
+    serde_json::to_string(&v).unwrap_or_else(|_| line.to_string())
+}
+
+/// Pump newline-delimited JSON-RPC from `reader` to `writer`, injecting
+/// `default_project` into `tools/call` messages that omit it. Used by both
+/// the daemon shim (stdin → socket) and the direct-mode server (stdin →
+/// in-process transport).
+pub(crate) async fn pump_lines_injecting<R, W>(
+    reader: R,
+    mut writer: W,
+    default_project: String,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut lines = BufReader::new(reader).lines();
+    while let Some(line) = lines.next_line().await? {
+        let out = inject_default_project_line(&line, &default_project);
+        writer.write_all(out.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+    }
+    Ok(())
+}
+
+pub async fn run_mcp_server(default_project: Option<String>) -> Result<()> {
+    match default_project {
+        Some(dp) => {
+            // Feed stdin through the project-injecting pump into an
+            // in-process pipe that backs the MCP transport's read half.
+            let (mut feed, server_read) = tokio::io::duplex(64 * 1024);
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let _ = pump_lines_injecting(tokio::io::stdin(), &mut feed, dp).await;
+                let _ = feed.shutdown().await;
+            });
+            let server = CodeSageServer::new();
+            let service = server
+                .serve((server_read, tokio::io::stdout()))
+                .await
+                .map_err(|e| anyhow::anyhow!("MCP server error: {e}"))?;
+            service
+                .waiting()
+                .await
+                .map_err(|e| anyhow::anyhow!("MCP server stopped: {e}"))?;
+        }
+        None => {
+            let server = CodeSageServer::new();
+            let service = server
+                .serve(rmcp::transport::io::stdio())
+                .await
+                .map_err(|e| anyhow::anyhow!("MCP server error: {e}"))?;
+            service
+                .waiting()
+                .await
+                .map_err(|e| anyhow::anyhow!("MCP server stopped: {e}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -1221,8 +1358,77 @@ mod tests {
     #[test]
     fn cap_passes_through_when_under_budget() {
         let v = json!([{"name": "a"}, {"name": "b"}]);
-        let out = cap_to_budget(v.clone(), "test");
+        let out = cap_to_budget_with(v.clone(), "test", MCP_BUDGET_CHARS);
         assert_eq!(out, v);
+    }
+
+    #[test]
+    fn inject_default_project_fills_missing() {
+        let line = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"status","arguments":{}}}"#;
+        let out = inject_default_project_line(line, "/abs/proj");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["params"]["arguments"]["project"], json!("/abs/proj"));
+    }
+
+    #[test]
+    fn inject_default_project_fills_empty_string() {
+        let line = r#"{"method":"tools/call","params":{"name":"search","arguments":{"project":"  ","query":"x"}}}"#;
+        let out = inject_default_project_line(line, "/abs/proj");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["params"]["arguments"]["project"], json!("/abs/proj"));
+        assert_eq!(v["params"]["arguments"]["query"], json!("x"));
+    }
+
+    #[test]
+    fn inject_default_project_leaves_present_value() {
+        let line = r#"{"method":"tools/call","params":{"name":"search","arguments":{"project":"/other"}}}"#;
+        let out = inject_default_project_line(line, "/abs/proj");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["params"]["arguments"]["project"], json!("/other"));
+    }
+
+    #[test]
+    fn inject_default_project_ignores_non_tool_calls() {
+        let init = r#"{"method":"initialize","params":{}}"#;
+        assert_eq!(inject_default_project_line(init, "/abs/proj"), init);
+        let garbage = "not json at all";
+        assert_eq!(inject_default_project_line(garbage, "/abs/proj"), garbage);
+    }
+
+    #[test]
+    fn bundle_token_budget_is_monotonic_by_repo_size() {
+        // Env override not exercised here: setting env vars is `unsafe` and
+        // racy under edition 2024; tier coverage is what matters.
+        let tiers = [
+            mcp_bundle_token_budget(0),
+            mcp_bundle_token_budget(149),
+            mcp_bundle_token_budget(150),
+            mcp_bundle_token_budget(4999),
+            mcp_bundle_token_budget(5000),
+            mcp_bundle_token_budget(14999),
+            mcp_bundle_token_budget(15000),
+            mcp_bundle_token_budget(500_000),
+        ];
+        assert_eq!(tiers[0], 4000);
+        assert_eq!(tiers[1], 4000);
+        assert_eq!(tiers[2], 8000);
+        assert_eq!(tiers[4], 10000);
+        assert_eq!(tiers[6], 12000);
+        for w in tiers.windows(2) {
+            assert!(w[1] >= w[0], "budget must be non-decreasing: {tiers:?}");
+        }
+    }
+
+    #[test]
+    fn cap_respects_explicit_smaller_budget() {
+        // A small per-call budget truncates input that the default would pass.
+        let items: Vec<Value> = (0..20)
+            .map(|i| json!({"i": i, "blob": fat_string(500)}))
+            .collect();
+        let out = cap_to_budget_with(Value::Array(items), "feature_bundle", 4000);
+        let obj = out.as_object().expect("wrapped as object");
+        assert_eq!(obj["_meta"]["truncated"], json!(true));
+        assert_eq!(obj["_meta"]["approx_tokens_budget"], json!(1000));
     }
 
     #[test]
@@ -1231,7 +1437,7 @@ mod tests {
         let items: Vec<Value> = (0..50)
             .map(|i| json!({"i": i, "blob": fat_string(1000)}))
             .collect();
-        let out = cap_to_budget(Value::Array(items), "search");
+        let out = cap_to_budget_with(Value::Array(items), "search", MCP_BUDGET_CHARS);
         let obj = out.as_object().expect("wrapped as object");
         let meta = &obj["_meta"];
         assert_eq!(meta["truncated"], json!(true));
@@ -1253,7 +1459,7 @@ mod tests {
             "primary": [{"file_path": "a.rs", "content": "small"}],
             "related": related,
         });
-        let out = cap_to_budget(v, "export_context");
+        let out = cap_to_budget_with(v, "export_context", MCP_BUDGET_CHARS);
         let obj = out.as_object().expect("still an object");
         assert_eq!(
             obj["primary"].as_array().unwrap().len(),
@@ -1272,7 +1478,7 @@ mod tests {
     #[test]
     fn cap_object_without_arrays_passes_through() {
         let v = json!({"a": "small", "b": 42});
-        let out = cap_to_budget(v.clone(), "test");
+        let out = cap_to_budget_with(v.clone(), "test", MCP_BUDGET_CHARS);
         assert_eq!(out, v);
     }
 

@@ -9,7 +9,8 @@ use std::path::Path;
 use anyhow::Result;
 use codesage_parser::discover::build_exclude_set;
 use codesage_protocol::{
-    FeatureFileRef, FeatureFileRole, FeatureMapStats, FeatureRecord, TrustBoundary,
+    FeatureFileRef, FeatureFileRole, FeatureMapStats, FeatureRecord, Reference, ReferenceKind,
+    TrustBoundary,
 };
 use codesage_storage::Database;
 
@@ -18,7 +19,7 @@ use crate::mappers::{
     c::CCppMapper,
     go::GoMapper,
     js::JsMapper,
-    php::PhpMapper,
+    php::{PhpMapper, laravel_route_handler_refs},
     python::PythonMapper,
     rust::RustMapper,
     shared::walk_files,
@@ -85,6 +86,29 @@ pub fn map_features(
         }
         Ok(())
     })?;
+    // Framework route edges: synthesize `RouteHandler` references so
+    // `impact_analysis` / `find_references` traverse Laravel routing.
+    // Re-derived every run and rewritten wholesale (delete-of-kind then
+    // insert) so edges from removed routes don't linger. Non-Laravel repos
+    // produce an empty set; the delete then just clears any prior edges.
+    let route_refs = laravel_route_handler_refs(root)?;
+    db.execute_batch(|db| {
+        db.delete_references_of_kind(ReferenceKind::RouteHandler)?;
+        let mut by_file: BTreeMap<&str, Vec<Reference>> = BTreeMap::new();
+        for r in &route_refs {
+            by_file
+                .entry(r.from_file.as_str())
+                .or_default()
+                .push(r.clone());
+        }
+        for (path, refs) in by_file {
+            if let Some(file_id) = db.file_id_for_path(path)? {
+                db.insert_references(file_id, &refs)?;
+            }
+        }
+        Ok(())
+    })?;
+
     let removed = if any_mapper_errored {
         tracing::warn!(
             "one or more mappers errored — skipping stale-feature GC to avoid deleting valid rows from an incomplete pass"
@@ -299,6 +323,64 @@ mod tests {
         assert_eq!(first.total_features, second.total_features);
         assert_eq!(second.created, 0);
         assert!(second.updated >= 1);
+    }
+
+    #[test]
+    fn laravel_route_handler_edge_emitted_and_idempotent() {
+        use codesage_protocol::{FileInfo, Language, ReferenceKind};
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "routes/web.php",
+            "<?php\nuse App\\Http\\Controllers\\UserController;\n\
+             Route::get('/users', [UserController::class, 'index']);\n",
+        );
+        write(
+            root,
+            "app/Http/Controllers/UserController.php",
+            "<?php\nnamespace App\\Http\\Controllers;\n\
+             class UserController {\n  public function index() {}\n}\n",
+        );
+        let db = Database::open_in_memory().unwrap();
+        // Structural index registers files before mapping in the real
+        // pipeline; emulate it so `file_id_for_path` resolves the route file.
+        db.upsert_file(&FileInfo {
+            path: "routes/web.php".to_string(),
+            language: Language::Php,
+            content_hash: "h".to_string(),
+        })
+        .unwrap();
+
+        map_features(root, &db, &[]).unwrap();
+
+        // Qualified lookup (the impact_analysis path) resolves the edge.
+        let qualified = db
+            .find_references("App\\Http\\Controllers\\UserController\\index", None)
+            .unwrap();
+        assert_eq!(
+            qualified.len(),
+            1,
+            "expected one route edge, got {qualified:?}"
+        );
+        assert_eq!(qualified[0].kind, ReferenceKind::RouteHandler);
+        assert_eq!(qualified[0].from_file, "routes/web.php");
+
+        // Unqualified (tail) lookup also resolves it.
+        let by_tail = db.find_references("index", None).unwrap();
+        assert!(
+            by_tail
+                .iter()
+                .any(|r| r.kind == ReferenceKind::RouteHandler),
+            "tail lookup missed route edge: {by_tail:?}"
+        );
+
+        // A second map run must not duplicate the edge.
+        map_features(root, &db, &[]).unwrap();
+        let after = db
+            .find_references("App\\Http\\Controllers\\UserController\\index", None)
+            .unwrap();
+        assert_eq!(after.len(), 1, "remap duplicated the route edge: {after:?}");
     }
 
     #[test]

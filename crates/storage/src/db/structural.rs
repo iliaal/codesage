@@ -140,6 +140,29 @@ impl Database {
         Ok(())
     }
 
+    /// Resolve a repo-relative path to its `files.id`, or `None` if the
+    /// file isn't indexed. Used by the feature mapper to attach
+    /// framework-derived references (route edges) to their source file.
+    pub fn file_id_for_path(&self, path: &str) -> Result<Option<i64>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM files WHERE path = ?1")?;
+        match stmt.query_row(params![path], |row| row.get::<_, i64>(0)) {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Delete every reference of a given kind across all files. The feature
+    /// mapper calls this before re-inserting synthetic edges (e.g.
+    /// `RouteHandler`) so a remap stays idempotent and drops edges whose
+    /// route declaration was removed.
+    pub fn delete_references_of_kind(&self, kind: ReferenceKind) -> Result<usize> {
+        let n = self
+            .conn
+            .execute("DELETE FROM refs WHERE kind = ?1", params![kind.as_str()])?;
+        Ok(n)
+    }
+
     pub fn get_file_hash(&self, path: &str) -> Result<Option<String>> {
         let mut stmt = self
             .conn
