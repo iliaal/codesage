@@ -56,7 +56,7 @@ impl AgentTarget for OpencodeTarget {
 
     fn install(&self, ctx: &InstallCtx) -> Result<InstallOutcome> {
         let path = self.path(ctx);
-        let original = fs::read_to_string(&path).unwrap_or_else(|_| "{}\n".to_string());
+        let original = super::read_config(&path, "{}\n")?;
         let root = CstRootNode::parse(&original, &ParseOptions::default())
             .map_err(|e| anyhow!("parsing JSONC at {}: {e}", path.display()))?;
 
@@ -89,9 +89,12 @@ impl AgentTarget for OpencodeTarget {
 
     fn uninstall(&self, ctx: &InstallCtx) -> Result<UninstallOutcome> {
         let path = self.path(ctx);
-        let Ok(original) = fs::read_to_string(&path) else {
+        // Absent file → nothing to remove; a real read error propagates so we
+        // don't misreport an unreadable-but-present config as "not configured".
+        if !path.exists() {
             return Ok(UninstallOutcome::NotConfigured);
-        };
+        }
+        let original = super::read_config(&path, "{}\n")?;
         let root = CstRootNode::parse(&original, &ParseOptions::default())
             .map_err(|e| anyhow!("parsing JSONC at {}: {e}", path.display()))?;
 
@@ -165,6 +168,19 @@ mod tests {
             "other server lost: {written}"
         );
         assert!(written.contains("\"codesage\""));
+    }
+
+    #[test]
+    fn install_errors_on_unreadable_file_without_clobbering() {
+        // Invalid UTF-8: read fails but the file exists. Must propagate, not
+        // replace the user's config with a fresh `{}`.
+        let proj = tempdir().unwrap();
+        let cfg = proj.path().join("opencode.jsonc");
+        fs::write(&cfg, [0xff, 0xfe, 0x00, 0x01]).unwrap();
+
+        let t = OpencodeTarget;
+        assert!(t.install(&ctx(proj.path())).is_err());
+        assert_eq!(fs::read(&cfg).unwrap(), vec![0xff, 0xfe, 0x00, 0x01]);
     }
 
     #[test]

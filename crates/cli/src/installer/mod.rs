@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 mod codex;
 mod opencode;
@@ -70,6 +70,19 @@ pub fn all_targets() -> Vec<Box<dyn AgentTarget>> {
 /// Resolve a target by id, or `None` if unknown.
 pub fn target_by_id(id: &str) -> Option<Box<dyn AgentTarget>> {
     all_targets().into_iter().find(|t| t.id() == id)
+}
+
+/// Read a config file, treating "not found" as `default_when_absent` but
+/// surfacing any other read error (permission denied, invalid UTF-8) rather
+/// than collapsing it to empty. The collapse is dangerous: the caller then
+/// writes a fresh file and clobbers the user's real config (comments, other
+/// servers) it couldn't read.
+pub(crate) fn read_config(path: &Path, default_when_absent: &str) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(default_when_absent.to_string()),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
 }
 
 /// The argv CodeSage registers for every agent: the `codesage` binary plus

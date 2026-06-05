@@ -1187,14 +1187,38 @@ pub(crate) fn inject_default_project_line(line: &str, default: &str) -> String {
     let Ok(mut v) = serde_json::from_str::<serde_json::Value>(trimmed) else {
         return line.to_string();
     };
-    if v.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+    // Handle a JSON-RPC batch (top-level array) by injecting into each
+    // contained message, as well as a single message.
+    let changed = match &mut v {
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .fold(false, |acc, item| acc | inject_into_message(item, default)),
+        other => inject_into_message(other, default),
+    };
+    if !changed {
         return line.to_string();
     }
-    let Some(args) = v
-        .pointer_mut("/params/arguments")
-        .and_then(|a| a.as_object_mut())
-    else {
-        return line.to_string();
+    serde_json::to_string(&v).unwrap_or_else(|_| line.to_string())
+}
+
+/// Inject `default` into one JSON-RPC message if it is a `tools/call` whose
+/// arguments omit a non-empty `project`. Returns whether it changed `v`.
+/// Creates an empty `arguments` object when the call omits it entirely.
+fn inject_into_message(v: &mut serde_json::Value, default: &str) -> bool {
+    if v.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return false;
+    }
+    let Some(params) = v.get_mut("params").and_then(|p| p.as_object_mut()) else {
+        return false;
+    };
+    let args = params
+        .entry("arguments")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if args.is_null() {
+        *args = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let Some(args) = args.as_object_mut() else {
+        return false; // arguments present but not an object: let the server validate
     };
     let needs = match args.get("project") {
         Some(serde_json::Value::String(s)) => s.trim().is_empty(),
@@ -1202,13 +1226,13 @@ pub(crate) fn inject_default_project_line(line: &str, default: &str) -> String {
         None => true,
     };
     if !needs {
-        return line.to_string();
+        return false;
     }
     args.insert(
         "project".to_string(),
         serde_json::Value::String(default.to_string()),
     );
-    serde_json::to_string(&v).unwrap_or_else(|_| line.to_string())
+    true
 }
 
 /// Pump newline-delimited JSON-RPC from `reader` to `writer`, injecting
@@ -1247,14 +1271,24 @@ pub async fn run_mcp_server(default_project: Option<String>) -> Result<()> {
                 let _ = feed.shutdown().await;
             });
             let server = CodeSageServer::new();
-            let service = server
-                .serve((server_read, tokio::io::stdout()))
-                .await
-                .map_err(|e| anyhow::anyhow!("MCP server error: {e}"))?;
-            service
-                .waiting()
-                .await
-                .map_err(|e| anyhow::anyhow!("MCP server stopped: {e}"))?;
+            let code = match server.serve((server_read, tokio::io::stdout())).await {
+                Ok(service) => match service.waiting().await {
+                    Ok(_) => 0,
+                    Err(e) => {
+                        tracing::error!(error = %e, "MCP server stopped");
+                        1
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(error = %e, "MCP server error");
+                    1
+                }
+            };
+            // The spawned stdin pump owns a blocking read that can't be
+            // cancelled; if the server exits first, the runtime drop in
+            // cmd_mcp would block on it forever. Exit the process directly,
+            // mirroring the daemon shim's proxy_stdio rationale.
+            std::process::exit(code);
         }
         None => {
             let server = CodeSageServer::new();
@@ -1385,6 +1419,27 @@ mod tests {
         let out = inject_default_project_line(line, "/abs/proj");
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["params"]["arguments"]["project"], json!("/other"));
+    }
+
+    #[test]
+    fn inject_default_project_creates_missing_arguments() {
+        let line = r#"{"method":"tools/call","params":{"name":"list_features"}}"#;
+        let out = inject_default_project_line(line, "/abs/proj");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["params"]["arguments"]["project"], json!("/abs/proj"));
+    }
+
+    #[test]
+    fn inject_default_project_handles_batch_array() {
+        let line = r#"[{"method":"tools/call","params":{"name":"a","arguments":{}}},{"method":"initialize","params":{}},{"method":"tools/call","params":{"name":"b","arguments":{"project":"/keep"}}}]"#;
+        let out = inject_default_project_line(line, "/abs/proj");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v[0]["params"]["arguments"]["project"], json!("/abs/proj"));
+        assert!(
+            v[1]["params"].get("arguments").is_none(),
+            "initialize untouched"
+        );
+        assert_eq!(v[2]["params"]["arguments"]["project"], json!("/keep"));
     }
 
     #[test]

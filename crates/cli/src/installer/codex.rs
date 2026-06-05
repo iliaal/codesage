@@ -34,7 +34,7 @@ impl AgentTarget for CodexTarget {
 
     fn install(&self, ctx: &InstallCtx) -> Result<InstallOutcome> {
         let path = self.path(ctx);
-        let original = fs::read_to_string(&path).unwrap_or_default();
+        let original = super::read_config(&path, "")?;
         let mut doc = original
             .parse::<DocumentMut>()
             .with_context(|| format!("parsing existing TOML at {}", path.display()))?;
@@ -61,10 +61,18 @@ impl AgentTarget for CodexTarget {
             t.set_implicit(true);
             t
         }));
-        if servers.is_inline_table()
-            && let Some(inline) = servers.as_inline_table().cloned()
-        {
-            *servers = Item::Table(inline.into_table());
+        if !servers.is_table() {
+            // Coerce an inline table; replace any other non-table value
+            // (scalar/array — malformed for Codex) with a fresh table so we
+            // never silently report "unchanged" without writing the entry.
+            *servers = match servers.as_inline_table().cloned() {
+                Some(inline) => Item::Table(inline.into_table()),
+                None => Item::Table({
+                    let mut t = Table::new();
+                    t.set_implicit(true);
+                    t
+                }),
+            };
         }
         if let Some(t) = servers.as_table_mut() {
             t.set_implicit(true);
@@ -84,9 +92,12 @@ impl AgentTarget for CodexTarget {
 
     fn uninstall(&self, ctx: &InstallCtx) -> Result<UninstallOutcome> {
         let path = self.path(ctx);
-        let Ok(original) = fs::read_to_string(&path) else {
+        // Absent file → nothing to remove; a real read error propagates so we
+        // don't misreport an unreadable-but-present config as "not configured".
+        let original = super::read_config(&path, "")?;
+        if original.is_empty() {
             return Ok(UninstallOutcome::NotConfigured);
-        };
+        }
         let mut doc = original
             .parse::<DocumentMut>()
             .with_context(|| format!("parsing existing TOML at {}", path.display()))?;
@@ -170,6 +181,41 @@ mod tests {
         assert_eq!(t.install(&c).unwrap(), InstallOutcome::Unchanged);
         assert_eq!(t.uninstall(&c).unwrap(), UninstallOutcome::Removed);
         assert!(!fs::read_to_string(&cfg).unwrap().contains("codesage"));
+    }
+
+    #[test]
+    fn install_coerces_non_table_mcp_servers() {
+        // A scalar `mcp_servers` used to make install silently report
+        // "unchanged" without adding the entry.
+        let home = tempdir().unwrap();
+        let cfg = home.path().join(".codex/config.toml");
+        fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        fs::write(&cfg, "mcp_servers = \"oops\"\n").unwrap();
+
+        let t = CodexTarget;
+        let c = ctx(home.path(), Path::new("/abs/proj"));
+        assert_eq!(t.install(&c).unwrap(), InstallOutcome::Wrote);
+        let written = fs::read_to_string(&cfg).unwrap();
+        assert!(
+            written.contains("[mcp_servers.codesage]"),
+            "expected header form, got: {written}"
+        );
+    }
+
+    #[test]
+    fn install_errors_on_unreadable_file_without_clobbering() {
+        // Invalid UTF-8: read fails, but the file exists. Must propagate the
+        // error, not overwrite the user's config with a fresh one.
+        let home = tempdir().unwrap();
+        let cfg = home.path().join(".codex/config.toml");
+        fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        fs::write(&cfg, [0xff, 0xfe, 0x00, 0x01]).unwrap();
+
+        let t = CodexTarget;
+        let c = ctx(home.path(), Path::new("/abs/proj"));
+        assert!(t.install(&c).is_err(), "should error on unreadable file");
+        // File bytes untouched.
+        assert_eq!(fs::read(&cfg).unwrap(), vec![0xff, 0xfe, 0x00, 0x01]);
     }
 
     #[test]
