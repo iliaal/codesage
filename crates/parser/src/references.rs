@@ -75,6 +75,20 @@ fn ref_query_for(lang: Language) -> &'static RefQuerySpec {
     }
 }
 
+/// Every (language, reference-query-source) pair. Counterpart to
+/// [`crate::extract::SYMBOL_QUERY_SOURCES`]; iterated by `crate::validate`.
+pub(crate) const REF_QUERY_SOURCES: &[(Language, &str)] = &[
+    (Language::Php, PHP_REF_QUERY),
+    (Language::Python, PYTHON_REF_QUERY),
+    (Language::C, C_REF_QUERY),
+    (Language::Cpp, CPP_REF_QUERY),
+    (Language::Java, JAVA_REF_QUERY),
+    (Language::Rust, RUST_REF_QUERY),
+    (Language::JavaScript, JS_REF_QUERY),
+    (Language::TypeScript, TS_REF_QUERY),
+    (Language::Go, GO_REF_QUERY),
+];
+
 fn php_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
     match pattern_index {
         0 => Some(ReferenceKind::Import), // namespace_use_declaration

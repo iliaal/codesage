@@ -519,6 +519,111 @@ impl CodeSageServer {
         f(&db)
     }
 
+    /// Render a tool result, then annotate it with a staleness banner if any of
+    /// the files it references have changed on disk since indexing. Handlers
+    /// route through this instead of the free `render_with_kind` so the project
+    /// context needed to stat files is available.
+    fn render<T: serde::Serialize>(
+        &self,
+        project: &str,
+        r: Result<T>,
+        kind: &str,
+    ) -> CallToolResult {
+        self.annotate_staleness(project, render_with_kind(r, kind))
+    }
+
+    /// [`Self::render`] with an explicit char budget (context-bundle tools).
+    fn render_budget<T: serde::Serialize>(
+        &self,
+        project: &str,
+        r: Result<T>,
+        kind: &str,
+        budget_chars: usize,
+    ) -> CallToolResult {
+        self.annotate_staleness(project, render_with_budget(r, kind, budget_chars))
+    }
+
+    /// If staleness checking is enabled and the result references indexed files
+    /// that have since changed on disk, prepend a `⚠️` banner to the content and
+    /// record the stale paths under `_meta.stale_files`. Best-effort: any error
+    /// (project not resolvable, DB unreadable) leaves the result untouched —
+    /// staleness is a hint, never a reason to fail a tool call.
+    fn annotate_staleness(&self, project: &str, mut result: CallToolResult) -> CallToolResult {
+        if result.is_error == Some(true) || !staleness_enabled() {
+            return result;
+        }
+        let Some(structured) = result.structured_content.as_ref() else {
+            return result;
+        };
+        let mut paths = Vec::new();
+        collect_referenced_paths(structured, &mut paths);
+        paths.sort();
+        paths.dedup();
+        if paths.is_empty() {
+            return result;
+        }
+        paths.truncate(STALENESS_MAX_FILES);
+
+        let stale = match self.compute_stale_files(project, &paths) {
+            Ok(stale) if !stale.is_empty() => stale,
+            Ok(_) => return result,
+            Err(e) => {
+                tracing::debug!(error = %e, "staleness check skipped");
+                return result;
+            }
+        };
+
+        if let Some(mut structured) = result.structured_content.take() {
+            merge_stale_meta(&mut structured, &stale);
+            result.structured_content = Some(structured);
+        }
+        let banner = format!(
+            "⚠️ {} file(s) changed on disk since indexing and may be stale in these results: {}. \
+             Read them directly for current contents; run `codesage index` to refresh.",
+            stale.len(),
+            stale.join(", ")
+        );
+        let existing = std::mem::take(&mut result.content);
+        let mut content = Vec::with_capacity(existing.len() + 1);
+        content.push(Content::text(banner));
+        content.extend(existing);
+        result.content = content;
+        result
+    }
+
+    /// Of `rel_paths` (project-relative), return those whose current on-disk
+    /// content hash differs from the indexed hash (or that no longer exist).
+    /// Paths not present in the index are skipped — they may be synthetic or
+    /// out-of-index references, not drift.
+    fn compute_stale_files(&self, project: &str, rel_paths: &[String]) -> Result<Vec<String>> {
+        let state = self.resolve_project(project)?;
+        let root = state
+            .db_path
+            .parent()
+            .and_then(|p| p.parent())
+            .ok_or_else(|| anyhow::anyhow!("could not derive project root from db path"))?
+            .to_path_buf();
+        let db = self.open_structural_db_for(&state)?;
+        let mut stale = Vec::new();
+        for rel in rel_paths {
+            let Some(expected) = db.get_file_hash(rel)? else {
+                continue;
+            };
+            match std::fs::read(root.join(rel)) {
+                Ok(bytes) => {
+                    if codesage_parser::discover::content_hash(&bytes) != expected {
+                        stale.push(rel.clone());
+                    }
+                }
+                // Indexed file gone or unreadable: treat as stale so the agent
+                // is told to look rather than trusting an indexed copy of a file
+                // that no longer matches the tree.
+                Err(_) => stale.push(rel.clone()),
+            }
+        }
+        Ok(stale)
+    }
+
     /// Resolve a project, embed `query`, and call `f` with the resulting
     /// query embedding + a reranker callback that lazily locks the shared
     /// reranker only when the search pipeline actually invokes it.
@@ -631,6 +736,105 @@ fn render_with_budget<T: serde::Serialize>(
         }
         Err(e) => CallToolResult::error(vec![Content::text(format!("Error: {e:#}"))]),
     }
+}
+
+/// Cap on how many distinct files a single response triggers an on-disk hash
+/// for. Responses are already budget-capped, so the unique-file count is
+/// bounded in practice; this is a hard backstop against a pathological result.
+const STALENESS_MAX_FILES: usize = 50;
+
+/// JSON keys whose string value (or string array elements) is a
+/// project-relative file path in a tool result. Deliberately excludes
+/// `imports` / `imported_by` (bare module names) and `clustered_directories`
+/// (directories, not files). Over-inclusion is harmless — `compute_stale_files`
+/// filters against the indexed file set — but under-inclusion silently misses
+/// drift, so err toward listing a key.
+const PATH_KEYS: &[&str] = &[
+    "file_path",
+    "path",
+    "file",
+    "from_file",
+    "cycle_files",
+    "members",
+    "new_files",
+    "removed_files",
+    "test_gap_files",
+    "wide_blast_files",
+    "fix_heavy_files",
+    "hotspot_files",
+];
+
+/// Staleness checking is on by default; `CODESAGE_STALENESS_CHECK` set to a
+/// falsey value disables it (per-response stat+hash of referenced files).
+fn staleness_enabled() -> bool {
+    !matches!(
+        std::env::var("CODESAGE_STALENESS_CHECK").ok().as_deref(),
+        Some("0") | Some("false") | Some("no") | Some("off")
+    )
+}
+
+/// Walk a serialized tool result, collecting project-relative file paths from
+/// the [`PATH_KEYS`] fields wherever they appear (recursing through nested
+/// objects and arrays).
+fn collect_referenced_paths(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                if PATH_KEYS.contains(&k.as_str()) {
+                    match v {
+                        serde_json::Value::String(s) => out.push(s.clone()),
+                        serde_json::Value::Array(items) => {
+                            for item in items {
+                                if let serde_json::Value::String(s) = item {
+                                    out.push(s.clone());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                collect_referenced_paths(v, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_referenced_paths(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Record the stale paths under `_meta.stale_files` (+ a human `stale_warning`),
+/// merging into any existing `_meta` (e.g. a truncation marker) rather than
+/// overwriting it. No-op if the structured value isn't a JSON object.
+fn merge_stale_meta(structured: &mut serde_json::Value, stale: &[String]) {
+    let serde_json::Value::Object(map) = structured else {
+        return;
+    };
+    let meta = map
+        .entry("_meta")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let serde_json::Value::Object(meta) = meta else {
+        return;
+    };
+    meta.insert(
+        "stale_files".to_string(),
+        serde_json::Value::Array(
+            stale
+                .iter()
+                .map(|s| serde_json::Value::String(s.clone()))
+                .collect(),
+        ),
+    );
+    meta.insert(
+        "stale_warning".to_string(),
+        serde_json::Value::String(
+            "listed files changed on disk since indexing; read them directly and run \
+             `codesage index` to refresh"
+                .to_string(),
+        ),
+    );
 }
 
 /// If the serialized value fits within MCP_BUDGET_CHARS, return as-is. Otherwise truncate
@@ -849,7 +1053,8 @@ impl CodeSageServer {
             name: params.name,
             kind,
         };
-        render_with_kind(
+        self.render(
+            &params.project,
             self.with_project_db(&params.project, |db| find_symbol(db, &req)),
             "find_symbol",
         )
@@ -869,7 +1074,8 @@ impl CodeSageServer {
             symbol_name: params.name,
             kind,
         };
-        render_with_kind(
+        self.render(
+            &params.project,
             self.with_project_db(&params.project, |db| find_references(db, &req)),
             "find_references",
         )
@@ -884,7 +1090,8 @@ impl CodeSageServer {
         &self,
         Parameters(params): Parameters<ListDependenciesParams>,
     ) -> CallToolResult {
-        render_with_kind(
+        self.render(
+            &params.project,
             self.with_project_db(&params.project, |db| {
                 list_dependencies(db, &params.file_path)
             }),
@@ -911,7 +1118,8 @@ impl CodeSageServer {
             paths: params.paths,
         };
         let query_for_embed = req.query.clone();
-        render_with_kind(
+        self.render(
+            &params.project,
             self.with_project_query(&params.project, &query_for_embed, |db, emb, rr| {
                 search(db, emb, rr, &req)
             }),
@@ -930,7 +1138,8 @@ impl CodeSageServer {
             depth: params.depth.unwrap_or(2),
             source_only: params.source_only.unwrap_or(false),
         };
-        render_with_kind(
+        self.render(
+            &params.project,
             self.with_project_db(&params.project, |db| impact_analysis(db, &req)),
             "impact_analysis",
         )
@@ -954,7 +1163,8 @@ impl CodeSageServer {
         );
         let budget = self.bundle_budget_chars(&params.project);
         if let Some(sym_name) = req.symbol.clone() {
-            return render_with_budget(
+            return self.render_budget(
+                &params.project,
                 self.with_project_context_db(&params.project, |db| {
                     export_context_for_symbol(db, &sym_name, &req)
                 }),
@@ -963,7 +1173,8 @@ impl CodeSageServer {
             );
         }
         let query_for_embed = req.query.clone().unwrap_or_default();
-        render_with_budget(
+        self.render_budget(
+            &params.project,
             self.with_project_query(&params.project, &query_for_embed, |db, emb, rr| {
                 export_context(db, emb, rr, &req)
             }),
@@ -980,7 +1191,8 @@ impl CodeSageServer {
     fn find_coupling_tool(&self, Parameters(params): Parameters<CouplingParams>) -> CallToolResult {
         let limit = params.limit.unwrap_or(10);
         let file_path = params.file_path.clone();
-        render_with_kind(
+        self.render(
+            &params.project,
             self.with_project_db(&params.project, |db| find_coupling(db, &file_path, limit)),
             "find_coupling",
         )
@@ -993,7 +1205,8 @@ impl CodeSageServer {
     )]
     fn assess_risk_tool(&self, Parameters(params): Parameters<RiskParams>) -> CallToolResult {
         let file_path = params.file_path.clone();
-        render_with_kind(
+        self.render(
+            &params.project,
             self.with_project_db(&params.project, |db| assess_risk(db, &file_path)),
             "assess_risk",
         )
@@ -1009,7 +1222,8 @@ impl CodeSageServer {
         Parameters(params): Parameters<RiskDiffParams>,
     ) -> CallToolResult {
         let file_paths = params.file_paths.clone();
-        render_with_kind(
+        self.render(
+            &params.project,
             self.with_project_db(&params.project, |db| assess_risk_diff(db, &file_paths)),
             "assess_risk_diff",
         )
@@ -1025,7 +1239,8 @@ impl CodeSageServer {
         Parameters(params): Parameters<RiskBatchParams>,
     ) -> CallToolResult {
         let file_paths = params.file_paths.clone();
-        render_with_kind(
+        self.render(
+            &params.project,
             self.with_project_db(&params.project, |db| assess_risk_batch(db, &file_paths)),
             "assess_risk_batch",
         )
@@ -1041,7 +1256,8 @@ impl CodeSageServer {
         Parameters(params): Parameters<TestsForParams>,
     ) -> CallToolResult {
         let file_paths = params.file_paths.clone();
-        render_with_kind(
+        self.render(
+            &params.project,
             self.with_project_db(&params.project, |db| recommend_tests(db, &file_paths)),
             "recommend_tests",
         )
@@ -1057,7 +1273,8 @@ impl CodeSageServer {
             .session_id
             .clone()
             .unwrap_or_else(|| "default".to_string());
-        render_with_kind(
+        self.render(
+            &params.project,
             self.with_project_root_db(&params.project, |root, db| {
                 session_start(root, db, &session_id)
             }),
@@ -1083,7 +1300,8 @@ impl CodeSageServer {
         // intersection, mirroring the CLI: the SQL LIMIT runs before the
         // diff filter, so a pre-filter limit would truncate candidates.
         let query_limit = if since.is_some() { 0 } else { limit };
-        render_with_kind(
+        self.render(
+            &params.project,
             self.with_project_root_db(&params.project, |root, db| {
                 let mut features = db.list_features(kind, language, tag.as_deref(), query_limit)?;
                 if let Some(git_ref) = since.as_deref() {
@@ -1109,7 +1327,8 @@ impl CodeSageServer {
         Parameters(params): Parameters<FindFeatureParams>,
     ) -> CallToolResult {
         let file = params.file_path.clone();
-        render_with_kind(
+        self.render(
+            &params.project,
             self.with_project_db(&params.project, |db| db.features_for_file(&file)),
             "find_feature",
         )
@@ -1134,7 +1353,8 @@ impl CodeSageServer {
         // and returns empty content on projects using a non-default
         // model (php-src uses jina v2 768-dim, MiniLM is the default).
         let budget = self.bundle_budget_chars(&params.project);
-        render_with_budget(
+        self.render_budget(
+            &params.project,
             self.with_project_context_db(&params.project, |db| {
                 feature_bundle(db, &feature_id, include_callers, include_callees, limit)
             }),
@@ -1153,7 +1373,8 @@ impl CodeSageServer {
             .session_id
             .clone()
             .unwrap_or_else(|| "default".to_string());
-        render_with_kind(
+        self.render(
+            &params.project,
             self.with_project_root_db(&params.project, |root, db| {
                 session_end(root, db, &session_id)
             }),
@@ -2017,5 +2238,114 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    #[test]
+    fn collect_referenced_paths_pulls_path_fields_recursively() {
+        let v = json!({
+            "results": [
+                { "file_path": "src/a.rs", "name": "foo", "imports": ["std::io"] },
+                { "from_file": "src/b.rs" }
+            ],
+            "cycle_files": ["src/c.rs", "src/d.rs"],
+            "clustered_directories": ["src/ignored"],
+            "_meta": { "truncated": true }
+        });
+        let mut paths = Vec::new();
+        collect_referenced_paths(&v, &mut paths);
+        paths.sort();
+        // file_path, from_file, and cycle_files[*] collected; `imports`
+        // (bare module name) and `clustered_directories` (a dir) excluded.
+        assert_eq!(paths, vec!["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"]);
+    }
+
+    #[test]
+    fn merge_stale_meta_preserves_existing_meta() {
+        let mut v = json!({ "results": [], "_meta": { "truncated": true } });
+        merge_stale_meta(&mut v, &["src/a.rs".to_string()]);
+        // existing key untouched, stale info added alongside.
+        assert_eq!(v["_meta"]["truncated"], json!(true));
+        assert_eq!(v["_meta"]["stale_files"], json!(["src/a.rs"]));
+        assert!(v["_meta"]["stale_warning"].is_string());
+    }
+
+    #[test]
+    fn merge_stale_meta_creates_meta_when_absent() {
+        let mut v = json!({ "results": [] });
+        merge_stale_meta(&mut v, &["x.rs".to_string()]);
+        assert_eq!(v["_meta"]["stale_files"], json!(["x.rs"]));
+    }
+
+    #[test]
+    fn staleness_detects_changed_and_missing_files() {
+        // End-to-end against a real structural index: a file whose on-disk
+        // content matches its indexed hash is not stale; one that changed is;
+        // one deleted is; one never indexed is ignored (not in the index).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let codesage_dir = root.join(".codesage");
+        std::fs::create_dir_all(&codesage_dir).unwrap();
+        let db = Database::open(&codesage_dir.join("index.db")).unwrap();
+
+        let write = |rel: &str, body: &[u8]| {
+            let abs = root.join(rel);
+            std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+            std::fs::write(&abs, body).unwrap();
+        };
+        let index = |rel: &str, body: &[u8]| {
+            db.upsert_file(&codesage_protocol::FileInfo {
+                path: rel.to_string(),
+                language: Language::Rust,
+                content_hash: codesage_parser::discover::content_hash(body),
+            })
+            .unwrap();
+        };
+
+        // unchanged on disk vs index
+        write("src/same.rs", b"fn a() {}");
+        index("src/same.rs", b"fn a() {}");
+        // changed on disk since indexing
+        write("src/changed.rs", b"fn b() {} // edited");
+        index("src/changed.rs", b"fn b() {}");
+        // indexed but deleted from disk
+        index("src/gone.rs", b"fn c() {}");
+        drop(db);
+
+        let server = CodeSageServer::with_state(Arc::new(CodeSageServerState::new()));
+        let project = root.to_str().unwrap();
+
+        let stale = server
+            .compute_stale_files(
+                project,
+                &[
+                    "src/same.rs".to_string(),
+                    "src/changed.rs".to_string(),
+                    "src/gone.rs".to_string(),
+                    "src/never_indexed.rs".to_string(),
+                ],
+            )
+            .unwrap();
+
+        assert!(!stale.contains(&"src/same.rs".to_string()));
+        assert!(stale.contains(&"src/changed.rs".to_string()));
+        assert!(stale.contains(&"src/gone.rs".to_string()));
+        assert!(!stale.contains(&"src/never_indexed.rs".to_string()));
+
+        // annotate_staleness should prepend a banner and set _meta.stale_files
+        // when the result references a changed file.
+        let result = render_with_kind(
+            Ok(json!([{ "file_path": "src/changed.rs", "line": 1 }])),
+            "search",
+        );
+        let annotated = server.annotate_staleness(project, result);
+        let banner = annotated.content.first().and_then(|c| c.as_text());
+        assert!(
+            banner
+                .map(|t| t.text.contains("src/changed.rs"))
+                .unwrap_or(false),
+            "expected a staleness banner naming the changed file"
+        );
+        let stale_files = &annotated.structured_content.unwrap()["_meta"]["stale_files"];
+        assert_eq!(stale_files, &json!(["src/changed.rs"]));
     }
 }

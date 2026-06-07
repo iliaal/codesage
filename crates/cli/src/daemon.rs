@@ -12,7 +12,10 @@ mod unix {
         os::unix::fs::{MetadataExt, PermissionsExt},
         path::{Path, PathBuf},
         process::{Command, Stdio},
-        sync::Arc,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
@@ -29,6 +32,36 @@ mod unix {
 
     const START_TIMEOUT: Duration = Duration::from_secs(5);
     const RETRY_DELAY: Duration = Duration::from_millis(25);
+
+    /// Default idle backstop: shut the daemon down after this long with zero
+    /// connected clients. The daemon is meant to be a warm pool shared across
+    /// sessions, so this is generous — a 30-minute gap between queries is rare
+    /// inside an active session, and the only cost of reaping is one model
+    /// reload on the next query. Without it the daemon outlives every agent and
+    /// pins the embedder/reranker in memory indefinitely. Override with
+    /// `CODESAGE_DAEMON_IDLE_TIMEOUT_SECS`; `0` disables idle exit entirely.
+    const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(1800);
+
+    /// Resolve the idle backstop from the environment. `Duration::ZERO` means
+    /// "never reap" (the pre-backstop behavior). An unparseable value falls back
+    /// to the default rather than silently disabling the backstop.
+    fn daemon_idle_timeout() -> Duration {
+        match std::env::var("CODESAGE_DAEMON_IDLE_TIMEOUT_SECS") {
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(secs) => Duration::from_secs(secs),
+                Err(_) => {
+                    tracing::warn!(
+                        value = %raw,
+                        "invalid CODESAGE_DAEMON_IDLE_TIMEOUT_SECS (want integer seconds); \
+                         using default {:?}",
+                        DEFAULT_IDLE_TIMEOUT
+                    );
+                    DEFAULT_IDLE_TIMEOUT
+                }
+            },
+            Err(_) => DEFAULT_IDLE_TIMEOUT,
+        }
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct DaemonPaths {
@@ -206,6 +239,26 @@ mod unix {
         let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
         let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
 
+        // Idle backstop: track the number of connected clients and the last
+        // time that count changed. When it sits at zero past the idle timeout,
+        // the daemon reaps itself rather than leaking embedder/reranker memory
+        // after every agent has disconnected (the failure mode three peer tools
+        // — codegraph, GitNexus, repowise — all hardened independently).
+        let idle_timeout = daemon_idle_timeout();
+        let active = Arc::new(AtomicUsize::new(0));
+        let last_activity = Arc::new(Mutex::new(Instant::now()));
+        // Poll often enough to honor short idle timeouts in tests, but never
+        // busier than once a minute for the production default.
+        let idle_poll = if idle_timeout.is_zero() {
+            Duration::from_secs(3600)
+        } else {
+            idle_timeout
+                .min(Duration::from_secs(60))
+                .max(Duration::from_secs(1))
+        };
+        let mut idle_tick = tokio::time::interval(idle_poll);
+        idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         let shutdown_reason = loop {
             tokio::select! {
                 accepted = listener.accept() => {
@@ -240,18 +293,34 @@ mod unix {
                     }
 
                     let server = CodeSageServer::with_state(state.clone());
+                    active.fetch_add(1, Ordering::SeqCst);
+                    *last_activity.lock().unwrap() = Instant::now();
+                    let active_for_conn = active.clone();
+                    let last_activity_for_conn = last_activity.clone();
                     tokio::spawn(async move {
                         if let Err(e) = serve_client(server, stream).await {
                             tracing::debug!(error = %e, "MCP daemon client connection ended");
                         }
+                        active_for_conn.fetch_sub(1, Ordering::SeqCst);
+                        // Reset the idle clock on disconnect so the timeout
+                        // measures continuous idleness, not uptime.
+                        *last_activity_for_conn.lock().unwrap() = Instant::now();
                     });
+                }
+                _ = idle_tick.tick() => {
+                    if !idle_timeout.is_zero()
+                        && active.load(Ordering::SeqCst) == 0
+                        && last_activity.lock().unwrap().elapsed() >= idle_timeout
+                    {
+                        break "idle";
+                    }
                 }
                 _ = sigterm.recv() => break "SIGTERM",
                 _ = sigint.recv() => break "SIGINT",
             }
         };
         tracing::info!(
-            signal = shutdown_reason,
+            reason = shutdown_reason,
             "codesage MCP daemon shutting down"
         );
 

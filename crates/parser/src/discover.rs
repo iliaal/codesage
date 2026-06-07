@@ -18,6 +18,14 @@ use crate::detect::{detect_language_with_dialect, is_unambiguous_cpp_extension};
 /// while bounding worst-case allocation per file.
 pub const MAX_INDEXABLE_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
+/// The canonical per-file content hash the indexer stores in `files.content_hash`.
+/// Single source of truth: any consumer that wants to detect drift against the
+/// index (e.g. the MCP staleness banner) must hash with this exact function, or
+/// comparisons against the stored hash are meaningless.
+pub fn content_hash(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
 pub fn build_exclude_set(patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
@@ -120,7 +128,7 @@ pub fn discover_files_with_excludes(
                     return WalkState::Quit;
                 }
             };
-            let hash = hex::encode(Sha256::digest(&content));
+            let hash = content_hash(&content);
             // Receiver drop is fine — just bail.
             if tx
                 .send(FileInfo {

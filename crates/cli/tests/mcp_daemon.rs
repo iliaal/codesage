@@ -308,6 +308,80 @@ fn daemon_cleans_runtime_files_on_sigterm() {
     assert!(!pid_file.exists(), "pid file should be removed on SIGTERM");
 }
 
+#[test]
+fn daemon_self_exits_after_idle_timeout() {
+    // Idle backstop: with no client ever connecting, the daemon must reap
+    // itself once CODESAGE_DAEMON_IDLE_TIMEOUT_SECS elapses instead of pinning
+    // the embedder/reranker pools in memory forever after every agent exits.
+    // Set a 1s timeout and assert the process exits on its own (no signal sent)
+    // and cleans up its runtime files the same way a SIGTERM would.
+    let runtime = tempfile::tempdir().unwrap();
+    let runtime_dir = runtime.path().to_path_buf();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime_dir.clone(),
+    };
+    let bin = env!("CARGO_BIN_EXE_codesage");
+    let mut daemon = Command::new(bin)
+        .arg("daemon")
+        .arg("--runtime-dir")
+        .arg(&runtime_dir)
+        .env("CODESAGE_DAEMON_IDLE_TIMEOUT_SECS", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn codesage daemon");
+
+    // Wait for the daemon to bind (socket + pid both present) before timing
+    // the idle exit, matching the SIGTERM test's two-file wait.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut socket: Option<PathBuf> = None;
+    let mut pid_file: Option<PathBuf> = None;
+    while Instant::now() < deadline && (socket.is_none() || pid_file.is_none()) {
+        thread::sleep(Duration::from_millis(50));
+        for entry in std::fs::read_dir(&runtime_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let p = entry.path();
+            match p.extension().and_then(|e| e.to_str()) {
+                Some("sock") => socket = Some(p.clone()),
+                Some("pid") => pid_file = Some(p.clone()),
+                _ => {}
+            }
+        }
+    }
+    let socket = socket.expect("daemon socket never appeared");
+    let pid_file = pid_file.expect("daemon pid file never appeared");
+
+    // No signal sent: the 1s idle timeout (polled at 1s granularity) should
+    // trip within a couple of ticks.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match daemon.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = daemon.kill();
+                    panic!("daemon did not self-exit within 10s despite a 1s idle timeout");
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => panic!("try_wait failed: {e}"),
+        }
+    }
+
+    assert!(
+        !socket.exists(),
+        "socket file should be removed on idle exit"
+    );
+    assert!(
+        !pid_file.exists(),
+        "pid file should be removed on idle exit"
+    );
+}
+
 struct ChildGuard {
     child: Child,
 }

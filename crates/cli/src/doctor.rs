@@ -28,6 +28,7 @@ pub fn run(json: bool) -> Result<()> {
     let mut checks = Vec::new();
 
     checks.push(check_binary());
+    checks.push(check_queries());
 
     let project = find_project_root_opt();
 
@@ -92,6 +93,25 @@ fn check_binary() -> Check {
         name: "binary",
         status: Status::Pass,
         message: format!("codesage {version} ({profile}, {cuda})"),
+    }
+}
+
+/// Force-compile every embedded tree-sitter query against its grammar. A
+/// grammar version bump that renames a node type or field otherwise surfaces as
+/// a panic on the first file of the affected language indexed; surfacing it here
+/// makes a mismatched build visible before any indexing runs.
+fn check_queries() -> Check {
+    match codesage_parser::validate::validate_all_queries() {
+        Ok(()) => Check {
+            name: "queries",
+            status: Status::Pass,
+            message: "embedded tree-sitter queries valid against their grammars".to_string(),
+        },
+        Err(e) => Check {
+            name: "queries",
+            status: Status::Fail,
+            message: format!("{e:#}"),
+        },
     }
 }
 

@@ -76,6 +76,23 @@ fn symbol_query_for(lang: Language) -> &'static SymbolQuerySpec {
     }
 }
 
+/// Every (language, symbol-query-source) pair. Single source of truth for the
+/// validation gate (`crate::validate`) that compiles each query against its
+/// grammar in CI, so a tree-sitter grammar bump that renames a node type or
+/// field is caught pre-merge instead of panicking on the first file of that
+/// language indexed.
+pub(crate) const SYMBOL_QUERY_SOURCES: &[(Language, &str)] = &[
+    (Language::Php, PHP_QUERY),
+    (Language::Python, PYTHON_QUERY),
+    (Language::C, C_QUERY),
+    (Language::Cpp, CPP_QUERY),
+    (Language::Java, JAVA_QUERY),
+    (Language::Rust, RUST_QUERY),
+    (Language::JavaScript, JS_QUERY),
+    (Language::TypeScript, TS_QUERY),
+    (Language::Go, GO_QUERY),
+];
+
 fn php_kind_map(pattern_index: usize) -> Option<SymbolKind> {
     match pattern_index {
         0 => Some(SymbolKind::Function),
