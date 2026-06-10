@@ -523,8 +523,60 @@ fn load_index_embedder(
     }
 }
 
+fn print_version_info() {
+    let version = env!("CARGO_PKG_VERSION");
+    let arch = std::env::consts::ARCH;
+    let os = std::env::consts::OS;
+    let vendor = if cfg!(target_vendor = "apple") {
+        "apple"
+    } else if cfg!(target_vendor = "pc") {
+        "pc"
+    } else {
+        "unknown"
+    };
+    let target = format!("{arch}-{vendor}-{os}");
+
+    let features = [
+        "cpu",
+        #[cfg(feature = "cuda")]
+        "cuda",
+        #[cfg(target_vendor = "apple")]
+        "coreml",
+    ];
+
+    let configured = find_project_root_opt()
+        .and_then(|root| {
+            let config = load_project_config(&root).ok()?;
+            config.embedding.map(|e| e.device)
+        })
+        .unwrap_or_else(|| "none (no project config)".to_string());
+
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+
+    println!("codesage {version} ({profile})");
+    println!("  target: {target}");
+    println!("  features compiled: {}", features.join(", "));
+    println!("  device configured: {configured}");
+    flush_stdio();
+}
+
 fn main() {
     init_tracing();
+
+    // Handle -V / --version before clap so it works without a subcommand and
+    // can include project-local device config from .codesage/config.toml.
+    let wants_version = std::env::args()
+        .skip(1)
+        .any(|a| a == "-V" || a == "--version");
+    if wants_version {
+        print_version_info();
+        std::process::exit(0);
+    }
+
     // Resolve ONNX Runtime + NVIDIA library locations now, while we are still
     // single-threaded. The discovery code calls `std::env::set_var` for
     // `LD_LIBRARY_PATH` / `ORT_DYLIB_PATH`, which is `unsafe` under Rust 2024

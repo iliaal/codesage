@@ -1,6 +1,7 @@
 ## [Unreleased]
 
 ### Added
+- **Extended `codesage --version` output.** Prints compile target (`aarch64-apple-darwin`, etc.), enabled acceleration features (`cpu`, `cuda` when built with `--features cuda`, `coreml` on Apple targets), and the configured embedding `device` from the current project's `.codesage/config.toml` (or `none (no project config)` outside a project).
 - **README documents CoreML and CUDA hardware acceleration.** Adds `## CoreML setup (macOS)` and `## CUDA setup` sections (the README previously linked to a missing CUDA anchor), and updates the config example to list `device = "coreml"`.
 - **CoreML acceleration on macOS.** Set `device = "coreml"` in `.codesage/config.toml` to run embedding and reranker inference through ONNX Runtime's CoreML execution provider (GPU + Neural Engine on Apple Silicon). Uses the existing `load-dynamic` ORT path — no extra Cargo feature. Fails fast when `device = "coreml"` is configured on non-Apple hosts. `codesage doctor` reports CoreML readiness.
 - **`codesage index --verbose` (`-v`).** Emits structured `tracing::info!` progress through structural indexing, trust-boundary backfill, feature mapping, and semantic embedding (including per-batch file ranges). Default output is unchanged; pair with `RUST_LOG=codesage=info` to see the logs.
