@@ -83,7 +83,7 @@ Required pip packages: `onnxruntime-gpu`, `nvidia-cudnn-cu12`, `nvidia-cublas-cu
 
 ## CoreML setup (macOS)
 
-On Apple Silicon, set `device = "coreml"` in `.codesage/config.toml`. ONNX Runtime loads dynamically (same `load-dynamic` path as Linux); the macOS ORT dylib includes the CoreML EP. First session creation compiles CoreML submodels and can take a few minutes; subsequent runs in the same process are faster. Large models (e.g. Jina v2 base-code) may need a lower embed batch size than the default `BATCH_SIZE` in `crates/embed/src/config.rs` if memory pressure causes OOM during indexing.
+On Apple Silicon, set `device = "coreml"` in `.codesage/config.toml`. macOS builds statically link ONNX Runtime with the CoreML EP at compile time (`ort` `coreml` feature via target-specific deps in `crates/embed/Cargo.toml`); Linux/CUDA keeps `load-dynamic`. First session creation compiles CoreML submodels and can take a few minutes; subsequent runs in the same process are faster. Large models (e.g. Jina v2 base-code) may need a lower embed batch size than the default `BATCH_SIZE` in `crates/embed/src/config.rs` if memory pressure causes OOM during indexing.
 
 If CoreML registration fails, the process errors out instead of silently falling back to CPU.
 

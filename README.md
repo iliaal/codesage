@@ -390,7 +390,7 @@ Required pip packages: `onnxruntime-gpu`, `nvidia-cudnn-cu12`, `nvidia-cublas-cu
 
 ## CoreML setup (macOS)
 
-On Apple Silicon, set `device = "coreml"` in `.codesage/config.toml`. No extra Cargo feature is required — ONNX Runtime uses the same `load-dynamic` path as Linux, and the macOS ORT dylib includes the CoreML execution provider (GPU + Neural Engine).
+On Apple Silicon, set `device = "coreml"` in `.codesage/config.toml`. macOS builds statically link ONNX Runtime with the CoreML execution provider at compile time (no pip `onnxruntime` dylib, no extra Cargo feature). Linux/CUDA builds keep the `load-dynamic` path.
 
 ```bash
 cargo build --release -p codesage

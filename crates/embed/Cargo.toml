@@ -12,8 +12,13 @@ cuda = ["ort/cuda"]
 codesage-protocol.workspace = true
 serde.workspace = true
 anyhow.workspace = true
-ort.workspace = true
 tokenizers.workspace = true
 hf-hub.workspace = true
 tracing.workspace = true
 wait-timeout = "0.2"
+
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
+ort = { version = "2.0.0-rc.12", features = ["load-dynamic", "preload-dylibs"] }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+ort = { version = "2.0.0-rc.12", features = ["coreml"] }

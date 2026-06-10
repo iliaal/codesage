@@ -216,7 +216,7 @@ fn check_coreml(project: Option<&Path>) -> Check {
     Check {
         name: "coreml",
         status: Status::Pass,
-        message: "device=coreml on Apple hardware; first session build may compile CoreML submodels (slow once per process)"
+        message: "device=coreml on Apple hardware; ORT statically linked at build time with CoreML EP; first session may compile CoreML submodels (slow once per process)"
             .to_string(),
     }
 }

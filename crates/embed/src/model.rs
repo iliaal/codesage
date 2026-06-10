@@ -12,6 +12,7 @@ use crate::config::{
     BATCH_SIZE, EmbeddingConfig, MAX_SEQ_LENGTH, PoolingStrategy, wants_coreml, wants_cuda,
 };
 
+#[cfg(not(target_vendor = "apple"))]
 static ORT_INIT: Once = Once::new();
 static CUDA_PRELOAD: Once = Once::new();
 
@@ -192,6 +193,7 @@ pub(crate) fn require_cuda_libs_mapped() -> anyhow::Result<()> {
 /// silently broken), but in the bin path the work has already happened by
 /// then and the call is a cheap no-op.
 pub fn init_for_main() {
+    #[cfg(not(target_vendor = "apple"))]
     init_ort_dylib();
     #[cfg(feature = "cuda")]
     {
@@ -246,6 +248,7 @@ fn prepend_ld_library_path<P: AsRef<Path>>(dirs: &[P]) {
 
 /// Locate the ONNX Runtime shared library. Order: `ORT_DYLIB_PATH` env var →
 /// site-packages `onnxruntime/capi/libonnxruntime.so*` → standard system locations.
+#[cfg(not(target_vendor = "apple"))]
 fn discover_ort_dylib() -> Option<PathBuf> {
     for base in probe_python_site_packages() {
         let capi = base.join("onnxruntime").join("capi");
@@ -289,6 +292,9 @@ fn discover_ort_dylib() -> Option<PathBuf> {
     None
 }
 
+/// Runtime ONNX Runtime dylib discovery (`ORT_DYLIB_PATH`, pip site-packages).
+/// No-op on Apple targets: macOS builds statically link ORT with the CoreML EP.
+#[cfg(not(target_vendor = "apple"))]
 pub fn init_ort_dylib() {
     ORT_INIT.call_once(|| {
         if std::env::var("ORT_DYLIB_PATH").is_ok() {
@@ -321,6 +327,7 @@ pub fn init_ort_dylib() {
 /// libraries actually mapped (the silent-CPU-fallback guard). Returns the
 /// session, tokenizer, and whether the model takes a `token_type_ids` input.
 pub(crate) fn load_onnx_session(model: &str, device: &str) -> Result<(Session, Tokenizer, bool)> {
+    #[cfg(not(target_vendor = "apple"))]
     init_ort_dylib();
 
     if let Err(e) = crate::config::validate_device(device) {
