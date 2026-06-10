@@ -14,10 +14,27 @@ use globset::GlobSet;
 use regex::Regex;
 
 /// Parse a `Language` value out of a DB-stored language string. Every row was
-/// written by `Language::as_str()`, so an unknown value indicates DB corruption
-/// or a schema mismatch — fail loudly rather than producing garbage results.
+/// written by `Language::as_str()`, so an unknown value means version skew (an
+/// older binary reading an index a newer one wrote with a language it lacks) or
+/// a corrupt/hand-edited DB.
+///
+/// This must not panic. It runs in the per-row mapping of every search/export,
+/// and in the daemon a panic in a tool handler is silently swallowed by rmcp
+/// (no `catch_unwind`), leaving the client hung waiting for a reply that never
+/// comes. Degrade instead: warn once and keep the row with a placeholder label.
+/// The content is what the caller searched for; the language tag is annotation.
 fn parse_db_language(s: &str) -> Language {
-    Language::parse(s).unwrap_or_else(|| panic!("unknown language string in DB: {s:?}"))
+    Language::parse(s).unwrap_or_else(|| {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                language = %s,
+                "unknown language string in index (version skew or corruption); \
+                 results kept with a placeholder language label — reindex to fix"
+            );
+        });
+        Language::Rust
+    })
 }
 
 pub fn find_symbol(db: &Database, req: &FindSymbolRequest) -> Result<Vec<Symbol>> {
@@ -797,11 +814,17 @@ fn build_definition_pattern(symbol_name: &str) -> Option<Regex> {
         return None;
     }
     let escaped = regex::escape(symbol_name);
-    let kw_alts = DEFINITION_KEYWORDS
-        .iter()
-        .map(|k| regex::escape(k))
-        .collect::<Vec<_>>()
-        .join("|");
+    // The keyword alternation is constant; build it once. Only `escaped`
+    // (the symbol) varies between calls, so the full regex still has to compile
+    // per distinct symbol, but the per-call string churn is gone.
+    static KW_ALTS: OnceLock<String> = OnceLock::new();
+    let kw_alts = KW_ALTS.get_or_init(|| {
+        DEFINITION_KEYWORDS
+            .iter()
+            .map(|k| regex::escape(k))
+            .collect::<Vec<_>>()
+            .join("|")
+    });
     // Match: optional start-of-line/whitespace + keyword + whitespace +
     // (optional namespace prefix `foo.` or `Foo::`)* + symbol_name +
     // (whitespace, opening paren/brace/bracket, `<`, `:`, `;`, or end-of-line).

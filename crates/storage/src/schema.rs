@@ -267,6 +267,18 @@ pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
     // otherwise hit instant-busy on the brief WAL-checkpoint windows. Match
     // repowise's posture (see notes/2026-04-29 sweep, §1.8).
     conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+    // synchronous=NORMAL is the documented safe pairing with WAL: fsync only at
+    // checkpoint, not on every commit. Durability across a power loss is
+    // unchanged for WAL (only the last transaction(s) since the last checkpoint
+    // can be lost, and the DB stays consistent) — and this is a derived index,
+    // rebuildable from source, so the trade is firmly worth it for indexer
+    // commit throughput. mmap_size and a larger page cache cut syscall and
+    // page-fault overhead on the read-heavy search path (KNN + chunk rows).
+    // negative cache_size is in KiB; -65536 ≈ 64 MiB. mmap is backed by the OS
+    // page cache, so it doesn't pin RSS.
+    conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
+    conn.execute_batch("PRAGMA mmap_size=268435456;")?;
+    conn.execute_batch("PRAGMA cache_size=-65536;")?;
     conn.execute_batch(SCHEMA)?;
     run_migrations(conn)?;
     Ok(())

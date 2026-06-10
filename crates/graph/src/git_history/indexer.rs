@@ -402,9 +402,22 @@ pub fn changed_files_since(
     root: &Path,
     git_ref: &str,
 ) -> Result<std::collections::HashSet<String>> {
+    // Reject a leading-dash ref so it can never be parsed as a git option.
+    // `since` arrives from the MCP `list_features` arg and the `--since` CLI
+    // flag as free-form text; a value like `-O/path` would otherwise be
+    // consumed as an option (the trailing `...HEAD` defuses long flags but not
+    // short attached-value ones). The `--` separator below is the structural
+    // guard; this is the belt-and-suspenders message.
+    if git_ref.starts_with('-') {
+        return Err(anyhow!(
+            "invalid git ref `{git_ref}`: must not start with '-'"
+        ));
+    }
     let range = format!("{git_ref}...HEAD");
     let out = Command::new("git")
-        .args(["diff", "--name-only", "--relative", &range])
+        // `--` terminates option parsing so `range` is always read as a
+        // revision range, never as flags.
+        .args(["diff", "--name-only", "--relative", &range, "--"])
         .current_dir(root)
         .output()
         .with_context(|| format!("git diff --name-only {range} in {}", root.display()))?;
@@ -651,6 +664,18 @@ fn is_excluded(set: &GlobSet, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changed_files_since_rejects_dash_prefixed_ref() {
+        // SS-002: a `since` value starting with '-' must be rejected before it
+        // can be parsed by git as an option (e.g. `-O/path`).
+        let dir = tempfile::tempdir().unwrap();
+        let err = changed_files_since(dir.path(), "-O/etc/passwd").unwrap_err();
+        assert!(
+            err.to_string().contains("must not start with '-'"),
+            "expected leading-dash rejection, got: {err}"
+        );
+    }
 
     #[test]
     fn feature_touched_since_matches_entry_owned_context_not_test() {

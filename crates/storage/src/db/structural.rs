@@ -200,7 +200,12 @@ impl Database {
         } else {
             "SELECT 1 FROM symbols WHERE name = ?1 LIMIT 1"
         };
-        let mut stmt = self.conn.prepare(sql)?;
+        // prepare_cached: symbol_exists is called once per query token, and
+        // find_symbols/find_references run in per-reference loops during bundle
+        // assembly. Connections are per-tool-call, so the cached statement is
+        // reused across the loop iterations within one call. Only two distinct
+        // SQL strings here, so the cache stays tiny.
+        let mut stmt = self.conn.prepare_cached(sql)?;
         match stmt.query_row(params![name], |_| Ok(())) {
             Ok(()) => Ok(true),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
@@ -219,7 +224,7 @@ impl Database {
               WHERE s.name = ?1"
         };
 
-        let mut stmt = self.conn.prepare(sql)?;
+        let mut stmt = self.conn.prepare_cached(sql)?;
         let rows = stmt.query_map(params![name], row_to_symbol)?;
 
         let mut symbols: Vec<Symbol> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -275,7 +280,9 @@ impl Database {
     }
 
     fn query_refs(&self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<Reference>> {
-        let mut stmt = self.conn.prepare(sql)?;
+        // Cached: find_references runs in per-symbol loops during bundle
+        // assembly; a handful of distinct SQL strings flow through here.
+        let mut stmt = self.conn.prepare_cached(sql)?;
         let rows = stmt.query_map(params, |row| {
             let kind_str: String = row.get(3)?;
             Ok(Reference {
@@ -394,7 +401,11 @@ impl Database {
              ORDER BY s.line_start",
             placeholders.join(",")
         );
-        let mut stmt = self.conn.prepare(&sql)?;
+        // Cached per placeholder-count. The bundle helpers call this with a
+        // single path each (`annotate_with_symbols` on a one-element slice), so
+        // the N=1 form is reused across every file added to a bundle within one
+        // tool call instead of re-preparing each time.
+        let mut stmt = self.conn.prepare_cached(&sql)?;
         let params: Vec<&dyn rusqlite::types::ToSql> = file_paths
             .iter()
             .map(|p| p as &dyn rusqlite::types::ToSql)

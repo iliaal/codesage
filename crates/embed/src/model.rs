@@ -501,6 +501,32 @@ impl Embedder {
 
         let (_shape, hidden) = outputs[0].try_extract_tensor::<f32>()?;
 
+        // The pooling loops below index `hidden` as a `[batch, seq, dim]`
+        // tensor. `detect_dim` only validates the last dimension, so a model
+        // whose first output is already pooled (`[batch, dim]`) passes load but
+        // would make the `(i*seq_len + j)*dim` offsets run off the end of the
+        // slice — an out-of-bounds panic on the first embed. In the daemon that
+        // panic is swallowed by rmcp and the client hangs. Verify the shape up
+        // front and fail with an actionable message instead.
+        let expected = batch_size
+            .checked_mul(seq_len)
+            .and_then(|n| n.checked_mul(self.dim))
+            .context("token-level output size overflow")?;
+        if hidden.len() != expected {
+            anyhow::bail!(
+                "model output has {} values but mean/CLS pooling expects a \
+                 token-level [batch={}, seq={}, dim={}] tensor ({} values). \
+                 The configured model likely emits a pre-pooled [batch, dim] \
+                 output; pick a model whose first output is token-level hidden \
+                 states, or set pooling accordingly in .codesage/config.toml.",
+                hidden.len(),
+                batch_size,
+                seq_len,
+                self.dim,
+                expected
+            );
+        }
+
         let mut embeddings = Vec::with_capacity(batch_size);
 
         for i in 0..batch_size {

@@ -449,7 +449,11 @@ impl Database {
              ORDER BY start_line",
             self.chunk_table
         );
-        let mut stmt = self.conn.prepare(&sql)?;
+        // Cached: chunks_for_file is called once per file during bundle
+        // assembly (entry + owned + context). The table name is fixed per
+        // connection, so the SQL string is stable and the cached statement is
+        // reused across all files in one feature_bundle / export_context call.
+        let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt
             .query_map(params![file_path], |row| {
                 Ok(RawSearchRow {

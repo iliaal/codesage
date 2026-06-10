@@ -323,6 +323,12 @@ where
 
 pub(crate) struct CodeSageServerState {
     projects: Mutex<HashMap<PathBuf, ProjectState>>,
+    /// Fast-path cache keyed by the raw `project` arg string. Agents pass the
+    /// same literal absolute path on every call, so this lets `resolve_project`
+    /// skip `canonicalize()`'s per-component lstat on the hot path. `projects`
+    /// (keyed by canonical path) stays the source of truth and dedupes distinct
+    /// spellings of the same root.
+    resolved: Mutex<HashMap<String, ProjectState>>,
     embedders: Mutex<HashMap<String, ModelSlot<Embedder>>>,
     rerankers: Mutex<HashMap<String, ModelSlot<Reranker>>>,
 }
@@ -331,12 +337,14 @@ impl CodeSageServerState {
     pub(crate) fn new() -> Self {
         Self {
             projects: Mutex::new(HashMap::new()),
+            resolved: Mutex::new(HashMap::new()),
             embedders: Mutex::new(HashMap::new()),
             rerankers: Mutex::new(HashMap::new()),
         }
     }
 }
 
+#[derive(Clone)]
 pub struct CodeSageServer {
     state: Arc<CodeSageServerState>,
     tool_router: ToolRouter<Self>,
@@ -366,7 +374,44 @@ impl CodeSageServer {
         }
     }
 
+    /// Run a blocking tool-handler body off the tokio runtime threads.
+    ///
+    /// Every handler does blocking work — SQLite, ONNX inference, and on a cold
+    /// miss a model load that includes a (network) HuggingFace download. Run
+    /// directly on a runtime worker, enough concurrent calls block every worker
+    /// and the daemon stops answering even `initialize`/`ping` (CR-001).
+    /// Offloading to the blocking pool keeps the async workers free.
+    ///
+    /// `spawn_blocking` also gives a panic boundary: rmcp dispatches tool calls
+    /// with no `catch_unwind`, so a panic in a handler is otherwise silently
+    /// swallowed and the client hangs forever waiting for a reply that never
+    /// comes (CR-003). Here a panic surfaces as a `JoinError` we turn into an
+    /// error result the client actually receives.
+    async fn blocking<F>(&self, f: F) -> CallToolResult
+    where
+        F: FnOnce(&Self) -> CallToolResult + Send + 'static,
+    {
+        // Cheap: state is an Arc, the tool_router is an Arc-backed map clone.
+        let this = self.clone();
+        match tokio::task::spawn_blocking(move || f(&this)).await {
+            Ok(result) => result,
+            Err(join_err) => {
+                tracing::error!(error = %join_err, "MCP tool handler panicked");
+                CallToolResult::error(vec![Content::text(format!(
+                    "internal error: the tool handler panicked ({join_err}); see the daemon log"
+                ))])
+            }
+        }
+    }
+
     fn resolve_project(&self, project: &str) -> Result<ProjectState> {
+        // Fast path: same raw arg string seen before — skip canonicalize().
+        {
+            let guard = self.state.resolved.lock();
+            if let Some(state) = guard.get(project) {
+                return Ok(state.clone());
+            }
+        }
         let path = PathBuf::from(project);
         if !path.is_absolute() {
             bail!(
@@ -380,7 +425,13 @@ impl CodeSageServer {
         {
             let guard = self.state.projects.lock();
             if let Some(state) = guard.get(&canonical) {
-                return Ok(state.clone());
+                let state = state.clone();
+                drop(guard);
+                self.state
+                    .resolved
+                    .lock()
+                    .insert(project.to_string(), state.clone());
+                return Ok(state);
             }
         }
         let codesage_dir = canonical.join(".codesage");
@@ -415,6 +466,10 @@ impl CodeSageServer {
         if newly_registered && let Err(e) = write_drift_log_for_project(&canonical, &db_path) {
             tracing::debug!(error = %e, "drift log append failed");
         }
+        self.state
+            .resolved
+            .lock()
+            .insert(project.to_string(), state.clone());
         Ok(state)
     }
 
@@ -1047,17 +1102,23 @@ impl CodeSageServer {
         description = "Find symbol definitions (functions, classes, methods, structs, traits, enums) by name. Returns exact file path, line number, and kind. **Prefer this over Grep/ripgrep for any code-identifier lookup** — one call returns the definition, while grepping for a function name often produces many false hits (call sites, comments, other namespaces) that cost extra Read calls to disambiguate. Use partial names for broad search or qualified names ('MyClass\\\\method' for PHP, 'MyClass.method' for Python) for exact match. For the inverse question (who calls / imports / instantiates this symbol?) use `find_references`. When present, `rationale[]` carries `WHY:` / `NOTE:` / `IMPORTANT:` / `FIXME:` / `HACK:` / `XXX:` / `TODO:` comments attached to the definition — read these before refactoring or renaming so the agent doesn't drop a constraint the author wrote down. Currently extracted for Rust and Python.",
         output_schema = schema_for_type::<FindSymbolResults>()
     )]
-    fn find_symbol_tool(&self, Parameters(params): Parameters<FindSymbolParams>) -> CallToolResult {
-        let kind = params.kind.as_deref().and_then(SymbolKind::parse);
-        let req = FindSymbolRequest {
-            name: params.name,
-            kind,
-        };
-        self.render(
-            &params.project,
-            self.with_project_db(&params.project, |db| find_symbol(db, &req)),
-            "find_symbol",
-        )
+    async fn find_symbol_tool(
+        &self,
+        Parameters(params): Parameters<FindSymbolParams>,
+    ) -> CallToolResult {
+        self.blocking(move |s| {
+            let kind = params.kind.as_deref().and_then(SymbolKind::parse);
+            let req = FindSymbolRequest {
+                name: params.name,
+                kind,
+            };
+            s.render(
+                &params.project,
+                s.with_project_db(&params.project, |db| find_symbol(db, &req)),
+                "find_symbol",
+            )
+        })
+        .await
     }
 
     #[tool(
@@ -1065,20 +1126,23 @@ impl CodeSageServer {
         description = "Find all references to a symbol across the codebase. **Prefer this over Grep for 'where is X called / imported / instantiated?'** — returns structured {file, line, kind} rows with the reference type (call/import/inheritance/instantiation/type_hint) already classified, instead of raw grep hits that mix definitions, comments, and string literals together. For the definition itself use `find_symbol`; for transitive blast radius (callers of callers) use `impact_analysis`.",
         output_schema = schema_for_type::<FindReferencesResults>()
     )]
-    fn find_references_tool(
+    async fn find_references_tool(
         &self,
         Parameters(params): Parameters<FindReferencesParams>,
     ) -> CallToolResult {
-        let kind = params.kind.as_deref().and_then(ReferenceKind::parse);
-        let req = FindReferencesRequest {
-            symbol_name: params.name,
-            kind,
-        };
-        self.render(
-            &params.project,
-            self.with_project_db(&params.project, |db| find_references(db, &req)),
-            "find_references",
-        )
+        self.blocking(move |s| {
+            let kind = params.kind.as_deref().and_then(ReferenceKind::parse);
+            let req = FindReferencesRequest {
+                symbol_name: params.name,
+                kind,
+            };
+            s.render(
+                &params.project,
+                s.with_project_db(&params.project, |db| find_references(db, &req)),
+                "find_references",
+            )
+        })
+        .await
     }
 
     #[tool(
@@ -1086,17 +1150,20 @@ impl CodeSageServer {
         description = "List immediate (single-hop) import/include dependencies for a file: what THIS file imports and which other files import THIS file. Use when the question is 'what does this file depend on?' or 'who imports this file?'. For 'what breaks if I change this?' use `impact_analysis` (walks multiple hops, ranks by distance). For per-symbol callers/callees use `find_references` (per-symbol grain, not per-file).",
         output_schema = schema_for_type::<DependencyEntry>()
     )]
-    fn list_dependencies_tool(
+    async fn list_dependencies_tool(
         &self,
         Parameters(params): Parameters<ListDependenciesParams>,
     ) -> CallToolResult {
-        self.render(
-            &params.project,
-            self.with_project_db(&params.project, |db| {
-                list_dependencies(db, &params.file_path)
-            }),
-            "list_dependencies",
-        )
+        self.blocking(move |s| {
+            s.render(
+                &params.project,
+                s.with_project_db(&params.project, |db| {
+                    list_dependencies(db, &params.file_path)
+                }),
+                "list_dependencies",
+            )
+        })
+        .await
     }
 
     #[tool(
@@ -1104,27 +1171,30 @@ impl CodeSageServer {
         description = "Semantic code search (embedding-based + cross-encoder reranking). **Prefer this over Grep when you don't know the exact symbol name** — useful for queries like 'where is auth handled', 'error handling in the session pipeline', 'database connection pooling', 'where do we validate inputs'. Grep needs the literal token already; `search` lets the agent ask by intent. For exact identifier lookups with a known name, use `find_symbol` or `find_references` instead.",
         output_schema = schema_for_type::<SearchResults>()
     )]
-    fn search_tool(&self, Parameters(params): Parameters<SearchParams>) -> CallToolResult {
-        let languages = params
-            .language
-            .as_deref()
-            .and_then(Language::parse)
-            .map(|l| vec![l]);
-        let req = SearchRequest {
-            query: params.query,
-            limit: params.limit,
-            offset: params.offset,
-            languages,
-            paths: params.paths,
-        };
-        let query_for_embed = req.query.clone();
-        self.render(
-            &params.project,
-            self.with_project_query(&params.project, &query_for_embed, |db, emb, rr| {
-                search(db, emb, rr, &req)
-            }),
-            "search",
-        )
+    async fn search_tool(&self, Parameters(params): Parameters<SearchParams>) -> CallToolResult {
+        self.blocking(move |s| {
+            let languages = params
+                .language
+                .as_deref()
+                .and_then(Language::parse)
+                .map(|l| vec![l]);
+            let req = SearchRequest {
+                query: params.query,
+                limit: params.limit,
+                offset: params.offset,
+                languages,
+                paths: params.paths,
+            };
+            let query_for_embed = req.query.clone();
+            s.render(
+                &params.project,
+                s.with_project_query(&params.project, &query_for_embed, |db, emb, rr| {
+                    search(db, emb, rr, &req)
+                }),
+                "search",
+            )
+        })
+        .await
     }
 
     #[tool(
@@ -1132,17 +1202,23 @@ impl CodeSageServer {
         description = "Estimate which files are affected by changing a symbol or file. Walks the **reverse** reference graph up to `depth` hops (default 2) — i.e., callers/importers of the target and transitively their callers/importers — reports affected files ranked by distance and reference count. **Multi-hop blast radius from the target outward to its dependents.** Returns `[]` for leaf files nothing imports/calls. Does NOT include same-file symbols, does NOT include what the target itself depends on (use `list_dependencies` for the target's own forward dependencies). Use BEFORE making changes to know what else needs review/testing. For single-hop importer/importee of one file use `list_dependencies`; for raw call sites of a specific symbol use `find_references`.",
         output_schema = schema_for_type::<ImpactAnalysisResults>()
     )]
-    fn impact_analysis_tool(&self, Parameters(params): Parameters<ImpactParams>) -> CallToolResult {
-        let req = ImpactRequest {
-            target: ImpactTarget::from_hint(params.target, params.is_file),
-            depth: params.depth.unwrap_or(2),
-            source_only: params.source_only.unwrap_or(false),
-        };
-        self.render(
-            &params.project,
-            self.with_project_db(&params.project, |db| impact_analysis(db, &req)),
-            "impact_analysis",
-        )
+    async fn impact_analysis_tool(
+        &self,
+        Parameters(params): Parameters<ImpactParams>,
+    ) -> CallToolResult {
+        self.blocking(move |s| {
+            let req = ImpactRequest {
+                target: ImpactTarget::from_hint(params.target, params.is_file),
+                depth: params.depth.unwrap_or(2),
+                source_only: params.source_only.unwrap_or(false),
+            };
+            s.render(
+                &params.project,
+                s.with_project_db(&params.project, |db| impact_analysis(db, &req)),
+                "impact_analysis",
+            )
+        })
+        .await
     }
 
     #[tool(
@@ -1150,37 +1226,40 @@ impl CodeSageServer {
         description = "Build a curated context bundle for a free-form **query** or a single **symbol**: semantic search results, overlapping symbol definitions, and optionally caller/callee code, all wrapped as a structured bundle ready for LLM consumption. Use when the anchor is a phrase ('error handling in the parser') or one named symbol. For an already-mapped feature slice (entrypoint + owned files + tests + context already resolved), use `feature_bundle` instead — that anchors on `feature_id` and avoids re-running semantic search. Symbol entries inside the bundle carry `rationale[]` when the author left `WHY:` / `NOTE:` / `IMPORTANT:` / `FIXME:` / `HACK:` / `XXX:` / `TODO:` comments — preserve these in any synthesis the agent performs from the bundle. Currently extracted for Rust and Python.",
         output_schema = schema_for_type::<ContextBundle>()
     )]
-    fn export_context_tool(
+    async fn export_context_tool(
         &self,
         Parameters(params): Parameters<ExportContextParams>,
     ) -> CallToolResult {
-        let req = ExportRequest::from_target(
-            params.target,
-            params.is_symbol.unwrap_or(false),
-            params.limit.unwrap_or(5),
-            params.include_callers.unwrap_or(false),
-            params.include_callees.unwrap_or(false),
-        );
-        let budget = self.bundle_budget_chars(&params.project);
-        if let Some(sym_name) = req.symbol.clone() {
-            return self.render_budget(
+        self.blocking(move |s| {
+            let req = ExportRequest::from_target(
+                params.target,
+                params.is_symbol.unwrap_or(false),
+                params.limit.unwrap_or(5),
+                params.include_callers.unwrap_or(false),
+                params.include_callees.unwrap_or(false),
+            );
+            let budget = s.bundle_budget_chars(&params.project);
+            if let Some(sym_name) = req.symbol.clone() {
+                return s.render_budget(
+                    &params.project,
+                    s.with_project_context_db(&params.project, |db| {
+                        export_context_for_symbol(db, &sym_name, &req)
+                    }),
+                    "export_context",
+                    budget,
+                );
+            }
+            let query_for_embed = req.query.clone().unwrap_or_default();
+            s.render_budget(
                 &params.project,
-                self.with_project_context_db(&params.project, |db| {
-                    export_context_for_symbol(db, &sym_name, &req)
+                s.with_project_query(&params.project, &query_for_embed, |db, emb, rr| {
+                    export_context(db, emb, rr, &req)
                 }),
                 "export_context",
                 budget,
-            );
-        }
-        let query_for_embed = req.query.clone().unwrap_or_default();
-        self.render_budget(
-            &params.project,
-            self.with_project_query(&params.project, &query_for_embed, |db, emb, rr| {
-                export_context(db, emb, rr, &req)
-            }),
-            "export_context",
-            budget,
-        )
+            )
+        })
+        .await
     }
 
     #[tool(
@@ -1188,14 +1267,20 @@ impl CodeSageServer {
         description = "Files that historically change together with the given file, ranked by exponentially-decayed weight (τ=180d). Backed by git history. Use when planning a change to know which OTHER files (especially tests) tend to need updates too. Response is `{coupled: [...], file_indexed: bool, file_commits: u32, note?: string}` — read `coupled` for the ranked list. When `coupled` is empty, `note` disambiguates: file never indexed vs. file has history but no pair above the min-count=3 threshold vs. path shape mismatch. Index into `.coupled`, not the response directly. For the patch-level question 'which tests should I run after editing these files?' use `recommend_tests` instead (resolves test conventions + co-change in one call). For the single-file risk score that already folds in coupling pressure use `assess_risk`.",
         output_schema = schema_for_type::<CouplingReport>()
     )]
-    fn find_coupling_tool(&self, Parameters(params): Parameters<CouplingParams>) -> CallToolResult {
-        let limit = params.limit.unwrap_or(10);
-        let file_path = params.file_path.clone();
-        self.render(
-            &params.project,
-            self.with_project_db(&params.project, |db| find_coupling(db, &file_path, limit)),
-            "find_coupling",
-        )
+    async fn find_coupling_tool(
+        &self,
+        Parameters(params): Parameters<CouplingParams>,
+    ) -> CallToolResult {
+        self.blocking(move |s| {
+            let limit = params.limit.unwrap_or(10);
+            let file_path = params.file_path.clone();
+            s.render(
+                &params.project,
+                s.with_project_db(&params.project, |db| find_coupling(db, &file_path, limit)),
+                "find_coupling",
+            )
+        })
+        .await
     }
 
     #[tool(
@@ -1203,13 +1288,16 @@ impl CodeSageServer {
         description = "Risk score for changing one file: blends seven signals — churn percentile, fix ratio, blast radius (depth-2 reverse deps), historical coupling, test-gap, import-cycle membership, and trust-boundary count — into a 0..1 score. Response also carries `in_cycle` / `cycle_size` / `cycle_files`, the `trust_boundaries[]` list, and `top_symbols[]` (up to 5 symbols inside the file ranked by line count + reference count + cycle membership). Notes are paste-ready for PR descriptions; the `crosses N trust boundaries` line fires when ≥3 boundaries cross. Use BEFORE writing a patch to calibrate caution and BEFORE submitting to flag concerns. For per-file scoring across N files in one call use `assess_risk_batch`; for patch-level aggregation (max/mean, summary_notes, cycles touching the patch) use `assess_risk_diff`.",
         output_schema = schema_for_type::<RiskAssessment>()
     )]
-    fn assess_risk_tool(&self, Parameters(params): Parameters<RiskParams>) -> CallToolResult {
-        let file_path = params.file_path.clone();
-        self.render(
-            &params.project,
-            self.with_project_db(&params.project, |db| assess_risk(db, &file_path)),
-            "assess_risk",
-        )
+    async fn assess_risk_tool(&self, Parameters(params): Parameters<RiskParams>) -> CallToolResult {
+        self.blocking(move |s| {
+            let file_path = params.file_path.clone();
+            s.render(
+                &params.project,
+                s.with_project_db(&params.project, |db| assess_risk(db, &file_path)),
+                "assess_risk",
+            )
+        })
+        .await
     }
 
     #[tool(
@@ -1217,16 +1305,19 @@ impl CodeSageServer {
         description = "Aggregate risk for a SET of files (the file list of a patch or PR). Returns per-file decomposition plus rollups: max_score, mean_score, max_risk_file, and lists of files in each risk category (test_gap, hotspot, fix-heavy, wide blast radius). Use BEFORE submitting a patch: if max_score is high or any test_gap_files exist, add tests, split the patch, or flag concerns. summary_notes are paste-ready for a PR description. On large patches that touch ≥5 files from one directory, per-file entries for that directory move from `files` into a `clustered_directories[]` entry (top-3 by score preserved in detail, rest by name); rollup arrays still list every clustered file by name, so cross-referencing still works. `cycles_touching_patch[]` lists import cycles (files that mutually depend via import/include/inheritance/trait_use) that include at least one patch file, each with `members`, `size`, and `max_churn_file` (best refactor target). Honest caveat: we can't distinguish cycles the patch introduced from cycles that already existed; phrase PR feedback as 'this patch touches an existing cycle' unless you've verified the base branch.",
         output_schema = schema_for_type::<RiskDiffAssessment>()
     )]
-    fn assess_risk_diff_tool(
+    async fn assess_risk_diff_tool(
         &self,
         Parameters(params): Parameters<RiskDiffParams>,
     ) -> CallToolResult {
-        let file_paths = params.file_paths.clone();
-        self.render(
-            &params.project,
-            self.with_project_db(&params.project, |db| assess_risk_diff(db, &file_paths)),
-            "assess_risk_diff",
-        )
+        self.blocking(move |s| {
+            let file_paths = params.file_paths.clone();
+            s.render(
+                &params.project,
+                s.with_project_db(&params.project, |db| assess_risk_diff(db, &file_paths)),
+                "assess_risk_diff",
+            )
+        })
+        .await
     }
 
     #[tool(
@@ -1234,16 +1325,19 @@ impl CodeSageServer {
         description = "Risk score for EACH of N files, returned per-file with no patch-level aggregation. Use when you have a list of files (impact analysis output, coupling neighbours, the files of a feature you're touching one-by-one) and want each individual score — cuts the per-file MCP round-trip overhead vs calling `assess_risk` N times. Each entry is a full RiskAssessment with the same shape as `assess_risk`. The response also includes a top-level `_legend` short-code map: when ≥3 files in the batch share a categorical note (test-gap, no-git-history), per-file `notes[]` entries are aliased to short codes (e.g. `\"T\"`, `\"NG\"`) and the legend resolves them. For patch-level aggregation (max/mean, hotspot/test-gap rollups, cycles), use `assess_risk_diff` instead — they answer different questions.",
         output_schema = schema_for_type::<RiskBatchAssessment>()
     )]
-    fn assess_risk_batch_tool(
+    async fn assess_risk_batch_tool(
         &self,
         Parameters(params): Parameters<RiskBatchParams>,
     ) -> CallToolResult {
-        let file_paths = params.file_paths.clone();
-        self.render(
-            &params.project,
-            self.with_project_db(&params.project, |db| assess_risk_batch(db, &file_paths)),
-            "assess_risk_batch",
-        )
+        self.blocking(move |s| {
+            let file_paths = params.file_paths.clone();
+            s.render(
+                &params.project,
+                s.with_project_db(&params.project, |db| assess_risk_batch(db, &file_paths)),
+                "assess_risk_batch",
+            )
+        })
+        .await
     }
 
     #[tool(
@@ -1251,16 +1345,19 @@ impl CodeSageServer {
         description = "Tests an agent should run after editing the given files. Returns `primary` (sibling tests resolved by language convention — FooTest.php, foo.test.ts, test_foo.py, foo_test.go — high confidence, always run these) and `coupled` (tests that historically change with the input files via git co-change history — medium confidence, catches integration tests that don't follow naming conventions). Empty result means no test files in the index for these paths. Use AFTER making a change to know which subset of tests to actually run. Pair with `assess_risk_diff` on the same file list for the patch-level risk rollup (test-gap files, hotspot list, paste-ready summary notes).",
         output_schema = schema_for_type::<TestRecommendations>()
     )]
-    fn recommend_tests_tool(
+    async fn recommend_tests_tool(
         &self,
         Parameters(params): Parameters<TestsForParams>,
     ) -> CallToolResult {
-        let file_paths = params.file_paths.clone();
-        self.render(
-            &params.project,
-            self.with_project_db(&params.project, |db| recommend_tests(db, &file_paths)),
-            "recommend_tests",
-        )
+        self.blocking(move |s| {
+            let file_paths = params.file_paths.clone();
+            s.render(
+                &params.project,
+                s.with_project_db(&params.project, |db| recommend_tests(db, &file_paths)),
+                "recommend_tests",
+            )
+        })
+        .await
     }
 
     #[tool(
@@ -1268,18 +1365,24 @@ impl CodeSageServer {
         description = "Snapshot the project's structural state at the START of an editing session. Persists file count, symbol count, the full file list, all import cycles, and the top-50 highest-risk files (with their scores) to `.codesage/sessions/<session_id>.json`. Pair with `session_end` using the same `session_id` to detect new cycles, removed/added files, or risk regressions on hot files introduced during the session. `session_id` defaults to \"default\" — use a distinct id when running multiple parallel sessions. Re-running `session_start` overwrites the snapshot (useful for resetting a baseline mid-session).",
         output_schema = schema_for_type::<SessionSnapshot>()
     )]
-    fn session_start_tool(&self, Parameters(params): Parameters<SessionParams>) -> CallToolResult {
-        let session_id = params
-            .session_id
-            .clone()
-            .unwrap_or_else(|| "default".to_string());
-        self.render(
-            &params.project,
-            self.with_project_root_db(&params.project, |root, db| {
-                session_start(root, db, &session_id)
-            }),
-            "session_start",
-        )
+    async fn session_start_tool(
+        &self,
+        Parameters(params): Parameters<SessionParams>,
+    ) -> CallToolResult {
+        self.blocking(move |s| {
+            let session_id = params
+                .session_id
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+            s.render(
+                &params.project,
+                s.with_project_root_db(&params.project, |root, db| {
+                    session_start(root, db, &session_id)
+                }),
+                "session_start",
+            )
+        })
+        .await
     }
 
     #[tool(
@@ -1287,34 +1390,39 @@ impl CodeSageServer {
         description = "List feature slices in the project, optionally filtered by kind, language, or tag. A feature is a behavior-keyed bundle (entrypoint + owned files + context + tests + trust boundaries) — e.g. \"Laravel route POST /api/login\", \"Rust binary `codesage`\", \"php-src extension `iconv`\", \"CMake binary `myapp`\". Use this to discover the agent-facing surface area of the project before deep-diving into a specific slice. Pair with `find_feature` (file → features) and `assess_risk` (per-file scoring inside a feature).",
         output_schema = schema_for_type::<FeatureListResults>()
     )]
-    fn list_features_tool(
+    async fn list_features_tool(
         &self,
         Parameters(params): Parameters<ListFeaturesParams>,
     ) -> CallToolResult {
-        let kind = params.kind.as_deref().and_then(FeatureKind::parse);
-        let language = params.language.as_deref().and_then(Language::parse);
-        let tag = params.tag.clone();
-        let since = params.since.clone();
-        let limit = params.limit.unwrap_or(100);
-        // With `since`, fetch unbounded then cap after the changed-file
-        // intersection, mirroring the CLI: the SQL LIMIT runs before the
-        // diff filter, so a pre-filter limit would truncate candidates.
-        let query_limit = if since.is_some() { 0 } else { limit };
-        self.render(
-            &params.project,
-            self.with_project_root_db(&params.project, |root, db| {
-                let mut features = db.list_features(kind, language, tag.as_deref(), query_limit)?;
-                if let Some(git_ref) = since.as_deref() {
-                    let changed = codesage_graph::changed_files_since(root, git_ref)?;
-                    features.retain(|f| codesage_graph::feature_touched_since(&f.files, &changed));
-                    if limit > 0 && features.len() > limit {
-                        features.truncate(limit);
+        self.blocking(move |s| {
+            let kind = params.kind.as_deref().and_then(FeatureKind::parse);
+            let language = params.language.as_deref().and_then(Language::parse);
+            let tag = params.tag.clone();
+            let since = params.since.clone();
+            let limit = params.limit.unwrap_or(100);
+            // With `since`, fetch unbounded then cap after the changed-file
+            // intersection, mirroring the CLI: the SQL LIMIT runs before the
+            // diff filter, so a pre-filter limit would truncate candidates.
+            let query_limit = if since.is_some() { 0 } else { limit };
+            s.render(
+                &params.project,
+                s.with_project_root_db(&params.project, |root, db| {
+                    let mut features =
+                        db.list_features(kind, language, tag.as_deref(), query_limit)?;
+                    if let Some(git_ref) = since.as_deref() {
+                        let changed = codesage_graph::changed_files_since(root, git_ref)?;
+                        features
+                            .retain(|f| codesage_graph::feature_touched_since(&f.files, &changed));
+                        if limit > 0 && features.len() > limit {
+                            features.truncate(limit);
+                        }
                     }
-                }
-                Ok(features)
-            }),
-            "list_features",
-        )
+                    Ok(features)
+                }),
+                "list_features",
+            )
+        })
+        .await
     }
 
     #[tool(
@@ -1322,16 +1430,19 @@ impl CodeSageServer {
         description = "Features that include the given file in any role (entry, owned, context, or test). Use to answer \"what feature owns src/auth/login.php?\" — returns the matching feature records with their full file lists, tags, and trust boundaries. Empty result means no mapped feature claims this file (common: not every file belongs to a feature slice). For the curated code bundle of a matched feature (entry + owned + tests + context wrapped for LLM consumption) call `feature_bundle` with the `feature_id`.",
         output_schema = schema_for_type::<FeatureListResults>()
     )]
-    fn find_feature_tool(
+    async fn find_feature_tool(
         &self,
         Parameters(params): Parameters<FindFeatureParams>,
     ) -> CallToolResult {
-        let file = params.file_path.clone();
-        self.render(
-            &params.project,
-            self.with_project_db(&params.project, |db| db.features_for_file(&file)),
-            "find_feature",
-        )
+        self.blocking(move |s| {
+            let file = params.file_path.clone();
+            s.render(
+                &params.project,
+                s.with_project_db(&params.project, |db| db.features_for_file(&file)),
+                "find_feature",
+            )
+        })
+        .await
     }
 
     #[tool(
@@ -1339,28 +1450,31 @@ impl CodeSageServer {
         description = "Curated code bundle for one feature_id. Same shape as `export_context` but anchored on the feature's already-resolved file list (entry + owned + tests + context) instead of semantic search results. `primary[]` carries chunks from owned/entry files, `related[]` carries tests and context. Set `include_callers` / `include_callees` to also expand the entry symbol's callers/callees into `related[]` (reuses the symbol graph used by `export_context`). Use after `list_features` / `find_feature` to get all the code an agent needs to review or modify the slice in one MCP call — avoids fan-out Read calls per file. Empty bundle with `target_description` ending `(not found)` means the feature_id doesn't exist; empty bundle with non-empty title means the feature exists but no files have been semantically indexed yet (run `codesage index`).",
         output_schema = schema_for_type::<ContextBundle>()
     )]
-    fn feature_bundle_tool(
+    async fn feature_bundle_tool(
         &self,
         Parameters(params): Parameters<FeatureBundleParams>,
     ) -> CallToolResult {
-        let feature_id = params.feature_id.clone();
-        let include_callers = params.include_callers.unwrap_or(false);
-        let include_callees = params.include_callees.unwrap_or(false);
-        let limit = params.limit.unwrap_or(5);
-        // Use the context DB (binds to the configured embedding model's
-        // chunk table) so `primary`/`related` resolve real chunks. The
-        // structural-only db variant points at the default chunk table
-        // and returns empty content on projects using a non-default
-        // model (php-src uses jina v2 768-dim, MiniLM is the default).
-        let budget = self.bundle_budget_chars(&params.project);
-        self.render_budget(
-            &params.project,
-            self.with_project_context_db(&params.project, |db| {
-                feature_bundle(db, &feature_id, include_callers, include_callees, limit)
-            }),
-            "feature_bundle",
-            budget,
-        )
+        self.blocking(move |s| {
+            let feature_id = params.feature_id.clone();
+            let include_callers = params.include_callers.unwrap_or(false);
+            let include_callees = params.include_callees.unwrap_or(false);
+            let limit = params.limit.unwrap_or(5);
+            // Use the context DB (binds to the configured embedding model's
+            // chunk table) so `primary`/`related` resolve real chunks. The
+            // structural-only db variant points at the default chunk table
+            // and returns empty content on projects using a non-default
+            // model (php-src uses jina v2 768-dim, MiniLM is the default).
+            let budget = s.bundle_budget_chars(&params.project);
+            s.render_budget(
+                &params.project,
+                s.with_project_context_db(&params.project, |db| {
+                    feature_bundle(db, &feature_id, include_callers, include_callees, limit)
+                }),
+                "feature_bundle",
+                budget,
+            )
+        })
+        .await
     }
 
     #[tool(
@@ -1368,18 +1482,24 @@ impl CodeSageServer {
         description = "Diff the current structural state against the snapshot saved by `session_start` (matched by `session_id`, default \"default\"). Returns `pass: bool` (true when no new import cycles were introduced AND no top-risk file regressed by ≥ 0.10), plus `new_cycles`, `resolved_cycles`, `risk_regressions` (per-file before/after/delta), `new_files`, `removed_files`, and `summary_notes` ready to paste into a PR description. Errors when the snapshot file is missing — call `session_start` first. Snapshot file is left in place after the diff so the same id can be re-diffed.",
         output_schema = schema_for_type::<SessionDiff>()
     )]
-    fn session_end_tool(&self, Parameters(params): Parameters<SessionParams>) -> CallToolResult {
-        let session_id = params
-            .session_id
-            .clone()
-            .unwrap_or_else(|| "default".to_string());
-        self.render(
-            &params.project,
-            self.with_project_root_db(&params.project, |root, db| {
-                session_end(root, db, &session_id)
-            }),
-            "session_end",
-        )
+    async fn session_end_tool(
+        &self,
+        Parameters(params): Parameters<SessionParams>,
+    ) -> CallToolResult {
+        self.blocking(move |s| {
+            let session_id = params
+                .session_id
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+            s.render(
+                &params.project,
+                s.with_project_root_db(&params.project, |root, db| {
+                    session_end(root, db, &session_id)
+                }),
+                "session_end",
+            )
+        })
+        .await
     }
 }
 
@@ -2068,8 +2188,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn symbol_export_uses_existing_chunks_without_loading_embedding_model() {
+    #[tokio::test]
+    async fn symbol_export_uses_existing_chunks_without_loading_embedding_model() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let codesage_dir = root.join(".codesage");
@@ -2115,14 +2235,16 @@ mod tests {
         .unwrap();
 
         let server = CodeSageServer::new();
-        let result = server.export_context_tool(Parameters(ExportContextParams {
-            project: root.to_str().unwrap().to_string(),
-            target: "target".to_string(),
-            is_symbol: Some(true),
-            limit: Some(5),
-            include_callers: Some(false),
-            include_callees: Some(false),
-        }));
+        let result = server
+            .export_context_tool(Parameters(ExportContextParams {
+                project: root.to_str().unwrap().to_string(),
+                target: "target".to_string(),
+                is_symbol: Some(true),
+                limit: Some(5),
+                include_callers: Some(false),
+                include_callees: Some(false),
+            }))
+            .await;
 
         assert_ne!(result.is_error, Some(true));
         let value = result.structured_content.expect("structured content");

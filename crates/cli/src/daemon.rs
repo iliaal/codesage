@@ -264,12 +264,23 @@ mod unix {
         let shutdown_reason = loop {
             tokio::select! {
                 accepted = listener.accept() => {
-                    let (stream, _) = accepted.with_context(|| {
-                        format!(
-                            "accepting MCP daemon connection on {}",
-                            paths.socket.display()
-                        )
-                    })?;
+                    // A transient accept() error (EMFILE/ENFILE under fd
+                    // pressure, ECONNABORTED on a racing client hangup) must
+                    // not tear down the daemon and drop every in-flight
+                    // session. Log, pause briefly so we don't spin on a
+                    // persistent error, and keep serving.
+                    let (stream, _) = match accepted {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                socket = %paths.socket.display(),
+                                "transient error accepting MCP daemon connection; continuing"
+                            );
+                            sleep(Duration::from_millis(50)).await;
+                            continue;
+                        }
+                    };
 
                     // M4: refuse connections whose peer UID doesn't match
                     // ours. The 0o700 runtime dir + 0o600 socket already
@@ -783,7 +794,39 @@ mod unix {
     }
 
     fn prepare_runtime_dir(path: &Path) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
         fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
+
+        // The /tmp fallback lives under a world-writable, sticky-bit dir, so a
+        // co-located local user can pre-stage `codesage-<uid>` as a symlink (or
+        // a dir they own) before our daemon does. `create_dir_all` is then a
+        // no-op and the `set_permissions` below would follow the link and chmod
+        // the victim's target — or hand us a dir whose contents (pid/socket
+        // files) the attacker controls, enabling pid-file poisoning →
+        // `daemon stop` signalling an attacker-chosen process. Refuse anything
+        // that isn't a real directory we own. lstat (symlink_metadata) does not
+        // follow the link, so a symlinked runtime dir is rejected here.
+        let meta =
+            fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+        if meta.file_type().is_symlink() {
+            bail!(
+                "refusing to use runtime dir {}: it is a symlink \
+                 (possible cross-user attack on a shared /tmp)",
+                path.display()
+            );
+        }
+        // SAFETY: getuid is async-signal-safe and always succeeds.
+        let our_uid = unsafe { libc::getuid() };
+        if meta.uid() != our_uid {
+            bail!(
+                "refusing to use runtime dir {}: owned by uid {} but we are uid {}",
+                path.display(),
+                meta.uid(),
+                our_uid
+            );
+        }
+
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
             .with_context(|| format!("setting permissions on {}", path.display()))?;
         Ok(())
@@ -839,12 +882,17 @@ mod unix {
     /// prints a coherent "not running" answer when no daemon is found anywhere.
     fn existing_daemon_paths(runtime_dir: Option<PathBuf>) -> Result<DaemonPaths> {
         let exe = std::env::current_exe().context("resolving current executable")?;
-        if let Some(dir) = runtime_dir {
-            return DaemonPaths::for_exe(dir, &exe);
-        }
+        let dirs = match runtime_dir {
+            Some(dir) => vec![dir],
+            None => candidate_runtime_dirs(),
+        };
+
+        // First pass: the current binary's own key. This is the common case
+        // (same binary that spawned the daemon) and is preferred so we never
+        // pick a different daemon when ours is the one running.
         let mut fallback: Option<DaemonPaths> = None;
-        for dir in candidate_runtime_dirs() {
-            let paths = DaemonPaths::for_exe(dir, &exe)?;
+        for dir in &dirs {
+            let paths = DaemonPaths::for_exe(dir.clone(), &exe)?;
             if paths.pid.exists() {
                 return Ok(paths);
             }
@@ -852,7 +900,73 @@ mod unix {
                 fallback = Some(paths);
             }
         }
+
+        // Second pass: any *live* `mcp-<key>.pid` regardless of key. The key is
+        // derived from the exe's dev/ino/len/mtime, so a rebuilt binary has a
+        // new key and the first pass misses a daemon a prior build left running
+        // (it would keep serving stale code while `stop` reported "not
+        // running"). Scan for a foreign-key daemon whose pid is still alive.
+        for dir in &dirs {
+            if let Some(paths) = scan_live_daemon(dir) {
+                return Ok(paths);
+            }
+        }
+
         fallback.ok_or_else(|| anyhow::anyhow!("no candidate runtime dir resolved"))
+    }
+
+    /// Reconstruct [`DaemonPaths`] from a `<dir>/mcp-<key>.pid` path so
+    /// `status`/`stop` can address a daemon whose key differs from the current
+    /// binary's (e.g. after a rebuild). Returns `None` for names that don't fit
+    /// the `mcp-<key>.pid` shape.
+    fn paths_from_pid_file(pid_path: &Path) -> Option<DaemonPaths> {
+        let runtime_dir = pid_path.parent()?.to_path_buf();
+        let name = pid_path.file_name()?.to_str()?;
+        let key = name.strip_prefix("mcp-")?.strip_suffix(".pid")?;
+        if key.is_empty() {
+            return None;
+        }
+        Some(DaemonPaths {
+            socket: runtime_dir.join(format!("mcp-{key}.sock")),
+            lock: runtime_dir.join(format!("mcp-{key}.lock")),
+            pid: runtime_dir.join(format!("mcp-{key}.pid")),
+            log: runtime_dir.join(format!("mcp-{key}.log")),
+            runtime_dir,
+        })
+    }
+
+    /// Return the most-recently-started live daemon in `dir`, by scanning every
+    /// `mcp-*.pid` and keeping the newest whose pid is still alive. Newest wins
+    /// so that after a rebuild we address the freshest daemon when several keys
+    /// linger.
+    fn scan_live_daemon(dir: &Path) -> Option<DaemonPaths> {
+        let mut newest: Option<(SystemTime, DaemonPaths)> = None;
+        for entry in fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !(name.starts_with("mcp-") && name.ends_with(".pid")) {
+                continue;
+            }
+            let Some(paths) = paths_from_pid_file(&path) else {
+                continue;
+            };
+            let Some(pid) = read_daemon_pid(&paths.pid) else {
+                continue;
+            };
+            if !pid_alive(pid) {
+                continue;
+            }
+            let mtime = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            if newest.as_ref().is_none_or(|(best, _)| mtime > *best) {
+                newest = Some((mtime, paths));
+            }
+        }
+        newest.map(|(_, paths)| paths)
     }
 
     fn nonempty_env(key: &str) -> Option<std::ffi::OsString> {
@@ -980,6 +1094,61 @@ mod unix {
 
             let mode = fs::metadata(&runtime_dir).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700);
+        }
+
+        #[test]
+        fn prepare_runtime_dir_refuses_symlinked_dir() {
+            // SS-001: on a shared /tmp a co-located user can pre-stage the
+            // runtime dir as a symlink; prepare_runtime_dir must refuse it
+            // rather than follow the link and chmod the victim's target.
+            let dir = tempfile::tempdir().unwrap();
+            let real_target = dir.path().join("victim");
+            fs::create_dir(&real_target).unwrap();
+            let link = dir.path().join("codesage-runtime");
+            std::os::unix::fs::symlink(&real_target, &link).unwrap();
+
+            let err = prepare_runtime_dir(&link).unwrap_err();
+            assert!(
+                err.to_string().contains("symlink"),
+                "expected a symlink-refusal error, got: {err}"
+            );
+        }
+
+        #[test]
+        fn paths_from_pid_file_round_trips_key() {
+            // CR-007: status/stop reconstruct a daemon's paths from a
+            // foreign-key pid file (a daemon left by a different build).
+            let exe = std::env::current_exe().unwrap();
+            let runtime = std::path::Path::new("/tmp/codesage-test-runtime");
+            let original = DaemonPaths::for_exe(runtime.to_path_buf(), &exe).unwrap();
+
+            let reconstructed = paths_from_pid_file(&original.pid).expect("parse pid path");
+            assert_eq!(reconstructed.socket, original.socket);
+            assert_eq!(reconstructed.pid, original.pid);
+            assert_eq!(reconstructed.lock, original.lock);
+            assert_eq!(reconstructed.log, original.log);
+            assert_eq!(reconstructed.runtime_dir, original.runtime_dir);
+
+            // Non-matching names are rejected.
+            assert!(paths_from_pid_file(std::path::Path::new("/tmp/other.pid")).is_none());
+            assert!(paths_from_pid_file(std::path::Path::new("/tmp/mcp-.pid")).is_none());
+        }
+
+        #[test]
+        fn scan_live_daemon_finds_foreign_key_pid() {
+            // CR-007: a pid file under a different key than the current exe's,
+            // with a live pid, is discovered by the scan fallback.
+            let dir = tempfile::tempdir().unwrap();
+            // A key that is NOT the current exe's key.
+            let pid_file = dir.path().join("mcp-9.9.9-deadbeefdeadbeef.pid");
+            fs::write(&pid_file, std::process::id().to_string()).unwrap();
+
+            let found = scan_live_daemon(dir.path()).expect("should find the live daemon");
+            assert_eq!(found.pid, pid_file);
+
+            // A dead pid is skipped.
+            fs::write(&pid_file, "2147483646").unwrap();
+            assert!(scan_live_daemon(dir.path()).is_none());
         }
 
         #[test]
