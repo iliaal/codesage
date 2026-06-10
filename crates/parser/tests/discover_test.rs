@@ -145,3 +145,41 @@ fn sorted_by_path() {
     let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
     assert_eq!(paths, vec!["a.py", "m.c", "z.py"]);
 }
+
+#[cfg(unix)]
+#[test]
+fn unreadable_file_is_skipped_not_fatal() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    std::fs::write(root.join("ok.py"), "def good(): pass\n").unwrap();
+    let bad = root.join("bad.py");
+    std::fs::write(&bad, "def bad(): pass\n").unwrap();
+    std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    // Root bypasses permission bits: if the file is still readable we can't
+    // exercise the skip path, so skip rather than assert a false pass.
+    if std::fs::read(&bad).is_ok() {
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o644)).unwrap();
+        eprintln!("skipping: cannot make a file unreadable (running as root?)");
+        return;
+    }
+
+    // Pre-fix: an unreadable file aborted the whole walk (returned Err).
+    let files = discover_files_with_excludes(root, &[])
+        .expect("an unreadable file must be skipped, not abort the whole index");
+    let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert!(
+        names.contains(&"ok.py"),
+        "readable file must be indexed: {names:?}"
+    );
+    assert!(
+        !names.contains(&"bad.py"),
+        "unreadable file must be skipped: {names:?}"
+    );
+
+    // Restore perms so the tempdir can be cleaned up.
+    std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o644)).unwrap();
+}

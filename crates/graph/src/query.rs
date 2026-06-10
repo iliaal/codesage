@@ -50,7 +50,15 @@ pub fn list_dependencies(db: &Database, file_path: &str) -> Result<DependencyEnt
 }
 
 fn l2_to_score(distance: f32) -> f32 {
-    1.0 - distance * distance / 2.0
+    // Clamp to 0: for a distance > √2 (negative cosine similarity) the raw
+    // formula is negative, and the downstream multiplicative stages
+    // (`apply_path_penalties`, file/directory saturation, qualified-name boost)
+    // then *invert* ranking on those rows — a 0.15 penalty multiplies a
+    // negative score UP, promoting a worse match. With scores floored at 0 the
+    // multiplicative stages are no-ops on the tail and order falls to the stable
+    // sort + additive boosts. Mirrors the `.max(0.0)` clamp already used on
+    // `rrf_merge`'s synthetic distance.
+    (1.0 - distance * distance / 2.0).max(0.0)
 }
 
 const RERANK_OVERFETCH: usize = 5;
@@ -2630,6 +2638,51 @@ mod test_query_aware_penalty_tests {
             "tests/browser/interceptors.browser.test.js"
         );
         assert_eq!(results[1].file_path, "lib/core/InterceptorManager.js");
+    }
+
+    #[test]
+    fn l2_to_score_clamps_negative_similarity_to_zero() {
+        use super::l2_to_score;
+        // distance > √2 ⇒ negative cosine similarity ⇒ raw formula goes
+        // negative. Must clamp to 0 so the multiplicative ranking stages don't
+        // invert order on the tail.
+        assert_eq!(l2_to_score(2.0), 0.0); // 1 - 4/2 = -1 → 0
+        assert_eq!(l2_to_score(1.6), 0.0); // 1 - 2.56/2 = -0.28 → 0
+        assert!(l2_to_score(1.41) >= 0.0);
+        // Strong matches are unchanged.
+        assert!((l2_to_score(0.0) - 1.0).abs() < 1e-6);
+        assert!((l2_to_score(1.0) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn negative_similarity_does_not_invert_path_penalty_ranking() {
+        use super::l2_to_score;
+        // A weak-match query returns KNN rows past √2 distance (negative cosine
+        // similarity). The production file is the *better* match (smaller
+        // distance) but is a non-test path, so the test path's 0.15 penalty
+        // would multiply its larger-magnitude negative score UP and overtake the
+        // production file. Build scores exactly the way search() does.
+        let prod_score = l2_to_score(1.5); // better match
+        let test_score = l2_to_score(1.6); // worse match
+        let mut results = vec![
+            mk("src/auth/session.rs", prod_score),
+            mk("tests/auth/session_test.rs", test_score),
+        ];
+        // Non-test-shaped query so the test path gets the 0.15 demote.
+        apply_path_penalties(&mut results, "validate session token");
+        let prod_idx = results
+            .iter()
+            .position(|r| r.file_path == "src/auth/session.rs")
+            .unwrap();
+        let test_idx = results
+            .iter()
+            .position(|r| r.file_path == "tests/auth/session_test.rs")
+            .unwrap();
+        assert!(
+            prod_idx < test_idx,
+            "better-matching production file must not rank below a penalized \
+             test file: {results:?}"
+        );
     }
 }
 

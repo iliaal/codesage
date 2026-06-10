@@ -100,9 +100,28 @@ impl Reranker {
 /// which happens to be correct for `num_labels == 1` and silently scrambles
 /// scores for everything else.
 fn extract_relevance_scores(shape: &[i64], logits: &[f32], batch_size: usize) -> Vec<f32> {
-    let num_labels = shape.last().copied().filter(|n| *n > 0).unwrap_or(1) as usize;
-    if num_labels <= 1 {
-        return (0..batch_size).map(|i| logits[i]).collect();
+    if batch_size == 0 {
+        return Vec::new();
+    }
+    // `num_labels` is the size of the last dim ONLY for a rank-≥2 tensor. A
+    // rank-1 `[batch]` output — some community re-exports squeeze the
+    // `[batch, 1]` regression head — has a last dim equal to `batch_size`;
+    // treating that as `num_labels` makes the row-slicing loop below read past
+    // the end of `logits` and panic. In the daemon a tool-handler panic is
+    // swallowed by rmcp and the client hangs, so detect the single-score case
+    // by rank, not by `shape.last()`.
+    let num_labels = if shape.len() <= 1 {
+        1
+    } else {
+        shape.last().copied().filter(|n| *n > 0).unwrap_or(1) as usize
+    };
+    // A single-label head (or a malformed tensor whose element count doesn't
+    // cover `batch * num_labels`) is read as one raw score per row. `get` keeps
+    // a short/garbled tensor from panicking the handler.
+    if num_labels <= 1 || logits.len() < batch_size * num_labels {
+        return (0..batch_size)
+            .map(|i| logits.get(i).copied().unwrap_or(0.0))
+            .collect();
     }
     let mut out = Vec::with_capacity(batch_size);
     for i in 0..batch_size {
@@ -127,6 +146,25 @@ mod tests {
         let logits = vec![0.9, -0.2, 1.3];
         let scores = extract_relevance_scores(&[3, 1], &logits, 3);
         assert_eq!(scores, vec![0.9, -0.2, 1.3]);
+    }
+
+    #[test]
+    fn rank1_batch_output_returns_raw_logits_without_panicking() {
+        // A squeezed `[batch]` regression head. Pre-fix, `num_labels` was read
+        // as `shape.last()` == batch_size (3), and the row loop sliced
+        // logits[3..6] on a 3-element tensor → out-of-bounds panic.
+        let logits = vec![0.9, -0.2, 1.3];
+        let scores = extract_relevance_scores(&[3], &logits, 3);
+        assert_eq!(scores, vec![0.9, -0.2, 1.3]);
+    }
+
+    #[test]
+    fn malformed_short_tensor_does_not_panic() {
+        // A multi-label shape whose element count doesn't cover batch*num_labels
+        // must degrade, not panic the handler (which would hang the MCP client).
+        let logits = vec![0.5]; // shape claims [2,2] = 4 elements, only 1 present
+        let scores = extract_relevance_scores(&[2, 2], &logits, 2);
+        assert_eq!(scores.len(), 2);
     }
 
     #[test]

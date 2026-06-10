@@ -118,14 +118,19 @@ pub fn discover_files_with_excludes(
             let content = match std::fs::read(path) {
                 Ok(c) => c,
                 Err(e) => {
-                    let mut slot = first_err.lock().unwrap();
-                    if slot.is_none() {
-                        *slot = Some(
-                            anyhow::Error::new(e)
-                                .context(format!("reading file at {}", path.display())),
-                        );
-                    }
-                    return WalkState::Quit;
+                    // Skip an individual unreadable file rather than aborting the
+                    // whole index — matching the oversized-file branch above. A
+                    // permission-restricted file, or one deleted mid-walk (the
+                    // post-checkout git hook races `git checkout`/`stash`), must
+                    // not fail a whole-project reindex. Walk-entry errors (a
+                    // directory we can't traverse) still Quit above, since those
+                    // mean the discovered file set is genuinely incomplete.
+                    tracing::warn!(
+                        path = %rel_path,
+                        error = %e,
+                        "skipping unreadable file"
+                    );
+                    return WalkState::Continue;
                 }
             };
             let hash = content_hash(&content);

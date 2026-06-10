@@ -1515,6 +1515,14 @@ fn cmd_risk_diff(files: Vec<String>, json: bool) -> Result<()> {
 
 fn cmd_map(json: bool) -> Result<()> {
     let root = find_project_root()?;
+    // `map_features` writes the feature tables in multiple transactions and runs
+    // a GC pass; take the same project writer lock that cmd_index / cmd_git_index
+    // / cmd_cleanup hold so a manual `codesage map` doesn't race the background
+    // hook-driven indexer (which maps features itself) into SQLITE_BUSY or a
+    // partial multi-transaction state. Skip if an indexer already holds it.
+    let Some(_lock) = acquire_index_lock(&root, "skipping map")? else {
+        return Ok(());
+    };
     let db = open_db(&root)?;
     let config = load_project_config(&root)?;
     let excludes = get_exclude_patterns(&config);

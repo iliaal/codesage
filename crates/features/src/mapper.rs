@@ -178,17 +178,24 @@ fn build_record(db: &Database, seed: &FeatureSeed, all_files: &[String]) -> Resu
     let feature_id = feature_id::build(seed.kind, seed.source, &seed.entry_path, &disc);
 
     // Build the file ref set: entry + owned + context + (seed tests union
-    // nearby tests). Deduped by (path, role); entry always wins over owned.
-    let mut files_by_key: BTreeMap<(String, FeatureFileRole), FeatureFileRef> = BTreeMap::new();
-    let entry_ref = FeatureFileRef {
-        path: seed.entry_path.clone(),
-        role: FeatureFileRole::Entry,
-        reason: Some("entrypoint".to_string()),
-    };
-    files_by_key.insert((seed.entry_path.clone(), FeatureFileRole::Entry), entry_ref);
+    // nearby tests), deduped by PATH with role precedence Entry > Owned >
+    // Context > Test (first insertion of a path wins). Keying by path alone is
+    // load-bearing: several mappers — notably the C/C++ `filter_target_sources`
+    // — return the entry file again inside `owned_files`, so a `(path, role)`
+    // key would persist that file twice (once Entry, once Owned). The doc that
+    // used to say "entry always wins over owned" now actually holds.
+    let mut files_by_path: BTreeMap<String, FeatureFileRef> = BTreeMap::new();
+    files_by_path.insert(
+        seed.entry_path.clone(),
+        FeatureFileRef {
+            path: seed.entry_path.clone(),
+            role: FeatureFileRole::Entry,
+            reason: Some("entrypoint".to_string()),
+        },
+    );
     for f in &seed.owned_files {
-        files_by_key
-            .entry((f.path.clone(), FeatureFileRole::Owned))
+        files_by_path
+            .entry(f.path.clone())
             .or_insert(FeatureFileRef {
                 path: f.path.clone(),
                 role: FeatureFileRole::Owned,
@@ -196,8 +203,8 @@ fn build_record(db: &Database, seed: &FeatureSeed, all_files: &[String]) -> Resu
             });
     }
     for f in &seed.context_files {
-        files_by_key
-            .entry((f.path.clone(), FeatureFileRole::Context))
+        files_by_path
+            .entry(f.path.clone())
             .or_insert(FeatureFileRef {
                 path: f.path.clone(),
                 role: FeatureFileRole::Context,
@@ -206,8 +213,8 @@ fn build_record(db: &Database, seed: &FeatureSeed, all_files: &[String]) -> Resu
     }
     // Seed-attached tests.
     for t in &seed.tests {
-        files_by_key
-            .entry((t.path.clone(), FeatureFileRole::Test))
+        files_by_path
+            .entry(t.path.clone())
             .or_insert(FeatureFileRef {
                 path: t.path.clone(),
                 role: FeatureFileRole::Test,
@@ -217,15 +224,13 @@ fn build_record(db: &Database, seed: &FeatureSeed, all_files: &[String]) -> Resu
     // Nearby-test discovery from filesystem conventions.
     let nearby = nearby_tests(seed, all_files);
     for path in nearby {
-        files_by_key
-            .entry((path.clone(), FeatureFileRole::Test))
-            .or_insert(FeatureFileRef {
-                path,
-                role: FeatureFileRole::Test,
-                reason: Some("convention".to_string()),
-            });
+        files_by_path.entry(path.clone()).or_insert(FeatureFileRef {
+            path,
+            role: FeatureFileRole::Test,
+            reason: Some("convention".to_string()),
+        });
     }
-    let files: Vec<FeatureFileRef> = files_by_key.into_values().collect();
+    let files: Vec<FeatureFileRef> = files_by_path.into_values().collect();
     // Aggregate trust boundaries across owned + entry files (skip context
     // because context tends to be huge generic helpers and would dilute).
     let mut tb: BTreeSet<TrustBoundary> = BTreeSet::new();
@@ -273,6 +278,65 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(p, content).unwrap();
+    }
+
+    #[test]
+    fn entry_file_repeated_in_owned_is_deduped_to_entry_role() {
+        use crate::mappers::types::SeedFile;
+        use codesage_protocol::{FeatureConfidence, FeatureFileRole, Language};
+        // The C/C++ mapper's filter_target_sources returns ALL target sources as
+        // owned, including the file picked as the entry. build_record must
+        // persist that file once, as Entry — not twice (Entry + Owned).
+        let seed = FeatureSeed {
+            title: "svc".into(),
+            summary: String::new(),
+            kind: FeatureKind::CliCommand,
+            source: "cmake-target",
+            confidence: FeatureConfidence::High,
+            entry_path: "src/main.c".into(),
+            entry_symbol: Some("main".into()),
+            entry_route: None,
+            entry_command: Some("svc".into()),
+            test_command: None,
+            language: Language::C,
+            tags: Vec::new(),
+            owned_files: vec![
+                SeedFile {
+                    path: "src/main.c".into(),
+                    reason: "target source".into(),
+                },
+                SeedFile {
+                    path: "src/helper.c".into(),
+                    reason: "target source".into(),
+                },
+            ],
+            context_files: Vec::new(),
+            tests: Vec::new(),
+            test_prefixes: Vec::new(),
+        };
+        let db = Database::open_in_memory().unwrap();
+        let record = build_record(&db, &seed, &[]).unwrap();
+
+        let main_refs: Vec<_> = record
+            .files
+            .iter()
+            .filter(|f| f.path == "src/main.c")
+            .collect();
+        assert_eq!(
+            main_refs.len(),
+            1,
+            "entry file must appear exactly once: {:?}",
+            record.files
+        );
+        assert_eq!(main_refs[0].role, FeatureFileRole::Entry);
+        assert!(
+            record
+                .files
+                .iter()
+                .any(|f| f.path == "src/helper.c" && f.role == FeatureFileRole::Owned),
+            "non-entry owned file should remain: {:?}",
+            record.files
+        );
     }
 
     #[test]
