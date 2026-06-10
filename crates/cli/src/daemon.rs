@@ -11,18 +11,20 @@ mod unix {
         io::{self, Write},
         os::unix::fs::{MetadataExt, PermissionsExt},
         path::{Path, PathBuf},
+        pin::Pin,
         process::{Command, Stdio},
         sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
+        task::{Context as TaskContext, Poll},
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use anyhow::{Context, Result, bail};
     use rmcp::ServiceExt;
     use tokio::{
-        io::{AsyncWriteExt, copy},
+        io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf, copy},
         net::{UnixListener, UnixStream},
         signal::unix::{SignalKind, signal},
         time::sleep,
@@ -331,32 +333,134 @@ mod unix {
         Ok(())
     }
 
-    /// M7: a per-request timeout would require introspecting the rmcp
-    /// service's tool dispatch, which is private to the crate. As a
-    /// coarse alternative, the entire client connection has a hard
-    /// ceiling — if a hung tool call (e.g. deadlocked ORT session)
-    /// pins the connection past this, the daemon forcibly drops it
-    /// so the agent gets an error instead of an indefinite hang. A
-    /// healthy MCP session is typically a few minutes; one hour is
-    /// generous for slow, multi-call sweeps and still bounded.
-    const CLIENT_SESSION_MAX: Duration = Duration::from_secs(3600);
+    /// Default per-connection idle ceiling. A per-request timeout would
+    /// require introspecting the rmcp service's tool dispatch, which is
+    /// private to the crate, so we observe activity one layer down — at the
+    /// transport (see [`ActivityStream`]) — and drop a connection that has
+    /// gone this long without the client sending a byte. Measured from last
+    /// activity, NOT connection start: an active multi-hour sweep keeps
+    /// resetting the clock and is never guillotined mid-session, while a hung
+    /// tool call (which produces no further client bytes) or an agent that
+    /// wandered off without disconnecting is still reaped so the agent gets an
+    /// error instead of an indefinite hang. Override with
+    /// `CODESAGE_CLIENT_IDLE_MAX_SECS`; `0` disables the ceiling entirely.
+    const DEFAULT_CLIENT_IDLE_MAX: Duration = Duration::from_secs(4 * 3600);
+
+    /// Resolve the per-connection idle ceiling from the environment.
+    /// `Duration::ZERO` disables it. An unparseable value falls back to the
+    /// default rather than silently disabling the ceiling.
+    fn client_idle_max() -> Duration {
+        match std::env::var("CODESAGE_CLIENT_IDLE_MAX_SECS") {
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(secs) => Duration::from_secs(secs),
+                Err(_) => {
+                    tracing::warn!(
+                        value = %raw,
+                        "invalid CODESAGE_CLIENT_IDLE_MAX_SECS (want integer seconds); \
+                         using default {:?}",
+                        DEFAULT_CLIENT_IDLE_MAX
+                    );
+                    DEFAULT_CLIENT_IDLE_MAX
+                }
+            },
+            Err(_) => DEFAULT_CLIENT_IDLE_MAX,
+        }
+    }
+
+    /// Transparent wrapper around the client [`UnixStream`] that stamps
+    /// `last_activity` on every non-empty read. `serve_client` reads this to
+    /// measure the idle ceiling from the client's last request rather than
+    /// from connection start. Reads are the right signal: a healthy session
+    /// reads (requests/pings) continuously, whereas a hung tool call leaves
+    /// the client blocked waiting for a response it never sent more bytes for,
+    /// so the clock advances and the connection is reaped.
+    struct ActivityStream {
+        inner: UnixStream,
+        last_activity: Arc<Mutex<Instant>>,
+    }
+
+    impl AsyncRead for ActivityStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            let before = buf.filled().len();
+            let r = Pin::new(&mut this.inner).poll_read(cx, buf);
+            if matches!(r, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+                *this.last_activity.lock().unwrap() = Instant::now();
+            }
+            r
+        }
+    }
+
+    impl AsyncWrite for ActivityStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
 
     async fn serve_client(server: CodeSageServer, stream: UnixStream) -> Result<()> {
+        let last_activity = Arc::new(Mutex::new(Instant::now()));
+        let tracked = ActivityStream {
+            inner: stream,
+            last_activity: last_activity.clone(),
+        };
         let service = server
-            .serve(stream)
+            .serve(tracked)
             .await
             .map_err(|e| anyhow::anyhow!("MCP daemon server error: {e}"))?;
 
+        let idle_max = client_idle_max();
         let wait = service.waiting();
-        match tokio::time::timeout(CLIENT_SESSION_MAX, wait).await {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(e)) => Err(anyhow::anyhow!("MCP daemon server stopped: {e}")),
-            Err(_elapsed) => {
-                tracing::warn!(
-                    "MCP client connection exceeded {:?}; dropping",
-                    CLIENT_SESSION_MAX
-                );
-                Ok(())
+        tokio::pin!(wait);
+
+        if idle_max.is_zero() {
+            return match wait.await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(anyhow::anyhow!("MCP daemon server stopped: {e}")),
+            };
+        }
+
+        // Poll often enough to notice idleness within a minute of the
+        // ceiling, but never busier than once a minute.
+        let poll = idle_max
+            .min(Duration::from_secs(60))
+            .max(Duration::from_secs(1));
+        let mut idle_tick = tokio::time::interval(poll);
+        idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                res = &mut wait => {
+                    return match res {
+                        Ok(_) => Ok(()),
+                        Err(e) => Err(anyhow::anyhow!("MCP daemon server stopped: {e}")),
+                    };
+                }
+                _ = idle_tick.tick() => {
+                    let idle = last_activity.lock().unwrap().elapsed();
+                    if idle >= idle_max {
+                        tracing::warn!(
+                            "MCP client idle for {:?} (>= {:?}); dropping",
+                            idle, idle_max
+                        );
+                        return Ok(());
+                    }
+                }
             }
         }
     }

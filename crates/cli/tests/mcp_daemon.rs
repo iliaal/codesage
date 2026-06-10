@@ -382,6 +382,157 @@ fn daemon_self_exits_after_idle_timeout() {
     );
 }
 
+#[test]
+fn active_client_survives_past_client_idle_max() {
+    // The per-connection ceiling must be measured from the client's last
+    // request, not from connection start. A client that keeps sending requests
+    // faster than CODESAGE_CLIENT_IDLE_MAX_SECS must never be dropped, however
+    // old the connection gets. Pre-fix the ceiling was an absolute
+    // timeout(CLIENT_SESSION_MAX, waiting()) that guillotined healthy sessions
+    // at 1h regardless of activity.
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let bin = env!("CARGO_BIN_EXE_codesage");
+    let mut child = ChildGuard {
+        child: Command::new(bin)
+            .arg("mcp")
+            .arg("--runtime-dir")
+            .arg(runtime.path())
+            .env("CODESAGE_CLIENT_IDLE_MAX_SECS", "2")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn codesage mcp"),
+    };
+
+    let stdout = child.child.stdout.take().expect("child stdout");
+    let (tx, rx) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    {
+        let stdin = child.child.stdin.as_mut().expect("child stdin");
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-11-25","capabilities":{{}},"clientInfo":{{"name":"codesage-test","version":"0.0.0"}}}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+    }
+    let init = recv_response(&rx, 1);
+    assert_eq!(init["result"]["serverInfo"]["name"], "codesage");
+
+    // Send a request every 800ms for ~5s — well past the 2s ceiling. Each
+    // response must come back, proving the ceiling resets on every request.
+    let mut id = 2u64;
+    for _ in 0..6 {
+        thread::sleep(Duration::from_millis(800));
+        {
+            let stdin = child.child.stdin.as_mut().expect("child stdin");
+            writeln!(
+                stdin,
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/list"}}"#
+            )
+            .unwrap();
+            stdin.flush().unwrap();
+        }
+        let resp = recv_response(&rx, id);
+        assert!(
+            resp["result"]["tools"].is_array(),
+            "tools/list #{id} should still answer past the idle ceiling"
+        );
+        id += 1;
+    }
+
+    assert!(
+        child.child.try_wait().unwrap().is_none(),
+        "active client was dropped despite continuous use within the idle window"
+    );
+
+    drop(child.child.stdin.take());
+    let _ = child.child.kill();
+    let _ = child.child.wait();
+    let _ = reader.join();
+}
+
+#[test]
+fn idle_client_dropped_after_client_idle_max() {
+    // The ceiling must still fire when a client goes silent (a hung tool call
+    // or an agent that wandered off without disconnecting). With a 2s ceiling
+    // and no requests after initialize, the daemon drops the connection; the
+    // shim then sees its socket close and exits on its own. stdin is left open
+    // so the only thing that can end the shim is the daemon-side idle drop.
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let bin = env!("CARGO_BIN_EXE_codesage");
+    let mut child = ChildGuard {
+        child: Command::new(bin)
+            .arg("mcp")
+            .arg("--runtime-dir")
+            .arg(runtime.path())
+            .env("CODESAGE_CLIENT_IDLE_MAX_SECS", "2")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn codesage mcp"),
+    };
+
+    let stdout = child.child.stdout.take().expect("child stdout");
+    let (tx, rx) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    {
+        let stdin = child.child.stdin.as_mut().expect("child stdin");
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-11-25","capabilities":{{}},"clientInfo":{{"name":"codesage-test","version":"0.0.0"}}}}}}"#
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+    }
+    let init = recv_response(&rx, 1);
+    assert_eq!(init["result"]["serverInfo"]["name"], "codesage");
+
+    // Now go silent. Within a couple of 2s polls the daemon should drop the
+    // idle connection, and the shim exits when its socket closes.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match child.child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.child.kill();
+                    panic!("idle client was not dropped within 15s despite a 2s ceiling");
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => panic!("try_wait failed: {e}"),
+        }
+    }
+    let _ = reader.join();
+}
+
 struct ChildGuard {
     child: Child,
 }
