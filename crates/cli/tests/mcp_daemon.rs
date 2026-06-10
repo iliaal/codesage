@@ -437,8 +437,7 @@ fn active_client_survives_past_client_idle_max() {
 
     // Send a request every 800ms for ~5s — well past the 2s ceiling. Each
     // response must come back, proving the ceiling resets on every request.
-    let mut id = 2u64;
-    for _ in 0..6 {
+    for id in 2u64..8 {
         thread::sleep(Duration::from_millis(800));
         {
             let stdin = child.child.stdin.as_mut().expect("child stdin");
@@ -454,7 +453,6 @@ fn active_client_survives_past_client_idle_max() {
             resp["result"]["tools"].is_array(),
             "tools/list #{id} should still answer past the idle ceiling"
         );
-        id += 1;
     }
 
     assert!(
