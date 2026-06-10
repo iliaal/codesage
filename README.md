@@ -59,7 +59,7 @@ PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go.
 
 CodeSage ships as one static Rust binary plus a local SQLite database under `.codesage/` per project. No Docker container, no external vector DB server, no embedding service, and no service manager. CLI commands run directly. MCP clients use `codesage mcp`, a stdio shim that starts or reuses a user-local Unix-socket daemon so concurrent agent sessions share one project cache, embedding model pool, reranker pool, and CUDA context.
 
-The trade-off: CUDA-accelerated embeddings need the `nvidia-*-cu12` pip packages on the host (see [CUDA setup](#cuda-setup) below). In exchange, install once, run everywhere, no orchestration layer, no systemd unit to manage. Tools in the same category that take the other side of this trade (SocratiCode with managed Qdrant + Ollama, GitNexus with external Qdrant) are valid for different user profiles. If your team already runs Docker Compose for everything, use those. If you want `cargo install`, `codesage init`, and an on-demand local daemon hidden behind stdio MCP, use CodeSage.
+The trade-off: CUDA-accelerated embeddings on Linux need the `nvidia-*-cu12` pip packages on the host (see [CUDA setup](#cuda-setup)); on Apple Silicon, set `device = "coreml"` instead (see [CoreML setup](#coreml-setup-macos)). In exchange, install once, run everywhere, no orchestration layer, no systemd unit to manage. Tools in the same category that take the other side of this trade (SocratiCode with managed Qdrant + Ollama, GitNexus with external Qdrant) are valid for different user profiles. If your team already runs Docker Compose for everything, use those. If you want `cargo install`, `codesage init`, and an on-demand local daemon hidden behind stdio MCP, use CodeSage.
 
 ## 📊 Benchmarks
 
@@ -101,8 +101,8 @@ Run yourself with `bench/codesage-bench-runner <corpus.yaml>` (corpus format: `p
 ## 🚀 Getting started
 
 ```bash
-# Build with GPU support
-cargo build --release -p codesage --features cuda
+# Build (add --features cuda on Linux for GPU)
+cargo build --release -p codesage
 
 # Initialize and index a project
 cd /path/to/your/project
@@ -366,7 +366,7 @@ name = "my-project"
 
 [embedding]
 model = "sentence-transformers/all-MiniLM-L6-v2"
-device = "gpu"                                        # "gpu" or "cpu"
+device = "gpu"                                        # "cpu", "gpu", or "coreml" (macOS)
 reranker = "cross-encoder/ms-marco-MiniLM-L6-v2"     # optional, remove to disable
 
 [index]
@@ -377,6 +377,32 @@ exclude_patterns = [
 ```
 
 Models download from HuggingFace the first time you use them.
+
+## CUDA setup
+
+ONNX Runtime loads dynamically. CUDA libraries come from pip-installed `nvidia-*-cu12` packages. At first use, the binary discovers them via `CODESAGE_NVIDIA_LIBS`, Python `site-packages`, or standard system paths. `ORT_DYLIB_PATH` can override the ONNX Runtime library location.
+
+Build with GPU support: `cargo build --release -p codesage --features cuda`. Set `device = "gpu"` in config. `codesage doctor` reports how many nvidia lib dirs were discovered.
+
+If CUDA is requested but fails to register, the process errors out instead of falling back to CPU.
+
+Required pip packages: `onnxruntime-gpu`, `nvidia-cudnn-cu12`, `nvidia-cublas-cu12`, `nvidia-cuda-runtime-cu12`, `nvidia-cufft-cu12`, `nvidia-curand-cu12`, `nvidia-cuda-nvrtc-cu12`.
+
+## CoreML setup (macOS)
+
+On Apple Silicon, set `device = "coreml"` in `.codesage/config.toml`. No extra Cargo feature is required — ONNX Runtime uses the same `load-dynamic` path as Linux, and the macOS ORT dylib includes the CoreML execution provider (GPU + Neural Engine).
+
+```bash
+cargo build --release -p codesage
+codesage doctor    # includes a coreml readiness check
+codesage index
+```
+
+First session creation compiles CoreML submodels and can take a few minutes; subsequent inference in the same process is faster. Large models (e.g. `jinaai/jina-embeddings-v2-base-code`) may OOM at the default embed batch size — lower `BATCH_SIZE` in `crates/embed/src/config.rs` if indexing dies with signal 9.
+
+For verbose progress during a long first index: `RUST_LOG=codesage=info codesage index --verbose`.
+
+If CoreML registration fails, the process errors out instead of silently falling back to CPU.
 
 ## 🏗️ Architecture
 
