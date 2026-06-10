@@ -58,6 +58,6 @@ tree-sitter-javascript = "0.25"
 tree-sitter-typescript = "0.23"
 tree-sitter-go = "0.25"
 
-ort = { version = "2.0.0-rc.12", features = ["load-dynamic", "preload-dylibs"] }
+ort = { version = "2.0.0-rc.12", features = ["coreml"] }
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 hf-hub = "0.5"

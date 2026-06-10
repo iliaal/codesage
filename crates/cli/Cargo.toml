@@ -11,6 +11,7 @@ path = "src/main.rs"
 [features]
 default = []
 cuda = ["codesage-embed/cuda"]
+coreml = ["codesage-embed/coreml"]
 
 [dependencies]
 codesage-protocol.workspace = true

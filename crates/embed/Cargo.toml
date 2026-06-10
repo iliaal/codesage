@@ -7,6 +7,7 @@ license.workspace = true
 [features]
 default = []
 cuda = ["ort/cuda"]
+coreml = ["ort/coreml"]
 
 [dependencies]
 codesage-protocol.workspace = true

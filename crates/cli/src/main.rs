@@ -42,7 +42,8 @@ struct Cli {
 enum Commands {
     /// Initialize CodeSage for the current project
     Init,
-    /// Index the project (incremental by default)
+    /// Index the project (incremental by default). Use --full to reindex everything,
+    /// --no-semantic to skip embeddings, --verbose for per-file progress.
     Index {
         /// Force a full reindex
         #[arg(long)]
@@ -50,6 +51,9 @@ enum Commands {
         /// Skip semantic indexing (embeddings)
         #[arg(long)]
         no_semantic: bool,
+        /// Show per-file progress during indexing
+        #[arg(long, short)]
+        verbose: bool,
     },
     /// Find symbol definitions by name
     FindSymbol {
@@ -519,8 +523,59 @@ fn load_index_embedder(
     }
 }
 
+fn print_version_info() {
+    let version = env!("CARGO_PKG_VERSION");
+    let arch = std::env::consts::ARCH;
+    let os = std::env::consts::OS;
+    let vendor = if cfg!(target_vendor = "apple") {
+        "apple"
+    } else if cfg!(target_vendor = "pc") {
+        "pc"
+    } else {
+        "unknown"
+    };
+    let target = format!("{arch}-{vendor}-{os}");
+
+    let features = [
+        "cpu",
+        #[cfg(feature = "cuda")]
+        "cuda",
+        #[cfg(feature = "coreml")]
+        "coreml",
+    ];
+
+    let configured = find_project_root_opt()
+        .and_then(|root| {
+            let config = load_project_config(&root).ok()?;
+            config.embedding.map(|e| e.device)
+        })
+        .unwrap_or_else(|| "none (no project config)".to_string());
+
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+
+    println!("codesage {version} ({profile})");
+    println!("  target: {target}");
+    println!("  features compiled: {}", features.join(", "));
+    println!("  device configured: {configured}");
+    flush_stdio();
+}
+
 fn main() {
     init_tracing();
+
+    // Check for -V / --version before clap so it works without a subcommand.
+    let wants_version = std::env::args()
+        .skip(1)
+        .any(|a| a == "-V" || a == "--version");
+    if wants_version {
+        print_version_info();
+        std::process::exit(0);
+    }
+
     // Resolve ONNX Runtime + NVIDIA library locations now, while we are still
     // single-threaded. The discovery code calls `std::env::set_var` for
     // `LD_LIBRARY_PATH` / `ORT_DYLIB_PATH`, which is `unsafe` under Rust 2024
@@ -634,7 +689,11 @@ where
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Init => cmd_init(),
-        Commands::Index { full, no_semantic } => cmd_index(full, no_semantic),
+        Commands::Index {
+            full,
+            no_semantic,
+            verbose,
+        } => cmd_index(full, no_semantic, verbose),
         Commands::FindSymbol { name, kind, json } => cmd_find_symbol(&name, kind.as_deref(), json),
         Commands::FindReferences { name, kind, json } => {
             cmd_find_references(&name, kind.as_deref(), json)
@@ -1128,7 +1187,7 @@ fn git_local_exclude_path(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
     Some(git_common_dir(cwd)?.join("info").join("exclude"))
 }
 
-fn cmd_index(full: bool, no_semantic: bool) -> Result<()> {
+fn cmd_index(full: bool, no_semantic: bool, verbose: bool) -> Result<()> {
     let root = find_project_root()?;
     // Acquire the project-level indexing lock before loading embedders or
     // touching the DB. Skips work cleanly (exit 0) if another codesage
@@ -1143,6 +1202,18 @@ fn cmd_index(full: bool, no_semantic: bool) -> Result<()> {
     let excludes = get_exclude_patterns(&config);
 
     let emb_config = config.embedding.unwrap_or_default();
+
+    if verbose {
+        tracing::info!(
+            project = root.display().to_string(),
+            full,
+            no_semantic,
+            model = %emb_config.model,
+            device = %emb_config.device,
+            "starting index"
+        );
+    }
+
     let mut embedder = load_index_embedder(no_semantic, &emb_config)?;
 
     let db = match embedder.as_ref() {
@@ -1152,20 +1223,32 @@ fn cmd_index(full: bool, no_semantic: bool) -> Result<()> {
     };
 
     let stats = if full {
-        full_index(&root, &db, &excludes)?
+        full_index(&root, &db, &excludes, verbose)?
     } else {
-        incremental_index(&root, &db, &excludes)?
+        incremental_index(&root, &db, &excludes, verbose)?
     };
 
-    println!(
-        "Structural: {} files ({} skipped, {} failed, {} removed), {} symbols, {} references",
-        stats.files_indexed,
-        stats.files_skipped,
-        stats.files_failed,
-        stats.files_removed,
-        stats.symbols_found,
-        stats.references_found
-    );
+    if verbose {
+        tracing::info!(
+            files_indexed = stats.files_indexed,
+            files_skipped = stats.files_skipped,
+            files_failed = stats.files_failed,
+            files_removed = stats.files_removed,
+            symbols = stats.symbols_found,
+            refs = stats.references_found,
+            "structural index complete"
+        );
+    } else {
+        println!(
+            "Structural: {} files ({} skipped, {} failed, {} removed), {} symbols, {} references",
+            stats.files_indexed,
+            stats.files_skipped,
+            stats.files_failed,
+            stats.files_removed,
+            stats.symbols_found,
+            stats.references_found
+        );
+    }
 
     // Targeted trust-boundary backfill. `files_pending_boundary_derivation`
     // returns files that have never been derived (or were indexed before
@@ -1175,8 +1258,21 @@ fn cmd_index(full: bool, no_semantic: bool) -> Result<()> {
     match db.files_pending_boundary_derivation() {
         Ok(pending) if !pending.is_empty() => {
             let n_pending = pending.len();
+            if verbose {
+                tracing::info!(pending = n_pending, "backfilling trust boundaries");
+            }
             match codesage_features::derive_for_files(&db, &pending) {
-                Ok(n) => println!("Trust boundaries: backfilled {n}/{n_pending} pending files"),
+                Ok(n) => {
+                    if verbose {
+                        tracing::info!(
+                            backfilled = n,
+                            total = n_pending,
+                            "trust boundaries complete"
+                        );
+                    } else {
+                        println!("Trust boundaries: backfilled {n}/{n_pending} pending files");
+                    }
+                }
                 Err(e) => eprintln!("trust-boundary backfill failed: {e:#}"),
             }
         }
@@ -1189,28 +1285,57 @@ fn cmd_index(full: bool, no_semantic: bool) -> Result<()> {
     // trust-boundary tags are fresh. Errors here are fatal: a mid-run
     // failure must surface as command failure, not a silent eprintln
     // with feature tables left in a partial state.
+    if verbose {
+        tracing::info!("mapping features");
+    }
     match codesage_features::map_features(&root, &db, &excludes) {
-        Ok(map_stats) => println!(
-            "Features:   created={} updated={} removed={} total={}",
-            map_stats.created, map_stats.updated, map_stats.removed, map_stats.total_features
-        ),
+        Ok(map_stats) => {
+            if verbose {
+                tracing::info!(
+                    created = map_stats.created,
+                    updated = map_stats.updated,
+                    removed = map_stats.removed,
+                    total = map_stats.total_features,
+                    "feature mapping complete"
+                );
+            } else {
+                println!(
+                    "Features:   created={} updated={} removed={} total={}",
+                    map_stats.created,
+                    map_stats.updated,
+                    map_stats.removed,
+                    map_stats.total_features
+                );
+            }
+        }
         Err(e) => return Err(e.context("feature mapping failed during `codesage index`")),
     }
 
     if let Some(embedder) = embedder.as_mut() {
         let sem_stats = if full {
-            semantic_full_index(&root, &db, embedder, &excludes)?
+            semantic_full_index(&root, &db, embedder, &excludes, verbose)?
         } else {
-            semantic_incremental_index(&root, &db, embedder, &excludes)?
+            semantic_incremental_index(&root, &db, embedder, &excludes, verbose)?
         };
-        println!(
-            "Semantic: {} files ({} skipped, {} failed, {} removed), {} chunks",
-            sem_stats.files_processed,
-            sem_stats.files_skipped,
-            sem_stats.files_failed,
-            sem_stats.files_removed,
-            sem_stats.chunks_created
-        );
+        if verbose {
+            tracing::info!(
+                files_processed = sem_stats.files_processed,
+                files_skipped = sem_stats.files_skipped,
+                files_failed = sem_stats.files_failed,
+                files_removed = sem_stats.files_removed,
+                chunks = sem_stats.chunks_created,
+                "semantic index complete"
+            );
+        } else {
+            println!(
+                "Semantic: {} files ({} skipped, {} failed, {} removed), {} chunks",
+                sem_stats.files_processed,
+                sem_stats.files_skipped,
+                sem_stats.files_failed,
+                sem_stats.files_removed,
+                sem_stats.chunks_created
+            );
+        }
     }
 
     // Stamp the HEAD SHA we just indexed against. Skipped in non-git dirs.

@@ -8,9 +8,12 @@ use ort::session::Session;
 use tokenizers::Tokenizer;
 use wait_timeout::ChildExt;
 
-use crate::config::{BATCH_SIZE, EmbeddingConfig, MAX_SEQ_LENGTH, PoolingStrategy, wants_cuda};
+use crate::config::{
+    BATCH_SIZE, EmbeddingConfig, MAX_SEQ_LENGTH, PoolingStrategy, wants_coreml, wants_cuda,
+};
 
 static ORT_INIT: Once = Once::new();
+#[cfg(feature = "cuda")]
 static CUDA_PRELOAD: Once = Once::new();
 
 pub(crate) fn public_nvidia_lib_dirs() -> Vec<PathBuf> {
@@ -197,6 +200,7 @@ pub fn init_for_main() {
     }
 }
 
+#[cfg(feature = "cuda")]
 pub fn preload_cuda_libs() {
     CUDA_PRELOAD.call_once(|| {
         let lib_dirs = discover_nvidia_lib_dirs();
@@ -290,7 +294,6 @@ fn discover_ort_dylib() -> Option<PathBuf> {
 pub fn init_ort_dylib() {
     ORT_INIT.call_once(|| {
         if std::env::var("ORT_DYLIB_PATH").is_ok() {
-            // Caller took control. Still prepend discovered NVIDIA dirs so CUDA loads.
             let nvidia = discover_nvidia_lib_dirs();
             if !nvidia.is_empty() {
                 prepend_ld_library_path(nvidia);
@@ -334,9 +337,26 @@ pub(crate) fn load_onnx_session(model: &str, device: &str) -> Result<(Session, T
         }
     }
 
+    let want_coreml = wants_coreml(device);
+    if want_coreml && !cfg!(target_vendor = "apple") {
+        anyhow::bail!(
+            "CoreML requested in .codesage/config.toml but this binary is not running on Apple hardware"
+        );
+    }
+    #[cfg(not(feature = "coreml"))]
+    if want_coreml {
+        anyhow::bail!(
+            "CoreML requested but binary built without coreml feature. Rebuild with: cargo build --features coreml"
+        );
+    }
+
     let api = hf_hub::api::sync::Api::new().context("failed to create HuggingFace API client")?;
     let repo = api.model(model.to_string());
 
+    tracing::info!(
+        model,
+        "fetching model files (progress bar on stderr if uncached)"
+    );
     let tokenizer_path = repo
         .get("tokenizer.json")
         .context("failed to download tokenizer.json")?;
@@ -366,6 +386,28 @@ pub(crate) fn load_onnx_session(model: &str, device: &str) -> Result<(Session, T
         ..Default::default()
     }));
 
+    fn human_size(bytes: u64) -> String {
+        if bytes >= 1024 * 1024 * 1024 {
+            format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+        } else if bytes >= 1024 * 1024 {
+            format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+        } else if bytes >= 1024 {
+            format!("{:.1} KB", bytes as f64 / 1024.0)
+        } else {
+            format!("{bytes} B")
+        }
+    }
+
+    let tk_size = std::fs::metadata(&tokenizer_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let model_size = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
+    tracing::info!(
+        tokenizer = human_size(tk_size),
+        model = human_size(model_size),
+        "model files ready"
+    );
+
     let mut builder = Session::builder()?;
 
     if want_cuda {
@@ -382,6 +424,19 @@ pub(crate) fn load_onnx_session(model: &str, device: &str) -> Result<(Session, T
         }
     }
 
+    if want_coreml {
+        #[cfg(feature = "coreml")]
+        {
+            builder = builder
+                .with_execution_providers([ort::ep::CoreML::default()
+                    .with_compute_units(ort::ep::coreml::ComputeUnits::All)
+                    .build()
+                    .error_on_failure()])
+                .map_err(|e| anyhow::anyhow!("CoreML provider failed to register: {e}"))?;
+        }
+    }
+
+    tracing::info!(path = %model_path.display(), "building onnx session — this may take a moment for CoreML compilation");
     let session = builder.commit_from_file(&model_path)?;
 
     // Hard-fail when device = "gpu" was requested but ORT silently fell back to
