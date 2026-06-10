@@ -811,10 +811,14 @@ mod unix {
         if let Some(dir) = nonempty_env("XDG_RUNTIME_DIR") {
             dirs.push(PathBuf::from(dir).join("codesage"));
         }
-        let suffix = std::env::var("UID")
-            .or_else(|_| std::env::var("USER"))
-            .unwrap_or_else(|_| "unknown".to_string());
-        let tmp = std::env::temp_dir().join(format!("codesage-{suffix}"));
+        // Suffix the /tmp fallback with the real numeric UID, not the UID/USER
+        // env vars. bash doesn't export UID, and a Claude Code shim's env may
+        // carry UID=1000 while an interactive shell falls back to USER=ilia —
+        // so env-derived suffixes disagree across processes and put the daemon
+        // and a later `status`/`stop` in different /tmp dirs. getuid() is
+        // stable regardless of environment (and matches the SO_PEERCRED check).
+        let uid = unsafe { libc::getuid() };
+        let tmp = std::env::temp_dir().join(format!("codesage-{uid}"));
         if !dirs.contains(&tmp) {
             dirs.push(tmp);
         }

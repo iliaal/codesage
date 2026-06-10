@@ -533,22 +533,30 @@ fn idle_client_dropped_after_client_idle_max() {
 
 #[test]
 fn status_finds_daemon_in_fallback_runtime_dir() {
-    // Regression: runtime-dir resolution depends on the ambient env, so a
+    // Regression: runtime-dir resolution depended on the ambient env, so a
     // daemon a shim started in the /tmp fallback (env without XDG_RUNTIME_DIR)
     // was invisible to `daemon status` run from a shell where XDG_RUNTIME_DIR
     // is set — status resolved only $XDG/codesage and printed "not running".
-    // status/stop now scan all candidate dirs. Env is set per-spawned-Command,
+    // status/stop now scan all candidate dirs.
+    //
+    // This also guards the /tmp suffix being keyed on the real getuid() rather
+    // than the UID/USER env vars: the daemon is spawned with a bogus UID and
+    // status with a divergent USER, so an env-derived suffix would put them in
+    // different /tmp dirs (codesage-424242 vs codesage-$USER). getuid() makes
+    // both resolve to codesage-<real-uid>. Env is set per-spawned-Command,
     // never on the test process, so this stays parallel-safe.
     let scratch = tempfile::tempdir().unwrap(); // becomes $TMPDIR -> /tmp fallback root
     let xdg = tempfile::tempdir().unwrap(); // an unrelated, empty XDG dir
     let bin = env!("CARGO_BIN_EXE_codesage");
 
     // Daemon resolves its own runtime dir: no XDG / no override -> the
-    // $TMPDIR/codesage-$suffix fallback. Foreground child.
+    // $TMPDIR/codesage-<uid> fallback. Bogus UID env must be ignored in favor
+    // of getuid(). Foreground child.
     let mut daemon = ChildGuard {
         child: Command::new(bin)
             .arg("daemon")
             .env("TMPDIR", scratch.path())
+            .env("UID", "424242")
             .env_remove("XDG_RUNTIME_DIR")
             .env_remove("CODESAGE_DAEMON_RUNTIME_DIR")
             .stdin(Stdio::null())
@@ -585,6 +593,8 @@ fn status_finds_daemon_in_fallback_runtime_dir() {
         .arg("status")
         .env("TMPDIR", scratch.path())
         .env("XDG_RUNTIME_DIR", xdg.path())
+        .env("USER", "codesage-test-user")
+        .env_remove("UID")
         .env_remove("CODESAGE_DAEMON_RUNTIME_DIR")
         .output()
         .expect("run codesage daemon status");
