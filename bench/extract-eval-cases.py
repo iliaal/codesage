@@ -126,6 +126,12 @@ def normalize_path(path: str, project_root: str) -> str | None:
     rel_str = rel.as_posix()
     if not rel_str or rel_str.startswith("."):
         return None
+    # Reject control characters (notably newline — legal in POSIX filenames and
+    # capturable by the `"file_path":"([^"]+)"` regex, which matches across
+    # newlines). A newline-bearing path would split the emitted YAML list item
+    # into injected structure downstream. fnd_32ebb1d9.
+    if any(ord(ch) < 0x20 for ch in rel_str):
+        return None
     return rel_str
 
 
@@ -202,9 +208,15 @@ def _slugify(text: str, max_len: int = 60) -> str:
     return slug[:max_len] or "case"
 
 
+def _yaml_dq(s: str) -> str:
+    """Double-quoted YAML scalar: escape backslashes and double quotes.
+    Safe for arbitrary one-line text (colons, `#`, leading specials)."""
+    return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def write_yaml(cases: list[dict], project_root: str, project_name: str, out_path: Path) -> None:
     lines: list[str] = []
-    lines.append(f"project_root: {project_root}")
+    lines.append(f"project_root: {_yaml_dq(project_root)}")
     lines.append("description: |")
     lines.append(f"  Retrieval benchmark for {project_name}.")
     lines.append("  Session-based queries mined from real Claude Code session history by")
@@ -228,13 +240,14 @@ def write_yaml(cases: list[dict], project_root: str, project_name: str, out_path
         query = c["query"].replace("\n", " ").strip()
         lines.append(f"  - id: {candidate}")
         lines.append("    source: session")
-        # Quote the query defensively: YAML double-quoted string handles most user text
-        # once we escape backslashes and double quotes.
-        escaped = query.replace("\\", "\\\\").replace('"', '\\"')
-        lines.append(f'    query: "{escaped}"')
+        # Quote the query and every path defensively (double-quoted scalar with
+        # backslash/quote escaping) so user-derived text and mined paths can't
+        # inject YAML structure. normalize_path already drops control chars;
+        # this covers ordinary metacharacters (`: `, `#`, leading specials).
+        lines.append(f"    query: {_yaml_dq(query)}")
         lines.append("    expected_files:")
         for f in c["files"]:
-            lines.append(f"      - {f}")
+            lines.append(f"      - {_yaml_dq(f)}")
         lines.append("")
 
     out_path.write_text("\n".join(lines))

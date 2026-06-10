@@ -64,6 +64,63 @@ CODESAGE_RETRIEVAL_TOOLS = [
 
 BASE_TOOLS = ["Grep", "Read", "Glob"]
 
+# Tools the agent must never use in either arm. Bash/Edit/Write/etc. would let
+# it shell out to `codesage search` (a confound the harness must exclude) or
+# modify the benched repo. Read/Glob/Grep retrieval is all the task needs.
+DISALLOWED_TOOLS = ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch"]
+
+
+def expected_tool_set(with_codesage: bool) -> set[str]:
+    """The only tools the agent should be able to use under this condition."""
+    s = set(BASE_TOOLS)
+    if with_codesage:
+        s.update(CODESAGE_RETRIEVAL_TOOLS)
+    return s
+
+
+def build_command(
+    prompt: str,
+    *,
+    with_codesage: bool,
+    max_turns: int,
+    append_system_prompt_file: Path | None = None,
+) -> list[str]:
+    """Build the `claude -p` argv for one task.
+
+    Critically does NOT pass `--dangerously-skip-permissions`: in headless
+    print mode that flag lets the model call ANY tool (Bash, every globally
+    registered MCP server) regardless of `--allowedTools`, so the with/without-
+    codesage arms would not actually differ — the experiment would measure
+    nothing. Without it, a tool that isn't allow-listed and needs permission is
+    denied (no TTY to prompt on), which is exactly the gating this measurement
+    relies on. The `without` arm additionally loads an empty MCP config and
+    ignores all global ones (`--strict-mcp-config`), so the codesage server is
+    not even offered to the model.
+    """
+    tools = list(BASE_TOOLS)
+    if with_codesage:
+        tools.extend(CODESAGE_RETRIEVAL_TOOLS)
+    cmd = [
+        "claude", "-p", prompt,
+        "--allowedTools", ",".join(tools),
+        "--disallowedTools", ",".join(DISALLOWED_TOOLS),
+        "--output-format", "stream-json",
+        "--verbose",
+        "--max-turns", str(max_turns),
+    ]
+    if not with_codesage:
+        cmd.extend(["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'])
+    if append_system_prompt_file is not None:
+        # `claude -p` only exposes `--append-system-prompt <prompt>`. Inline the
+        # file's contents so the harness fails loudly at read time rather than
+        # silently when `claude` rejects an unknown flag and every task records
+        # `rc!=0`.
+        cmd.extend([
+            "--append-system-prompt",
+            append_system_prompt_file.read_text(encoding="utf-8"),
+        ])
+    return cmd
+
 
 def build_prompt(query: str) -> str:
     """Convert a commit-subject query into a neutral find-a-file task.
@@ -101,25 +158,12 @@ def run_task(
     the §2.3 follow-up that ships the codesage prompt-override (see
     plugins/codesage-tools/bin/codesage-prompt-override).
     """
-    tools = list(BASE_TOOLS)
-    if with_codesage:
-        tools.extend(CODESAGE_RETRIEVAL_TOOLS)
-    cmd = [
-        "claude", "-p", prompt,
-        "--allowedTools", ",".join(tools),
-        "--dangerously-skip-permissions",
-        "--output-format", "stream-json",
-        "--verbose",
-        "--max-turns", str(max_turns),
-    ]
-    if append_system_prompt_file is not None:
-        # `claude -p` only exposes `--append-system-prompt <prompt>`. Inline the file's
-        # contents so the harness fails loudly at read time rather than silently when
-        # `claude` rejects an unknown flag and every task records `rc!=0`.
-        cmd.extend([
-            "--append-system-prompt",
-            append_system_prompt_file.read_text(encoding="utf-8"),
-        ])
+    cmd = build_command(
+        prompt,
+        with_codesage=with_codesage,
+        max_turns=max_turns,
+        append_system_prompt_file=append_system_prompt_file,
+    )
     t0 = time.time()
     try:
         r = subprocess.run(
@@ -138,6 +182,7 @@ def run_task(
             "used_codesage": False,
             "codesage_count": 0,
             "grep_count": 0,
+            "unexpected_tools": [],
             "cost_usd": 0.0,
             "result_text": "",
             "stderr": "",
@@ -170,6 +215,16 @@ def run_task(
     first_tool = tool_uses[0] if tool_uses else None
     codesage_count = sum(1 for t in tool_uses if t.startswith("mcp__codesage__"))
     grep_count = sum(1 for t in tool_uses if t == "Grep")
+    # Self-check: any tool outside the condition's intended set means the gating
+    # leaked and this row's with/without comparison is invalid (the failure mode
+    # the old `--dangerously-skip-permissions` invocation hid).
+    allowed = expected_tool_set(with_codesage)
+    unexpected_tools = sorted({t for t in tool_uses if t and t not in allowed})
+    if unexpected_tools:
+        print(
+            f"  ! unexpected tools used (measurement may be invalid): {unexpected_tools}",
+            file=sys.stderr,
+        )
     stderr_tail = (r.stderr or "")[-2000:]
     if r.returncode != 0 and stderr_tail.strip():
         # Surface the subprocess stderr immediately so a bad flag or auth
@@ -183,6 +238,7 @@ def run_task(
         "used_codesage": codesage_count > 0,
         "codesage_count": codesage_count,
         "grep_count": grep_count,
+        "unexpected_tools": unexpected_tools,
         "cost_usd": cost_usd,
         "result_text": result_text,
         "stderr": stderr_tail,

@@ -121,12 +121,15 @@ def run_parallel(cmds: list[list[str]], cwd: Path, timeout_s: int = 300) -> list
             })
         except subprocess.TimeoutExpired:
             p.kill()
+            # Reap the killed child and capture whatever it had written — the
+            # last output before a livelock is the most useful diagnostic.
+            out, err = p.communicate()
             results.append({
                 "cmd": " ".join(cmd),
                 "returncode": None,
                 "duration_s": timeout_s,
-                "stdout_tail": "",
-                "stderr_tail": "TIMEOUT",
+                "stdout_tail": (out or "")[-400:],
+                "stderr_tail": ("TIMEOUT " + (err or ""))[-400:],
             })
     return results
 
@@ -233,6 +236,43 @@ def summarize_proc(r: dict) -> str:
     return f"  - {r['cmd']} → {verdict} in {r['duration_s']}s{suffix}"
 
 
+def classify_verdict(results: list[dict], state: dict) -> str:
+    """Map the per-process results + post-run DB state to a verdict string.
+
+    A timed-out process has `returncode is None` (SIGKILLed mid-run). It must
+    NOT be folded into the "one succeeded, other errored cleanly" branch — a
+    hung/livelocked writer is a distinct concurrency failure, exactly the class
+    this audit exists to surface, and it was previously reported with a green
+    checkmark.
+    """
+    corrupt = (
+        state["integrity"] != "ok"
+        or state["orphans"]["symbols_without_file"] > 0
+        or state["orphans"]["refs_without_file"] > 0
+        or state["dupes"]["files_same_path"] > 0
+        or any(m["count"] > 1 for m in state["schema_migrations"])
+        or len(state.get("foreign_key_violations") or []) > 0
+    )
+    if corrupt:
+        return "❌ CORRUPT — see detail above; fix required (lockfile / busy_timeout / retry)"
+
+    timed_out = sum(1 for r in results if r["returncode"] is None)
+    procs_ok = sum(1 for r in results if r["returncode"] == 0)
+    if timed_out:
+        return (
+            f"⚠ TIMEOUT — {timed_out} process(es) killed after the timeout; "
+            "possible writer livelock, not a clean serialization (investigate)"
+        )
+    if procs_ok == len(results):
+        return "✓ clean — both processes succeeded, DB is consistent"
+    if procs_ok >= 1:
+        return (
+            "✓ serialized — one process succeeded, other errored "
+            "(likely SQLITE_BUSY); DB is consistent"
+        )
+    return "⚠ both failed — DB is consistent but nothing got indexed"
+
+
 def summarize_db(state: dict) -> str:
     lines = []
     lines.append(f"  - integrity_check: {state['integrity']}")
@@ -283,24 +323,7 @@ def main() -> int:
             print("**Post-run DB**:")
             print(summarize_db(state))
             print()
-            # Verdict
-            procs_ok = sum(1 for r in results if r["returncode"] == 0)
-            corrupt = state["integrity"] != "ok" or state["orphans"]["symbols_without_file"] > 0 \
-                      or state["orphans"]["refs_without_file"] > 0 \
-                      or state["dupes"]["files_same_path"] > 0 \
-                      or any(m["count"] > 1 for m in state["schema_migrations"]) \
-                      or len(state.get("foreign_key_violations") or []) > 0
-            if corrupt:
-                verdict = "❌ CORRUPT — see detail above; fix required (lockfile / busy_timeout / retry)"
-            elif procs_ok == len(results):
-                verdict = "✓ clean — both processes succeeded, DB is consistent"
-            elif procs_ok >= 1:
-                verdict = (
-                    "✓ serialized — one process succeeded, other errored "
-                    "(likely SQLITE_BUSY); DB is consistent"
-                )
-            else:
-                verdict = "⚠ both failed — DB is consistent but nothing got indexed"
+            verdict = classify_verdict(results, state)
             print(f"**Verdict**: {verdict}")
             print()
         finally:

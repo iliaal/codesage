@@ -71,7 +71,24 @@ def candidate_files(project_root: Path) -> list[Path]:
         if line_count < MIN_LINES or line_count > MAX_LINES:
             continue
         out.append(path)
+    # Sort for determinism: rglob() yields entries in filesystem order, which
+    # varies across machines/filesystems/checkouts. The seeded shuffle below
+    # only reproduces the same sample if its input order is stable.
+    out.sort()
     return out
+
+
+def positive_int(value: str) -> int:
+    """argparse type: require a positive integer.
+
+    A negative `--num-cases` would be used as a slice bound (`candidates[:n]`),
+    silently selecting all-but-the-last-|n| candidates and firing hundreds of
+    paid `codex` calls.
+    """
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return n
 
 
 PROMPT_TEMPLATE = """\
@@ -95,6 +112,14 @@ File: {rel_path}
 {content}
 ```
 """
+
+
+def yaml_sq(s: str) -> str:
+    """Single-quoted YAML scalar: wrap in `'...'`, doubling embedded quotes.
+    A single-quoted YAML scalar treats every character literally except `'`, so
+    this is safe for arbitrary one-line text (colons, `#`, leading specials).
+    """
+    return "'" + str(s).replace("'", "''") + "'"
 
 
 def lang_for(suffix: str) -> str:
@@ -124,7 +149,11 @@ def generate_query(file_path: Path, project_root: Path) -> str | None:
 
     try:
         proc = subprocess.run(
-            ["codex", "exec", "--skip-git-repo-check"],
+            # `-s read-only`: the prompt embeds untrusted scanned-repo file
+            # content (bench fixtures include third-party mirrors), so pin the
+            # least-privilege sandbox rather than inheriting whatever the user's
+            # ~/.codex/config.toml grants. Query generation needs no exec/write.
+            ["codex", "exec", "--skip-git-repo-check", "-s", "read-only"],
             input=prompt,
             text=True,
             capture_output=True,
@@ -164,7 +193,7 @@ def generate_query(file_path: Path, project_root: Path) -> str | None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--project-root", required=True, type=Path)
-    ap.add_argument("-n", "--num-cases", type=int, default=20)
+    ap.add_argument("-n", "--num-cases", type=positive_int, default=20)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out", type=Path,
                     help="output yaml path (default: stdout)")
@@ -204,16 +233,17 @@ def main() -> int:
     # Hand-roll YAML so we don't pull in pyyaml just for output (the bench
     # runner needs it, but generation should work in lighter environments).
     out_lines: list[str] = []
-    out_lines.append(f"project_root: {payload['project_root']}")
+    out_lines.append(f"project_root: {yaml_sq(payload['project_root'])}")
     out_lines.append("cases:")
     for case in cases:
-        # Quote query if it contains characters YAML would mishandle.
-        q = case["query"].replace("'", "''")
         out_lines.append(f"  - id: {case['id']}")
-        out_lines.append(f"    query: '{q}'")
+        out_lines.append(f"    query: {yaml_sq(case['query'])}")
         out_lines.append("    expected_files:")
         for f in case["expected_files"]:
-            out_lines.append(f"      - {f}")
+            # Quote paths too: a filename with `: `, `#`, a leading special
+            # char, or (legal on POSIX) a newline would otherwise corrupt or
+            # inject YAML structure.
+            out_lines.append(f"      - {yaml_sq(f)}")
     serialized = "\n".join(out_lines) + "\n"
 
     if args.out:
