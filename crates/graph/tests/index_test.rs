@@ -28,7 +28,7 @@ fn setup_project() -> (tempfile::TempDir, Database) {
 #[test]
 fn full_index_discovers_and_indexes() {
     let (dir, db) = setup_project();
-    let stats = full_index(dir.path(), &db, &[]).unwrap();
+    let stats = full_index(dir.path(), &db, &[], false).unwrap();
 
     assert_eq!(stats.files_indexed, 3);
     assert!(stats.symbols_found > 0);
@@ -41,7 +41,7 @@ fn full_index_discovers_and_indexes() {
 #[test]
 fn find_symbol_by_name() {
     let (dir, db) = setup_project();
-    full_index(dir.path(), &db, &[]).unwrap();
+    full_index(dir.path(), &db, &[], false).unwrap();
 
     let results = find_symbol(
         &db,
@@ -60,7 +60,7 @@ fn find_symbol_by_name() {
 #[test]
 fn find_symbol_with_kind_filter() {
     let (dir, db) = setup_project();
-    full_index(dir.path(), &db, &[]).unwrap();
+    full_index(dir.path(), &db, &[], false).unwrap();
 
     let funcs = find_symbol(
         &db,
@@ -79,11 +79,11 @@ fn find_symbol_with_kind_filter() {
 fn incremental_skips_unchanged() {
     let (dir, db) = setup_project();
 
-    let stats1 = full_index(dir.path(), &db, &[]).unwrap();
+    let stats1 = full_index(dir.path(), &db, &[], false).unwrap();
     assert_eq!(stats1.files_indexed, 3);
     assert_eq!(stats1.files_skipped, 0);
 
-    let stats2 = incremental_index(dir.path(), &db, &[]).unwrap();
+    let stats2 = incremental_index(dir.path(), &db, &[], false).unwrap();
     assert_eq!(stats2.files_indexed, 0);
     assert_eq!(stats2.files_skipped, 3);
 }
@@ -91,7 +91,7 @@ fn incremental_skips_unchanged() {
 #[test]
 fn incremental_reindexes_changed_file() {
     let (dir, db) = setup_project();
-    full_index(dir.path(), &db, &[]).unwrap();
+    full_index(dir.path(), &db, &[], false).unwrap();
 
     std::fs::write(
         dir.path().join("main.py"),
@@ -99,7 +99,7 @@ fn incremental_reindexes_changed_file() {
     )
     .unwrap();
 
-    let stats = incremental_index(dir.path(), &db, &[]).unwrap();
+    let stats = incremental_index(dir.path(), &db, &[], false).unwrap();
     assert_eq!(stats.files_indexed, 1);
     assert_eq!(stats.files_skipped, 2);
 
@@ -127,12 +127,12 @@ fn incremental_reindexes_changed_file() {
 #[test]
 fn incremental_removes_deleted_files() {
     let (dir, db) = setup_project();
-    full_index(dir.path(), &db, &[]).unwrap();
+    full_index(dir.path(), &db, &[], false).unwrap();
     assert_eq!(db.file_count().unwrap(), 3);
 
     std::fs::remove_file(dir.path().join("util.c")).unwrap();
 
-    let stats = incremental_index(dir.path(), &db, &[]).unwrap();
+    let stats = incremental_index(dir.path(), &db, &[], false).unwrap();
     assert_eq!(stats.files_removed, 1);
     assert_eq!(db.file_count().unwrap(), 2);
 

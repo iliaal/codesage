@@ -53,7 +53,7 @@ fn returns_bundle_with_curated_files_after_map() {
     write(root, "src/main.rs", main_src);
     write(root, "tests/integration.rs", test_src);
     let db = Database::open_in_memory().unwrap();
-    full_index(root, &db, &[]).unwrap();
+    full_index(root, &db, &[], false).unwrap();
     map_features(root, &db, &[]).unwrap();
 
     // Seed chunks directly (avoids spinning up a real embedder in tests).
@@ -131,7 +131,7 @@ fn entry_chunk_overlaps_entry_symbol_not_first_chunk() {
     content.push_str("fn main() { println!(\"hi\"); }\n");
     write(root, "src/main.rs", &content);
     let db = Database::open_in_memory().unwrap();
-    full_index(root, &db, &[]).unwrap();
+    full_index(root, &db, &[], false).unwrap();
     map_features(root, &db, &[]).unwrap();
     // Seed two chunks: imports L1-50, body L51-101. Without the fix, the
     // bundle would pick L1-50; with the fix it picks the L51-101 chunk
@@ -196,7 +196,7 @@ fn missing_chunks_yield_empty_primary_but_keep_metadata() {
     );
     write(root, "src/main.rs", "fn main() {}\n");
     let db = Database::open_in_memory().unwrap();
-    full_index(root, &db, &[]).unwrap();
+    full_index(root, &db, &[], false).unwrap();
     map_features(root, &db, &[]).unwrap();
     let features = db.features_for_file("src/main.rs").unwrap();
     let main_feature = features.first().expect("at least one feature");

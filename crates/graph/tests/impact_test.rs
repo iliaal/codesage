@@ -39,7 +39,7 @@ fn setup_project() -> (tempfile::TempDir, Database) {
     ).unwrap();
 
     let db = Database::open_in_memory().unwrap();
-    full_index(root, &db, &[]).unwrap();
+    full_index(root, &db, &[], false).unwrap();
     (dir, db)
 }
 
@@ -65,7 +65,7 @@ fn setup_ambiguous_python_project() -> (tempfile::TempDir, Database) {
     .unwrap();
 
     let db = Database::open_in_memory().unwrap();
-    full_index(root, &db, &[]).unwrap();
+    full_index(root, &db, &[], false).unwrap();
     insert_chunk(
         &db,
         "app/models.py",
@@ -116,7 +116,7 @@ fn setup_qualified_rust_project() -> (tempfile::TempDir, Database) {
     .unwrap();
 
     let db = Database::open_in_memory().unwrap();
-    full_index(root, &db, &[]).unwrap();
+    full_index(root, &db, &[], false).unwrap();
     insert_chunk(
         &db,
         "db.rs",
@@ -160,7 +160,7 @@ fn setup_callee_rust_project() -> (tempfile::TempDir, Database) {
     .unwrap();
 
     let db = Database::open_in_memory().unwrap();
-    full_index(root, &db, &[]).unwrap();
+    full_index(root, &db, &[], false).unwrap();
     insert_chunk(&db, "helpers.rs", "rust", "pub fn helper() {}\n", 1);
     insert_chunk(
         &db,

@@ -48,7 +48,7 @@ fn write_cyclic_php(root: &std::path::Path) {
 fn session_end_passes_when_no_changes() {
     let (dir, db) = setup_project_with_codesage_dir();
     write_acyclic_php(dir.path());
-    full_index(dir.path(), &db, &[]).unwrap();
+    full_index(dir.path(), &db, &[], false).unwrap();
 
     let snap = session_start(dir.path(), &db, "default").unwrap();
     assert_eq!(snap.file_count, 3);
@@ -78,7 +78,7 @@ fn session_end_passes_when_no_changes() {
 fn session_end_fails_when_new_cycle_introduced() {
     let (dir, db) = setup_project_with_codesage_dir();
     write_acyclic_php(dir.path());
-    full_index(dir.path(), &db, &[]).unwrap();
+    full_index(dir.path(), &db, &[], false).unwrap();
 
     let _snap = session_start(dir.path(), &db, "default").unwrap();
 
@@ -89,7 +89,7 @@ fn session_end_fails_when_new_cycle_introduced() {
     write_cyclic_php(dir.path());
     // Remove C so it doesn't linger from the prior layout.
     let _ = std::fs::remove_file(dir.path().join("C.php"));
-    full_index(dir.path(), &db, &[]).unwrap();
+    full_index(dir.path(), &db, &[], false).unwrap();
 
     // Snapshot was written to disk during session_start; the new in-memory DB
     // doesn't matter for the snapshot read. session_end re-derives current
@@ -118,7 +118,7 @@ fn session_end_fails_when_new_cycle_introduced() {
 fn session_end_reports_resolved_cycle() {
     let (dir, db) = setup_project_with_codesage_dir();
     write_cyclic_php(dir.path());
-    full_index(dir.path(), &db, &[]).unwrap();
+    full_index(dir.path(), &db, &[], false).unwrap();
 
     let snap = session_start(dir.path(), &db, "default").unwrap();
     assert_eq!(snap.cycles.len(), 1, "baseline should have the A<->B cycle");
@@ -128,7 +128,7 @@ fn session_end_reports_resolved_cycle() {
     let _ = std::fs::remove_file(dir.path().join("A.php"));
     let _ = std::fs::remove_file(dir.path().join("B.php"));
     write_acyclic_php(dir.path());
-    full_index(dir.path(), &db, &[]).unwrap();
+    full_index(dir.path(), &db, &[], false).unwrap();
 
     let diff = session_end(dir.path(), &db, "default").unwrap();
     assert!(
@@ -150,7 +150,7 @@ fn session_end_reports_resolved_cycle() {
 fn session_end_errors_when_snapshot_missing() {
     let (dir, db) = setup_project_with_codesage_dir();
     write_acyclic_php(dir.path());
-    full_index(dir.path(), &db, &[]).unwrap();
+    full_index(dir.path(), &db, &[], false).unwrap();
 
     let err = session_end(dir.path(), &db, "never-started").unwrap_err();
     let msg = format!("{err:#}");
@@ -167,7 +167,7 @@ fn session_start_overwrites_existing_snapshot() {
     // current state, not the prior one.
     let (dir, db) = setup_project_with_codesage_dir();
     write_acyclic_php(dir.path());
-    full_index(dir.path(), &db, &[]).unwrap();
+    full_index(dir.path(), &db, &[], false).unwrap();
 
     let snap1 = session_start(dir.path(), &db, "default").unwrap();
     assert_eq!(snap1.file_count, 3);
@@ -179,7 +179,7 @@ fn session_start_overwrites_existing_snapshot() {
     )
     .unwrap();
     let db = Database::open_in_memory().unwrap();
-    full_index(dir.path(), &db, &[]).unwrap();
+    full_index(dir.path(), &db, &[], false).unwrap();
 
     let snap2 = session_start(dir.path(), &db, "default").unwrap();
     assert_eq!(snap2.file_count, 4, "second snapshot should see 4 files");
@@ -195,7 +195,7 @@ fn session_start_overwrites_existing_snapshot() {
 fn session_start_rejects_invalid_session_id() {
     let (dir, db) = setup_project_with_codesage_dir();
     write_acyclic_php(dir.path());
-    full_index(dir.path(), &db, &[]).unwrap();
+    full_index(dir.path(), &db, &[], false).unwrap();
 
     assert!(session_start(dir.path(), &db, "../etc/passwd").is_err());
     assert!(session_start(dir.path(), &db, "a/b").is_err());
