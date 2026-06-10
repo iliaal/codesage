@@ -8,7 +8,9 @@ use ort::session::Session;
 use tokenizers::Tokenizer;
 use wait_timeout::ChildExt;
 
-use crate::config::{BATCH_SIZE, EmbeddingConfig, MAX_SEQ_LENGTH, PoolingStrategy, wants_cuda};
+use crate::config::{
+    BATCH_SIZE, EmbeddingConfig, MAX_SEQ_LENGTH, PoolingStrategy, wants_coreml, wants_cuda,
+};
 
 static ORT_INIT: Once = Once::new();
 static CUDA_PRELOAD: Once = Once::new();
@@ -334,6 +336,13 @@ pub(crate) fn load_onnx_session(model: &str, device: &str) -> Result<(Session, T
         }
     }
 
+    let want_coreml = wants_coreml(device);
+    if want_coreml && !cfg!(target_vendor = "apple") {
+        anyhow::bail!(
+            "CoreML requested in .codesage/config.toml but this binary is not running on Apple hardware"
+        );
+    }
+
     let api = hf_hub::api::sync::Api::new().context("failed to create HuggingFace API client")?;
     let repo = api.model(model.to_string());
 
@@ -379,6 +388,18 @@ pub(crate) fn load_onnx_session(model: &str, device: &str) -> Result<(Session, T
                         .error_on_failure(),
                 ])
                 .map_err(|e| anyhow::anyhow!("CUDA provider failed to register: {e}"))?;
+        }
+    }
+
+    if want_coreml {
+        #[cfg(target_vendor = "apple")]
+        {
+            builder = builder
+                .with_execution_providers([ort::ep::CoreML::default()
+                    .with_compute_units(ort::ep::coreml::ComputeUnits::All)
+                    .build()
+                    .error_on_failure()])
+                .map_err(|e| anyhow::anyhow!("CoreML provider failed to register: {e}"))?;
         }
     }
 
