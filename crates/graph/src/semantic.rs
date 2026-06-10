@@ -251,6 +251,7 @@ fn semantic_index(
     embedder: &mut Embedder,
     exclude_patterns: &[String],
     strategy: IndexStrategy,
+    verbose: bool,
 ) -> Result<SemanticIndexStats> {
     let files = discover_files_with_excludes(root, exclude_patterns)?;
     let config = ChunkConfig::default();
@@ -293,7 +294,24 @@ fn semantic_index(
         return Ok(stats);
     }
 
-    for batch in to_index.chunks(COMMIT_BATCH_SIZE) {
+    if verbose {
+        tracing::info!(files_to_embed = to_index.len(), "semantic indexing");
+    }
+
+    let n_batches = to_index.len().div_ceil(COMMIT_BATCH_SIZE);
+    for (i, batch) in to_index.chunks(COMMIT_BATCH_SIZE).enumerate() {
+        if verbose {
+            let file_count = batch.len();
+            let start = i * COMMIT_BATCH_SIZE + 1;
+            let end = (start + file_count - 1).min(to_index.len());
+            tracing::info!(
+                batch = i + 1,
+                total_batches = n_batches,
+                files = file_count,
+                range = format!("{start}-{end}"),
+                "embedding batch"
+            );
+        }
         process_semantic_batch(root, db, embedder, &config, batch, &mut stats)?;
     }
     Ok(stats)
@@ -304,8 +322,16 @@ pub fn semantic_full_index(
     db: &Database,
     embedder: &mut Embedder,
     exclude_patterns: &[String],
+    verbose: bool,
 ) -> Result<SemanticIndexStats> {
-    semantic_index(root, db, embedder, exclude_patterns, IndexStrategy::Full)
+    semantic_index(
+        root,
+        db,
+        embedder,
+        exclude_patterns,
+        IndexStrategy::Full,
+        verbose,
+    )
 }
 
 pub fn semantic_incremental_index(
@@ -313,6 +339,7 @@ pub fn semantic_incremental_index(
     db: &Database,
     embedder: &mut Embedder,
     exclude_patterns: &[String],
+    verbose: bool,
 ) -> Result<SemanticIndexStats> {
     semantic_index(
         root,
@@ -320,6 +347,7 @@ pub fn semantic_incremental_index(
         embedder,
         exclude_patterns,
         IndexStrategy::Incremental,
+        verbose,
     )
 }
 

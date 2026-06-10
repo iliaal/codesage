@@ -26,7 +26,7 @@ fn setup_project() -> (tempfile::TempDir, Database) {
     )
     .unwrap();
     let db = Database::open_in_memory().unwrap();
-    full_index(root, &db, &[]).unwrap();
+    full_index(root, &db, &[], false).unwrap();
     (dir, db)
 }
 
@@ -404,7 +404,7 @@ fn assess_risk_flags_file_in_two_file_cycle() {
     )
     .unwrap();
     let db = Database::open_in_memory().unwrap();
-    codesage_graph::full_index(root, &db, &[]).unwrap();
+    codesage_graph::full_index(root, &db, &[], false).unwrap();
     db.upsert_git_file("A.php", 1.0, 0, 5, Some(1_700_000_000))
         .unwrap();
     db.upsert_git_file("B.php", 1.0, 0, 5, Some(1_700_000_000))
@@ -441,7 +441,7 @@ fn risk_batch_reuses_patch_cycles_for_per_file_cycle_signal() {
     )
     .unwrap();
     let db = Database::open_in_memory().unwrap();
-    codesage_graph::full_index(root, &db, &[]).unwrap();
+    codesage_graph::full_index(root, &db, &[], false).unwrap();
     db.upsert_git_file("A.php", 1.0, 0, 5, Some(1_700_000_000))
         .unwrap();
     db.upsert_git_file("B.php", 1.0, 0, 5, Some(1_700_000_000))
@@ -476,7 +476,7 @@ fn assess_risk_no_cycle_signal_in_acyclic_codebase() {
     )
     .unwrap();
     let db = Database::open_in_memory().unwrap();
-    codesage_graph::full_index(root, &db, &[]).unwrap();
+    codesage_graph::full_index(root, &db, &[], false).unwrap();
     db.upsert_git_file("A.php", 1.0, 0, 5, Some(1_700_000_000))
         .unwrap();
 
@@ -513,7 +513,7 @@ fn assess_risk_cycle_term_lifts_score_for_otherwise_quiet_file() {
     std::fs::write(root.join("ATest.php"), b"<?php\nclass ATest {}\n").unwrap();
     std::fs::write(root.join("BTest.php"), b"<?php\nclass BTest {}\n").unwrap();
     let db = Database::open_in_memory().unwrap();
-    codesage_graph::full_index(root, &db, &[]).unwrap();
+    codesage_graph::full_index(root, &db, &[], false).unwrap();
     // Seed sibling tests in git_files so test_sibling_exists picks them up.
     db.upsert_git_file("ATest.php", 0.1, 0, 1, Some(1_700_000_000))
         .unwrap();
@@ -556,7 +556,7 @@ fn risk_diff_finds_two_file_cycle_touching_patch() {
     )
     .unwrap();
     let db = Database::open_in_memory().unwrap();
-    codesage_graph::full_index(root, &db, &[]).unwrap();
+    codesage_graph::full_index(root, &db, &[], false).unwrap();
     // Seed enough git_files so the risk pass has a distribution.
     for f in ["A.php", "B.php"] {
         db.upsert_git_file(f, 1.0, 0, 5, Some(1_700_000_000))
@@ -601,7 +601,7 @@ fn risk_diff_skips_cycles_not_involving_patch_files() {
     )
     .unwrap();
     let db = Database::open_in_memory().unwrap();
-    codesage_graph::full_index(root, &db, &[]).unwrap();
+    codesage_graph::full_index(root, &db, &[], false).unwrap();
     db.upsert_git_file("C.php", 1.0, 0, 5, Some(1_700_000_000))
         .unwrap();
     let r = codesage_graph::assess_risk_diff(&db, &["C.php".to_string()]).unwrap();
@@ -633,7 +633,7 @@ fn risk_diff_cycle_pick_max_churn_points_at_hottest_member() {
     )
     .unwrap();
     let db = Database::open_in_memory().unwrap();
-    codesage_graph::full_index(root, &db, &[]).unwrap();
+    codesage_graph::full_index(root, &db, &[], false).unwrap();
     db.upsert_git_file("A.php", 1.0, 0, 5, Some(1_700_000_000))
         .unwrap();
     db.upsert_git_file("B.php", 99.0, 0, 5, Some(1_700_000_000))
@@ -669,7 +669,7 @@ fn risk_diff_no_cycles_in_trivially_acyclic_codebase() {
     )
     .unwrap();
     let db = Database::open_in_memory().unwrap();
-    codesage_graph::full_index(root, &db, &[]).unwrap();
+    codesage_graph::full_index(root, &db, &[], false).unwrap();
     db.upsert_git_file("A.php", 1.0, 0, 5, Some(1_700_000_000))
         .unwrap();
     let r = codesage_graph::assess_risk_diff(&db, &["A.php".to_string()]).unwrap();
@@ -1247,7 +1247,7 @@ fn trust_boundaries_populate_via_indexer_and_feed_risk_score() {
     )
     .unwrap();
     let db = Database::open_in_memory().unwrap();
-    full_index(root, &db, &[]).unwrap();
+    full_index(root, &db, &[], false).unwrap();
 
     let tags = db.trust_boundaries_for_file_path("Risky.php").unwrap();
     assert!(tags.contains(&TrustBoundary::ProcessExec), "got {:?}", tags);

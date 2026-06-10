@@ -45,9 +45,14 @@ fn index(
     db: &Database,
     exclude_patterns: &[String],
     strategy: IndexStrategy,
+    verbose: bool,
 ) -> Result<IndexStats> {
     let files = discover_files_with_excludes(root, exclude_patterns)?;
     let mut stats = IndexStats::default();
+
+    if verbose {
+        tracing::info!(total = files.len(), "discovered files for structural index");
+    }
 
     let discovered_paths: std::collections::HashSet<&str> =
         files.iter().map(|f| f.path.as_str()).collect();
@@ -82,6 +87,10 @@ fn index(
         stats.files_skipped = files.len() - to_parse.len();
     }
 
+    if verbose {
+        tracing::info!(files_to_parse = to_parse.len(), "parsing files");
+    }
+
     let parsed_results: Vec<Result<ParsedFile>> =
         to_parse.par_iter().map(|f| parse_one(root, f)).collect();
     let mut parsed = Vec::with_capacity(parsed_results.len());
@@ -93,6 +102,14 @@ fn index(
                 tracing::warn!(error = %e, "skipping file during structural index");
             }
         }
+    }
+
+    if verbose {
+        tracing::info!(
+            parsed = parsed.len(),
+            failed = stats.files_failed,
+            "structural parse complete, writing to db"
+        );
     }
 
     db.execute_batch(|db| {
@@ -118,16 +135,28 @@ fn index(
     Ok(stats)
 }
 
-pub fn full_index(root: &Path, db: &Database, exclude_patterns: &[String]) -> Result<IndexStats> {
-    index(root, db, exclude_patterns, IndexStrategy::Full)
+pub fn full_index(
+    root: &Path,
+    db: &Database,
+    exclude_patterns: &[String],
+    verbose: bool,
+) -> Result<IndexStats> {
+    index(root, db, exclude_patterns, IndexStrategy::Full, verbose)
 }
 
 pub fn incremental_index(
     root: &Path,
     db: &Database,
     exclude_patterns: &[String],
+    verbose: bool,
 ) -> Result<IndexStats> {
-    index(root, db, exclude_patterns, IndexStrategy::Incremental)
+    index(
+        root,
+        db,
+        exclude_patterns,
+        IndexStrategy::Incremental,
+        verbose,
+    )
 }
 
 #[cfg(test)]
