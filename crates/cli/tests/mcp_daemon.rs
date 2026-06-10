@@ -531,6 +531,75 @@ fn idle_client_dropped_after_client_idle_max() {
     let _ = reader.join();
 }
 
+#[test]
+fn status_finds_daemon_in_fallback_runtime_dir() {
+    // Regression: runtime-dir resolution depends on the ambient env, so a
+    // daemon a shim started in the /tmp fallback (env without XDG_RUNTIME_DIR)
+    // was invisible to `daemon status` run from a shell where XDG_RUNTIME_DIR
+    // is set — status resolved only $XDG/codesage and printed "not running".
+    // status/stop now scan all candidate dirs. Env is set per-spawned-Command,
+    // never on the test process, so this stays parallel-safe.
+    let scratch = tempfile::tempdir().unwrap(); // becomes $TMPDIR -> /tmp fallback root
+    let xdg = tempfile::tempdir().unwrap(); // an unrelated, empty XDG dir
+    let bin = env!("CARGO_BIN_EXE_codesage");
+
+    // Daemon resolves its own runtime dir: no XDG / no override -> the
+    // $TMPDIR/codesage-$suffix fallback. Foreground child.
+    let mut daemon = ChildGuard {
+        child: Command::new(bin)
+            .arg("daemon")
+            .env("TMPDIR", scratch.path())
+            .env_remove("XDG_RUNTIME_DIR")
+            .env_remove("CODESAGE_DAEMON_RUNTIME_DIR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn codesage daemon"),
+    };
+
+    // Wait for the daemon to bind a socket somewhere under $TMPDIR/codesage-*.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut bound = false;
+    while Instant::now() < deadline && !bound {
+        thread::sleep(Duration::from_millis(50));
+        if let Ok(entries) = std::fs::read_dir(scratch.path()) {
+            for e in entries.flatten() {
+                if !e.file_name().to_string_lossy().starts_with("codesage-") {
+                    continue;
+                }
+                if let Ok(inner) = std::fs::read_dir(e.path()) {
+                    bound |= inner
+                        .flatten()
+                        .any(|f| f.path().extension().and_then(|x| x.to_str()) == Some("sock"));
+                }
+            }
+        }
+    }
+    assert!(bound, "daemon never bound a socket under the tmp fallback");
+
+    // status WITHOUT --runtime-dir, with XDG_RUNTIME_DIR pointing at the empty
+    // dir — the canonical resolution that, pre-fix, missed the daemon.
+    let status = Command::new(bin)
+        .arg("daemon")
+        .arg("status")
+        .env("TMPDIR", scratch.path())
+        .env("XDG_RUNTIME_DIR", xdg.path())
+        .env_remove("CODESAGE_DAEMON_RUNTIME_DIR")
+        .output()
+        .expect("run codesage daemon status");
+
+    let _ = daemon.child.kill();
+    let _ = daemon.child.wait();
+
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status.status.success() && stdout.contains("running"),
+        "status should find the fallback-dir daemon; exit={:?} stdout={stdout:?}",
+        status.status.code()
+    );
+}
+
 struct ChildGuard {
     child: Child,
 }

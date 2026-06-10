@@ -131,7 +131,7 @@ mod unix {
     /// `codesage daemon status` — print the running daemon's pid + socket
     /// path, or report "not running". Exit code 0 if running, 1 if not.
     pub(crate) async fn run_daemon_status(runtime_dir: Option<PathBuf>) -> Result<()> {
-        let paths = DaemonPaths::for_current_exe(runtime_dir)?;
+        let paths = existing_daemon_paths(runtime_dir)?;
         let Some(pid) = read_daemon_pid(&paths.pid) else {
             println!("not running (no pid file at {})", paths.pid.display());
             std::process::exit(1);
@@ -164,7 +164,7 @@ mod unix {
     /// `codesage daemon stop` — SIGTERM the running daemon and wait
     /// (bounded) for it to exit + clean up its socket/pid files.
     pub(crate) async fn run_daemon_stop(runtime_dir: Option<PathBuf>) -> Result<()> {
-        let paths = DaemonPaths::for_current_exe(runtime_dir)?;
+        let paths = existing_daemon_paths(runtime_dir)?;
         let Some(pid) = read_daemon_pid(&paths.pid) else {
             println!("not running (no pid file at {})", paths.pid.display());
             return Ok(());
@@ -789,23 +789,66 @@ mod unix {
         Ok(())
     }
 
-    fn default_runtime_dir() -> PathBuf {
+    /// Every runtime dir a daemon could plausibly live in, in resolution
+    /// order. The first entry is the canonical choice ([`default_runtime_dir`]);
+    /// `status`/`stop` scan the whole list so they find a daemon that a
+    /// differently-environment'd process started. Concretely: a Claude Code
+    /// shim spawned without `XDG_RUNTIME_DIR` falls through to `/tmp`, while an
+    /// interactive `codesage daemon status` has `XDG_RUNTIME_DIR` set and would
+    /// otherwise look only under `/run/user/$UID/codesage`, missing the daemon
+    /// and falsely reporting "not running" (and `stop` would fail to stop it).
+    fn candidate_runtime_dirs() -> Vec<PathBuf> {
         // Treat set-but-empty env vars as unset. Documented workaround for the
         // WSL2 `/run/user/$UID` trap is to inject `XDG_RUNTIME_DIR=""` in the
         // client MCP env so the shim falls through to `/tmp`; without this
         // guard `PathBuf::from("").join("codesage")` collapses to a relative
         // `codesage/` that gets created next to whatever cwd the shim was
         // spawned in.
+        let mut dirs: Vec<PathBuf> = Vec::new();
         if let Some(dir) = nonempty_env("CODESAGE_DAEMON_RUNTIME_DIR") {
-            return PathBuf::from(dir);
+            dirs.push(PathBuf::from(dir));
         }
         if let Some(dir) = nonempty_env("XDG_RUNTIME_DIR") {
-            return PathBuf::from(dir).join("codesage");
+            dirs.push(PathBuf::from(dir).join("codesage"));
         }
         let suffix = std::env::var("UID")
             .or_else(|_| std::env::var("USER"))
             .unwrap_or_else(|_| "unknown".to_string());
-        std::env::temp_dir().join(format!("codesage-{suffix}"))
+        let tmp = std::env::temp_dir().join(format!("codesage-{suffix}"));
+        if !dirs.contains(&tmp) {
+            dirs.push(tmp);
+        }
+        dirs
+    }
+
+    fn default_runtime_dir() -> PathBuf {
+        candidate_runtime_dirs()
+            .into_iter()
+            .next()
+            .expect("candidate_runtime_dirs always yields the /tmp fallback")
+    }
+
+    /// Resolve the [`DaemonPaths`] of an existing daemon for `status`/`stop`.
+    /// With an explicit `runtime_dir` (e.g. `--runtime-dir` in tests), use only
+    /// that. Otherwise scan the candidate dirs and return the first whose pid
+    /// file exists, falling back to the canonical dir so the caller still
+    /// prints a coherent "not running" answer when no daemon is found anywhere.
+    fn existing_daemon_paths(runtime_dir: Option<PathBuf>) -> Result<DaemonPaths> {
+        let exe = std::env::current_exe().context("resolving current executable")?;
+        if let Some(dir) = runtime_dir {
+            return DaemonPaths::for_exe(dir, &exe);
+        }
+        let mut fallback: Option<DaemonPaths> = None;
+        for dir in candidate_runtime_dirs() {
+            let paths = DaemonPaths::for_exe(dir, &exe)?;
+            if paths.pid.exists() {
+                return Ok(paths);
+            }
+            if fallback.is_none() {
+                fallback = Some(paths);
+            }
+        }
+        fallback.ok_or_else(|| anyhow::anyhow!("no candidate runtime dir resolved"))
     }
 
     fn nonempty_env(key: &str) -> Option<std::ffi::OsString> {
