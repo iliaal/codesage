@@ -376,6 +376,17 @@ fn is_inside_impl_or_class(node: &Node, language: Language) -> bool {
     let mut current = node.parent();
     while let Some(parent) = current {
         match parent.kind() {
+            // An ENCLOSING function scope means this is a local/nested function
+            // (`def helper()` inside a method, `fn local()` inside an impl fn),
+            // not a method of the outer class. Stop before reaching the class so
+            // it stays a Function — otherwise it gets kind=Method and a
+            // fabricated `Class.helper` qualified name. `node` is the symbol's
+            // own function node, so its own kind is never matched here (we start
+            // from `node.parent()`).
+            "function_definition" if language == Language::Python || language == Language::Cpp => {
+                return false;
+            }
+            "function_item" if language == Language::Rust => return false,
             "class_definition" | "class_declaration" if language == Language::Python => {
                 return true;
             }

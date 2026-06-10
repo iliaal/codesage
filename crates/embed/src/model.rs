@@ -321,6 +321,9 @@ pub fn init_ort_dylib() {
 pub(crate) fn load_onnx_session(model: &str, device: &str) -> Result<(Session, Tokenizer, bool)> {
     init_ort_dylib();
 
+    if let Err(e) = crate::config::validate_device(device) {
+        anyhow::bail!("{e}");
+    }
     let want_cuda = wants_cuda(device);
     if want_cuda {
         #[cfg(not(feature = "cuda"))]

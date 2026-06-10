@@ -115,11 +115,15 @@ File: {rel_path}
 
 
 def yaml_sq(s: str) -> str:
-    """Single-quoted YAML scalar: wrap in `'...'`, doubling embedded quotes.
-    A single-quoted YAML scalar treats every character literally except `'`, so
-    this is safe for arbitrary one-line text (colons, `#`, leading specials).
+    """Single-quoted YAML scalar: strip C0 control chars, then wrap in `'...'`
+    doubling embedded quotes. A single-quoted YAML scalar treats every character
+    literally except `'`, so this is safe for arbitrary one-line text (colons,
+    `#`, leading specials). Control chars (a newline in a POSIX filename, an ANSI
+    escape) are stripped because YAML rejects raw control characters even inside
+    quotes.
     """
-    return "'" + str(s).replace("'", "''") + "'"
+    cleaned = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", str(s))
+    return "'" + cleaned.replace("'", "''") + "'"
 
 
 def lang_for(suffix: str) -> str:
@@ -190,6 +194,23 @@ def generate_query(file_path: Path, project_root: Path) -> str | None:
     return None
 
 
+def format_corpus_yaml(project_root: str, cases: list[dict]) -> str:
+    """Hand-roll the corpus YAML (avoids a pyyaml dependency for generation; the
+    bench runner needs it but lighter environments shouldn't). Every
+    interpolated value — project_root, id, query, and each expected_files path —
+    is quoted via `yaml_sq` so a `: `, `#`, leading special, or control char in
+    any of them can't corrupt or inject structure into the document.
+    """
+    out_lines: list[str] = [f"project_root: {yaml_sq(project_root)}", "cases:"]
+    for case in cases:
+        out_lines.append(f"  - id: {yaml_sq(case['id'])}")
+        out_lines.append(f"    query: {yaml_sq(case['query'])}")
+        out_lines.append("    expected_files:")
+        for f in case["expected_files"]:
+            out_lines.append(f"      - {yaml_sq(f)}")
+    return "\n".join(out_lines) + "\n"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--project-root", required=True, type=Path)
@@ -228,23 +249,7 @@ def main() -> int:
         })
         print(f"  q: {query}", file=sys.stderr)
 
-    payload = {"project_root": str(project_root), "cases": cases}
-
-    # Hand-roll YAML so we don't pull in pyyaml just for output (the bench
-    # runner needs it, but generation should work in lighter environments).
-    out_lines: list[str] = []
-    out_lines.append(f"project_root: {yaml_sq(payload['project_root'])}")
-    out_lines.append("cases:")
-    for case in cases:
-        out_lines.append(f"  - id: {case['id']}")
-        out_lines.append(f"    query: {yaml_sq(case['query'])}")
-        out_lines.append("    expected_files:")
-        for f in case["expected_files"]:
-            # Quote paths too: a filename with `: `, `#`, a leading special
-            # char, or (legal on POSIX) a newline would otherwise corrupt or
-            # inject YAML structure.
-            out_lines.append(f"      - {yaml_sq(f)}")
-    serialized = "\n".join(out_lines) + "\n"
+    serialized = format_corpus_yaml(str(project_root), cases)
 
     if args.out:
         args.out.write_text(serialized)

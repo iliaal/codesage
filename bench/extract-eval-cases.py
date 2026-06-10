@@ -209,9 +209,17 @@ def _slugify(text: str, max_len: int = 60) -> str:
 
 
 def _yaml_dq(s: str) -> str:
-    """Double-quoted YAML scalar: escape backslashes and double quotes.
-    Safe for arbitrary one-line text (colons, `#`, leading specials)."""
-    return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+    """Double-quoted YAML scalar: strip C0 control chars, then escape
+    backslashes and double quotes. Safe for arbitrary one-line text.
+
+    YAML forbids raw control characters (other than tab) anywhere in a document,
+    including inside double-quoted scalars — PyYAML rejects them with a
+    ReaderError, so one ANSI escape in mined query text (pasted terminal output)
+    would poison the whole corpus. normalize_path drops control chars for the
+    path channel; this covers the query channel and any future caller.
+    """
+    cleaned = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", str(s))
+    return '"' + cleaned.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def write_yaml(cases: list[dict], project_root: str, project_name: str, out_path: Path) -> None:

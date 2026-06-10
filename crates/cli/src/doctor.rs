@@ -191,7 +191,7 @@ fn check_cuda(project: Option<&Path>) -> Check {
             let config = load_project_config(root).ok()?;
             config
                 .embedding
-                .map(|e| e.device == "gpu" || e.device == "cuda")
+                .map(|e| codesage_embed::config::wants_cuda(&e.device))
         })
         .unwrap_or(false);
     let built_with_cuda = cfg!(feature = "cuda");

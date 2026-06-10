@@ -365,3 +365,62 @@ fn go_line_numbers_are_positive() {
         );
     }
 }
+
+fn symbols_from_source(source: &str, language: Language) -> Vec<codesage_protocol::Symbol> {
+    let bytes = source.as_bytes();
+    let tree = parse_file(bytes, language).unwrap();
+    extract_symbols(&tree, bytes, language, "inline").unwrap()
+}
+
+#[test]
+fn nested_function_in_python_method_is_not_a_method() {
+    // A local helper defined inside a method must stay a Function with an
+    // unprefixed qualified name — not Method `A.helper`.
+    let src = "class A:\n    def m(self):\n        def helper():\n            return 1\n        return helper()\n";
+    let syms = symbols_from_source(src, Language::Python);
+    let helper = syms
+        .iter()
+        .find(|s| s.name == "helper")
+        .expect("helper extracted");
+    assert_eq!(
+        helper.kind,
+        SymbolKind::Function,
+        "nested def must stay Function"
+    );
+    assert_eq!(
+        helper.qualified_name, "helper",
+        "nested def must not get a class prefix"
+    );
+    // The real method is unaffected.
+    let m = syms
+        .iter()
+        .find(|s| s.name == "m")
+        .expect("method m extracted");
+    assert_eq!(m.kind, SymbolKind::Method);
+    assert_eq!(m.qualified_name, "A.m");
+}
+
+#[test]
+fn nested_function_in_rust_method_is_not_a_method() {
+    let src = "struct Foo;\nimpl Foo {\n    fn method(&self) {\n        fn local() {}\n        local();\n    }\n}\n";
+    let syms = symbols_from_source(src, Language::Rust);
+    let local = syms
+        .iter()
+        .find(|s| s.name == "local")
+        .expect("local extracted");
+    assert_eq!(
+        local.kind,
+        SymbolKind::Function,
+        "nested fn must stay Function"
+    );
+    assert_eq!(
+        local.qualified_name, "local",
+        "nested fn must not get an impl prefix"
+    );
+    let method = syms
+        .iter()
+        .find(|s| s.name == "method")
+        .expect("method extracted");
+    assert_eq!(method.kind, SymbolKind::Method);
+    assert_eq!(method.qualified_name, "Foo::method");
+}

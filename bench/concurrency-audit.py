@@ -39,6 +39,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -91,46 +92,61 @@ def restore_db(codesage_dir: Path, bak: Path | None) -> None:
     shutil.copy2(bak, src)
 
 
+def _read_tail(f, limit: int = 400) -> str:
+    """Read a temp file from the start and return its last `limit` chars."""
+    try:
+        f.seek(0)
+        data = f.read()
+    finally:
+        f.close()
+    return data[-limit:]
+
+
 def run_parallel(cmds: list[list[str]], cwd: Path, timeout_s: int = 300) -> list[dict]:
     """Launch N commands simultaneously, wait for all, return structured
-    summaries. Intentionally does not stagger — the whole point is the
-    hard concurrency case."""
+    summaries. Intentionally does not stagger — the whole point is the hard
+    concurrency case.
+
+    Each child's stdout/stderr is redirected to its own temp file rather than a
+    PIPE. Draining PIPEs sequentially (communicate() per child) let a child that
+    wrote more than the ~64 KiB OS pipe buffer block in write() while the harness
+    was busy on the other child — and if that blocked write happened while the
+    child held the SQLite write lock, the harness manufactured the very livelock
+    it exists to detect. Files have no such back-pressure. A single shared
+    deadline also bounds total wall time to one timeout window instead of N.
+    """
     procs = []
+    files = []
     start_times = []
+    deadline = time.time() + timeout_s
     for cmd in cmds:
         t0 = time.time()
-        p = subprocess.Popen(
-            cmd,
-            cwd=str(cwd),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        out_f = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
+        err_f = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
+        p = subprocess.Popen(cmd, cwd=str(cwd), stdout=out_f, stderr=err_f, text=True)
         procs.append(p)
+        files.append((out_f, err_f))
         start_times.append(t0)
+
     results = []
-    for p, cmd, t0 in zip(procs, cmds, start_times):
+    for p, cmd, t0, (out_f, err_f) in zip(procs, cmds, start_times, files):
+        remaining = max(0.0, deadline - time.time())
+        timed_out = False
         try:
-            out, err = p.communicate(timeout=timeout_s)
-            results.append({
-                "cmd": " ".join(cmd),
-                "returncode": p.returncode,
-                "duration_s": round(time.time() - t0, 2),
-                "stdout_tail": (out or "")[-400:],
-                "stderr_tail": (err or "")[-400:],
-            })
+            p.wait(timeout=remaining)
         except subprocess.TimeoutExpired:
+            timed_out = True
             p.kill()
-            # Reap the killed child and capture whatever it had written — the
-            # last output before a livelock is the most useful diagnostic.
-            out, err = p.communicate()
-            results.append({
-                "cmd": " ".join(cmd),
-                "returncode": None,
-                "duration_s": timeout_s,
-                "stdout_tail": (out or "")[-400:],
-                "stderr_tail": ("TIMEOUT " + (err or ""))[-400:],
-            })
+            p.wait()
+        out_tail = _read_tail(out_f)
+        err_tail = _read_tail(err_f)
+        results.append({
+            "cmd": " ".join(cmd),
+            "returncode": None if timed_out else p.returncode,
+            "duration_s": round(time.time() - t0, 2),
+            "stdout_tail": out_tail,
+            "stderr_tail": ("TIMEOUT " + err_tail)[-400:] if timed_out else err_tail,
+        })
     return results
 
 

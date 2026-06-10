@@ -16,7 +16,13 @@ from __future__ import annotations
 import importlib.util
 import sys
 import tempfile
+import time
 from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 HERE = Path(__file__).resolve().parent
 failures: list[str] = []
@@ -177,6 +183,60 @@ check("clean" in v, f"audit: both-ok is clean (got {v!r})")
 corrupt_state = dict(clean_state, integrity="row 5 missing")
 v = audit.classify_verdict([{"returncode": 0}, {"returncode": None}], corrupt_state)
 check("CORRUPT" in v, f"audit: corruption wins over timeout (got {v!r})")
+
+# --------------------------------------------------------------------
+# Round-2 findings
+# --------------------------------------------------------------------
+
+# extract-eval-cases.py — fnd_f243e0e9: control chars in query text must not
+# survive into emitted YAML (PyYAML rejects raw C0 control chars even in quotes).
+dq = extract._yaml_dq("hello\x1b[31mworld\x00")
+check("\x1b" not in dq and "\x00" not in dq, "extract: _yaml_dq strips control chars")
+if yaml is not None:
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "corpus.yaml"
+        extract.write_yaml(
+            [{"query": "color \x1b[31mred\x1b[0m output", "files": ["src/a.py"]}],
+            "/proj",
+            "proj",
+            out,
+        )
+        try:
+            loaded = yaml.safe_load(out.read_text())  # pre-fix: raises ReaderError
+            ok = loaded["cases"][0]["query"] == "color [31mred[0m output"
+        except yaml.YAMLError:
+            ok = False
+        check(ok, "extract: control-char query round-trips through YAML")
+
+# generate-llm-corpus.py — fnd_4c49b101: the id field embeds the filename stem
+# and must be quoted so a stem with ': ' doesn't break the corpus parse.
+if yaml is not None:
+    doc = gen.format_corpus_yaml(
+        "/proj",
+        [{"id": "llm-001-foo: bar", "query": "q", "expected_files": ["src/a.py"]}],
+    )
+    try:
+        loaded = yaml.safe_load(doc)  # pre-fix: 'mapping values are not allowed here'
+        ok = loaded["cases"][0]["id"] == "llm-001-foo: bar"
+    except yaml.YAMLError:
+        ok = False
+    check(ok, "gen: id with ': ' round-trips through YAML")
+
+# concurrency-audit.py — fnd_c8431abd: two hanging children must be bounded to
+# ONE timeout window (shared deadline), not N. Pre-fix each got a fresh timeout
+# so two hangs took ~2x. (Also exercises file-redirect, not PIPE.)
+hang = [sys.executable, "-c", "import time; time.sleep(30)"]
+t0 = time.time()
+results = audit.run_parallel([hang, hang], Path("."), timeout_s=2)
+elapsed = time.time() - t0
+check(
+    elapsed < 3.5,
+    f"audit: two hanging children bounded to ~1 timeout window, took {elapsed:.1f}s",
+)
+check(
+    all(r["returncode"] is None for r in results),
+    "audit: both hanging children marked timed-out",
+)
 
 
 if failures:

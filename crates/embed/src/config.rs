@@ -15,8 +15,56 @@ pub const MAX_SEQ_LENGTH: usize = 512;
 pub const BATCH_SIZE: usize = 64;
 
 /// Whether a configured `device` string requests the CUDA / GPU execution path.
+/// Case-insensitive so `"GPU"` / `"CUDA"` take the GPU path like `"gpu"`.
 pub fn wants_cuda(device: &str) -> bool {
-    device == "gpu" || device == "cuda"
+    matches!(device.trim().to_ascii_lowercase().as_str(), "gpu" | "cuda")
+}
+
+/// Validate a configured `device` string. Accepts `cpu` / `gpu` / `cuda`
+/// (case-insensitive); errors on anything else.
+///
+/// Without this, any unrecognized value — `"GPU"` before the case fix,
+/// `"cuda:0"`, or a typo — made [`wants_cuda`] false and silently ran on CPU
+/// with no error and no warning: the exact silent-CPU-fallback failure this
+/// crate goes out of its way to make loud elsewhere (the `/proc/self/maps`
+/// guard in `model.rs`). Validating up front turns a near-miss into an
+/// actionable error instead of a 10x-slower run.
+pub fn validate_device(device: &str) -> Result<(), String> {
+    match device.trim().to_ascii_lowercase().as_str() {
+        "cpu" | "gpu" | "cuda" => Ok(()),
+        other => Err(format!(
+            "unknown device {other:?} in .codesage/config.toml: expected one of \"cpu\", \"gpu\", \"cuda\""
+        )),
+    }
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::{validate_device, wants_cuda};
+
+    #[test]
+    fn validate_device_accepts_known_values_any_case() {
+        for d in ["cpu", "gpu", "cuda", "GPU", "Cuda", " cpu "] {
+            assert!(validate_device(d).is_ok(), "{d} should be valid");
+        }
+    }
+
+    #[test]
+    fn validate_device_rejects_unknown_values() {
+        // Pre-fix these silently ran on CPU; now they error.
+        for d in ["cuda:0", "gpuu", "CPU0", "metal", ""] {
+            assert!(validate_device(d).is_err(), "{d} should be rejected");
+        }
+    }
+
+    #[test]
+    fn wants_cuda_is_case_insensitive() {
+        assert!(wants_cuda("gpu"));
+        assert!(wants_cuda("GPU"));
+        assert!(wants_cuda("CUDA"));
+        assert!(!wants_cuda("cpu"));
+        assert!(!wants_cuda("cuda:0"));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

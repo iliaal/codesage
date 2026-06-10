@@ -583,21 +583,34 @@ fn main() {
 /// for a real model-loading codepath; the only way to hit one is to pass
 /// `--direct` as part of a sub-subcommand, and `mcp` has no sub-subcommands.
 fn is_shim_invocation() -> bool {
-    is_shim_argv(std::env::args().skip(1))
+    // args_os(), not args(): the latter panics mid-iteration on a non-UTF-8
+    // argument, and this runs before clap on EVERY invocation. Non-UTF-8 paths
+    // are legal on Linux and `codesage install` writes `--project <root>`
+    // verbatim into agent configs, so a non-UTF-8 root would abort startup with
+    // a raw panic for every subcommand.
+    is_shim_argv(std::env::args_os().skip(1))
 }
 
-fn is_shim_argv<I: IntoIterator<Item = String>>(args: I) -> bool {
+fn is_shim_argv<I>(args: I) -> bool
+where
+    I: IntoIterator,
+    I::Item: AsRef<std::ffi::OsStr>,
+{
     let mut saw_mcp = false;
     let mut saw_direct = false;
     for a in args {
+        let a = a.as_ref();
         if a == "--" {
             break;
         }
         if !saw_mcp {
             // Skip clap-style global flags that may precede the subcommand.
             // Today there are none, but a future `-v` / `--verbose` should
-            // not flip this off accidentally.
-            if a.starts_with('-') {
+            // not flip this off accidentally. A non-UTF-8 arg (`to_str()` None)
+            // is not a flag and not `mcp`, so it falls through to the non-shim
+            // return below — the documented safe direction (only costs an
+            // unnecessary ORT preload).
+            if a.to_str().is_some_and(|s| s.starts_with('-')) {
                 continue;
             }
             if a == "mcp" {
@@ -2594,5 +2607,23 @@ mod tests {
     fn shim_detector_rejects_empty_argv() {
         // No subcommand at all → not the shim (clap will error after).
         assert!(!is_shim_argv(argv(&[])));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shim_detector_handles_non_utf8_argv() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        // A non-UTF-8 project path (legal on Linux) must not panic. `codesage
+        // mcp --project <non-utf8>` is still the shim.
+        let bad = OsString::from_vec(vec![b'/', 0xff, 0xfe, b'p']);
+        let args: Vec<OsString> = vec![
+            OsString::from("mcp"),
+            OsString::from("--project"),
+            bad.clone(),
+        ];
+        assert!(is_shim_argv(args));
+        // A non-UTF-8 first positional is treated as non-shim (no panic).
+        assert!(!is_shim_argv(vec![bad]));
     }
 }
