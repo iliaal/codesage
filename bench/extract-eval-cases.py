@@ -156,13 +156,23 @@ def normalize_path(path: str, project_root: str) -> str | None:
 
 def extract_cases(session_dir: Path, project_root: str, min_files: int, max_cases: int) -> list[dict]:
     candidates = []
-    jsonl_files = sorted(session_dir.rglob("*.jsonl"), key=lambda p: p.stat().st_size, reverse=True)
+    jsonl_files: list[tuple[Path, int]] = []
+    for path in session_dir.rglob("*.jsonl"):
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        jsonl_files.append((path, size))
+    jsonl_files.sort(key=lambda item: item[1], reverse=True)
 
-    for jsonl_path in jsonl_files[:40]:
-        if jsonl_path.stat().st_size < 3000:
+    for jsonl_path, size in jsonl_files[:40]:
+        if size < 3000:
             continue
 
-        messages = parse_session(jsonl_path)
+        try:
+            messages = parse_session(jsonl_path)
+        except OSError:
+            continue
         if not messages:
             continue
 

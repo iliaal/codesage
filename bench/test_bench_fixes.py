@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -84,6 +85,41 @@ check(
     "harness: without-arm expected tool set is base only",
 )
 
+class _HarnessRun:
+    returncode = 0
+    stderr = ""
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "tool_use", "name": "mcp__codesage__search"}
+                        ]
+                    },
+                }
+            ),
+            json.dumps({"type": "result", "result": "src/main.py", "total_cost_usd": 0.01}),
+        ]
+    )
+
+
+orig_harness_run = harness.subprocess.run
+harness.subprocess.run = lambda *args, **kwargs: _HarnessRun()
+try:
+    result = harness.run_task(Path("."), "find main", with_codesage=False, max_turns=1)
+finally:
+    harness.subprocess.run = orig_harness_run
+check(
+    result["error"],
+    "harness: unexpected tool use invalidates an otherwise successful run",
+)
+check(
+    result["unexpected_tools"] == ["mcp__codesage__search"],
+    "harness: unexpected tool use is reported",
+)
+
 # --------------------------------------------------------------------
 # generate-llm-corpus.py — fnd_a15786db (negative --num-cases) +
 # fnd_136d5663 (unsorted candidates) + YAML quoting hardening
@@ -124,6 +160,49 @@ with tempfile.TemporaryDirectory() as td:
 
 check(gen.yaml_sq("a: b # c") == "'a: b # c'", "gen: yaml_sq quotes metacharacters")
 check(gen.yaml_sq("it's") == "'it''s'", "gen: yaml_sq doubles single quotes")
+
+orig_gen_run = gen.subprocess.run
+captured_gen_call: dict[str, object] = {}
+
+
+def _capture_gen_run(cmd, **kwargs):
+    captured_gen_call["cmd"] = cmd
+    captured_gen_call.update(kwargs)
+
+    class _Run:
+        returncode = 0
+        stdout = "A focused query about this file\n"
+        stderr = ""
+
+    return _Run()
+
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    source = root / "example.py"
+    source.write_text("\n".join(f"# line {i}" for i in range(40)) + "\n")
+    old_aws_secret = os.environ.get("AWS_SECRET_ACCESS_KEY")
+    os.environ["AWS_SECRET_ACCESS_KEY"] = "must-not-leak"
+    gen.subprocess.run = _capture_gen_run
+    try:
+        gen.generate_query(source, root)
+    finally:
+        gen.subprocess.run = orig_gen_run
+        if old_aws_secret is None:
+            os.environ.pop("AWS_SECRET_ACCESS_KEY", None)
+        else:
+            os.environ["AWS_SECRET_ACCESS_KEY"] = old_aws_secret
+cmd = captured_gen_call.get("cmd") or []
+env = captured_gen_call.get("env") or {}
+check("--ignore-user-config" in cmd, "gen: codex ignores user config")
+check("--ignore-rules" in cmd, "gen: codex ignores project/user rules")
+check("--ephemeral" in cmd, "gen: codex uses ephemeral session storage")
+check("--cd" in cmd, "gen: codex runs from an isolated working directory")
+check("--output-schema" in cmd, "gen: codex constrains the final output schema")
+check(
+    "env" in captured_gen_call and "AWS_SECRET_ACCESS_KEY" not in env,
+    "gen: codex environment is scrubbed",
+)
 
 # --------------------------------------------------------------------
 # extract-eval-cases.py — fnd_32ebb1d9 (YAML injection via path)
@@ -186,6 +265,53 @@ with tempfile.TemporaryDirectory() as td:
         f"extract: root-level allowed files are retained in cases (got {cases!r})",
     )
 
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "project"
+    sessions = Path(td) / "sessions"
+    root.mkdir()
+    sessions.mkdir()
+    (root / "Cargo.toml").write_text("[package]\nname = 'demo'\n")
+    broken = sessions / "broken.jsonl"
+    try:
+        broken.symlink_to(sessions / "missing.jsonl")
+    except OSError:
+        broken = None
+    session = sessions / "valid.jsonl"
+    session.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "message": {
+                            "content": "where is the cargo manifest configured for this project"
+                        },
+                        "padding": "x" * 3500,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "input": {"file_path": str(root / "Cargo.toml")},
+                                }
+                            ]
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+    cases = extract.extract_cases(sessions, str(root), min_files=1, max_cases=1)
+    check(
+        cases and cases[0]["files"] == ["Cargo.toml"],
+        f"extract: broken session symlinks are skipped (got {cases!r}, broken={broken})",
+    )
+
 check(
     extract._yaml_dq('a: b') == '"a: b"',
     "extract: _yaml_dq wraps in double quotes",
@@ -239,6 +365,16 @@ check("clean" in v, f"audit: both-ok is clean (got {v!r})")
 corrupt_state = dict(clean_state, integrity="row 5 missing")
 v = audit.classify_verdict([{"returncode": 0}, {"returncode": None}], corrupt_state)
 check("CORRUPT" in v, f"audit: corruption wins over timeout (got {v!r})")
+
+with tempfile.TemporaryDirectory() as td:
+    codesage_dir = Path(td)
+    for name in ("index.db", "index.db-wal", "index.db-shm"):
+        (codesage_dir / name).write_text("audit-created")
+    audit.restore_db(codesage_dir, None)
+    check(
+        not any((codesage_dir / name).exists() for name in ("index.db", "index.db-wal", "index.db-shm")),
+        "audit: restore_db removes audit-created database files when there was no original backup",
+    )
 
 # --------------------------------------------------------------------
 # Round-2 findings

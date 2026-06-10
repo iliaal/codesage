@@ -532,33 +532,21 @@ fn idle_client_dropped_after_client_idle_max() {
 }
 
 #[test]
-fn status_finds_daemon_in_fallback_runtime_dir() {
-    // Regression: runtime-dir resolution depended on the ambient env, so a
-    // daemon a shim started in the /tmp fallback (env without XDG_RUNTIME_DIR)
-    // was invisible to `daemon status` run from a shell where XDG_RUNTIME_DIR
-    // is set — status resolved only $XDG/codesage and printed "not running".
-    // status/stop now scan all candidate dirs.
-    //
-    // This also guards the /tmp suffix being keyed on the real getuid() rather
-    // than the UID/USER env vars: the daemon is spawned with a bogus UID and
-    // status with a divergent USER, so an env-derived suffix would put them in
-    // different /tmp dirs (codesage-424242 vs codesage-$USER). getuid() makes
-    // both resolve to codesage-<real-uid>. Env is set per-spawned-Command,
-    // never on the test process, so this stays parallel-safe.
-    let scratch = tempfile::tempdir().unwrap(); // becomes $TMPDIR -> /tmp fallback root
-    let xdg = tempfile::tempdir().unwrap(); // an unrelated, empty XDG dir
+fn status_finds_daemon_in_env_runtime_dir() {
+    // The fallback path is covered by daemon.rs unit tests; this integration
+    // test uses an explicit runtime dir so it never collides with a developer's
+    // real daemon under /tmp while still exercising status against a live child.
+    let scratch = tempfile::tempdir().unwrap();
+    let runtime = scratch.path().join("runtime");
+    let xdg = tempfile::tempdir().unwrap();
     let bin = env!("CARGO_BIN_EXE_codesage");
 
-    // Daemon resolves its own runtime dir: no XDG / no override -> the
-    // $TMPDIR/codesage-<uid> fallback. Bogus UID env must be ignored in favor
-    // of getuid(). Foreground child.
     let mut daemon = ChildGuard {
         child: Command::new(bin)
             .arg("daemon")
-            .env("TMPDIR", scratch.path())
+            .env("CODESAGE_DAEMON_RUNTIME_DIR", &runtime)
             .env("UID", "424242")
             .env_remove("XDG_RUNTIME_DIR")
-            .env_remove("CODESAGE_DAEMON_RUNTIME_DIR")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -566,36 +554,29 @@ fn status_finds_daemon_in_fallback_runtime_dir() {
             .expect("spawn codesage daemon"),
     };
 
-    // Wait for the daemon to bind a socket somewhere under $TMPDIR/codesage-*.
+    // Wait for the daemon to bind a socket under the explicit runtime dir.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut bound = false;
     while Instant::now() < deadline && !bound {
         thread::sleep(Duration::from_millis(50));
-        if let Ok(entries) = std::fs::read_dir(scratch.path()) {
-            for e in entries.flatten() {
-                if !e.file_name().to_string_lossy().starts_with("codesage-") {
-                    continue;
-                }
-                if let Ok(inner) = std::fs::read_dir(e.path()) {
-                    bound |= inner
-                        .flatten()
-                        .any(|f| f.path().extension().and_then(|x| x.to_str()) == Some("sock"));
-                }
-            }
+        if let Ok(entries) = std::fs::read_dir(&runtime) {
+            bound = entries
+                .flatten()
+                .any(|f| f.path().extension().and_then(|x| x.to_str()) == Some("sock"));
         }
     }
-    assert!(bound, "daemon never bound a socket under the tmp fallback");
+    assert!(
+        bound,
+        "daemon never bound a socket under the explicit runtime dir"
+    );
 
-    // status WITHOUT --runtime-dir, with XDG_RUNTIME_DIR pointing at the empty
-    // dir — the canonical resolution that, pre-fix, missed the daemon.
     let status = Command::new(bin)
         .arg("daemon")
         .arg("status")
-        .env("TMPDIR", scratch.path())
+        .env("CODESAGE_DAEMON_RUNTIME_DIR", &runtime)
         .env("XDG_RUNTIME_DIR", xdg.path())
         .env("USER", "codesage-test-user")
         .env_remove("UID")
-        .env_remove("CODESAGE_DAEMON_RUNTIME_DIR")
         .output()
         .expect("run codesage daemon status");
 
@@ -605,7 +586,7 @@ fn status_finds_daemon_in_fallback_runtime_dir() {
     let stdout = String::from_utf8_lossy(&status.stdout);
     assert!(
         status.status.success() && stdout.contains("running"),
-        "status should find the fallback-dir daemon; exit={:?} stdout={stdout:?}",
+        "status should find the runtime-dir daemon; exit={:?} stdout={stdout:?}",
         status.status.code()
     );
 }

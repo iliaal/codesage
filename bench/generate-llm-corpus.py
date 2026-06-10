@@ -21,11 +21,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 # Skip these — already excluded from the structural index, also useless as
@@ -50,6 +52,12 @@ ALLOWED_SUFFIXES = (
 
 MIN_LINES = 30
 MAX_LINES = 500
+
+CODEX_QUERY_SCHEMA = {
+    "type": "string",
+    "minLength": 8,
+    "maxLength": 200,
+}
 
 
 def candidate_files(project_root: Path) -> list[Path]:
@@ -138,6 +146,24 @@ def lang_for(suffix: str) -> str:
     }.get(suffix, "")
 
 
+def codex_query_env() -> dict[str, str]:
+    keep = [
+        "PATH",
+        "HOME",
+        "CODEX_HOME",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_ORG_ID",
+        "OPENAI_PROJECT",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "NO_PROXY",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    ]
+    return {k: os.environ[k] for k in keep if os.environ.get(k)}
+
+
 def generate_query(file_path: Path, project_root: Path) -> str | None:
     rel = file_path.relative_to(project_root).as_posix()
     try:
@@ -154,17 +180,34 @@ def generate_query(file_path: Path, project_root: Path) -> str | None:
     )
 
     try:
-        proc = subprocess.run(
-            # `-s read-only`: the prompt embeds untrusted scanned-repo file
-            # content (bench fixtures include third-party mirrors), so pin the
-            # least-privilege sandbox rather than inheriting whatever the user's
-            # ~/.codex/config.toml grants. Query generation needs no exec/write.
-            ["codex", "exec", "--skip-git-repo-check", "-s", "read-only"],
-            input=prompt,
-            text=True,
-            capture_output=True,
-            timeout=180,
-        )
+        with tempfile.TemporaryDirectory(prefix="codesage-llm-corpus-") as td:
+            sandbox = Path(td)
+            workspace = sandbox / "workspace"
+            workspace.mkdir()
+            schema = sandbox / "query.schema.json"
+            schema.write_text(json.dumps(CODEX_QUERY_SCHEMA), encoding="utf-8")
+
+            proc = subprocess.run(
+                [
+                    "codex",
+                    "exec",
+                    "--skip-git-repo-check",
+                    "--ignore-user-config",
+                    "--ignore-rules",
+                    "--ephemeral",
+                    "--cd",
+                    str(workspace),
+                    "-s",
+                    "read-only",
+                    "--output-schema",
+                    str(schema),
+                ],
+                input=prompt,
+                text=True,
+                capture_output=True,
+                timeout=180,
+                env=codex_query_env(),
+            )
     except subprocess.TimeoutExpired:
         # A single hung codex call used to bubble out of the per-file
         # loop and discard every case produced so far (real-money API

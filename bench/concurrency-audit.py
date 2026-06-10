@@ -81,8 +81,6 @@ def backup_db(codesage_dir: Path) -> Path | None:
 
 
 def restore_db(codesage_dir: Path, bak: Path | None) -> None:
-    if bak is None:
-        return
     src = codesage_dir / "index.db"
     # Remove WAL/SHM siblings so the restored .db (which was checkpointed
     # to a self-contained state at backup time) isn't shadowed by stale
@@ -91,6 +89,10 @@ def restore_db(codesage_dir: Path, bak: Path | None) -> None:
         side = codesage_dir / f"index.db{ext}"
         if side.exists():
             side.unlink()
+    if bak is None:
+        if src.exists():
+            src.unlink()
+        return
     shutil.copy2(bak, src)
 
 

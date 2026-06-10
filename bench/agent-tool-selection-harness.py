@@ -238,8 +238,12 @@ def run_task(
         # Surface the subprocess stderr immediately so a bad flag or auth
         # failure does not nuke an entire run while looking like "all rc=N".
         print(f"  ! claude rc={r.returncode}: {stderr_tail.strip()}", file=sys.stderr)
+    error = None if r.returncode == 0 else f"rc={r.returncode}"
+    if unexpected_tools:
+        unexpected = "unexpected_tools=" + ",".join(unexpected_tools)
+        error = unexpected if error is None else f"{error};{unexpected}"
     return {
-        "error": None if r.returncode == 0 else f"rc={r.returncode}",
+        "error": error,
         "duration_s": round(duration, 2),
         "first_tool": first_tool,
         "tool_calls": tool_uses,

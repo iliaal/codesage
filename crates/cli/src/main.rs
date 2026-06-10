@@ -1137,9 +1137,16 @@ fn cmd_init() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let project_dir = cwd.join(PROJECT_DIR);
 
-    if project_dir.exists() {
-        println!("Already initialized in {}", cwd.display());
-        return Ok(());
+    match std::fs::symlink_metadata(&project_dir) {
+        Ok(meta) if meta.is_dir() => {
+            println!("Already initialized in {}", cwd.display());
+            return Ok(());
+        }
+        Ok(_) => {
+            bail!("{} exists but is not a directory", project_dir.display());
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).with_context(|| format!("stat {}", project_dir.display())),
     }
 
     std::fs::create_dir_all(&project_dir)?;

@@ -183,3 +183,32 @@ fn unreadable_file_is_skipped_not_fatal() {
     // Restore perms so the tempdir can be cleaned up.
     std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o644)).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn excluded_unreadable_directory_is_pruned_not_fatal() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    std::fs::write(root.join("ok.py"), "def good(): pass\n").unwrap();
+    let vendor = root.join("vendor");
+    std::fs::create_dir(&vendor).unwrap();
+    std::fs::write(vendor.join("dep.py"), "def dep(): pass\n").unwrap();
+    std::fs::set_permissions(&vendor, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    if std::fs::read_dir(&vendor).is_ok() {
+        std::fs::set_permissions(&vendor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipping: cannot make a directory unreadable (running as root?)");
+        return;
+    }
+
+    let excludes = vec!["**/vendor/**".to_string()];
+    let files = discover_files_with_excludes(root, &excludes)
+        .expect("an excluded unreadable directory must be pruned before walk errors");
+    let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(names, vec!["ok.py"]);
+
+    std::fs::set_permissions(&vendor, std::fs::Permissions::from_mode(0o755)).unwrap();
+}

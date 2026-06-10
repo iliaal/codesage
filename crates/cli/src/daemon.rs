@@ -991,9 +991,13 @@ mod unix {
         // and a later `status`/`stop` in different /tmp dirs. getuid() is
         // stable regardless of environment (and matches the SO_PEERCRED check).
         let uid = unsafe { libc::getuid() };
-        let tmp = std::env::temp_dir().join(format!("codesage-{uid}"));
+        let tmp = PathBuf::from("/tmp").join(format!("codesage-{uid}"));
+        let legacy_tmp = std::env::temp_dir().join(format!("codesage-{uid}"));
         if !dirs.contains(&tmp) {
-            dirs.push(tmp);
+            dirs.push(tmp.clone());
+        }
+        if legacy_tmp != tmp && !dirs.contains(&legacy_tmp) {
+            dirs.push(legacy_tmp);
         }
         dirs
     }
@@ -1167,6 +1171,19 @@ mod unix {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::ffi::OsString;
+        use std::sync::Mutex;
+
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+        fn restore_env(key: &str, value: Option<OsString>) {
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
 
         #[test]
         fn daemon_paths_are_scoped_by_executable_metadata() {
@@ -1190,11 +1207,9 @@ mod unix {
             // returns Some("") for set-but-empty vars. The shim then
             // mkdir'd `codesage/` next to whatever cwd it spawned in.
             //
-            // Mutating process env in tests is racy with parallel test
-            // threads, so this is wrapped in a Mutex.
-            use std::sync::Mutex;
-            static ENV_LOCK: Mutex<()> = Mutex::new(());
             let _guard = ENV_LOCK.lock().unwrap();
+            let old_runtime_dir = std::env::var_os("CODESAGE_DAEMON_RUNTIME_DIR");
+            let old_xdg = std::env::var_os("XDG_RUNTIME_DIR");
 
             // SAFETY: tests in this file may not run in parallel with other
             // code that reads these vars; ENV_LOCK serializes against the
@@ -1212,15 +1227,41 @@ mod unix {
                 resolved.display()
             );
             assert!(
-                resolved.starts_with(std::env::temp_dir()),
+                resolved.starts_with("/tmp"),
                 "expected /tmp fallback, got {}",
                 resolved.display()
             );
 
+            restore_env("CODESAGE_DAEMON_RUNTIME_DIR", old_runtime_dir);
+            restore_env("XDG_RUNTIME_DIR", old_xdg);
+        }
+
+        #[test]
+        fn fallback_runtime_dir_does_not_depend_on_tmpdir() {
+            let _guard = ENV_LOCK.lock().unwrap();
+            let scratch = tempfile::tempdir().unwrap();
+            let old_runtime_dir = std::env::var_os("CODESAGE_DAEMON_RUNTIME_DIR");
+            let old_xdg = std::env::var_os("XDG_RUNTIME_DIR");
+            let old_tmpdir = std::env::var_os("TMPDIR");
+
             unsafe {
                 std::env::remove_var("CODESAGE_DAEMON_RUNTIME_DIR");
                 std::env::remove_var("XDG_RUNTIME_DIR");
+                std::env::set_var("TMPDIR", scratch.path());
             }
+
+            let candidates = candidate_runtime_dirs();
+            let uid = unsafe { libc::getuid() };
+            let expected = PathBuf::from("/tmp").join(format!("codesage-{uid}"));
+            assert_eq!(
+                candidates.first(),
+                Some(&expected),
+                "canonical fallback must be stable across different TMPDIR values: {candidates:?}"
+            );
+
+            restore_env("CODESAGE_DAEMON_RUNTIME_DIR", old_runtime_dir);
+            restore_env("XDG_RUNTIME_DIR", old_xdg);
+            restore_env("TMPDIR", old_tmpdir);
         }
 
         #[test]

@@ -48,22 +48,59 @@ fn discover_nvidia_lib_dirs() -> &'static Vec<PathBuf> {
             roots.push(PathBuf::from(sys));
         }
 
-        let mut lib_dirs: Vec<PathBuf> = Vec::new();
-        for root in &roots {
-            if !root.is_dir() {
-                continue;
-            }
-            if let Ok(entries) = std::fs::read_dir(root) {
-                for entry in entries.flatten() {
-                    let lib_dir = entry.path().join("lib");
-                    if lib_dir.is_dir() && !lib_dirs.contains(&lib_dir) {
-                        lib_dirs.push(lib_dir);
-                    }
+        collect_nvidia_lib_dirs(&roots)
+    })
+}
+
+fn collect_nvidia_lib_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut lib_dirs: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        if !root.is_dir() {
+            continue;
+        }
+        if looks_like_cuda_lib_dir(root) && !lib_dirs.contains(root) {
+            lib_dirs.push(root.clone());
+        }
+        let root_lib = root.join("lib");
+        if root_lib.is_dir() && !lib_dirs.contains(&root_lib) {
+            lib_dirs.push(root_lib);
+        }
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let lib_dir = entry.path().join("lib");
+                if lib_dir.is_dir() && !lib_dirs.contains(&lib_dir) {
+                    lib_dirs.push(lib_dir);
                 }
             }
         }
-        lib_dirs
+    }
+    lib_dirs
+}
+
+fn looks_like_cuda_lib_dir(path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .is_some_and(is_cuda_shared_library_name)
     })
+}
+
+fn is_cuda_shared_library_name(name: &str) -> bool {
+    [
+        "libcuda.so",
+        "libcudart.so",
+        "libcublas.so",
+        "libcudnn.so",
+        "libcufft.so",
+        "libcurand.so",
+        "libnvrtc.so",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
 }
 
 /// Maximum time to wait for the Python site-packages probe before killing the
@@ -620,4 +657,33 @@ fn detect_dim(session: &Session) -> Result<usize> {
          wrong-dimension vectors. Set the model explicitly in \
          .codesage/config.toml to one with a static output shape."
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn nvidia_lib_root_can_point_directly_at_shared_libraries() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "codesage-nvidia-lib-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("libcudart.so.12"), b"").unwrap();
+
+        let dirs = collect_nvidia_lib_dirs(std::slice::from_ref(&root));
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            dirs.contains(&root),
+            "CODESAGE_NVIDIA_LIBS should accept a directory that directly contains CUDA shared libraries: {dirs:?}"
+        );
+    }
 }

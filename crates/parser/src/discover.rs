@@ -55,10 +55,24 @@ pub fn discover_files_with_excludes(
     // workers via `AtomicBool` and drain finished file rows through an mpsc
     // channel — single-producer-single-consumer per thread, no shared Vec
     // contention.
-    let walker = ignore::WalkBuilder::new(root)
-        .hidden(true)
-        .git_ignore(true)
-        .build_parallel();
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder.hidden(true).git_ignore(true);
+    if let Some(excludes_for_filter) = excludes.clone() {
+        let root_for_filter = root.to_path_buf();
+        builder.filter_entry(move |entry| {
+            let path = entry.path();
+            let Ok(rel) = path.strip_prefix(&root_for_filter) else {
+                return true;
+            };
+            if rel.as_os_str().is_empty() {
+                return true;
+            }
+            let rel_path = rel.to_string_lossy();
+            let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+            !exclude_matches_path(&excludes_for_filter, &rel_path, is_dir)
+        });
+    }
+    let walker = builder.build_parallel();
 
     let saw_cpp = AtomicBool::new(false);
     let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
@@ -96,7 +110,7 @@ pub fn discover_files_with_excludes(
                 .to_string_lossy()
                 .into_owned();
             if let Some(ref exc) = excludes
-                && exc.is_match(&rel_path)
+                && exclude_matches_path(exc, &rel_path, false)
             {
                 return WalkState::Continue;
             }
@@ -164,6 +178,20 @@ pub fn discover_files_with_excludes(
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
+}
+
+fn exclude_matches_path(excludes: &GlobSet, rel_path: &str, is_dir: bool) -> bool {
+    if excludes.is_match(rel_path) {
+        return true;
+    }
+    if !is_dir {
+        return false;
+    }
+    let slash = format!("{rel_path}/");
+    if excludes.is_match(&slash) {
+        return true;
+    }
+    excludes.is_match(format!("{rel_path}/_"))
 }
 
 /// Test and benchmark files. These ARE indexed structurally and semantically
