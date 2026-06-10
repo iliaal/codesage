@@ -22,6 +22,7 @@
 - **SQLite opened with `synchronous=NORMAL` + a 256 MiB mmap and 64 MiB page cache.** `NORMAL` is the documented-safe pairing with WAL (fsync at checkpoint rather than every commit) and improves indexer commit throughput; the DB stays consistent across a crash and is rebuildable from source regardless. mmap and the larger cache cut syscall and page-fault overhead on the read-heavy search path. Internal — no API or output change.
 
 ### Fixed
+- **`--version` no longer panics on non-UTF-8 argv.** The pre-clap version handler used `std::env::args()`, which aborts on invalid UTF-8 before `mcp --project` or clap could fail cleanly; it now uses `args_os()` like the shim detector.
 - **`ReferenceKind` JSON now uses the documented underscore spellings.** Multiword reference kinds serialize as `trait_use`, `type_hint`, and `route_handler`, matching the CLI/MCP filter values and database strings. The previous `traituse` / `typehint` / `routehandler` spellings remain accepted as JSON input for compatibility.
 - **Benchmark harness scorecards no longer include failed Claude runs.** `bench/agent-tool-selection-harness.py` now rejects nonpositive `--limit` values and aborts a run when a subprocess returns an error or timeout instead of scoring it as a valid benchmark miss.
 - **Benchmark expected-file scoring matches full path segments.** `bench/agent-tool-selection-harness.py` no longer counts `src/foo.py.bak` or `other/src/foo.py` as a hit for expected file `src/foo.py`.

@@ -569,7 +569,8 @@ fn main() {
 
     // Handle -V / --version before clap so it works without a subcommand and
     // can include project-local device config from .codesage/config.toml.
-    let wants_version = std::env::args()
+    // Use args_os — std::env::args() panics on non-UTF-8 argv (see cli_args test).
+    let wants_version = std::env::args_os()
         .skip(1)
         .any(|a| a == "-V" || a == "--version");
     if wants_version {
