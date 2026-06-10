@@ -81,6 +81,12 @@ If CUDA is requested (`device = "gpu"`) but fails to register, the process error
 
 Required pip packages: `onnxruntime-gpu`, `nvidia-cudnn-cu12`, `nvidia-cublas-cu12`, `nvidia-cuda-runtime-cu12`, `nvidia-cufft-cu12`, `nvidia-curand-cu12`, `nvidia-cuda-nvrtc-cu12`.
 
+## CoreML setup (macOS)
+
+On Apple Silicon, set `device = "coreml"` in `.codesage/config.toml`. ONNX Runtime loads dynamically (same `load-dynamic` path as Linux); the macOS ORT dylib includes the CoreML EP. First session creation compiles CoreML submodels and can take a few minutes; subsequent runs in the same process are faster. Large models (e.g. Jina v2 base-code) may need a lower embed batch size than the default `BATCH_SIZE` in `crates/embed/src/config.rs` if memory pressure causes OOM during indexing.
+
+If CoreML registration fails, the process errors out instead of silently falling back to CPU.
+
 ## Conventions
 
 - Rust 2024 edition

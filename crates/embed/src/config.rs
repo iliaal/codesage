@@ -20,8 +20,14 @@ pub fn wants_cuda(device: &str) -> bool {
     matches!(device.trim().to_ascii_lowercase().as_str(), "gpu" | "cuda")
 }
 
-/// Validate a configured `device` string. Accepts `cpu` / `gpu` / `cuda`
-/// (case-insensitive); errors on anything else.
+/// Whether a configured `device` string requests the CoreML execution provider.
+/// CoreML accelerates ONNX inference on Apple Silicon via ONNX Runtime's CoreML EP.
+pub fn wants_coreml(device: &str) -> bool {
+    matches!(device.trim().to_ascii_lowercase().as_str(), "coreml")
+}
+
+/// Validate a configured `device` string. Accepts `cpu` / `gpu` / `cuda` /
+/// `coreml` (case-insensitive); errors on anything else.
 ///
 /// Without this, any unrecognized value — `"GPU"` before the case fix,
 /// `"cuda:0"`, or a typo — made [`wants_cuda`] false and silently ran on CPU
@@ -31,20 +37,22 @@ pub fn wants_cuda(device: &str) -> bool {
 /// actionable error instead of a 10x-slower run.
 pub fn validate_device(device: &str) -> Result<(), String> {
     match device.trim().to_ascii_lowercase().as_str() {
-        "cpu" | "gpu" | "cuda" => Ok(()),
+        "cpu" | "gpu" | "cuda" | "coreml" => Ok(()),
         other => Err(format!(
-            "unknown device {other:?} in .codesage/config.toml: expected one of \"cpu\", \"gpu\", \"cuda\""
+            "unknown device {other:?} in .codesage/config.toml: expected one of \"cpu\", \"gpu\", \"cuda\", \"coreml\""
         )),
     }
 }
 
 #[cfg(test)]
 mod device_tests {
-    use super::{validate_device, wants_cuda};
+    use super::{validate_device, wants_coreml, wants_cuda};
 
     #[test]
     fn validate_device_accepts_known_values_any_case() {
-        for d in ["cpu", "gpu", "cuda", "GPU", "Cuda", " cpu "] {
+        for d in [
+            "cpu", "gpu", "cuda", "coreml", "GPU", "Cuda", "CoreML", " cpu ", " CoreML ",
+        ] {
             assert!(validate_device(d).is_ok(), "{d} should be valid");
         }
     }
@@ -64,6 +72,15 @@ mod device_tests {
         assert!(wants_cuda("CUDA"));
         assert!(!wants_cuda("cpu"));
         assert!(!wants_cuda("cuda:0"));
+    }
+
+    #[test]
+    fn wants_coreml_is_case_insensitive() {
+        assert!(wants_coreml("coreml"));
+        assert!(wants_coreml("CoreML"));
+        assert!(wants_coreml(" COREml "));
+        assert!(!wants_coreml("cpu"));
+        assert!(!wants_coreml("gpu"));
     }
 }
 

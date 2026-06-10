@@ -48,6 +48,7 @@ pub fn run(json: bool) -> Result<()> {
     }
 
     checks.push(check_cuda(project.as_deref()));
+    checks.push(check_coreml(project.as_deref()));
     checks.push(check_models(project.as_deref()));
     checks.push(check_mcp());
 
@@ -182,6 +183,41 @@ fn check_disk(root: &Path) -> Check {
         name: "disk",
         status: Status::Pass,
         message: format!("index.db {}", format_bytes(size)),
+    }
+}
+
+fn check_coreml(project: Option<&Path>) -> Check {
+    let want_coreml = project
+        .and_then(|root| {
+            let config = load_project_config(root).ok()?;
+            config
+                .embedding
+                .map(|e| codesage_embed::config::wants_coreml(&e.device))
+        })
+        .unwrap_or(false);
+
+    if !want_coreml {
+        return Check {
+            name: "coreml",
+            status: Status::Pass,
+            message: "config requests non-CoreML device; CoreML not required".to_string(),
+        };
+    }
+
+    if !cfg!(target_vendor = "apple") {
+        return Check {
+            name: "coreml",
+            status: Status::Fail,
+            message: "config wants device=coreml but this binary is not running on Apple hardware"
+                .to_string(),
+        };
+    }
+
+    Check {
+        name: "coreml",
+        status: Status::Pass,
+        message: "device=coreml on Apple hardware; first session build may compile CoreML submodels (slow once per process)"
+            .to_string(),
     }
 }
 
