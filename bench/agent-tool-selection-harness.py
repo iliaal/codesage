@@ -39,6 +39,7 @@ import argparse
 import datetime as _dt
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -68,6 +69,13 @@ BASE_TOOLS = ["Grep", "Read", "Glob"]
 # it shell out to `codesage search` (a confound the harness must exclude) or
 # modify the benched repo. Read/Glob/Grep retrieval is all the task needs.
 DISALLOWED_TOOLS = ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch"]
+
+
+def positive_int(value: str) -> int:
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return n
 
 
 def expected_tool_set(with_codesage: bool) -> set[str]:
@@ -247,15 +255,27 @@ def run_task(
 
 def score_task(result: dict[str, Any], expected_files: list[str]) -> dict[str, Any]:
     """Did the agent's final answer include any of the expected files?
-    Loose match: we accept if the expected relative path appears
-    anywhere in the result text (tolerates leading `./`, quoting, etc.).
+    Loose formatting is accepted (`./path`, quotes, punctuation), but path
+    segments must match exactly so `src/foo.py.bak` and `other/src/foo.py`
+    don't count as `src/foo.py`.
     """
+    if result.get("error"):
+        raise ValueError(f"cannot score failed run: {result['error']}")
     text = result.get("result_text", "")
-    hit = any(exp.strip() and exp in text for exp in expected_files)
+    hit = any(exp.strip() and path_mentioned(text, exp.strip()) for exp in expected_files)
     return {
         **result,
         "found_expected": hit,
     }
+
+
+def path_mentioned(text: str, expected: str) -> bool:
+    pattern = re.compile(
+        r"(?<![A-Za-z0-9_./-])(?:\./)?"
+        + re.escape(expected.removeprefix("./"))
+        + r"(?![A-Za-z0-9_./-])"
+    )
+    return pattern.search(text) is not None
 
 
 def render_scorecard(
@@ -322,7 +342,7 @@ def render_scorecard(
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("corpus", type=Path)
-    ap.add_argument("--limit", type=int, default=5,
+    ap.add_argument("--limit", type=positive_int, default=5,
                     help="How many corpus cases to run (default 5, bench budget).")
     ap.add_argument("--condition", choices=["with", "without", "both"], default="with",
                     help="Which toolset the agent sees. `both` runs each task twice.")
@@ -367,6 +387,12 @@ def main() -> int:
                 max_turns=args.max_turns,
                 append_system_prompt_file=args.append_system_prompt_file,
             )
+            if r.get("error"):
+                print(
+                    f"  ! task failed ({r['error']}); aborting so aggregate scores stay valid",
+                    file=sys.stderr,
+                )
+                return 1
             scored = score_task(r, case["expected_files"])
             scored["id"] = case["id"]
             rows.append(scored)

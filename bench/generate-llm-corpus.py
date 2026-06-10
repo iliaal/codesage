@@ -55,6 +55,8 @@ MAX_LINES = 500
 def candidate_files(project_root: Path) -> list[Path]:
     out: list[Path] = []
     for path in project_root.rglob("*"):
+        if path.is_symlink():
+            continue
         if not path.is_file():
             continue
         rel = path.relative_to(project_root).as_posix()
@@ -122,7 +124,7 @@ def yaml_sq(s: str) -> str:
     escape) are stripped because YAML rejects raw control characters even inside
     quotes.
     """
-    cleaned = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", str(s))
+    cleaned = re.sub(r"[\x00-\x1f\x7f]", "", str(s))
     return "'" + cleaned.replace("'", "''") + "'"
 
 

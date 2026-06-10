@@ -74,6 +74,12 @@ mod unix {
         log: PathBuf,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct DaemonPid {
+        pid: i32,
+        start_time_ticks: Option<u64>,
+    }
+
     impl DaemonPaths {
         fn for_current_exe(runtime_dir: Option<PathBuf>) -> Result<Self> {
             let exe = std::env::current_exe().context("resolving current executable")?;
@@ -132,17 +138,18 @@ mod unix {
     /// path, or report "not running". Exit code 0 if running, 1 if not.
     pub(crate) async fn run_daemon_status(runtime_dir: Option<PathBuf>) -> Result<()> {
         let paths = existing_daemon_paths(runtime_dir)?;
-        let Some(pid) = read_daemon_pid(&paths.pid) else {
+        let Some(pid_record) = read_daemon_pid_file(&paths.pid) else {
             println!("not running (no pid file at {})", paths.pid.display());
             std::process::exit(1);
         };
-        if !pid_alive(pid) {
+        if !daemon_pid_file_matches(&paths, pid_record) {
             println!(
-                "not running (pid file references dead pid {}; left over from a previous run)",
-                pid
+                "not running (pid file references stale or non-daemon pid {}; left over from a previous run)",
+                pid_record.pid
             );
             std::process::exit(1);
         }
+        let pid = pid_record.pid;
         // Probe the socket: a stale pid + dead socket is rare but possible
         // if the daemon was SIGKILL'd before the cleanup branch ran.
         let socket_reachable = UnixStream::connect(&paths.socket).await.is_ok();
@@ -165,19 +172,20 @@ mod unix {
     /// (bounded) for it to exit + clean up its socket/pid files.
     pub(crate) async fn run_daemon_stop(runtime_dir: Option<PathBuf>) -> Result<()> {
         let paths = existing_daemon_paths(runtime_dir)?;
-        let Some(pid) = read_daemon_pid(&paths.pid) else {
+        let Some(pid_record) = read_daemon_pid_file(&paths.pid) else {
             println!("not running (no pid file at {})", paths.pid.display());
             return Ok(());
         };
-        if !pid_alive(pid) {
+        if !daemon_pid_file_matches(&paths, pid_record) {
             println!(
-                "not running (pid {} already dead); cleaning stale files",
-                pid
+                "not running (pid file references stale or non-daemon pid {}); cleaning stale files",
+                pid_record.pid
             );
             let _ = fs::remove_file(&paths.pid);
             let _ = fs::remove_file(&paths.socket);
             return Ok(());
         }
+        let pid = pid_record.pid;
         // SAFETY: kill is async-signal-safe.
         let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
         if rc != 0 {
@@ -227,8 +235,7 @@ mod unix {
         let listener = listener?;
         fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))
             .with_context(|| format!("setting permissions on {}", paths.socket.display()))?;
-        fs::write(&paths.pid, std::process::id().to_string())
-            .with_context(|| format!("writing {}", paths.pid.display()))?;
+        write_daemon_pid(&paths.pid)?;
 
         tracing::info!(socket = %paths.socket.display(), "codesage MCP daemon listening");
         let state = Arc::new(CodeSageServerState::new());
@@ -712,13 +719,13 @@ mod unix {
             // Liveness check at most every 100ms — cheap (one kill(pid, 0)
             // syscall) but no point doing it every 25ms retry.
             if Instant::now().duration_since(last_alive_check) >= Duration::from_millis(100) {
-                if let Some(pid) = read_daemon_pid(&paths.pid)
-                    && !pid_alive(pid)
+                if let Some(pid_record) = read_daemon_pid_file(&paths.pid)
+                    && !daemon_pid_file_matches(paths, pid_record)
                 {
                     bail!(
-                        "codesage MCP daemon (pid {}) exited before becoming ready; \
+                        "codesage MCP daemon (pid {}) exited before becoming ready or no longer matches its pid file; \
                          see {} for the failure",
-                        pid,
+                        pid_record.pid,
                         paths.log.display()
                     );
                 }
@@ -728,11 +735,116 @@ mod unix {
         }
     }
 
-    fn read_daemon_pid(pid_path: &Path) -> Option<i32> {
-        fs::read_to_string(pid_path)
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .filter(|&p: &i32| p > 0)
+    fn write_daemon_pid(pid_path: &Path) -> Result<()> {
+        let pid = i32::try_from(std::process::id()).context("current pid does not fit i32")?;
+        let record = DaemonPid {
+            pid,
+            start_time_ticks: process_start_time_ticks(pid),
+        };
+        let contents = match record.start_time_ticks {
+            Some(start_time_ticks) => {
+                format!(
+                    "pid={}\nstart_time_ticks={}\n",
+                    record.pid, start_time_ticks
+                )
+            }
+            None => format!("{}\n", record.pid),
+        };
+        fs::write(pid_path, contents).with_context(|| format!("writing {}", pid_path.display()))
+    }
+
+    fn read_daemon_pid_file(pid_path: &Path) -> Option<DaemonPid> {
+        parse_daemon_pid_file(&fs::read_to_string(pid_path).ok()?)
+    }
+
+    fn parse_daemon_pid_file(contents: &str) -> Option<DaemonPid> {
+        let trimmed = contents.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Ok(pid) = trimmed.parse::<i32>() {
+            if pid > 0 {
+                return Some(DaemonPid {
+                    pid,
+                    start_time_ticks: None,
+                });
+            }
+            return None;
+        }
+
+        let mut pid = None;
+        let mut start_time_ticks = None;
+        for line in contents.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            match key.trim() {
+                "pid" => {
+                    pid = value.trim().parse::<i32>().ok().filter(|pid| *pid > 0);
+                }
+                "start_time_ticks" => {
+                    start_time_ticks = value.trim().parse::<u64>().ok();
+                }
+                _ => {}
+            }
+        }
+        Some(DaemonPid {
+            pid: pid?,
+            start_time_ticks,
+        })
+    }
+
+    fn daemon_pid_file_matches(paths: &DaemonPaths, record: DaemonPid) -> bool {
+        pid_alive(record.pid) && daemon_pid_matches_process(paths, record)
+    }
+
+    fn daemon_pid_matches_process(paths: &DaemonPaths, record: DaemonPid) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(expected_start) = record.start_time_ticks {
+                return process_start_time_ticks(record.pid) == Some(expected_start);
+            }
+            legacy_pid_looks_like_daemon(record.pid, paths)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = paths;
+            let _ = record;
+            true
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_start_time_ticks(pid: i32) -> Option<u64> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let (_, after_comm) = stat.rsplit_once(") ")?;
+        after_comm.split_whitespace().nth(19)?.parse().ok()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn process_start_time_ticks(_pid: i32) -> Option<u64> {
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    fn legacy_pid_looks_like_daemon(pid: i32, paths: &DaemonPaths) -> bool {
+        let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
+            return false;
+        };
+        let args: Vec<String> = cmdline
+            .split(|b| *b == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect();
+        if !args.iter().any(|arg| arg == "daemon") {
+            return false;
+        }
+        args.windows(2).any(|pair| {
+            pair[0] == "--runtime-dir" && Path::new(pair[1].as_str()) == paths.runtime_dir.as_path()
+        }) || args.iter().any(|arg| {
+            arg.strip_prefix("--runtime-dir=")
+                .is_some_and(|dir| Path::new(dir) == paths.runtime_dir.as_path())
+        })
     }
 
     async fn proxy_stdio(stream: UnixStream, default_project: Option<String>) -> Result<()> {
@@ -793,26 +905,27 @@ mod unix {
         }
     }
 
-    fn prepare_runtime_dir(path: &Path) -> Result<()> {
+    fn validate_runtime_dir(path: &Path) -> Result<()> {
         use std::os::unix::fs::MetadataExt;
-
-        fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
 
         // The /tmp fallback lives under a world-writable, sticky-bit dir, so a
         // co-located local user can pre-stage `codesage-<uid>` as a symlink (or
-        // a dir they own) before our daemon does. `create_dir_all` is then a
-        // no-op and the `set_permissions` below would follow the link and chmod
-        // the victim's target — or hand us a dir whose contents (pid/socket
-        // files) the attacker controls, enabling pid-file poisoning →
-        // `daemon stop` signalling an attacker-chosen process. Refuse anything
-        // that isn't a real directory we own. lstat (symlink_metadata) does not
-        // follow the link, so a symlinked runtime dir is rejected here.
+        // a dir they own) before our daemon does. Refuse anything that isn't a
+        // real directory we own before creating sockets or trusting pid files.
+        // lstat (symlink_metadata) does not follow the link, so a symlinked
+        // runtime dir is rejected here.
         let meta =
             fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
         if meta.file_type().is_symlink() {
             bail!(
                 "refusing to use runtime dir {}: it is a symlink \
                  (possible cross-user attack on a shared /tmp)",
+                path.display()
+            );
+        }
+        if !meta.file_type().is_dir() {
+            bail!(
+                "refusing to use runtime dir {}: it is not a directory",
                 path.display()
             );
         }
@@ -826,10 +939,27 @@ mod unix {
                 our_uid
             );
         }
+        Ok(())
+    }
+
+    fn prepare_runtime_dir(path: &Path) -> Result<()> {
+        fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
+        validate_runtime_dir(path)?;
 
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
             .with_context(|| format!("setting permissions on {}", path.display()))?;
         Ok(())
+    }
+
+    fn runtime_dir_exists_and_is_valid(path: &Path) -> Result<bool> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => {
+                validate_runtime_dir(path)?;
+                Ok(true)
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err).with_context(|| format!("stat {}", path.display())),
+        }
     }
 
     /// Every runtime dir a daemon could plausibly live in, in resolution
@@ -882,6 +1012,7 @@ mod unix {
     /// prints a coherent "not running" answer when no daemon is found anywhere.
     fn existing_daemon_paths(runtime_dir: Option<PathBuf>) -> Result<DaemonPaths> {
         let exe = std::env::current_exe().context("resolving current executable")?;
+        let explicit_runtime_dir = runtime_dir.is_some();
         let dirs = match runtime_dir {
             Some(dir) => vec![dir],
             None => candidate_runtime_dirs(),
@@ -891,7 +1022,14 @@ mod unix {
         // (same binary that spawned the daemon) and is preferred so we never
         // pick a different daemon when ours is the one running.
         let mut fallback: Option<DaemonPaths> = None;
+        let mut valid_dirs: Vec<&PathBuf> = Vec::new();
         for dir in &dirs {
+            match runtime_dir_exists_and_is_valid(dir) {
+                Ok(_) => valid_dirs.push(dir),
+                Err(err) if explicit_runtime_dir => return Err(err),
+                Err(_) => continue,
+            }
+
             let paths = DaemonPaths::for_exe(dir.clone(), &exe)?;
             if paths.pid.exists() {
                 return Ok(paths);
@@ -906,7 +1044,7 @@ mod unix {
         // new key and the first pass misses a daemon a prior build left running
         // (it would keep serving stale code while `stop` reported "not
         // running"). Scan for a foreign-key daemon whose pid is still alive.
-        for dir in &dirs {
+        for dir in valid_dirs {
             if let Some(paths) = scan_live_daemon(dir) {
                 return Ok(paths);
             }
@@ -952,10 +1090,10 @@ mod unix {
             let Some(paths) = paths_from_pid_file(&path) else {
                 continue;
             };
-            let Some(pid) = read_daemon_pid(&paths.pid) else {
+            let Some(pid_record) = read_daemon_pid_file(&paths.pid) else {
                 continue;
             };
-            if !pid_alive(pid) {
+            if !daemon_pid_file_matches(&paths, pid_record) {
                 continue;
             }
             let mtime = entry
@@ -1115,6 +1253,25 @@ mod unix {
         }
 
         #[test]
+        fn existing_daemon_paths_refuses_symlinked_runtime_dir_with_pid_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let attacker_target = dir.path().join("attacker-runtime");
+            fs::create_dir(&attacker_target).unwrap();
+            let link = dir.path().join("codesage-runtime");
+            std::os::unix::fs::symlink(&attacker_target, &link).unwrap();
+
+            let exe = std::env::current_exe().unwrap();
+            let paths = DaemonPaths::for_exe(link.clone(), &exe).unwrap();
+            fs::write(&paths.pid, std::process::id().to_string()).unwrap();
+
+            let err = existing_daemon_paths(Some(link)).unwrap_err();
+            assert!(
+                err.to_string().contains("symlink"),
+                "expected a symlink-refusal error, got: {err}"
+            );
+        }
+
+        #[test]
         fn paths_from_pid_file_round_trips_key() {
             // CR-007: status/stop reconstruct a daemon's paths from a
             // foreign-key pid file (a daemon left by a different build).
@@ -1135,20 +1292,39 @@ mod unix {
         }
 
         #[test]
-        fn scan_live_daemon_finds_foreign_key_pid() {
-            // CR-007: a pid file under a different key than the current exe's,
-            // with a live pid, is discovered by the scan fallback.
+        fn scan_live_daemon_skips_plain_pid_file_for_non_daemon_process() {
             let dir = tempfile::tempdir().unwrap();
-            // A key that is NOT the current exe's key.
             let pid_file = dir.path().join("mcp-9.9.9-deadbeefdeadbeef.pid");
             fs::write(&pid_file, std::process::id().to_string()).unwrap();
 
-            let found = scan_live_daemon(dir.path()).expect("should find the live daemon");
+            assert!(scan_live_daemon(dir.path()).is_none());
+        }
+
+        #[test]
+        #[cfg(target_os = "linux")]
+        fn scan_live_daemon_requires_matching_structured_start_time() {
+            let dir = tempfile::tempdir().unwrap();
+            let pid_file = dir.path().join("mcp-9.9.9-deadbeefdeadbeef.pid");
+            let pid = i32::try_from(std::process::id()).unwrap();
+            let start_time = process_start_time_ticks(pid).unwrap();
+
+            fs::write(
+                &pid_file,
+                format!("pid={pid}\nstart_time_ticks={start_time}\n"),
+            )
+            .unwrap();
+            let found = scan_live_daemon(dir.path()).expect("matching pid record should be live");
             assert_eq!(found.pid, pid_file);
 
-            // A dead pid is skipped.
-            fs::write(&pid_file, "2147483646").unwrap();
-            assert!(scan_live_daemon(dir.path()).is_none());
+            fs::write(
+                &pid_file,
+                format!("pid={pid}\nstart_time_ticks={}\n", start_time + 1),
+            )
+            .unwrap();
+            assert!(
+                scan_live_daemon(dir.path()).is_none(),
+                "reused or mismatched pid must not be treated as a live daemon"
+            );
         }
 
         #[test]

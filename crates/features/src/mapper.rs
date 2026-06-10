@@ -74,7 +74,7 @@ pub fn map_features(
             // Final safety net: even when a mapper forgets to filter, no
             // FeatureFileRef should reference a path the structural
             // indexer excludes. Drop any leaked refs before persisting.
-            record.files.retain(|f| ctx.allowed(&f.path));
+            retain_allowed_files_and_refresh_boundaries(db, &mut record, |path| ctx.allowed(path))?;
             let exists = db.load_feature(&record.feature_id)?.is_some();
             db.upsert_feature(&record)?;
             keep_ids.push(record.feature_id.clone());
@@ -231,23 +231,10 @@ fn build_record(db: &Database, seed: &FeatureSeed, all_files: &[String]) -> Resu
         });
     }
     let files: Vec<FeatureFileRef> = files_by_path.into_values().collect();
-    // Aggregate trust boundaries across owned + entry files (skip context
-    // because context tends to be huge generic helpers and would dilute).
-    let mut tb: BTreeSet<TrustBoundary> = BTreeSet::new();
-    let boundary_inputs: Vec<&str> = files
-        .iter()
-        .filter(|f| matches!(f.role, FeatureFileRole::Entry | FeatureFileRole::Owned))
-        .map(|f| f.path.as_str())
-        .collect();
-    for p in boundary_inputs {
-        for b in db.trust_boundaries_for_file_path(p)? {
-            tb.insert(b);
-        }
-    }
     let mut tags = seed.tags.clone();
     tags.sort();
     tags.dedup();
-    Ok(FeatureRecord {
+    let mut record = FeatureRecord {
         feature_id,
         title: seed.title.clone(),
         summary: seed.summary.clone(),
@@ -261,9 +248,38 @@ fn build_record(db: &Database, seed: &FeatureSeed, all_files: &[String]) -> Resu
         test_command: seed.test_command.clone(),
         language: seed.language,
         tags,
-        trust_boundaries: tb.into_iter().collect(),
+        trust_boundaries: Vec::new(),
         files,
-    })
+    };
+    refresh_record_trust_boundaries(db, &mut record)?;
+    Ok(record)
+}
+
+fn retain_allowed_files_and_refresh_boundaries(
+    db: &Database,
+    record: &mut FeatureRecord,
+    mut allowed: impl FnMut(&str) -> bool,
+) -> Result<()> {
+    record.files.retain(|f| allowed(&f.path));
+    refresh_record_trust_boundaries(db, record)
+}
+
+fn refresh_record_trust_boundaries(db: &Database, record: &mut FeatureRecord) -> Result<()> {
+    // Aggregate trust boundaries across owned + entry files (skip context
+    // because context tends to be huge generic helpers and would dilute).
+    let mut tb: BTreeSet<TrustBoundary> = BTreeSet::new();
+    for path in record
+        .files
+        .iter()
+        .filter(|f| matches!(f.role, FeatureFileRole::Entry | FeatureFileRole::Owned))
+        .map(|f| f.path.as_str())
+    {
+        for b in db.trust_boundaries_for_file_path(path)? {
+            tb.insert(b);
+        }
+    }
+    record.trust_boundaries = tb.into_iter().collect();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -586,6 +602,70 @@ mod tests {
         assert!(
             !owned_paths.iter().any(|p| p == &"helper_generated.c"),
             "generated source leaked as owned file despite exclude, got {owned_paths:?}"
+        );
+    }
+
+    #[test]
+    fn excluded_owned_files_do_not_contribute_feature_trust_boundaries() {
+        use crate::mappers::types::SeedFile;
+        use codesage_protocol::{FeatureConfidence, FileInfo, Language};
+
+        let db = Database::open_in_memory().unwrap();
+        let helper_id = db
+            .upsert_file(&FileInfo {
+                path: "helper_generated.c".to_string(),
+                language: Language::C,
+                content_hash: "helper".to_string(),
+            })
+            .unwrap();
+        db.replace_file_trust_boundaries(helper_id, &[TrustBoundary::ProcessExec])
+            .unwrap();
+
+        let seed = FeatureSeed {
+            title: "svc".into(),
+            summary: String::new(),
+            kind: FeatureKind::CliCommand,
+            source: "test-seed",
+            confidence: FeatureConfidence::High,
+            entry_path: "main.c".into(),
+            entry_symbol: Some("main".into()),
+            entry_route: None,
+            entry_command: Some("svc".into()),
+            test_command: None,
+            language: Language::C,
+            tags: Vec::new(),
+            owned_files: vec![SeedFile {
+                path: "helper_generated.c".into(),
+                reason: "target source".into(),
+            }],
+            context_files: Vec::new(),
+            tests: Vec::new(),
+            test_prefixes: Vec::new(),
+        };
+        let mut record = build_record(&db, &seed, &[]).unwrap();
+        assert!(
+            record
+                .trust_boundaries
+                .contains(&TrustBoundary::ProcessExec),
+            "test setup must start with the helper boundary on the record"
+        );
+
+        retain_allowed_files_and_refresh_boundaries(&db, &mut record, |path| {
+            path != "helper_generated.c"
+        })
+        .unwrap();
+
+        assert!(
+            !record.files.iter().any(|f| f.path == "helper_generated.c"),
+            "excluded helper stayed attached to feature: {:?}",
+            record.files
+        );
+        assert!(
+            !record
+                .trust_boundaries
+                .contains(&TrustBoundary::ProcessExec),
+            "excluded helper boundary leaked into feature: {:?}",
+            record.trust_boundaries
         );
     }
 

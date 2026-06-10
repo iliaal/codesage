@@ -73,7 +73,9 @@ def backup_db(codesage_dir: Path) -> Path | None:
             "Stop the codesage daemon (`codesage daemon stop`) and any "
             "running indexer, then re-run this audit."
         )
-    bak = codesage_dir / f"index.db.audit-backup-{int(time.time())}"
+    fd, bak_name = tempfile.mkstemp(prefix="index.db.audit-backup-", dir=codesage_dir)
+    os.close(fd)
+    bak = Path(bak_name)
     shutil.copy2(src, bak)
     return bak
 
@@ -282,11 +284,27 @@ def classify_verdict(results: list[dict], state: dict) -> str:
     if procs_ok == len(results):
         return "✓ clean — both processes succeeded, DB is consistent"
     if procs_ok >= 1:
+        failed = [r for r in results if r["returncode"] not in (0, None)]
+        if failed and all(is_lock_contention_failure(r) for r in failed):
+            return (
+                "✓ serialized — one process succeeded, other errored "
+                "(SQLITE_BUSY/database locked); DB is consistent"
+            )
         return (
-            "✓ serialized — one process succeeded, other errored "
-            "(likely SQLITE_BUSY); DB is consistent"
+            "⚠ child failure — one process succeeded, but a peer failed for a "
+            "non-lock reason; DB is consistent but audit did not cleanly serialize"
         )
     return "⚠ both failed — DB is consistent but nothing got indexed"
+
+
+def is_lock_contention_failure(result: dict) -> bool:
+    text = (result.get("stderr_tail") or "").lower()
+    return (
+        "sqlite_busy" in text
+        or "database is locked" in text
+        or "database locked" in text
+        or "database busy" in text
+    )
 
 
 def summarize_db(state: dict) -> str:
@@ -344,10 +362,9 @@ def main() -> int:
             print()
         finally:
             restore_db(codesage_dir, bak)
-            # Remove backup files created this run.
-            for p in codesage_dir.glob("index.db*.audit-backup-*"):
+            if bak is not None:
                 try:
-                    p.unlink()
+                    bak.unlink()
                 except OSError:
                     pass
 

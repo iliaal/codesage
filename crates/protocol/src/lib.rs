@@ -7,9 +7,8 @@ pub const DEFAULT_EMBEDDING_DIM: usize = 384;
 /// Generate `as_str` / `parse` / `Display` for a string-keyed enum. The literal
 /// keys are the on-disk / DB representation, which is deliberately distinct from
 /// the serde JSON wire format each enum owns via its own `#[serde(rename_all)]`
-/// (e.g. `ReferenceKind::TraitUse` is `"trait_use"` here but `"traituse"` in
-/// JSON). Extra `| "alias"` literals are accepted by `parse` but never emitted
-/// by `as_str`.
+/// when a type needs a separate API spelling. Extra `| "alias"` literals are
+/// accepted by `parse` but never emitted by `as_str`.
 macro_rules! str_enum {
     ($name:ident { $($variant:ident => $s:literal $(| $alias:literal)* ),+ $(,)? }) => {
         impl $name {
@@ -244,19 +243,22 @@ str_enum!(TrustBoundary {
 });
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum ReferenceKind {
     Import,
     Include,
     Call,
     Instantiation,
     Inheritance,
+    #[serde(alias = "traituse")]
     TraitUse,
+    #[serde(alias = "typehint")]
     TypeHint,
     /// Framework routing edge: a route declaration bound to its handler
     /// method (e.g. Laravel `Route::get('/x', [Ctrl::class, 'show'])`).
     /// Synthesized by the feature mapper, not the tree-sitter parser, so
     /// `impact_analysis`/`find_references` traverse routing.
+    #[serde(alias = "routehandler")]
     RouteHandler,
 }
 
@@ -1196,6 +1198,48 @@ mod tests {
         assert_eq!(
             FileCategory::classify("src/spec/helpers.rb"),
             FileCategory::Test
+        );
+    }
+
+    #[test]
+    fn reference_kind_json_uses_stable_snake_case_names() {
+        assert_eq!(
+            serde_json::to_string(&ReferenceKind::TraitUse).unwrap(),
+            "\"trait_use\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReferenceKind::TypeHint).unwrap(),
+            "\"type_hint\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReferenceKind::RouteHandler).unwrap(),
+            "\"route_handler\""
+        );
+
+        assert_eq!(
+            serde_json::from_str::<ReferenceKind>("\"trait_use\"").unwrap(),
+            ReferenceKind::TraitUse
+        );
+        assert_eq!(
+            serde_json::from_str::<ReferenceKind>("\"type_hint\"").unwrap(),
+            ReferenceKind::TypeHint
+        );
+        assert_eq!(
+            serde_json::from_str::<ReferenceKind>("\"route_handler\"").unwrap(),
+            ReferenceKind::RouteHandler
+        );
+
+        assert_eq!(
+            serde_json::from_str::<ReferenceKind>("\"traituse\"").unwrap(),
+            ReferenceKind::TraitUse
+        );
+        assert_eq!(
+            serde_json::from_str::<ReferenceKind>("\"typehint\"").unwrap(),
+            ReferenceKind::TypeHint
+        );
+        assert_eq!(
+            serde_json::from_str::<ReferenceKind>("\"routehandler\"").unwrap(),
+            ReferenceKind::RouteHandler
         );
     }
 

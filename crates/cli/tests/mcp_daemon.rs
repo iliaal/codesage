@@ -282,10 +282,10 @@ fn daemon_cleans_runtime_files_on_sigterm() {
     let pid_file = pid_file.expect("daemon pid file never appeared");
 
     // Send SIGTERM by reading the pid.
-    let pid = std::fs::read_to_string(&pid_file).expect("read pid file");
+    let pid = read_daemon_pid_file(&pid_file).expect("read pid file");
     let _ = Command::new("kill")
         .arg("-TERM")
-        .arg(pid.trim())
+        .arg(pid.to_string())
         .status()
         .expect("kill");
 
@@ -657,9 +657,27 @@ fn kill_daemon(runtime_dir: &std::path::Path) {
         if path.extension().and_then(|ext| ext.to_str()) != Some("pid") {
             continue;
         }
-        let Ok(pid) = std::fs::read_to_string(&path) else {
+        let Some(pid) = read_daemon_pid_file(&path) else {
             continue;
         };
-        let _ = Command::new("kill").arg("-TERM").arg(pid.trim()).status();
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status();
     }
+}
+
+fn read_daemon_pid_file(path: &std::path::Path) -> Option<i32> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let trimmed = contents.trim();
+    if let Ok(pid) = trimmed.parse::<i32>() {
+        return (pid > 0).then_some(pid);
+    }
+    contents.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        if key.trim() != "pid" {
+            return None;
+        }
+        value.trim().parse::<i32>().ok().filter(|pid| *pid > 0)
+    })
 }

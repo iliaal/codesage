@@ -544,11 +544,7 @@ fn main() {
 
     let result = run(cli);
 
-    // Flush stdio explicitly so the explicit `process::exit` below doesn't
-    // drop buffered output.
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
+    flush_stdio();
 
     let code = match result {
         Ok(()) => 0,
@@ -571,6 +567,14 @@ fn main() {
     // (`codesage mcp`) loops indefinitely and never reaches this exit;
     // when it terminates via signal, the same skip applies.
     std::process::exit(code);
+}
+
+fn flush_stdio() {
+    // Flush stdio explicitly so explicit `process::exit` calls don't drop
+    // buffered output.
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
 }
 
 /// Cheap pre-clap detector for the `codesage mcp` stdio-shim case.
@@ -1915,6 +1919,7 @@ fn cmd_session_end(session_id: &str, json: bool) -> Result<()> {
         }
     }
     if !pass {
+        flush_stdio();
         std::process::exit(1);
     }
     Ok(())

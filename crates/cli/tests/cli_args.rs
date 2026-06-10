@@ -28,6 +28,10 @@ fn non_utf8_project_arg_does_not_panic_at_startup() {
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
+        !out.status.success(),
+        "non-UTF-8 --project must fail cleanly, not be silently accepted"
+    );
+    assert!(
         !stderr.contains("panicked") && !stderr.contains("invalid utf-8"),
         "startup panicked on a non-UTF-8 argument instead of erroring cleanly:\n{stderr}"
     );

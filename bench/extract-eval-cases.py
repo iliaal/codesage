@@ -49,9 +49,28 @@ def extract_tool_file_paths(msg: dict) -> set[str]:
                     paths.add(fp)
         if block.get("type") == "tool_result":
             result_content = block.get("content", "")
-            if isinstance(result_content, str):
-                for m in re.finditer(r'"file_path"\s*:\s*"([^"]+)"', result_content):
-                    paths.add(m.group(1))
+            paths.update(extract_file_paths_from_value(result_content))
+    return paths
+
+
+def extract_tool_result_file_paths(msg: dict) -> set[str]:
+    return extract_file_paths_from_value(msg.get("toolUseResult"))
+
+
+def extract_file_paths_from_value(value) -> set[str]:
+    paths = set()
+    if isinstance(value, dict):
+        fp = value.get("file_path")
+        if isinstance(fp, str) and fp:
+            paths.add(fp)
+        for child in value.values():
+            paths.update(extract_file_paths_from_value(child))
+    elif isinstance(value, list):
+        for child in value:
+            paths.update(extract_file_paths_from_value(child))
+    elif isinstance(value, str):
+        for m in re.finditer(r'"file_path"\s*:\s*"([^"]+)"', value):
+            paths.add(m.group(1))
     return paths
 
 
@@ -124,7 +143,7 @@ def normalize_path(path: str, project_root: str) -> str | None:
     except ValueError:
         return None
     rel_str = rel.as_posix()
-    if not rel_str or rel_str.startswith("."):
+    if not rel_str or rel_str == ".":
         return None
     # Reject control characters (notably newline — legal in POSIX filenames and
     # capturable by the `"file_path":"([^"]+)"` regex, which matches across
@@ -165,11 +184,13 @@ def extract_cases(session_dir: Path, project_root: str, min_files: int, max_case
                             break
                         if next_msg.get("type") == "assistant":
                             files.update(extract_tool_file_paths(next_msg))
+                        elif is_tool_result(next_msg):
+                            files.update(extract_tool_result_file_paths(next_msg))
 
                     rel_files = set()
                     for f in files:
                         rel = normalize_path(f, project_root)
-                        if rel and "/" in rel:
+                        if rel:
                             ext = rel.rsplit(".", 1)[-1] if "." in rel else ""
                             if ext in ("php", "py", "js", "jsx", "ts", "tsx", "c", "h", "rs",
                                        "vue", "rb", "go", "java", "kt", "swift", "yml", "yaml",

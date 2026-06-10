@@ -14,6 +14,8 @@ the finding id. A test earns its keep by failing against the pre-fix code.
 from __future__ import annotations
 
 import importlib.util
+import json
+import sqlite3
 import sys
 import tempfile
 import time
@@ -111,6 +113,15 @@ with tempfile.TemporaryDirectory() as td:
     cands = gen.candidate_files(root)
     check(cands == sorted(cands), "gen: candidate_files returns a sorted list")
 
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "project"
+    root.mkdir()
+    outside = Path(td) / "secret.py"
+    outside.write_text("\n".join(f"# outside {i}" for i in range(40)) + "\n")
+    (root / "leak.py").symlink_to(outside)
+    cands = [p.name for p in gen.candidate_files(root)]
+    check("leak.py" not in cands, "gen: candidate_files rejects symlinked source files")
+
 check(gen.yaml_sq("a: b # c") == "'a: b # c'", "gen: yaml_sq quotes metacharacters")
 check(gen.yaml_sq("it's") == "'it''s'", "gen: yaml_sq doubles single quotes")
 
@@ -131,6 +142,48 @@ with tempfile.TemporaryDirectory() as td:
     check(
         extract.normalize_path(str(root) + "/a\n  - evil.py", str(root)) is None,
         "extract: newline-bearing path is rejected",
+    )
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "project"
+    sessions = Path(td) / "sessions"
+    root.mkdir()
+    sessions.mkdir()
+    (root / "Cargo.toml").write_text("[package]\nname = 'demo'\n")
+    session = sessions / "root-file.jsonl"
+    session.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "message": {
+                            "content": "where is the cargo manifest configured for this project"
+                        },
+                        "padding": "x" * 3500,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "input": {"file_path": str(root / "Cargo.toml")},
+                                }
+                            ]
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+    cases = extract.extract_cases(sessions, str(root), min_files=1, max_cases=1)
+    check(
+        cases and cases[0]["files"] == ["Cargo.toml"],
+        f"extract: root-level allowed files are retained in cases (got {cases!r})",
     )
 
 check(
@@ -173,9 +226,12 @@ v = audit.classify_verdict(
     [{"returncode": 0}, {"returncode": None}], clean_state
 )
 check("TIMEOUT" in v, f"audit: success+timeout is a TIMEOUT verdict (got {v!r})")
-# One success + one clean error stays "serialized".
-v = audit.classify_verdict([{"returncode": 0}, {"returncode": 1}], clean_state)
-check("serialized" in v, f"audit: success+error is serialized (got {v!r})")
+# One success + one lock error stays "serialized".
+v = audit.classify_verdict(
+    [{"returncode": 0}, {"returncode": 1, "stderr_tail": "database is locked"}],
+    clean_state,
+)
+check("serialized" in v, f"audit: success+lock-error is serialized (got {v!r})")
 # Both succeed → clean.
 v = audit.classify_verdict([{"returncode": 0}, {"returncode": 0}], clean_state)
 check("clean" in v, f"audit: both-ok is clean (got {v!r})")
@@ -237,6 +293,43 @@ check(
     all(r["returncode"] is None for r in results),
     "audit: both hanging children marked timed-out",
 )
+
+with tempfile.TemporaryDirectory() as td:
+    codesage_dir = Path(td)
+    db_path = codesage_dir / "index.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE t(x)")
+    conn.commit()
+    conn.close()
+
+    first = audit.backup_db(codesage_dir)
+    second = audit.backup_db(codesage_dir)
+    check(first is not None and second is not None, "audit: backup_db returns backup paths")
+    check(first != second, "audit: backup_db creates unique paths for repeated calls")
+    check(first.exists() and second.exists(), "audit: unique backup files exist")
+
+# agent-tool-selection-harness.py — fnd_329c8aed / fnd_42e0caa2
+raised = False
+try:
+    harness.positive_int("-1")
+except Exception:
+    raised = True
+check(raised, "harness: positive_int rejects -1")
+
+raised = False
+try:
+    harness.positive_int("0")
+except Exception:
+    raised = True
+check(raised, "harness: positive_int rejects 0")
+check(harness.positive_int("2") == 2, "harness: positive_int accepts 2")
+
+raised = False
+try:
+    harness.score_task({"error": "timeout", "result_text": "src/main.py"}, ["src/main.py"])
+except ValueError:
+    raised = True
+check(raised, "harness: failed subprocess results cannot be scored")
 
 
 if failures:
