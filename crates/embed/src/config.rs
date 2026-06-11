@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use serde::{Deserialize, Serialize};
 
 pub use codesage_protocol::DEFAULT_EMBEDDING_DIM;
@@ -12,7 +14,10 @@ pub use codesage_protocol::DEFAULT_EMBEDDING_DIM;
 // chunks grow to ~1500 chars with no truncation. The bench A/B that
 // validated this lives in `bench/history/cap512-1500-2026-05-04.md`.
 pub const MAX_SEQ_LENGTH: usize = 512;
+#[cfg(not(target_vendor = "apple"))]
 pub const BATCH_SIZE: usize = 64;
+#[cfg(target_vendor = "apple")]
+pub const BATCH_SIZE: usize = 10;
 
 /// Whether a configured `device` string requests the CUDA / GPU execution path.
 /// Case-insensitive so `"GPU"` / `"CUDA"` take the GPU path like `"gpu"`.
@@ -98,6 +103,13 @@ pub struct EmbeddingConfig {
     /// explicitly when picking a non-default model.
     #[serde(default)]
     pub pooling: Option<PoolingStrategy>,
+    /// Embedding batch size. When omitted, falls back to
+    /// `CODESAGE_BATCH_SIZE`, then the platform default.
+    #[serde(default)]
+    pub batch_size: Option<NonZeroUsize>,
+    /// Runtime override from CLI flag. Highest priority and not serialized.
+    #[serde(skip)]
+    pub batch_size_override: Option<NonZeroUsize>,
 }
 
 impl Default for EmbeddingConfig {
@@ -107,11 +119,44 @@ impl Default for EmbeddingConfig {
             device: "cpu".to_string(),
             reranker: None,
             pooling: None,
+            batch_size: None,
+            batch_size_override: None,
         }
     }
 }
 
 impl EmbeddingConfig {
+    pub fn effective_batch_size(&self) -> Result<NonZeroUsize, String> {
+        self.effective_batch_size_with_env(std::env::var("CODESAGE_BATCH_SIZE").ok().as_deref())
+    }
+
+    fn effective_batch_size_with_env(
+        &self,
+        env_value: Option<&str>,
+    ) -> Result<NonZeroUsize, String> {
+        if let Some(n) = self.batch_size_override {
+            return Ok(n);
+        }
+        if let Some(value) = env_value {
+            let parsed = value.trim().parse::<usize>().map_err(|e| {
+                format!(
+                    "invalid CODESAGE_BATCH_SIZE value {value:?}: expected a positive integer ({e})"
+                )
+            })?;
+            return NonZeroUsize::new(parsed).ok_or_else(|| {
+                format!("invalid CODESAGE_BATCH_SIZE value {value:?}: expected a positive integer")
+            });
+        }
+        if let Some(n) = self.batch_size {
+            return Ok(n);
+        }
+        Ok(default_batch_size())
+    }
+
+    pub fn set_batch_size_override(&mut self, n: NonZeroUsize) {
+        self.batch_size_override = Some(n);
+    }
+
     pub fn pooling_strategy(&self) -> PoolingStrategy {
         if let Some(p) = self.pooling {
             return p;
@@ -121,6 +166,86 @@ impl EmbeddingConfig {
         } else {
             PoolingStrategy::Mean
         }
+    }
+}
+
+pub fn default_batch_size() -> NonZeroUsize {
+    NonZeroUsize::new(BATCH_SIZE).expect("BATCH_SIZE must be non-zero")
+}
+
+#[cfg(test)]
+mod batch_size_tests {
+    use std::num::NonZeroUsize;
+
+    use super::{BATCH_SIZE, EmbeddingConfig};
+
+    fn nz(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).unwrap()
+    }
+
+    #[test]
+    fn effective_batch_size_uses_platform_default() {
+        let cfg = EmbeddingConfig::default();
+
+        assert_eq!(
+            cfg.effective_batch_size_with_env(None).unwrap().get(),
+            BATCH_SIZE
+        );
+    }
+
+    #[test]
+    fn effective_batch_size_uses_config_value_before_default() {
+        let cfg = EmbeddingConfig {
+            batch_size: Some(nz(7)),
+            ..EmbeddingConfig::default()
+        };
+
+        assert_eq!(cfg.effective_batch_size_with_env(None).unwrap().get(), 7);
+    }
+
+    #[test]
+    fn effective_batch_size_env_overrides_config_value() {
+        let cfg = EmbeddingConfig {
+            batch_size: Some(nz(7)),
+            ..EmbeddingConfig::default()
+        };
+
+        assert_eq!(
+            cfg.effective_batch_size_with_env(Some("9")).unwrap().get(),
+            9
+        );
+    }
+
+    #[test]
+    fn effective_batch_size_cli_override_wins_over_env_and_config() {
+        let mut cfg = EmbeddingConfig {
+            batch_size: Some(nz(7)),
+            ..EmbeddingConfig::default()
+        };
+        cfg.set_batch_size_override(nz(11));
+
+        assert_eq!(
+            cfg.effective_batch_size_with_env(Some("9")).unwrap().get(),
+            11
+        );
+    }
+
+    #[test]
+    fn effective_batch_size_rejects_zero_env_value() {
+        let cfg = EmbeddingConfig::default();
+
+        let err = cfg.effective_batch_size_with_env(Some("0")).unwrap_err();
+
+        assert!(err.contains("positive integer"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn effective_batch_size_rejects_invalid_env_value() {
+        let cfg = EmbeddingConfig::default();
+
+        let err = cfg.effective_batch_size_with_env(Some("abc")).unwrap_err();
+
+        assert!(err.contains("positive integer"), "unexpected error: {err}");
     }
 }
 

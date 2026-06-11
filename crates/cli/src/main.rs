@@ -6,6 +6,7 @@ mod lockfile;
 mod mcp;
 mod util;
 
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -26,6 +27,13 @@ use codesage_storage::Database;
 
 pub(crate) const PROJECT_DIR: &str = ".codesage";
 pub(crate) const DB_FILE: &str = "index.db";
+
+fn parse_positive_usize(value: &str) -> Result<NonZeroUsize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|e| format!("expected a positive integer ({e})"))?;
+    NonZeroUsize::new(parsed).ok_or_else(|| "expected a positive integer".to_string())
+}
 
 #[derive(Parser)]
 #[command(
@@ -54,6 +62,9 @@ enum Commands {
         /// Emit structured progress logs (set RUST_LOG=codesage=info)
         #[arg(long, short)]
         verbose: bool,
+        /// Embedding batch size for this index run
+        #[arg(long, value_parser = parse_positive_usize)]
+        batch_size: Option<NonZeroUsize>,
     },
     /// Find symbol definitions by name
     FindSymbol {
@@ -571,8 +582,8 @@ fn main() {
     // can include project-local device config from .codesage/config.toml.
     // Use args_os — std::env::args() panics on non-UTF-8 argv (see cli_args test).
     let wants_version = std::env::args_os()
-        .skip(1)
-        .any(|a| a == "-V" || a == "--version");
+        .nth(1)
+        .is_some_and(|a| a == "-V" || a == "--version");
     if wants_version {
         print_version_info();
         std::process::exit(0);
@@ -695,7 +706,8 @@ fn run(cli: Cli) -> Result<()> {
             full,
             no_semantic,
             verbose,
-        } => cmd_index(full, no_semantic, verbose),
+            batch_size,
+        } => cmd_index(full, no_semantic, verbose, batch_size),
         Commands::FindSymbol { name, kind, json } => cmd_find_symbol(&name, kind.as_deref(), json),
         Commands::FindReferences { name, kind, json } => {
             cmd_find_references(&name, kind.as_deref(), json)
@@ -1160,7 +1172,9 @@ fn cmd_init() -> Result<()> {
         project_dir.join("config.toml"),
         format!(
             "[project]\nname = {}\n\n\
-             [embedding]\nmodel = \"jinaai/jina-embeddings-v2-base-code\"\ndevice = \"gpu\"\nreranker = \"cross-encoder/ms-marco-MiniLM-L6-v2\"\n\n\
+             [embedding]\nmodel = \"jinaai/jina-embeddings-v2-base-code\"\ndevice = \"gpu\"\nreranker = \"cross-encoder/ms-marco-MiniLM-L6-v2\"\n\
+             # Optional. Defaults to 64 on non-Apple targets and 10 on Apple targets.\n\
+             # batch_size = 64\n\n\
              [index]\n\
              # Built-in defaults always apply (vendored deps, build outputs, lock files,\n\
              # caches, IDE state). Test files are indexed structurally and semantically,\n\
@@ -1196,7 +1210,12 @@ fn git_local_exclude_path(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
     Some(git_common_dir(cwd)?.join("info").join("exclude"))
 }
 
-fn cmd_index(full: bool, no_semantic: bool, verbose: bool) -> Result<()> {
+fn cmd_index(
+    full: bool,
+    no_semantic: bool,
+    verbose: bool,
+    batch_size_override: Option<NonZeroUsize>,
+) -> Result<()> {
     let root = find_project_root()?;
     // Acquire the project-level indexing lock before loading embedders or
     // touching the DB. Skips work cleanly (exit 0) if another codesage
@@ -1210,15 +1229,22 @@ fn cmd_index(full: bool, no_semantic: bool, verbose: bool) -> Result<()> {
     let config = load_project_config(&root)?;
     let excludes = get_exclude_patterns(&config);
 
-    let emb_config = config.embedding.unwrap_or_default();
+    let mut emb_config = config.embedding.unwrap_or_default();
+    if let Some(n) = batch_size_override {
+        emb_config.set_batch_size_override(n);
+    }
 
     if verbose {
+        let batch_size = emb_config
+            .effective_batch_size()
+            .map_err(anyhow::Error::msg)?;
         tracing::info!(
             project = root.display().to_string(),
             full,
             no_semantic,
             model = %emb_config.model,
             device = %emb_config.device,
+            batch_size = batch_size.get(),
             "starting index"
         );
     }
@@ -2645,8 +2671,7 @@ mod tests {
         let cfg = EmbeddingConfig {
             model: "codesage-test/does-not-matter".to_string(),
             device: "gpu".to_string(),
-            reranker: None,
-            pooling: None,
+            ..EmbeddingConfig::default()
         };
 
         let err = match load_index_embedder(false, &cfg) {
@@ -2666,8 +2691,7 @@ mod tests {
         let cfg = EmbeddingConfig {
             model: "codesage-test/does-not-exist".to_string(),
             device: "gpu".to_string(),
-            reranker: None,
-            pooling: None,
+            ..EmbeddingConfig::default()
         };
 
         assert!(load_index_embedder(true, &cfg).unwrap().is_none());
@@ -2694,6 +2718,27 @@ mod tests {
         assert_eq!(
             db.chunk_table_name(),
             "chunks_codesage_test_does_not_exist_384"
+        );
+    }
+
+    #[test]
+    fn load_project_config_rejects_zero_embedding_batch_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let codesage_dir = root.join(PROJECT_DIR);
+        std::fs::create_dir_all(&codesage_dir).unwrap();
+        std::fs::write(
+            codesage_dir.join("config.toml"),
+            "[embedding]\nmodel = \"codesage-test/model\"\ndevice = \"cpu\"\nbatch_size = 0\n",
+        )
+        .unwrap();
+
+        let err = load_project_config(root).unwrap_err();
+        let rendered = format!("{err:#}");
+
+        assert!(
+            rendered.contains("nonzero usize"),
+            "unexpected error: {rendered}"
         );
     }
 

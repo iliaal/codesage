@@ -60,3 +60,52 @@ fn init_rejects_file_named_codesage_dir() {
         "init should explain the invalid project marker; stderr={stderr:?}"
     );
 }
+
+#[test]
+fn version_like_subcommand_arg_is_not_hijacked() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_codesage"))
+        .arg("find-symbol")
+        .arg("--")
+        .arg("--version")
+        .current_dir(dir.path())
+        .output()
+        .expect("spawn codesage find-symbol");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "subcommand should receive --version as data and fail on missing project; stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        !stdout.starts_with("codesage "),
+        "subcommand argument was handled as top-level --version; stdout={stdout:?}"
+    );
+    assert!(
+        stderr.contains("not a codesage project"),
+        "subcommand did not reach normal project-root validation; stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn index_rejects_zero_batch_size_at_parse_time() {
+    let out = Command::new(env!("CARGO_BIN_EXE_codesage"))
+        .arg("index")
+        .arg("--batch-size")
+        .arg("0")
+        .output()
+        .expect("spawn codesage index");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "invalid batch size should be rejected by clap; stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("positive integer"),
+        "parse error should explain the positive integer requirement; stderr={stderr:?}"
+    );
+}

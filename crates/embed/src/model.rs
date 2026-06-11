@@ -1,6 +1,9 @@
 use std::io::Read;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::{Once, OnceLock};
+#[cfg(any(feature = "cuda", not(target_vendor = "apple")))]
+use std::sync::Once;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -8,12 +11,11 @@ use ort::session::Session;
 use tokenizers::Tokenizer;
 use wait_timeout::ChildExt;
 
-use crate::config::{
-    BATCH_SIZE, EmbeddingConfig, MAX_SEQ_LENGTH, PoolingStrategy, wants_coreml, wants_cuda,
-};
+use crate::config::{EmbeddingConfig, MAX_SEQ_LENGTH, PoolingStrategy, wants_coreml, wants_cuda};
 
 #[cfg(not(target_vendor = "apple"))]
 static ORT_INIT: Once = Once::new();
+#[cfg(feature = "cuda")]
 static CUDA_PRELOAD: Once = Once::new();
 
 pub(crate) fn public_nvidia_lib_dirs() -> Vec<PathBuf> {
@@ -238,6 +240,7 @@ pub fn init_for_main() {
     }
 }
 
+#[cfg(feature = "cuda")]
 pub fn preload_cuda_libs() {
     CUDA_PRELOAD.call_once(|| {
         let lib_dirs = discover_nvidia_lib_dirs();
@@ -481,6 +484,7 @@ pub struct Embedder {
     dim: usize,
     pooling: PoolingStrategy,
     has_token_type_ids: bool,
+    batch_size: NonZeroUsize,
 }
 
 impl Embedder {
@@ -490,11 +494,13 @@ impl Embedder {
             load_onnx_session(&config.model, &config.device)?;
         let dim = detect_dim(&session)?;
         let pooling = config.pooling_strategy();
+        let batch_size = config.effective_batch_size().map_err(anyhow::Error::msg)?;
 
         tracing::info!(
             dim,
             pooling = ?pooling,
             token_type_ids = has_token_type_ids,
+            batch_size = batch_size.get(),
             "embedding model loaded"
         );
 
@@ -504,6 +510,7 @@ impl Embedder {
             dim,
             pooling,
             has_token_type_ids,
+            batch_size,
         })
     }
 
@@ -523,7 +530,7 @@ impl Embedder {
 
         let mut all_embeddings = Vec::with_capacity(texts.len());
 
-        for batch in texts.chunks(BATCH_SIZE) {
+        for batch in texts.chunks(self.batch_size.get()) {
             all_embeddings.extend(self.embed_batch_inner(batch)?);
         }
 

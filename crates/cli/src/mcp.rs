@@ -474,7 +474,8 @@ impl CodeSageServer {
     }
 
     fn get_or_load_embedder(&self, config: &EmbeddingConfig) -> Result<Arc<Mutex<Embedder>>> {
-        let key = format!("{}|{}", config.model, config.device);
+        let batch_size = config.effective_batch_size().map_err(anyhow::Error::msg)?;
+        let key = format!("{}|{}|{}", config.model, config.device, batch_size.get());
         get_or_load_slot(&self.state.embedders, key, || {
             Embedder::new(config).with_context(|| {
                 format!(

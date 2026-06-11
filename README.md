@@ -368,6 +368,7 @@ name = "my-project"
 model = "sentence-transformers/all-MiniLM-L6-v2"
 device = "gpu"                                        # "cpu", "gpu", or "coreml" (macOS)
 reranker = "cross-encoder/ms-marco-MiniLM-L6-v2"     # optional, remove to disable
+# batch_size = 64                                    # optional; defaults to 64, or 10 on Apple
 
 [index]
 exclude_patterns = [
@@ -398,7 +399,7 @@ codesage doctor    # includes a coreml readiness check
 codesage index
 ```
 
-First session creation compiles CoreML submodels and can take a few minutes; subsequent inference in the same process is faster. Large models (e.g. `jinaai/jina-embeddings-v2-base-code`) may OOM at the default embed batch size — lower `BATCH_SIZE` in `crates/embed/src/config.rs` if indexing dies with signal 9.
+First session creation compiles CoreML submodels and can take a few minutes; subsequent inference in the same process is faster. Large models (e.g. `jinaai/jina-embeddings-v2-base-code`) may need smaller batches under memory pressure. Apple targets default to batch size 10; set `[embedding].batch_size`, `CODESAGE_BATCH_SIZE`, or run `codesage index --batch-size <N>` to lower it further for one index run.
 
 For verbose progress during a long first index: `RUST_LOG=codesage=info codesage index --verbose`.
 
