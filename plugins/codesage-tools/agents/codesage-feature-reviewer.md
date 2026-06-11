@@ -12,7 +12,7 @@ You review one **feature slice** (a behavior-keyed bundle: entrypoint + owned fi
 - `project` — absolute path to the codesage-onboarded project
 - `feature_id` — the slice's stable id (`feat_<16hex>`)
 - `severity_threshold` — `low` / `medium` / `high` — drop findings below this bar before returning
-- `categories` — array of `bug` / `security` / `perf` / `maintainability` / `style` — restrict to these (default: `bug`, `security`)
+- `categories` — array of `bug` / `security` / `perf` / `maintainability` / `style` — restrict to these (default: `bug`, `security`). `perf` and `maintainability` are off by default by design: review is static (no profiling), so perf is the highest false-positive category, and the default keeps the two categories where a finding is almost always actionable. They activate only when the caller passes them explicitly.
 - `prior_findings` — array of previously-recorded findings for this feature (may be empty). Use to avoid re-reporting the same issue; if you find a prior finding still applies, return it verbatim with `status: open` so the orchestrator can dedupe.
 
 ## What you call
