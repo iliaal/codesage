@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.10.0] - 2026-06-11
+
 ### Added
 - Add `codesage index --batch-size <N>` to override embedding batch size.
 - Add target, acceleration, and embedding-device details to `codesage --version`.
@@ -458,5 +460,7 @@ Initial public release.
 
 [0.8.1]: https://github.com/iliaal/codesage/releases/tag/v0.8.1
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.9.0...HEAD
 [0.9.0]: https://github.com/iliaal/codesage/releases/tag/v0.9.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/iliaal/codesage/releases/tag/v0.10.0
