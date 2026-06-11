@@ -49,6 +49,7 @@ ALLOWED_SUFFIXES = (
     ".c", ".cc", ".cpp", ".h", ".hpp", ".cs",
     ".ex", ".exs", ".erl", ".lua",
 )
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 MIN_LINES = 30
 MAX_LINES = 500
@@ -80,6 +81,8 @@ def candidate_files(project_root: Path) -> list[Path]:
         if not path_within_root(path, root):
             continue
         rel = path.relative_to(project_root).as_posix()
+        if CONTROL_CHARS.search(rel):
+            continue
         if SKIP_DIR_PATTERNS.search(rel):
             continue
         if path.suffix not in ALLOWED_SUFFIXES:
@@ -144,8 +147,15 @@ def yaml_sq(s: str) -> str:
     escape) are stripped because YAML rejects raw control characters even inside
     quotes.
     """
-    cleaned = re.sub(r"[\x00-\x1f\x7f]", "", str(s))
+    cleaned = CONTROL_CHARS.sub("", str(s))
     return "'" + cleaned.replace("'", "''") + "'"
+
+
+def yaml_path(s: str) -> str:
+    path = str(s)
+    if CONTROL_CHARS.search(path):
+        raise ValueError(f"unsupported control character in YAML path scalar: {path!r}")
+    return yaml_sq(path)
 
 
 def lang_for(suffix: str) -> str:
@@ -239,6 +249,10 @@ def generate_query(file_path: Path, project_root: Path) -> str | None:
                     "--skip-git-repo-check",
                     "--ignore-user-config",
                     "--ignore-rules",
+                    "-c",
+                    'web_search="disabled"',
+                    "--disable",
+                    "shell_tool",
                     "--ephemeral",
                     "--cd",
                     str(workspace),
@@ -280,13 +294,13 @@ def format_corpus_yaml(project_root: str, cases: list[dict]) -> str:
     is quoted via `yaml_sq` so a `: `, `#`, leading special, or control char in
     any of them can't corrupt or inject structure into the document.
     """
-    out_lines: list[str] = [f"project_root: {yaml_sq(project_root)}", "cases:"]
+    out_lines: list[str] = [f"project_root: {yaml_path(project_root)}", "cases:"]
     for case in cases:
         out_lines.append(f"  - id: {yaml_sq(case['id'])}")
         out_lines.append(f"    query: {yaml_sq(case['query'])}")
         out_lines.append("    expected_files:")
         for f in case["expected_files"]:
-            out_lines.append(f"      - {yaml_sq(f)}")
+            out_lines.append(f"      - {yaml_path(f)}")
     return "\n".join(out_lines) + "\n"
 
 

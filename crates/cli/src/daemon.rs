@@ -808,9 +808,8 @@ mod unix {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = paths;
             let _ = record;
-            true
+            daemon_socket_reachable(paths)
         }
     }
 
@@ -824,6 +823,11 @@ mod unix {
     #[cfg(not(target_os = "linux"))]
     fn process_start_time_ticks(_pid: i32) -> Option<u64> {
         None
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn daemon_socket_reachable(paths: &DaemonPaths) -> bool {
+        std::os::unix::net::UnixStream::connect(&paths.socket).is_ok()
     }
 
     #[cfg(target_os = "linux")]

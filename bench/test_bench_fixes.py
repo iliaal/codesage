@@ -161,6 +161,30 @@ with tempfile.TemporaryDirectory() as td:
 check(gen.yaml_sq("a: b # c") == "'a: b # c'", "gen: yaml_sq quotes metacharacters")
 check(gen.yaml_sq("it's") == "'it''s'", "gen: yaml_sq doubles single quotes")
 
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    body = "\n".join(f"# line {i}" for i in range(40)) + "\n"
+    safe = root / "safe.py"
+    unsafe = root / "bad\nname.py"
+    safe.write_text(body)
+    unsafe.write_text(body)
+    cands = [p.name for p in gen.candidate_files(root)]
+    check("safe.py" in cands, "gen: candidate_files keeps normal source paths")
+    check(
+        "bad\nname.py" not in cands,
+        "gen: candidate_files rejects control-character paths",
+    )
+
+raised = False
+try:
+    gen.format_corpus_yaml(
+        "/proj",
+        [{"id": "case", "query": "q", "expected_files": ["bad\nname.py"]}],
+    )
+except ValueError:
+    raised = True
+check(raised, "gen: format_corpus_yaml rejects control-character expected paths")
+
 orig_gen_run = gen.subprocess.run
 captured_gen_call: dict[str, object] = {}
 
@@ -197,6 +221,8 @@ env = captured_gen_call.get("env") or {}
 check("--ignore-user-config" in cmd, "gen: codex ignores user config")
 check("--ignore-rules" in cmd, "gen: codex ignores project/user rules")
 check("--ephemeral" in cmd, "gen: codex uses ephemeral session storage")
+check("--disable" in cmd and "shell_tool" in cmd, "gen: codex disables shell tools")
+check("-c" in cmd and 'web_search="disabled"' in cmd, "gen: codex disables web search")
 check("--cd" in cmd, "gen: codex runs from an isolated working directory")
 check("--output-schema" in cmd, "gen: codex constrains the final output schema")
 check(
@@ -440,6 +466,82 @@ with tempfile.TemporaryDirectory() as td:
         f"extract: lookahead beyond 40 messages includes late file (got {cases!r})",
     )
 
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "project"
+    sessions = Path(td) / "sessions"
+    root.mkdir()
+    sessions.mkdir()
+    (root / "dup.py").write_text("x = 1\n")
+    (root / "unique.py").write_text("y = 2\n")
+    duplicate_query = "where is the duplicate candidate in this project"
+    unique_query = "where is the unique candidate in this project"
+    now = time.time()
+    for idx in range(6):
+        session = sessions / f"duplicate-{idx}.jsonl"
+        session.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "message": {"content": duplicate_query},
+                            "padding": "x" * 3500,
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "message": {
+                                "content": [
+                                    {
+                                        "type": "tool_use",
+                                        "input": {"file_path": str(root / "dup.py")},
+                                    }
+                                ]
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n"
+        )
+        os.utime(session, (now + idx + 10, now + idx + 10))
+    unique = sessions / "unique.jsonl"
+    unique.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "message": {"content": unique_query},
+                        "padding": "x" * 3500,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "input": {"file_path": str(root / "unique.py")},
+                                }
+                            ]
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+    os.utime(unique, (now, now))
+    cases = extract.extract_cases(sessions, str(root), min_files=1, max_cases=2)
+    files = {tuple(c["files"]) for c in cases}
+    check(
+        len(cases) == 2 and {("dup.py",), ("unique.py",)} == files,
+        f"extract: raw duplicate cap does not starve older unique sessions (got {cases!r})",
+    )
+
 # The emitted YAML for a path with a metacharacter round-trips as a string,
 # not injected structure.
 with tempfile.TemporaryDirectory() as td:
@@ -496,6 +598,20 @@ check("serialized" in v, f"audit: lockfile skip is serialized (got {v!r})")
 corrupt_state = dict(clean_state, integrity="row 5 missing")
 v = audit.classify_verdict([{"returncode": 0}, {"returncode": None}], corrupt_state)
 check("CORRUPT" in v, f"audit: corruption wins over timeout (got {v!r})")
+
+with tempfile.TemporaryDirectory() as td:
+    db_path = Path(td) / "index.db"
+    sqlite3.connect(db_path).close()
+    try:
+        state = audit.integrity_check(db_path)
+        ok = (
+            state["integrity"] != "ok"
+            and "symbols" in state.get("schema_missing", [])
+            and state["orphans"]["symbols_without_file"] == 0
+        )
+    except sqlite3.OperationalError:
+        ok = False
+    check(ok, "audit: integrity_check reports partial schema instead of raising")
 
 with tempfile.TemporaryDirectory() as td:
     codesage_dir = Path(td)

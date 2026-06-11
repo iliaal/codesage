@@ -177,6 +177,7 @@ def extract_cases(
     max_sessions: int = 40,
 ) -> list[dict]:
     candidates = []
+    seen_keys = set()
     jsonl_files: list[tuple[Path, int, float]] = []
     for path in session_dir.rglob("*.jsonl"):
         if path.is_symlink():
@@ -236,28 +237,24 @@ def extract_cases(
                     if len(rel_files) >= min_files:
                         query = text[:300].strip()
                         query = re.sub(r'\s+', ' ', query)
-                        candidates.append({
+                        case = {
                             "query": query,
                             "files": sorted(rel_files),
                             "session": jsonl_path.name,
                             "file_count": len(rel_files),
-                        })
+                        }
+                        key = dedup_key(case)
+                        if key not in seen_keys:
+                            seen_keys.add(key)
+                            candidates.append(case)
 
             i += 1
 
         if len(candidates) >= max_cases * 3:
             break
 
-    seen_keys = set()
-    deduped = []
-    for c in candidates:
-        key = dedup_key(c)
-        if key not in seen_keys:
-            seen_keys.add(key)
-            deduped.append(c)
-
-    deduped.sort(key=lambda c: c["file_count"], reverse=True)
-    return deduped[:max_cases]
+    candidates.sort(key=lambda c: c["file_count"], reverse=True)
+    return candidates[:max_cases]
 
 
 def _slugify(text: str, max_len: int = 60) -> str:

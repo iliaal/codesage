@@ -462,6 +462,13 @@ fn setup_ambiguous_helper_rust_project() -> (tempfile::TempDir, Database) {
     );
     insert_chunk(
         &db,
+        "helpers_b.rs",
+        "rust",
+        "pub fn helper() -> i32 { 2 }\n",
+        1,
+    );
+    insert_chunk(
+        &db,
         "service.rs",
         "rust",
         "use crate::helpers_a::helper;\npub fn run() { let _ = helper(); }\n",
