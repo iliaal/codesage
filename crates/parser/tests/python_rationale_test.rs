@@ -107,4 +107,14 @@ fn attaches_rationale_above_decorated_python_defs() {
         registered.rationale[0].text,
         "must be a classmethod for the registry"
     );
+
+    // Regression: rationale parked at class_definition level (sibling of the
+    // body block, not inside it) must attach to the first method.
+    let first_method = symbol(&symbols, "first_method");
+    assert_eq!(first_method.rationale.len(), 1);
+    assert_eq!(first_method.rationale[0].kind, RationaleKind::Why);
+    assert_eq!(
+        first_method.rationale[0].text,
+        "header comment applies to the first method below"
+    );
 }

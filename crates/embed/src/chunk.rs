@@ -36,7 +36,7 @@ pub fn chunk_text(content: &str, config: &ChunkConfig) -> Vec<Chunk> {
 
     let raw = split_recursive(content, config.chunk_size, 0);
 
-    let mut merged = merge_small_chunks(raw, config.min_chunk_size);
+    let mut merged = merge_small_chunks(raw, config.min_chunk_size, config.chunk_size);
 
     apply_overlap(&mut merged, content, config.overlap);
 
@@ -155,7 +155,11 @@ fn split_keeping_offsets(text: &str, sep: &str) -> Vec<(usize, usize)> {
     parts
 }
 
-fn merge_small_chunks(segments: Vec<Segment>, min_size: usize) -> Vec<Segment> {
+fn segment_len(seg: &Segment) -> usize {
+    seg.end - seg.start
+}
+
+fn merge_small_chunks(segments: Vec<Segment>, min_size: usize, max_size: usize) -> Vec<Segment> {
     if segments.is_empty() {
         return segments;
     }
@@ -163,7 +167,8 @@ fn merge_small_chunks(segments: Vec<Segment>, min_size: usize) -> Vec<Segment> {
     let mut merged: Vec<Segment> = Vec::new();
     for seg in segments {
         if let Some(last) = merged.last_mut()
-            && (last.end - last.start) < min_size
+            && segment_len(last) < min_size
+            && segment_len(last) + segment_len(&seg) <= max_size
         {
             last.end = seg.end;
             continue;
@@ -173,10 +178,13 @@ fn merge_small_chunks(segments: Vec<Segment>, min_size: usize) -> Vec<Segment> {
 
     if merged.len() > 1 {
         let last_idx = merged.len() - 1;
-        if (merged[last_idx].end - merged[last_idx].start) < min_size {
-            let last_end = merged[last_idx].end;
-            merged[last_idx - 1].end = last_end;
-            merged.pop();
+        if segment_len(&merged[last_idx]) < min_size {
+            let combined = segment_len(&merged[last_idx - 1]) + segment_len(&merged[last_idx]);
+            if combined <= max_size {
+                let last_end = merged[last_idx].end;
+                merged[last_idx - 1].end = last_end;
+                merged.pop();
+            }
         }
     }
 
@@ -340,6 +348,26 @@ mod tests {
         assert!(chunks[0].start_line == 1);
         if chunks.len() > 1 {
             assert!(chunks.last().unwrap().end_line >= 5);
+        }
+    }
+
+    #[test]
+    fn merge_small_chunks_respects_chunk_size_cap() {
+        let seg_a = "x".repeat(349);
+        let seg_b = "y".repeat(349);
+        let text = format!("{seg_a}\n{seg_b}");
+        let config = ChunkConfig {
+            chunk_size: 500,
+            min_chunk_size: 350,
+            overlap: 0,
+        };
+        let chunks = chunk_text(&text, &config);
+        for chunk in &chunks {
+            assert!(
+                chunk.text.len() <= 500,
+                "merged chunk exceeded chunk_size: {} bytes",
+                chunk.text.len()
+            );
         }
     }
 

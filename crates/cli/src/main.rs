@@ -801,12 +801,18 @@ fn cmd_mcp(direct: bool, runtime_dir: Option<PathBuf>, project: Option<PathBuf>)
     // Canonicalize the default project to an absolute path so injected
     // tool-call args resolve regardless of the agent's cwd.
     let default_project = match project {
-        Some(p) => Some(
-            std::fs::canonicalize(&p)
-                .with_context(|| format!("resolving --project path {}", p.display()))?
-                .to_string_lossy()
-                .into_owned(),
-        ),
+        Some(p) => {
+            let canon = std::fs::canonicalize(&p)
+                .with_context(|| format!("resolving --project path {}", p.display()))?;
+            Some(
+                canon
+                    .to_str()
+                    .with_context(|| {
+                        format!("--project path is not valid UTF-8: {}", canon.display())
+                    })?
+                    .to_owned(),
+            )
+        }
         None => None,
     };
     let rt = tokio::runtime::Runtime::new()?;
@@ -1308,11 +1314,15 @@ fn cmd_index(
                         println!("Trust boundaries: backfilled {n}/{n_pending} pending files");
                     }
                 }
-                Err(e) => eprintln!("trust-boundary backfill failed: {e:#}"),
+                Err(e) => {
+                    return Err(e.context("trust-boundary backfill failed during codesage index"));
+                }
             }
         }
         Ok(_) => {}
-        Err(e) => eprintln!("trust-boundary pending-list query failed: {e:#}"),
+        Err(e) => {
+            return Err(e.context("trust-boundary pending-list query failed during codesage index"));
+        }
     }
 
     // Feature mapping runs after structural (which populated `refs` and
@@ -2141,11 +2151,8 @@ fn cmd_cleanup(dry_run: bool) -> Result<()> {
     let config = load_project_config(&root)?;
     let emb_config = config.embedding.unwrap_or_default();
 
-    let embedder = Embedder::new(&emb_config)?;
-    let active_dim = embedder.dim();
-    let active_table = codesage_storage::schema::model_table_name(&emb_config.model, active_dim);
-
-    let db = open_db(&root)?;
+    let db = open_context_db_for_existing_model(&root, &emb_config.model)?;
+    let active_table = db.chunk_table_name().to_string();
 
     let db_path = root.join(PROJECT_DIR).join(DB_FILE);
     let size_before = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);

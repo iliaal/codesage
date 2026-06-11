@@ -90,9 +90,14 @@ fn file_relates_to(seed: &FeatureSeed, stem: &str, dir: &str, candidate: &str) -
     if !dir.is_empty() && cand_dir == dir {
         return true;
     }
-    // 2. Test file whose stem matches the entry's stem at a word boundary.
+    // 2. Test file whose stem matches the entry's stem at a word boundary,
+    // but only within the same monorepo package/crate root so identical
+    // stems in different packages (e.g. packages/api vs packages/ui) don't
+    // cross-attach.
     let cand_stem = file_stem(candidate);
-    if stem_at_word_boundary(cand_stem, stem) {
+    if stem_at_word_boundary(cand_stem, stem)
+        && same_stem_scope(seed.entry_path.as_str(), candidate)
+    {
         return true;
     }
     // 3. Convention dirs at the repo root that are typically the test home.
@@ -239,6 +244,27 @@ fn is_test_file(path: &str, language: Language) -> bool {
     }
 }
 
+/// When both paths live under `packages/<name>/` or `crates/<name>/`, require
+/// the same `<name>`. Non-monorepo layouts keep the historical cross-dir
+/// stem-match behavior (e.g. `acme/widget.py` + `other/widget_test.py`).
+fn same_stem_scope(entry: &str, candidate: &str) -> bool {
+    match (monorepo_member_root(entry), monorepo_member_root(candidate)) {
+        (Some(e), Some(c)) => e == c,
+        _ => true,
+    }
+}
+
+fn monorepo_member_root(rel: &str) -> Option<String> {
+    for prefix in ["packages/", "crates/"] {
+        let rest = rel.strip_prefix(prefix)?;
+        let member = rest.split('/').next()?;
+        if !member.is_empty() {
+            return Some(format!("{prefix}{member}"));
+        }
+    }
+    None
+}
+
 fn parent_dir(rel: &str) -> String {
     match rel.rfind('/') {
         Some(i) => rel[..i].to_string(),
@@ -364,6 +390,20 @@ mod tests {
         assert!(
             t.contains(&"other/widget_test.py".to_string()),
             "separator-boundary stem match should attach: {t:?}"
+        );
+    }
+
+    #[test]
+    fn identical_stem_does_not_cross_monorepo_packages() {
+        let s = seed("packages/api/src/index.ts", Language::TypeScript);
+        let all = vec![
+            "packages/api/src/index.ts".to_string(),
+            "packages/ui/src/index.test.ts".to_string(),
+        ];
+        let t = nearby_tests(&s, &all);
+        assert!(
+            !t.contains(&"packages/ui/src/index.test.ts".to_string()),
+            "cross-package stem match should not attach: {t:?}"
         );
     }
 

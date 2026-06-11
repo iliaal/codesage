@@ -554,20 +554,29 @@ fn status_finds_daemon_in_env_runtime_dir() {
             .expect("spawn codesage daemon"),
     };
 
-    // Wait for the daemon to bind a socket under the explicit runtime dir.
+    // Wait for both socket and pid file — status reads the pid file and the
+    // daemon binds the socket before writing it (fnd_017ca191).
     let deadline = Instant::now() + Duration::from_secs(5);
-    let mut bound = false;
-    while Instant::now() < deadline && !bound {
+    let mut socket: Option<PathBuf> = None;
+    let mut pid_file: Option<PathBuf> = None;
+    while Instant::now() < deadline && (socket.is_none() || pid_file.is_none()) {
         thread::sleep(Duration::from_millis(50));
-        if let Ok(entries) = std::fs::read_dir(&runtime) {
-            bound = entries
-                .flatten()
-                .any(|f| f.path().extension().and_then(|x| x.to_str()) == Some("sock"));
+        for entry in std::fs::read_dir(&runtime).into_iter().flatten().flatten() {
+            let p = entry.path();
+            match p.extension().and_then(|e| e.to_str()) {
+                Some("sock") => socket = Some(p.clone()),
+                Some("pid") => pid_file = Some(p.clone()),
+                _ => {}
+            }
         }
     }
     assert!(
-        bound,
+        socket.is_some(),
         "daemon never bound a socket under the explicit runtime dir"
+    );
+    assert!(
+        pid_file.is_some(),
+        "daemon never wrote a pid file under the explicit runtime dir"
     );
 
     let status = Command::new(bin)

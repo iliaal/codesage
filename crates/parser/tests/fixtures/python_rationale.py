@@ -48,6 +48,12 @@ def stacked_decorator_fixme():
     pass
 
 
+class ClassHeaderComment:
+    # WHY: header comment applies to the first method below
+    def first_method(self):
+        pass
+
+
 class DecoratedMethods:
     # NOTE: cached for the lifetime of the instance
     @property

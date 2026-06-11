@@ -350,7 +350,7 @@ fn php_api_entries_in_file(root: &Path, entry_path: &str) -> Vec<PhpApiEntry> {
     let Ok(raw) = fs::read_to_string(path) else {
         return Vec::new();
     };
-    let code = strip_c_comments_and_strings(&raw);
+    let code = strip_c_comments_and_strings(&strip_if_zero_blocks(&raw));
     let mut out = Vec::new();
     for caps in php_api_macro_re().captures_iter(&code) {
         match &caps[1] {
@@ -408,6 +408,55 @@ fn php_api_macro_re() -> &'static Regex {
         )
         .expect("valid PHP extension API macro regex")
     })
+}
+
+/// Blank out `#if 0` … `#endif` regions before macro scanning. php-src
+/// routinely parks removed handlers in inactive preprocessor blocks.
+fn strip_if_zero_blocks(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_if_zero = false;
+    let mut depth = 0;
+
+    for line in input.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if !in_if_zero {
+            if is_if_zero_directive(trimmed) {
+                in_if_zero = true;
+                depth = 1;
+                out.push_str(&blank_line_preserve_newline(line));
+            } else {
+                out.push_str(line);
+            }
+            continue;
+        }
+
+        out.push_str(&blank_line_preserve_newline(line));
+        if (trimmed.starts_with("#if")
+            && !trimmed.starts_with("#ifdef")
+            && !trimmed.starts_with("#ifndef"))
+            || trimmed.starts_with("#ifdef")
+            || trimmed.starts_with("#ifndef")
+        {
+            depth += 1;
+        } else if trimmed == "#endif" || trimmed.starts_with("#endif ") {
+            depth -= 1;
+            if depth == 0 {
+                in_if_zero = false;
+            }
+        }
+    }
+
+    out
+}
+
+fn is_if_zero_directive(trimmed: &str) -> bool {
+    trimmed == "#if 0" || trimmed.starts_with("#if 0 ") || trimmed.starts_with("#if\t0")
+}
+
+fn blank_line_preserve_newline(line: &str) -> String {
+    line.chars()
+        .map(|c| if c == '\n' { '\n' } else { ' ' })
+        .collect()
 }
 
 fn strip_c_comments_and_strings(input: &str) -> String {
@@ -2360,6 +2409,29 @@ class SyncUsers extends Command {
             Some("clickhouse_escape")
         );
         assert_eq!(functions[0].entry_path, "clickhouse.cpp");
+    }
+
+    #[test]
+    fn php_ext_skips_php_function_inside_if_zero() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "ext/demo/config.m4", "PHP_ARG_ENABLE(demo,,)\n");
+        write(
+            dir.path(),
+            "ext/demo/demo.c",
+            r#"
+                PHP_FUNCTION(demo_active) {}
+                #if 0
+                PHP_FUNCTION(demo_removed) {}
+                #endif
+            "#,
+        );
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let symbols: Vec<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "php-ext-function")
+            .filter_map(|s| s.entry_symbol.as_deref())
+            .collect();
+        assert_eq!(symbols, vec!["demo_active"]);
     }
 
     #[test]
