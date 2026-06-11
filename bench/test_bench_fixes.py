@@ -203,6 +203,32 @@ check(
     "env" in captured_gen_call and "AWS_SECRET_ACCESS_KEY" not in env,
     "gen: codex environment is scrubbed",
 )
+check(
+    "OPENAI_API_KEY" not in env,
+    "gen: OPENAI_API_KEY is not passed to nested codex",
+)
+check(
+    "--output-last-message" in cmd,
+    "gen: codex writes structured last message to a file",
+)
+
+with tempfile.TemporaryDirectory() as td:
+    out_file = Path(td) / "last.txt"
+    out_file.write_text('"find the auth middleware handler"\n', encoding="utf-8")
+    noisy_stdout = "\n".join(
+        [
+            "session id: abc",
+            "tokens used",
+            "12,345",
+            "role: assistant",
+            "garbage metadata line",
+        ]
+    )
+    parsed = gen.parse_codex_query_output(noisy_stdout, out_file)
+    check(
+        parsed == "find the auth middleware handler",
+        f"gen: parse_codex_query_output reads schema file, got {parsed!r}",
+    )
 
 # --------------------------------------------------------------------
 # extract-eval-cases.py — fnd_32ebb1d9 (YAML injection via path)
@@ -321,6 +347,99 @@ check(
     "extract: _yaml_dq escapes embedded double quotes",
 )
 
+raised = False
+try:
+    extract.positive_int("0")
+except Exception:
+    raised = True
+check(raised, "extract: positive_int rejects 0")
+raised = False
+try:
+    extract.positive_int("-1")
+except Exception:
+    raised = True
+check(raised, "extract: positive_int rejects -1")
+check(extract.positive_int("3") == 3, "extract: positive_int accepts 3")
+
+prefix = "where is the cargo manifest configured for this project"
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "project"
+    sessions = Path(td) / "sessions"
+    root.mkdir()
+    sessions.mkdir()
+    (root / "a.py").write_text("x = 1\n")
+    (root / "b.py").write_text("y = 2\n")
+    for idx, target in enumerate(("a.py", "b.py")):
+        session = sessions / f"dedup-{idx}.jsonl"
+        session.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "message": {"content": f"{prefix} variant {idx}"},
+                            "padding": "x" * 3500,
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "message": {
+                                "content": [
+                                    {
+                                        "type": "tool_use",
+                                        "input": {"file_path": str(root / target)},
+                                    }
+                                ]
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n"
+        )
+    cases = extract.extract_cases(sessions, str(root), min_files=1, max_cases=10)
+    check(len(cases) == 2, f"extract: full-query dedup keeps distinct cases (got {len(cases)})")
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "project"
+    sessions = Path(td) / "sessions"
+    root.mkdir()
+    sessions.mkdir()
+    (root / "late.py").write_text("z = 3\n")
+    msgs = [
+        json.dumps(
+            {
+                "type": "user",
+                "message": {"content": "where is the late accessed file in this project"},
+                "padding": "x" * 3500,
+            }
+        ),
+    ]
+    for _ in range(44):
+        msgs.append(json.dumps({"type": "assistant", "message": {"content": []}}))
+    msgs.append(
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "input": {"file_path": str(root / "late.py")},
+                        }
+                    ]
+                },
+            }
+        )
+    )
+    (sessions / "late.jsonl").write_text("\n".join(msgs) + "\n")
+    cases = extract.extract_cases(sessions, str(root), min_files=1, max_cases=1)
+    check(
+        cases and cases[0]["files"] == ["late.py"],
+        f"extract: lookahead beyond 40 messages includes late file (got {cases!r})",
+    )
+
 # The emitted YAML for a path with a metacharacter round-trips as a string,
 # not injected structure.
 with tempfile.TemporaryDirectory() as td:
@@ -361,6 +480,18 @@ check("serialized" in v, f"audit: success+lock-error is serialized (got {v!r})")
 # Both succeed → clean.
 v = audit.classify_verdict([{"returncode": 0}, {"returncode": 0}], clean_state)
 check("clean" in v, f"audit: both-ok is clean (got {v!r})")
+# One lockfile skip at rc=0 is serialized, not a false green "both succeeded".
+v = audit.classify_verdict(
+    [
+        {"returncode": 0},
+        {
+            "returncode": 0,
+            "stderr_tail": "another codesage indexer is running on /proj — skipping",
+        },
+    ],
+    clean_state,
+)
+check("serialized" in v, f"audit: lockfile skip is serialized (got {v!r})")
 # Corruption wins over everything, even a timeout.
 corrupt_state = dict(clean_state, integrity="row 5 missing")
 v = audit.classify_verdict([{"returncode": 0}, {"returncode": None}], corrupt_state)
@@ -443,6 +574,43 @@ with tempfile.TemporaryDirectory() as td:
     check(first is not None and second is not None, "audit: backup_db returns backup paths")
     check(first != second, "audit: backup_db creates unique paths for repeated calls")
     check(first.exists() and second.exists(), "audit: unique backup files exist")
+
+with tempfile.TemporaryDirectory() as td:
+    db_path = Path(td) / "index.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT UNIQUE);
+        CREATE TABLE symbols (
+            id INTEGER PRIMARY KEY,
+            file_id INTEGER REFERENCES files(id),
+            name TEXT, kind TEXT, line INTEGER
+        );
+        CREATE TABLE refs (
+            id INTEGER PRIMARY KEY,
+            from_file_id INTEGER REFERENCES files(id),
+            to_file_id INTEGER,
+            name TEXT, kind TEXT, line INTEGER
+        );
+        CREATE TABLE schema_migrations (name TEXT UNIQUE);
+        """
+    )
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("INSERT INTO symbols (id, file_id, name, kind, line) VALUES (1, 99, 'x', 'fn', 1)")
+    conn.commit()
+    conn.close()
+    state = audit.integrity_check(db_path)
+    check(
+        len(state.get("foreign_key_violations") or []) > 0,
+        "audit: foreign_key_check reports orphan symbols with FK enforcement on",
+    )
+
+inconclusive_state = dict(
+    clean_state,
+    semantic={"status": "inconclusive", "vec_tables": ["chunks_test_384"], "issues": [], "fts_mismatches": []},
+)
+v = audit.classify_verdict([{"returncode": 0}, {"returncode": 0}], inconclusive_state)
+check("INCONCLUSIVE" in v, f"audit: semantic inconclusive is not clean (got {v!r})")
 
 # agent-tool-selection-harness.py — fnd_329c8aed / fnd_42e0caa2
 raised = False

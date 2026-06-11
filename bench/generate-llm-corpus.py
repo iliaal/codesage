@@ -60,12 +60,24 @@ CODEX_QUERY_SCHEMA = {
 }
 
 
+def path_within_root(path: Path, project_root: Path) -> bool:
+    """True when `path` resolves to a location under `project_root`."""
+    try:
+        path.resolve().relative_to(project_root.resolve())
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return True
+
+
 def candidate_files(project_root: Path) -> list[Path]:
+    root = project_root.resolve()
     out: list[Path] = []
     for path in project_root.rglob("*"):
-        if path.is_symlink():
+        if path.is_symlink() or path.is_dir():
             continue
         if not path.is_file():
+            continue
+        if not path_within_root(path, root):
             continue
         rel = path.relative_to(project_root).as_posix()
         if SKIP_DIR_PATTERNS.search(rel):
@@ -147,14 +159,11 @@ def lang_for(suffix: str) -> str:
 
 
 def codex_query_env() -> dict[str, str]:
+    """Minimal env for nested codex: auth via CODEX_HOME, no API secrets."""
     keep = [
         "PATH",
         "HOME",
         "CODEX_HOME",
-        "OPENAI_API_KEY",
-        "OPENAI_BASE_URL",
-        "OPENAI_ORG_ID",
-        "OPENAI_PROJECT",
         "HTTPS_PROXY",
         "HTTP_PROXY",
         "NO_PROXY",
@@ -164,7 +173,42 @@ def codex_query_env() -> dict[str, str]:
     return {k: os.environ[k] for k in keep if os.environ.get(k)}
 
 
+def parse_codex_query_output(stdout: str, output_file: Path | None) -> str | None:
+    """Read the schema-constrained query from codex's last-message file."""
+    if output_file is not None and output_file.is_file():
+        try:
+            raw = output_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            raw = ""
+        if raw:
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                return raw.strip().strip('"').strip("'").rstrip(".")
+            if isinstance(parsed, str) and parsed.strip():
+                return parsed.strip().strip('"').strip("'").rstrip(".")
+            if isinstance(parsed, dict):
+                for key in ("query", "text", "result", "answer"):
+                    val = parsed.get(key)
+                    if isinstance(val, str) and val.strip():
+                        return val.strip().strip('"').strip("'").rstrip(".")
+    # Fallback: last JSON string literal in stdout (older codex builds).
+    for line in reversed([ln.rstrip() for ln in stdout.splitlines() if ln.strip()]):
+        if re.search(r"^\d+(,\d{3})*$|^tokens used$|^session id:", line, re.I):
+            continue
+        try:
+            parsed = json.loads(line)
+            if isinstance(parsed, str) and parsed.strip():
+                return parsed.strip().strip('"').strip("'").rstrip(".")
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
 def generate_query(file_path: Path, project_root: Path) -> str | None:
+    root = project_root.resolve()
+    if not path_within_root(file_path, root):
+        return None
     rel = file_path.relative_to(project_root).as_posix()
     try:
         content = file_path.read_text(encoding="utf-8", errors="ignore")
@@ -186,6 +230,7 @@ def generate_query(file_path: Path, project_root: Path) -> str | None:
             workspace.mkdir()
             schema = sandbox / "query.schema.json"
             schema.write_text(json.dumps(CODEX_QUERY_SCHEMA), encoding="utf-8")
+            last_message = sandbox / "last-message.txt"
 
             proc = subprocess.run(
                 [
@@ -201,6 +246,8 @@ def generate_query(file_path: Path, project_root: Path) -> str | None:
                     "read-only",
                     "--output-schema",
                     str(schema),
+                    "--output-last-message",
+                    str(last_message),
                 ],
                 input=prompt,
                 text=True,
@@ -208,6 +255,7 @@ def generate_query(file_path: Path, project_root: Path) -> str | None:
                 timeout=180,
                 env=codex_query_env(),
             )
+            query_text = parse_codex_query_output(proc.stdout, last_message)
     except subprocess.TimeoutExpired:
         # A single hung codex call used to bubble out of the per-file
         # loop and discard every case produced so far (real-money API
@@ -222,21 +270,7 @@ def generate_query(file_path: Path, project_root: Path) -> str | None:
               file=sys.stderr)
         return None
 
-    # codex exec output format: session id line, separator, user/codex sections,
-    # tokens used, then the raw final response. The final non-empty line in the
-    # last `codex` block is the model's actual answer.
-    lines = [ln.rstrip() for ln in proc.stdout.splitlines() if ln.strip()]
-    if not lines:
-        return None
-    # Walk backwards from the end, skipping tokens-used / numeric noise, to
-    # find the first plausibly-sentence line. Codex emits the final response
-    # twice (in the codex section AND after the tokens-used footer); the
-    # post-footer copy is the last line.
-    for line in reversed(lines):
-        if re.search(r"^\d+(,\d{3})*$|^tokens used$|^session id:", line):
-            continue
-        return line.strip().strip('"').strip("'").rstrip(".")
-    return None
+    return query_text
 
 
 def format_corpus_yaml(project_root: str, cases: list[dict]) -> str:
@@ -297,6 +331,7 @@ def main() -> int:
     serialized = format_corpus_yaml(str(project_root), cases)
 
     if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(serialized)
         print(f"wrote {len(cases)} cases to {args.out}", file=sys.stderr)
     else:

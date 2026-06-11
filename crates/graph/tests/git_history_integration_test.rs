@@ -28,6 +28,16 @@ fn codesage_repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn init_hermetic_repo(root: &std::path::Path) {
+    run_git(root, &["init", "-q"]);
+    run_git(root, &["config", "user.email", "review@example.invalid"]);
+    run_git(root, &["config", "user.name", "Review"]);
+    // Ignore ambient signing/hooks config so temp-repo tests don't fail on
+    // machines with global commit.gpgsign or custom core.hooksPath.
+    run_git(root, &["config", "commit.gpgsign", "false"]);
+    run_git(root, &["config", "core.hooksPath", ".git/hooks"]);
+}
+
 fn run_git(root: &std::path::Path, args: &[&str]) {
     let status = Command::new("git")
         .args(args)
@@ -160,9 +170,7 @@ fn auto_mode_matches_full_on_fresh_db() {
 fn extra_excludes_skip_git_history_files() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    run_git(root, &["init", "-q"]);
-    run_git(root, &["config", "user.email", "review@example.invalid"]);
-    run_git(root, &["config", "user.name", "Review"]);
+    init_hermetic_repo(root);
 
     std::fs::create_dir_all(root.join("keep")).unwrap();
     std::fs::create_dir_all(root.join("skip")).unwrap();
@@ -184,9 +192,7 @@ fn extra_excludes_skip_git_history_files() {
 fn changed_files_since_returns_only_files_touched_after_ref() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    run_git(root, &["init", "-q"]);
-    run_git(root, &["config", "user.email", "review@example.invalid"]);
-    run_git(root, &["config", "user.name", "Review"]);
+    init_hermetic_repo(root);
 
     // Commit 1: two files, both untouched after this point except `changed.rs`.
     std::fs::write(root.join("stable.rs"), "fn stable() {}\n").unwrap();
@@ -220,9 +226,7 @@ fn changed_files_since_returns_only_files_touched_after_ref() {
 fn changed_files_since_errors_on_unknown_ref() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    run_git(root, &["init", "-q"]);
-    run_git(root, &["config", "user.email", "review@example.invalid"]);
-    run_git(root, &["config", "user.name", "Review"]);
+    init_hermetic_repo(root);
     std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
     run_git(root, &["add", "."]);
     run_git(root, &["commit", "-qm", "only"]);

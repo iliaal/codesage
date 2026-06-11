@@ -12,10 +12,18 @@ With --yaml, writes a corpus YAML directly (project_root + scoring + cases).
 """
 
 import argparse
+import hashlib
 import json
 import re
 import sys
 from pathlib import Path
+
+
+def positive_int(value: str) -> int:
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return n
 
 
 def parse_session(path: Path) -> list[dict]:
@@ -154,18 +162,36 @@ def normalize_path(path: str, project_root: str) -> str | None:
     return rel_str
 
 
-def extract_cases(session_dir: Path, project_root: str, min_files: int, max_cases: int) -> list[dict]:
+def dedup_key(case: dict) -> str:
+    query = re.sub(r"\s+", " ", case["query"].strip().lower())
+    files = ",".join(sorted(case["files"]))
+    payload = f"{query}\0{files}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def extract_cases(
+    session_dir: Path,
+    project_root: str,
+    min_files: int,
+    max_cases: int,
+    max_sessions: int = 40,
+) -> list[dict]:
     candidates = []
-    jsonl_files: list[tuple[Path, int]] = []
+    jsonl_files: list[tuple[Path, int, float]] = []
     for path in session_dir.rglob("*.jsonl"):
+        if path.is_symlink():
+            continue
         try:
-            size = path.stat().st_size
+            st = path.stat()
         except OSError:
             continue
-        jsonl_files.append((path, size))
-    jsonl_files.sort(key=lambda item: item[1], reverse=True)
+        if not path.is_file():
+            continue
+        jsonl_files.append((path, st.st_size, st.st_mtime))
+    # Prefer recent sessions; size breaks ties on the same mtime.
+    jsonl_files.sort(key=lambda item: (item[2], item[1]), reverse=True)
 
-    for jsonl_path, size in jsonl_files[:40]:
+    for jsonl_path, size, _mtime in jsonl_files[:max_sessions]:
         if size < 3000:
             continue
 
@@ -188,7 +214,7 @@ def extract_cases(session_dir: Path, project_root: str, min_files: int, max_case
 
                 if is_search_query(text):
                     files = set()
-                    for j in range(i + 1, min(i + 40, len(messages))):
+                    for j in range(i + 1, len(messages)):
                         next_msg = messages[j]
                         if next_msg.get("type") == "user" and not is_tool_result(next_msg):
                             break
@@ -222,12 +248,12 @@ def extract_cases(session_dir: Path, project_root: str, min_files: int, max_case
         if len(candidates) >= max_cases * 3:
             break
 
-    seen_queries = set()
+    seen_keys = set()
     deduped = []
     for c in candidates:
-        key = c["query"][:60].lower()
-        if key not in seen_queries:
-            seen_queries.add(key)
+        key = dedup_key(c)
+        if key not in seen_keys:
+            seen_keys.add(key)
             deduped.append(c)
 
     deduped.sort(key=lambda c: c["file_count"], reverse=True)
@@ -257,7 +283,8 @@ def write_yaml(cases: list[dict], project_root: str, project_name: str, out_path
     lines: list[str] = []
     lines.append(f"project_root: {_yaml_dq(project_root)}")
     lines.append("description: |")
-    lines.append(f"  Retrieval benchmark for {project_name}.")
+    safe_name = re.sub(r"[\x00-\x1f\x7f]", "", str(project_name))
+    lines.append(f"  Retrieval benchmark for {safe_name}.")
     lines.append("  Session-based queries mined from real Claude Code session history by")
     lines.append("  bench/extract-eval-cases.py --yaml.")
     lines.append("")
@@ -296,15 +323,31 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("session_dir", type=Path)
     ap.add_argument("project_root", type=str)
-    ap.add_argument("--min-files", type=int, default=1)
-    ap.add_argument("--max-cases", type=int, default=50)
+    ap.add_argument("--min-files", type=positive_int, default=1)
+    ap.add_argument("--max-cases", type=positive_int, default=50)
+    ap.add_argument(
+        "--max-sessions",
+        type=positive_int,
+        default=40,
+        help="maximum number of session jsonl files to scan (newest first)",
+    )
     ap.add_argument("--yaml", type=Path, default=None,
                     help="Write a corpus YAML to this path instead of printing candidates")
     ap.add_argument("--project-name", type=str, default=None,
                     help="Name used in YAML description (default: basename of project_root)")
     args = ap.parse_args()
 
-    cases = extract_cases(args.session_dir, args.project_root, args.min_files, args.max_cases)
+    if not args.session_dir.is_dir():
+        print(f"not a directory: {args.session_dir}", file=sys.stderr)
+        return 1
+
+    cases = extract_cases(
+        args.session_dir,
+        args.project_root,
+        args.min_files,
+        args.max_cases,
+        args.max_sessions,
+    )
 
     if args.yaml is not None:
         if not cases:

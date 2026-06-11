@@ -40,6 +40,27 @@ fn setup_project() -> (tempfile::TempDir, Database) {
 
     let db = Database::open_in_memory().unwrap();
     full_index(root, &db, &[], false).unwrap();
+    insert_chunk(
+        &db,
+        "Repository.php",
+        "php",
+        "<?php\nnamespace App;\nclass Repository {\n  public function find($id) { return null; }\n}\n",
+        4,
+    );
+    insert_chunk(
+        &db,
+        "Controller.php",
+        "php",
+        "<?php\nnamespace App;\nuse App\\Repository;\nclass Controller {\n  public function show(Repository $repo, $id) { return $repo->find($id); }\n}\n",
+        4,
+    );
+    insert_chunk(
+        &db,
+        "Service.php",
+        "php",
+        "<?php\nnamespace App;\nuse App\\Repository;\nclass Service {\n  public function run(Repository $repo) { return $repo->find(1); }\n}\n",
+        4,
+    );
     (dir, db)
 }
 
@@ -269,7 +290,20 @@ fn impact_source_only_filters_tests() {
         source_only: true,
     };
     let src = impact_analysis(&db, &req_src).unwrap();
+    let src_paths: Vec<String> = src.iter().map(|e| e.file_path.clone()).collect();
     assert!(src.iter().all(|e| e.category == FileCategory::Source));
+    assert!(
+        src_paths.iter().any(|p| p.ends_with("Controller.php")),
+        "source_only should retain Controller.php caller, got {src_paths:?}"
+    );
+    assert!(
+        src_paths.iter().any(|p| p.ends_with("Service.php")),
+        "source_only should retain Service.php caller, got {src_paths:?}"
+    );
+    assert!(
+        !src_paths.iter().any(|p| p.ends_with("RepositoryTest.php")),
+        "source_only must exclude RepositoryTest.php, got {src_paths:?}"
+    );
     assert!(src.len() < all.len());
 }
 
@@ -344,10 +378,19 @@ fn export_context_for_symbol_with_callers() {
     };
 
     let bundle = codesage_graph::query::export_context_for_symbol(&db, "Repository", &req).unwrap();
+    let related_paths: Vec<String> = bundle.related.iter().map(|r| r.file_path.clone()).collect();
 
     assert!(
         !bundle.symbol_definitions.is_empty(),
         "should have found the definition"
+    );
+    assert!(
+        related_paths.iter().any(|p| p.ends_with("Controller.php")),
+        "include_callers should surface Controller.php, got {related_paths:?}"
+    );
+    assert!(
+        related_paths.iter().any(|p| p.ends_with("Service.php")),
+        "include_callers should surface Service.php, got {related_paths:?}"
     );
 }
 

@@ -159,15 +159,65 @@ def run_parallel(cmds: list[list[str]], cwd: Path, timeout_s: int = 300) -> list
 # ---------------------------------------------------------------------------
 
 
+def semantic_chunk_check(conn: sqlite3.Connection) -> dict:
+    """Best-effort semantic/vector consistency without loading sqlite-vec."""
+    out: dict = {
+        "status": "ok",
+        "vec_tables": [],
+        "issues": [],
+        "fts_mismatches": [],
+    }
+    vec_rows = conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='table' AND sql LIKE '%vec0%'"
+    ).fetchall()
+    for (table_name,) in vec_rows:
+        out["vec_tables"].append(table_name)
+        fts_name = f"{table_name}_fts"
+        fts_row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (fts_name,),
+        ).fetchone()
+        fts_count = None
+        if fts_row:
+            try:
+                fts_count = conn.execute(
+                    f'SELECT COUNT(*) FROM "{fts_name}"'
+                ).fetchone()[0]
+            except sqlite3.OperationalError as e:
+                out["issues"].append(f"fts query failed for {fts_name}: {e}")
+        try:
+            vec_count = conn.execute(
+                f'SELECT COUNT(*) FROM "{table_name}"'
+            ).fetchone()[0]
+            if fts_count is not None and vec_count != fts_count:
+                out["fts_mismatches"].append(
+                    {"table": table_name, "vec": vec_count, "fts": fts_count}
+                )
+        except sqlite3.OperationalError:
+            out["status"] = "inconclusive"
+            if fts_count is not None and fts_count > 0:
+                out["issues"].append(
+                    f"cannot verify vec table {table_name} "
+                    f"(sqlite-vec not loaded; fts has {fts_count} rows)"
+                )
+    if out["fts_mismatches"]:
+        out["status"] = "mismatch"
+    return out
+
+
 def integrity_check(db_path: Path) -> dict:
     """Run SQLite's own corruption probe plus targeted orphan queries."""
-    # `vec0` virtual tables require the sqlite-vec extension to query. We
-    # only need structural tables + fts tables for the audit, so skip the
-    # extension load here by using raw sqlite3 and only touching structural
-    # tables we know don't depend on vec0.
     conn = sqlite3.connect(str(db_path))
     try:
-        out = {"integrity": "unknown", "orphans": {}, "dupes": {}, "schema_migrations": []}
+        conn.execute("PRAGMA foreign_keys=ON")
+        out = {
+            "integrity": "unknown",
+            "orphans": {},
+            "dupes": {},
+            "schema_migrations": [],
+            "semantic": {},
+        }
         rows = conn.execute("PRAGMA integrity_check").fetchall()
         out["integrity"] = ", ".join(r[0] for r in rows) if rows else "empty"
         # FK enforcement is ON per init_db but cheap to re-verify: list
@@ -203,6 +253,7 @@ def integrity_check(db_path: Path) -> dict:
         # Summary row counts for sanity.
         for t in ("files", "symbols", "refs"):
             out[f"count_{t}"] = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        out["semantic"] = semantic_chunk_check(conn)
         return out
     finally:
         conn.close()
@@ -265,6 +316,7 @@ def classify_verdict(results: list[dict], state: dict) -> str:
     this audit exists to surface, and it was previously reported with a green
     checkmark.
     """
+    semantic = state.get("semantic") or {}
     corrupt = (
         state["integrity"] != "ok"
         or state["orphans"]["symbols_without_file"] > 0
@@ -272,18 +324,32 @@ def classify_verdict(results: list[dict], state: dict) -> str:
         or state["dupes"]["files_same_path"] > 0
         or any(m["count"] > 1 for m in state["schema_migrations"])
         or len(state.get("foreign_key_violations") or []) > 0
+        or semantic.get("status") == "mismatch"
+        or bool(semantic.get("fts_mismatches"))
     )
     if corrupt:
         return "❌ CORRUPT — see detail above; fix required (lockfile / busy_timeout / retry)"
 
+    if semantic.get("status") == "inconclusive":
+        return (
+            "⚠ INCONCLUSIVE — vec tables present but sqlite-vec is not loaded; "
+            "structural checks passed but semantic/vector state was not verified"
+        )
+
     timed_out = sum(1 for r in results if r["returncode"] is None)
     procs_ok = sum(1 for r in results if r["returncode"] == 0)
+    lockfile_skips = sum(1 for r in results if is_lockfile_skip(r))
     if timed_out:
         return (
             f"⚠ TIMEOUT — {timed_out} process(es) killed after the timeout; "
             "possible writer livelock, not a clean serialization (investigate)"
         )
     if procs_ok == len(results):
+        if lockfile_skips:
+            return (
+                f"✓ serialized — {lockfile_skips} process(es) exited 0 after "
+                "lockfile skip; DB is consistent"
+            )
         return "✓ clean — both processes succeeded, DB is consistent"
     if procs_ok >= 1:
         failed = [r for r in results if r["returncode"] not in (0, None)]
@@ -309,6 +375,11 @@ def is_lock_contention_failure(result: dict) -> bool:
     )
 
 
+def is_lockfile_skip(result: dict) -> bool:
+    text = (result.get("stderr_tail") or "").lower()
+    return "another codesage indexer is running" in text and "skipping" in text
+
+
 def summarize_db(state: dict) -> str:
     lines = []
     lines.append(f"  - integrity_check: {state['integrity']}")
@@ -322,6 +393,15 @@ def summarize_db(state: dict) -> str:
     mig_dupes = [m for m in state['schema_migrations'] if m['count'] > 1]
     lines.append(f"  - schema_migrations duplicates: {len(mig_dupes)}")
     lines.append(f"  - counts: files={state['count_files']}, symbols={state['count_symbols']}, refs={state['count_refs']}")
+    semantic = state.get("semantic") or {}
+    if semantic:
+        lines.append(f"  - semantic check: {semantic.get('status', 'unknown')}")
+        if semantic.get("vec_tables"):
+            lines.append(f"  - vec tables: {len(semantic['vec_tables'])}")
+        if semantic.get("fts_mismatches"):
+            lines.append(f"  - vec/fts mismatches: {len(semantic['fts_mismatches'])} (!!)")
+        if semantic.get("issues"):
+            lines.append(f"  - semantic notes: {len(semantic['issues'])}")
     return "\n".join(lines)
 
 
