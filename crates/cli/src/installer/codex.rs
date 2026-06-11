@@ -39,7 +39,7 @@ impl AgentTarget for CodexTarget {
             .parse::<DocumentMut>()
             .with_context(|| format!("parsing existing TOML at {}", path.display()))?;
 
-        let (command, args) = mcp_command_args(ctx.project);
+        let (command, args) = mcp_command_args(ctx.project_utf8);
         let mut arg_arr = Array::new();
         for a in &args {
             arg_arr.push(a.as_str());
@@ -133,6 +133,7 @@ mod tests {
         InstallCtx {
             home,
             project,
+            project_utf8: project.to_str().expect("test project path must be UTF-8"),
             global: true,
         }
     }

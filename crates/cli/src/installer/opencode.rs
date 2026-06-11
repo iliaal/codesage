@@ -63,11 +63,10 @@ impl AgentTarget for OpencodeTarget {
         let root_obj = root.object_value_or_set();
         let mcp_obj = root_obj.object_value_or_set("mcp");
 
-        let proj = ctx.project.to_string_lossy().into_owned();
-        let proj_ref = proj.as_str();
+        let project = ctx.project_utf8;
         let entry = json!({
             "type": "local",
-            "command": ["codesage", "mcp", "--project", proj_ref],
+            "command": ["codesage", "mcp", "--project", project],
             "enabled": true,
         });
         if let Some(prop) = mcp_obj.get("codesage") {
@@ -129,6 +128,7 @@ mod tests {
         InstallCtx {
             home: Path::new("/unused"),
             project,
+            project_utf8: project.to_str().expect("test project path must be UTF-8"),
             global: false,
         }
     }

@@ -450,7 +450,17 @@ fn strip_if_zero_blocks(input: &str) -> String {
 }
 
 fn is_if_zero_directive(trimmed: &str) -> bool {
-    trimmed == "#if 0" || trimmed.starts_with("#if 0 ") || trimmed.starts_with("#if\t0")
+    if !trimmed.starts_with("#if") {
+        return false;
+    }
+    let rest = trimmed
+        .trim_start_matches("#if")
+        .trim_start_matches(|c: char| c.is_whitespace());
+    rest.starts_with('0')
+        && matches!(
+            rest.chars().nth(1),
+            None | Some(' ') | Some('\t') | Some('/') | Some('*')
+        )
 }
 
 fn blank_line_preserve_newline(line: &str) -> String {
@@ -2422,6 +2432,9 @@ class SyncUsers extends Command {
                 PHP_FUNCTION(demo_active) {}
                 #if 0
                 PHP_FUNCTION(demo_removed) {}
+                #endif
+                #if 0 // disabled during refactor
+                PHP_FUNCTION(demo_commented) {}
                 #endif
             "#,
         );

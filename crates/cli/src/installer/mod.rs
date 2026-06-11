@@ -23,8 +23,10 @@ pub struct InstallCtx<'a> {
     /// it; passed in rather than read from the environment so targets are
     /// unit-testable without mutating process env.
     pub home: &'a Path,
-    /// Absolute project root, baked into the registered server args.
+    /// Absolute project root (for display and project-local config paths).
     pub project: &'a Path,
+    /// Canonical UTF-8 project root baked into `codesage mcp --project`.
+    pub project_utf8: &'a str,
     /// Global (user-level) vs project-local registration. Some targets
     /// (Codex) are global-only and ignore this.
     pub global: bool,
@@ -88,13 +90,13 @@ pub(crate) fn read_config(path: &Path, default_when_absent: &str) -> Result<Stri
 /// The argv CodeSage registers for every agent: the `codesage` binary plus
 /// `mcp --project <abs>`. Returned split so TOML (separate command/args) and
 /// JSON (single command array) targets can each shape it.
-pub(crate) fn mcp_command_args(project: &Path) -> (String, Vec<String>) {
+pub(crate) fn mcp_command_args(project_utf8: &str) -> (String, Vec<String>) {
     (
         "codesage".to_string(),
         vec![
             "mcp".to_string(),
             "--project".to_string(),
-            project.to_string_lossy().into_owned(),
+            project_utf8.to_string(),
         ],
     )
 }
@@ -119,7 +121,7 @@ mod tests {
 
     #[test]
     fn mcp_command_args_bakes_project() {
-        let (cmd, args) = mcp_command_args(Path::new("/abs/proj"));
+        let (cmd, args) = mcp_command_args("/abs/proj");
         assert_eq!(cmd, "codesage");
         assert_eq!(args, vec!["mcp", "--project", "/abs/proj"]);
     }

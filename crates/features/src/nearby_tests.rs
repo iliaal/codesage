@@ -122,7 +122,7 @@ fn file_relates_to(seed: &FeatureSeed, stem: &str, dir: &str, candidate: &str) -
         if always_attach_in_convention_dir {
             return true;
         }
-        if stem_match(candidate, stem) {
+        if stem_match(candidate, stem) && same_stem_scope(seed.entry_path.as_str(), candidate) {
             return true;
         }
     }
@@ -250,7 +250,8 @@ fn is_test_file(path: &str, language: Language) -> bool {
 fn same_stem_scope(entry: &str, candidate: &str) -> bool {
     match (monorepo_member_root(entry), monorepo_member_root(candidate)) {
         (Some(e), Some(c)) => e == c,
-        _ => true,
+        (Some(_), None) | (None, Some(_)) => false,
+        (None, None) => true,
     }
 }
 
@@ -390,6 +391,20 @@ mod tests {
         assert!(
             t.contains(&"other/widget_test.py".to_string()),
             "separator-boundary stem match should attach: {t:?}"
+        );
+    }
+
+    #[test]
+    fn monorepo_entry_does_not_attach_root_convention_tests() {
+        let s = seed("packages/api/src/index.ts", Language::TypeScript);
+        let all = vec![
+            "packages/api/src/index.ts".to_string(),
+            "tests/index.test.ts".to_string(),
+        ];
+        let t = nearby_tests(&s, &all);
+        assert!(
+            !t.contains(&"tests/index.test.ts".to_string()),
+            "root tests/ must not attach to a packages/* entry: {t:?}"
         );
     }
 

@@ -862,14 +862,24 @@ fn home_dir() -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("$HOME is not set; cannot resolve agent config paths"))
 }
 
+fn canonical_project_utf8() -> Result<(PathBuf, String)> {
+    let root = find_project_root()?;
+    let canon = std::fs::canonicalize(&root).unwrap_or(root);
+    let utf8 = canon
+        .to_str()
+        .with_context(|| format!("project path is not valid UTF-8: {}", canon.display()))?
+        .to_owned();
+    Ok((canon, utf8))
+}
+
 fn cmd_install(target: &str, global: bool) -> Result<()> {
-    let project = find_project_root()?;
-    let project = std::fs::canonicalize(&project).unwrap_or(project);
+    let (project, project_utf8) = canonical_project_utf8()?;
     let home = home_dir()?;
     let targets = resolve_install_targets(target)?;
     let ctx = installer::InstallCtx {
         home: &home,
         project: &project,
+        project_utf8: &project_utf8,
         global,
     };
     for t in &targets {
@@ -895,13 +905,13 @@ fn cmd_install(target: &str, global: bool) -> Result<()> {
 }
 
 fn cmd_uninstall(target: &str, global: bool) -> Result<()> {
-    let project = find_project_root()?;
-    let project = std::fs::canonicalize(&project).unwrap_or(project);
+    let (project, project_utf8) = canonical_project_utf8()?;
     let home = home_dir()?;
     let targets = resolve_install_targets(target)?;
     let ctx = installer::InstallCtx {
         home: &home,
         project: &project,
+        project_utf8: &project_utf8,
         global,
     };
     for t in &targets {
@@ -929,7 +939,15 @@ fn cmd_install_hooks() -> Result<()> {
 
     let codesage_bin =
         std::env::current_exe().context("resolving current_exe for git hook body")?;
-    let codesage_path = codesage_bin.display().to_string();
+    let codesage_path = codesage_bin
+        .to_str()
+        .with_context(|| {
+            format!(
+                "codesage binary path is not valid UTF-8: {}",
+                codesage_bin.display()
+            )
+        })?
+        .to_owned();
 
     // Background indexers run niced + ionice'd so they can't soak the foreground.
     // `nice` is portable; `ionice` is Linux-only (util-linux), gated on `command -v`
@@ -2158,10 +2176,25 @@ fn cmd_cleanup(dry_run: bool) -> Result<()> {
     let size_before = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
     let tables = db.list_vec_tables()?;
+    if active_table.is_empty() && !tables.is_empty() {
+        bail!(
+            "no active semantic table for model {}; run `codesage index` for this model before \
+             dropping orphan vec tables (found {} table(s) that would all be treated as orphans)",
+            emb_config.model,
+            tables.len()
+        );
+    }
     let mut dropped = 0;
 
     println!("Active model:  {}", emb_config.model);
-    println!("Active table:  {active_table}");
+    println!(
+        "Active table:  {}",
+        if active_table.is_empty() {
+            "(none)"
+        } else {
+            &active_table
+        }
+    );
     println!("DB size before: {}", format_bytes(size_before));
     println!();
 
