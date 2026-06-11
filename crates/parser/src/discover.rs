@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -129,8 +130,16 @@ pub fn discover_files_with_excludes(
                 );
                 return WalkState::Continue;
             }
-            let content = match std::fs::read(path) {
-                Ok(c) => c,
+            let content = match read_indexable_content(path) {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    tracing::warn!(
+                        path = %rel_path,
+                        cap = MAX_INDEXABLE_FILE_BYTES,
+                        "skipping oversized file (post-read or TOCTOU growth)"
+                    );
+                    return WalkState::Continue;
+                }
                 Err(e) => {
                     // Skip an individual unreadable file rather than aborting the
                     // whole index — matching the oversized-file branch above. A
@@ -178,6 +187,20 @@ pub fn discover_files_with_excludes(
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
+}
+
+/// Read up to `MAX_INDEXABLE_FILE_BYTES` bytes. Returns `Ok(None)` when the
+/// file exceeds the cap (including a TOCTOU growth between metadata and read).
+fn read_indexable_content(path: &Path) -> Result<Option<Vec<u8>>> {
+    let file = std::fs::File::open(path)?;
+    let cap = MAX_INDEXABLE_FILE_BYTES;
+    let mut limited = file.take(cap.saturating_add(1));
+    let mut content = Vec::new();
+    limited.read_to_end(&mut content)?;
+    if content.len() as u64 > cap {
+        return Ok(None);
+    }
+    Ok(Some(content))
 }
 
 fn exclude_matches_path(excludes: &GlobSet, rel_path: &str, is_dir: bool) -> bool {

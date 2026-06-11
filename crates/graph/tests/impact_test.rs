@@ -421,6 +421,81 @@ fn export_context_for_qualified_symbol_uses_exact_callers() {
 }
 
 #[test]
+fn impact_by_ambiguous_bare_name_requires_disambiguation() {
+    let (_dir, db) = setup_qualified_rust_project();
+
+    let req = ImpactRequest {
+        target: ImpactTarget::Symbol {
+            name: "open".to_string(),
+        },
+        depth: 1,
+        source_only: false,
+    };
+
+    let err = impact_analysis(&db, &req).unwrap_err();
+    assert!(
+        err.to_string().contains("ambiguous symbol"),
+        "expected disambiguation error, got: {err:#}"
+    );
+}
+
+fn setup_ambiguous_helper_rust_project() -> (tempfile::TempDir, Database) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    std::fs::write(root.join("helpers_a.rs"), b"pub fn helper() -> i32 { 1 }\n").unwrap();
+    std::fs::write(root.join("helpers_b.rs"), b"pub fn helper() -> i32 { 2 }\n").unwrap();
+    std::fs::write(
+        root.join("service.rs"),
+        b"use crate::helpers_a::helper;\npub fn run() { let _ = helper(); }\n",
+    )
+    .unwrap();
+
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+    insert_chunk(
+        &db,
+        "helpers_a.rs",
+        "rust",
+        "pub fn helper() -> i32 { 1 }\n",
+        1,
+    );
+    insert_chunk(
+        &db,
+        "service.rs",
+        "rust",
+        "use crate::helpers_a::helper;\npub fn run() { let _ = helper(); }\n",
+        3,
+    );
+    (dir, db)
+}
+
+#[test]
+fn export_context_callees_resolve_imported_helper_not_homonym() {
+    let (_dir, db) = setup_ambiguous_helper_rust_project();
+
+    let req = ExportRequest {
+        query: None,
+        symbol: Some("run".to_string()),
+        limit: 10,
+        include_callers: false,
+        include_callees: true,
+    };
+
+    let bundle = codesage_graph::query::export_context_for_symbol(&db, "run", &req).unwrap();
+    let related_paths: Vec<String> = bundle.related.iter().map(|r| r.file_path.clone()).collect();
+
+    assert!(
+        related_paths.iter().any(|p| p.ends_with("helpers_a.rs")),
+        "imported helper should be included, got {related_paths:?}"
+    );
+    assert!(
+        !related_paths.iter().any(|p| p.ends_with("helpers_b.rs")),
+        "unimported homonym helper must not appear: {related_paths:?}"
+    );
+}
+
+#[test]
 fn export_context_for_symbol_includes_callees() {
     let (_dir, db) = setup_callee_rust_project();
 

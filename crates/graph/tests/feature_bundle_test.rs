@@ -182,6 +182,85 @@ fn entry_chunk_overlaps_entry_symbol_not_first_chunk() {
 }
 
 #[test]
+fn feature_bundle_include_callers_and_callees() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"acme\"\nversion = \"0.1.0\"\n",
+    );
+    write(root, "src/helpers.rs", "pub fn helper() {}\n");
+    write(
+        root,
+        "src/main.rs",
+        "mod helpers;\nuse helpers::helper;\nfn main() { helper(); }\n",
+    );
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+    map_features(root, &db, &[]).unwrap();
+    seed_chunk(&db, "src/helpers.rs", "rust", "pub fn helper() {}\n");
+    seed_chunk(
+        &db,
+        "src/main.rs",
+        "rust",
+        "mod helpers;\nuse helpers::helper;\nfn main() { helper(); }\n",
+    );
+
+    let features = db.features_for_file("src/main.rs").unwrap();
+    let main_feature = features
+        .iter()
+        .find(|f| f.entry_path == "src/main.rs")
+        .expect("main feature mapped");
+
+    let bundle = feature_bundle(&db, &main_feature.feature_id, true, true, 10).unwrap();
+    let related_paths: Vec<&str> = bundle
+        .related
+        .iter()
+        .map(|c| c.file_path.as_str())
+        .collect();
+    assert!(
+        related_paths.contains(&"src/helpers.rs"),
+        "callee helper file should appear in related[], got {related_paths:?}"
+    );
+}
+
+#[test]
+fn entry_chunk_present_when_owned_lib_sorts_before_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"acme\"\nversion = \"0.1.0\"\n",
+    );
+    write(root, "src/lib.rs", "pub fn lib_fn() {}\n");
+    write(root, "src/main.rs", "fn main() {}\n");
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+    map_features(root, &db, &[]).unwrap();
+    seed_chunk(&db, "src/lib.rs", "rust", "pub fn lib_fn() {}\n");
+    seed_chunk(&db, "src/main.rs", "rust", "use std::io;\nfn main() {}\n");
+
+    let features = db.features_for_file("src/main.rs").unwrap();
+    let main_feature = features
+        .iter()
+        .find(|f| f.entry_path == "src/main.rs")
+        .expect("main feature mapped");
+
+    let bundle = feature_bundle(&db, &main_feature.feature_id, false, false, 1).unwrap();
+    let primary_paths: Vec<&str> = bundle
+        .primary
+        .iter()
+        .map(|c| c.file_path.as_str())
+        .collect();
+    assert!(
+        primary_paths.contains(&"src/main.rs"),
+        "entry file must stay in primary[] even with a low limit and owned lib.rs, got {primary_paths:?}"
+    );
+}
+
+#[test]
 fn missing_chunks_yield_empty_primary_but_keep_metadata() {
     // Feature mapped but never semantically indexed: the bundle returns
     // metadata + the entry symbol definition (loaded from the symbol

@@ -64,13 +64,15 @@ pub fn map_features(
     let mut updated = 0usize;
     // Snapshot of repo files for the nearby-test walker. Capped to keep
     // big repos under a couple seconds of wall-time.
-    let all_files = walk_files(root, root, 50_000, ctx.excludes);
+    const MAPPER_WALK_CAP: usize = 50_000;
+    let all_files = walk_files(root, root, MAPPER_WALK_CAP, ctx.excludes);
+    let walk_truncated = all_files.len() >= MAPPER_WALK_CAP;
     db.execute_batch(|db| {
         for seed in &seeds {
             if !ctx.allowed(&seed.entry_path) {
                 continue;
             }
-            let mut record = build_record(db, seed, &all_files)?;
+            let mut record = build_record(db, seed, &all_files, walk_truncated)?;
             // Final safety net: even when a mapper forgets to filter, no
             // FeatureFileRef should reference a path the structural
             // indexer excludes. Drop any leaked refs before persisting.
@@ -173,7 +175,12 @@ fn collect_seeds(ctx: &MapperContext) -> Result<CollectedSeeds> {
     })
 }
 
-fn build_record(db: &Database, seed: &FeatureSeed, all_files: &[String]) -> Result<FeatureRecord> {
+fn build_record(
+    db: &Database,
+    seed: &FeatureSeed,
+    all_files: &[String],
+    walk_truncated: bool,
+) -> Result<FeatureRecord> {
     let disc = seed.discriminator();
     let feature_id = feature_id::build(seed.kind, seed.source, &seed.entry_path, &disc);
 
@@ -221,8 +228,13 @@ fn build_record(db: &Database, seed: &FeatureSeed, all_files: &[String]) -> Resu
                 reason: Some("seed test".to_string()),
             });
     }
-    // Nearby-test discovery from filesystem conventions.
-    let nearby = nearby_tests(seed, all_files);
+    // Nearby-test discovery from filesystem conventions. Skip when the repo
+    // walk hit its cap — partial file lists produce false-negative test matches.
+    let nearby = if walk_truncated {
+        Vec::new()
+    } else {
+        nearby_tests(seed, all_files)
+    };
     for path in nearby {
         files_by_path.entry(path.clone()).or_insert(FeatureFileRef {
             path,
@@ -331,7 +343,7 @@ mod tests {
             test_prefixes: Vec::new(),
         };
         let db = Database::open_in_memory().unwrap();
-        let record = build_record(&db, &seed, &[]).unwrap();
+        let record = build_record(&db, &seed, &[], false).unwrap();
 
         let main_refs: Vec<_> = record
             .files
@@ -642,7 +654,7 @@ mod tests {
             tests: Vec::new(),
             test_prefixes: Vec::new(),
         };
-        let mut record = build_record(&db, &seed, &[]).unwrap();
+        let mut record = build_record(&db, &seed, &[], false).unwrap();
         assert!(
             record
                 .trust_boundaries

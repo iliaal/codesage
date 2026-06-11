@@ -173,9 +173,22 @@ fn probe_one(py: &str) -> Option<Vec<PathBuf>> {
             .lines()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
+            .filter_map(validate_site_packages_dir)
             .collect(),
     )
+}
+
+fn validate_site_packages_dir(line: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(line);
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return None;
+    }
+    let name = path.file_name().and_then(|n| n.to_str())?;
+    if name != "site-packages" && name != "dist-packages" {
+        return None;
+    }
+    Some(path)
 }
 
 /// Verifies that the current Linux process has the CUDA runtime + cuDNN +

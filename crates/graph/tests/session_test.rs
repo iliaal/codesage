@@ -191,6 +191,52 @@ fn session_start_overwrites_existing_snapshot() {
     assert!(diff.new_files.is_empty());
 }
 
+#[cfg(unix)]
+#[test]
+fn session_start_refuses_symlinked_snapshot_path() {
+    use std::os::unix::fs::symlink;
+
+    let (dir, db) = setup_project_with_codesage_dir();
+    write_acyclic_php(dir.path());
+    full_index(dir.path(), &db, &[], false).unwrap();
+
+    let sessions_dir = dir.path().join(".codesage/sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    let snap_path = sessions_dir.join("default.json");
+    let target = dir.path().join("victim.txt");
+    std::fs::write(&target, b"{}").unwrap();
+    if snap_path.exists() {
+        std::fs::remove_file(&snap_path).unwrap();
+    }
+    symlink(&target, &snap_path).unwrap();
+
+    let err = session_start(dir.path(), &db, "default").unwrap_err();
+    assert!(
+        err.to_string().contains("symlink"),
+        "expected symlink refusal, got: {err:#}"
+    );
+}
+
+#[test]
+fn session_end_rejects_tampered_session_id() {
+    let (dir, db) = setup_project_with_codesage_dir();
+    write_acyclic_php(dir.path());
+    full_index(dir.path(), &db, &[], false).unwrap();
+    session_start(dir.path(), &db, "default").unwrap();
+
+    let snap_path = dir.path().join(".codesage/sessions/default.json");
+    let raw = std::fs::read_to_string(&snap_path).unwrap();
+    let tampered = raw.replace("\"session_id\": \"default\"", "\"session_id\": \"other\"");
+    std::fs::write(&snap_path, tampered).unwrap();
+
+    let err = session_end(dir.path(), &db, "default").unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("session_id mismatch"),
+        "expected tamper rejection, got: {msg}"
+    );
+}
+
 #[test]
 fn session_start_rejects_invalid_session_id() {
     let (dir, db) = setup_project_with_codesage_dir();

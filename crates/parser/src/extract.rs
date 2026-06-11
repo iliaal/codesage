@@ -241,7 +241,7 @@ pub fn extract_symbols(
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, root, source);
 
-    let namespace = match language {
+    let file_namespace = match language {
         Language::Php => find_php_namespace(&root, source),
         Language::Java => find_java_package(&root, source),
         _ => None,
@@ -316,6 +316,11 @@ pub fn extract_symbols(
         let qualified_name = if language == Language::Cpp {
             cpp_qualified_name(&name, &captured_name, kind, &def_node, source)
         } else {
+            let namespace = match language {
+                Language::Php => find_php_namespace_for_node(&def_node, &root, source),
+                Language::Java => file_namespace.clone(),
+                _ => None,
+            };
             build_qualified_name(&name, kind, &def_node, source, language, &namespace)
         };
 
@@ -354,6 +359,39 @@ fn find_php_namespace(root: &Node, source: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+/// Resolve the PHP namespace for a symbol: innermost braced `namespace { }`
+/// block first, otherwise the most recent file-level `namespace Name;`
+/// declaration before the symbol.
+fn find_php_namespace_for_node(node: &Node, root: &Node, source: &[u8]) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "namespace_definition"
+            && let Some(name_node) = parent.child_by_field_name("name")
+        {
+            return name_node.utf8_text(source).ok().map(str::to_string);
+        }
+        current = parent.parent();
+    }
+    find_php_namespace_before_offset(root, source, node.start_byte())
+}
+
+fn find_php_namespace_before_offset(root: &Node, source: &[u8], offset: usize) -> Option<String> {
+    let mut cursor = root.walk();
+    let mut current: Option<String> = None;
+    for child in root.children(&mut cursor) {
+        if child.start_byte() > offset {
+            break;
+        }
+        if child.kind() == "namespace_definition"
+            && let Some(name_node) = child.child_by_field_name("name")
+            && let Ok(name) = name_node.utf8_text(source)
+        {
+            current = Some(name.to_string());
+        }
+    }
+    current
 }
 
 fn find_java_package(root: &Node, source: &[u8]) -> Option<String> {
@@ -491,6 +529,48 @@ fn cpp_qualified_name(
     parts.join("::")
 }
 
+/// Collect enclosing Java type names from outermost to innermost (e.g.
+/// `["Outer", "Inner"]` for a method inside `Outer.Inner`).
+fn find_java_enclosing_type_names(node: &Node, source: &[u8]) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration" => {
+                if let Some(name_node) = parent.child_by_field_name("name")
+                    && let Ok(text) = name_node.utf8_text(source)
+                {
+                    parts.push(text.to_string());
+                }
+            }
+            _ => {}
+        }
+        current = parent.parent();
+    }
+    parts.reverse();
+    parts
+}
+
+fn java_qualified_name(
+    name: &str,
+    _kind: SymbolKind,
+    def_node: &Node,
+    source: &[u8],
+    package: &Option<String>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(pkg) = package {
+        parts.push(pkg.clone());
+    }
+    let enclosing = find_java_enclosing_type_names(def_node, source);
+    parts.extend(enclosing);
+    parts.push(name.to_string());
+    parts.join(".")
+}
+
 fn find_parent_class_name<'a>(node: &Node, source: &'a [u8]) -> Option<&'a str> {
     let mut current = node.parent();
     while let Some(parent) = current {
@@ -565,7 +645,7 @@ fn build_qualified_name(
         // exists only to keep the match exhaustive; the dispatcher never
         // reaches here for Cpp.
         Language::Cpp => name.to_string(),
-        Language::Java => join_qualified(name, kind, def_node, source, namespace, "."),
+        Language::Java => java_qualified_name(name, kind, def_node, source, namespace),
         Language::Rust => {
             if kind == SymbolKind::Method
                 && let Some(type_name) = find_parent_class_name(def_node, source)

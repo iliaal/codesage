@@ -27,6 +27,20 @@ fn parse_feature_role(s: &str) -> rusqlite::Result<FeatureFileRole> {
     row_enum(s, FeatureFileRole::parse, "FeatureFileRole")
 }
 
+fn escape_like_pattern(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '%' | '_' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn parse_language_loose(s: &str) -> rusqlite::Result<Language> {
     row_enum(s, Language::parse, "Language")
 }
@@ -200,8 +214,8 @@ impl Database {
             // tag string (with quote anchors) — `tag="framework"` would
             // miss `framework:react-router` even though the doc above
             // promises "tag substring" semantics.
-            sql.push_str(" AND tags LIKE ?");
-            binds.push(Box::new(format!("%{t}%")));
+            sql.push_str(" AND tags LIKE ? ESCAPE '\\'");
+            binds.push(Box::new(format!("%{}%", escape_like_pattern(t))));
         }
         sql.push_str(" ORDER BY kind, entry_path, feature_id");
         if limit > 0 {

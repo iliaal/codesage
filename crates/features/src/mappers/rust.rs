@@ -118,7 +118,7 @@ fn seed_for_package(
                 test_command: None,
                 language: Language::Rust,
                 tags: vec!["rust".to_string(), "library".to_string()],
-                owned_files: Vec::new(),
+                owned_files: library_owned_files(ctx, pkg_dir, &entry),
                 context_files: cargo_toml_context(ctx, pkg_dir),
                 tests: Vec::new(),
                 test_prefixes: vec![rel_path(root, &pkg_dir.join("tests"))],
@@ -196,6 +196,23 @@ fn seed_for_package(
         }
     }
     Ok(())
+}
+
+fn library_owned_files(ctx: &MapperContext, pkg_dir: &Path, entry_path: &str) -> Vec<SeedFile> {
+    use crate::mappers::shared::walk_files;
+    let src_dir = pkg_dir.join("src");
+    if !is_safe_dir(ctx.root, &src_dir) {
+        return Vec::new();
+    }
+    walk_files(ctx.root, &src_dir, 10_000, ctx.excludes)
+        .into_iter()
+        .filter(|rel| rel.ends_with(".rs") && rel != entry_path && !rel.starts_with("src/bin/"))
+        .filter(|rel| ctx.allowed(rel))
+        .map(|rel| SeedFile {
+            path: rel,
+            reason: "package source".to_string(),
+        })
+        .collect()
 }
 
 fn lib_rs_as_owned(ctx: &MapperContext, pkg_dir: &Path) -> Vec<SeedFile> {

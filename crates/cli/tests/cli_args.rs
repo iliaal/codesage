@@ -18,12 +18,15 @@ use std::process::Command;
 #[test]
 fn non_utf8_project_arg_does_not_panic_at_startup() {
     let bin = env!("CARGO_BIN_EXE_codesage");
-    let bad = OsStr::from_bytes(b"/tmp/\xff\xfe-not-a-project");
+    let dir = tempfile::tempdir().unwrap();
+    let bad_name = OsStr::from_bytes(b"\xff\xfe-not-a-project");
+    let bad = dir.path().join(bad_name);
+    fs::create_dir(&bad).expect("create non-UTF-8 project dir");
 
     let out = Command::new(bin)
         .arg("mcp")
         .arg("--project")
-        .arg(bad)
+        .arg(&bad)
         .output()
         .expect("spawn codesage");
 
@@ -31,6 +34,10 @@ fn non_utf8_project_arg_does_not_panic_at_startup() {
     assert!(
         !out.status.success(),
         "non-UTF-8 --project must fail cleanly, not be silently accepted"
+    );
+    assert!(
+        stderr.contains("UTF-8") || stderr.contains("utf-8"),
+        "expected UTF-8 rejection message, got:\n{stderr}"
     );
     assert!(
         !stderr.contains("panicked") && !stderr.contains("invalid utf-8"),

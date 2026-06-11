@@ -212,6 +212,13 @@ mod tests {
     }
 
     #[test]
+    fn rust_serde_json_yields_serialization() {
+        let refs = vec![imp("serde_json::from_str")];
+        let b = derive_from_refs(&refs, Language::Rust);
+        assert_eq!(b, vec![TrustBoundary::Serialization]);
+    }
+
+    #[test]
     fn rust_dedupes_when_multiple_imports_share_boundary() {
         let refs = vec![imp("std::fs"), imp("std::fs::File"), imp("tokio::fs::read")];
         let b = derive_from_refs(&refs, Language::Rust);

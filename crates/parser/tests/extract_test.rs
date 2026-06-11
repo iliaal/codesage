@@ -29,6 +29,23 @@ fn php_extracts_all_symbol_types() {
 }
 
 #[test]
+fn php_multi_namespace_blocks_use_enclosing_namespace() {
+    let source = br#"<?php
+namespace A;
+class First {}
+
+namespace B;
+class Second {}
+"#;
+    let tree = parse_file(source, Language::Php).unwrap();
+    let syms = extract_symbols(&tree, source, Language::Php, "multi.php").unwrap();
+    let second = syms.iter().find(|s| s.name == "Second").unwrap();
+    assert_eq!(second.qualified_name, "B\\Second");
+    let first = syms.iter().find(|s| s.name == "First").unwrap();
+    assert_eq!(first.qualified_name, "A\\First");
+}
+
+#[test]
 fn php_qualified_names() {
     let syms = symbols_for("sample.php", Language::Php);
 

@@ -137,6 +137,7 @@ const RUST_RULES: &[TrustBoundaryRule] = &[
     rule("serde_xml_rs", MatchMode::PrefixDoubleColon, SERIALIZATION),
     rule("quick_xml", MatchMode::PrefixDoubleColon, SERIALIZATION),
     rule("bincode", MatchMode::PrefixDoubleColon, SERIALIZATION),
+    rule("serde_json", MatchMode::PrefixDoubleColon, SERIALIZATION),
     // concurrency
     rule(
         "std::sync::Mutex",

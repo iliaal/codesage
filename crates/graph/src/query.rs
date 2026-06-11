@@ -1406,9 +1406,25 @@ fn annotate_with_symbols(db: &Database, results: &mut [SearchResult]) -> Result<
     Ok(())
 }
 
+fn is_qualified_symbol_name(name: &str) -> bool {
+    name.contains('\\') || name.contains('.') || name.contains("::")
+}
+
 pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactEntry>> {
     let seed_symbols: Vec<Symbol> = match &req.target {
-        ImpactTarget::Symbol { name } => db.find_symbols(name, None)?,
+        ImpactTarget::Symbol { name } => {
+            let syms = db.find_symbols(name, None)?;
+            if !is_qualified_symbol_name(name) && syms.len() > 1 {
+                let candidates: Vec<String> =
+                    syms.iter().map(|s| s.qualified_name.clone()).collect();
+                anyhow::bail!(
+                    "ambiguous symbol '{name}': {} definitions — qualify with one of: {}",
+                    syms.len(),
+                    candidates.join(", ")
+                );
+            }
+            syms
+        }
         ImpactTarget::File { path } => db.symbols_for_file(path)?,
     };
 
@@ -2048,7 +2064,7 @@ fn add_callees_for_symbol(
         if !is_callee_reference(r.kind) {
             continue;
         }
-        for def in db.find_symbols(&r.to_name, None)? {
+        for def in resolve_callee_definitions(db, &sym.file_path, &r.to_name)? {
             let key = (
                 def.file_path.clone(),
                 def.qualified_name.clone(),
@@ -2064,6 +2080,76 @@ fn add_callees_for_symbol(
         }
     }
     Ok(())
+}
+
+fn resolve_callee_definitions(
+    db: &Database,
+    caller_file: &str,
+    to_name: &str,
+) -> Result<Vec<Symbol>> {
+    let candidates = db.find_symbols(to_name, None)?;
+    if is_qualified_symbol_name(to_name) {
+        return Ok(candidates
+            .into_iter()
+            .filter(|s| s.qualified_name == to_name || s.name == to_name)
+            .collect());
+    }
+    if candidates.len() <= 1 {
+        return Ok(candidates);
+    }
+    let import_refs = import_refs_for_file(db, caller_file)?;
+    let filtered: Vec<Symbol> = candidates
+        .into_iter()
+        .filter(|s| {
+            import_refs
+                .iter()
+                .any(|imp| import_ref_targets_symbol(imp, to_name, s))
+        })
+        .collect();
+    Ok(filtered)
+}
+
+fn import_refs_for_file(db: &Database, caller_file: &str) -> Result<Vec<String>> {
+    let mut refs = Vec::new();
+    if let Some(file_id) = db.file_id_for_path(caller_file)? {
+        for (to_name, kind) in db.refs_outgoing_for_file_id(file_id)? {
+            if matches!(
+                kind,
+                ReferenceKind::Import | ReferenceKind::Include | ReferenceKind::TraitUse
+            ) {
+                refs.push(to_name);
+            }
+        }
+    }
+    refs.extend(db.list_file_dependencies(caller_file)?.imports);
+    refs.sort();
+    refs.dedup();
+    Ok(refs)
+}
+
+/// True when `import_ref` (e.g. `crate::helpers_a::helper`) names `sym` in
+/// `sym_file` even if the symbol table only stores the bare tail (`helper`).
+fn import_ref_targets_symbol(import_ref: &str, callee_name: &str, sym: &Symbol) -> bool {
+    if import_ref == sym.qualified_name || import_ref == sym.name {
+        return true;
+    }
+    let Some((module, tail)) = import_ref.rsplit_once("::") else {
+        return import_ref == callee_name && import_ref == sym.name;
+    };
+    if tail != callee_name && tail != sym.name {
+        return false;
+    }
+    let module_path = module
+        .strip_prefix("crate::")
+        .unwrap_or(module)
+        .replace("::", "/");
+    let candidates = [
+        format!("{module_path}.rs"),
+        format!("{module_path}/mod.rs"),
+        format!("src/{module_path}.rs"),
+        format!("src/{module_path}/mod.rs"),
+    ];
+    candidates.iter().any(|c| c == &sym.file_path)
 }
 
 fn is_callee_reference(kind: ReferenceKind) -> bool {

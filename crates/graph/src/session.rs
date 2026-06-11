@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use codesage_protocol::{SessionDiff, SessionRiskEntry, SessionRiskRegression, SessionSnapshot};
 use codesage_storage::Database;
 
@@ -34,6 +34,10 @@ const RISK_REGRESSION_THRESHOLD: f64 = 0.05;
 /// is normal during active editing; one moving past 0.10 in delta is
 /// the kind of signal worth pausing on.
 const RISK_FAIL_THRESHOLD: f64 = 0.10;
+
+/// Upper bound on snapshot file size before read/parse. Large monorepos store
+/// full file lists; this caps hostile or corrupted snapshots.
+const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Take a snapshot of the current index state and persist it under
 /// `.codesage/sessions/<session_id>.json`. Overwrites any existing
@@ -109,6 +113,7 @@ pub fn session_end(project_root: &Path, db: &Database, session_id: &str) -> Resu
 
     let mut risk_regressions: Vec<SessionRiskRegression> = Vec::new();
     let mut max_risk_regression = 0.0_f64;
+    let mut risk_assessment_failed = false;
     for entry in &snapshot.top_risk_files {
         if !now_files_set.contains(entry.file.as_str()) {
             // File removed during the session — counted under removed_files,
@@ -119,6 +124,7 @@ pub fn session_end(project_root: &Path, db: &Database, session_id: &str) -> Resu
             Ok(r) => r.score,
             Err(e) => {
                 tracing::warn!(error = %e, file = %entry.file, "assess_risk failed during session_end");
+                risk_assessment_failed = true;
                 continue;
             }
         };
@@ -141,9 +147,17 @@ pub fn session_end(project_root: &Path, db: &Database, session_id: &str) -> Resu
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    let pass = new_cycles.is_empty() && max_risk_regression < RISK_FAIL_THRESHOLD;
+    let pass = new_cycles.is_empty()
+        && max_risk_regression < RISK_FAIL_THRESHOLD
+        && !risk_assessment_failed;
 
     let mut summary_notes = Vec::new();
+    if risk_assessment_failed {
+        summary_notes.push(
+            "risk reassessment failed for one or more baseline files — session gate failed closed"
+                .to_string(),
+        );
+    }
     if !new_cycles.is_empty() {
         let largest = new_cycles.iter().map(|c| c.len()).max().unwrap_or(0);
         summary_notes.push(format!(
@@ -316,17 +330,72 @@ fn write_snapshot(project_root: &Path, snap: &SessionSnapshot) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating sessions dir {}", parent.display()))?;
     }
+    reject_snapshot_symlink(&path)?;
     let json = serde_json::to_vec_pretty(snap).context("serializing snapshot")?;
-    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
+    ensure!(
+        json.len() as u64 <= MAX_SNAPSHOT_BYTES,
+        "snapshot payload too large to write ({} bytes, max {MAX_SNAPSHOT_BYTES})",
+        json.len()
+    );
+    let parent = path
+        .parent()
+        .context("snapshot path must have a parent directory")?;
+    let tmp_name = format!(
+        ".{}.tmp",
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("snapshot")
+    );
+    let tmp_path = parent.join(tmp_name);
+    std::fs::write(&tmp_path, &json)
+        .with_context(|| format!("writing temp snapshot {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, &path)
+        .with_context(|| format!("renaming {} to {}", tmp_path.display(), path.display()))?;
     Ok(())
 }
 
 fn read_snapshot(project_root: &Path, session_id: &str) -> Result<SessionSnapshot> {
     let path = snapshot_path(project_root, session_id);
+    reject_snapshot_symlink(&path)?;
+    let meta = std::fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+    ensure!(
+        meta.len() <= MAX_SNAPSHOT_BYTES,
+        "session snapshot {} is too large ({} bytes, max {MAX_SNAPSHOT_BYTES})",
+        path.display(),
+        meta.len()
+    );
     let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let snap: SessionSnapshot =
         serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+    ensure!(
+        snap.session_id == session_id,
+        "session snapshot session_id mismatch: expected '{session_id}', got '{}'",
+        snap.session_id
+    );
+    let now = now_unix();
+    ensure!(
+        snap.created_at <= now,
+        "session snapshot created_at is in the future ({})",
+        snap.created_at
+    );
     Ok(snap)
+}
+
+/// Refuse to read or write through a symlinked snapshot path — same posture as
+/// the MCP daemon's runtime-dir guard.
+fn reject_snapshot_symlink(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let meta =
+        std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    if meta.file_type().is_symlink() {
+        bail!(
+            "refusing to use session snapshot {}: it is a symlink",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

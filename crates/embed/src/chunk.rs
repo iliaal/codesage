@@ -38,7 +38,7 @@ pub fn chunk_text(content: &str, config: &ChunkConfig) -> Vec<Chunk> {
 
     let mut merged = merge_small_chunks(raw, config.min_chunk_size, config.chunk_size);
 
-    apply_overlap(&mut merged, content, config.overlap);
+    apply_overlap(&mut merged, content, config.overlap, config.chunk_size);
 
     merged
         .into_iter()
@@ -191,7 +191,7 @@ fn merge_small_chunks(segments: Vec<Segment>, min_size: usize, max_size: usize) 
     merged
 }
 
-fn apply_overlap(segments: &mut [Segment], text: &str, overlap: usize) {
+fn apply_overlap(segments: &mut [Segment], text: &str, overlap: usize, chunk_size: usize) {
     if segments.len() < 2 || overlap == 0 {
         return;
     }
@@ -200,6 +200,8 @@ fn apply_overlap(segments: &mut [Segment], text: &str, overlap: usize) {
         let prev_end = segments[i - 1].end;
         let target_start = prev_end.saturating_sub(overlap);
         let new_start = find_line_boundary_after(text, target_start);
+        let min_start = segments[i].end.saturating_sub(chunk_size);
+        let new_start = new_start.max(min_start);
         if new_start < segments[i].start {
             segments[i].start = new_start;
         }
@@ -292,6 +294,30 @@ mod tests {
         assert!(chunks.len() >= 2);
         for chunk in &chunks {
             assert!(chunk.text.len() <= 500 + 10);
+        }
+    }
+
+    #[test]
+    fn overlap_respects_chunk_size_ceiling() {
+        let line = "x".repeat(80);
+        let text = (0..30)
+            .map(|_| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let config = ChunkConfig {
+            chunk_size: 800,
+            min_chunk_size: 100,
+            overlap: 300,
+        };
+        let chunks = chunk_text(&text, &config);
+        assert!(chunks.len() >= 2);
+        for chunk in &chunks {
+            assert!(
+                chunk.text.len() <= config.chunk_size,
+                "chunk length {} exceeds cap {}",
+                chunk.text.len(),
+                config.chunk_size
+            );
         }
     }
 

@@ -145,16 +145,26 @@ impl Database {
     }
 
     pub fn delete_chunks_for_file(&self, file_path: &str) -> Result<usize> {
-        let sql = format!("DELETE FROM \"{}\" WHERE file_path = ?1", self.chunk_table);
-        let count = self.conn.execute(&sql, params![file_path])?;
-        let fts = self.fts_table();
-        let fts_sql = format!("DELETE FROM \"{fts}\" WHERE file_path = ?1");
-        // FTS5 DELETE by file_path relies on UNINDEXED columns being queryable
-        // by value; unicode61 tokenizer persists the column verbatim so this
-        // works. Errors bubble — silent FTS drift is the problem we're
-        // preventing.
-        let _ = self.conn.execute(&fts_sql, params![file_path])?;
-        Ok(count)
+        self.conn.execute_batch("SAVEPOINT delete_chunks")?;
+        let result = (|| -> Result<usize> {
+            let sql = format!("DELETE FROM \"{}\" WHERE file_path = ?1", self.chunk_table);
+            let count = self.conn.execute(&sql, params![file_path])?;
+            let fts = self.fts_table();
+            let fts_sql = format!("DELETE FROM \"{fts}\" WHERE file_path = ?1");
+            self.conn.execute(&fts_sql, params![file_path])?;
+            Ok(count)
+        })();
+        match result {
+            Ok(count) => {
+                self.conn.execute_batch("RELEASE delete_chunks")?;
+                Ok(count)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK TO delete_chunks");
+                let _ = self.conn.execute_batch("RELEASE delete_chunks");
+                Err(e)
+            }
+        }
     }
 
     pub fn search_knn(

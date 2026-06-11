@@ -378,7 +378,10 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codesage_protocol::{FileInfo, Language, Reference, Symbol};
+    use codesage_protocol::{
+        FeatureConfidence, FeatureKind, FeatureRecord, FileInfo, Language, Reference, Symbol,
+        TrustBoundary,
+    };
 
     fn make_file(path: &str) -> FileInfo {
         FileInfo {
@@ -538,6 +541,115 @@ mod tests {
         let deps = db.list_file_dependencies("src/target.rs").unwrap();
 
         assert_eq!(deps.imported_by, vec!["src/importer.rs".to_string()]);
+    }
+
+    #[test]
+    fn enumerate_file_import_edges_ignores_ambiguous_short_imports() {
+        let db = Database::open_in_memory().unwrap();
+        let target_id = db.upsert_file(&make_file("src/target.rs")).unwrap();
+        db.insert_symbols(
+            target_id,
+            &[make_qualified_symbol(
+                "Config",
+                "crate_a::Config",
+                SymbolKind::Class,
+            )],
+        )
+        .unwrap();
+        let other_id = db.upsert_file(&make_file("src/other.rs")).unwrap();
+        db.insert_symbols(
+            other_id,
+            &[make_qualified_symbol(
+                "Config",
+                "crate_b::Config",
+                SymbolKind::Class,
+            )],
+        )
+        .unwrap();
+        let importer_id = db.upsert_file(&make_file("src/importer.rs")).unwrap();
+        db.insert_references(
+            importer_id,
+            &[Reference {
+                from_file: "src/importer.rs".to_string(),
+                to_name: "Config".to_string(),
+                kind: ReferenceKind::Import,
+                ..make_reference("unused", ReferenceKind::Import)
+            }],
+        )
+        .unwrap();
+
+        let edges = db.enumerate_file_import_edges().unwrap();
+
+        assert!(
+            edges.is_empty(),
+            "ambiguous bare import should not produce file edges: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn upsert_file_clears_stale_trust_boundaries() {
+        let db = Database::open_in_memory().unwrap();
+        let file_id = db.upsert_file(&make_file("src/a.rs")).unwrap();
+        db.replace_file_trust_boundaries(file_id, &[TrustBoundary::Network])
+            .unwrap();
+        assert_eq!(db.file_trust_boundary_count().unwrap(), 1);
+
+        db.upsert_file(&make_file("src/a.rs")).unwrap();
+
+        assert_eq!(
+            db.file_trust_boundary_count().unwrap(),
+            0,
+            "re-index must drop stale trust-boundary rows"
+        );
+    }
+
+    #[test]
+    fn list_features_tag_filter_escapes_like_metacharacters() {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_feature(&FeatureRecord {
+            feature_id: "feat_wildcard".to_string(),
+            title: "Wildcard tag".to_string(),
+            summary: String::new(),
+            kind: FeatureKind::Library,
+            source: "test".to_string(),
+            confidence: FeatureConfidence::High,
+            entry_path: "src/lib.rs".to_string(),
+            entry_symbol: None,
+            entry_route: None,
+            entry_command: None,
+            test_command: None,
+            language: Language::Rust,
+            tags: vec!["%".to_string()],
+            trust_boundaries: Vec::new(),
+            files: Vec::new(),
+        })
+        .unwrap();
+        db.upsert_feature(&FeatureRecord {
+            feature_id: "feat_plain".to_string(),
+            title: "Plain tag".to_string(),
+            summary: String::new(),
+            kind: FeatureKind::Library,
+            source: "test".to_string(),
+            confidence: FeatureConfidence::High,
+            entry_path: "src/other.rs".to_string(),
+            entry_symbol: None,
+            entry_route: None,
+            entry_command: None,
+            test_command: None,
+            language: Language::Rust,
+            tags: vec!["rust".to_string()],
+            trust_boundaries: Vec::new(),
+            files: Vec::new(),
+        })
+        .unwrap();
+
+        let wildcard = db.list_features(None, None, Some("%"), 0).unwrap();
+        assert_eq!(wildcard.len(), 1);
+        assert_eq!(wildcard[0].feature_id, "feat_wildcard");
+
+        let plain = db.list_features(None, None, Some("rust"), 0).unwrap();
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0].feature_id, "feat_plain");
     }
 
     #[test]

@@ -32,6 +32,18 @@ fn has_ref(refs: &[codesage_protocol::Reference], to_name: &str, kind: Reference
 }
 
 #[test]
+fn java_nested_type_qualified_names() {
+    let syms = symbols_for("nested_types.java");
+    let visit = syms.iter().find(|s| s.name == "visit").unwrap();
+    assert_eq!(visit.qualified_name, "com.acme.nested.Outer.Inner.visit");
+    let inner = syms
+        .iter()
+        .find(|s| s.name == "Inner" && s.kind == SymbolKind::Class)
+        .unwrap();
+    assert_eq!(inner.qualified_name, "com.acme.nested.Outer.Inner");
+}
+
+#[test]
 fn java_simple_class_symbols_and_references() {
     let syms = symbols_for("simple_class.java");
     assert_eq!(syms.len(), 5);

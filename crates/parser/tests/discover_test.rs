@@ -1,4 +1,4 @@
-use codesage_parser::discover::discover_files_with_excludes;
+use codesage_parser::discover::{MAX_INDEXABLE_FILE_BYTES, discover_files_with_excludes};
 use codesage_protocol::Language;
 
 #[test]
@@ -144,6 +144,22 @@ fn sorted_by_path() {
     let files = discover_files_with_excludes(root, &[]).unwrap();
     let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
     assert_eq!(paths, vec!["a.py", "m.c", "z.py"]);
+}
+
+#[test]
+fn oversized_file_is_skipped_after_read_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let path = root.join("huge.py");
+    let bytes = vec![b'x'; (MAX_INDEXABLE_FILE_BYTES as usize) + 1];
+    std::fs::write(&path, &bytes).unwrap();
+
+    let files = discover_files_with_excludes(root, &[]).unwrap();
+    assert!(
+        files.is_empty(),
+        "file larger than MAX_INDEXABLE_FILE_BYTES must be skipped: {:?}",
+        files
+    );
 }
 
 #[cfg(unix)]

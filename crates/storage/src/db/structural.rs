@@ -88,6 +88,14 @@ impl Database {
             .execute("DELETE FROM symbols WHERE file_id = ?1", params![file_id])?;
         self.conn
             .execute("DELETE FROM refs WHERE from_file_id = ?1", params![file_id])?;
+        self.conn.execute(
+            "DELETE FROM file_trust_boundaries WHERE file_id = ?1",
+            params![file_id],
+        )?;
+        self.conn.execute(
+            "UPDATE files SET boundaries_derived_at = 0 WHERE id = ?1",
+            params![file_id],
+        )?;
 
         Ok(file_id)
     }
@@ -315,7 +323,18 @@ impl Database {
             SELECT DISTINCT f_from.path, f_to.path
             FROM refs r
             JOIN files f_from ON r.from_file_id = f_from.id
-            JOIN symbols s ON (s.name = r.to_name OR s.qualified_name = r.to_name)
+            JOIN symbols s ON (
+              s.qualified_name = r.to_name
+              OR (
+                s.name = r.to_name
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM symbols s2
+                  WHERE s2.name = r.to_name
+                    AND s2.file_id <> s.file_id
+                )
+              )
+            )
             JOIN files f_to ON s.file_id = f_to.id
             WHERE r.kind IN ('import', 'include', 'inheritance', 'trait_use')
               AND f_from.path <> f_to.path
