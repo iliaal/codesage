@@ -75,11 +75,26 @@ pub fn try_acquire(project_root: &Path) -> Result<LockOutcome> {
     // `File::try_lock` returns `Ok(())` on success and
     // `Err(TryLockError::WouldBlock)` on contention. Any other error
     // is a real IO failure we want to surface.
-    match file.try_lock() {
-        Ok(()) => Ok(LockOutcome::Acquired(IndexLock { _file: file })),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(LockOutcome::AlreadyHeld),
-        Err(std::fs::TryLockError::Error(e)) => {
-            Err(anyhow::Error::from(e).context(format!("try_lock on {}", path.display())))
+    //
+    // On Android (Rust ≤1.95), the stdlib `try_lock` returns
+    // `Unsupported` due to a missing `cfg` — bypass with direct
+    // `libc::flock` FFI. Remove when the toolchain catches up.
+    #[cfg(target_os = "android")]
+    {
+        match crate::flock_override::try_flock_exclusive(&file) {
+            Ok(()) => Ok(LockOutcome::Acquired(IndexLock { _file: file })),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(LockOutcome::AlreadyHeld),
+            Err(e) => Err(anyhow::Error::from(e).context(format!("flock on {}", path.display()))),
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        match file.try_lock() {
+            Ok(()) => Ok(LockOutcome::Acquired(IndexLock { _file: file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(LockOutcome::AlreadyHeld),
+            Err(std::fs::TryLockError::Error(e)) => {
+                Err(anyhow::Error::from(e).context(format!("try_lock on {}", path.display())))
+            }
         }
     }
 }

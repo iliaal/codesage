@@ -1,9 +1,12 @@
 mod daemon;
 mod doctor;
 mod drift;
+#[cfg(target_os = "android")]
+mod flock_override;
 mod installer;
 mod lockfile;
 mod mcp;
+mod statewatcher;
 mod util;
 
 use std::num::NonZeroUsize;
@@ -171,6 +174,9 @@ enum Commands {
         /// their tool calls route to this project automatically.
         #[arg(long)]
         project: Option<PathBuf>,
+        /// Enable the file watcher (statewatcher) on the given project root
+        #[arg(long)]
+        statewatcher: Option<PathBuf>,
     },
     /// Manage the shared MCP daemon (run in foreground, check status, stop)
     Daemon {
@@ -182,6 +188,10 @@ enum Commands {
         /// Override the daemon runtime directory
         #[arg(long, hide = true, global = true)]
         runtime_dir: Option<PathBuf>,
+
+        /// Enable the file watcher (statewatcher) on the given project root
+        #[arg(long)]
+        statewatcher: Option<PathBuf>,
     },
     /// Install git hooks for automatic reindexing
     InstallHooks,
@@ -371,6 +381,18 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Watch the project directory for file changes and reindex automatically.
+    /// Uses inotify/FSEvents to detect edits, creates, and deletes.
+    /// Debounces edits (default 1s), cascades to direct importers,
+    /// and falls back to bulk incremental on large batch events.
+    Statewatcher {
+        /// Project root directory to watch
+        #[arg(default_value = ".")]
+        project: Option<PathBuf>,
+        /// Debounce window in milliseconds (default 1000, env REINDEX_DEBOUNCE)
+        #[arg(long)]
+        reindex_debounce: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -455,7 +477,7 @@ pub(crate) fn load_project_config(root: &Path) -> Result<ProjectConfig> {
     toml::from_str(&content).with_context(|| format!("parsing {}", config_path.display()))
 }
 
-fn get_exclude_patterns(config: &ProjectConfig) -> Vec<String> {
+pub(crate) fn get_exclude_patterns(config: &ProjectConfig) -> Vec<String> {
     let mut patterns: Vec<String> = DEFAULT_EXCLUDE_PATTERNS
         .iter()
         .map(|s| s.to_string())
@@ -742,12 +764,14 @@ fn run(cli: Cli) -> Result<()> {
             direct,
             runtime_dir,
             project,
-        } => cmd_mcp(direct, runtime_dir, project),
+            statewatcher,
+        } => cmd_mcp(direct, runtime_dir, project, statewatcher),
         Commands::Daemon {
             action,
             runtime_dir,
+            statewatcher,
         } => match action.unwrap_or(DaemonAction::Run) {
-            DaemonAction::Run => cmd_daemon(runtime_dir),
+            DaemonAction::Run => cmd_daemon(runtime_dir, statewatcher),
             DaemonAction::Status => cmd_daemon_status(runtime_dir),
             DaemonAction::Stop => cmd_daemon_stop(runtime_dir),
         },
@@ -794,10 +818,19 @@ fn run(cli: Cli) -> Result<()> {
         } => cmd_feature_bundle(&id, include_callers, include_callees, limit, json),
         Commands::SessionStart { session_id, json } => cmd_session_start(&session_id, json),
         Commands::SessionEnd { session_id, json } => cmd_session_end(&session_id, json),
+        Commands::Statewatcher {
+            project,
+            reindex_debounce,
+        } => cmd_statewatcher(project, reindex_debounce),
     }
 }
 
-fn cmd_mcp(direct: bool, runtime_dir: Option<PathBuf>, project: Option<PathBuf>) -> Result<()> {
+fn cmd_mcp(
+    direct: bool,
+    runtime_dir: Option<PathBuf>,
+    project: Option<PathBuf>,
+    statewatcher: Option<PathBuf>,
+) -> Result<()> {
     // Canonicalize the default project to an absolute path so injected
     // tool-call args resolve regardless of the agent's cwd.
     let default_project = match project {
@@ -819,13 +852,17 @@ fn cmd_mcp(direct: bool, runtime_dir: Option<PathBuf>, project: Option<PathBuf>)
     if direct {
         rt.block_on(mcp::run_mcp_server(default_project))
     } else {
-        rt.block_on(daemon::run_mcp_shim(runtime_dir, default_project))
+        rt.block_on(daemon::run_mcp_shim(
+            runtime_dir,
+            default_project,
+            statewatcher,
+        ))
     }
 }
 
-fn cmd_daemon(runtime_dir: Option<PathBuf>) -> Result<()> {
+fn cmd_daemon(runtime_dir: Option<PathBuf>, statewatcher: Option<PathBuf>) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(daemon::run_daemon(runtime_dir))
+    rt.block_on(daemon::run_daemon(runtime_dir, statewatcher))
 }
 
 fn cmd_daemon_status(runtime_dir: Option<PathBuf>) -> Result<()> {
@@ -2111,6 +2148,38 @@ fn cmd_session_end(session_id: &str, json: bool) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+fn cmd_statewatcher(project: Option<PathBuf>, debounce_ms: Option<u64>) -> Result<()> {
+    let root = match project {
+        Some(p) => std::fs::canonicalize(&p)
+            .with_context(|| format!("resolving project path {}", p.display()))?,
+        None => find_project_root()?,
+    };
+
+    let config = load_project_config(&root)?;
+    let excludes = get_exclude_patterns(&config);
+    let emb_config = config.embedding.unwrap_or_default();
+    let debounce = debounce_ms.unwrap_or_else(statewatcher::resolve_debounce_ms);
+
+    let shutdown = statewatcher::register_shutdown_flag();
+
+    let db = db_path(&root);
+    let watcher_config = statewatcher::StateWatcherConfig {
+        project_root: root,
+        db_path: db,
+        embed_config: emb_config,
+        exclude_patterns: excludes,
+        debounce_ms: debounce,
+        shutdown,
+    };
+
+    eprintln!(
+        "Watching {} for file changes (debounce: {}ms)...",
+        watcher_config.project_root.display(),
+        debounce
+    );
+    statewatcher::run_statewatcher(watcher_config)
 }
 
 fn cmd_status() -> Result<()> {

@@ -15,7 +15,7 @@ mod unix {
         process::{Command, Stdio},
         sync::{
             Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         task::{Context as TaskContext, Poll},
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -127,10 +127,11 @@ mod unix {
     pub(crate) async fn run_mcp_shim(
         runtime_dir: Option<PathBuf>,
         default_project: Option<String>,
+        statewatcher: Option<PathBuf>,
     ) -> Result<()> {
         let paths = DaemonPaths::for_current_exe(runtime_dir)?;
         prepare_runtime_dir(&paths.runtime_dir)?;
-        let stream = ensure_daemon(&paths).await?;
+        let stream = ensure_daemon(&paths, statewatcher.as_ref()).await?;
         proxy_stdio(stream, default_project).await
     }
 
@@ -207,7 +208,10 @@ mod unix {
         )
     }
 
-    pub(crate) async fn run_daemon(runtime_dir: Option<PathBuf>) -> Result<()> {
+    pub(crate) async fn run_daemon(
+        runtime_dir: Option<PathBuf>,
+        statewatcher: Option<PathBuf>,
+    ) -> Result<()> {
         let paths = DaemonPaths::for_current_exe(runtime_dir)?;
         prepare_runtime_dir(&paths.runtime_dir)?;
 
@@ -240,6 +244,22 @@ mod unix {
         tracing::info!(socket = %paths.socket.display(), "codesage MCP daemon listening");
         let state = Arc::new(CodeSageServerState::new());
         let our_uid = unsafe { libc::getuid() };
+
+        // Spawn statewatcher task if requested.
+        let statewatcher_shutdown = if let Some(watch_root) = statewatcher {
+            let root = watch_root.clone();
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown_clone = shutdown.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = spawn_statewatcher_in_daemon(&root, shutdown_clone) {
+                    tracing::error!(error = %e, root = %root.display(), "statewatcher task failed");
+                }
+            });
+            tracing::info!(root = %watch_root.display(), "statewatcher task spawned");
+            Some(shutdown)
+        } else {
+            None
+        };
 
         // M6: install a shutdown signal so SIGTERM / SIGINT exit the
         // accept loop cleanly and remove socket + pid files. Without
@@ -335,8 +355,18 @@ mod unix {
                         break "idle";
                     }
                 }
-                _ = sigterm.recv() => break "SIGTERM",
-                _ = sigint.recv() => break "SIGINT",
+                _ = sigterm.recv() => {
+                    if let Some(ref sd) = statewatcher_shutdown {
+                        sd.store(true, Ordering::SeqCst);
+                    }
+                    break "SIGTERM";
+                }
+                _ = sigint.recv() => {
+                    if let Some(ref sd) = statewatcher_shutdown {
+                        sd.store(true, Ordering::SeqCst);
+                    }
+                    break "SIGINT";
+                }
             }
         };
         tracing::info!(
@@ -483,7 +513,10 @@ mod unix {
         }
     }
 
-    async fn ensure_daemon(paths: &DaemonPaths) -> Result<UnixStream> {
+    async fn ensure_daemon(
+        paths: &DaemonPaths,
+        statewatcher: Option<&PathBuf>,
+    ) -> Result<UnixStream> {
         if let Ok(stream) = UnixStream::connect(&paths.socket).await {
             return Ok(stream);
         }
@@ -507,7 +540,7 @@ mod unix {
                         );
                     }
                     remove_stale_socket(paths).await?;
-                    spawn_daemon(paths)?;
+                    spawn_daemon(paths, statewatcher)?;
                     return wait_for_socket(&paths.socket, START_TIMEOUT, paths).await;
                 }
                 None => {
@@ -621,7 +654,7 @@ mod unix {
     const LOG_ROTATE_AT_BYTES: u64 = 4 * 1024 * 1024;
     const LOG_KEEP_GENERATIONS: usize = 3;
 
-    fn spawn_daemon(paths: &DaemonPaths) -> Result<()> {
+    fn spawn_daemon(paths: &DaemonPaths, statewatcher: Option<&PathBuf>) -> Result<()> {
         let exe = std::env::current_exe().context("resolving current executable")?;
         rotate_log_if_large(&paths.log);
         let log = OpenOptions::new()
@@ -629,11 +662,14 @@ mod unix {
             .append(true)
             .open(&paths.log)
             .with_context(|| format!("opening daemon log {}", paths.log.display()))?;
-        Command::new(exe)
-            .arg("daemon")
+        let mut cmd = Command::new(exe);
+        cmd.arg("daemon")
             .arg("--runtime-dir")
-            .arg(&paths.runtime_dir)
-            .stdin(Stdio::null())
+            .arg(&paths.runtime_dir);
+        if let Some(root) = statewatcher {
+            cmd.arg("--statewatcher").arg(root);
+        }
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::from(
                 log.try_clone().context("cloning daemon log for stdout")?,
             ))
@@ -1168,6 +1204,27 @@ mod unix {
         }
     }
 
+    fn spawn_statewatcher_in_daemon(root: &Path, shutdown: Arc<AtomicBool>) -> Result<()> {
+        use crate::PROJECT_DIR;
+        use crate::statewatcher::{self, StateWatcherConfig};
+
+        let config = crate::load_project_config(root)?;
+        let emb_config = config.embedding.clone().unwrap_or_default();
+        let excludes = crate::get_exclude_patterns(&config);
+        let debounce = statewatcher::resolve_debounce_ms();
+
+        let watcher_config = StateWatcherConfig {
+            project_root: root.to_path_buf(),
+            db_path: root.join(PROJECT_DIR).join("index.db"),
+            embed_config: emb_config,
+            exclude_patterns: excludes,
+            debounce_ms: debounce,
+            shutdown,
+        };
+
+        statewatcher::run_statewatcher(watcher_config)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1522,6 +1579,7 @@ pub(crate) use unix::{run_daemon, run_daemon_status, run_daemon_stop, run_mcp_sh
 pub(crate) async fn run_mcp_shim(
     runtime_dir: Option<PathBuf>,
     default_project: Option<String>,
+    _statewatcher: Option<PathBuf>,
 ) -> Result<()> {
     // L3: surface the unsupported flag instead of silently ignoring it.
     // Non-Unix has no daemon path; --runtime-dir would have configured
@@ -1533,7 +1591,10 @@ pub(crate) async fn run_mcp_shim(
 }
 
 #[cfg(not(unix))]
-pub(crate) async fn run_daemon(_runtime_dir: Option<PathBuf>) -> Result<()> {
+pub(crate) async fn run_daemon(
+    _runtime_dir: Option<PathBuf>,
+    _statewatcher: Option<PathBuf>,
+) -> Result<()> {
     bail!("codesage MCP daemon requires Unix domain sockets")
 }
 

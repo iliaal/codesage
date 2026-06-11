@@ -10,10 +10,12 @@ pub use git_history::{
     feature_touched_since, find_coupling, git_history_index, git_history_index_with_options,
     recommend_tests,
 };
-pub use index::{full_index, incremental_index};
+pub use index::{full_index, incremental_index, index_files, remove_files};
 pub use query::{
     RerankFn, export_context, export_context_for_symbol, feature_bundle, find_references,
     find_symbol, impact_analysis, list_dependencies, search,
 };
-pub use semantic::{semantic_full_index, semantic_incremental_index};
+pub use semantic::{
+    semantic_full_index, semantic_incremental_index, semantic_index_files, semantic_remove_files,
+};
 pub use session::{session_end, session_start};

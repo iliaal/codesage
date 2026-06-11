@@ -351,6 +351,62 @@ pub fn semantic_incremental_index(
     )
 }
 
+pub fn semantic_index_files(
+    root: &Path,
+    db: &Database,
+    embedder: &mut Embedder,
+    files: &[FileInfo],
+    verbose: bool,
+) -> Result<SemanticIndexStats> {
+    let config = ChunkConfig::default();
+    let mut stats = SemanticIndexStats::default();
+
+    if files.is_empty() {
+        return Ok(stats);
+    }
+
+    if verbose {
+        tracing::info!(count = files.len(), "semantic indexing specific files");
+    }
+
+    // Remove old chunks and semantic hashes for these files before re-indexing.
+    db.execute_batch(|db| {
+        for f in files {
+            db.delete_chunks_for_file(&f.path)?;
+        }
+        Ok(())
+    })?;
+
+    let file_refs: Vec<&FileInfo> = files.iter().collect();
+    let n_batches = file_refs.len().div_ceil(COMMIT_BATCH_SIZE);
+    for (i, batch) in file_refs.chunks(COMMIT_BATCH_SIZE).enumerate() {
+        if verbose {
+            let file_count = batch.len();
+            tracing::info!(
+                batch = i + 1,
+                total_batches = n_batches,
+                files = file_count,
+                "semantic per-file batch"
+            );
+        }
+        process_semantic_batch(root, db, embedder, &config, batch, &mut stats)?;
+    }
+    Ok(stats)
+}
+
+pub fn semantic_remove_files(db: &Database, paths: &[String]) -> Result<usize> {
+    let mut removed = 0;
+    db.execute_batch(|db| {
+        for path in paths {
+            db.delete_chunks_for_file(path)?;
+            db.delete_semantic_file_hash(path)?;
+            removed += 1;
+        }
+        Ok(())
+    })?;
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

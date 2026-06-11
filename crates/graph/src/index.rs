@@ -159,6 +159,66 @@ pub fn incremental_index(
     )
 }
 
+pub fn index_files(
+    root: &Path,
+    db: &Database,
+    files: &[FileInfo],
+    verbose: bool,
+) -> Result<IndexStats> {
+    let mut stats = IndexStats::default();
+
+    if files.is_empty() {
+        return Ok(stats);
+    }
+
+    if verbose {
+        tracing::info!(count = files.len(), "indexing specific files");
+    }
+
+    let parsed_results: Vec<Result<ParsedFile>> =
+        files.par_iter().map(|f| parse_one(root, f)).collect();
+    let mut parsed = Vec::with_capacity(parsed_results.len());
+    for result in parsed_results {
+        match result {
+            Ok(file) => parsed.push(file),
+            Err(e) => {
+                stats.files_failed += 1;
+                tracing::warn!(error = %e, "skipping file during per-file structural index");
+            }
+        }
+    }
+
+    db.execute_batch(|db| {
+        for p in &parsed {
+            let file_id = db.upsert_file(&p.info)?;
+            db.insert_symbols(file_id, &p.symbols)?;
+            db.insert_references(file_id, &p.refs)?;
+            let boundaries = derive_from_refs(&p.refs, p.info.language);
+            db.replace_file_trust_boundaries(file_id, &boundaries)?;
+        }
+        Ok(())
+    })?;
+    for p in &parsed {
+        stats.symbols_found += p.symbols.len();
+        stats.references_found += p.refs.len();
+        stats.files_indexed += 1;
+    }
+
+    Ok(stats)
+}
+
+pub fn remove_files(db: &Database, paths: &[String]) -> Result<usize> {
+    let mut removed = 0;
+    db.execute_batch(|db| {
+        for path in paths {
+            db.remove_file(path)?;
+            removed += 1;
+        }
+        Ok(())
+    })?;
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
