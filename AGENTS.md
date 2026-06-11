@@ -99,10 +99,17 @@ If CoreML registration fails, the process errors out instead of silently falling
 
 This repo follows [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/) and [SemVer 2.0.0](https://semver.org/spec/v2.0.0.html). Workspace version lives in `[workspace.package] version` in the root `Cargo.toml`; all six crates inherit it via `version.workspace = true`.
 
-**Every code change that is user-visible must update `CHANGELOG.md` in the same commit.** User-visible means: new CLI flags or subcommands, new or changed MCP tools, behavior changes, breaking changes, new dependencies, schema migrations, hook template changes, config surface changes, and security fixes. Pure internal refactors, test-only changes, doc-only changes, and dev-tooling tweaks don't need an entry.
+**Every release-notable product change must update `CHANGELOG.md` in the same commit.** Release-notable means: new CLI flags or subcommands, new or changed MCP tools, behavior changes, breaking changes, new dependencies, schema migrations, hook template changes, config surface changes, and security fixes that affect shipped CodeSage behavior.
 
-- Put entries under `## [Unreleased]` at the top of the file, in one of the standard sections: `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`.
-- One bullet per change, written for the reader of the next release notes — describe the user-observable effect, not the implementation.
+No changelog entry for pure internal refactors, tests, benchmark/eval harnesses, review-process fixes, doc-only changes, or performance-only internals whose output and operator contract are unchanged.
+
+Write entries in terse style:
+
+- Put entries under `## [Unreleased]` in the standard sections: `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`.
+- Use one plain bullet per user-visible change. No bold lead-in, no paragraph explanation, no file lists.
+- Name the command, MCP tool, config key, or behavior that changed. Stop after the observable effect.
+- Prefer consolidation when several fixes share one surface (`codesage daemon status` / `stop`, parser symbol extraction, feature mapping).
+- If a reviewer would need the git diff to care, it probably does not belong in the changelog.
 
 ### Cutting a release
 
