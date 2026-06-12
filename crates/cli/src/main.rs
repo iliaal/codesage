@@ -6,6 +6,7 @@ mod flock_override;
 mod installer;
 mod lockfile;
 mod mcp;
+mod overview;
 mod statewatcher;
 mod util;
 
@@ -135,6 +136,13 @@ enum Commands {
         /// Exclude test and config files from results
         #[arg(long)]
         source_only: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// One-call project orientation: languages, freshness, features, risk,
+    /// trust boundaries, test conventions, and suggested next calls
+    Overview {
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -772,6 +780,7 @@ fn run(cli: Cli) -> Result<()> {
             source_only,
             json,
         } => cmd_impact(&target, file, symbol, depth, source_only, json),
+        Commands::Overview { json } => cmd_overview(json),
         Commands::Export {
             target,
             symbol,
@@ -2453,6 +2462,85 @@ fn cmd_impact(
             println!("    via {} @ line {} ({})", r.via_symbol, r.line, r.kind);
         }
     }
+    Ok(())
+}
+
+fn cmd_overview(json: bool) -> Result<()> {
+    let root = find_project_root()?;
+    let db = open_db(&root)?;
+    let overview = crate::overview::build_project_overview(&root, &db)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&overview)?);
+        return Ok(());
+    }
+
+    println!("Project: {}", overview.project_root);
+    println!(
+        "Index: {} files, {} symbols | {}",
+        overview.file_count, overview.symbol_count, overview.freshness.structural_summary
+    );
+    if overview.freshness.semantic_indexed {
+        println!(
+            "Semantic: {} files with chunks",
+            overview.freshness.semantic_indexed_files
+        );
+    } else {
+        println!("Semantic: not indexed");
+    }
+
+    if !overview.languages.is_empty() {
+        let langs: Vec<String> = overview
+            .languages
+            .iter()
+            .map(|l| format!("{} ({})", l.language.as_str(), l.file_count))
+            .collect();
+        println!("Languages: {}", langs.join(", "));
+    }
+
+    if overview.feature_count > 0 {
+        let kinds: Vec<String> = overview
+            .feature_summary
+            .iter()
+            .map(|k| format!("{} {}", k.count, k.kind.as_str()))
+            .collect();
+        println!(
+            "Features: {} total ({})",
+            overview.feature_count,
+            kinds.join(", ")
+        );
+    }
+
+    if !overview.top_risk_files.is_empty() {
+        println!("Top risk:");
+        for r in &overview.top_risk_files {
+            println!("  {:.3}  {}", r.score, r.file);
+        }
+    }
+
+    if !overview.trust_boundary_clusters.is_empty() {
+        let tb: Vec<String> = overview
+            .trust_boundary_clusters
+            .iter()
+            .map(|c| format!("{} ({})", c.boundary.as_str(), c.file_count))
+            .collect();
+        println!("Trust boundaries: {}", tb.join(", "));
+    }
+
+    if !overview.entrypoints.is_empty() {
+        println!("Entrypoints (sample):");
+        for e in &overview.entrypoints {
+            println!("  [{}] {} — {}", e.kind.as_str(), e.title, e.entry_path);
+        }
+    }
+
+    if !overview.suggested_next_calls.is_empty() {
+        println!("Suggested next calls:");
+        for c in &overview.suggested_next_calls {
+            println!("  {} → {}  ({})", c.intent, c.tool, c.why);
+        }
+    }
+
     Ok(())
 }
 

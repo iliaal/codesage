@@ -1156,6 +1156,108 @@ pub struct ImpactAnalysisResults {
     pub results: Vec<ImpactEntry>,
 }
 
+/// One-call orientation snapshot for an agent starting work on a project.
+/// Aggregates already-indexed facts (languages, freshness, features, risk,
+/// trust boundaries, conventions) plus suggested next tool calls. Bounded by
+/// construction — every list is capped — so it stays a digest, not a dump.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ProjectOverview {
+    /// Absolute canonical project root.
+    pub project_root: String,
+    /// Per-language file counts, descending.
+    pub languages: Vec<LanguageStat>,
+    /// Total indexed files.
+    pub file_count: usize,
+    /// Total indexed symbols.
+    pub symbol_count: usize,
+    /// Structural + semantic index freshness vs git HEAD.
+    pub freshness: FreshnessInfo,
+    /// Mapped feature count by kind, descending.
+    pub feature_summary: Vec<FeatureKindCount>,
+    /// Total mapped features.
+    pub feature_count: usize,
+    /// Highest-risk files (capped), descending by score. Empty when git
+    /// history is not yet indexed.
+    pub top_risk_files: Vec<SessionRiskEntry>,
+    /// Trust-boundary file counts across the project, descending. Surfaces the
+    /// security-sensitive clusters (network, secrets, process-exec, …).
+    pub trust_boundary_clusters: Vec<TrustBoundaryCount>,
+    /// Test-file naming conventions an agent should expect, one hint per
+    /// indexed language.
+    pub test_conventions: Vec<String>,
+    /// A sample of mapped entrypoints (routes, CLI commands, services,
+    /// libraries) — the agent-facing surface area. Capped.
+    pub entrypoints: Vec<EntrypointSummary>,
+    /// Recommended next CodeSage calls for common intents, given this project's
+    /// current state.
+    pub suggested_next_calls: Vec<SuggestedCall>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct LanguageStat {
+    pub language: Language,
+    pub file_count: usize,
+}
+
+/// Index freshness. Structural drift is measured against git HEAD; semantic
+/// coverage is reported as the number of files with embedding chunks.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FreshnessInfo {
+    /// Drift classification: `fresh`, `behind_head`, `unrelated_ancestor`,
+    /// `never_indexed`, `not_git`, or `unknown`.
+    pub structural_kind: String,
+    /// Human-readable one-line summary of the structural drift state.
+    pub structural_summary: String,
+    /// Commits between the indexed SHA and HEAD when behind on the same line.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub commits_behind: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub indexed_sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub head_sha: Option<String>,
+    /// Files with at least one semantic chunk indexed.
+    pub semantic_indexed_files: usize,
+    /// True when any semantic chunks exist (a model is configured and the
+    /// semantic pass has run).
+    pub semantic_indexed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FeatureKindCount {
+    pub kind: FeatureKind,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TrustBoundaryCount {
+    pub boundary: TrustBoundary,
+    pub file_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct EntrypointSummary {
+    pub feature_id: String,
+    pub kind: FeatureKind,
+    pub title: String,
+    pub entry_path: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub route: Option<String>,
+}
+
+/// A suggested next tool call keyed by the agent's likely intent.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SuggestedCall {
+    /// The intent this call serves (e.g. "find code by behavior",
+    /// "before editing a file", "before committing a patch").
+    pub intent: String,
+    /// The CodeSage tool to call.
+    pub tool: String,
+    /// Why this call, in one line.
+    pub why: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

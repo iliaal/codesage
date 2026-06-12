@@ -18,4 +18,4 @@ pub use query::{
 pub use semantic::{
     semantic_full_index, semantic_incremental_index, semantic_index_files, semantic_remove_files,
 };
-pub use session::{session_end, session_start};
+pub use session::{session_end, session_start, top_risk_files};

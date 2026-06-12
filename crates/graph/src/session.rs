@@ -242,6 +242,18 @@ fn compute_cycles(db: &Database) -> Result<Vec<Vec<String>>> {
     Ok(out)
 }
 
+/// The top-`limit` highest-risk files across the whole indexed project.
+/// Backs `project_overview`. Returns empty when no files are indexed or git
+/// history hasn't been indexed (every file scores ~0 without it).
+pub fn top_risk_files(db: &Database, limit: usize) -> Result<Vec<SessionRiskEntry>> {
+    let files: Vec<String> = db
+        .all_files_with_id_and_language()?
+        .into_iter()
+        .map(|(_, path, _)| path)
+        .collect();
+    compute_top_risk(db, &files, limit)
+}
+
 /// Score every file via `assess_risk`, return the top `limit` by score.
 /// Files with a risk computation error are skipped (logged).
 fn compute_top_risk(

@@ -15,9 +15,9 @@ use codesage_graph::{
 use codesage_protocol::{
     ContextBundle, CouplingReport, DependencyEntry, ExportRequest, FeatureKind, FeatureListResults,
     FindReferencesRequest, FindReferencesResults, FindSymbolRequest, FindSymbolResults,
-    ImpactAnalysisResults, ImpactRequest, ImpactTarget, Language, ReferenceKind, RiskAssessment,
-    RiskBatchAssessment, RiskDiffAssessment, SearchRequest, SearchResults, SessionDiff,
-    SessionSnapshot, SymbolKind, TestRecommendations,
+    ImpactAnalysisResults, ImpactRequest, ImpactTarget, Language, ProjectOverview, ReferenceKind,
+    RiskAssessment, RiskBatchAssessment, RiskDiffAssessment, SearchRequest, SearchResults,
+    SessionDiff, SessionSnapshot, SymbolKind, TestRecommendations,
 };
 use codesage_storage::Database;
 use parking_lot::Mutex;
@@ -261,6 +261,12 @@ pub struct FeatureBundleParams {
     #[schemars(description = "Max chunks per section (primary, related). Default 5.")]
     #[serde(default, deserialize_with = "deser_optional_usize")]
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ProjectOverviewParams {
+    #[schemars(description = PROJECT_ARG_DESC)]
+    pub project: String,
 }
 
 #[derive(Clone)]
@@ -1210,6 +1216,27 @@ impl ServerHandler for CodeSageServer {
 
 #[tool_router]
 impl CodeSageServer {
+    #[tool(
+        name = "project_overview",
+        description = "First-call orientation for a project: one bounded response with languages and file/symbol counts, index freshness (structural drift vs git HEAD + semantic coverage), mapped feature summary by kind, a sample of entrypoints (routes/CLI/services/libraries), the top-risk files, trust-boundary clusters, the test-file naming conventions per language, and suggested next CodeSage calls for common intents. Pure aggregation of already-indexed facts — no semantic search, no analysis. Call this once at the start of a session to orient before reaching for `search`/`find_symbol`/`assess_risk`. `top_risk_files` is empty until git history is indexed; `freshness.structural_kind` of `behind_head`/`unrelated_ancestor` means structural results may be stale (re-run `codesage index`).",
+        output_schema = schema_for_type::<ProjectOverview>()
+    )]
+    async fn project_overview_tool(
+        &self,
+        Parameters(params): Parameters<ProjectOverviewParams>,
+    ) -> CallToolResult {
+        self.blocking(move |s| {
+            s.render(
+                &params.project,
+                s.with_project_root_db(&params.project, |root, db| {
+                    crate::overview::build_project_overview(root, db)
+                }),
+                "project_overview",
+            )
+        })
+        .await
+    }
+
     #[tool(
         name = "find_symbol",
         description = "Find symbol definitions (functions, classes, methods, structs, traits, enums) by name. Returns exact file path, line number, and kind. **Prefer this over Grep/ripgrep for any code-identifier lookup** — one call returns the definition, while grepping for a function name often produces many false hits (call sites, comments, other namespaces) that cost extra Read calls to disambiguate. Use partial names for broad search or qualified names ('MyClass\\\\method' for PHP, 'MyClass.method' for Python) for exact match. For the inverse question (who calls / imports / instantiates this symbol?) use `find_references`. When present, `rationale[]` carries `WHY:` / `NOTE:` / `IMPORTANT:` / `FIXME:` / `HACK:` / `XXX:` / `TODO:` comments attached to the definition — read these before refactoring or renaming so the agent doesn't drop a constraint the author wrote down. Currently extracted for Rust and Python.",

@@ -643,6 +643,24 @@ impl Database {
         Ok(n as usize)
     }
 
+    /// Per-boundary file counts across the whole project, descending by count.
+    /// Backs the trust-boundary cluster summary in `project_overview`.
+    pub fn trust_boundary_counts(&self) -> Result<Vec<(TrustBoundary, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT boundary, COUNT(*) AS n FROM file_trust_boundaries
+             GROUP BY boundary ORDER BY n DESC",
+        )?;
+        let rows: Vec<(TrustBoundary, usize)> = stmt
+            .query_map([], |row| {
+                let s: String = row.get(0)?;
+                let n: i64 = row.get(1)?;
+                let b = row_enum(&s, TrustBoundary::parse, "TrustBoundary")?;
+                Ok((b, n as usize))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Trust boundaries for one file identified by repo-relative path. Empty
     /// when the file has no row (never derived, or genuinely no boundary
     /// signal). Sorted by enum discriminant for stable output.

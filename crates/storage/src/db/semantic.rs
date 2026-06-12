@@ -262,6 +262,19 @@ impl Database {
         Ok(n as usize)
     }
 
+    /// Distinct files with at least one semantic chunk indexed, across all
+    /// model chunk tables. Model-agnostic (reads `semantic_files`, a shared
+    /// table) so it works on a plain structural handle. Backs the semantic
+    /// freshness signal in `project_overview`.
+    pub fn semantic_file_count(&self) -> Result<usize> {
+        let n: i64 =
+            self.conn
+                .query_row("SELECT COUNT(DISTINCT path) FROM semantic_files", [], |r| {
+                    r.get(0)
+                })?;
+        Ok(n as usize)
+    }
+
     pub fn all_semantic_file_hashes(&self) -> Result<std::collections::HashMap<String, String>> {
         if self.chunk_table.is_empty() {
             return Ok(std::collections::HashMap::new());
