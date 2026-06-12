@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use codesage_embed::config::EmbeddingConfig;
@@ -317,31 +318,41 @@ struct LoadedEmbeddingConfig {
 /// model loaded two ORT sessions and the loser was thrown away.
 type ModelSlot<T> = Arc<Mutex<Option<Arc<Mutex<T>>>>>;
 
+/// A pooled model: its load slot plus the last time it was requested.
+/// `last_used` is protected by the enclosing map mutex (stamped on every
+/// `get_or_load_slot` and read by the idle reaper), so it needs no lock
+/// of its own.
+struct ModelEntry<T> {
+    slot: ModelSlot<T>,
+    last_used: Instant,
+}
+
+type ModelMap<T> = Mutex<HashMap<String, ModelEntry<T>>>;
+
 /// Find or create the slot for `key` and, if not yet populated, run
 /// `load()` under the slot lock. Returns the shared `Arc<Mutex<T>>`
 /// either way. The map lock is held only long enough to find-or-insert
-/// the slot; the loader runs while only the per-key slot lock is held,
-/// so concurrent calls for *different* keys never wait on each other.
+/// the slot (and stamp `last_used`); the loader runs while only the
+/// per-key slot lock is held, so concurrent calls for *different* keys
+/// never wait on each other.
 ///
 /// The CR-001 race was `check map → drop → load → insert`: two threads
 /// hitting the same cold key both ran `load()` and the loser's value
 /// got dropped. This helper closes that window — for a single key, the
 /// first thread to reach the slot lock runs `load()` exactly once; the
 /// rest read the populated `Some(arc)` and return immediately.
-fn get_or_load_slot<T, F>(
-    map: &Mutex<HashMap<String, ModelSlot<T>>>,
-    key: String,
-    load: F,
-) -> Result<Arc<Mutex<T>>>
+fn get_or_load_slot<T, F>(map: &ModelMap<T>, key: String, load: F) -> Result<Arc<Mutex<T>>>
 where
     F: FnOnce() -> Result<T>,
 {
     let slot = {
         let mut guard = map.lock();
-        guard
-            .entry(key)
-            .or_insert_with(|| Arc::new(Mutex::new(None)))
-            .clone()
+        let entry = guard.entry(key).or_insert_with(|| ModelEntry {
+            slot: Arc::new(Mutex::new(None)),
+            last_used: Instant::now(),
+        });
+        entry.last_used = Instant::now();
+        entry.slot.clone()
     };
     let mut slot_guard = slot.lock();
     if let Some(arc) = slot_guard.as_ref() {
@@ -353,6 +364,40 @@ where
     Ok(arc)
 }
 
+/// Drop pooled models that have sat unused longer than `timeout` and are
+/// not currently in flight, returning how many were evicted. The loaded
+/// model (and its ORT `Session`) is dropped *outside* the map lock so a
+/// slow CUDA teardown never stalls other lookups.
+///
+/// "Not in flight" is `Arc::strong_count(inner) == 1` — only the pool
+/// holds the model, no tool call has a clone out. We `try_lock` each
+/// slot rather than block: a slot held by an in-flight cold load is
+/// skipped this round instead of pinning the map lock for seconds.
+fn evict_idle_from_map<T>(map: &ModelMap<T>, timeout: Duration) -> usize {
+    let mut taken: Vec<Arc<Mutex<T>>> = Vec::new();
+    {
+        let mut guard = map.lock();
+        guard.retain(|_key, entry| {
+            if entry.last_used.elapsed() < timeout {
+                return true;
+            }
+            let Some(mut slot_guard) = entry.slot.try_lock() else {
+                return true; // busy (loading or cloning) — leave it
+            };
+            match slot_guard.as_ref() {
+                Some(arc) if Arc::strong_count(arc) == 1 => {
+                    taken.push(slot_guard.take().expect("just matched Some"));
+                    false // drop the now-empty entry from the map
+                }
+                _ => true, // unloaded already, or a call holds a clone
+            }
+        });
+    }
+    let count = taken.len();
+    drop(taken); // ORT Session teardown happens here, outside the map lock
+    count
+}
+
 pub(crate) struct CodeSageServerState {
     projects: Mutex<HashMap<PathBuf, ProjectState>>,
     /// Fast-path cache keyed by the raw `project` arg string. Agents pass the
@@ -361,8 +406,8 @@ pub(crate) struct CodeSageServerState {
     /// (keyed by canonical path) stays the source of truth and dedupes distinct
     /// spellings of the same root.
     resolved: Mutex<HashMap<String, ProjectState>>,
-    embedders: Mutex<HashMap<String, ModelSlot<Embedder>>>,
-    rerankers: Mutex<HashMap<String, ModelSlot<Reranker>>>,
+    embedders: ModelMap<Embedder>,
+    rerankers: ModelMap<Reranker>,
     /// Live filesystem watchers, one per project, keyed by canonical root.
     /// Spawned lazily on first tool call for a project (see
     /// [`CodeSageServer::ensure_watcher`]) and reaped on daemon shutdown.
@@ -386,6 +431,17 @@ impl CodeSageServerState {
             rerankers: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Drop pooled embedders + rerankers idle longer than `timeout`,
+    /// returning how many were evicted. Frees the ORT `Session` (and thus
+    /// its GPU VRAM); the host-side `malloc_trim` is the caller's job so it
+    /// runs once per sweep rather than per model. Models with an in-flight
+    /// call (a held `Arc` clone) are left alone. Called periodically by the
+    /// daemon's model-eviction task.
+    pub(crate) fn evict_idle_models(&self, timeout: Duration) -> usize {
+        evict_idle_from_map(&self.embedders, timeout)
+            + evict_idle_from_map(&self.rerankers, timeout)
     }
 
     /// Signal every live watcher to drain and exit. Called from the daemon's
@@ -1850,6 +1906,51 @@ mod tests {
         "x".repeat(n)
     }
 
+    fn loaded_entry(value: i32, age: Duration) -> ModelEntry<i32> {
+        ModelEntry {
+            slot: Arc::new(Mutex::new(Some(Arc::new(Mutex::new(value))))),
+            last_used: Instant::now().checked_sub(age).expect("test clock"),
+        }
+    }
+
+    #[test]
+    fn evict_idle_drops_only_idle_and_unreferenced_models() {
+        let timeout = Duration::from_secs(900);
+        let map: ModelMap<i32> = Mutex::new(HashMap::new());
+
+        // fresh: used just now -> kept.
+        map.lock()
+            .insert("fresh".into(), loaded_entry(1, Duration::from_secs(0)));
+        // idle + unreferenced -> evicted.
+        map.lock()
+            .insert("idle".into(), loaded_entry(2, Duration::from_secs(1200)));
+        // idle but a tool call holds a clone (strong_count > 1) -> kept.
+        let idle_busy = loaded_entry(3, Duration::from_secs(1200));
+        let in_flight = idle_busy.slot.lock().as_ref().expect("loaded").clone();
+        map.lock().insert("idle_busy".into(), idle_busy);
+
+        let evicted = evict_idle_from_map(&map, timeout);
+
+        assert_eq!(evicted, 1, "only the idle, unreferenced model is evicted");
+        let guard = map.lock();
+        assert!(guard.contains_key("fresh"), "recently used model retained");
+        assert!(!guard.contains_key("idle"), "idle model removed from pool");
+        assert!(
+            guard.contains_key("idle_busy"),
+            "in-flight model retained despite being idle"
+        );
+        drop(in_flight);
+    }
+
+    #[test]
+    fn evict_idle_is_noop_when_nothing_is_stale() {
+        let map: ModelMap<i32> = Mutex::new(HashMap::new());
+        map.lock()
+            .insert("a".into(), loaded_entry(1, Duration::from_secs(10)));
+        assert_eq!(evict_idle_from_map(&map, Duration::from_secs(900)), 0);
+        assert_eq!(map.lock().len(), 1);
+    }
+
     #[test]
     fn coupling_params_accept_int_limit() {
         let p: CouplingParams = serde_json::from_value(json!({
@@ -2207,7 +2308,7 @@ mod tests {
         // observe Some(arc) and return it.
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let map: Arc<Mutex<HashMap<String, ModelSlot<u32>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let map: Arc<ModelMap<u32>> = Arc::new(Mutex::new(HashMap::new()));
         let load_count = Arc::new(AtomicUsize::new(0));
 
         // Gate the loader on a shared start signal so all threads are
@@ -2255,7 +2356,7 @@ mod tests {
         // should not serialize on each other. Verify by measuring that
         // two loaders that each block for ~80ms complete in well under
         // 160ms (they run concurrently, not back-to-back).
-        let map: Arc<Mutex<HashMap<String, ModelSlot<u32>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let map: Arc<ModelMap<u32>> = Arc::new(Mutex::new(HashMap::new()));
         let start = Arc::new(std::sync::Barrier::new(2));
 
         let t0 = std::time::Instant::now();
@@ -2298,7 +2399,7 @@ mod tests {
         // be able to retry. Pre-fix code had the same behavior (the
         // failed value never went into the map); the helper preserves
         // that property by writing to *slot_guard only on Ok.
-        let map: Arc<Mutex<HashMap<String, ModelSlot<u32>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let map: Arc<ModelMap<u32>> = Arc::new(Mutex::new(HashMap::new()));
 
         let first: Result<_, anyhow::Error> =
             get_or_load_slot(&map, "k".to_string(), || anyhow::bail!("boom"));

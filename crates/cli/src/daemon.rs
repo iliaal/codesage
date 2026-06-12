@@ -65,6 +65,44 @@ mod unix {
         }
     }
 
+    /// Default per-model idle eviction timeout: drop a pooled embedder /
+    /// reranker that has not been used for this long, freeing its ORT
+    /// `Session` (GPU VRAM + host buffers). Generous enough that genuinely
+    /// active sessions never reload, short enough that an idle warm daemon
+    /// gives memory back. Override with `CODESAGE_MODEL_IDLE_SECS`; `0`
+    /// disables per-model eviction (the daemon-level backstop still applies).
+    const DEFAULT_MODEL_IDLE_TIMEOUT: Duration = Duration::from_secs(900);
+
+    fn model_idle_timeout() -> Duration {
+        match std::env::var("CODESAGE_MODEL_IDLE_SECS") {
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(secs) => Duration::from_secs(secs),
+                Err(_) => {
+                    tracing::warn!(
+                        value = %raw,
+                        "invalid CODESAGE_MODEL_IDLE_SECS (want integer seconds); using default {:?}",
+                        DEFAULT_MODEL_IDLE_TIMEOUT
+                    );
+                    DEFAULT_MODEL_IDLE_TIMEOUT
+                }
+            },
+            Err(_) => DEFAULT_MODEL_IDLE_TIMEOUT,
+        }
+    }
+
+    /// Ask the allocator to return freed pages to the OS after a model
+    /// eviction. glibc retains freed heap by default, so dropping an ORT
+    /// `Session` frees the VRAM but leaves host RSS at its high-water mark
+    /// until this runs (measured: recovers ~170 MB after a Jina-base drop).
+    /// No-op off glibc.
+    fn free_retained_heap() {
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        // SAFETY: malloc_trim is thread-safe and has no preconditions.
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct DaemonPaths {
         runtime_dir: PathBuf,
@@ -248,6 +286,43 @@ mod unix {
         tracing::info!(socket = %paths.socket.display(), "codesage MCP daemon listening");
         let state = Arc::new(CodeSageServerState::new());
         let our_uid = unsafe { libc::getuid() };
+
+        // Per-model idle eviction. The whole-daemon backstop below can't fire
+        // while a client connection is parked open (the common interactive
+        // case), so a warm daemon otherwise pins its embedder + reranker —
+        // host context + GPU VRAM — for the whole session. This drops the
+        // individual models that have sat unused past the timeout, reclaiming
+        // their VRAM (and, via malloc_trim, some host pages) while keeping the
+        // daemon and its connections alive; the next query reloads them cold.
+        let model_idle = model_idle_timeout();
+        if !model_idle.is_zero() {
+            let state_evict = state.clone();
+            let evict_poll = model_idle
+                .min(Duration::from_secs(60))
+                .max(Duration::from_secs(1));
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(evict_poll);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    let s = state_evict.clone();
+                    // An ORT Session drop can block on CUDA teardown; keep it
+                    // off the async worker threads.
+                    let evicted = tokio::task::spawn_blocking(move || {
+                        let n = s.evict_idle_models(model_idle);
+                        if n > 0 {
+                            free_retained_heap();
+                        }
+                        n
+                    })
+                    .await
+                    .unwrap_or(0);
+                    if evicted > 0 {
+                        tracing::info!(evicted, "evicted idle pooled models");
+                    }
+                }
+            });
+        }
 
         // M6: install a shutdown signal so SIGTERM / SIGINT exit the
         // accept loop cleanly and remove socket + pid files. Without
@@ -642,11 +717,21 @@ mod unix {
             .append(true)
             .open(&paths.log)
             .with_context(|| format!("opening daemon log {}", paths.log.display()))?;
-        Command::new(exe)
-            .arg("daemon")
+        let mut cmd = Command::new(exe);
+        cmd.arg("daemon")
             .arg("--runtime-dir")
-            .arg(&paths.runtime_dir)
-            .stdin(Stdio::null())
+            .arg(&paths.runtime_dir);
+        // Cap glibc's per-thread arena count. ORT + tokio are multithreaded,
+        // so the default (8×ncpu arenas) retains a lot of freed model-load
+        // scratch the daemon never gives back; 2 arenas trims the steady-state
+        // RSS (~60 MB measured) at negligible alloc-contention cost for this
+        // workload. MALLOC_ARENA_MAX is read at the child's first malloc, so it
+        // must be set here on the spawn, not from within the daemon. Respect an
+        // explicit operator override.
+        if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+            cmd.env("MALLOC_ARENA_MAX", "2");
+        }
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::from(
                 log.try_clone().context("cloning daemon log for stdout")?,
             ))

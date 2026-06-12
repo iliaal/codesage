@@ -1,5 +1,8 @@
 ## [Unreleased]
 
+### Added
+- The MCP daemon evicts pooled embedder/reranker models after they sit unused (default 15 min, `CODESAGE_MODEL_IDLE_SECS`, `0` disables), freeing their GPU VRAM and (via `malloc_trim`) some host memory while keeping the daemon and its client connections alive; the next query reloads them. The daemon now also spawns with `MALLOC_ARENA_MAX=2` unless overridden.
+
 ### Fixed
 - The MCP daemon now reaps stale-version daemons sharing its runtime dir on startup, so a rebuilt or upgraded binary no longer leaves the old daemon pinning a second copy of the embedder + reranker in memory until the idle backstop fires.
 
