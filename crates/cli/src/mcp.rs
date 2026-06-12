@@ -1310,7 +1310,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "find_references",
-        description = "Find all references to a symbol across the codebase. **Prefer this over Grep for 'where is X called / imported / instantiated?'** — returns structured {file, line, kind} rows with the reference type (call/import/inheritance/instantiation/type_hint) already classified, instead of raw grep hits that mix definitions, comments, and string literals together. For the definition itself use `find_symbol`; for transitive blast radius (callers of callers) use `impact_analysis`.",
+        description = "Find all references to a symbol across the codebase. **Prefer this over Grep for 'where is X called / imported / instantiated?'** — returns structured {file, line, kind, from_symbol} rows with the reference type (call/import/inheritance/instantiation/type_hint) already classified, instead of raw grep hits that mix definitions, comments, and string literals together. `from_symbol` names the enclosing symbol that makes each reference (the caller), so you get caller→callee edges without re-deriving them from line numbers; it is null for references at file scope (e.g. top-level imports) or in files with no extracted symbols. For the definition itself use `find_symbol`; for transitive blast radius (callers of callers) use `impact_analysis`.",
         output_schema = schema_for_type::<FindReferencesResults>()
     )]
     async fn find_references_tool(

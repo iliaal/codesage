@@ -1449,7 +1449,7 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
     for depth in 1..=req.depth as u32 {
         // First pass: collect refs, update file_reasons, record (from_file, line) pairs
         // that need caller-symbol lookups for the next frontier.
-        let mut pending_callers: Vec<(String, u32)> = Vec::new();
+        let mut pending_callers: Vec<(String, Option<String>, u32)> = Vec::new();
         for sym in &frontier {
             if !visited_symbols.insert(sym.qualified_name.clone()) {
                 continue;
@@ -1473,7 +1473,7 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
                     });
                 }
                 if depth < req.depth as u32 {
-                    pending_callers.push((r.from_file, r.line));
+                    pending_callers.push((r.from_file, r.from_symbol, r.line));
                 }
             }
         }
@@ -1486,7 +1486,7 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
         // how many lines in that file triggered the lookup.
         let distinct_files: Vec<String> = {
             let mut set: HashSet<String> = HashSet::new();
-            pending_callers.iter().for_each(|(f, _)| {
+            pending_callers.iter().for_each(|(f, _, _)| {
                 set.insert(f.clone());
             });
             set.into_iter().collect()
@@ -1494,13 +1494,33 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
         let syms_by_file = db.symbols_for_files(&distinct_files)?;
 
         let mut next_frontier: Vec<Symbol> = Vec::new();
-        for (from_file, line) in &pending_callers {
-            if let Some(syms) = syms_by_file.get(from_file) {
-                for s in syms {
-                    if s.line_start <= *line && s.line_end >= *line {
-                        next_frontier.push(s.clone());
+        for (from_file, from_symbol, line) in &pending_callers {
+            let Some(syms) = syms_by_file.get(from_file) else {
+                continue;
+            };
+            // Precise path: the reference recorded its enclosing symbol, so jump
+            // straight to that one symbol instead of every symbol spanning the
+            // line (which conflated a method with its containing class).
+            if let Some(qn) = from_symbol
+                && let Some(s) = syms.iter().find(|s| &s.qualified_name == qn)
+            {
+                next_frontier.push(s.clone());
+                continue;
+            }
+            // Fallback for references with no recorded enclosing symbol: the
+            // innermost symbol whose range contains the line.
+            let mut best: Option<&Symbol> = None;
+            for s in syms {
+                if s.line_start <= *line && s.line_end >= *line {
+                    let span = s.line_end - s.line_start;
+                    match best {
+                        Some(b) if (b.line_end - b.line_start) <= span => {}
+                        _ => best = Some(s),
                     }
                 }
+            }
+            if let Some(s) = best {
+                next_frontier.push(s.clone());
             }
         }
 

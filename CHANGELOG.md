@@ -6,6 +6,7 @@
 
 ### Changed
 - `impact_analysis` gains opt-in `include_forward` (forward dependencies), `include_siblings` (same-file symbols), `limit`, and `summary_only` controls; the result is now an object with `results` plus the requested extras (`codesage impact --forward --siblings --limit --summary-only`). Reading `.results` is unchanged.
+- `find_references` now populates each reference's `from_symbol` with the enclosing caller symbol (null at file scope), and `impact_analysis` walks the call graph at symbol precision via that field instead of re-deriving callers from line numbers. Requires a reindex (`codesage index --full`) to backfill existing projects.
 - Live filesystem watcher: the daemon auto-starts a per-project watcher on first tool call that reindexes (structural + semantic) on edit, debounced (default 1s, `REINDEX_DEBOUNCE`), reusing the daemon's pooled embedder. Honors `.gitignore` and `[index].exclude_patterns` and skips ignored top-level trees (`target/`, `.git/`, `node_modules/`) from the watch set. On by default; disable with `[index] watch = false` or `CODESAGE_WATCH=0`. Self-exits after idle (`CODESAGE_WATCH_IDLE_SECS`, default 1800; `0` disables).
 - `codesage watch run|status|stop|start [project]` to manually control the live watcher (`run` is a foreground instance with its own embedder).
 

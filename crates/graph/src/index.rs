@@ -25,13 +25,44 @@ fn parse_one(root: &Path, file_info: &FileInfo) -> Result<ParsedFile> {
         .with_context(|| format!("parsing {}", file_info.path))?;
     let symbols = extract_symbols(&tree, &source, file_info.language, &file_info.path)
         .with_context(|| format!("extracting symbols from {}", file_info.path))?;
-    let refs = extract_references(&tree, &source, file_info.language, &file_info.path)
+    let mut refs = extract_references(&tree, &source, file_info.language, &file_info.path)
         .with_context(|| format!("extracting references from {}", file_info.path))?;
+    populate_from_symbol(&symbols, &mut refs);
     Ok(ParsedFile {
         info: file_info.clone(),
         symbols,
         refs,
     })
+}
+
+/// Set each reference's `from_symbol` to the qualified name of the innermost
+/// symbol whose line range encloses the reference. This is what lets
+/// `find_references` report the calling symbol and `impact_analysis` walk the
+/// call graph at symbol precision instead of re-deriving the caller from
+/// `(file, line)`. References with no enclosing symbol (a top-level import, a
+/// reference in a file with no extracted symbols) keep `from_symbol = None`,
+/// so downstream consumers degrade cleanly.
+fn populate_from_symbol(symbols: &[Symbol], refs: &mut [Reference]) {
+    if symbols.is_empty() {
+        return;
+    }
+    for r in refs.iter_mut() {
+        let mut best: Option<&Symbol> = None;
+        for s in symbols {
+            if s.line_start <= r.line && r.line <= s.line_end {
+                let span = s.line_end - s.line_start;
+                match best {
+                    // Strictly smaller span = more deeply nested; ties keep the
+                    // first (outer-declared) match for determinism.
+                    Some(b) if (b.line_end - b.line_start) <= span => {}
+                    _ => best = Some(s),
+                }
+            }
+        }
+        if let Some(s) = best {
+            r.from_symbol = Some(s.qualified_name.clone());
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
