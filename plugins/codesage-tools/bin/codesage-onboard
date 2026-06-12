@@ -29,6 +29,10 @@ Options:
   --no-hint               Skip writing .claude/CLAUDE.md hint file
   --refresh-hint          Overwrite an existing .claude/CLAUDE.md hint
                           (default: skip when present, preserve user edits)
+  --hint-only             Only (re)write the agent hint; skip MCP registration,
+                          init, indexing, and hooks. Use with --refresh-hint to
+                          refresh an already-onboarded repo's hint without a
+                          reindex.
   -h, --help              This help
 EOF
     exit 2
@@ -41,6 +45,7 @@ skip_mcp=0
 skip_hooks=0
 skip_hint=0
 refresh_hint=0
+hint_only=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -50,6 +55,7 @@ while [ $# -gt 0 ]; do
         --no-hooks)     skip_hooks=1 ;;
         --no-hint)      skip_hint=1 ;;
         --refresh-hint) refresh_hint=1 ;;
+        --hint-only)    hint_only=1 ;;
         -h|--help)      usage ;;
         --*)            echo "unknown option: $1" >&2; usage ;;
         *)              [ -z "$project" ] && project="$1" || usage ;;
@@ -89,6 +95,10 @@ echo "    project:      $project"
 echo "    codesage bin: $codesage_bin"
 echo "    device:       $device"
 echo
+
+if [ "$hint_only" -eq 1 ]; then
+    echo "==> hint-only mode: skipping MCP registration, init, index, and hooks"
+else
 
 # --- Step 1: global MCP registration ---
 if [ "$skip_mcp" -eq 0 ]; then
@@ -173,6 +183,8 @@ else
     echo "==> [6/7] not a git repo, skipping git history index"
 fi
 
+fi  # end: steps 1-6 (skipped in --hint-only mode)
+
 # --- Step 7: agent context hint ---
 #
 # Target selection: if AGENTS.md exists at the repo root AND is gitignored,
@@ -226,7 +238,7 @@ if [ "$skip_hint" -eq 0 ]; then
         trap 'rm -f "$hint_tmp"' EXIT
         cat > "$hint_tmp" <<HINT
 <!-- codesage-onboard-hint-begin -->
-<!-- codesage-onboard-hint-version: 0.7.1 -->
+<!-- codesage-onboard-hint-version: 0.7.2 -->
 # Local: code intelligence (CodeSage)
 
 Global MCP server \`codesage\` provides semantic search and structural graph queries for this project.
