@@ -10,6 +10,12 @@
 - Live filesystem watcher: the daemon auto-starts a per-project watcher on first tool call that reindexes (structural + semantic) on edit, debounced (default 1s, `REINDEX_DEBOUNCE`), reusing the daemon's pooled embedder. Honors `.gitignore` and `[index].exclude_patterns` and skips ignored top-level trees (`target/`, `.git/`, `node_modules/`) from the watch set. On by default; disable with `[index] watch = false` or `CODESAGE_WATCH=0`. Self-exits after idle (`CODESAGE_WATCH_IDLE_SECS`, default 1800; `0` disables).
 - `codesage watch run|status|stop|start [project]` to manually control the live watcher (`run` is a foreground instance with its own embedder).
 
+### Fixed
+- CUDA verification now fails when neither cuDNN nor cuBLAS is loaded after GPU session creation.
+- `recommend_tests` now finds primary sibling tests from the structural file index, independent of git-history rows.
+- CMake `target_sources` feature mapping no longer records later `PUBLIC` / `INTERFACE` scope keywords as owned files.
+- The live watcher now applies nested `.gitignore` files consistently with indexing discovery.
+
 ## [0.10.0] - 2026-06-11
 
 ### Added

@@ -1,4 +1,6 @@
-use codesage_parser::discover::{MAX_INDEXABLE_FILE_BYTES, discover_files_with_excludes};
+use codesage_parser::discover::{
+    MAX_INDEXABLE_FILE_BYTES, WatchFilter, discover_files_with_excludes,
+};
 use codesage_protocol::Language;
 
 #[test]
@@ -114,6 +116,26 @@ fn respects_gitignore() {
 
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].path, "app.php");
+}
+
+#[test]
+fn watch_filter_respects_nested_gitignore_like_discovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    std::fs::create_dir(root.join(".git")).unwrap();
+    std::fs::create_dir_all(root.join("src/generated")).unwrap();
+    std::fs::write(root.join("src/.gitignore"), "generated/\n").unwrap();
+    std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(root.join("src/generated/out.rs"), "fn generated() {}\n").unwrap();
+
+    let files = discover_files_with_excludes(root, &[]).unwrap();
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, vec!["src/main.rs"]);
+
+    let filter = WatchFilter::new(root, &[]).unwrap();
+    assert!(!filter.is_ignored(&root.join("src/main.rs"), false));
+    assert!(filter.is_ignored(&root.join("src/generated/out.rs"), false));
 }
 
 #[test]

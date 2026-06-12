@@ -237,8 +237,7 @@ impl WatchFilter {
             Some(build_exclude_set(exclude_patterns)?)
         };
         let mut gb = ignore::gitignore::GitignoreBuilder::new(root);
-        // Best-effort: a missing .gitignore just yields no rules.
-        let _ = gb.add(root.join(".gitignore"));
+        add_nested_gitignores(&mut gb, root, excludes.as_ref());
         let _ = gb.add(root.join(".git").join("info").join("exclude"));
         let gitignore = gb.build()?;
         Ok(Self {
@@ -273,6 +272,47 @@ impl WatchFilter {
         self.gitignore
             .matched_path_or_any_parents(rel, is_dir)
             .is_ignore()
+    }
+}
+
+fn add_nested_gitignores(
+    gb: &mut ignore::gitignore::GitignoreBuilder,
+    root: &Path,
+    excludes: Option<&GlobSet>,
+) {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let _ = gb.add(dir.join(".gitignore"));
+
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if !file_type.is_dir() || file_type.is_symlink() {
+                continue;
+            }
+
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(root) else {
+                continue;
+            };
+            let rel_str = rel.to_string_lossy();
+            if let Some(excludes) = excludes
+                && exclude_matches_path(excludes, &rel_str, true)
+            {
+                continue;
+            }
+            stack.push(path);
+        }
     }
 }
 

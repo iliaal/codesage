@@ -204,6 +204,11 @@ fn validate_site_packages_dir(line: &str) -> Option<PathBuf> {
 pub(crate) fn require_cuda_libs_mapped() -> anyhow::Result<()> {
     let maps = std::fs::read_to_string("/proc/self/maps")
         .context("reading /proc/self/maps to verify CUDA libraries are loaded")?;
+    verify_cuda_libs_mapped(&maps)
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn verify_cuda_libs_mapped(maps: &str) -> anyhow::Result<()> {
     let has_libcuda = maps.contains("libcuda.so");
     let has_cudart = maps.contains("libcudart.so");
     // Either cuDNN or cuBLAS is enough evidence the CUDA EP is functional;
@@ -225,9 +230,15 @@ pub(crate) fn require_cuda_libs_mapped() -> anyhow::Result<()> {
         );
     }
     if !has_dnn_or_blas {
-        tracing::warn!(
-            "CUDA runtime is mapped but neither libcudnn nor libcublas were found in /proc/self/maps. \
-             Inference may fall back to CPU on attention ops."
+        anyhow::bail!(
+            "GPU was requested (device = \"gpu\") but neither libcudnn nor libcublas \
+             is loaded into this process — ORT may be running inference on CPU. \
+             Refusing to continue.\n\
+             Missing: libcudnn=true, libcublas=true\n\
+             Fixes: install nvidia-cudnn-cu12 and nvidia-cublas-cu12, set \
+             CODESAGE_NVIDIA_LIBS to the directory containing them, and check \
+             `codesage doctor` for nvidia-lib discovery details. \
+             To override (e.g. for tests), set CODESAGE_ALLOW_CPU_FALLBACK=1."
         );
     }
     Ok(())
@@ -704,6 +715,23 @@ mod tests {
         assert!(
             dirs.contains(&root),
             "CODESAGE_NVIDIA_LIBS should accept a directory that directly contains CUDA shared libraries: {dirs:?}"
+        );
+    }
+
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    #[test]
+    fn cuda_maps_without_cudnn_or_cublas_are_rejected() {
+        let maps = "\
+7f0000000000-7f0000010000 r-xp 00000000 00:00 0 /usr/lib/libcuda.so.1
+7f0000010000-7f0000020000 r-xp 00000000 00:00 0 /usr/lib/libcudart.so.12
+";
+
+        let err = verify_cuda_libs_mapped(maps)
+            .expect_err("CUDA runtime without cuDNN/cuBLAS should be treated as CPU fallback");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("libcudnn") && msg.contains("libcublas"),
+            "error should name the missing math libraries: {msg}"
         );
     }
 }

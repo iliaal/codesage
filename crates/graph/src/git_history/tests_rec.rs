@@ -46,7 +46,7 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<Vec<String>> {
     let mut found = Vec::new();
     for c in &candidates {
         let normalized = c.trim_start_matches('/').to_string();
-        if db.git_file(&normalized)?.is_some() {
+        if db.file_id_for_path(&normalized)?.is_some() {
             found.push(normalized);
         }
     }
@@ -60,7 +60,7 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<Vec<String>> {
     {
         let crate_root = &file_path[..idx];
         let tests_prefix = format!("{crate_root}/tests/");
-        for path in db.git_files_with_prefix(&tests_prefix)? {
+        for path in db.indexed_files_with_prefix(&tests_prefix)? {
             if path.ends_with(".rs") && !path.contains("/fixtures/") && !found.contains(&path) {
                 found.push(path);
             }
@@ -68,7 +68,7 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<Vec<String>> {
     }
     // Workspace-root case: src/foo.rs paired with tests/*.rs at the same level.
     if file_path.ends_with(".rs") && file_path.starts_with("src/") {
-        for path in db.git_files_with_prefix("tests/")? {
+        for path in db.indexed_files_with_prefix("tests/")? {
             if path.ends_with(".rs") && !path.contains("/fixtures/") && !found.contains(&path) {
                 found.push(path);
             }
@@ -86,7 +86,7 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<Vec<String>> {
     {
         let tests_prefix = format!("{dir}/tests/");
         let candidates: Vec<String> = db
-            .git_files_with_prefix(&tests_prefix)?
+            .indexed_files_with_prefix(&tests_prefix)?
             .into_iter()
             .filter(|p| p.ends_with(".phpt") && !found.contains(p))
             .collect();
@@ -106,7 +106,7 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<Vec<String>> {
     {
         for type_dir in ["Unit", "Feature", "Integration", "Browser"] {
             let candidate = format!("tests/{type_dir}/{rest_dir}/{mirror_stem}Test.php");
-            if !found.contains(&candidate) && db.git_file(&candidate)?.is_some() {
+            if !found.contains(&candidate) && db.file_id_for_path(&candidate)?.is_some() {
                 found.push(candidate);
             }
         }
@@ -121,7 +121,7 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<Vec<String>> {
         && let Some((mirror_stem, _)) = stem_with_ext.rsplit_once('.')
     {
         let candidate = format!("tests/{rest_dir}/{mirror_stem}Test.php");
-        if !found.contains(&candidate) && db.git_file(&candidate)?.is_some() {
+        if !found.contains(&candidate) && db.file_id_for_path(&candidate)?.is_some() {
             found.push(candidate);
         }
     }

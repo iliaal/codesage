@@ -1164,12 +1164,10 @@ fn strip_library_type_keyword(words: &mut Vec<String>) {
 }
 
 fn strip_target_sources_scope(words: &mut Vec<String>) {
-    if let Some(first) = words.first() {
-        let kw = first.to_ascii_uppercase();
-        if matches!(kw.as_str(), "PRIVATE" | "PUBLIC" | "INTERFACE") {
-            words.remove(0);
-        }
-    }
+    words.retain(|word| {
+        let kw = word.to_ascii_uppercase();
+        !matches!(kw.as_str(), "PRIVATE" | "PUBLIC" | "INTERFACE")
+    });
 }
 
 /// Dedup keyed on `(entry_path, kind)`. First seed wins, so the order
@@ -1442,10 +1440,12 @@ mod tests {
             dir.path(),
             "CMakeLists.txt",
             "add_executable(latebin)\n\
-             target_sources(latebin PRIVATE src/late_main.c src/late_util.c)\n",
+             target_sources(latebin PRIVATE src/late_main.c src/late_util.c PUBLIC include/late.h INTERFACE include/api.h)\n",
         );
         write(dir.path(), "src/late_main.c", "int main(){return 0;}\n");
         write(dir.path(), "src/late_util.c", "int util(){return 0;}\n");
+        write(dir.path(), "include/late.h", "int late(void);\n");
+        write(dir.path(), "include/api.h", "int api(void);\n");
         let seeds = CCppMapper
             .map(&MapperContext::for_root(dir.path()))
             .unwrap();
@@ -1456,6 +1456,10 @@ mod tests {
         let owned_paths: Vec<&str> = s.owned_files.iter().map(|f| f.path.as_str()).collect();
         assert!(owned_paths.contains(&"src/late_main.c"));
         assert!(owned_paths.contains(&"src/late_util.c"));
+        assert!(owned_paths.contains(&"include/late.h"));
+        assert!(owned_paths.contains(&"include/api.h"));
+        assert!(!owned_paths.contains(&"PUBLIC"));
+        assert!(!owned_paths.contains(&"INTERFACE"));
     }
 
     #[test]

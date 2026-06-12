@@ -2,6 +2,7 @@
 //! the score inputs are controlled (bypasses the real git log indexer).
 
 use codesage_graph::{assess_risk, full_index};
+use codesage_protocol::{FileInfo, Language};
 use codesage_storage::Database;
 
 /// Build a small project so impact_analysis has a graph to walk. One class, two
@@ -28,6 +29,29 @@ fn setup_project() -> (tempfile::TempDir, Database) {
     let db = Database::open_in_memory().unwrap();
     full_index(root, &db, &[], false).unwrap();
     (dir, db)
+}
+
+fn index_test_file(db: &Database, path: &str) {
+    let language = if path.ends_with(".php") || path.ends_with(".phpt") {
+        Language::Php
+    } else if path.ends_with(".rs") {
+        Language::Rust
+    } else if path.ends_with(".go") {
+        Language::Go
+    } else if path.ends_with(".py") {
+        Language::Python
+    } else if path.ends_with(".c") || path.ends_with(".h") {
+        Language::C
+    } else {
+        Language::TypeScript
+    };
+
+    db.upsert_file(&FileInfo {
+        path: path.to_string(),
+        language,
+        content_hash: format!("test-hash-{path}"),
+    })
+    .unwrap();
 }
 
 #[test]
@@ -134,8 +158,7 @@ fn test_gap_false_when_sibling_test_exists_without_coupling() {
     // Same directory, PHP sibling convention.
     db.upsert_git_file("Repository.php", 1.0, 0, 5, Some(1_700_000_000))
         .unwrap();
-    db.upsert_git_file("RepositoryTest.php", 0.5, 0, 5, Some(1_700_000_000))
-        .unwrap();
+    index_test_file(&db, "RepositoryTest.php");
     // No co-change relationship seeded.
     let r = assess_risk(&db, "Repository.php").unwrap();
     assert!(
@@ -698,10 +721,30 @@ fn recommend_tests_returns_empty_when_no_test_signal() {
 #[test]
 fn recommend_tests_finds_sibling_test_in_index() {
     let (_dir, db) = setup_project();
-    // Seed a sibling test file in git_files. assess_risk's test_sibling check
-    // queries the same table, so this is the canonical "sibling exists" signal.
-    db.upsert_git_file("RepositoryTest.php", 0.5, 0, 5, Some(1_700_000_000))
-        .unwrap();
+    index_test_file(&db, "RepositoryTest.php");
+
+    let r = codesage_graph::recommend_tests(&db, &["Repository.php".to_string()]).unwrap();
+    assert_eq!(r.primary, vec!["RepositoryTest.php".to_string()]);
+    assert!(r.coupled.is_empty(), "no co-change history seeded");
+}
+
+#[test]
+fn recommend_tests_finds_structural_sibling_without_git_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("Repository.php"),
+        b"<?php\nclass Repository { public function find($id) { return null; } }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("RepositoryTest.php"),
+        b"<?php\nclass RepositoryTest { public function testFind() {} }\n",
+    )
+    .unwrap();
+
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
 
     let r = codesage_graph::recommend_tests(&db, &["Repository.php".to_string()]).unwrap();
     assert_eq!(r.primary, vec!["RepositoryTest.php".to_string()]);
@@ -747,8 +790,7 @@ fn recommend_tests_dedupes_coupled_when_also_primary() {
     // only list it once, in primary, to avoid duplicate "run me" lines.
     db.upsert_git_file("Repository.php", 1.0, 0, 5, Some(1_700_000_000))
         .unwrap();
-    db.upsert_git_file("RepositoryTest.php", 0.5, 0, 5, Some(1_700_000_000))
-        .unwrap();
+    index_test_file(&db, "RepositoryTest.php");
     db.upsert_git_co_change(
         "Repository.php",
         "RepositoryTest.php",
@@ -773,10 +815,8 @@ fn recommend_tests_aggregates_across_multiple_input_files() {
         .unwrap();
     db.upsert_git_file("Service.php", 1.0, 0, 5, Some(1_700_000_000))
         .unwrap();
-    db.upsert_git_file("RepositoryTest.php", 0.5, 0, 5, Some(1_700_000_000))
-        .unwrap();
-    db.upsert_git_file("ServiceTest.php", 0.5, 0, 5, Some(1_700_000_000))
-        .unwrap();
+    index_test_file(&db, "RepositoryTest.php");
+    index_test_file(&db, "ServiceTest.php");
 
     let r = codesage_graph::recommend_tests(
         &db,
@@ -796,31 +836,10 @@ fn recommend_tests_finds_rust_integration_tests_under_crate_tests_dir() {
     // recommender lists every .rs file in that tests/ directory.
     db.upsert_git_file("crates/storage/src/db.rs", 1.0, 0, 5, Some(1_700_000_000))
         .unwrap();
-    db.upsert_git_file(
-        "crates/storage/tests/db_integration.rs",
-        0.5,
-        0,
-        5,
-        Some(1_700_000_000),
-    )
-    .unwrap();
-    db.upsert_git_file(
-        "crates/storage/tests/schema_migration_test.rs",
-        0.5,
-        0,
-        5,
-        Some(1_700_000_000),
-    )
-    .unwrap();
+    index_test_file(&db, "crates/storage/tests/db_integration.rs");
+    index_test_file(&db, "crates/storage/tests/schema_migration_test.rs");
     // A test under a different crate must NOT leak in.
-    db.upsert_git_file(
-        "crates/parser/tests/extract_test.rs",
-        0.5,
-        0,
-        5,
-        Some(1_700_000_000),
-    )
-    .unwrap();
+    index_test_file(&db, "crates/parser/tests/extract_test.rs");
 
     let r =
         codesage_graph::recommend_tests(&db, &["crates/storage/src/db.rs".to_string()]).unwrap();
@@ -851,23 +870,9 @@ fn recommend_tests_skips_fixture_files_under_rust_tests_dir() {
         Some(1_700_000_000),
     )
     .unwrap();
-    db.upsert_git_file(
-        "crates/parser/tests/extract_test.rs",
-        0.5,
-        0,
-        5,
-        Some(1_700_000_000),
-    )
-    .unwrap();
+    index_test_file(&db, "crates/parser/tests/extract_test.rs");
     // Fixture files are NOT test entry points; should not be recommended.
-    db.upsert_git_file(
-        "crates/parser/tests/fixtures/sample.rs",
-        0.1,
-        0,
-        2,
-        Some(1_700_000_000),
-    )
-    .unwrap();
+    index_test_file(&db, "crates/parser/tests/fixtures/sample.rs");
 
     let r = codesage_graph::recommend_tests(&db, &["crates/parser/src/extract.rs".to_string()])
         .unwrap();
@@ -884,19 +889,10 @@ fn recommend_tests_finds_phpt_tests_for_c_source() {
     // php-src convention: source at Zend/zend_compile.c, tests at Zend/tests/*.phpt.
     db.upsert_git_file("Zend/zend_compile.c", 5.0, 0, 10, Some(1_700_000_000))
         .unwrap();
-    db.upsert_git_file("Zend/tests/bug12345.phpt", 0.5, 0, 2, Some(1_700_000_000))
-        .unwrap();
-    db.upsert_git_file("Zend/tests/gh21709.phpt", 0.5, 0, 2, Some(1_700_000_000))
-        .unwrap();
+    index_test_file(&db, "Zend/tests/bug12345.phpt");
+    index_test_file(&db, "Zend/tests/gh21709.phpt");
     // Different subsystem's tests must not leak in.
-    db.upsert_git_file(
-        "ext/standard/tests/array_test.phpt",
-        0.5,
-        0,
-        2,
-        Some(1_700_000_000),
-    )
-    .unwrap();
+    index_test_file(&db, "ext/standard/tests/array_test.phpt");
 
     let r = codesage_graph::recommend_tests(&db, &["Zend/zend_compile.c".to_string()]).unwrap();
     assert!(r.primary.contains(&"Zend/tests/bug12345.phpt".to_string()));
@@ -917,8 +913,7 @@ fn recommend_tests_skips_phpt_tests_dir_when_oversized() {
     // Seed 60 .phpt files — should be skipped as too noisy for "primary".
     for i in 0..60 {
         let p = format!("ext/standard/tests/test_{i:03}.phpt");
-        db.upsert_git_file(&p, 0.1, 0, 2, Some(1_700_000_000))
-            .unwrap();
+        index_test_file(&db, &p);
     }
 
     let r = codesage_graph::recommend_tests(&db, &["ext/standard/array.c".to_string()]).unwrap();
@@ -942,17 +937,12 @@ fn recommend_tests_finds_laravel_mirror_tree_tests() {
     let test = "tests/Integration/Actions/CredentialingApplication/ExportZipActionTest.php";
     db.upsert_git_file(src, 1.0, 0, 5, Some(1_700_000_000))
         .unwrap();
-    db.upsert_git_file(test, 0.5, 0, 5, Some(1_700_000_000))
-        .unwrap();
+    index_test_file(&db, test);
     // A test for an unrelated class must not leak in.
-    db.upsert_git_file(
+    index_test_file(
+        &db,
         "tests/Integration/Actions/Other/UnrelatedActionTest.php",
-        0.5,
-        0,
-        5,
-        Some(1_700_000_000),
-    )
-    .unwrap();
+    );
 
     let r = codesage_graph::recommend_tests(&db, &[src.to_string()]).unwrap();
     assert_eq!(r.primary, vec![test.to_string()]);
@@ -964,22 +954,11 @@ fn recommend_tests_finds_laravel_test_under_unit_or_feature_too() {
     let src = "app/Services/Facility/ProviderService.php";
     db.upsert_git_file(src, 1.0, 0, 5, Some(1_700_000_000))
         .unwrap();
-    db.upsert_git_file(
-        "tests/Unit/Services/Facility/ProviderServiceTest.php",
-        0.5,
-        0,
-        5,
-        Some(1_700_000_000),
-    )
-    .unwrap();
-    db.upsert_git_file(
+    index_test_file(&db, "tests/Unit/Services/Facility/ProviderServiceTest.php");
+    index_test_file(
+        &db,
         "tests/Feature/Services/Facility/ProviderServiceTest.php",
-        0.5,
-        0,
-        5,
-        Some(1_700_000_000),
-    )
-    .unwrap();
+    );
 
     let r = codesage_graph::recommend_tests(&db, &[src.to_string()]).unwrap();
     assert!(
@@ -1226,8 +1205,7 @@ fn recommend_tests_finds_symfony_mirror_tree_tests() {
     let test = "tests/Domain/Order/OrderServiceTest.php";
     db.upsert_git_file(src, 1.0, 0, 5, Some(1_700_000_000))
         .unwrap();
-    db.upsert_git_file(test, 0.5, 0, 5, Some(1_700_000_000))
-        .unwrap();
+    index_test_file(&db, test);
 
     let r = codesage_graph::recommend_tests(&db, &[src.to_string()]).unwrap();
     assert_eq!(r.primary, vec![test.to_string()]);

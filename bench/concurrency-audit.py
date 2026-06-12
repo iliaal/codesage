@@ -225,6 +225,7 @@ def integrity_check(db_path: Path) -> dict:
             "schema_migrations": [],
             "schema_missing": [],
             "query_errors": [],
+            "foreign_key_violations": [],
             "semantic": {},
         }
 
@@ -373,12 +374,6 @@ def classify_verdict(results: list[dict], state: dict) -> str:
     if corrupt:
         return "❌ CORRUPT — see detail above; fix required (lockfile / busy_timeout / retry)"
 
-    if semantic.get("status") == "inconclusive":
-        return (
-            "⚠ INCONCLUSIVE — vec tables present but sqlite-vec is not loaded; "
-            "structural checks passed but semantic/vector state was not verified"
-        )
-
     timed_out = sum(1 for r in results if r["returncode"] is None)
     procs_ok = sum(1 for r in results if r["returncode"] == 0)
     lockfile_skips = sum(1 for r in results if is_lockfile_skip(r))
@@ -387,6 +382,13 @@ def classify_verdict(results: list[dict], state: dict) -> str:
             f"⚠ TIMEOUT — {timed_out} process(es) killed after the timeout; "
             "possible writer livelock, not a clean serialization (investigate)"
         )
+
+    if semantic.get("status") == "inconclusive":
+        return (
+            "⚠ INCONCLUSIVE — vec tables present but sqlite-vec is not loaded; "
+            "structural checks passed but semantic/vector state was not verified"
+        )
+
     if procs_ok == len(results):
         if lockfile_skips:
             return (
@@ -425,17 +427,32 @@ def is_lockfile_skip(result: dict) -> bool:
 
 def summarize_db(state: dict) -> str:
     lines = []
-    lines.append(f"  - integrity_check: {state['integrity']}")
+    lines.append(f"  - integrity_check: {state.get('integrity', 'unknown')}")
+    if state.get("schema_missing"):
+        lines.append(f"  - missing schema tables: {', '.join(state['schema_missing'])}")
+    if state.get("query_errors"):
+        lines.append(f"  - query errors: {len(state['query_errors'])} (!!)")
     if state.get("foreign_key_violations"):
         lines.append(f"  - FK violations: {len(state['foreign_key_violations'])} (!!)")
     else:
         lines.append(f"  - FK violations: none")
-    lines.append(f"  - orphan symbols: {state['orphans']['symbols_without_file']}")
-    lines.append(f"  - orphan refs:    {state['orphans']['refs_without_file']}")
-    lines.append(f"  - dupe file paths: {state['dupes']['files_same_path']}")
-    mig_dupes = [m for m in state['schema_migrations'] if m['count'] > 1]
+    orphans = state.get("orphans") or {}
+    dupes = state.get("dupes") or {}
+    lines.append(f"  - orphan symbols: {orphans.get('symbols_without_file', 0)}")
+    lines.append(f"  - orphan refs:    {orphans.get('refs_without_file', 0)}")
+    lines.append(f"  - dupe file paths: {dupes.get('files_same_path', 0)}")
+    schema_migrations = state.get("schema_migrations") or []
+    mig_dupes = [m for m in schema_migrations if m.get('count', 0) > 1]
     lines.append(f"  - schema_migrations duplicates: {len(mig_dupes)}")
-    lines.append(f"  - counts: files={state['count_files']}, symbols={state['count_symbols']}, refs={state['count_refs']}")
+    counts = [
+        f"{table}={state[f'count_{table}']}"
+        for table in ("files", "symbols", "refs")
+        if f"count_{table}" in state
+    ]
+    if counts:
+        lines.append(f"  - counts: {', '.join(counts)}")
+    else:
+        lines.append("  - counts: unavailable")
     semantic = state.get("semantic") or {}
     if semantic:
         lines.append(f"  - semantic check: {semantic.get('status', 'unknown')}")

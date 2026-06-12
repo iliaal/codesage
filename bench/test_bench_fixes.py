@@ -261,6 +261,10 @@ with tempfile.TemporaryDirectory() as td:
 # --------------------------------------------------------------------
 extract = _load("extract-eval-cases.py", "extract")
 
+
+def _tool_result(path: Path) -> str:
+    return json.dumps({"type": "user", "toolUseResult": {"file_path": str(path)}})
+
 with tempfile.TemporaryDirectory() as td:
     root = Path(td)
     # A normal path normalizes; a newline-bearing path is rejected so it can
@@ -307,6 +311,7 @@ with tempfile.TemporaryDirectory() as td:
                         },
                     }
                 ),
+                _tool_result(root / "Cargo.toml"),
             ]
         )
         + "\n"
@@ -354,6 +359,7 @@ with tempfile.TemporaryDirectory() as td:
                         },
                     }
                 ),
+                _tool_result(root / "Cargo.toml"),
             ]
         )
         + "\n"
@@ -420,6 +426,7 @@ with tempfile.TemporaryDirectory() as td:
                             },
                         }
                     ),
+                    _tool_result(root / target),
                 ]
             )
             + "\n"
@@ -459,6 +466,7 @@ with tempfile.TemporaryDirectory() as td:
             }
         )
     )
+    msgs.append(_tool_result(root / "late.py"))
     (sessions / "late.jsonl").write_text("\n".join(msgs) + "\n")
     cases = extract.extract_cases(sessions, str(root), min_files=1, max_cases=1)
     check(
@@ -501,6 +509,7 @@ with tempfile.TemporaryDirectory() as td:
                             },
                         }
                     ),
+                    _tool_result(root / "dup.py"),
                 ]
             )
             + "\n"
@@ -530,6 +539,7 @@ with tempfile.TemporaryDirectory() as td:
                         },
                     }
                 ),
+                _tool_result(root / "unique.py"),
             ]
         )
         + "\n"

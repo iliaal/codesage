@@ -112,6 +112,7 @@ def build_command(
         "claude", "-p", prompt,
         "--allowedTools", ",".join(tools),
         "--disallowedTools", ",".join(DISALLOWED_TOOLS),
+        "--setting-sources", "user",
         "--output-format", "stream-json",
         "--verbose",
         "--max-turns", str(max_turns),
@@ -277,7 +278,7 @@ def path_mentioned(text: str, expected: str) -> bool:
     pattern = re.compile(
         r"(?<![A-Za-z0-9_./-])(?:\./)?"
         + re.escape(expected.removeprefix("./"))
-        + r"(?![A-Za-z0-9_./-])"
+        + r"(?!(?:[A-Za-z0-9_/-]|\.[A-Za-z0-9_/-]))"
     )
     return pattern.search(text) is not None
 

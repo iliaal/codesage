@@ -49,12 +49,6 @@ def extract_tool_file_paths(msg: dict) -> set[str]:
     for block in content:
         if not isinstance(block, dict):
             continue
-        if block.get("type") == "tool_use":
-            inp = block.get("input", {})
-            if isinstance(inp, dict):
-                fp = inp.get("file_path", "")
-                if fp:
-                    paths.add(fp)
         if block.get("type") == "tool_result":
             result_content = block.get("content", "")
             paths.update(extract_file_paths_from_value(result_content))
@@ -76,9 +70,6 @@ def extract_file_paths_from_value(value) -> set[str]:
     elif isinstance(value, list):
         for child in value:
             paths.update(extract_file_paths_from_value(child))
-    elif isinstance(value, str):
-        for m in re.finditer(r'"file_path"\s*:\s*"([^"]+)"', value):
-            paths.add(m.group(1))
     return paths
 
 

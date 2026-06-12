@@ -50,6 +50,13 @@ ALLOWED_SUFFIXES = (
     ".ex", ".exs", ".erl", ".lua",
 )
 CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+COMMIT_PREFIX = re.compile(
+    r"^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)(\([^)]+\))?:",
+    re.I,
+)
+DECLARED_SYMBOL = re.compile(
+    r"\b(?:class|def|enum|fn|function|interface|struct|trait|type)\s+([A-Za-z_][A-Za-z0-9_]*)"
+)
 
 MIN_LINES = 30
 MAX_LINES = 500
@@ -73,34 +80,94 @@ def path_within_root(path: Path, project_root: Path) -> bool:
 def candidate_files(project_root: Path) -> list[Path]:
     root = project_root.resolve()
     out: list[Path] = []
-    for path in project_root.rglob("*"):
-        if path.is_symlink() or path.is_dir():
-            continue
-        if not path.is_file():
-            continue
-        if not path_within_root(path, root):
-            continue
-        rel = path.relative_to(project_root).as_posix()
-        if CONTROL_CHARS.search(rel):
-            continue
-        if SKIP_DIR_PATTERNS.search(rel):
-            continue
-        if path.suffix not in ALLOWED_SUFFIXES:
-            continue
-        if path.name.endswith(SKIP_FILE_SUFFIXES):
-            continue
-        try:
-            line_count = sum(1 for _ in path.open("r", encoding="utf-8", errors="ignore"))
-        except OSError:
-            continue
-        if line_count < MIN_LINES or line_count > MAX_LINES:
-            continue
-        out.append(path)
-    # Sort for determinism: rglob() yields entries in filesystem order, which
+    for dirpath, dirnames, filenames in os.walk(root):
+        current = Path(dirpath)
+        kept_dirs = []
+        for dirname in dirnames:
+            child = current / dirname
+            if child.is_symlink():
+                continue
+            rel_dir = child.relative_to(root).as_posix()
+            if CONTROL_CHARS.search(rel_dir):
+                continue
+            if SKIP_DIR_PATTERNS.search(f"{rel_dir}/"):
+                continue
+            kept_dirs.append(dirname)
+        dirnames[:] = kept_dirs
+
+        for filename in filenames:
+            path = current / filename
+            if path.is_symlink():
+                continue
+            if not path.is_file():
+                continue
+            if not path_within_root(path, root):
+                continue
+            rel = path.relative_to(root).as_posix()
+            if CONTROL_CHARS.search(rel):
+                continue
+            if SKIP_DIR_PATTERNS.search(rel):
+                continue
+            if path.suffix not in ALLOWED_SUFFIXES:
+                continue
+            if path.name.endswith(SKIP_FILE_SUFFIXES):
+                continue
+            try:
+                line_count = sum(1 for _ in path.open("r", encoding="utf-8", errors="ignore"))
+            except OSError:
+                continue
+            if line_count < MIN_LINES or line_count > MAX_LINES:
+                continue
+            out.append(path)
+    # Sort for determinism: os.walk() yields entries in filesystem order, which
     # varies across machines/filesystems/checkouts. The seeded shuffle below
     # only reproduces the same sample if its input order is stable.
     out.sort()
     return out
+
+
+def query_rejection_reason(query: str, rel_path: str, content: str) -> str | None:
+    q = query.strip()
+    if not q:
+        return "empty query"
+    if "\n" in q or "\r" in q:
+        return "query is not a single line"
+    words = q.split()
+    if len(words) < 4 or len(words) > 15:
+        return "query must be 4-15 words"
+    if COMMIT_PREFIX.match(q):
+        return "query looks like a conventional commit subject"
+    if "/" in q or "\\" in q:
+        return "query contains a path separator"
+
+    q_lower = q.lower()
+    rel_lower = rel_path.lower()
+    path = Path(rel_path)
+    forbidden_path_terms = {
+        rel_lower,
+        path.name.lower(),
+        path.stem.lower(),
+    }
+    for term in forbidden_path_terms:
+        if term and term in q_lower:
+            return f"query includes path term {term!r}"
+
+    for match in DECLARED_SYMBOL.finditer(content):
+        symbol = match.group(1).lower()
+        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(symbol)}(?![A-Za-z0-9_])", q_lower):
+            return f"query includes symbol {match.group(1)!r}"
+
+    return None
+
+
+def validate_query_text(query: str | None, rel_path: str, content: str) -> str | None:
+    if query is None:
+        return None
+    reason = query_rejection_reason(query, rel_path, content)
+    if reason:
+        print(f"  ! rejected generated query: {reason}", file=sys.stderr)
+        return None
+    return query
 
 
 def positive_int(value: str) -> int:
@@ -284,7 +351,7 @@ def generate_query(file_path: Path, project_root: Path) -> str | None:
               file=sys.stderr)
         return None
 
-    return query_text
+    return validate_query_text(query_text, rel, content)
 
 
 def format_corpus_yaml(project_root: str, cases: list[dict]) -> str:

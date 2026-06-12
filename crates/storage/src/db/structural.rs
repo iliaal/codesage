@@ -160,6 +160,17 @@ impl Database {
         }
     }
 
+    pub fn indexed_files_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let pattern = format!("{}%", escape_like(prefix));
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM files WHERE path LIKE ?1 ESCAPE '\\' ORDER BY path")?;
+        let rows = stmt
+            .query_map(params![pattern], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Delete every reference of a given kind across all files. The feature
     /// mapper calls this before re-inserting synthetic edges (e.g.
     /// `RouteHandler`) so a remap stays idempotent and drops edges whose
@@ -681,4 +692,11 @@ impl Database {
         tags.dedup();
         Ok(tags)
     }
+}
+
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
