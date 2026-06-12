@@ -462,6 +462,9 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
             if !is_valid_target_name(&name) {
                 continue;
             }
+            // `add_executable(name [WIN32] [MACOSX_BUNDLE] [EXCLUDE_FROM_ALL] …)`
+            // — option keywords are not sources.
+            strip_cmake_target_options(&mut words);
             let mut all_sources: Vec<String> = words;
             if let Some(extra) = extra_sources.get(&name) {
                 all_sources.extend(extra.iter().cloned());
@@ -570,9 +573,10 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
             if !is_valid_target_name(&name) {
                 continue;
             }
-            // `add_library(name [SHARED|STATIC|MODULE|OBJECT|INTERFACE] …)`
-            // — the library-type keyword, if present, is not a source.
+            // `add_library(name [SHARED|STATIC|MODULE|OBJECT|INTERFACE] [EXCLUDE_FROM_ALL] …)`
+            // — neither the library-type keyword nor EXCLUDE_FROM_ALL is a source.
             strip_library_type_keyword(&mut words);
+            strip_cmake_target_options(&mut words);
             let mut all_sources: Vec<String> = words;
             if let Some(extra) = extra_sources.get(&name) {
                 all_sources.extend(extra.iter().cloned());
@@ -1167,6 +1171,21 @@ fn strip_target_sources_scope(words: &mut Vec<String>) {
     words.retain(|word| {
         let kw = word.to_ascii_uppercase();
         !matches!(kw.as_str(), "PRIVATE" | "PUBLIC" | "INTERFACE")
+    });
+}
+
+/// Drop the `add_executable` / `add_library` option keywords that sit between
+/// the target name (and library type) and the source list: `WIN32` and
+/// `MACOSX_BUNDLE` (executables) and `EXCLUDE_FROM_ALL` (both). Without this
+/// they leak into `owned_files` as phantom paths like `<dir>/WIN32`. Sibling of
+/// [`strip_target_sources_scope`] on the executable/library axis. `WIN32` /
+/// `MACOSX_BUNDLE` never legally appear in `add_library`, so stripping them
+/// there is a harmless no-op on real input (a source named exactly `WIN32` with
+/// no extension isn't a compilable file).
+fn strip_cmake_target_options(words: &mut Vec<String>) {
+    words.retain(|word| {
+        let kw = word.to_ascii_uppercase();
+        !matches!(kw.as_str(), "WIN32" | "MACOSX_BUNDLE" | "EXCLUDE_FROM_ALL")
     });
 }
 
@@ -1862,6 +1881,56 @@ mod tests {
         assert!(
             owned.contains(&"src/a.c") && owned.contains(&"src/b.c"),
             "real sources missing: {owned:?}"
+        );
+    }
+
+    #[test]
+    fn cmake_strips_executable_and_library_option_keywords() {
+        // Sibling of the target_sources PRIVATE/PUBLIC/INTERFACE fix:
+        // `add_executable(app WIN32 MACOSX_BUNDLE main.c)` and
+        // `add_library(foo STATIC EXCLUDE_FROM_ALL a.c)` must not record the
+        // option keywords as phantom owned files.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "CMakeLists.txt",
+            "add_executable(app WIN32 MACOSX_BUNDLE main.c)\n\
+             add_library(foo STATIC EXCLUDE_FROM_ALL a.c)\n",
+        );
+        write(dir.path(), "main.c", "int main(){return 0;}\n");
+        write(dir.path(), "a.c", "int a(){return 0;}\n");
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+
+        let exe = seeds
+            .iter()
+            .find(|s| s.source == "cmake-bin" && s.entry_command.as_deref() == Some("app"))
+            .expect("cmake-bin seed for `app`");
+        let exe_owned: Vec<&str> = exe.owned_files.iter().map(|f| f.path.as_str()).collect();
+        assert!(
+            !exe_owned
+                .iter()
+                .any(|p| p.ends_with("WIN32") || p.ends_with("MACOSX_BUNDLE")),
+            "executable option keyword leaked as a source: {exe_owned:?}"
+        );
+        assert!(
+            exe_owned.contains(&"main.c"),
+            "real source missing: {exe_owned:?}"
+        );
+
+        let lib = seeds
+            .iter()
+            .find(|s| s.source == "cmake-lib" && s.title == "CMake library `foo`")
+            .expect("cmake-lib seed for `foo`");
+        let lib_owned: Vec<&str> = lib.owned_files.iter().map(|f| f.path.as_str()).collect();
+        assert!(
+            !lib_owned.iter().any(|p| p.ends_with("EXCLUDE_FROM_ALL")),
+            "EXCLUDE_FROM_ALL leaked as a source: {lib_owned:?}"
+        );
+        assert!(
+            lib_owned.contains(&"a.c"),
+            "real source missing: {lib_owned:?}"
         );
     }
 

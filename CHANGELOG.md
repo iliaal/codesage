@@ -2,7 +2,7 @@
 
 ### Added
 - `project_overview` MCP tool and `codesage overview` CLI command: one-call project orientation (languages, structural+semantic freshness, feature summary by kind, top-risk files, trust-boundary clusters, per-language test conventions, sample entrypoints, suggested next calls).
-- `review_rehearsal` MCP tool and `codesage rehearse` CLI command: predict severity-ranked review objections for a patch (missing tests, high-risk/blast-radius/fix-prone/hotspot files, import cycles, trust-boundary expansion, feature-test gaps, and `scope-spread` when a patch touches ≥4 unrelated feature slices) from `assess_risk_diff` + `recommend_tests` + drift + feature mapping. High-risk objections list the file's hottest symbols. CLI falls back to working-tree changes vs HEAD when no files are given.
+- `review_rehearsal` MCP tool and `codesage rehearse` CLI command: predict severity-ranked review objections for a patch (missing tests, high-risk/blast-radius/fix-prone/hotspot files, import cycles, trust-boundary expansion, feature-test gaps, and `scope-spread` when a patch touches ≥4 unrelated feature areas) from `assess_risk_diff` + `recommend_tests` + drift + feature mapping. High-risk objections list the file's hottest symbols. CLI falls back to working-tree changes vs HEAD when no files are given.
 
 ### Changed
 - `impact_analysis` gains opt-in `include_forward` (forward dependencies), `include_siblings` (same-file symbols), `limit`, and `summary_only` controls; the result is now an object with `results` plus the requested extras (`codesage impact --forward --siblings --limit --summary-only`). Reading `.results` is unchanged.
@@ -14,6 +14,7 @@
 - CUDA verification now fails when neither cuDNN nor cuBLAS is loaded after GPU session creation.
 - `recommend_tests` now finds primary sibling tests from the structural file index, independent of git-history rows.
 - CMake `target_sources` feature mapping no longer records later `PUBLIC` / `INTERFACE` scope keywords as owned files.
+- CMake `add_executable` / `add_library` feature mapping no longer records option keywords (`WIN32`, `MACOSX_BUNDLE`, `EXCLUDE_FROM_ALL`) as owned files.
 - The live watcher now applies nested `.gitignore` files consistently with indexing discovery.
 
 ## [0.10.0] - 2026-06-11
