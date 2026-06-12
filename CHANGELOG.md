@@ -2,7 +2,7 @@
 
 ### Added
 - `project_overview` MCP tool and `codesage overview` CLI command: one-call project orientation (languages, structural+semantic freshness, feature summary by kind, top-risk files, trust-boundary clusters, per-language test conventions, sample entrypoints, suggested next calls).
-- `review_rehearsal` MCP tool and `codesage rehearse` CLI command: predict severity-ranked review objections for a patch (missing tests, high-risk/blast-radius/fix-prone/hotspot files, import cycles, trust-boundary expansion, feature-test gaps) from `assess_risk_diff` + `recommend_tests` + drift + feature mapping. CLI falls back to working-tree changes vs HEAD when no files are given.
+- `review_rehearsal` MCP tool and `codesage rehearse` CLI command: predict severity-ranked review objections for a patch (missing tests, high-risk/blast-radius/fix-prone/hotspot files, import cycles, trust-boundary expansion, feature-test gaps, and `scope-spread` when a patch touches ≥4 unrelated feature slices) from `assess_risk_diff` + `recommend_tests` + drift + feature mapping. High-risk objections list the file's hottest symbols. CLI falls back to working-tree changes vs HEAD when no files are given.
 
 ### Changed
 - `impact_analysis` gains opt-in `include_forward` (forward dependencies), `include_siblings` (same-file symbols), `limit`, and `summary_only` controls; the result is now an object with `results` plus the requested extras (`codesage impact --forward --siblings --limit --summary-only`). Reading `.results` is unchanged.

@@ -4,7 +4,7 @@
 //! mapping — so there is no duplicated analysis logic here, only the glue that
 //! turns those signals into severity-ranked objections.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::Result;
@@ -19,6 +19,18 @@ use crate::drift::{self, DriftKind};
 /// A file crossing at least this many trust boundaries warrants a security note
 /// (matches the `assess_risk` threshold).
 const TRUST_BOUNDARY_THRESHOLD: usize = 3;
+
+/// Hottest symbols to surface per high-risk file.
+const HOTSPOT_EVIDENCE_CAP: usize = 3;
+
+/// A patch touching at least this many distinct feature slices reads as
+/// scattered — worth confirming the change set is intentional. Tuned to fire on
+/// genuine scope creep, not a focused deep change (which concentrates in 1–2
+/// features).
+const SCOPE_SPREAD_THRESHOLD: usize = 4;
+
+/// Cap on per-slice evidence lines in the scope-spread objection.
+const SCOPE_EVIDENCE_CAP: usize = 10;
 
 pub fn build_review_rehearsal(
     root: &Path,
@@ -85,6 +97,20 @@ pub fn build_review_rehearsal(
         }
     }
     if !high.is_empty() {
+        // For each high-risk file, the score line followed by its hottest
+        // symbols (already computed by `assess_risk`) so the reviewer knows
+        // which function to read first. `why` reflects structural load
+        // (size × references × cycle), not edit frequency.
+        let mut evidence = Vec::new();
+        for a in &high {
+            evidence.push(format!("{} (score {:.2})", a.file, a.score));
+            for s in a.top_symbols.iter().take(HOTSPOT_EVIDENCE_CAP) {
+                evidence.push(format!(
+                    "  hot symbol: {} @ line {} ({})",
+                    s.name, s.line, s.why
+                ));
+            }
+        }
         objections.push(ReviewObjection {
             severity: ReviewSeverity::High,
             category: "high-risk-file".to_string(),
@@ -92,10 +118,7 @@ pub fn build_review_rehearsal(
                 "{} high-risk file(s) in the patch (score ≥ 0.60)",
                 high.len()
             ),
-            evidence: high
-                .iter()
-                .map(|a| format!("{} (score {:.2})", a.file, a.score))
-                .collect(),
+            evidence,
             files: high.iter().map(|a| a.file.clone()).collect(),
         });
     }
@@ -208,12 +231,29 @@ pub fn build_review_rehearsal(
         }
     }
 
-    // --- feature-test gap: the patch changes a feature's core (entry/owned)
-    // files but none of that feature's mapped tests ---
+    // --- feature mapping: one `features_for_file` pass per input file feeds
+    // both the feature-test-gap check and the scope-cohesion check ---
     let input_set: BTreeSet<&str> = files.iter().map(String::as_str).collect();
     let mut seen_features: BTreeSet<String> = BTreeSet::new();
+    // Scope accumulation: distinct slices touched, the patch files under each,
+    // and files claimed by no feature.
+    let mut feature_titles: BTreeMap<String, String> = BTreeMap::new();
+    let mut feature_patch_files: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut orphan_files: Vec<String> = Vec::new();
     for f in files {
         let feats = db.features_for_file(f).unwrap_or_default();
+        if feats.is_empty() {
+            orphan_files.push(f.clone());
+        }
+        for feat in &feats {
+            feature_titles
+                .entry(feat.feature_id.clone())
+                .or_insert_with(|| feat.title.clone());
+            feature_patch_files
+                .entry(feat.feature_id.clone())
+                .or_default()
+                .push(f.clone());
+        }
         for feat in feats {
             let core_change = feat.files.iter().any(|r| {
                 r.path == *f && matches!(r.role, FeatureFileRole::Entry | FeatureFileRole::Owned)
@@ -247,6 +287,47 @@ pub fn build_review_rehearsal(
                 });
             }
         }
+    }
+
+    // --- scope cohesion: a patch spread thin across many unrelated slices reads
+    // as scope creep. Deterministic proxy for "intent mismatch" — we can't read
+    // the PR's stated intent, so we flag the spread and ask for confirmation.
+    // Low severity: an attention prompt, never a defect. ---
+    if feature_titles.len() >= SCOPE_SPREAD_THRESHOLD {
+        let mut evidence: Vec<String> = feature_titles
+            .iter()
+            .take(SCOPE_EVIDENCE_CAP)
+            .map(|(id, title)| {
+                let patch_files = feature_patch_files
+                    .get(id)
+                    .map(|v| v.join(", "))
+                    .unwrap_or_default();
+                format!("{title}: {patch_files}")
+            })
+            .collect();
+        if feature_titles.len() > SCOPE_EVIDENCE_CAP {
+            evidence.push(format!(
+                "… and {} more slice(s)",
+                feature_titles.len() - SCOPE_EVIDENCE_CAP
+            ));
+        }
+        if !orphan_files.is_empty() {
+            evidence.push(format!(
+                "{} file(s) belong to no mapped feature: {}",
+                orphan_files.len(),
+                orphan_files.join(", ")
+            ));
+        }
+        objections.push(ReviewObjection {
+            severity: ReviewSeverity::Low,
+            category: "scope-spread".to_string(),
+            title: format!(
+                "Patch spans {} feature slices — confirm this is one intentional change, not unrelated edits bundled together",
+                feature_titles.len()
+            ),
+            evidence,
+            files: orphan_files,
+        });
     }
 
     // High first, then by category for stable output.
