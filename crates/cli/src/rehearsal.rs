@@ -23,13 +23,13 @@ const TRUST_BOUNDARY_THRESHOLD: usize = 3;
 /// Hottest symbols to surface per high-risk file.
 const HOTSPOT_EVIDENCE_CAP: usize = 3;
 
-/// A patch touching at least this many distinct feature slices reads as
-/// scattered — worth confirming the change set is intentional. Tuned to fire on
-/// genuine scope creep, not a focused deep change (which concentrates in 1–2
-/// features).
+/// A patch touching at least this many distinct feature *areas* (entry
+/// directories) reads as scattered — worth confirming the change set is
+/// intentional. Tuned against real history on php-src + a Laravel backend so a
+/// focused deep change (which concentrates in 1–2 areas) does not fire.
 const SCOPE_SPREAD_THRESHOLD: usize = 4;
 
-/// Cap on per-slice evidence lines in the scope-spread objection.
+/// Cap on per-area evidence lines in the scope-spread objection.
 const SCOPE_EVIDENCE_CAP: usize = 10;
 
 pub fn build_review_rehearsal(
@@ -235,10 +235,13 @@ pub fn build_review_rehearsal(
     // both the feature-test-gap check and the scope-cohesion check ---
     let input_set: BTreeSet<&str> = files.iter().map(String::as_str).collect();
     let mut seen_features: BTreeSet<String> = BTreeSet::new();
-    // Scope accumulation: distinct slices touched, the patch files under each,
-    // and files claimed by no feature.
-    let mut feature_titles: BTreeMap<String, String> = BTreeMap::new();
-    let mut feature_patch_files: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // Scope accumulation keyed by the feature's entry *directory*, not
+    // feature_id. php-src maps every PHP function/method as its own feature
+    // sharing one source file, so a single-file change can touch 60+ features
+    // in one directory — counting feature ids would scream "scattered" on a
+    // focused patch. Entry directory is the area-level locus that actually
+    // signals scatter.
+    let mut area_files: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut orphan_files: Vec<String> = Vec::new();
     for f in files {
         let feats = db.features_for_file(f).unwrap_or_default();
@@ -246,13 +249,10 @@ pub fn build_review_rehearsal(
             orphan_files.push(f.clone());
         }
         for feat in &feats {
-            feature_titles
-                .entry(feat.feature_id.clone())
-                .or_insert_with(|| feat.title.clone());
-            feature_patch_files
-                .entry(feat.feature_id.clone())
+            area_files
+                .entry(entry_area(&feat.entry_path))
                 .or_default()
-                .push(f.clone());
+                .insert(f.clone());
         }
         for feat in feats {
             let core_change = feat.files.iter().any(|r| {
@@ -293,22 +293,19 @@ pub fn build_review_rehearsal(
     // as scope creep. Deterministic proxy for "intent mismatch" — we can't read
     // the PR's stated intent, so we flag the spread and ask for confirmation.
     // Low severity: an attention prompt, never a defect. ---
-    if feature_titles.len() >= SCOPE_SPREAD_THRESHOLD {
-        let mut evidence: Vec<String> = feature_titles
+    if area_files.len() >= SCOPE_SPREAD_THRESHOLD {
+        let mut evidence: Vec<String> = area_files
             .iter()
             .take(SCOPE_EVIDENCE_CAP)
-            .map(|(id, title)| {
-                let patch_files = feature_patch_files
-                    .get(id)
-                    .map(|v| v.join(", "))
-                    .unwrap_or_default();
-                format!("{title}: {patch_files}")
+            .map(|(area, fs)| {
+                let patch_files = fs.iter().cloned().collect::<Vec<_>>().join(", ");
+                format!("{area}/: {patch_files}")
             })
             .collect();
-        if feature_titles.len() > SCOPE_EVIDENCE_CAP {
+        if area_files.len() > SCOPE_EVIDENCE_CAP {
             evidence.push(format!(
-                "… and {} more slice(s)",
-                feature_titles.len() - SCOPE_EVIDENCE_CAP
+                "… and {} more area(s)",
+                area_files.len() - SCOPE_EVIDENCE_CAP
             ));
         }
         if !orphan_files.is_empty() {
@@ -322,8 +319,8 @@ pub fn build_review_rehearsal(
             severity: ReviewSeverity::Low,
             category: "scope-spread".to_string(),
             title: format!(
-                "Patch spans {} feature slices — confirm this is one intentional change, not unrelated edits bundled together",
-                feature_titles.len()
+                "Patch spans {} feature areas — confirm this is one intentional change, not unrelated edits bundled together",
+                area_files.len()
             ),
             evidence,
             files: orphan_files,
@@ -344,6 +341,18 @@ pub fn build_review_rehearsal(
         objections,
         summary_notes,
     })
+}
+
+/// The "area" of a feature for scope-spread accounting: the directory of its
+/// entry file. Collapses many fine-grained features that share one source file
+/// (php-src maps each PHP function as its own feature) into a single locus, so
+/// the signal measures scatter across the tree rather than function density.
+fn entry_area(entry_path: &str) -> String {
+    std::path::Path::new(entry_path)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| ".".to_string())
 }
 
 fn build_summary(
