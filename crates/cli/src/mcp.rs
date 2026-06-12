@@ -9,15 +9,15 @@ use codesage_embed::model::Embedder;
 use codesage_embed::reranker::Reranker;
 use codesage_graph::{
     assess_risk, assess_risk_batch, assess_risk_diff, export_context, export_context_for_symbol,
-    feature_bundle, find_coupling, find_references, find_symbol, impact_analysis,
+    feature_bundle, find_coupling, find_references, find_symbol, impact_analysis_report,
     list_dependencies, recommend_tests, search, session_end, session_start,
 };
 use codesage_protocol::{
     ContextBundle, CouplingReport, DependencyEntry, ExportRequest, FeatureKind, FeatureListResults,
     FindReferencesRequest, FindReferencesResults, FindSymbolRequest, FindSymbolResults,
-    ImpactAnalysisResults, ImpactRequest, ImpactTarget, Language, ProjectOverview, ReferenceKind,
-    ReviewRehearsal, RiskAssessment, RiskBatchAssessment, RiskDiffAssessment, SearchRequest,
-    SearchResults, SessionDiff, SessionSnapshot, SymbolKind, TestRecommendations,
+    ImpactOptions, ImpactReport, ImpactRequest, ImpactTarget, Language, ProjectOverview,
+    ReferenceKind, ReviewRehearsal, RiskAssessment, RiskBatchAssessment, RiskDiffAssessment,
+    SearchRequest, SearchResults, SessionDiff, SessionSnapshot, SymbolKind, TestRecommendations,
 };
 use codesage_storage::Database;
 use parking_lot::Mutex;
@@ -172,6 +172,21 @@ pub struct ImpactParams {
     pub depth: Option<usize>,
     #[schemars(description = "Exclude test and config files from results")]
     pub source_only: Option<bool>,
+    #[schemars(
+        description = "Also return the target's forward dependencies — the import targets (modules/symbols) its file imports — in `forward_dependencies`"
+    )]
+    pub include_forward: Option<bool>,
+    #[schemars(
+        description = "Also return the symbols defined alongside the target in its own file, in `sibling_symbols`"
+    )]
+    pub include_siblings: Option<bool>,
+    #[schemars(description = "Cap the reverse-impact `results` list to this many entries")]
+    #[serde(default, deserialize_with = "deser_optional_usize")]
+    pub limit: Option<usize>,
+    #[schemars(
+        description = "Collapse per-reason detail and attach a `summary` rollup (total affected, counts by distance and category) — use on wide blast radii"
+    )]
+    pub summary_only: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1371,8 +1386,8 @@ impl CodeSageServer {
 
     #[tool(
         name = "impact_analysis",
-        description = "Estimate which files are affected by changing a symbol or file. Walks the **reverse** reference graph up to `depth` hops (default 2) — i.e., callers/importers of the target and transitively their callers/importers — reports affected files ranked by distance and reference count. **Multi-hop blast radius from the target outward to its dependents.** Returns `[]` for leaf files nothing imports/calls. Does NOT include same-file symbols, does NOT include what the target itself depends on (use `list_dependencies` for the target's own forward dependencies). Use BEFORE making changes to know what else needs review/testing. For single-hop importer/importee of one file use `list_dependencies`; for raw call sites of a specific symbol use `find_references`.",
-        output_schema = schema_for_type::<ImpactAnalysisResults>()
+        description = "Estimate which files are affected by changing a symbol or file. Walks the **reverse** reference graph up to `depth` hops (default 2) — i.e., callers/importers of the target and transitively their callers/importers — reports affected files in `results` ranked by distance and reference count. **Multi-hop blast radius from the target outward to its dependents.** `results` is `[]` for leaf files nothing imports/calls. Opt-in extras (all default off): `include_forward` adds the target's own forward dependencies in `forward_dependencies`; `include_siblings` adds same-file symbols in `sibling_symbols`; `limit` caps `results` (sets `truncated`); `summary_only` drops per-reason detail and attaches a `summary` rollup for wide blast radii. For single-hop importer/importee of one file use `list_dependencies`; for raw call sites of a specific symbol use `find_references`.",
+        output_schema = schema_for_type::<ImpactReport>()
     )]
     async fn impact_analysis_tool(
         &self,
@@ -1384,9 +1399,17 @@ impl CodeSageServer {
                 depth: params.depth.unwrap_or(2),
                 source_only: params.source_only.unwrap_or(false),
             };
+            let opts = ImpactOptions {
+                include_forward: params.include_forward.unwrap_or(false),
+                include_siblings: params.include_siblings.unwrap_or(false),
+                limit: params.limit,
+                summary_only: params.summary_only.unwrap_or(false),
+            };
             s.render(
                 &params.project,
-                s.with_project_db(&params.project, |db| impact_analysis(db, &req)),
+                s.with_project_db(&params.project, |db| {
+                    impact_analysis_report(db, &req, &opts)
+                }),
                 "impact_analysis",
             )
         })

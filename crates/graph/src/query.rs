@@ -5,9 +5,10 @@ use std::sync::OnceLock;
 use anyhow::Result;
 use codesage_parser::discover::{TEST_LIKE_EXCLUDE_PATTERNS, build_exclude_set};
 use codesage_protocol::{
-    ContextBundle, DependencyEntry, ExportRequest, FileCategory, FindReferencesRequest,
-    FindSymbolRequest, ImpactEntry, ImpactReason, ImpactRequest, ImpactTarget, Language, Reference,
-    ReferenceKind, SearchRequest, SearchResult, Symbol, SymbolSummary,
+    CategoryCount, ContextBundle, DependencyEntry, DistanceCount, ExportRequest, FileCategory,
+    FindReferencesRequest, FindSymbolRequest, ImpactEntry, ImpactOptions, ImpactReason,
+    ImpactReport, ImpactRequest, ImpactSummary, ImpactTarget, Language, Reference, ReferenceKind,
+    SearchRequest, SearchResult, SiblingSymbol, Symbol, SymbolSummary,
 };
 use codesage_storage::{Database, RawSearchRow, embedding_to_bytes};
 use globset::GlobSet;
@@ -1529,6 +1530,164 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
             .then_with(|| b.reasons.len().cmp(&a.reasons.len()))
     });
     Ok(entries)
+}
+
+/// Cap on `sibling_symbols` to keep dense files from blowing up the response.
+const SIBLING_SYMBOL_CAP: usize = 60;
+
+/// `impact_analysis` plus the adaptive extras requested via [`ImpactOptions`]:
+/// forward dependencies, same-file sibling symbols, a result `limit`, and a
+/// `summary_only` rollup. With all options default, the `results` field equals
+/// the classic `impact_analysis` output.
+pub fn impact_analysis_report(
+    db: &Database,
+    req: &ImpactRequest,
+    opts: &ImpactOptions,
+) -> Result<ImpactReport> {
+    let mut entries = impact_analysis(db, req)?;
+
+    // Summary reflects the full result set, before any limit truncation.
+    let summary = if opts.summary_only {
+        Some(build_impact_summary(&entries))
+    } else {
+        None
+    };
+
+    let mut truncated = false;
+    if let Some(limit) = opts.limit
+        && entries.len() > limit
+    {
+        entries.truncate(limit);
+        truncated = true;
+    }
+
+    // Collapse each file's reason list to a single exemplar when summarizing.
+    if opts.summary_only {
+        for e in &mut entries {
+            e.reasons.truncate(1);
+        }
+    }
+
+    let mut forward_dependencies = Vec::new();
+    let mut sibling_symbols = Vec::new();
+    if opts.include_forward || opts.include_siblings {
+        let target_files = impact_target_files(db, &req.target)?;
+        if opts.include_forward {
+            let mut fwd: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for f in &target_files {
+                for imp in list_dependencies(db, f)?.imports {
+                    fwd.insert(imp);
+                }
+            }
+            for f in &target_files {
+                fwd.remove(f);
+            }
+            forward_dependencies = fwd.into_iter().collect();
+        }
+        if opts.include_siblings {
+            sibling_symbols = collect_sibling_symbols(db, &req.target, &target_files)?;
+        }
+    }
+
+    Ok(ImpactReport {
+        results: entries,
+        forward_dependencies,
+        sibling_symbols,
+        truncated,
+        summary,
+    })
+}
+
+/// Resolve the file(s) the impact target lives in.
+fn impact_target_files(db: &Database, target: &ImpactTarget) -> Result<Vec<String>> {
+    match target {
+        ImpactTarget::File { path } => Ok(vec![path.clone()]),
+        ImpactTarget::Symbol { name } => {
+            let mut files: Vec<String> = db
+                .find_symbols(name, None)?
+                .iter()
+                .map(|s| s.file_path.clone())
+                .collect();
+            files.sort();
+            files.dedup();
+            Ok(files)
+        }
+    }
+}
+
+/// Symbols defined in the target's file(s), excluding the target symbol itself.
+/// Repetitive same-name definitions (overloads) collapse to one entry, and the
+/// list is capped at [`SIBLING_SYMBOL_CAP`].
+fn collect_sibling_symbols(
+    db: &Database,
+    target: &ImpactTarget,
+    target_files: &[String],
+) -> Result<Vec<SiblingSymbol>> {
+    let target_name = match target {
+        ImpactTarget::Symbol { name } => Some(name.as_str()),
+        ImpactTarget::File { .. } => None,
+    };
+    let mut seen_names: HashSet<String> = HashSet::new();
+    let mut out: Vec<SiblingSymbol> = Vec::new();
+    for f in target_files {
+        for s in db.symbols_for_file(f)? {
+            if let Some(n) = target_name
+                && (s.name == n || s.qualified_name == n)
+            {
+                continue;
+            }
+            // Collapse repeated implementations (same name+kind) to one signature.
+            let key = format!("{}::{}", s.kind.as_str(), s.name);
+            if !seen_names.insert(key) {
+                continue;
+            }
+            out.push(SiblingSymbol {
+                name: s.name,
+                kind: s.kind,
+                line: s.line_start,
+            });
+            if out.len() >= SIBLING_SYMBOL_CAP {
+                break;
+            }
+        }
+        if out.len() >= SIBLING_SYMBOL_CAP {
+            break;
+        }
+    }
+    out.sort_by_key(|s| s.line);
+    Ok(out)
+}
+
+fn build_impact_summary(entries: &[ImpactEntry]) -> ImpactSummary {
+    let mut by_distance: HashMap<u32, usize> = HashMap::new();
+    let (mut src, mut test, mut cfg) = (0usize, 0usize, 0usize);
+    for e in entries {
+        *by_distance.entry(e.distance).or_insert(0) += 1;
+        match e.category {
+            FileCategory::Source => src += 1,
+            FileCategory::Test => test += 1,
+            FileCategory::Config => cfg += 1,
+        }
+    }
+    let mut by_distance: Vec<DistanceCount> = by_distance
+        .into_iter()
+        .map(|(distance, count)| DistanceCount { distance, count })
+        .collect();
+    by_distance.sort_by_key(|d| d.distance);
+    let by_category: Vec<CategoryCount> = [
+        (FileCategory::Source, src),
+        (FileCategory::Test, test),
+        (FileCategory::Config, cfg),
+    ]
+    .into_iter()
+    .filter(|(_, count)| *count > 0)
+    .map(|(category, count)| CategoryCount { category, count })
+    .collect();
+    ImpactSummary {
+        total_affected: entries.len(),
+        by_distance,
+        by_category,
+    }
 }
 
 fn references_for_symbol(db: &Database, sym: &Symbol) -> Result<Vec<Reference>> {

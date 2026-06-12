@@ -1156,6 +1156,75 @@ pub struct ImpactAnalysisResults {
     pub results: Vec<ImpactEntry>,
 }
 
+/// Optional controls for the richer `impact_analysis` report. All default off,
+/// so the report reduces to the classic reverse-impact list.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ImpactOptions {
+    /// Also include the target's forward dependencies — the import targets
+    /// (modules/symbols) its file imports.
+    pub include_forward: bool,
+    /// Also include the symbols defined alongside the target in the same file.
+    pub include_siblings: bool,
+    /// Cap the reverse-impact `results` list to this many entries.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub limit: Option<usize>,
+    /// Drop per-reason detail (keep one exemplar reason per file) and attach a
+    /// `summary` rollup — keeps the response small on wide blast radii.
+    pub summary_only: bool,
+}
+
+/// A symbol defined in the same file as the impact target. Signature-level
+/// (name + kind + line, no body) so a dense file collapses to a compact list.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SiblingSymbol {
+    pub name: String,
+    pub kind: SymbolKind,
+    pub line: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DistanceCount {
+    pub distance: u32,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CategoryCount {
+    pub category: FileCategory,
+    pub count: usize,
+}
+
+/// Rollup over the reverse-impact results, attached when `summary_only` is set.
+/// `total_affected` is the count before any `limit` truncation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ImpactSummary {
+    pub total_affected: usize,
+    pub by_distance: Vec<DistanceCount>,
+    pub by_category: Vec<CategoryCount>,
+}
+
+/// Adaptive `impact_analysis` output. `results` is the existing reverse-impact
+/// list (so callers reading `.results` keep working); the other fields populate
+/// only when the matching [`ImpactOptions`] flag is set.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ImpactReport {
+    /// Reverse impact: files affected by changing the target, by distance.
+    pub results: Vec<ImpactEntry>,
+    /// Forward dependencies — the import targets (modules/symbols) the target's
+    /// file imports. Present with `include_forward`.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub forward_dependencies: Vec<String>,
+    /// Symbols in the target's own file(s). Present with `include_siblings`.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub sibling_symbols: Vec<SiblingSymbol>,
+    /// True when `limit` dropped entries from `results`.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub truncated: bool,
+    /// Rollup counts; present with `summary_only`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub summary: Option<ImpactSummary>,
+}
+
 /// One-call orientation snapshot for an agent starting work on a project.
 /// Aggregates already-indexed facts (languages, freshness, features, risk,
 /// trust boundaries, conventions) plus suggested next tool calls. Bounded by

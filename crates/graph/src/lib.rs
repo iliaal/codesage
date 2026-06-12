@@ -13,7 +13,7 @@ pub use git_history::{
 pub use index::{full_index, incremental_index, index_files, remove_files};
 pub use query::{
     RerankFn, export_context, export_context_for_symbol, feature_bundle, find_references,
-    find_symbol, impact_analysis, list_dependencies, search,
+    find_symbol, impact_analysis, impact_analysis_report, list_dependencies, search,
 };
 pub use semantic::{
     semantic_full_index, semantic_incremental_index, semantic_index_files, semantic_remove_files,

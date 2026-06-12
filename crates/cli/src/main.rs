@@ -20,13 +20,13 @@ use codesage_embed::config::{EmbeddingConfig, ProjectConfig};
 use codesage_embed::model::Embedder;
 use codesage_graph::{
     assess_risk, export_context, export_context_for_symbol, find_coupling, find_references,
-    find_symbol, full_index, impact_analysis, incremental_index, list_dependencies, search,
+    find_symbol, full_index, impact_analysis_report, incremental_index, list_dependencies, search,
     semantic_full_index, semantic_incremental_index,
 };
 use codesage_parser::discover::DEFAULT_EXCLUDE_PATTERNS;
 use codesage_protocol::{
     ContextBundle, ExportRequest, FileCategory, FindReferencesRequest, FindSymbolRequest,
-    ImpactRequest, ImpactTarget, Language, ReferenceKind, SearchRequest, SymbolKind,
+    ImpactOptions, ImpactRequest, ImpactTarget, Language, ReferenceKind, SearchRequest, SymbolKind,
 };
 use codesage_storage::Database;
 
@@ -137,6 +137,18 @@ enum Commands {
         /// Exclude test and config files from results
         #[arg(long)]
         source_only: bool,
+        /// Also list the target's import targets (the modules/symbols it imports)
+        #[arg(long)]
+        forward: bool,
+        /// Also list the symbols defined alongside the target in its file
+        #[arg(long)]
+        siblings: bool,
+        /// Cap the reverse-impact result list to this many entries
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Drop per-reason detail and print a rollup summary instead
+        #[arg(long)]
+        summary_only: bool,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -789,8 +801,23 @@ fn run(cli: Cli) -> Result<()> {
             symbol,
             depth,
             source_only,
+            forward,
+            siblings,
+            limit,
+            summary_only,
             json,
-        } => cmd_impact(&target, file, symbol, depth, source_only, json),
+        } => cmd_impact(
+            &target,
+            file,
+            symbol,
+            depth,
+            source_only,
+            forward,
+            siblings,
+            limit,
+            summary_only,
+            json,
+        ),
         Commands::Overview { json } => cmd_overview(json),
         Commands::Export {
             target,
@@ -2481,12 +2508,17 @@ fn cmd_cleanup(dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_impact(
     target: &str,
     is_file: bool,
     is_symbol: bool,
     depth: usize,
     source_only: bool,
+    forward: bool,
+    siblings: bool,
+    limit: Option<usize>,
+    summary_only: bool,
     json: bool,
 ) -> Result<()> {
     let root = find_project_root()?;
@@ -2506,26 +2538,36 @@ fn cmd_impact(
         depth,
         source_only,
     };
+    let opts = ImpactOptions {
+        include_forward: forward,
+        include_siblings: siblings,
+        limit,
+        summary_only,
+    };
 
-    let entries = impact_analysis(&db, &req)?;
+    let report = impact_analysis_report(&db, &req, &opts)?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&entries)?);
+        println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
 
-    if entries.is_empty() {
+    if report.results.is_empty()
+        && report.forward_dependencies.is_empty()
+        && report.sibling_symbols.is_empty()
+    {
         println!("No impact detected for '{target}'.");
         return Ok(());
     }
 
     println!(
-        "Impact of '{}' (depth={}, {} files affected):",
+        "Impact of '{}' (depth={}, {} files affected{}):",
         target,
         depth,
-        entries.len()
+        report.results.len(),
+        if report.truncated { ", truncated" } else { "" }
     );
-    for e in &entries {
+    for e in &report.results {
         let cat = match e.category {
             FileCategory::Source => "src",
             FileCategory::Test => "test",
@@ -2539,6 +2581,36 @@ fn cmd_impact(
         );
         for r in e.reasons.iter().take(3) {
             println!("    via {} @ line {} ({})", r.via_symbol, r.line, r.kind);
+        }
+    }
+
+    if let Some(summary) = &report.summary {
+        let dist: Vec<String> = summary
+            .by_distance
+            .iter()
+            .map(|d| format!("d{}={}", d.distance, d.count))
+            .collect();
+        println!(
+            "Summary: {} affected ({})",
+            summary.total_affected,
+            dist.join(" ")
+        );
+    }
+
+    if !report.forward_dependencies.is_empty() {
+        println!(
+            "Forward dependencies ({}):",
+            report.forward_dependencies.len()
+        );
+        for f in &report.forward_dependencies {
+            println!("  {f}");
+        }
+    }
+
+    if !report.sibling_symbols.is_empty() {
+        println!("Sibling symbols ({}):", report.sibling_symbols.len());
+        for s in &report.sibling_symbols {
+            println!("  {} ({}) @ line {}", s.name, s.kind.as_str(), s.line);
         }
     }
     Ok(())
