@@ -1,5 +1,8 @@
 ## [Unreleased]
 
+### Fixed
+- The MCP daemon now reaps stale-version daemons sharing its runtime dir on startup, so a rebuilt or upgraded binary no longer leaves the old daemon pinning a second copy of the embedder + reranker in memory until the idle backstop fires.
+
 ## [0.11.0] - 2026-06-12
 
 ### Added

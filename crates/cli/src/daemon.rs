@@ -237,6 +237,14 @@ mod unix {
             .with_context(|| format!("setting permissions on {}", paths.socket.display()))?;
         write_daemon_pid(&paths.pid)?;
 
+        // Now that our own socket is bound and pid file written, reap any
+        // daemon left over from a previous build/version sharing this runtime
+        // dir. The version-keyed socket name means we just spawned fresh
+        // rather than attaching to the old one; without this sweep the old
+        // daemon pins a second copy of the embedder + reranker in memory
+        // until its 30-minute idle backstop fires.
+        reap_stale_version_daemons(&paths);
+
         tracing::info!(socket = %paths.socket.display(), "codesage MCP daemon listening");
         let state = Arc::new(CodeSageServerState::new());
         let our_uid = unsafe { libc::getuid() };
@@ -801,6 +809,84 @@ mod unix {
 
     fn daemon_pid_file_matches(paths: &DaemonPaths, record: DaemonPid) -> bool {
         pid_alive(record.pid) && daemon_pid_matches_process(paths, record)
+    }
+
+    /// SIGTERM codesage daemons in this runtime dir whose key differs from
+    /// ours — i.e. left over from a previous build or version. The daemon key
+    /// folds in the binary's version + on-disk identity, so a rebuilt or
+    /// upgraded binary boots a fresh daemon under a new socket name instead of
+    /// attaching to the incompatible old one. The old daemon then keeps its
+    /// embedder + reranker resident until the idle backstop fires (default 30
+    /// min) — a full second copy of the model memory for the whole overlap.
+    ///
+    /// Safety: we only signal processes that are (a) a live, start-time- or
+    /// cmdline-validated codesage daemon in *this* runtime dir and (b) started
+    /// strictly before us. The strictly-before guard means two daemons racing
+    /// to start can never kill each other. SIGTERM is graceful — the target
+    /// drains in-flight clients and removes its own socket/pid files on exit.
+    fn reap_stale_version_daemons(paths: &DaemonPaths) {
+        let our_start = i32::try_from(std::process::id())
+            .ok()
+            .and_then(process_start_time_ticks);
+        let Ok(entries) = fs::read_dir(&paths.runtime_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let sibling = entry.path();
+            if sibling == paths.pid {
+                continue; // our own pid file
+            }
+            if !sibling
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(is_sibling_daemon_pidfile)
+            {
+                continue;
+            }
+            let Some(record) = read_daemon_pid_file(&sibling) else {
+                continue;
+            };
+            if !daemon_pid_file_matches(paths, record) {
+                // Dead or recycled pid: clear its leftover runtime files so
+                // `status` / `stop` don't trip over them, then move on.
+                cleanup_sibling_runtime_files(&sibling);
+                continue;
+            }
+            // Only reap daemons that demonstrably started before us. When both
+            // sides carry a comparable start time (always, on Linux) this is
+            // the race guard; if either is missing we fall through and reap.
+            if let (Some(ours), Some(theirs)) = (our_start, record.start_time_ticks)
+                && theirs >= ours
+            {
+                continue;
+            }
+            // SAFETY: kill is async-signal-safe.
+            let rc = unsafe { libc::kill(record.pid, libc::SIGTERM) };
+            if rc == 0 {
+                tracing::info!(
+                    stale_pid = record.pid,
+                    pidfile = %sibling.display(),
+                    "reaped stale-version codesage daemon to reclaim its model memory"
+                );
+            } else {
+                tracing::warn!(
+                    stale_pid = record.pid,
+                    error = %io::Error::last_os_error(),
+                    "failed to SIGTERM stale-version codesage daemon"
+                );
+            }
+        }
+    }
+
+    fn is_sibling_daemon_pidfile(name: &str) -> bool {
+        name.starts_with("mcp-") && name.ends_with(".pid")
+    }
+
+    fn cleanup_sibling_runtime_files(pidfile: &Path) {
+        let _ = fs::remove_file(pidfile);
+        for ext in ["sock", "lock"] {
+            let _ = fs::remove_file(pidfile.with_extension(ext));
+        }
     }
 
     fn daemon_pid_matches_process(paths: &DaemonPaths, record: DaemonPid) -> bool {
@@ -1520,6 +1606,45 @@ mod unix {
             let dir = tempfile::tempdir().unwrap();
             // log doesn't exist; should not panic / create anything.
             rotate_log_if_large(&dir.path().join("missing.log"));
+        }
+
+        #[test]
+        fn sibling_daemon_pidfile_filter_matches_only_pid_files() {
+            assert!(is_sibling_daemon_pidfile("mcp-0.11.0-2808e07c624d3082.pid"));
+            assert!(is_sibling_daemon_pidfile("mcp-0.9.0-6017ca4d7764e95e.pid"));
+            assert!(!is_sibling_daemon_pidfile(
+                "mcp-0.11.0-2808e07c624d3082.sock"
+            ));
+            assert!(!is_sibling_daemon_pidfile(
+                "mcp-0.11.0-2808e07c624d3082.log"
+            ));
+            assert!(!is_sibling_daemon_pidfile(
+                "mcp-0.11.0-2808e07c624d3082.log.1"
+            ));
+            assert!(!is_sibling_daemon_pidfile("watch.disabled"));
+        }
+
+        #[test]
+        fn cleanup_sibling_runtime_files_removes_socket_and_lock_despite_dotted_version() {
+            // The daemon key embeds the semver version, so the pid file name
+            // carries dots ("mcp-0.11.0-<hash>.pid"). with_extension must
+            // replace only the trailing ".pid", leaving the version intact.
+            let dir = tempfile::tempdir().unwrap();
+            let stem = "mcp-0.11.0-2808e07c624d3082";
+            let pid = dir.path().join(format!("{stem}.pid"));
+            let sock = dir.path().join(format!("{stem}.sock"));
+            let lock = dir.path().join(format!("{stem}.lock"));
+            let log = dir.path().join(format!("{stem}.log"));
+            for p in [&pid, &sock, &lock, &log] {
+                fs::write(p, "x").unwrap();
+            }
+
+            cleanup_sibling_runtime_files(&pid);
+
+            assert!(!pid.exists(), "pid file should be removed");
+            assert!(!sock.exists(), "socket file should be removed");
+            assert!(!lock.exists(), "lock file should be removed");
+            assert!(log.exists(), "log file should be left for diagnostics");
         }
     }
 }
