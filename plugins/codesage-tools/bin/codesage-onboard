@@ -244,9 +244,10 @@ Pass that on every call. The server uses it to route to the right index.
 ## Tool selection
 
 ### Code intelligence
+- \`project_overview\`: call ONCE at the start of a session to orient — languages, index freshness/drift, feature summary, top-risk files, trust-boundary clusters, test conventions, entrypoints, and suggested next calls in one bounded response. Cheaper than fanning out \`status\` + \`features-list\` + risk probes.
 - \`search\`: "where does X happen?", debugging by symptom, intent queries spanning files, when you don't know the symbol name.
-- \`find_symbol\` / \`find_references\`: exact symbol lookups, callers/callees, dependency mapping.
-- \`impact_analysis\`: before renaming a symbol or modifying a widely-used class or function. Identifies tests to run.
+- \`find_symbol\` / \`find_references\`: exact symbol lookups, callers/callees, dependency mapping. \`find_references\` rows carry \`from_symbol\` (the enclosing caller), so you get caller→callee edges directly.
+- \`impact_analysis\`: before renaming a symbol or modifying a widely-used class or function. Identifies tests to run. Add \`include_forward\` / \`include_siblings\` for the target's own deps and same-file neighbours; \`limit\` / \`summary_only\` to cap a wide blast radius.
 - \`export_context\`: package code for another LLM around a free-form query or a single named symbol. For an already-mapped feature slice, use \`feature_bundle\` instead — it avoids re-running semantic search.
 - grep / ripgrep: exact strings, constants, error messages; when you already have the exact symbol name.
 
@@ -276,8 +277,9 @@ Patch-level (slice 2, added in 0.3.0):
   - Go: \`foo_test.go\`.
   - JavaScript/TypeScript: \`foo.test.ts(x)\`, \`foo.spec.ts(x)\`, \`.js\` variants.
   - Rust: integration tests under \`<crate_root>/tests/*.rs\`. (Inline \`#[cfg(test)] mod tests\` not surfaced — they ride along with the source file.)
+- \`review_rehearsal\`: the LAST step before committing. Pass the patch's file list; returns severity-ranked objections (missing tests, high-risk / blast-radius / fix-prone / hotspot files with hot-symbol evidence, import cycles, trust-boundary expansion, feature-test gaps, and \`scope-spread\` when the patch touches ≥4 unrelated feature areas) plus paste-ready \`summary_notes\`. Composes \`assess_risk_diff\` + \`recommend_tests\` + drift + feature mapping — fix or consciously accept each objection. CLI: \`git diff --name-only | codesage rehearse\`.
 
-All four require git history indexed. Initial \`codesage git-index\` runs at onboard; subsequent commits/merges auto-refresh via git hooks. Run \`codesage git-index --full\` weekly to rebaseline. Empty results mean either no history yet or the file is too new.
+All four of \`assess_risk\` / \`assess_risk_batch\` / \`assess_risk_diff\` / \`recommend_tests\` require git history indexed. Initial \`codesage git-index\` runs at onboard; subsequent commits/merges auto-refresh via git hooks. Run \`codesage git-index --full\` weekly to rebaseline. Empty results mean either no history yet or the file is too new.
 
 ## Operations
 
