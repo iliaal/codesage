@@ -16,8 +16,8 @@ use codesage_protocol::{
     ContextBundle, CouplingReport, DependencyEntry, ExportRequest, FeatureKind, FeatureListResults,
     FindReferencesRequest, FindReferencesResults, FindSymbolRequest, FindSymbolResults,
     ImpactAnalysisResults, ImpactRequest, ImpactTarget, Language, ProjectOverview, ReferenceKind,
-    RiskAssessment, RiskBatchAssessment, RiskDiffAssessment, SearchRequest, SearchResults,
-    SessionDiff, SessionSnapshot, SymbolKind, TestRecommendations,
+    ReviewRehearsal, RiskAssessment, RiskBatchAssessment, RiskDiffAssessment, SearchRequest,
+    SearchResults, SessionDiff, SessionSnapshot, SymbolKind, TestRecommendations,
 };
 use codesage_storage::Database;
 use parking_lot::Mutex;
@@ -267,6 +267,16 @@ pub struct FeatureBundleParams {
 pub struct ProjectOverviewParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ReviewRehearsalParams {
+    #[schemars(description = PROJECT_ARG_DESC)]
+    pub project: String,
+    #[schemars(
+        description = "Repo-relative file paths in the patch / working-tree change set (typically `git diff --name-only`)"
+    )]
+    pub file_paths: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -1232,6 +1242,28 @@ impl CodeSageServer {
                     crate::overview::build_project_overview(root, db)
                 }),
                 "project_overview",
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        name = "review_rehearsal",
+        description = "Predict the objections a reviewer will likely raise against a patch, BEFORE committing. Input is the patch's file list (e.g. `git diff --name-only`). Returns severity-ranked objections — missing tests, high-risk files, wide blast radius, fix-prone files, churn hotspots, import cycles touched, trust-boundary expansion (≥3 boundaries), and feature-test gaps (changed a feature's core files but none of its mapped tests) — each with concrete evidence and the files it concerns, plus paste-ready `summary_notes` (objection counts + risk summary + the exact tests to run). Pure composition of `assess_risk_diff`, `recommend_tests`, index-drift, and feature mapping — read-only, no AI prose. Use as the last step before a commit: fix or consciously accept each objection.",
+        output_schema = schema_for_type::<ReviewRehearsal>()
+    )]
+    async fn review_rehearsal_tool(
+        &self,
+        Parameters(params): Parameters<ReviewRehearsalParams>,
+    ) -> CallToolResult {
+        self.blocking(move |s| {
+            let file_paths = params.file_paths.clone();
+            s.render(
+                &params.project,
+                s.with_project_root_db(&params.project, |root, db| {
+                    crate::rehearsal::build_review_rehearsal(root, db, &file_paths)
+                }),
+                "review_rehearsal",
             )
         })
         .await

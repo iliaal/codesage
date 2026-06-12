@@ -7,6 +7,7 @@ mod installer;
 mod lockfile;
 mod mcp;
 mod overview;
+mod rehearsal;
 mod statewatcher;
 mod util;
 
@@ -279,6 +280,16 @@ enum Commands {
     /// Reads file paths from stdin (one per line) or from positional args. (V2b slice 2)
     TestsFor {
         /// Repo-relative file paths. If empty, read newline-separated paths from stdin.
+        files: Vec<String>,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Predict likely review objections for a patch (missing tests, risky files,
+    /// blast radius, cycles, trust boundaries, feature-test gaps) before committing
+    Rehearse {
+        /// Repo-relative file paths. If empty, read stdin (when piped) or fall
+        /// back to the working-tree changes vs HEAD.
         files: Vec<String>,
         /// Emit JSON
         #[arg(long)]
@@ -818,6 +829,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::RiskDiff { files, json } => cmd_risk_diff(files, json),
         Commands::RiskBatch { files, json } => cmd_risk_batch(files, json),
         Commands::TestsFor { files, json } => cmd_tests_for(files, json),
+        Commands::Rehearse { files, json } => cmd_rehearse(files, json),
         Commands::TrustBoundaries { file, json } => cmd_trust_boundaries(&file, json),
         Commands::Map { json } => cmd_map(json),
         Commands::FeaturesList {
@@ -1774,6 +1786,73 @@ fn cmd_risk_diff(files: Vec<String>, json: bool) -> Result<()> {
             for n in &assessment.summary_notes {
                 println!("    - {n}");
             }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the patch file list for `rehearse`: explicit args, else piped stdin,
+/// else the working-tree changes vs HEAD. Lets the command run both in a
+/// pipeline (`git diff --name-only | codesage rehearse`) and bare in a dirty
+/// working tree.
+fn resolve_patch_files(root: &Path, files: Vec<String>) -> Result<Vec<String>> {
+    if !files.is_empty() {
+        return Ok(files);
+    }
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return resolve_file_list(Vec::new());
+    }
+    working_tree_changes(root)
+}
+
+/// Files changed in the working tree relative to HEAD (tracked modifications,
+/// staged or not). Empty on a clean tree or when git is unavailable.
+fn working_tree_changes(root: &Path) -> Result<Vec<String>> {
+    let out = std::process::Command::new("git")
+        .args(["diff", "--name-only", "HEAD"])
+        .current_dir(root)
+        .output()?;
+    if !out.status.success() {
+        return Ok(Vec::new());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect())
+}
+
+fn cmd_rehearse(files: Vec<String>, json: bool) -> Result<()> {
+    let root = find_project_root()?;
+    let db = open_db(&root)?;
+    let files = resolve_patch_files(&root, files)?;
+    if files.is_empty() {
+        bail!(
+            "no changed files (pass paths as args, pipe via stdin, or make working-tree changes)"
+        );
+    }
+    let rehearsal = crate::rehearsal::build_review_rehearsal(&root, &db, &files)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rehearsal)?);
+        return Ok(());
+    }
+    println!(
+        "Review rehearsal: {} file(s), {} objection(s)",
+        rehearsal.files.len(),
+        rehearsal.objections.len()
+    );
+    for o in &rehearsal.objections {
+        println!("  [{}] {} — {}", o.severity.as_str(), o.category, o.title);
+        for e in &o.evidence {
+            println!("      {e}");
+        }
+    }
+    if !rehearsal.summary_notes.is_empty() {
+        println!("Summary:");
+        for n in &rehearsal.summary_notes {
+            println!("  - {n}");
         }
     }
     Ok(())

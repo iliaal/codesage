@@ -1258,6 +1258,60 @@ pub struct SuggestedCall {
     pub why: String,
 }
 
+/// Severity of a predicted review objection. Declaration order is the sort
+/// order: `High` first.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewSeverity {
+    High,
+    Medium,
+    Low,
+}
+
+impl ReviewSeverity {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReviewSeverity::High => "high",
+            ReviewSeverity::Medium => "medium",
+            ReviewSeverity::Low => "low",
+        }
+    }
+}
+
+/// One predicted review objection for a patch. Composed from the same signals
+/// that back `assess_risk_diff`, `recommend_tests`, session checks, and feature
+/// mapping — no new analysis, just the objections a reviewer would likely raise.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ReviewObjection {
+    pub severity: ReviewSeverity,
+    /// Short machine code: `missing-tests`, `high-risk-file`, `blast-radius`,
+    /// `fix-prone`, `hotspot`, `import-cycle`, `trust-boundary`,
+    /// `feature-test-gap`, `stale-index`.
+    pub category: String,
+    /// One-line human-readable objection.
+    pub title: String,
+    /// Concrete evidence lines (counts, scores, file lists) a reviewer can check.
+    pub evidence: Vec<String>,
+    /// Files this objection concerns.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub files: Vec<String>,
+}
+
+/// Predicted review objections for a patch, severity-ranked. Read-only,
+/// pre-commit. Reuses `assess_risk_diff`, `recommend_tests`, drift, and feature
+/// mapping rather than duplicating their logic.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ReviewRehearsal {
+    /// The files considered (the patch / working-tree set).
+    pub files: Vec<String>,
+    /// Objections, `High` first.
+    pub objections: Vec<ReviewObjection>,
+    /// Paste-ready summary lines (headline + risk summary + tests to run).
+    pub summary_notes: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

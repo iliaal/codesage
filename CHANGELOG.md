@@ -2,6 +2,7 @@
 
 ### Added
 - `project_overview` MCP tool and `codesage overview` CLI command: one-call project orientation (languages, structural+semantic freshness, feature summary by kind, top-risk files, trust-boundary clusters, per-language test conventions, sample entrypoints, suggested next calls).
+- `review_rehearsal` MCP tool and `codesage rehearse` CLI command: predict severity-ranked review objections for a patch (missing tests, high-risk/blast-radius/fix-prone/hotspot files, import cycles, trust-boundary expansion, feature-test gaps) from `assess_risk_diff` + `recommend_tests` + drift + feature mapping. CLI falls back to working-tree changes vs HEAD when no files are given.
 - Live filesystem watcher: the daemon auto-starts a per-project watcher on first tool call that reindexes (structural + semantic) on edit, debounced (default 1s, `REINDEX_DEBOUNCE`), reusing the daemon's pooled embedder. Honors `.gitignore` and `[index].exclude_patterns` and skips ignored top-level trees (`target/`, `.git/`, `node_modules/`) from the watch set. On by default; disable with `[index] watch = false` or `CODESAGE_WATCH=0`. Self-exits after idle (`CODESAGE_WATCH_IDLE_SECS`, default 1800; `0` disables).
 - `codesage watch run|status|stop|start [project]` to manually control the live watcher (`run` is a foreground instance with its own embedder).
 
