@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use codesage_embed::config::EmbeddingConfig;
@@ -331,6 +332,18 @@ pub(crate) struct CodeSageServerState {
     resolved: Mutex<HashMap<String, ProjectState>>,
     embedders: Mutex<HashMap<String, ModelSlot<Embedder>>>,
     rerankers: Mutex<HashMap<String, ModelSlot<Reranker>>>,
+    /// Live filesystem watchers, one per project, keyed by canonical root.
+    /// Spawned lazily on first tool call for a project (see
+    /// [`CodeSageServer::ensure_watcher`]) and reaped on daemon shutdown.
+    watchers: Mutex<HashMap<PathBuf, WatcherEntry>>,
+}
+
+/// Handle to a per-project watcher thread. `alive` flips to false when the
+/// thread exits (idle timeout, disabled marker, error), so `ensure_watcher`
+/// can tell a dead entry from a running one and respawn.
+struct WatcherEntry {
+    shutdown: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
 }
 
 impl CodeSageServerState {
@@ -340,7 +353,20 @@ impl CodeSageServerState {
             resolved: Mutex::new(HashMap::new()),
             embedders: Mutex::new(HashMap::new()),
             rerankers: Mutex::new(HashMap::new()),
+            watchers: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Signal every live watcher to drain and exit. Called from the daemon's
+    /// shutdown path. Threads notice within one poll interval; we don't join
+    /// (the process exit reaps any straggler), so this never blocks shutdown.
+    pub(crate) fn shutdown_all_watchers(&self) {
+        let mut guard = self.watchers.lock();
+        for (root, entry) in guard.iter() {
+            entry.shutdown.store(true, Ordering::SeqCst);
+            tracing::info!(root = %root.display(), "signalling watcher shutdown");
+        }
+        guard.clear();
     }
 }
 
@@ -405,6 +431,17 @@ impl CodeSageServer {
     }
 
     fn resolve_project(&self, project: &str) -> Result<ProjectState> {
+        let state = self.resolve_project_inner(project)?;
+        // Ensure a live watcher on every resolution (cheap when one is already
+        // running) so an idle-exited watcher respawns the next time an agent
+        // touches the project. Root is `<...>/.codesage/index.db` → two parents.
+        if let Some(root) = state.db_path.parent().and_then(|p| p.parent()) {
+            self.ensure_watcher(root, &state);
+        }
+        Ok(state)
+    }
+
+    fn resolve_project_inner(&self, project: &str) -> Result<ProjectState> {
         // Fast path: same raw arg string seen before — skip canonicalize().
         {
             let guard = self.state.resolved.lock();
@@ -471,6 +508,81 @@ impl CodeSageServer {
             .lock()
             .insert(project.to_string(), state.clone());
         Ok(state)
+    }
+
+    /// Ensure a live filesystem watcher is running for `root`, spawning one if
+    /// absent and the project hasn't opted out. The watcher reuses the daemon's
+    /// pooled embedder (no extra model load) and self-exits after idle; this
+    /// just guarantees one exists. Errors are logged, never propagated.
+    fn ensure_watcher(&self, root: &Path, state: &ProjectState) {
+        // Hot path: a live watcher already exists. Just a lock + atomic load,
+        // no config I/O — this runs on every tool call.
+        {
+            let watchers = self.state.watchers.lock();
+            if let Some(entry) = watchers.get(root)
+                && entry.alive.load(Ordering::SeqCst)
+            {
+                return;
+            }
+        }
+
+        // (Re)spawn path: load config and honor opt-out / disabled marker.
+        let project_config = crate::load_project_config(root).ok().unwrap_or_default();
+        let config_watch = project_config.index.as_ref().and_then(|i| i.watch);
+        if !crate::statewatcher::watch_enabled(root, config_watch) {
+            return;
+        }
+
+        let exclude_patterns = crate::get_exclude_patterns(&project_config);
+
+        // Hand the watcher the daemon's pooled embedder, resolved lazily so an
+        // idle watcher never forces a model load. `None` = structural-only.
+        let embedder: Option<crate::statewatcher::EmbedderProvider> =
+            if state.embedding_config.model.is_empty() || state.embedding_config_error.is_some() {
+                None
+            } else {
+                let server = self.clone();
+                let cfg = state.embedding_config.clone();
+                Some(Arc::new(move || server.get_or_load_embedder(&cfg)))
+            };
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(true));
+        let watcher_config = crate::statewatcher::StateWatcherConfig {
+            project_root: root.to_path_buf(),
+            db_path: state.db_path.clone(),
+            embed_config: state.embedding_config.clone(),
+            exclude_patterns,
+            debounce_ms: crate::statewatcher::resolve_debounce_ms(),
+            idle_timeout: crate::statewatcher::resolve_idle_timeout(),
+            mode: crate::statewatcher::WatcherMode::Daemon,
+            embedder,
+            shutdown: shutdown.clone(),
+        };
+
+        let alive_clone = alive.clone();
+        let root_disp = root.to_path_buf();
+        let spawned = std::thread::Builder::new()
+            .name("cs-watch".to_string())
+            .spawn(move || {
+                if let Err(e) = crate::statewatcher::run_statewatcher(watcher_config) {
+                    tracing::error!(error = %e, root = %root_disp.display(), "watcher exited with error");
+                }
+                alive_clone.store(false, Ordering::SeqCst);
+            });
+
+        match spawned {
+            Ok(_join) => {
+                self.state
+                    .watchers
+                    .lock()
+                    .insert(root.to_path_buf(), WatcherEntry { shutdown, alive });
+                tracing::info!(root = %root.display(), "live watcher started");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, root = %root.display(), "failed to spawn watcher thread");
+            }
+        }
     }
 
     fn get_or_load_embedder(&self, config: &EmbeddingConfig) -> Result<Arc<Mutex<Embedder>>> {

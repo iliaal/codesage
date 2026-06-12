@@ -1,5 +1,5 @@
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -217,6 +217,65 @@ fn exclude_matches_path(excludes: &GlobSet, rel_path: &str, is_dir: bool) -> boo
     excludes.is_match(format!("{rel_path}/_"))
 }
 
+/// Replicates the indexer's discovery filters — hidden files,
+/// `.gitignore` / `.git/info/exclude`, and `[index].exclude_patterns` — as a
+/// single-path predicate. The live watcher uses it both to prune the inotify
+/// watch set (never watching `target/`, `.git/`, `node_modules/`, or anything
+/// gitignored) and to filter individual events, so it reindexes exactly the
+/// file set the indexer would.
+pub struct WatchFilter {
+    root: PathBuf,
+    excludes: Option<GlobSet>,
+    gitignore: ignore::gitignore::Gitignore,
+}
+
+impl WatchFilter {
+    pub fn new(root: &Path, exclude_patterns: &[String]) -> Result<Self> {
+        let excludes = if exclude_patterns.is_empty() {
+            None
+        } else {
+            Some(build_exclude_set(exclude_patterns)?)
+        };
+        let mut gb = ignore::gitignore::GitignoreBuilder::new(root);
+        // Best-effort: a missing .gitignore just yields no rules.
+        let _ = gb.add(root.join(".gitignore"));
+        let _ = gb.add(root.join(".git").join("info").join("exclude"));
+        let gitignore = gb.build()?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            excludes,
+            gitignore,
+        })
+    }
+
+    /// True if `abs_path` (a descendant of the project root) should be skipped.
+    /// `is_dir` distinguishes directory globs from file globs.
+    pub fn is_ignored(&self, abs_path: &Path, is_dir: bool) -> bool {
+        let Ok(rel) = abs_path.strip_prefix(&self.root) else {
+            return false;
+        };
+        if rel.as_os_str().is_empty() {
+            return false;
+        }
+        // Hidden files/dirs — matches `WalkBuilder::hidden(true)`.
+        if rel
+            .components()
+            .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+        {
+            return true;
+        }
+        let rel_str = rel.to_string_lossy();
+        if let Some(exc) = &self.excludes
+            && exclude_matches_path(exc, &rel_str, is_dir)
+        {
+            return true;
+        }
+        self.gitignore
+            .matched_path_or_any_parents(rel, is_dir)
+            .is_ignore()
+    }
+}
+
 /// Test and benchmark files. These ARE indexed structurally and semantically
 /// (so `find_references` can see test callsites and `find_symbol` can find test
 /// fixtures), but the search ranker demotes them via path-based penalties and
@@ -364,3 +423,52 @@ pub const HARD_EXCLUDE_PATTERNS: &[&str] = &[
 /// structural graph stays correct on test code (callsites, fixtures) and the
 /// search ranker can demote them at rank time instead.
 pub const DEFAULT_EXCLUDE_PATTERNS: &[&str] = HARD_EXCLUDE_PATTERNS;
+
+#[cfg(test)]
+mod watch_filter_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn touch(path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, "").unwrap();
+    }
+
+    #[test]
+    fn watch_filter_respects_gitignore_excludes_and_hidden() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(root.join(".gitignore"), "generated/\n*.gen.rs\n").unwrap();
+        touch(&root.join("src/main.rs"));
+        touch(&root.join("generated/out.rs"));
+        touch(&root.join("api.gen.rs"));
+        touch(&root.join("target/debug/x.rs"));
+        touch(&root.join(".hidden/x.rs"));
+
+        let filter = WatchFilter::new(root, &["**/target/**".to_string()]).unwrap();
+
+        // Real source is watched.
+        assert!(!filter.is_ignored(&root.join("src/main.rs"), false));
+        // Gitignored dir + pattern are skipped.
+        assert!(filter.is_ignored(&root.join("generated"), true));
+        assert!(filter.is_ignored(&root.join("generated/out.rs"), false));
+        assert!(filter.is_ignored(&root.join("api.gen.rs"), false));
+        // exclude_patterns globset is honored.
+        assert!(filter.is_ignored(&root.join("target/debug/x.rs"), false));
+        // Hidden dirs are skipped (matches WalkBuilder::hidden(true)).
+        assert!(filter.is_ignored(&root.join(".hidden/x.rs"), false));
+    }
+
+    #[test]
+    fn watch_filter_empty_excludes_still_applies_gitignore() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(root.join(".gitignore"), "build/\n").unwrap();
+        let filter = WatchFilter::new(root, &[]).unwrap();
+        assert!(filter.is_ignored(&root.join("build/artifact.rs"), false));
+        assert!(!filter.is_ignored(&root.join("lib.rs"), false));
+    }
+}

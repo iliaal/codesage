@@ -275,7 +275,6 @@ dependencies = [
  "codesage-parser",
  "codesage-protocol",
  "codesage-storage",
- "globset",
  "jsonc-parser",
  "libc",
  "notify",

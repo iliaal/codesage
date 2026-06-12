@@ -22,7 +22,6 @@ codesage-features.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-globset.workspace = true
 toml = "1.1"
 toml_edit = "0.25"
 jsonc-parser = { version = "0.32", features = ["cst"] }

@@ -271,4 +271,7 @@ pub struct ProjectMeta {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IndexConfig {
     pub exclude_patterns: Option<Vec<String>>,
+    /// Whether the live filesystem watcher auto-starts for this project.
+    /// `None` is treated as enabled; set `false` to opt out.
+    pub watch: Option<bool>,
 }

@@ -167,7 +167,9 @@ The daemon writes tracing to `mcp-<version>-<key>.log` in the runtime dir; check
 
 ## CLI commands
 
-`init`, `index`, `search`, `find-symbol`, `find-references`, `dependencies`, `impact`, `export`, `status`, `mcp`, `daemon`, `install-hooks`, `install`, `uninstall`, `cleanup`, `git-index`, `coupling`, `risk`, `risk-batch`, `risk-diff`, `tests-for`, `session-start`, `session-end`, `doctor`, `map`, `features-list`, `feature-show`, `feature-for`, `feature-bundle`, `trust-boundaries`.
+`init`, `index`, `search`, `find-symbol`, `find-references`, `dependencies`, `impact`, `export`, `status`, `mcp`, `daemon`, `watch`, `install-hooks`, `install`, `uninstall`, `cleanup`, `git-index`, `coupling`, `risk`, `risk-batch`, `risk-diff`, `tests-for`, `session-start`, `session-end`, `doctor`, `map`, `features-list`, `feature-show`, `feature-for`, `feature-bundle`, `trust-boundaries`.
+
+`watch run|status|stop|start [project]` controls the live filesystem watcher. The daemon auto-starts a per-project watcher on the first MCP tool call for that project (reusing the daemon's pooled embedder), debounces edits, and reindexes structural + semantic on change; it self-exits after idle (`CODESAGE_WATCH_IDLE_SECS`) and is reaped on daemon shutdown. Disable per project with `[index] watch = false` or globally with `CODESAGE_WATCH=0`. `watch run` is a foreground instance with its own embedder for debugging; `watch stop` writes a `.codesage/watch.disabled` marker the running watcher honors; `watch start` clears it.
 
 `install <codex|opencode|all> [--global]` registers CodeSage as an MCP server in agents that have no CodeSage plugin (Codex CLI, opencode), writing their native MCP config (`toml_edit` / `jsonc-parser` CST, comment-preserving and idempotent). It registers the command `codesage mcp --project <abs root>`; `uninstall` removes only CodeSage's entry. Claude Code is not a target — it keeps its `claude mcp add` / plugin registration.
 

@@ -174,9 +174,6 @@ enum Commands {
         /// their tool calls route to this project automatically.
         #[arg(long)]
         project: Option<PathBuf>,
-        /// Enable the file watcher (statewatcher) on the given project root
-        #[arg(long)]
-        statewatcher: Option<PathBuf>,
     },
     /// Manage the shared MCP daemon (run in foreground, check status, stop)
     Daemon {
@@ -188,10 +185,6 @@ enum Commands {
         /// Override the daemon runtime directory
         #[arg(long, hide = true, global = true)]
         runtime_dir: Option<PathBuf>,
-
-        /// Enable the file watcher (statewatcher) on the given project root
-        #[arg(long)]
-        statewatcher: Option<PathBuf>,
     },
     /// Install git hooks for automatic reindexing
     InstallHooks,
@@ -381,17 +374,45 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Watch the project directory for file changes and reindex automatically.
-    /// Uses inotify/FSEvents to detect edits, creates, and deletes.
-    /// Debounces edits (default 1s), cascades to direct importers,
-    /// and falls back to bulk incremental on large batch events.
-    Statewatcher {
-        /// Project root directory to watch
+    /// Manage the live filesystem watcher for a project (auto-reindex on edit).
+    ///
+    /// The daemon auto-starts a watcher per project on first use; these
+    /// subcommands are for explicit control and inspection.
+    Watch {
+        #[command(subcommand)]
+        action: WatchAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum WatchAction {
+    /// Run a watcher in the foreground for a project (own embedder; logs to
+    /// stderr). Useful for debugging or when not using the daemon.
+    Run {
+        /// Project root to watch
         #[arg(default_value = ".")]
         project: Option<PathBuf>,
         /// Debounce window in milliseconds (default 1000, env REINDEX_DEBOUNCE)
         #[arg(long)]
         reindex_debounce: Option<u64>,
+    },
+    /// Report whether a watcher is active for a project.
+    Status {
+        /// Project root (defaults to the current project)
+        project: Option<PathBuf>,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop the active watcher for a project and disable auto-restart.
+    Stop {
+        /// Project root (defaults to the current project)
+        project: Option<PathBuf>,
+    },
+    /// Re-enable auto-start for a project previously stopped.
+    Start {
+        /// Project root (defaults to the current project)
+        project: Option<PathBuf>,
     },
 }
 
@@ -764,14 +785,12 @@ fn run(cli: Cli) -> Result<()> {
             direct,
             runtime_dir,
             project,
-            statewatcher,
-        } => cmd_mcp(direct, runtime_dir, project, statewatcher),
+        } => cmd_mcp(direct, runtime_dir, project),
         Commands::Daemon {
             action,
             runtime_dir,
-            statewatcher,
         } => match action.unwrap_or(DaemonAction::Run) {
-            DaemonAction::Run => cmd_daemon(runtime_dir, statewatcher),
+            DaemonAction::Run => cmd_daemon(runtime_dir),
             DaemonAction::Status => cmd_daemon_status(runtime_dir),
             DaemonAction::Stop => cmd_daemon_stop(runtime_dir),
         },
@@ -818,19 +837,19 @@ fn run(cli: Cli) -> Result<()> {
         } => cmd_feature_bundle(&id, include_callers, include_callees, limit, json),
         Commands::SessionStart { session_id, json } => cmd_session_start(&session_id, json),
         Commands::SessionEnd { session_id, json } => cmd_session_end(&session_id, json),
-        Commands::Statewatcher {
-            project,
-            reindex_debounce,
-        } => cmd_statewatcher(project, reindex_debounce),
+        Commands::Watch { action } => match action {
+            WatchAction::Run {
+                project,
+                reindex_debounce,
+            } => cmd_watch_run(project, reindex_debounce),
+            WatchAction::Status { project, json } => cmd_watch_status(project, json),
+            WatchAction::Stop { project } => cmd_watch_stop(project),
+            WatchAction::Start { project } => cmd_watch_start(project),
+        },
     }
 }
 
-fn cmd_mcp(
-    direct: bool,
-    runtime_dir: Option<PathBuf>,
-    project: Option<PathBuf>,
-    statewatcher: Option<PathBuf>,
-) -> Result<()> {
+fn cmd_mcp(direct: bool, runtime_dir: Option<PathBuf>, project: Option<PathBuf>) -> Result<()> {
     // Canonicalize the default project to an absolute path so injected
     // tool-call args resolve regardless of the agent's cwd.
     let default_project = match project {
@@ -852,17 +871,13 @@ fn cmd_mcp(
     if direct {
         rt.block_on(mcp::run_mcp_server(default_project))
     } else {
-        rt.block_on(daemon::run_mcp_shim(
-            runtime_dir,
-            default_project,
-            statewatcher,
-        ))
+        rt.block_on(daemon::run_mcp_shim(runtime_dir, default_project))
     }
 }
 
-fn cmd_daemon(runtime_dir: Option<PathBuf>, statewatcher: Option<PathBuf>) -> Result<()> {
+fn cmd_daemon(runtime_dir: Option<PathBuf>) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(daemon::run_daemon(runtime_dir, statewatcher))
+    rt.block_on(daemon::run_daemon(runtime_dir))
 }
 
 fn cmd_daemon_status(runtime_dir: Option<PathBuf>) -> Result<()> {
@@ -2087,6 +2102,111 @@ fn cmd_session_start(session_id: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn resolve_watch_root(project: Option<PathBuf>) -> Result<PathBuf> {
+    match project {
+        Some(p) => std::fs::canonicalize(&p)
+            .with_context(|| format!("resolving project path {}", p.display())),
+        None => find_project_root(),
+    }
+}
+
+fn cmd_watch_run(project: Option<PathBuf>, debounce_ms: Option<u64>) -> Result<()> {
+    let root = resolve_watch_root(project)?;
+    let config = load_project_config(&root)?;
+    let excludes = get_exclude_patterns(&config);
+    let emb_config = config.embedding.clone().unwrap_or_default();
+    let debounce = debounce_ms.unwrap_or_else(statewatcher::resolve_debounce_ms);
+
+    // An explicit foreground run overrides a prior `watch stop`.
+    let _ = std::fs::remove_file(statewatcher::watch_disabled_path(&root));
+
+    let shutdown = statewatcher::register_shutdown_flag();
+
+    let embedder: Option<statewatcher::EmbedderProvider> = if emb_config.model.is_empty() {
+        None
+    } else {
+        let cfg = emb_config.clone();
+        Some(std::sync::Arc::new(move || {
+            Embedder::new(&cfg).map(|e| std::sync::Arc::new(parking_lot::Mutex::new(e)))
+        }))
+    };
+
+    let watcher_config = statewatcher::StateWatcherConfig {
+        project_root: root.clone(),
+        db_path: db_path(&root),
+        embed_config: emb_config,
+        exclude_patterns: excludes,
+        debounce_ms: debounce,
+        // Foreground watchers run until Ctrl-C; no idle self-exit.
+        idle_timeout: std::time::Duration::ZERO,
+        mode: statewatcher::WatcherMode::Foreground,
+        embedder,
+        shutdown,
+    };
+
+    eprintln!(
+        "Watching {} for file changes (debounce: {}ms). Ctrl-C to stop.",
+        root.display(),
+        debounce
+    );
+    statewatcher::run_statewatcher(watcher_config)
+}
+
+fn cmd_watch_status(project: Option<PathBuf>, json: bool) -> Result<()> {
+    let root = resolve_watch_root(project)?;
+    let status = statewatcher::read_status(&root);
+    let disabled = statewatcher::watch_disabled_path(&root).exists();
+
+    if json {
+        let obj = serde_json::json!({
+            "project": root.display().to_string(),
+            "active": status.is_some(),
+            "disabled": disabled,
+            "status": status,
+        });
+        println!("{}", serde_json::to_string_pretty(&obj)?);
+    } else {
+        match status {
+            Some(s) => println!(
+                "watcher active for {} (mode: {:?}, pid: {})",
+                root.display(),
+                s.mode,
+                s.pid
+            ),
+            None => println!(
+                "watcher not active for {}{}",
+                root.display(),
+                if disabled { " (disabled)" } else { "" }
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn cmd_watch_stop(project: Option<PathBuf>) -> Result<()> {
+    let root = resolve_watch_root(project)?;
+    // The marker both stops any running watcher (its loop polls for it) and
+    // suppresses auto-restart on the next tool call.
+    let marker = statewatcher::watch_disabled_path(&root);
+    std::fs::write(&marker, "").with_context(|| format!("writing {}", marker.display()))?;
+    println!("watcher stopped and disabled for {}", root.display());
+    Ok(())
+}
+
+fn cmd_watch_start(project: Option<PathBuf>) -> Result<()> {
+    let root = resolve_watch_root(project)?;
+    let marker = statewatcher::watch_disabled_path(&root);
+    if marker.exists() {
+        std::fs::remove_file(&marker).with_context(|| format!("removing {}", marker.display()))?;
+    }
+    println!(
+        "watcher enabled for {}; the daemon starts it on the next tool call, \
+         or run `codesage watch run` for a foreground instance",
+        root.display()
+    );
+    Ok(())
+}
+
 fn cmd_session_end(session_id: &str, json: bool) -> Result<()> {
     let root = find_project_root()?;
     let db = open_db(&root)?;
@@ -2148,38 +2268,6 @@ fn cmd_session_end(session_id: &str, json: bool) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
-}
-
-fn cmd_statewatcher(project: Option<PathBuf>, debounce_ms: Option<u64>) -> Result<()> {
-    let root = match project {
-        Some(p) => std::fs::canonicalize(&p)
-            .with_context(|| format!("resolving project path {}", p.display()))?,
-        None => find_project_root()?,
-    };
-
-    let config = load_project_config(&root)?;
-    let excludes = get_exclude_patterns(&config);
-    let emb_config = config.embedding.unwrap_or_default();
-    let debounce = debounce_ms.unwrap_or_else(statewatcher::resolve_debounce_ms);
-
-    let shutdown = statewatcher::register_shutdown_flag();
-
-    let db = db_path(&root);
-    let watcher_config = statewatcher::StateWatcherConfig {
-        project_root: root,
-        db_path: db,
-        embed_config: emb_config,
-        exclude_patterns: excludes,
-        debounce_ms: debounce,
-        shutdown,
-    };
-
-    eprintln!(
-        "Watching {} for file changes (debounce: {}ms)...",
-        watcher_config.project_root.display(),
-        debounce
-    );
-    statewatcher::run_statewatcher(watcher_config)
 }
 
 fn cmd_status() -> Result<()> {
@@ -2723,6 +2811,7 @@ mod tests {
             embedding: None,
             index: Some(IndexConfig {
                 exclude_patterns: Some(vec!["**/my-custom/**".to_string()]),
+                watch: None,
             }),
         };
         let patterns = get_exclude_patterns(&cfg);
@@ -2744,6 +2833,7 @@ mod tests {
             embedding: None,
             index: Some(IndexConfig {
                 exclude_patterns: Some(vec![]),
+                watch: None,
             }),
         };
         let patterns = get_exclude_patterns(&cfg);
@@ -2757,6 +2847,7 @@ mod tests {
             embedding: None,
             index: Some(IndexConfig {
                 exclude_patterns: Some(vec!["skip/**".to_string()]),
+                watch: None,
             }),
         };
 
