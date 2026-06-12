@@ -158,6 +158,8 @@ def run_parallel(cmds: list[list[str]], cwd: Path, timeout_s: int = 300) -> list
 # Post-run DB integrity checks
 # ---------------------------------------------------------------------------
 
+REQUIRED_TABLES = ("files", "symbols", "refs", "schema_migrations")
+
 
 def semantic_chunk_check(conn: sqlite3.Connection) -> dict:
     """Best-effort semantic/vector consistency without loading sqlite-vec."""
@@ -213,13 +215,47 @@ def integrity_check(db_path: Path) -> dict:
         conn.execute("PRAGMA foreign_keys=ON")
         out = {
             "integrity": "unknown",
-            "orphans": {},
-            "dupes": {},
+            "orphans": {
+                "symbols_without_file": 0,
+                "refs_without_file": 0,
+            },
+            "dupes": {
+                "files_same_path": 0,
+            },
             "schema_migrations": [],
+            "schema_missing": [],
+            "query_errors": [],
             "semantic": {},
         }
+
+        def count_query(label: str, sql: str) -> int:
+            try:
+                return conn.execute(sql).fetchone()[0]
+            except sqlite3.OperationalError as e:
+                out["query_errors"].append({"check": label, "error": str(e)})
+                if out["integrity"] == "ok":
+                    out["integrity"] = f"query failed: {label}: {e}"
+                return 0
+
         rows = conn.execute("PRAGMA integrity_check").fetchall()
         out["integrity"] = ", ".join(r[0] for r in rows) if rows else "empty"
+
+        existing_tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        missing = [table for table in REQUIRED_TABLES if table not in existing_tables]
+        out["schema_missing"] = missing
+        if missing:
+            if out["integrity"] == "ok":
+                out["integrity"] = (
+                    "schema incomplete: missing " + ", ".join(missing)
+                )
+            out["semantic"] = semantic_chunk_check(conn)
+            return out
+
         # FK enforcement is ON per init_db but cheap to re-verify: list
         # foreign key violations (should be empty).
         fk_rows = conn.execute("PRAGMA foreign_key_check").fetchall()
@@ -229,30 +265,37 @@ def integrity_check(db_path: Path) -> dict:
         # Symbols / refs without a parent file row (FK is ON DELETE CASCADE
         # so this should be impossible, but if WAL committed a half-state
         # we'd see it).
-        out["orphans"]["symbols_without_file"] = conn.execute(
+        out["orphans"]["symbols_without_file"] = count_query(
+            "symbols_without_file",
             "SELECT COUNT(*) FROM symbols s "
             "LEFT JOIN files f ON s.file_id = f.id WHERE f.id IS NULL"
-        ).fetchone()[0]
-        out["orphans"]["refs_without_file"] = conn.execute(
+        )
+        out["orphans"]["refs_without_file"] = count_query(
+            "refs_without_file",
             "SELECT COUNT(*) FROM refs r "
             "LEFT JOIN files f ON r.from_file_id = f.id WHERE f.id IS NULL"
-        ).fetchone()[0]
+        )
         # Duplicate files by path (files.path is UNIQUE so this must be 0).
-        out["dupes"]["files_same_path"] = conn.execute(
+        out["dupes"]["files_same_path"] = count_query(
+            "files_same_path",
             "SELECT COUNT(*) FROM ("
             "  SELECT path, COUNT(*) c FROM files GROUP BY path HAVING c > 1"
             ")"
-        ).fetchone()[0]
+        )
         # Schema-migration registry state — two concurrent writers could
         # each INSERT into schema_migrations. UNIQUE constraint on name
         # should prevent dupes, but worth verifying on the live DB.
-        mig_rows = conn.execute(
-            "SELECT name, COUNT(*) FROM schema_migrations GROUP BY name"
-        ).fetchall()
+        try:
+            mig_rows = conn.execute(
+                "SELECT name, COUNT(*) FROM schema_migrations GROUP BY name"
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            out["query_errors"].append({"check": "schema_migrations", "error": str(e)})
+            mig_rows = []
         out["schema_migrations"] = [{"name": n, "count": c} for n, c in mig_rows]
         # Summary row counts for sanity.
         for t in ("files", "symbols", "refs"):
-            out[f"count_{t}"] = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            out[f"count_{t}"] = count_query(f"count_{t}", f"SELECT COUNT(*) FROM {t}")
         out["semantic"] = semantic_chunk_check(conn)
         return out
     finally:

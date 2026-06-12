@@ -35,7 +35,8 @@ fn init_hermetic_repo(root: &std::path::Path) {
     // Ignore ambient signing/hooks config so temp-repo tests don't fail on
     // machines with global commit.gpgsign or custom core.hooksPath.
     run_git(root, &["config", "commit.gpgsign", "false"]);
-    run_git(root, &["config", "core.hooksPath", ".git/hooks"]);
+    std::fs::create_dir_all(root.join(".git/disabled-hooks")).unwrap();
+    run_git(root, &["config", "core.hooksPath", ".git/disabled-hooks"]);
 }
 
 fn run_git(root: &std::path::Path, args: &[&str]) {
@@ -45,6 +46,26 @@ fn run_git(root: &std::path::Path, args: &[&str]) {
         .status()
         .expect("git command starts");
     assert!(status.success(), "git {:?} failed", args);
+}
+
+#[test]
+#[cfg(unix)]
+fn init_hermetic_repo_ignores_hooks_left_in_git_hooks_dir() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_hermetic_repo(root);
+
+    let hook = root.join(".git/hooks/pre-commit");
+    std::fs::write(&hook, "#!/bin/sh\nexit 42\n").unwrap();
+    let mut perms = std::fs::metadata(&hook).unwrap().permissions();
+    perms.set_mode(perms.mode() | 0o111);
+    std::fs::set_permissions(&hook, perms).unwrap();
+
+    std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+    run_git(root, &["add", "."]);
+    run_git(root, &["commit", "-qm", "commit ignores disabled hook"]);
 }
 
 #[test]

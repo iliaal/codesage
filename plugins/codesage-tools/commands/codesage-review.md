@@ -18,7 +18,7 @@ Flags:
 - `--feature <id>` — review one specific feature (skips the discovery step)
 - `--kind <k>` — filter features by kind (`route`, `library`, `cli-command`, `test-suite`, `service`, `config`, `infra`)
 - `--severity <s>` — minimum severity to report (`low`/`medium`/`high`, default `medium`)
-- `--categories <c,c,...>` — comma-separated list (default: `bug,security`)
+- `--categories <c,c,...>` — comma-separated list of `bug`/`security`/`perf`/`maintainability`/`style` (default: `bug,security`). `perf` and `maintainability` are opt-in: the reviewer reads slices statically and never profiles, so perf findings are inherently speculative and the highest false-positive category. The default keeps the two categories where a finding is almost always actionable. Add `perf` explicitly (`--categories bug,security,perf`) when you have a concrete hotspot concern; the rubric still gates it to demonstrable pessimizations.
 
 ## Step 1: Discover features
 
