@@ -30,6 +30,7 @@ Concrete answers to the questions a code-intelligence tool earns its keep on. Th
 
 | Capability | CodeSage |
 |---|---|
+| First-call project orientation (languages, freshness, features, top risk, conventions, next calls) | ✓ via `project_overview`, one bounded response |
 | Natural-language semantic search | ✓ MiniLM embeddings + cross-encoder reranker (jina-embeddings-v2-base-code optional via config) |
 | Symbol-level lookup (definitions, references, callers/callees, inheritance) | ✓ tree-sitter, 9 languages, exact line/column ranges |
 | File-level dependency mapping (imports / imported-by) | ✓ via `list_dependencies` |
@@ -39,6 +40,7 @@ Concrete answers to the questions a code-intelligence tool earns its keep on. Th
 | Patch-level risk aggregation (max/mean, hotspots, test-gap files) | ✓ via `assess_risk_diff`; per-file batch via `assess_risk_batch` |
 | Historical co-change / coupling | ✓ via `find_coupling`, decay-weighted with τ=180d |
 | Test-recommendation for a changed file set | ✓ via `recommend_tests`, sibling conventions for 7 frameworks + co-change |
+| Pre-commit review prediction (severity-ranked objections for a patch) | ✓ via `review_rehearsal`, composes risk-diff + recommend-tests + drift + feature mapping |
 | Curated context bundle for downstream LLM | ✓ via `export_context`, callers + callees optional |
 | Session-baseline diff (did this session decay the index?) | ✓ via `session_start` / `session_end`, cycle + risk regressions |
 | Cycle / SCC detection in the import graph | ✓ folded into `assess_risk` and `assess_risk_diff.cycles_touching_patch` |

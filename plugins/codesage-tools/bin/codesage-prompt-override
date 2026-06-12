@@ -23,6 +23,7 @@ shape of the question:
 
 | Question shape | Tool |
 |---|---|
+| "What is this codebase?" / starting work / "where do I begin?" (one bounded orientation: languages, freshness, features, top risk, conventions, next calls) | `mcp__codesage__project_overview` |
 | "Where is <Identifier> defined?" (function, class, struct, enum, constant, macro) | `mcp__codesage__find_symbol` |
 | "Where is <Identifier> called / imported / inherited from / instantiated?" | `mcp__codesage__find_references` |
 | "Where does <concept> happen?" / "Where is auth, config, retries, logging handled?" / paraphrase queries | `mcp__codesage__search` |
@@ -30,6 +31,7 @@ shape of the question:
 | "What files break if I rename / change <Symbol>?" | `mcp__codesage__impact_analysis` |
 | "Bundle code for this concept for another LLM." | `mcp__codesage__export_context` |
 | "What's the risk of this patch?" / "What tests should I run?" / "What files co-change with this one?" | `mcp__codesage__assess_risk` / `mcp__codesage__assess_risk_diff` / `mcp__codesage__recommend_tests` / `mcp__codesage__find_coupling` |
+| "Before I commit — what will a reviewer flag?" (missing tests, risky/blast-radius files, cycles, trust boundaries, feature-test gaps, scope creep) | `mcp__codesage__review_rehearsal` |
 
 Use `Grep` / `Glob` / `Bash` only when the target is a non-identifier
 literal: error messages, log text, config keys, TODO/FIXME markers,

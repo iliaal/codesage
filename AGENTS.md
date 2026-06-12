@@ -132,17 +132,19 @@ PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go.
 
 ## MCP tools
 
+- `project_overview` -- one bounded first-call orientation: languages, structural + semantic freshness, feature summary by kind, top-risk files, trust-boundary clusters, per-language test conventions, sample entrypoints, and suggested next calls. Pure aggregation over the index; call once at session start.
 - `search` -- semantic search with embedding + reranking
 - `find_symbol` -- symbol definitions by name
-- `find_references` -- references to a symbol
+- `find_references` -- references to a symbol; each row's `from_symbol` names the enclosing caller (null at file scope)
 - `list_dependencies` -- file-level imports/imported-by
-- `impact_analysis` -- files affected by changing a symbol or file, with distance and reasons
+- `impact_analysis` -- files affected by changing a symbol or file, with distance and reasons. Opt-in `include_forward` (forward deps), `include_siblings` (same-file symbols), `limit`, and `summary_only` controls; result is an object with `results` plus the requested extras.
 - `export_context` -- curated code bundle for a query or symbol, optionally with callers/callees
 - `find_coupling` -- files that historically change with a given file (V2b)
 - `assess_risk` -- risk score for a single file (V2b slice 1; now blends import-cycle membership alongside churn / fix / blast / coupling / test-gap)
 - `assess_risk_batch` -- per-file risk for N files in one call, no aggregation. Use when you have a list of files and want each one's score; saves the per-file MCP round-trip overhead vs N `assess_risk` calls. For patch-level aggregation use `assess_risk_diff` instead.
 - `assess_risk_diff` -- aggregate risk for a patch / set of files (V2b slice 2). Per-file `notes[]` may contain short codes (`"T"`, `"NG"`); resolve via the top-level `_legend` map.
 - `recommend_tests` -- tests an agent should run after editing a set of files (V2b slice 2)
+- `review_rehearsal` -- predict severity-ranked review objections for a patch (missing tests, high-risk / blast-radius / fix-prone / hotspot files, import cycles, trust-boundary expansion, feature-test gaps, and `scope-spread` when a patch touches ≥4 unrelated feature areas) with hot-symbol evidence. Composes `assess_risk_diff` + `recommend_tests` + drift + feature mapping; read-only, no AI prose. Use as the last step before a commit.
 - `session_start` / `session_end` -- snapshot structural state at the start of an editing session, diff at the end. Returns `pass: bool` plus new/resolved cycles, per-file risk regressions on the top-50 baseline, and added/removed files.
 - `list_features` -- list mapped feature slices, filterable by `kind` (`route`, `cli-command`, `library`, `test-suite`, `service`, `config`, `infra`), `language`, or `tag` (0.7.0).
 - `find_feature` -- given a file path, return the feature(s) that own it. Routes "what slice owns this file?" without scanning by hand.
@@ -174,7 +176,7 @@ The daemon writes tracing to `mcp-<version>-<key>.log` in the runtime dir; check
 
 ## CLI commands
 
-`init`, `index`, `search`, `find-symbol`, `find-references`, `dependencies`, `impact`, `export`, `status`, `mcp`, `daemon`, `watch`, `install-hooks`, `install`, `uninstall`, `cleanup`, `git-index`, `coupling`, `risk`, `risk-batch`, `risk-diff`, `tests-for`, `session-start`, `session-end`, `doctor`, `map`, `features-list`, `feature-show`, `feature-for`, `feature-bundle`, `trust-boundaries`.
+`init`, `index`, `overview`, `search`, `find-symbol`, `find-references`, `dependencies`, `impact`, `export`, `status`, `mcp`, `daemon`, `watch`, `install-hooks`, `install`, `uninstall`, `cleanup`, `git-index`, `coupling`, `risk`, `risk-batch`, `risk-diff`, `tests-for`, `rehearse`, `session-start`, `session-end`, `doctor`, `map`, `features-list`, `feature-show`, `feature-for`, `feature-bundle`, `trust-boundaries`.
 
 `watch run|status|stop|start [project]` controls the live filesystem watcher. The daemon auto-starts a per-project watcher on the first MCP tool call for that project (reusing the daemon's pooled embedder), debounces edits, and reindexes structural + semantic on change; it self-exits after idle (`CODESAGE_WATCH_IDLE_SECS`) and is reaped on daemon shutdown. Disable per project with `[index] watch = false` or globally with `CODESAGE_WATCH=0`. `watch run` is a foreground instance with its own embedder for debugging; `watch stop` writes a `.codesage/watch.disabled` marker the running watcher honors; `watch start` clears it. The watcher complements the git hooks, it does not replace them: it refreshes structural + semantic content live during a session, but git history intelligence (`git-index`, feeding `assess_risk` / `find_coupling`) and feature mapping still refresh only via the hooks or a full `codesage index`, and the watcher only runs while a daemon is alive.
 
