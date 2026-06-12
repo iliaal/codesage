@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.11.0] - 2026-06-12
+
 ### Added
 - `project_overview` MCP tool and `codesage overview` CLI command: one-call project orientation (languages, structural+semantic freshness, feature summary by kind, top-risk files, trust-boundary clusters, per-language test conventions, sample entrypoints, suggested next calls).
 - `review_rehearsal` MCP tool and `codesage rehearse` CLI command: predict severity-ranked review objections for a patch (missing tests, high-risk/blast-radius/fix-prone/hotspot files, import cycles, trust-boundary expansion, feature-test gaps, and `scope-spread` when a patch touches ≥4 unrelated feature areas) from `assess_risk_diff` + `recommend_tests` + drift + feature mapping. High-risk objections list the file's hottest symbols. CLI falls back to working-tree changes vs HEAD when no files are given.
@@ -479,5 +481,7 @@ Initial public release.
 
 [0.9.0]: https://github.com/iliaal/codesage/releases/tag/v0.9.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.10.0...HEAD
 [0.10.0]: https://github.com/iliaal/codesage/releases/tag/v0.10.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/iliaal/codesage/releases/tag/v0.11.0
