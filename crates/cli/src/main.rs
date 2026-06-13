@@ -679,7 +679,14 @@ fn main() {
     // Code subagent. The `Once::call_once` fallback inside `Embedder::new`
     // / `Reranker::new` covers any future shim codepath that grew to
     // actually run inference (none today).
-    if !is_shim_invocation() {
+    // Only commands that build an Embedder/Reranker need the ORT + CUDA preload.
+    // Structural/metadata commands (status, risk, find-symbol, …) must skip it:
+    // `preload_cuda_libs` dlopen's the CUDA/cuDNN stack, whose native constructors
+    // can hard-abort (SIGABRT) under a restricted sandbox — e.g. a Codex review
+    // that runs `codesage status` as its `.codesage/index.db` onboarding probe.
+    // The `Once::call_once` fallback in Embedder::new / Reranker::new still covers
+    // any embedder codepath that reaches inference without a main-thread preload.
+    if !is_shim_invocation() && uses_embedder() {
         codesage_embed::model::init_for_main();
     }
     let cli = Cli::parse();
@@ -771,6 +778,41 @@ where
         }
     }
     saw_mcp && !saw_direct
+}
+
+/// Subcommands that construct an `Embedder`/`Reranker` (directly or via the
+/// in-process server) and therefore need the single-threaded ORT + CUDA preload
+/// in `main`. Every other command is structural/metadata-only (graph, git, SQL)
+/// and must not pay the preload, whose CUDA dlopen can abort under a restricted
+/// sandbox. `mcp` is listed for the `--direct` server; the bare `mcp` shim is
+/// already excluded earlier via `is_shim_invocation`.
+const EMBEDDER_COMMANDS: &[&str] = &["search", "index", "export", "watch", "daemon", "mcp"];
+
+fn uses_embedder() -> bool {
+    argv_uses_embedder(std::env::args_os().skip(1))
+}
+
+fn argv_uses_embedder<I>(args: I) -> bool
+where
+    I: IntoIterator,
+    I::Item: AsRef<std::ffi::OsStr>,
+{
+    for a in args {
+        let a = a.as_ref();
+        if a == "--" {
+            break;
+        }
+        // Skip clap-style global flags that may precede the subcommand.
+        if a.to_str().is_some_and(|s| s.starts_with('-')) {
+            continue;
+        }
+        // First positional token is the subcommand. A non-UTF-8 token is never a
+        // known embedder command, so it falls through to the safe direction
+        // (skip preload) — structural commands never embed, and the Embedder::new
+        // fallback covers anything that does.
+        return a.to_str().is_some_and(|s| EMBEDDER_COMMANDS.contains(&s));
+    }
+    false
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -3248,5 +3290,59 @@ mod tests {
         assert!(is_shim_argv(args));
         // A non-UTF-8 first positional is treated as non-shim (no panic).
         assert!(!is_shim_argv(vec![bad]));
+    }
+
+    // ---------- embedder-preload gate (CUDA dlopen skip) ----------
+
+    #[test]
+    fn embedder_gate_preloads_for_embedding_commands() {
+        for cmd in ["search", "index", "export", "watch", "daemon", "mcp"] {
+            assert!(
+                argv_uses_embedder(argv(&[cmd])),
+                "expected preload for {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn embedder_gate_skips_structural_commands() {
+        // These never construct an Embedder; preloading the CUDA stack for them
+        // is pure waste and aborts under a restricted sandbox (the `status` case).
+        for cmd in [
+            "status",
+            "risk",
+            "risk-diff",
+            "risk-batch",
+            "tests-for",
+            "coupling",
+            "find-symbol",
+            "find-references",
+            "dependencies",
+            "impact",
+            "trust-boundaries",
+            "map",
+            "features-list",
+            "feature-show",
+            "feature-for",
+            "feature-bundle",
+            "overview",
+            "doctor",
+            "init",
+        ] {
+            assert!(!argv_uses_embedder(argv(&[cmd])), "expected skip for {cmd}");
+        }
+    }
+
+    #[test]
+    fn embedder_gate_skips_leading_global_flags() {
+        // A future global flag before the subcommand must not flip the gate.
+        assert!(argv_uses_embedder(argv(&["--verbose", "search"])));
+        assert!(!argv_uses_embedder(argv(&["--verbose", "status"])));
+    }
+
+    #[test]
+    fn embedder_gate_skips_empty_and_unknown() {
+        assert!(!argv_uses_embedder(argv(&[])));
+        assert!(!argv_uses_embedder(argv(&["definitely-not-a-command"])));
     }
 }
