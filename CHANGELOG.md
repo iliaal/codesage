@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.12.0] - 2026-06-13
+
 ### Added
 - The MCP daemon evicts pooled embedder/reranker models after they sit unused (default 15 min, `CODESAGE_MODEL_IDLE_SECS`, `0` disables), freeing their GPU VRAM and (via `malloc_trim`) some host memory while keeping the daemon and its client connections alive; the next query reloads them. The daemon now also spawns with `MALLOC_ARENA_MAX=2` unless overridden.
 
@@ -490,5 +492,7 @@ Initial public release.
 
 [0.10.0]: https://github.com/iliaal/codesage/releases/tag/v0.10.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.11.0...HEAD
 [0.11.0]: https://github.com/iliaal/codesage/releases/tag/v0.11.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/iliaal/codesage/releases/tag/v0.12.0
