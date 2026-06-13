@@ -173,6 +173,20 @@ git diff origin/main...HEAD --name-only | codesage risk-diff
 
 Same as the pre-commit check, but scoped to everything on the branch instead of just the staged diff. Useful as the last step before `gh pr create`.
 
+### Gate a PR in CI on review objections
+
+```bash
+# Fail the job if the patch raises any high-severity review objection.
+# Prereq: the index must exist in CI — run `codesage index && codesage git-index`
+# in an earlier step, or cache .codesage/ between runs.
+git diff --name-only "origin/${GITHUB_BASE_REF:-main}...HEAD" \
+  | codesage rehearse --json \
+  | jq -e '[.objections[] | select(.severity == "high")] | length == 0' >/dev/null \
+  || { echo "::error::review_rehearsal raised high-severity objections"; exit 1; }
+```
+
+Runs `review_rehearsal` over the branch diff and fails the job when any objection is `high` severity (missing tests on a high-risk file, blast-radius, hotspot, import cycle, trust-boundary expansion). Drop `--json` to print the full severity-ranked objection list into the CI log so reviewers see the reasoning; the `summary_notes` are paste-ready for the PR description. Tune the gate by widening the `select` to `"high","medium"` for a stricter bar, or key off a specific `.category`.
+
 ### What changed in the last week, ranked by risk
 
 ```bash
