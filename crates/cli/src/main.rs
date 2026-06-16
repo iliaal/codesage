@@ -20,8 +20,8 @@ use codesage_embed::config::{EmbeddingConfig, ProjectConfig};
 use codesage_embed::model::Embedder;
 use codesage_graph::{
     assess_risk, export_context, export_context_for_symbol, find_coupling, find_references,
-    find_symbol, full_index, impact_analysis_report, incremental_index, list_dependencies, search,
-    semantic_full_index, semantic_incremental_index,
+    find_similar, find_symbol, full_index, impact_analysis_report, incremental_index,
+    list_dependencies, search, semantic_full_index, semantic_incremental_index,
 };
 use codesage_parser::discover::DEFAULT_EXCLUDE_PATTERNS;
 use codesage_protocol::{
@@ -265,6 +265,20 @@ enum Commands {
     Risk {
         /// Repo-relative file path (e.g. src/auth/login.php)
         file: String,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Find functions structurally similar to a named one (near-clone detection)
+    Similar {
+        /// Function/method name to find clones of
+        symbol: String,
+        /// Minimum Jaccard similarity in [0, 1]
+        #[arg(long, default_value_t = 0.85)]
+        min_jaccard: f32,
+        /// Max results
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
         /// Emit JSON
         #[arg(long)]
         json: bool,
@@ -895,6 +909,12 @@ fn run(cli: Cli) -> Result<()> {
         } => cmd_git_index(json, full, incremental),
         Commands::Coupling { file, limit, json } => cmd_coupling(&file, limit, json),
         Commands::Risk { file, json } => cmd_risk(&file, json),
+        Commands::Similar {
+            symbol,
+            min_jaccard,
+            limit,
+            json,
+        } => cmd_similar(&symbol, min_jaccard, limit, json),
         Commands::RiskDiff { files, json } => cmd_risk_diff(files, json),
         Commands::RiskBatch { files, json } => cmd_risk_batch(files, json),
         Commands::TestsFor { files, json } => cmd_tests_for(files, json),
@@ -1742,6 +1762,26 @@ fn cmd_coupling(file: &str, limit: usize, json: bool) -> Result<()> {
         );
         for e in &report.coupled {
             println!("  {:>6.2}  {:>4}x  {}", e.weight, e.count, e.file);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_similar(symbol: &str, min_jaccard: f32, limit: usize, json: bool) -> Result<()> {
+    let root = find_project_root()?;
+    let db = open_db(&root)?;
+    let hits = find_similar(&db, symbol, min_jaccard, limit)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&hits)?);
+    } else if hits.is_empty() {
+        println!("No clones of '{symbol}' at Jaccard >= {min_jaccard:.2}");
+    } else {
+        println!("Clones of '{symbol}' (Jaccard >= {min_jaccard:.2}):");
+        for h in &hits {
+            println!(
+                "  {:.3}  {}:{}-{}  {}()",
+                h.jaccard, h.file_path, h.line_start, h.line_end, h.name
+            );
         }
     }
     Ok(())

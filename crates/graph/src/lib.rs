@@ -4,6 +4,7 @@ pub mod query;
 mod scc;
 pub mod semantic;
 pub mod session;
+pub mod similar;
 
 pub use git_history::{
     IndexMode, assess_risk, assess_risk_batch, assess_risk_diff, changed_files_since,
@@ -19,3 +20,4 @@ pub use semantic::{
     semantic_full_index, semantic_incremental_index, semantic_index_files, semantic_remove_files,
 };
 pub use session::{session_end, session_start, top_risk_files};
+pub use similar::find_similar;

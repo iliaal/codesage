@@ -19,10 +19,10 @@ static GO_QUERY: &str = include_str!("queries/go.scm");
 /// per language on first use, then reused across every file. `capture_index_for_name`
 /// is O(n) over captures, so caching it beside the Query matters when the indexer
 /// runs through tens of thousands of files.
-struct SymbolQuerySpec {
-    query: Query,
-    name_idx: u32,
-    def_idx: u32,
+pub(crate) struct SymbolQuerySpec {
+    pub(crate) query: Query,
+    pub(crate) name_idx: u32,
+    pub(crate) def_idx: u32,
 }
 
 fn compile_symbol_query(lang: tree_sitter::Language, src: &str) -> SymbolQuerySpec {
@@ -62,7 +62,7 @@ static TS_SYM: LazyLock<SymbolQuerySpec> = LazyLock::new(|| {
 static GO_SYM: LazyLock<SymbolQuerySpec> =
     LazyLock::new(|| compile_symbol_query(crate::parse::ts_language(Language::Go), GO_QUERY));
 
-fn symbol_query_for(lang: Language) -> &'static SymbolQuerySpec {
+pub(crate) fn symbol_query_for(lang: Language) -> &'static SymbolQuerySpec {
     match lang {
         Language::Php => &PHP_SYM,
         Language::Python => &PY_SYM,
@@ -73,6 +73,23 @@ fn symbol_query_for(lang: Language) -> &'static SymbolQuerySpec {
         Language::JavaScript => &JS_SYM,
         Language::TypeScript => &TS_SYM,
         Language::Go => &GO_SYM,
+    }
+}
+
+/// The pattern-index → `SymbolKind` map for a language, shared by
+/// `extract_symbols` and the fingerprint pass so both agree on which `@def`
+/// matches are functions/methods.
+pub(crate) fn kind_map_for(language: Language) -> fn(usize) -> Option<SymbolKind> {
+    match language {
+        Language::Php => php_kind_map,
+        Language::Python => python_kind_map,
+        Language::C => c_kind_map,
+        Language::Cpp => cpp_kind_map,
+        Language::Java => java_kind_map,
+        Language::Rust => rust_kind_map,
+        Language::JavaScript => js_kind_map,
+        Language::TypeScript => ts_kind_map,
+        Language::Go => go_kind_map,
     }
 }
 
@@ -220,17 +237,7 @@ pub fn extract_symbols(
     language: Language,
     file_path: &str,
 ) -> Result<Vec<Symbol>> {
-    let kind_map: fn(usize) -> Option<SymbolKind> = match language {
-        Language::Php => php_kind_map,
-        Language::Python => python_kind_map,
-        Language::C => c_kind_map,
-        Language::Cpp => cpp_kind_map,
-        Language::Java => java_kind_map,
-        Language::Rust => rust_kind_map,
-        Language::JavaScript => js_kind_map,
-        Language::TypeScript => ts_kind_map,
-        Language::Go => go_kind_map,
-    };
+    let kind_map = kind_map_for(language);
 
     let spec = symbol_query_for(language);
     let query = &spec.query;
@@ -449,7 +456,7 @@ fn is_inside_impl_or_class(node: &Node, language: Language) -> bool {
 /// in-class definitions. Destructors (`~Foo`) and operators (`operator+`) are
 /// returned as-is because the leading marker is part of the conventional
 /// search term.
-fn cpp_bare_name(captured: &str) -> String {
+pub(crate) fn cpp_bare_name(captured: &str) -> String {
     captured.rsplit("::").next().unwrap_or(captured).to_string()
 }
 

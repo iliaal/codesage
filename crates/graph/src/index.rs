@@ -4,10 +4,12 @@ use anyhow::{Context, Result};
 use codesage_features::trust_boundary::derive_from_refs;
 use codesage_protocol::{FileInfo, IndexStats, Reference, Symbol};
 use codesage_storage::Database;
+use codesage_storage::db::FingerprintInput;
 use rayon::prelude::*;
 
 use codesage_parser::discover::discover_files_with_excludes;
 use codesage_parser::extract::extract_symbols;
+use codesage_parser::fingerprint::{FunctionFingerprint, file_fingerprints};
 use codesage_parser::parse::parse_file;
 use codesage_parser::references::extract_references;
 
@@ -16,6 +18,7 @@ struct ParsedFile {
     info: FileInfo,
     symbols: Vec<Symbol>,
     refs: Vec<Reference>,
+    fingerprints: Vec<FunctionFingerprint>,
 }
 
 fn parse_one(root: &Path, file_info: &FileInfo) -> Result<ParsedFile> {
@@ -28,11 +31,28 @@ fn parse_one(root: &Path, file_info: &FileInfo) -> Result<ParsedFile> {
     let mut refs = extract_references(&tree, &source, file_info.language, &file_info.path)
         .with_context(|| format!("extracting references from {}", file_info.path))?;
     populate_from_symbol(&symbols, &mut refs);
+    let fingerprints = file_fingerprints(&tree, &source, file_info.language);
     Ok(ParsedFile {
         info: file_info.clone(),
         symbols,
         refs,
+        fingerprints,
     })
+}
+
+/// Map parsed fingerprints to borrowed insert rows.
+fn fingerprint_inputs(p: &ParsedFile) -> Vec<FingerprintInput<'_>> {
+    p.fingerprints
+        .iter()
+        .map(|f| FingerprintInput {
+            name: &f.name,
+            kind: f.kind.as_str(),
+            line_start: f.line_start,
+            line_end: f.line_end,
+            leaf_count: f.leaf_count as u32,
+            fp: &f.fp,
+        })
+        .collect()
 }
 
 /// Set each reference's `from_symbol` to the qualified name of the innermost
@@ -148,6 +168,7 @@ fn index(
             let file_id = db.upsert_file(&p.info)?;
             db.insert_symbols(file_id, &p.symbols)?;
             db.insert_references(file_id, &p.refs)?;
+            db.insert_fingerprints(file_id, &fingerprint_inputs(p))?;
             // Trust-boundary derivation runs against the in-memory refs we
             // just inserted — no DB round-trip to re-read them. Replace
             // whatever was stored previously so re-index keeps the set
@@ -224,6 +245,7 @@ pub fn index_files(
             let file_id = db.upsert_file(&p.info)?;
             db.insert_symbols(file_id, &p.symbols)?;
             db.insert_references(file_id, &p.refs)?;
+            db.insert_fingerprints(file_id, &fingerprint_inputs(p))?;
             let boundaries = derive_from_refs(&p.refs, p.info.language);
             db.replace_file_trust_boundaries(file_id, &boundaries)?;
         }
