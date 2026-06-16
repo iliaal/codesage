@@ -65,16 +65,23 @@ const SEEDS: [u64; MINHASH_K] = {
 /// Pre-order walk of `node`, pushing each node's `kind_id` and counting leaves
 /// (childless nodes — the actual source tokens). Order is preserved so the
 /// trigram sequence reflects structure, not just a node-kind bag.
-fn collect_preorder(node: &Node, kinds: &mut Vec<u16>, leaves: &mut usize) {
-    kinds.push(node.kind_id());
-    let mut cursor = node.walk();
-    let mut had_child = false;
-    for child in node.children(&mut cursor) {
-        had_child = true;
-        collect_preorder(&child, kinds, leaves);
-    }
-    if !had_child {
-        *leaves += 1;
+fn collect_preorder(root: &Node, kinds: &mut Vec<u16>, leaves: &mut usize) {
+    // Explicit-stack pre-order walk rather than recursion: this runs inside the
+    // indexer's rayon workers (fixed, non-growable stacks), and a deeply nested
+    // AST (machine-generated code, long expression chains) would otherwise
+    // overflow the stack — an uncatchable SIGABRT that aborts the whole index
+    // run. Children are pushed in reverse so the leftmost is visited first,
+    // preserving pre-order (the trigram sequence depends on it).
+    let mut stack: Vec<Node> = vec![*root];
+    while let Some(node) = stack.pop() {
+        kinds.push(node.kind_id());
+        let mut cursor = node.walk();
+        let children: Vec<Node> = node.children(&mut cursor).collect();
+        if children.is_empty() {
+            *leaves += 1;
+        } else {
+            stack.extend(children.into_iter().rev());
+        }
     }
 }
 
@@ -198,6 +205,28 @@ mod tests {
     fn fps(src: &str, lang: Language) -> Vec<FunctionFingerprint> {
         let tree = parse_file(src.as_bytes(), lang).unwrap();
         file_fingerprints(&tree, src.as_bytes(), lang)
+    }
+
+    #[test]
+    fn deeply_nested_ast_does_not_overflow_the_stack() {
+        // A function body nested thousands of levels deep. The previous
+        // recursive `collect_preorder` used one native stack frame per level;
+        // on a small (rayon-worker-sized) stack that SIGABRTs and aborts the
+        // whole indexer. The iterative walk uses the heap, so it completes.
+        // Run on a deliberately small stack to make the regression observable.
+        let depth = 4000;
+        let mut body = String::from("1");
+        for _ in 0..depth {
+            body = format!("({body})");
+        }
+        let src = format!("fn deep() -> i32 {{ {body} }}\n");
+        let out = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || fps(&src, Language::Rust).len())
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(out, 1, "deeply nested function should still fingerprint");
     }
 
     #[test]
