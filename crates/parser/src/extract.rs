@@ -456,7 +456,7 @@ fn is_inside_impl_or_class(node: &Node, language: Language) -> bool {
 /// in-class definitions. Destructors (`~Foo`) and operators (`operator+`) are
 /// returned as-is because the leading marker is part of the conventional
 /// search term.
-fn cpp_bare_name(captured: &str) -> String {
+pub(crate) fn cpp_bare_name(captured: &str) -> String {
     captured.rsplit("::").next().unwrap_or(captured).to_string()
 }
 

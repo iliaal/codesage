@@ -27,6 +27,15 @@ pub fn find_similar(
     min_jaccard: f32,
     limit: usize,
 ) -> Result<Vec<SimilarSymbol>> {
+    // Guard against NaN / out-of-range thresholds: NaN would bypass the `<`
+    // filter (admitting everything) and a negative bound admits every LSH
+    // candidate.
+    let min_jaccard = if min_jaccard.is_finite() {
+        min_jaccard.clamp(0.0, 1.0)
+    } else {
+        0.85
+    };
+
     let all = db.all_fingerprints()?;
     let targets: Vec<usize> = all
         .iter()
@@ -38,15 +47,21 @@ pub fn find_similar(
         return Ok(Vec::new());
     }
 
-    // LSH band index over non-test fingerprints: band key → candidate indices.
-    let mut buckets: HashMap<u64, Vec<usize>> = HashMap::new();
+    // LSH band index over non-test fingerprints, keyed by (language, band key).
+    // Tree-sitter `kind_id`s are grammar-local, so fingerprints only compare
+    // within a language — bucketing on language prevents cross-language
+    // coincidental matches with meaningless Jaccard scores.
+    let mut buckets: HashMap<(&str, u64), Vec<usize>> = HashMap::new();
     for (i, f) in all.iter().enumerate() {
         if matches!(FileCategory::classify(&f.file_path), FileCategory::Test) {
             continue;
         }
         if let Some(sig) = as_sig(&f.fp) {
             for key in band_keys(sig) {
-                buckets.entry(key).or_default().push(i);
+                buckets
+                    .entry((f.language.as_str(), key))
+                    .or_default()
+                    .push(i);
             }
         }
     }
@@ -60,7 +75,7 @@ pub fn find_similar(
         };
         let mut candidates = HashSet::new();
         for key in band_keys(tsig) {
-            if let Some(ids) = buckets.get(&key) {
+            if let Some(ids) = buckets.get(&(target.language.as_str(), key)) {
                 candidates.extend(ids.iter().copied());
             }
         }

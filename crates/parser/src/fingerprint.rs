@@ -143,8 +143,18 @@ pub fn file_fingerprints(
         let Some((fp, leaves)) = fingerprint_def(&def) else {
             continue;
         };
+        // Normalize the captured name the same way `extract_symbols` does, so a
+        // fingerprint's name matches what `find_symbol` stores (C++ out-of-line
+        // `Foo::bar` captures as bare `bar`). Otherwise `find_similar bar` would
+        // miss C++ methods.
+        let captured = name_cap.node.utf8_text(source).unwrap_or("");
+        let name = if language == Language::Cpp {
+            crate::extract::cpp_bare_name(captured)
+        } else {
+            captured.to_string()
+        };
         out.push(FunctionFingerprint {
-            name: name_cap.node.utf8_text(source).unwrap_or("").to_string(),
+            name,
             kind,
             line_start: def.start_position().row as u32 + 1,
             line_end: def.end_position().row as u32 + 1,

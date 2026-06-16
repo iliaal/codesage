@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS symbol_fingerprints (
     line_start INTEGER NOT NULL,
     line_end INTEGER NOT NULL,
     leaf_count INTEGER NOT NULL,
-    fp BLOB NOT NULL
+    fp BLOB NOT NULL CHECK (length(fp) = 512)
 );
 
 CREATE INDEX IF NOT EXISTS idx_symfp_file ON symbol_fingerprints(file_id);
@@ -452,25 +452,6 @@ fn migrate_0010_files_boundaries_derived_at(conn: &Connection) -> rusqlite::Resu
 /// change as the project's package-manager / lockfile evolves, so they
 /// must not destabilize feature identity. Existing rows default to NULL
 /// and get populated on the next `codesage index` mapper pass.
-/// Adds the `symbol_fingerprints` table (per-function MinHash for near-clone
-/// detection). Idempotent via `IF NOT EXISTS`; existing indexes get the table
-/// empty and populate it on the next `codesage index`.
-fn migrate_0012_symbol_fingerprints(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS symbol_fingerprints (
-             file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-             name TEXT NOT NULL,
-             kind TEXT NOT NULL,
-             line_start INTEGER NOT NULL,
-             line_end INTEGER NOT NULL,
-             leaf_count INTEGER NOT NULL,
-             fp BLOB NOT NULL
-         );
-         CREATE INDEX IF NOT EXISTS idx_symfp_file ON symbol_fingerprints(file_id);",
-    )?;
-    Ok(())
-}
-
 fn migrate_0011_features_test_command(conn: &Connection) -> rusqlite::Result<()> {
     let has_column: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('features') WHERE name = 'test_command'",
@@ -480,6 +461,26 @@ fn migrate_0011_features_test_command(conn: &Connection) -> rusqlite::Result<()>
     if has_column == 0 {
         conn.execute_batch("ALTER TABLE features ADD COLUMN test_command TEXT;")?;
     }
+    Ok(())
+}
+
+/// Adds the `symbol_fingerprints` table (per-function MinHash for near-clone
+/// detection). Idempotent via `IF NOT EXISTS`; existing indexes get the table
+/// empty and populate it on the next `codesage index`. `fp` is a fixed
+/// 512-byte BLOB (64 little-endian u64).
+fn migrate_0012_symbol_fingerprints(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS symbol_fingerprints (
+             file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+             name TEXT NOT NULL,
+             kind TEXT NOT NULL,
+             line_start INTEGER NOT NULL,
+             line_end INTEGER NOT NULL,
+             leaf_count INTEGER NOT NULL,
+             fp BLOB NOT NULL CHECK (length(fp) = 512)
+         );
+         CREATE INDEX IF NOT EXISTS idx_symfp_file ON symbol_fingerprints(file_id);",
+    )?;
     Ok(())
 }
 

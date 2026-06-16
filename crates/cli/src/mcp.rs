@@ -103,6 +103,7 @@ pub struct FindSimilarParams {
     #[schemars(description = "Minimum Jaccard similarity in [0, 1] (default 0.85)")]
     pub min_jaccard: Option<f32>,
     #[schemars(description = "Max results (default 20)")]
+    #[serde(default, deserialize_with = "deser_optional_usize")]
     pub limit: Option<usize>,
 }
 

@@ -60,10 +60,11 @@ pub struct FingerprintInput<'a> {
     pub fp: &'a [u64],
 }
 
-/// Owned fingerprint row as read back, with its file path.
+/// Owned fingerprint row as read back, with its file path and language.
 #[derive(Debug, Clone)]
 pub struct StoredFingerprint {
     pub file_path: String,
+    pub language: String,
     pub name: String,
     pub kind: String,
     pub line_start: u32,
@@ -81,6 +82,12 @@ fn fp_to_blob(fp: &[u64]) -> Vec<u8> {
 }
 
 fn blob_to_fp(b: &[u8]) -> Vec<u64> {
+    // A non-8-multiple blob is corrupt; return empty so the caller's
+    // fixed-length conversion rejects it rather than silently dropping the
+    // trailing bytes and decoding a plausible-but-wrong signature.
+    if !b.len().is_multiple_of(8) {
+        return Vec::new();
+    }
     b.chunks_exact(8)
         .map(|c| u64::from_le_bytes(c.try_into().expect("chunks_exact(8) yields 8 bytes")))
         .collect()
@@ -215,18 +222,19 @@ impl Database {
     /// function count; fine for repos up to the low hundreds of thousands.
     pub fn all_fingerprints(&self) -> Result<Vec<StoredFingerprint>> {
         let mut stmt = self.conn.prepare(
-            "SELECT f.path, sf.name, sf.kind, sf.line_start, sf.line_end, sf.leaf_count, sf.fp
+            "SELECT f.path, f.language, sf.name, sf.kind, sf.line_start, sf.line_end, sf.leaf_count, sf.fp
              FROM symbol_fingerprints sf JOIN files f ON sf.file_id = f.id",
         )?;
         let rows = stmt.query_map([], |row| {
-            let blob: Vec<u8> = row.get(6)?;
+            let blob: Vec<u8> = row.get(7)?;
             Ok(StoredFingerprint {
                 file_path: row.get(0)?,
-                name: row.get(1)?,
-                kind: row.get(2)?,
-                line_start: row.get(3)?,
-                line_end: row.get(4)?,
-                leaf_count: row.get(5)?,
+                language: row.get(1)?,
+                name: row.get(2)?,
+                kind: row.get(3)?,
+                line_start: row.get(4)?,
+                line_end: row.get(5)?,
+                leaf_count: row.get(6)?,
                 fp: blob_to_fp(&blob),
             })
         })?;
