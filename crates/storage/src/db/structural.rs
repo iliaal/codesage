@@ -50,6 +50,42 @@ fn row_to_file_lang(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, String, L
     Ok((id, path, row_enum(&lang_str, Language::parse, "Language")?))
 }
 
+/// Borrowed fingerprint row for insertion. `fp` is the MinHash signature.
+pub struct FingerprintInput<'a> {
+    pub name: &'a str,
+    pub kind: &'a str,
+    pub line_start: u32,
+    pub line_end: u32,
+    pub leaf_count: u32,
+    pub fp: &'a [u64],
+}
+
+/// Owned fingerprint row as read back, with its file path.
+#[derive(Debug, Clone)]
+pub struct StoredFingerprint {
+    pub file_path: String,
+    pub name: String,
+    pub kind: String,
+    pub line_start: u32,
+    pub line_end: u32,
+    pub leaf_count: u32,
+    pub fp: Vec<u64>,
+}
+
+fn fp_to_blob(fp: &[u64]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(fp.len() * 8);
+    for &x in fp {
+        b.extend_from_slice(&x.to_le_bytes());
+    }
+    b
+}
+
+fn blob_to_fp(b: &[u8]) -> Vec<u64> {
+    b.chunks_exact(8)
+        .map(|c| u64::from_le_bytes(c.try_into().expect("chunks_exact(8) yields 8 bytes")))
+        .collect()
+}
+
 impl Database {
     /// Return `(last_sha, last_indexed_at_unix)` for the structural index if a
     /// stamp exists. Mirrors [`Database::get_git_index_state`] but tracks the
@@ -88,6 +124,10 @@ impl Database {
             .execute("DELETE FROM symbols WHERE file_id = ?1", params![file_id])?;
         self.conn
             .execute("DELETE FROM refs WHERE from_file_id = ?1", params![file_id])?;
+        self.conn.execute(
+            "DELETE FROM symbol_fingerprints WHERE file_id = ?1",
+            params![file_id],
+        )?;
         self.conn.execute(
             "DELETE FROM file_trust_boundaries WHERE file_id = ?1",
             params![file_id],
@@ -146,6 +186,51 @@ impl Database {
             ])?;
         }
         Ok(())
+    }
+
+    /// Persist MinHash fingerprints for one file's functions/methods. Caller
+    /// deletes prior rows via `upsert_file`; this only inserts.
+    pub fn insert_fingerprints(&self, file_id: i64, fps: &[FingerprintInput<'_>]) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO symbol_fingerprints
+                 (file_id, name, kind, line_start, line_end, leaf_count, fp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
+        for f in fps {
+            stmt.execute(params![
+                file_id,
+                f.name,
+                f.kind,
+                f.line_start,
+                f.line_end,
+                f.leaf_count,
+                fp_to_blob(f.fp),
+            ])?;
+        }
+        Ok(())
+    }
+
+    /// Every stored function fingerprint with its file path. Loaded whole by
+    /// `find_similar`, which builds the LSH index in memory. Scales with the
+    /// function count; fine for repos up to the low hundreds of thousands.
+    pub fn all_fingerprints(&self) -> Result<Vec<StoredFingerprint>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path, sf.name, sf.kind, sf.line_start, sf.line_end, sf.leaf_count, sf.fp
+             FROM symbol_fingerprints sf JOIN files f ON sf.file_id = f.id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let blob: Vec<u8> = row.get(6)?;
+            Ok(StoredFingerprint {
+                file_path: row.get(0)?,
+                name: row.get(1)?,
+                kind: row.get(2)?,
+                line_start: row.get(3)?,
+                line_end: row.get(4)?,
+                leaf_count: row.get(5)?,
+                fp: blob_to_fp(&blob),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Resolve a repo-relative path to its `files.id`, or `None` if the

@@ -10,15 +10,16 @@ use codesage_embed::model::Embedder;
 use codesage_embed::reranker::Reranker;
 use codesage_graph::{
     assess_risk, assess_risk_batch, assess_risk_diff, export_context, export_context_for_symbol,
-    feature_bundle, find_coupling, find_references, find_symbol, impact_analysis_report,
-    list_dependencies, recommend_tests, search, session_end, session_start,
+    feature_bundle, find_coupling, find_references, find_similar, find_symbol,
+    impact_analysis_report, list_dependencies, recommend_tests, search, session_end, session_start,
 };
 use codesage_protocol::{
     ContextBundle, CouplingReport, DependencyEntry, ExportRequest, FeatureKind, FeatureListResults,
-    FindReferencesRequest, FindReferencesResults, FindSymbolRequest, FindSymbolResults,
-    ImpactOptions, ImpactReport, ImpactRequest, ImpactTarget, Language, ProjectOverview,
-    ReferenceKind, ReviewRehearsal, RiskAssessment, RiskBatchAssessment, RiskDiffAssessment,
-    SearchRequest, SearchResults, SessionDiff, SessionSnapshot, SymbolKind, TestRecommendations,
+    FindReferencesRequest, FindReferencesResults, FindSimilarResults, FindSymbolRequest,
+    FindSymbolResults, ImpactOptions, ImpactReport, ImpactRequest, ImpactTarget, Language,
+    ProjectOverview, ReferenceKind, ReviewRehearsal, RiskAssessment, RiskBatchAssessment,
+    RiskDiffAssessment, SearchRequest, SearchResults, SessionDiff, SessionSnapshot, SymbolKind,
+    TestRecommendations,
 };
 use codesage_storage::Database;
 use parking_lot::Mutex;
@@ -91,6 +92,18 @@ pub struct FindReferencesParams {
         description = "Filter by reference kind: import, include, call, instantiation, inheritance, trait_use, type_hint"
     )]
     pub kind: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct FindSimilarParams {
+    #[schemars(description = PROJECT_ARG_DESC)]
+    pub project: String,
+    #[schemars(description = "Function/method name to find near-clones of")]
+    pub name: String,
+    #[schemars(description = "Minimum Jaccard similarity in [0, 1] (default 0.85)")]
+    pub min_jaccard: Option<f32>,
+    #[schemars(description = "Max results (default 20)")]
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1383,6 +1396,29 @@ impl CodeSageServer {
                 &params.project,
                 s.with_project_db(&params.project, |db| find_references(db, &req)),
                 "find_references",
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        name = "find_similar",
+        description = "Find functions/methods structurally similar to a named one (near-clone detection via MinHash over AST shape; identifiers and literals are ignored). Use before editing a function to find its copies so a fix lands everywhere, to spot divergent forks of a helper, or to locate copy-paste during review. Returns {name, file_path, line_start, line_end, kind, jaccard} ranked by similarity (1.0 = structurally identical body). Test files are excluded. Tune `min_jaccard` up for exact clones, down for looser matches.",
+        output_schema = schema_for_type::<FindSimilarResults>()
+    )]
+    async fn find_similar_tool(
+        &self,
+        Parameters(params): Parameters<FindSimilarParams>,
+    ) -> CallToolResult {
+        self.blocking(move |s| {
+            let min_jaccard = params.min_jaccard.unwrap_or(0.85);
+            let limit = params.limit.unwrap_or(20);
+            s.render(
+                &params.project,
+                s.with_project_db(&params.project, |db| {
+                    find_similar(db, &params.name, min_jaccard, limit)
+                }),
+                "find_similar",
             )
         })
         .await

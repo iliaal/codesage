@@ -1,5 +1,8 @@
 ## [Unreleased]
 
+### Added
+- `find_similar` MCP tool and `codesage similar <name>` CLI command: near-clone detection for functions/methods via MinHash over AST structure (identifiers and literals ignored), ranked by Jaccard similarity. Test files are excluded; tune `--min-jaccard`. Requires a reindex (`codesage index`) to populate fingerprints (schema migration `0012_symbol_fingerprints`).
+
 ### Fixed
 - `impact_analysis` / `assess_risk` reverse-dependency resolution is now import-aware: a reference to an unqualified name is attributed only to the definition the caller imports, not to every same-named definition. Deflates inflated `dependent_files` blast radius for common names (framework lifecycle methods, shared utilities, trait-method implementations).
 

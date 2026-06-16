@@ -289,6 +289,20 @@ pub struct FindSymbolRequest {
     pub kind: Option<SymbolKind>,
 }
 
+/// One near-clone of a queried function, scored by MinHash Jaccard similarity
+/// over AST structure. Returned by `find_similar`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SimilarSymbol {
+    pub name: String,
+    pub file_path: String,
+    pub line_start: u32,
+    pub line_end: u32,
+    pub kind: String,
+    /// Estimated Jaccard similarity in [0, 1]; 1.0 is a structurally identical
+    /// body (identifiers and literals are ignored).
+    pub jaccard: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FindReferencesRequest {
     pub symbol_name: String,
@@ -1148,6 +1162,12 @@ pub struct FindReferencesResults {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SearchResults {
     pub results: Vec<SearchResult>,
+}
+
+/// `{"results": [...]}` envelope around `Vec<SimilarSymbol>`. See [`FindSymbolResults`].
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FindSimilarResults {
+    pub results: Vec<SimilarSymbol>,
 }
 
 /// `{"results": [...]}` envelope around `Vec<ImpactEntry>`. See [`FindSymbolResults`].

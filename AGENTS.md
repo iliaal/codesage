@@ -136,6 +136,7 @@ PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go.
 - `search` -- semantic search with embedding + reranking
 - `find_symbol` -- symbol definitions by name
 - `find_references` -- references to a symbol; each row's `from_symbol` names the enclosing caller (null at file scope)
+- `find_similar` -- near-clone detection: functions/methods structurally similar to a named one (MinHash over AST shape, identifiers/literals ignored), ranked by Jaccard. Test files excluded. Needs fingerprints from a reindex.
 - `list_dependencies` -- file-level imports/imported-by
 - `impact_analysis` -- files affected by changing a symbol or file, with distance and reasons. Opt-in `include_forward` (forward deps), `include_siblings` (same-file symbols), `limit`, and `summary_only` controls; result is an object with `results` plus the requested extras.
 - `export_context` -- curated code bundle for a query or symbol, optionally with callers/callees
@@ -176,7 +177,7 @@ The daemon writes tracing to `mcp-<version>-<key>.log` in the runtime dir; check
 
 ## CLI commands
 
-`init`, `index`, `overview`, `search`, `find-symbol`, `find-references`, `dependencies`, `impact`, `export`, `status`, `mcp`, `daemon`, `watch`, `install-hooks`, `install`, `uninstall`, `cleanup`, `git-index`, `coupling`, `risk`, `risk-batch`, `risk-diff`, `tests-for`, `rehearse`, `session-start`, `session-end`, `doctor`, `map`, `features-list`, `feature-show`, `feature-for`, `feature-bundle`, `trust-boundaries`.
+`init`, `index`, `overview`, `search`, `find-symbol`, `find-references`, `dependencies`, `impact`, `export`, `status`, `mcp`, `daemon`, `watch`, `install-hooks`, `install`, `uninstall`, `cleanup`, `git-index`, `coupling`, `risk`, `risk-batch`, `risk-diff`, `similar`, `tests-for`, `rehearse`, `session-start`, `session-end`, `doctor`, `map`, `features-list`, `feature-show`, `feature-for`, `feature-bundle`, `trust-boundaries`.
 
 `watch run|status|stop|start [project]` controls the live filesystem watcher. The daemon auto-starts a per-project watcher on the first MCP tool call for that project (reusing the daemon's pooled embedder), debounces edits, and reindexes structural + semantic on change; it self-exits after idle (`CODESAGE_WATCH_IDLE_SECS`) and is reaped on daemon shutdown. Disable per project with `[index] watch = false` or globally with `CODESAGE_WATCH=0`. `watch run` is a foreground instance with its own embedder for debugging; `watch stop` writes a `.codesage/watch.disabled` marker the running watcher honors; `watch start` clears it. The watcher complements the git hooks, it does not replace them: it refreshes structural + semantic content live during a session, but git history intelligence (`git-index`, feeding `assess_risk` / `find_coupling`) and feature mapping still refresh only via the hooks or a full `codesage index`, and the watcher only runs while a daemon is alive.
 
