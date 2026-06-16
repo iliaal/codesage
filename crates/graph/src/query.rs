@@ -1711,11 +1711,46 @@ fn build_impact_summary(entries: &[ImpactEntry]) -> ImpactSummary {
 }
 
 fn references_for_symbol(db: &Database, sym: &Symbol) -> Result<Vec<Reference>> {
-    if sym.qualified_name != sym.name {
-        return db.find_references(&sym.qualified_name, None);
-    }
+    let key = if sym.qualified_name != sym.name {
+        &sym.qualified_name
+    } else {
+        &sym.name
+    };
+    let raw = db.find_references(key, None)?;
 
-    db.find_references(&sym.name, None)
+    // Import-aware reverse resolution. `find_references` matches by
+    // `to_name_tail`, so an unqualified name fans out to *every* same-named
+    // definition — a call to one class's `getAttributes` was counted toward
+    // all of them, inflating the reverse blast radius that `impact_analysis`
+    // and `assess_risk` read. `resolve_callee_definitions` already filters
+    // candidates by the caller file's imports (the forward path); routing each
+    // candidate reference back through it makes a reverse edge exist iff the
+    // matching forward edge does. Unique names short-circuit in the resolver
+    // (≤1 candidate), so distinctively-named symbols are untouched — only
+    // genuinely ambiguous names get import-filtered. Resolutions are cached per
+    // `(from_file, to_name)` because a hot symbol's callers repeat both.
+    let mut out = Vec::with_capacity(raw.len());
+    let mut cache: HashMap<(String, String), Vec<Symbol>> = HashMap::new();
+    for r in raw {
+        let cache_key = (r.from_file.clone(), r.to_name.clone());
+        if !cache.contains_key(&cache_key) {
+            let resolved = resolve_callee_definitions(db, &r.from_file, &r.to_name)?;
+            cache.insert(cache_key.clone(), resolved);
+        }
+        if cache[&cache_key].iter().any(|s| same_symbol_def(s, sym)) {
+            out.push(r);
+        }
+    }
+    Ok(out)
+}
+
+/// Identity test for two `Symbol`s naming the same definition. `Symbol` carries
+/// no stable id, so we key on the triple that uniquely locates a definition:
+/// file, qualified name, and start line.
+fn same_symbol_def(a: &Symbol, b: &Symbol) -> bool {
+    a.file_path == b.file_path
+        && a.qualified_name == b.qualified_name
+        && a.line_start == b.line_start
 }
 
 /// Default-on; opt-out via `CODESAGE_BUNDLE_LINE_NUMBERS=0` (or "false").

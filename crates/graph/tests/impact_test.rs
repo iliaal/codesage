@@ -503,6 +503,44 @@ fn export_context_callees_resolve_imported_helper_not_homonym() {
 }
 
 #[test]
+fn reverse_impact_attributes_caller_to_imported_helper_only() {
+    // Reverse counterpart of the forward test above: `service.rs` imports
+    // `helpers_a::helper`, so it must inflate `helpers_a`'s reverse blast radius
+    // but NOT `helpers_b`'s homonym. Before import-aware reverse resolution,
+    // `find_references` tail-matched "helper" and attributed the caller to both.
+    let (_dir, db) = setup_ambiguous_helper_rust_project();
+
+    let reverse_files = |path: &str| -> Vec<String> {
+        impact_analysis(
+            &db,
+            &ImpactRequest {
+                target: ImpactTarget::File {
+                    path: path.to_string(),
+                },
+                depth: 2,
+                source_only: false,
+            },
+        )
+        .unwrap()
+        .iter()
+        .map(|e| e.file_path.clone())
+        .collect()
+    };
+
+    let files_a = reverse_files("helpers_a.rs");
+    assert!(
+        files_a.iter().any(|p| p.ends_with("service.rs")),
+        "caller importing helpers_a must appear in its reverse impact: {files_a:?}"
+    );
+
+    let files_b = reverse_files("helpers_b.rs");
+    assert!(
+        !files_b.iter().any(|p| p.ends_with("service.rs")),
+        "caller importing helpers_a must NOT inflate helpers_b's reverse impact: {files_b:?}"
+    );
+}
+
+#[test]
 fn export_context_for_symbol_includes_callees() {
     let (_dir, db) = setup_callee_rust_project();
 
