@@ -1,5 +1,8 @@
 ## [Unreleased]
 
+### Fixed
+- `impact_analysis` / `assess_risk` reverse-dependency resolution is now import-aware: a reference to an unqualified name is attributed only to the definition the caller imports, not to every same-named definition. Deflates inflated `dependent_files` blast radius for common names (framework lifecycle methods, shared utilities, trait-method implementations).
+
 ## [0.12.0] - 2026-06-13
 
 ### Added
