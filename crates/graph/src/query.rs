@@ -2315,9 +2315,15 @@ fn resolve_callee_definitions(
     let filtered: Vec<Symbol> = candidates
         .into_iter()
         .filter(|s| {
-            import_refs
-                .iter()
-                .any(|imp| import_ref_targets_symbol(imp, to_name, s))
+            // A definition in the caller's own file is a valid target: a
+            // same-file call emits no import edge, so without this the local
+            // definition is filtered out and the reverse edge (read by
+            // `impact_analysis` / `assess_risk` through `references_for_symbol`)
+            // is lost. Mirrors the same-file preference in `resolve_def_summary`.
+            s.file_path == caller_file
+                || import_refs
+                    .iter()
+                    .any(|imp| import_ref_targets_symbol(imp, to_name, s))
         })
         .collect();
     Ok(filtered)
@@ -3430,6 +3436,44 @@ mod context_export_tests {
         assert!(
             refs.is_empty(),
             "qualified method without exact refs must not fall back to all bare `find` references: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn same_file_definition_resolves_when_name_is_ambiguous() {
+        // `helper` is defined in both a.rs and b.rs (ambiguous bare name). A call
+        // to `helper` from a.rs has no import edge for the local definition, so
+        // the import filter alone would drop it and lose the same-file reverse
+        // edge. The same-file fallback keeps a.rs's definition; the unimported
+        // homonym in b.rs is still excluded.
+        let db = Database::open_in_memory().unwrap();
+        let a = db
+            .upsert_file(&FileInfo {
+                path: "a.rs".to_string(),
+                language: Language::Rust,
+                content_hash: "a".to_string(),
+            })
+            .unwrap();
+        let b = db
+            .upsert_file(&FileInfo {
+                path: "b.rs".to_string(),
+                language: Language::Rust,
+                content_hash: "b".to_string(),
+            })
+            .unwrap();
+        db.insert_symbols(a, &[symbol("helper", "helper", "a.rs")])
+            .unwrap();
+        db.insert_symbols(b, &[symbol("helper", "helper", "b.rs")])
+            .unwrap();
+
+        let resolved = resolve_callee_definitions(&db, "a.rs", "helper").unwrap();
+        assert!(
+            resolved.iter().any(|s| s.file_path == "a.rs"),
+            "same-file ambiguous call must resolve to the local definition: {resolved:?}"
+        );
+        assert!(
+            !resolved.iter().any(|s| s.file_path == "b.rs"),
+            "the unimported homonym must not be resolved: {resolved:?}"
         );
     }
 
