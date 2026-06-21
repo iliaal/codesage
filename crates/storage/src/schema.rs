@@ -222,21 +222,25 @@ fn repair_fts_sidecar(
 
     let chunk_table = quote_ident(chunk_table);
     let fts_table = quote_ident(fts_table);
-    // Wrap DELETE + INSERT…SELECT in one transaction. Without it, a crash
+    // Wrap DELETE + INSERT…SELECT in one savepoint. Without it, a crash
     // between the two statements leaves the FTS sidecar empty while the
     // chunk table still has data; BM25 search returns zero results until
-    // the next process start re-runs the repair.
+    // the next process start re-runs the repair. A savepoint (not a raw
+    // BEGIN/COMMIT) composes when this runs inside an outer transaction —
+    // a bare BEGIN errors with "cannot start a transaction within a
+    // transaction." fnd: CR-024.
     let sql = format!(
-        "BEGIN;
+        "SAVEPOINT repair_fts;
          DELETE FROM \"{fts_table}\";
          INSERT INTO \"{fts_table}\"(rowid, content, file_path, language, start_line, end_line)
          SELECT id, content, file_path, language, start_line, end_line
          FROM \"{chunk_table}\"
          ORDER BY id;
-         COMMIT;"
+         RELEASE repair_fts;"
     );
     if let Err(e) = conn.execute_batch(&sql) {
-        let _ = conn.execute_batch("ROLLBACK");
+        let _ = conn.execute_batch("ROLLBACK TO repair_fts");
+        let _ = conn.execute_batch("RELEASE repair_fts");
         return Err(e);
     }
     Ok(())

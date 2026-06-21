@@ -261,8 +261,29 @@ fn compute_top_risk(
     files: &[String],
     limit: usize,
 ) -> Result<Vec<SessionRiskEntry>> {
-    let mut scored: Vec<SessionRiskEntry> = Vec::with_capacity(files.len());
-    for f in files {
+    // `assess_risk` runs a depth-2 reverse-dep BFS per file, so scoring every
+    // file is O(files × graph) and dominates session_start / project_overview
+    // on large repos. Churn is the dominant risk component, so when the file
+    // set is large, narrow to the highest-churn candidates before the BFS.
+    // Files absent from git history score ~0 anyway. fnd: CR-009.
+    const CANDIDATE_BUDGET: usize = 400;
+    let candidates: Vec<String> = if files.len() > CANDIDATE_BUDGET {
+        let ranked = db.top_churn_files(CANDIDATE_BUDGET)?;
+        if ranked.is_empty() {
+            // No git history → every file scores ~0; nothing to rank without
+            // running the full O(N) BFS sweep for no signal.
+            return Ok(Vec::new());
+        }
+        let allowed: std::collections::HashSet<&str> = files.iter().map(String::as_str).collect();
+        ranked
+            .into_iter()
+            .filter(|p| allowed.contains(p.as_str()))
+            .collect()
+    } else {
+        files.to_vec()
+    };
+    let mut scored: Vec<SessionRiskEntry> = Vec::with_capacity(candidates.len());
+    for f in &candidates {
         match assess_risk(db, f) {
             Ok(r) => scored.push(SessionRiskEntry {
                 file: r.file,

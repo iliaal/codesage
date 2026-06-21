@@ -166,8 +166,11 @@ fn merge_small_chunks(segments: Vec<Segment>, min_size: usize, max_size: usize) 
 
     let mut merged: Vec<Segment> = Vec::new();
     for seg in segments {
+        // Merge when either neighbor is sub-`min_size` and the result still
+        // fits `max_size` — so a small segment following a large one is also
+        // absorbed, not just a small predecessor. fnd: CR-016.
         if let Some(last) = merged.last_mut()
-            && segment_len(last) < min_size
+            && (segment_len(last) < min_size || segment_len(&seg) < min_size)
             && segment_len(last) + segment_len(&seg) <= max_size
         {
             last.end = seg.end;

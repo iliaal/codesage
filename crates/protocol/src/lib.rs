@@ -384,7 +384,12 @@ pub enum FileCategory {
 
 impl FileCategory {
     pub fn classify(path: &str) -> Self {
-        let lower = path.to_lowercase();
+        let lower_owned = path.to_lowercase();
+        // Strip a leading `./` so relative paths (`./tests/foo.rs`) still match
+        // the directory-prefix checks below. fnd: CR-031.
+        let lower = lower_owned
+            .strip_prefix("./")
+            .unwrap_or(lower_owned.as_str());
         let has_dir = |seg: &str| {
             lower.contains(&format!("/{seg}/")) || lower.starts_with(&format!("{seg}/"))
         };
@@ -414,7 +419,7 @@ impl FileCategory {
         {
             return FileCategory::Test;
         }
-        let basename = lower.rsplit('/').next().unwrap_or(&lower);
+        let basename = lower.rsplit('/').next().unwrap_or(lower);
         if basename.starts_with("test_") {
             return FileCategory::Test;
         }

@@ -67,7 +67,10 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<Vec<String>> {
         }
     }
     // Workspace-root case: src/foo.rs paired with tests/*.rs at the same level.
-    if file_path.ends_with(".rs") && file_path.starts_with("src/") {
+    // Guard against a nested `.../src/.../src/...` path that the crate-local
+    // block above already resolved, so we don't list the root `tests/` for a
+    // sub-crate source file too. fnd: CR-020.
+    if file_path.ends_with(".rs") && file_path.starts_with("src/") && !file_path.contains("/src/") {
         for path in db.indexed_files_with_prefix("tests/")? {
             if path.ends_with(".rs") && !path.contains("/fixtures/") && !found.contains(&path) {
                 found.push(path);

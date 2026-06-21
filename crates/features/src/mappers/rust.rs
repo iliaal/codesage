@@ -293,9 +293,35 @@ fn cargo_workspace_members(root: &Path, manifest: &Path) -> Result<Vec<String>> 
     for cap in string_re.captures_iter(inside) {
         if let Some(v) = cap.get(1) {
             let s = v.as_str().trim_end_matches('/').to_string();
-            // Reject glob members for v1 — `crates/*` style; we already
-            // pick those up via the `crates_dir` walk above.
             if s.contains('*') || s.contains('?') {
+                // Expand a simple `prefix/*` glob against the filesystem.
+                // `crates/*` is already covered by the dedicated crates_dir
+                // walk in `map`, so skip it here to avoid double-seeding;
+                // other prefixes (`libs/*`, `packages/*`) were previously
+                // dropped silently. fnd: CR-041.
+                if let Some(prefix) = s.strip_suffix("/*")
+                    && prefix != "crates"
+                    && !prefix.is_empty()
+                    && !prefix.contains('*')
+                    && !prefix.contains('?')
+                    && !prefix.contains("..")
+                {
+                    let base = root.join(prefix);
+                    if is_safe_dir(root, &base)
+                        && let Ok(rd) = fs::read_dir(&base)
+                    {
+                        for sub in rd.flatten() {
+                            let p = sub.path();
+                            if p.is_dir() && p.join("Cargo.toml").is_file() && is_safe_dir(root, &p)
+                            {
+                                let rel = rel_path(root, &p);
+                                if !rel.is_empty() {
+                                    out.push(rel);
+                                }
+                            }
+                        }
+                    }
+                }
                 continue;
             }
             if s.is_empty() || s.contains("..") {

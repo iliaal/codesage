@@ -21,3 +21,6 @@
 
 ; Pattern 7: Namespace → Namespace
 (namespace_definition name: (namespace_name) @name) @def
+
+; Pattern 8: Enum case → Constant (PHP 8.1 `case Hearts;`)
+(enum_case name: (name) @name) @def

@@ -120,6 +120,7 @@ fn php_kind_map(pattern_index: usize) -> Option<SymbolKind> {
         5 => Some(SymbolKind::Enum),
         6 => Some(SymbolKind::Constant),
         7 => Some(SymbolKind::Namespace),
+        8 => Some(SymbolKind::Constant), // enum case (PHP 8.1)
         _ => None,
     }
 }

@@ -164,6 +164,20 @@ impl EmbeddingConfig {
         if self.model.contains("bge-") {
             PoolingStrategy::Cls
         } else {
+            // Mean is correct for MiniLM/E5-style models but wrong for any
+            // CLS model not named `bge-*`. Warn once so a silent pooling
+            // mismatch on a custom model surfaces. fnd: CR-007.
+            if !self.model.to_lowercase().contains("minilm") {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        model = %self.model,
+                        "no [embedding].pooling set; defaulting to mean pooling. \
+                         If this model expects CLS pooling, set pooling = \"cls\" explicitly."
+                    );
+                }
+            }
             PoolingStrategy::Mean
         }
     }

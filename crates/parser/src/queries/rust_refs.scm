@@ -15,3 +15,12 @@
 
 ; Pattern 5: macro invocation (scoped like std::println!)
 (macro_invocation macro: (scoped_identifier) @ref)
+
+; Pattern 6: method call (obj.method())
+(call_expression function: (field_expression field: (field_identifier) @ref))
+
+; Pattern 7: trait implemented for a type (impl Trait for Type)
+(impl_item trait: (type_identifier) @ref)
+
+; Pattern 8: type of an impl block (impl Type / impl Trait for Type)
+(impl_item type: (type_identifier) @ref)

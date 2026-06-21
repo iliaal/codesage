@@ -113,44 +113,47 @@ fn composer_seeds(root: &Path, composer: &Value) -> Vec<FeatureSeed> {
         .and_then(|v| v.as_object());
     if let Some(psr4) = psr4 {
         for (ns, path_val) in psr4 {
-            let path = match path_val {
-                Value::String(s) => s.clone(),
+            // A PSR-4 namespace may map to multiple directories; register each.
+            let paths: Vec<String> = match path_val {
+                Value::String(s) => vec![s.clone()],
                 Value::Array(arr) => arr
                     .iter()
-                    .find_map(|v| v.as_str().map(|s| s.to_string()))
-                    .unwrap_or_default(),
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect(),
                 _ => continue,
             };
-            if path.is_empty() {
-                continue;
-            }
-            let entry = path.trim_end_matches('/').to_string();
-            let abs = root.join(&entry);
-            if !is_safe_dir(root, &abs) {
-                continue;
-            }
             let ns_clean = ns.trim_end_matches('\\');
-            out.push(FeatureSeed {
-                title: format!("PHP namespace `{ns_clean}`"),
-                summary: format!("PSR-4 autoload root at {entry}/ (namespace {ns_clean})"),
-                kind: FeatureKind::Library,
-                source: "composer-psr4",
-                confidence: FeatureConfidence::High,
-                entry_path: entry.clone(),
-                entry_symbol: Some(ns_clean.to_string()),
-                entry_route: None,
-                entry_command: None,
-                test_command: None,
-                language: Language::Php,
-                tags: vec!["php".to_string(), "library".to_string()],
-                owned_files: Vec::new(),
-                context_files: vec![SeedFile {
-                    path: "composer.json".to_string(),
-                    reason: "PSR-4 autoload manifest".to_string(),
-                }],
-                tests: Vec::new(),
-                test_prefixes: vec!["tests".to_string(), "test".to_string()],
-            });
+            for path in paths {
+                if path.is_empty() {
+                    continue;
+                }
+                let entry = path.trim_end_matches('/').to_string();
+                let abs = root.join(&entry);
+                if !is_safe_dir(root, &abs) {
+                    continue;
+                }
+                out.push(FeatureSeed {
+                    title: format!("PHP namespace `{ns_clean}`"),
+                    summary: format!("PSR-4 autoload root at {entry}/ (namespace {ns_clean})"),
+                    kind: FeatureKind::Library,
+                    source: "composer-psr4",
+                    confidence: FeatureConfidence::High,
+                    entry_path: entry.clone(),
+                    entry_symbol: Some(ns_clean.to_string()),
+                    entry_route: None,
+                    entry_command: None,
+                    test_command: None,
+                    language: Language::Php,
+                    tags: vec!["php".to_string(), "library".to_string()],
+                    owned_files: Vec::new(),
+                    context_files: vec![SeedFile {
+                        path: "composer.json".to_string(),
+                        reason: "PSR-4 autoload manifest".to_string(),
+                    }],
+                    tests: Vec::new(),
+                    test_prefixes: vec!["tests".to_string(), "test".to_string()],
+                });
+            }
         }
     }
     out
@@ -443,6 +446,12 @@ fn strip_if_zero_blocks(input: &str) -> String {
             if depth == 0 {
                 in_if_zero = false;
             }
+        } else if depth == 1
+            && (trimmed.starts_with("#elif") || trimmed == "#else" || trimmed.starts_with("#else "))
+        {
+            // The `#if 0` arm is dead; a top-level `#elif`/`#else` switches to
+            // an active branch, so stop blanking from here. fnd: CR-039.
+            in_if_zero = false;
         }
     }
 
@@ -1935,6 +1944,12 @@ fn walk_php_files(root: &Path, dir: &Path, max: usize) -> Vec<String> {
                     continue;
                 }
                 if meta.is_dir() {
+                    // Skip dependency / VCS trees even when a caller points us
+                    // at a directory that contains them. fnd: CR-021.
+                    let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    if matches!(name, "vendor" | "node_modules" | ".git") {
+                        continue;
+                    }
                     recurse(root, &p, max, out);
                 } else if meta.is_file()
                     && p.extension().and_then(|s| s.to_str()) == Some("php")

@@ -12,7 +12,10 @@ static CPP_REF_QUERY: &str = include_str!("queries/cpp_refs.scm");
 static JAVA_REF_QUERY: &str = include_str!("queries/java_refs.scm");
 static RUST_REF_QUERY: &str = include_str!("queries/rust_refs.scm");
 static JS_REF_QUERY: &str = include_str!("queries/javascript_refs.scm");
-static TS_REF_QUERY: &str = include_str!("queries/typescript_refs.scm");
+// TypeScript shares JavaScript's reference patterns (import / require / call /
+// member-call); the tree-sitter-typescript grammar accepts the same node names.
+// Reuse the JS query rather than maintain a byte-identical copy. fnd: CR-013.
+static TS_REF_QUERY: &str = include_str!("queries/javascript_refs.scm");
 static GO_REF_QUERY: &str = include_str!("queries/go_refs.scm");
 
 /// Compiled reference query + cached @ref capture index, lazily initialized
@@ -92,14 +95,12 @@ pub(crate) const REF_QUERY_SOURCES: &[(Language, &str)] = &[
 fn php_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
     match pattern_index {
         0 => Some(ReferenceKind::Import), // namespace_use_declaration
-        1 => Some(ReferenceKind::Import), // use_declaration
-        2 => Some(ReferenceKind::Call),   // function_call_expression
-        3 => Some(ReferenceKind::Instantiation), // object_creation_expression
-        4 => Some(ReferenceKind::Call),   // scoped_call_expression
-        5..=7 => Some(ReferenceKind::Call), // static / instance / nullsafe method names
-        8 => Some(ReferenceKind::Inheritance), // class extends
-        9 => Some(ReferenceKind::Inheritance), // class implements
-        10 => Some(ReferenceKind::TraitUse), // use_declaration inside class
+        1 => Some(ReferenceKind::Call),   // function_call_expression
+        2 => Some(ReferenceKind::Instantiation), // object_creation_expression
+        3..=6 => Some(ReferenceKind::Call), // scoped scope/name, member, nullsafe method names
+        7 | 8 => Some(ReferenceKind::Inheritance), // class extends / implements
+        9 => Some(ReferenceKind::TraitUse), // use_declaration inside class
+        10..=13 => Some(ReferenceKind::TypeHint), // param / promoted-property / return type hints
         _ => None,
     }
 }
@@ -150,9 +151,12 @@ fn java_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
 
 fn rust_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
     match pattern_index {
-        0 | 1 => Some(ReferenceKind::Import), // use_declaration
-        2 | 3 => Some(ReferenceKind::Call),   // call_expression
-        4 | 5 => Some(ReferenceKind::Call),   // macro_invocation
+        0 | 1 => Some(ReferenceKind::Import),  // use_declaration
+        2 | 3 => Some(ReferenceKind::Call),    // call_expression
+        4 | 5 => Some(ReferenceKind::Call),    // macro_invocation
+        6 => Some(ReferenceKind::Call),        // method call (obj.method())
+        7 => Some(ReferenceKind::Inheritance), // impl Trait for Type
+        8 => Some(ReferenceKind::TypeHint),    // type of an impl block
         _ => None,
     }
 }

@@ -138,7 +138,9 @@ impl Database {
             }
             Err(e) => {
                 let _ = self.conn.execute_batch("ROLLBACK TO insert_chunks");
-                let _ = self.conn.execute_batch("RELEASE insert_chunks");
+                if let Err(re) = self.conn.execute_batch("RELEASE insert_chunks") {
+                    tracing::warn!(error = %re, "failed to release savepoint insert_chunks after rollback");
+                }
                 Err(e)
             }
         }
@@ -161,7 +163,9 @@ impl Database {
             }
             Err(e) => {
                 let _ = self.conn.execute_batch("ROLLBACK TO delete_chunks");
-                let _ = self.conn.execute_batch("RELEASE delete_chunks");
+                if let Err(re) = self.conn.execute_batch("RELEASE delete_chunks") {
+                    tracing::warn!(error = %re, "failed to release savepoint delete_chunks after rollback");
+                }
                 Err(e)
             }
         }

@@ -64,6 +64,14 @@ fn l2_to_score(distance: f32) -> f32 {
 
 const RERANK_OVERFETCH: usize = 5;
 
+/// Upper bound on the candidate pool fed to KNN + cross-encoder reranking.
+/// `limit + offset` times the overfetch factor would otherwise grow without
+/// bound on deep pagination (`offset=1000` → 5000+ rows through the
+/// cross-encoder); cap it so rerank cost stays bounded. Pages past this depth
+/// return fewer / no results, which is acceptable for semantic search.
+/// fnd: CR-019.
+const MAX_SEMANTIC_FETCH: usize = 500;
+
 /// RRF constant. Standard value from the original paper; larger values
 /// damp the influence of absolute rank position, smaller values amplify it.
 const RRF_K: f64 = 60.0;
@@ -354,7 +362,11 @@ pub fn search(
     let embedding_bytes = embedding_to_bytes(query_embedding);
 
     let page_window = limit.saturating_add(offset);
-    let semantic_fetch = page_window.saturating_mul(overfetch);
+    // Cap the candidate pool so a deep `offset` can't balloon the cross-encoder
+    // workload, while still honoring a large explicit `limit`. fnd: CR-019.
+    let semantic_fetch = page_window
+        .saturating_mul(overfetch)
+        .min(limit.max(MAX_SEMANTIC_FETCH));
 
     // Gate: is this a query where BM25 would help? Two distinctive shapes
     // covered by `query_has_rare_literal`: backticked identifiers / glob
@@ -1522,6 +1534,23 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
             if let Some(s) = best {
                 next_frontier.push(s.clone());
             }
+        }
+
+        // Bound fan-out: a symbol referenced by hundreds of files explodes the
+        // frontier and the per-symbol `references_for_symbol` queries at the
+        // next depth. Dedup by qualified name and cap each level so a wide
+        // blast radius can't make impact analysis unbounded. fnd: CR-017.
+        const MAX_FRONTIER: usize = 512;
+        let mut seen_qn: HashSet<String> = HashSet::new();
+        next_frontier.retain(|s| seen_qn.insert(s.qualified_name.clone()));
+        if next_frontier.len() > MAX_FRONTIER {
+            tracing::debug!(
+                frontier = next_frontier.len(),
+                cap = MAX_FRONTIER,
+                depth,
+                "impact_analysis frontier capped"
+            );
+            next_frontier.truncate(MAX_FRONTIER);
         }
 
         if next_frontier.is_empty() {

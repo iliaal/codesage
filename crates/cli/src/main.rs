@@ -1371,22 +1371,16 @@ fn cmd_init() -> Result<()> {
         ),
     )?;
 
-    if cwd.join(".git").exists()
-        && let Some(exclude) = git_local_exclude_path(&cwd)
-    {
-        let content = std::fs::read_to_string(&exclude).unwrap_or_default();
-        if !content.contains(".codesage") {
-            if let Some(parent) = exclude.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(&exclude)?;
-            use std::io::Write;
-            writeln!(f, "\n# codesage index\n/.codesage/")?;
-        }
-    }
+    // Keep the index, session/review state, and other generated artifacts out
+    // of version control. An in-tree .gitignore is shared across the team —
+    // unlike a per-clone .git/info/exclude — so teammates who never run
+    // `codesage init` (e.g. onboarded via the plugin) still don't commit
+    // session snapshots or the index db. `*` + `!.gitignore` ignores the whole
+    // directory but lets this file itself be committed. fnd: CR-034.
+    std::fs::write(
+        project_dir.join(".gitignore"),
+        "# CodeSage local index and session state — not for version control.\n*\n!.gitignore\n",
+    )?;
 
     println!("Initialized CodeSage in {}", cwd.display());
     Ok(())

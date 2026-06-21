@@ -2,11 +2,23 @@
 
 ### Added
 - `find_similar` MCP tool and `codesage similar <name>` CLI command: near-clone detection for functions/methods via MinHash over AST structure (identifiers and literals ignored), ranked by Jaccard similarity. Test files are excluded; tune `--min-jaccard`. Requires a reindex (`codesage index`) to populate fingerprints (schema migration `0012_symbol_fingerprints`).
+- Rust `find_references` now captures method calls (`obj.method()`) and `impl Trait for Type` edges (trait as inheritance, type as type_hint).
+- PHP `find_references` now emits `type_hint` references for parameter, constructor-promoted-property, and return type hints; the same signal feeds `assess_risk` trust-boundary derivation.
+- PHP `find_symbol` now resolves enum cases (PHP 8.1 `case Hearts;`) as constants.
+
+### Changed
+- `codesage init` writes a committed `.codesage/.gitignore` (instead of a per-clone `.git/info/exclude` entry) so index/session/review state stays out of version control for every teammate, including plugin-onboarded ones.
+- `search` caps the KNN + reranker candidate pool on deep pagination, so a large `offset` no longer balloons cross-encoder work (pages past the cap return fewer results).
 
 ### Fixed
 - `impact_analysis` / `assess_risk` reverse-dependency resolution is now import-aware: a reference to an unqualified name is attributed only to the definition the caller imports, not to every same-named definition. Deflates inflated `dependent_files` blast radius for common names (framework lifecycle methods, shared utilities, trait-method implementations).
 - Import-aware resolution now also keeps same-file callers: a call to a name defined both locally and elsewhere resolves to the local definition (which has no import edge) instead of being dropped, so same-file callers are no longer lost from `impact_analysis` / `find_references`.
 - `find_similar` fingerprinting no longer recurses per AST depth; a pathologically deep source file can't overflow an indexer worker stack and abort `codesage index`.
+- PHP `find_references` no longer double-counts in-class trait uses (`use SomeTrait;`) as both an import and a trait_use.
+- `session_start` / `project_overview` top-risk scoring no longer runs a reverse-dependency BFS over every file; on large repos it scores the highest-churn candidates, bounding session-start latency.
+- `impact_analysis` bounds per-level fan-out, so a symbol referenced by hundreds of files can no longer make traversal unbounded.
+- Feature mapper: PSR-4 namespaces mapping to multiple directories now register every directory; Rust workspace glob members (`libs/*`) outside `crates/` are mapped instead of dropped; php-src `#elif`/`#else` branches under `#if 0` are no longer blanked (their symbols were lost).
+- `FileCategory::classify` recognizes `./`-prefixed relative paths, so test/config files passed with a leading `./` are categorized correctly.
 
 ## [0.12.0] - 2026-06-13
 

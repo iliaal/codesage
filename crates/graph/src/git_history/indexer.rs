@@ -532,6 +532,9 @@ fn parse_log(raw: &str) -> Vec<Commit> {
     let mut current: Option<Commit> = None;
     let mut skipped_commits = 0usize;
     let mut skipped_changes = 0usize;
+    // Keep a bounded sample of dropped commit SHAs so the warning can name
+    // which commits were skipped, not just how many. fnd: CR-043.
+    let mut skipped_shas: Vec<String> = Vec::new();
 
     for line in raw.lines() {
         if let Some(rest) = line.strip_prefix("commit\t") {
@@ -546,6 +549,9 @@ fn parse_log(raw: &str) -> Vec<Commit> {
             let ts: Option<i64> = parts.next().and_then(|s| s.parse().ok());
             let Some(ts) = ts else {
                 skipped_commits += 1;
+                if skipped_shas.len() < 20 && !_sha.is_empty() {
+                    skipped_shas.push(_sha.to_string());
+                }
                 current = None;
                 continue;
             };
@@ -594,6 +600,7 @@ fn parse_log(raw: &str) -> Vec<Commit> {
         tracing::warn!(
             skipped_commits,
             skipped_changes,
+            skipped_shas = ?skipped_shas,
             "parse_log skipped unparseable git output entries"
         );
     }

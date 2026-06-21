@@ -99,6 +99,19 @@ impl Database {
         Ok(rows)
     }
 
+    /// Paths from `git_files` ordered by churn_score desc, capped at `limit`.
+    /// Used to bound the candidate set for top-risk scoring before the
+    /// per-file blast-radius BFS. Empty when git history isn't indexed.
+    pub fn top_churn_files(&self, limit: usize) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM git_files ORDER BY churn_score DESC LIMIT ?1")?;
+        let rows: Vec<String> = stmt
+            .query_map(rusqlite::params![limit as i64], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Record the commit SHA we just indexed up to. indexed_at stamped with unixepoch().
     pub fn set_git_index_state(&self, sha: &str) -> Result<()> {
         super::set_index_state(&self.conn, "git_index_state", sha)
