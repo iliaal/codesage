@@ -1291,6 +1291,68 @@ fn load_embedding_config(path: &Path) -> LoadedEmbeddingConfig {
     }
 }
 
+/// JSON Schema standard `format` values (Draft 2020-12 + the common format
+/// vocabulary). `schemars` emits Rust-specific formats (`uint32`, `uint`,
+/// `int64`, `float`, `double`, …) for numeric fields that are NOT in this set;
+/// strict MCP clients (e.g. opencode) log "unknown format uint32" warnings on
+/// them. We strip the non-standard ones from advertised tool schemas.
+fn is_standard_json_schema_format(fmt: &str) -> bool {
+    matches!(
+        fmt,
+        "date-time"
+            | "date"
+            | "time"
+            | "duration"
+            | "email"
+            | "idn-email"
+            | "hostname"
+            | "idn-hostname"
+            | "ipv4"
+            | "ipv6"
+            | "uri"
+            | "uri-reference"
+            | "iri"
+            | "iri-reference"
+            | "uri-template"
+            | "uuid"
+            | "json-pointer"
+            | "relative-json-pointer"
+            | "regex"
+    )
+}
+
+/// Recursively remove non-standard `format` annotations from a JSON Schema.
+/// Unsigned-int formats (`uint*`) are replaced with `minimum: 0` so the
+/// non-negativity constraint they encoded survives the strip.
+fn strip_nonstandard_schema_formats(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let fmt = map
+                .get("format")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            if let Some(fmt) = fmt
+                && !is_standard_json_schema_format(&fmt)
+            {
+                map.remove("format");
+                if fmt.starts_with("uint") {
+                    map.entry("minimum".to_string())
+                        .or_insert_with(|| serde_json::Value::from(0));
+                }
+            }
+            for child in map.values_mut() {
+                strip_nonstandard_schema_formats(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items.iter_mut() {
+                strip_nonstandard_schema_formats(child);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for CodeSageServer {
     fn get_info(&self) -> ServerInfo {
@@ -1306,6 +1368,33 @@ impl ServerHandler for CodeSageServer {
                  for natural-language semantic code search, impact_analysis to estimate \
                  blast radius of a change, and export_context to bundle code for an LLM.",
             )
+    }
+
+    // Override the macro-generated `list_tools` to strip schemars' non-standard
+    // numeric `format` annotations from every tool's input + output schema, so
+    // strict MCP clients don't log "unknown format" warnings. The macro only
+    // generates `list_tools` when the impl doesn't already define one.
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> std::result::Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let mut tools = self.tool_router.list_all();
+        for tool in &mut tools {
+            let mut input = serde_json::Value::Object((*tool.input_schema).clone());
+            strip_nonstandard_schema_formats(&mut input);
+            if let serde_json::Value::Object(map) = input {
+                tool.input_schema = Arc::new(map);
+            }
+            if let Some(output) = tool.output_schema.take() {
+                let mut out = serde_json::Value::Object((*output).clone());
+                strip_nonstandard_schema_formats(&mut out);
+                if let serde_json::Value::Object(map) = out {
+                    tool.output_schema = Some(Arc::new(map));
+                }
+            }
+        }
+        Ok(rmcp::model::ListToolsResult::with_all_items(tools))
     }
 }
 
@@ -1938,6 +2027,47 @@ pub async fn run_mcp_server(default_project: Option<String>) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    #[test]
+    fn strips_nonstandard_numeric_formats() {
+        // Shape mirrors what schemars emits for `Option<usize>` / `Option<f32>`
+        // params and `u32` line numbers in nested output schemas.
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "limit": { "type": "integer", "format": "uint" },
+                "min_jaccard": { "type": "number", "format": "float" },
+                "results": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "line": { "type": "integer", "format": "uint32" },
+                            "delta": { "type": "integer", "format": "int64" }
+                        }
+                    }
+                },
+                "created_at": { "type": "string", "format": "date-time" }
+            }
+        });
+        strip_nonstandard_schema_formats(&mut schema);
+
+        let props = &schema["properties"];
+        // uint* formats dropped, minimum:0 added to preserve non-negativity.
+        assert!(props["limit"].get("format").is_none());
+        assert_eq!(props["limit"]["minimum"], json!(0));
+        // float dropped, no minimum injected.
+        assert!(props["min_jaccard"].get("format").is_none());
+        assert!(props["min_jaccard"].get("minimum").is_none());
+        // Recurses into array items.
+        let item = &props["results"]["items"]["properties"];
+        assert!(item["line"].get("format").is_none());
+        assert_eq!(item["line"]["minimum"], json!(0));
+        assert!(item["delta"].get("format").is_none());
+        assert!(item["delta"].get("minimum").is_none());
+        // Standard formats are left untouched.
+        assert_eq!(props["created_at"]["format"], json!("date-time"));
+    }
 
     fn fat_string(n: usize) -> String {
         "x".repeat(n)

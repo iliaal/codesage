@@ -19,6 +19,7 @@
 - `impact_analysis` bounds per-level fan-out, so a symbol referenced by hundreds of files can no longer make traversal unbounded.
 - Feature mapper: PSR-4 namespaces mapping to multiple directories now register every directory; Rust workspace glob members (`libs/*`) outside `crates/` are mapped instead of dropped; php-src `#elif`/`#else` branches under `#if 0` are no longer blanked (their symbols were lost).
 - `FileCategory::classify` recognizes `./`-prefixed relative paths, so test/config files passed with a leading `./` are categorized correctly.
+- MCP tool schemas no longer advertise schemars' non-standard numeric `format` values (`uint32`, `uint`, `float`, …), so strict clients (e.g. opencode) stop logging "unknown format" warnings; unsigned params keep their `minimum: 0` constraint.
 
 ## [0.12.0] - 2026-06-13
 
