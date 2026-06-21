@@ -120,7 +120,12 @@ EOF
 [Unreleased]: https://github.com/iliaal/codesage/compare/v1.2.2...HEAD
 [1.2.2]: https://github.com/iliaal/codesage/releases/tag/v1.2.2
 EOF
-	git add Cargo.toml CHANGELOG.md
+	# release.sh runs scripts/check-changelog.py as a pre-flight against the
+	# repo root it is invoked in; provision (and commit, to keep the tree clean)
+	# the lint so the fake repo mirrors a real checkout.
+	mkdir -p scripts
+	cp "$repo_root/scripts/check-changelog.py" scripts/check-changelog.py
+	git add Cargo.toml CHANGELOG.md scripts/check-changelog.py
 	git commit -q -m initial
 	git push -q origin master
 
