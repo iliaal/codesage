@@ -105,11 +105,14 @@ No changelog entry for pure internal refactors, tests, benchmark/eval harnesses,
 
 Write entries in terse style:
 
-- Put entries under `## [Unreleased]` in the standard sections: `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`.
+- Put entries under `## [Unreleased]` in these sections, in this fixed order: `Added` → `Changed` → `Deprecated` → `Removed` → `Fixed` → `Security`. This is the shared iliaal/* Keep-a-Changelog section ordering (see `~/ai/wiki/architecture/php-extension-c-conventions.md` § CHANGELOG section ordering).
+- Skip empty subsections; never carry a placeholder bullet just to populate the structure. Any project-specific section (none today) comes after the standard ones.
 - Use one plain bullet per user-visible change. No bold lead-in, no paragraph explanation, no file lists.
 - Name the command, MCP tool, config key, or behavior that changed. Stop after the observable effect.
 - Prefer consolidation when several fixes share one surface (`codesage daemon status` / `stop`, parser symbol extraction, feature mapping).
 - If a reviewer would need the git diff to care, it probably does not belong in the changelog.
+
+`scripts/check-changelog.py` enforces the section set, ordering, and no-empty-section rules on `## [Unreleased]`; it runs as a release pre-flight (`scripts/release.sh` and `/release`). Run it directly any time: `python3 scripts/check-changelog.py`.
 
 ### Cutting a release
 

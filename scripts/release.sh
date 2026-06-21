@@ -63,6 +63,12 @@ if git rev-parse "v$VERSION" >/dev/null 2>&1; then
 	die "tag v$VERSION already exists"
 fi
 
+# CHANGELOG section ordering / validity gate (shared iliaal/* convention).
+# Runs before any mutation so a malformed [Unreleased] block stops the release
+# cleanly rather than getting stamped into a version section.
+python3 "$ROOT/scripts/check-changelog.py" "$ROOT/CHANGELOG.md" ||
+	die "CHANGELOG [Unreleased] failed validation (see above)"
+
 current=$(awk -F'"' '/^\[workspace\.package\]/{f=1;next} f && /^version *=/{print $2; exit}' Cargo.toml)
 [[ -n "$current" ]] || die "could not read current version from Cargo.toml"
 echo "Current version: $current"
