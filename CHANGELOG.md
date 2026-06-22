@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.13.0] - 2026-06-22
+
 ### Added
 - `find_similar` MCP tool and `codesage similar <name>` CLI command: near-clone detection for functions/methods via MinHash over AST structure (identifiers and literals ignored), ranked by Jaccard similarity. Test files are excluded; tune `--min-jaccard`. Requires a reindex (`codesage index`) to populate fingerprints (schema migration `0012_symbol_fingerprints`).
 - Rust `find_references` now captures method calls (`obj.method()`) and `impl Trait for Type` edges (trait as inheritance, type as type_hint).
@@ -515,5 +517,7 @@ Initial public release.
 
 [0.11.0]: https://github.com/iliaal/codesage/releases/tag/v0.11.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.12.0...HEAD
 [0.12.0]: https://github.com/iliaal/codesage/releases/tag/v0.12.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/iliaal/codesage/releases/tag/v0.13.0
