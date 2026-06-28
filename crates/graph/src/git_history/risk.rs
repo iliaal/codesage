@@ -232,40 +232,59 @@ fn assess_risk_with_cycles(
             sample.join(", ")
         ));
 
-        // Candidate break edge: among the import edges *within* this cycle, the
-        // pair with the lowest historical co-change weight is the most arbitrary
-        // coupling — the safest, cheapest dependency to invert or remove. For an
-        // SCC larger than a simple 2-cycle, cutting one edge may not fully break
-        // the cycle, so this is surfaced as a candidate, not a guarantee.
+        // Cycle-breaking guidance, shaped by the cycle's structure. A single
+        // edge removal only meaningfully breaks an SCC close to a simple ring
+        // (each file imported by ~one other cycle member, edges ≈ nodes); there
+        // the lowest-co-change edge is the most arbitrary coupling and the
+        // safest dependency to invert. When the SCC has a hub many cycle files
+        // import, or far more edges than a ring, one cut won't untangle it — so
+        // surface the most-depended-on files (the decoupling targets) instead.
         // `cycle_files` excludes the current file, so add it back for the SCC.
         let mut scc: Vec<&str> = cycle_files.iter().map(String::as_str).collect();
         scc.push(file_path);
         match db.import_edges_within(&scc) {
             Ok(edges) if !edges.is_empty() => {
-                let weakest = edges
-                    .iter()
-                    .map(|(from, to)| (db.co_change_weight(from, to).unwrap_or(0.0), from, to))
-                    .min_by(|(wa, fa, ta), (wb, fb, tb)| {
-                        wa.partial_cmp(wb)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                            .then_with(|| fa.cmp(fb))
-                            .then_with(|| ta.cmp(tb))
-                    });
-                if let Some((weight, from, to)) = weakest {
-                    if weight > 0.0 {
-                        notes.push(format!(
-                            "candidate break point: {from} → {to} (lowest co-change weight {weight:.2} among cycle edges)"
-                        ));
-                    } else {
-                        notes.push(format!(
-                            "candidate break point: {from} → {to} (these cycle files do not co-change in git history)"
-                        ));
+                let mut in_degree: std::collections::HashMap<&str, u32> =
+                    std::collections::HashMap::new();
+                for (_from, to) in &edges {
+                    *in_degree.entry(to.as_str()).or_insert(0) += 1;
+                }
+                let max_in_degree = in_degree.values().copied().max().unwrap_or(0);
+                let ring_like = max_in_degree <= 2 && edges.len() <= scc.len() + scc.len() / 2;
+                if ring_like {
+                    let weakest = edges
+                        .iter()
+                        .map(|(from, to)| (db.co_change_weight(from, to).unwrap_or(0.0), from, to))
+                        .min_by(|(wa, fa, ta), (wb, fb, tb)| {
+                            wa.partial_cmp(wb)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then_with(|| fa.cmp(fb))
+                                .then_with(|| ta.cmp(tb))
+                        });
+                    if let Some((weight, from, to)) = weakest {
+                        if weight > 0.0 {
+                            notes.push(format!(
+                                "candidate break point: {from} → {to} (lowest co-change weight {weight:.2} among cycle edges)"
+                            ));
+                        } else {
+                            notes.push(format!(
+                                "candidate break point: {from} → {to} (these cycle files do not co-change in git history)"
+                            ));
+                        }
                     }
+                } else {
+                    let mut ranked: Vec<(&str, u32)> = in_degree.into_iter().collect();
+                    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+                    let hubs: Vec<&str> = ranked.iter().take(3).map(|(f, _)| *f).collect();
+                    notes.push(format!(
+                        "cycle is hub-dominated (not a simple ring); cutting one edge won't break it — most-depended-on within the cycle (decoupling targets): {}",
+                        hubs.join(", ")
+                    ));
                 }
             }
             Ok(_) => {}
             Err(e) => {
-                tracing::warn!(error = %e, file = %file_path, "break-edge ranking failed; omitting from risk notes");
+                tracing::warn!(error = %e, file = %file_path, "cycle-break guidance failed; omitting from risk notes");
             }
         }
     }

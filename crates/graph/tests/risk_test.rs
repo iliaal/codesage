@@ -493,6 +493,52 @@ fn assess_risk_suggests_lowest_co_change_break_edge_in_cycle() {
 }
 
 #[test]
+fn assess_risk_reframes_hub_dominated_cycle_as_decoupling_targets() {
+    // Hub-spoke cycle: Resource imports P1/P2/P3 and each Pn imports Resource.
+    // Resource has in-degree 3 within the cycle, so it's hub-dominated, not a
+    // ring — cutting one edge won't break it. assess_risk should surface the
+    // hub as a decoupling target instead of a single break edge.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("Resource.php"),
+        b"<?php\nnamespace App;\nuse App\\P1;\nuse App\\P2;\nuse App\\P3;\nclass Resource { public function a(P1 $a, P2 $b, P3 $c) {} }\n",
+    )
+    .unwrap();
+    for p in ["P1", "P2", "P3"] {
+        std::fs::write(
+            root.join(format!("{p}.php")),
+            format!("<?php\nnamespace App;\nuse App\\Resource;\nclass {p} {{ public function x(Resource $r) {{}} }}\n").as_bytes(),
+        )
+        .unwrap();
+    }
+    let db = Database::open_in_memory().unwrap();
+    codesage_graph::full_index(root, &db, &[], false).unwrap();
+
+    let r = assess_risk(&db, "Resource.php").unwrap();
+    assert!(r.in_cycle, "Resource is in the hub-spoke cycle");
+    let note = r
+        .notes
+        .iter()
+        .find(|n| n.contains("hub-dominated"))
+        .unwrap_or_else(|| panic!("expected hub-dominated note, got {:?}", r.notes));
+    assert!(
+        note.contains("decoupling targets"),
+        "note should name decoupling targets: {note}"
+    );
+    assert!(
+        note.contains("Resource.php"),
+        "the hub (Resource.php) should be the top decoupling target: {note}"
+    );
+    // The single-break-edge note must NOT fire for a hub-dominated cycle.
+    assert!(
+        !r.notes.iter().any(|n| n.contains("candidate break point")),
+        "hub-dominated cycle should not emit a single break-edge note: {:?}",
+        r.notes
+    );
+}
+
+#[test]
 fn risk_batch_reuses_patch_cycles_for_per_file_cycle_signal() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
