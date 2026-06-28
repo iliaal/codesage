@@ -3,6 +3,9 @@
 ### Added
 - MCP tools now advertise `readOnlyHint: true` and `openWorldHint: false` annotations, so read-only-gated clients (e.g. Cursor's Ask mode) can call the full CodeSage surface without a write-confirmation prompt.
 
+### Changed
+- `assess_risk` / `codesage risk` now suggest a candidate break edge for a file in an import cycle: the cycle's lowest-co-change-weight import edge, surfaced in the risk notes as the safest dependency to invert or remove.
+
 ## [0.13.0] - 2026-06-22
 
 ### Added

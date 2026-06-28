@@ -198,6 +198,26 @@ impl Database {
         Ok(n > 0)
     }
 
+    /// Co-change weight for a file pair (symmetric — caller need not pre-sort).
+    /// Returns 0.0 when the pair has no recorded co-change: either the two files
+    /// have never been observed changing together, or git history isn't indexed.
+    pub fn co_change_weight(&self, file_a: &str, file_b: &str) -> Result<f64> {
+        let (lo, hi) = if file_a <= file_b {
+            (file_a, file_b)
+        } else {
+            (file_b, file_a)
+        };
+        match self.conn.query_row(
+            "SELECT weight FROM git_co_changes WHERE file_a = ?1 AND file_b = ?2",
+            rusqlite::params![lo, hi],
+            |r| r.get::<_, f64>(0),
+        ) {
+            Ok(w) => Ok(w),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0.0),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Preload every existing co-change pair as `file_a -> {file_b}`. Incremental
     /// indexing uses this instead of `co_change_pair_exists` per pair, replacing
     /// N round-trips inside the write transaction with one sequential scan before

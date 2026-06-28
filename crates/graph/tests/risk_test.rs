@@ -450,6 +450,49 @@ fn assess_risk_flags_file_in_two_file_cycle() {
 }
 
 #[test]
+fn assess_risk_suggests_lowest_co_change_break_edge_in_cycle() {
+    // A <-> B cycle with a recorded co-change weight. assess_risk should surface
+    // a candidate break edge naming a cycle edge and its co-change weight, so an
+    // agent knows which dependency to invert/remove to break the cycle.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("A.php"),
+        b"<?php\nnamespace App;\nuse App\\Repository;\nclass Controller { public function x(Repository $r) { return $r->y(); } }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("B.php"),
+        b"<?php\nnamespace App;\nuse App\\Controller;\nclass Repository { public function y(Controller $c) { return $c->x(null); } }\n",
+    )
+    .unwrap();
+    let db = Database::open_in_memory().unwrap();
+    codesage_graph::full_index(root, &db, &[], false).unwrap();
+    db.upsert_git_file("A.php", 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+    db.upsert_git_file("B.php", 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+    // Co-change pair stored sorted (A.php < B.php).
+    db.upsert_git_co_change("A.php", "B.php", 2.5, 4, Some(1_700_000_000))
+        .unwrap();
+
+    let r = assess_risk(&db, "A.php").unwrap();
+    assert!(r.in_cycle);
+    let note = r
+        .notes
+        .iter()
+        .find(|n| n.contains("candidate break point"))
+        .unwrap_or_else(|| panic!("expected break-point note, got {:?}", r.notes));
+    // Deterministic tie-break picks the edge sorted first (A.php → B.php).
+    assert!(note.contains("A.php"), "note: {note}");
+    assert!(note.contains("B.php"), "note: {note}");
+    assert!(
+        note.contains("2.50"),
+        "expected co-change weight in note: {note}"
+    );
+}
+
+#[test]
 fn risk_batch_reuses_patch_cycles_for_per_file_cycle_signal() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();

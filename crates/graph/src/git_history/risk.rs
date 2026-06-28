@@ -231,6 +231,43 @@ fn assess_risk_with_cycles(
             cycle_size,
             sample.join(", ")
         ));
+
+        // Candidate break edge: among the import edges *within* this cycle, the
+        // pair with the lowest historical co-change weight is the most arbitrary
+        // coupling — the safest, cheapest dependency to invert or remove. For an
+        // SCC larger than a simple 2-cycle, cutting one edge may not fully break
+        // the cycle, so this is surfaced as a candidate, not a guarantee.
+        // `cycle_files` excludes the current file, so add it back for the SCC.
+        let mut scc: Vec<&str> = cycle_files.iter().map(String::as_str).collect();
+        scc.push(file_path);
+        match db.import_edges_within(&scc) {
+            Ok(edges) if !edges.is_empty() => {
+                let weakest = edges
+                    .iter()
+                    .map(|(from, to)| (db.co_change_weight(from, to).unwrap_or(0.0), from, to))
+                    .min_by(|(wa, fa, ta), (wb, fb, tb)| {
+                        wa.partial_cmp(wb)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| fa.cmp(fb))
+                            .then_with(|| ta.cmp(tb))
+                    });
+                if let Some((weight, from, to)) = weakest {
+                    if weight > 0.0 {
+                        notes.push(format!(
+                            "candidate break point: {from} → {to} (lowest co-change weight {weight:.2} among cycle edges)"
+                        ));
+                    } else {
+                        notes.push(format!(
+                            "candidate break point: {from} → {to} (these cycle files do not co-change in git history)"
+                        ));
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, file = %file_path, "break-edge ranking failed; omitting from risk notes");
+            }
+        }
     }
     if trust_boundaries.len() >= 3 {
         let names: Vec<&str> = trust_boundaries.iter().map(|b| b.as_str()).collect();
