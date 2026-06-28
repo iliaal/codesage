@@ -1,5 +1,8 @@
 ## [Unreleased]
 
+### Added
+- MCP tools now advertise `readOnlyHint: true` and `openWorldHint: false` annotations, so read-only-gated clients (e.g. Cursor's Ask mode) can call the full CodeSage surface without a write-confirmation prompt.
+
 ## [0.13.0] - 2026-06-22
 
 ### Added

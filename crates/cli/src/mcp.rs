@@ -1353,6 +1353,35 @@ fn strip_nonstandard_schema_formats(value: &mut serde_json::Value) {
     }
 }
 
+/// Finalize the router's tool list for the MCP `tools/list` response: strip
+/// schemars' non-standard numeric `format` keys from each schema and stamp the
+/// read-only / closed-world annotations. Every CodeSage tool is read-only (the
+/// server never mutates a project) and reads a local index rather than the open
+/// internet, so `readOnlyHint`/`openWorldHint` hold for the whole surface.
+/// Read-only-gated clients (e.g. Cursor's Ask mode) refuse to call a tool that
+/// doesn't advertise `readOnlyHint`, so the annotation is a reachability fix.
+fn finalize_tools_for_listing(tools: &mut [rmcp::model::Tool]) {
+    for tool in tools.iter_mut() {
+        let mut input = serde_json::Value::Object((*tool.input_schema).clone());
+        strip_nonstandard_schema_formats(&mut input);
+        if let serde_json::Value::Object(map) = input {
+            tool.input_schema = Arc::new(map);
+        }
+        if let Some(output) = tool.output_schema.take() {
+            let mut out = serde_json::Value::Object((*output).clone());
+            strip_nonstandard_schema_formats(&mut out);
+            if let serde_json::Value::Object(map) = out {
+                tool.output_schema = Some(Arc::new(map));
+            }
+        }
+        tool.annotations = Some(
+            rmcp::model::ToolAnnotations::new()
+                .read_only(true)
+                .open_world(false),
+        );
+    }
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for CodeSageServer {
     fn get_info(&self) -> ServerInfo {
@@ -1371,29 +1400,17 @@ impl ServerHandler for CodeSageServer {
     }
 
     // Override the macro-generated `list_tools` to strip schemars' non-standard
-    // numeric `format` annotations from every tool's input + output schema, so
-    // strict MCP clients don't log "unknown format" warnings. The macro only
-    // generates `list_tools` when the impl doesn't already define one.
+    // numeric `format` annotations (so strict MCP clients don't log "unknown
+    // format" warnings) and stamp read-only / closed-world tool annotations (so
+    // read-only-gated clients can call the surface). The macro only generates
+    // `list_tools` when the impl doesn't already define one.
     async fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> std::result::Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
         let mut tools = self.tool_router.list_all();
-        for tool in &mut tools {
-            let mut input = serde_json::Value::Object((*tool.input_schema).clone());
-            strip_nonstandard_schema_formats(&mut input);
-            if let serde_json::Value::Object(map) = input {
-                tool.input_schema = Arc::new(map);
-            }
-            if let Some(output) = tool.output_schema.take() {
-                let mut out = serde_json::Value::Object((*output).clone());
-                strip_nonstandard_schema_formats(&mut out);
-                if let serde_json::Value::Object(map) = out {
-                    tool.output_schema = Some(Arc::new(map));
-                }
-            }
-        }
+        finalize_tools_for_listing(&mut tools);
         Ok(rmcp::model::ListToolsResult::with_all_items(tools))
     }
 }
@@ -2820,6 +2837,37 @@ mod tests {
                     || schema.contains_key("$ref")
                     || schema.contains_key("$defs"),
                 "tool `{}` output schema has no properties/$ref/$defs",
+                tool.name
+            );
+        }
+    }
+
+    /// Every tool must advertise `readOnlyHint: true` + `openWorldHint: false`
+    /// through the `tools/list` finalization path. Read-only-gated clients (e.g.
+    /// Cursor's Ask mode) refuse to call an unannotated tool, so a tool shipping
+    /// without the annotation is unreachable there. Exercises the same
+    /// `finalize_tools_for_listing` the `list_tools` override uses.
+    #[test]
+    fn every_tool_advertises_readonly_annotation() {
+        let server = CodeSageServer::new();
+        let mut tools = server.tool_router.list_all();
+        finalize_tools_for_listing(&mut tools);
+        assert!(!tools.is_empty(), "router should expose at least one tool");
+        for tool in &tools {
+            let ann = tool
+                .annotations
+                .as_ref()
+                .unwrap_or_else(|| panic!("tool `{}` is missing annotations", tool.name));
+            assert_eq!(
+                ann.read_only_hint,
+                Some(true),
+                "tool `{}` must advertise readOnlyHint: true",
+                tool.name
+            );
+            assert_eq!(
+                ann.open_world_hint,
+                Some(false),
+                "tool `{}` must advertise openWorldHint: false",
                 tool.name
             );
         }
