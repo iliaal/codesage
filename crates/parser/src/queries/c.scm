@@ -26,3 +26,10 @@
 
 ; Pattern 6: Macro (#define) → Macro
 (preproc_def name: (identifier) @name) @def
+
+; Pattern 7: Function (double-pointer return, e.g. char **f()) → Function
+(function_definition
+  declarator: (pointer_declarator
+    declarator: (pointer_declarator
+      declarator: (function_declarator
+        declarator: (identifier) @name)))) @def

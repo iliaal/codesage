@@ -23,3 +23,12 @@
       object: (identifier) @_obj
       property: (property_identifier) @name)
     (#eq? @_obj "exports")) @def)
+
+; Pattern 7: generator function (function* g()) → Function
+(generator_function_declaration name: (identifier) @name) @def
+
+; Pattern 8: top-level var → Constant
+(program (variable_declaration (variable_declarator name: (identifier) @name) @def))
+
+; Pattern 9: exported var → Constant
+(export_statement declaration: (variable_declaration (variable_declarator name: (identifier) @name) @def))

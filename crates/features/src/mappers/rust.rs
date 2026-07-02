@@ -204,9 +204,13 @@ fn library_owned_files(ctx: &MapperContext, pkg_dir: &Path, entry_path: &str) ->
     if !is_safe_dir(ctx.root, &src_dir) {
         return Vec::new();
     }
+    // walk_files yields ROOT-relative paths, so the bin-exclusion prefix
+    // must be root-relative too. For a workspace member at crates/foo the
+    // bin dir is crates/foo/src/bin — a bare "src/bin/" would never match.
+    let bin_prefix = format!("{}/", rel_path(ctx.root, &src_dir.join("bin")));
     walk_files(ctx.root, &src_dir, 10_000, ctx.excludes)
         .into_iter()
-        .filter(|rel| rel.ends_with(".rs") && rel != entry_path && !rel.starts_with("src/bin/"))
+        .filter(|rel| rel.ends_with(".rs") && rel != entry_path && !rel.starts_with(&bin_prefix))
         .filter(|rel| ctx.allowed(rel))
         .map(|rel| SeedFile {
             path: rel,
@@ -423,6 +427,43 @@ mod tests {
         let binary_b = seeds.iter().any(|s| s.title == "Rust binary `b`");
         assert!(library_a, "member `a` library seed missing: {seeds:?}");
         assert!(binary_b, "member `b` binary seed missing: {seeds:?}");
+    }
+
+    #[test]
+    fn workspace_member_bin_excluded_from_library_owned_files() {
+        // A workspace member's src/bin/*.rs must not leak into the
+        // library seed's owned_files. The bin-exclusion prefix is
+        // root-relative, so it has to account for the member subdir.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/foo\"]\n",
+        );
+        write(
+            dir.path(),
+            "crates/foo/Cargo.toml",
+            "[package]\nname = \"foo\"\nversion = \"0.1.0\"\n",
+        );
+        write(dir.path(), "crates/foo/src/lib.rs", "pub fn x() {}");
+        write(dir.path(), "crates/foo/src/inner.rs", "pub fn y() {}");
+        write(dir.path(), "crates/foo/src/bin/tool.rs", "fn main() {}");
+        let seeds = RustMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let lib = seeds
+            .iter()
+            .find(|s| s.title == "Rust library `foo`")
+            .expect("member library seed missing");
+        let owned: Vec<&str> = lib.owned_files.iter().map(|f| f.path.as_str()).collect();
+        assert!(
+            !owned.contains(&"crates/foo/src/bin/tool.rs"),
+            "bin source leaked into library owned_files: {owned:?}"
+        );
+        assert!(
+            owned.contains(&"crates/foo/src/inner.rs"),
+            "non-bin member source missing from owned_files: {owned:?}"
+        );
     }
 
     #[test]

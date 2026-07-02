@@ -33,10 +33,19 @@ def run_search(codesage_bin: str, project_root: Path, query: str, limit: int,
     chunks of the same file share one rank position — the earliest)."""
     env = os.environ.copy()
     env.update(env_extra)
-    r = subprocess.run(
-        [codesage_bin, "search", "--json", "--limit", str(limit), query],
-        cwd=project_root, capture_output=True, text=True, env=env, timeout=120,
-    )
+    try:
+        r = subprocess.run(
+            [codesage_bin, "search", "--json", "--limit", str(limit), query],
+            cwd=project_root, capture_output=True, text=True, env=env, timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        # Score as a miss (empty path list) rather than crashing the A/B run
+        # and losing every prior query's result.
+        print(f"[warn] codesage search timed out after 120s: {query!r}", file=sys.stderr)
+        return []
+    except subprocess.SubprocessError as e:
+        print(f"[warn] codesage search errored: {e}", file=sys.stderr)
+        return []
     if r.returncode != 0:
         return []
     try:

@@ -140,6 +140,7 @@ fn c_kind_map(pattern_index: usize) -> Option<SymbolKind> {
         4 => Some(SymbolKind::Enum),
         5 => Some(SymbolKind::Constant), // typedef
         6 => Some(SymbolKind::Macro),
+        7 => Some(SymbolKind::Function), // double-pointer return
         _ => None,
     }
 }
@@ -176,6 +177,7 @@ fn java_kind_map(pattern_index: usize) -> Option<SymbolKind> {
         5 => Some(SymbolKind::Method),    // constructor
         6 => Some(SymbolKind::Constant),  // field
         7 => Some(SymbolKind::Interface), // @interface (annotation type)
+        8 => Some(SymbolKind::Constant),  // enum constant
         _ => None,
     }
 }
@@ -191,6 +193,7 @@ fn rust_kind_map(pattern_index: usize) -> Option<SymbolKind> {
         6 => Some(SymbolKind::Constant), // static
         7 => Some(SymbolKind::Module),
         8 => Some(SymbolKind::Macro),
+        9 => Some(SymbolKind::Method), // trait method signature
         _ => None,
     }
 }
@@ -203,6 +206,8 @@ fn js_kind_map(pattern_index: usize) -> Option<SymbolKind> {
         3 | 4 => Some(SymbolKind::Constant), // exported/top-level const
         5 => Some(SymbolKind::Class),        // export default class
         6 => Some(SymbolKind::Constant),     // exports.X = ...
+        7 => Some(SymbolKind::Function),     // generator function
+        8 | 9 => Some(SymbolKind::Constant), // top-level / exported var
         _ => None,
     }
 }
@@ -214,6 +219,7 @@ fn go_kind_map(pattern_index: usize) -> Option<SymbolKind> {
         2 => Some(SymbolKind::Struct), // placeholder; refined by refine_go_type_kind
         3 => Some(SymbolKind::Constant), // type alias (type X = Y)
         4 => Some(SymbolKind::Constant), // const
+        5 => Some(SymbolKind::Constant), // package-level var
         _ => None,
     }
 }
@@ -228,6 +234,10 @@ fn ts_kind_map(pattern_index: usize) -> Option<SymbolKind> {
         5 => Some(SymbolKind::Enum),
         6 | 7 => Some(SymbolKind::Constant), // exported/top-level const
         8 => Some(SymbolKind::Class),        // export default class
+        9 | 10 => Some(SymbolKind::Class),   // abstract class (+ exported)
+        11 => Some(SymbolKind::Function),    // generator function
+        12 | 13 => Some(SymbolKind::Constant), // top-level / exported var
+        14 => Some(SymbolKind::Method),      // abstract method signature
         _ => None,
     }
 }
@@ -436,7 +446,7 @@ fn is_inside_impl_or_class(node: &Node, language: Language) -> bool {
             "class_definition" | "class_declaration" if language == Language::Python => {
                 return true;
             }
-            "impl_item" if language == Language::Rust => return true,
+            "impl_item" | "trait_item" if language == Language::Rust => return true,
             "class_specifier" | "struct_specifier" | "union_specifier"
                 if language == Language::Cpp =>
             {
@@ -585,7 +595,9 @@ fn find_parent_class_name<'a>(node: &Node, source: &'a [u8]) -> Option<&'a str> 
         match parent.kind() {
             "class_definition"
             | "class_declaration"
+            | "abstract_class_declaration"
             | "trait_declaration"
+            | "trait_item"
             | "interface_declaration"
             | "enum_declaration"
             | "record_declaration"

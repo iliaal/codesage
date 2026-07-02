@@ -1,3 +1,10 @@
+; TypeScript reference patterns. Patterns 0-5 mirror javascript_refs.scm;
+; pattern 6 handles the TS-only `extends_clause` heritage node, which does not
+; exist in the JavaScript grammar (so it cannot live in the shared JS file).
+; The JS `class_heritage (identifier)` inheritance form is an impossible pattern
+; in the TSX grammar (heritage is always wrapped in extends/implements clauses),
+; so it is omitted here.
+
 ; Pattern 0: import statement (captures the module source string)
 (import_statement source: (string) @ref)
 
@@ -16,8 +23,8 @@
 ; Pattern 4: re-export (export { x } from "./mod" / export * from "./mod")
 (export_statement source: (string) @ref)
 
-; Pattern 5: class inheritance (class Foo extends Bar) -- JS heritage form
-(class_heritage (identifier) @ref)
-
-; Pattern 6: instantiation (new Foo())
+; Pattern 5: instantiation (new Foo())
 (new_expression constructor: (identifier) @ref)
+
+; Pattern 6: class inheritance (class Foo extends Bar) -- TS extends_clause form
+(extends_clause value: (identifier) @ref)

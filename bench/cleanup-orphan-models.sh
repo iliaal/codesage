@@ -28,7 +28,14 @@ codesage_bin="${CODESAGE_BIN:-codesage}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) args+=("--dry-run") ;;
-        --codesage-bin) shift; codesage_bin="$1" ;;
+        --codesage-bin)
+            shift
+            [ $# -gt 0 ] || {
+                echo "error: --codesage-bin needs an argument" >&2
+                exit 2
+            }
+            codesage_bin="$1"
+            ;;
         -h|--help) usage ;;
         *) [ -z "$repo" ] && repo="$1" || usage ;;
     esac

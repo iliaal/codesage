@@ -32,19 +32,39 @@ use tree_sitter::Node;
 /// they routinely sit between the doc-comment and the item.
 pub fn extract_rust_rationale(def_node: &Node, source: &[u8]) -> Vec<RationaleEntry> {
     let mut entries = Vec::new();
+    let mut next_start_row = def_node.start_position().row;
     let mut sib = def_node.prev_sibling();
     while let Some(node) = sib {
         match node.kind() {
             "line_comment" | "block_comment" => {
+                // Adjacency guard (mirrors the Python walk): the comment must
+                // sit on the row immediately above the node we last accepted. A
+                // blank-line gap detaches it and stops the walk. Rust
+                // `line_comment` nodes include the trailing newline, so their
+                // end lands at column 0 of the *next* row; treat that row as
+                // one past the last content row rather than as content.
+                let end = node.end_position();
+                let last_content_row = if end.column == 0 && end.row > node.start_position().row {
+                    end.row - 1
+                } else {
+                    end.row
+                };
+                if last_content_row + 1 != next_start_row {
+                    break;
+                }
                 if let Ok(text) = node.utf8_text(source) {
                     let stripped = strip_rust_comment_markers(text);
                     if let Some(parsed) = parse_marker_line(&stripped, &node) {
                         entries.push(parsed);
                     }
                 }
+                next_start_row = node.start_position().row;
             }
             "attribute_item" | "inner_attribute_item" => {
-                // Skip attributes — they sit between docs and the item.
+                // Skip attributes — they sit between docs and the item — but
+                // advance the adjacency anchor so a doc comment directly above
+                // the attribute stack still counts as adjacent.
+                next_start_row = node.start_position().row;
             }
             _ => break,
         }
@@ -226,10 +246,23 @@ fn parse_marker(body: &str) -> Option<(RationaleKind, String)> {
     }
     let kind = RationaleKind::from_marker(maybe_marker)?;
 
+    // The no-colon path is restricted to the bare-tag markers
+    // (TODO/FIXME/XXX/HACK) that tooling conventionally writes without a colon.
+    // Prose markers like WHY/NOTE/IMPORTANT require a trailing colon, so plain
+    // sentences ("Note that ...", "Why not just ...") don't become rationale.
+    let has_colon = body.as_bytes().get(maybe_marker.len()) == Some(&b':');
+    if !has_colon
+        && !matches!(
+            kind,
+            RationaleKind::Todo | RationaleKind::Fixme | RationaleKind::Xxx | RationaleKind::Hack
+        )
+    {
+        return None;
+    }
+
     // Re-split on `:` specifically to capture only the after-colon body.
-    // If the first token was a marker but no colon followed (e.g. "TODO ..."
-    // without a colon), we still record it — TODO/FIXME tools often write
-    // the marker without a colon.
+    // If the first token was a bare-tag marker but no colon followed
+    // (e.g. "TODO ..." without a colon), we still record it.
     let after_marker = match body.find(':') {
         Some(idx) if idx == maybe_marker.len() => body[idx + 1..].trim().to_string(),
         Some(_) | None => body[maybe_marker.len()..]
@@ -383,6 +416,53 @@ fn id<T>(x: T) -> T { x }
         let symbols = extract_for_source(src);
         let id = symbols.iter().find(|s| s.name == "id").unwrap();
         assert!(id.rationale.is_empty());
+    }
+
+    #[test]
+    fn blank_line_gapped_comment_does_not_attach() {
+        // Rationale (a): a marker comment separated from the item by a blank
+        // line is not adjacent and must not attach.
+        let src = "\
+// NOTE: general file-level note, not about beta.
+
+fn beta() {}
+";
+        let symbols = extract_for_source(src);
+        let beta = symbols.iter().find(|s| s.name == "beta").unwrap();
+        assert!(
+            beta.rationale.is_empty(),
+            "blank-line-gapped comment must not attach"
+        );
+    }
+
+    #[test]
+    fn adjacent_comment_still_attaches_after_guard() {
+        // Rationale (a): the guard must not regress the adjacent case.
+        let src = "\
+// FIXME: needs bounds check.
+fn gamma() {}
+";
+        let symbols = extract_for_source(src);
+        let gamma = symbols.iter().find(|s| s.name == "gamma").unwrap();
+        assert_eq!(gamma.rationale.len(), 1);
+        assert_eq!(gamma.rationale[0].kind, RationaleKind::Fixme);
+    }
+
+    #[test]
+    fn note_without_colon_is_rejected() {
+        // Rationale (b): the no-colon path is restricted to bare-tag markers.
+        assert!(parse_for_test("Note that this is prose").is_none());
+        assert!(parse_for_test("Why not just inline it").is_none());
+        assert!(parse_for_test("Important consideration here").is_none());
+        // Bare-tag markers still accepted without a colon.
+        assert!(parse_for_test("FIXME broken").is_some());
+        assert!(parse_for_test("HACK workaround").is_some());
+        assert!(parse_for_test("XXX revisit").is_some());
+        // Prose markers still accepted *with* a colon.
+        assert_eq!(
+            parse_for_test("NOTE: real note").unwrap().0,
+            RationaleKind::Note
+        );
     }
 
     #[test]

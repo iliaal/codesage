@@ -25,8 +25,11 @@ jobs:
 
       - name: Extract CHANGELOG section for this version
         id: notes
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          TAG: ${{ steps.ver.outputs.tag }}
         run: |
-          version='${{ steps.ver.outputs.version }}'
+          version="$VERSION"
           # Print lines between '## [VERSION]' and the next top-level '## ' heading.
           # Strip the version heading itself; release UI already shows it.
           # Skip markdown link references like '[Unreleased]: https://...' that
@@ -46,14 +49,15 @@ jobs:
           # Trim leading and trailing blank lines for a tidier release body.
           sed -i -e '/./,$!d' -e ':a; /^\s*$/ { $d; N; ba; }' release-notes.md
 
-          echo "--- release notes for ${{ steps.ver.outputs.tag }} ---"
+          echo "--- release notes for ${TAG} ---"
           cat release-notes.md
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
         run: |
-          tag='${{ steps.ver.outputs.tag }}'
+          tag="$TAG"
           # Pre-1.0: every release marked as a normal release (not pre-release).
           # GitHub auto-attaches source tarball + zip for the tag.
           gh release create "$tag" \

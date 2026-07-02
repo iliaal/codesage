@@ -39,3 +39,9 @@
 
 ; Pattern 13: method return type hint (public function f(): PDO)
 (method_declaration return_type: (named_type [(name) (qualified_name)] @ref))
+
+; Pattern 14: group use (use App\Models\{User, Post};) -- one ref per clause;
+; the declaration's base namespace_name is prepended in references.rs.
+(namespace_use_declaration
+  (namespace_use_group
+    (namespace_use_clause [(name) (qualified_name)] @ref)))

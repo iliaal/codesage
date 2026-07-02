@@ -92,8 +92,11 @@ fn java_interface_and_impl_symbols_and_references() {
 #[test]
 fn java_enum_and_record_symbols_and_references() {
     let syms = symbols_for("enum_and_record.java");
-    assert_eq!(syms.len(), 5);
+    // 5 prior symbols + 2 enum constants (ACTIVE, DISABLED) now captured (CR-018).
+    assert_eq!(syms.len(), 7);
     assert!(has_symbol(&syms, "Status", SymbolKind::Enum));
+    assert!(has_symbol(&syms, "ACTIVE", SymbolKind::Constant));
+    assert!(has_symbol(&syms, "DISABLED", SymbolKind::Constant));
     assert!(has_symbol(&syms, "active", SymbolKind::Method));
     assert!(has_symbol(&syms, "AuditEvent", SymbolKind::Class));
     assert!(has_symbol(&syms, "label", SymbolKind::Method));
@@ -154,7 +157,8 @@ fn java_annotations_and_annotation_type_and_multi_declarator_fields() {
 #[test]
 fn java_nested_types_are_captured() {
     let syms = symbols_for("nested_types.java");
-    assert_eq!(syms.len(), 11);
+    // 11 prior symbols + 2 Mode enum constants (FAST, SLOW) now captured (CR-018).
+    assert_eq!(syms.len(), 13);
     assert!(has_symbol(&syms, "Outer", SymbolKind::Class));
     assert!(has_symbol(&syms, "helper", SymbolKind::Constant));
     assert!(has_symbol(&syms, "Outer", SymbolKind::Method));
@@ -164,6 +168,8 @@ fn java_nested_types_are_captured() {
     assert!(has_symbol(&syms, "Marker", SymbolKind::Interface));
     assert!(has_symbol(&syms, "mark", SymbolKind::Method));
     assert!(has_symbol(&syms, "Mode", SymbolKind::Enum));
+    assert!(has_symbol(&syms, "FAST", SymbolKind::Constant));
+    assert!(has_symbol(&syms, "SLOW", SymbolKind::Constant));
     assert!(has_symbol(&syms, "Helper", SymbolKind::Class));
     assert!(has_symbol(&syms, "work", SymbolKind::Method));
 

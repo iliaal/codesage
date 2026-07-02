@@ -18,3 +18,10 @@
 (const_declaration
   (const_spec
     name: (identifier) @name) @def)
+
+; Pattern 5: Package-level var → Constant
+; Anchored to source_file so locals inside function bodies are not captured.
+(source_file
+  (var_declaration
+    (var_spec
+      name: (identifier) @name) @def))

@@ -153,7 +153,7 @@ PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go.
 - `recommend_tests` -- tests an agent should run after editing a set of files (V2b slice 2)
 - `review_rehearsal` -- predict severity-ranked review objections for a patch (missing tests, high-risk / blast-radius / fix-prone / hotspot files, import cycles, trust-boundary expansion, feature-test gaps, and `scope-spread` when a patch touches ≥4 unrelated feature areas) with hot-symbol evidence. Composes `assess_risk_diff` + `recommend_tests` + drift + feature mapping; read-only, no AI prose. Use as the last step before a commit.
 - `session_start` / `session_end` -- snapshot structural state at the start of an editing session, diff at the end. Returns `pass: bool` plus new/resolved cycles, per-file risk regressions on the top-50 baseline, and added/removed files.
-- `list_features` -- list mapped feature slices, filterable by `kind` (`route`, `cli-command`, `library`, `test-suite`, `service`, `config`, `infra`), `language`, or `tag` (0.7.0).
+- `list_features` -- list mapped feature slices, filterable by `kind` (`route`, `cli-command`, `library`, `test-suite`, `service`, `config`, `job`), `language`, or `tag` (0.7.0).
 - `find_feature` -- given a file path, return the feature(s) that own it. Routes "what slice owns this file?" without scanning by hand.
 - `feature_bundle` -- curated code bundle for one feature slice (entry + owned + tests + context as primary/related chunks, plus the entry symbol's definition and optionally its callers/callees). Same shape as `export_context` but anchored on the feature's pre-curated file list. Returns `not found` marker when the `feature_id` is unknown.
 
@@ -205,7 +205,7 @@ Corpus YAMLs are not bundled; bring your own. `CODESAGE_BENCH_CORPUS_DIR` (consu
 
 ## Plugin
 
-`plugins/codesage-tools/` ships as a Claude Code plugin: one global `codesage` MCP registration serves every onboarded project, routed by an absolute `project` argument. The registered command remains `codesage mcp`; the shim handles daemon startup and reuse. Slash commands: `/codesage-onboard`, `/codesage-reset`, `/codesage-reindex`, `/codesage-bench`, `/codesage-eval`. Marketplace manifest at repo root.
+`plugins/codesage-tools/` ships as a Claude Code plugin: one global `codesage` MCP registration serves every onboarded project, routed by an absolute `project` argument. The registered command remains `codesage mcp`; the shim handles daemon startup and reuse. Slash commands: `/codesage-onboard`, `/codesage-reset`, `/codesage-reindex`, `/codesage-bench`, `/codesage-eval`, `/codesage-prompt-override`, and the four feature-slice review commands (`/codesage-review`, `/codesage-triage`, `/codesage-revalidate`, `/codesage-report`). Marketplace manifest at repo root.
 
 ## Git history intelligence (V2b slice 1)
 

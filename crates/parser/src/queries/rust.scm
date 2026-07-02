@@ -24,3 +24,6 @@
 
 ; Pattern 8: Macro definition → Macro
 (macro_definition name: (identifier) @name) @def
+
+; Pattern 9: Trait method signature (fn foo(&self) -> T;) → Method
+(function_signature_item name: (identifier) @name) @def

@@ -521,8 +521,11 @@ const CPP_EXTRA_RULES: &[TrustBoundaryRule] = &[
     // STL
     rule("filesystem", MatchMode::Exact, FS),
     rule("fstream", MatchMode::Exact, FS),
-    rule("iostream", MatchMode::Exact, USER_INPUT),
-    rule("system_error", MatchMode::Exact, EXEC),
+    // A bare `#include <iostream>` fires on every hello-world, so key user-input
+    // off actual `std::cin` usage instead of the include. The parser only records
+    // `std::cin` as a ref via `using std::cin;` (it is not a call expression), so
+    // this is deliberately narrow — output-only I/O (`std::cout`) no longer taints.
+    rule("std::cin", MatchMode::PrefixDoubleColon, USER_INPUT),
     // Boost / asio
     rule("boost/asio.hpp", MatchMode::Exact, NETWORK),
     rule("boost/asio/", MatchMode::PrefixSlash, NETWORK),
@@ -560,9 +563,18 @@ const PYTHON_RULES: &[TrustBoundaryRule] = &[
     rule("shutil", MatchMode::PrefixDot, FS),
     rule("tempfile", MatchMode::PrefixDot, FS),
     rule("glob", MatchMode::PrefixDot, FS),
-    // process-exec
+    // process-exec — subprocess/multiprocessing plus the classic os-module
+    // shell/exec sinks. The exec/spawn families share a bare prefix (no dot
+    // separator: `os.execv`, `os.spawnl`), so they match by `Contains` rather
+    // than `PrefixDot`.
     rule("subprocess", MatchMode::PrefixDot, EXEC),
     rule("multiprocessing", MatchMode::PrefixDot, EXEC),
+    rule("os.system", MatchMode::PrefixDot, EXEC),
+    rule("os.popen", MatchMode::PrefixDot, EXEC),
+    rule("os.exec", MatchMode::Contains, EXEC),
+    rule("os.spawn", MatchMode::Contains, EXEC),
+    rule("os.posix_spawn", MatchMode::Contains, EXEC),
+    rule("pty.spawn", MatchMode::PrefixDot, EXEC),
     // secrets / crypto / env
     rule("os.environ", MatchMode::PrefixDot, SECRETS),
     rule("getpass", MatchMode::PrefixDot, SECRETS),
@@ -922,6 +934,69 @@ mod tests {
         assert!(rule_matches(nh, "net/http"));
         assert!(rule_matches(nh, "net/http/httptest"));
         assert!(!rule_matches(nh, "net/httpx"));
+    }
+
+    fn python_fires(name: &str, expected: TrustBoundary) -> bool {
+        rules_for(Language::Python)[0]
+            .iter()
+            .any(|r| rule_matches(r, name) && r.boundaries.contains(&expected))
+    }
+
+    #[test]
+    fn python_os_module_exec_sinks_fire_process_exec() {
+        // `os.system(user_input)` and friends are the classic shell-exec sinks;
+        // without these rules a file using them derives too few boundaries to
+        // trip the >=3 "security review recommended" note.
+        for name in [
+            "os.system",
+            "os.popen",
+            "os.execl",
+            "os.execve",
+            "os.execvp",
+            "os.spawnl",
+            "os.spawnvpe",
+            "os.posix_spawn",
+            "os.posix_spawnp",
+            "pty.spawn",
+        ] {
+            assert!(
+                python_fires(name, TrustBoundary::ProcessExec),
+                "expected process-exec boundary for `{name}`"
+            );
+        }
+    }
+
+    #[test]
+    fn python_os_path_and_environ_still_route_correctly() {
+        // The new exec rules must not steal os.path (filesystem) / os.environ
+        // (secrets) — those share the `os.` prefix but different capabilities.
+        assert!(python_fires("os.path", TrustBoundary::Filesystem));
+        assert!(python_fires("os.environ", TrustBoundary::Secrets));
+        assert!(!python_fires("os.path", TrustBoundary::ProcessExec));
+        assert!(!python_fires("os.environ", TrustBoundary::ProcessExec));
+    }
+
+    fn cpp_fires(name: &str, expected: TrustBoundary) -> bool {
+        rules_for(Language::Cpp)
+            .iter()
+            .flat_map(|table| table.iter())
+            .any(|r| rule_matches(r, name) && r.boundaries.contains(&expected))
+    }
+
+    #[test]
+    fn cpp_system_error_include_is_not_process_exec() {
+        // `<system_error>` is std error-handling, not a process launcher; the
+        // real exec sink `std::system` keeps its own rule.
+        assert!(!cpp_fires("system_error", TrustBoundary::ProcessExec));
+        assert!(cpp_fires("std::system", TrustBoundary::ProcessExec));
+    }
+
+    #[test]
+    fn cpp_iostream_include_does_not_taint_user_input() {
+        // A bare `#include <iostream>` no longer implies user input; only
+        // `std::cin` (recorded via `using std::cin;`) does.
+        assert!(!cpp_fires("iostream", TrustBoundary::UserInput));
+        assert!(cpp_fires("std::cin", TrustBoundary::UserInput));
     }
 
     #[test]

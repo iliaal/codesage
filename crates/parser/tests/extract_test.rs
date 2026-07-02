@@ -248,8 +248,18 @@ fn rust_qualified_names() {
     let new_method = syms.iter().find(|s| s.name == "new").unwrap();
     assert_eq!(new_method.qualified_name, "Config::new");
 
-    let serialize = syms.iter().find(|s| s.name == "serialize").unwrap();
-    assert_eq!(serialize.qualified_name, "Config::serialize");
+    // Two `serialize` symbols now exist: the trait method signature
+    // (`Serializable::serialize`, CR-018a) and the impl (`Config::serialize`).
+    let impl_serialize = syms
+        .iter()
+        .find(|s| s.name == "serialize" && s.qualified_name == "Config::serialize")
+        .expect("impl serialize resolves to Config::serialize");
+    assert_eq!(impl_serialize.kind, SymbolKind::Method);
+    let trait_serialize = syms
+        .iter()
+        .find(|s| s.name == "serialize" && s.qualified_name == "Serializable::serialize")
+        .expect("trait signature serialize resolves to Serializable::serialize");
+    assert_eq!(trait_serialize.kind, SymbolKind::Method);
 
     let process = syms.iter().find(|s| s.name == "process").unwrap();
     assert_eq!(process.qualified_name, "process");
@@ -415,6 +425,88 @@ fn nested_function_in_python_method_is_not_a_method() {
         .expect("method m extracted");
     assert_eq!(m.kind, SymbolKind::Method);
     assert_eq!(m.qualified_name, "A.m");
+}
+
+#[test]
+fn rust_trait_method_signature_is_captured() {
+    // CR-018a: `function_signature_item` (a trait method without a body) must
+    // surface as a Method qualified by the trait name.
+    let src = "trait Store {\n    fn get(&self, k: &str) -> u8;\n}\n";
+    let syms = symbols_from_source(src, Language::Rust);
+    let get = syms
+        .iter()
+        .find(|s| s.name == "get")
+        .expect("trait signature get extracted");
+    assert_eq!(get.kind, SymbolKind::Method);
+    assert_eq!(get.qualified_name, "Store::get");
+}
+
+#[test]
+fn rust_default_trait_method_is_a_method() {
+    // With `trait_item` added to is_inside_impl_or_class, a default method
+    // (a `function_item` with a body inside a trait) refines Function -> Method.
+    let src = "trait Store {\n    fn touch(&self) { let _ = self; }\n}\n";
+    let syms = symbols_from_source(src, Language::Rust);
+    let touch = syms.iter().find(|s| s.name == "touch").unwrap();
+    assert_eq!(touch.kind, SymbolKind::Method);
+    assert_eq!(touch.qualified_name, "Store::touch");
+}
+
+#[test]
+fn typescript_abstract_class_and_methods() {
+    // CR-012: abstract_class_declaration + its members.
+    let src = "abstract class Repo {\n  abstract find(id: number): string;\n  save(): void {}\n}\nexport default abstract class Base {}\n";
+    let syms = symbols_from_source(src, Language::TypeScript);
+    assert!(has_symbol(&syms, "Repo", SymbolKind::Class));
+    assert!(has_symbol(&syms, "Base", SymbolKind::Class));
+    // Abstract method signature -> Method, qualified by the abstract class.
+    let find = syms.iter().find(|s| s.name == "find").unwrap();
+    assert_eq!(find.kind, SymbolKind::Method);
+    assert_eq!(find.qualified_name, "Repo.find");
+    // Concrete method resolves its parent class name (abstract_class_declaration
+    // added to find_parent_class_name).
+    let save = syms.iter().find(|s| s.name == "save").unwrap();
+    assert_eq!(save.qualified_name, "Repo.save");
+}
+
+#[test]
+fn go_package_level_var_is_captured_but_not_locals() {
+    // CR-018b: package-level `var` -> Constant; locals must stay uncaptured.
+    let src =
+        "package main\nvar Registry = 1\nvar A, B int\nfunc f() { var local = 2; _ = local }\n";
+    let syms = symbols_from_source(src, Language::Go);
+    assert!(has_symbol(&syms, "Registry", SymbolKind::Constant));
+    assert!(has_symbol(&syms, "A", SymbolKind::Constant));
+    assert!(has_symbol(&syms, "B", SymbolKind::Constant));
+    assert!(
+        !syms.iter().any(|s| s.name == "local"),
+        "function-local var must not be captured as a package symbol"
+    );
+}
+
+#[test]
+fn generator_functions_are_captured() {
+    // CR-018c: generator_function_declaration -> Function in JS and TS.
+    let js = symbols_from_source("function* gen() { yield 1; }\n", Language::JavaScript);
+    assert!(has_symbol(&js, "gen", SymbolKind::Function));
+    let ts = symbols_from_source("function* gen() { yield 1; }\n", Language::TypeScript);
+    assert!(has_symbol(&ts, "gen", SymbolKind::Function));
+}
+
+#[test]
+fn top_level_var_is_captured_js_and_ts() {
+    // Cheap gap: top-level `var x` (variable_declaration, not lexical_declaration).
+    let js = symbols_from_source("var legacy = 1;\n", Language::JavaScript);
+    assert!(has_symbol(&js, "legacy", SymbolKind::Constant));
+    let ts = symbols_from_source("var legacy = 1;\n", Language::TypeScript);
+    assert!(has_symbol(&ts, "legacy", SymbolKind::Constant));
+}
+
+#[test]
+fn c_double_pointer_return_function_is_captured() {
+    // Cheap gap: `char **f()` nests two pointer_declarator levels.
+    let syms = symbols_from_source("char **get_names(void) { return 0; }\n", Language::C);
+    assert!(has_symbol(&syms, "get_names", SymbolKind::Function));
 }
 
 #[test]

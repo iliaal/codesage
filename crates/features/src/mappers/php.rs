@@ -1050,6 +1050,14 @@ fn parse_laravel_routes(root: &Path) -> Result<Vec<LaravelRoute>> {
     let group_inner_re = Regex::new(
         r#"(?ms)Route::((?:[A-Za-z_]\w*\s*\([^;]*?\)\s*->\s*)*)(get|post|put|patch|delete|options|any)\s*\(\s*['"]([^'"]+)['"](?:\s*,\s*['"]([^'"]+)['"])?"#,
     )?;
+    // Any `Route::<chain>group(function (...) { body });`. Used to catch
+    // prefix/middleware-only groups (no controller). The chain segment's
+    // `[^;]*?` can't span the `;` inside the closure body, so a `group(...)`
+    // call is never mistaken for a chain element and always binds as the
+    // literal group opener.
+    let group_re = Regex::new(
+        r#"(?ms)Route::((?:[A-Za-z_]\w*\s*\([^;]*?\)\s*->\s*)*)group\s*\(\s*function\s*\([^)]*\)\s*\{(.*?)\}\s*\)\s*;"#,
+    )?;
     for file in ["web.php", "api.php", "console.php", "channels.php"] {
         let path = routes_dir.join(file);
         if !is_safe_file(root, &path) {
@@ -1113,6 +1121,80 @@ fn parse_laravel_routes(root: &Path) -> Result<Vec<LaravelRoute>> {
                     verb,
                     pattern: route_uri_with_prefixes(&prefixes, pattern),
                     controller_class: controller_class.clone(),
+                    action,
+                    line,
+                });
+            }
+            if let Some(s) = span {
+                consumed_spans.push(s);
+            }
+        }
+
+        // Pass 1b: prefix/middleware-only groups —
+        // `Route::prefix('admin')->group(function () { … })` with no
+        // controller. Inner routes must inherit the group's prefix chain;
+        // without this they emit with their own (empty) chain and lose the
+        // group prefix. Controller groups are handled by pass 1, so skip a
+        // chain that names `controller(` and any span already consumed.
+        for cap in group_re.captures_iter(&scanned) {
+            let span = cap.get(0).map(|m| (m.start(), m.end()));
+            if let Some((s, e)) = span
+                && consumed_spans.iter().any(|(cs, ce)| s >= *cs && e <= *ce)
+            {
+                continue;
+            }
+            let outer_chain = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+            if outer_chain.contains("controller(") {
+                continue;
+            }
+            let body = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+            let body_base = cap.get(2).map(|m| m.start()).unwrap_or(0);
+            let outer_prefixes: Vec<String> = file_prefixes
+                .iter()
+                .cloned()
+                .chain(fluent_route_prefixes(outer_chain))
+                .collect();
+            for inner in route_re.captures_iter(body) {
+                let inner_abs = inner
+                    .get(0)
+                    .map(|m| (body_base + m.start(), body_base + m.end()));
+                // Guard against re-emitting a route a controller-group pass
+                // already consumed (nested groups).
+                if let Some((s, e)) = inner_abs
+                    && consumed_spans.iter().any(|(cs, ce)| s >= *cs && e <= *ce)
+                {
+                    continue;
+                }
+                let inner_chain = inner.get(1).map(|m| m.as_str()).unwrap_or("");
+                let verb = inner
+                    .get(2)
+                    .map(|m| m.as_str().to_uppercase())
+                    .unwrap_or_default();
+                let pattern = inner.get(3).map(|m| m.as_str()).unwrap_or("");
+                let raw_class = inner.get(4).map(|m| m.as_str()).unwrap_or("");
+                let action = inner.get(5).map(|m| m.as_str().to_string());
+                if verb.is_empty() || pattern.is_empty() {
+                    continue;
+                }
+                let line = inner
+                    .get(0)
+                    .map(|m| line_at(&scanned, body_base + m.start()))
+                    .unwrap_or(1);
+                let controller_class = if raw_class.is_empty() {
+                    None
+                } else {
+                    resolve_imported_class(&imports, raw_class)
+                };
+                let prefixes: Vec<String> = outer_prefixes
+                    .iter()
+                    .cloned()
+                    .chain(fluent_route_prefixes(inner_chain))
+                    .collect();
+                out.push(LaravelRoute {
+                    file: rel.clone(),
+                    verb,
+                    pattern: route_uri_with_prefixes(&prefixes, pattern),
+                    controller_class,
                     action,
                     line,
                 });
@@ -2746,6 +2828,42 @@ Route::prefix('admin')->prefix('settings')->get('/general', [AdminController::cl
         assert!(
             routes.iter().any(|r| r == &"GET /admin/settings/general"),
             "nested prefix not expanded: {routes:?}"
+        );
+    }
+
+    #[test]
+    fn laravel_prefix_group_inherits_prefix_on_inner_routes() {
+        let dir = tempdir().unwrap();
+        laravel_marker(dir.path());
+        write(
+            dir.path(),
+            "routes/web.php",
+            r#"<?php
+use App\Http\Controllers\UserController;
+Route::prefix('admin')->group(function () {
+    Route::get('/users', [UserController::class, 'index']);
+    Route::post('/users', [UserController::class, 'store']);
+});
+"#,
+        );
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let routes: Vec<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "laravel-route")
+            .filter_map(|s| s.entry_route.as_deref())
+            .collect();
+        assert!(
+            routes.iter().any(|r| r == &"GET /admin/users"),
+            "prefix-group prefix not inherited by inner GET: {routes:?}"
+        );
+        assert!(
+            routes.iter().any(|r| r == &"POST /admin/users"),
+            "prefix-group prefix not inherited by inner POST: {routes:?}"
+        );
+        // No duplicate, prefix-less emission from the top-level pass.
+        assert!(
+            !routes.iter().any(|r| r == &"GET /users"),
+            "inner route double-emitted without prefix: {routes:?}"
         );
     }
 

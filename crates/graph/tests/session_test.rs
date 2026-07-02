@@ -114,6 +114,40 @@ fn session_end_fails_when_new_cycle_introduced() {
     );
 }
 
+// A cycle wired only through PHP group-use syntax must be detected. Before
+// grouped-import refs were captured, the group-use clauses emitted no import
+// edges, so this cycle was invisible and session_start reported none.
+fn write_cyclic_php_group_use(root: &std::path::Path) {
+    std::fs::write(
+        root.join("A.php"),
+        b"<?php\nnamespace App;\nuse App\\{Repository};\nclass Controller { public function x(Repository $r) { return $r->y(); } }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("B.php"),
+        b"<?php\nnamespace App;\nuse App\\{Controller};\nclass Repository { public function y(Controller $c) { return $c->x(null); } }\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn cycle_through_group_use_is_detected() {
+    let (dir, db) = setup_project_with_codesage_dir();
+    write_cyclic_php_group_use(dir.path());
+    full_index(dir.path(), &db, &[], false).unwrap();
+
+    let snap = session_start(dir.path(), &db, "default").unwrap();
+    assert_eq!(
+        snap.cycles.len(),
+        1,
+        "group-use A<->B cycle must surface, got {:?}",
+        snap.cycles
+    );
+    let cycle = &snap.cycles[0];
+    assert!(cycle.contains(&"A.php".to_string()));
+    assert!(cycle.contains(&"B.php".to_string()));
+}
+
 #[test]
 fn session_end_reports_resolved_cycle() {
     let (dir, db) = setup_project_with_codesage_dir();

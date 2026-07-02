@@ -29,7 +29,7 @@ Skip confirmation only if `--yes` is in `$ARGUMENTS`.
 cd <project> && codesage status
 ```
 
-Record chunk count, file count, and language breakdown. This is the baseline for the post-reset diff.
+Record chunk count and file count. This is the baseline for the post-reset diff. `codesage status` does not emit a language breakdown; run `codesage overview` if you want one.
 
 ## Step 3: Drop the index
 

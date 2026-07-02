@@ -287,13 +287,8 @@ fn autotools_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<Featur
                     .filter(|s| is_c_or_cpp_compilable(s))
                     .cloned()
                     .collect::<Vec<_>>();
-                let entry = pick_entry(root, &dir, &entry_candidates, name).unwrap_or_else(|| {
-                    format!(
-                        "{}/{}",
-                        dir.trim_end_matches('/'),
-                        mf.rsplit('/').next().unwrap_or(mf)
-                    )
-                });
+                let entry = pick_entry(root, &dir, &entry_candidates, name)
+                    .unwrap_or_else(|| mf.to_string());
                 if !ctx.allowed(&entry) {
                     continue;
                 }
@@ -880,6 +875,13 @@ fn is_test_like_path(rel: &str) -> bool {
 /// the line-comment branch. Newlines inside bracket comments are
 /// preserved so the line layout isn't compressed.
 ///
+/// Quoted strings (`"..."`) and bracket arguments (`[[...]]`) are copied
+/// through verbatim so a `#` inside a string literal — `set(H "sha#abc")`,
+/// `project(x DESCRIPTION "C# bindings")` — is not mistaken for a line
+/// comment. Without this the cut left a dangling `"` that made the
+/// downstream command walker swallow to the next quote, dropping later
+/// `add_executable` / `add_library` targets.
+///
 /// The walk is driven by byte indices because the bracket-close marker
 /// (`]=*]`, `\n`, `#`, `[`) is pure ASCII and so can never match inside
 /// a UTF-8 continuation byte (continuation bytes are 0x80..=0xBF). Non-
@@ -916,6 +918,14 @@ fn strip_cmake_comments(body: &str) -> String {
                     continue;
                 }
             }
+        }
+        // Copy string-like spans (quoted strings and bracket arguments)
+        // through untouched. Both `cmake_skip_string_like` and `i` sit on
+        // char boundaries, so slicing `body[i..j]` never splits a scalar.
+        if let Some(j) = cmake_skip_string_like(bytes, i) {
+            out.push_str(&body[i..j]);
+            i = j;
+            continue;
         }
         if bytes[i] == b'#' {
             while i < bytes.len() && bytes[i] != b'\n' {
@@ -2239,5 +2249,68 @@ mod tests {
             .expect("autotools-bin seed");
         assert_eq!(s.entry_path, "subdir/thing.c");
         assert!(s.owned_files.iter().any(|f| f.path == "subdir/thing.c"));
+    }
+
+    #[test]
+    fn strip_cmake_comments_ignores_hash_inside_string() {
+        // A `#` inside a quoted string must not be treated as a line
+        // comment. The old stripper had no quote state, so it cut at the
+        // `#` and left a dangling `"`, which made the command walker
+        // swallow to the next quote and drop later targets.
+        let stripped = super::strip_cmake_comments(
+            "project(x DESCRIPTION \"C# bindings\")\nadd_executable(real src/real.c)\n",
+        );
+        assert!(
+            stripped.contains("C# bindings"),
+            "hash inside a quoted string was truncated: {stripped:?}"
+        );
+        assert!(
+            stripped.contains("add_executable(real src/real.c)"),
+            "target following a hash-bearing string was dropped: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn cmake_hash_in_string_does_not_drop_following_target() {
+        // End-to-end: a `#` inside a string literal earlier in the file
+        // must not corrupt parsing of a later add_executable.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "CMakeLists.txt",
+            "set(HASH \"sha256#abcdef\")\nadd_executable(real src/real.c)\n",
+        );
+        write(dir.path(), "src/real.c", "int main(){return 0;}\n");
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        assert!(
+            seeds
+                .iter()
+                .any(|s| s.source == "cmake-bin" && s.entry_command.as_deref() == Some("real")),
+            "target after a hash-in-string set() was dropped"
+        );
+    }
+
+    #[test]
+    fn autotools_root_bin_without_sources_has_no_phantom_path() {
+        // A root-level Makefile.am `bin_PROGRAMS` target with no explicit
+        // `_SOURCES` (automake defaults `thing_SOURCES = thing.c`) must not
+        // fall back to a phantom leading-slash entry path `/Makefile.am`.
+        let dir = tempdir().unwrap();
+        write(dir.path(), "Makefile.am", "bin_PROGRAMS = thing\n");
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let s = seeds
+            .iter()
+            .find(|s| s.source == "autotools-bin" && s.entry_command.as_deref() == Some("thing"))
+            .expect("autotools-bin seed");
+        assert!(
+            !s.entry_path.starts_with('/'),
+            "phantom leading-slash entry path: {:?}",
+            s.entry_path
+        );
+        assert_eq!(s.entry_path, "Makefile.am");
     }
 }

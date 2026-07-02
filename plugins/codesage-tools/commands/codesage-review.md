@@ -16,7 +16,7 @@ Flags:
 - `--limit N` — cap the number of features reviewed in one run (default: 50)
 - `--jobs N` — parallel subagents (default: 4; clamp to 8)
 - `--feature <id>` — review one specific feature (skips the discovery step)
-- `--kind <k>` — filter features by kind (`route`, `library`, `cli-command`, `test-suite`, `service`, `config`, `infra`)
+- `--kind <k>` — filter features by kind (`route`, `library`, `cli-command`, `test-suite`, `service`, `config`, `job`)
 - `--severity <s>` — minimum severity to report (`low`/`medium`/`high`, default `medium`)
 - `--categories <c,c,...>` — comma-separated list of `bug`/`security`/`perf`/`maintainability`/`style` (default: `bug,security`). `perf` and `maintainability` are opt-in: the reviewer reads slices statically and never profiles, so perf findings are inherently speculative and the highest false-positive category. The default keeps the two categories where a finding is almost always actionable. Add `perf` explicitly (`--categories bug,security,perf`) when you have a concrete hotspot concern; the rubric still gates it to demonstrable pessimizations.
 
@@ -26,7 +26,7 @@ If `--feature` is set, skip this step.
 
 Otherwise call MCP `mcp__codesage__list_features(project, kind?, limit=200)` to get the feature inventory. Then filter to features that need review:
 
-1. Drop features whose `.codesage/findings/<feature_id>.json` is newer than the feature's `updated_at` from the record AND has `runs[-1].status == "complete"` (already reviewed since last change).
+1. Drop features already reviewed since their last code change. A feature is up-to-date when its `.codesage/findings/<feature_id>.json` mtime is newer than the entry file's last commit time (`git -C <project> log -1 --format=%ct -- <entry_path>`) AND the most recent `.codesage/reviews/*.json` record that planned this feature has `"status": "complete"`. `FeatureRecord` carries no timestamp, so use the file mtime and git history rather than a record field.
 2. Sort by what the user is most likely to care about: `kind == "route"` > `kind == "cli-command"` > `kind == "service"` > rest. Then by `confidence: high` first.
 3. Apply `--limit`.
 
@@ -142,4 +142,4 @@ If any severity-high findings exist, list them with `finding_id` + `file:line` +
 - The subagent runs READ-ONLY. It must not edit, write, or commit. Its `autoApprove: read` setting enforces this.
 - If `--jobs` × token budget × feature count looks excessive, warn the user upfront ("This will dispatch 35 subagents in batches of 4; expect ~12 LLM invocations and a few minutes of wall-clock").
 - Subagent dispatch inherits the host's model. If you want a cheaper sweep, the user can prefix with `claude /codesage-review --model haiku` (handled at the Claude Code level, not by this skill).
-- The `.codesage/findings/` and `.codesage/reviews/` directories should be gitignored by default. The plugin's onboard script will add the entries on next refresh.
+- The `.codesage/findings/` and `.codesage/reviews/` directories are gitignored automatically. `codesage init` writes `.codesage/.gitignore` containing `*` (plus `!.gitignore`), so the whole `.codesage/` tree stays out of version control.

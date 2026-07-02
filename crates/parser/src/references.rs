@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use anyhow::Result;
 use codesage_protocol::{Language, Reference, ReferenceKind};
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{Query, QueryCursor, Tree};
+use tree_sitter::{Node, Query, QueryCursor, Tree};
 
 static PHP_REF_QUERY: &str = include_str!("queries/php_refs.scm");
 static PYTHON_REF_QUERY: &str = include_str!("queries/python_refs.scm");
@@ -12,10 +12,13 @@ static CPP_REF_QUERY: &str = include_str!("queries/cpp_refs.scm");
 static JAVA_REF_QUERY: &str = include_str!("queries/java_refs.scm");
 static RUST_REF_QUERY: &str = include_str!("queries/rust_refs.scm");
 static JS_REF_QUERY: &str = include_str!("queries/javascript_refs.scm");
-// TypeScript shares JavaScript's reference patterns (import / require / call /
-// member-call); the tree-sitter-typescript grammar accepts the same node names.
-// Reuse the JS query rather than maintain a byte-identical copy. fnd: CR-013.
-static TS_REF_QUERY: &str = include_str!("queries/javascript_refs.scm");
+// TypeScript mirrors JavaScript's reference patterns (import / require / call /
+// member-call / re-export / instantiation) but adds one TS-only pattern for
+// class inheritance: TS wraps the superclass in an `extends_clause` node that
+// does not exist in the JavaScript grammar, so it cannot live in the shared
+// JS file (the query would fail to compile against tree-sitter-javascript).
+// fnd: CR-013.
+static TS_REF_QUERY: &str = include_str!("queries/typescript_refs.scm");
 static GO_REF_QUERY: &str = include_str!("queries/go_refs.scm");
 
 /// Compiled reference query + cached @ref capture index, lazily initialized
@@ -92,6 +95,62 @@ pub(crate) const REF_QUERY_SOURCES: &[(Language, &str)] = &[
     (Language::Go, GO_REF_QUERY),
 ];
 
+/// Rust grouped-use prefix: for `use a::b::{X, Y}`, the leaf captured inside the
+/// `use_list` is bare (`X`). Walk up through any chain of enclosing
+/// `scoped_use_list` nodes, collecting their `path` fields, so the stored import
+/// name resolves to `a::b::X`. Returns `None` when the node is not inside a
+/// grouped use (e.g. a call or macro identifier).
+fn rust_grouped_use_prefix(node: &Node, source: &[u8]) -> Option<String> {
+    let mut segments: Vec<String> = Vec::new();
+    let mut current = node.parent();
+    while let Some(n) = current {
+        match n.kind() {
+            "use_list" => {}
+            "scoped_use_list" => {
+                if let Some(path) = n.child_by_field_name("path")
+                    && let Ok(text) = path.utf8_text(source)
+                {
+                    segments.push(text.to_string());
+                }
+            }
+            _ => break,
+        }
+        current = n.parent();
+    }
+    if segments.is_empty() {
+        None
+    } else {
+        segments.reverse();
+        Some(segments.join("::"))
+    }
+}
+
+/// PHP group-use prefix: for `use App\Models\{User, Post};`, the clause leaf is
+/// the bare suffix (`User`). Walk up to the enclosing `namespace_use_declaration`
+/// and read its base `namespace_name` so the stored import resolves to
+/// `App\Models\User`. Returns `None` for a plain (non-group) use, whose clause
+/// already carries the full name.
+fn php_group_use_prefix(node: &Node, source: &[u8]) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(n) = current {
+        match n.kind() {
+            "namespace_use_clause" | "namespace_use_group" => {}
+            "namespace_use_declaration" => {
+                let mut cursor = n.walk();
+                for child in n.named_children(&mut cursor) {
+                    if child.kind() == "namespace_name" {
+                        return child.utf8_text(source).ok().map(str::to_string);
+                    }
+                }
+                return None;
+            }
+            _ => return None,
+        }
+        current = n.parent();
+    }
+    None
+}
+
 fn php_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
     match pattern_index {
         0 => Some(ReferenceKind::Import), // namespace_use_declaration
@@ -101,6 +160,7 @@ fn php_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
         7 | 8 => Some(ReferenceKind::Inheritance), // class extends / implements
         9 => Some(ReferenceKind::TraitUse), // use_declaration inside class
         10..=13 => Some(ReferenceKind::TypeHint), // param / promoted-property / return type hints
+        14 => Some(ReferenceKind::Import), // group use (use App\Models\{User, Post};)
         _ => None,
     }
 }
@@ -112,6 +172,7 @@ fn python_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
         2 => Some(ReferenceKind::Import),   // from X import Y (specific name)
         3 => Some(ReferenceKind::Import),   // from X import Y as Z (aliased)
         4 | 5 => Some(ReferenceKind::Call), // call expression
+        6 => Some(ReferenceKind::Import),   // relative import module (from . import x)
         _ => None,
     }
 }
@@ -157,6 +218,7 @@ fn rust_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
         6 => Some(ReferenceKind::Call),        // method call (obj.method())
         7 => Some(ReferenceKind::Inheritance), // impl Trait for Type
         8 => Some(ReferenceKind::TypeHint),    // type of an impl block
+        9..=12 => Some(ReferenceKind::Import), // renamed / glob / grouped / braced use
         _ => None,
     }
 }
@@ -171,10 +233,30 @@ fn go_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
 
 fn js_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
     match pattern_index {
-        0 => Some(ReferenceKind::Import), // import statement
-        1 => Some(ReferenceKind::Import), // require("module")
-        2 => Some(ReferenceKind::Call),   // call (identifier)
-        3 => Some(ReferenceKind::Call),   // call (member expression)
+        0 => Some(ReferenceKind::Import),        // import statement
+        1 => Some(ReferenceKind::Import),        // require("module")
+        2 => Some(ReferenceKind::Call),          // call (identifier)
+        3 => Some(ReferenceKind::Call),          // call (member expression)
+        4 => Some(ReferenceKind::Import),        // re-export (export ... from "src")
+        5 => Some(ReferenceKind::Inheritance),   // class Foo extends Bar (JS heritage)
+        6 => Some(ReferenceKind::Instantiation), // new Foo()
+        _ => None,
+    }
+}
+
+/// TypeScript reference kinds. See `typescript_refs.scm`; the pattern order
+/// diverges from JS because the JS-only `class_heritage (identifier)`
+/// inheritance form is an impossible pattern under the TSX grammar and is
+/// dropped, shifting instantiation/inheritance up by one.
+fn ts_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
+    match pattern_index {
+        0 => Some(ReferenceKind::Import),        // import statement
+        1 => Some(ReferenceKind::Import),        // require("module")
+        2 => Some(ReferenceKind::Call),          // call (identifier)
+        3 => Some(ReferenceKind::Call),          // call (member expression)
+        4 => Some(ReferenceKind::Import),        // re-export (export ... from "src")
+        5 => Some(ReferenceKind::Instantiation), // new Foo()
+        6 => Some(ReferenceKind::Inheritance),   // class Foo extends Bar (TS extends_clause)
         _ => None,
     }
 }
@@ -193,7 +275,7 @@ pub fn extract_references(
         Language::Java => java_ref_kind,
         Language::Rust => rust_ref_kind,
         Language::JavaScript => js_ref_kind,
-        Language::TypeScript => js_ref_kind, // same ref structure
+        Language::TypeScript => ts_ref_kind,
         Language::Go => go_ref_kind,
     };
 
@@ -218,16 +300,26 @@ pub fn extract_references(
 
         let ref_node = ref_cap.node;
         let raw = ref_node.utf8_text(source).unwrap_or("");
-        let to_name = strip_surrounding_quotes(raw);
-        if to_name.is_empty() {
+        let stripped = strip_surrounding_quotes(raw);
+        if stripped.is_empty() {
             continue;
         }
+
+        // Grouped-import leaves are captured bare; prepend the enclosing base
+        // path so the stored name resolves the same way a flat import does.
+        let to_name = match language {
+            Language::Rust => rust_grouped_use_prefix(&ref_node, source)
+                .map_or_else(|| stripped.to_string(), |p| format!("{p}::{stripped}")),
+            Language::Php => php_group_use_prefix(&ref_node, source)
+                .map_or_else(|| stripped.to_string(), |p| format!("{p}\\{stripped}")),
+            _ => stripped.to_string(),
+        };
 
         let (row, col) = crate::position::node_start_utf8(&ref_node, source);
         refs.push(Reference {
             from_file: file_path.to_string(),
             from_symbol: None,
-            to_name: to_name.to_string(),
+            to_name,
             kind,
             line: row + 1,
             col,

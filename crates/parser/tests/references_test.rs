@@ -9,6 +9,67 @@ fn references_for(fixture: &str, language: Language) -> Vec<codesage_protocol::R
     extract_references(&tree, &source, language, fixture).unwrap()
 }
 
+fn refs_from_source(source: &str, language: Language) -> Vec<codesage_protocol::Reference> {
+    let bytes = source.as_bytes();
+    let tree = parse_file(bytes, language).unwrap();
+    extract_references(&tree, bytes, language, "inline").unwrap()
+}
+
+fn has_ref(refs: &[codesage_protocol::Reference], name: &str, kind: ReferenceKind) -> bool {
+    refs.iter().any(|r| r.to_name == name && r.kind == kind)
+}
+
+#[test]
+fn rust_grouped_glob_and_renamed_use_emit_prefixed_imports() {
+    // CR-011: grouped / glob / `as` use forms previously emitted zero imports.
+    let src = "use std::io::{Read, Write};\nuse a::b::*;\nuse x::y as z;\nuse std::{fmt, cmp::Ordering};\n";
+    let refs = refs_from_source(src, Language::Rust);
+    assert!(has_ref(&refs, "std::io::Read", ReferenceKind::Import));
+    assert!(has_ref(&refs, "std::io::Write", ReferenceKind::Import));
+    assert!(has_ref(&refs, "a::b", ReferenceKind::Import)); // glob module
+    assert!(has_ref(&refs, "x::y", ReferenceKind::Import)); // renamed source
+    assert!(has_ref(&refs, "std::fmt", ReferenceKind::Import)); // grouped bare name
+    assert!(has_ref(&refs, "std::cmp::Ordering", ReferenceKind::Import)); // grouped scoped name
+}
+
+#[test]
+fn php_group_use_emits_prefixed_imports() {
+    // CR-016: `use App\Models\{User, Post};` clauses nest under namespace_use_group.
+    let src = "<?php\nuse App\\Models\\{User, Post};\n";
+    let refs = refs_from_source(src, Language::Php);
+    assert!(has_ref(&refs, "App\\Models\\User", ReferenceKind::Import));
+    assert!(has_ref(&refs, "App\\Models\\Post", ReferenceKind::Import));
+}
+
+#[test]
+fn python_relative_import_module_edge_is_captured() {
+    // CR-017: `from .models import User` / `from . import helpers`.
+    let src = "from .models import User\nfrom . import helpers\n";
+    let refs = refs_from_source(src, Language::Python);
+    assert!(has_ref(&refs, ".models", ReferenceKind::Import));
+    assert!(has_ref(&refs, ".", ReferenceKind::Import));
+}
+
+#[test]
+fn javascript_reexport_inheritance_and_instantiation() {
+    // CR-013: re-export source, class heritage, and `new` in plain JS.
+    let src = "export { a } from \"./m\";\nclass Foo extends Bar {}\nconst x = new Baz();\n";
+    let refs = refs_from_source(src, Language::JavaScript);
+    assert!(has_ref(&refs, "./m", ReferenceKind::Import));
+    assert!(has_ref(&refs, "Bar", ReferenceKind::Inheritance));
+    assert!(has_ref(&refs, "Baz", ReferenceKind::Instantiation));
+}
+
+#[test]
+fn typescript_reexport_inheritance_and_instantiation() {
+    // CR-013: same three edges under the TSX grammar (extends_clause form).
+    let src = "export { a } from \"./m\";\nclass Foo extends Bar {}\nconst x = new Baz();\n";
+    let refs = refs_from_source(src, Language::TypeScript);
+    assert!(has_ref(&refs, "./m", ReferenceKind::Import));
+    assert!(has_ref(&refs, "Bar", ReferenceKind::Inheritance));
+    assert!(has_ref(&refs, "Baz", ReferenceKind::Instantiation));
+}
+
 #[test]
 fn python_extracts_attribute_method_calls() {
     let refs = references_for("sample.py", Language::Python);

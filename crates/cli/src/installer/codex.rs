@@ -3,7 +3,6 @@
 //! is ignored. Edited with `toml_edit` to preserve the user's formatting and
 //! comments.
 
-use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -83,10 +82,7 @@ impl AgentTarget for CodexTarget {
         if new_text == original {
             return Ok(InstallOutcome::Unchanged);
         }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        fs::write(&path, new_text).with_context(|| format!("writing {}", path.display()))?;
+        super::atomic_write(&path, &new_text)?;
         Ok(InstallOutcome::Wrote)
     }
 
@@ -118,7 +114,7 @@ impl AgentTarget for CodexTarget {
         if !removed {
             return Ok(UninstallOutcome::NotConfigured);
         }
-        fs::write(&path, doc.to_string()).with_context(|| format!("writing {}", path.display()))?;
+        super::atomic_write(&path, &doc.to_string())?;
         Ok(UninstallOutcome::Removed)
     }
 }
@@ -126,6 +122,7 @@ impl AgentTarget for CodexTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -159,6 +156,13 @@ mod tests {
         assert!(written.contains("[mcp_servers.codesage]"));
         assert!(written.contains("--project"));
         assert!(written.contains("/abs/proj"));
+
+        // Atomic write must not leave its same-dir temp file behind.
+        let leftovers: Vec<_> = fs::read_dir(cfg.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, vec![std::ffi::OsString::from("config.toml")]);
 
         // Second run changes nothing.
         assert_eq!(t.install(&c).unwrap(), InstallOutcome::Unchanged);

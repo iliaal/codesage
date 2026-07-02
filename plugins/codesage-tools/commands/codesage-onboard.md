@@ -1,7 +1,7 @@
 ---
 name: codesage-onboard
 description: Onboard a project to CodeSage (global MCP registration, init, index, git hooks, agent hint)
-argument-hint: "<project-path> [--device gpu|cpu] [--codesage-bin PATH] [--no-mcp] [--no-hooks] [--no-hint]"
+argument-hint: "<project-path> [--device gpu|cpu] [--codesage-bin PATH] [--no-mcp] [--no-hooks] [--no-hint] [--refresh-hint] [--hint-only]"
 ---
 
 # Onboard a project to CodeSage
@@ -24,7 +24,7 @@ Invoke via Bash:
 ${CLAUDE_PLUGIN_ROOT}/bin/codesage-onboard $ARGUMENTS
 ```
 
-The script runs six steps: global MCP registration (idempotent), `codesage init`, set device in `config.toml`, `codesage index`, install git hooks (if repo), write `.claude/CLAUDE.md` hint (if missing).
+The script runs seven steps: global MCP registration (idempotent), `codesage init`, set device in `config.toml`, `codesage index`, install git hooks (if repo), `codesage git-index` for V2b history (if repo), and write the agent hint. The hint lands in `.claude/CLAUDE.md` by default, or in a marked block inside a gitignored `AGENTS.md` if the repo keeps one. `--refresh-hint` overwrites an existing hint; `--hint-only` rewrites just the hint and skips MCP registration, init, indexing, and hooks.
 
 Indexing on CUDA is fast (seconds to a few minutes for most repos). On CPU it's 5-10× slower. If the script looks like it will run longer than ~2 minutes, use `run_in_background: true` and poll the output file.
 
@@ -33,7 +33,7 @@ Indexing on CUDA is fast (seconds to a few minutes for most repos). On CPU it's 
 Report what the script actually did, not what it planned:
 
 - Whether the global `codesage` MCP was newly registered or already present
-- Number of chunks indexed and language breakdown from `codesage index` output
+- Number of chunks indexed (the `Semantic:` line of `codesage index` output). `codesage index` does not emit a language breakdown; run `codesage overview` or the `project_overview` MCP tool if you want one.
 - Whether git hooks were installed
 - Whether `.claude/CLAUDE.md` was written or already existed
 - Any CUDA-fallback warnings from the script output
@@ -68,7 +68,7 @@ End with a short status block:
 
 - Project: `<path>`
 - MCP: `codesage` (connected/failed) — newly registered / already present
-- Index: `<N>` chunks, `<langs>`
+- Index: `<N>` chunks
 - Hooks: installed / skipped / N/A
 - Hint: written / existed / skipped
 - Sanity query: top hit `<file>` @ `<score>`

@@ -5,7 +5,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use anyhow::Result;
 use codesage_parser::discover::{TEST_LIKE_EXCLUDE_PATTERNS, build_exclude_set};
 use codesage_protocol::{Language, SearchRequest, SearchResult, Symbol, SymbolSummary};
-use codesage_storage::{Database, RawSearchRow, embedding_to_bytes};
+use codesage_storage::{Database, RawSearchRow, SemanticValidityToken, embedding_to_bytes};
 use globset::GlobSet;
 use regex::Regex;
 
@@ -269,6 +269,17 @@ fn rrf_merge(
         // No semantic candidates (BM25-only fusion): fall back to the full
         // valid score range.
         (0.0, 1.0)
+    };
+    // When every semantic candidate shares one score (duplicated chunks, a
+    // tiny corpus), the span collapses and the rescale below would map every
+    // fused row onto that single value — defeating the whole point, since a
+    // flat +0.1 boost could then reorder the fused ranking freely. Open a
+    // small synthetic span below the shared score so fused order survives with
+    // headroom under the additive boost.
+    let (sem_min, sem_max) = if (sem_max - sem_min).abs() < f32::EPSILON {
+        ((sem_max - 0.2).clamp(0.0, 1.0), sem_max.clamp(0.0, 1.0))
+    } else {
+        (sem_min, sem_max)
     };
     // Key is (path, start, end). Two chunks at the same location appearing
     // in both rankings collapse to one row with the summed RRF score.
@@ -978,13 +989,13 @@ fn definition_boost_enabled() -> bool {
 /// it. Replaces the per-query `all_chunk_file_paths()` full scan plus
 /// per-file lowercasing that used to run on every symbol-shaped search.
 struct StemIndex {
-    token: (i64, i64, i64),
+    token: SemanticValidityToken,
     by_lower: HashMap<String, Vec<String>>,
     by_norm: HashMap<String, Vec<String>>,
 }
 
 impl StemIndex {
-    fn build(db: &Database, token: (i64, i64, i64)) -> Result<Self> {
+    fn build(db: &Database, token: SemanticValidityToken) -> Result<Self> {
         let mut by_lower: HashMap<String, Vec<String>> = HashMap::new();
         let mut by_norm: HashMap<String, Vec<String>> = HashMap::new();
         for file_path in db.all_chunk_file_paths()? {
@@ -1041,27 +1052,44 @@ type StemCacheMap = HashMap<StemCacheKey, Arc<StemIndex>>;
 static STEM_CACHE: LazyLock<Mutex<StemCacheMap>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn stem_index_from_cache(
-    cache: &mut StemCacheMap,
+    cache: &Mutex<StemCacheMap>,
     key: StemCacheKey,
     db: &Database,
 ) -> Result<Arc<StemIndex>> {
+    // Read the validity token, then check the cache under the lock and drop
+    // it immediately. Building a cold or invalidated index (a full
+    // `all_chunk_file_paths` scan) must happen OUTSIDE the global lock: this
+    // cache is shared across every pooled project in the daemon, so holding
+    // it across a build would serialize the stem stage of concurrent searches
+    // on unrelated projects behind one project's rebuild.
     let token = db.semantic_files_validity_token()?;
+    {
+        let cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(hit) = cache.get(&key)
+            && hit.token == token
+        {
+            return Ok(Arc::clone(hit));
+        }
+    }
+    // Build unlocked. A concurrent builder racing on the same key produces an
+    // equivalent index, so a duplicate build is wasted work but never wrong.
+    let built = Arc::new(StemIndex::build(db, token)?);
+    let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+    // Re-check: a racer may have inserted a fresh entry for the same token
+    // while we built. Prefer the already-cached Arc so concurrent callers
+    // converge on one instance.
     if let Some(hit) = cache.get(&key)
         && hit.token == token
     {
         return Ok(Arc::clone(hit));
     }
-    let built = Arc::new(StemIndex::build(db, token)?);
     cache.insert(key, Arc::clone(&built));
     Ok(built)
 }
 
 fn stem_index_for(db: &Database) -> Result<Arc<StemIndex>> {
     match db.semantic_cache_key() {
-        Some(key) => {
-            let mut cache = STEM_CACHE.lock().unwrap_or_else(|p| p.into_inner());
-            stem_index_from_cache(&mut cache, key, db)
-        }
+        Some(key) => stem_index_from_cache(&STEM_CACHE, key, db),
         // In-memory handles have no stable identity to key a process cache
         // on; build fresh (the single-shot CLI cost profile).
         None => {
@@ -1869,6 +1897,59 @@ mod hybrid_tests {
         apply_symbol_boost(&mut results, &["known_sym".to_string()]);
         assert_eq!(results[0].file_path, "top.rs");
     }
+
+    #[test]
+    fn fused_rescale_spreads_rows_when_all_semantic_scores_are_equal() {
+        // Degenerate corpus: every semantic candidate shares one score
+        // (duplicated chunks / tiny index), so sem_max == sem_min. Without the
+        // synthetic-span fallback the rescale maps all fused rows to that one
+        // value, and a single +0.1 boost on a mid row then reorders the fused
+        // ranking freely. The fallback opens a span below the shared score so
+        // fused order is preserved with headroom the boost can't erase.
+        let mk_row = |path: &str, content: &str| RawSearchRow {
+            file_path: path.into(),
+            language: "rust".into(),
+            content: content.into(),
+            start_line: 1,
+            end_line: 1,
+            distance: 0.2, // identical for every row => l2_to_score = 0.98
+        };
+        // Fused order follows semantic rank: r0 (top) .. r3 (bottom).
+        let semantic = vec![
+            mk_row("top.rs", "fn top() {}"),
+            mk_row("second.rs", "fn second() {}"),
+            mk_row("mid.rs", "uses known_sym here"),
+            mk_row("low.rs", "fn low() {}"),
+        ];
+        let fused = rrf_merge(semantic, Vec::new(), 10);
+        let mut results: Vec<SearchResult> = fused
+            .into_iter()
+            .map(|r| SearchResult {
+                file_path: r.file_path,
+                language: codesage_protocol::Language::Rust,
+                content: r.content,
+                start_line: r.start_line,
+                end_line: r.end_line,
+                score: l2_to_score(r.distance),
+                symbols: Vec::new(),
+            })
+            .collect();
+
+        // The rescale must not collapse: the top fused hit keeps a strictly
+        // higher score than the bottom one.
+        assert_eq!(results[0].file_path, "top.rs");
+        assert!(
+            results[0].score > results.last().unwrap().score,
+            "equal semantic scores must still yield a spread fused ranking: {:?}",
+            results.iter().map(|r| r.score).collect::<Vec<_>>()
+        );
+
+        // A single +0.1 boost on the mid row must not displace the top hit.
+        // Without the fallback every score would be 0.98, so the boosted row
+        // (1.08) would jump straight past the top.
+        apply_symbol_boost(&mut results, &["known_sym".to_string()]);
+        assert_eq!(results[0].file_path, "top.rs");
+    }
 }
 
 #[cfg(test)]
@@ -2513,17 +2594,17 @@ mod stem_scan_tests {
     fn stem_cache_reuses_entry_while_validity_token_is_unchanged() {
         use super::stem_index_from_cache;
         use std::collections::HashMap;
-        use std::sync::Arc;
+        use std::sync::{Arc, Mutex};
 
         let db = Database::open_in_memory().unwrap();
         seed(&db);
         db.upsert_semantic_file_hash("src/foo_bar.rs", "h1")
             .unwrap();
 
-        let mut cache = HashMap::new();
+        let cache = Mutex::new(HashMap::new());
         let key = ("/tmp/test.db".to_string(), "chunks_test".to_string());
-        let first = stem_index_from_cache(&mut cache, key.clone(), &db).unwrap();
-        let again = stem_index_from_cache(&mut cache, key, &db).unwrap();
+        let first = stem_index_from_cache(&cache, key.clone(), &db).unwrap();
+        let again = stem_index_from_cache(&cache, key, &db).unwrap();
         assert!(
             Arc::ptr_eq(&first, &again),
             "unchanged validity token must reuse the cached index"
@@ -2534,16 +2615,16 @@ mod stem_scan_tests {
     fn stem_cache_rebuilds_when_validity_token_changes() {
         use super::stem_index_from_cache;
         use std::collections::HashMap;
-        use std::sync::Arc;
+        use std::sync::{Arc, Mutex};
 
         let db = Database::open_in_memory().unwrap();
         seed(&db);
         db.upsert_semantic_file_hash("src/foo_bar.rs", "h1")
             .unwrap();
 
-        let mut cache = HashMap::new();
+        let cache = Mutex::new(HashMap::new());
         let key = ("/tmp/test.db".to_string(), "chunks_test".to_string());
-        let first = stem_index_from_cache(&mut cache, key.clone(), &db).unwrap();
+        let first = stem_index_from_cache(&cache, key.clone(), &db).unwrap();
         assert!(!first.by_lower.contains_key("new_thing"));
 
         // Indexing a new file bumps the semantic_files validity token, which
@@ -2558,7 +2639,7 @@ mod stem_scan_tests {
         db.upsert_semantic_file_hash("src/new_thing.rs", "h2")
             .unwrap();
 
-        let rebuilt = stem_index_from_cache(&mut cache, key, &db).unwrap();
+        let rebuilt = stem_index_from_cache(&cache, key, &db).unwrap();
         assert!(
             !Arc::ptr_eq(&first, &rebuilt),
             "a changed validity token must rebuild the index"

@@ -397,14 +397,14 @@ const ALLOWED_MODELS: &[&str] = &[
     "nomic-ai/nomic-embed-text-v1.5",
 ];
 
-fn allow_any_model_from_env() -> bool {
+pub fn allow_any_model_from_env() -> bool {
     matches!(
         std::env::var("CODESAGE_ALLOW_ANY_MODEL").as_deref(),
         Ok("1") | Ok("true")
     )
 }
 
-fn validate_model_allowed(model: &str, allow_any: bool) -> Result<()> {
+pub fn validate_model_allowed(model: &str, allow_any: bool) -> Result<()> {
     if allow_any || ALLOWED_MODELS.contains(&model) {
         return Ok(());
     }

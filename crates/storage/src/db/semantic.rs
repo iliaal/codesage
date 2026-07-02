@@ -5,6 +5,12 @@ use rusqlite::params;
 
 use super::{Database, drop_chunk_table_group};
 
+/// Opaque comparison token returned by
+/// [`Database::semantic_files_validity_token`]. Components are
+/// `(count, max_rowid, max_indexed_at, sum_path_len, sum_path_first_char)`;
+/// callers only compare tokens for equality, never interpret the fields.
+pub type SemanticValidityToken = (i64, i64, i64, i64, i64);
+
 #[derive(Debug, Clone)]
 pub struct RawSearchRow {
     pub file_path: String,
@@ -527,16 +533,68 @@ impl Database {
     /// indexed file paths for the active chunk table changes. Reads the
     /// regular `semantic_files` bookkeeping table, not the vec0 chunk table:
     /// new files bump `COUNT(*)` / `MAX(rowid)`, removals drop `COUNT(*)`,
-    /// and any (re)index touches `MAX(indexed_at)`. Content-only re-embeds
-    /// of an existing path may leave the token unchanged within one second —
-    /// fine for consumers that only depend on the path set.
-    pub fn semantic_files_validity_token(&self) -> Result<(i64, i64, i64)> {
+    /// and any (re)index touches `MAX(indexed_at)`.
+    ///
+    /// `COUNT(*)` + `MAX(rowid)` + `MAX(indexed_at)` alone can be spoofed:
+    /// `semantic_files` has no AUTOINCREMENT, so deleting the highest-rowid
+    /// row and inserting a *different* path within the same second (a
+    /// watcher-debounced rename batch) reuses the freed rowid and restores an
+    /// identical `(count, max_rowid, max_indexed_at)` triple even though the
+    /// path set changed. `SUM(length(path))` and `SUM(unicode(path))` (the
+    /// summed first-char code point) are path-content-sensitive, so a rename
+    /// that changes total path length OR any leading character shifts the
+    /// token even when the counts and rowids line up. The residual blind spot
+    /// is a same-second rename that preserves both aggregates (e.g. an
+    /// anagram-length swap of the max-rowid row); content-only re-embeds of an
+    /// existing path may likewise leave the token unchanged within one second
+    /// — fine for consumers that only depend on the path set.
+    pub fn semantic_files_validity_token(&self) -> Result<SemanticValidityToken> {
         let token = self.conn.query_row(
-            "SELECT COUNT(*), COALESCE(MAX(rowid), 0), COALESCE(MAX(indexed_at), 0)
+            "SELECT COUNT(*), COALESCE(MAX(rowid), 0), COALESCE(MAX(indexed_at), 0),
+                    COALESCE(SUM(length(path)), 0), COALESCE(SUM(unicode(path)), 0)
              FROM semantic_files WHERE chunk_table = ?1",
             params![&self.chunk_table],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )?;
         Ok(token)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Database;
+
+    #[test]
+    fn validity_token_differs_when_max_rowid_row_swapped_for_new_path() {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_semantic_file_hash("aa", "h").unwrap();
+        db.upsert_semantic_file_hash("bbbb", "h").unwrap(); // highest rowid
+        // Pin indexed_at so MAX(indexed_at) can't be what distinguishes the
+        // tokens — isolating the collision to count/rowid.
+        db.conn
+            .execute("UPDATE semantic_files SET indexed_at = 1000", [])
+            .unwrap();
+        let before = db.semantic_files_validity_token().unwrap();
+
+        // Delete the highest-rowid row and insert a different path. SQLite has
+        // no AUTOINCREMENT here, so the freed rowid is reused: COUNT(*),
+        // MAX(rowid), and (pinned) MAX(indexed_at) all match `before`. The old
+        // 3-component token collided here even though the path set changed.
+        db.delete_semantic_file_hash("bbbb").unwrap();
+        db.upsert_semantic_file_hash("ccccccc", "h").unwrap();
+        db.conn
+            .execute("UPDATE semantic_files SET indexed_at = 1000", [])
+            .unwrap();
+        let after = db.semantic_files_validity_token().unwrap();
+
+        assert_eq!(
+            (before.0, before.1, before.2),
+            (after.0, after.1, after.2),
+            "count/max_rowid/max_indexed_at must collide — the exact case the old token missed"
+        );
+        assert_ne!(
+            before, after,
+            "path-content components must break the collision"
+        );
     }
 }

@@ -25,6 +25,17 @@ const MAX_TESTS_PER_SEED: usize = 5;
 pub fn nearby_tests(seed: &FeatureSeed, all_files: &[String]) -> Vec<String> {
     let stem = file_stem(&seed.entry_path);
     let dir = parent_dir(&seed.entry_path);
+
+    // Partition the repo once: keep only same-language test files, preserving
+    // `all_files` order so cap-truncation picks the same winners a full re-scan
+    // would. Both loops below then iterate this small candidate set instead of
+    // re-scanning (and re-`is_test_file`-checking) every repo file per seed —
+    // the hot path on seed-dense repos (php-src maps one seed per function).
+    let candidates: Vec<&String> = all_files
+        .iter()
+        .filter(|f| matches_language(f, seed.language) && is_test_file(f, seed.language))
+        .collect();
+
     let mut out: Vec<String> = Vec::new();
 
     // Authoritative first: tests the mapper explicitly declared via
@@ -37,27 +48,22 @@ pub fn nearby_tests(seed: &FeatureSeed, all_files: &[String]) -> Vec<String> {
         if pfx.is_empty() {
             continue;
         }
-        for f in all_files {
+        let pfx_slash = format!("{pfx}/");
+        for f in candidates.iter().copied() {
             if out.len() >= MAX_TESTS_PER_SEED {
                 break;
             }
             if out.iter().any(|x| x == f) {
                 continue;
             }
-            if !matches_language(f, seed.language) {
-                continue;
-            }
-            if !is_test_file(f, seed.language) {
-                continue;
-            }
-            if f.starts_with(&format!("{pfx}/")) || f == pfx {
+            if f.starts_with(&pfx_slash) || f == pfx {
                 out.push(f.clone());
             }
         }
     }
 
     // Heuristic convention/stem discovery fills the remaining slots.
-    for f in all_files {
+    for f in candidates.iter().copied() {
         if out.len() >= MAX_TESTS_PER_SEED {
             break;
         }
@@ -65,12 +71,6 @@ pub fn nearby_tests(seed: &FeatureSeed, all_files: &[String]) -> Vec<String> {
             continue;
         }
         if out.iter().any(|x| x == f) {
-            continue;
-        }
-        if !matches_language(f, seed.language) {
-            continue;
-        }
-        if !is_test_file(f, seed.language) {
             continue;
         }
         if file_relates_to(seed, stem, &dir, f) {
@@ -116,7 +116,7 @@ fn file_relates_to(seed: &FeatureSeed, stem: &str, dir: &str, candidate: &str) -
     };
     let always_attach_in_convention_dir = matches!(seed.language, Language::Rust);
     for default in convention_dirs {
-        if !candidate.starts_with(&format!("{default}/")) {
+        if !path_has_dir_prefix(candidate, default) {
             continue;
         }
         if always_attach_in_convention_dir {
@@ -257,13 +257,25 @@ fn same_stem_scope(entry: &str, candidate: &str) -> bool {
 
 fn monorepo_member_root(rel: &str) -> Option<String> {
     for prefix in ["packages/", "crates/"] {
-        let rest = rel.strip_prefix(prefix)?;
-        let member = rest.split('/').next()?;
+        // `continue` on a non-matching prefix — a bare `?` here returned None
+        // from the whole function on the first miss, leaving the `crates/`
+        // branch dead so `crates/*` sources never resolved a member root.
+        let Some(rest) = rel.strip_prefix(prefix) else {
+            continue;
+        };
+        let member = rest.split('/').next().unwrap_or("");
         if !member.is_empty() {
             return Some(format!("{prefix}{member}"));
         }
     }
     None
+}
+
+/// True if `dir` is the first path segment of `path` (i.e. `path` starts with
+/// `dir/`). Avoids the `format!("{dir}/")` allocation on the per-candidate hot
+/// path.
+fn path_has_dir_prefix(path: &str, dir: &str) -> bool {
+    path.len() > dir.len() && path.as_bytes()[dir.len()] == b'/' && path.starts_with(dir)
 }
 
 fn parent_dir(rel: &str) -> String {
@@ -419,6 +431,68 @@ mod tests {
         assert!(
             !t.contains(&"packages/ui/src/index.test.ts".to_string()),
             "cross-package stem match should not attach: {t:?}"
+        );
+    }
+
+    #[test]
+    fn crates_member_does_not_cross_attach_sibling_crate_test() {
+        // Regression: the `crates/` branch of monorepo_member_root was dead, so
+        // a crates-workspace source resolved no member root and a same-stem test
+        // in a *sibling* crate cross-attached. `crates/foo` must not pull in
+        // `crates/bar`'s test.
+        let s = seed("crates/foo/src/lib.rs", Language::Rust);
+        let all = vec![
+            "crates/foo/src/lib.rs".to_string(),
+            "crates/bar/tests/lib.rs".to_string(),
+        ];
+        let t = nearby_tests(&s, &all);
+        assert!(
+            !t.contains(&"crates/bar/tests/lib.rs".to_string()),
+            "sibling-crate test must not cross-attach: {t:?}"
+        );
+    }
+
+    #[test]
+    fn crates_member_attaches_own_crate_test() {
+        // The flip side: with the branch live, a crate's own in-tree test still
+        // attaches (proves the crates/ branch is no longer dead).
+        let s = seed("crates/foo/src/lib.rs", Language::Rust);
+        let all = vec![
+            "crates/foo/src/lib.rs".to_string(),
+            "crates/foo/tests/lib.rs".to_string(),
+        ];
+        let t = nearby_tests(&s, &all);
+        assert!(
+            t.contains(&"crates/foo/tests/lib.rs".to_string()),
+            "own-crate test should attach: {t:?}"
+        );
+    }
+
+    #[test]
+    fn candidate_partition_preserves_output_on_mixed_fixture() {
+        // Locks the optimized (partition + hoisted-format!) path against a
+        // fixture that exercises declared prefixes, stem matches, sibling-dir
+        // matches, and non-test noise together.
+        let mut s = seed("src/app/widget.py", Language::Python);
+        s.test_prefixes = vec!["integration".to_string()];
+        let all = vec![
+            "src/app/widget.py".to_string(),
+            "src/app/helper.py".to_string(), // non-test, same dir
+            "src/app/test_widget.py".to_string(), // sibling-dir test
+            "tests/test_widget.py".to_string(), // convention + stem match
+            "tests/test_unrelated.py".to_string(), // convention, no stem
+            "integration/widget_smoke_test.py".to_string(), // declared prefix
+            "README.md".to_string(),         // wrong language
+        ];
+        let mut t = nearby_tests(&s, &all);
+        t.sort();
+        assert_eq!(
+            t,
+            vec![
+                "integration/widget_smoke_test.py".to_string(),
+                "src/app/test_widget.py".to_string(),
+                "tests/test_widget.py".to_string(),
+            ]
         );
     }
 

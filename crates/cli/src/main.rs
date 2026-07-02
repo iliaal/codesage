@@ -182,7 +182,7 @@ enum Commands {
         #[arg(long)]
         callees: bool,
         /// Output format: md (default), json, or ingest (gitingest-style flat-text bundle)
-        #[arg(long, default_value = "md")]
+        #[arg(long, value_parser = ["md", "json", "ingest"], default_value = "md")]
         format: String,
     },
     /// Show project index status
@@ -449,8 +449,7 @@ enum WatchAction {
     /// Run a watcher in the foreground for a project (own embedder; logs to
     /// stderr). Useful for debugging or when not using the daemon.
     Run {
-        /// Project root to watch
-        #[arg(default_value = ".")]
+        /// Project root to watch (defaults to the current project)
         project: Option<PathBuf>,
         /// Debounce window in milliseconds (default 1000, env REINDEX_DEBOUNCE)
         #[arg(long)]
@@ -2605,6 +2604,7 @@ fn cmd_cleanup(dry_run: bool) -> Result<()> {
         );
     }
     let mut dropped = 0;
+    let mut failed = 0;
 
     println!("Active model:  {}", emb_config.model);
     println!(
@@ -2630,6 +2630,8 @@ fn cmd_cleanup(dry_run: bool) -> Result<()> {
                 Ok(()) => println!("  drop: {table}"),
                 Err(e) => {
                     tracing::error!(%table, error = %e, "failed to drop orphan vec table");
+                    eprintln!("  FAILED to drop: {table} ({e})");
+                    failed += 1;
                     continue;
                 }
             }
@@ -2653,6 +2655,12 @@ fn cmd_cleanup(dry_run: bool) -> Result<()> {
     println!("DB size after:  {}", format_bytes(size_after));
     println!("Saved:          {}", format_bytes(saved));
     println!("Dropped:        {dropped} tables");
+    if failed > 0 {
+        println!("Failed:         {failed} tables");
+        // Non-zero exit so a scripted auto-clean (e.g. /codesage-reindex) can
+        // detect that orphan tables were left behind.
+        bail!("failed to drop {failed} orphan vec table(s); see errors above");
+    }
     Ok(())
 }
 
@@ -3537,5 +3545,41 @@ mod tests {
 
         assert!(!hooks_dir.join("pre-commit").exists());
         assert!(installed.is_empty());
+    }
+
+    // ---------- clap arg contracts ----------
+
+    #[test]
+    fn export_rejects_unknown_format() {
+        let err = match Cli::try_parse_from(["codesage", "export", "foo", "--format", "bogus"]) {
+            Err(e) => e,
+            Ok(_) => panic!("an unrecognized --format must be rejected at parse time"),
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn export_accepts_known_formats() {
+        for fmt in ["md", "json", "ingest"] {
+            Cli::try_parse_from(["codesage", "export", "foo", "--format", fmt])
+                .unwrap_or_else(|e| panic!("--format {fmt} should parse, got {e}"));
+        }
+    }
+
+    #[test]
+    fn watch_run_defaults_project_to_none() {
+        // No default_value on `project`, so a bare `watch run` yields None and
+        // falls through to find_project_root() — matching watch status/stop/start.
+        let cli = Cli::try_parse_from(["codesage", "watch", "run"]).unwrap();
+        let project = match cli.command {
+            Commands::Watch {
+                action: WatchAction::Run { project, .. },
+            } => project,
+            _ => panic!("expected `watch run` to parse"),
+        };
+        assert!(
+            project.is_none(),
+            "bare `watch run` must leave project unset, got {project:?}"
+        );
     }
 }

@@ -10,8 +10,10 @@
 #   5. codesage index (structural + semantic)
 #   6. Verify CUDA actually engaged if device=gpu
 #   7. codesage install-hooks (if git repo)
-#   8. Write .claude/CLAUDE.md hint file teaching tool selection and the
-#      required `project` argument for every MCP call
+#   8. codesage git-index (V2b history, if git repo)
+#   9. Write the agent hint file (.claude/CLAUDE.md, or a marked block in a
+#      gitignored AGENTS.md) teaching tool selection and the required
+#      `project` argument for every MCP call
 #
 # Every step is idempotent or skippable — safe to re-run.
 
@@ -102,7 +104,7 @@ else
 
 # --- Step 1: global MCP registration ---
 if [ "$skip_mcp" -eq 0 ]; then
-    echo "==> [1/6] global MCP registration"
+    echo "==> [1/7] global MCP registration"
     if claude mcp list 2>/dev/null | grep -qE '^codesage[[:space:]:]'; then
         echo "    'codesage' already registered, skipping"
     else
@@ -114,11 +116,11 @@ if [ "$skip_mcp" -eq 0 ]; then
         fi
     fi
 else
-    echo "==> [1/6] MCP registration skipped (--no-mcp)"
+    echo "==> [1/7] MCP registration skipped (--no-mcp)"
 fi
 
 # --- Step 2: codesage init ---
-echo "==> [2/6] codesage init"
+echo "==> [2/7] codesage init"
 ( cd "$project" && "$codesage_bin" init )
 
 config="$project/.codesage/config.toml"
@@ -128,7 +130,7 @@ if [ ! -f "$config" ]; then
 fi
 
 # --- Step 3: set device in config.toml ---
-echo "==> [3/6] set device = $device"
+echo "==> [3/7] set device = $device"
 # Replace the first `device = "..."` line under [embedding].
 # codesage init writes device = "cpu" by default.
 python3 - "$config" "$device" <<'PY'
@@ -143,7 +145,7 @@ path.write_text(new_text)
 PY
 
 # --- Step 4: codesage index ---
-echo "==> [4/6] codesage index"
+echo "==> [4/7] codesage index"
 index_log="$(mktemp)"
 trap 'rm -f "$index_log"' EXIT
 
@@ -238,7 +240,7 @@ if [ "$skip_hint" -eq 0 ]; then
         trap 'rm -f "$hint_tmp"' EXIT
         cat > "$hint_tmp" <<HINT
 <!-- codesage-onboard-hint-begin -->
-<!-- codesage-onboard-hint-version: 0.7.2 -->
+<!-- codesage-onboard-hint-version: 0.13.0 -->
 # Local: code intelligence (CodeSage)
 
 Global MCP server \`codesage\` provides semantic search and structural graph queries for this project.
@@ -267,7 +269,7 @@ Pass that on every call. The server uses it to route to the right index.
 
 A feature slice is a behavior-keyed bundle: entrypoint + owned files + context files + tests + crossed trust boundaries + tags. Mapped deterministically (no LLM) from build manifests, framework routing, and source-level signals across PHP/Laravel, C/C++, Rust, Python, JS/TS, Go.
 
-- \`list_features\`: enumerate feature slices, filter by \`kind\` (\`route\`, \`cli-command\`, \`library\`, \`test-suite\`, \`service\`, \`config\`, \`infra\`), \`language\`, or \`tag\`. Use to discover the agent-facing surface area before deep-diving.
+- \`list_features\`: enumerate feature slices, filter by \`kind\` (\`route\`, \`cli-command\`, \`library\`, \`test-suite\`, \`service\`, \`config\`, \`job\`), \`language\`, or \`tag\`. Use to discover the agent-facing surface area before deep-diving.
 - \`find_feature\`: given a file path, return the feature(s) that own it. Answers "what slice owns app/Http/Controllers/UserController.php?" without scanning by hand.
 - \`feature_bundle\`: curated code bundle for one \`feature_id\`. Same shape as \`export_context\` but anchored on the feature's pre-resolved file list (entry + owned + tests + context) — avoids fan-out Read calls per file when reviewing or modifying a whole slice. Optionally expand the entry symbol's callers/callees.
 - Trust-boundary signal: each file in the index carries a derived tag set (\`network\`, \`filesystem\`, \`process-exec\`, \`secrets\`, \`database\`, \`user-input\`, \`external-api\`, \`serialization\`, \`auth\`, \`concurrency\`). The same signal feeds \`assess_risk\` and surfaces a \`"crosses N trust boundaries (X, Y, Z) — security review recommended"\` note when ≥3 are crossed. Quote that note in PR descriptions for security-sensitive patches.

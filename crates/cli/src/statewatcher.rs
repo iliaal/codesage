@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-use std::sync::{Arc, Weak, mpsc};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -55,25 +55,20 @@ pub struct StateWatcherConfig {
     pub shutdown: Arc<AtomicBool>,
 }
 
-/// Resolves the embedder through the provider on demand, holding only a
-/// `Weak` between uses, and only when a semantic reindex actually needs it
-/// (an idle watcher never triggers a model load). A strong ref held across
-/// idle periods would make the daemon pool's idle eviction — which skips
-/// models with outstanding clones — treat a watcher-idle model as in
-/// flight forever, pinning its VRAM and host RSS. Re-resolving through the
-/// provider is a pool lookup while the model is resident, a reload after
-/// eviction.
+/// Resolves the embedder through the provider on every use, holding no ref
+/// between uses. The provider is a pool lookup (map-lock + slot-lock) that
+/// restamps the pooled entry's `last_used`, so a reindex keeps the model
+/// marked in-use and the daemon's idle eviction won't drop a model the
+/// watcher touched seconds ago. Holding no strong ref across idle periods
+/// also means an idle watcher never pins the model's VRAM/host RSS against
+/// eviction; an idle watcher never calls `get`, so it never forces a load.
 struct EmbedderHandle {
     provider: Option<EmbedderProvider>,
-    cached: Option<Weak<Mutex<Embedder>>>,
 }
 
 impl EmbedderHandle {
     fn new(provider: Option<EmbedderProvider>) -> Self {
-        Self {
-            provider,
-            cached: None,
-        }
+        Self { provider }
     }
 
     fn enabled(&self) -> bool {
@@ -81,17 +76,10 @@ impl EmbedderHandle {
     }
 
     fn get(&mut self) -> Option<Arc<Mutex<Embedder>>> {
-        if let Some(emb) = self.cached.as_ref().and_then(Weak::upgrade) {
-            return Some(emb);
-        }
         let provider = self.provider.as_ref()?;
         match provider() {
-            Ok(emb) => {
-                self.cached = Some(Arc::downgrade(&emb));
-                Some(emb)
-            }
+            Ok(emb) => Some(emb),
             Err(e) => {
-                self.cached = None;
                 tracing::warn!(error = %e, "loading embedder for watcher");
                 None
             }
@@ -191,6 +179,11 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
                     let rel_str = rel.to_string_lossy().to_string();
                     match event.kind {
                         EventKind::Create(_) | EventKind::Modify(_) => {
+                            // A re-creation cancels a still-queued removal for
+                            // the same path; otherwise a removal deferred on
+                            // lock contention would fire later and delete the
+                            // live file's symbols/chunks.
+                            removed_paths.retain(|p| *p != rel_str);
                             pending.insert(rel, Instant::now());
                             batch_event_times.push(Instant::now());
                         }
@@ -565,6 +558,19 @@ fn handle_removals(config: &StateWatcherConfig, paths: &[String]) -> WorkOutcome
         return WorkOutcome::Done;
     }
 
+    // A path that exists on disk was re-created after its removal was queued
+    // (git checkout back-and-forth, atomic-save editors). Deleting its rows
+    // would silently drop a live file's symbols/chunks for the session, so
+    // only purge paths that are genuinely gone.
+    let to_remove: Vec<String> = paths
+        .iter()
+        .filter(|p| !config.project_root.join(p).exists())
+        .cloned()
+        .collect();
+    if to_remove.is_empty() {
+        return WorkOutcome::Done;
+    }
+
     let _lock = match lockfile::try_acquire(&config.project_root) {
         Ok(lockfile::LockOutcome::Acquired(lock)) => Some(lock),
         Ok(lockfile::LockOutcome::AlreadyHeld) => {
@@ -585,19 +591,44 @@ fn handle_removals(config: &StateWatcherConfig, paths: &[String]) -> WorkOutcome
         }
     };
 
-    match remove_files(&db, paths) {
+    match remove_files(&db, &to_remove) {
         Ok(n) => {
             if n > 0 {
-                tracing::info!(removed = n, paths = ?paths, "files removed from index");
+                tracing::info!(removed = n, paths = ?to_remove, "files removed from index");
             }
+        }
+        // A busy/locked DB is transient (a concurrent daemon reader or the
+        // lock holder). Retain the paths and retry rather than clear them,
+        // which would leave ghost symbols/chunks for the session.
+        Err(e) if is_retryable_db_error(&e) => {
+            tracing::debug!(error = %e, "removal deferred: database busy, will retry");
+            return WorkOutcome::Skipped;
         }
         Err(e) => {
             tracing::warn!(error = %e, "removing files from structural index");
+            return WorkOutcome::Failed;
         }
     }
 
-    let _ = semantic_remove_files(&db, paths);
+    if let Err(e) = semantic_remove_files(&db, &to_remove) {
+        if is_retryable_db_error(&e) {
+            tracing::debug!(error = %e, "semantic removal deferred: database busy, will retry");
+            return WorkOutcome::Skipped;
+        }
+        tracing::warn!(error = %e, "removing files from semantic index");
+    }
     WorkOutcome::Done
+}
+
+/// SQLITE_BUSY / SQLITE_LOCKED are transient — a concurrent daemon reader or
+/// the index-lock holder had the DB write-locked. Retrying after a debounce
+/// clears them, so the caller must retain the work (Skipped) rather than drop
+/// it (both Done and Failed clear the queued paths). Classified by rendered
+/// message because `rusqlite` is not a direct dependency of this crate; SQLite
+/// renders the whole busy/locked family as "... is locked".
+fn is_retryable_db_error(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    msg.contains("is locked") || msg.contains("busy")
 }
 
 /// Apply a bulk-incremental outcome to the accumulated watch state,
@@ -1052,6 +1083,58 @@ mod tests {
         // paths absent from the index is a no-op success.
         let paths = vec!["gone.rs".to_string()];
         assert_eq!(handle_removals(&config, &paths), WorkOutcome::Done);
+    }
+
+    #[test]
+    fn handle_removals_skips_recreated_file() {
+        // A removal queued while the path still exists on disk (a re-creation
+        // raced ahead of the retry) must not delete the live file's rows.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        let src = "fn main() {}\n";
+        std::fs::write(root.join("foo.rs"), src).unwrap();
+        let config = test_config(root);
+
+        let db = Database::open(&config.db_path).unwrap();
+        let file_info = FileInfo {
+            path: "foo.rs".to_string(),
+            language: codesage_protocol::Language::Rust,
+            content_hash: content_hash(src.as_bytes()),
+        };
+        index_files(root, &db, std::slice::from_ref(&file_info), false).unwrap();
+        assert!(db.get_file_hash("foo.rs").unwrap().is_some());
+        drop(db);
+
+        // foo.rs is present on disk, so the removal is a no-op and the rows
+        // survive.
+        assert_eq!(
+            handle_removals(&config, &["foo.rs".to_string()]),
+            WorkOutcome::Done
+        );
+        let db = Database::open(&config.db_path).unwrap();
+        assert!(
+            db.get_file_hash("foo.rs").unwrap().is_some(),
+            "re-created file must keep its indexed rows"
+        );
+    }
+
+    #[test]
+    fn is_retryable_db_error_classifies_busy_vs_permanent() {
+        assert!(is_retryable_db_error(&anyhow::anyhow!(
+            "database is locked"
+        )));
+        assert!(is_retryable_db_error(&anyhow::anyhow!(
+            "database table is locked"
+        )));
+        // The classifier walks the anyhow context chain, not just the top.
+        assert!(is_retryable_db_error(
+            &anyhow::anyhow!("database is locked").context("removing files")
+        ));
+        assert!(!is_retryable_db_error(&anyhow::anyhow!(
+            "no such table: files"
+        )));
+        assert!(!is_retryable_db_error(&anyhow::anyhow!("disk I/O error")));
     }
 
     #[test]

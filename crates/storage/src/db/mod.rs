@@ -31,7 +31,7 @@ mod semantic;
 mod structural;
 
 pub use git_hist::{CoChangeRow, GitFileRow};
-pub use semantic::{RawSearchRow, SemanticFreshness, embedding_to_bytes};
+pub use semantic::{RawSearchRow, SemanticFreshness, SemanticValidityToken, embedding_to_bytes};
 pub use structural::{FingerprintInput, StoredFingerprint};
 
 /// Decode a stored DB string column into an enum via its `parse`, surfacing an

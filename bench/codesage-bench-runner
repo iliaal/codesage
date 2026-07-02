@@ -148,13 +148,22 @@ def now_iso_utc() -> str:
 
 def run_codesage_search(codesage_bin: str, project_root: Path, query: str, limit: int) -> str:
     cmd = [codesage_bin, "search", "--json", "--limit", str(limit), query]
-    result = subprocess.run(
-        cmd,
-        cwd=project_root,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        # Score this case as a miss (empty output) instead of crashing the
+        # whole run and discarding every prior result.
+        print(f"[warn] codesage search timed out after 120s: {query!r}", file=sys.stderr)
+        return ""
+    except subprocess.SubprocessError as e:
+        print(f"[warn] codesage search errored: {e}", file=sys.stderr)
+        return ""
     if result.returncode != 0:
         print(f"[warn] codesage search failed rc={result.returncode}: {result.stderr}", file=sys.stderr)
     return result.stdout

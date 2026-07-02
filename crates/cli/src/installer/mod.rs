@@ -10,9 +10,11 @@
 //! the spawned server defaults the per-call `project` argument to that root
 //! (see `crate::mcp::inject_default_project_line`).
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use tempfile::NamedTempFile;
 
 mod codex;
 mod opencode;
@@ -87,6 +89,34 @@ pub(crate) fn read_config(path: &Path, default_when_absent: &str) -> Result<Stri
     }
 }
 
+/// Replace `path`'s contents atomically: write to a temp file in the *same*
+/// directory, flush it to disk, then rename over the target. A crash, ENOSPC,
+/// or interrupt mid-write leaves the original config intact instead of a
+/// truncated one. Truncate-then-write would let a failed write destroy the
+/// user's other MCP servers, settings, and comments — the very content the
+/// read side works so hard not to clobber. The temp file shares the target's
+/// directory so the rename stays on one filesystem (a cross-device rename is
+/// not atomic and would fail); on any error the `NamedTempFile` is cleaned up
+/// on drop, so no stray temp file lingers.
+pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let mut tmp = NamedTempFile::new_in(parent)
+        .with_context(|| format!("creating temp file in {}", parent.display()))?;
+    tmp.write_all(contents.as_bytes())
+        .with_context(|| format!("writing temp file in {}", parent.display()))?;
+    tmp.as_file()
+        .sync_all()
+        .with_context(|| format!("flushing temp file in {}", parent.display()))?;
+    tmp.persist(path)
+        .map_err(|e| e.error)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 /// The argv CodeSage registers for every agent: the `codesage` binary plus
 /// `mcp --project <abs>`. Returned split so TOML (separate command/args) and
 /// JSON (single command array) targets can each shape it.
@@ -124,5 +154,30 @@ mod tests {
         let (cmd, args) = mcp_command_args("/abs/proj");
         assert_eq!(cmd, "codesage");
         assert_eq!(args, vec!["mcp", "--project", "/abs/proj"]);
+    }
+
+    #[test]
+    fn atomic_write_replaces_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "original\n").unwrap();
+
+        atomic_write(&path, "replaced\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "replaced\n");
+
+        // The same-dir temp file must be renamed away, not left behind.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries.len(), 1, "temp file lingered: {entries:?}");
+    }
+
+    #[test]
+    fn atomic_write_creates_missing_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/deep/config.toml");
+        atomic_write(&path, "hi\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hi\n");
     }
 }

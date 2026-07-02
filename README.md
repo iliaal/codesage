@@ -244,7 +244,7 @@ claude plugin install codesage-tools@codesage
 /codesage-onboard /path/to/project
 ```
 
-Slash commands: `/codesage-onboard`, `/codesage-reset`, `/codesage-reindex`, `/codesage-bench`, `/codesage-eval`. The plugin handles global MCP registration, per-project init, indexing, git hook install (Husky-aware), and writes a `.claude/CLAUDE.md` hint teaching the agent how to route MCP calls.
+Slash commands: `/codesage-onboard`, `/codesage-reset`, `/codesage-reindex`, `/codesage-bench`, `/codesage-eval`, and `/codesage-prompt-override`, plus the four feature-slice review commands documented below (`/codesage-review`, `/codesage-triage`, `/codesage-revalidate`, `/codesage-report`). The plugin handles global MCP registration, per-project init, indexing, git hook install (Husky-aware), and writes a `.claude/CLAUDE.md` hint teaching the agent how to route MCP calls. `/codesage-prompt-override` prints a system-prompt fragment that steers Claude Code to prefer CodeSage's MCP tools over Grep for retrieval-shape tasks.
 
 ## 🔍 Feature-slice review
 
@@ -269,7 +269,7 @@ Dispatches subagents in parallel batches over the project's mapped feature slice
 - `--severity <s>`: minimum severity to report: `low` / `medium` / `high` (default `medium`)
 - `--categories <c,c,...>`: comma-separated list (default `bug,security`); other values include `perf`, `maintainability`
 
-Features whose `.codesage/findings/<feature_id>.json` is newer than the feature's `updated_at` AND whose last run was complete are skipped (already up-to-date). Sort order: `route` > `cli-command` > `service` > `library` > rest, then `high` confidence first.
+Features whose `.codesage/findings/<feature_id>.json` is newer than the entry file's last commit (`git log -1 --format=%ct -- <entry_path>`) AND whose last review run completed are skipped (already up-to-date). Sort order: `route` > `cli-command` > `service` > `library` > rest, then `high` confidence first.
 
 ### `/codesage-triage`
 
@@ -302,7 +302,7 @@ Deterministic Markdown render of the findings JSON. No LLM call.
 /codesage-report <project> [--status <s>] [--severity <s>] [--category <c>] [--feature <id>]
 ```
 
-- `--status <s>`: filter to one status (default: all except `false-positive` and `wont-fix`)
+- `--status <s,s>`: comma-separated statuses to include (default `open,wont-fix`; `false-positive` and `fixed` excluded unless named)
 - `--severity <s>`: minimum severity to render
 - `--category <c>`: filter to one category
 - `--feature <id>`: render findings for a single feature
@@ -315,7 +315,7 @@ Deterministic Markdown render of the findings JSON. No LLM call.
 | `.codesage/findings/history/<feature_id>-<run_id>.json` | Per-run snapshot of the feature's findings, never modified after write |
 | `.codesage/reviews/<run_id>.json` | Run record: filters used, features planned, completion stats by severity/category, top features by finding count, severity-high list |
 
-Both directories are added to `.gitignore` by `/codesage-onboard` (or its hint).
+Both directories are gitignored automatically. `codesage init` (run during `/codesage-onboard`) writes `.codesage/.gitignore` containing `*`, so the whole `.codesage/` tree stays out of version control.
 
 ### Example workflow
 

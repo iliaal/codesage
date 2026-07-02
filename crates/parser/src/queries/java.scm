@@ -37,3 +37,8 @@
 ;   they surface as Method symbols.
 (annotation_type_declaration
   name: (identifier) @name) @def
+
+; Pattern 8: enum constant (enum E { A, B }) -> Constant.
+; Parity with PHP enum_case, which already surfaces as Constant.
+(enum_constant
+  name: (identifier) @name) @def

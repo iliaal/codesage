@@ -82,11 +82,10 @@ pub fn build_project_overview(root: &Path, db: &Database) -> Result<ProjectOverv
         })
         .collect();
 
-    let top_risk_files = codesage_graph::top_risk_files(db, TOP_RISK_CAP).unwrap_or_default();
+    let top_risk_files = codesage_graph::top_risk_files(db, TOP_RISK_CAP)?;
 
     let trust_boundary_clusters: Vec<TrustBoundaryCount> = db
-        .trust_boundary_counts()
-        .unwrap_or_default()
+        .trust_boundary_counts()?
         .into_iter()
         .map(|(boundary, file_count)| TrustBoundaryCount {
             boundary,
@@ -100,8 +99,8 @@ pub fn build_project_overview(root: &Path, db: &Database) -> Result<ProjectOverv
     Ok(ProjectOverview {
         project_root: root.display().to_string(),
         languages,
-        file_count: db.file_count().unwrap_or(0),
-        symbol_count: db.symbol_count().unwrap_or(0),
+        file_count: db.file_count()?,
+        symbol_count: db.symbol_count()?,
         freshness,
         feature_summary,
         feature_count,
@@ -255,6 +254,20 @@ mod tests {
     fn unrelated_ancestor_prepends_stale_index_nudge() {
         let calls = suggested_next_calls(&freshness("unrelated_ancestor"));
         assert_eq!(calls.first().map(|c| c.tool.as_str()), Some(STALE_TOOL));
+    }
+
+    #[test]
+    fn build_overview_on_empty_db_reports_zero_counts() {
+        // A valid but empty index must produce a real zero-count overview via
+        // the `?` paths, not a fabricated one masked by `.unwrap_or_default()`.
+        let db = Database::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let overview = build_project_overview(dir.path(), &db)
+            .expect("overview must build on a valid empty index");
+        assert_eq!(overview.file_count, 0);
+        assert_eq!(overview.symbol_count, 0);
+        assert!(overview.top_risk_files.is_empty());
+        assert!(overview.trust_boundary_clusters.is_empty());
     }
 
     #[test]

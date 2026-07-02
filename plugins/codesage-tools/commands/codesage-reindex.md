@@ -58,12 +58,14 @@ If the mismatch path ran, the semantic portion will rebuild from scratch for eve
 
 ## Step 5: Report
 
-Parse the `codesage index` output and report:
+Parse the `codesage index` output. It prints these lines:
 
-- Files listed / added / deleted / reprocessed / unchanged
-- Total chunks after and delta vs. pre-count
-- Whether cleanup ran (and which model → which model)
-- Any errors
+- `Structural: N files (X skipped, Y failed, Z removed), S symbols, R references`
+- `Trust boundaries: backfilled N/M pending files` (only when a boundary backfill runs)
+- `Features:   created=… updated=… removed=… total=…`
+- `Semantic: N files (X skipped, Y failed, Z removed), C chunks`
+
+Report the structural and semantic file counts, the semantic chunk count and its delta vs. the pre-count, whether cleanup ran (and which model → which model), and any errors.
 
 End with one line: `<project>: <N> chunks, <M> files indexed, took <time>s`. If cleanup ran, prefix with `[model switched: old → new]`.
 

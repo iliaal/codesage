@@ -279,6 +279,31 @@ fn check_models(project: Option<&Path>) -> Check {
             )
         });
 
+    // A model name that isn't on the load-path allowlist errors at first load
+    // instead of downloading (see crates/embed/src/model.rs), so the cache
+    // "will download on first use" advice below would be wrong for it.
+    let allow_any = codesage_embed::model::allow_any_model_from_env();
+    let mut disallowed = Vec::new();
+    if codesage_embed::model::validate_model_allowed(&embed_model, allow_any).is_err() {
+        disallowed.push(embed_model.clone());
+    }
+    if let Some(m) = &rerank_model
+        && codesage_embed::model::validate_model_allowed(m, allow_any).is_err()
+    {
+        disallowed.push(m.clone());
+    }
+    if !disallowed.is_empty() {
+        return Check {
+            name: "models",
+            status: Status::Fail,
+            message: format!(
+                "{} not on the validated-model allowlist; will ERROR at first load, not download. \
+                 Set CODESAGE_ALLOW_ANY_MODEL=1 to run a model you trust.",
+                disallowed.join(", ")
+            ),
+        };
+    }
+
     let embed_present = model_in_cache(&cache, &embed_model);
     let rerank_present = rerank_model
         .as_ref()
@@ -566,12 +591,13 @@ fn check_mcp() -> Check {
 
 use crate::util::git_common_dir;
 
+/// Mirror hf-hub's `Cache::from_env` resolution (the path the embedder actually
+/// reads from): `$HF_HOME/hub`, else `~/.cache/huggingface/hub`. Deliberately
+/// does not honor `HUGGINGFACE_HUB_CACHE` — hf-hub 0.5.0 ignores it, so keying
+/// cache verdicts off it would test a directory the download never touches.
 fn hf_cache_dir() -> PathBuf {
     if let Ok(p) = std::env::var("HF_HOME") {
         return PathBuf::from(p).join("hub");
-    }
-    if let Ok(p) = std::env::var("HUGGINGFACE_HUB_CACHE") {
-        return PathBuf::from(p);
     }
     if let Ok(home) = std::env::var("HOME") {
         return PathBuf::from(home).join(".cache/huggingface/hub");
@@ -650,6 +676,24 @@ mod tests {
         let check = check_hooks(dir.path());
 
         assert_eq!(check.status, Status::Pass);
+    }
+
+    #[test]
+    fn check_models_fails_on_non_allowlisted_model() {
+        // The load path errors on a non-allowlisted model rather than
+        // downloading it, so doctor must surface that instead of "will
+        // download". Skip when the env override that neuters the gate is set.
+        if codesage_embed::model::allow_any_model_from_env() {
+            return;
+        }
+        let dir = init_codesage_project(); // model = codesage-test/model (not allowlisted)
+        let check = check_models(Some(dir.path()));
+        assert_eq!(check.status, Status::Fail);
+        assert!(
+            check.message.contains("CODESAGE_ALLOW_ANY_MODEL"),
+            "message should name the override env var: {}",
+            check.message
+        );
     }
 
     #[test]

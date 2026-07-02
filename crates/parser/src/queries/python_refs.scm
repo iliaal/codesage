@@ -15,3 +15,8 @@
 
 ; Pattern 5: attribute method call (self.db.find(...))
 (call function: (attribute attribute: (identifier) @ref))
+
+; Pattern 6: relative import module (from .models import User / from . import helpers)
+; The captured text keeps the leading dots so the consumer can resolve it
+; relative to the importing file.
+(import_from_statement module_name: (relative_import) @ref)

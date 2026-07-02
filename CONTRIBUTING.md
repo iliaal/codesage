@@ -60,12 +60,12 @@ Keep them focused. One topic per PR. Aim for under ~300 lines of diff; split if 
 
 CodeSage is actively developed and dogfooded against private codebases. Two mechanisms keep that work from leaking into the public repo.
 
-**Pre-commit leak check.** `codesage install-hooks` installs a `pre-commit` hook that greps every staged file against extended-regex patterns in two files:
+**Pre-commit leak check.** `codesage install-hooks --with-leak-check` installs a `pre-commit` hook that runs `scripts/leak-check.sh` over staged content. Plain `codesage install-hooks` does not add it: the hook execs a repo-shipped script, so wiring it automatically would hand a fresh clone of a malicious repo code execution on your next commit. When `scripts/leak-check.sh` is present, plain `install-hooks` prints a notice pointing you at the `--with-leak-check` flag. The script scans against extended-regex patterns in two files:
 
 - `scripts/leak-patterns.txt` — tracked, shared. Generic secret formats (private keys, AWS/GitHub/Slack tokens).
 - `.git/info/leak-patterns.txt` — local-only, per-developer. Add your own entries here: private repo names, internal domain terms, absolute home paths. This file never enters git.
 
-The hook prints the offending `file:line` and blocks the commit. Bypass with `git commit --no-verify` only when you're sure the match is a false positive, and refine the pattern afterwards.
+The script prints the offending `file:line` and blocks the commit. Bypass with `git commit --no-verify` only when you're sure the match is a false positive, and refine the pattern afterwards.
 
 **External test data via env vars.** Any path that points at private test data lives outside the repo and gets injected via environment variable. The existing example is `CODESAGE_BENCH_CORPUS_DIR` (default: `./bench-corpora`); set it to wherever your corpora actually live. Do not hardcode paths in tests, fixtures, or plugin commands.
 

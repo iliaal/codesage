@@ -1088,6 +1088,15 @@ fn next_pages_routes_at(ctx: &MapperContext, package_rel: &str) -> Result<Vec<Fe
         if !ends_with_any(&rel, &[".tsx", ".ts", ".jsx", ".js"]) {
             continue;
         }
+        // Next.js special pages-router files are not routes: `_app`,
+        // `_document`, `_error` (and any other `_`-prefixed convention
+        // file) plus `middleware`. Without this filter they surfaced as
+        // bogus `/_app`-style route features.
+        let basename = rel.rsplit('/').next().unwrap_or(&rel);
+        let stem = basename.rsplit_once('.').map_or(basename, |(head, _)| head);
+        if stem.starts_with('_') || stem == "middleware" {
+            continue;
+        }
         let language = language_for_entry(&rel);
         let inside_pages = rel.strip_prefix(&pkg_path_prefix).unwrap_or(&rel);
         let stripped = inside_pages
@@ -2813,6 +2822,59 @@ app.get("/health", (_, res) => res.send("ok"));
             next_routes.contains(&("apps/marketing/pages/about.tsx", "/about")),
             "missing apps/marketing /about page: {next_routes:?}"
         );
+    }
+
+    #[test]
+    fn next_pages_router_skips_special_files() {
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "package.json",
+            r#"{"name":"site","dependencies":{"next":"15.0.0"}}"#,
+        );
+        write(
+            dir.path(),
+            "pages/index.tsx",
+            "export default function Home() { return null; }\n",
+        );
+        write(
+            dir.path(),
+            "pages/about.tsx",
+            "export default function About() { return null; }\n",
+        );
+        write(
+            dir.path(),
+            "pages/_app.tsx",
+            "export default function App() { return null; }\n",
+        );
+        write(
+            dir.path(),
+            "pages/_document.tsx",
+            "export default function Doc() { return null; }\n",
+        );
+        write(
+            dir.path(),
+            "pages/_error.tsx",
+            "export default function Err() { return null; }\n",
+        );
+        write(dir.path(), "pages/middleware.ts", "export default {};\n");
+        let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let routes: BTreeSet<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "next-pages-route")
+            .filter_map(|s| s.entry_route.as_deref())
+            .collect();
+        assert!(routes.contains("/about"), "about page missing: {routes:?}");
+        assert!(
+            routes.contains("/index"),
+            "root index page missing: {routes:?}"
+        );
+        for bogus in ["/_app", "/_document", "/_error", "/middleware"] {
+            assert!(
+                !routes.contains(bogus),
+                "special file leaked as route {bogus}: {routes:?}"
+            );
+        }
     }
 
     #[test]

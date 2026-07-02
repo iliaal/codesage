@@ -7,7 +7,12 @@
 - The migration runner warns when an index was migrated by a newer codesage binary and refuses to open one carrying a `breaking_`-prefixed migration.
 
 ### Changed
+- Tree-sitter extraction now captures import forms that previously produced no edges: Rust grouped/glob/renamed `use {a, b}` / `use x::*` / `use x as y`, PHP group-use `use App\{A, B}`, and Python relative imports `from .mod import x`. Import-cycle detection, `assess_risk` blast radius, and trust-boundary derivation see these dependencies now (a cycle or a `use reqwest::{Client}` security import wired through grouped syntax was previously invisible).
+- Tree-sitter extraction now captures previously-missed definitions and references: TypeScript abstract classes and their methods, JS/TS generator functions and top-level `var`, JS/TS re-exports / `extends` / `new` (inheritance and instantiation edges), Rust trait method signatures (as methods of the trait), Go package-level `var`, C double-pointer return functions, and Java enum constants.
 - `assess_risk` / `codesage risk` now give structure-aware cycle-breaking guidance for a file in an import cycle: for a ring-like cycle, the lowest-co-change-weight edge as a candidate break point; for a hub-dominated cycle (where one cut won't help), the most-depended-on files as decoupling targets.
+- `codesage doctor` validates the configured embedding model and reranker against the allowlist and reports a failure (naming `CODESAGE_ALLOW_ANY_MODEL`) instead of promising a first-use download that would error.
+- `codesage export --format` rejects an unrecognized value at parse time instead of silently rendering markdown.
+- `codesage cleanup` reports failed vec-table drops and exits non-zero when any drop fails, so a scripted reindex can detect leftover orphans.
 - CLI `--json` output for `find-symbol`, `find-references`, `search`, and `similar` wraps results in the same `{"results": [...]}` envelope as the MCP tools (breaking for scripts that parsed the previous bare arrays).
 - MCP `kind` / `language` filter params are typed enums: input schemas advertise the legal values and an unrecognized value errors instead of silently returning unfiltered results.
 - The daemon picks up `.codesage/config.toml` changes per project (model switches, corrected configs) without `codesage daemon stop`; transient config read errors are no longer cached for the daemon's lifetime.
@@ -19,10 +24,19 @@
 - The filesystem watcher retains and retries reindex and removal work when the index lock is contended (deletions no longer ghost in search results for the session), respawns after a panic, no longer spawns duplicates on concurrent first tool-calls, and no longer pins pooled models against idle eviction.
 - Deleted files no longer linger in semantic search after a structural-only reindex: `remove_file` purges chunk tables, FTS sidecars, and feature refs.
 - Daemon startup on non-Linux platforms no longer SIGTERMs an unrelated process when a stale pid file's pid has been recycled; sibling daemons are validated against their own socket.
+- The filesystem watcher no longer deletes a file's index rows when the file is removed and re-created with identical content while the index lock is held; a re-creation now cancels a pending removal.
+- `assess_risk` / `review_rehearsal` now flag Python files that call the `os.system` / `os.popen` / `os.exec` / `os.spawn` / `pty.spawn` shell-exec family as crossing the process-exec trust boundary; `<system_error>` no longer false-tags C++ files as process-exec.
+- Feature mapper: Laravel `Route::prefix(...)->group(...)` inner routes inherit the group prefix; a `#` inside a CMake quoted string no longer truncates later targets; Rust workspace-member binaries no longer leak into a library slice's owned files; Next.js pages-router skips `_app` / `_document` / `middleware`; crates-based monorepo members no longer cross-attach a sibling crate's tests.
+- `codesage overview` / `project_overview` surface a query error instead of reporting a false zero-risk, zero-file result when the index is broken or pre-migration.
+- `codesage watch run` resolves the project root by walking up from the current directory, matching `watch status` / `stop` / `start`.
+- Drift detection classifies a repository with no commits as never-indexed rather than "not a git repository".
 
 ### Security
 - Embedding/reranker model names from repo-local `.codesage/config.toml` are validated against a built-in allowlist before any download or load, so indexing a cloned repo can no longer fetch an attacker-chosen ONNX model; set `CODESAGE_ALLOW_ANY_MODEL=1` to run a non-allowlisted model deliberately.
 - The leak-check pre-commit hook (which executes a repo-shipped script) is no longer auto-installed; opt in with `codesage install-hooks --with-leak-check`.
+- `scripts/leak-check.sh` no longer skips staged files with non-ASCII names (git's quoted-path output made the scan read them as empty), so secrets in such files are caught.
+- Agent configs written by `codesage install` are written atomically (temp file + rename), so an interrupted write can no longer truncate a user's existing Codex/opencode MCP config.
+- The release workflow passes tag-derived values through the environment instead of interpolating them into a shell command.
 
 ## [0.13.0] - 2026-06-22
 

@@ -89,14 +89,14 @@ if [ "$regex_status" -gt 1 ]; then
 	exit 2
 fi
 
-# Discover files to scan and the source for their content.
+# Resolve the content ref per mode and validate the range. `content_ref` is
+# empty in staged mode (blob lives at ":FILE"), the range endpoint in range
+# mode, and HEAD in all mode.
 case "$mode" in
 staged)
-	files="$(git diff --cached --name-only --diff-filter=AM)"
 	content_ref="" # ":FILE" syntax for staged content
 	;;
 range)
-	files="$(git diff --name-only --diff-filter=AM "$range")"
 	range_tip="${range##*..}"
 	if [ -z "$range_tip" ] || [ "$range_tip" = "$range" ]; then
 		echo "leak-check: --range must be A..B or A...B (got: $range)" >&2
@@ -105,28 +105,43 @@ range)
 	content_ref="$(git rev-parse --verify "${range_tip}^{commit}")"
 	;;
 all)
-	files="$(git ls-files)"
 	content_ref="HEAD"
 	;;
 esac
 
-if [ -z "$files" ]; then
-	exit 0
-fi
+# Emit the NUL-delimited file list for the active mode. core.quotepath=false +
+# -z keeps non-ASCII paths verbatim; the default C-quoting would rename them
+# (e.g. "p\303\242th.txt") so the later `git show ":$file"` would miss and the
+# file would be scanned as empty — a silent secret-scan bypass.
+list_files() {
+	case "$mode" in
+	staged)
+		git -c core.quotepath=false diff -z --cached --name-only --diff-filter=AM
+		;;
+	range)
+		git -c core.quotepath=false diff -z --name-only --diff-filter=AM "$range"
+		;;
+	all)
+		git -c core.quotepath=false ls-files -z
+		;;
+	esac
+}
 
-# Resolve the content source per file. In `staged` mode the blob is at `:FILE`;
-# in `range` mode it's at the range endpoint; in `all` mode it's at `HEAD:FILE`.
-content_source() {
+# Materialize one file's blob into $content_file. In `staged` mode the blob is
+# at `:FILE`; otherwise it's at `$content_ref:FILE`. Returns git show's exit
+# status so the caller can fail loudly rather than treat an unreadable blob as
+# empty.
+read_content() {
 	local file="$1"
 	if [ "$mode" = "staged" ]; then
-		git show ":$file" 2>/dev/null
+		git show ":$file" >"$content_file" 2>/dev/null
 	else
-		git show "$content_ref:$file" 2>/dev/null
+		git show "$content_ref:$file" >"$content_file" 2>/dev/null
 	fi
 }
 
 # Detect binary additions in staged mode via numstat. In other modes, let GNU
-# grep classify binary streams as non-text.
+# grep classify the already-materialized blob as text or binary.
 is_binary() {
 	local file="$1"
 	if [ "$mode" = "staged" ]; then
@@ -134,23 +149,37 @@ is_binary() {
 		added="$(git diff --cached --numstat -- "$file" | awk 'NR==1{print $1}')"
 		[ "$added" = "-" ]
 	else
-		if content_source "$file" | grep -I . >/dev/null; then
+		if grep -Iq . "$content_file"; then
 			return 1
 		fi
 		return 0
 	fi
 }
 
+content_file="$(mktemp)"
+trap 'rm -f "$content_file"' EXIT
+
 found=0
-while IFS= read -r file; do
+while IFS= read -r -d '' file; do
 	[ -z "$file" ] && continue
 
-	if echo "$file" | grep -qE -- "$FILENAME_ALLOW_RE"; then
+	if printf '%s\n' "$file" | grep -qE -- "$FILENAME_ALLOW_RE"; then
 		: # explicitly allowed, fall through to content scan
-	elif echo "$file" | grep -qE -- "$FILENAME_BLOCK_RE"; then
+	elif printf '%s\n' "$file" | grep -qE -- "$FILENAME_BLOCK_RE"; then
 		echo "leak-check: $file is denied by filename policy (secret/credential pattern)" >&2
 		found=1
 		continue
+	fi
+
+	# Fail loudly if the blob can't be read: silently skipping a listed file
+	# would let a secret through unscanned.
+	set +e
+	read_content "$file"
+	show_status=$?
+	set -e
+	if [ "$show_status" -ne 0 ]; then
+		echo "leak-check: failed to read content for $file (git show exit $show_status); refusing to skip it" >&2
+		exit 2
 	fi
 
 	if is_binary "$file"; then
@@ -158,7 +187,7 @@ while IFS= read -r file; do
 	fi
 
 	set +e
-	matches="$(content_source "$file" | grep -nI -E -e "$patterns")"
+	matches="$(grep -nI -E -e "$patterns" "$content_file")"
 	grep_status=$?
 	set -e
 	if [ "$grep_status" -gt 1 ]; then
@@ -170,9 +199,7 @@ while IFS= read -r file; do
 		printf '%s\n' "$matches" | head -5 | sed "s|^|  $file:|" >&2
 		found=1
 	fi
-done <<EOF
-$files
-EOF
+done < <(list_files)
 
 if [ "$found" -eq 1 ]; then
 	echo >&2

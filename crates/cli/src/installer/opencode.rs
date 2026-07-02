@@ -4,10 +4,9 @@
 //! and formatting survive a re-run. An existing `opencode.json` (no `c`) is
 //! preferred when present; otherwise `.jsonc` is created.
 
-use std::fs;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use jsonc_parser::ParseOptions;
 use jsonc_parser::cst::CstRootNode;
 use jsonc_parser::json;
@@ -79,10 +78,7 @@ impl AgentTarget for OpencodeTarget {
         if new_text == original {
             return Ok(InstallOutcome::Unchanged);
         }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        fs::write(&path, new_text).with_context(|| format!("writing {}", path.display()))?;
+        super::atomic_write(&path, &new_text)?;
         Ok(InstallOutcome::Wrote)
     }
 
@@ -111,8 +107,7 @@ impl AgentTarget for OpencodeTarget {
         if !removed {
             return Ok(UninstallOutcome::NotConfigured);
         }
-        fs::write(&path, root.to_string())
-            .with_context(|| format!("writing {}", path.display()))?;
+        super::atomic_write(&path, &root.to_string())?;
         Ok(UninstallOutcome::Removed)
     }
 }
@@ -120,6 +115,7 @@ impl AgentTarget for OpencodeTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -145,6 +141,13 @@ mod tests {
         assert!(written.contains("\"codesage\""));
         assert!(written.contains("--project"));
         assert!(written.contains(proj.path().to_string_lossy().as_ref()));
+
+        // Atomic write must not leave its same-dir temp file behind.
+        let leftovers: Vec<_> = fs::read_dir(proj.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, vec![std::ffi::OsString::from("opencode.jsonc")]);
 
         assert_eq!(t.install(&c).unwrap(), InstallOutcome::Unchanged);
     }

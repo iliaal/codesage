@@ -23,6 +23,8 @@ use std::process::Command;
 use codesage_storage::Database;
 use serde::Serialize;
 
+use crate::util::git_common_dir;
+
 /// Current drift state for a project's structural index.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DriftReport {
@@ -165,26 +167,26 @@ pub(crate) fn check_drift(project_root: &Path, db: &Database) -> DriftReport {
 
     let head_sha = git_head_sha(project_root);
 
-    let kind = match (&stored_sha, &head_sha) {
-        (_, None) => DriftKind::NotGit,
-        (None, Some(_)) => DriftKind::NeverIndexed,
-        (Some(stored), Some(head)) if stored == head => DriftKind::Fresh,
+    // Single `commits_between` spawn: derive both the classification and the
+    // count from one result instead of running the git pair twice.
+    let (kind, commits_between) = match (&stored_sha, &head_sha) {
+        // No HEAD SHA: distinguish a repo with an unborn HEAD (fresh `git
+        // init`, `checkout --orphan` — no commits yet) from a non-repo. Both
+        // yield `head_sha == None`, but only the latter is `NotGit`.
+        (_, None) => {
+            if git_common_dir(project_root).is_some() {
+                (DriftKind::NeverIndexed, None)
+            } else {
+                (DriftKind::NotGit, None)
+            }
+        }
+        (None, Some(_)) => (DriftKind::NeverIndexed, None),
+        (Some(stored), Some(head)) if stored == head => (DriftKind::Fresh, None),
         (Some(stored), Some(head)) => match commits_between(project_root, stored, head) {
-            CommitsBetween::Count(_) => DriftKind::BehindHead,
-            CommitsBetween::NotAncestor => DriftKind::UnrelatedAncestor,
-            CommitsBetween::Unknown => DriftKind::Unknown,
+            CommitsBetween::Count(n) => (DriftKind::BehindHead, Some(n)),
+            CommitsBetween::NotAncestor => (DriftKind::UnrelatedAncestor, None),
+            CommitsBetween::Unknown => (DriftKind::Unknown, None),
         },
-    };
-
-    let commits_between = match &kind {
-        DriftKind::BehindHead => match (&stored_sha, &head_sha) {
-            (Some(s), Some(h)) => match commits_between(project_root, s, h) {
-                CommitsBetween::Count(n) => Some(n),
-                _ => None,
-            },
-            _ => None,
-        },
-        _ => None,
     };
 
     DriftReport {
@@ -394,6 +396,41 @@ mod tests {
         };
         assert!(r.summary().contains("not an ancestor"));
         assert!(r.is_drift());
+    }
+
+    fn git_init(dir: &Path) {
+        let status = Command::new("git")
+            .arg("init")
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed");
+    }
+
+    #[test]
+    fn unborn_head_repo_is_not_classified_notgit() {
+        // Fresh `git init` with no commits: HEAD is unborn so `git rev-parse
+        // HEAD` fails, but it is still a real repo. Must not be reported as
+        // "not a git repository".
+        let dir = tempfile::tempdir().unwrap();
+        git_init(dir.path());
+        let db = Database::open_in_memory().unwrap();
+
+        let report = check_drift(dir.path(), &db);
+
+        assert_eq!(report.kind, DriftKind::NeverIndexed);
+        assert!(!report.is_drift());
+        assert_ne!(report.kind, DriftKind::NotGit);
+    }
+
+    #[test]
+    fn non_repo_dir_is_classified_notgit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+
+        let report = check_drift(dir.path(), &db);
+
+        assert_eq!(report.kind, DriftKind::NotGit);
     }
 
     #[test]

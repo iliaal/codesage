@@ -25,8 +25,8 @@ use codesage_protocol::{FeatureConfidence, FeatureKind, Language};
 use regex::Regex;
 
 use crate::mappers::shared::{
-    AUTH_SENSITIVE_TAG, is_safe_dir, is_safe_file, route_is_auth_sensitive, strip_line_comments,
-    walk_files,
+    AUTH_SENSITIVE_TAG, is_safe_dir, is_safe_file, read_to_string_bounded, route_is_auth_sensitive,
+    strip_line_comments, walk_files,
 };
 use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile, SeedTest};
 
@@ -74,10 +74,14 @@ impl FeatureMapper for PythonMapper {
         seeds.extend(pyproject_poetry_scripts(ctx)?);
         seeds.extend(setup_py_entry_points(ctx)?);
         seeds.extend(setup_cfg_entry_points(ctx)?);
-        seeds.extend(main_guard_modules(ctx)?);
-        seeds.extend(flask_routes(ctx)?);
-        seeds.extend(fastapi_routes(ctx)?);
-        seeds.extend(django_routes(ctx)?);
+        // Walk the tree once and read each `.py` once (bounded); the four
+        // source scanners below share this set instead of each re-walking
+        // and re-reading every file with an unbounded `read_to_string`.
+        let py_files = collect_python_source_files(ctx);
+        seeds.extend(main_guard_modules(&py_files)?);
+        seeds.extend(flask_routes(&py_files)?);
+        seeds.extend(fastapi_routes(&py_files)?);
+        seeds.extend(django_routes(&py_files)?);
         seeds.extend(pytest_test_suites(ctx, test_cmd.as_deref())?);
         seeds.retain(|s| ctx.allowed(&s.entry_path));
         Ok(seeds)
@@ -567,13 +571,37 @@ fn resolve_script_module_path(ctx: &MapperContext, module: &str) -> Option<Strin
     None
 }
 
-fn main_guard_modules(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
-    use codesage_protocol::FileCategory;
+/// A `.py` file read once during `map`, shared by every source scanner so
+/// the tree is walked once and each file read once (bounded).
+struct PyFile {
+    rel: String,
+    contents: String,
+}
+
+/// Walk the project once, reading each `.py` file with the bounded reader.
+/// Files above the reader's size cap (or unreadable) are dropped. The
+/// 30_000 file cap matches the per-scanner walk it replaces.
+fn collect_python_source_files(ctx: &MapperContext) -> Vec<PyFile> {
     let root = ctx.root;
     let mut out = Vec::new();
+    for rel in walk_files(root, root, 30_000, ctx.excludes) {
+        if !rel.ends_with(".py") {
+            continue;
+        }
+        let abs = root.join(&rel);
+        if let Ok(Some(contents)) = read_to_string_bounded(&abs) {
+            out.push(PyFile { rel, contents });
+        }
+    }
+    out
+}
+
+fn main_guard_modules(files: &[PyFile]) -> Result<Vec<FeatureSeed>> {
+    use codesage_protocol::FileCategory;
+    let mut out = Vec::new();
     let guard_re = Regex::new(r#"(?m)^if\s+__name__\s*==\s*['"]__main__['"]"#)?;
-    let files = walk_files(root, root, 30_000, ctx.excludes);
-    for rel in files.iter().filter(|p| p.ends_with(".py")) {
+    for f in files {
+        let rel = &f.rel;
         // Test files with `if __name__ == "__main__":` are ad-hoc test
         // runners, not CLI commands. They're often excluded by the
         // project's `[index].exclude_patterns`, so emitting features
@@ -582,17 +610,13 @@ fn main_guard_modules(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
         if matches!(FileCategory::classify(rel), FileCategory::Test) {
             continue;
         }
-        let abs = root.join(rel);
-        let Ok(raw) = fs::read_to_string(&abs) else {
-            continue;
-        };
-        if !guard_re.is_match(&raw) {
+        if !guard_re.is_match(&f.contents) {
             continue;
         }
         let stem = rel
             .rsplit('/')
             .next()
-            .and_then(|f| f.strip_suffix(".py"))
+            .and_then(|name| name.strip_suffix(".py"))
             .unwrap_or("script");
         out.push(FeatureSeed {
             title: format!("Python module `{stem}` (__main__)"),
@@ -627,8 +651,8 @@ fn main_guard_modules(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
 /// Known limitations: blueprint `url_prefix` is NOT expanded into mounted
 /// paths; non-literal paths or method lists are intentionally skipped
 /// rather than guessed.
-fn flask_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
-    python_framework_routes(ctx, PythonFramework::Flask)
+fn flask_routes(files: &[PyFile]) -> Result<Vec<FeatureSeed>> {
+    python_framework_routes(files, PythonFramework::Flask)
 }
 
 /// FastAPI route detection. Scans `.py` files that import fastapi for
@@ -639,8 +663,8 @@ fn flask_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
 /// Known limitations: `include_router(prefix=…)` mount prefixes are NOT
 /// expanded — upstream clawpatch doesn't expand them either. Non-literal
 /// paths are skipped.
-fn fastapi_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
-    python_framework_routes(ctx, PythonFramework::FastApi)
+fn fastapi_routes(files: &[PyFile]) -> Result<Vec<FeatureSeed>> {
+    python_framework_routes(files, PythonFramework::FastApi)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -696,12 +720,10 @@ impl PythonFramework {
 }
 
 fn python_framework_routes(
-    ctx: &MapperContext,
+    files: &[PyFile],
     framework: PythonFramework,
 ) -> Result<Vec<FeatureSeed>> {
-    let root = ctx.root;
     let mut out = Vec::new();
-    let files = walk_files(root, root, 30_000, ctx.excludes);
     let ctor_pattern: &str = match framework {
         PythonFramework::Flask => {
             r"(?m)^\s*([A-Za-z_][\w]*)\s*=\s*(?:flask\s*\.\s*)?(?:Flask|Blueprint)\s*\("
@@ -716,18 +738,15 @@ fn python_framework_routes(
         name = framework.import_token()
     ))?;
 
-    for rel in files.iter().filter(|p| p.ends_with(".py")) {
-        let abs = root.join(rel);
-        let Ok(raw) = fs::read_to_string(&abs) else {
-            continue;
-        };
+    for f in files {
+        let raw = &f.contents;
         // Cheap gates: framework token must appear, and an import line
         // must confirm it (avoids matching a string literal that
         // mentions the framework name).
         if !raw.contains(framework.import_token()) {
             continue;
         }
-        let source = strip_line_comments(&raw, '#');
+        let source = strip_line_comments(raw, '#');
         if !import_re.is_match(&source) {
             continue;
         }
@@ -742,7 +761,7 @@ fn python_framework_routes(
         }
         let mut emitted: BTreeSet<(String, String)> = BTreeSet::new();
         for recv in &receivers {
-            emit_python_routes_for(&source, rel, recv, framework, &mut emitted, &mut out)?;
+            emit_python_routes_for(&source, &f.rel, recv, framework, &mut emitted, &mut out)?;
         }
     }
     Ok(out)
@@ -1057,10 +1076,8 @@ fn push_python_route_seed(
 /// Non-literal route patterns (a variable instead of a string) are skipped.
 /// Django binds no HTTP method at the URL layer, so route labels carry the
 /// path only; the `auth-sensitive` tag therefore fires on path shape alone.
-fn django_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
-    let root = ctx.root;
+fn django_routes(files: &[PyFile]) -> Result<Vec<FeatureSeed>> {
     let mut out = Vec::new();
-    let files = walk_files(root, root, 30_000, ctx.excludes);
     let import_re = Regex::new(
         r"(?m)^\s*(?:from\s+django\.(?:urls|conf\.urls)\s+import\b|import\s+django\.(?:urls|conf\.urls)\b)",
     )?;
@@ -1068,16 +1085,14 @@ fn django_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
     // attribute access like `views.url(`; group 2 = the helper name.
     let call_re = Regex::new(r"(^|[^.\w])(path|re_path|url)\s*\(")?;
 
-    for rel in files.iter().filter(|p| p.ends_with(".py")) {
-        let abs = root.join(rel);
-        let Ok(raw) = fs::read_to_string(&abs) else {
-            continue;
-        };
+    for f in files {
+        let rel = &f.rel;
+        let raw = &f.contents;
         // Cheap gates before the comment strip + regex work.
         if !raw.contains("urlpatterns") || !raw.contains("django") {
             continue;
         }
-        let source = strip_line_comments(&raw, '#');
+        let source = strip_line_comments(raw, '#');
         if !import_re.is_match(&source) {
             continue;
         }
