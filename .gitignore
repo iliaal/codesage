@@ -37,4 +37,4 @@ id_ecdsa*
 id_ed25519*
 credentials.json
 service-account*.json
-bench/__pycache__/
+__pycache__/
