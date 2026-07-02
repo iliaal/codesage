@@ -5,7 +5,10 @@ iliaal/* Keep-a-Changelog convention.
 Checks (on the `## [Unreleased]` section only — released blocks are history):
   - every `### ` subsection is one of the canonical sections;
   - subsections appear in the canonical order, with no duplicates;
-  - no subsection is empty (each has at least one `- ` bullet).
+  - no subsection is empty (each has at least one `- ` bullet);
+  - each bullet is terse: no bold lead-in, no justification/explanation
+    phrase, and under the length backstop (consolidated semicolon lists are
+    fine; multi-sentence paragraphs are not).
 
 Canonical order: Added, Changed, Deprecated, Removed, Fixed, Security.
 
@@ -24,6 +27,31 @@ import sys
 
 CANONICAL = ["Added", "Changed", "Deprecated", "Removed", "Fixed", "Security"]
 RANK = {name: i for i, name in enumerate(CANONICAL)}
+
+# Substrings that mark a bullet as explaining or justifying the change rather
+# than stating it. The terse convention is: name the command/tool/behavior,
+# state the observable effect, stop. These are the tells of a paragraph
+# creeping in. Matched case-insensitively. Kept deliberately narrow so a
+# consolidated bullet (several sibling fixes joined by `;`) does not trip it.
+PROSE_TELLS = (
+    ", so ",          # causal tail: "...refs, so a reindex leaves no stale hits"
+    "so that ",
+    "in order to ",
+    "which means ",
+    "note that ",
+    "was previously",
+    "previously, ",
+)
+
+# Backstop against paragraph bullets. Consolidated semicolon lists run ~300
+# chars; genuine multi-sentence explanations run longer. Not a style ceiling —
+# a single terse change should land well under this.
+BULLET_MAX_LEN = 400
+
+
+def _excerpt(bullet: str, width: int = 60) -> str:
+    """A short, single-line handle for a bullet in an error message."""
+    return bullet if len(bullet) <= width else bullet[: width - 1] + "…"
 
 
 def extract_unreleased(text: str) -> str | None:
@@ -71,8 +99,31 @@ def lint(body: str) -> list[str]:
                 f"canonical order: {' -> '.join(CANONICAL)})"
             )
         last_rank = max(last_rank, RANK[name])
-        if not any(ln.lstrip().startswith("- ") for ln in lines):
+        bullets = [ln.strip()[2:].strip() for ln in lines if ln.lstrip().startswith("- ")]
+        if not bullets:
             problems.append(f"section `### {name}` has no `- ` bullets (remove it or fill it)")
+        for bullet in bullets:
+            problems.extend(f"`### {name}`: {p}" for p in _lint_bullet(bullet))
+    return problems
+
+
+def _lint_bullet(bullet: str) -> list[str]:
+    """Terse-style problems for a single bullet body (leading `- ` stripped)."""
+    problems: list[str] = []
+    if bullet.startswith("**"):
+        problems.append(f"bold lead-in — drop the `**...**` prefix — {_excerpt(bullet)}")
+    low = bullet.lower()
+    for tell in PROSE_TELLS:
+        if tell in low:
+            problems.append(
+                f"reads as explanation not a change (`{tell.strip()}`); "
+                f"state the effect and stop — {_excerpt(bullet)}"
+            )
+            break
+    if len(bullet) > BULLET_MAX_LEN:
+        problems.append(
+            f"{len(bullet)} chars (cap {BULLET_MAX_LEN}); split or tighten — {_excerpt(bullet)}"
+        )
     return problems
 
 

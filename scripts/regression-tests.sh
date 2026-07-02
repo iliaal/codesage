@@ -142,8 +142,62 @@ EOF
 	cd "$repo_root"
 }
 
+test_check_changelog_terseness() {
+	local tmp checker status
+	tmp="$(mktemp -d)"
+	trap 'rm -rf "$tmp"' RETURN
+	checker="$repo_root/scripts/check-changelog.py"
+
+	# A justification tail and a bold lead-in must both be rejected.
+	cat >"$tmp/bad.md" <<'EOF'
+# Changelog
+
+## [Unreleased]
+
+### Fixed
+
+- **Thing:** it broke, so users waited longer than before.
+EOF
+	set +e
+	python3 "$checker" "$tmp/bad.md" >"$tmp/bad.out" 2>&1
+	status=$?
+	set -e
+	if [ "$status" -eq 0 ]; then
+		printf 'expected check-changelog to reject a non-terse bullet\n' >&2
+		cat "$tmp/bad.out" >&2
+		return 1
+	fi
+	if ! grep -q 'bold lead-in' "$tmp/bad.out" || ! grep -q 'explanation' "$tmp/bad.out"; then
+		printf 'expected both bold-lead-in and explanation diagnostics\n' >&2
+		cat "$tmp/bad.out" >&2
+		return 1
+	fi
+
+	# A terse single change plus a consolidated semicolon list must pass.
+	cat >"$tmp/good.md" <<'EOF'
+# Changelog
+
+## [Unreleased]
+
+### Changed
+
+- `codesage export --format` rejects an unknown value instead of rendering markdown.
+
+### Fixed
+
+- Feature mapper: Laravel `prefix()->group()` inner routes inherit the prefix; `#` in a CMake string no longer truncates targets; Rust workspace-member bins stay out of library slices; Next.js pages-router skips special files.
+EOF
+	if ! python3 "$checker" "$tmp/good.md" >"$tmp/good.out" 2>&1; then
+		printf 'expected check-changelog to accept terse + consolidated bullets\n' >&2
+		cat "$tmp/good.out" >&2
+		return 1
+	fi
+	cd "$repo_root"
+}
+
 test_leak_check_range_uses_range_endpoint
 test_leak_check_invalid_regex_fails_closed
 test_release_script_updates_changelog_links
+test_check_changelog_terseness
 
 printf 'script regression tests passed\n'

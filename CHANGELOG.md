@@ -23,7 +23,7 @@
 ### Fixed
 - Chunk `end_line` no longer counts the chunk's trailing newline, fixing symbol misattribution at chunk boundaries.
 - The filesystem watcher retains and retries reindex / removal work under index-lock contention, cancels a pending removal when a file is re-created, respawns after a panic, avoids duplicate spawns, and no longer pins pooled models against idle eviction.
-- `remove_file` purges chunk tables, FTS sidecars, and feature refs, so a structural-only reindex leaves no stale search hits.
+- A structural-only reindex no longer leaves a deleted file's chunks, FTS rows, or feature refs in the index; `remove_file` purges them.
 - Non-Linux daemon startup no longer SIGTERMs a recycled pid; siblings are validated against their own socket.
 - `assess_risk` / `review_rehearsal` flag Python `os.system` / `os.popen` / `os.exec` / `os.spawn` / `pty.spawn` as process-exec; `<system_error>` no longer tags C++ as process-exec.
 - Feature mapper: Laravel `prefix()->group()` inner routes inherit the prefix; `#` in a CMake string no longer truncates targets; Rust workspace-member bins stay out of library slices; Next.js pages-router skips `_app` / `_document` / `middleware`; crates monorepo members don't cross-attach sibling tests.
