@@ -269,7 +269,7 @@ Dispatches subagents in parallel batches over the project's mapped feature slice
 - `--severity <s>`: minimum severity to report: `low` / `medium` / `high` (default `medium`)
 - `--categories <c,c,...>`: comma-separated list (default `bug,security`); other values include `perf`, `maintainability`
 
-Features whose `.codesage/findings/<feature_id>.json` is newer than the entry file's last commit (`git log -1 --format=%ct -- <entry_path>`) AND whose last review run completed are skipped (already up-to-date). Sort order: `route` > `cli-command` > `service` > `library` > rest, then `high` confidence first.
+Features whose `.codesage/findings/<feature_id>.json` is newer than the entry file's last commit (`git log -1 --format=%ct -- <entry_path>`) and whose last review run completed are skipped (already up-to-date). Sort order: `route` > `cli-command` > `service` > `library` > rest, then `high` confidence first.
 
 ### `/codesage-triage`
 
