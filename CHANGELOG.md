@@ -1,42 +1,41 @@
 ## [Unreleased]
 
 ### Added
-- MCP tools now advertise `readOnlyHint` and `openWorldHint: false` annotations, so read-only-gated clients (e.g. Cursor's Ask mode) can call the CodeSage surface without a write-confirmation prompt; `session_start` / `session_end` advertise `readOnlyHint: false` since they write session snapshots under `.codesage/`.
-- `--lock-wait <secs>` on `codesage index` and `codesage git-index`; installed git hooks pass `--lock-wait 60` so hook-triggered indexing waits out a busy watcher instead of silently skipping. Rerun `codesage install-hooks` per project to refresh existing hooks.
-- `found` boolean on `export_context`, `feature_bundle`, and `find_coupling` results: structured signal that the requested symbol, feature, or file exists in the index, replacing prose-sentinel sniffing.
-- The migration runner warns when an index was migrated by a newer codesage binary and refuses to open one carrying a `breaking_`-prefixed migration.
+- MCP tools advertise `readOnlyHint` / `openWorldHint: false`; `session_start` / `session_end` set `readOnlyHint: false`.
+- `--lock-wait <secs>` on `codesage index` and `git-index`; installed hooks pass `--lock-wait 60`. Rerun `codesage install-hooks` to refresh existing hooks.
+- `found` boolean on `export_context`, `feature_bundle`, and `find_coupling` results.
+- Migration runner refuses to open an index carrying an unknown `breaking_`-prefixed migration.
 
 ### Changed
-- Tree-sitter extraction now captures import forms that previously produced no edges: Rust grouped/glob/renamed `use {a, b}` / `use x::*` / `use x as y`, PHP group-use `use App\{A, B}`, and Python relative imports `from .mod import x`. Import-cycle detection, `assess_risk` blast radius, and trust-boundary derivation see these dependencies now (a cycle or a `use reqwest::{Client}` security import wired through grouped syntax was previously invisible).
-- Tree-sitter extraction now captures previously-missed definitions and references: TypeScript abstract classes and their methods, JS/TS generator functions and top-level `var`, JS/TS re-exports / `extends` / `new` (inheritance and instantiation edges), Rust trait method signatures (as methods of the trait), Go package-level `var`, C double-pointer return functions, and Java enum constants.
-- `assess_risk` / `codesage risk` now give structure-aware cycle-breaking guidance for a file in an import cycle: for a ring-like cycle, the lowest-co-change-weight edge as a candidate break point; for a hub-dominated cycle (where one cut won't help), the most-depended-on files as decoupling targets.
-- `codesage doctor` validates the configured embedding model and reranker against the allowlist and reports a failure (naming `CODESAGE_ALLOW_ANY_MODEL`) instead of promising a first-use download that would error.
-- `codesage export --format` rejects an unrecognized value at parse time instead of silently rendering markdown.
-- `codesage cleanup` reports failed vec-table drops and exits non-zero when any drop fails, so a scripted reindex can detect leftover orphans.
-- CLI `--json` output for `find-symbol`, `find-references`, `search`, and `similar` wraps results in the same `{"results": [...]}` envelope as the MCP tools (breaking for scripts that parsed the previous bare arrays).
-- MCP `kind` / `language` filter params are typed enums: input schemas advertise the legal values and an unrecognized value errors instead of silently returning unfiltered results.
-- The daemon picks up `.codesage/config.toml` changes per project (model switches, corrected configs) without `codesage daemon stop`; transient config read errors are no longer cached for the daemon's lifetime.
-- Search ranking: BM25-fused scores are rescaled onto the semantic score span so symbol boosts can't swamp fusion; reranking is skipped only when fusion actually contributed candidates; single English words no longer take the identifier rerank weight.
-- MCP budget truncation protects `assess_risk_diff`'s `files` array; when trimming is unavoidable the dropped entries are recorded in `_meta.dropped_files`.
+- Parser captures Rust grouped/glob/renamed `use`, PHP group-use, and Python relative imports as import edges; import-cycle detection, `assess_risk`, and trust boundaries now see them.
+- Parser captures TypeScript abstract classes, JS/TS generators and top-level `var`, JS/TS re-exports / `extends` / `new`, Rust trait method signatures, Go package-level `var`, C double-pointer returns, and Java enum constants.
+- `assess_risk` / `codesage risk` give structure-aware cycle-breaking guidance (ring: lowest-weight break edge; hub: top decoupling targets).
+- CLI `--json` for `find-symbol` / `find-references` / `search` / `similar` wraps results in `{"results": [...]}`.
+- MCP `kind` / `language` filter params are typed enums; an unknown value errors instead of returning unfiltered results.
+- The daemon reloads `.codesage/config.toml` per project on change without `codesage daemon stop`.
+- Search: BM25-fused scores rescale onto the semantic span; reranking skipped only when fusion contributed; single English words don't take the identifier rerank weight.
+- MCP budget truncation preserves `assess_risk_diff.files` and records dropped entries in `_meta.dropped_files`.
+- `codesage doctor` fails a non-allowlisted model or reranker, naming `CODESAGE_ALLOW_ANY_MODEL`.
+- `codesage export --format` rejects an unknown value instead of rendering markdown.
+- `codesage cleanup` reports failed vec-table drops and exits non-zero when any drop fails.
+- `codesage watch run` resolves the project root by walking up, matching `watch status` / `stop` / `start`.
 
 ### Fixed
-- Chunk `end_line` no longer counts the chunk's own trailing newline, fixing symbol misattribution at chunk boundaries in search annotation and `feature_bundle` entry-chunk selection.
-- The filesystem watcher retains and retries reindex and removal work when the index lock is contended (deletions no longer ghost in search results for the session), respawns after a panic, no longer spawns duplicates on concurrent first tool-calls, and no longer pins pooled models against idle eviction.
-- Deleted files no longer linger in semantic search after a structural-only reindex: `remove_file` purges chunk tables, FTS sidecars, and feature refs.
-- Daemon startup on non-Linux platforms no longer SIGTERMs an unrelated process when a stale pid file's pid has been recycled; sibling daemons are validated against their own socket.
-- The filesystem watcher no longer deletes a file's index rows when the file is removed and re-created with identical content while the index lock is held; a re-creation now cancels a pending removal.
-- `assess_risk` / `review_rehearsal` now flag Python files that call the `os.system` / `os.popen` / `os.exec` / `os.spawn` / `pty.spawn` shell-exec family as crossing the process-exec trust boundary; `<system_error>` no longer false-tags C++ files as process-exec.
-- Feature mapper: Laravel `Route::prefix(...)->group(...)` inner routes inherit the group prefix; a `#` inside a CMake quoted string no longer truncates later targets; Rust workspace-member binaries no longer leak into a library slice's owned files; Next.js pages-router skips `_app` / `_document` / `middleware`; crates-based monorepo members no longer cross-attach a sibling crate's tests.
-- `codesage overview` / `project_overview` surface a query error instead of reporting a false zero-risk, zero-file result when the index is broken or pre-migration.
-- `codesage watch run` resolves the project root by walking up from the current directory, matching `watch status` / `stop` / `start`.
-- Drift detection classifies a repository with no commits as never-indexed rather than "not a git repository".
+- Chunk `end_line` no longer counts the chunk's trailing newline, fixing symbol misattribution at chunk boundaries.
+- The filesystem watcher retains and retries reindex / removal work under index-lock contention, cancels a pending removal when a file is re-created, respawns after a panic, avoids duplicate spawns, and no longer pins pooled models against idle eviction.
+- `remove_file` purges chunk tables, FTS sidecars, and feature refs, so a structural-only reindex leaves no stale search hits.
+- Non-Linux daemon startup no longer SIGTERMs a recycled pid; siblings are validated against their own socket.
+- `assess_risk` / `review_rehearsal` flag Python `os.system` / `os.popen` / `os.exec` / `os.spawn` / `pty.spawn` as process-exec; `<system_error>` no longer tags C++ as process-exec.
+- Feature mapper: Laravel `prefix()->group()` inner routes inherit the prefix; `#` in a CMake string no longer truncates targets; Rust workspace-member bins stay out of library slices; Next.js pages-router skips `_app` / `_document` / `middleware`; crates monorepo members don't cross-attach sibling tests.
+- `codesage overview` / `project_overview` surface a query error instead of a false zero-risk result.
+- Drift detection classifies a commit-less repository as never-indexed, not "not a git repository".
 
 ### Security
-- Embedding/reranker model names from repo-local `.codesage/config.toml` are validated against a built-in allowlist before any download or load, so indexing a cloned repo can no longer fetch an attacker-chosen ONNX model; set `CODESAGE_ALLOW_ANY_MODEL=1` to run a non-allowlisted model deliberately.
-- The leak-check pre-commit hook (which executes a repo-shipped script) is no longer auto-installed; opt in with `codesage install-hooks --with-leak-check`.
-- `scripts/leak-check.sh` no longer skips staged files with non-ASCII names (git's quoted-path output made the scan read them as empty), so secrets in such files are caught.
-- Agent configs written by `codesage install` are written atomically (temp file + rename), so an interrupted write can no longer truncate a user's existing Codex/opencode MCP config.
-- The release workflow passes tag-derived values through the environment instead of interpolating them into a shell command.
+- Embedding/reranker model names from repo config are allowlisted before download or load; `CODESAGE_ALLOW_ANY_MODEL=1` overrides.
+- The leak-check pre-commit hook is opt-in via `codesage install-hooks --with-leak-check`, not auto-installed.
+- `scripts/leak-check.sh` scans staged files with non-ASCII names instead of reading them as empty.
+- `codesage install` writes agent MCP configs atomically (temp file + rename).
+- The release workflow passes tag values through the environment, not shell interpolation.
 
 ## [0.13.0] - 2026-06-22
 
