@@ -1,10 +1,28 @@
 ## [Unreleased]
 
 ### Added
-- MCP tools now advertise `readOnlyHint: true` and `openWorldHint: false` annotations, so read-only-gated clients (e.g. Cursor's Ask mode) can call the full CodeSage surface without a write-confirmation prompt.
+- MCP tools now advertise `readOnlyHint` and `openWorldHint: false` annotations, so read-only-gated clients (e.g. Cursor's Ask mode) can call the CodeSage surface without a write-confirmation prompt; `session_start` / `session_end` advertise `readOnlyHint: false` since they write session snapshots under `.codesage/`.
+- `--lock-wait <secs>` on `codesage index` and `codesage git-index`; installed git hooks pass `--lock-wait 60` so hook-triggered indexing waits out a busy watcher instead of silently skipping. Rerun `codesage install-hooks` per project to refresh existing hooks.
+- `found` boolean on `export_context`, `feature_bundle`, and `find_coupling` results: structured signal that the requested symbol, feature, or file exists in the index, replacing prose-sentinel sniffing.
+- The migration runner warns when an index was migrated by a newer codesage binary and refuses to open one carrying a `breaking_`-prefixed migration.
 
 ### Changed
 - `assess_risk` / `codesage risk` now give structure-aware cycle-breaking guidance for a file in an import cycle: for a ring-like cycle, the lowest-co-change-weight edge as a candidate break point; for a hub-dominated cycle (where one cut won't help), the most-depended-on files as decoupling targets.
+- CLI `--json` output for `find-symbol`, `find-references`, `search`, and `similar` wraps results in the same `{"results": [...]}` envelope as the MCP tools (breaking for scripts that parsed the previous bare arrays).
+- MCP `kind` / `language` filter params are typed enums: input schemas advertise the legal values and an unrecognized value errors instead of silently returning unfiltered results.
+- The daemon picks up `.codesage/config.toml` changes per project (model switches, corrected configs) without `codesage daemon stop`; transient config read errors are no longer cached for the daemon's lifetime.
+- Search ranking: BM25-fused scores are rescaled onto the semantic score span so symbol boosts can't swamp fusion; reranking is skipped only when fusion actually contributed candidates; single English words no longer take the identifier rerank weight.
+- MCP budget truncation protects `assess_risk_diff`'s `files` array; when trimming is unavoidable the dropped entries are recorded in `_meta.dropped_files`.
+
+### Fixed
+- Chunk `end_line` no longer counts the chunk's own trailing newline, fixing symbol misattribution at chunk boundaries in search annotation and `feature_bundle` entry-chunk selection.
+- The filesystem watcher retains and retries reindex and removal work when the index lock is contended (deletions no longer ghost in search results for the session), respawns after a panic, no longer spawns duplicates on concurrent first tool-calls, and no longer pins pooled models against idle eviction.
+- Deleted files no longer linger in semantic search after a structural-only reindex: `remove_file` purges chunk tables, FTS sidecars, and feature refs.
+- Daemon startup on non-Linux platforms no longer SIGTERMs an unrelated process when a stale pid file's pid has been recycled; sibling daemons are validated against their own socket.
+
+### Security
+- Embedding/reranker model names from repo-local `.codesage/config.toml` are validated against a built-in allowlist before any download or load, so indexing a cloned repo can no longer fetch an attacker-chosen ONNX model; set `CODESAGE_ALLOW_ANY_MODEL=1` to run a non-allowlisted model deliberately.
+- The leak-check pre-commit hook (which executes a repo-shipped script) is no longer auto-installed; opt in with `codesage install-hooks --with-leak-check`.
 
 ## [0.13.0] - 2026-06-22
 

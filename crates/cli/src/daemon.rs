@@ -905,10 +905,15 @@ mod unix {
     /// min) — a full second copy of the model memory for the whole overlap.
     ///
     /// Safety: we only signal processes that are (a) a live, start-time- or
-    /// cmdline-validated codesage daemon in *this* runtime dir and (b) started
-    /// strictly before us. The strictly-before guard means two daemons racing
-    /// to start can never kill each other. SIGTERM is graceful — the target
-    /// drains in-flight clients and removes its own socket/pid files on exit.
+    /// cmdline- or socket-validated codesage daemon in *this* runtime dir,
+    /// validated against the SIBLING's own runtime files (our own socket is
+    /// already bound by the time this runs, so probing it would vacuously
+    /// succeed), and (b) started strictly before us. The strictly-before
+    /// guard means two daemons racing to start can never kill each other;
+    /// when either start time is unavailable (non-Linux) we skip rather than
+    /// kill — reaping is an optimization, SIGTERM'ing a recycled pid is not
+    /// recoverable. SIGTERM is graceful — the target drains in-flight clients
+    /// and removes its own socket/pid files on exit.
     fn reap_stale_version_daemons(paths: &DaemonPaths) {
         let our_start = i32::try_from(std::process::id())
             .ok()
@@ -928,38 +933,76 @@ mod unix {
             {
                 continue;
             }
+            let Some(sibling_paths) = paths_from_pid_file(&sibling) else {
+                continue;
+            };
             let Some(record) = read_daemon_pid_file(&sibling) else {
                 continue;
             };
-            if !daemon_pid_file_matches(paths, record) {
-                // Dead or recycled pid: clear its leftover runtime files so
-                // `status` / `stop` don't trip over them, then move on.
-                cleanup_sibling_runtime_files(&sibling);
-                continue;
+            let validated = daemon_pid_file_matches(&sibling_paths, record);
+            match sibling_reap_action(validated, our_start, record.start_time_ticks) {
+                SiblingReapAction::CleanupFiles => {
+                    // Dead or recycled pid: clear its leftover runtime files so
+                    // `status` / `stop` don't trip over them, then move on.
+                    cleanup_sibling_runtime_files(&sibling);
+                }
+                SiblingReapAction::Leave => {
+                    tracing::debug!(
+                        sibling_pid = record.pid,
+                        pidfile = %sibling.display(),
+                        "leaving live sibling daemon alone (started later, or start-time comparison unavailable)"
+                    );
+                }
+                SiblingReapAction::Reap => {
+                    // SAFETY: kill is async-signal-safe.
+                    let rc = unsafe { libc::kill(record.pid, libc::SIGTERM) };
+                    if rc == 0 {
+                        tracing::info!(
+                            stale_pid = record.pid,
+                            pidfile = %sibling.display(),
+                            "reaped stale-version codesage daemon to reclaim its model memory"
+                        );
+                    } else {
+                        tracing::warn!(
+                            stale_pid = record.pid,
+                            error = %io::Error::last_os_error(),
+                            "failed to SIGTERM stale-version codesage daemon"
+                        );
+                    }
+                }
             }
-            // Only reap daemons that demonstrably started before us. When both
-            // sides carry a comparable start time (always, on Linux) this is
-            // the race guard; if either is missing we fall through and reap.
-            if let (Some(ours), Some(theirs)) = (our_start, record.start_time_ticks)
-                && theirs >= ours
-            {
-                continue;
-            }
-            // SAFETY: kill is async-signal-safe.
-            let rc = unsafe { libc::kill(record.pid, libc::SIGTERM) };
-            if rc == 0 {
-                tracing::info!(
-                    stale_pid = record.pid,
-                    pidfile = %sibling.display(),
-                    "reaped stale-version codesage daemon to reclaim its model memory"
-                );
-            } else {
-                tracing::warn!(
-                    stale_pid = record.pid,
-                    error = %io::Error::last_os_error(),
-                    "failed to SIGTERM stale-version codesage daemon"
-                );
-            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SiblingReapAction {
+        /// Dead or recycled pid: remove its leftover runtime files.
+        CleanupFiles,
+        /// Live sibling we must not touch.
+        Leave,
+        /// Live stale-version daemon that provably started before us.
+        Reap,
+    }
+
+    /// Pure reap decision for one sibling pid record. `validated` means the
+    /// record survived [`daemon_pid_file_matches`] against the sibling's own
+    /// paths (start-time match, cmdline match, or its socket accepting
+    /// connections). Reaping requires proof the sibling started strictly
+    /// before us; without comparable start times on both sides (non-Linux,
+    /// where `process_start_time_ticks` is `None`) we leave it alone — a
+    /// wrongly-killed innocent process is not recoverable, an unreaped
+    /// stale daemon merely holds memory until its idle backstop fires.
+    fn sibling_reap_action(
+        validated: bool,
+        our_start: Option<u64>,
+        their_start: Option<u64>,
+    ) -> SiblingReapAction {
+        if !validated {
+            return SiblingReapAction::CleanupFiles;
+        }
+        match (our_start, their_start) {
+            (Some(ours), Some(theirs)) if theirs < ours => SiblingReapAction::Reap,
+            _ => SiblingReapAction::Leave,
         }
     }
 
@@ -1730,6 +1773,62 @@ mod unix {
             assert!(!sock.exists(), "socket file should be removed");
             assert!(!lock.exists(), "lock file should be removed");
             assert!(log.exists(), "log file should be left for diagnostics");
+        }
+
+        // ---------- sibling reap decision table ----------
+
+        #[test]
+        fn sibling_reap_dead_or_recycled_pid_cleans_files() {
+            // A record that fails validation is a dead daemon or a recycled
+            // pid — never signal it, just clear its runtime files.
+            assert_eq!(
+                sibling_reap_action(false, Some(100), Some(50)),
+                SiblingReapAction::CleanupFiles
+            );
+            assert_eq!(
+                sibling_reap_action(false, None, None),
+                SiblingReapAction::CleanupFiles
+            );
+        }
+
+        #[test]
+        fn sibling_reap_requires_both_start_times() {
+            // Without comparable start times on BOTH sides (the non-Linux
+            // case, where process_start_time_ticks returns None) the
+            // strictly-before race guard can't run. Reaping is an
+            // optimization; killing an innocent same-UID process whose pid
+            // was recycled is not recoverable — so a validated sibling with
+            // missing start times is always left alone.
+            assert_eq!(
+                sibling_reap_action(true, None, None),
+                SiblingReapAction::Leave
+            );
+            assert_eq!(
+                sibling_reap_action(true, Some(100), None),
+                SiblingReapAction::Leave
+            );
+            assert_eq!(
+                sibling_reap_action(true, None, Some(50)),
+                SiblingReapAction::Leave
+            );
+        }
+
+        #[test]
+        fn sibling_reap_only_strictly_older_daemons() {
+            assert_eq!(
+                sibling_reap_action(true, Some(100), Some(50)),
+                SiblingReapAction::Reap
+            );
+            // Equal or newer start time: could be a daemon racing us up —
+            // never reap.
+            assert_eq!(
+                sibling_reap_action(true, Some(100), Some(100)),
+                SiblingReapAction::Leave
+            );
+            assert_eq!(
+                sibling_reap_action(true, Some(50), Some(100)),
+                SiblingReapAction::Leave
+            );
         }
     }
 }

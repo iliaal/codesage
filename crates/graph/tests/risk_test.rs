@@ -1069,6 +1069,7 @@ fn find_coupling_unindexed_file_returns_explanatory_note() {
     // with no context.
     let (_dir, db) = setup_project();
     let r = codesage_graph::find_coupling(&db, "does/not/exist.rs", 5).unwrap();
+    assert!(!r.found);
     assert!(r.coupled.is_empty());
     assert!(!r.file_indexed);
     assert_eq!(r.file_commits, 0);
@@ -1088,6 +1089,7 @@ fn find_coupling_indexed_but_below_threshold_explains_why() {
     db.upsert_git_file("solitary.rs", 1.0, 0, 7, Some(1_700_000_000))
         .unwrap();
     let r = codesage_graph::find_coupling(&db, "solitary.rs", 5).unwrap();
+    assert!(r.found);
     assert!(r.coupled.is_empty());
     assert!(r.file_indexed);
     assert_eq!(r.file_commits, 7);
@@ -1128,6 +1130,7 @@ fn find_coupling_populated_result_carries_index_state() {
     db.upsert_git_co_change("a.rs", "b.rs", 5.0, 5, Some(1_700_000_000))
         .unwrap();
     let r = codesage_graph::find_coupling(&db, "a.rs", 5).unwrap();
+    assert!(r.found);
     assert_eq!(r.coupled.len(), 1);
     assert_eq!(r.coupled[0].file, "b.rs");
     assert!(r.file_indexed);

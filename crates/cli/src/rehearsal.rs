@@ -393,3 +393,156 @@ fn build_summary(
 
     notes
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codesage_protocol::{
+        FeatureConfidence, FeatureFileRef, FeatureKind, FeatureRecord, Language,
+    };
+
+    fn file_ref(path: &str, role: FeatureFileRole) -> FeatureFileRef {
+        FeatureFileRef {
+            path: path.to_string(),
+            role,
+            reason: None,
+        }
+    }
+
+    fn feature(id: &str, entry_path: &str, files: Vec<FeatureFileRef>) -> FeatureRecord {
+        FeatureRecord {
+            feature_id: id.to_string(),
+            title: format!("feature {id}"),
+            summary: String::new(),
+            kind: FeatureKind::Library,
+            source: "test".to_string(),
+            confidence: FeatureConfidence::High,
+            entry_path: entry_path.to_string(),
+            entry_symbol: None,
+            entry_route: None,
+            entry_command: None,
+            test_command: None,
+            language: Language::Php,
+            tags: Vec::new(),
+            trust_boundaries: Vec::new(),
+            files: vec![file_ref(entry_path, FeatureFileRole::Entry)]
+                .into_iter()
+                .chain(files)
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn scope_spread_keys_on_entry_directory_not_feature_id() {
+        // php-src regression shape: one source file owns 60+ features (each
+        // PHP function is its own feature), all sharing one entry directory.
+        // Counting feature_ids would fire scope-spread on a focused one-file
+        // patch; keying on the entry directory must not.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let changed = "ext/standard/array.c";
+        for i in 0..SCOPE_SPREAD_THRESHOLD + 2 {
+            db.upsert_feature(&feature(&format!("feat_{i:016x}"), changed, Vec::new()))
+                .unwrap();
+        }
+
+        let r = build_review_rehearsal(dir.path(), &db, &[changed.to_string()]).unwrap();
+        assert!(
+            r.objections.iter().all(|o| o.category != "scope-spread"),
+            "many feature_ids in ONE entry directory must not read as scatter, got {:?}",
+            r.objections
+                .iter()
+                .map(|o| (&o.category, &o.title))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn scope_spread_fires_across_distinct_entry_areas() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut changed: Vec<String> = Vec::new();
+        for i in 0..SCOPE_SPREAD_THRESHOLD {
+            let entry = format!("area{i}/mod.rs");
+            db.upsert_feature(&feature(&format!("feat_area_{i}"), &entry, Vec::new()))
+                .unwrap();
+            changed.push(entry);
+        }
+
+        let r = build_review_rehearsal(dir.path(), &db, &changed).unwrap();
+        let obj = r
+            .objections
+            .iter()
+            .find(|o| o.category == "scope-spread")
+            .unwrap_or_else(|| {
+                panic!(
+                    "{SCOPE_SPREAD_THRESHOLD} distinct entry areas must fire scope-spread, got {:?}",
+                    r.objections
+                        .iter()
+                        .map(|o| (&o.category, &o.title))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(obj.severity, ReviewSeverity::Low);
+        assert!(
+            obj.title
+                .contains(&format!("{SCOPE_SPREAD_THRESHOLD} feature areas")),
+            "title should name the area count, got {:?}",
+            obj.title
+        );
+    }
+
+    #[test]
+    fn review_severity_ord_ranks_high_before_medium_before_low() {
+        // The objection sort relies on ReviewSeverity's derived Ord, which in
+        // turn relies on declaration order in protocol. Pin the contract so a
+        // careless reorder or extension of the enum fails here.
+        assert!(ReviewSeverity::High < ReviewSeverity::Medium);
+        assert!(ReviewSeverity::Medium < ReviewSeverity::Low);
+        assert!(ReviewSeverity::High < ReviewSeverity::Low);
+    }
+
+    #[test]
+    fn objections_are_sorted_high_to_low() {
+        // Scenario producing all three severities:
+        //   High   missing-tests (no sibling or coupled tests anywhere)
+        //   Medium feature-test-gap (feature has a mapped test not in the patch)
+        //   Low    scope-spread (>= threshold distinct entry areas)
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut changed: Vec<String> = Vec::new();
+        for i in 0..SCOPE_SPREAD_THRESHOLD {
+            let entry = format!("area{i}/mod.rs");
+            let tests = vec![file_ref(
+                &format!("area{i}/tests/it.rs"),
+                FeatureFileRole::Test,
+            )];
+            db.upsert_feature(&feature(&format!("feat_area_{i}"), &entry, tests))
+                .unwrap();
+            changed.push(entry);
+        }
+
+        let r = build_review_rehearsal(dir.path(), &db, &changed).unwrap();
+        let severities: Vec<ReviewSeverity> = r.objections.iter().map(|o| o.severity).collect();
+        assert!(
+            severities.contains(&ReviewSeverity::High)
+                && severities.contains(&ReviewSeverity::Medium)
+                && severities.contains(&ReviewSeverity::Low),
+            "fixture should produce all three severities, got {severities:?}"
+        );
+        assert_eq!(
+            severities.first(),
+            Some(&ReviewSeverity::High),
+            "highest severity must lead"
+        );
+        assert_eq!(
+            severities.last(),
+            Some(&ReviewSeverity::Low),
+            "lowest severity must trail"
+        );
+        assert!(
+            severities.windows(2).all(|w| w[0] <= w[1]),
+            "objections must be sorted high → low, got {severities:?}"
+        );
+    }
+}

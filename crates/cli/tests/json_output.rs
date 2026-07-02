@@ -1,0 +1,67 @@
+//! CLI `--json` output-shape regression tests.
+//!
+//! The MCP server wraps every list-shaped tool result in a `{"results": [...]}`
+//! envelope (protocol `*Results` structs). The CLI used to emit bare arrays for
+//! `find-symbol` / `find-references` / `search` / `similar`, so the same data
+//! had two shapes depending on the entrypoint. These tests pin the envelope on
+//! the CLI side. (`search` is exercised only via code symmetry — it needs a
+//! model + embedder, which integration tests can't assume.)
+
+use std::path::Path;
+use std::process::Command;
+
+fn init_project(dir: &Path) {
+    let out = Command::new(env!("CARGO_BIN_EXE_codesage"))
+        .arg("init")
+        .current_dir(dir)
+        .output()
+        .expect("spawn codesage init");
+    assert!(
+        out.status.success(),
+        "codesage init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn assert_results_envelope(args: &[&str]) {
+    let dir = tempfile::tempdir().unwrap();
+    init_project(dir.path());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_codesage"))
+        .args(args)
+        .arg("--json")
+        .current_dir(dir.path())
+        .output()
+        .expect("spawn codesage");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{args:?} failed; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let value: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("{args:?} emitted invalid JSON ({e}):\n{stdout}"));
+    let obj = value
+        .as_object()
+        .unwrap_or_else(|| panic!("{args:?} must emit an object envelope, got:\n{stdout}"));
+    assert!(
+        obj.get("results").is_some_and(serde_json::Value::is_array),
+        "{args:?} must emit {{\"results\": [...]}}, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn find_symbol_json_uses_results_envelope() {
+    assert_results_envelope(&["find-symbol", "no_such_symbol"]);
+}
+
+#[test]
+fn find_references_json_uses_results_envelope() {
+    assert_results_envelope(&["find-references", "no_such_symbol"]);
+}
+
+#[test]
+fn similar_json_uses_results_envelope() {
+    assert_results_envelope(&["similar", "no_such_symbol"]);
+}

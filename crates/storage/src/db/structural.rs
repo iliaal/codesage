@@ -110,45 +110,53 @@ impl Database {
         set_index_state(&self.conn, "structural_index_state", sha)
     }
 
+    // prepare_cached throughout the per-file index loop (`upsert_file` +
+    // `insert_symbols` / `insert_references` / `insert_fingerprints`): these
+    // run once per file, so a plain `prepare` re-plans the same SQL thousands
+    // of times on a large repo. Connections are long-lived per index pass, so
+    // the cached statements are reused across every file.
     pub fn upsert_file(&self, file: &FileInfo) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO files (path, language, content_hash, indexed_at)
-             VALUES (?1, ?2, ?3, unixepoch())
-             ON CONFLICT(path) DO UPDATE SET
-               language = excluded.language,
-               content_hash = excluded.content_hash,
-               indexed_at = excluded.indexed_at",
-            params![file.path, file.language.as_str(), file.content_hash],
-        )?;
+        self.conn
+            .prepare_cached(
+                "INSERT INTO files (path, language, content_hash, indexed_at)
+                 VALUES (?1, ?2, ?3, unixepoch())
+                 ON CONFLICT(path) DO UPDATE SET
+                   language = excluded.language,
+                   content_hash = excluded.content_hash,
+                   indexed_at = excluded.indexed_at",
+            )?
+            .execute(params![
+                file.path,
+                file.language.as_str(),
+                file.content_hash
+            ])?;
 
-        let file_id: i64 = self.conn.query_row(
-            "SELECT id FROM files WHERE path = ?1",
-            params![file.path],
-            |row| row.get(0),
-        )?;
+        let file_id: i64 = self
+            .conn
+            .prepare_cached("SELECT id FROM files WHERE path = ?1")?
+            .query_row(params![file.path], |row| row.get(0))?;
 
         self.conn
-            .execute("DELETE FROM symbols WHERE file_id = ?1", params![file_id])?;
+            .prepare_cached("DELETE FROM symbols WHERE file_id = ?1")?
+            .execute(params![file_id])?;
         self.conn
-            .execute("DELETE FROM refs WHERE from_file_id = ?1", params![file_id])?;
-        self.conn.execute(
-            "DELETE FROM symbol_fingerprints WHERE file_id = ?1",
-            params![file_id],
-        )?;
-        self.conn.execute(
-            "DELETE FROM file_trust_boundaries WHERE file_id = ?1",
-            params![file_id],
-        )?;
-        self.conn.execute(
-            "UPDATE files SET boundaries_derived_at = 0 WHERE id = ?1",
-            params![file_id],
-        )?;
+            .prepare_cached("DELETE FROM refs WHERE from_file_id = ?1")?
+            .execute(params![file_id])?;
+        self.conn
+            .prepare_cached("DELETE FROM symbol_fingerprints WHERE file_id = ?1")?
+            .execute(params![file_id])?;
+        self.conn
+            .prepare_cached("DELETE FROM file_trust_boundaries WHERE file_id = ?1")?
+            .execute(params![file_id])?;
+        self.conn
+            .prepare_cached("UPDATE files SET boundaries_derived_at = 0 WHERE id = ?1")?
+            .execute(params![file_id])?;
 
         Ok(file_id)
     }
 
     pub fn insert_symbols(&self, file_id: i64, symbols: &[Symbol]) -> Result<()> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT INTO symbols (file_id, name, qualified_name, kind, line_start, line_end, col_start, col_end, rationale)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )?;
@@ -176,7 +184,7 @@ impl Database {
     }
 
     pub fn insert_references(&self, file_id: i64, refs: &[Reference]) -> Result<()> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT INTO refs (from_file_id, from_symbol, to_name, to_name_tail, kind, line, col)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
@@ -198,7 +206,7 @@ impl Database {
     /// Persist MinHash fingerprints for one file's functions/methods. Caller
     /// deletes prior rows via `upsert_file`; this only inserts.
     pub fn insert_fingerprints(&self, file_id: i64, fps: &[FingerprintInput<'_>]) -> Result<()> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT INTO symbol_fingerprints
                  (file_id, name, kind, line_start, line_end, leaf_count, fp)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -602,21 +610,102 @@ impl Database {
         Ok(rows)
     }
 
-    pub fn remove_file(&self, path: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM files WHERE path = ?1", params![path])?;
-        self.conn
-            .execute("DELETE FROM semantic_files WHERE path = ?1", params![path])?;
-        // git tables are path-keyed (not FK'd to `files`, because git-index can run
-        // without a structural index), so cascade manually. Without this, deleted
-        // files stay visible in `find_coupling` / `assess_risk` / future hotspots.
-        self.conn
-            .execute("DELETE FROM git_files WHERE path = ?1", params![path])?;
-        self.conn.execute(
-            "DELETE FROM git_co_changes WHERE file_a = ?1 OR file_b = ?1",
-            params![path],
+    /// Every vec0 chunk table in the DB, across all models — not just the
+    /// one this connection was opened for. A real chunk table is a
+    /// `chunks_`-prefixed table with a vec0 `_info` shadow sibling; the
+    /// sibling check filters out FTS sidecars and vec0's own shadow tables,
+    /// which share the prefix. Same identification rule as the open-time
+    /// chunk-table discovery in `db/mod.rs`.
+    fn all_chunk_table_names(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT m.name FROM sqlite_master m
+             WHERE m.type = 'table' AND m.name GLOB 'chunks_*'
+               AND EXISTS (
+                   SELECT 1 FROM sqlite_master aux
+                   WHERE aux.type = 'table' AND aux.name = m.name || '_info'
+               )
+             ORDER BY m.name",
         )?;
-        Ok(())
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn table_exists(&self, name: &str) -> Result<bool> {
+        let n: i64 = self
+            .conn
+            .prepare_cached(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            )?
+            .query_row(params![name], |row| row.get(0))?;
+        Ok(n > 0)
+    }
+
+    /// Remove one file from every per-path store: `files` (FK cascades cover
+    /// symbols / refs / fingerprints / trust boundaries), semantic freshness,
+    /// git history, feature membership, and EVERY model's chunk table plus
+    /// its FTS sidecar. Sweeping all chunk tables — not just the active one —
+    /// matters because a structural-only pass (`codesage index --no-semantic`)
+    /// opens without a model, and a per-model delete would leave the removed
+    /// file searchable until the next semantic sweep. Savepoint-wrapped so a
+    /// mid-delete failure can't leave the removal half-applied; a savepoint
+    /// (not a bare BEGIN) composes with a caller's outer transaction.
+    /// fnd: CR-035.
+    pub fn remove_file(&self, path: &str) -> Result<()> {
+        self.conn.execute_batch("SAVEPOINT remove_file")?;
+        let result = (|| -> Result<()> {
+            self.conn
+                .prepare_cached("DELETE FROM files WHERE path = ?1")?
+                .execute(params![path])?;
+            self.conn
+                .prepare_cached("DELETE FROM semantic_files WHERE path = ?1")?
+                .execute(params![path])?;
+            // git tables are path-keyed (not FK'd to `files`, because git-index can run
+            // without a structural index), so cascade manually. Without this, deleted
+            // files stay visible in `find_coupling` / `assess_risk` / future hotspots.
+            self.conn
+                .prepare_cached("DELETE FROM git_files WHERE path = ?1")?
+                .execute(params![path])?;
+            self.conn
+                .prepare_cached("DELETE FROM git_co_changes WHERE file_a = ?1 OR file_b = ?1")?
+                .execute(params![path])?;
+            self.conn
+                .prepare_cached("DELETE FROM feature_files WHERE path = ?1")?
+                .execute(params![path])?;
+            for table in self.all_chunk_table_names()? {
+                let sql = format!(
+                    "DELETE FROM \"{}\" WHERE file_path = ?1",
+                    crate::schema::quote_ident(&table)
+                );
+                self.conn.prepare_cached(&sql)?.execute(params![path])?;
+                let fts = crate::schema::fts_table_name(&table);
+                if self.table_exists(&fts)? {
+                    let fts_sql = format!(
+                        "DELETE FROM \"{}\" WHERE file_path = ?1",
+                        crate::schema::quote_ident(&fts)
+                    );
+                    self.conn.prepare_cached(&fts_sql)?.execute(params![path])?;
+                }
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("RELEASE remove_file")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK TO remove_file");
+                if let Err(re) = self.conn.execute_batch("RELEASE remove_file") {
+                    tracing::warn!(
+                        error = %re,
+                        "failed to release savepoint remove_file after rollback"
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 
     pub fn all_file_paths(&self) -> Result<Vec<String>> {
@@ -742,22 +831,22 @@ impl Database {
         file_id: i64,
         tags: &[TrustBoundary],
     ) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM file_trust_boundaries WHERE file_id = ?1",
-            params![file_id],
-        )?;
+        // prepare_cached: called once per file in the boundary-derivation
+        // loop, same rationale as the index-loop inserts above.
+        self.conn
+            .prepare_cached("DELETE FROM file_trust_boundaries WHERE file_id = ?1")?
+            .execute(params![file_id])?;
         // Stamp `boundaries_derived_at` on every write — including when
         // the derived set is empty — so a rule-clean file (no matches)
         // stays distinguishable from a never-derived one (zero matches
         // because derivation never ran).
-        self.conn.execute(
-            "UPDATE files SET boundaries_derived_at = unixepoch() WHERE id = ?1",
-            params![file_id],
-        )?;
+        self.conn
+            .prepare_cached("UPDATE files SET boundaries_derived_at = unixepoch() WHERE id = ?1")?
+            .execute(params![file_id])?;
         if tags.is_empty() {
             return Ok(());
         }
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT OR IGNORE INTO file_trust_boundaries (file_id, boundary) VALUES (?1, ?2)",
         )?;
         for t in tags {

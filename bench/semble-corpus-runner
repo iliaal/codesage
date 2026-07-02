@@ -43,6 +43,8 @@ def run_search(codesage_bin: str, project_root: Path, query: str, limit: int,
         results = json.loads(r.stdout)
     except json.JSONDecodeError:
         return []
+    if isinstance(results, dict):
+        results = results.get("results", [])
     seen = set()
     out = []
     for row in results:

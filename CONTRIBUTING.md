@@ -37,7 +37,7 @@ Run `cargo test --workspace` before you send a pull request. Tests that need GPU
 ## Conventions
 
 - Rust 2024 edition.
-- `anyhow` for error handling in binaries. Domain types live in the `protocol` crate.
+- `anyhow` for error handling workspace-wide. Shared domain types live in the `protocol` crate.
 - Tree-sitter queries are `.scm` files under `crates/parser/src/queries/`, embedded via `include_str!`.
 - All query commands emit JSON with `--json`.
 - Write a comment only when the reason isn't obvious from the code. If the next reader would ask "why is this here?", add the comment. Otherwise, let the code speak.

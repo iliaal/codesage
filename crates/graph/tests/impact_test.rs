@@ -354,7 +354,7 @@ fn export_context_for_symbol_returns_definition() {
         include_callees: false,
     };
 
-    let bundle = codesage_graph::query::export_context_for_symbol(&db, "Repository", &req).unwrap();
+    let bundle = codesage_graph::export_context_for_symbol(&db, "Repository", &req).unwrap();
 
     assert!(bundle.target_description.contains("Repository"));
     assert!(
@@ -377,7 +377,7 @@ fn export_context_for_symbol_with_callers() {
         include_callees: false,
     };
 
-    let bundle = codesage_graph::query::export_context_for_symbol(&db, "Repository", &req).unwrap();
+    let bundle = codesage_graph::export_context_for_symbol(&db, "Repository", &req).unwrap();
     let related_paths: Vec<String> = bundle.related.iter().map(|r| r.file_path.clone()).collect();
 
     assert!(
@@ -406,8 +406,7 @@ fn export_context_for_qualified_symbol_uses_exact_callers() {
         include_callees: false,
     };
 
-    let bundle =
-        codesage_graph::query::export_context_for_symbol(&db, "Database::open", &req).unwrap();
+    let bundle = codesage_graph::export_context_for_symbol(&db, "Database::open", &req).unwrap();
     let related_paths: Vec<String> = bundle.related.iter().map(|r| r.file_path.clone()).collect();
 
     assert!(
@@ -489,7 +488,7 @@ fn export_context_callees_resolve_imported_helper_not_homonym() {
         include_callees: true,
     };
 
-    let bundle = codesage_graph::query::export_context_for_symbol(&db, "run", &req).unwrap();
+    let bundle = codesage_graph::export_context_for_symbol(&db, "run", &req).unwrap();
     let related_paths: Vec<String> = bundle.related.iter().map(|r| r.file_path.clone()).collect();
 
     assert!(
@@ -552,7 +551,7 @@ fn export_context_for_symbol_includes_callees() {
         include_callees: true,
     };
 
-    let bundle = codesage_graph::query::export_context_for_symbol(&db, "run", &req).unwrap();
+    let bundle = codesage_graph::export_context_for_symbol(&db, "run", &req).unwrap();
     let related_paths: Vec<String> = bundle.related.iter().map(|r| r.file_path.clone()).collect();
 
     assert!(
@@ -573,7 +572,7 @@ fn export_context_for_symbol_respects_limit_for_definitions_and_primary() {
         include_callees: false,
     };
 
-    let bundle = codesage_graph::query::export_context_for_symbol(&db, "open", &req).unwrap();
+    let bundle = codesage_graph::export_context_for_symbol(&db, "open", &req).unwrap();
 
     assert_eq!(bundle.symbol_definitions.len(), 1);
     assert_eq!(bundle.primary.len(), 1);
@@ -591,8 +590,7 @@ fn export_context_unknown_symbol_returns_empty_bundle() {
         include_callees: false,
     };
 
-    let bundle =
-        codesage_graph::query::export_context_for_symbol(&db, "NoSuchSymbol", &req).unwrap();
+    let bundle = codesage_graph::export_context_for_symbol(&db, "NoSuchSymbol", &req).unwrap();
     assert!(bundle.primary.is_empty());
     assert!(bundle.symbol_definitions.is_empty());
     assert!(bundle.target_description.contains("not found"));

@@ -35,13 +35,14 @@ The "fmt then edit then forget to re-fmt" class of break is real (commit `a43c51
 Query flows through these stages in order:
 
 1. **Embed query** -- MiniLM-L6-v2 (384d) via ONNX Runtime
-2. **KNN retrieval** -- sqlite-vec, overfetch 5x when reranker is active
-3. **Symbol boost** -- +0.1 per query token that matches a known symbol in the chunk
-4. **Cross-encoder rerank** -- ms-marco-MiniLM-L6-v2, blended 50/50 with semantic score
+2. **KNN retrieval** -- sqlite-vec, overfetch 5x when the reranker is active
+3. **BM25 fusion** -- code-literal queries (backticks, `::`, glob patterns) merge BM25 candidates via RRF; fused scores are rescaled onto the semantic score span so downstream boosts can't swamp them
+4. **Symbol boost** -- +0.1 per query token that matches a known symbol in the chunk, plus definition/qualified-name boosts, path penalties, and directory/file saturation (each env-toggleable)
 5. **Symbol annotation** -- attach overlapping symbol names to each result
-6. **Truncate** to requested limit
+6. **Cross-encoder rerank** -- ms-marco-MiniLM-L6-v2, adaptive blend weight (0.35 identifier-shaped / 0.6 natural-language / 0.5 default); skipped when BM25 fusion already ran
+7. **Truncate** to requested limit
 
-The reranker is optional (configured per-project in config.toml). Without it, steps 2-3-5 still run.
+The reranker is optional (configured per-project in config.toml). Without it, the remaining stages still run.
 
 ## Config
 
@@ -64,6 +65,8 @@ exclude_patterns = [
   "**/vendor/**", "**/node_modules/**",
 ]
 ```
+
+`[embedding] model` / `reranker` values are validated against a built-in allowlist before any download — repo-local config is untrusted input (a cloned repo must not be able to pick the ONNX graph that gets loaded). To run a non-allowlisted model deliberately, set `CODESAGE_ALLOW_ANY_MODEL=1`; the allowlist lives in `crates/embed/src/model.rs`.
 
 ## CUDA setup
 
@@ -90,7 +93,7 @@ If CoreML registration fails, the process errors out instead of silently falling
 ## Conventions
 
 - Rust 2024 edition
-- `anyhow` in binaries, types in protocol crate
+- `anyhow` for error handling workspace-wide; shared domain types live in the `protocol` crate
 - Tree-sitter queries in `.scm` files under `crates/parser/src/queries/`, embedded via `include_str!`
 - JSON output on all query commands (`--json`)
 - Model-specific vec0 tables (`chunks_{model}_{dim}`) allow switching models without re-indexing structural data

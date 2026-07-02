@@ -507,4 +507,36 @@ impl Database {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(paths)
     }
+
+    /// Identity key for process-lifetime caches over this handle's semantic
+    /// content: the database file path plus the active chunk table. `None`
+    /// for in-memory or table-less handles — every in-memory connection is a
+    /// distinct database, so a path-keyed cache entry would alias unrelated
+    /// handles.
+    pub fn semantic_cache_key(&self) -> Option<(String, String)> {
+        if self.chunk_table.is_empty() {
+            return None;
+        }
+        match self.conn.path() {
+            Some(p) if !p.is_empty() => Some((p.to_string(), self.chunk_table.clone())),
+            _ => None,
+        }
+    }
+
+    /// Cheap validity token that changes whenever the set of semantically
+    /// indexed file paths for the active chunk table changes. Reads the
+    /// regular `semantic_files` bookkeeping table, not the vec0 chunk table:
+    /// new files bump `COUNT(*)` / `MAX(rowid)`, removals drop `COUNT(*)`,
+    /// and any (re)index touches `MAX(indexed_at)`. Content-only re-embeds
+    /// of an existing path may leave the token unchanged within one second —
+    /// fine for consumers that only depend on the path set.
+    pub fn semantic_files_validity_token(&self) -> Result<(i64, i64, i64)> {
+        let token = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(MAX(rowid), 0), COALESCE(MAX(indexed_at), 0)
+             FROM semantic_files WHERE chunk_table = ?1",
+            params![&self.chunk_table],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        Ok(token)
+    }
 }

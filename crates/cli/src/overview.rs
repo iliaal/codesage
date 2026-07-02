@@ -217,3 +217,58 @@ fn suggested_next_calls(freshness: &FreshnessInfo) -> Vec<SuggestedCall> {
     ]);
     calls
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const STALE_TOOL: &str = "codesage index (CLI)";
+
+    fn freshness(kind: &str) -> FreshnessInfo {
+        FreshnessInfo {
+            structural_kind: kind.to_string(),
+            structural_summary: format!("summary for {kind}"),
+            commits_behind: None,
+            indexed_sha: None,
+            head_sha: None,
+            semantic_indexed_files: 0,
+            semantic_indexed: false,
+        }
+    }
+
+    #[test]
+    fn behind_head_prepends_stale_index_nudge() {
+        let calls = suggested_next_calls(&freshness("behind_head"));
+        assert_eq!(
+            calls.first().map(|c| c.tool.as_str()),
+            Some(STALE_TOOL),
+            "stale nudge must come first so the agent refreshes before trusting results"
+        );
+        assert!(
+            calls[0].why.contains("summary for behind_head"),
+            "why should carry the drift summary, got {:?}",
+            calls[0].why
+        );
+    }
+
+    #[test]
+    fn unrelated_ancestor_prepends_stale_index_nudge() {
+        let calls = suggested_next_calls(&freshness("unrelated_ancestor"));
+        assert_eq!(calls.first().map(|c| c.tool.as_str()), Some(STALE_TOOL));
+    }
+
+    #[test]
+    fn fresh_index_omits_stale_index_nudge() {
+        let calls = suggested_next_calls(&freshness("fresh"));
+        assert!(
+            calls.iter().all(|c| c.tool != STALE_TOOL),
+            "fresh index must not nudge a reindex, got {:?}",
+            calls.iter().map(|c| c.tool.as_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            calls.first().map(|c| c.tool.as_str()),
+            Some("search"),
+            "baseline suggestions should lead with search when nothing is stale"
+        );
+    }
+}

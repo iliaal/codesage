@@ -191,6 +191,8 @@ def parse_results(output: str) -> list[tuple[str, str]]:
         results = json.loads(json_str)
     except json.JSONDecodeError:
         return []
+    if isinstance(results, dict):
+        results = results.get("results", [])
 
     seen: set[str] = set()
     ordered: list[tuple[str, str]] = []

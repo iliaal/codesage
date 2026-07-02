@@ -244,6 +244,91 @@ fn changed_files_since_returns_only_files_touched_after_ref() {
 }
 
 #[test]
+fn incremental_falls_back_to_full_when_history_rewritten() {
+    // Documented contract: when the stored SHA is no longer an ancestor of
+    // HEAD (rebase, reset+recommit, force-update), incremental must detect
+    // non-ancestry and fall back to a full rescan instead of additively
+    // updating counters against an abandoned line of history.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_hermetic_repo(root);
+
+    std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+    run_git(root, &["add", "."]);
+    run_git(root, &["commit", "-qm", "first"]);
+    std::fs::write(root.join("b.rs"), "fn b() {}\n").unwrap();
+    run_git(root, &["add", "."]);
+    run_git(root, &["commit", "-qm", "second adds b"]);
+
+    let db = Database::open_in_memory().unwrap();
+    let full = git_history_index_with_options(&db, root, &[], IndexMode::Full).unwrap();
+    assert_eq!(full.commits_scanned, 2);
+    assert!(db.git_file("b.rs").unwrap().is_some());
+    let (stale_sha, _) = db.get_git_index_state().unwrap().expect("state after full");
+
+    // Rewrite history: drop the second commit and commit different content,
+    // so the stored SHA still exists as an object but is not an ancestor of
+    // the new HEAD.
+    run_git(root, &["reset", "--hard", "HEAD~1"]);
+    std::fs::write(root.join("a.rs"), "fn a() { let _ = 1; }\n").unwrap();
+    std::fs::write(root.join("c.rs"), "fn c() {}\n").unwrap();
+    run_git(root, &["add", "."]);
+    run_git(root, &["commit", "-qm", "rewritten second adds c"]);
+
+    let incr = git_history_index_with_options(&db, root, &[], IndexMode::Incremental).unwrap();
+
+    // (a) Non-ancestry detected → full rescan. The whole rewritten history is
+    // scanned (2 commits), not just the delta reachable from HEAD but not the
+    // stale SHA (which would be 1). State must move off the stale SHA.
+    assert_eq!(
+        incr.commits_scanned, 2,
+        "fallback must rescan the entire rewritten history"
+    );
+    let (new_sha, _) = db
+        .get_git_index_state()
+        .unwrap()
+        .expect("state after fallback");
+    assert_ne!(
+        new_sha, stale_sha,
+        "state must be restamped to the new HEAD"
+    );
+
+    // The full rescan drops rows from the abandoned line; a buggy additive
+    // incremental would have kept b.rs.
+    assert!(
+        db.git_file("b.rs").unwrap().is_none(),
+        "b.rs only exists on the abandoned history line"
+    );
+
+    // (b) Counters equal a pristine full scan of the rewritten history.
+    let db_fresh = Database::open_in_memory().unwrap();
+    let fresh = git_history_index_with_options(&db_fresh, root, &[], IndexMode::Full).unwrap();
+    assert_eq!(incr.commits_scanned, fresh.commits_scanned);
+    assert_eq!(incr.files_tracked, fresh.files_tracked);
+    assert_eq!(incr.co_change_pairs, fresh.co_change_pairs);
+    for path in ["a.rs", "c.rs"] {
+        let got = db
+            .git_file(path)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{path} missing after fallback"));
+        let want = db_fresh
+            .git_file(path)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{path} missing from pristine full scan"));
+        assert_eq!(got.total_commits, want.total_commits, "{path}");
+        assert_eq!(got.fix_count, want.fix_count, "{path}");
+        // Churn decays against wall-clock "now" at scan time; the two scans run
+        // moments apart so the scores agree to well under a permille.
+        assert!(
+            (got.churn_score - want.churn_score).abs() < 1e-3,
+            "{path}: churn {} vs pristine {}",
+            got.churn_score,
+            want.churn_score
+        );
+    }
+}
+
+#[test]
 fn changed_files_since_errors_on_unknown_ref() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

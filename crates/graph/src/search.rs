@@ -1,15 +1,10 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use anyhow::Result;
 use codesage_parser::discover::{TEST_LIKE_EXCLUDE_PATTERNS, build_exclude_set};
-use codesage_protocol::{
-    CategoryCount, ContextBundle, DependencyEntry, DistanceCount, ExportRequest, FileCategory,
-    FindReferencesRequest, FindSymbolRequest, ImpactEntry, ImpactOptions, ImpactReason,
-    ImpactReport, ImpactRequest, ImpactSummary, ImpactTarget, Language, Reference, ReferenceKind,
-    SearchRequest, SearchResult, SiblingSymbol, Symbol, SymbolSummary,
-};
+use codesage_protocol::{Language, SearchRequest, SearchResult, Symbol, SymbolSummary};
 use codesage_storage::{Database, RawSearchRow, embedding_to_bytes};
 use globset::GlobSet;
 use regex::Regex;
@@ -24,7 +19,7 @@ use regex::Regex;
 /// (no `catch_unwind`), leaving the client hung waiting for a reply that never
 /// comes. Degrade instead: warn once and keep the row with a placeholder label.
 /// The content is what the caller searched for; the language tag is annotation.
-fn parse_db_language(s: &str) -> Language {
+pub(crate) fn parse_db_language(s: &str) -> Language {
     Language::parse(s).unwrap_or_else(|| {
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| {
@@ -36,18 +31,6 @@ fn parse_db_language(s: &str) -> Language {
         });
         Language::Rust
     })
-}
-
-pub fn find_symbol(db: &Database, req: &FindSymbolRequest) -> Result<Vec<Symbol>> {
-    db.find_symbols(&req.name, req.kind)
-}
-
-pub fn find_references(db: &Database, req: &FindReferencesRequest) -> Result<Vec<Reference>> {
-    db.find_references(&req.symbol_name, req.kind)
-}
-
-pub fn list_dependencies(db: &Database, file_path: &str) -> Result<DependencyEntry> {
-    db.list_file_dependencies(file_path)
 }
 
 fn l2_to_score(distance: f32) -> f32 {
@@ -272,6 +255,21 @@ fn rrf_merge(
     limit: usize,
 ) -> Vec<RawSearchRow> {
     use std::collections::HashMap;
+    // Span of the semantic candidates' scores, used to rescale fused RRF
+    // scores back onto the scale the downstream boost stages were tuned for.
+    let (sem_min, sem_max) = semantic
+        .iter()
+        .map(|r| l2_to_score(r.distance))
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), s| {
+            (lo.min(s), hi.max(s))
+        });
+    let (sem_min, sem_max) = if sem_min.is_finite() && sem_max.is_finite() {
+        (sem_min, sem_max)
+    } else {
+        // No semantic candidates (BM25-only fusion): fall back to the full
+        // valid score range.
+        (0.0, 1.0)
+    };
     // Key is (path, start, end). Two chunks at the same location appearing
     // in both rankings collapse to one row with the summed RRF score.
     let mut scores: HashMap<(String, u32, u32), (f64, RawSearchRow)> = HashMap::new();
@@ -293,17 +291,28 @@ fn rrf_merge(
     }
     let mut ranked: Vec<(f64, RawSearchRow)> = scores.into_values().collect();
     ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
-    // Convert the fused RRF score to the `distance` field downstream code
-    // expects: it reads it through `l2_to_score` which is monotonic on L2
-    // distance. To keep the downstream ordering intact we inject an
-    // "equivalent L2" that preserves rank: higher RRF score → lower synthetic
-    // distance. Using `distance = 1.0 - rrf_score` works because all pipeline
-    // math downstream cares about is monotonic order.
+    ranked.truncate(limit);
+    // Convert each fused RRF score to the `distance` field downstream code
+    // reads through `l2_to_score`. Order alone is not enough: the boost
+    // stages are additive (+0.1 per symbol token), so score *scale* matters.
+    // Raw RRF scores top out around 3/(RRF_K+1) ≈ 0.05, which l2_to_score
+    // would compress into a ~0.03-wide band — a single +0.1 boost on a
+    // mid-ranked row would then overwrite the entire fused ranking. Min-max
+    // rescale the fused scores onto the semantic candidates' span instead,
+    // then invert l2_to_score (d = sqrt(2*(1-score))) so the downstream read
+    // reproduces the rescaled score.
+    let fused_hi = ranked.first().map(|(s, _)| *s).unwrap_or(0.0);
+    let fused_lo = ranked.last().map(|(s, _)| *s).unwrap_or(0.0);
+    let fused_range = fused_hi - fused_lo;
     ranked
         .into_iter()
-        .take(limit)
         .map(|(score, mut row)| {
-            row.distance = (1.0 - score as f32).max(0.0);
+            let rescaled = if fused_range > f64::EPSILON {
+                sem_min + ((score - fused_lo) / fused_range) as f32 * (sem_max - sem_min)
+            } else {
+                sem_max
+            };
+            row.distance = (2.0 * (1.0 - rescaled.clamp(0.0, 1.0))).sqrt();
             row
         })
         .collect()
@@ -425,7 +434,10 @@ pub fn search(
     // semantic-only path identical to pre-hybrid behavior for the 80%+ of
     // queries that don't contain a rare literal, so the ecosystem default
     // doesn't get copy-pasted in where the memo's net-negative finding still
-    // applies.
+    // applies. `fused` records whether RRF fusion actually ran — the gate can
+    // fire while BM25 contributes nothing (empty MATCH expression, no hits),
+    // in which case rows stay purely semantic.
+    let mut fused = false;
     let rows = if hybrid_gate {
         let match_expr = build_fts_match_query(&req.query);
         if match_expr.is_empty() {
@@ -450,6 +462,7 @@ pub fn search(
                 bm25_paths.as_deref(),
             ) {
                 Ok(bm25_rows) if !bm25_rows.is_empty() => {
+                    fused = true;
                     rrf_merge(rows, bm25_rows, semantic_fetch)
                 }
                 _ => rows,
@@ -496,15 +509,16 @@ pub fn search(
         apply_path_penalties(&mut results, &req.query);
     }
 
-    // Skip reranking on hybrid-gated queries. The cross-encoder judges
-    // query/doc semantic similarity; for queries driven by a literal
-    // identifier (the `hybrid_gate` trigger conditions), the rare-token
-    // match is already the dominant signal and reranking typically flips
+    // Skip reranking when BM25 fusion actually ran. The cross-encoder judges
+    // query/doc semantic similarity; when a rare-token match drove the fused
+    // ranking, it's already the dominant signal and reranking typically flips
     // the BM25 win back down — the exact failure mode the memo at
     // `project_hybrid_bm25_rrf.md` warned about. Measured on the ripgrep
     // canary: reranker demotes `lib.rs` (rank 5 post-RRF) out of top-10
-    // on `use \`doc_cfg\`` queries.
-    if !hybrid_gate && let Some(mut rerank) = rerank {
+    // on `use \`doc_cfg\`` queries. Keyed on `fused`, not `hybrid_gate`:
+    // a gated query whose BM25 leg came back empty is still purely semantic
+    // and must not lose reranking too.
+    if !fused && let Some(mut rerank) = rerank {
         apply_reranking(&mut rerank, &req.query, &mut results);
     }
 
@@ -547,6 +561,28 @@ fn looks_like_identifier(s: &str) -> bool {
     s.contains('_')
         || s.chars().any(|c| c.is_uppercase())
         || s.chars().all(|c| c.is_alphanumeric() || c == '_') && s.len() >= 4
+}
+
+/// Identifier test for the adaptive-rerank SHORT_ID branch. Stricter than
+/// [`looks_like_identifier`]: the token must carry an explicit identifier
+/// signal — `_` (snake_case), `-` (kebab-case), an uppercase letter
+/// (camel/PascalCase), `::` scoping, or a digit. `looks_like_identifier`'s
+/// length clause admits any all-lowercase word ≥4 chars because its caller
+/// verifies the token against the symbol table; here there is no existence
+/// check, so a plain English word ("authentication") must not qualify.
+fn looks_like_short_identifier(s: &str) -> bool {
+    let first = match s.chars().next() {
+        Some(c) => c,
+        None => return false,
+    };
+    if !first.is_alphabetic() && first != '_' {
+        return false;
+    }
+    s.contains('_')
+        || s.contains('-')
+        || s.contains("::")
+        || s.chars().any(|c| c.is_uppercase())
+        || s.chars().any(|c| c.is_ascii_digit())
 }
 
 fn apply_symbol_boost(results: &mut [SearchResult], known_symbols: &[String]) {
@@ -927,7 +963,7 @@ fn apply_definition_boost(results: &mut [SearchResult], query: &str) {
 // 1.45; MicroservicesModule: 0.65 → 2.57).
 /// True unless the named env var is explicitly set to `0` / `false`. The
 /// default-on gate shape shared by the post-retrieval scoring stages.
-fn env_default_on(var: &str) -> bool {
+pub(crate) fn env_default_on(var: &str) -> bool {
     !matches!(std::env::var(var).as_deref(), Ok("0") | Ok("false"))
 }
 
@@ -935,6 +971,104 @@ static DEFINITION_BOOST_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn definition_boost_enabled() -> bool {
     *DEFINITION_BOOST_ENABLED.get_or_init(|| env_default_on("CODESAGE_DEFINITION_BOOST"))
+}
+
+/// Precomputed lookup from a file's stem — lowercased, and separator-
+/// normalized via [`normalize_stem`] — to every indexed file path sharing
+/// it. Replaces the per-query `all_chunk_file_paths()` full scan plus
+/// per-file lowercasing that used to run on every symbol-shaped search.
+struct StemIndex {
+    token: (i64, i64, i64),
+    by_lower: HashMap<String, Vec<String>>,
+    by_norm: HashMap<String, Vec<String>>,
+}
+
+impl StemIndex {
+    fn build(db: &Database, token: (i64, i64, i64)) -> Result<Self> {
+        let mut by_lower: HashMap<String, Vec<String>> = HashMap::new();
+        let mut by_norm: HashMap<String, Vec<String>> = HashMap::new();
+        for file_path in db.all_chunk_file_paths()? {
+            let Some(stem) = std::path::Path::new(&file_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+            else {
+                continue;
+            };
+            by_lower
+                .entry(stem.to_lowercase())
+                .or_default()
+                .push(file_path.clone());
+            by_norm
+                .entry(normalize_stem(stem))
+                .or_default()
+                .push(file_path);
+        }
+        Ok(Self {
+            token,
+            by_lower,
+            by_norm,
+        })
+    }
+
+    /// File paths whose stem equals `symbol_lower` (lowercase) or
+    /// `symbol_norm` (separator-stripped), deduped, in stable path order.
+    fn matching_paths(&self, symbol_lower: &str, symbol_norm: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for hit in [
+            self.by_lower.get(symbol_lower),
+            self.by_norm.get(symbol_norm),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            out.extend(hit.iter().cloned());
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+}
+
+/// (db file path, chunk table) — see `Database::semantic_cache_key`.
+type StemCacheKey = (String, String);
+type StemCacheMap = HashMap<StemCacheKey, Arc<StemIndex>>;
+
+/// Process-lifetime cache of per-project [`StemIndex`]es, keyed by
+/// (db file path, chunk table). Entries rebuild when the cheap validity
+/// token from `semantic_files` changes, so the watcher's reindex naturally
+/// invalidates them. Values hold only stems + paths, so memory stays small
+/// even with many projects pooled in one daemon.
+static STEM_CACHE: LazyLock<Mutex<StemCacheMap>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn stem_index_from_cache(
+    cache: &mut StemCacheMap,
+    key: StemCacheKey,
+    db: &Database,
+) -> Result<Arc<StemIndex>> {
+    let token = db.semantic_files_validity_token()?;
+    if let Some(hit) = cache.get(&key)
+        && hit.token == token
+    {
+        return Ok(Arc::clone(hit));
+    }
+    let built = Arc::new(StemIndex::build(db, token)?);
+    cache.insert(key, Arc::clone(&built));
+    Ok(built)
+}
+
+fn stem_index_for(db: &Database) -> Result<Arc<StemIndex>> {
+    match db.semantic_cache_key() {
+        Some(key) => {
+            let mut cache = STEM_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+            stem_index_from_cache(&mut cache, key, db)
+        }
+        // In-memory handles have no stable identity to key a process cache
+        // on; build fresh (the single-shot CLI cost profile).
+        None => {
+            let token = db.semantic_files_validity_token()?;
+            Ok(Arc::new(StemIndex::build(db, token)?))
+        }
+    }
 }
 
 // Non-candidate stem scan: when a bare-symbol query (e.g. "FooBar") didn't
@@ -965,21 +1099,10 @@ fn apply_non_candidate_stem_scan(
 
     let candidate_set: HashSet<String> = results.iter().map(|r| r.file_path.clone()).collect();
 
-    let all_files = db.all_chunk_file_paths()?;
+    let stem_index = stem_index_for(db)?;
     let mut injected: Vec<SearchResult> = Vec::new();
-    for file_path in all_files {
+    for file_path in stem_index.matching_paths(&symbol_lower, &symbol_norm) {
         if candidate_set.contains(&file_path) {
-            continue;
-        }
-        let Some(stem_str) = std::path::Path::new(&file_path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-        else {
-            continue;
-        };
-        let stem_lower = stem_str.to_lowercase();
-        let stem_norm = normalize_stem(stem_str);
-        if stem_lower != symbol_lower && stem_norm != symbol_norm {
             continue;
         }
         // Stem matches; scan this file's chunks for the definition.
@@ -1050,49 +1173,16 @@ fn has_dir_segment(path: &str, names: &[&str]) -> bool {
     path.split('/').any(|seg| names.contains(&seg))
 }
 
-// Test-like demote intensity, by query shape. The non-test default below is
-// the §2.11-motivated harder demote (0.15x total); the legacy variant (0.3x)
-// is preserved for the no-query `path_penalty(path)` callers (unit tests).
-#[derive(Clone, Copy)]
-enum TestPathDemote {
-    /// Legacy: 0.3x for test-like paths regardless of query shape. Only used
-    /// by the no-query `path_penalty(path)` wrapper, which is itself only
-    /// reachable from unit tests in release builds — kept to preserve the
-    /// pre-§1.22 contract for any future external callers.
-    #[allow(dead_code)]
-    Legacy,
-    /// Non-test-shaped query: extra demote on top of legacy (0.15x total).
-    /// §2.11 motivation — 0.3x alone wasn't enough to surface
-    /// `InterceptorManager.js` over 9 sibling `*.test.js` files on the
-    /// axios "request and response interceptors" query.
-    NonTestQuery,
-    /// Test-shaped query ("test for X", "X spec", "login fixtures"): no
-    /// test-like demote. Test files compete on merit so "find the test for X"
-    /// surfaces them above the production file.
-    TestQuery,
-}
-
-#[allow(dead_code)]
-pub(crate) fn path_penalty(path: &str) -> f32 {
-    path_penalty_with(path, TestPathDemote::Legacy)
-}
-
 // Query-aware path penalty. `query_is_test_shaped` tells the function whether
 // the user query mentions test/spec/fixture intent — when true, we skip the
-// test-like demote so legitimate test-intent queries surface test files.
+// test-like demote so legitimate test-intent queries surface test files and
+// they compete on merit ("find the test for X" surfaces them above the
+// production file). Non-test-shaped queries get the full 0.15x demote
+// (0.3x baseline × 0.5x extra) — §2.11 motivation: 0.3x alone wasn't enough
+// to surface `InterceptorManager.js` over 9 sibling `*.test.js` files on the
+// axios "request and response interceptors" query.
 // Compat/examples/d.ts/re-export demotes are query-independent.
 pub(crate) fn path_penalty_for_query(path: &str, query_is_test_shaped: bool) -> f32 {
-    path_penalty_with(
-        path,
-        if query_is_test_shaped {
-            TestPathDemote::TestQuery
-        } else {
-            TestPathDemote::NonTestQuery
-        },
-    )
-}
-
-fn path_penalty_with(path: &str, test_demote: TestPathDemote) -> f32 {
     let normalized = if path.contains('\\') {
         path.replace('\\', "/")
     } else {
@@ -1100,14 +1190,8 @@ fn path_penalty_with(path: &str, test_demote: TestPathDemote) -> f32 {
     };
     let mut penalty = 1.0f32;
 
-    if test_like_globset().is_match(&normalized) {
-        match test_demote {
-            TestPathDemote::Legacy => penalty *= SOFT_PENALTY_STRONG,
-            TestPathDemote::NonTestQuery => {
-                penalty *= SOFT_PENALTY_STRONG * EXTRA_TEST_DEMOTE_NON_TEST_QUERY
-            }
-            TestPathDemote::TestQuery => {}
-        }
+    if !query_is_test_shaped && test_like_globset().is_match(&normalized) {
+        penalty *= SOFT_PENALTY_STRONG * EXTRA_TEST_DEMOTE_NON_TEST_QUERY;
     }
     if has_dir_segment(&normalized, COMPAT_DIR_NAMES) {
         penalty *= SOFT_PENALTY_STRONG;
@@ -1334,10 +1418,13 @@ fn adaptive_rerank_weight(query: &str) -> f32 {
     if trimmed.is_empty() {
         return RERANK_WEIGHT_DEFAULT;
     }
-    // Short identifier shape: single token, looks like an identifier
-    // (CamelCase / snake_case / kebab-case with 3+ chars, no whitespace).
+    // Short identifier shape: single token carrying an explicit identifier
+    // signal (snake_case, kebab-case, camel/PascalCase, `::` scoping, or a
+    // digit — see `looks_like_short_identifier`). A single all-lowercase
+    // alphabetic word ("authentication") is natural language, not an
+    // identifier, and falls through to the default weight.
     let single_token = !trimmed.chars().any(char::is_whitespace);
-    if single_token && looks_like_identifier(trimmed) {
+    if single_token && looks_like_short_identifier(trimmed) {
         return RERANK_WEIGHT_SHORT_ID;
     }
     // Natural language: 3+ alphabetic words, none of them looking like
@@ -1386,7 +1473,7 @@ fn apply_reranking(rerank: &mut RerankFn<'_>, query: &str, results: &mut [Search
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 }
 
-fn annotate_with_symbols(db: &Database, results: &mut [SearchResult]) -> Result<()> {
+pub(crate) fn annotate_with_symbols(db: &Database, results: &mut [SearchResult]) -> Result<()> {
     if results.is_empty() {
         return Ok(());
     }
@@ -1417,1098 +1504,6 @@ fn annotate_with_symbols(db: &Database, results: &mut [SearchResult]) -> Result<
         result.symbols = overlapping;
     }
     Ok(())
-}
-
-fn is_qualified_symbol_name(name: &str) -> bool {
-    name.contains('\\') || name.contains('.') || name.contains("::")
-}
-
-pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactEntry>> {
-    let seed_symbols: Vec<Symbol> = match &req.target {
-        ImpactTarget::Symbol { name } => {
-            let syms = db.find_symbols(name, None)?;
-            if !is_qualified_symbol_name(name) && syms.len() > 1 {
-                let candidates: Vec<String> =
-                    syms.iter().map(|s| s.qualified_name.clone()).collect();
-                anyhow::bail!(
-                    "ambiguous symbol '{name}': {} definitions — qualify with one of: {}",
-                    syms.len(),
-                    candidates.join(", ")
-                );
-            }
-            syms
-        }
-        ImpactTarget::File { path } => db.symbols_for_file(path)?,
-    };
-
-    if seed_symbols.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let origin_files: HashSet<String> = match &req.target {
-        ImpactTarget::File { path } => {
-            let mut s = HashSet::new();
-            s.insert(path.clone());
-            s
-        }
-        ImpactTarget::Symbol { .. } => seed_symbols.iter().map(|s| s.file_path.clone()).collect(),
-    };
-
-    let mut file_reasons: HashMap<String, (u32, Vec<ImpactReason>)> = HashMap::new();
-    let mut frontier: Vec<Symbol> = seed_symbols;
-    let mut visited_symbols: HashSet<String> = HashSet::new();
-
-    for depth in 1..=req.depth as u32 {
-        // First pass: collect refs, update file_reasons, record (from_file, line) pairs
-        // that need caller-symbol lookups for the next frontier.
-        let mut pending_callers: Vec<(String, Option<String>, u32)> = Vec::new();
-        for sym in &frontier {
-            if !visited_symbols.insert(sym.qualified_name.clone()) {
-                continue;
-            }
-            let refs = references_for_symbol(db, sym)?;
-            for r in refs {
-                if origin_files.contains(&r.from_file) {
-                    continue;
-                }
-                let entry = file_reasons
-                    .entry(r.from_file.clone())
-                    .or_insert_with(|| (depth, Vec::new()));
-                if entry.0 > depth {
-                    entry.0 = depth;
-                }
-                if entry.1.len() < 10 {
-                    entry.1.push(ImpactReason {
-                        via_symbol: sym.name.clone(),
-                        kind: r.kind,
-                        line: r.line,
-                    });
-                }
-                if depth < req.depth as u32 {
-                    pending_callers.push((r.from_file, r.from_symbol, r.line));
-                }
-            }
-        }
-
-        if pending_callers.is_empty() {
-            break;
-        }
-
-        // Batched caller-symbol lookup: one query per distinct file, regardless of
-        // how many lines in that file triggered the lookup.
-        let distinct_files: Vec<String> = {
-            let mut set: HashSet<String> = HashSet::new();
-            pending_callers.iter().for_each(|(f, _, _)| {
-                set.insert(f.clone());
-            });
-            set.into_iter().collect()
-        };
-        let syms_by_file = db.symbols_for_files(&distinct_files)?;
-
-        let mut next_frontier: Vec<Symbol> = Vec::new();
-        for (from_file, from_symbol, line) in &pending_callers {
-            let Some(syms) = syms_by_file.get(from_file) else {
-                continue;
-            };
-            // Precise path: the reference recorded its enclosing symbol, so jump
-            // straight to that one symbol instead of every symbol spanning the
-            // line (which conflated a method with its containing class).
-            if let Some(qn) = from_symbol
-                && let Some(s) = syms.iter().find(|s| &s.qualified_name == qn)
-            {
-                next_frontier.push(s.clone());
-                continue;
-            }
-            // Fallback for references with no recorded enclosing symbol: the
-            // innermost symbol whose range contains the line.
-            let mut best: Option<&Symbol> = None;
-            for s in syms {
-                if s.line_start <= *line && s.line_end >= *line {
-                    let span = s.line_end - s.line_start;
-                    match best {
-                        Some(b) if (b.line_end - b.line_start) <= span => {}
-                        _ => best = Some(s),
-                    }
-                }
-            }
-            if let Some(s) = best {
-                next_frontier.push(s.clone());
-            }
-        }
-
-        // Bound fan-out: a symbol referenced by hundreds of files explodes the
-        // frontier and the per-symbol `references_for_symbol` queries at the
-        // next depth. Dedup by qualified name and cap each level so a wide
-        // blast radius can't make impact analysis unbounded. fnd: CR-017.
-        const MAX_FRONTIER: usize = 512;
-        let mut seen_qn: HashSet<String> = HashSet::new();
-        next_frontier.retain(|s| seen_qn.insert(s.qualified_name.clone()));
-        if next_frontier.len() > MAX_FRONTIER {
-            tracing::debug!(
-                frontier = next_frontier.len(),
-                cap = MAX_FRONTIER,
-                depth,
-                "impact_analysis frontier capped"
-            );
-            next_frontier.truncate(MAX_FRONTIER);
-        }
-
-        if next_frontier.is_empty() {
-            break;
-        }
-        frontier = next_frontier;
-    }
-
-    let mut entries: Vec<ImpactEntry> = file_reasons
-        .into_iter()
-        .map(|(path, (distance, reasons))| {
-            let category = FileCategory::classify(&path);
-            ImpactEntry {
-                file_path: path,
-                distance,
-                category,
-                reasons,
-            }
-        })
-        .filter(|e| !req.source_only || e.category == FileCategory::Source)
-        .collect();
-
-    entries.sort_by(|a, b| {
-        a.distance
-            .cmp(&b.distance)
-            .then_with(|| b.reasons.len().cmp(&a.reasons.len()))
-    });
-    Ok(entries)
-}
-
-/// Cap on `sibling_symbols` to keep dense files from blowing up the response.
-const SIBLING_SYMBOL_CAP: usize = 60;
-
-/// `impact_analysis` plus the adaptive extras requested via [`ImpactOptions`]:
-/// forward dependencies, same-file sibling symbols, a result `limit`, and a
-/// `summary_only` rollup. With all options default, the `results` field equals
-/// the classic `impact_analysis` output.
-pub fn impact_analysis_report(
-    db: &Database,
-    req: &ImpactRequest,
-    opts: &ImpactOptions,
-) -> Result<ImpactReport> {
-    let mut entries = impact_analysis(db, req)?;
-
-    // Summary reflects the full result set, before any limit truncation.
-    let summary = if opts.summary_only {
-        Some(build_impact_summary(&entries))
-    } else {
-        None
-    };
-
-    let mut truncated = false;
-    if let Some(limit) = opts.limit
-        && entries.len() > limit
-    {
-        entries.truncate(limit);
-        truncated = true;
-    }
-
-    // Collapse each file's reason list to a single exemplar when summarizing.
-    if opts.summary_only {
-        for e in &mut entries {
-            e.reasons.truncate(1);
-        }
-    }
-
-    let mut forward_dependencies = Vec::new();
-    let mut sibling_symbols = Vec::new();
-    if opts.include_forward || opts.include_siblings {
-        let target_files = impact_target_files(db, &req.target)?;
-        if opts.include_forward {
-            let mut fwd: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-            for f in &target_files {
-                for imp in list_dependencies(db, f)?.imports {
-                    fwd.insert(imp);
-                }
-            }
-            for f in &target_files {
-                fwd.remove(f);
-            }
-            forward_dependencies = fwd.into_iter().collect();
-        }
-        if opts.include_siblings {
-            sibling_symbols = collect_sibling_symbols(db, &req.target, &target_files)?;
-        }
-    }
-
-    Ok(ImpactReport {
-        results: entries,
-        forward_dependencies,
-        sibling_symbols,
-        truncated,
-        summary,
-    })
-}
-
-/// Resolve the file(s) the impact target lives in.
-fn impact_target_files(db: &Database, target: &ImpactTarget) -> Result<Vec<String>> {
-    match target {
-        ImpactTarget::File { path } => Ok(vec![path.clone()]),
-        ImpactTarget::Symbol { name } => {
-            let mut files: Vec<String> = db
-                .find_symbols(name, None)?
-                .iter()
-                .map(|s| s.file_path.clone())
-                .collect();
-            files.sort();
-            files.dedup();
-            Ok(files)
-        }
-    }
-}
-
-/// Symbols defined in the target's file(s), excluding the target symbol itself.
-/// Repetitive same-name definitions (overloads) collapse to one entry, and the
-/// list is capped at [`SIBLING_SYMBOL_CAP`].
-fn collect_sibling_symbols(
-    db: &Database,
-    target: &ImpactTarget,
-    target_files: &[String],
-) -> Result<Vec<SiblingSymbol>> {
-    let target_name = match target {
-        ImpactTarget::Symbol { name } => Some(name.as_str()),
-        ImpactTarget::File { .. } => None,
-    };
-    let mut seen_names: HashSet<String> = HashSet::new();
-    let mut out: Vec<SiblingSymbol> = Vec::new();
-    for f in target_files {
-        for s in db.symbols_for_file(f)? {
-            if let Some(n) = target_name
-                && (s.name == n || s.qualified_name == n)
-            {
-                continue;
-            }
-            // Collapse repeated implementations (same name+kind) to one signature.
-            let key = format!("{}::{}", s.kind.as_str(), s.name);
-            if !seen_names.insert(key) {
-                continue;
-            }
-            out.push(SiblingSymbol {
-                name: s.name,
-                kind: s.kind,
-                line: s.line_start,
-            });
-            if out.len() >= SIBLING_SYMBOL_CAP {
-                break;
-            }
-        }
-        if out.len() >= SIBLING_SYMBOL_CAP {
-            break;
-        }
-    }
-    out.sort_by_key(|s| s.line);
-    Ok(out)
-}
-
-fn build_impact_summary(entries: &[ImpactEntry]) -> ImpactSummary {
-    let mut by_distance: HashMap<u32, usize> = HashMap::new();
-    let (mut src, mut test, mut cfg) = (0usize, 0usize, 0usize);
-    for e in entries {
-        *by_distance.entry(e.distance).or_insert(0) += 1;
-        match e.category {
-            FileCategory::Source => src += 1,
-            FileCategory::Test => test += 1,
-            FileCategory::Config => cfg += 1,
-        }
-    }
-    let mut by_distance: Vec<DistanceCount> = by_distance
-        .into_iter()
-        .map(|(distance, count)| DistanceCount { distance, count })
-        .collect();
-    by_distance.sort_by_key(|d| d.distance);
-    let by_category: Vec<CategoryCount> = [
-        (FileCategory::Source, src),
-        (FileCategory::Test, test),
-        (FileCategory::Config, cfg),
-    ]
-    .into_iter()
-    .filter(|(_, count)| *count > 0)
-    .map(|(category, count)| CategoryCount { category, count })
-    .collect();
-    ImpactSummary {
-        total_affected: entries.len(),
-        by_distance,
-        by_category,
-    }
-}
-
-fn references_for_symbol(db: &Database, sym: &Symbol) -> Result<Vec<Reference>> {
-    let key = if sym.qualified_name != sym.name {
-        &sym.qualified_name
-    } else {
-        &sym.name
-    };
-    let raw = db.find_references(key, None)?;
-
-    // Import-aware reverse resolution. `find_references` matches by
-    // `to_name_tail`, so an unqualified name fans out to *every* same-named
-    // definition — a call to one class's `getAttributes` was counted toward
-    // all of them, inflating the reverse blast radius that `impact_analysis`
-    // and `assess_risk` read. `resolve_callee_definitions` already filters
-    // candidates by the caller file's imports (the forward path); routing each
-    // candidate reference back through it makes a reverse edge exist iff the
-    // matching forward edge does. Unique names short-circuit in the resolver
-    // (≤1 candidate), so distinctively-named symbols are untouched — only
-    // genuinely ambiguous names get import-filtered. Resolutions are cached per
-    // `(from_file, to_name)` because a hot symbol's callers repeat both.
-    let mut out = Vec::with_capacity(raw.len());
-    let mut cache: HashMap<(String, String), Vec<Symbol>> = HashMap::new();
-    for r in raw {
-        let cache_key = (r.from_file.clone(), r.to_name.clone());
-        if !cache.contains_key(&cache_key) {
-            let resolved = resolve_callee_definitions(db, &r.from_file, &r.to_name)?;
-            cache.insert(cache_key.clone(), resolved);
-        }
-        if cache[&cache_key].iter().any(|s| same_symbol_def(s, sym)) {
-            out.push(r);
-        }
-    }
-    Ok(out)
-}
-
-/// Identity test for two `Symbol`s naming the same definition. `Symbol` carries
-/// no stable id, so we key on the triple that uniquely locates a definition:
-/// file, qualified name, and start line.
-fn same_symbol_def(a: &Symbol, b: &Symbol) -> bool {
-    a.file_path == b.file_path
-        && a.qualified_name == b.qualified_name
-        && a.line_start == b.line_start
-}
-
-/// Default-on; opt-out via `CODESAGE_BUNDLE_LINE_NUMBERS=0` (or "false").
-static BUNDLE_LINE_NUMBERS_ENABLED: OnceLock<bool> = OnceLock::new();
-
-fn bundle_line_numbers_enabled() -> bool {
-    *BUNDLE_LINE_NUMBERS_ENABLED.get_or_init(|| env_default_on("CODESAGE_BUNDLE_LINE_NUMBERS"))
-}
-
-/// `SymbolKind` render strings, used to recognize a chunk-augmentation
-/// header's `# <name> (<kind>)` lines without mistaking a source comment
-/// like `# cleanup (later)` for one.
-const SYMBOL_KIND_STRS: [&str; 11] = [
-    "function",
-    "method",
-    "class",
-    "trait",
-    "interface",
-    "struct",
-    "enum",
-    "constant",
-    "macro",
-    "module",
-    "namespace",
-];
-
-fn is_symbol_header_line(line: &str) -> bool {
-    let Some(rest) = line.strip_prefix("# ") else {
-        return false;
-    };
-    let Some(open) = rest.rfind(" (") else {
-        return false;
-    };
-    let Some(kind) = rest[open + 2..].strip_suffix(')') else {
-        return false;
-    };
-    SYMBOL_KIND_STRS.contains(&kind)
-}
-
-/// Prefix the body lines of a bundle chunk with 1-based file line numbers
-/// (`  12 | code`) starting at `start_line`, so an agent can cite
-/// `file:line` straight from the bundle without re-reading. Applied at read
-/// time only — stored and embedded chunk text is never touched.
-///
-/// The augmentation header (`# <file_path>` plus `# <symbol> (<kind>)`
-/// lines that `semantic.rs` prepends) passes through unnumbered. Detection
-/// is anchored on the chunk's own `file_path` for line 1, so a C/Rust chunk
-/// (no header) or a source line that merely starts with `#` is never
-/// mistaken for header.
-fn number_chunk_lines(content: &str, file_path: &str, start_line: u32) -> String {
-    if content.is_empty() {
-        return String::new();
-    }
-    let lines: Vec<&str> = content.lines().collect();
-    let mut idx = 0;
-    let header_anchor = format!("# {file_path}");
-    if lines.first() == Some(&header_anchor.as_str()) {
-        idx = 1;
-        while idx < lines.len() && is_symbol_header_line(lines[idx]) {
-            idx += 1;
-        }
-    }
-    let body_count = lines.len() - idx;
-    let last_no = start_line as usize + body_count.saturating_sub(1);
-    let width = last_no.to_string().len().max(4);
-
-    let mut out = String::with_capacity(content.len() + body_count * (width + 4));
-    for header_line in &lines[..idx] {
-        out.push_str(header_line);
-        out.push('\n');
-    }
-    for (offset, body_line) in lines[idx..].iter().enumerate() {
-        let n = start_line as usize + offset;
-        out.push_str(&format!("{n:>width$} | {body_line}\n"));
-    }
-    // `lines()` drops a trailing newline; we always append one per line.
-    // Restore the original trailing-newline shape so the chunk doesn't grow.
-    if !content.ends_with('\n') {
-        out.pop();
-    }
-    out
-}
-
-/// Apply read-time line numbering to every chunk in a bundle, when enabled.
-fn finalize_bundle(mut bundle: ContextBundle) -> ContextBundle {
-    if bundle_line_numbers_enabled() {
-        for r in bundle.primary.iter_mut().chain(bundle.related.iter_mut()) {
-            r.content = number_chunk_lines(&r.content, &r.file_path, r.start_line);
-        }
-    }
-    bundle
-}
-
-pub fn export_context(
-    db: &Database,
-    query_embedding: &[f32],
-    rerank: Option<RerankFn<'_>>,
-    req: &ExportRequest,
-) -> Result<ContextBundle> {
-    if let Some(sym_name) = &req.symbol {
-        return export_context_for_symbol(db, sym_name, req);
-    }
-
-    let query = req.query.as_deref().unwrap_or_default();
-    if query.is_empty() {
-        anyhow::bail!("export_context requires either `query` or `symbol`");
-    }
-
-    let search_req = SearchRequest {
-        query: query.to_string(),
-        limit: Some(req.limit),
-        offset: Some(0),
-        languages: None,
-        paths: None,
-    };
-    let primary = search(db, query_embedding, rerank, &search_req)?;
-
-    let mut symbol_defs: Vec<Symbol> = Vec::new();
-    let mut seen_sym: HashSet<String> = HashSet::new();
-    let mut related: Vec<SearchResult> = Vec::new();
-    let mut related_keys: HashSet<(String, u32)> = primary
-        .iter()
-        .map(|r| (r.file_path.clone(), r.start_line))
-        .collect();
-
-    for result in &primary {
-        for sum in &result.symbols {
-            if !seen_sym.insert(sum.qualified_name.clone()) {
-                continue;
-            }
-            if let Some(d) = find_definition_for_summary(db, sum, &result.file_path)? {
-                symbol_defs.push(d);
-            }
-        }
-    }
-
-    if req.include_callees || req.include_callers {
-        let related_symbols: Vec<Symbol> = symbol_defs.iter().take(5).cloned().collect();
-        add_related_for_symbols(
-            db,
-            &related_symbols,
-            req.include_callers,
-            req.include_callees,
-            req.limit,
-            &mut related,
-            &mut related_keys,
-        )?;
-    }
-
-    Ok(finalize_bundle(ContextBundle {
-        target_description: format!("query: {query}"),
-        primary,
-        related,
-        symbol_definitions: symbol_defs,
-    }))
-}
-
-fn find_definition_for_summary(
-    db: &Database,
-    summary: &SymbolSummary,
-    file_path: &str,
-) -> Result<Option<Symbol>> {
-    let candidates: Vec<Symbol> = db
-        .find_symbols(&summary.name, Some(summary.kind))?
-        .into_iter()
-        .filter(|d| d.qualified_name == summary.qualified_name)
-        .collect();
-
-    if let Some(same_file) = candidates.iter().find(|d| d.file_path == file_path) {
-        return Ok(Some(same_file.clone()));
-    }
-
-    Ok(candidates.into_iter().next())
-}
-
-pub fn export_context_for_symbol(
-    db: &Database,
-    sym_name: &str,
-    req: &ExportRequest,
-) -> Result<ContextBundle> {
-    let defs = db.find_symbols(sym_name, None)?;
-    if defs.is_empty() {
-        return Ok(ContextBundle {
-            target_description: format!("symbol: {sym_name} (not found)"),
-            primary: Vec::new(),
-            related: Vec::new(),
-            symbol_definitions: Vec::new(),
-        });
-    }
-
-    let defs: Vec<Symbol> = defs.into_iter().take(req.limit).collect();
-    let mut primary: Vec<SearchResult> = Vec::new();
-    let mut primary_keys: HashSet<(String, u32)> = HashSet::new();
-    for def in &defs {
-        if primary.len() >= req.limit {
-            break;
-        }
-        add_related_from_file(
-            db,
-            &def.file_path,
-            def.line_start,
-            &mut primary,
-            &mut primary_keys,
-        )?;
-    }
-
-    let mut related: Vec<SearchResult> = Vec::new();
-    let mut related_keys: HashSet<(String, u32)> = primary_keys.clone();
-
-    if req.include_callers || req.include_callees {
-        add_related_for_symbols(
-            db,
-            &defs,
-            req.include_callers,
-            req.include_callees,
-            req.limit,
-            &mut related,
-            &mut related_keys,
-        )?;
-    }
-
-    Ok(finalize_bundle(ContextBundle {
-        target_description: format!("symbol: {sym_name}"),
-        primary,
-        related,
-        symbol_definitions: defs,
-    }))
-}
-
-/// Build a curated [`ContextBundle`] for one feature_id. Composes the
-/// feature's already-curated file list (entry + owned + tests + context)
-/// with the existing chunk store and symbol graph, so an agent doesn't
-/// have to fan out per-file `Read` calls after `find_feature` / `list_features`.
-///
-/// Layout:
-/// - `primary[]` — chunks from owned + entry files, capped at `limit`.
-/// - `related[]` — chunks from tests first, then context files. Caller/
-///   callee expansion of the entry symbol (when `include_callers` /
-///   `include_callees` is set and the feature has a real entry symbol)
-///   joins this list, capped by `limit`.
-/// - `symbol_definitions[]` — entry-symbol definition (when present) +
-///   any symbol definitions discovered while building primary chunks.
-/// - `target_description` — `"feature: <title> (<feature_id>)"`.
-///
-/// When the feature_id doesn't resolve, returns an empty bundle with a
-/// `not found` marker in `target_description` (mirrors
-/// `export_context_for_symbol`'s missing-symbol behavior).
-pub fn feature_bundle(
-    db: &Database,
-    feature_id: &str,
-    include_callers: bool,
-    include_callees: bool,
-    limit: usize,
-) -> Result<ContextBundle> {
-    use codesage_protocol::FeatureFileRole;
-    let limit = if limit == 0 { 5 } else { limit };
-
-    let feature = match db.load_feature(feature_id)? {
-        Some(f) => f,
-        None => {
-            return Ok(ContextBundle {
-                target_description: format!("feature: {feature_id} (not found)"),
-                primary: Vec::new(),
-                related: Vec::new(),
-                symbol_definitions: Vec::new(),
-            });
-        }
-    };
-
-    let mut primary: Vec<SearchResult> = Vec::new();
-    let mut primary_keys: HashSet<(String, u32)> = HashSet::new();
-    // Entry first so it's the first chunk in primary order. For the entry
-    // file itself, prefer the chunk overlapping the feature's entry symbol
-    // — `crates/cli/src/main.rs` opens with 400 lines of `use` statements
-    // before `fn main()` starts, and an agent reviewing the feature wants
-    // the body, not the imports. Fall back to first-chunk when the entry
-    // symbol can't be located (no entry_symbol on the feature, or symbol
-    // line is outside any chunk).
-    let entry_line = feature.entry_symbol.as_ref().and_then(|sym| {
-        entry_symbol_line(db, sym, &feature.entry_path)
-            .ok()
-            .flatten()
-    });
-    for f in feature
-        .files
-        .iter()
-        .filter(|f| matches!(f.role, FeatureFileRole::Entry | FeatureFileRole::Owned))
-    {
-        if primary.len() >= limit {
-            break;
-        }
-        if f.role == FeatureFileRole::Entry
-            && let Some(line) = entry_line
-        {
-            add_chunk_at_line(db, &f.path, line, &mut primary, &mut primary_keys)?;
-            // Fall back to first-chunk only when the symbol-overlap path
-            // produced nothing (no chunk covers that line yet).
-            if primary.is_empty() {
-                add_first_chunk_of_file(db, &f.path, &mut primary, &mut primary_keys)?;
-            }
-        } else {
-            add_first_chunk_of_file(db, &f.path, &mut primary, &mut primary_keys)?;
-        }
-    }
-
-    let mut related: Vec<SearchResult> = Vec::new();
-    let mut related_keys: HashSet<(String, u32)> = primary_keys.clone();
-    // Tests next (run-this-after-review signal), then context.
-    for role in [FeatureFileRole::Test, FeatureFileRole::Context] {
-        for f in feature.files.iter().filter(|f| f.role == role) {
-            if related.len() >= limit {
-                break;
-            }
-            add_first_chunk_of_file(db, &f.path, &mut related, &mut related_keys)?;
-        }
-        if related.len() >= limit {
-            break;
-        }
-    }
-
-    // Symbol definitions: entry symbol (if any) + symbols overlapping the
-    // primary chunks (annotated already by add_first_chunk_of_file).
-    // Filter entry-symbol matches to definitions that live in the
-    // feature's entry file when possible — `main` is a common-enough
-    // name that an unqualified lookup pulls in unrelated definitions
-    // (e.g. Python `if __name__ == "__main__"` modules share the same
-    // entry_symbol = "main" string as Rust binaries).
-    let mut symbol_definitions: Vec<Symbol> = Vec::new();
-    let mut seen_sym: HashSet<String> = HashSet::new();
-    if let Some(entry_sym) = &feature.entry_symbol {
-        let all_defs = db.find_symbols(entry_sym, None)?;
-        let in_entry_file: Vec<Symbol> = all_defs
-            .iter()
-            .filter(|d| d.file_path == feature.entry_path)
-            .cloned()
-            .collect();
-        let preferred = if in_entry_file.is_empty() {
-            all_defs
-        } else {
-            in_entry_file
-        };
-        for def in preferred {
-            if seen_sym.insert(def.qualified_name.clone()) {
-                symbol_definitions.push(def);
-            }
-        }
-    }
-    for r in &primary {
-        for sum in &r.symbols {
-            if !seen_sym.insert(sum.qualified_name.clone()) {
-                continue;
-            }
-            if let Some(d) = find_definition_for_summary(db, sum, &r.file_path)? {
-                symbol_definitions.push(d);
-            }
-        }
-    }
-
-    // Caller/callee expansion of the entry symbol when requested.
-    if (include_callers || include_callees) && !symbol_definitions.is_empty() {
-        // Use the entry symbol's definition(s) as the anchor — limited to
-        // the first few so the bundle stays bounded.
-        let anchors: Vec<Symbol> = symbol_definitions.iter().take(3).cloned().collect();
-        add_related_for_symbols(
-            db,
-            &anchors,
-            include_callers,
-            include_callees,
-            limit,
-            &mut related,
-            &mut related_keys,
-        )?;
-    }
-
-    Ok(finalize_bundle(ContextBundle {
-        target_description: format!("feature: {} ({})", feature.title, feature.feature_id),
-        primary,
-        related,
-        symbol_definitions,
-    }))
-}
-
-/// Insert the chunk of `file_path` whose `[start_line, end_line]` covers
-/// `line` (the entry symbol's `line_start`). Falls back silently when no
-/// chunk covers that line — the outer caller then drops back to
-/// `add_first_chunk_of_file`. Mirrors `add_related_from_file`'s
-/// covering-chunk lookup but stays in the primary-chunk track for
-/// feature_bundle.
-fn add_chunk_at_line(
-    db: &Database,
-    file_path: &str,
-    line: u32,
-    out: &mut Vec<SearchResult>,
-    seen: &mut HashSet<(String, u32)>,
-) -> Result<()> {
-    let chunks = db.chunks_for_file(file_path)?;
-    let Some(c) = chunks
-        .into_iter()
-        .find(|c| c.start_line <= line && c.end_line >= line)
-    else {
-        return Ok(());
-    };
-    let key = (c.file_path.clone(), c.start_line);
-    if !seen.insert(key) {
-        return Ok(());
-    }
-    let mut result = SearchResult {
-        file_path: c.file_path,
-        language: parse_db_language(&c.language),
-        content: c.content,
-        start_line: c.start_line,
-        end_line: c.end_line,
-        score: 0.0,
-        symbols: Vec::new(),
-    };
-    annotate_with_symbols(db, std::slice::from_mut(&mut result))?;
-    out.push(result);
-    Ok(())
-}
-
-/// Resolve the `line_start` of `entry_symbol` in `entry_path`. Used by
-/// `feature_bundle` to pick the chunk that holds the entry symbol's
-/// definition rather than the file's first chunk (which is usually
-/// imports/use statements). Returns `Ok(None)` when the symbol can't be
-/// uniquely placed inside the entry file — the caller falls back to
-/// first-chunk lookup.
-fn entry_symbol_line(db: &Database, entry_symbol: &str, entry_path: &str) -> Result<Option<u32>> {
-    let defs = db.find_symbols(entry_symbol, None)?;
-    Ok(defs
-        .into_iter()
-        .find(|d| d.file_path == entry_path)
-        .map(|d| d.line_start))
-}
-
-/// Insert the first chunk of `file_path` into `out` (deduped by
-/// `(path, start_line)`). Skips files that haven't been semantically
-/// indexed yet — their chunks just don't exist. Used by `feature_bundle`
-/// where we always want a deterministic per-file entry, not best-match
-/// search semantics.
-fn add_first_chunk_of_file(
-    db: &Database,
-    file_path: &str,
-    out: &mut Vec<SearchResult>,
-    seen: &mut HashSet<(String, u32)>,
-) -> Result<()> {
-    let chunks = db.chunks_for_file(file_path)?;
-    let Some(c) = chunks.into_iter().min_by_key(|c| c.start_line) else {
-        return Ok(());
-    };
-    let key = (c.file_path.clone(), c.start_line);
-    if !seen.insert(key) {
-        return Ok(());
-    }
-    let mut result = SearchResult {
-        file_path: c.file_path,
-        language: parse_db_language(&c.language),
-        content: c.content,
-        start_line: c.start_line,
-        end_line: c.end_line,
-        score: 0.0,
-        symbols: Vec::new(),
-    };
-    annotate_with_symbols(db, std::slice::from_mut(&mut result))?;
-    out.push(result);
-    Ok(())
-}
-
-fn add_related_for_symbols(
-    db: &Database,
-    symbols: &[Symbol],
-    include_callers: bool,
-    include_callees: bool,
-    limit: usize,
-    related: &mut Vec<SearchResult>,
-    related_keys: &mut HashSet<(String, u32)>,
-) -> Result<()> {
-    let mut seen_callee_defs: HashSet<(String, String, u32)> = HashSet::new();
-    for sym in symbols {
-        if include_callers {
-            add_callers_for_symbol(db, sym, limit, related, related_keys)?;
-        }
-        if related.len() >= limit {
-            break;
-        }
-        if include_callees {
-            add_callees_for_symbol(db, sym, limit, related, related_keys, &mut seen_callee_defs)?;
-        }
-        if related.len() >= limit {
-            break;
-        }
-    }
-    Ok(())
-}
-
-fn add_callers_for_symbol(
-    db: &Database,
-    sym: &Symbol,
-    limit: usize,
-    related: &mut Vec<SearchResult>,
-    related_keys: &mut HashSet<(String, u32)>,
-) -> Result<()> {
-    let refs = references_for_symbol(db, sym)?;
-    for r in refs {
-        if related.len() >= limit {
-            break;
-        }
-        add_related_from_file(db, &r.from_file, r.line, related, related_keys)?;
-    }
-    Ok(())
-}
-
-fn add_callees_for_symbol(
-    db: &Database,
-    sym: &Symbol,
-    limit: usize,
-    related: &mut Vec<SearchResult>,
-    related_keys: &mut HashSet<(String, u32)>,
-    seen_defs: &mut HashSet<(String, String, u32)>,
-) -> Result<()> {
-    let refs = db.references_in_file_range(&sym.file_path, sym.line_start, sym.line_end)?;
-    for r in refs {
-        if related.len() >= limit {
-            break;
-        }
-        if !is_callee_reference(r.kind) {
-            continue;
-        }
-        for def in resolve_callee_definitions(db, &sym.file_path, &r.to_name)? {
-            let key = (
-                def.file_path.clone(),
-                def.qualified_name.clone(),
-                def.line_start,
-            );
-            if !seen_defs.insert(key) {
-                continue;
-            }
-            add_related_from_file(db, &def.file_path, def.line_start, related, related_keys)?;
-            if related.len() >= limit {
-                break;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn resolve_callee_definitions(
-    db: &Database,
-    caller_file: &str,
-    to_name: &str,
-) -> Result<Vec<Symbol>> {
-    let candidates = db.find_symbols(to_name, None)?;
-    if is_qualified_symbol_name(to_name) {
-        return Ok(candidates
-            .into_iter()
-            .filter(|s| s.qualified_name == to_name || s.name == to_name)
-            .collect());
-    }
-    if candidates.len() <= 1 {
-        return Ok(candidates);
-    }
-    let import_refs = import_refs_for_file(db, caller_file)?;
-    let filtered: Vec<Symbol> = candidates
-        .into_iter()
-        .filter(|s| {
-            // A definition in the caller's own file is a valid target: a
-            // same-file call emits no import edge, so without this the local
-            // definition is filtered out and the reverse edge (read by
-            // `impact_analysis` / `assess_risk` through `references_for_symbol`)
-            // is lost. Mirrors the same-file preference in `resolve_def_summary`.
-            s.file_path == caller_file
-                || import_refs
-                    .iter()
-                    .any(|imp| import_ref_targets_symbol(imp, to_name, s))
-        })
-        .collect();
-    Ok(filtered)
-}
-
-fn import_refs_for_file(db: &Database, caller_file: &str) -> Result<Vec<String>> {
-    let mut refs = Vec::new();
-    if let Some(file_id) = db.file_id_for_path(caller_file)? {
-        for (to_name, kind) in db.refs_outgoing_for_file_id(file_id)? {
-            if matches!(
-                kind,
-                ReferenceKind::Import | ReferenceKind::Include | ReferenceKind::TraitUse
-            ) {
-                refs.push(to_name);
-            }
-        }
-    }
-    refs.extend(db.list_file_dependencies(caller_file)?.imports);
-    refs.sort();
-    refs.dedup();
-    Ok(refs)
-}
-
-/// True when `import_ref` (e.g. `crate::helpers_a::helper`) names `sym` in
-/// `sym_file` even if the symbol table only stores the bare tail (`helper`).
-fn import_ref_targets_symbol(import_ref: &str, callee_name: &str, sym: &Symbol) -> bool {
-    if import_ref == sym.qualified_name || import_ref == sym.name {
-        return true;
-    }
-    let Some((module, tail)) = import_ref.rsplit_once("::") else {
-        return import_ref == callee_name && import_ref == sym.name;
-    };
-    if tail != callee_name && tail != sym.name {
-        return false;
-    }
-    let module_path = module
-        .strip_prefix("crate::")
-        .unwrap_or(module)
-        .replace("::", "/");
-    let candidates = [
-        format!("{module_path}.rs"),
-        format!("{module_path}/mod.rs"),
-        format!("src/{module_path}.rs"),
-        format!("src/{module_path}/mod.rs"),
-    ];
-    candidates.iter().any(|c| c == &sym.file_path)
-}
-
-fn is_callee_reference(kind: ReferenceKind) -> bool {
-    matches!(
-        kind,
-        ReferenceKind::Call
-            | ReferenceKind::Instantiation
-            | ReferenceKind::Import
-            | ReferenceKind::Include
-            | ReferenceKind::Inheritance
-            | ReferenceKind::TraitUse
-            | ReferenceKind::TypeHint
-    )
-}
-
-fn add_related_from_file(
-    db: &Database,
-    file_path: &str,
-    line: u32,
-    out: &mut Vec<SearchResult>,
-    seen: &mut HashSet<(String, u32)>,
-) -> Result<()> {
-    let chunks = db.chunks_for_file(file_path)?;
-    let best = chunks
-        .into_iter()
-        .find(|c| c.start_line <= line && c.end_line >= line);
-    if let Some(c) = best {
-        let key = (c.file_path.clone(), c.start_line);
-        if seen.insert(key) {
-            let mut result = SearchResult {
-                file_path: c.file_path,
-                language: parse_db_language(&c.language),
-                content: c.content,
-                start_line: c.start_line,
-                end_line: c.end_line,
-                score: 0.0,
-                symbols: Vec::new(),
-            };
-            annotate_with_symbols(db, std::slice::from_mut(&mut result))?;
-            out.push(result);
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod line_number_tests {
-    use super::*;
-
-    #[test]
-    fn numbers_body_after_augmentation_header() {
-        let content = "# app/Svc.php\n# App\\Svc (class)\n<?php\nclass Svc {}";
-        let out = number_chunk_lines(content, "app/Svc.php", 10);
-        let lines: Vec<&str> = out.lines().collect();
-        // Header lines pass through unnumbered.
-        assert_eq!(lines[0], "# app/Svc.php");
-        assert_eq!(lines[1], "# App\\Svc (class)");
-        // Body numbered from start_line.
-        assert_eq!(lines[2], "  10 | <?php");
-        assert_eq!(lines[3], "  11 | class Svc {}");
-    }
-
-    #[test]
-    fn numbers_from_line_one_when_no_header() {
-        // C/Rust chunks are not augmented — first line is real source.
-        let content = "fn main() {\n    let x = 1;\n}";
-        let out = number_chunk_lines(content, "src/main.rs", 42);
-        let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines[0], "  42 | fn main() {");
-        assert_eq!(lines[1], "  43 |     let x = 1;");
-        assert_eq!(lines[2], "  44 | }");
-    }
-
-    #[test]
-    fn source_comment_resembling_header_is_not_stripped() {
-        // Python body whose first line is a `# word (word)` comment must
-        // not be mistaken for a symbol-header line: `(later)` is not a
-        // SymbolKind, so numbering still starts at the comment.
-        let content = "# app/x.py\n# cleanup (later)\nx = 1";
-        let out = number_chunk_lines(content, "app/x.py", 5);
-        let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines[0], "# app/x.py");
-        assert_eq!(lines[1], "   5 | # cleanup (later)");
-        assert_eq!(lines[2], "   6 | x = 1");
-    }
-
-    #[test]
-    fn header_anchor_must_match_this_files_path() {
-        // A `# something` first line that is not THIS chunk's path anchor
-        // is treated as body, not header.
-        let content = "# not a path\ncode";
-        let out = number_chunk_lines(content, "app/x.py", 1);
-        assert_eq!(out.lines().next().unwrap(), "   1 | # not a path");
-    }
-
-    #[test]
-    fn preserves_trailing_newline_shape() {
-        assert!(number_chunk_lines("a\nb\n", "f.rs", 1).ends_with("b\n"));
-        assert!(!number_chunk_lines("a\nb", "f.rs", 1).ends_with('\n'));
-        assert_eq!(number_chunk_lines("", "f.rs", 1), "");
-    }
-
-    #[test]
-    fn is_symbol_header_line_matches_known_kinds_only() {
-        assert!(is_symbol_header_line("# App\\Svc (class)"));
-        assert!(is_symbol_header_line("# foo (function)"));
-        assert!(!is_symbol_header_line("# cleanup (later)"));
-        assert!(!is_symbol_header_line("not a comment"));
-        assert!(!is_symbol_header_line("# no parens here"));
-    }
 }
 
 #[cfg(test)]
@@ -2767,96 +1762,215 @@ mod hybrid_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].file_path, "src/reg.rs");
     }
+
+    fn search_req(query: &str) -> SearchRequest {
+        SearchRequest {
+            query: query.to_string(),
+            limit: Some(10),
+            offset: Some(0),
+            languages: None,
+            paths: None,
+        }
+    }
+
+    #[test]
+    fn gated_query_with_empty_bm25_still_applies_reranking() {
+        // `Zzz::qqq` fires the hybrid gate (`::`), but no indexed chunk
+        // contains "Zzz", so BM25 comes back empty and the rows stay purely
+        // semantic. The reranker must still run — skipping it too would drop
+        // BOTH ranking stages for this query.
+        let db = Database::open_in_memory().unwrap();
+        seed_chunks(&db);
+        let emb = mk_embedding(0.1);
+        let mut called = false;
+        let rerank: RerankFn = Box::new(|_q, docs| {
+            called = true;
+            Ok(vec![0.0; docs.len()])
+        });
+        let results = search(&db, &emb, Some(rerank), &search_req("Zzz::qqq")).unwrap();
+        assert!(
+            called,
+            "reranking must still run when BM25 fusion produced nothing"
+        );
+        assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn fused_query_skips_reranking() {
+        // "ColdFusion" is in src/reg.rs, so BM25 has hits, fusion runs, and
+        // the reranker is skipped — the rare-token match is the dominant
+        // signal.
+        let db = Database::open_in_memory().unwrap();
+        seed_chunks(&db);
+        let emb = mk_embedding(0.1);
+        let mut called = false;
+        let rerank: RerankFn = Box::new(|_q, docs| {
+            called = true;
+            Ok(vec![0.0; docs.len()])
+        });
+        search(&db, &emb, Some(rerank), &search_req("ColdFusion::register")).unwrap();
+        assert!(!called, "reranking must be skipped when RRF fusion ran");
+    }
+
+    #[test]
+    fn fused_scores_rescale_to_semantic_span_so_flat_boost_cannot_invert() {
+        // Regression for score compression: raw RRF scores (≤ ~3/61) read
+        // through l2_to_score used to land every fused row in ~[0.52, 0.55],
+        // so a flat +0.1 symbol boost on a mid-ranked row (2-3x the whole
+        // spread) overwrote the fused ranking. Rescaled onto the semantic
+        // candidates' span, the fused top hit keeps a margin a single +0.1
+        // boost can't erase.
+        let top = RawSearchRow {
+            file_path: "top.rs".into(),
+            language: "rust".into(),
+            content: "fn top() {}".into(),
+            start_line: 1,
+            end_line: 1,
+            distance: 0.2, // l2_to_score = 0.98
+        };
+        let mid = RawSearchRow {
+            file_path: "mid.rs".into(),
+            language: "rust".into(),
+            content: "uses known_sym here".into(),
+            start_line: 1,
+            end_line: 1,
+            distance: 1.2, // l2_to_score = 0.28
+        };
+        // top is rank 1 in both lists; mid appears in semantic only.
+        let fused = rrf_merge(vec![top.clone(), mid], vec![top], 10);
+        let mut results: Vec<SearchResult> = fused
+            .into_iter()
+            .map(|r| SearchResult {
+                file_path: r.file_path,
+                language: codesage_protocol::Language::Rust,
+                content: r.content,
+                start_line: r.start_line,
+                end_line: r.end_line,
+                score: l2_to_score(r.distance),
+                symbols: Vec::new(),
+            })
+            .collect();
+        // Fused scores span the semantic candidates' range, not ~[0.52, 0.55].
+        assert_eq!(results[0].file_path, "top.rs");
+        assert!(
+            (results[0].score - 0.98).abs() < 1e-3,
+            "top: {}",
+            results[0].score
+        );
+        assert!(
+            (results[1].score - 0.28).abs() < 1e-3,
+            "mid: {}",
+            results[1].score
+        );
+
+        // A single +0.1 boost on the mid-ranked row must not displace the
+        // fused top hit. Under the old 1.0-rrf_score compression, mid would
+        // jump from ~0.516 to ~0.616 past top's ~0.548.
+        apply_symbol_boost(&mut results, &["known_sym".to_string()]);
+        assert_eq!(results[0].file_path, "top.rs");
+    }
 }
 
 #[cfg(test)]
 mod path_penalty_tests {
-    use super::path_penalty;
+    use super::path_penalty_for_query;
+
+    // The non-test-query shape — the production `search()` path for ordinary
+    // queries. Test-like paths get 0.3 (baseline) * 0.5 (extra) = 0.15;
+    // compat/examples/re-export/d.ts demotes are query-independent.
+    fn penalty(path: &str) -> f32 {
+        path_penalty_for_query(path, false)
+    }
+
+    fn assert_penalty(path: &str, expected: f32) {
+        let p = penalty(path);
+        assert!((p - expected).abs() < 1e-6, "{path}: got {p}");
+    }
 
     #[test]
     fn production_code_keeps_full_score() {
-        assert_eq!(path_penalty("src/auth/login.rs"), 1.0);
-        assert_eq!(path_penalty("crates/graph/src/query.rs"), 1.0);
-        assert_eq!(
-            path_penalty("packages/common/pipes/parse-date.pipe.ts"),
-            1.0
-        );
+        assert_penalty("src/auth/login.rs", 1.0);
+        assert_penalty("crates/graph/src/query.rs", 1.0);
+        assert_penalty("packages/common/pipes/parse-date.pipe.ts", 1.0);
     }
 
     #[test]
     fn test_files_get_strong_penalty() {
-        assert_eq!(path_penalty("tests/integration.rs"), 0.3);
-        assert_eq!(path_penalty("crates/graph/tests/risk.rs"), 0.3);
-        assert_eq!(path_penalty("packages/core/test/auth.spec.ts"), 0.3);
-        assert_eq!(path_penalty("src/__tests__/login.test.ts"), 0.3);
-        assert_eq!(path_penalty("ext/standard/tests/string/foo.phpt"), 0.3);
-        assert_eq!(path_penalty("tests/test_login.py"), 0.3);
-        assert_eq!(path_penalty("foo/bar/something_test.go"), 0.3);
-        assert_eq!(path_penalty("src/Login/LoginTest.php"), 0.3);
+        assert_penalty("tests/integration.rs", 0.15);
+        assert_penalty("crates/graph/tests/risk.rs", 0.15);
+        assert_penalty("packages/core/test/auth.spec.ts", 0.15);
+        assert_penalty("src/__tests__/login.test.ts", 0.15);
+        assert_penalty("ext/standard/tests/string/foo.phpt", 0.15);
+        assert_penalty("tests/test_login.py", 0.15);
+        assert_penalty("foo/bar/something_test.go", 0.15);
+        assert_penalty("src/Login/LoginTest.php", 0.15);
     }
 
     #[test]
     fn bench_files_get_strong_penalty() {
-        assert_eq!(path_penalty("benches/throughput.rs"), 0.3);
-        assert_eq!(path_penalty("benchmarks/end_to_end.py"), 0.3);
+        assert_penalty("benches/throughput.rs", 0.15);
+        assert_penalty("benchmarks/end_to_end.py", 0.15);
     }
 
     #[test]
     fn compat_legacy_dirs_get_strong_penalty() {
-        assert_eq!(path_penalty("src/compat/php7.php"), 0.3);
-        assert_eq!(path_penalty("src/_compat/legacy_api.rs"), 0.3);
-        assert_eq!(path_penalty("packages/legacy/v1/foo.ts"), 0.3);
+        assert_penalty("src/compat/php7.php", 0.3);
+        assert_penalty("src/_compat/legacy_api.rs", 0.3);
+        assert_penalty("packages/legacy/v1/foo.ts", 0.3);
+        // Query-independent: a test-shaped query does not lift the compat demote.
+        let p = path_penalty_for_query("src/compat/php7.php", true);
+        assert!((p - 0.3).abs() < 1e-6, "got {p}");
     }
 
     #[test]
     fn examples_dirs_get_strong_penalty() {
-        assert_eq!(path_penalty("examples/quickstart.rs"), 0.3);
-        assert_eq!(path_penalty("packages/sdk/examples/main.go"), 0.3);
-        assert_eq!(path_penalty("src/_examples/demo.py"), 0.3);
+        assert_penalty("examples/quickstart.rs", 0.3);
+        assert_penalty("packages/sdk/examples/main.go", 0.3);
+        assert_penalty("src/_examples/demo.py", 0.3);
     }
 
     #[test]
     fn reexport_barrels_get_moderate_penalty() {
-        assert_eq!(path_penalty("src/auth/__init__.py"), 0.5);
+        assert_penalty("src/auth/__init__.py", 0.5);
         // `com.example.*` Java/Kotlin namespace must NOT trigger the examples
         // penalty; we only match plural forms.
-        assert_eq!(path_penalty("com/example/foo/package-info.java"), 0.5);
+        assert_penalty("com/example/foo/package-info.java", 0.5);
     }
 
     #[test]
     fn type_declarations_get_mild_penalty() {
-        assert!((path_penalty("types/express.d.ts") - 0.7).abs() < 1e-6);
+        assert_penalty("types/express.d.ts", 0.7);
     }
 
     #[test]
     fn penalties_compose_multiplicatively() {
-        // Test in compat/ — strong test penalty AND strong compat penalty stack.
-        // 0.3 * 0.3 = 0.09
-        assert!((path_penalty("compat/tests/old_api_test.go") - 0.09).abs() < 1e-6);
+        // Test in compat/ — the test-like demote (0.3 * 0.5) AND the strong
+        // compat penalty stack: 0.15 * 0.3 = 0.045.
+        assert_penalty("compat/tests/old_api_test.go", 0.045);
+        // A test-shaped query lifts only the test-like part; compat remains.
+        let p = path_penalty_for_query("compat/tests/old_api_test.go", true);
+        assert!((p - 0.3).abs() < 1e-6, "got {p}");
     }
 
     #[test]
     fn windows_separators_normalize() {
-        assert_eq!(path_penalty(r"tests\integration.rs"), 0.3);
+        assert_penalty(r"tests\integration.rs", 0.15);
     }
 
     #[test]
     fn substring_match_does_not_trigger_dir_penalty() {
         // "compatibility" should not match "compat" as a directory segment.
-        assert_eq!(path_penalty("src/compatibility/check.rs"), 1.0);
+        assert_penalty("src/compatibility/check.rs", 1.0);
         // "examplesite" should not match "examples".
-        assert_eq!(path_penalty("src/examplesite/index.ts"), 1.0);
+        assert_penalty("src/examplesite/index.ts", 1.0);
         // "test_helpers" file in src/ should NOT trigger (no test-like glob match).
-        assert_eq!(path_penalty("src/utilities.rs"), 1.0);
+        assert_penalty("src/utilities.rs", 1.0);
     }
 }
 
 #[cfg(test)]
 mod test_query_aware_penalty_tests {
-    use super::{
-        SearchResult, apply_path_penalties, path_penalty, path_penalty_for_query,
-        query_is_test_shaped,
-    };
+    use super::{SearchResult, apply_path_penalties, path_penalty_for_query, query_is_test_shaped};
 
     fn mk(file: &str, score: f32) -> SearchResult {
         SearchResult {
@@ -2913,17 +2027,6 @@ mod test_query_aware_penalty_tests {
             (path_penalty_for_query("src/compat/php7.php", true) - 0.3).abs() < 1e-6,
             "compat dir should still demote on test queries"
         );
-    }
-
-    #[test]
-    fn legacy_path_penalty_preserved() {
-        // path_penalty(...) is the no-query wrapper. It must keep the legacy
-        // 0.3x for test-like paths (independent of query shape) so existing
-        // unit tests and external callers see the pre-§1.22 contract. The new
-        // query-aware split lives in path_penalty_for_query.
-        assert_eq!(path_penalty("tests/integration.rs"), 0.3);
-        assert!((path_penalty_for_query("tests/integration.rs", false) - 0.15).abs() < 1e-6);
-        assert_eq!(path_penalty_for_query("tests/integration.rs", true), 1.0);
     }
 
     #[test]
@@ -3405,147 +2508,63 @@ mod stem_scan_tests {
         apply_non_candidate_stem_scan(&db, &mut results, "Fb").unwrap();
         assert_eq!(results.len(), before);
     }
-}
-
-#[cfg(test)]
-mod context_export_tests {
-    use super::*;
-    use codesage_protocol::{FileInfo, Language, Reference, ReferenceKind, SymbolKind};
-
-    fn symbol(name: &str, qualified_name: &str, file_path: &str) -> Symbol {
-        Symbol {
-            name: name.to_string(),
-            qualified_name: qualified_name.to_string(),
-            kind: SymbolKind::Method,
-            file_path: file_path.to_string(),
-            line_start: 1,
-            line_end: 1,
-            col_start: 0,
-            col_end: 0,
-            rationale: vec![],
-        }
-    }
-
-    fn reference(to_name: &str, file_path: &str) -> Reference {
-        Reference {
-            from_file: file_path.to_string(),
-            from_symbol: None,
-            to_name: to_name.to_string(),
-            kind: ReferenceKind::Call,
-            line: 5,
-            col: 12,
-        }
-    }
 
     #[test]
-    fn qualified_symbol_without_exact_refs_does_not_fallback_to_bare_tail() {
+    fn stem_cache_reuses_entry_while_validity_token_is_unchanged() {
+        use super::stem_index_from_cache;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
         let db = Database::open_in_memory().unwrap();
-        let repo_file = db
-            .upsert_file(&FileInfo {
-                path: "app/repo_controller.py".to_string(),
-                language: Language::Python,
-                content_hash: "repo".to_string(),
-            })
-            .unwrap();
-        let cache_file = db
-            .upsert_file(&FileInfo {
-                path: "app/cache_controller.py".to_string(),
-                language: Language::Python,
-                content_hash: "cache".to_string(),
-            })
-            .unwrap();
-        db.insert_references(repo_file, &[reference("find", "app/repo_controller.py")])
-            .unwrap();
-        db.insert_references(cache_file, &[reference("find", "app/cache_controller.py")])
+        seed(&db);
+        db.upsert_semantic_file_hash("src/foo_bar.rs", "h1")
             .unwrap();
 
-        let refs = references_for_symbol(&db, &symbol("find", "Repository.find", "app/models.py"))
-            .unwrap();
-
+        let mut cache = HashMap::new();
+        let key = ("/tmp/test.db".to_string(), "chunks_test".to_string());
+        let first = stem_index_from_cache(&mut cache, key.clone(), &db).unwrap();
+        let again = stem_index_from_cache(&mut cache, key, &db).unwrap();
         assert!(
-            refs.is_empty(),
-            "qualified method without exact refs must not fall back to all bare `find` references: {refs:?}"
+            Arc::ptr_eq(&first, &again),
+            "unchanged validity token must reuse the cached index"
         );
     }
 
     #[test]
-    fn same_file_definition_resolves_when_name_is_ambiguous() {
-        // `helper` is defined in both a.rs and b.rs (ambiguous bare name). A call
-        // to `helper` from a.rs has no import edge for the local definition, so
-        // the import filter alone would drop it and lose the same-file reverse
-        // edge. The same-file fallback keeps a.rs's definition; the unimported
-        // homonym in b.rs is still excluded.
+    fn stem_cache_rebuilds_when_validity_token_changes() {
+        use super::stem_index_from_cache;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
         let db = Database::open_in_memory().unwrap();
-        let a = db
-            .upsert_file(&FileInfo {
-                path: "a.rs".to_string(),
-                language: Language::Rust,
-                content_hash: "a".to_string(),
-            })
-            .unwrap();
-        let b = db
-            .upsert_file(&FileInfo {
-                path: "b.rs".to_string(),
-                language: Language::Rust,
-                content_hash: "b".to_string(),
-            })
-            .unwrap();
-        db.insert_symbols(a, &[symbol("helper", "helper", "a.rs")])
-            .unwrap();
-        db.insert_symbols(b, &[symbol("helper", "helper", "b.rs")])
+        seed(&db);
+        db.upsert_semantic_file_hash("src/foo_bar.rs", "h1")
             .unwrap();
 
-        let resolved = resolve_callee_definitions(&db, "a.rs", "helper").unwrap();
-        assert!(
-            resolved.iter().any(|s| s.file_path == "a.rs"),
-            "same-file ambiguous call must resolve to the local definition: {resolved:?}"
-        );
-        assert!(
-            !resolved.iter().any(|s| s.file_path == "b.rs"),
-            "the unimported homonym must not be resolved: {resolved:?}"
-        );
-    }
+        let mut cache = HashMap::new();
+        let key = ("/tmp/test.db".to_string(), "chunks_test".to_string());
+        let first = stem_index_from_cache(&mut cache, key.clone(), &db).unwrap();
+        assert!(!first.by_lower.contains_key("new_thing"));
 
-    #[test]
-    fn summary_definition_lookup_uses_qualified_name_and_file() {
-        let db = Database::open_in_memory().unwrap();
-        let cpp_file = db
-            .upsert_file(&FileInfo {
-                path: "fixtures/sample.cpp".to_string(),
-                language: Language::Cpp,
-                content_hash: "cpp".to_string(),
-            })
-            .unwrap();
-        let rust_file = db
-            .upsert_file(&FileInfo {
-                path: "src/db.rs".to_string(),
-                language: Language::Rust,
-                content_hash: "rust".to_string(),
-            })
-            .unwrap();
-        db.insert_symbols(
-            cpp_file,
-            &[symbol(
-                "open",
-                "app::net::Connection::open",
-                "fixtures/sample.cpp",
-            )],
+        // Indexing a new file bumps the semantic_files validity token, which
+        // must rebuild the cache entry so the new stem becomes visible.
+        let zero = vec![0.0f32; codesage_storage::db::DEFAULT_EMBEDDING_DIM];
+        db.insert_chunks(
+            "src/new_thing.rs",
+            "rust",
+            &[("pub struct NewThing;", 1, 5, zero.as_slice())],
         )
         .unwrap();
-        db.insert_symbols(rust_file, &[symbol("open", "Database::open", "src/db.rs")])
+        db.upsert_semantic_file_hash("src/new_thing.rs", "h2")
             .unwrap();
 
-        let summary = SymbolSummary {
-            name: "open".to_string(),
-            qualified_name: "Database::open".to_string(),
-            kind: codesage_protocol::SymbolKind::Method,
-        };
-        let found = find_definition_for_summary(&db, &summary, "src/db.rs")
-            .unwrap()
-            .expect("definition should match the summary");
-
-        assert_eq!(found.qualified_name, "Database::open");
-        assert_eq!(found.file_path, "src/db.rs");
+        let rebuilt = stem_index_from_cache(&mut cache, key, &db).unwrap();
+        assert!(
+            !Arc::ptr_eq(&first, &rebuilt),
+            "a changed validity token must rebuild the index"
+        );
+        assert!(rebuilt.by_lower.contains_key("new_thing"));
+        assert!(rebuilt.by_norm.contains_key("newthing"));
     }
 }
 
@@ -3596,6 +2615,114 @@ mod adaptive_rerank_tests {
     fn empty_query_uses_default() {
         assert_eq!(adaptive_rerank_weight(""), RERANK_WEIGHT_DEFAULT);
         assert_eq!(adaptive_rerank_weight("   "), RERANK_WEIGHT_DEFAULT);
+    }
+
+    #[test]
+    fn plain_english_word_is_not_a_short_identifier() {
+        // All-lowercase alphabetic single words are natural language, not
+        // identifiers — they must not get the reduced cross-encoder weight.
+        assert_eq!(
+            adaptive_rerank_weight("authentication"),
+            RERANK_WEIGHT_DEFAULT
+        );
+        assert_eq!(adaptive_rerank_weight("middleware"), RERANK_WEIGHT_DEFAULT);
+    }
+
+    #[test]
+    fn kebab_snake_and_camel_identifiers_lean_semantic() {
+        assert_eq!(adaptive_rerank_weight("foo-bar"), RERANK_WEIGHT_SHORT_ID);
+        assert_eq!(
+            adaptive_rerank_weight("getUserById"),
+            RERANK_WEIGHT_SHORT_ID
+        );
+        assert_eq!(adaptive_rerank_weight("user_id"), RERANK_WEIGHT_SHORT_ID);
+    }
+}
+
+#[cfg(test)]
+mod rerank_blend_tests {
+    use super::{RERANK_WEIGHT_NATLANG, RerankFn, SearchResult, apply_reranking};
+
+    fn mk(file: &str, content: &str, score: f32) -> SearchResult {
+        SearchResult {
+            file_path: file.to_string(),
+            language: codesage_protocol::Language::Rust,
+            content: content.to_string(),
+            start_line: 1,
+            end_line: 10,
+            score,
+            symbols: Vec::new(),
+        }
+    }
+
+    // Natural-language query (≥3 alphabetic words) → adaptive weight 0.6.
+    const QUERY: &str = "where does authentication happen";
+
+    #[test]
+    fn blended_ordering_matches_expected_arithmetic() {
+        // CE raw scores 0.0 / 10.0 min-max normalize to 0.0 / 1.0. Blend:
+        //   a: 0.4 * 0.9 + 0.6 * 0.0 = 0.36
+        //   b: 0.4 * 0.5 + 0.6 * 1.0 = 0.80
+        // so the cross-encoder flips the semantic order.
+        let mut results = vec![mk("a.rs", "doc a", 0.9), mk("b.rs", "doc b", 0.5)];
+        let mut rerank: RerankFn = Box::new(|_q, docs| {
+            Ok(docs
+                .iter()
+                .map(|d| if *d == "doc b" { 10.0 } else { 0.0 })
+                .collect())
+        });
+        apply_reranking(&mut rerank, QUERY, &mut results);
+
+        let w = RERANK_WEIGHT_NATLANG;
+        assert_eq!(results[0].file_path, "b.rs");
+        assert!(
+            (results[0].score - ((1.0 - w) * 0.5 + w)).abs() < 1e-6,
+            "b: {}",
+            results[0].score
+        );
+        assert_eq!(results[1].file_path, "a.rs");
+        assert!(
+            (results[1].score - (1.0 - w) * 0.9).abs() < 1e-6,
+            "a: {}",
+            results[1].score
+        );
+    }
+
+    #[test]
+    fn equal_ce_scores_fall_back_to_half_and_preserve_semantic_order() {
+        // Degenerate CE range (all equal) → every ce_norm = 0.5. The blend
+        // is then monotone in the semantic score, so ordering is unchanged.
+        let mut results = vec![
+            mk("a.rs", "doc a", 0.9),
+            mk("b.rs", "doc b", 0.5),
+            mk("c.rs", "doc c", 0.1),
+        ];
+        let mut rerank: RerankFn = Box::new(|_q, docs| Ok(vec![3.25; docs.len()]));
+        apply_reranking(&mut rerank, QUERY, &mut results);
+
+        let order: Vec<&str> = results.iter().map(|r| r.file_path.as_str()).collect();
+        assert_eq!(order, ["a.rs", "b.rs", "c.rs"]);
+        let w = RERANK_WEIGHT_NATLANG;
+        assert!(
+            (results[0].score - ((1.0 - w) * 0.9 + w * 0.5)).abs() < 1e-6,
+            "a: {}",
+            results[0].score
+        );
+        assert!(
+            (results[2].score - ((1.0 - w) * 0.1 + w * 0.5)).abs() < 1e-6,
+            "c: {}",
+            results[2].score
+        );
+    }
+
+    #[test]
+    fn rerank_error_leaves_results_untouched() {
+        let mut results = vec![mk("a.rs", "doc a", 0.9), mk("b.rs", "doc b", 0.5)];
+        let mut rerank: RerankFn = Box::new(|_q, _docs| anyhow::bail!("ORT unavailable"));
+        apply_reranking(&mut rerank, QUERY, &mut results);
+        assert_eq!(results[0].file_path, "a.rs");
+        assert!((results[0].score - 0.9).abs() < 1e-6);
+        assert!((results[1].score - 0.5).abs() < 1e-6);
     }
 }
 

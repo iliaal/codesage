@@ -6,7 +6,7 @@
 //! could run. This test creates such a stale database, runs init_db, and asserts
 //! that the column, index, and backfill all land correctly.
 
-use codesage_storage::schema::{init_db, name_tail};
+use codesage_storage::schema::{BREAKING_MIGRATION_PREFIX, init_db, name_tail};
 use rusqlite::Connection;
 
 fn create_old_schema(conn: &Connection) {
@@ -317,6 +317,83 @@ fn migrates_path_only_semantic_files_to_chunk_table_scoped_shape() {
         )
         .unwrap();
     assert_eq!(migration_recorded, 1);
+}
+
+/// Minimal subscriber that records the debug-rendered fields of every WARN
+/// event. Just enough to prove `init_db` warns loudly on forward-compat
+/// detection without pulling in tracing-subscriber.
+struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for WarnCapture {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() <= tracing::Level::WARN
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Fields(String);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                let _ = write!(self.0, "{}={:?} ", field.name(), value);
+            }
+        }
+        if *event.metadata().level() == tracing::Level::WARN {
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+#[test]
+fn unknown_additive_migration_from_newer_binary_warns_but_opens() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_db(&conn).expect("first init_db");
+    conn.execute(
+        "INSERT INTO schema_migrations (name) VALUES ('9999_from_the_future')",
+        [],
+    )
+    .unwrap();
+
+    let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    tracing::subscriber::with_default(WarnCapture(warnings.clone()), || {
+        init_db(&conn).expect("unknown additive migration must not block an old binary");
+    });
+
+    let warnings = warnings.lock().unwrap();
+    assert!(
+        warnings.iter().any(|w| w.contains("9999_from_the_future")),
+        "init_db must warn naming the unknown migration, got: {warnings:?}"
+    );
+}
+
+#[test]
+fn breaking_migration_marker_from_newer_binary_refuses_open() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_db(&conn).expect("first init_db");
+    let marker = format!("{BREAKING_MIGRATION_PREFIX}9999_drop_everything");
+    conn.execute(
+        "INSERT INTO schema_migrations (name) VALUES (?1)",
+        rusqlite::params![marker],
+    )
+    .unwrap();
+
+    let err = init_db(&conn).expect_err("breaking marker must refuse open");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&marker),
+        "error must name the breaking migration: {msg}"
+    );
+    assert!(
+        msg.contains("upgrade codesage"),
+        "error must tell the operator how to recover: {msg}"
+    );
 }
 
 #[test]

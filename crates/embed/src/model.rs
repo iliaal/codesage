@@ -384,6 +384,46 @@ pub fn init_ort_dylib() {
     });
 }
 
+/// Embedding / reranker models this project has validated end-to-end. The
+/// model name comes from the indexed repo's own `.codesage/config.toml`, so
+/// it is attacker-controlled when indexing a cloned repo; passing it straight
+/// to hf-hub would let that repo pick an arbitrary ONNX graph to download and
+/// load into the native ONNX Runtime. Gate every load on this allowlist
+/// unless the user (not the repo) opts out via `CODESAGE_ALLOW_ANY_MODEL=1`.
+const ALLOWED_MODELS: &[&str] = &[
+    "sentence-transformers/all-MiniLM-L6-v2",
+    "cross-encoder/ms-marco-MiniLM-L6-v2",
+    "jinaai/jina-embeddings-v2-base-code",
+    "nomic-ai/nomic-embed-text-v1.5",
+];
+
+fn allow_any_model_from_env() -> bool {
+    matches!(
+        std::env::var("CODESAGE_ALLOW_ANY_MODEL").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+fn validate_model_allowed(model: &str, allow_any: bool) -> Result<()> {
+    if allow_any || ALLOWED_MODELS.contains(&model) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "model {model:?} is not on CodeSage's validated-model allowlist. \
+         The model name comes from the project's .codesage/config.toml, which \
+         is untrusted when the repo isn't yours — an arbitrary name would \
+         download and execute an attacker-chosen ONNX graph inside ONNX \
+         Runtime. Validated models: {ALLOWED_MODELS:?}. To experiment with \
+         another model you trust, set CODESAGE_ALLOW_ANY_MODEL=1."
+    )
+}
+
+/// Whether a model's declared input names include `token_type_ids`, i.e. the
+/// inference call must supply that third tensor alongside ids + mask.
+pub(crate) fn wants_token_type_ids<'a>(mut input_names: impl Iterator<Item = &'a str>) -> bool {
+    input_names.any(|name| name == "token_type_ids")
+}
+
 /// Shared model-loading path for [`Embedder`] and [`Reranker`]: downloads the
 /// tokenizer + ONNX model (and the optional external-weights sidecar), builds a
 /// padding/truncating tokenizer, creates an ORT session — registering the CUDA
@@ -391,6 +431,8 @@ pub fn init_ort_dylib() {
 /// libraries actually mapped (the silent-CPU-fallback guard). Returns the
 /// session, tokenizer, and whether the model takes a `token_type_ids` input.
 pub(crate) fn load_onnx_session(model: &str, device: &str) -> Result<(Session, Tokenizer, bool)> {
+    validate_model_allowed(model, allow_any_model_from_env())?;
+
     #[cfg(not(target_vendor = "apple"))]
     init_ort_dylib();
 
@@ -494,10 +536,7 @@ pub(crate) fn load_onnx_session(model: &str, device: &str) -> Result<(Session, T
         require_cuda_libs_mapped()?;
     }
 
-    let has_token_type_ids = session
-        .inputs()
-        .iter()
-        .any(|i| i.name() == "token_type_ids");
+    let has_token_type_ids = wants_token_type_ids(session.inputs().iter().map(|i| i.name()));
 
     Ok((session, tokenizer, has_token_type_ids))
 }
@@ -716,6 +755,47 @@ mod tests {
             dirs.contains(&root),
             "CODESAGE_NVIDIA_LIBS should accept a directory that directly contains CUDA shared libraries: {dirs:?}"
         );
+    }
+
+    #[test]
+    fn allowlisted_models_pass_validation() {
+        for model in ALLOWED_MODELS {
+            assert!(
+                validate_model_allowed(model, false).is_ok(),
+                "{model} should be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn arbitrary_model_is_rejected_without_override() {
+        let err = validate_model_allowed("evil/backdoored-model", false)
+            .expect_err("repo-supplied model names outside the allowlist must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("evil/backdoored-model"),
+            "error should name the rejected model: {msg}"
+        );
+        assert!(
+            msg.contains("CODESAGE_ALLOW_ANY_MODEL"),
+            "error should name the escape hatch: {msg}"
+        );
+    }
+
+    #[test]
+    fn allow_any_override_bypasses_allowlist() {
+        assert!(validate_model_allowed("evil/backdoored-model", true).is_ok());
+    }
+
+    #[test]
+    fn token_type_ids_detected_from_input_names() {
+        assert!(wants_token_type_ids(
+            ["input_ids", "token_type_ids", "attention_mask"].into_iter()
+        ));
+        assert!(!wants_token_type_ids(
+            ["input_ids", "attention_mask"].into_iter()
+        ));
+        assert!(!wants_token_type_ids(std::iter::empty()));
     }
 
     #[cfg(all(feature = "cuda", target_os = "linux"))]

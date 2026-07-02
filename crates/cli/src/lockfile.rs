@@ -20,8 +20,13 @@
 
 use std::fs::{File, OpenOptions};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+
+/// How often [`acquire_with_wait`] re-polls a held lock. Watcher passes
+/// release within seconds, so sub-second polling just burns wakeups.
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Outcome of a non-blocking lock acquisition attempt.
 pub enum LockOutcome {
@@ -99,6 +104,30 @@ pub fn try_acquire(project_root: &Path) -> Result<LockOutcome> {
     }
 }
 
+/// Like [`try_acquire`], but polls a held lock for up to `wait` before
+/// reporting `AlreadyHeld`. `Duration::ZERO` degenerates to a single
+/// non-blocking attempt (identical to `try_acquire`). Exists for
+/// hook-invoked indexing: the daemon's filesystem watcher debounce-indexes
+/// right around commit time, and a silent skip there would leave
+/// hook-only passes (feature mapping, git history) stale until the next
+/// commit. Watcher passes release within seconds, so a bounded wait
+/// converts the silent skip into eventual success.
+pub fn acquire_with_wait(project_root: &Path, wait: Duration) -> Result<LockOutcome> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match try_acquire(project_root)? {
+            LockOutcome::Acquired(lock) => return Ok(LockOutcome::Acquired(lock)),
+            LockOutcome::AlreadyHeld => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Ok(LockOutcome::AlreadyHeld);
+                }
+                std::thread::sleep(POLL_INTERVAL.min(deadline - now));
+            }
+        }
+    }
+}
+
 /// Returns an open file handle on `/dev/null`-equivalent that holds a
 /// permissive lock for the non-onboarded-dir branch. Kept tiny so the
 /// `Acquired` variant remains a value we can construct even when
@@ -154,6 +183,73 @@ mod tests {
             LockOutcome::Acquired(_) => { /* expected */ }
             LockOutcome::AlreadyHeld => panic!("no-op branch should never report contention"),
         }
+    }
+
+    #[test]
+    fn acquire_with_wait_zero_matches_try_acquire() {
+        // `Duration::ZERO` must be exactly the non-blocking behavior:
+        // one attempt, immediate AlreadyHeld, no polling delay.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".codesage")).unwrap();
+        let _first = match try_acquire(tmp.path()).unwrap() {
+            LockOutcome::Acquired(l) => l,
+            LockOutcome::AlreadyHeld => unreachable!(),
+        };
+        let t0 = std::time::Instant::now();
+        match acquire_with_wait(tmp.path(), Duration::ZERO).unwrap() {
+            LockOutcome::AlreadyHeld => { /* expected */ }
+            LockOutcome::Acquired(_) => panic!("lock is held; zero-wait must not acquire"),
+        }
+        assert!(
+            t0.elapsed() < Duration::from_millis(200),
+            "zero-wait acquire took {:?} — it must not poll",
+            t0.elapsed()
+        );
+    }
+
+    #[test]
+    fn acquire_with_wait_times_out_when_lock_never_released() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".codesage")).unwrap();
+        let _first = match try_acquire(tmp.path()).unwrap() {
+            LockOutcome::Acquired(l) => l,
+            LockOutcome::AlreadyHeld => unreachable!(),
+        };
+        let wait = Duration::from_millis(300);
+        let t0 = std::time::Instant::now();
+        match acquire_with_wait(tmp.path(), wait).unwrap() {
+            LockOutcome::AlreadyHeld => { /* expected — bounded skip */ }
+            LockOutcome::Acquired(_) => panic!("lock is held for the whole window"),
+        }
+        assert!(
+            t0.elapsed() >= wait,
+            "returned after {:?}, before the {wait:?} window elapsed",
+            t0.elapsed()
+        );
+    }
+
+    #[test]
+    fn acquire_with_wait_acquires_after_holder_releases() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".codesage")).unwrap();
+        let root = tmp.path().to_path_buf();
+
+        let first = match try_acquire(&root).unwrap() {
+            LockOutcome::Acquired(l) => l,
+            LockOutcome::AlreadyHeld => unreachable!(),
+        };
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            drop(first);
+        });
+
+        match acquire_with_wait(tmp.path(), Duration::from_secs(10)).unwrap() {
+            LockOutcome::Acquired(_) => { /* expected — waited out the holder */ }
+            LockOutcome::AlreadyHeld => {
+                panic!("holder released within the window; wait should have acquired")
+            }
+        }
+        holder.join().unwrap();
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Query-side risk + coupling over the `git_files` / `git_co_changes` tables.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Context, Result};
 use codesage_protocol::{
@@ -11,7 +11,7 @@ use codesage_storage::Database;
 use codesage_storage::db::CoChangeRow;
 
 use super::tests_rec::test_sibling_exists;
-use crate::query::impact_analysis;
+use crate::impact::impact_analysis;
 
 /// Map a storage `CoChangeRow` into the protocol `CoChangeEntry`. Shared by
 /// `find_coupling` and `assess_risk`, which read the same co-change rows.
@@ -65,6 +65,7 @@ pub fn find_coupling(db: &Database, file_path: &str, limit: usize) -> Result<Cou
     };
 
     Ok(CouplingReport {
+        found: file_indexed,
         coupled,
         file_indexed,
         file_commits,
@@ -88,19 +89,25 @@ pub fn find_coupling(db: &Database, file_path: &str, limit: usize) -> Result<Cou
 /// shape is preserved when tuning so the structural signals (churn, fix
 /// ratio) keep dominating over the security-shaped trust-boundary term.
 pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
-    assess_risk_with_cycles(db, file_path, None)
+    assess_risk_with_context(db, file_path, None, None)
 }
 
-fn assess_risk_with_cycles(
+fn assess_risk_with_context(
     db: &Database,
     file_path: &str,
     precomputed_cycles: Option<&[CycleEntry]>,
+    precomputed_percentiles: Option<&HashMap<String, f64>>,
 ) -> Result<RiskAssessment> {
     let git = db.git_file(file_path)?;
     let churn_score = git.as_ref().map(|g| g.churn_score).unwrap_or(0.0);
     let total_commits = git.as_ref().map(|g| g.total_commits).unwrap_or(0);
     let fix_count = git.as_ref().map(|g| g.fix_count).unwrap_or(0);
-    let churn_percentile = db.churn_percentile(file_path)?;
+    // A missing map entry means the file has no git_files row, which the
+    // per-file query also scores as 0.0.
+    let churn_percentile = match precomputed_percentiles {
+        Some(map) => map.get(file_path).copied().unwrap_or(0.0),
+        None => db.churn_percentile(file_path)?,
+    };
     let fix_ratio = if total_commits > 0 {
         (fix_count as f64 / total_commits as f64).clamp(0.0, 1.0)
     } else {
@@ -443,9 +450,15 @@ pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiff
         }
     };
 
+    // Churn percentiles rank each file against the whole git_files table;
+    // one window-function query replaces a full-table aggregate per file.
+    let percentiles = db
+        .churn_percentiles()
+        .context("bulk churn percentiles for risk diff")?;
+
     let files: Vec<RiskAssessment> = file_paths
         .iter()
-        .map(|p| assess_risk_with_cycles(db, p, Some(&cycles_touching_patch)))
+        .map(|p| assess_risk_with_context(db, p, Some(&cycles_touching_patch), Some(&percentiles)))
         .collect::<Result<Vec<_>>>()?;
 
     let max_score = files.iter().map(|f| f.score).fold(0.0_f64, f64::max);
@@ -581,9 +594,12 @@ pub fn assess_risk_batch(db: &Database, file_paths: &[String]) -> Result<RiskBat
             Vec::new()
         }
     };
+    let percentiles = db
+        .churn_percentiles()
+        .context("bulk churn percentiles for risk batch")?;
     let mut files: Vec<RiskAssessment> = file_paths
         .iter()
-        .map(|p| assess_risk_with_cycles(db, p, Some(&cycles)))
+        .map(|p| assess_risk_with_context(db, p, Some(&cycles), Some(&percentiles)))
         .collect::<Result<Vec<_>>>()?;
     let mut refs: Vec<&mut RiskAssessment> = files.iter_mut().collect();
     let legend = alias_categorical_notes_in_place(&mut refs);
@@ -751,4 +767,84 @@ fn cluster_by_directory(
         });
     }
     (kept, clusters)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Small indexed project so impact_analysis has a graph to walk; mirrors
+    /// the setup in `tests/risk_test.rs`.
+    fn setup_project() -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Repository.php"),
+            b"<?php\nnamespace App;\nclass Repository {\n  public function find($id) { return null; }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Controller.php"),
+            b"<?php\nnamespace App;\nuse App\\Repository;\nclass Controller {\n  public function show(Repository $r, $id) { return $r->find($id); }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Service.php"),
+            b"<?php\nnamespace App;\nuse App\\Repository;\nclass Service {\n  public function run(Repository $r) { return $r->find(1); }\n}\n",
+        )
+        .unwrap();
+        let db = Database::open_in_memory().unwrap();
+        crate::full_index(root, &db, &[], false).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn batch_scores_bit_identical_to_single_file_path() {
+        let (_dir, db) = setup_project();
+        // Tied churn scores exercise the CUME_DIST tie handling end-to-end;
+        // Service.php has no git row so its percentile takes the 0.0 fallback
+        // on both paths.
+        db.upsert_git_file("Repository.php", 10.0, 4, 8, Some(1_700_000_000))
+            .unwrap();
+        db.upsert_git_file("Controller.php", 10.0, 1, 8, Some(1_700_000_000))
+            .unwrap();
+        db.upsert_git_file("other_a.php", 10.0, 0, 5, Some(1_700_000_000))
+            .unwrap();
+        db.upsert_git_file("other_b.php", 0.5, 0, 2, Some(1_700_000_000))
+            .unwrap();
+
+        let files: Vec<String> = [
+            "Repository.php",
+            "Controller.php",
+            "Service.php",
+            "other_b.php",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let batch = assess_risk_batch(&db, &files).unwrap();
+        assert_eq!(batch.files.len(), files.len());
+        for (path, batched) in files.iter().zip(batch.files.iter()) {
+            let single = assess_risk(&db, path).unwrap();
+            assert_eq!(&single.file, path);
+            assert_eq!(&batched.file, path);
+            assert_eq!(
+                single.score.to_bits(),
+                batched.score.to_bits(),
+                "{path}: single score {} != batch score {}",
+                single.score,
+                batched.score
+            );
+            assert_eq!(
+                single.churn_percentile.to_bits(),
+                batched.churn_percentile.to_bits(),
+                "{path}: single percentile {} != batch percentile {}",
+                single.churn_percentile,
+                batched.churn_percentile
+            );
+            assert_eq!(single.in_cycle, batched.in_cycle, "{path}: cycle flag");
+            assert_eq!(single.cycle_size, batched.cycle_size, "{path}: cycle size");
+        }
+    }
 }

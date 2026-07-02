@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Weak, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -55,12 +55,17 @@ pub struct StateWatcherConfig {
     pub shutdown: Arc<AtomicBool>,
 }
 
-/// Caches the result of the embedder provider so the model is resolved at most
-/// once, and only when a semantic reindex actually needs it (an idle watcher
-/// never triggers a model load).
+/// Resolves the embedder through the provider on demand, holding only a
+/// `Weak` between uses, and only when a semantic reindex actually needs it
+/// (an idle watcher never triggers a model load). A strong ref held across
+/// idle periods would make the daemon pool's idle eviction — which skips
+/// models with outstanding clones — treat a watcher-idle model as in
+/// flight forever, pinning its VRAM and host RSS. Re-resolving through the
+/// provider is a pool lookup while the model is resident, a reload after
+/// eviction.
 struct EmbedderHandle {
     provider: Option<EmbedderProvider>,
-    cached: Option<Arc<Mutex<Embedder>>>,
+    cached: Option<Weak<Mutex<Embedder>>>,
 }
 
 impl EmbedderHandle {
@@ -76,18 +81,38 @@ impl EmbedderHandle {
     }
 
     fn get(&mut self) -> Option<Arc<Mutex<Embedder>>> {
-        if self.cached.is_none() {
-            let provider = self.provider.as_ref()?;
-            match provider() {
-                Ok(emb) => self.cached = Some(emb),
-                Err(e) => {
-                    tracing::warn!(error = %e, "loading embedder for watcher");
-                    return None;
-                }
+        if let Some(emb) = self.cached.as_ref().and_then(Weak::upgrade) {
+            return Some(emb);
+        }
+        let provider = self.provider.as_ref()?;
+        match provider() {
+            Ok(emb) => {
+                self.cached = Some(Arc::downgrade(&emb));
+                Some(emb)
+            }
+            Err(e) => {
+                self.cached = None;
+                tracing::warn!(error = %e, "loading embedder for watcher");
+                None
             }
         }
-        self.cached.clone()
     }
+}
+
+/// Outcome of a lock-guarded indexing pass. Callers must only discard
+/// accumulated work (`pending` / `removed_paths`) on `Done`: a `Skipped`
+/// pass did nothing, and dropping the state would silently lose the
+/// changes it represented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkOutcome {
+    /// The pass ran; accumulated state it covered can be cleared.
+    Done,
+    /// The index lock was held by another process. Nothing was indexed;
+    /// keep the state and retry after a debounce.
+    Skipped,
+    /// Hard error (I/O, DB). Logged; retrying the same pass is unlikely
+    /// to help.
+    Failed,
 }
 
 /// Removes the status file when the watcher loop exits by any path
@@ -127,6 +152,8 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
     let mut batch_event_times: Vec<Instant> = Vec::new();
     let mut currently_indexing: HashSet<PathBuf> = HashSet::new();
     let mut recheck_queue: HashSet<PathBuf> = HashSet::new();
+    let mut bulk_retry_at: Option<Instant> = None;
+    let mut removal_retry_at: Option<Instant> = None;
     let mut last_activity = Instant::now();
 
     tracing::info!(
@@ -139,7 +166,6 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
     let exit_reason = loop {
         match rx.recv_timeout(POLL_INTERVAL) {
             Ok(event) => {
-                last_activity = Instant::now();
                 for path in &event.paths {
                     // A newly created top-level directory needs its own watch:
                     // the root is watched non-recursively, so new top-level
@@ -183,16 +209,15 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
                         count = batch_event_times.len(),
                         "batch threshold reached, triggering bulk incremental index"
                     );
-                    run_bulk_incremental(&config, &mut embedder);
-                    pending.clear();
-                    removed_paths.clear();
                     batch_event_times.clear();
+                    bulk_retry_at = apply_bulk_outcome(
+                        run_bulk_incremental(&config, &mut embedder),
+                        &mut pending,
+                        &mut removed_paths,
+                        Instant::now(),
+                        debounce,
+                    );
                     continue;
-                }
-
-                if !removed_paths.is_empty() {
-                    let paths = std::mem::take(&mut removed_paths);
-                    handle_removals(&config, &paths);
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -201,6 +226,9 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
 
         if config.shutdown.load(Ordering::Relaxed) {
             tracing::info!("shutdown requested, draining pending work");
+            if !removed_paths.is_empty() {
+                let _ = handle_removals(&config, &removed_paths);
+            }
             drain_pending_force(
                 &config,
                 &mut pending,
@@ -216,6 +244,38 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
             break "disabled marker present";
         }
 
+        // A lock-skipped bulk pass retries here, ahead of the per-file
+        // drain, so a success clears `pending` wholesale instead of
+        // re-walking it file by file.
+        if let Some(at) = bulk_retry_at
+            && Instant::now() >= at
+        {
+            bulk_retry_at = apply_bulk_outcome(
+                run_bulk_incremental(&config, &mut embedder),
+                &mut pending,
+                &mut removed_paths,
+                Instant::now(),
+                debounce,
+            );
+        }
+
+        // Deletions have no natural retrigger: a removal dropped on lock
+        // contention would leave ghost symbols/chunks for the whole
+        // session, so keep the paths queued and retry a debounce later.
+        if removed_paths.is_empty() {
+            removal_retry_at = None;
+        } else if removal_retry_at.is_none_or(|at| Instant::now() >= at) {
+            match handle_removals(&config, &removed_paths) {
+                WorkOutcome::Skipped => {
+                    removal_retry_at = Some(Instant::now() + debounce);
+                }
+                WorkOutcome::Done | WorkOutcome::Failed => {
+                    removed_paths.clear();
+                    removal_retry_at = None;
+                }
+            }
+        }
+
         drain_pending(
             &config,
             &mut pending,
@@ -226,7 +286,14 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
             debounce,
         );
 
-        if !pending.is_empty() || !currently_indexing.is_empty() || !recheck_queue.is_empty() {
+        // Idle clock: only queued or in-flight work counts as activity, so
+        // raw FS events that fail the source/ignore filters can't keep the
+        // watcher (and its pooled model) alive.
+        if !pending.is_empty()
+            || !currently_indexing.is_empty()
+            || !recheck_queue.is_empty()
+            || !removed_paths.is_empty()
+        {
             last_activity = Instant::now();
         } else if is_idle(last_activity, config.idle_timeout) {
             break "idle timeout";
@@ -327,8 +394,15 @@ fn process_ready(
         }
 
         currently_indexing.insert(path.clone());
-        reindex_one(config, &path, embedder);
+        let outcome = reindex_one(config, &path, embedder);
         currently_indexing.remove(&path);
+
+        // Lock contention: re-queue with a fresh stamp so the retry waits
+        // out a full debounce window instead of spinning on the held lock.
+        if outcome == WorkOutcome::Skipped {
+            pending.insert(path, Instant::now());
+            continue;
+        }
 
         if recheck_queue.remove(&path) {
             let abs_path = config.project_root.join(&path);
@@ -367,7 +441,11 @@ fn process_ready(
     }
 }
 
-fn reindex_one(config: &StateWatcherConfig, rel: &Path, embedder: &mut EmbedderHandle) {
+fn reindex_one(
+    config: &StateWatcherConfig,
+    rel: &Path,
+    embedder: &mut EmbedderHandle,
+) -> WorkOutcome {
     let abs = config.project_root.join(rel);
     let rel_str = rel.to_string_lossy().to_string();
 
@@ -375,23 +453,23 @@ fn reindex_one(config: &StateWatcherConfig, rel: &Path, embedder: &mut EmbedderH
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(path = %rel_str, error = %e, "failed to read file for reindex");
-            return;
+            return WorkOutcome::Failed;
         }
     };
     if bytes.is_empty() {
-        return;
+        return WorkOutcome::Done;
     }
 
     let hash = content_hash(&bytes);
     let Some(lang) = detect_language(rel) else {
-        return;
+        return WorkOutcome::Done;
     };
 
     if let Ok(db) = Database::open(&config.db_path)
         && let Ok(Some(stored)) = db.get_file_hash(&rel_str)
         && stored == hash
     {
-        return;
+        return WorkOutcome::Done;
     }
 
     let _lock = match lockfile::try_acquire(&config.project_root) {
@@ -399,13 +477,13 @@ fn reindex_one(config: &StateWatcherConfig, rel: &Path, embedder: &mut EmbedderH
         Ok(lockfile::LockOutcome::AlreadyHeld) => {
             tracing::debug!(
                 path = %rel_str,
-                "skipping reindex: index lock held by another process"
+                "deferring reindex: index lock held by another process"
             );
-            return;
+            return WorkOutcome::Skipped;
         }
         Err(e) => {
             tracing::warn!(error = %e, "acquiring index lock");
-            return;
+            return WorkOutcome::Failed;
         }
     };
 
@@ -440,7 +518,7 @@ fn reindex_one(config: &StateWatcherConfig, rel: &Path, embedder: &mut EmbedderH
         }
         Err(e) => {
             tracing::warn!(path = %rel_str, error = %e, "opening DB for structural reindex");
-            return;
+            return WorkOutcome::Failed;
         }
     }
 
@@ -454,7 +532,7 @@ fn reindex_one(config: &StateWatcherConfig, rel: &Path, embedder: &mut EmbedderH
             Ok(db) => db,
             Err(e) => {
                 tracing::warn!(path = %rel_str, error = %e, "opening DB for semantic reindex");
-                return;
+                return WorkOutcome::Failed;
             }
         };
         match semantic_index_files(
@@ -478,18 +556,24 @@ fn reindex_one(config: &StateWatcherConfig, rel: &Path, embedder: &mut EmbedderH
             }
         }
     }
+
+    WorkOutcome::Done
 }
 
-fn handle_removals(config: &StateWatcherConfig, paths: &[String]) {
+fn handle_removals(config: &StateWatcherConfig, paths: &[String]) -> WorkOutcome {
     if paths.is_empty() {
-        return;
+        return WorkOutcome::Done;
     }
 
     let _lock = match lockfile::try_acquire(&config.project_root) {
         Ok(lockfile::LockOutcome::Acquired(lock)) => Some(lock),
-        _ => {
-            tracing::debug!("skipping removal: index lock held");
-            return;
+        Ok(lockfile::LockOutcome::AlreadyHeld) => {
+            tracing::debug!("deferring removal: index lock held");
+            return WorkOutcome::Skipped;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "acquiring index lock for removal");
+            return WorkOutcome::Failed;
         }
     };
 
@@ -497,7 +581,7 @@ fn handle_removals(config: &StateWatcherConfig, paths: &[String]) {
         Ok(db) => db,
         Err(e) => {
             tracing::warn!(error = %e, "opening DB for removal");
-            return;
+            return WorkOutcome::Failed;
         }
     };
 
@@ -513,14 +597,50 @@ fn handle_removals(config: &StateWatcherConfig, paths: &[String]) {
     }
 
     let _ = semantic_remove_files(&db, paths);
+    WorkOutcome::Done
 }
 
-fn run_bulk_incremental(config: &StateWatcherConfig, embedder: &mut EmbedderHandle) {
+/// Apply a bulk-incremental outcome to the accumulated watch state,
+/// returning when (if at all) the bulk pass should be retried. `Done`
+/// clears the state the pass covered. `Skipped` keeps it, restamps
+/// `pending` so the per-file drain doesn't race the bulk retry, and
+/// schedules that retry one debounce out — never sooner, so lock
+/// contention can't turn into a tight respin. `Failed` keeps the state
+/// with its original stamps: the per-file drain becomes the fallback,
+/// with per-file error logging.
+fn apply_bulk_outcome(
+    outcome: WorkOutcome,
+    pending: &mut HashMap<PathBuf, Instant>,
+    removed_paths: &mut Vec<String>,
+    now: Instant,
+    debounce: Duration,
+) -> Option<Instant> {
+    match outcome {
+        WorkOutcome::Done => {
+            pending.clear();
+            removed_paths.clear();
+            None
+        }
+        WorkOutcome::Skipped => {
+            for stamp in pending.values_mut() {
+                *stamp = now;
+            }
+            Some(now + debounce)
+        }
+        WorkOutcome::Failed => None,
+    }
+}
+
+fn run_bulk_incremental(config: &StateWatcherConfig, embedder: &mut EmbedderHandle) -> WorkOutcome {
     let _lock = match lockfile::try_acquire(&config.project_root) {
         Ok(lockfile::LockOutcome::Acquired(lock)) => Some(lock),
-        _ => {
-            tracing::debug!("skipping bulk incremental: index lock held");
-            return;
+        Ok(lockfile::LockOutcome::AlreadyHeld) => {
+            tracing::debug!("deferring bulk incremental: index lock held");
+            return WorkOutcome::Skipped;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "acquiring index lock for bulk incremental");
+            return WorkOutcome::Failed;
         }
     };
 
@@ -528,7 +648,7 @@ fn run_bulk_incremental(config: &StateWatcherConfig, embedder: &mut EmbedderHand
         Ok(db) => db,
         Err(e) => {
             tracing::warn!(error = %e, "opening DB for bulk incremental");
-            return;
+            return WorkOutcome::Failed;
         }
     };
 
@@ -539,9 +659,13 @@ fn run_bulk_incremental(config: &StateWatcherConfig, embedder: &mut EmbedderHand
         false,
     ) {
         tracing::warn!(error = %e, "bulk incremental structural reindex failed");
-        return;
+        return WorkOutcome::Failed;
     }
 
+    // Semantic phase is best-effort: structural indexing above already
+    // updated the stored file hashes, so a retained `pending` set couldn't
+    // reach a failed semantic pass anyway (per-file reindex short-circuits
+    // on an unchanged hash). Report `Done` and rely on the warning logs.
     if let Some(emb_arc) = embedder.get() {
         let mut emb = emb_arc.lock();
         let db = match Database::open_for_model(
@@ -552,7 +676,7 @@ fn run_bulk_incremental(config: &StateWatcherConfig, embedder: &mut EmbedderHand
             Ok(db) => db,
             Err(e) => {
                 tracing::warn!(error = %e, "opening DB for bulk semantic incremental");
-                return;
+                return WorkOutcome::Done;
             }
         };
         if let Err(e) = codesage_graph::semantic_incremental_index(
@@ -565,6 +689,8 @@ fn run_bulk_incremental(config: &StateWatcherConfig, embedder: &mut EmbedderHand
             tracing::warn!(error = %e, "bulk incremental semantic reindex failed");
         }
     }
+
+    WorkOutcome::Done
 }
 
 /// Set up the inotify watch set: the root non-recursively (top-level files +
@@ -812,6 +938,176 @@ mod tests {
         let past = Instant::now() - Duration::from_secs(10);
         assert!(is_idle(past, Duration::from_secs(1)));
         assert!(!is_idle(Instant::now(), Duration::from_secs(60)));
+    }
+
+    fn test_config(root: &Path) -> StateWatcherConfig {
+        StateWatcherConfig {
+            project_root: root.to_path_buf(),
+            db_path: root.join(".codesage").join("index.db"),
+            embed_config: EmbeddingConfig::default(),
+            exclude_patterns: vec![],
+            debounce_ms: 100,
+            idle_timeout: Duration::ZERO,
+            mode: WatcherMode::Foreground,
+            embedder: None,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn hold_lock(root: &Path) -> lockfile::IndexLock {
+        match lockfile::try_acquire(root).unwrap() {
+            lockfile::LockOutcome::Acquired(l) => l,
+            lockfile::LockOutcome::AlreadyHeld => panic!("fresh tmpdir must lock"),
+        }
+    }
+
+    #[test]
+    fn apply_bulk_outcome_done_clears_accumulated_state() {
+        let debounce = Duration::from_millis(500);
+        let now = Instant::now();
+        let mut pending = HashMap::new();
+        pending.insert(PathBuf::from("a.rs"), now);
+        let mut removed = vec!["gone.rs".to_string()];
+
+        let retry =
+            apply_bulk_outcome(WorkOutcome::Done, &mut pending, &mut removed, now, debounce);
+
+        assert_eq!(retry, None);
+        assert!(pending.is_empty());
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn apply_bulk_outcome_skipped_retains_and_rearms_after_debounce() {
+        let debounce = Duration::from_millis(500);
+        let now = Instant::now();
+        let stale = now - Duration::from_secs(10);
+        let mut pending = HashMap::new();
+        pending.insert(PathBuf::from("a.rs"), stale);
+        pending.insert(PathBuf::from("b.rs"), stale);
+        let mut removed = vec!["gone.rs".to_string()];
+
+        let retry = apply_bulk_outcome(
+            WorkOutcome::Skipped,
+            &mut pending,
+            &mut removed,
+            now,
+            debounce,
+        );
+
+        // Everything retained, bulk retry scheduled a full debounce out.
+        assert_eq!(retry, Some(now + debounce));
+        assert_eq!(pending.len(), 2);
+        assert_eq!(removed, vec!["gone.rs".to_string()]);
+        // Stamps were refreshed: nothing is drain-ready before the retry
+        // fires, so the skipped batch can't respin through the per-file path.
+        assert!(compute_ready(&pending, now, debounce).is_empty());
+        assert_eq!(compute_ready(&pending, now + debounce, debounce).len(), 2);
+    }
+
+    #[test]
+    fn apply_bulk_outcome_failed_retains_for_per_file_fallback() {
+        let debounce = Duration::from_millis(500);
+        let now = Instant::now();
+        let stale = now - Duration::from_secs(10);
+        let mut pending = HashMap::new();
+        pending.insert(PathBuf::from("a.rs"), stale);
+        let mut removed = vec!["gone.rs".to_string()];
+
+        let retry = apply_bulk_outcome(
+            WorkOutcome::Failed,
+            &mut pending,
+            &mut removed,
+            now,
+            debounce,
+        );
+
+        // No bulk retry, but the state survives with its original stamps so
+        // the per-file drain picks it up immediately.
+        assert_eq!(retry, None);
+        assert_eq!(compute_ready(&pending, now, debounce).len(), 1);
+        assert_eq!(removed.len(), 1);
+    }
+
+    #[test]
+    fn handle_removals_skipped_when_lock_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        let config = test_config(root);
+
+        let _held = hold_lock(root);
+        let paths = vec!["gone.rs".to_string()];
+        assert_eq!(handle_removals(&config, &paths), WorkOutcome::Skipped);
+    }
+
+    #[test]
+    fn handle_removals_done_when_lock_free() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        let config = test_config(root);
+
+        // `Database::open` creates the schema on a fresh path; removing
+        // paths absent from the index is a no-op success.
+        let paths = vec!["gone.rs".to_string()];
+        assert_eq!(handle_removals(&config, &paths), WorkOutcome::Done);
+    }
+
+    #[test]
+    fn reindex_one_skipped_when_lock_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        std::fs::write(root.join("foo.rs"), "fn main() {}\n").unwrap();
+        let config = test_config(root);
+        let mut embedder = EmbedderHandle::new(None);
+
+        let _held = hold_lock(root);
+        assert_eq!(
+            reindex_one(&config, Path::new("foo.rs"), &mut embedder),
+            WorkOutcome::Skipped
+        );
+    }
+
+    #[test]
+    fn process_ready_requeues_on_lock_contention() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        std::fs::write(root.join("foo.rs"), "fn main() {}\n").unwrap();
+        let config = test_config(root);
+        let filter = WatchFilter::new(root, &config.exclude_patterns).unwrap();
+        let mut embedder = EmbedderHandle::new(None);
+
+        let debounce = Duration::from_millis(100);
+        let stale = Instant::now() - Duration::from_secs(10);
+        let mut pending = HashMap::new();
+        pending.insert(PathBuf::from("foo.rs"), stale);
+        let mut currently_indexing = HashSet::new();
+        let mut recheck_queue = HashSet::new();
+
+        let _held = hold_lock(root);
+        process_ready(
+            &config,
+            &mut pending,
+            &mut currently_indexing,
+            &mut recheck_queue,
+            &filter,
+            &mut embedder,
+            vec![PathBuf::from("foo.rs")],
+        );
+
+        // Re-queued with a fresh stamp: still pending, but not drain-ready
+        // until another debounce window elapses.
+        let stamp = pending
+            .get(Path::new("foo.rs"))
+            .copied()
+            .expect("path re-queued after lock skip");
+        assert!(stamp > stale);
+        assert!(compute_ready(&pending, Instant::now(), debounce).is_empty());
+        assert!(currently_indexing.is_empty());
+        assert!(recheck_queue.is_empty());
     }
 
     #[test]

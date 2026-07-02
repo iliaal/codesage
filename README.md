@@ -39,6 +39,7 @@ Concrete answers to the questions a code-intelligence tool earns its keep on. Th
 | Per-file risk score (churn, fix ratio, blast radius, coupling, test gap, cycles, trust boundaries) | ✓ via `assess_risk`, seven-signal blend |
 | Patch-level risk aggregation (max/mean, hotspots, test-gap files) | ✓ via `assess_risk_diff`; per-file batch via `assess_risk_batch` |
 | Historical co-change / coupling | ✓ via `find_coupling`, decay-weighted with τ=180d |
+| Near-clone / structural-similarity detection | ✓ via `find_similar` / `codesage similar`, MinHash over AST shape, identifiers ignored |
 | Test-recommendation for a changed file set | ✓ via `recommend_tests`, sibling conventions for 7 frameworks + co-change |
 | Pre-commit review prediction (severity-ranked objections for a patch) | ✓ via `review_rehearsal`, composes risk-diff + recommend-tests + drift + feature mapping |
 | Curated context bundle for downstream LLM | ✓ via `export_context`, callers + callees optional |

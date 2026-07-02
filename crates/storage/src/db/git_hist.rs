@@ -315,4 +315,66 @@ impl Database {
         }
         Ok(lower as f64 / total as f64)
     }
+
+    /// Churn percentile for every path in `git_files`, in one query. Bulk
+    /// counterpart of [`Database::churn_percentile`] for callers scoring many
+    /// files at once. `CUME_DIST()` is defined as
+    /// `count(rows with value <= current) / count(*)` — the exact formula the
+    /// per-file query computes, ties included — so both paths return identical
+    /// values. Paths absent from the map score 0.0, matching the per-file
+    /// no-row fallback.
+    pub fn churn_percentiles(&self) -> Result<std::collections::HashMap<String, f64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, CUME_DIST() OVER (ORDER BY churn_score) FROM git_files")?;
+        let mut out = std::collections::HashMap::new();
+        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))? {
+            let (path, pct) = row?;
+            out.insert(path, pct);
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Database;
+
+    #[test]
+    fn churn_percentiles_bit_identical_to_per_file_query_with_ties() {
+        let db = Database::open_in_memory().unwrap();
+        // Three-way tie at 2.0 plus distinct low/high values: CUME_DIST must
+        // reproduce count(churn <= x)/count(*) exactly for every tie peer.
+        for (p, c) in [
+            ("a", 1.0_f64),
+            ("b", 2.0),
+            ("c", 2.0),
+            ("d", 2.0),
+            ("e", 5.0),
+            ("f", 0.5),
+        ] {
+            db.upsert_git_file(p, c, 0, 1, None).unwrap();
+        }
+
+        let bulk = db.churn_percentiles().unwrap();
+        assert_eq!(bulk.len(), 6);
+        for p in ["a", "b", "c", "d", "e", "f"] {
+            let single = db.churn_percentile(p).unwrap();
+            let batch = bulk[p];
+            assert_eq!(
+                single.to_bits(),
+                batch.to_bits(),
+                "path {p}: per-file {single} != bulk {batch}"
+            );
+        }
+        // Spot-check the tie group lands on the last-peer rank: 5 of 6 rows
+        // have churn <= 2.0.
+        assert_eq!(bulk["c"].to_bits(), (5.0_f64 / 6.0).to_bits());
+    }
+
+    #[test]
+    fn churn_percentiles_empty_table_returns_empty_map() {
+        let db = Database::open_in_memory().unwrap();
+        assert!(db.churn_percentiles().unwrap().is_empty());
+    }
 }

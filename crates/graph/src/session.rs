@@ -7,14 +7,14 @@
 //! reimplemented around CodeSage's existing risk + cycle infrastructure.
 //! Snapshots persist as JSON under `.codesage/sessions/<id>.json`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use codesage_protocol::{SessionDiff, SessionRiskEntry, SessionRiskRegression, SessionSnapshot};
 use codesage_storage::Database;
 
-use crate::git_history::assess_risk;
+use crate::git_history::{assess_risk, assess_risk_batch};
 
 /// Subdirectory under `.codesage/` where session snapshots live.
 const SESSIONS_DIR: &str = "sessions";
@@ -111,22 +111,29 @@ pub fn session_end(project_root: &Path, db: &Database, session_id: &str) -> Resu
         .collect();
     resolved_cycles.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
 
+    // File removed during the session — counted under removed_files,
+    // not as a regression.
+    let baseline_files: Vec<String> = snapshot
+        .top_risk_files
+        .iter()
+        .filter(|e| now_files_set.contains(e.file.as_str()))
+        .map(|e| e.file.clone())
+        .collect();
+    let (after_scores, mut risk_assessment_failed) = risk_scores(db, &baseline_files);
+    let after_by_file: HashMap<&str, f64> =
+        after_scores.iter().map(|(f, s)| (f.as_str(), *s)).collect();
+
     let mut risk_regressions: Vec<SessionRiskRegression> = Vec::new();
     let mut max_risk_regression = 0.0_f64;
-    let mut risk_assessment_failed = false;
     for entry in &snapshot.top_risk_files {
         if !now_files_set.contains(entry.file.as_str()) {
-            // File removed during the session — counted under removed_files,
-            // not as a regression.
             continue;
         }
-        let after = match assess_risk(db, &entry.file) {
-            Ok(r) => r.score,
-            Err(e) => {
-                tracing::warn!(error = %e, file = %entry.file, "assess_risk failed during session_end");
-                risk_assessment_failed = true;
-                continue;
-            }
+        let Some(&after) = after_by_file.get(entry.file.as_str()) else {
+            // Scored set omits files whose per-file fallback failed; the
+            // failure flag is already set, keep the gate failing closed.
+            risk_assessment_failed = true;
+            continue;
         };
         let delta = after - entry.score;
         if delta >= RISK_REGRESSION_THRESHOLD {
@@ -254,8 +261,8 @@ pub fn top_risk_files(db: &Database, limit: usize) -> Result<Vec<SessionRiskEntr
     compute_top_risk(db, &files, limit)
 }
 
-/// Score every file via `assess_risk`, return the top `limit` by score.
-/// Files with a risk computation error are skipped (logged).
+/// Score every file via one batched risk call, return the top `limit` by
+/// score. Files with a risk computation error are skipped (logged).
 fn compute_top_risk(
     db: &Database,
     files: &[String],
@@ -282,18 +289,11 @@ fn compute_top_risk(
     } else {
         files.to_vec()
     };
-    let mut scored: Vec<SessionRiskEntry> = Vec::with_capacity(candidates.len());
-    for f in &candidates {
-        match assess_risk(db, f) {
-            Ok(r) => scored.push(SessionRiskEntry {
-                file: r.file,
-                score: r.score,
-            }),
-            Err(e) => {
-                tracing::warn!(error = %e, file = %f, "assess_risk failed during snapshot; skipping");
-            }
-        }
-    }
+    let (pairs, _any_failed) = risk_scores(db, &candidates);
+    let mut scored: Vec<SessionRiskEntry> = pairs
+        .into_iter()
+        .map(|(file, score)| SessionRiskEntry { file, score })
+        .collect();
     scored.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -301,6 +301,41 @@ fn compute_top_risk(
     });
     scored.truncate(limit);
     Ok(scored)
+}
+
+/// Risk scores for `files` via one `assess_risk_batch` call, which computes
+/// the import-cycle SCC set and the churn-percentile table once instead of
+/// per file (per-file `assess_risk` re-runs both — tens of ms each on large
+/// repos, unaffordable across a 400-candidate sweep). fnd: CR-001, CR-008.
+///
+/// If the batch call fails as a whole, falls back to per-file scoring to
+/// preserve the skip-on-error semantics: files that error are logged and
+/// omitted, and the returned flag reports whether any file failed.
+fn risk_scores(db: &Database, files: &[String]) -> (Vec<(String, f64)>, bool) {
+    if files.is_empty() {
+        return (Vec::new(), false);
+    }
+    match assess_risk_batch(db, files) {
+        Ok(batch) => (
+            batch.files.into_iter().map(|r| (r.file, r.score)).collect(),
+            false,
+        ),
+        Err(e) => {
+            tracing::warn!(error = %e, "batched risk scoring failed; falling back to per-file assess_risk");
+            let mut out = Vec::with_capacity(files.len());
+            let mut any_failed = false;
+            for f in files {
+                match assess_risk(db, f) {
+                    Ok(r) => out.push((r.file, r.score)),
+                    Err(e) => {
+                        tracing::warn!(error = %e, file = %f, "assess_risk failed; skipping");
+                        any_failed = true;
+                    }
+                }
+            }
+            (out, any_failed)
+        }
+    }
 }
 
 /// Best-effort `git rev-parse HEAD`. Returns None when not a git repo or

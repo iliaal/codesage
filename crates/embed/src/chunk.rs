@@ -46,7 +46,16 @@ pub fn chunk_text(content: &str, config: &ChunkConfig) -> Vec<Chunk> {
             let start = snap_to_char_boundary(content, seg.start);
             let end = find_char_boundary(content, seg.end);
             let start_line = 1 + content[..start].matches('\n').count() as u32;
-            let end_line = 1 + content[..end].matches('\n').count() as u32;
+            // A chunk's own trailing newline terminates its last line rather
+            // than starting a new one; counting it would report an end_line
+            // one past the chunk's content (a "aaa\n" chunk is line 1, not
+            // lines 1-2) and misattribute symbols at chunk boundaries.
+            let count_end = if end > start && content.as_bytes()[end - 1] == b'\n' {
+                end - 1
+            } else {
+                end
+            };
+            let end_line = 1 + content[..count_end].matches('\n').count() as u32;
             Chunk {
                 text: content[start..end].to_string(),
                 start_line,
@@ -374,10 +383,45 @@ mod tests {
             overlap: 0,
         };
         let chunks = chunk_text(text, &config);
-        assert!(chunks[0].start_line == 1);
-        if chunks.len() > 1 {
-            assert!(chunks.last().unwrap().end_line >= 5);
-        }
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].text, "line1\nline2\n");
+        assert_eq!((chunks[0].start_line, chunks[0].end_line), (1, 2));
+        assert_eq!(chunks[1].text, "line3\n\n");
+        assert_eq!((chunks[1].start_line, chunks[1].end_line), (3, 4));
+        assert_eq!(chunks[2].text, "line5\nline6");
+        assert_eq!((chunks[2].start_line, chunks[2].end_line), (5, 6));
+    }
+
+    #[test]
+    fn end_line_excludes_chunk_trailing_newline() {
+        // First chunk is exactly "aaa\n": its content is line 1 only, and the
+        // second chunk ("bbb", no trailing newline) is line 2 only.
+        let config = ChunkConfig {
+            chunk_size: 4,
+            min_chunk_size: 1,
+            overlap: 0,
+        };
+        let chunks = chunk_text("aaa\nbbb", &config);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].text, "aaa\n");
+        assert_eq!((chunks[0].start_line, chunks[0].end_line), (1, 1));
+        assert_eq!(chunks[1].text, "bbb");
+        assert_eq!((chunks[1].start_line, chunks[1].end_line), (2, 2));
+    }
+
+    #[test]
+    fn newline_terminated_file_single_chunk() {
+        let chunks = chunk_text("aaa\nbbb\n", &default_config());
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "aaa\nbbb\n");
+        assert_eq!((chunks[0].start_line, chunks[0].end_line), (1, 2));
+    }
+
+    #[test]
+    fn single_line_file_without_trailing_newline() {
+        let chunks = chunk_text("aaa", &default_config());
+        assert_eq!(chunks.len(), 1);
+        assert_eq!((chunks[0].start_line, chunks[0].end_line), (1, 1));
     }
 
     #[test]

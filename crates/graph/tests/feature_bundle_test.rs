@@ -33,6 +33,7 @@ fn seed_chunk(db: &Database, file_path: &str, language: &str, content: &str) {
 fn returns_empty_bundle_with_marker_when_feature_missing() {
     let db = Database::open_in_memory().unwrap();
     let bundle = feature_bundle(&db, "feat_does_not_exist", false, false, 5).unwrap();
+    assert!(!bundle.found);
     assert!(bundle.target_description.contains("not found"));
     assert!(bundle.primary.is_empty());
     assert!(bundle.related.is_empty());
@@ -67,6 +68,7 @@ fn returns_bundle_with_curated_files_after_map() {
         .expect("main feature mapped");
 
     let bundle = feature_bundle(&db, &main_feature.feature_id, false, false, 5).unwrap();
+    assert!(bundle.found);
     assert!(
         bundle.target_description.contains(&main_feature.feature_id),
         "target_description should name the feature id, got {:?}",

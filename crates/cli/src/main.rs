@@ -13,6 +13,7 @@ mod util;
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -70,6 +71,10 @@ enum Commands {
         /// Embedding batch size for this index run
         #[arg(long, value_parser = parse_positive_usize)]
         batch_size: Option<NonZeroUsize>,
+        /// Wait up to SECS for the project index lock instead of skipping
+        /// immediately when another indexer holds it (0 = skip, the default)
+        #[arg(long, value_name = "SECS", default_value_t = 0)]
+        lock_wait: u64,
     },
     /// Find symbol definitions by name
     FindSymbol {
@@ -208,7 +213,13 @@ enum Commands {
         runtime_dir: Option<PathBuf>,
     },
     /// Install git hooks for automatic reindexing
-    InstallHooks,
+    InstallHooks {
+        /// Also install a pre-commit hook that runs the repo's
+        /// scripts/leak-check.sh. Opt-in: the script is repo-controlled
+        /// code, so it never auto-wires on a fresh clone.
+        #[arg(long)]
+        with_leak_check: bool,
+    },
     /// Register CodeSage as an MCP server in another agent (codex, opencode)
     Install {
         /// Agent to register with: `codex`, `opencode`, or `all`
@@ -249,6 +260,10 @@ enum Commands {
         /// is auto: incremental if state is valid, else full.
         #[arg(long)]
         incremental: bool,
+        /// Wait up to SECS for the project index lock instead of skipping
+        /// immediately when another indexer holds it (0 = skip, the default)
+        #[arg(long, value_name = "SECS", default_value_t = 0)]
+        lock_wait: u64,
     },
     /// Top files that historically change together with the given file (V2b)
     Coupling {
@@ -511,12 +526,18 @@ fn open_context_db_for_existing_model(root: &Path, model: &str) -> Result<Databa
         .context("failed to open index database")
 }
 
-/// Try to acquire the project indexing lock. On contention, prints the
-/// standard "another indexer is running … {action}" line and returns
-/// `Ok(None)` so the caller can skip work cleanly:
-/// `let Some(_lock) = acquire_index_lock(&root, "skipping")? else { return Ok(()) };`.
-fn acquire_index_lock(root: &Path, action: &str) -> Result<Option<lockfile::IndexLock>> {
-    match lockfile::try_acquire(root)? {
+/// Try to acquire the project indexing lock, polling for up to `wait`
+/// (`Duration::ZERO` = single non-blocking attempt). On contention past
+/// the window, prints the standard "another indexer is running …
+/// {action}" line and returns `Ok(None)` so the caller can skip work
+/// cleanly:
+/// `let Some(_lock) = acquire_index_lock(&root, "skipping", wait)? else { return Ok(()) };`.
+fn acquire_index_lock(
+    root: &Path,
+    action: &str,
+    wait: Duration,
+) -> Result<Option<lockfile::IndexLock>> {
+    match lockfile::acquire_with_wait(root, wait)? {
         lockfile::LockOutcome::Acquired(lock) => Ok(Some(lock)),
         lockfile::LockOutcome::AlreadyHeld => {
             eprintln!(
@@ -837,7 +858,14 @@ fn run(cli: Cli) -> Result<()> {
             no_semantic,
             verbose,
             batch_size,
-        } => cmd_index(full, no_semantic, verbose, batch_size),
+            lock_wait,
+        } => cmd_index(
+            full,
+            no_semantic,
+            verbose,
+            batch_size,
+            Duration::from_secs(lock_wait),
+        ),
         Commands::FindSymbol { name, kind, json } => cmd_find_symbol(&name, kind.as_deref(), json),
         Commands::FindReferences { name, kind, json } => {
             cmd_find_references(&name, kind.as_deref(), json)
@@ -897,7 +925,7 @@ fn run(cli: Cli) -> Result<()> {
             DaemonAction::Status => cmd_daemon_status(runtime_dir),
             DaemonAction::Stop => cmd_daemon_stop(runtime_dir),
         },
-        Commands::InstallHooks => cmd_install_hooks(),
+        Commands::InstallHooks { with_leak_check } => cmd_install_hooks(with_leak_check),
         Commands::Install { target, global } => cmd_install(&target, global),
         Commands::Uninstall { target, global } => cmd_uninstall(&target, global),
         Commands::Cleanup { dry_run } => cmd_cleanup(dry_run),
@@ -906,7 +934,8 @@ fn run(cli: Cli) -> Result<()> {
             json,
             full,
             incremental,
-        } => cmd_git_index(json, full, incremental),
+            lock_wait,
+        } => cmd_git_index(json, full, incremental, Duration::from_secs(lock_wait)),
         Commands::Coupling { file, limit, json } => cmd_coupling(&file, limit, json),
         Commands::Risk { file, json } => cmd_risk(&file, json),
         Commands::Similar {
@@ -1090,7 +1119,7 @@ fn cmd_uninstall(target: &str, global: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_install_hooks() -> Result<()> {
+fn cmd_install_hooks(with_leak_check: bool) -> Result<()> {
     let root = find_project_root()?;
     if !root.join(".git").exists() {
         bail!("not a git repository (no .git at project root)");
@@ -1150,7 +1179,7 @@ fn cmd_install_hooks() -> Result<()> {
         exclude_husky_hook_paths(&root, &installed)?;
     }
 
-    install_leak_check_hook(&root, &hooks_dir, is_husky, &mut installed)?;
+    install_leak_check_hook(&root, &hooks_dir, is_husky, with_leak_check, &mut installed)?;
 
     Ok(())
 }
@@ -1161,6 +1190,13 @@ fn cmd_install_hooks() -> Result<()> {
 /// lock; if launched in parallel one would silently skip on lock
 /// contention, with no log visibility because stdout/stderr are
 /// redirected to /dev/null. Sequencing makes both passes always run.
+///
+/// The daemon's filesystem watcher is a third lock contender: it
+/// debounce-indexes ~1s after an edit, i.e. right around commit time,
+/// but covers only structural+semantic — never feature mapping or git
+/// history. `--lock-wait` makes each hook pass poll the lock for up to
+/// 60s instead of skipping, so a watcher pass in flight delays the hook
+/// by seconds rather than silently starving the hook-only passes.
 fn generate_post_commit_hook_body(bin: &str) -> String {
     let bin = shell_single_quote(bin);
     format!(
@@ -1174,10 +1210,13 @@ fn generate_post_commit_hook_body(bin: &str) -> String {
          # in one background subshell. Both subcommands take the same\n\
          # project lock and would silently skip on contention if launched in\n\
          # parallel — losing whichever lost the race, with no log visibility\n\
-         # because stdout/stderr are redirected to /dev/null.\n\
+         # because stdout/stderr are redirected to /dev/null. The daemon's\n\
+         # filesystem watcher contends for the same lock around commit time\n\
+         # but never runs feature mapping or git-history indexing, so\n\
+         # --lock-wait polls it out instead of skipping.\n\
          [ -d \"$root/.codesage\" ] && ( cd \"$root\" && \\\n\
-           $IONICE $NICE {bin} index && \\\n\
-           $IONICE $NICE {bin} git-index --incremental ) >/dev/null 2>&1 &\n\
+           $IONICE $NICE {bin} index --lock-wait 60 && \\\n\
+           $IONICE $NICE {bin} git-index --incremental --lock-wait 60 ) >/dev/null 2>&1 &\n\
          exit 0\n",
     )
 }
@@ -1186,17 +1225,32 @@ fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\"'\"'"))
 }
 
-/// Install a pre-commit leak-check hook if the repo ships `scripts/leak-check.sh`.
+/// Install a pre-commit leak-check hook wrapping the repo's `scripts/leak-check.sh`.
 /// Keeps the hook a thin wrapper that invokes the repo's own script so the pattern
 /// list and script logic can be iterated without re-running install-hooks.
+///
+/// Opt-in only (`--with-leak-check`): unlike the other hooks, which exec the
+/// trusted codesage binary, this one execs a repo-shipped script — auto-wiring
+/// it would hand a fresh clone of a malicious repo code execution on the
+/// user's next commit.
 fn install_leak_check_hook(
     root: &std::path::Path,
     hooks_dir: &std::path::Path,
     is_husky: bool,
+    enabled: bool,
     installed: &mut Vec<PathBuf>,
 ) -> Result<()> {
     let script = root.join("scripts/leak-check.sh");
     if !script.exists() {
+        if enabled {
+            println!("skip: --with-leak-check passed but no scripts/leak-check.sh in repo");
+        }
+        return Ok(());
+    }
+    if !enabled {
+        println!(
+            "notice: scripts/leak-check.sh found; rerun with --with-leak-check to install it as a pre-commit hook"
+        );
         return Ok(());
     }
 
@@ -1395,6 +1449,7 @@ fn cmd_index(
     no_semantic: bool,
     verbose: bool,
     batch_size_override: Option<NonZeroUsize>,
+    lock_wait: Duration,
 ) -> Result<()> {
     let root = find_project_root()?;
     // Acquire the project-level indexing lock before loading embedders or
@@ -1403,7 +1458,10 @@ fn cmd_index(
     // finding from recommendations doc §2.4 said the previous behavior was
     // "one process wins with rc=0, loser dies with SQLITE_BUSY", which
     // looks like a failure in hook logs even though no data is at risk.
-    let Some(_lock) = acquire_index_lock(&root, "skipping")? else {
+    // `--lock-wait` bounds a polling wait first: the daemon's watcher
+    // debounce-indexes around commit time but never runs feature mapping,
+    // so a hook-invoked skip here would leave feature slices stale.
+    let Some(_lock) = acquire_index_lock(&root, "skipping", lock_wait)? else {
         return Ok(());
     };
     let config = load_project_config(&root)?;
@@ -1583,7 +1641,10 @@ fn cmd_find_symbol(name: &str, kind_str: Option<&str>, json: bool) -> Result<()>
     )?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&results)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&codesage_protocol::FindSymbolResults { results })?
+        );
     } else if results.is_empty() {
         println!("No symbols found for '{name}'");
     } else {
@@ -1611,7 +1672,10 @@ fn cmd_find_references(name: &str, kind_str: Option<&str>, json: bool) -> Result
     )?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&results)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&codesage_protocol::FindReferencesResults { results })?
+        );
     } else if results.is_empty() {
         println!("No references found for '{name}'");
     } else {
@@ -1655,7 +1719,10 @@ fn cmd_search(
     let results = search(&db, &query_embedding, rerank_fn, &req)?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&results)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&codesage_protocol::SearchResults { results })?
+        );
     } else if results.is_empty() {
         println!("No results found for '{query}'");
     } else {
@@ -1706,13 +1773,15 @@ fn cmd_dependencies(file: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_git_index(json: bool, full: bool, incremental: bool) -> Result<()> {
+fn cmd_git_index(json: bool, full: bool, incremental: bool, lock_wait: Duration) -> Result<()> {
     let root = find_project_root()?;
     // Same lock as `codesage index`: if a structural index is in flight,
     // the git-history pass would race it and hit SQLITE_BUSY. Skipping
     // here lets the hook-driven scheduler converge on a single indexer
-    // at a time without the user seeing an error.
-    let Some(_lock) = acquire_index_lock(&root, "skipping")? else {
+    // at a time without the user seeing an error. `--lock-wait` bounds
+    // a polling wait first — the watcher never refreshes git history, so
+    // a hook-invoked skip would leave it stale until the next commit.
+    let Some(_lock) = acquire_index_lock(&root, "skipping", lock_wait)? else {
         return Ok(());
     };
     let db = open_db(&root)?;
@@ -1766,7 +1835,10 @@ fn cmd_similar(symbol: &str, min_jaccard: f32, limit: usize, json: bool) -> Resu
     let db = open_db(&root)?;
     let hits = find_similar(&db, symbol, min_jaccard, limit)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&hits)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&codesage_protocol::FindSimilarResults { results: hits })?
+        );
     } else if hits.is_empty() {
         println!("No clones of '{symbol}' at Jaccard >= {min_jaccard:.2}");
     } else {
@@ -1968,7 +2040,7 @@ fn cmd_map(json: bool) -> Result<()> {
     // / cmd_cleanup hold so a manual `codesage map` doesn't race the background
     // hook-driven indexer (which maps features itself) into SQLITE_BUSY or a
     // partial multi-transaction state. Skip if an indexer already holds it.
-    let Some(_lock) = acquire_index_lock(&root, "skipping map")? else {
+    let Some(_lock) = acquire_index_lock(&root, "skipping map", Duration::ZERO)? else {
         return Ok(());
     };
     let db = open_db(&root)?;
@@ -2511,7 +2583,7 @@ fn cmd_cleanup(dry_run: bool) -> Result<()> {
     // Cleanup drops orphan vec tables (from prior model switches) — also
     // a writer-style operation that races with in-flight indexers. Same
     // lock coordination.
-    let Some(_lock) = acquire_index_lock(&root, "skipping cleanup")? else {
+    let Some(_lock) = acquire_index_lock(&root, "skipping cleanup", Duration::ZERO)? else {
         return Ok(());
     };
     let config = load_project_config(&root)?;
@@ -3021,12 +3093,12 @@ mod tests {
         // subshell so both passes always run after every commit.
         let body = generate_post_commit_hook_body("/usr/local/bin/codesage");
         assert!(
-            body.contains("'/usr/local/bin/codesage' index &&"),
-            "expected `index` to be chained with `&&`, got:\n{body}"
+            body.contains("'/usr/local/bin/codesage' index --lock-wait 60 &&"),
+            "expected `index --lock-wait` to be chained with `&&`, got:\n{body}"
         );
         assert!(
-            body.contains("'/usr/local/bin/codesage' git-index --incremental"),
-            "expected `git-index --incremental` invocation, got:\n{body}"
+            body.contains("'/usr/local/bin/codesage' git-index --incremental --lock-wait 60"),
+            "expected `git-index --incremental --lock-wait` invocation, got:\n{body}"
         );
         // Only one background `&` should appear at the top level —
         // we sequence inside one subshell, then background the whole
@@ -3049,7 +3121,7 @@ mod tests {
         let body = generate_post_commit_hook_body("/tmp/cod\"e$age`bin's/codesage");
 
         assert!(
-            body.contains("'/tmp/cod\"e$age`bin'\"'\"'s/codesage' index &&"),
+            body.contains("'/tmp/cod\"e$age`bin'\"'\"'s/codesage' index --lock-wait 60 &&"),
             "expected shell-quoted binary path, got:\n{body}"
         );
         assert!(
@@ -3183,8 +3255,11 @@ mod tests {
     #[cfg(not(feature = "cuda"))]
     #[test]
     fn index_embedder_setup_errors_when_gpu_requested_without_cuda() {
+        // Must be an allowlisted model name: the validated-model gate runs
+        // before the cuda-feature guard, and this test targets the latter.
+        // No download happens — the guard bails before any hf-hub call.
         let cfg = EmbeddingConfig {
-            model: "codesage-test/does-not-matter".to_string(),
+            model: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
             device: "gpu".to_string(),
             ..EmbeddingConfig::default()
         };
@@ -3378,5 +3453,89 @@ mod tests {
     fn embedder_gate_skips_empty_and_unknown() {
         assert!(!argv_uses_embedder(argv(&[])));
         assert!(!argv_uses_embedder(argv(&["definitely-not-a-command"])));
+    }
+
+    // ---------- leak-check hook opt-in gate ----------
+
+    fn leak_check_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        std::fs::write(root.join("scripts/leak-check.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        let hooks_dir = root.join(".git/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        (dir, root, hooks_dir)
+    }
+
+    #[test]
+    fn leak_check_hook_requires_explicit_opt_in() {
+        // The leak-check hook execs a repo-shipped script. Auto-installing it
+        // on `install-hooks` would give a fresh clone of a malicious repo
+        // code execution on the user's next commit, so without
+        // --with-leak-check nothing may be written.
+        let (_dir, root, hooks_dir) = leak_check_fixture();
+        let mut installed = Vec::new();
+
+        install_leak_check_hook(&root, &hooks_dir, false, false, &mut installed).unwrap();
+
+        assert!(
+            !hooks_dir.join("pre-commit").exists(),
+            "pre-commit hook must not be installed without --with-leak-check"
+        );
+        assert!(installed.is_empty());
+    }
+
+    #[test]
+    fn leak_check_hook_installed_with_opt_in() {
+        let (_dir, root, hooks_dir) = leak_check_fixture();
+        let mut installed = Vec::new();
+
+        install_leak_check_hook(&root, &hooks_dir, false, true, &mut installed).unwrap();
+
+        let hook = hooks_dir.join("pre-commit");
+        let body = std::fs::read_to_string(&hook).expect("pre-commit hook written");
+        assert!(
+            body.contains("codesage install-hooks"),
+            "hook must carry the codesage marker for idempotent reinstall:\n{body}"
+        );
+        assert!(
+            body.contains("scripts/leak-check.sh"),
+            "hook must exec the repo's leak-check script:\n{body}"
+        );
+        assert_eq!(installed, vec![hook.clone()]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&hook).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "hook must be executable");
+        }
+    }
+
+    #[test]
+    fn leak_check_hook_never_overwrites_foreign_pre_commit() {
+        let (_dir, root, hooks_dir) = leak_check_fixture();
+        let foreign = "#!/bin/sh\n# user's own hook\nexit 0\n";
+        std::fs::write(hooks_dir.join("pre-commit"), foreign).unwrap();
+        let mut installed = Vec::new();
+
+        install_leak_check_hook(&root, &hooks_dir, false, true, &mut installed).unwrap();
+
+        let body = std::fs::read_to_string(hooks_dir.join("pre-commit")).unwrap();
+        assert_eq!(body, foreign, "foreign pre-commit hook must be untouched");
+        assert!(installed.is_empty());
+    }
+
+    #[test]
+    fn leak_check_hook_noop_without_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let hooks_dir = root.join(".git/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let mut installed = Vec::new();
+
+        install_leak_check_hook(&root, &hooks_dir, false, true, &mut installed).unwrap();
+
+        assert!(!hooks_dir.join("pre-commit").exists());
+        assert!(installed.is_empty());
     }
 }

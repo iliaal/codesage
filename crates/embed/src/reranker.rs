@@ -29,17 +29,9 @@ impl Reranker {
     }
 
     pub fn score_pairs(&mut self, query: &str, documents: &[&str]) -> Result<Vec<f32>> {
-        if documents.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut all_scores = Vec::with_capacity(documents.len());
-
-        for batch in documents.chunks(RERANK_BATCH) {
-            all_scores.extend(self.score_batch(query, batch)?);
-        }
-
-        Ok(all_scores)
+        score_in_batches(documents, RERANK_BATCH, |batch| {
+            self.score_batch(query, batch)
+        })
     }
 
     fn score_batch(&mut self, query: &str, documents: &[&str]) -> Result<Vec<f32>> {
@@ -87,6 +79,39 @@ impl Reranker {
         }
         Ok(extract_relevance_scores(&shape[..], logits, batch_size))
     }
+}
+
+/// Split `documents` into `batch_size` chunks, score each with `score_batch`,
+/// and concatenate the scores in input order. A batch result whose length
+/// doesn't match its batch is an error: extending anyway would silently
+/// attach scores to the wrong documents downstream, and letting the mismatch
+/// surface as an index panic later would hang the MCP client.
+fn score_in_batches<F>(
+    documents: &[&str],
+    batch_size: usize,
+    mut score_batch: F,
+) -> Result<Vec<f32>>
+where
+    F: FnMut(&[&str]) -> Result<Vec<f32>>,
+{
+    if documents.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut all_scores = Vec::with_capacity(documents.len());
+
+    for batch in documents.chunks(batch_size) {
+        let scores = score_batch(batch)?;
+        anyhow::ensure!(
+            scores.len() == batch.len(),
+            "reranker returned {} scores for a batch of {} documents",
+            scores.len(),
+            batch.len()
+        );
+        all_scores.extend(scores);
+    }
+
+    Ok(all_scores)
 }
 
 /// Pull one relevance score per query/document pair out of the cross-encoder
@@ -139,7 +164,7 @@ fn extract_relevance_scores(shape: &[i64], logits: &[f32], batch_size: usize) ->
 
 #[cfg(test)]
 mod tests {
-    use super::extract_relevance_scores;
+    use super::{extract_relevance_scores, score_in_batches};
 
     #[test]
     fn single_label_head_returns_raw_logits() {
@@ -190,5 +215,45 @@ mod tests {
         let logits = vec![0.0, 0.0, 3.0];
         let scores = extract_relevance_scores(&[1, 3], &logits, 1);
         assert!(scores[0] > 0.85);
+    }
+
+    #[test]
+    fn score_in_batches_splits_at_batch_size_and_preserves_order() {
+        let docs: Vec<String> = (0..33).map(|i| format!("doc{i}")).collect();
+        let doc_refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+
+        let mut batch_lens = Vec::new();
+        let scores = score_in_batches(&doc_refs, 32, |batch| {
+            batch_lens.push(batch.len());
+            batch
+                .iter()
+                .map(|d| Ok(d.trim_start_matches("doc").parse::<f32>().unwrap()))
+                .collect()
+        })
+        .unwrap();
+
+        assert_eq!(batch_lens, vec![32, 1]);
+        let expected: Vec<f32> = (0..33).map(|i| i as f32).collect();
+        assert_eq!(scores, expected);
+    }
+
+    #[test]
+    fn score_in_batches_empty_input_never_calls_closure() {
+        let scores = score_in_batches(&[], 32, |_| -> anyhow::Result<Vec<f32>> {
+            panic!("closure must not run on empty input")
+        })
+        .unwrap();
+        assert!(scores.is_empty());
+    }
+
+    #[test]
+    fn score_in_batches_wrong_length_batch_is_an_error() {
+        let docs = ["a", "b", "c"];
+        let err = score_in_batches(&docs, 2, |batch| Ok(vec![0.0; batch.len() + 1]))
+            .expect_err("a wrong-length batch result must not be concatenated");
+        assert!(
+            err.to_string().contains("scores"),
+            "unexpected error: {err}"
+        );
     }
 }

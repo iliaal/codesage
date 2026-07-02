@@ -600,6 +600,218 @@ fn status_finds_daemon_in_env_runtime_dir() {
     );
 }
 
+#[test]
+fn tools_call_unknown_tool_returns_jsonrpc_error() {
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut session = McpSession::start(runtime.path());
+    session.initialize();
+
+    let resp = session.request(
+        2,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"no_such_tool","arguments":{}}}"#,
+    );
+    let err = resp
+        .get("error")
+        .unwrap_or_else(|| panic!("unknown tool must be a JSON-RPC error, got: {resp}"));
+    // rmcp's ToolRouter rejects unknown tools with invalid_params (-32602),
+    // message "tool not found" — not the spec's -32601 method-not-found.
+    assert_eq!(err["code"], -32602, "unexpected error shape: {err}");
+    let msg = err["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("tool not found"),
+        "error should say the tool was not found, got: {msg:?}"
+    );
+}
+
+#[test]
+fn tools_call_find_coupling_rejects_unparseable_limit_with_named_value() {
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut session = McpSession::start(runtime.path());
+    session.initialize();
+
+    let resp = session.request(
+        2,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"find_coupling","arguments":{"project":"/nonexistent","file_path":"a.rs","limit":"not-a-number"}}}"#,
+    );
+    // rmcp surfaces a parameter-deserialization failure as a tool RESULT with
+    // isError=true (not a protocol-level -32602), with the serde message in
+    // the content text.
+    assert!(
+        resp.get("error").is_none(),
+        "param failures come back as tool results, got protocol error: {resp}"
+    );
+    assert_eq!(
+        resp["result"]["isError"],
+        Value::Bool(true),
+        "unparseable limit must fail the call: {resp}"
+    );
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    // The offending value must be quoted so an agent can self-correct; the
+    // exact phrasing around it is free to change.
+    assert!(
+        text.contains("not-a-number"),
+        "error must quote the offending value, got: {text:?}"
+    );
+}
+
+#[test]
+fn tools_call_find_coupling_coerces_stringy_limit() {
+    // The documented dominant real-world agent error is `"limit": "5"` (a
+    // JSON string instead of a number). The server coerces it, so the call
+    // must get PAST parameter validation — no -32602 — and run the tool.
+    let project = tempfile::tempdir().unwrap();
+    onboard_fixture_project(project.path());
+
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut session = McpSession::start(runtime.path());
+    session.initialize();
+
+    let resp = session.request(
+        2,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"find_coupling","arguments":{{"project":"{}","file_path":"src/lib.rs","limit":"5"}}}}}}"#,
+            project.path().display()
+        ),
+    );
+    assert!(
+        resp.get("error").is_none(),
+        "stringy limit must be coerced, not rejected: {resp}"
+    );
+    assert_ne!(
+        resp["result"]["isError"],
+        Value::Bool(true),
+        "tool run should succeed on an onboarded project: {resp}"
+    );
+    assert!(
+        resp["result"]["structuredContent"].is_object(),
+        "successful call should carry structured content: {resp}"
+    );
+}
+
+#[test]
+fn tools_call_find_symbol_round_trips_against_structural_index() {
+    let project = tempfile::tempdir().unwrap();
+    onboard_fixture_project(project.path());
+
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut session = McpSession::start(runtime.path());
+    session.initialize();
+
+    let resp = session.request(
+        2,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"find_symbol","arguments":{{"project":"{}","name":"hello_symbol"}}}}}}"#,
+            project.path().display()
+        ),
+    );
+    assert!(resp.get("error").is_none(), "expected a result: {resp}");
+    assert_ne!(
+        resp["result"]["isError"],
+        Value::Bool(true),
+        "find_symbol should succeed: {resp}"
+    );
+    let results = resp["result"]["structuredContent"]["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected results array: {resp}"));
+    assert!(
+        results
+            .iter()
+            .any(|r| r["name"] == "hello_symbol" && r["file_path"] == "src/lib.rs"),
+        "structural index should resolve the fixture symbol, got: {results:?}"
+    );
+}
+
+/// One MCP shim (stdin/stdout JSON-RPC) with a line-reader thread, so
+/// tools/call tests don't re-inline the pump plumbing per test.
+struct McpSession {
+    child: ChildGuard,
+    rx: Receiver<std::io::Result<String>>,
+}
+
+impl McpSession {
+    fn start(runtime_dir: &std::path::Path) -> Self {
+        let bin = env!("CARGO_BIN_EXE_codesage");
+        let mut child = ChildGuard {
+            child: Command::new(bin)
+                .arg("mcp")
+                .arg("--runtime-dir")
+                .arg(runtime_dir)
+                // The daemon inherits the first shim's env; keep the
+                // per-project watcher out of tool-call tests.
+                .env("CODESAGE_WATCH", "0")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn codesage mcp"),
+        };
+        let stdout = child.child.stdout.take().expect("child stdout");
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { child, rx }
+    }
+
+    fn send(&mut self, line: &str) {
+        let stdin = self.child.child.stdin.as_mut().expect("child stdin");
+        writeln!(stdin, "{line}").unwrap();
+        stdin.flush().unwrap();
+    }
+
+    fn request(&mut self, id: u64, line: &str) -> Value {
+        self.send(line);
+        recv_response(&self.rx, id)
+    }
+
+    fn initialize(&mut self) {
+        let init = self.request(
+            1,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"codesage-test","version":"0.0.0"}}}"#,
+        );
+        assert_eq!(init["result"]["serverInfo"]["name"], "codesage");
+        self.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+    }
+}
+
+/// Onboard a throwaway project offline: `init` + structural-only index
+/// (`--no-semantic` needs no model download, no network).
+fn onboard_fixture_project(root: &std::path::Path) {
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn hello_symbol() {}\n").unwrap();
+    let bin = env!("CARGO_BIN_EXE_codesage");
+    for args in [vec!["init"], vec!["index", "--no-semantic"]] {
+        let out = Command::new(bin)
+            .args(&args)
+            .current_dir(root)
+            .output()
+            .expect("run codesage");
+        assert!(
+            out.status.success(),
+            "codesage {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 struct ChildGuard {
     child: Child,
 }

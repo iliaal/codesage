@@ -33,10 +33,13 @@ pub enum Language {
     Php,
     Python,
     C,
+    #[serde(alias = "c++", alias = "cxx")]
     Cpp,
     Java,
     Rust,
+    #[serde(alias = "js")]
     JavaScript,
+    #[serde(alias = "ts")]
     TypeScript,
     Go,
 }
@@ -575,8 +578,16 @@ fn default_export_limit() -> usize {
     5
 }
 
+fn default_found() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ContextBundle {
+    /// False when the requested target (symbol or feature_id) does not
+    /// exist in the index; the bundle is empty in that case.
+    #[serde(default = "default_found")]
+    pub found: bool,
     pub target_description: String,
     pub primary: Vec<SearchResult>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -609,6 +620,11 @@ pub struct CoChangeEntry {
 /// one.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CouplingReport {
+    /// False when the requested file does not exist in the git-history
+    /// index (mirrors `file_indexed`; structured replacement for
+    /// substring-matching the `note` prose).
+    #[serde(default = "default_found")]
+    pub found: bool,
     pub coupled: Vec<CoChangeEntry>,
     /// True when the file has at least one row in `git_files`.
     pub file_indexed: bool,
@@ -1654,5 +1670,19 @@ mod tests {
             !json.contains("_legend"),
             "empty legend must be omitted, got {json}"
         );
+    }
+
+    /// Backward compatibility: payloads serialized before the structured
+    /// `found` field existed must deserialize as `found=true` — absence of
+    /// the field meant a success result under the old prose-sentinel scheme.
+    #[test]
+    fn found_defaults_to_true_when_absent() {
+        let bundle: ContextBundle =
+            serde_json::from_str(r#"{"target_description":"symbol: foo","primary":[]}"#).unwrap();
+        assert!(bundle.found);
+
+        let report: CouplingReport =
+            serde_json::from_str(r#"{"coupled":[],"file_indexed":true,"file_commits":4}"#).unwrap();
+        assert!(report.found);
     }
 }

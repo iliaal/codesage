@@ -200,12 +200,21 @@ pub fn fts_schema(table_name: &str) -> String {
     )
 }
 
-fn quote_ident(identifier: &str) -> String {
+pub(crate) fn quote_ident(identifier: &str) -> String {
     identifier.replace('"', "\"\"")
 }
 
 fn table_row_count(conn: &Connection, table_name: &str) -> rusqlite::Result<i64> {
     let sql = format!("SELECT COUNT(*) FROM \"{}\"", quote_ident(table_name));
+    conn.query_row(&sql, [], |row| row.get(0))
+}
+
+fn table_max_id(conn: &Connection, table_name: &str, id_col: &str) -> rusqlite::Result<i64> {
+    let sql = format!(
+        "SELECT COALESCE(MAX(\"{}\"), 0) FROM \"{}\"",
+        quote_ident(id_col),
+        quote_ident(table_name)
+    );
     conn.query_row(&sql, [], |row| row.get(0))
 }
 
@@ -216,7 +225,14 @@ fn repair_fts_sidecar(
 ) -> rusqlite::Result<()> {
     let chunk_count = table_row_count(conn, chunk_table)?;
     let fts_count = table_row_count(conn, fts_table)?;
-    if chunk_count == fts_count {
+    // Equal counts alone miss paired delete+insert divergence (one row
+    // removed, a different one added leaves counts equal but content stale).
+    // Count + MAX(rowid) together is a much stronger invariant for the
+    // append/delete workload the indexer produces, and stays two cheap
+    // queries — no checksums. fnd: CR-037.
+    if chunk_count == fts_count
+        && table_max_id(conn, chunk_table, "id")? == table_max_id(conn, fts_table, "rowid")?
+    {
         return Ok(());
     }
 
@@ -317,6 +333,15 @@ pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
 /// neither does.
 type MigrationUp = fn(&Connection) -> rusqlite::Result<()>;
 
+/// Reserved name prefix for destructive migrations. A future migration that
+/// rewrites data in a way older binaries cannot safely read past must be
+/// named `breaking_<nnnn>_<desc>`; any binary that finds such a row in
+/// `schema_migrations` without knowing the migration itself refuses to open
+/// the DB. Unknown migrations WITHOUT this prefix are treated as additive:
+/// the open proceeds with a loud warning so mixed-version setups keep
+/// working. fnd: CR-016.
+pub const BREAKING_MIGRATION_PREFIX: &str = "breaking_";
+
 const MIGRATIONS: &[(&str, MigrationUp)] = &[
     ("0001_refs_name_tail", migrate_0001_refs_name_tail),
     (
@@ -377,6 +402,44 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
             return Err(e);
         }
         conn.execute_batch("COMMIT")?;
+    }
+    check_unknown_migrations(conn)?;
+    Ok(())
+}
+
+/// Detect `schema_migrations` rows this binary doesn't know about — i.e. the
+/// DB was migrated by a newer codesage. Additive unknowns warn; a
+/// [`BREAKING_MIGRATION_PREFIX`] row hard-errors, because that name is the
+/// newer binary's declaration that older code must not proceed.
+fn check_unknown_migrations(conn: &Connection) -> rusqlite::Result<()> {
+    let known: std::collections::HashSet<&str> = MIGRATIONS.iter().map(|(name, _)| *name).collect();
+    let unknown: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT name FROM schema_migrations ORDER BY name")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .filter(|name| !known.contains(name.as_str()))
+            .collect()
+    };
+    if let Some(breaking) = unknown
+        .iter()
+        .find(|name| name.starts_with(BREAKING_MIGRATION_PREFIX))
+    {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+            Some(format!(
+                "index was migrated by a newer codesage (breaking migration {breaking:?}); \
+                 this binary is too old to open it safely — upgrade codesage or rebuild the index"
+            )),
+        ));
+    }
+    if !unknown.is_empty() {
+        tracing::warn!(
+            migrations = ?unknown,
+            "schema_migrations has entries unknown to this binary — the index was \
+             migrated by a newer codesage; proceeding (additive migrations only)"
+        );
     }
     Ok(())
 }
@@ -731,6 +794,95 @@ mod tests {
     fn init_db_sets_foreign_keys_on() {
         let conn = open_initialized();
         assert_eq!(pragma_int(&conn, "foreign_keys"), 1);
+    }
+
+    fn open_with_chunk_table(table: &str, dim: usize) -> Connection {
+        init_vec_extension();
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        init_db(&conn).expect("init_db");
+        ensure_chunk_table(&conn, table, dim).expect("ensure_chunk_table");
+        conn
+    }
+
+    fn insert_chunk_pair(conn: &Connection, table: &str, id: i64, content: &str) {
+        // dim=2 → embedding is 8 zero bytes.
+        conn.execute(
+            &format!(
+                "INSERT INTO \"{table}\"(id, file_path, language, content, start_line, end_line, embedding)
+                 VALUES (?1, 'a.rs', 'rust', ?2, 1, 2, X'0000000000000000')"
+            ),
+            rusqlite::params![id, content],
+        )
+        .expect("insert chunk row");
+        conn.execute(
+            &format!(
+                "INSERT INTO \"{}\"(rowid, content, file_path, language, start_line, end_line)
+                 VALUES (?1, ?2, 'a.rs', 'rust', 1, 2)",
+                fts_table_name(table)
+            ),
+            rusqlite::params![id, content],
+        )
+        .expect("insert fts row");
+    }
+
+    #[test]
+    fn repair_fts_sidecar_repairs_equal_count_max_rowid_divergence() {
+        let table = "chunks_repairtest_2";
+        let conn = open_with_chunk_table(table, 2);
+        insert_chunk_pair(&conn, table, 1, "fn one");
+        insert_chunk_pair(&conn, table, 2, "fn two");
+
+        // Diverge while keeping counts equal: drop chunk id=2, add id=3
+        // to the chunk table only. Counts are 2 == 2 but MAX(id)=3 vs
+        // MAX(rowid)=2 — the pre-CR-037 count-only check skipped repair here.
+        conn.execute(&format!("DELETE FROM \"{table}\" WHERE id = 2"), [])
+            .unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO \"{table}\"(id, file_path, language, content, start_line, end_line, embedding)
+                 VALUES (3, 'a.rs', 'rust', 'fn three', 5, 6, X'0000000000000000')"
+            ),
+            [],
+        )
+        .unwrap();
+
+        let fts = fts_table_name(table);
+        repair_fts_sidecar(&conn, table, &fts).expect("repair");
+
+        let fts_rowids: Vec<i64> = {
+            let mut stmt = conn
+                .prepare(&format!("SELECT rowid FROM \"{fts}\" ORDER BY rowid"))
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(fts_rowids, vec![1, 3], "fts must mirror the chunk table");
+        let content: String = conn
+            .query_row(
+                &format!("SELECT content FROM \"{fts}\" WHERE rowid = 3"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "fn three");
+    }
+
+    #[test]
+    fn repair_fts_sidecar_still_repairs_count_mismatch() {
+        let table = "chunks_repaircount_2";
+        let conn = open_with_chunk_table(table, 2);
+        insert_chunk_pair(&conn, table, 1, "fn one");
+        let fts = fts_table_name(table);
+        conn.execute(&format!("DELETE FROM \"{fts}\""), []).unwrap();
+
+        repair_fts_sidecar(&conn, table, &fts).expect("repair");
+
+        let n: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM \"{fts}\""), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "fts must be rebuilt from the chunk table");
     }
 
     #[test]
