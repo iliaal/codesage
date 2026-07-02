@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.14.0] - 2026-07-02
+
 ### Added
 - MCP tools advertise `readOnlyHint` / `openWorldHint: false`; `session_start` / `session_end` set `readOnlyHint: false`.
 - `--lock-wait <secs>` on `codesage index` and `git-index`; installed hooks pass `--lock-wait 60`. Rerun `codesage install-hooks` to refresh existing hooks.
@@ -556,5 +558,7 @@ Initial public release.
 
 [0.12.0]: https://github.com/iliaal/codesage/releases/tag/v0.12.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.13.0...HEAD
 [0.13.0]: https://github.com/iliaal/codesage/releases/tag/v0.13.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/iliaal/codesage/releases/tag/v0.14.0
