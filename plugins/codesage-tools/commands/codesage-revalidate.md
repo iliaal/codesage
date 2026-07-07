@@ -61,7 +61,7 @@ Run feature_bundle + assess_risk as usual. For each prior finding:
   - If the same defect is present but moved: return with the prior finding_id, updated file:line, and a one-line note in the summary noting the shift.
   - If the defect is gone: do NOT include it in your output.
 
-Also report any NEW findings you'd flag — they may indicate the fix introduced a regression.
+Also report any NEW findings you'd flag (without a finding_id — the orchestrator assigns those) — they may indicate the fix introduced a regression.
 
 Return strict JSON per your agent definition. The orchestrator distinguishes "still present" vs "no longer present" by checking which prior finding_ids appear in your output.
 ```
@@ -70,7 +70,12 @@ Dispatch all subagent calls in a single message with multiple tool-use blocks (p
 
 ## Step 3: Reconcile responses
 
-For each subagent's response, compare against the prior findings list for that feature:
+Before reconciling, apply the same mechanical gates as `/codesage-review` Step 5:
+
+- **Evidence check:** whitespace-normalize each returned finding's `evidence[]` lines and verify at least one non-trivial line actually appears in the cited file. A "still-present" claim whose evidence doesn't match the file is treated as **not seen** (the quote is stale — the code changed). A NEW finding that fails the check is dropped.
+- **IDs for new findings:** compute `fnd_$(printf '%s' "<feature_id>|<file>|<category>|<line>" | sha256sum | cut -c1-8)` — subagents never mint IDs.
+
+Then, for each subagent's response, compare against the prior findings list for that feature:
 
 - **Still present** (finding_id appears in response): preserve prior `status`, append `history` entry:
   ```json

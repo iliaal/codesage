@@ -1,7 +1,12 @@
 ## [Unreleased]
 
+### Added
+- `/codesage-review` gains `--deep` (multi-lens reviewers on high-risk slices), `--no-verify`, `--model`, and `--verify-model`; new findings pass an adversarial verification stage (new `codesage-finding-verifier` agent) by default.
+
 ### Changed
 - Upgrade the `rmcp` MCP SDK to 2.x (MCP 2025-11-25 spec model types).
+- `/codesage-review` / `/codesage-revalidate` drop findings whose quoted evidence doesn't match the cited file, compute `finding_id`s orchestrator-side with fuzzy prior-matching (IDs survive model/wording changes and small code motion), repair unparseable reviewer JSON before erroring a feature, and pass a last-reviewed base SHA so re-reviews focus on the diff.
+- `codesage-feature-reviewer` agent: explicit review procedure (trust-boundary tracing, error-path walks, self-audit), contract lookups via `find_symbol` outside the slice, risk-scaled read depth, lens mode, and severity calibration anchors.
 
 ### Security
 - Bump `crossbeam-epoch` to 0.9.20, clearing RUSTSEC-2026-0204 (invalid pointer dereference in `fmt::Pointer`).
