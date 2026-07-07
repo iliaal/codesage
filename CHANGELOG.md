@@ -1,5 +1,8 @@
 ## [Unreleased]
 
+### Security
+- Bump `crossbeam-epoch` to 0.9.20, clearing RUSTSEC-2026-0204 (invalid pointer dereference in `fmt::Pointer`).
+
 ## [0.14.0] - 2026-07-02
 
 ### Added
