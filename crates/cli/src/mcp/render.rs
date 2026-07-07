@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 
 use super::CodeSageServer;
 
@@ -82,7 +82,7 @@ impl CodeSageServer {
         );
         let existing = std::mem::take(&mut result.content);
         let mut content = Vec::with_capacity(existing.len() + 1);
-        content.push(Content::text(banner));
+        content.push(ContentBlock::text(banner));
         content.extend(existing);
         result.content = content;
         result
@@ -186,10 +186,10 @@ fn render_with_budget<T: serde::Serialize>(
             let mut result = CallToolResult::structured(structured);
             // `CallToolResult::structured` defaults content to a compact
             // `value.to_string()`; replace with pretty JSON for transcript use.
-            result.content = vec![Content::text(text)];
+            result.content = vec![ContentBlock::text(text)];
             result
         }
-        Err(e) => CallToolResult::error(vec![Content::text(format!("Error: {e:#}"))]),
+        Err(e) => CallToolResult::error(vec![ContentBlock::text(format!("Error: {e:#}"))]),
     }
 }
 

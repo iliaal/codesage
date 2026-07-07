@@ -23,7 +23,7 @@ use codesage_protocol::{
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, tool::schema_for_type, wrapper::Parameters},
-    model::{CallToolResult, Content, Implementation, ServerInfo},
+    model::{CallToolResult, ContentBlock, Implementation, ServerInfo},
     tool, tool_handler, tool_router,
 };
 
@@ -83,7 +83,7 @@ impl CodeSageServer {
             Ok(result) => result,
             Err(join_err) => {
                 tracing::error!(error = %join_err, "MCP tool handler panicked");
-                CallToolResult::error(vec![Content::text(format!(
+                CallToolResult::error(vec![ContentBlock::text(format!(
                     "internal error: the tool handler panicked ({join_err}); see the daemon log"
                 ))])
             }
