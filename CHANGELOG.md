@@ -1,5 +1,8 @@
 ## [Unreleased]
 
+### Changed
+- Upgrade the `rmcp` MCP SDK to 2.x (MCP 2025-11-25 spec model types).
+
 ### Security
 - Bump `crossbeam-epoch` to 0.9.20, clearing RUSTSEC-2026-0204 (invalid pointer dereference in `fmt::Pointer`).
 
