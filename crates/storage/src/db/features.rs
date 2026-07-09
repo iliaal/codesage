@@ -56,72 +56,90 @@ impl Database {
     /// idempotent. Wrap multiple calls in `execute_batch` for a large
     /// mapping pass.
     pub fn upsert_feature(&self, feature: &FeatureRecord) -> Result<()> {
-        let tags_json = serde_json::to_string(&feature.tags).unwrap_or_else(|_| "[]".to_string());
-        self.conn.execute(
-            "INSERT INTO features (
-                feature_id, title, summary, kind, source, confidence,
-                entry_path, entry_symbol, entry_route, entry_command,
-                language, tags, test_command, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, unixepoch(), unixepoch())
-             ON CONFLICT(feature_id) DO UPDATE SET
-                title         = excluded.title,
-                summary       = excluded.summary,
-                kind          = excluded.kind,
-                source        = excluded.source,
-                confidence    = excluded.confidence,
-                entry_path    = excluded.entry_path,
-                entry_symbol  = excluded.entry_symbol,
-                entry_route   = excluded.entry_route,
-                entry_command = excluded.entry_command,
-                language      = excluded.language,
-                tags          = excluded.tags,
-                test_command  = excluded.test_command,
-                updated_at    = unixepoch()",
-            params![
-                feature.feature_id,
-                feature.title,
-                feature.summary,
-                feature.kind.as_str(),
-                feature.source,
-                feature.confidence.as_str(),
-                feature.entry_path,
-                feature.entry_symbol,
-                feature.entry_route,
-                feature.entry_command,
-                feature.language.as_str(),
-                tags_json,
-                feature.test_command,
-            ],
-        )?;
-        // Replace file refs.
-        self.conn.execute(
-            "DELETE FROM feature_files WHERE feature_id = ?1",
-            params![feature.feature_id],
-        )?;
-        let mut files_stmt = self.conn.prepare(
-            "INSERT OR IGNORE INTO feature_files (feature_id, path, role, reason)
-             VALUES (?1, ?2, ?3, ?4)",
-        )?;
-        for f in &feature.files {
-            files_stmt.execute(params![
-                feature.feature_id,
-                f.path,
-                f.role.as_str(),
-                f.reason,
-            ])?;
+        self.conn.execute_batch("SAVEPOINT upsert_feature")?;
+        let result = (|| -> Result<()> {
+            let tags_json =
+                serde_json::to_string(&feature.tags).unwrap_or_else(|_| "[]".to_string());
+            self.conn.execute(
+                "INSERT INTO features (
+                    feature_id, title, summary, kind, source, confidence,
+                    entry_path, entry_symbol, entry_route, entry_command,
+                    language, tags, test_command, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, unixepoch(), unixepoch())
+                 ON CONFLICT(feature_id) DO UPDATE SET
+                    title         = excluded.title,
+                    summary       = excluded.summary,
+                    kind          = excluded.kind,
+                    source        = excluded.source,
+                    confidence    = excluded.confidence,
+                    entry_path    = excluded.entry_path,
+                    entry_symbol  = excluded.entry_symbol,
+                    entry_route   = excluded.entry_route,
+                    entry_command = excluded.entry_command,
+                    language      = excluded.language,
+                    tags          = excluded.tags,
+                    test_command  = excluded.test_command,
+                    updated_at    = unixepoch()",
+                params![
+                    feature.feature_id,
+                    feature.title,
+                    feature.summary,
+                    feature.kind.as_str(),
+                    feature.source,
+                    feature.confidence.as_str(),
+                    feature.entry_path,
+                    feature.entry_symbol,
+                    feature.entry_route,
+                    feature.entry_command,
+                    feature.language.as_str(),
+                    tags_json,
+                    feature.test_command,
+                ],
+            )?;
+            self.conn.execute(
+                "DELETE FROM feature_files WHERE feature_id = ?1",
+                params![feature.feature_id],
+            )?;
+            {
+                let mut files_stmt = self.conn.prepare(
+                    "INSERT OR IGNORE INTO feature_files (feature_id, path, role, reason)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )?;
+                for f in &feature.files {
+                    files_stmt.execute(params![
+                        feature.feature_id,
+                        f.path,
+                        f.role.as_str(),
+                        f.reason,
+                    ])?;
+                }
+            }
+            self.conn.execute(
+                "DELETE FROM feature_trust_boundaries WHERE feature_id = ?1",
+                params![feature.feature_id],
+            )?;
+            {
+                let mut tb_stmt = self.conn.prepare(
+                    "INSERT OR IGNORE INTO feature_trust_boundaries (feature_id, boundary)
+                     VALUES (?1, ?2)",
+                )?;
+                for b in &feature.trust_boundaries {
+                    tb_stmt.execute(params![feature.feature_id, b.as_str()])?;
+                }
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("RELEASE upsert_feature")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK TO upsert_feature");
+                let _ = self.conn.execute_batch("RELEASE upsert_feature");
+                Err(e)
+            }
         }
-        // Replace trust boundaries.
-        self.conn.execute(
-            "DELETE FROM feature_trust_boundaries WHERE feature_id = ?1",
-            params![feature.feature_id],
-        )?;
-        let mut tb_stmt = self.conn.prepare(
-            "INSERT OR IGNORE INTO feature_trust_boundaries (feature_id, boundary) VALUES (?1, ?2)",
-        )?;
-        for b in &feature.trust_boundaries {
-            tb_stmt.execute(params![feature.feature_id, b.as_str()])?;
-        }
-        Ok(())
     }
 
     /// Drop every feature whose `feature_id` is not in `keep`. Used at the

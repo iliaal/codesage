@@ -1,3 +1,5 @@
+use std::path::{Component, Path, PathBuf};
+
 use anyhow::Result;
 use rmcp::model::{CallToolResult, ContentBlock};
 
@@ -106,7 +108,11 @@ impl CodeSageServer {
             let Some(expected) = db.get_file_hash(rel)? else {
                 continue;
             };
-            match std::fs::read(root.join(rel)) {
+            let Some(path) = confined_project_path(&root, rel) else {
+                stale.push(rel.clone());
+                continue;
+            };
+            match std::fs::read(path) {
                 Ok(bytes) => {
                     if codesage_parser::discover::content_hash(&bytes) != expected {
                         stale.push(rel.clone());
@@ -119,6 +125,26 @@ impl CodeSageServer {
             }
         }
         Ok(stale)
+    }
+}
+
+fn confined_project_path(root: &Path, rel: &str) -> Option<PathBuf> {
+    let root = root.canonicalize().ok()?;
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute()
+        || rel_path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+    {
+        return None;
+    }
+    let candidate = root.join(rel_path);
+    match candidate.canonicalize() {
+        Ok(canonical) if canonical.starts_with(&root) => Some(canonical),
+        Ok(_) => None,
+        // Missing indexed files are reported stale by the caller. Component
+        // checks above already ruled out absolute paths and `..` escapes.
+        Err(_) => Some(candidate),
     }
 }
 
@@ -812,6 +838,33 @@ mod tests {
     }
 
     #[test]
+    fn confined_project_path_rejects_parent_dir_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+
+        assert!(confined_project_path(&root, "../secret.rs").is_none());
+        assert!(confined_project_path(&root, "src/lib.rs").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_project_path_canonicalizes_symlink_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_root = dir.path().join("real");
+        std::fs::create_dir_all(real_root.join("src")).unwrap();
+        std::fs::write(real_root.join("src/lib.rs"), "fn main() {}\n").unwrap();
+        let link_root = dir.path().join("link");
+        std::os::unix::fs::symlink(&real_root, &link_root).unwrap();
+
+        let resolved = confined_project_path(&link_root, "src/lib.rs").unwrap();
+
+        assert_eq!(
+            resolved,
+            real_root.join("src/lib.rs").canonicalize().unwrap()
+        );
+    }
+
+    #[test]
     fn staleness_detects_changed_and_missing_files() {
         // End-to-end against a real structural index: a file whose on-disk
         // content matches its indexed hash is not stale; one that changed is;
@@ -882,5 +935,30 @@ mod tests {
         );
         let stale_files = &annotated.structured_content.unwrap()["_meta"]["stale_files"];
         assert_eq!(stale_files, &json!(["src/changed.rs"]));
+    }
+
+    #[test]
+    fn staleness_refuses_absolute_indexed_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let outside = dir.path().join("secret.rs");
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        std::fs::write(&outside, "fn secret() {}\n").unwrap();
+        let outside_path = outside.to_string_lossy().into_owned();
+        let db = Database::open(&root.join(".codesage/index.db")).unwrap();
+        db.upsert_file(&codesage_protocol::FileInfo {
+            path: outside_path.clone(),
+            language: Language::Rust,
+            content_hash: codesage_parser::discover::content_hash(b"fn secret() {}\n"),
+        })
+        .unwrap();
+        drop(db);
+
+        let server = CodeSageServer::with_state(Arc::new(CodeSageServerState::new()));
+        let stale = server
+            .compute_stale_files(root.to_str().unwrap(), std::slice::from_ref(&outside_path))
+            .unwrap();
+
+        assert_eq!(stale, vec![outside_path]);
     }
 }

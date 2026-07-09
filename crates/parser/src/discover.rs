@@ -105,11 +105,14 @@ pub fn discover_files_with_excludes(
             let Some(language) = detect_language_with_dialect(path, false) else {
                 return WalkState::Continue;
             };
-            let rel_path = path
-                .strip_prefix(&root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .into_owned();
+            let Some(rel_path) = project_relative_path(&root, path) else {
+                tracing::warn!(
+                    root = %root.display(),
+                    path = %path.display(),
+                    "skipping discovered path outside project root"
+                );
+                return WalkState::Continue;
+            };
             if let Some(ref exc) = excludes
                 && exclude_matches_path(exc, &rel_path, false)
             {
@@ -187,6 +190,12 @@ pub fn discover_files_with_excludes(
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
+}
+
+fn project_relative_path(root: &Path, path: &Path) -> Option<String> {
+    path.strip_prefix(root)
+        .ok()
+        .map(|rel| rel.to_string_lossy().into_owned())
 }
 
 /// Read up to `MAX_INDEXABLE_FILE_BYTES` bytes. Returns `Ok(None)` when the
@@ -510,5 +519,18 @@ mod watch_filter_tests {
         let filter = WatchFilter::new(root, &[]).unwrap();
         assert!(filter.is_ignored(&root.join("build/artifact.rs"), false));
         assert!(!filter.is_ignored(&root.join("lib.rs"), false));
+    }
+
+    #[test]
+    fn project_relative_path_fails_closed_outside_root() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside.rs");
+
+        assert!(project_relative_path(&root, &outside).is_none());
+        assert_eq!(
+            project_relative_path(&root, &root.join("src/lib.rs")).as_deref(),
+            Some("src/lib.rs")
+        );
     }
 }

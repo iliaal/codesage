@@ -47,14 +47,14 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
 
     let mut file_reasons: HashMap<String, (u32, Vec<ImpactReason>)> = HashMap::new();
     let mut frontier: Vec<Symbol> = seed_symbols;
-    let mut visited_symbols: HashSet<String> = HashSet::new();
+    let mut visited_symbols: HashSet<(String, String, u32)> = HashSet::new();
 
     for depth in 1..=req.depth as u32 {
         // First pass: collect refs, update file_reasons, record (from_file, line) pairs
         // that need caller-symbol lookups for the next frontier.
         let mut pending_callers: Vec<(String, Option<String>, u32)> = Vec::new();
         for sym in &frontier {
-            if !visited_symbols.insert(sym.qualified_name.clone()) {
+            if !visited_symbols.insert(symbol_identity_key(sym)) {
                 continue;
             }
             let refs = references_for_symbol(db, sym)?;
@@ -132,8 +132,8 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
         // next depth. Dedup by qualified name and cap each level so a wide
         // blast radius can't make impact analysis unbounded. fnd: CR-017.
         const MAX_FRONTIER: usize = 512;
-        let mut seen_qn: HashSet<String> = HashSet::new();
-        next_frontier.retain(|s| seen_qn.insert(s.qualified_name.clone()));
+        let mut seen_symbols: HashSet<(String, String, u32)> = HashSet::new();
+        next_frontier.retain(|s| seen_symbols.insert(symbol_identity_key(s)));
         if next_frontier.len() > MAX_FRONTIER {
             tracing::debug!(
                 frontier = next_frontier.len(),
@@ -371,4 +371,12 @@ fn same_symbol_def(a: &Symbol, b: &Symbol) -> bool {
     a.file_path == b.file_path
         && a.qualified_name == b.qualified_name
         && a.line_start == b.line_start
+}
+
+fn symbol_identity_key(sym: &Symbol) -> (String, String, u32) {
+    (
+        sym.file_path.clone(),
+        sym.qualified_name.clone(),
+        sym.line_start,
+    )
 }

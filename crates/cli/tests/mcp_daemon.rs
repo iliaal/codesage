@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use codesage_storage::Database;
 use serde_json::Value;
 
 #[test]
@@ -700,6 +701,96 @@ fn tools_call_find_coupling_coerces_stringy_limit() {
 }
 
 #[test]
+fn tools_call_file_list_tools_reject_empty_lists() {
+    let project = tempfile::tempdir().unwrap();
+    onboard_fixture_project(project.path());
+
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut session = McpSession::start(runtime.path());
+    session.initialize();
+
+    for (id, tool) in [
+        (2, "assess_risk_diff"),
+        (3, "assess_risk_batch"),
+        (4, "recommend_tests"),
+    ] {
+        let resp = session.request(
+            id,
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{tool}","arguments":{{"project":"{}","file_paths":[]}}}}}}"#,
+                project.path().display()
+            ),
+        );
+        assert!(
+            resp.get("error").is_none(),
+            "empty list validation should be a tool error, not JSON-RPC error: {resp}"
+        );
+        assert_eq!(
+            resp["result"]["isError"],
+            Value::Bool(true),
+            "{tool} must reject empty file_paths: {resp}"
+        );
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            text.contains("at least one file path"),
+            "error should tell the agent how to fix the request, got: {text:?}"
+        );
+    }
+}
+
+#[test]
+fn tools_call_session_start_returns_summary_not_full_snapshot() {
+    let project = tempfile::tempdir().unwrap();
+    onboard_fixture_project(project.path());
+
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut session = McpSession::start(runtime.path());
+    session.initialize();
+
+    let resp = session.request(
+        2,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"session_start","arguments":{{"project":"{}","session_id":"wire"}}}}}}"#,
+            project.path().display()
+        ),
+    );
+
+    assert!(resp.get("error").is_none(), "expected tool result: {resp}");
+    assert_ne!(
+        resp["result"]["isError"],
+        Value::Bool(true),
+        "session_start should succeed: {resp}"
+    );
+    let structured = &resp["result"]["structuredContent"];
+    assert!(
+        structured.get("files").is_none(),
+        "MCP response should be compact, not the full SessionSnapshot: {structured}"
+    );
+    assert_eq!(structured["session_id"], "wire");
+    let snapshot_path = structured["snapshot_path"]
+        .as_str()
+        .unwrap_or_else(|| panic!("snapshot_path missing: {structured}"));
+    assert!(
+        std::path::Path::new(snapshot_path).exists(),
+        "full snapshot should still be persisted at {snapshot_path}"
+    );
+    let disk: Value =
+        serde_json::from_str(&std::fs::read_to_string(snapshot_path).unwrap()).unwrap();
+    assert!(
+        disk["files"].is_array(),
+        "disk snapshot should keep the full file list: {disk}"
+    );
+}
+
+#[test]
 fn tools_call_find_symbol_round_trips_against_structural_index() {
     let project = tempfile::tempdir().unwrap();
     onboard_fixture_project(project.path());
@@ -735,6 +826,91 @@ fn tools_call_find_symbol_round_trips_against_structural_index() {
     );
 }
 
+#[test]
+fn tools_call_search_returns_seeded_hits_without_model_download() {
+    let project = tempfile::tempdir().unwrap();
+    onboard_fixture_project(project.path());
+    seed_search_chunks(project.path());
+
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut session = McpSession::start_with_env(
+        runtime.path(),
+        &[("CODESAGE_MCP_TEST_QUERY_EMBEDDING", "0.1,0.2,0.3,0.4")],
+    );
+    session.initialize();
+
+    let resp = session.request(
+        2,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"search","arguments":{{"project":"{}","query":"hello symbol","limit":3}}}}}}"#,
+            project.path().display()
+        ),
+    );
+
+    assert!(resp.get("error").is_none(), "expected a result: {resp}");
+    assert_ne!(
+        resp["result"]["isError"],
+        Value::Bool(true),
+        "search should succeed against seeded chunks: {resp}"
+    );
+    let results = resp["result"]["structuredContent"]["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected search results array: {resp}"));
+    assert!(
+        results.iter().any(|r| r["file_path"] == "src/lib.rs"
+            && r["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("hello_symbol"))),
+        "seeded search hit missing from results: {results:?}"
+    );
+}
+
+#[test]
+fn tools_call_search_round_trips_tool_error_without_protocol_failure() {
+    let project = tempfile::tempdir().unwrap();
+    onboard_fixture_project(project.path());
+    std::fs::write(
+        project.path().join(".codesage").join("config.toml"),
+        "[project]\nname = \"fixture\"\n\n[embedding]\nmodel = \"not-on/allowlist\"\ndevice = \"cpu\"\n\n[index]\nexclude_patterns = []\n",
+    )
+    .unwrap();
+
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut session = McpSession::start(runtime.path());
+    session.initialize();
+
+    let resp = session.request(
+        2,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"search","arguments":{{"project":"{}","query":"hello symbol","limit":3}}}}}}"#,
+            project.path().display()
+        ),
+    );
+
+    assert!(
+        resp.get("error").is_none(),
+        "search tool errors must be rendered as tool results, not JSON-RPC errors: {resp}"
+    );
+    assert_eq!(
+        resp["result"]["isError"],
+        Value::Bool(true),
+        "unallowlisted model should produce a tool-level error: {resp}"
+    );
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("not on CodeSage's validated-model allowlist"),
+        "expected allowlist error text, got: {text:?}"
+    );
+}
+
 /// One MCP shim (stdin/stdout JSON-RPC) with a line-reader thread, so
 /// tools/call tests don't re-inline the pump plumbing per test.
 struct McpSession {
@@ -744,20 +920,27 @@ struct McpSession {
 
 impl McpSession {
     fn start(runtime_dir: &std::path::Path) -> Self {
+        Self::start_with_env(runtime_dir, &[])
+    }
+
+    fn start_with_env(runtime_dir: &std::path::Path, envs: &[(&str, &str)]) -> Self {
         let bin = env!("CARGO_BIN_EXE_codesage");
+        let mut command = Command::new(bin);
+        command
+            .arg("mcp")
+            .arg("--runtime-dir")
+            .arg(runtime_dir)
+            // The daemon inherits the first shim's env; keep the
+            // per-project watcher out of tool-call tests.
+            .env("CODESAGE_WATCH", "0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, value) in envs {
+            command.env(key, value);
+        }
         let mut child = ChildGuard {
-            child: Command::new(bin)
-                .arg("mcp")
-                .arg("--runtime-dir")
-                .arg(runtime_dir)
-                // The daemon inherits the first shim's env; keep the
-                // per-project watcher out of tool-call tests.
-                .env("CODESAGE_WATCH", "0")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("spawn codesage mcp"),
+            child: command.spawn().expect("spawn codesage mcp"),
         };
         let stdout = child.child.stdout.take().expect("child stdout");
         let (tx, rx) = mpsc::channel();
@@ -810,6 +993,18 @@ fn onboard_fixture_project(root: &std::path::Path) {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+}
+
+fn seed_search_chunks(root: &std::path::Path) {
+    let db_path = root.join(".codesage").join("index.db");
+    let db = Database::open_for_model(&db_path, "jinaai/jina-embeddings-v2-base-code", 4).unwrap();
+    let embedding = [0.1_f32, 0.2, 0.3, 0.4];
+    db.insert_chunks(
+        "src/lib.rs",
+        "rust",
+        &[("pub fn hello_symbol() {}", 1, 1, embedding.as_slice())],
+    )
+    .unwrap();
 }
 
 struct ChildGuard {

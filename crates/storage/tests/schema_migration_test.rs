@@ -267,6 +267,92 @@ fn legacy_db_records_migration_after_upgrade() {
 }
 
 #[test]
+fn intermediate_db_records_0008_through_0012_after_upgrade() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_db(&conn).expect("initial current schema");
+
+    conn.execute_batch(
+        "DROP TABLE file_trust_boundaries;
+         DROP TABLE features;
+         DROP TABLE feature_files;
+         DROP TABLE feature_trust_boundaries;
+         DROP TABLE symbol_fingerprints;
+         DELETE FROM schema_migrations
+         WHERE name IN (
+             '0008_file_trust_boundaries',
+             '0009_feature_tables',
+             '0010_files_boundaries_derived_at',
+             '0011_features_test_command',
+             '0012_symbol_fingerprints'
+         );",
+    )
+    .unwrap();
+
+    init_db(&conn).expect("init_db applies post-0007 migrations");
+
+    for table in &[
+        "file_trust_boundaries",
+        "features",
+        "feature_files",
+        "feature_trust_boundaries",
+        "symbol_fingerprints",
+    ] {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?1",
+                rusqlite::params![table],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "table {table} must exist after upgrade");
+    }
+
+    for column in [
+        ("files", "boundaries_derived_at"),
+        ("features", "test_command"),
+    ] {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                rusqlite::params![column.0, column.1],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            exists, 1,
+            "column {}.{} must exist after upgrade",
+            column.0, column.1
+        );
+    }
+
+    let symfp_name_index: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_symfp_name'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(symfp_name_index, 1);
+
+    for migration in [
+        "0008_file_trust_boundaries",
+        "0009_feature_tables",
+        "0010_files_boundaries_derived_at",
+        "0011_features_test_command",
+        "0012_symbol_fingerprints",
+    ] {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE name = ?1",
+                rusqlite::params![migration],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "{migration} recorded after intermediate upgrade");
+    }
+}
+
+#[test]
 fn migrates_path_only_semantic_files_to_chunk_table_scoped_shape() {
     let conn = Connection::open_in_memory().unwrap();
     init_db(&conn).expect("initial current schema");

@@ -369,14 +369,6 @@ pub fn semantic_index_files(
         tracing::info!(count = files.len(), "semantic indexing specific files");
     }
 
-    // Remove old chunks and semantic hashes for these files before re-indexing.
-    db.execute_batch(|db| {
-        for f in files {
-            db.delete_chunks_for_file(&f.path)?;
-        }
-        Ok(())
-    })?;
-
     let file_refs: Vec<&FileInfo> = files.iter().collect();
     let n_batches = file_refs.len().div_ceil(COMMIT_BATCH_SIZE);
     for (i, batch) in file_refs.chunks(COMMIT_BATCH_SIZE).enumerate() {

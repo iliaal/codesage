@@ -13,6 +13,8 @@
 //! blocks (row-kind parsers, embedding bytes) stay here.
 
 use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 use anyhow::Result;
 use codesage_protocol::{ReferenceKind, SymbolKind};
@@ -97,8 +99,57 @@ pub struct Database {
     pub(super) chunk_table: String,
 }
 
-fn quote_ident(identifier: &str) -> String {
+pub(super) fn quote_ident(identifier: &str) -> String {
     identifier.replace('"', "\"\"")
+}
+
+fn harden_db_path_permissions(path: &Path) -> Result<()> {
+    harden_db_path_permissions_impl(path)
+}
+
+#[cfg(unix)]
+fn harden_db_path_permissions_impl(path: &Path) -> Result<()> {
+    use std::fs::{self, OpenOptions};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    if let Some(parent) = path.parent()
+        && parent.file_name().and_then(|n| n.to_str()) == Some(".codesage")
+        && parent.exists()
+    {
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    }
+
+    if !path.exists() {
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .mode(0o600)
+            .open(path)?;
+    }
+
+    for sidecar in db_sidecar_paths(path) {
+        if sidecar.exists() {
+            fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600))?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_db_path_permissions_impl(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn db_sidecar_paths(path: &Path) -> [PathBuf; 3] {
+    [
+        path.to_path_buf(),
+        PathBuf::from(format!("{}-wal", path.display())),
+        PathBuf::from(format!("{}-shm", path.display())),
+    ]
 }
 
 fn existing_chunk_table_name(conn: &Connection, chunk_table: &str) -> Result<Option<String>> {
@@ -178,21 +229,35 @@ pub(super) fn drop_chunk_table_group(conn: &Connection, table_name: &str) -> Res
     }
     let fts_table = fts_table_name(table_name);
     let vocab_table = format!("{fts_table}_vocab");
-    let vocab_sql = format!("DROP TABLE IF EXISTS \"{}\"", quote_ident(&vocab_table));
-    conn.execute(&vocab_sql, [])?;
-    let fts_sql = format!("DROP TABLE IF EXISTS \"{}\"", quote_ident(&fts_table));
-    conn.execute(&fts_sql, [])?;
-    conn.execute(
-        "DELETE FROM semantic_files WHERE chunk_table = ?1",
-        params![table_name],
-    )?;
-    conn.execute(
-        "DELETE FROM semantic_models WHERE chunk_table = ?1",
-        params![table_name],
-    )?;
-    let sql = format!("DROP TABLE IF EXISTS \"{}\"", quote_ident(table_name));
-    conn.execute(&sql, [])?;
-    Ok(())
+    conn.execute_batch("SAVEPOINT drop_chunk_table_group")?;
+    let result = (|| -> Result<()> {
+        let vocab_sql = format!("DROP TABLE IF EXISTS \"{}\"", quote_ident(&vocab_table));
+        conn.execute(&vocab_sql, [])?;
+        let fts_sql = format!("DROP TABLE IF EXISTS \"{}\"", quote_ident(&fts_table));
+        conn.execute(&fts_sql, [])?;
+        conn.execute(
+            "DELETE FROM semantic_files WHERE chunk_table = ?1",
+            params![table_name],
+        )?;
+        conn.execute(
+            "DELETE FROM semantic_models WHERE chunk_table = ?1",
+            params![table_name],
+        )?;
+        let sql = format!("DROP TABLE IF EXISTS \"{}\"", quote_ident(table_name));
+        conn.execute(&sql, [])?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE drop_chunk_table_group")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO drop_chunk_table_group");
+            let _ = conn.execute_batch("RELEASE drop_chunk_table_group");
+            Err(e)
+        }
+    }
 }
 
 fn ensure_semantic_model_compatible(
@@ -251,8 +316,10 @@ impl Database {
     /// semantic queries will fail until `open_for_model` is used instead.
     pub fn open(path: &Path) -> Result<Self> {
         init_vec_extension();
+        harden_db_path_permissions(path)?;
         let conn = Connection::open(path)?;
         init_db(&conn)?;
+        harden_db_path_permissions(path)?;
         Ok(Database {
             conn,
             chunk_table: String::new(),
@@ -261,6 +328,7 @@ impl Database {
 
     pub fn open_for_model(path: &Path, model: &str, dim: usize) -> Result<Self> {
         init_vec_extension();
+        harden_db_path_permissions(path)?;
         let conn = Connection::open(path)?;
         init_db(&conn)?;
         let requested_table = model_table_name(model, dim);
@@ -269,11 +337,13 @@ impl Database {
         ensure_semantic_model_compatible(&conn, &chunk_table, model, dim)?;
         ensure_chunk_table(&conn, &chunk_table, dim)?;
         record_semantic_model_table(&conn, &chunk_table, model, dim)?;
+        harden_db_path_permissions(path)?;
         Ok(Database { conn, chunk_table })
     }
 
     pub fn open_for_model_rebuild(path: &Path, model: &str, dim: usize) -> Result<Self> {
         init_vec_extension();
+        harden_db_path_permissions(path)?;
         let conn = Connection::open(path)?;
         init_db(&conn)?;
         let requested_table = model_table_name(model, dim);
@@ -288,6 +358,7 @@ impl Database {
         }
         ensure_chunk_table(&conn, &chunk_table, dim)?;
         record_semantic_model_table(&conn, &chunk_table, model, dim)?;
+        harden_db_path_permissions(path)?;
         Ok(Database { conn, chunk_table })
     }
 
@@ -298,6 +369,7 @@ impl Database {
     /// results; if multiple tables match, the caller must resolve the ambiguity.
     pub fn open_for_existing_model(path: &Path, model: &str) -> Result<Self> {
         init_vec_extension();
+        harden_db_path_permissions(path)?;
         let conn = Connection::open(path)?;
         init_db(&conn)?;
         let matches = {
@@ -335,6 +407,7 @@ impl Database {
                 );
             }
         };
+        harden_db_path_permissions(path)?;
         Ok(Database { conn, chunk_table })
     }
 
@@ -511,6 +584,25 @@ mod tests {
         assert_eq!(
             deps.imported_by,
             vec!["crates/storage/src/db/mod.rs".to_string()]
+        );
+        assert!(deps.found);
+        assert!(deps.note.is_none());
+    }
+
+    #[test]
+    fn list_file_dependencies_reports_unknown_path() {
+        let db = Database::open_in_memory().unwrap();
+
+        let deps = db.list_file_dependencies("src/missing.rs").unwrap();
+
+        assert!(!deps.found);
+        assert!(deps.imports.is_empty());
+        assert!(deps.imported_by.is_empty());
+        assert!(
+            deps.note
+                .as_deref()
+                .is_some_and(|note| note.contains("not indexed")),
+            "missing path should carry a diagnostic note, got {deps:?}"
         );
     }
 
@@ -956,6 +1048,24 @@ mod tests {
     }
 
     #[test]
+    fn filtered_chunk_count_matches_language_and_path_predicates() {
+        let db = Database::open_in_memory().unwrap();
+        let e = make_embedding(0.1);
+        db.insert_chunks("src/a.rs", "rust", &[("rust a", 1, 5, e.as_slice())])
+            .unwrap();
+        db.insert_chunks("src/b.py", "python", &[("python b", 1, 5, e.as_slice())])
+            .unwrap();
+        db.insert_chunks("tests/a.rs", "rust", &[("rust test", 1, 5, e.as_slice())])
+            .unwrap();
+
+        let count = db
+            .filtered_chunk_count(Some(&["rust"]), Some(&["src/*"]))
+            .unwrap();
+
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn structural_index_state_roundtrip() {
         let db = Database::open_in_memory().unwrap();
         assert!(db.get_structural_index_state().unwrap().is_none());
@@ -1051,6 +1161,38 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?1",
                 rusqlite::params![format!("{}_vocab", crate::schema::fts_table_name(&table))],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(vocab_after, 0);
+    }
+
+    #[test]
+    fn token_doc_frequency_does_not_create_missing_vocab_table() {
+        let db = Database::open_in_memory().unwrap();
+        let table = db.chunk_table_name().to_string();
+        let fts = crate::schema::fts_table_name(&table);
+        let vocab = format!("{fts}_vocab");
+        let embedding = make_embedding(0.1);
+        db.insert_chunks(
+            "src/lib.rs",
+            "rust",
+            &[("fn target() {}", 1, 1, embedding.as_slice())],
+        )
+        .unwrap();
+        db.conn
+            .execute_batch(&format!(
+                "DROP TABLE \"{}\"",
+                crate::schema::quote_ident(&vocab)
+            ))
+            .unwrap();
+
+        assert_eq!(db.token_doc_frequency("target").unwrap(), (0, 1));
+        let vocab_after: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?1",
+                rusqlite::params![vocab],
                 |r| r.get(0),
             )
             .unwrap();
@@ -1383,6 +1525,25 @@ mod tests {
 
         let db = Database::open_for_existing_model(&path, model).unwrap();
         assert_eq!(db.chunk_table_name(), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_hardens_codesage_directory_and_db_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let codesage = dir.path().join(".codesage");
+        std::fs::create_dir_all(&codesage).unwrap();
+        std::fs::set_permissions(&codesage, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = codesage.join("index.db");
+
+        Database::open(&path).unwrap();
+
+        let dir_mode = std::fs::metadata(&codesage).unwrap().permissions().mode() & 0o777;
+        let db_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(db_mode, 0o600);
     }
 
     #[test]

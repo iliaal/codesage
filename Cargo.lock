@@ -291,9 +291,11 @@ version = "0.14.0"
 dependencies = [
  "anyhow",
  "codesage-protocol",
+ "hex",
  "hf-hub",
  "ort",
  "serde",
+ "sha2",
  "tokenizers",
  "tracing",
  "wait-timeout",

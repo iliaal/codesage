@@ -5,6 +5,7 @@ mod state;
 
 pub(crate) use state::CodeSageServerState;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -18,7 +19,7 @@ use codesage_protocol::{
     FindReferencesRequest, FindReferencesResults, FindSimilarResults, FindSymbolRequest,
     FindSymbolResults, ImpactOptions, ImpactReport, ImpactRequest, ImpactTarget, ProjectOverview,
     ReviewRehearsal, RiskAssessment, RiskBatchAssessment, RiskDiffAssessment, SearchRequest,
-    SearchResults, SessionDiff, SessionSnapshot, TestRecommendations,
+    SearchResults, SessionDiff, SessionStartReport, TestRecommendations,
 };
 use rmcp::{
     ServerHandler, ServiceExt,
@@ -29,6 +30,61 @@ use rmcp::{
 
 use params::*;
 use schema::finalize_tools_for_listing;
+
+const MAX_MCP_LIMIT: usize = 100;
+const MAX_MCP_IMPACT_LIMIT: usize = 500;
+const MAX_MCP_IMPACT_DEPTH: usize = 6;
+const MAX_MCP_FILE_PATHS: usize = 500;
+const MAX_MCP_CONTEXT_LIMIT: usize = 20;
+const MAX_MCP_FEATURE_LIMIT: usize = 500;
+const MAX_MCP_FEATURE_SCAN_LIMIT: usize = 5_000;
+const MAX_MCP_OFFSET: usize = 1_000;
+
+fn capped_limit(value: Option<usize>, default: usize, max: usize) -> usize {
+    value.unwrap_or(default).min(max)
+}
+
+fn capped_optional_limit(value: Option<usize>, max: usize) -> Option<usize> {
+    value.map(|n| n.min(max))
+}
+
+fn validate_file_list_len(paths: &[String], tool: &str) -> Result<()> {
+    if paths.len() > MAX_MCP_FILE_PATHS {
+        anyhow::bail!(
+            "{tool} accepts at most {MAX_MCP_FILE_PATHS} file paths per call (got {})",
+            paths.len()
+        );
+    }
+    Ok(())
+}
+
+fn validate_non_empty_file_list(paths: &[String], tool: &str) -> Result<()> {
+    validate_file_list_len(paths, tool)?;
+    if paths.is_empty() {
+        anyhow::bail!("{tool} requires at least one file path");
+    }
+    Ok(())
+}
+
+fn session_start_report(
+    root: &Path,
+    snapshot: codesage_protocol::SessionSnapshot,
+) -> SessionStartReport {
+    let snapshot_path = root
+        .join(".codesage")
+        .join("sessions")
+        .join(format!("{}.json", snapshot.session_id));
+    SessionStartReport {
+        session_id: snapshot.session_id,
+        created_at: snapshot.created_at,
+        file_count: snapshot.file_count,
+        symbol_count: snapshot.symbol_count,
+        cycle_count: snapshot.cycles.len(),
+        top_risk_file_count: snapshot.top_risk_files.len(),
+        snapshot_path: snapshot_path.to_string_lossy().into_owned(),
+        git_head: snapshot.git_head,
+    }
+}
 
 #[derive(Clone)]
 pub struct CodeSageServer {
@@ -149,7 +205,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "review_rehearsal",
-        description = "Predict the objections a reviewer will likely raise against a patch, BEFORE committing. Input is the patch's file list (e.g. `git diff --name-only`). Returns severity-ranked objections — missing tests, high-risk files, wide blast radius, fix-prone files, churn hotspots, import cycles touched, trust-boundary expansion (≥3 boundaries), and feature-test gaps (changed a feature's core files but none of its mapped tests) — each with concrete evidence and the files it concerns, plus paste-ready `summary_notes` (objection counts + risk summary + the exact tests to run). Pure composition of `assess_risk_diff`, `recommend_tests`, index-drift, and feature mapping — read-only, no AI prose. Use as the last step before a commit: fix or consciously accept each objection.",
+        description = "Predict the objections a reviewer will likely raise against a patch, BEFORE committing. Input is the patch's file list (e.g. `git diff --name-only`). Returns severity-ranked objections — missing tests, high-risk files, wide blast radius, fix-prone files, churn hotspots, import cycles touched, trust-boundary expansion (≥3 boundaries), feature-test gaps (changed a feature's core files but none of its mapped tests), and scope-spread when a patch touches many unrelated feature areas — each with concrete evidence and the files it concerns, plus paste-ready `summary_notes` (objection counts + risk summary + the exact tests to run). Pure composition of `assess_risk_diff`, `recommend_tests`, index-drift, and feature mapping — read-only, no AI prose. Use as the last step before a commit: fix or consciously accept each objection.",
         output_schema = schema_for_type::<ReviewRehearsal>()
     )]
     async fn review_rehearsal_tool(
@@ -160,8 +216,10 @@ impl CodeSageServer {
             let file_paths = params.file_paths.clone();
             s.render(
                 &params.project,
-                s.with_project_root_db(&params.project, |root, db| {
-                    crate::rehearsal::build_review_rehearsal(root, db, &file_paths)
+                validate_file_list_len(&file_paths, "review_rehearsal").and_then(|()| {
+                    s.with_project_root_db(&params.project, |root, db| {
+                        crate::rehearsal::build_review_rehearsal(root, db, &file_paths)
+                    })
                 }),
                 "review_rehearsal",
             )
@@ -226,7 +284,7 @@ impl CodeSageServer {
     ) -> CallToolResult {
         self.blocking(move |s| {
             let min_jaccard = params.min_jaccard.unwrap_or(0.85);
-            let limit = params.limit.unwrap_or(20);
+            let limit = capped_limit(params.limit, 20, MAX_MCP_LIMIT);
             s.render(
                 &params.project,
                 s.with_project_db(&params.project, |db| {
@@ -261,7 +319,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "search",
-        description = "Semantic code search (embedding-based + cross-encoder reranking). **Prefer this over Grep when you don't know the exact symbol name** — useful for queries like 'where is auth handled', 'error handling in the session pipeline', 'database connection pooling', 'where do we validate inputs'. Grep needs the literal token already; `search` lets the agent ask by intent. For exact identifier lookups with a known name, use `find_symbol` or `find_references` instead.",
+        description = "Semantic code search (embedding-based + cross-encoder reranking). **Prefer this over Grep when you don't know the exact symbol name** — useful for queries like 'where is auth handled', 'error handling in the session pipeline', 'database connection pooling', 'where do we validate inputs'. Grep needs the literal token already; `search` lets the agent ask by intent. For exact identifier lookups with a known name, use `find_symbol` or `find_references` instead. `paths` filters are applied after bounded KNN retrieval so large MCP calls stay responsive; recall is approximate when a filter excludes many near-neighbor chunks.",
         output_schema = schema_for_type::<SearchResults>()
     )]
     async fn search_tool(&self, Parameters(params): Parameters<SearchParams>) -> CallToolResult {
@@ -269,17 +327,23 @@ impl CodeSageServer {
             let languages = params.language.map(|l| vec![l]);
             let req = SearchRequest {
                 query: params.query,
-                limit: params.limit,
-                offset: params.offset,
+                limit: Some(capped_limit(params.limit, 10, MAX_MCP_LIMIT)),
+                offset: Some(capped_limit(params.offset, 0, MAX_MCP_OFFSET)),
                 languages,
                 paths: params.paths,
             };
             let query_for_embed = req.query.clone();
             s.render(
                 &params.project,
-                s.with_project_query(&params.project, &query_for_embed, |db, emb, rr| {
-                    search(db, emb, rr, &req)
-                }),
+                req.paths
+                    .as_ref()
+                    .map(|paths| validate_file_list_len(paths, "search.paths"))
+                    .unwrap_or(Ok(()))
+                    .and_then(|()| {
+                        s.with_project_query(&params.project, &query_for_embed, |db, emb, rr| {
+                            search(db, emb, rr, &req)
+                        })
+                    }),
                 "search",
             )
         })
@@ -298,13 +362,13 @@ impl CodeSageServer {
         self.blocking(move |s| {
             let req = ImpactRequest {
                 target: ImpactTarget::from_hint(params.target, params.is_file),
-                depth: params.depth.unwrap_or(2),
+                depth: capped_limit(params.depth, 2, MAX_MCP_IMPACT_DEPTH),
                 source_only: params.source_only.unwrap_or(false),
             };
             let opts = ImpactOptions {
                 include_forward: params.include_forward.unwrap_or(false),
                 include_siblings: params.include_siblings.unwrap_or(false),
-                limit: params.limit,
+                limit: capped_optional_limit(params.limit, MAX_MCP_IMPACT_LIMIT),
                 summary_only: params.summary_only.unwrap_or(false),
             };
             s.render(
@@ -331,7 +395,7 @@ impl CodeSageServer {
             let req = ExportRequest::from_target(
                 params.target,
                 params.is_symbol.unwrap_or(false),
-                params.limit.unwrap_or(5),
+                capped_limit(params.limit, 5, MAX_MCP_CONTEXT_LIMIT),
                 params.include_callers.unwrap_or(false),
                 params.include_callees.unwrap_or(false),
             );
@@ -369,7 +433,7 @@ impl CodeSageServer {
         Parameters(params): Parameters<CouplingParams>,
     ) -> CallToolResult {
         self.blocking(move |s| {
-            let limit = params.limit.unwrap_or(10);
+            let limit = capped_limit(params.limit, 10, MAX_MCP_LIMIT);
             let file_path = params.file_path.clone();
             s.render(
                 &params.project,
@@ -410,7 +474,9 @@ impl CodeSageServer {
             let file_paths = params.file_paths.clone();
             s.render(
                 &params.project,
-                s.with_project_db(&params.project, |db| assess_risk_diff(db, &file_paths)),
+                validate_non_empty_file_list(&file_paths, "assess_risk_diff").and_then(|()| {
+                    s.with_project_db(&params.project, |db| assess_risk_diff(db, &file_paths))
+                }),
                 "assess_risk_diff",
             )
         })
@@ -430,7 +496,9 @@ impl CodeSageServer {
             let file_paths = params.file_paths.clone();
             s.render(
                 &params.project,
-                s.with_project_db(&params.project, |db| assess_risk_batch(db, &file_paths)),
+                validate_non_empty_file_list(&file_paths, "assess_risk_batch").and_then(|()| {
+                    s.with_project_db(&params.project, |db| assess_risk_batch(db, &file_paths))
+                }),
                 "assess_risk_batch",
             )
         })
@@ -450,7 +518,9 @@ impl CodeSageServer {
             let file_paths = params.file_paths.clone();
             s.render(
                 &params.project,
-                s.with_project_db(&params.project, |db| recommend_tests(db, &file_paths)),
+                validate_non_empty_file_list(&file_paths, "recommend_tests").and_then(|()| {
+                    s.with_project_db(&params.project, |db| recommend_tests(db, &file_paths))
+                }),
                 "recommend_tests",
             )
         })
@@ -459,8 +529,8 @@ impl CodeSageServer {
 
     #[tool(
         name = "session_start",
-        description = "Snapshot the project's structural state at the START of an editing session. Persists file count, symbol count, the full file list, all import cycles, and the top-50 highest-risk files (with their scores) to `.codesage/sessions/<session_id>.json`. Pair with `session_end` using the same `session_id` to detect new cycles, removed/added files, or risk regressions on hot files introduced during the session. `session_id` defaults to \"default\" — use a distinct id when running multiple parallel sessions. Re-running `session_start` overwrites the snapshot (useful for resetting a baseline mid-session).",
-        output_schema = schema_for_type::<SessionSnapshot>()
+        description = "Snapshot the project's structural state at the START of an editing session. Persists the full snapshot (file count, symbol count, full file list, all import cycles, and the top-50 highest-risk files with scores) to `.codesage/sessions/<session_id>.json`, but returns only a compact summary plus `snapshot_path` over MCP so the wire response is never budget-truncated. Pair with `session_end` using the same `session_id` to detect new cycles, removed/added files, or risk regressions on hot files introduced during the session. `session_id` defaults to \"default\" — use a distinct id when running multiple parallel sessions. Re-running `session_start` overwrites the snapshot (useful for resetting a baseline mid-session).",
+        output_schema = schema_for_type::<SessionStartReport>()
     )]
     async fn session_start_tool(
         &self,
@@ -474,7 +544,8 @@ impl CodeSageServer {
             s.render(
                 &params.project,
                 s.with_project_root_db(&params.project, |root, db| {
-                    session_start(root, db, &session_id)
+                    let snapshot = session_start(root, db, &session_id)?;
+                    Ok(session_start_report(root, snapshot))
                 }),
                 "session_start",
             )
@@ -496,11 +567,18 @@ impl CodeSageServer {
             let language = params.language;
             let tag = params.tag.clone();
             let since = params.since.clone();
-            let limit = params.limit.unwrap_or(100);
+            let limit = match params.limit {
+                Some(0) | None => 100,
+                Some(n) => n.min(MAX_MCP_FEATURE_LIMIT),
+            };
             // With `since`, fetch unbounded then cap after the changed-file
             // intersection, mirroring the CLI: the SQL LIMIT runs before the
             // diff filter, so a pre-filter limit would truncate candidates.
-            let query_limit = if since.is_some() { 0 } else { limit };
+            let query_limit = if since.is_some() {
+                MAX_MCP_FEATURE_SCAN_LIMIT
+            } else {
+                limit
+            };
             s.render(
                 &params.project,
                 s.with_project_root_db(&params.project, |root, db| {
@@ -555,7 +633,7 @@ impl CodeSageServer {
             let feature_id = params.feature_id.clone();
             let include_callers = params.include_callers.unwrap_or(false);
             let include_callees = params.include_callees.unwrap_or(false);
-            let limit = params.limit.unwrap_or(5);
+            let limit = capped_limit(params.limit, 5, MAX_MCP_CONTEXT_LIMIT);
             // Use the context DB (binds to the configured embedding model's
             // chunk table) so `primary`/`related` resolve real chunks. The
             // structural-only db variant points at the default chunk table

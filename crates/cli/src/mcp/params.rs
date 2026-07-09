@@ -41,6 +41,36 @@ where
     }
 }
 
+fn deser_optional_f32<'de, D>(d: D) -> std::result::Result<Option<f32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum F32OrString {
+        F(f32),
+        S(String),
+    }
+
+    match Option::<F32OrString>::deserialize(d)? {
+        None => Ok(None),
+        Some(F32OrString::F(n)) => Ok(Some(n)),
+        Some(F32OrString::S(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            trimmed.parse::<f32>().map(Some).map_err(|e| {
+                serde::de::Error::custom(format!(
+                    "expected number or number-as-string, got {s:?}: {e}"
+                ))
+            })
+        }
+    }
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct FindSymbolParams {
     #[schemars(description = PROJECT_ARG_DESC)]
@@ -72,6 +102,7 @@ pub struct FindSimilarParams {
     #[schemars(description = "Function/method name to find near-clones of")]
     pub name: String,
     #[schemars(description = "Minimum Jaccard similarity in [0, 1] (default 0.85)")]
+    #[serde(default, deserialize_with = "deser_optional_f32")]
     pub min_jaccard: Option<f32>,
     #[schemars(description = "Max results (default 20)")]
     #[serde(default, deserialize_with = "deser_optional_usize")]
@@ -361,6 +392,32 @@ mod tests {
         .unwrap();
         assert_eq!(p.limit, Some(10));
         assert_eq!(p.offset, Some(20));
+    }
+
+    #[test]
+    fn find_similar_params_coerce_min_jaccard_string() {
+        let p: FindSimilarParams = serde_json::from_value(json!({
+            "project": "/p",
+            "name": "clone_me",
+            "min_jaccard": "0.72",
+        }))
+        .unwrap();
+        assert_eq!(p.min_jaccard, Some(0.72));
+    }
+
+    #[test]
+    fn find_similar_params_reject_bad_min_jaccard_string() {
+        let r: Result<FindSimilarParams, _> = serde_json::from_value(json!({
+            "project": "/p",
+            "name": "clone_me",
+            "min_jaccard": "close",
+        }));
+        assert!(r.is_err(), "non-float string must still error");
+        let msg = r.unwrap_err().to_string();
+        assert!(
+            msg.contains("close"),
+            "error must quote offending value, got: {msg}"
+        );
     }
 
     #[test]

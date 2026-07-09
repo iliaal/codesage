@@ -58,6 +58,7 @@ fn index_test_file(db: &Database, path: &str) {
 fn score_zero_and_note_when_no_git_history() {
     let (_dir, db) = setup_project();
     let r = assess_risk(&db, "Repository.php").unwrap();
+    assert!(r.found);
     assert_eq!(r.total_commits, 0);
     assert_eq!(r.fix_count, 0);
     assert!(
@@ -70,6 +71,18 @@ fn score_zero_and_note_when_no_git_history() {
         "expected 'no git history' note, got {:?}",
         r.notes
     );
+}
+
+#[test]
+fn missing_path_is_unknown_not_test_gap() {
+    let (_dir, db) = setup_project();
+
+    let r = assess_risk(&db, "NoSuch.php").unwrap();
+
+    assert!(!r.found);
+    assert_eq!(r.score, 0.0);
+    assert!(!r.test_gap);
+    assert!(r.notes.iter().any(|n| n.contains("not indexed")));
 }
 
 #[test]
@@ -246,11 +259,12 @@ fn wide_blast_radius_note_fires_when_many_dependents() {
 fn risk_diff_empty_input_returns_defaults() {
     let (_dir, db) = setup_project();
     let r = codesage_graph::assess_risk_diff(&db, &[]).unwrap();
+    assert!(r.empty_input);
     assert!(r.files.is_empty());
     assert_eq!(r.max_score, 0.0);
     assert_eq!(r.mean_score, 0.0);
     assert!(r.max_risk_file.is_none());
-    assert!(r.summary_notes.is_empty());
+    assert!(!r.summary_notes.is_empty());
 }
 
 #[test]
@@ -1260,6 +1274,9 @@ fn risk_batch_legend_aliases_no_git_history_at_threshold() {
         "x/3.rs".to_string(),
         "x/4.rs".to_string(),
     ];
+    for path in &input {
+        index_test_file(&db, path);
+    }
     let r = codesage_graph::assess_risk_batch(&db, &input).unwrap();
 
     // 4 files with no git history also have no test sibling, so both

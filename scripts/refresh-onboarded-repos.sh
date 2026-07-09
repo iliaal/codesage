@@ -14,15 +14,23 @@
 #   bash scripts/refresh-onboarded-repos.sh --dry-run   # list what would run
 #   bash scripts/refresh-onboarded-repos.sh --no-index  # skip the index step
 #                                                      # (just refresh hints)
+#   bash scripts/refresh-onboarded-repos.sh --full --no-semantic
+#                                                      # force a full structural
+#                                                      # reparse (after a parser
+#                                                      # upgrade) without redoing
+#                                                      # embeddings
 
 set -euo pipefail
 
 dry_run=0
 do_index=1
+index_args=()
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--dry-run) dry_run=1 ;;
 	--no-index) do_index=0 ;;
+	--full) index_args+=(--full) ;;
+	--no-semantic) index_args+=(--no-semantic) ;;
 	-h | --help)
 		sed -n '2,16p' "$0" >&2
 		exit 0
@@ -42,7 +50,7 @@ repo_root() {
 
 is_excluded() {
 	case "$1" in
-	*/bench-repos/* | */codesage_ref/*) return 0 ;;
+	*/bench-repos/* | */codesage_ref/* | */.codesage/*) return 0 ;;
 	*) return 1 ;;
 	esac
 }
@@ -110,8 +118,8 @@ for root in "${active[@]:-}"; do
 	echo "--- $root ---"
 
 	if [ "$do_index" -eq 1 ]; then
-		echo "    [1/3] codesage index"
-		if ! (cd "$root" && "$codesage_bin" index 2>&1 | sed 's/^/        /'); then
+		echo "    [1/3] codesage index ${index_args[*]:-}"
+		if ! (cd "$root" && "$codesage_bin" index ${index_args[@]+"${index_args[@]}"} 2>&1 | sed 's/^/        /'); then
 			failures+=("$root (index)")
 			echo "        FAILED"
 			continue

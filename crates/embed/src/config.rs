@@ -18,6 +18,7 @@ pub const MAX_SEQ_LENGTH: usize = 512;
 pub const BATCH_SIZE: usize = 64;
 #[cfg(target_vendor = "apple")]
 pub const BATCH_SIZE: usize = 10;
+pub const MAX_BATCH_SIZE: usize = 256;
 
 /// Whether a configured `device` string requests the CUDA / GPU execution path.
 /// Case-insensitive so `"GPU"` / `"CUDA"` take the GPU path like `"gpu"`.
@@ -135,7 +136,7 @@ impl EmbeddingConfig {
         env_value: Option<&str>,
     ) -> Result<NonZeroUsize, String> {
         if let Some(n) = self.batch_size_override {
-            return Ok(n);
+            return validate_batch_size(n, "batch size override");
         }
         if let Some(value) = env_value {
             let parsed = value.trim().parse::<usize>().map_err(|e| {
@@ -143,12 +144,13 @@ impl EmbeddingConfig {
                     "invalid CODESAGE_BATCH_SIZE value {value:?}: expected a positive integer ({e})"
                 )
             })?;
-            return NonZeroUsize::new(parsed).ok_or_else(|| {
+            let n = NonZeroUsize::new(parsed).ok_or_else(|| {
                 format!("invalid CODESAGE_BATCH_SIZE value {value:?}: expected a positive integer")
-            });
+            })?;
+            return validate_batch_size(n, "CODESAGE_BATCH_SIZE");
         }
         if let Some(n) = self.batch_size {
-            return Ok(n);
+            return validate_batch_size(n, "[embedding].batch_size");
         }
         Ok(default_batch_size())
     }
@@ -187,11 +189,22 @@ pub fn default_batch_size() -> NonZeroUsize {
     NonZeroUsize::new(BATCH_SIZE).expect("BATCH_SIZE must be non-zero")
 }
 
+fn validate_batch_size(n: NonZeroUsize, source: &str) -> Result<NonZeroUsize, String> {
+    if n.get() > MAX_BATCH_SIZE {
+        Err(format!(
+            "{source} value {} exceeds max supported batch size {MAX_BATCH_SIZE}",
+            n.get()
+        ))
+    } else {
+        Ok(n)
+    }
+}
+
 #[cfg(test)]
 mod batch_size_tests {
     use std::num::NonZeroUsize;
 
-    use super::{BATCH_SIZE, EmbeddingConfig};
+    use super::{BATCH_SIZE, EmbeddingConfig, MAX_BATCH_SIZE};
 
     fn nz(n: usize) -> NonZeroUsize {
         NonZeroUsize::new(n).unwrap()
@@ -260,6 +273,48 @@ mod batch_size_tests {
         let err = cfg.effective_batch_size_with_env(Some("abc")).unwrap_err();
 
         assert!(err.contains("positive integer"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn effective_batch_size_rejects_oversized_config_value() {
+        let cfg = EmbeddingConfig {
+            batch_size: Some(nz(MAX_BATCH_SIZE + 1)),
+            ..EmbeddingConfig::default()
+        };
+
+        let err = cfg.effective_batch_size_with_env(None).unwrap_err();
+
+        assert!(
+            err.contains("exceeds max supported batch size"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn effective_batch_size_rejects_oversized_env_value() {
+        let cfg = EmbeddingConfig::default();
+
+        let err = cfg
+            .effective_batch_size_with_env(Some(&(MAX_BATCH_SIZE + 1).to_string()))
+            .unwrap_err();
+
+        assert!(
+            err.contains("exceeds max supported batch size"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn effective_batch_size_rejects_oversized_cli_override() {
+        let mut cfg = EmbeddingConfig::default();
+        cfg.set_batch_size_override(nz(MAX_BATCH_SIZE + 1));
+
+        let err = cfg.effective_batch_size_with_env(None).unwrap_err();
+
+        assert!(
+            err.contains("exceeds max supported batch size"),
+            "unexpected error: {err}"
+        );
     }
 }
 

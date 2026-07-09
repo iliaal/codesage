@@ -57,6 +57,25 @@ fn find_symbol_json_uses_results_envelope() {
 }
 
 #[test]
+fn find_symbol_rejects_unknown_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    init_project(dir.path());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_codesage"))
+        .args(["find-symbol", "no_such_symbol", "--kind", "bogus"])
+        .current_dir(dir.path())
+        .output()
+        .expect("spawn codesage");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(!out.status.success(), "unknown kind must fail");
+    assert!(
+        stderr.contains("unknown symbol kind: bogus"),
+        "unexpected stderr: {stderr}"
+    );
+}
+
+#[test]
 fn find_references_json_uses_results_envelope() {
     assert_results_envelope(&["find-references", "no_such_symbol"]);
 }

@@ -93,6 +93,20 @@ fn blob_to_fp(b: &[u8]) -> Vec<u64> {
         .collect()
 }
 
+fn stored_fingerprint_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredFingerprint> {
+    let blob: Vec<u8> = row.get(7)?;
+    Ok(StoredFingerprint {
+        file_path: row.get(0)?,
+        language: row.get(1)?,
+        name: row.get(2)?,
+        kind: row.get(3)?,
+        line_start: row.get(4)?,
+        line_end: row.get(5)?,
+        leaf_count: row.get(6)?,
+        fp: blob_to_fp(&blob),
+    })
+}
+
 impl Database {
     /// Return `(last_sha, last_indexed_at_unix)` for the structural index if a
     /// stamp exists. Mirrors [`Database::get_git_index_state`] but tracks the
@@ -233,20 +247,48 @@ impl Database {
             "SELECT f.path, f.language, sf.name, sf.kind, sf.line_start, sf.line_end, sf.leaf_count, sf.fp
              FROM symbol_fingerprints sf JOIN files f ON sf.file_id = f.id",
         )?;
-        let rows = stmt.query_map([], |row| {
-            let blob: Vec<u8> = row.get(7)?;
-            Ok(StoredFingerprint {
-                file_path: row.get(0)?,
-                language: row.get(1)?,
-                name: row.get(2)?,
-                kind: row.get(3)?,
-                line_start: row.get(4)?,
-                line_end: row.get(5)?,
-                leaf_count: row.get(6)?,
-                fp: blob_to_fp(&blob),
-            })
-        })?;
+        let rows = stmt.query_map([], stored_fingerprint_from_row)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn fingerprints_named(&self, name: &str) -> Result<Vec<StoredFingerprint>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path, f.language, sf.name, sf.kind, sf.line_start, sf.line_end, sf.leaf_count, sf.fp
+             FROM symbol_fingerprints sf JOIN files f ON sf.file_id = f.id
+             WHERE sf.name = ?1",
+        )?;
+        let rows = stmt.query_map(params![name], stored_fingerprint_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn fingerprints_for_language(&self, language: &str) -> Result<Vec<StoredFingerprint>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path, f.language, sf.name, sf.kind, sf.line_start, sf.line_end, sf.leaf_count, sf.fp
+             FROM symbol_fingerprints sf JOIN files f ON sf.file_id = f.id
+             WHERE f.language = ?1",
+        )?;
+        let rows = stmt.query_map(params![language], stored_fingerprint_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn fingerprint_cache_key(&self) -> Option<String> {
+        self.conn
+            .path()
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+    }
+
+    pub fn fingerprint_validity_token(&self) -> Result<(i64, i64, i64, i64)> {
+        let token = self.conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(MAX(sf.rowid), 0),
+                    COALESCE(SUM(length(f.path)), 0),
+                    COALESCE(SUM(sf.line_start + sf.line_end + sf.leaf_count), 0)
+             FROM symbol_fingerprints sf JOIN files f ON sf.file_id = f.id",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        Ok(token)
     }
 
     /// Resolve a repo-relative path to its `files.id`, or `None` if the
@@ -460,6 +502,97 @@ impl Database {
         Ok(rows)
     }
 
+    pub fn import_targets_for_file(&self, file_path: &str) -> Result<Vec<String>> {
+        let sql = r#"
+            SELECT DISTINCT f_to.path
+            FROM refs r
+            JOIN files f_from ON r.from_file_id = f_from.id
+            JOIN symbols s ON (
+              s.qualified_name = r.to_name
+              OR (
+                s.name = r.to_name
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM symbols s2
+                  WHERE s2.name = r.to_name
+                    AND s2.file_id <> s.file_id
+                )
+              )
+            )
+            JOIN files f_to ON s.file_id = f_to.id
+            WHERE r.kind IN ('import', 'include', 'inheritance', 'trait_use')
+              AND f_from.path = ?1
+              AND f_from.path <> f_to.path
+        "#;
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt
+            .query_map(params![file_path], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn import_sources_for_file(&self, file_path: &str) -> Result<Vec<String>> {
+        let sql = r#"
+            SELECT DISTINCT f_from.path
+            FROM refs r
+            JOIN files f_from ON r.from_file_id = f_from.id
+            JOIN symbols s ON (
+              s.qualified_name = r.to_name
+              OR (
+                s.name = r.to_name
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM symbols s2
+                  WHERE s2.name = r.to_name
+                    AND s2.file_id <> s.file_id
+                )
+              )
+            )
+            JOIN files f_to ON s.file_id = f_to.id
+            WHERE r.kind IN ('import', 'include', 'inheritance', 'trait_use')
+              AND f_to.path = ?1
+              AND f_from.path <> f_to.path
+        "#;
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt
+            .query_map(params![file_path], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn import_cycle_cache_key(&self) -> Option<String> {
+        self.conn
+            .path()
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+    }
+
+    pub fn import_cycle_validity_token(&self) -> Result<(i64, i64, i64, i64, i64, i64)> {
+        let token = self.conn.query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM refs WHERE kind IN ('import', 'include', 'inheritance', 'trait_use')),
+                 (SELECT COALESCE(MAX(id), 0) FROM refs WHERE kind IN ('import', 'include', 'inheritance', 'trait_use')),
+                 (SELECT COALESCE(SUM(line + length(to_name) + length(kind)), 0)
+                  FROM refs WHERE kind IN ('import', 'include', 'inheritance', 'trait_use')),
+                 (SELECT COUNT(*) FROM symbols),
+                 (SELECT COALESCE(MAX(id), 0) FROM symbols),
+                 (SELECT COALESCE(SUM(file_id + line_start + line_end + length(qualified_name)), 0)
+                  FROM symbols)",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        Ok(token)
+    }
+
     /// Directed file→file import edges where BOTH endpoints are in `files`.
     /// Targeted variant of `enumerate_file_import_edges`: callers in the
     /// per-file risk path (e.g. ranking a break edge inside one import cycle)
@@ -508,6 +641,19 @@ impl Database {
     }
 
     pub fn list_file_dependencies(&self, file_path: &str) -> Result<DependencyEntry> {
+        if self.file_id_for_path(file_path)?.is_none() {
+            return Ok(DependencyEntry {
+                file_path: file_path.to_string(),
+                found: false,
+                note: Some(
+                    "file is not indexed; verify the repo-relative path or run `codesage index`"
+                        .to_string(),
+                ),
+                imports: Vec::new(),
+                imported_by: Vec::new(),
+            });
+        }
+
         let mut imports_stmt = self.conn.prepare(
             "SELECT DISTINCT r.to_name
              FROM refs r JOIN files f ON r.from_file_id = f.id
@@ -551,6 +697,8 @@ impl Database {
 
         Ok(DependencyEntry {
             file_path: file_path.to_string(),
+            found: true,
+            note: None,
             imports,
             imported_by,
         })
@@ -831,28 +979,56 @@ impl Database {
         file_id: i64,
         tags: &[TrustBoundary],
     ) -> Result<()> {
-        // prepare_cached: called once per file in the boundary-derivation
-        // loop, same rationale as the index-loop inserts above.
         self.conn
-            .prepare_cached("DELETE FROM file_trust_boundaries WHERE file_id = ?1")?
-            .execute(params![file_id])?;
-        // Stamp `boundaries_derived_at` on every write — including when
-        // the derived set is empty — so a rule-clean file (no matches)
-        // stays distinguishable from a never-derived one (zero matches
-        // because derivation never ran).
-        self.conn
-            .prepare_cached("UPDATE files SET boundaries_derived_at = unixepoch() WHERE id = ?1")?
-            .execute(params![file_id])?;
-        if tags.is_empty() {
-            return Ok(());
+            .execute_batch("SAVEPOINT replace_file_trust_boundaries")?;
+        let result = (|| -> Result<()> {
+            // prepare_cached: called once per file in the boundary-derivation
+            // loop, same rationale as the index-loop inserts above.
+            self.conn
+                .prepare_cached("DELETE FROM file_trust_boundaries WHERE file_id = ?1")?
+                .execute(params![file_id])?;
+            // Stamp `boundaries_derived_at` on every write — including when
+            // the derived set is empty — so a rule-clean file (no matches)
+            // stays distinguishable from a never-derived one (zero matches
+            // because derivation never ran).
+            self.conn
+                .prepare_cached(
+                    "UPDATE files SET boundaries_derived_at = unixepoch() WHERE id = ?1",
+                )?
+                .execute(params![file_id])?;
+            if tags.is_empty() {
+                return Ok(());
+            }
+            let mut stmt = self.conn.prepare_cached(
+                "INSERT OR IGNORE INTO file_trust_boundaries (file_id, boundary) VALUES (?1, ?2)",
+            )?;
+            for t in tags {
+                stmt.execute(params![file_id, t.as_str()])?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn
+                    .execute_batch("RELEASE replace_file_trust_boundaries")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self
+                    .conn
+                    .execute_batch("ROLLBACK TO replace_file_trust_boundaries");
+                if let Err(re) = self
+                    .conn
+                    .execute_batch("RELEASE replace_file_trust_boundaries")
+                {
+                    tracing::warn!(
+                        error = %re,
+                        "failed to release savepoint replace_file_trust_boundaries after rollback"
+                    );
+                }
+                Err(e)
+            }
         }
-        let mut stmt = self.conn.prepare_cached(
-            "INSERT OR IGNORE INTO file_trust_boundaries (file_id, boundary) VALUES (?1, ?2)",
-        )?;
-        for t in tags {
-            stmt.execute(params![file_id, t.as_str()])?;
-        }
-        Ok(())
     }
 
     /// Files that have never had their trust boundaries derived (or were

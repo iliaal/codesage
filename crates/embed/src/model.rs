@@ -3,11 +3,14 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 #[cfg(any(feature = "cuda", not(target_vendor = "apple")))]
 use std::sync::Once;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, mpsc};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use hf_hub::{Repo, RepoType};
 use ort::session::Session;
+use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 use wait_timeout::ChildExt;
 
@@ -110,6 +113,80 @@ fn is_cuda_shared_library_name(name: &str) -> bool {
 /// hung interpreter would block every thread waiting on `Embedder::new` /
 /// `Reranker::new` indefinitely.
 const PROBE_PYTHON_TIMEOUT: Duration = Duration::from_secs(10);
+const HF_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const HF_DOWNLOAD_TIMEOUT_ENV: &str = "CODESAGE_HF_DOWNLOAD_TIMEOUT_SECS";
+
+fn hf_download_timeout_from_env_value(value: Option<&str>) -> Result<Duration> {
+    let Some(value) = value else {
+        return Ok(HF_DOWNLOAD_TIMEOUT);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(HF_DOWNLOAD_TIMEOUT);
+    }
+    let secs: u64 = value.parse().with_context(|| {
+        format!("{HF_DOWNLOAD_TIMEOUT_ENV} must be a positive integer number of seconds")
+    })?;
+    if secs == 0 {
+        anyhow::bail!("{HF_DOWNLOAD_TIMEOUT_ENV} must be greater than zero seconds");
+    }
+    Ok(Duration::from_secs(secs))
+}
+
+fn hf_download_timeout() -> Duration {
+    match hf_download_timeout_from_env_value(std::env::var(HF_DOWNLOAD_TIMEOUT_ENV).ok().as_deref())
+    {
+        Ok(timeout) => timeout,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                fallback_secs = HF_DOWNLOAD_TIMEOUT.as_secs(),
+                "invalid HuggingFace download timeout; using default"
+            );
+            HF_DOWNLOAD_TIMEOUT
+        }
+    }
+}
+
+fn hf_get_model_file(
+    model: &str,
+    revision: Option<&str>,
+    artifact: &'static str,
+) -> Result<PathBuf> {
+    let timeout = hf_download_timeout();
+    let model = model.to_string();
+    let revision = revision.map(str::to_string);
+    let (tx, rx) = mpsc::sync_channel(1);
+
+    thread::spawn(move || {
+        let result = (|| -> Result<PathBuf> {
+            let api =
+                hf_hub::api::sync::Api::new().context("failed to create HuggingFace API client")?;
+            let repo = if let Some(revision) = revision {
+                api.repo(Repo::with_revision(model, RepoType::Model, revision))
+            } else {
+                api.model(model)
+            };
+            repo.get(artifact)
+                .with_context(|| format!("failed to download {artifact}"))
+        })();
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            anyhow::bail!(
+                "timed out after {}s downloading {artifact} from HuggingFace; \
+                 set {HF_DOWNLOAD_TIMEOUT_ENV} to adjust the limit",
+                timeout.as_secs()
+            )
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            anyhow::bail!("HuggingFace download worker exited before fetching {artifact}")
+        }
+    }
+}
 
 /// Best-effort probe of Python `site-packages` directories. Does not fail on
 /// missing Python; just returns an empty Vec. Bounded by `PROBE_PYTHON_TIMEOUT`
@@ -388,14 +465,58 @@ pub fn init_ort_dylib() {
 /// model name comes from the indexed repo's own `.codesage/config.toml`, so
 /// it is attacker-controlled when indexing a cloned repo; passing it straight
 /// to hf-hub would let that repo pick an arbitrary ONNX graph to download and
-/// load into the native ONNX Runtime. Gate every load on this allowlist
-/// unless the user (not the repo) opts out via `CODESAGE_ALLOW_ANY_MODEL=1`.
+/// load into the native ONNX Runtime. Gate every load on this allowlist plus
+/// pinned artifact hashes unless the user (not the repo) opts out via
+/// `CODESAGE_ALLOW_ANY_MODEL=1`.
 const ALLOWED_MODELS: &[&str] = &[
     "sentence-transformers/all-MiniLM-L6-v2",
     "cross-encoder/ms-marco-MiniLM-L6-v2",
     "jinaai/jina-embeddings-v2-base-code",
     "nomic-ai/nomic-embed-text-v1.5",
 ];
+
+struct ModelPin {
+    model: &'static str,
+    revision: &'static str,
+    tokenizer_sha256: &'static str,
+    onnx_sha256: &'static str,
+    onnx_data_sha256: Option<&'static str>,
+}
+
+const MODEL_PINS: &[ModelPin] = &[
+    ModelPin {
+        model: "sentence-transformers/all-MiniLM-L6-v2",
+        revision: "c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+        tokenizer_sha256: "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037",
+        onnx_sha256: "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452",
+        onnx_data_sha256: None,
+    },
+    ModelPin {
+        model: "cross-encoder/ms-marco-MiniLM-L6-v2",
+        revision: "c5ee24cb16019beea0893ab7796b1df96625c6b8",
+        tokenizer_sha256: "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+        onnx_sha256: "5d3e70fd0c9ff14b9b5169a51e957b7a9c74897afd0a35ce4bd318150c1d4d4a",
+        onnx_data_sha256: None,
+    },
+    ModelPin {
+        model: "jinaai/jina-embeddings-v2-base-code",
+        revision: "516f4baf13dec4ddddda8631e019b5737c8bc250",
+        tokenizer_sha256: "b01c78a902aa4facb2f47f95449f48e2f7bbfea5d2472ee2f6ce92323c6f86e5",
+        onnx_sha256: "63363fc178428b74620c6f3780cbc7191883fa5c7f84c0945c45eb5c4256733b",
+        onnx_data_sha256: None,
+    },
+    ModelPin {
+        model: "nomic-ai/nomic-embed-text-v1.5",
+        revision: "e9b6763023c676ca8431644204f50c2b100d9aab",
+        tokenizer_sha256: "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+        onnx_sha256: "147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965",
+        onnx_data_sha256: None,
+    },
+];
+
+fn model_pin(model: &str) -> Option<&'static ModelPin> {
+    MODEL_PINS.iter().find(|pin| pin.model == model)
+}
 
 pub fn allow_any_model_from_env() -> bool {
     matches!(
@@ -418,6 +539,71 @@ pub fn validate_model_allowed(model: &str, allow_any: bool) -> Result<()> {
     )
 }
 
+fn verify_model_artifact_sha256(
+    model: &str,
+    artifact: &str,
+    path: &Path,
+    expected: &str,
+) -> Result<()> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("opening {artifact} for pinned model {model:?}"))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("reading {artifact} for pinned model {model:?}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let actual = hex::encode(hasher.finalize());
+    if actual != expected {
+        anyhow::bail!(
+            "pinned model artifact hash mismatch for {model:?} {artifact}: \
+             expected sha256 {expected}, got {actual}. Refusing to load cached/downloaded \
+             bytes into ONNX Runtime; clear the HuggingFace cache or update CodeSage's model pin deliberately."
+        );
+    }
+    Ok(())
+}
+
+fn verify_pinned_model_artifacts(
+    model: &str,
+    pin: &ModelPin,
+    tokenizer_path: &Path,
+    model_path: &Path,
+    onnx_data_path: Option<&Path>,
+) -> Result<()> {
+    verify_model_artifact_sha256(
+        model,
+        "tokenizer.json",
+        tokenizer_path,
+        pin.tokenizer_sha256,
+    )?;
+    verify_model_artifact_sha256(model, "onnx/model.onnx", model_path, pin.onnx_sha256)?;
+    match (pin.onnx_data_sha256, onnx_data_path) {
+        (Some(expected), Some(path)) => {
+            verify_model_artifact_sha256(model, "onnx/model.onnx_data", path, expected)?;
+        }
+        (Some(_), None) => {
+            anyhow::bail!(
+                "pinned model {model:?} requires onnx/model.onnx_data at revision {}, but it was not downloaded",
+                pin.revision
+            );
+        }
+        (None, Some(path)) => {
+            anyhow::bail!(
+                "pinned model {model:?} unexpectedly resolved onnx/model.onnx_data at {}; refusing unpinned sidecar",
+                path.display()
+            );
+        }
+        (None, None) => {}
+    }
+    Ok(())
+}
+
 /// Whether a model's declared input names include `token_type_ids`, i.e. the
 /// inference call must supply that third tensor alongside ids + mask.
 pub(crate) fn wants_token_type_ids<'a>(mut input_names: impl Iterator<Item = &'a str>) -> bool {
@@ -431,7 +617,14 @@ pub(crate) fn wants_token_type_ids<'a>(mut input_names: impl Iterator<Item = &'a
 /// libraries actually mapped (the silent-CPU-fallback guard). Returns the
 /// session, tokenizer, and whether the model takes a `token_type_ids` input.
 pub(crate) fn load_onnx_session(model: &str, device: &str) -> Result<(Session, Tokenizer, bool)> {
-    validate_model_allowed(model, allow_any_model_from_env())?;
+    let allow_any = allow_any_model_from_env();
+    validate_model_allowed(model, allow_any)?;
+    let pin = if allow_any { None } else { model_pin(model) };
+    if !allow_any && pin.is_none() {
+        anyhow::bail!(
+            "validated model {model:?} has no pinned revision/hash metadata; refusing unpinned load"
+        );
+    }
 
     #[cfg(not(target_vendor = "apple"))]
     init_ort_dylib();
@@ -456,23 +649,30 @@ pub(crate) fn load_onnx_session(model: &str, device: &str) -> Result<(Session, T
         );
     }
 
-    let api = hf_hub::api::sync::Api::new().context("failed to create HuggingFace API client")?;
-    let repo = api.model(model.to_string());
-
-    let tokenizer_path = repo
-        .get("tokenizer.json")
-        .context("failed to download tokenizer.json")?;
-    let model_path = repo
-        .get("onnx/model.onnx")
-        .context("failed to download onnx/model.onnx")?;
+    let revision = pin.map(|pin| pin.revision);
+    let tokenizer_path = hf_get_model_file(model, revision, "tokenizer.json")?;
+    let model_path = hf_get_model_file(model, revision, "onnx/model.onnx")?;
     // External-weights sidecar (>2GB models like Jina v2 base, BGE-large).
     // Most models don't have this file — a 404 is the expected outcome and
     // not worth surfacing. A real failure (network, disk, permission) is
     // worth a debug-level breadcrumb so users running with RUST_LOG=debug
     // don't have to guess when commit_from_file later errors with an
     // opaque ORT external-data load failure.
-    if let Err(e) = repo.get("onnx/model.onnx_data") {
-        tracing::debug!(error = %e, "onnx/model.onnx_data not fetched (normal for small models)");
+    let onnx_data_path = match hf_get_model_file(model, revision, "onnx/model.onnx_data") {
+        Ok(path) => Some(path),
+        Err(e) => {
+            tracing::debug!(error = %e, "onnx/model.onnx_data not fetched (normal for small models)");
+            None
+        }
+    };
+    if let Some(pin) = pin {
+        verify_pinned_model_artifacts(
+            model,
+            pin,
+            &tokenizer_path,
+            &model_path,
+            onnx_data_path.as_deref(),
+        )?;
     }
 
     let mut tokenizer =
@@ -768,6 +968,62 @@ mod tests {
     }
 
     #[test]
+    fn allowlisted_models_have_pinned_artifacts() {
+        for model in ALLOWED_MODELS {
+            let pin = model_pin(model).unwrap_or_else(|| panic!("{model} missing model pin"));
+            assert_eq!(
+                pin.revision.len(),
+                40,
+                "{model} revision should be a git SHA"
+            );
+            assert_eq!(
+                pin.tokenizer_sha256.len(),
+                64,
+                "{model} tokenizer hash should be sha256 hex"
+            );
+            assert_eq!(
+                pin.onnx_sha256.len(),
+                64,
+                "{model} ONNX hash should be sha256 hex"
+            );
+        }
+    }
+
+    #[test]
+    fn model_artifact_sha256_rejects_mismatch() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "codesage-model-hash-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::write(&path, b"abc").unwrap();
+
+        verify_model_artifact_sha256(
+            "test/model",
+            "tokenizer.json",
+            &path,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        )
+        .unwrap();
+        let err = verify_model_artifact_sha256(
+            "test/model",
+            "tokenizer.json",
+            &path,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .expect_err("wrong pinned hash must be rejected");
+        let _ = fs::remove_file(&path);
+
+        assert!(
+            err.to_string().contains("hash mismatch"),
+            "error should explain the integrity failure: {err}"
+        );
+    }
+
+    #[test]
     fn arbitrary_model_is_rejected_without_override() {
         let err = validate_model_allowed("evil/backdoored-model", false)
             .expect_err("repo-supplied model names outside the allowlist must be rejected");
@@ -785,6 +1041,20 @@ mod tests {
     #[test]
     fn allow_any_override_bypasses_allowlist() {
         assert!(validate_model_allowed("evil/backdoored-model", true).is_ok());
+    }
+
+    #[test]
+    fn hf_download_timeout_env_parser_rejects_unbounded_values() {
+        assert_eq!(
+            hf_download_timeout_from_env_value(None).unwrap(),
+            HF_DOWNLOAD_TIMEOUT
+        );
+        assert_eq!(
+            hf_download_timeout_from_env_value(Some("7")).unwrap(),
+            Duration::from_secs(7)
+        );
+        assert!(hf_download_timeout_from_env_value(Some("0")).is_err());
+        assert!(hf_download_timeout_from_env_value(Some("abc")).is_err());
     }
 
     #[test]

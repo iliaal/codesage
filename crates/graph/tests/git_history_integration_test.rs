@@ -170,6 +170,45 @@ fn incremental_without_state_falls_back_to_full() {
 }
 
 #[test]
+fn incremental_after_new_commit_updates_existing_state_hermetically() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_hermetic_repo(root);
+
+    std::fs::write(root.join("a.rs"), "fn a() {}\n").unwrap();
+    run_git(root, &["add", "."]);
+    run_git(root, &["commit", "-qm", "first"]);
+
+    let db = Database::open_in_memory().unwrap();
+    let full = git_history_index_with_options(&db, root, &[], IndexMode::Full).unwrap();
+    assert_eq!(full.commits_scanned, 1);
+    assert_eq!(full.files_tracked, 1);
+    let (first_sha, _) = db.get_git_index_state().unwrap().expect("state after full");
+
+    std::fs::write(root.join("a.rs"), "fn a() { let _ = 1; }\n").unwrap();
+    std::fs::write(root.join("b.rs"), "fn b() {}\n").unwrap();
+    run_git(root, &["add", "."]);
+    run_git(root, &["commit", "-qm", "second"]);
+
+    let incr = git_history_index_with_options(&db, root, &[], IndexMode::Incremental).unwrap();
+    assert_eq!(
+        incr.commits_scanned, 1,
+        "incremental should scan only the commit after the recorded SHA"
+    );
+    assert_eq!(incr.files_tracked, 2);
+    let a = db.git_file("a.rs").unwrap().expect("a.rs row after incr");
+    let b = db.git_file("b.rs").unwrap().expect("b.rs row after incr");
+    assert_eq!(a.total_commits, 2);
+    assert_eq!(b.total_commits, 1);
+
+    let (second_sha, _) = db
+        .get_git_index_state()
+        .unwrap()
+        .expect("state after incremental");
+    assert_ne!(second_sha, first_sha);
+}
+
+#[test]
 fn auto_mode_matches_full_on_fresh_db() {
     let root = codesage_repo_root();
     if !root.join(".git").exists() {

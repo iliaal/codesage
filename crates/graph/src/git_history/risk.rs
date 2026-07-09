@@ -1,6 +1,7 @@
 //! Query-side risk + coupling over the `git_files` / `git_co_changes` tables.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Context, Result};
 use codesage_protocol::{
@@ -12,6 +13,12 @@ use codesage_storage::db::CoChangeRow;
 
 use super::tests_rec::test_sibling_exists;
 use crate::impact::impact_analysis;
+
+type CycleToken = (i64, i64, i64, i64, i64, i64);
+type CycleComponentCache = HashMap<String, (CycleToken, Arc<Vec<Vec<String>>>)>;
+
+static IMPORT_CYCLE_CACHE: LazyLock<Mutex<CycleComponentCache>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Map a storage `CoChangeRow` into the protocol `CoChangeEntry`. Shared by
 /// `find_coupling` and `assess_risk`, which read the same co-change rows.
@@ -99,6 +106,36 @@ fn assess_risk_with_context(
     precomputed_percentiles: Option<&HashMap<String, f64>>,
 ) -> Result<RiskAssessment> {
     let git = db.git_file(file_path)?;
+    let structural_found = db
+        .file_id_for_path(file_path)
+        .with_context(|| format!("checking indexed file existence for risk({file_path})"))?
+        .is_some();
+    if !structural_found && git.is_none() {
+        return Ok(RiskAssessment {
+            found: false,
+            file: file_path.to_string(),
+            score: 0.0,
+            churn_score: 0.0,
+            churn_percentile: 0.0,
+            fix_ratio: 0.0,
+            total_commits: 0,
+            fix_count: 0,
+            dependent_files: 0,
+            coupled_files: 0,
+            test_gap: false,
+            in_cycle: false,
+            cycle_size: 0,
+            cycle_files: Vec::new(),
+            top_coupled: Vec::new(),
+            trust_boundaries: Vec::new(),
+            notes: vec![
+                "file is not indexed (path may be wrong, excluded, deleted, or index is stale)"
+                    .to_string(),
+            ],
+            top_symbols: Vec::new(),
+        });
+    }
+
     let churn_score = git.as_ref().map(|g| g.churn_score).unwrap_or(0.0);
     let total_commits = git.as_ref().map(|g| g.total_commits).unwrap_or(0);
     let fix_count = git.as_ref().map(|g| g.fix_count).unwrap_or(0);
@@ -152,8 +189,9 @@ fn assess_risk_with_context(
     let (in_cycle, cycle_size, cycle_files) = if let Some(cycles) = precomputed_cycles {
         cycle_membership(cycles, file_path)
     } else {
-        match find_cycles_touching(db, &[file_path.to_string()]) {
-            Ok(cycles) => cycle_membership(&cycles, file_path),
+        match find_cycle_containing_file(db, file_path) {
+            Ok(Some(cycle)) => cycle_membership(&[cycle], file_path),
+            Ok(None) => (false, 0, Vec::new()),
             Err(e) => {
                 tracing::warn!(error = %e, file = %file_path, "cycle detection failed; omitting cycle signal from risk score");
                 (false, 0, Vec::new())
@@ -315,6 +353,7 @@ fn assess_risk_with_context(
     };
 
     Ok(RiskAssessment {
+        found: true,
         file: file_path.to_string(),
         score,
         churn_score,
@@ -437,7 +476,14 @@ fn compute_top_symbols(
 /// risk category, paste-ready summary notes).
 pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiffAssessment> {
     if file_paths.is_empty() {
-        return Ok(RiskDiffAssessment::default());
+        return Ok(RiskDiffAssessment {
+            empty_input: true,
+            summary_notes: vec![
+                "No files supplied — pass the patch's file list (e.g. `git diff --name-only`)."
+                    .to_string(),
+            ],
+            ..RiskDiffAssessment::default()
+        });
     }
 
     // Cycles are graph-wide SCCs; compute once for the patch, then reuse the
@@ -559,6 +605,7 @@ pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiff
     let legend = alias_categorical_notes_in_place(&mut all_for_alias);
 
     Ok(RiskDiffAssessment {
+        empty_input: false,
         files,
         max_score,
         mean_score,
@@ -663,18 +710,10 @@ fn alias_categorical_notes_in_place(files: &mut [&mut RiskAssessment]) -> BTreeM
 /// "cycles the patch introduces" distinction. We do not have a
 /// pre-patch index to diff against, so this returns both.
 fn find_cycles_touching(db: &Database, patch_files: &[String]) -> Result<Vec<CycleEntry>> {
-    use std::collections::HashSet;
-
-    let edges = db
-        .enumerate_file_import_edges()
-        .with_context(|| "enumerate_file_import_edges")?;
-    if edges.is_empty() {
-        return Ok(Vec::new());
-    }
     let patch: HashSet<&str> = patch_files.iter().map(|s| s.as_str()).collect();
-    let components = crate::scc::tarjan_scc(&edges);
+    let components = import_cycle_components(db)?;
     let mut out: Vec<CycleEntry> = Vec::new();
-    for component in components {
+    for component in components.iter() {
         // Trivial SCCs (single-node, no self-edge) aren't cycles.
         if component.len() < 2 {
             continue;
@@ -682,8 +721,8 @@ fn find_cycles_touching(db: &Database, patch_files: &[String]) -> Result<Vec<Cyc
         if !component.iter().any(|f| patch.contains(f.as_str())) {
             continue;
         }
-        let max_churn_file = pick_max_churn(db, &component)?;
-        let mut members = component;
+        let max_churn_file = pick_max_churn(db, component)?;
+        let mut members = component.clone();
         members.sort();
         let size = members.len() as u32;
         out.push(CycleEntry {
@@ -695,6 +734,91 @@ fn find_cycles_touching(db: &Database, patch_files: &[String]) -> Result<Vec<Cyc
     // Largest cycles first — most useful for an agent scanning the output.
     out.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.members.cmp(&b.members)));
     Ok(out)
+}
+
+const SINGLE_FILE_CYCLE_WALK_LIMIT: usize = 2_000;
+
+#[derive(Clone, Copy)]
+enum ImportWalkDirection {
+    Forward,
+    Reverse,
+}
+
+fn find_cycle_containing_file(db: &Database, file_path: &str) -> Result<Option<CycleEntry>> {
+    let forward = reachable_import_files(db, file_path, ImportWalkDirection::Forward)?;
+    if forward.len() < 2 {
+        return Ok(None);
+    }
+    let reverse = reachable_import_files(db, file_path, ImportWalkDirection::Reverse)?;
+    let mut members: Vec<String> = forward.intersection(&reverse).cloned().collect();
+    if members.len() < 2 {
+        return Ok(None);
+    }
+    members.sort();
+    let size = members.len() as u32;
+    let max_churn_file = pick_max_churn(db, &members)?;
+    Ok(Some(CycleEntry {
+        members,
+        size,
+        max_churn_file,
+    }))
+}
+
+fn reachable_import_files(
+    db: &Database,
+    start: &str,
+    direction: ImportWalkDirection,
+) -> Result<HashSet<String>> {
+    let mut seen = HashSet::new();
+    let mut stack = vec![start.to_string()];
+    seen.insert(start.to_string());
+
+    while let Some(file) = stack.pop() {
+        let next = match direction {
+            ImportWalkDirection::Forward => db.import_targets_for_file(&file)?,
+            ImportWalkDirection::Reverse => db.import_sources_for_file(&file)?,
+        };
+        for neighbor in next {
+            if seen.insert(neighbor.clone()) {
+                if seen.len() > SINGLE_FILE_CYCLE_WALK_LIMIT {
+                    anyhow::bail!(
+                        "single-file import cycle walk exceeded {SINGLE_FILE_CYCLE_WALK_LIMIT} files"
+                    );
+                }
+                stack.push(neighbor);
+            }
+        }
+    }
+
+    Ok(seen)
+}
+
+fn import_cycle_components(db: &Database) -> Result<Arc<Vec<Vec<String>>>> {
+    let Some(key) = db.import_cycle_cache_key() else {
+        let edges = db
+            .enumerate_file_import_edges()
+            .with_context(|| "enumerate_file_import_edges")?;
+        return Ok(Arc::new(crate::scc::tarjan_scc(&edges)));
+    };
+    let token = db.import_cycle_validity_token()?;
+    if let Some((_, cached)) = IMPORT_CYCLE_CACHE
+        .lock()
+        .expect("import cycle cache lock poisoned")
+        .get(&key)
+        .filter(|(cached_token, _)| *cached_token == token)
+    {
+        return Ok(Arc::clone(cached));
+    }
+
+    let edges = db
+        .enumerate_file_import_edges()
+        .with_context(|| "enumerate_file_import_edges")?;
+    let components = Arc::new(crate::scc::tarjan_scc(&edges));
+    IMPORT_CYCLE_CACHE
+        .lock()
+        .expect("import cycle cache lock poisoned")
+        .insert(key, (token, Arc::clone(&components)));
+    Ok(components)
 }
 
 /// Return the member with the highest `churn_score` in `git_files`, or

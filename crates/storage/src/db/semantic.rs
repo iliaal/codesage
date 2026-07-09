@@ -1,9 +1,9 @@
 //! Chunk table + sqlite-vec KNN + fullscan search.
 
 use anyhow::Result;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
-use super::{Database, drop_chunk_table_group};
+use super::{Database, drop_chunk_table_group, quote_ident};
 
 /// Opaque comparison token returned by
 /// [`Database::semantic_files_validity_token`]. Components are
@@ -89,6 +89,25 @@ fn push_path_glob(
     }
 }
 
+fn push_language_filter(
+    conditions: &mut Vec<String>,
+    param_values: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+    languages: &[&str],
+) {
+    if languages.is_empty() {
+        return;
+    }
+    let placeholders: Vec<String> = languages
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", param_values.len() + i + 1))
+        .collect();
+    conditions.push(format!("language IN ({})", placeholders.join(",")));
+    for lang in languages {
+        param_values.push(Box::new(lang.to_string()));
+    }
+}
+
 impl Database {
     /// FTS5 sidecar name for the active chunk table. Kept private to the
     /// storage layer — callers should go through `search_bm25` /
@@ -115,12 +134,13 @@ impl Database {
             let sql = format!(
                 "INSERT INTO \"{}\"(file_path, language, content, start_line, end_line, embedding)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                self.chunk_table
+                quote_ident(&self.chunk_table)
             );
             let fts = self.fts_table();
             let fts_sql = format!(
-                "INSERT INTO \"{fts}\"(rowid, content, file_path, language, start_line, end_line)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+                "INSERT INTO \"{}\"(rowid, content, file_path, language, start_line, end_line)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                quote_ident(&fts)
             );
             let mut vec_stmt = self.conn.prepare(&sql)?;
             let mut fts_stmt = self.conn.prepare(&fts_sql)?;
@@ -153,12 +173,18 @@ impl Database {
     }
 
     pub fn delete_chunks_for_file(&self, file_path: &str) -> Result<usize> {
+        if self.chunk_table.is_empty() {
+            return Ok(0);
+        }
         self.conn.execute_batch("SAVEPOINT delete_chunks")?;
         let result = (|| -> Result<usize> {
-            let sql = format!("DELETE FROM \"{}\" WHERE file_path = ?1", self.chunk_table);
+            let sql = format!(
+                "DELETE FROM \"{}\" WHERE file_path = ?1",
+                quote_ident(&self.chunk_table)
+            );
             let count = self.conn.execute(&sql, params![file_path])?;
             let fts = self.fts_table();
-            let fts_sql = format!("DELETE FROM \"{fts}\" WHERE file_path = ?1");
+            let fts_sql = format!("DELETE FROM \"{}\" WHERE file_path = ?1", quote_ident(&fts));
             self.conn.execute(&fts_sql, params![file_path])?;
             Ok(count)
         })();
@@ -183,7 +209,10 @@ impl Database {
         k: usize,
         language: Option<&str>,
     ) -> Result<Vec<RawSearchRow>> {
-        let t = &self.chunk_table;
+        if self.chunk_table.is_empty() {
+            return Ok(Vec::new());
+        }
+        let t = quote_ident(&self.chunk_table);
         let lang_clause = if language.is_some() {
             " AND language = ?3"
         } else {
@@ -214,7 +243,10 @@ impl Database {
         languages: Option<&[&str]>,
         paths: Option<&[&str]>,
     ) -> Result<Vec<RawSearchRow>> {
-        let t = &self.chunk_table;
+        if self.chunk_table.is_empty() {
+            return Ok(Vec::new());
+        }
+        let t = quote_ident(&self.chunk_table);
         let mut conditions = Vec::new();
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         param_values.push(Box::new(embedding_bytes.to_vec()));
@@ -222,15 +254,7 @@ impl Database {
         if let Some(langs) = languages
             && !langs.is_empty()
         {
-            let placeholders: Vec<String> = langs
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("?{}", param_values.len() + i + 1))
-                .collect();
-            conditions.push(format!("language IN ({})", placeholders.join(",")));
-            for lang in langs {
-                param_values.push(Box::new(lang.to_string()));
-            }
+            push_language_filter(&mut conditions, &mut param_values, langs);
         }
 
         if let Some(path_patterns) = paths {
@@ -266,8 +290,50 @@ impl Database {
         Ok(rows)
     }
 
+    pub fn filtered_chunk_count(
+        &self,
+        languages: Option<&[&str]>,
+        paths: Option<&[&str]>,
+    ) -> Result<usize> {
+        if self.chunk_table.is_empty() {
+            return Ok(0);
+        }
+        let t = quote_ident(&self.chunk_table);
+        let mut conditions = Vec::new();
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(langs) = languages
+            && !langs.is_empty()
+        {
+            push_language_filter(&mut conditions, &mut param_values, langs);
+        }
+
+        if let Some(path_patterns) = paths {
+            push_path_glob(&mut conditions, &mut param_values, path_patterns);
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+        let sql = format!("SELECT COUNT(*) FROM \"{t}\" {where_clause}");
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+        let n: i64 = self
+            .conn
+            .query_row(&sql, params_refs.as_slice(), |row| row.get(0))?;
+        Ok(n as usize)
+    }
+
     pub fn chunk_count(&self) -> Result<usize> {
-        let sql = format!("SELECT COUNT(*) FROM \"{}\"", self.chunk_table);
+        if self.chunk_table.is_empty() {
+            return Ok(0);
+        }
+        let sql = format!(
+            "SELECT COUNT(*) FROM \"{}\"",
+            quote_ident(&self.chunk_table)
+        );
         let n: i64 = self.conn.query_row(&sql, [], |row| row.get(0))?;
         Ok(n as usize)
     }
@@ -301,6 +367,9 @@ impl Database {
     }
 
     pub fn upsert_semantic_file_hash(&self, path: &str, content_hash: &str) -> Result<()> {
+        if self.chunk_table.is_empty() {
+            return Ok(());
+        }
         self.conn.execute(
             "INSERT INTO semantic_files (chunk_table, path, content_hash, indexed_at)
              VALUES (?1, ?2, ?3, unixepoch())
@@ -313,11 +382,29 @@ impl Database {
     }
 
     pub fn delete_semantic_file_hash(&self, path: &str) -> Result<()> {
+        if self.chunk_table.is_empty() {
+            return Ok(());
+        }
         self.conn.execute(
             "DELETE FROM semantic_files WHERE chunk_table = ?1 AND path = ?2",
             params![&self.chunk_table, path],
         )?;
         Ok(())
+    }
+
+    pub fn get_semantic_file_hash(&self, path: &str) -> Result<Option<String>> {
+        if self.chunk_table.is_empty() {
+            return Ok(None);
+        }
+        let hash = self
+            .conn
+            .query_row(
+                "SELECT content_hash FROM semantic_files WHERE chunk_table = ?1 AND path = ?2",
+                params![&self.chunk_table, path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(hash)
     }
 
     pub fn semantic_freshness(&self) -> Result<Option<SemanticFreshness>> {
@@ -367,7 +454,10 @@ impl Database {
         language: Option<&str>,
         paths: Option<&[&str]>,
     ) -> Result<Vec<RawSearchRow>> {
-        let t = self.fts_table();
+        if self.chunk_table.is_empty() {
+            return Ok(Vec::new());
+        }
+        let t = quote_ident(&self.fts_table());
         let mut conditions = vec![format!("\"{t}\" MATCH ?1")];
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> =
             vec![Box::new(match_expr.to_string())];
@@ -413,19 +503,22 @@ impl Database {
         if total == 0 {
             return Ok((0, 0));
         }
-        let vocab = format!("{}_vocab", self.fts_table());
-        // Create the vocab shadow if it doesn't exist. FTS5 vocab tables are
-        // virtual; creating them is idempotent and only records the shape,
-        // no data copy.
-        self.conn.execute_batch(&format!(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS \"{vocab}\" USING fts5vocab(\"{}\", row);",
-            self.fts_table()
-        ))?;
-        let sql = format!("SELECT doc FROM \"{vocab}\" WHERE term = ?1");
-        let doc: Option<i64> = self
+        let fts = self.fts_table();
+        let vocab = format!("{fts}_vocab");
+        let vocab_ident = quote_ident(&vocab);
+        let sql = format!("SELECT doc FROM \"{vocab_ident}\" WHERE term = ?1");
+        let term = token.to_lowercase();
+        let doc = self
             .conn
-            .query_row(&sql, params![token.to_lowercase()], |r| r.get(0))
-            .ok();
+            .query_row(&sql, params![&term], |r| r.get::<_, i64>(0));
+        let doc: Option<i64> = match doc {
+            Ok(n) => Some(n),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("no such table") => {
+                return Ok((0, total));
+            }
+            Err(e) => return Err(e.into()),
+        };
         Ok((doc.unwrap_or(0) as u64, total))
     }
 
@@ -438,7 +531,7 @@ impl Database {
         let tables = self.list_vec_tables()?;
         let mut total: i64 = 0;
         for t in &tables {
-            let sql = format!("SELECT COUNT(*) FROM \"{t}\"");
+            let sql = format!("SELECT COUNT(*) FROM \"{}\"", quote_ident(t));
             let n: i64 = self.conn.query_row(&sql, [], |row| row.get(0))?;
             total += n;
         }
@@ -480,7 +573,7 @@ impl Database {
              FROM \"{}\"
              WHERE file_path = ?1
              ORDER BY start_line",
-            self.chunk_table
+            quote_ident(&self.chunk_table)
         );
         // Cached: chunks_for_file is called once per file during bundle
         // assembly (entry + owned + context). The table name is fixed per
@@ -503,9 +596,12 @@ impl Database {
     }
 
     pub fn all_chunk_file_paths(&self) -> Result<Vec<String>> {
+        if self.chunk_table.is_empty() {
+            return Ok(Vec::new());
+        }
         let sql = format!(
             "SELECT DISTINCT file_path FROM \"{}\" ORDER BY file_path",
-            self.chunk_table
+            quote_ident(&self.chunk_table)
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let paths = stmt

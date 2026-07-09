@@ -70,8 +70,19 @@ pub fn build_review_rehearsal(
 
     // --- risk rollup for the patch ---
     let risk = assess_risk_diff(db, files)?;
-    let by_file: HashMap<&str, &codesage_protocol::RiskAssessment> =
-        risk.files.iter().map(|a| (a.file.as_str(), a)).collect();
+    let detailed_risk: Vec<&codesage_protocol::RiskAssessment> = risk
+        .files
+        .iter()
+        .chain(
+            risk.clustered_directories
+                .iter()
+                .flat_map(|cluster| cluster.top_files.iter()),
+        )
+        .collect();
+    let by_file: HashMap<&str, &codesage_protocol::RiskAssessment> = detailed_risk
+        .iter()
+        .map(|a| (a.file.as_str(), *a))
+        .collect();
 
     if !risk.test_gap_files.is_empty() {
         objections.push(ReviewObjection {
@@ -86,10 +97,10 @@ pub fn build_review_rehearsal(
         });
     }
 
-    // High / elevated risk files, from the detailed (non-clustered) entries.
+    // High / elevated risk files, from every detailed risk entry.
     let mut high: Vec<&codesage_protocol::RiskAssessment> = Vec::new();
     let mut elevated: Vec<&codesage_protocol::RiskAssessment> = Vec::new();
-    for a in &risk.files {
+    for &a in &detailed_risk {
         if a.score >= 0.60 {
             high.push(a);
         } else if a.score >= 0.40 {
@@ -398,7 +409,7 @@ fn build_summary(
 mod tests {
     use super::*;
     use codesage_protocol::{
-        FeatureConfidence, FeatureFileRef, FeatureKind, FeatureRecord, Language,
+        FeatureConfidence, FeatureFileRef, FeatureKind, FeatureRecord, FileInfo, Language,
     };
 
     fn file_ref(path: &str, role: FeatureFileRole) -> FeatureFileRef {
@@ -430,6 +441,79 @@ mod tests {
                 .chain(files)
                 .collect(),
         }
+    }
+
+    fn index_rust_file(db: &Database, path: &str) {
+        db.upsert_file(&FileInfo {
+            path: path.to_string(),
+            language: Language::Rust,
+            content_hash: format!("test-hash-{path}"),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn high_risk_objection_includes_clustered_top_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let clustered: Vec<String> = (0..5).map(|i| format!("app/Risk/File{i}.php")).collect();
+        let hot_id = db
+            .upsert_file(&FileInfo {
+                path: "app/Risk/File0.php".to_string(),
+                language: Language::Php,
+                content_hash: "hot".to_string(),
+            })
+            .unwrap();
+        db.replace_file_trust_boundaries(
+            hot_id,
+            &[
+                TrustBoundary::Network,
+                TrustBoundary::Filesystem,
+                TrustBoundary::Database,
+                TrustBoundary::Secrets,
+                TrustBoundary::ProcessExec,
+            ],
+        )
+        .unwrap();
+        for (i, path) in clustered.iter().enumerate() {
+            db.upsert_git_file(
+                path,
+                if i == 0 { 100.0 } else { 0.1 },
+                if i == 0 { 40 } else { 0 },
+                if i == 0 { 80 } else { 5 },
+                Some(1_700_000_000),
+            )
+            .unwrap();
+        }
+        for path in ["cold_a.php", "cold_b.php", "cold_c.php"] {
+            db.upsert_git_file(path, 0.05, 0, 5, Some(1_700_000_000))
+                .unwrap();
+        }
+
+        let risk = codesage_graph::assess_risk_diff(&db, &clustered).unwrap();
+        assert!(
+            risk.files.iter().all(|a| a.file != "app/Risk/File0.php"),
+            "fixture must prove File0 only survives in clustered top_files"
+        );
+        assert!(
+            risk.clustered_directories
+                .iter()
+                .flat_map(|c| c.top_files.iter())
+                .any(|a| a.file == "app/Risk/File0.php" && a.score >= 0.60),
+            "fixture should keep a high-risk clustered top file, got {risk:?}"
+        );
+
+        let r = build_review_rehearsal(dir.path(), &db, &clustered).unwrap();
+        let obj = r
+            .objections
+            .iter()
+            .find(|o| o.category == "high-risk-file" && o.severity == ReviewSeverity::High)
+            .unwrap_or_else(|| panic!("expected high-risk-file objection, got {:?}", r.objections));
+
+        assert!(
+            obj.files.contains(&"app/Risk/File0.php".to_string()),
+            "high-risk objection must include clustered top_files, got {obj:?}"
+        );
     }
 
     #[test]
@@ -517,6 +601,7 @@ mod tests {
                 &format!("area{i}/tests/it.rs"),
                 FeatureFileRole::Test,
             )];
+            index_rust_file(&db, &entry);
             db.upsert_feature(&feature(&format!("feat_area_{i}"), &entry, tests))
                 .unwrap();
             changed.push(entry);

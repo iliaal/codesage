@@ -31,7 +31,7 @@ Concrete answers to the questions a code-intelligence tool earns its keep on. Th
 | Capability | CodeSage |
 |---|---|
 | First-call project orientation (languages, freshness, features, top risk, conventions, next calls) | ✓ via `project_overview`, one bounded response |
-| Natural-language semantic search | ✓ MiniLM embeddings + cross-encoder reranker (jina-embeddings-v2-base-code optional via config) |
+| Natural-language semantic search | ✓ Jina code embeddings + optional cross-encoder reranker |
 | Symbol-level lookup (definitions, references, callers/callees, inheritance) | ✓ tree-sitter, 9 languages, exact line/column ranges |
 | File-level dependency mapping (imports / imported-by) | ✓ via `list_dependencies` |
 | Change impact / blast-radius analysis | ✓ via `impact_analysis`, configurable depth, symbol or file target |
@@ -61,6 +61,8 @@ PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go.
 ## Why a single Rust binary
 
 CodeSage ships as one static Rust binary plus a local SQLite database under `.codesage/` per project. No Docker container, no external vector DB server, no embedding service, and no service manager. CLI commands run directly. MCP clients use `codesage mcp`, a stdio shim that starts or reuses a user-local Unix-socket daemon so concurrent agent sessions share one project cache, embedding model pool, reranker pool, and CUDA context.
+
+The daemon is a same-UID co-trust boundary, not a same-UID isolation boundary. Its socket is private to the Unix user and checks peer credentials, but any process running as that user can ask the daemon to open any onboarded project index. Run untrusted agents under a separate Unix user when project isolation matters. MCP calls are agent-safety capped; CLI commands remain operator tools and can request larger limits or file lists.
 
 The trade-off: CUDA-accelerated embeddings on Linux need the `nvidia-*-cu12` pip packages on the host (see [CUDA setup](#cuda-setup)); on Apple Silicon, set `device = "coreml"` instead (see [CoreML setup](#coreml-setup-macos)). In exchange, install once, run everywhere, no orchestration layer, no systemd unit to manage. Tools in the same category that take the other side of this trade (SocratiCode with managed Qdrant + Ollama, GitNexus with external Qdrant) are valid for different user profiles. If your team already runs Docker Compose for everything, use those. If you want `cargo install`, `codesage init`, and an on-demand local daemon hidden behind stdio MCP, use CodeSage.
 
@@ -345,8 +347,8 @@ flowchart LR
     C --> D[Extract symbols<br/>and references]
     C --> E[Chunk text<br/>recursive splitter]
     D --> F[(SQLite<br/>files, symbols, refs)]
-    E --> G[Embed via ONNX<br/>MiniLM-L6-v2]
-    G --> H[(sqlite-vec<br/>chunks_minilm_384)]
+    E --> G[Embed via ONNX<br/>Jina code v2]
+    G --> H[(sqlite-vec<br/>chunks_jina_768)]
 ```
 
 Parsing happens in parallel via Rayon; SQLite writes are batched. Re-running `codesage index` is incremental: only files whose content hash changed are re-parsed and re-embedded.
@@ -357,7 +359,7 @@ A query flows through five stages:
 
 ```mermaid
 flowchart LR
-    Q[Query string] --> E[Embed<br/>MiniLM-L6-v2]
+    Q[Query string] --> E[Embed<br/>Jina code v2]
     E --> K[KNN retrieval<br/>sqlite-vec<br/>overfetch 5x]
     K --> B[Symbol boost<br/>+0.1 per token match]
     B --> R[Cross-encoder rerank<br/>ms-marco<br/>blend 50/50]
@@ -365,7 +367,7 @@ flowchart LR
     A --> T[Top-N results]
 ```
 
-1. Embed the query with MiniLM-L6-v2 (22M params, 384d) via ONNX Runtime.
+1. Embed the query with Jina embeddings v2 base-code (768d) via ONNX Runtime.
 2. Prepend file path and symbol context to chunks before embedding.
 3. Boost chunks whose content matches known symbol names.
 4. Re-score the top candidates with ms-marco-MiniLM-L6-v2 and blend 50/50 with the semantic score.
@@ -382,7 +384,7 @@ The reranker is optional. Set or remove it in `config.toml`; stages 1-3 and the 
 name = "my-project"
 
 [embedding]
-model = "sentence-transformers/all-MiniLM-L6-v2"
+model = "jinaai/jina-embeddings-v2-base-code"
 device = "gpu"                                        # "cpu", "gpu", or "coreml" (macOS)
 reranker = "cross-encoder/ms-marco-MiniLM-L6-v2"     # optional, remove to disable
 # batch_size = 64                                    # optional; defaults to 64, or 10 on Apple

@@ -2,11 +2,11 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use codesage_parser::discover::{TEST_LIKE_EXCLUDE_PATTERNS, build_exclude_set};
 use codesage_protocol::{Language, SearchRequest, SearchResult, Symbol, SymbolSummary};
 use codesage_storage::{Database, RawSearchRow, SemanticValidityToken, embedding_to_bytes};
-use globset::GlobSet;
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use regex::Regex;
 
 /// Parse a `Language` value out of a DB-stored language string. Every row was
@@ -54,6 +54,13 @@ const RERANK_OVERFETCH: usize = 5;
 /// return fewer / no results, which is acceptable for semantic search.
 /// fnd: CR-019.
 const MAX_SEMANTIC_FETCH: usize = 500;
+
+/// Extra KNN candidates to fetch before applying path globs. Path filters are
+/// applied after bounded sqlite-vec retrieval, so recall is approximate when a
+/// glob excludes many of the nearest neighbors, but query cost stays bounded
+/// independently of total chunk count.
+const PATH_FILTER_KNN_OVERFETCH: usize = 10;
+const MAX_PATH_FILTER_KNN_FETCH: usize = 5_000;
 
 /// RRF constant. Standard value from the original paper; larger values
 /// damp the influence of absolute rank position, smaller values amplify it.
@@ -359,6 +366,74 @@ fn bm25_search_candidates(
 /// interleave their SQL work while one is in the (slow) ORT call.
 pub type RerankFn<'a> = Box<dyn FnMut(&str, &[&str]) -> Result<Vec<f32>> + 'a>;
 
+fn semantic_knn_candidates(
+    db: &Database,
+    embedding_bytes: &[u8],
+    fetch: usize,
+    languages: Option<&[Language]>,
+) -> Result<Vec<RawSearchRow>> {
+    if fetch == 0 {
+        return Ok(Vec::new());
+    }
+    match languages {
+        None => db.search_knn(embedding_bytes, fetch, None),
+        Some(langs) if langs.len() == 1 => {
+            db.search_knn(embedding_bytes, fetch, Some(langs[0].as_str()))
+        }
+        Some(langs) => {
+            // Fan-out per language (sqlite-vec's partition key forces
+            // per-value queries) and merge in-memory. sort+truncate is
+            // simpler than a bounded BinaryHeap and fetch_k stays bounded.
+            let mut merged: Vec<RawSearchRow> = Vec::new();
+            for lang in langs {
+                let lang_rows = db.search_knn(embedding_bytes, fetch, Some(lang.as_str()))?;
+                merged.extend(lang_rows);
+            }
+            merged.sort_by(|a, b| {
+                a.distance
+                    .partial_cmp(&b.distance)
+                    .unwrap_or(Ordering::Equal)
+            });
+            merged.truncate(fetch);
+            Ok(merged)
+        }
+    }
+}
+
+fn path_globset(patterns: &[String]) -> Result<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob = GlobBuilder::new(pattern)
+            .literal_separator(false)
+            .build()
+            .with_context(|| format!("invalid search path glob {pattern:?}"))?;
+        builder.add(glob);
+    }
+    builder
+        .build()
+        .context("failed to build search path globset")
+}
+
+fn path_filtered_knn_candidates(
+    db: &Database,
+    embedding_bytes: &[u8],
+    semantic_fetch: usize,
+    languages: Option<&[Language]>,
+    path_patterns: &[String],
+) -> Result<Vec<RawSearchRow>> {
+    if semantic_fetch == 0 {
+        return Ok(Vec::new());
+    }
+    let globset = path_globset(path_patterns)?;
+    let fetch = semantic_fetch
+        .saturating_mul(PATH_FILTER_KNN_OVERFETCH)
+        .min(MAX_PATH_FILTER_KNN_FETCH);
+    let mut rows = semantic_knn_candidates(db, embedding_bytes, fetch, languages)?;
+    rows.retain(|row| globset.is_match(row.file_path.as_str()));
+    rows.truncate(semantic_fetch);
+    Ok(rows)
+}
+
 pub fn search(
     db: &Database,
     query_embedding: &[f32],
@@ -397,48 +472,21 @@ pub fn search(
     // `notes/20260411-code-intelligence-landscape.md` §1.4 for the memo chain.
     let hybrid_gate = query_has_rare_literal(db, &req.query).unwrap_or(false);
 
-    let rows = if req.paths.is_some() {
-        let languages: Option<Vec<&str>> = req
-            .languages
-            .as_ref()
-            .map(|langs| langs.iter().map(|l| l.as_str()).collect());
-        let paths: Option<Vec<&str>> = req
-            .paths
-            .as_ref()
-            .map(|p| p.iter().map(|s| s.as_str()).collect());
-        db.search_fullscan(
+    let rows = if let Some(path_patterns) = &req.paths {
+        path_filtered_knn_candidates(
+            db,
             &embedding_bytes,
             semantic_fetch,
-            0,
-            languages.as_deref(),
-            paths.as_deref(),
+            req.languages.as_deref(),
+            path_patterns,
         )?
     } else {
-        match &req.languages {
-            None => db.search_knn(&embedding_bytes, semantic_fetch, None)?,
-            Some(langs) if langs.len() == 1 => {
-                db.search_knn(&embedding_bytes, semantic_fetch, Some(langs[0].as_str()))?
-            }
-            Some(langs) => {
-                // Fan-out per language (sqlite-vec's partition key forces
-                // per-value queries) and merge in-memory. sort+truncate is
-                // simpler than a bounded BinaryHeap and fetch_k stays small
-                // enough (N_langs * ~50) that asymptotic cost doesn't matter.
-                let mut merged: Vec<RawSearchRow> = Vec::new();
-                for lang in langs {
-                    let lang_rows =
-                        db.search_knn(&embedding_bytes, semantic_fetch, Some(lang.as_str()))?;
-                    merged.extend(lang_rows);
-                }
-                merged.sort_by(|a, b| {
-                    a.distance
-                        .partial_cmp(&b.distance)
-                        .unwrap_or(Ordering::Equal)
-                });
-                merged.truncate(semantic_fetch);
-                merged
-            }
-        }
+        semantic_knn_candidates(
+            db,
+            &embedding_bytes,
+            semantic_fetch,
+            req.languages.as_deref(),
+        )?
     };
 
     // Hybrid BM25+semantic fusion, only when the gate triggered. Keeps the
@@ -482,6 +530,12 @@ pub fn search(
     } else {
         rows
     };
+
+    let mut rows = rows;
+    if let Some(languages) = &req.languages {
+        let allowed: HashSet<&str> = languages.iter().map(|lang| lang.as_str()).collect();
+        rows.retain(|row| allowed.contains(row.language.as_str()));
+    }
 
     let semantic_results: Vec<SearchResult> = rows
         .into_iter()
@@ -1789,6 +1843,59 @@ mod hybrid_tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].file_path, "src/reg.rs");
+    }
+
+    #[test]
+    fn path_filtered_knn_candidates_apply_glob_after_bounded_knn() {
+        let db = Database::open_in_memory().unwrap();
+        seed_chunks(&db);
+        db.insert_chunks(
+            "vendor/close.rs",
+            "rust",
+            &[("fn vendor_close() {}", 1, 5, mk_embedding(0.05).as_slice())],
+        )
+        .unwrap();
+        let query_bytes = embedding_to_bytes(&mk_embedding(0.05));
+        let rows = path_filtered_knn_candidates(
+            &db,
+            &query_bytes,
+            10,
+            Some(&[Language::Rust]),
+            &["src/*".to_string()],
+        )
+        .unwrap();
+
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter().all(|r| r.file_path.starts_with("src/")),
+            "path-filtered KNN must not leak nonmatching files: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn hybrid_search_respects_multi_language_filters_after_bm25_fusion() {
+        let db = Database::open_in_memory().unwrap();
+        seed_chunks(&db);
+        db.insert_chunks(
+            "src/legacy.php",
+            "php",
+            &[(
+                "// ColdFusion::register legacy PHP integration",
+                1,
+                3,
+                mk_embedding(0.05).as_slice(),
+            )],
+        )
+        .unwrap();
+        let mut req = search_req("ColdFusion::register");
+        req.languages = Some(vec![Language::Rust, Language::TypeScript]);
+
+        let results = search(&db, &mk_embedding(0.05), None, &req).unwrap();
+
+        assert!(
+            results.iter().all(|r| r.language != Language::Php),
+            "BM25-fused results must not leak excluded languages: {results:?}"
+        );
     }
 
     fn search_req(query: &str) -> SearchRequest {

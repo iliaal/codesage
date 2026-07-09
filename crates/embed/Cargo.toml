@@ -15,6 +15,8 @@ anyhow.workspace = true
 tokenizers.workspace = true
 hf-hub.workspace = true
 tracing.workspace = true
+sha2.workspace = true
+hex.workspace = true
 wait-timeout = "0.2"
 
 [target.'cfg(not(target_vendor = "apple"))'.dependencies]

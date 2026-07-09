@@ -34,7 +34,7 @@ The "fmt then edit then forget to re-fmt" class of break is real (commit `a43c51
 
 Query flows through these stages in order:
 
-1. **Embed query** -- MiniLM-L6-v2 (384d) via ONNX Runtime
+1. **Embed query** -- Jina embeddings v2 base-code (768d) via ONNX Runtime
 2. **KNN retrieval** -- sqlite-vec, overfetch 5x when the reranker is active
 3. **BM25 fusion** -- code-literal queries (backticks, `::`, glob patterns) merge BM25 candidates via RRF; fused scores are rescaled onto the semantic score span so downstream boosts can't swamp them
 4. **Symbol boost** -- +0.1 per query token that matches a known symbol in the chunk, plus definition/qualified-name boosts, path penalties, and directory/file saturation (each env-toggleable)
@@ -53,7 +53,7 @@ Per-project config lives at `.codesage/config.toml`:
 name = "my-project"
 
 [embedding]
-model = "sentence-transformers/all-MiniLM-L6-v2"
+model = "jinaai/jina-embeddings-v2-base-code"
 device = "gpu"
 reranker = "cross-encoder/ms-marco-MiniLM-L6-v2"
 
@@ -66,7 +66,7 @@ exclude_patterns = [
 ]
 ```
 
-`[embedding] model` / `reranker` values are validated against a built-in allowlist before any download — repo-local config is untrusted input (a cloned repo must not be able to pick the ONNX graph that gets loaded). To run a non-allowlisted model deliberately, set `CODESAGE_ALLOW_ANY_MODEL=1`; the allowlist lives in `crates/embed/src/model.rs`.
+`[embedding] model` / `reranker` values are validated against a built-in allowlist before any download, then loaded only from pinned Hugging Face revisions with sha256-verified tokenizer/ONNX artifacts — repo-local config is untrusted input (a cloned repo must not be able to pick the graph that gets loaded). To run a non-allowlisted or unpinned model deliberately, set `CODESAGE_ALLOW_ANY_MODEL=1`; the allowlist and pins live in `crates/embed/src/model.rs`.
 
 ## CUDA setup
 
@@ -164,6 +164,8 @@ Every MCP tool advertises an `outputSchema` (0.7.0); agents that consult it know
 `codesage mcp` is the stable client entrypoint. It runs as a stdio shim, starts or connects to the per-user Unix-socket daemon, and forwards MCP JSON-RPC unchanged. The daemon hosts the real MCP server and owns shared project/model/reranker pools across main sessions and subagents.
 
 `codesage mcp --project <abs root>` makes the server default the per-call `project` argument to that root when a `tools/call` omits it. Set automatically by `codesage install` for agents without a CodeSage plugin (Codex, opencode), which otherwise have no way to inject the project path. With no `--project` (the Claude-plugin path) the shim raw-copies stdio with zero overhead.
+
+The daemon co-trusts every process under the same Unix UID. Runtime dirs, socket mode `0o600`, and `SO_PEERCRED` keep other users out, but a compromised same-UID agent can ask the daemon to read any onboarded project index. Use a separate Unix user for untrusted agents that need project isolation. MCP tools are capped for agent safety; CLI commands are the operator surface and intentionally keep broader limits unless a command documents its own cap.
 
 Use `codesage mcp --direct` only when debugging the old single-process stdio path. Use `codesage daemon` to run the foreground daemon explicitly. Socket state lives under `$CODESAGE_DAEMON_RUNTIME_DIR`, `$XDG_RUNTIME_DIR/codesage`, or `/tmp/codesage-$UID`; the socket name includes the running binary's version and executable metadata so rebuilt binaries don't attach to stale daemons.
 

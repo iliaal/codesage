@@ -1401,6 +1401,12 @@ fn cmd_init() -> Result<()> {
     }
 
     std::fs::create_dir_all(&project_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(&project_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
 
     let dir_name = cwd
         .file_name()
@@ -1630,7 +1636,11 @@ fn cmd_find_symbol(name: &str, kind_str: Option<&str>, json: bool) -> Result<()>
     let root = find_project_root()?;
     let db = open_db(&root)?;
 
-    let kind = kind_str.and_then(SymbolKind::parse);
+    let kind = kind_str
+        .map(|kind| {
+            SymbolKind::parse(kind).ok_or_else(|| anyhow::anyhow!("unknown symbol kind: {kind}"))
+        })
+        .transpose()?;
     let results = find_symbol(
         &db,
         &FindSymbolRequest {
@@ -1661,7 +1671,12 @@ fn cmd_find_references(name: &str, kind_str: Option<&str>, json: bool) -> Result
     let root = find_project_root()?;
     let db = open_db(&root)?;
 
-    let kind = kind_str.and_then(ReferenceKind::parse);
+    let kind = kind_str
+        .map(|kind| {
+            ReferenceKind::parse(kind)
+                .ok_or_else(|| anyhow::anyhow!("unknown reference kind: {kind}"))
+        })
+        .transpose()?;
     let results = find_references(
         &db,
         &FindReferencesRequest {

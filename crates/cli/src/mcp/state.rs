@@ -13,6 +13,8 @@ use parking_lot::Mutex;
 
 use super::CodeSageServer;
 
+const MCP_TEST_QUERY_EMBEDDING_ENV: &str = "CODESAGE_MCP_TEST_QUERY_EMBEDDING";
+
 #[derive(Debug, Clone)]
 pub(super) struct ProjectState {
     pub(super) db_path: PathBuf,
@@ -519,6 +521,44 @@ impl CodeSageServer {
         Database::open_for_existing_model(&state.db_path, &config.model)
     }
 
+    // Daemon integration tests spawn the real binary, where ordinary
+    // `#[cfg(test)]` fakes are unavailable. This test-named env var lets that
+    // binary exercise MCP search with a seeded vector table and no model
+    // download; release/user paths ignore it unless explicitly set.
+    fn test_query_embedding_override(&self) -> Result<Option<Vec<f32>>> {
+        let Ok(raw) = std::env::var(MCP_TEST_QUERY_EMBEDDING_ENV) else {
+            return Ok(None);
+        };
+
+        let mut embedding = Vec::new();
+        for (i, part) in raw.split(',').enumerate() {
+            let value = part.trim();
+            if value.is_empty() {
+                bail!(
+                    "{MCP_TEST_QUERY_EMBEDDING_ENV} component {} is empty",
+                    i + 1
+                );
+            }
+            let parsed: f32 = value.parse().with_context(|| {
+                format!(
+                    "{MCP_TEST_QUERY_EMBEDDING_ENV} component {} must be an f32",
+                    i + 1
+                )
+            })?;
+            if !parsed.is_finite() {
+                bail!(
+                    "{MCP_TEST_QUERY_EMBEDDING_ENV} component {} must be finite",
+                    i + 1
+                );
+            }
+            embedding.push(parsed);
+        }
+        if embedding.is_empty() {
+            bail!("{MCP_TEST_QUERY_EMBEDDING_ENV} must contain at least one f32");
+        }
+        Ok(Some(embedding))
+    }
+
     /// Resolve project, open its DB, run `f` with the DB. Error handling funnel:
     /// each handler's body lives under this so the tool dispatch stays one-liner.
     pub(super) fn with_project_db<F, R>(&self, project: &str, f: F) -> Result<R>
@@ -575,6 +615,11 @@ impl CodeSageServer {
     {
         let state = self.resolve_project(project)?;
         let config = self.semantic_embedding_config(&state)?;
+        if let Some(query_embedding) = self.test_query_embedding_override()? {
+            let db =
+                Database::open_for_model(&state.db_path, &config.model, query_embedding.len())?;
+            return f(&db, &query_embedding, None);
+        }
         let db = self.open_db_for(&state)?;
         let embedder_arc = self.get_or_load_embedder(config)?;
         let reranker_arc = config

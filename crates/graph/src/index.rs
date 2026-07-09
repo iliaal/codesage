@@ -91,6 +91,33 @@ pub enum IndexStrategy {
     Incremental,
 }
 
+const STRUCTURAL_INDEX_BATCH_SIZE: usize = 50;
+
+fn write_parsed_batch(db: &Database, parsed: &[ParsedFile], stats: &mut IndexStats) -> Result<()> {
+    if parsed.is_empty() {
+        return Ok(());
+    }
+
+    db.execute_batch(|db| {
+        for p in parsed {
+            let file_id = db.upsert_file(&p.info)?;
+            db.insert_symbols(file_id, &p.symbols)?;
+            db.insert_references(file_id, &p.refs)?;
+            db.insert_fingerprints(file_id, &fingerprint_inputs(p))?;
+            let boundaries = derive_from_refs(&p.refs, p.info.language);
+            db.replace_file_trust_boundaries(file_id, &boundaries)?;
+        }
+        Ok(())
+    })?;
+
+    for p in parsed {
+        stats.symbols_found += p.symbols.len();
+        stats.references_found += p.refs.len();
+        stats.files_indexed += 1;
+    }
+    Ok(())
+}
+
 fn index(
     root: &Path,
     db: &Database,
@@ -142,46 +169,28 @@ fn index(
         tracing::info!(files_to_parse = to_parse.len(), "parsing files");
     }
 
-    let parsed_results: Vec<Result<ParsedFile>> =
-        to_parse.par_iter().map(|f| parse_one(root, f)).collect();
-    let mut parsed = Vec::with_capacity(parsed_results.len());
-    for result in parsed_results {
-        match result {
-            Ok(file) => parsed.push(file),
-            Err(e) => {
-                stats.files_failed += 1;
-                tracing::warn!(error = %e, "skipping file during structural index");
+    for batch in to_parse.chunks(STRUCTURAL_INDEX_BATCH_SIZE) {
+        let parsed_results: Vec<Result<ParsedFile>> =
+            batch.par_iter().map(|f| parse_one(root, f)).collect();
+        let mut parsed = Vec::with_capacity(parsed_results.len());
+        for result in parsed_results {
+            match result {
+                Ok(file) => parsed.push(file),
+                Err(e) => {
+                    stats.files_failed += 1;
+                    tracing::warn!(error = %e, "skipping file during structural index");
+                }
             }
         }
-    }
 
-    if verbose {
-        tracing::info!(
-            parsed = parsed.len(),
-            failed = stats.files_failed,
-            "structural parse complete, writing to db"
-        );
-    }
-
-    db.execute_batch(|db| {
-        for p in &parsed {
-            let file_id = db.upsert_file(&p.info)?;
-            db.insert_symbols(file_id, &p.symbols)?;
-            db.insert_references(file_id, &p.refs)?;
-            db.insert_fingerprints(file_id, &fingerprint_inputs(p))?;
-            // Trust-boundary derivation runs against the in-memory refs we
-            // just inserted — no DB round-trip to re-read them. Replace
-            // whatever was stored previously so re-index keeps the set
-            // current as imports change.
-            let boundaries = derive_from_refs(&p.refs, p.info.language);
-            db.replace_file_trust_boundaries(file_id, &boundaries)?;
+        if verbose {
+            tracing::info!(
+                parsed = parsed.len(),
+                failed = stats.files_failed,
+                "structural parse batch complete, writing to db"
+            );
         }
-        Ok(())
-    })?;
-    for p in &parsed {
-        stats.symbols_found += p.symbols.len();
-        stats.references_found += p.refs.len();
-        stats.files_indexed += 1;
+        write_parsed_batch(db, &parsed, &mut stats)?;
     }
 
     Ok(stats)
@@ -227,34 +236,20 @@ pub fn index_files(
         tracing::info!(count = files.len(), "indexing specific files");
     }
 
-    let parsed_results: Vec<Result<ParsedFile>> =
-        files.par_iter().map(|f| parse_one(root, f)).collect();
-    let mut parsed = Vec::with_capacity(parsed_results.len());
-    for result in parsed_results {
-        match result {
-            Ok(file) => parsed.push(file),
-            Err(e) => {
-                stats.files_failed += 1;
-                tracing::warn!(error = %e, "skipping file during per-file structural index");
+    for batch in files.chunks(STRUCTURAL_INDEX_BATCH_SIZE) {
+        let parsed_results: Vec<Result<ParsedFile>> =
+            batch.par_iter().map(|f| parse_one(root, f)).collect();
+        let mut parsed = Vec::with_capacity(parsed_results.len());
+        for result in parsed_results {
+            match result {
+                Ok(file) => parsed.push(file),
+                Err(e) => {
+                    stats.files_failed += 1;
+                    tracing::warn!(error = %e, "skipping file during per-file structural index");
+                }
             }
         }
-    }
-
-    db.execute_batch(|db| {
-        for p in &parsed {
-            let file_id = db.upsert_file(&p.info)?;
-            db.insert_symbols(file_id, &p.symbols)?;
-            db.insert_references(file_id, &p.refs)?;
-            db.insert_fingerprints(file_id, &fingerprint_inputs(p))?;
-            let boundaries = derive_from_refs(&p.refs, p.info.language);
-            db.replace_file_trust_boundaries(file_id, &boundaries)?;
-        }
-        Ok(())
-    })?;
-    for p in &parsed {
-        stats.symbols_found += p.symbols.len();
-        stats.references_found += p.refs.len();
-        stats.files_indexed += 1;
+        write_parsed_batch(db, &parsed, &mut stats)?;
     }
 
     Ok(stats)

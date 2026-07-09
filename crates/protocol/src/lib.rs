@@ -315,6 +315,10 @@ pub struct FindReferencesRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DependencyEntry {
     pub file_path: String,
+    #[serde(default)]
+    pub found: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     pub imports: Vec<String>,
     pub imported_by: Vec<String>,
 }
@@ -582,6 +586,10 @@ fn default_found() -> bool {
     true
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ContextBundle {
     /// False when the requested target (symbol or feature_id) does not
@@ -656,6 +664,10 @@ pub struct TopSymbol {
 /// see WHY a file is risky, not just the magnitude.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RiskAssessment {
+    /// False when the requested file does not exist in the structural or
+    /// git-history index. A missing path is unknown, not low-risk.
+    #[serde(default = "default_found")]
+    pub found: bool,
     pub file: String,
     pub score: f64,
     pub churn_score: f64,
@@ -711,6 +723,10 @@ pub struct RiskAssessment {
 /// per-file round-trips and manual aggregation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RiskDiffAssessment {
+    /// True when the caller supplied no files. Empty input is a usage signal,
+    /// not a clean low-risk patch.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub empty_input: bool,
     /// Per-file decomposition. Same shape as a single `assess_risk` call.
     pub files: Vec<RiskAssessment>,
     /// Highest score across the patch. The signal that should drive the agent's
@@ -901,6 +917,23 @@ pub struct SessionSnapshot {
     pub top_risk_files: Vec<SessionRiskEntry>,
     /// Best-effort `git rev-parse HEAD` at snapshot time. None when not in
     /// a git repo or git isn't on PATH.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_head: Option<String>,
+}
+
+/// Compact MCP response for `session_start`. The full snapshot is still
+/// persisted on disk as `SessionSnapshot`; the tool response deliberately
+/// avoids returning the full file list so MCP budget truncation cannot make
+/// the advertised shape ambiguous.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SessionStartReport {
+    pub session_id: String,
+    pub created_at: i64,
+    pub file_count: u32,
+    pub symbol_count: u32,
+    pub cycle_count: usize,
+    pub top_risk_file_count: usize,
+    pub snapshot_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_head: Option<String>,
 }

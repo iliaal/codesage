@@ -2,13 +2,39 @@
 
 ### Added
 - `/codesage-review` gains `--deep` (multi-lens reviewers on high-risk slices), `--no-verify`, `--model`, and `--verify-model`; new findings pass an adversarial verification stage (new `codesage-finding-verifier` agent) by default.
+- `CODESAGE_HF_DOWNLOAD_TIMEOUT_SECS` bounds Hugging Face artifact downloads during model load.
 
 ### Changed
 - Upgrade the `rmcp` MCP SDK to 2.x (MCP 2025-11-25 spec model types).
 - `/codesage-review` / `/codesage-revalidate` drop findings whose quoted evidence doesn't match the cited file, compute `finding_id`s orchestrator-side with fuzzy prior-matching (IDs survive model/wording changes and small code motion), repair unparseable reviewer JSON before erroring a feature, and pass a last-reviewed base SHA so re-reviews focus on the diff.
 - `codesage-feature-reviewer` agent: explicit review procedure (trust-boundary tracing, error-path walks, self-audit), contract lookups via `find_symbol` outside the slice, risk-scaled read depth, lens mode, and severity calibration anchors.
+- `assess_risk` returns `found: false` for paths absent from both the structural and git-history indexes; `assess_risk_diff` returns `empty_input: true` with a note for empty file lists.
+- MCP tools cap large limits, depth, and file-path lists instead of accepting unbounded request sizes.
+- MCP `session_start` returns a compact summary plus `snapshot_path`; the full file list remains persisted in `.codesage/sessions/<session_id>.json`.
+- `find-symbol --kind` and `find-references --kind` reject unknown values instead of running unfiltered.
+
+### Fixed
+- The filesystem watcher retries failed structural/semantic reindexes and removals, removes stale rows for empty files, and no longer deletes semantic chunks before a replacement embedding succeeds.
+- `review_rehearsal` includes high-risk files preserved inside `assess_risk_diff.clustered_directories[].top_files`.
+- `list_dependencies` reports `found: false` with a note for paths absent from the structural index.
+- `find_similar` MCP params accept `min_jaccard` as a JSON string number.
+- `assess_risk_diff`, `assess_risk_batch`, and `recommend_tests` MCP calls reject empty `file_paths` instead of returning successful empty payloads.
+- `token_doc_frequency` no longer creates an FTS vocab table on the query path when the sidecar is missing.
+- Feature mapping persists feature rows, Laravel route-handler refs, and stale-feature cleanup in one transaction.
+- `impact_analysis` deduplicates traversal by file, qualified name, and line instead of qualified name alone.
+- `search` filters BM25-fused rows by every requested language before scoring and reranking.
+- `search` applies `paths` filters after bounded KNN retrieval instead of running L2 distance over every matching chunk.
+- `find_similar` resolves target fingerprints before loading same-language candidates, avoiding full fingerprint loads for unknown symbols.
+- `assess_risk` uses a bounded target-file import walk for single-file cycle membership instead of running whole-graph SCC detection.
+- Structural indexing writes parsed files in batches instead of buffering the entire changed set before one transaction.
+- Feature upserts replace feature rows, file refs, and trust-boundary refs atomically.
+- Vec table drops and schema migration commits roll back cleanly on failure.
 
 ### Security
+- `.codesage` directories and `index.db` sidecars are created with private Unix permissions; MCP stale-file checks refuse indexed paths that escape the project root.
+- File discovery skips paths that cannot be made project-relative instead of storing absolute/out-of-root paths.
+- Allowlisted embedding and reranker model artifacts are pinned by Hugging Face revision and sha256 before loading tokenizer or ONNX bytes.
+- Embedding batch size is capped at 256 from config, environment, and CLI overrides.
 - Bump `crossbeam-epoch` to 0.9.20, clearing RUSTSEC-2026-0204 (invalid pointer dereference in `fmt::Pointer`).
 
 ## [0.14.0] - 2026-07-02

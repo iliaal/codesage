@@ -262,9 +262,12 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
                 WorkOutcome::Skipped => {
                     removal_retry_at = Some(Instant::now() + debounce);
                 }
-                WorkOutcome::Done | WorkOutcome::Failed => {
+                WorkOutcome::Done => {
                     removed_paths.clear();
                     removal_retry_at = None;
+                }
+                WorkOutcome::Failed => {
+                    removal_retry_at = Some(Instant::now() + debounce);
                 }
             }
         }
@@ -450,7 +453,21 @@ fn reindex_one(
         }
     };
     if bytes.is_empty() {
-        return WorkOutcome::Done;
+        let _lock = match lockfile::try_acquire(&config.project_root) {
+            Ok(lockfile::LockOutcome::Acquired(lock)) => Some(lock),
+            Ok(lockfile::LockOutcome::AlreadyHeld) => {
+                tracing::debug!(
+                    path = %rel_str,
+                    "deferring empty-file purge: index lock held by another process"
+                );
+                return WorkOutcome::Skipped;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "acquiring index lock for empty-file purge");
+                return WorkOutcome::Failed;
+            }
+        };
+        return purge_index_rows(config, std::slice::from_ref(&rel_str));
     }
 
     let hash = content_hash(&bytes);
@@ -458,10 +475,7 @@ fn reindex_one(
         return WorkOutcome::Done;
     };
 
-    if let Ok(db) = Database::open(&config.db_path)
-        && let Ok(Some(stored)) = db.get_file_hash(&rel_str)
-        && stored == hash
-    {
+    if indexed_hashes_are_fresh(config, &rel_str, &hash, embedder.enabled()) {
         return WorkOutcome::Done;
     }
 
@@ -506,6 +520,7 @@ fn reindex_one(
                 }
                 Err(e) => {
                     tracing::warn!(path = %rel_str, error = %e, "structural reindex failed");
+                    return WorkOutcome::Failed;
                 }
             }
         }
@@ -546,11 +561,48 @@ fn reindex_one(
             }
             Err(e) => {
                 tracing::warn!(path = %rel_str, error = %e, "semantic reindex failed");
+                return WorkOutcome::Failed;
             }
         }
     }
 
     WorkOutcome::Done
+}
+
+fn indexed_hashes_are_fresh(
+    config: &StateWatcherConfig,
+    rel_str: &str,
+    content_hash: &str,
+    semantic_enabled: bool,
+) -> bool {
+    let Ok(db) = Database::open(&config.db_path) else {
+        return false;
+    };
+    let structural_fresh =
+        matches!(db.get_file_hash(rel_str), Ok(Some(stored)) if stored == content_hash);
+    if !structural_fresh {
+        return false;
+    }
+    if !semantic_enabled {
+        return true;
+    }
+
+    let semantic_db =
+        match Database::open_for_existing_model(&config.db_path, &config.embed_config.model) {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::warn!(
+                    path = %rel_str,
+                    error = %e,
+                    "opening DB for semantic freshness check"
+                );
+                return false;
+            }
+        };
+    matches!(
+        semantic_db.get_semantic_file_hash(rel_str),
+        Ok(Some(stored)) if stored == content_hash
+    )
 }
 
 fn handle_removals(config: &StateWatcherConfig, paths: &[String]) -> WorkOutcome {
@@ -583,6 +635,10 @@ fn handle_removals(config: &StateWatcherConfig, paths: &[String]) -> WorkOutcome
         }
     };
 
+    purge_index_rows(config, &to_remove)
+}
+
+fn purge_index_rows(config: &StateWatcherConfig, paths: &[String]) -> WorkOutcome {
     let db = match Database::open(&config.db_path) {
         Ok(db) => db,
         Err(e) => {
@@ -591,10 +647,10 @@ fn handle_removals(config: &StateWatcherConfig, paths: &[String]) -> WorkOutcome
         }
     };
 
-    match remove_files(&db, &to_remove) {
+    match remove_files(&db, paths) {
         Ok(n) => {
             if n > 0 {
-                tracing::info!(removed = n, paths = ?to_remove, "files removed from index");
+                tracing::info!(removed = n, paths = ?paths, "files removed from index");
             }
         }
         // A busy/locked DB is transient (a concurrent daemon reader or the
@@ -610,20 +666,30 @@ fn handle_removals(config: &StateWatcherConfig, paths: &[String]) -> WorkOutcome
         }
     }
 
-    if let Err(e) = semantic_remove_files(&db, &to_remove) {
+    let semantic_db =
+        match Database::open_for_existing_model(&config.db_path, &config.embed_config.model) {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::warn!(error = %e, "opening DB for semantic removal");
+                return WorkOutcome::Failed;
+            }
+        };
+
+    if let Err(e) = semantic_remove_files(&semantic_db, paths) {
         if is_retryable_db_error(&e) {
             tracing::debug!(error = %e, "semantic removal deferred: database busy, will retry");
             return WorkOutcome::Skipped;
         }
         tracing::warn!(error = %e, "removing files from semantic index");
+        return WorkOutcome::Failed;
     }
     WorkOutcome::Done
 }
 
 /// SQLITE_BUSY / SQLITE_LOCKED are transient — a concurrent daemon reader or
 /// the index-lock holder had the DB write-locked. Retrying after a debounce
-/// clears them, so the caller must retain the work (Skipped) rather than drop
-/// it (both Done and Failed clear the queued paths). Classified by rendered
+/// clears them, so the caller must retain the work instead of dropping the
+/// queued paths. Classified by rendered
 /// message because `rusqlite` is not a direct dependency of this crate; SQLite
 /// renders the whole busy/locked family as "... is locked".
 fn is_retryable_db_error(err: &anyhow::Error) -> bool {
@@ -693,10 +759,6 @@ fn run_bulk_incremental(config: &StateWatcherConfig, embedder: &mut EmbedderHand
         return WorkOutcome::Failed;
     }
 
-    // Semantic phase is best-effort: structural indexing above already
-    // updated the stored file hashes, so a retained `pending` set couldn't
-    // reach a failed semantic pass anyway (per-file reindex short-circuits
-    // on an unchanged hash). Report `Done` and rely on the warning logs.
     if let Some(emb_arc) = embedder.get() {
         let mut emb = emb_arc.lock();
         let db = match Database::open_for_model(
@@ -707,7 +769,7 @@ fn run_bulk_incremental(config: &StateWatcherConfig, embedder: &mut EmbedderHand
             Ok(db) => db,
             Err(e) => {
                 tracing::warn!(error = %e, "opening DB for bulk semantic incremental");
-                return WorkOutcome::Done;
+                return WorkOutcome::Failed;
             }
         };
         if let Err(e) = codesage_graph::semantic_incremental_index(
@@ -718,6 +780,7 @@ fn run_bulk_incremental(config: &StateWatcherConfig, embedder: &mut EmbedderHand
             false,
         ) {
             tracing::warn!(error = %e, "bulk incremental semantic reindex failed");
+            return WorkOutcome::Failed;
         }
     }
 
@@ -1151,6 +1214,135 @@ mod tests {
             reindex_one(&config, Path::new("foo.rs"), &mut embedder),
             WorkOutcome::Skipped
         );
+    }
+
+    #[test]
+    fn reindex_one_empty_file_removes_existing_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        let src = "fn foo() {}\n";
+        std::fs::write(root.join("foo.rs"), src).unwrap();
+        let config = test_config(root);
+        let hash = content_hash(src.as_bytes());
+
+        let db = Database::open(&config.db_path).unwrap();
+        let file_info = FileInfo {
+            path: "foo.rs".to_string(),
+            language: codesage_protocol::Language::Rust,
+            content_hash: hash.clone(),
+        };
+        index_files(root, &db, std::slice::from_ref(&file_info), false).unwrap();
+        assert!(db.get_file_hash("foo.rs").unwrap().is_some());
+        drop(db);
+
+        let semantic_db = Database::open_for_model(
+            &config.db_path,
+            &config.embed_config.model,
+            codesage_storage::db::DEFAULT_EMBEDDING_DIM,
+        )
+        .unwrap();
+        let embedding = vec![0.0; codesage_storage::db::DEFAULT_EMBEDDING_DIM];
+        semantic_db
+            .insert_chunks("foo.rs", "rust", &[("fn foo() {}", 1, 1, &embedding)])
+            .unwrap();
+        semantic_db
+            .upsert_semantic_file_hash("foo.rs", &hash)
+            .unwrap();
+        assert_eq!(semantic_db.chunks_for_file("foo.rs").unwrap().len(), 1);
+        drop(semantic_db);
+
+        std::fs::write(root.join("foo.rs"), "").unwrap();
+        let mut embedder = EmbedderHandle::new(None);
+
+        assert_eq!(
+            reindex_one(&config, Path::new("foo.rs"), &mut embedder),
+            WorkOutcome::Done
+        );
+
+        let db = Database::open(&config.db_path).unwrap();
+        assert!(db.get_file_hash("foo.rs").unwrap().is_none());
+        drop(db);
+        let semantic_db =
+            Database::open_for_existing_model(&config.db_path, &config.embed_config.model).unwrap();
+        assert!(semantic_db.chunks_for_file("foo.rs").unwrap().is_empty());
+        assert!(
+            semantic_db
+                .get_semantic_file_hash("foo.rs")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reindex_one_empty_file_removes_structural_only_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        let src = "fn foo() {}\n";
+        std::fs::write(root.join("foo.rs"), src).unwrap();
+        let config = test_config(root);
+
+        let db = Database::open(&config.db_path).unwrap();
+        index_files(
+            root,
+            &db,
+            &[FileInfo {
+                path: "foo.rs".to_string(),
+                language: codesage_protocol::Language::Rust,
+                content_hash: content_hash(src.as_bytes()),
+            }],
+            false,
+        )
+        .unwrap();
+        assert!(db.get_file_hash("foo.rs").unwrap().is_some());
+        drop(db);
+        assert!(
+            Database::open_for_existing_model(&config.db_path, &config.embed_config.model)
+                .unwrap()
+                .chunk_table_name()
+                .is_empty(),
+            "fixture must remain structural-only"
+        );
+
+        std::fs::write(root.join("foo.rs"), "").unwrap();
+        let mut embedder = EmbedderHandle::new(None);
+
+        assert_eq!(
+            reindex_one(&config, Path::new("foo.rs"), &mut embedder),
+            WorkOutcome::Done
+        );
+
+        let db = Database::open(&config.db_path).unwrap();
+        assert!(db.get_file_hash("foo.rs").unwrap().is_none());
+    }
+
+    #[test]
+    fn indexed_hashes_are_fresh_requires_semantic_hash_when_enabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        let src = "fn foo() {}\n";
+        std::fs::write(root.join("foo.rs"), src).unwrap();
+        let config = test_config(root);
+        let hash = content_hash(src.as_bytes());
+
+        let db = Database::open(&config.db_path).unwrap();
+        index_files(
+            root,
+            &db,
+            &[FileInfo {
+                path: "foo.rs".to_string(),
+                language: codesage_protocol::Language::Rust,
+                content_hash: hash.clone(),
+            }],
+            false,
+        )
+        .unwrap();
+        drop(db);
+
+        assert!(indexed_hashes_are_fresh(&config, "foo.rs", &hash, false));
+        assert!(!indexed_hashes_are_fresh(&config, "foo.rs", &hash, true));
     }
 
     #[test]

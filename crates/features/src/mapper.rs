@@ -67,6 +67,10 @@ pub fn map_features(
     const MAPPER_WALK_CAP: usize = 50_000;
     let all_files = walk_files(root, root, MAPPER_WALK_CAP, ctx.excludes);
     let walk_truncated = all_files.len() >= MAPPER_WALK_CAP;
+    // Framework route edges are derived from the filesystem before opening the
+    // write transaction, then persisted atomically with feature rows below.
+    let route_refs = laravel_route_handler_refs(root)?;
+    let mut removed = 0usize;
     db.execute_batch(|db| {
         for seed in &seeds {
             if !ctx.allowed(&seed.entry_path) {
@@ -86,15 +90,12 @@ pub fn map_features(
                 created += 1;
             }
         }
-        Ok(())
-    })?;
-    // Framework route edges: synthesize `RouteHandler` references so
-    // `impact_analysis` / `find_references` traverse Laravel routing.
-    // Re-derived every run and rewritten wholesale (delete-of-kind then
-    // insert) so edges from removed routes don't linger. Non-Laravel repos
-    // produce an empty set; the delete then just clears any prior edges.
-    let route_refs = laravel_route_handler_refs(root)?;
-    db.execute_batch(|db| {
+
+        // Framework route edges: synthesize `RouteHandler` references so
+        // `impact_analysis` / `find_references` traverse Laravel routing.
+        // Re-derived every run and rewritten wholesale (delete-of-kind then
+        // insert) so edges from removed routes don't linger. Non-Laravel repos
+        // produce an empty set; the delete then just clears any prior edges.
         db.delete_references_of_kind(ReferenceKind::RouteHandler)?;
         let mut by_file: BTreeMap<&str, Vec<Reference>> = BTreeMap::new();
         for r in &route_refs {
@@ -108,17 +109,16 @@ pub fn map_features(
                 db.insert_references(file_id, &refs)?;
             }
         }
+
+        if any_mapper_errored {
+            tracing::warn!(
+                "one or more mappers errored — skipping stale-feature GC to avoid deleting valid rows from an incomplete pass"
+            );
+        } else {
+            removed = db.remove_features_not_in(&keep_ids)?;
+        }
         Ok(())
     })?;
-
-    let removed = if any_mapper_errored {
-        tracing::warn!(
-            "one or more mappers errored — skipping stale-feature GC to avoid deleting valid rows from an incomplete pass"
-        );
-        0
-    } else {
-        db.remove_features_not_in(&keep_ids)?
-    };
     Ok(FeatureMapStats {
         created,
         updated,

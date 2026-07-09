@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS symbol_fingerprints (
 );
 
 CREATE INDEX IF NOT EXISTS idx_symfp_file ON symbol_fingerprints(file_id);
+CREATE INDEX IF NOT EXISTS idx_symfp_name ON symbol_fingerprints(name);
 
 CREATE TABLE IF NOT EXISTS refs (
     id INTEGER PRIMARY KEY,
@@ -197,6 +198,15 @@ pub fn fts_schema(table_name: &str) -> String {
          start_line UNINDEXED, \
          end_line UNINDEXED, \
          tokenize = \"unicode61 remove_diacritics 1 tokenchars '_'\");"
+    )
+}
+
+pub fn fts_vocab_schema(fts_table_name: &str) -> String {
+    let vocab_table = format!("{fts_table_name}_vocab");
+    format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS \"{}\" USING fts5vocab(\"{}\", row);",
+        quote_ident(&vocab_table),
+        quote_ident(fts_table_name)
     )
 }
 
@@ -401,7 +411,10 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
             let _ = conn.execute_batch("ROLLBACK");
             return Err(e);
         }
-        conn.execute_batch("COMMIT")?;
+        if let Err(e) = conn.execute_batch("COMMIT") {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
     }
     check_unknown_migrations(conn)?;
     Ok(())
@@ -546,7 +559,8 @@ fn migrate_0012_symbol_fingerprints(conn: &Connection) -> rusqlite::Result<()> {
              leaf_count INTEGER NOT NULL,
              fp BLOB NOT NULL CHECK (length(fp) = 512)
          );
-         CREATE INDEX IF NOT EXISTS idx_symfp_file ON symbol_fingerprints(file_id);",
+         CREATE INDEX IF NOT EXISTS idx_symfp_file ON symbol_fingerprints(file_id);
+         CREATE INDEX IF NOT EXISTS idx_symfp_name ON symbol_fingerprints(name);",
     )?;
     Ok(())
 }
@@ -747,6 +761,7 @@ pub fn ensure_chunk_table(conn: &Connection, table_name: &str, dim: usize) -> ru
     conn.execute_batch(&semantic_schema(table_name, dim))?;
     let fts = fts_table_name(table_name);
     conn.execute_batch(&fts_schema(&fts))?;
+    conn.execute_batch(&fts_vocab_schema(&fts))?;
     repair_fts_sidecar(conn, table_name, &fts)?;
     Ok(())
 }
