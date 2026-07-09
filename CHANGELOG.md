@@ -21,16 +21,11 @@
 - `list_dependencies` reports `found: false` with a note for paths absent from the structural index.
 - `find_similar` MCP params accept `min_jaccard` as a JSON string number, rejecting non-finite values (`nan`/`inf`) that would silently zero results.
 - `assess_risk_diff`, `assess_risk_batch`, and `recommend_tests` MCP calls reject empty `file_paths` instead of returning successful empty payloads.
-- `token_doc_frequency` no longer creates an FTS vocab table on the query path when the sidecar is missing.
-- Feature mapping persists feature rows, Laravel route-handler refs, and stale-feature cleanup in one transaction.
+- `search` no longer creates a table on the query path when the BM25 FTS sidecar is missing, so it works against a read-only index.
 - `impact_analysis` deduplicates traversal by file, qualified name, and line instead of qualified name alone.
-- `search` filters BM25-fused rows by every requested language before scoring and reranking.
-- `search` applies `paths` filters after bounded KNN retrieval instead of running L2 distance over every matching chunk.
-- `find_similar` resolves target fingerprints before loading same-language candidates, avoiding full fingerprint loads for unknown symbols.
-- `assess_risk` uses a bounded target-file import walk for single-file cycle membership instead of running whole-graph SCC detection.
-- Structural indexing writes parsed files in batches instead of buffering the entire changed set before one transaction.
-- Feature upserts replace feature rows, file refs, and trust-boundary refs atomically.
-- Vec table drops and schema migration commits roll back cleanly on failure.
+- `search` applies every requested language filter to BM25-fused rows.
+- Feature mapping and upserts no longer leave partial feature, route-handler, or trust-boundary state when a run fails mid-pass.
+- A failed vec-table drop or schema migration rolls back cleanly instead of leaving a half-migrated database.
 
 ### Security
 - `.codesage` directories and `index.db` sidecars are created with private Unix permissions; MCP stale-file checks refuse indexed paths that escape the project root.
