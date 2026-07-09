@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.15.0] - 2026-07-09
+
 ### Added
 - `/codesage-review` gains `--deep` (multi-lens reviewers on high-risk slices), `--no-verify`, `--model`, and `--verify-model`; new findings pass an adversarial verification stage (new `codesage-finding-verifier` agent) by default.
 - `CODESAGE_HF_DOWNLOAD_TIMEOUT_SECS` bounds Hugging Face artifact downloads during model load.
@@ -597,5 +599,7 @@ Initial public release.
 
 [0.13.0]: https://github.com/iliaal/codesage/releases/tag/v0.13.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.14.0...HEAD
 [0.14.0]: https://github.com/iliaal/codesage/releases/tag/v0.14.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/iliaal/codesage/releases/tag/v0.15.0
