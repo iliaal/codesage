@@ -14,10 +14,10 @@
 - `find-symbol --kind` and `find-references --kind` reject unknown values instead of running unfiltered.
 
 ### Fixed
-- The filesystem watcher retries failed structural/semantic reindexes and removals, removes stale rows for empty files, and no longer deletes semantic chunks before a replacement embedding succeeds.
+- The filesystem watcher retries structural/semantic reindexes and removals on a transient busy/locked database instead of dropping the edit, gives up on removals after repeated hard failures so it can still idle out, removes stale rows for empty files, and no longer deletes semantic chunks before a replacement embedding succeeds.
 - `review_rehearsal` includes high-risk files preserved inside `assess_risk_diff.clustered_directories[].top_files`.
 - `list_dependencies` reports `found: false` with a note for paths absent from the structural index.
-- `find_similar` MCP params accept `min_jaccard` as a JSON string number.
+- `find_similar` MCP params accept `min_jaccard` as a JSON string number, rejecting non-finite values (`nan`/`inf`) that would silently zero results.
 - `assess_risk_diff`, `assess_risk_batch`, and `recommend_tests` MCP calls reject empty `file_paths` instead of returning successful empty payloads.
 - `token_doc_frequency` no longer creates an FTS vocab table on the query path when the sidecar is missing.
 - Feature mapping persists feature rows, Laravel route-handler refs, and stale-feature cleanup in one transaction.

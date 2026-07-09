@@ -54,19 +54,31 @@ where
         S(String),
     }
 
+    // NaN/inf make every `value >= min_jaccard` comparison false, so a
+    // non-finite threshold silently returns zero results instead of erroring.
+    // `f32::parse` accepts "nan"/"inf", so reject non-finite on both paths.
+    fn finite<E: serde::de::Error>(n: f32) -> std::result::Result<f32, E> {
+        if n.is_finite() {
+            Ok(n)
+        } else {
+            Err(E::custom(format!("expected a finite number, got {n}")))
+        }
+    }
+
     match Option::<F32OrString>::deserialize(d)? {
         None => Ok(None),
-        Some(F32OrString::F(n)) => Ok(Some(n)),
+        Some(F32OrString::F(n)) => finite(n).map(Some),
         Some(F32OrString::S(s)) => {
             let trimmed = s.trim();
             if trimmed.is_empty() {
                 return Ok(None);
             }
-            trimmed.parse::<f32>().map(Some).map_err(|e| {
+            let n = trimmed.parse::<f32>().map_err(|e| {
                 serde::de::Error::custom(format!(
                     "expected number or number-as-string, got {s:?}: {e}"
                 ))
-            })
+            })?;
+            finite(n).map(Some)
         }
     }
 }
@@ -418,6 +430,21 @@ mod tests {
             msg.contains("close"),
             "error must quote offending value, got: {msg}"
         );
+    }
+
+    #[test]
+    fn find_similar_params_reject_non_finite_min_jaccard() {
+        for bad in ["nan", "inf", "-inf", "infinity"] {
+            let r: Result<FindSimilarParams, _> = serde_json::from_value(json!({
+                "project": "/p",
+                "name": "clone_me",
+                "min_jaccard": bad,
+            }));
+            assert!(
+                r.is_err(),
+                "non-finite threshold {bad:?} must error (NaN/inf silently zeroes results)"
+            );
+        }
     }
 
     #[test]

@@ -25,6 +25,12 @@ const BATCH_THRESHOLD: usize = 10;
 const BATCH_WINDOW: Duration = Duration::from_secs(3);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_IDLE_SECS: u64 = 1800;
+/// Give up on a set of removals after this many consecutive hard failures.
+/// A persistent failure (disk full, EACCES, corrupt table) will never clear,
+/// and retaining the paths keeps the loop reporting activity — which would
+/// pin the pooled embedder and its VRAM against the idle timeout forever.
+/// Transient lock contention (`Skipped`) does not count toward this ceiling.
+const MAX_REMOVAL_FAILURES: u32 = 10;
 
 /// Lazily yields the embedder the watcher should use for semantic reindex.
 /// In the daemon this hands back the pooled `Arc<Mutex<Embedder>>` shared with
@@ -142,6 +148,7 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
     let mut recheck_queue: HashSet<PathBuf> = HashSet::new();
     let mut bulk_retry_at: Option<Instant> = None;
     let mut removal_retry_at: Option<Instant> = None;
+    let mut removal_fail_count: u32 = 0;
     let mut last_activity = Instant::now();
 
     tracing::info!(
@@ -257,19 +264,16 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
         // session, so keep the paths queued and retry a debounce later.
         if removed_paths.is_empty() {
             removal_retry_at = None;
+            removal_fail_count = 0;
         } else if removal_retry_at.is_none_or(|at| Instant::now() >= at) {
-            match handle_removals(&config, &removed_paths) {
-                WorkOutcome::Skipped => {
-                    removal_retry_at = Some(Instant::now() + debounce);
-                }
-                WorkOutcome::Done => {
-                    removed_paths.clear();
-                    removal_retry_at = None;
-                }
-                WorkOutcome::Failed => {
-                    removal_retry_at = Some(Instant::now() + debounce);
-                }
-            }
+            let outcome = handle_removals(&config, &removed_paths);
+            removal_retry_at = apply_removal_outcome(
+                outcome,
+                &mut removed_paths,
+                &mut removal_fail_count,
+                Instant::now(),
+                debounce,
+            );
         }
 
         drain_pending(
@@ -518,6 +522,10 @@ fn reindex_one(
                         );
                     }
                 }
+                Err(e) if is_retryable_db_error(&e) => {
+                    tracing::debug!(path = %rel_str, error = %e, "structural reindex deferred: database busy, will retry");
+                    return WorkOutcome::Skipped;
+                }
                 Err(e) => {
                     tracing::warn!(path = %rel_str, error = %e, "structural reindex failed");
                     return WorkOutcome::Failed;
@@ -558,6 +566,10 @@ fn reindex_one(
                         "semantic reindex"
                     );
                 }
+            }
+            Err(e) if is_retryable_db_error(&e) => {
+                tracing::debug!(path = %rel_str, error = %e, "semantic reindex deferred: database busy, will retry");
+                return WorkOutcome::Skipped;
             }
             Err(e) => {
                 tracing::warn!(path = %rel_str, error = %e, "semantic reindex failed");
@@ -725,6 +737,46 @@ fn apply_bulk_outcome(
             Some(now + debounce)
         }
         WorkOutcome::Failed => None,
+    }
+}
+
+/// Apply a removal pass outcome to the accumulated removal state, returning
+/// when (if at all) the removal should be retried. `Done` clears the paths and
+/// resets the failure counter. `Skipped` (transient lock contention) keeps the
+/// paths and reschedules without counting toward the give-up ceiling. `Failed`
+/// counts toward the ceiling; after `MAX_REMOVAL_FAILURES` consecutive hard
+/// failures it gives up — clearing the paths so the loop stops reporting
+/// activity and the watcher can idle out instead of pinning the pooled model.
+fn apply_removal_outcome(
+    outcome: WorkOutcome,
+    removed_paths: &mut Vec<String>,
+    fail_count: &mut u32,
+    now: Instant,
+    debounce: Duration,
+) -> Option<Instant> {
+    match outcome {
+        WorkOutcome::Done => {
+            removed_paths.clear();
+            *fail_count = 0;
+            None
+        }
+        WorkOutcome::Skipped => Some(now + debounce),
+        WorkOutcome::Failed => {
+            *fail_count += 1;
+            if *fail_count >= MAX_REMOVAL_FAILURES {
+                tracing::error!(
+                    failures = *fail_count,
+                    paths = ?removed_paths,
+                    "giving up on index removals after repeated hard failures; \
+                     index may retain stale rows until the next full reindex"
+                );
+                removed_paths.clear();
+                *fail_count = 0;
+                None
+            } else {
+                Some(now + debounce)
+            }
+        }
     }
 }
 
@@ -1121,6 +1173,66 @@ mod tests {
         assert_eq!(retry, None);
         assert_eq!(compute_ready(&pending, now, debounce).len(), 1);
         assert_eq!(removed.len(), 1);
+    }
+
+    #[test]
+    fn apply_removal_outcome_skipped_retains_without_counting_failures() {
+        let debounce = Duration::from_millis(500);
+        let now = Instant::now();
+        let mut removed = vec!["gone.rs".to_string()];
+        let mut fails = 0;
+
+        let retry = apply_removal_outcome(
+            WorkOutcome::Skipped,
+            &mut removed,
+            &mut fails,
+            now,
+            debounce,
+        );
+
+        assert_eq!(retry, Some(now + debounce));
+        assert_eq!(removed, vec!["gone.rs".to_string()]);
+        // Lock contention is not a hard failure — the give-up ceiling stays put.
+        assert_eq!(fails, 0);
+    }
+
+    #[test]
+    fn apply_removal_outcome_gives_up_after_ceiling() {
+        let debounce = Duration::from_millis(500);
+        let now = Instant::now();
+        let mut removed = vec!["gone.rs".to_string()];
+        let mut fails = 0;
+
+        // Every hard failure short of the ceiling retains the paths and reschedules.
+        for _ in 0..(MAX_REMOVAL_FAILURES - 1) {
+            let retry =
+                apply_removal_outcome(WorkOutcome::Failed, &mut removed, &mut fails, now, debounce);
+            assert_eq!(retry, Some(now + debounce));
+            assert_eq!(removed.len(), 1);
+        }
+
+        // The ceiling hit: give up, drop the paths so the loop stops reporting
+        // activity and the watcher can idle out instead of pinning the model.
+        let retry =
+            apply_removal_outcome(WorkOutcome::Failed, &mut removed, &mut fails, now, debounce);
+        assert_eq!(retry, None);
+        assert!(removed.is_empty());
+        assert_eq!(fails, 0);
+    }
+
+    #[test]
+    fn apply_removal_outcome_done_resets_failure_streak() {
+        let debounce = Duration::from_millis(500);
+        let now = Instant::now();
+        let mut removed = vec!["gone.rs".to_string()];
+        let mut fails = 3;
+
+        let retry =
+            apply_removal_outcome(WorkOutcome::Done, &mut removed, &mut fails, now, debounce);
+
+        assert_eq!(retry, None);
+        assert!(removed.is_empty());
+        assert_eq!(fails, 0);
     }
 
     #[test]
