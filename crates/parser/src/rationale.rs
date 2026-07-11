@@ -13,11 +13,14 @@
 //!    parent of the path") are not stored — the agent recovers those from
 //!    the symbol name + signature anyway. See `notes/20260509-...md` §1.2
 //!    for the full reasoning.
-//! 2. **Language-specific by design.** This module currently covers Rust and
-//!    Python. Each language needs a deliberate attachment rule because comment
-//!    placement varies (Rust `///` precedes the item, Python docstrings
-//!    live inside the body as the first `(string)` statement, PHP `/** */`
-//!    blocks immediately precede, etc.).
+//! 2. **Language-specific by design.** This module covers Rust and Python with
+//!    dedicated walks, and C / C++ / Go / PHP through a shared C-family walk
+//!    (`extract_clike_rationale`). Each family needs a deliberate attachment
+//!    rule because comment placement varies (Rust `///` precedes the item,
+//!    Python docstrings live inside the body as the first `(string)` statement,
+//!    PHP `/** */` docblocks immediately precede — with the marker often on an
+//!    interior `*` line — and PHP 8 `#[...]` attributes sit between the docblock
+//!    and the definition).
 
 use codesage_protocol::{RationaleEntry, RationaleKind};
 use tree_sitter::Node;
@@ -167,6 +170,94 @@ fn walk_python_prev_comments(
         }
     }
     true
+}
+
+/// Rationale walk for C-family grammars plus Go and PHP — all of which use a
+/// single `comment` node kind with C-style (`//`, `/* */`, `/** */`) and, for
+/// PHP, `#` line delimiters. Mirrors [`extract_rust_rationale`]'s adjacency walk
+/// over previous siblings. PHP 8 attribute lists (`#[Route(...)]`) are skipped
+/// the way Rust attributes are, so a docblock above the attribute stack still
+/// attaches.
+///
+/// Unlike the Rust path, a single block comment is scanned line-by-line for the
+/// first marker, so a `/**\n * WHY: ...\n */` docblock — the dominant PHP shape —
+/// attaches even though the marker isn't on the opening `/**` line.
+pub fn extract_clike_rationale(def_node: &Node, source: &[u8]) -> Vec<RationaleEntry> {
+    let mut entries = Vec::new();
+    let mut next_start_row = def_node.start_position().row;
+    let mut sib = def_node.prev_sibling();
+    while let Some(node) = sib {
+        match node.kind() {
+            "comment" => {
+                // Adjacency guard, identical to the Rust walk: the comment must
+                // sit on the row immediately above the last node we accepted. A
+                // blank-line gap detaches it. Some grammars park the trailing
+                // newline inside a line comment (end column 0 on the next row),
+                // so treat that row as one past the last content row.
+                let end = node.end_position();
+                let last_content_row = if end.column == 0 && end.row > node.start_position().row {
+                    end.row - 1
+                } else {
+                    end.row
+                };
+                if last_content_row + 1 != next_start_row {
+                    break;
+                }
+                if let Ok(text) = node.utf8_text(source)
+                    && let Some(parsed) = parse_clike_comment(text, &node)
+                {
+                    entries.push(parsed);
+                }
+                next_start_row = node.start_position().row;
+            }
+            // PHP 8 attributes sit between the docblock and the item; skip them
+            // but advance the anchor so a docblock above the attribute stack
+            // still counts as adjacent.
+            "attribute_list" => {
+                next_start_row = node.start_position().row;
+            }
+            _ => break,
+        }
+        sib = node.prev_sibling();
+    }
+    // Walked in reverse source order; restore file order for consumers.
+    entries.reverse();
+    entries
+}
+
+/// Parse one C-family / PHP comment node into at most one rationale entry. The
+/// delimiters are stripped, then each interior line (with a leading docblock
+/// `*` removed) is scanned for the first `MARKER: text` — so both a single-line
+/// `// WHY: ...` and a multi-line `/** ... * WHY: ... */` docblock resolve.
+fn parse_clike_comment(raw: &str, node: &Node) -> Option<RationaleEntry> {
+    let body = strip_clike_comment_markers(raw);
+    for line in body.lines() {
+        let line = line.trim_start();
+        let line = line.strip_prefix('*').map(str::trim_start).unwrap_or(line);
+        if let Some((kind, text)) = parse_marker(line) {
+            return Some(RationaleEntry {
+                kind,
+                text,
+                line_start: node.start_position().row as u32 + 1,
+                line_end: node.end_position().row as u32 + 1,
+            });
+        }
+    }
+    None
+}
+
+/// Strip C-family / PHP comment delimiters: PHP `#` line comments, plus
+/// everything [`strip_rust_comment_markers`] handles (`//`, `///`, `//!`,
+/// `/* */`, `/** */`, `/*! */`). A block comment's interior newlines are kept so
+/// the caller can scan each docblock line for a marker.
+fn strip_clike_comment_markers(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix('#') {
+        // PHP `#` line comment. `#[...]` attributes never reach here — the
+        // grammar emits them as `attribute_list`, not `comment`.
+        return rest.trim_start().to_string();
+    }
+    strip_rust_comment_markers(trimmed)
 }
 
 /// Strip Rust comment delimiters and any leading `!` (inner doc) so the
@@ -478,5 +569,98 @@ fn beta() {}
         let beta = symbols.iter().find(|s| s.name == "beta").unwrap();
         assert_eq!(alpha.rationale.len(), 1);
         assert!(beta.rationale.is_empty());
+    }
+
+    // C-family / Go / PHP rationale (extract_clike_rationale)
+
+    fn extract_lang(
+        src: &str,
+        lang: codesage_protocol::Language,
+        path: &str,
+    ) -> Vec<codesage_protocol::Symbol> {
+        let tree = crate::parse::parse_file(src.as_bytes(), lang).expect("parse");
+        crate::extract::extract_symbols(&tree, src.as_bytes(), lang, path).expect("extract")
+    }
+
+    #[test]
+    fn strip_clike_markers() {
+        assert_eq!(strip_clike_comment_markers("# WHY: x"), "WHY: x");
+        assert_eq!(strip_clike_comment_markers("// note"), "note");
+        assert_eq!(strip_clike_comment_markers("/** WHY: y */"), "WHY: y");
+    }
+
+    #[test]
+    fn extracts_c_line_comment_rationale() {
+        let src = "// WHY: guards against a null deref.\nint foo(int x) { return x; }\n";
+        let syms = extract_lang(src, codesage_protocol::Language::C, "s.c");
+        let foo = syms.iter().find(|s| s.name == "foo").expect("foo symbol");
+        assert_eq!(foo.rationale.len(), 1);
+        assert_eq!(foo.rationale[0].kind, RationaleKind::Why);
+        assert!(foo.rationale[0].text.contains("null deref"));
+    }
+
+    #[test]
+    fn extracts_cpp_line_comment_rationale() {
+        let src = "// IMPORTANT: not thread-safe.\nvoid run() {}\n";
+        let syms = extract_lang(src, codesage_protocol::Language::Cpp, "s.cpp");
+        let run = syms.iter().find(|s| s.name == "run").expect("run symbol");
+        assert_eq!(run.rationale.len(), 1);
+        assert_eq!(run.rationale[0].kind, RationaleKind::Important);
+    }
+
+    #[test]
+    fn extracts_go_line_comment_rationale() {
+        let src = "package main\n// FIXME: retries are not idempotent yet.\nfunc Foo() {}\n";
+        let syms = extract_lang(src, codesage_protocol::Language::Go, "s.go");
+        let foo = syms.iter().find(|s| s.name == "Foo").expect("Foo symbol");
+        assert_eq!(foo.rationale.len(), 1);
+        assert_eq!(foo.rationale[0].kind, RationaleKind::Fixme);
+    }
+
+    #[test]
+    fn extracts_php_docblock_rationale() {
+        let src = "<?php\n/**\n * WHY: cached because the upstream API is rate-limited.\n */\nfunction load() {}\n";
+        let syms = extract_lang(src, codesage_protocol::Language::Php, "s.php");
+        let load = syms.iter().find(|s| s.name == "load").expect("load symbol");
+        assert_eq!(load.rationale.len(), 1);
+        assert_eq!(load.rationale[0].kind, RationaleKind::Why);
+        assert!(load.rationale[0].text.contains("rate-limited"));
+    }
+
+    #[test]
+    fn extracts_php_hash_comment_rationale() {
+        let src = "<?php\n# HACK: works around a driver bug.\nfunction q() {}\n";
+        let syms = extract_lang(src, codesage_protocol::Language::Php, "s.php");
+        let q = syms.iter().find(|s| s.name == "q").expect("q symbol");
+        assert_eq!(q.rationale.len(), 1);
+        assert_eq!(q.rationale[0].kind, RationaleKind::Hack);
+    }
+
+    #[test]
+    fn php_rationale_survives_attribute_between_docblock_and_fn() {
+        let src = "<?php\n/** WHY: the sole registration entrypoint. */\n#[Route(\"/x\")]\nfunction handler() {}\n";
+        let syms = extract_lang(src, codesage_protocol::Language::Php, "s.php");
+        let handler = syms
+            .iter()
+            .find(|s| s.name == "handler")
+            .expect("handler symbol");
+        assert_eq!(handler.rationale.len(), 1);
+        assert_eq!(handler.rationale[0].kind, RationaleKind::Why);
+    }
+
+    #[test]
+    fn clike_plain_docblock_without_marker_does_not_attach() {
+        let src = "<?php\n/**\n * Returns the parsed config. Just describes behaviour.\n */\nfunction cfg() {}\n";
+        let syms = extract_lang(src, codesage_protocol::Language::Php, "s.php");
+        let cfg = syms.iter().find(|s| s.name == "cfg").expect("cfg symbol");
+        assert!(cfg.rationale.is_empty());
+    }
+
+    #[test]
+    fn clike_blank_line_gapped_comment_does_not_attach() {
+        let src = "package main\n// NOTE: file-level note, not about Bar.\n\nfunc Bar() {}\n";
+        let syms = extract_lang(src, codesage_protocol::Language::Go, "s.go");
+        let bar = syms.iter().find(|s| s.name == "Bar").expect("Bar symbol");
+        assert!(bar.rationale.is_empty());
     }
 }

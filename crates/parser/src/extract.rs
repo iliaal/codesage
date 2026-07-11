@@ -348,6 +348,9 @@ pub fn extract_symbols(
         let rationale = match language {
             Language::Rust => crate::rationale::extract_rust_rationale(&def_node, source),
             Language::Python => crate::rationale::extract_python_rationale(&def_node, source),
+            Language::C | Language::Cpp | Language::Go | Language::Php => {
+                crate::rationale::extract_clike_rationale(&def_node, source)
+            }
             _ => Vec::new(),
         };
 

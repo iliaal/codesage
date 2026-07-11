@@ -1,5 +1,8 @@
 ## [Unreleased]
 
+### Changed
+- Rationale-comment extraction (`WHY:` / `NOTE:` / `IMPORTANT:` / `TODO` markers surfaced on `find_symbol` / `export_context`) now covers C, C++, Go, and PHP in addition to Rust and Python; PHP `/** */` docblocks (marker on an interior line), `#` line comments, and `#[...]` attributes between docblock and definition are handled.
+
 ## [0.15.0] - 2026-07-09
 
 ### Added
