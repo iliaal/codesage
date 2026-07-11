@@ -1,0 +1,656 @@
+#!/usr/bin/env python3
+"""
+Agent-task A/B runner for recommendations doc §2.14(2).
+
+CodeSage's other benches measure *retrieval* (recall@k, NDCG, miss-rate) or
+*tool-selection* (does the agent pick CodeSage over Grep). Both are one step
+removed from the question a user actually asks: **does installing CodeSage make
+the agent cheaper / faster / leaner on a real task?**
+
+This runner answers that directly, mirroring codegraph's agent-eval protocol
+(`~/ai/codesage_ref/codegraph/scripts/agent-eval`):
+
+  - Run `claude -p` headless on the same task, twice:
+      WITH   = only the CodeSage MCP server is offered (hermetic --mcp-config)
+      WITHOUT = empty MCP config (--strict-mcp-config, no servers)
+  - N runs per arm (median-of-N; single runs are too noisy to trust).
+  - Per task, compare median cost / tokens / wall-clock / tool-calls and report
+    the WITH→WITHOUT delta as a savings %.
+
+Honesty rails (carried from the sweep notes and codegraph's own caveats):
+  * The agent arm's model + effort are PINNED (default sonnet / high) so runs are
+    comparable and the confound of a varying model is removed. Quoting any number
+    must name the model: a stronger base model greps/reads more efficiently, so
+    the WITHOUT arm gets leaner and CodeSage's marginal delta SHRINKS. The delta
+    is model-relative, not absolute.
+  * Evals must run NON-NESTED. A CodeSage MCP measured from inside another agent
+    session pays attach latency that contaminates the timing. This script refuses
+    to run inside a Claude Code session unless --allow-nested is passed (and then
+    stamps the output as contaminated).
+  * Cold-start races (the WITH arm's MCP server not registering before the first
+    tool call -> "No such tool available") are detected and EXCLUDED from
+    aggregates by default; --include-raced overrides. Silent inclusion would
+    understate CodeSage's value.
+
+Both arms gate tools through the permission system (NO --dangerously-skip-
+permissions / bypassPermissions): a tool that isn't allow-listed and has no TTY
+to prompt on is denied. That is what keeps the WITHOUT arm from shelling out to
+the `codesage` CLI via Bash (a confound), and what makes "WITH = codesage
+offered, WITHOUT = not" a real contrast rather than a no-op.
+
+Corpus YAML is the same schema the retrieval benches use:
+
+    project_root: /abs/path/to/repo
+    cases:
+      - id: some-task
+        query: "commit-message-style description of a change"
+        expected_files: [relative/path.py]
+
+Usage:
+  bench/agent-task-runner <corpus.yaml> [--runs 4] [--limit 5] \
+      [--model sonnet] [--effort high] [--max-turns 12] [--timeout-s 240] \
+      [--codesage-bin /abs/codesage] [--output-dir bench/history] \
+      [--allow-nested] [--include-raced] [--max-budget-usd 2.0]
+
+Stdlib + pyyaml. Needs `claude` on PATH (uses its existing auth) and a built
+`codesage` binary. Budget: ~2 * runs * limit `claude -p` sessions; at ~$0.20-0.30
+each this adds up — start with --runs 2 --limit 2 to smoke the wiring.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import os
+import shutil
+import statistics
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+try:
+    import yaml
+except ImportError:
+    sys.exit("pyyaml required: pip install pyyaml")
+
+
+# Base retrieval tools available in BOTH arms — the grep+read baseline CodeSage
+# is measured against. Bash/Edit/Write are deliberately absent: Bash would let
+# the agent shell out to the `codesage` CLI (a confound in the WITHOUT arm) or
+# mutate the benched repo.
+BASE_TOOLS = ["Grep", "Read", "Glob"]
+DISALLOWED_TOOLS = ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch"]
+
+# Wildcard grant enables every tool the CodeSage MCP server exposes. The bare
+# server name (`mcp__codesage`) is also valid per the docs, but the explicit
+# wildcard is the documented form and — under CLI 2.1.x's `--allowedTools` +
+# `--mcp-config` interaction — dodges a regression where the bare grant coincided
+# with a built-in (`Grep`) reporting "not enabled in this context". Confirm with
+# bench/probe-claude-tools.sh before a full run.
+CODESAGE_MCP_GRANT = "mcp__codesage__*"
+CODESAGE_TOOL_PREFIX = "mcp__codesage__"
+
+# Substrings meaning the WITH arm's CodeSage MCP wasn't available when the agent
+# reached for it — a measurement artifact, not a result. Scoped to codesage
+# specifically: a *generic* "No such tool available" / "tool not found" also
+# fires when the agent tries a DISALLOWED tool (e.g. Bash on a grep-hostile task)
+# or hallucinates a non-codesage tool name. Those are valid runs — the agent
+# falls back to Grep/Read — not codesage cold-starts, and must NOT be discarded.
+# Under-matching here is safe: a genuinely-raced run has cs=0 and is caught by
+# the cs-usage validity gate; over-matching silently throws away good data.
+RACE_MARKERS = (
+    "No such tool available: mcp__codesage",
+    "tool not found: mcp__codesage",
+    'MCP server "codesage" failed',
+)
+
+
+def positive_int(value: str) -> int:
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return n
+
+
+def _is_claude_env_key(k: str) -> bool:
+    return k == "CLAUDECODE" or k.startswith("CLAUDE_CODE") or k.startswith("CLAUDE_PLUGIN")
+
+
+def running_inside_claude_code() -> bool:
+    """Detect a nested invocation. Claude Code sets a family of CLAUDE_CODE_* /
+    CLAUDECODE / CLAUDE_PLUGIN_* vars; check the whole family, not a hand-picked
+    three (the original missed CLAUDE_CODE_CHILD_SESSION / _SESSION_ID, which let
+    a nested run slip through and spawn `claude -p` with the wrong tool set)."""
+    return any(_is_claude_env_key(k) for k in os.environ)
+
+
+def clean_child_env() -> dict:
+    """os.environ minus Claude Code session markers, so a spawned `claude -p`
+    starts as a fresh top-level session with the standard file tools rather than
+    a restricted nested-agent tool set (Task/SendMessage/Workflow…). NOTE: this
+    scrubs env-var *inheritance* but cannot escape a *live* parent coordinator —
+    the CLI detects an active parent by more than env vars — so for a clean run,
+    also launch from a terminal that Claude Code did not spawn."""
+    return {k: v for k, v in os.environ.items() if not _is_claude_env_key(k)}
+
+
+def resolve_codesage_bin(explicit: str | None) -> str:
+    """Absolute path to the codesage binary for the WITH arm's MCP config."""
+    if explicit:
+        p = Path(explicit).expanduser()
+        if not p.exists():
+            sys.exit(f"--codesage-bin: {p} does not exist")
+        return str(p.resolve())
+    env = os.environ.get("CODESAGE_BIN")
+    if env and Path(env).exists():
+        return str(Path(env).resolve())
+    found = shutil.which("codesage")
+    if found:
+        return str(Path(found).resolve())
+    sys.exit(
+        "codesage binary not found — pass --codesage-bin, set CODESAGE_BIN, or "
+        "put `codesage` on PATH (e.g. cargo build --release && ln -s ...)."
+    )
+
+
+def mcp_config_with(codesage_bin: str, project_root: Path) -> str:
+    """Hermetic single-server config for the WITH arm.
+
+    Pins the server to an explicit binary + project root so the bench doesn't
+    depend on whatever `codesage` is globally registered in the user's Claude
+    settings — the bench controls exactly which MCP is present.
+    """
+    return json.dumps(
+        {
+            "mcpServers": {
+                "codesage": {
+                    "command": codesage_bin,
+                    "args": ["mcp", "--project", str(project_root)],
+                }
+            }
+        }
+    )
+
+
+def build_command(
+    prompt: str,
+    *,
+    with_codesage: bool,
+    mcp_config: str,
+    model: str,
+    effort: str,
+    max_turns: int,
+    max_budget_usd: float,
+) -> list[str]:
+    """`claude -p` argv for one run. Both arms pass --strict-mcp-config so the
+    ONLY MCP servers in play are the ones this script chose: codesage (WITH) or
+    none (WITHOUT). Runs are ISOLATED from the operator's environment: `--bare`
+    skips auto-discovered hooks/LSP/plugins and `--permission-mode default` pins
+    an explicit gate — without these, `--setting-sources user` pulled in the
+    operator's personal settings (e.g. a `bypassPermissions` default + RTK-style
+    PreToolUse hooks), contaminating the measurement and defeating the tool gate.
+    Tools gate through the allow/disallow lists in `default` mode: listed tools
+    run, unlisted ones would prompt and are denied (no TTY headless)."""
+    tools = list(BASE_TOOLS)
+    if with_codesage:
+        tools.append(CODESAGE_MCP_GRANT)
+    return [
+        "claude", "-p", prompt,
+        # NOT --bare: it strips the built-in Grep/Read/Glob (leaves only the
+        # agent-orchestration primitives) — confirmed via bench/probe-claude-tools.py.
+        # --permission-mode default overrides an operator settings.json that may
+        # set defaultMode:bypassPermissions, restoring the intended allow/disallow
+        # gate without pulling in the operator's hooks the way --setting-sources
+        # user did.
+        "--permission-mode", "default",
+        "--allowedTools", ",".join(tools),
+        "--disallowedTools", ",".join(DISALLOWED_TOOLS),
+        "--output-format", "stream-json",
+        "--verbose",
+        "--model", model,
+        "--effort", effort,
+        "--max-turns", str(max_turns),
+        "--max-budget-usd", str(max_budget_usd),
+        "--strict-mcp-config",
+        "--mcp-config", mcp_config,
+    ]
+
+
+def build_prompt(query: str, *, steer_codesage: bool = False) -> str:
+    """Find-a-file task; the answer (a file path) stays cheaply scorable against
+    expected_files. Default is NEUTRAL ("use whatever tools") — which measures
+    whether the agent picks CodeSage on merit. `steer_codesage` prepends a nudge
+    toward the CodeSage MCP, applied to the WITH arm only, to measure CodeSage AS
+    SHIPPED WITH ITS prompt-override affordance (`/codesage-prompt-override`) —
+    i.e. "if used, is it cheaper?" rather than "is it picked?"."""
+    steer = (
+        "You have a code-intelligence MCP server available (`mcp__codesage__*`): "
+        "semantic `search`, plus `find_symbol` / `find_references` / "
+        "`impact_analysis`. For locating code by intent or meaning it is built for "
+        "exactly this and is usually faster than reading files after a Grep.\n\n"
+        if steer_codesage
+        else ""
+    )
+    return (
+        f"{steer}"
+        "Find the file in this codebase that implements / addresses the "
+        "following change, described in commit-message style:\n\n"
+        f"  {query}\n\n"
+        "Respond with only the relative file path(s), one per line. "
+        "Do not explain. Use whichever tools you think are appropriate."
+    )
+
+
+def run_once(
+    project_root: Path,
+    prompt: str,
+    *,
+    with_codesage: bool,
+    mcp_config: str,
+    model: str,
+    effort: str,
+    max_turns: int,
+    max_budget_usd: float,
+    timeout_s: int,
+) -> dict[str, Any]:
+    """One `claude -p` run; parse stream-json into per-run metrics."""
+    cmd = build_command(
+        prompt,
+        with_codesage=with_codesage,
+        mcp_config=mcp_config,
+        model=model,
+        effort=effort,
+        max_turns=max_turns,
+        max_budget_usd=max_budget_usd,
+    )
+    t0 = time.time()
+    try:
+        r = subprocess.run(
+            cmd, cwd=str(project_root), capture_output=True, text=True, timeout=timeout_s,
+            env=clean_child_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "error": "timeout", "raced": False, "duration_s": float(timeout_s),
+            "tool_calls": 0, "codesage_calls": 0, "grep_calls": 0, "read_calls": 0,
+            "tokens": 0, "cost_usd": 0.0, "result_text": "", "stderr": "",
+        }
+    duration = time.time() - t0
+    return parse_run_output(
+        r.stdout, r.stderr or "", r.returncode, round(duration, 2),
+        with_codesage=with_codesage,
+    )
+
+
+def parse_run_output(
+    stdout: str, stderr: str, returncode: int, duration_s: float, *, with_codesage: bool
+) -> dict[str, Any]:
+    """Turn one run's stream-json stdout into per-run metrics. Pure (no I/O) so
+    the bug-prone parsing — token summation, cost extraction, race detection — is
+    unit-testable against synthetic transcripts."""
+    tool_uses: list[str] = []
+    tokens = 0
+    cost_usd = 0.0
+    result_text = ""
+    is_error = False
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("type") == "assistant":
+            msg = obj.get("message") or {}
+            for c in msg.get("content") or []:
+                if isinstance(c, dict) and c.get("type") == "tool_use":
+                    tool_uses.append(c.get("name") or "")
+            usage = msg.get("usage") or {}
+            tokens += (
+                int(usage.get("input_tokens") or 0)
+                + int(usage.get("output_tokens") or 0)
+                + int(usage.get("cache_read_input_tokens") or 0)
+                + int(usage.get("cache_creation_input_tokens") or 0)
+            )
+        elif obj.get("type") == "result":
+            result_text = (obj.get("result") or "").strip()
+            cost_usd = float(obj.get("total_cost_usd") or 0.0)
+            is_error = bool(obj.get("is_error")) or obj.get("subtype") not in (None, "success")
+
+    blob = stdout + "\n" + stderr
+    raced = with_codesage and any(m in blob for m in RACE_MARKERS)
+    # First line that explains a failure, so raced/errored runs are diagnosable
+    # from the console instead of guessed at (opaque "raced" with no reason is
+    # what made the first grep-hostile run impossible to interpret).
+    diag = ""
+    for _line in blob.splitlines():
+        _low = _line.lower()
+        if (
+            "no such tool" in _low
+            or "tool not found" in _low
+            or "not allowed" in _low
+            or ("mcp" in _low and "fail" in _low)
+        ):
+            diag = _line.strip()[:240]
+            break
+    error = None
+    if returncode != 0:
+        error = f"rc={returncode}"
+    elif is_error:
+        error = "result_error"
+    return {
+        "error": error,
+        "raced": raced,
+        "diag": diag,
+        "duration_s": duration_s,
+        "tool_calls": len(tool_uses),
+        "codesage_calls": sum(1 for t in tool_uses if t.startswith(CODESAGE_TOOL_PREFIX)),
+        "grep_calls": sum(1 for t in tool_uses if t in ("Grep", "Glob")),
+        "read_calls": sum(1 for t in tool_uses if t == "Read"),
+        "tokens": tokens,
+        "cost_usd": cost_usd,
+        "result_text": result_text,
+        "stderr": stderr[-1500:],
+    }
+
+
+def median_of(runs: list[dict[str, Any]], key: str) -> float:
+    vals = [float(r[key]) for r in runs]
+    return float(statistics.median(vals)) if vals else 0.0
+
+
+def saved_pct(with_val: float, without_val: float) -> float | None:
+    """Percent the WITH arm saved vs WITHOUT. None when WITHOUT is ~0 (no base
+    cost to save against — reporting a % would be meaningless / divide-by-zero)."""
+    if without_val <= 0:
+        return None
+    return (1.0 - with_val / without_val) * 100.0
+
+
+def run_arm(
+    case: dict[str, Any],
+    *,
+    with_codesage: bool,
+    mcp_config: str,
+    project_root: Path,
+    runs: int,
+    include_raced: bool,
+    model: str,
+    effort: str,
+    max_turns: int,
+    max_budget_usd: float,
+    timeout_s: int,
+    steer: bool = False,
+) -> dict[str, Any]:
+    """Run one arm N times; drop errored/raced runs; return medians + metadata."""
+    prompt = build_prompt(case["query"], steer_codesage=(steer and with_codesage))
+    arm = "with" if with_codesage else "without"
+    raw: list[dict[str, Any]] = []
+    for i in range(runs):
+        res = run_once(
+            project_root, prompt, with_codesage=with_codesage, mcp_config=mcp_config,
+            model=model, effort=effort, max_turns=max_turns,
+            max_budget_usd=max_budget_usd, timeout_s=timeout_s,
+        )
+        flags = []
+        if res["error"]:
+            flags.append(res["error"])
+        if res["raced"]:
+            flags.append("raced")
+        print(
+            f"  [{arm} {i + 1}/{runs}] cost=${res['cost_usd']:.3f} tok={res['tokens']} "
+            f"tools={res['tool_calls']} cs={res['codesage_calls']} "
+            f"t={res['duration_s']}s {' '.join(flags)}",
+            file=sys.stderr,
+        )
+        if (res["error"] or res["raced"]) and res.get("diag"):
+            print(f"      ↳ {res['diag']}", file=sys.stderr)
+        raw.append(res)
+
+    usable = [
+        r for r in raw
+        if r["error"] is None and (include_raced or not r["raced"])
+    ]
+    return {
+        "arm": arm,
+        "runs_total": len(raw),
+        "runs_used": len(usable),
+        # How many usable WITH runs actually called a CodeSage tool. If this is
+        # ~0 the WITH arm never exercised CodeSage — the A/B has degenerated to
+        # A/A (both arms grep+read) and the deltas are variance, not signal.
+        # NOT excluded like a race: a race is an infra artifact, but the agent
+        # *choosing* grep over CodeSage is a real outcome, and dropping those
+        # runs would flatter CodeSage by only counting favorable ones.
+        "cs_used_runs": sum(1 for r in usable if r["codesage_calls"] >= 1),
+        "raced": sum(1 for r in raw if r["raced"]),
+        "errored": sum(1 for r in raw if r["error"]),
+        "median_cost": median_of(usable, "cost_usd"),
+        "median_tokens": median_of(usable, "tokens"),
+        "median_tools": median_of(usable, "tool_calls"),
+        "median_duration": median_of(usable, "duration_s"),
+        "median_codesage_calls": median_of(usable, "codesage_calls"),
+        "result_texts": [r["result_text"] for r in usable],
+    }
+
+
+def render_scorecard(
+    *,
+    project_root: Path,
+    corpus_name: str,
+    rows: list[dict[str, Any]],
+    run_ts: str,
+    runs: int,
+    model: str,
+    effort: str,
+    nested: bool,
+    include_raced: bool,
+    codesage_version: str,
+    steer: bool = False,
+) -> str:
+    total_with_used = sum(r["with"]["runs_used"] for r in rows)
+    total_with_cs = sum(r["with"].get("cs_used_runs", 0) for r in rows)
+    cs_rate = (total_with_cs / total_with_used) if total_with_used else 0.0
+
+    out: list[str] = []
+    out.append("# Agent-task A/B — WITH vs WITHOUT CodeSage MCP")
+    out.append("")
+    if total_with_used and cs_rate < 0.5:
+        out.append(
+            "> **⚠️ INVALID / UNRELIABLE — the agent barely used CodeSage.** It "
+            f"called a CodeSage tool in only {total_with_cs}/{total_with_used} WITH "
+            f"runs ({cs_rate * 100:.0f}%); with the tools unused, the WITH arm "
+            "degenerates to the same grep+read as WITHOUT, so the deltas below are "
+            "run-to-run **variance, not CodeSage's effect** (an A/A comparison in "
+            "A/B clothing). A cs-usage rate near zero is itself the finding — the "
+            "agent didn't pick CodeSage on merit for these tasks. Fix before "
+            "quoting any number: use a corpus where CodeSage's tools are the "
+            "*winning* path — intent/semantic localization that defeats grep, or "
+            "find_references / impact / risk questions grep can't answer."
+        )
+        out.append("")
+    out.append(f"- **Project**: `{project_root}`")
+    out.append(f"- **Corpus**: `{corpus_name}` — {len(rows)} tasks")
+    out.append(f"- **Runs per arm**: {runs} (median-of-{runs})")
+    out.append(f"- **Agent model / effort (pinned)**: {model} / {effort}")
+    out.append(
+        "- **WITH-arm steering**: "
+        + ("**ON** — WITH arm nudged toward CodeSage; this measures value *when used* "
+           "(CodeSage as shipped with its prompt-override), NOT merit-selection"
+           if steer else
+           "off — neutral prompt; measures whether the agent picks CodeSage *on merit*")
+    )
+    out.append(f"- **CodeSage**: {codesage_version}")
+    out.append(f"- **Run at**: {run_ts}")
+    out.append(f"- **Raced WITH runs**: {'included' if include_raced else 'excluded'} from medians")
+    if nested:
+        out.append(
+            "- **⚠️ NESTED RUN**: executed inside a Claude Code session "
+            "(--allow-nested). Timings are contaminated by attach latency; treat "
+            "wall-clock as indicative only."
+        )
+    out.append("")
+    out.append(
+        "> Numbers are model-relative. A stronger base model greps/reads more "
+        f"efficiently, shrinking the WITHOUT arm and with it CodeSage's marginal "
+        f"delta. Quote as \"on {model}\", never as an absolute."
+    )
+    out.append("")
+
+    out.append("## Per-task medians (WITH → WITHOUT, saved%)")
+    out.append("")
+    out.append(
+        "| id | cost W→WO (saved) | tokens W→WO (saved) | tools W→WO (saved) | "
+        "time W→WO (saved) | cs calls | runs used (w/wo) |"
+    )
+    out.append("|---|---|---|---|---|---:|---|")
+    def cell(w: dict, wo: dict, metric: str, fmt: str, prefix: str = "", suffix: str = "") -> str:
+        wv, wov = w[metric], wo[metric]
+        sv = saved_pct(wv, wov)
+        sv_s = "n/a" if sv is None else f"{sv:+.0f}%"
+        return f"{prefix}{wv:{fmt}}{suffix}→{prefix}{wov:{fmt}}{suffix} ({sv_s})"
+
+    for row in rows:
+        w, wo = row["with"], row["without"]
+        out.append(
+            f"| {row['id']} "
+            f"| {cell(w, wo, 'median_cost', '.3f', prefix='$')} "
+            f"| {cell(w, wo, 'median_tokens', '.0f')} "
+            f"| {cell(w, wo, 'median_tools', '.0f')} "
+            f"| {cell(w, wo, 'median_duration', '.0f', suffix='s')} "
+            f"| {w['median_codesage_calls']:.0f} "
+            f"| {w['runs_used']}/{wo['runs_used']} |"
+        )
+    out.append("")
+
+    # Overall: median of per-task saved% (robust to one task dominating totals).
+    def overall_saved(metric: str) -> str:
+        svs = [
+            saved_pct(r["with"][metric], r["without"][metric])
+            for r in rows
+        ]
+        svs = [s for s in svs if s is not None]
+        if not svs:
+            return "n/a"
+        return f"{statistics.median(svs):+.0f}%"
+
+    out.append("## Overall (median of per-task saved%)")
+    out.append("")
+    out.append(f"- **Cost saved**: {overall_saved('median_cost')}")
+    out.append(f"- **Tokens saved**: {overall_saved('median_tokens')}")
+    out.append(f"- **Tool-calls saved**: {overall_saved('median_tools')}")
+    out.append(f"- **Wall-clock saved**: {overall_saved('median_duration')}")
+    total_raced = sum(r["with"]["raced"] + r["without"]["raced"] for r in rows)
+    total_err = sum(r["with"]["errored"] + r["without"]["errored"] for r in rows)
+    out.append(
+        f"- **CodeSage used in WITH arm**: {total_with_cs}/{total_with_used} runs "
+        f"({cs_rate * 100:.0f}%) called ≥1 codesage tool"
+    )
+    out.append(f"- **Raced runs seen**: {total_raced} · **Errored runs**: {total_err}")
+    out.append("")
+    return "\n".join(out)
+
+
+def codesage_version(codesage_bin: str) -> str:
+    try:
+        r = subprocess.run(
+            [codesage_bin, "--version"], capture_output=True, text=True, timeout=10
+        )
+        return (r.stdout or r.stderr or "").strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Agent-task A/B: WITH vs WITHOUT CodeSage MCP.")
+    ap.add_argument("corpus", type=Path)
+    ap.add_argument("--runs", type=positive_int, default=4,
+                    help="Runs per arm per task (median-of-N). Default 4.")
+    ap.add_argument("--limit", type=positive_int, default=5,
+                    help="How many corpus cases to run. Default 5.")
+    ap.add_argument("--model", default="sonnet",
+                    help="Pinned agent model. Default sonnet (comparable + cheap).")
+    ap.add_argument("--effort", default="high",
+                    help="Pinned reasoning effort. Default high.")
+    ap.add_argument("--max-turns", type=int, default=12)
+    ap.add_argument("--max-budget-usd", type=float, default=2.0)
+    ap.add_argument("--timeout-s", type=int, default=240)
+    ap.add_argument("--codesage-bin", default=None,
+                    help="codesage binary for the WITH arm (default: $CODESAGE_BIN or PATH).")
+    ap.add_argument("--output-dir", type=Path, default=None)
+    ap.add_argument("--allow-nested", action="store_true",
+                    help="Permit running inside a Claude Code session (timings contaminated).")
+    ap.add_argument("--include-raced", action="store_true",
+                    help="Keep cold-start-raced WITH runs in the medians (default: exclude).")
+    ap.add_argument("--steer", action="store_true",
+                    help="Nudge the WITH arm toward CodeSage (measures 'if used, is it "
+                         "cheaper?' — CodeSage as shipped with its prompt-override — vs the "
+                         "default neutral 'is it picked on merit?').")
+    args = ap.parse_args()
+
+    nested = running_inside_claude_code()
+    if nested and not args.allow_nested:
+        sys.exit(
+            "Refusing to run nested inside a Claude Code session — attach latency "
+            "contaminates the timing (codegraph's 'evals must run non-nested' rule). "
+            "Run from a plain shell, or pass --allow-nested to override (output will "
+            "be stamped contaminated)."
+        )
+
+    codesage_bin = resolve_codesage_bin(args.codesage_bin)
+    corpus = yaml.safe_load(args.corpus.read_text())
+    project_root = Path(corpus["project_root"]).expanduser().resolve()
+    if not project_root.exists():
+        sys.exit(f"project_root does not exist: {project_root}")
+    cases = corpus["cases"][: args.limit]
+    run_ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    cfg_with = mcp_config_with(codesage_bin, project_root)
+    cfg_without = json.dumps({"mcpServers": {}})
+
+    rows: list[dict[str, Any]] = []
+    for case in cases:
+        print(f"[task] {case['id']}: {case['query'][:70]!r}", file=sys.stderr)
+        arm_kwargs = dict(
+            project_root=project_root, runs=args.runs, include_raced=args.include_raced,
+            model=args.model, effort=args.effort, max_turns=args.max_turns,
+            max_budget_usd=args.max_budget_usd, timeout_s=args.timeout_s,
+            steer=args.steer,
+        )
+        with_arm = run_arm(case, with_codesage=True, mcp_config=cfg_with, **arm_kwargs)
+        without_arm = run_arm(case, with_codesage=False, mcp_config=cfg_without, **arm_kwargs)
+        if with_arm["runs_used"] == 0 or without_arm["runs_used"] == 0:
+            print(
+                f"  ! {case['id']}: an arm had 0 usable runs "
+                f"(with={with_arm['runs_used']} without={without_arm['runs_used']}); "
+                "skipping this task from aggregates.",
+                file=sys.stderr,
+            )
+            continue
+        rows.append({"id": case["id"], "with": with_arm, "without": without_arm})
+
+    if not rows:
+        sys.exit("No tasks produced usable runs in both arms — nothing to score.")
+
+    report = render_scorecard(
+        project_root=project_root, corpus_name=args.corpus.name, rows=rows,
+        run_ts=run_ts, runs=args.runs, model=args.model, effort=args.effort,
+        nested=nested, include_raced=args.include_raced,
+        codesage_version=codesage_version(codesage_bin),
+        steer=args.steer,
+    )
+    print(report)
+    if args.output_dir:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        out_path = args.output_dir / f"{args.corpus.stem}-agent-task-{stamp}.md"
+        out_path.write_text(report, encoding="utf-8")
+        print(f"wrote {out_path}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

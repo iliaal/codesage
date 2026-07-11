@@ -1,0 +1,58 @@
+# Grep-hostile agent-task A/B corpus for bench/agent-task-runner (§2.14).
+#
+# WHY THIS EXISTS: the sibling `agent-task-corpus.example.yaml` is grep-FRIENDLY
+# — its queries name identifiers that live in the answer file, so a capable agent
+# correctly uses Grep/Glob and never calls CodeSage (the runner stamps it
+# INVALID, cs-usage ~0). That measures nothing about CodeSage.
+#
+# These queries describe a BEHAVIOUR in natural language, deliberately avoiding
+# the identifiers/tokens the code actually uses (verified: e.g. this file's
+# "changes together" is NOT in git_history/, "sensitive" is NOT in
+# trust_boundary.rs). A keyword grep has nothing distinctive to match, so dense
+# semantic search (CodeSage `search`) should win — and the agent has a reason to
+# call CodeSage. Each answer file was ground-truthed to actually implement the
+# behaviour; `expected_files` is not scored by the runner yet (it's for eyeball /
+# future scoring), so it lists the primary home file.
+#
+# THE TEST: run this on the model you actually use, NON-NESTED (plain terminal):
+#   bench/agent-task-runner bench/agent-task-corpus.grep-hostile.yaml --model opus  --runs 2 --limit 3   # smoke
+#   bench/agent-task-runner bench/agent-task-corpus.grep-hostile.yaml --model opus  --runs 4             # real
+#   bench/agent-task-runner bench/agent-task-corpus.grep-hostile.yaml --model fable --runs 4             # second regime
+#
+# READ THE cs-USAGE LINE FIRST. If the report is still stamped INVALID (agent
+# rarely called CodeSage), that is itself the finding — a capable model won't
+# select CodeSage even where semantic search should win, which is a tool-
+# selection / affordance problem (§2.3 / §5.16), not a corpus problem. Only a
+# report WITHOUT the INVALID banner (cs-usage well above 0) yields a savings
+# number worth reading, and even then quote it as "on opus"/"on fable".
+
+project_root: .   # resolves to your working dir — run the harness from the repo root
+
+cases:
+  - id: daemon-supersede-reaper
+    query: "When a new copy of the long-lived background service starts up, how does it make an already-running leftover instance of itself shut down, so an out-of-date one doesn't keep the model resident in memory?"
+    expected_files: [crates/cli/src/daemon.rs]
+
+  - id: untrusted-repo-model-choice
+    query: "Where do we make sure a checked-out repository cannot silently decide which machine-learning model the engine downloads and loads, since that config comes from an untrusted source?"
+    expected_files: [crates/embed/src/model.rs]
+
+  - id: merge-two-rankings
+    query: "Where do we combine two candidate lists that were each ranked separately into a single ordering, in a way that doesn't assume the two lists' raw scores are on the same scale?"
+    expected_files: [crates/graph/src/search.rs]
+
+  - id: capability-tagging
+    query: "Where do we label each source file with the categories of risky capability it exercises, so a reviewer can flag files that do too many dangerous things at once?"
+    expected_files: [crates/features/src/trust_boundary.rs]
+
+  - id: answer-may-be-outdated
+    query: "Where do we warn the caller that a file it asked about has been edited on disk since the engine last read it, so the answer it's getting might be out of date?"
+    expected_files: [crates/cli/src/mcp/render.rs]
+
+  - id: files-that-move-together
+    query: "Where do we work out, from a project's change history, which files tend to be modified in the same commits, so editing one can hint that you should also look at the others?"
+    expected_files: [crates/graph/src/git_history/indexer.rs]
+
+  - id: reason-behind-the-code
+    query: "Where do we capture a short human-written justification a developer left in a comment right above a definition — the note explaining why the code is the way it is — and attach it to that symbol as structured data?"
+    expected_files: [crates/parser/src/rationale.rs]

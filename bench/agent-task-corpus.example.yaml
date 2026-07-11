@@ -1,0 +1,46 @@
+# Example agent-task A/B corpus for bench/agent-task-runner (recommendations §2.14).
+#
+# Each case is a real "find where X lives" question with a known answer file, so
+# the runner can cheaply score whether the agent's answer (a file path) matches
+# `expected_files`. Swap `project_root` / add cases for your own repo.
+#
+# Run NON-NESTED (from a plain terminal, not inside a Claude Code session).
+# Pin the model you actually use — the delta is model-relative, and a stronger
+# model greps/reads more efficiently, shrinking CodeSage's marginal delta:
+#   bench/agent-task-runner bench/agent-task-corpus.example.yaml --model opus  --runs 2 --limit 3
+#   bench/agent-task-runner bench/agent-task-corpus.example.yaml --model fable --runs 2 --limit 3
+# Smoke the wiring first with --runs 2 --limit 2; scale up once it's green.
+#
+# NOTE: these example tasks are grep-friendly (the query names identifiers that
+# live in the answer file), so a capable agent correctly uses Grep/Glob and never
+# calls CodeSage — the runner will stamp the report INVALID (cs-usage near 0).
+# Replace them with grep-HOSTILE tasks (intent/behaviour described without the
+# code's literal tokens, or find_references / impact / risk questions) before
+# trusting any savings number.
+
+project_root: .   # resolves to your working dir — run the harness from the repo root
+
+cases:
+  - id: daemon-socket-path
+    query: "Where is the per-user MCP daemon's Unix socket path computed (the versioned socket name under the runtime dir)?"
+    expected_files: [crates/cli/src/daemon.rs]
+
+  - id: rationale-extraction
+    query: "Where are rationale comments (WHY:/NOTE:/IMPORTANT: markers) extracted from a symbol's adjacent comments?"
+    expected_files: [crates/parser/src/rationale.rs]
+
+  - id: bm25-rrf-fusion
+    query: "Where does BM25 fusion merge candidates into the semantic search results via reciprocal rank fusion?"
+    expected_files: [crates/graph/src/search.rs]
+
+  - id: mcp-output-budget-cap
+    query: "Where is the MCP tool-result output budget cap applied (truncating the largest array and recording dropped entries)?"
+    expected_files: [crates/cli/src/mcp/render.rs]
+
+  - id: trust-boundary-rules
+    query: "Where are the per-language trust-boundary rules (network, filesystem, secrets, ...) defined?"
+    expected_files: [crates/features/src/trust_boundary_rules.rs]
+
+  - id: git-churn-weighting
+    query: "Where is per-file churn weight computed with exponential time decay from git history?"
+    expected_files: [crates/graph/src/git_history/indexer.rs]
