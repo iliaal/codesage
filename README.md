@@ -238,7 +238,7 @@ Per-file capability tags (network, filesystem, process-exec, secrets, database, 
 
 ## 🔌 Agent plugins
 
-`plugins/codesage-tools/` supports Claude Code and Codex from the same package. Claude receives task commands; Codex receives the `codesage-retrieval` skill for choosing focused semantic, structural, risk, and test-selection calls. CodeSage keeps MCP registration global, so install that server first with `codesage install codex --global`.
+`plugins/codesage-tools/` supports Claude Code and Codex from the same package. Both hosts load the `codesage-retrieval` skill for choosing focused semantic, structural, risk, and test-selection calls; Claude additionally ships the task commands. CodeSage keeps MCP registration global, so install that server first with `codesage install codex --global`.
 
 ### Claude Code
 
@@ -267,7 +267,7 @@ python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/plugin-creator/scripts/updat
 codex plugin add codesage-tools@codesage
 ```
 
-Start a new Codex thread after installation or reinstall so the updated skill metadata and instructions are loaded.
+Start a new Codex thread after installation or reinstall so Codex loads the updated skill metadata and instructions.
 
 ## 🔍 Feature-slice review
 
