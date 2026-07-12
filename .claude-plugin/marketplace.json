@@ -6,13 +6,13 @@
   },
   "metadata": {
     "description": "Claude Code integration for CodeSage: a single global MCP that serves semantic search, structural graph, impact analysis, and context export across every onboarded project, plus slash commands for onboarding, reset, reindex, retrieval benchmarking, and a subagent-driven review workflow over feature slices",
-    "version": "0.2.0"
+    "version": "0.4.0"
   },
   "plugins": [
     {
       "name": "codesage-tools",
       "description": "CodeSage integration: onboarding (/codesage-onboard / -reset / -reindex), retrieval benchmarks (/codesage-bench / -eval), and a subagent-driven review workflow (/codesage-review / -triage / -revalidate / -report) over the feature slices codesage maps. Shared global MCP, git hook installer.",
-      "version": "0.2.0",
+      "version": "0.4.0",
       "author": {
         "name": "Ilia Alshanetsky",
         "url": "https://github.com/iliaal"
