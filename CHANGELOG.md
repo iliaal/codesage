@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.16.0] - 2026-07-12
+
 ### Added
 - Added a `codesage-retrieval` skill (loaded by both Claude Code and Codex) that routes retrieval, risk, and test-selection queries through CodeSage, packaged as a repo-local Codex marketplace that reuses the global MCP registration.
 
@@ -602,5 +604,7 @@ Initial public release.
 
 [0.14.0]: https://github.com/iliaal/codesage/releases/tag/v0.14.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.15.0...HEAD
 [0.15.0]: https://github.com/iliaal/codesage/releases/tag/v0.15.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/iliaal/codesage/releases/tag/v0.16.0
