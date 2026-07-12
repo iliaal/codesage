@@ -7,10 +7,10 @@
 #   1. Pre-flight checks (on master, clean tree, in sync with origin, tag free)
 #   2. Move `## [Unreleased]` content into a new `## [X.Y.Z] - YYYY-MM-DD` block
 #      and append the matching link reference.
-#   3. Bump `[workspace.package].version` in the root Cargo.toml.
+#   3. Bump `[workspace.package].version` and the Codex plugin version.
 #   4. Build the release binary with `--features cuda` so Cargo.lock is up to date.
 #   5. Prompt, then commit + tag.
-#   6. Prompt, then push master + tag.
+#   6. Prompt, then refresh the local Codex plugin and push master + tag.
 #   7. Refresh whichever `codesage` is on PATH so the maintainer's local install
 #      jumps to the new version. Skipped silently if no install is found or the
 #      binary path is not writable.
@@ -77,7 +77,7 @@ echo "Target version:  $VERSION"
 DATE=$(date +%Y-%m-%d)
 
 python3 - "$VERSION" "$DATE" <<'PYEOF'
-import pathlib, re, sys
+import json, pathlib, re, sys
 
 version, date = sys.argv[1], sys.argv[2]
 
@@ -115,6 +115,16 @@ new_ctext, n = pattern.subn(rf'\g<1>{version}\g<2>', ctext, count=1)
 if n != 1:
     sys.exit("release: failed to bump [workspace.package].version in Cargo.toml")
 ct.write_text(new_ctext)
+
+plugin = pathlib.Path("plugins/codesage-tools/.codex-plugin/plugin.json")
+try:
+    plugin_data = json.loads(plugin.read_text())
+except (OSError, json.JSONDecodeError) as exc:
+    sys.exit(f"release: could not read Codex plugin manifest: {exc}")
+if plugin_data.get("name") != "codesage-tools":
+    sys.exit("release: Codex plugin manifest has unexpected name")
+plugin_data["version"] = version
+plugin.write_text(json.dumps(plugin_data, indent=2) + "\n")
 PYEOF
 
 echo
@@ -123,6 +133,9 @@ git --no-pager diff Cargo.toml
 echo
 echo "--- CHANGELOG.md diff (head) ---"
 git --no-pager diff CHANGELOG.md | head -80
+echo
+echo "--- Codex plugin manifest diff ---"
+git --no-pager diff plugins/codesage-tools/.codex-plugin/plugin.json
 echo
 
 echo "Building release binary with --features cuda (refreshes Cargo.lock)..."
@@ -156,6 +169,16 @@ else
 	read -r -p "Push master + v$VERSION to origin? [y/N] " ans
 fi
 if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
+	if command -v codex >/dev/null 2>&1; then
+		echo
+		echo "Refreshing Codex plugin codesage-tools@codesage ..."
+		codex plugin marketplace add "${ROOT}" || die "failed to register the local CodeSage marketplace"
+		codex plugin add codesage-tools@codesage || die "failed to refresh the Codex plugin"
+		echo "Codex plugin refreshed. Start a new Codex thread to load version ${VERSION}."
+	else
+		echo
+		echo "No 'codex' on PATH; skipping Codex plugin refresh."
+	fi
 	git push origin master
 	git push origin "v$VERSION"
 	echo

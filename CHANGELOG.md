@@ -4,6 +4,7 @@
 - Added a repo-local Codex package for `codesage-tools`. Codex can now load CodeSage retrieval guidance without duplicating the existing global MCP registration or the Claude Code commands.
 
 ### Changed
+- `scripts/release.sh` now versions and reinstalls the Codex plugin during local releases.
 - Rationale-comment extraction (`WHY:` / `NOTE:` / `IMPORTANT:` / `TODO` markers surfaced on `find_symbol` / `export_context`) now covers C, C++, Go, and PHP in addition to Rust and Python; PHP `/** */` docblocks (marker on an interior line), `#` line comments, and `#[...]` attributes between docblock and definition are handled.
 
 ## [0.15.0] - 2026-07-09

@@ -259,7 +259,7 @@ codex plugin marketplace add /path/to/codesage
 codex plugin add codesage-tools@codesage
 ```
 
-During local plugin development, update its manifest cachebuster and reinstall it from the same marketplace:
+When a release is approved for push, `scripts/release.sh` bumps the plugin to the CodeSage release version and reinstalls it before pushing when `codex` is on `PATH`. During local plugin development between releases, update its manifest cachebuster and reinstall it from the same marketplace:
 
 ```bash
 python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/plugin-creator/scripts/update_plugin_cachebuster.py" \
