@@ -236,9 +236,11 @@ codesage trust-boundaries crates/cli/src/main.rs --json
 
 Per-file capability tags (network, filesystem, process-exec, secrets, database, user-input, external-api, serialization, auth, concurrency) derived from imports / includes / calls. The same signal contributes to `assess_risk` and surfaces a "crosses N trust boundaries, security review recommended" note when a file touches three or more.
 
-## 🔌 Claude Code plugin
+## 🔌 Agent plugins
 
-`plugins/codesage-tools/` wraps everything above into one command per task. The marketplace manifest lives at the repo root.
+`plugins/codesage-tools/` supports Claude Code and Codex from the same package. Claude receives task commands; Codex receives the `codesage-retrieval` skill for choosing focused semantic, structural, risk, and test-selection calls. CodeSage keeps MCP registration global, so install that server first with `codesage install codex --global`.
+
+### Claude Code
 
 ```bash
 claude plugin marketplace add /path/to/codesage
@@ -247,6 +249,25 @@ claude plugin install codesage-tools@codesage
 ```
 
 Slash commands: `/codesage-onboard`, `/codesage-reset`, `/codesage-reindex`, `/codesage-bench`, `/codesage-eval`, and `/codesage-prompt-override`, plus the four feature-slice review commands documented below (`/codesage-review`, `/codesage-triage`, `/codesage-revalidate`, `/codesage-report`). The plugin handles global MCP registration, per-project init, indexing, git hook install (Husky-aware), and writes a `.claude/CLAUDE.md` hint teaching the agent how to route MCP calls. `/codesage-prompt-override` prints a system-prompt fragment that steers Claude Code to prefer CodeSage's MCP tools over Grep for retrieval-shape tasks.
+
+### Codex
+
+Register this repository as a local marketplace, then install the plugin:
+
+```bash
+codex plugin marketplace add /path/to/codesage
+codex plugin add codesage-tools@codesage
+```
+
+During local plugin development, update its manifest cachebuster and reinstall it from the same marketplace:
+
+```bash
+python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/plugin-creator/scripts/update_plugin_cachebuster.py" \
+  /path/to/codesage/plugins/codesage-tools
+codex plugin add codesage-tools@codesage
+```
+
+Start a new Codex thread after installation or reinstall so the updated skill metadata and instructions are loaded.
 
 ## 🔍 Feature-slice review
 

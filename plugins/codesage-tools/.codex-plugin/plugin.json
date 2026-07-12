@@ -1,0 +1,33 @@
+{
+  "name": "codesage-tools",
+  "version": "0.3.0",
+  "description": "CodeSage retrieval routing and code-intelligence workflows for Codex.",
+  "author": {
+    "name": "Ilia Alshanetsky",
+    "url": "https://github.com/iliaal"
+  },
+  "homepage": "https://github.com/iliaal/codesage",
+  "repository": "https://github.com/iliaal/codesage",
+  "license": "MIT",
+  "keywords": [
+    "codesage",
+    "semantic-search",
+    "code-intelligence",
+    "retrieval"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "CodeSage Tools",
+    "shortDescription": "Route codebase retrieval through CodeSage.",
+    "longDescription": "Adds CodeSage-aware retrieval, impact, risk, and test-selection guidance while using the separately registered global CodeSage MCP server.",
+    "developerName": "Ilia Alshanetsky",
+    "category": "Productivity",
+    "capabilities": [
+      "Code intelligence",
+      "Semantic retrieval"
+    ],
+    "defaultPrompt": [
+      "Explore this codebase with CodeSage."
+    ]
+  }
+}

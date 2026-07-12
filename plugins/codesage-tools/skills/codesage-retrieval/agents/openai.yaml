@@ -1,0 +1,6 @@
+interface:
+  display_name: "CodeSage Retrieval"
+  short_description: "Route code retrieval through CodeSage"
+  default_prompt: "Use $codesage-retrieval to explore this indexed codebase efficiently."
+policy:
+  allow_implicit_invocation: true
