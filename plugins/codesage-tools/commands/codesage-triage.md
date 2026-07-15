@@ -16,8 +16,8 @@ From `$ARGUMENTS`:
 - `--status <s>`: required, one of:
   - `open` — the finding is real and not yet acted on (the default state from review).
   - `false-positive` — the finding doesn't actually apply; subsequent reviews should not re-raise it.
-  - `wont-fix` — the finding is real but won't be acted on. Reviews continue to raise it; this just records the human decision.
-  - `fixed` — the finding has been resolved in the source. The next `/codesage-revalidate` run should confirm it's gone; if it reappears, the status flips back to `open`.
+  - `wont-fix` — the finding is real but won't be acted on. Later reviews suppress it while preserving the human decision.
+  - `fixed` — the finding has been resolved in the source. A revalidation run reopens it only when current evidence shows the same defect is still present.
 - `--note "<text>"`: optional. Free-form context — why this is a false positive, link to a ticket, whatever the user wants future-them to read.
 
 Reject invalid combinations early (missing finding_id, unknown status). Don't proceed if any are malformed.
@@ -54,11 +54,11 @@ Triaged fnd_abcd1234 in feat_xyz789
   file: src/api/handler.rs:142
   title: Unauthenticated path bypasses token check
 
-Future /codesage-review runs will skip this finding unless its title/file/line shifts.
+Future /codesage-review runs will suppress this finding.
 ```
 
 ## Notes
 
-- The triage state is owned by the user, not the reviewer. Subsequent `/codesage-review` runs MUST NOT auto-flip a `false-positive` or `wont-fix` back to `open` — the subagent receives prior findings and is told to respect their status (see the agent definition).
-- `fixed` is a soft assertion. The user is claiming the underlying code change resolves the finding. To verify, run `/codesage-revalidate --finding <id>` which re-runs the review subagent on the slice and checks whether the same defect still surfaces.
+- The user owns `false-positive` and `wont-fix`. Later reviews don't reopen or re-echo either status.
+- `fixed` is a soft assertion. `/codesage-revalidate --finding <id>` reopens it only when the reviewer returns the same ID with current evidence. Omission alone doesn't prove the fix.
 - The status flip is reversible: `--status open` always works. The full `history[]` preserves every change so audit is intact.

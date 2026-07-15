@@ -1,5 +1,16 @@
 ## [Unreleased]
 
+### Added
+- `/codesage-review` adds `--focus all|product` and `--max-verify-findings`; product focus skips test-suite, `bench/`, and `scripts/` slices while full coverage remains the default.
+
+### Changed
+- `feature_bundle` reserves up to two existing `related` slots for requested caller/callee chunks before backfilling tests and context, keeping the response limit unchanged.
+- `/codesage-review` ranks slices by maximum owned-file risk, sends slim feature-local priors and precomputed batch risk to reviewers, targets large files by hot symbols, and verifies new findings once per feature.
+
+### Fixed
+- Review findings now use deterministic evidence validation, identity matching, content-based freshness, feature metadata persistence, atomic merges, and transition-only history; revalidation no longer marks an omitted open finding fixed.
+- Release automation keeps the Codex plugin, Claude plugin, and Claude marketplace versions aligned with the workspace version.
+
 ## [0.16.0] - 2026-07-12
 
 ### Added

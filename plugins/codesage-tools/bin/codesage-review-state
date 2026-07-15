@@ -1,0 +1,758 @@
+#!/usr/bin/env python3
+
+import argparse
+import copy
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+
+
+ACTIVE_PRIOR_STATUSES = {"open", "false-positive", "wont-fix"}
+PRIOR_FIELDS = (
+    "finding_id",
+    "file",
+    "line",
+    "severity",
+    "category",
+    "title",
+    "status",
+    "summary",
+)
+FINDING_FIELDS = (
+    "finding_id",
+    "file",
+    "line",
+    "severity",
+    "category",
+    "title",
+    "summary",
+    "evidence",
+    "suggested_fix",
+)
+SEVERITIES = {"low", "medium", "high"}
+CATEGORIES = {"bug", "security", "perf", "maintainability"}
+REVIEW_PROTOCOL_VERSION = "2"
+
+
+def slim_priors(document):
+    return [
+        {field: finding.get(field) for field in PRIOR_FIELDS}
+        for finding in document.get("findings", [])
+        if finding.get("status") in ACTIVE_PRIOR_STATUSES
+    ]
+
+
+def feature_files(feature):
+    files = feature.get("files", feature.get("feature_files", []))
+    by_path = {}
+    for item in files:
+        path = item.get("path")
+        if isinstance(path, str) and path:
+            by_path[path] = {
+                "path": path,
+                "role": item.get("role"),
+                "reason": item.get("reason"),
+            }
+    return [by_path[path] for path in sorted(by_path)]
+
+
+def project_file(project, relative_path):
+    if not isinstance(relative_path, str) or not relative_path:
+        raise ValueError("finding file path is empty")
+    relative = Path(relative_path)
+    if relative.is_absolute():
+        raise ValueError(f"finding file path must be relative: {relative_path}")
+    root = Path(project).resolve()
+    candidate = (root / relative).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"finding file escapes project: {relative_path}") from exc
+    return candidate
+
+
+def file_content_digest(project, relative_path, cache):
+    if relative_path in cache:
+        return cache[relative_path]
+    source = project_file(project, relative_path)
+    if source.is_file():
+        value = "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest()
+    else:
+        value = "missing"
+    cache[relative_path] = value
+    return value
+
+
+def feature_state(project, feature, content_cache=None):
+    content_cache = {} if content_cache is None else content_cache
+    digest = hashlib.sha256()
+    digest.update(REVIEW_PROTOCOL_VERSION.encode("ascii"))
+    digest.update(b"\0")
+    for item in feature_files(feature):
+        path = item["path"]
+        role = item.get("role") or ""
+        digest.update(path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(role.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(file_content_digest(project, path, content_cache).encode("ascii"))
+        digest.update(b"\0")
+    return f"sha256:{digest.hexdigest()}"
+
+
+def feature_states(project, features):
+    content_cache = {}
+    return [
+        {
+            "feature_id": feature.get("feature_id"),
+            "feature_state": feature_state(project, feature, content_cache),
+            "files": feature_files(feature),
+        }
+        for feature in features
+    ]
+
+
+def normalize_line(value):
+    return " ".join(str(value).split())
+
+
+def evidence_lines(finding):
+    lines = []
+    for item in finding.get("evidence", []):
+        if not isinstance(item, str):
+            continue
+        for line in item.splitlines():
+            normalized = normalize_line(line)
+            if normalized:
+                lines.append(normalized)
+    return lines
+
+
+def substantive(line, minimum=11):
+    return len(line) >= minimum and any(character.isalnum() for character in line)
+
+
+def evidence_fingerprint(finding):
+    lines = [line for line in evidence_lines(finding) if substantive(line)]
+    if not lines:
+        return None
+    content = "\n".join(lines).encode("utf-8")
+    return hashlib.sha256(content).hexdigest()
+
+
+def evidence_match(source, cited_line, finding):
+    normalized_source = [normalize_line(line) for line in source.read_text().splitlines()]
+    quoted = evidence_lines(finding)
+    cited_line = max(int(cited_line), 1)
+    lower = max(cited_line - 15, 1)
+    upper = min(cited_line + 15, len(normalized_source))
+    matches = []
+
+    for index in range(len(quoted) - 1):
+        first = quoted[index]
+        second = quoted[index + 1]
+        if not substantive(first) or not substantive(second):
+            continue
+        for source_index in range(max(lower - 1, 0), min(upper, len(normalized_source) - 1)):
+            if (
+                normalized_source[source_index] == first
+                and normalized_source[source_index + 1] == second
+            ):
+                matches.append(source_index + 1)
+
+    for line in quoted:
+        if not substantive(line, minimum=40):
+            continue
+        positions = [
+            index + 1
+            for index, source_line in enumerate(normalized_source)
+            if source_line == line
+        ]
+        if len(positions) == 1 and lower <= positions[0] <= upper:
+            matches.append(positions[0])
+
+    if not matches:
+        return None
+    return min(matches, key=lambda line: (abs(line - cited_line), line))
+
+
+def title_tokens(title):
+    return set(re.findall(r"[a-z0-9]+", str(title).lower()))
+
+
+def title_similarity(left, right):
+    left_tokens = title_tokens(left)
+    right_tokens = title_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+
+def mint_finding_id(feature_id, finding, occupied):
+    base = f"{feature_id}|{finding['file']}|{finding['category']}|{finding['line']}"
+    suffix = 1
+    while True:
+        material = base if suffix == 1 else f"{base}|{suffix}"
+        candidate = "fnd_" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:8]
+        if candidate not in occupied:
+            return candidate
+        suffix += 1
+
+
+def match_prior(finding, priors, used_ids):
+    returned_id = finding.get("finding_id")
+    by_id = {prior.get("finding_id"): prior for prior in priors}
+    if returned_id in by_id and returned_id not in used_ids:
+        return by_id[returned_id]
+
+    candidates = [
+        prior
+        for prior in priors
+        if prior.get("finding_id") not in used_ids
+        and prior.get("file") == finding.get("file")
+        and prior.get("category") == finding.get("category")
+    ]
+    fingerprint = evidence_fingerprint(finding)
+    evidence_matches = [
+        prior
+        for prior in candidates
+        if fingerprint is not None and evidence_fingerprint(prior) == fingerprint
+    ]
+    if evidence_matches:
+        return min(
+            evidence_matches,
+            key=lambda prior: abs(int(prior.get("line", 0)) - int(finding["line"])),
+        )
+
+    title_matches = [
+        prior
+        for prior in candidates
+        if abs(int(prior.get("line", 0)) - int(finding["line"])) <= 10
+        and title_similarity(prior.get("title"), finding.get("title")) >= 0.8
+    ]
+    if not title_matches:
+        return None
+    return max(
+        title_matches,
+        key=lambda prior: (
+            title_similarity(prior.get("title"), finding.get("title")),
+            -abs(int(prior.get("line", 0)) - int(finding["line"])),
+        ),
+    )
+
+
+def same_candidate(left, right):
+    if left.get("file") != right.get("file") or left.get("category") != right.get(
+        "category"
+    ):
+        return False
+    left_fingerprint = evidence_fingerprint(left)
+    right_fingerprint = evidence_fingerprint(right)
+    if left_fingerprint is not None and left_fingerprint == right_fingerprint:
+        return True
+    return abs(int(left["line"]) - int(right["line"])) <= 10 and title_similarity(
+        left.get("title"), right.get("title")
+    ) >= 0.8
+
+
+def combine_responses(responses):
+    if not responses:
+        raise ValueError("at least one review response is required")
+    feature_id = responses[0].get("feature_id")
+    if not isinstance(feature_id, str) or not feature_id.startswith("feat_"):
+        raise ValueError("response feature_id is missing or invalid")
+    findings = []
+    for response in responses:
+        if not isinstance(response, dict):
+            raise ValueError("review response must be an object")
+        if response.get("feature_id") != feature_id:
+            raise ValueError("review responses have different feature IDs")
+        response_findings = response.get("findings", [])
+        if not isinstance(response_findings, list):
+            raise ValueError("response findings must be an array")
+        findings.extend(copy.deepcopy(response_findings))
+    return {"feature_id": feature_id, "findings": findings}
+
+
+def clean_finding(finding):
+    cleaned = {field: copy.deepcopy(finding.get(field)) for field in FINDING_FIELDS}
+    if cleaned["severity"] not in SEVERITIES:
+        raise ValueError(f"invalid severity: {cleaned['severity']}")
+    if cleaned["category"] not in CATEGORIES:
+        raise ValueError(f"invalid category: {cleaned['category']}")
+    if not isinstance(cleaned["title"], str) or not cleaned["title"].strip():
+        raise ValueError("finding title is empty")
+    if not isinstance(cleaned["summary"], str) or not cleaned["summary"].strip():
+        raise ValueError("finding summary is empty")
+    if not isinstance(cleaned["evidence"], list):
+        raise ValueError("finding evidence must be an array")
+    cleaned["line"] = int(cleaned["line"])
+    if cleaned["line"] < 1:
+        raise ValueError("finding line must be positive")
+    return cleaned
+
+
+def validate_response(project, response, existing):
+    if not isinstance(response, dict):
+        raise ValueError("review response must be an object")
+    feature_id = response.get("feature_id")
+    if not isinstance(feature_id, str) or not feature_id.startswith("feat_"):
+        raise ValueError("response feature_id is missing or invalid")
+    raw_findings = response.get("findings", [])
+    if not isinstance(raw_findings, list):
+        raise ValueError("response findings must be an array")
+    priors = existing.get("findings", [])
+    occupied = {
+        finding.get("finding_id")
+        for finding in priors
+        if isinstance(finding.get("finding_id"), str)
+    }
+    used_ids = set()
+    findings = []
+    new_ids = []
+    recurring_ids = []
+    rejected = []
+
+    for raw_finding in raw_findings:
+        if not isinstance(raw_finding, dict):
+            rejected.append(
+                {
+                    "file": None,
+                    "title": None,
+                    "reason": "finding must be an object",
+                }
+            )
+            continue
+        try:
+            finding = clean_finding(raw_finding)
+            source = project_file(project, finding["file"])
+            if not source.is_file():
+                raise ValueError(f"finding file does not exist: {finding['file']}")
+            matched_line = evidence_match(source, finding["line"], finding)
+            if matched_line is None:
+                raise ValueError("evidence has no nearby block or unique substantive line")
+            finding["line"] = matched_line
+        except (OSError, TypeError, ValueError) as exc:
+            rejected.append(
+                {
+                    "file": raw_finding.get("file"),
+                    "title": raw_finding.get("title"),
+                    "reason": str(exc),
+                }
+            )
+            continue
+
+        if any(same_candidate(finding, accepted) for accepted in findings):
+            rejected.append(
+                {
+                    "file": finding.get("file"),
+                    "title": finding.get("title"),
+                    "reason": "duplicate candidate in response",
+                }
+            )
+            continue
+
+        prior = match_prior(finding, priors, used_ids)
+        if prior is not None:
+            finding_id = prior["finding_id"]
+            finding["finding_id"] = finding_id
+            recurring_ids.append(finding_id)
+            used_ids.add(finding_id)
+        else:
+            finding_id = mint_finding_id(feature_id, finding, occupied | used_ids)
+            finding["finding_id"] = finding_id
+            new_ids.append(finding_id)
+            used_ids.add(finding_id)
+        findings.append(finding)
+
+    return {
+        "feature_id": feature_id,
+        "findings": findings,
+        "new_finding_ids": new_ids,
+        "recurring_finding_ids": recurring_ids,
+        "evidence_rejected": rejected,
+    }
+
+
+def git_head(project):
+    result = subprocess.run(
+        ["git", "-C", str(project), "rev-parse", "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def last_event_is_pending(history):
+    if not history:
+        return False
+    event = history[-1]
+    return event.get("action") == "not-seen" and event.get("result") == "needs-confirmation"
+
+
+def verdict_history(verdict, now, run_id):
+    result = verdict.get("verdict", "unverified")
+    event = {"action": "verify", "at": now, "run_id": run_id, "result": result}
+    if verdict.get("note"):
+        event["note"] = verdict["note"]
+    return event
+
+
+def merge_document(
+    project,
+    feature,
+    existing,
+    validated,
+    verdicts,
+    run_id,
+    now,
+    mode,
+    target_finding_ids=None,
+):
+    feature_id = feature.get("feature_id")
+    if validated.get("feature_id") != feature_id:
+        raise ValueError("validated feature_id does not match feature metadata")
+    if mode not in {"review", "revalidate"}:
+        raise ValueError(f"invalid merge mode: {mode}")
+    if mode == "revalidate" and target_finding_ids is None:
+        raise ValueError("revalidation requires target finding IDs")
+
+    target_finding_ids = set(target_finding_ids or [])
+    existing_ids = {
+        finding.get("finding_id") for finding in existing.get("findings", [])
+    }
+    if mode == "revalidate":
+        unknown_targets = target_finding_ids - existing_ids
+        if unknown_targets:
+            raise ValueError(
+                "revalidation target IDs are not in the findings document: "
+                + ", ".join(sorted(unknown_targets))
+            )
+        recurring_ids = set(validated.get("recurring_finding_ids", []))
+        unexpected = recurring_ids - target_finding_ids
+        if unexpected:
+            raise ValueError(
+                "revalidation returned out-of-scope prior IDs: "
+                + ", ".join(sorted(unexpected))
+            )
+
+    returned = {finding["finding_id"]: finding for finding in validated.get("findings", [])}
+    verdict_by_id = {
+        verdict.get("finding_id"): verdict for verdict in verdicts.get("verdicts", [])
+    }
+    merged_findings = []
+    seen_prior_ids = set()
+    summary = {
+        "new": [],
+        "recurring": [],
+        "not_seen": [],
+        "refuted": [],
+        "unverified": [],
+        "evidence_rejected": validated.get("evidence_rejected", []),
+    }
+
+    for prior in existing.get("findings", []):
+        finding_id = prior.get("finding_id")
+        current = copy.deepcopy(prior)
+        if finding_id in returned:
+            update = returned[finding_id]
+            for field in FINDING_FIELDS:
+                if field in update:
+                    current[field] = copy.deepcopy(update[field])
+            current["last_seen_at"] = now
+            history = current.setdefault("history", [])
+            if history and history[-1].get("action") == "not-seen":
+                history.append(
+                    {"action": "review", "at": now, "run_id": run_id, "result": "seen-again"}
+                )
+            if mode == "revalidate":
+                event = {
+                    "action": "revalidate",
+                    "at": now,
+                    "run_id": run_id,
+                    "result": "still-present",
+                }
+                if current.get("status") == "fixed":
+                    current["status"] = "open"
+                    event["from_status"] = "fixed"
+                    event["to_status"] = "open"
+                history.append(event)
+            seen_prior_ids.add(finding_id)
+            summary["recurring"].append(finding_id)
+        elif current.get("status") == "open" and (
+            mode == "review" or finding_id in target_finding_ids
+        ):
+            history = current.setdefault("history", [])
+            if not last_event_is_pending(history):
+                history.append(
+                    {
+                        "action": "not-seen",
+                        "at": now,
+                        "run_id": run_id,
+                        "result": "needs-confirmation",
+                    }
+                )
+                summary["not_seen"].append(finding_id)
+        merged_findings.append(current)
+
+    for finding_id in validated.get("new_finding_ids", []):
+        if finding_id in seen_prior_ids or finding_id not in returned:
+            continue
+        verdict = verdict_by_id.get(
+            finding_id,
+            {"finding_id": finding_id, "verdict": "unverified", "note": "verification not run"},
+        )
+        if verdict.get("verdict") == "refuted":
+            summary["refuted"].append(
+                {
+                    "finding_id": finding_id,
+                    "title": returned[finding_id].get("title"),
+                    "refutation": verdict.get("refutation"),
+                }
+            )
+            continue
+        current = copy.deepcopy(returned[finding_id])
+        current.update(
+            {
+                "status": "open",
+                "first_seen_at": now,
+                "last_seen_at": now,
+                "history": [
+                    {"action": "review", "at": now, "run_id": run_id},
+                    verdict_history(verdict, now, run_id),
+                ],
+            }
+        )
+        merged_findings.append(current)
+        summary["new"].append(finding_id)
+        if verdict.get("verdict") == "unverified":
+            summary["unverified"].append(finding_id)
+
+    document = copy.deepcopy(existing)
+    document.update(
+        {
+            "schema_version": 2,
+            "feature_id": feature_id,
+            "title": feature.get("title"),
+            "kind": feature.get("kind"),
+            "entry_path": feature.get("entry_path"),
+            "feature_files": feature_files(feature),
+            "reviewed_at": now,
+            "reviewed_at_sha": git_head(project),
+            "reviewed_state": feature_state(project, feature),
+            "findings": merged_findings,
+        }
+    )
+    return document, summary
+
+
+def atomic_write_json(destination, value):
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, destination)
+    except BaseException:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def load_json(path, default=None):
+    if path is None:
+        return copy.deepcopy(default)
+    source = Path(path)
+    if not source.exists() and default is not None:
+        return copy.deepcopy(default)
+    with source.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def print_json(value):
+    json.dump(value, sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+
+
+def utc_now():
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def default_findings_path(project, feature_id):
+    return Path(project) / ".codesage" / "findings" / f"{feature_id}.json"
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Deterministic CodeSage review-state operations")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    slim = subparsers.add_parser("slim-priors")
+    slim.add_argument("--findings", required=True)
+
+    state = subparsers.add_parser("feature-state")
+    state.add_argument("--project", required=True)
+    state.add_argument("--feature", required=True)
+    state.add_argument("--findings")
+
+    states = subparsers.add_parser("feature-states")
+    states.add_argument("--project", required=True)
+    states.add_argument("--features", required=True)
+    states.add_argument("--findings-dir")
+
+    validate = subparsers.add_parser("validate")
+    validate.add_argument("--project", required=True)
+    validate.add_argument("--response", required=True)
+    validate.add_argument("--findings")
+    validate.add_argument("--output")
+
+    combine = subparsers.add_parser("combine")
+    combine.add_argument("--responses", nargs="+", required=True)
+    combine.add_argument("--output")
+
+    merge = subparsers.add_parser("merge")
+    merge.add_argument("--project", required=True)
+    merge.add_argument("--feature", required=True)
+    merge.add_argument("--validated", required=True)
+    merge.add_argument("--verdicts")
+    merge.add_argument("--findings")
+    merge.add_argument("--run-id", required=True)
+    merge.add_argument("--mode", choices=("review", "revalidate"), default="review")
+    merge.add_argument("--target-ids")
+    merge.add_argument("--now")
+
+    return parser
+
+
+def run_cli(args):
+    if args.command == "slim-priors":
+        print_json(slim_priors(load_json(args.findings)))
+        return
+
+    if args.command == "feature-state":
+        feature = load_json(args.feature)
+        current = feature_state(args.project, feature)
+        stored = None
+        if args.findings:
+            stored = load_json(args.findings, {}).get("reviewed_state")
+        print_json(
+            {
+                "feature_id": feature.get("feature_id"),
+                "feature_state": current,
+                "stored_state": stored,
+                "up_to_date": stored is not None and stored == current,
+                "files": feature_files(feature),
+            }
+        )
+        return
+
+    if args.command == "feature-states":
+        inventory = load_json(args.features)
+        features = inventory.get("results", []) if isinstance(inventory, dict) else inventory
+        if not isinstance(features, list):
+            raise ValueError("feature inventory must be an array or a results object")
+        findings_dir = Path(
+            args.findings_dir or Path(args.project) / ".codesage" / "findings"
+        )
+        results = feature_states(args.project, features)
+        for result in results:
+            stored = load_json(
+                findings_dir / f"{result['feature_id']}.json", {}
+            ).get("reviewed_state")
+            result["stored_state"] = stored
+            result["up_to_date"] = stored is not None and stored == result["feature_state"]
+        print_json({"results": results})
+        return
+
+    if args.command == "validate":
+        response = load_json(args.response)
+        feature_id = response.get("feature_id")
+        findings_path = args.findings or default_findings_path(args.project, feature_id)
+        validated = validate_response(
+            args.project, response, load_json(findings_path, {"findings": []})
+        )
+        if args.output:
+            atomic_write_json(args.output, validated)
+        print_json(validated)
+        return
+
+    if args.command == "combine":
+        combined = combine_responses([load_json(path) for path in args.responses])
+        if args.output:
+            atomic_write_json(args.output, combined)
+        print_json(combined)
+        return
+
+    if args.command == "merge":
+        feature = load_json(args.feature)
+        feature_id = feature.get("feature_id")
+        findings_path = Path(
+            args.findings or default_findings_path(args.project, feature_id)
+        )
+        existing = load_json(findings_path, {"findings": []})
+        validated = load_json(args.validated)
+        verdicts = load_json(args.verdicts, {"verdicts": []})
+        target_finding_ids = load_json(args.target_ids) if args.target_ids else None
+        if target_finding_ids is not None and not isinstance(target_finding_ids, list):
+            raise ValueError("target finding IDs must be an array")
+        now = args.now or utc_now()
+        document, summary = merge_document(
+            args.project,
+            feature,
+            existing,
+            validated,
+            verdicts,
+            args.run_id,
+            now,
+            args.mode,
+            target_finding_ids,
+        )
+        atomic_write_json(findings_path, document)
+        snapshot = (
+            Path(args.project)
+            / ".codesage"
+            / "findings"
+            / "history"
+            / f"{feature_id}-{args.run_id}.json"
+        )
+        atomic_write_json(snapshot, document)
+        print_json({"findings_path": str(findings_path), "snapshot_path": str(snapshot), **summary})
+        return
+
+    raise ValueError(f"unknown command: {args.command}")
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        run_cli(args)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"codesage-review-state: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

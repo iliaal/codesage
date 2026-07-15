@@ -76,7 +76,7 @@ test_leak_check_invalid_regex_fails_closed() {
 }
 
 test_release_script_updates_changelog_links() {
-	local tmp origin fake_bin release_script version changelog codex_calls plugin_version
+	local tmp origin fake_bin release_script version changelog codex_calls codex_version claude_version marketplace_metadata_version marketplace_plugin_version
 	tmp="$(mktemp -d)"
 	trap 'rm -rf "$tmp"' RETURN
 	origin="${tmp}/origin.git"
@@ -140,12 +140,28 @@ EOF
   "version": "1.2.2"
 }
 EOF
+	mkdir -p plugins/codesage-tools/.claude-plugin .claude-plugin
+	cp plugins/codesage-tools/.codex-plugin/plugin.json plugins/codesage-tools/.claude-plugin/plugin.json
+	cat >.claude-plugin/marketplace.json <<'EOF'
+{
+  "name": "codesage",
+  "metadata": {"version": "1.2.2"},
+  "plugins": [
+    {
+      "name": "codesage-tools",
+      "version": "1.2.2",
+      "source": "./plugins/codesage-tools"
+    }
+  ]
+}
+EOF
 	# release.sh runs scripts/check-changelog.py as a pre-flight against the
 	# repo root it is invoked in; provision (and commit, to keep the tree clean)
-	# the lint so the fake repo mirrors a real checkout.
+	# the lints so the fake repo mirrors a real checkout.
 	mkdir -p scripts
 	cp "$repo_root/scripts/check-changelog.py" scripts/check-changelog.py
-	git add Cargo.toml CHANGELOG.md scripts/check-changelog.py plugins/codesage-tools/.codex-plugin/plugin.json
+	cp "$repo_root/scripts/check-plugin-versions.py" scripts/check-plugin-versions.py
+	git add Cargo.toml CHANGELOG.md .claude-plugin/marketplace.json scripts/check-changelog.py scripts/check-plugin-versions.py plugins/codesage-tools/.codex-plugin/plugin.json plugins/codesage-tools/.claude-plugin/plugin.json
 	git commit -q -m initial
 	git push -q origin master
 
@@ -160,12 +176,16 @@ EOF
 		cat CHANGELOG.md >&2
 		return 1
 	fi
-	plugin_version="$(git show HEAD:plugins/codesage-tools/.codex-plugin/plugin.json | python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])')"
-	[[ "${plugin_version}" == "${version}" ]] || {
-		printf 'release commit left Codex plugin at %s, expected %s\n' "${plugin_version}" "${version}" >&2
+	codex_version="$(git show HEAD:plugins/codesage-tools/.codex-plugin/plugin.json | python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])')"
+	claude_version="$(git show HEAD:plugins/codesage-tools/.claude-plugin/plugin.json | python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])')"
+	marketplace_metadata_version="$(git show HEAD:.claude-plugin/marketplace.json | python3 -c 'import json, sys; print(json.load(sys.stdin)["metadata"]["version"])')"
+	marketplace_plugin_version="$(git show HEAD:.claude-plugin/marketplace.json | python3 -c 'import json, sys; print(json.load(sys.stdin)["plugins"][0]["version"])')"
+	if [[ "${codex_version}" != "${version}" || "${claude_version}" != "${version}" || "${marketplace_metadata_version}" != "${version}" || "${marketplace_plugin_version}" != "${version}" ]]; then
+		printf 'release commit left plugin versions at codex=%s claude=%s metadata=%s marketplace=%s, expected %s\n' \
+			"${codex_version}" "${claude_version}" "${marketplace_metadata_version}" "${marketplace_plugin_version}" "${version}" >&2
 		cat "${tmp}/release-script.out" >&2
 		return 1
-	}
+	fi
 	[[ "$(grep -Fxc "plugin marketplace add ${tmp}/work" "${codex_calls}")" -eq 1 ]]
 	[[ "$(grep -Fxc 'plugin add codesage-tools@codesage' "${codex_calls}")" -eq 1 ]]
 
@@ -252,5 +272,7 @@ test_leak_check_range_uses_range_endpoint
 test_leak_check_invalid_regex_fails_closed
 test_release_script_updates_changelog_links
 test_check_changelog_terseness
+python3 -m unittest discover -s "$repo_root/scripts/tests" -p 'test_*.py'
+python3 -m unittest discover -s "$repo_root/plugins/codesage-tools/tests" -p 'test_*.py'
 
-printf 'script regression tests passed\n'
+printf 'script and plugin regression tests passed\n'

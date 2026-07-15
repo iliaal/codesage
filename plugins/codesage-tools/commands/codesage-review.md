@@ -1,216 +1,182 @@
 ---
 name: codesage-review
-description: Review codesage feature slices in parallel via subagents, persist findings to .codesage/findings/
-argument-hint: "<project-path> [--limit N] [--jobs N] [--feature <id>] [--kind route|library|cli-command|test-suite] [--severity low|medium|high] [--categories bug,security,perf,maintainability] [--deep] [--no-verify] [--model <m>] [--verify-model <m>]"
+description: Review CodeSage feature slices in parallel and persist validated findings
+argument-hint: "<project-path> [--limit N] [--jobs N] [--feature <id>] [--kind <kind>] [--focus all|product] [--severity low|medium|high] [--categories bug,security,perf,maintainability] [--deep] [--no-verify] [--max-verify-findings N] [--model <m>] [--verify-model <m>]"
 ---
 
-# Review codesage feature slices
+# Review CodeSage feature slices
 
-Fan out a code review across the project's mapped feature slices using subagents. Each subagent reviews one slice in its own context; this command coordinates, mechanically checks the evidence, adversarially verifies new findings, and persists the survivors.
+Review mapped feature slices with read-only subagents. The subagents inspect code and return candidate findings. `${CLAUDE_PLUGIN_ROOT}/bin/codesage-review-state` validates evidence, assigns identities, compares feature content, merges prior state, and writes findings atomically.
 
-## Inputs
+## Parse inputs
 
-Parse `$ARGUMENTS`. First positional argument MUST be an absolute project path that's already onboarded to codesage (has `.codesage/index.db`). If not, stop and tell the user to run `/codesage-onboard <path>` first.
+The first positional argument must be an absolute onboarded project path containing `.codesage/index.db`.
 
 Flags:
-- `--limit N` — cap the number of features reviewed in one run (default: 50)
-- `--jobs N` — parallel subagents (default: 4; clamp to 8)
-- `--feature <id>` — review one specific feature (skips the discovery step)
-- `--kind <k>` — filter features by kind (`route`, `library`, `cli-command`, `test-suite`, `service`, `config`, `job`)
-- `--severity <s>` — minimum severity to report (`low`/`medium`/`high`, default `medium`)
-- `--categories <c,c,...>` — comma-separated list of `bug`/`security`/`perf`/`maintainability`/`style` (default: `bug,security`). `perf` and `maintainability` are opt-in: the reviewer reads slices statically and never profiles, so perf findings are inherently speculative and the highest false-positive category. The default keeps the two categories where a finding is almost always actionable. Add `perf` explicitly (`--categories bug,security,perf`) when you have a concrete hotspot concern; the rubric still gates it to demonstrable pessimizations.
-- `--deep` — multi-lens mode: high-risk slices get 2-3 parallel reviewers with distinct lenses instead of one generalist (see Step 4). Costs roughly 2× on the slices it triggers for.
-- `--no-verify` — skip the adversarial verification stage (Step 6). Verification is on by default; skip it only for quick informal sweeps.
-- `--model <m>` — model for the reviewer subagents (pass as `model` on the Agent call). Default: inherit the session model.
-- `--verify-model <m>` — model for the verifier subagents. Default: inherit the session model. When running a cheap sweep (`--model haiku`), keep the verifier on a stronger model — the model you trust for judgment belongs in the verifier seat.
 
-## Step 1: Discover features
+- `--limit N`: cap planned features after filtering and sorting. Default `50`.
+- `--jobs N`: parallel reviewer or verifier calls. Default `4`, maximum `8`.
+- `--feature <id>`: review one feature.
+- `--kind <kind>`: filter to `route`, `library`, `cli-command`, `test-suite`, `service`, `config`, or `job`.
+- `--focus all|product`: `all` reviews every mapped kind and is the default. `product` excludes `test-suite` plus entries under `bench/` and `scripts/`.
+- `--severity low|medium|high`: minimum severity. Default `medium`.
+- `--categories <list>`: any of `bug`, `security`, `perf`, `maintainability`. Default `bug,security`.
+- `--deep`: use correctness, security, and lifecycle lenses on eligible slices.
+- `--no-verify`: skip adversarial verification.
+- `--max-verify-findings N`: maximum new findings sent to one feature's verifier. Default `5`, maximum `10`. Keep extra findings as `unverified` rather than dropping them.
+- `--model <m>` and `--verify-model <m>`: reviewer and verifier model overrides.
 
-If `--feature` is set, skip this step.
-
-Otherwise call MCP `mcp__codesage__list_features(project, kind?, limit=200)` to get the feature inventory. Then filter to features that need review:
-
-1. Drop features already reviewed since their last code change. A feature is up-to-date when its `.codesage/findings/<feature_id>.json` mtime is newer than the entry file's last commit time (`git -C <project> log -1 --format=%ct -- <entry_path>`) AND the most recent `.codesage/reviews/*.json` record that planned this feature has `"status": "complete"`. `FeatureRecord` carries no timestamp, so use the file mtime and git history rather than a record field.
-2. Sort by what the user is most likely to care about: `kind == "route"` > `kind == "cli-command"` > `kind == "service"` > rest. Then by `confidence: high` first.
-3. Apply `--limit`.
-
-Report the count: "Found 47 features; 12 already up-to-date; reviewing 35 (capped at --limit 35)."
-
-## Step 2: Generate run ID and prep state dir
+Reject unknown values before dispatch. Set:
 
 ```bash
-RUN_ID="run_$(date +%Y%m%dT%H%M%SZ -u)"
-mkdir -p "$PROJECT/.codesage/findings" "$PROJECT/.codesage/findings/history" "$PROJECT/.codesage/reviews"
+REVIEW_STATE="${CLAUDE_PLUGIN_ROOT}/bin/codesage-review-state"
+test -x "$REVIEW_STATE"
 ```
 
-Write the run start record to `.codesage/reviews/$RUN_ID.json`:
+## 1. Create the run
 
-```json
-{
-  "run_id": "run_20260516T203000Z",
-  "started_at": "2026-05-16T20:30:00Z",
-  "project": "/abs/path",
-  "filters": { "limit": 35, "jobs": 4, "kind": null, "severity": "medium", "categories": ["bug", "security"], "deep": false, "verify": true },
-  "features_planned": ["feat_aaa", "feat_bbb", ...],
-  "status": "in_progress"
-}
+Use `run_$(date -u +%Y%m%dT%H%M%SZ)` as `RUN_ID`. Create:
+
+```text
+.codesage/findings/history/
+.codesage/reviews/<RUN_ID>/features/
+.codesage/reviews/<RUN_ID>/responses/
+.codesage/reviews/<RUN_ID>/validated/
+.codesage/reviews/<RUN_ID>/verdicts/
 ```
 
-## Step 3: Load prior findings and compute the diff base per feature
+Write `.codesage/reviews/<RUN_ID>.json` with the run ID, start time, filters, and `status: in_progress`.
 
-For each feature in the plan, read `.codesage/findings/<feature_id>.json` if it exists. Pass the `findings[]` array (where `status` is `open`, `false-positive`, or `wont-fix`) to the subagent as `prior_findings` so it can dedupe and respect prior triage.
+## 2. Discover, check freshness, and rank
 
-If no file exists yet, pass `prior_findings: []`.
+Unless `--feature` names one slice, call `mcp__codesage__list_features(project, kind?, limit=200)`. For `--feature`, run `codesage feature-show --json <feature_id>` from the project and fail if the ID is unknown. Write the inventory to `.codesage/reviews/<RUN_ID>/features.json` and each complete feature record to `.codesage/reviews/<RUN_ID>/features/<feature_id>.json`.
 
-When a prior findings file exists, also compute the commit the slice was last reviewed at, so the subagent can focus depth on what changed since:
+Hash freshness for the inventory in one process:
 
 ```bash
-LAST_TS=$(stat -c %Y "$PROJECT/.codesage/findings/<feature_id>.json")
-BASE=$(git -C "$PROJECT" rev-list -1 --before=@$LAST_TS HEAD)
+"$REVIEW_STATE" feature-states \
+  --project "$PROJECT" \
+  --features ".codesage/reviews/$RUN_ID/features.json" \
+  --findings-dir ".codesage/findings"
 ```
 
-Pass `$BASE` as `last_reviewed_base` in the subagent prompt (omit the line entirely on first review or if the command fails). The subagent diffs the bundle's files against it itself.
+The helper reads each unique slice file once even when features overlap. Skip only records where `up_to_date` is true. The fingerprint covers every entry, owned, context, and test file. Findings mtimes and triage edits don't affect it. Legacy documents without `reviewed_state` are reviewed once and upgraded during merge.
 
-## Step 4: Dispatch subagents in parallel batches
+Apply `--focus` and `--kind`.
 
-Process features in batches of `--jobs`. For each batch, send all Agent tool calls in a SINGLE message with multiple tool-use blocks so they run concurrently. When `--model` is set, pass it as `model` on every reviewer Agent call.
+Collect every candidate's entry and owned paths. Call `mcp__codesage__assess_risk_batch` in chunks of at most 100 unique paths. Attach each full risk record to its feature and compute `max_owned_risk`.
 
-**Standard dispatch** (the default) — one reviewer per feature:
+Sort by:
 
-```
-Agent({
-  description: "Review feat_<id>",
-  subagent_type: "codesage-feature-reviewer",
-  prompt: <<SELF-CONTAINED PROMPT>>
-})
-```
+1. product paths before `bench/`, `scripts/`, and `test-suite`;
+2. `max_owned_risk` descending;
+3. `route`, `service`, `cli-command`, `library`, then the remaining kinds;
+4. high confidence first, then feature ID.
 
-The prompt must be fully self-contained (subagents don't see your context). Template:
+Apply `--limit`. This keeps full coverage by default while making a capped run reach risky product code first. Report discovered, fresh, filtered, and planned counts.
 
-```
-Review codesage feature <feature_id> in project <abs project path>.
+## 3. Prepare compact prompts
 
-Severity threshold: <severity>
-Categories: <comma-separated>
-Last reviewed base: <sha>        # omit this line on first review
-Prior findings: <inline JSON array, possibly empty>
+For each planned feature:
 
-Call mcp__codesage__feature_bundle({project: "...", feature_id: "...", include_callers: true, include_callees: true}) for context, then mcp__codesage__assess_risk on the entry file, then Read on relevant files. Return strict JSON per your agent definition.
-```
+1. Generate feature-local priors:
 
-Don't add extra commentary in the subagent prompt — the agent file already has the full spec. Keep the dispatch prompt short and unambiguous.
+   ```bash
+   "$REVIEW_STATE" slim-priors \
+     --findings ".codesage/findings/<feature_id>.json"
+   ```
 
-**Deep dispatch** (`--deep` only): before dispatching, call `mcp__codesage__assess_risk(project, entry_path)` for each planned feature. A feature is deep-eligible when `score >= 0.5` OR it crosses 3+ trust boundaries. Deep-eligible features get 2-3 reviewers in the same batch, identical prompts except one extra line each — `Lens: correctness`, `Lens: security`, `Lens: lifecycle` (drop the `security` lens if `security` isn't in `--categories`; drop `lifecycle` for pure-config slices). Non-eligible features get the standard single reviewer. Lens results for one feature merge in Step 5 exactly like one response with the findings concatenated — the ID computation dedupes overlaps.
+   Use `[]` when the file doesn't exist. Never inline full histories or prior suggested fixes.
+2. If the findings document has `reviewed_at_sha`, compute changed slice files in the orchestrator with `git diff --name-only <sha> -- <feature paths>`. Include committed and working-tree changes. Reviewers don't receive Bash.
+3. Build a self-contained prompt with:
 
-## Step 5: Parse, mechanically check, and merge
+   ```text
+   Review CodeSage feature <feature_id> in project <absolute path>.
+   Severity threshold: <severity>
+   Categories: <categories>
+   Feature: <JSON containing id, title, kind, entry_path, files, trust_boundaries>
+   Risk by file: <JSON from assess_risk_batch>
+   Changed files since prior review: <JSON array, possibly empty>
+   Prior findings: <slim JSON array, possibly empty>
+   Lens: <optional lens>
+   Follow your agent definition and return one strict JSON object.
+   ```
 
-Each subagent returns a single JSON block. Extract it (`{ ... }` between ```json fences).
+## 4. Dispatch reviewers
 
-**Parse repair:** if extraction or JSON parsing fails, don't give up on the feature yet. Dispatch one minimal repair subagent (`model: haiku`, general-purpose) with the raw output and the instruction: "Below is the raw output of a code-review agent that was supposed to return one fenced JSON object. Extract and syntax-repair that object. Output ONLY the fenced JSON — do not add, remove, or reword findings." If the repaired output parses, continue with it; if not, record the raw output to `.codesage/reviews/<run_id>-<feature_id>-raw.txt` and mark that feature as `error` in the run record. Don't crash the run — process other features and surface the failures at the end.
+Process features in batches of `--jobs`; send all Agent calls in one message per batch.
 
-For each successfully parsed response, run these gates **in order**:
+Standard mode uses one `codesage-feature-reviewer` per feature. Deep mode uses separate lenses when `max_owned_risk >= 0.5`, the feature crosses at least three trust boundaries, the feature has at least eight owned files, or the entry exceeds 800 lines. Use `correctness`, `security`, and `lifecycle`; omit security when the category is disabled and lifecycle for config slices.
 
-### 5a. Evidence check (mechanical, no LLM)
+Pass precomputed risk in every prompt. Reviewers must not repeat the batch risk call when risk is present.
 
-For every finding, verify the quoted evidence against the actual file. For each line in `evidence[]`, whitespace-normalize it (collapse runs of whitespace, trim) and search the whitespace-normalized content of `<project>/<file>`:
+Before dispatch, report the exact upper bound: reviewer count plus at most one verifier per feature. Warn when it exceeds 30 calls.
 
-- At least one non-trivial evidence line (>10 chars after normalization) must appear in the file. If none does, **drop the finding** — the quote is fabricated or stale. Count it under `evidence_rejected` in the run record, with feature_id, file, title.
-- If the evidence matches but sits outside `line ± 15`, correct the finding's `line` to where the evidence actually is and keep it.
+## 5. Parse and validate
 
-Do this with a small python3/bash check, not by eyeballing. This gate is what makes the pipeline safe to run on weaker reviewer models.
+Extract the first fenced JSON object from each response. If parsing fails, use one small repair call that may only repair JSON syntax. Save a second failure as `.codesage/reviews/<RUN_ID>/responses/<feature_id>-raw.txt` and mark the feature errored.
 
-### 5b. Compute finding IDs (orchestrator-side)
-
-Reviewers do not mint IDs. For each surviving finding **without** a `finding_id` (i.e. not an echoed prior):
+For deep mode, save each lens response separately and combine them in fixed `correctness`, `security`, `lifecycle` order:
 
 ```bash
-fnd_$(printf '%s' "<feature_id>|<file>|<category>|<line>" | sha256sum | cut -c1-8)
+"$REVIEW_STATE" combine \
+  --responses \
+    ".codesage/reviews/$RUN_ID/responses/<feature_id>-correctness.json" \
+    ".codesage/reviews/$RUN_ID/responses/<feature_id>-security.json" \
+    ".codesage/reviews/$RUN_ID/responses/<feature_id>-lifecycle.json" \
+  --output ".codesage/reviews/$RUN_ID/responses/<feature_id>.json"
 ```
 
-If two findings in one response collide on the tuple, append `|2`, `|3`, ... to the hashed string for the second and later ones (the ID format stays `fnd_<8hex>`).
+Include only the lenses that were dispatched, and pass their paths explicitly in lens order rather than relying on glob order. The validation step below removes duplicate candidates by evidence fingerprint or close title/location identity before assigning IDs.
 
-### 5c. Merge with prior findings (exact, then fuzzy)
+Write parsed JSON to `.codesage/reviews/<RUN_ID>/responses/<feature_id>.json`, then run:
 
-Merge with the existing `.codesage/findings/<feature_id>.json`:
-
-1. **Exact match:** the finding's `finding_id` (echoed or computed) exists in the prior file → preserve `status` and `history` from the prior, update `last_seen_at` to now.
-2. **Fuzzy match:** no exact ID match, but a prior finding has the same `file` + `category` and `|line delta| <= 10` → treat as the same finding: **keep the prior `finding_id`**, preserve `status`/`history`, update `line`, `title`, `summary`, `evidence` from the new response, set `last_seen_at` to now. This is what keeps identity stable across model changes (different title wording) and small code motion.
-3. **New:** no match → set `status: open`, `first_seen_at: now`, `last_seen_at: now`, append `{action: "review", at: now, run_id: <run>}` to `history`. Queue it for Step 6 verification.
-4. For each prior finding NOT in the response: mark `last_seen_at: now-1` (older than the run), append `{action: "not-seen", at: now, run_id: <run>}` to `history`. Don't auto-resolve — that's `/codesage-revalidate`'s job.
-
-Don't write the merged file yet — Step 6 may still remove new findings.
-
-## Step 6: Adversarial verification (default on; skipped by --no-verify)
-
-Only **new** findings (Step 5c case 3) are verified — recurring findings already survived a prior round and the user's triage. Dispatch one `codesage-finding-verifier` subagent per new finding, batched by `--jobs`, all calls in one message per batch. When `--verify-model` is set, pass it as `model` on each verifier call. Prompt template:
-
-```
-Verify this code-review finding in project <abs project path>.
-
-Finding:
-<inline JSON of the finding, including its computed finding_id>
-
-Try to refute it per your agent definition. Return strict JSON.
+```bash
+"$REVIEW_STATE" validate \
+  --project "$PROJECT" \
+  --response ".codesage/reviews/$RUN_ID/responses/<feature_id>.json" \
+  --findings ".codesage/findings/<feature_id>.json" \
+  --output ".codesage/reviews/$RUN_ID/validated/<feature_id>.json"
 ```
 
-Apply verdicts:
+The helper rejects fabricated or weakly-located evidence, corrects accepted loci, preserves identity by evidence fingerprint or close title match, prevents nearby defects from collapsing, and mints IDs for new findings. Use its `evidence_rejected` and new/recurring ID lists in the run stats.
 
-- `confirmed` — keep; append `{action: "verify", at: now, run_id: <run>, result: "confirmed"}` to its history.
-- `uncertain` — keep; append `{action: "verify", result: "uncertain", note: <note>}`. It stays `open`; the user adjudicates.
-- `refuted` — **drop the finding** from the merge; record it in the run record under `refuted[]` with feature_id, title, and the verifier's `refutation` text so the user can spot-check the kills.
+## 6. Verify new findings once per feature
 
-If a verifier errors or returns unparseable output, treat the finding as `uncertain` (keep it) — verification failure must not silently delete findings.
+Skip this step under `--no-verify`. Otherwise, for each feature with new IDs:
 
-Now write the merged file for each feature and snapshot the per-run state to `.codesage/findings/history/<feature_id>-<run_id>.json`.
+1. Sort new findings by severity, then file and line.
+2. Take at most `--max-verify-findings`.
+3. Dispatch one `codesage-finding-verifier` with the selected JSON array. Don't dispatch one verifier per finding.
+4. Save its strict response as `.codesage/reviews/<RUN_ID>/verdicts/<feature_id>.json`.
 
-## Step 7: Write the run completion record
+The verifier returns one verdict per selected ID. Findings beyond the cap or missing from a failed verifier response remain open with an `unverified` history event. Never delete them because verification failed.
 
-Update `.codesage/reviews/<run_id>.json`:
+## 7. Merge atomically
 
-```json
-{
-  ...,
-  "completed_at": "...",
-  "status": "complete",
-  "stats": {
-    "features_reviewed": 34,
-    "features_errored": 1,
-    "features_deep_reviewed": 5,
-    "findings_new": 23,
-    "findings_recurring": 9,
-    "findings_evidence_rejected": 3,
-    "findings_refuted": 4,
-    "findings_by_severity": { "high": 3, "medium": 18, "low": 11 },
-    "findings_by_category": { "bug": 14, "security": 8, "perf": 6, "maintainability": 4 }
-  },
-  "evidence_rejected": [ { "feature_id": "...", "file": "...", "title": "..." } ],
-  "refuted": [ { "feature_id": "...", "finding_id": "...", "title": "...", "refutation": "..." } ]
-}
+For every successfully reviewed feature, run:
+
+```bash
+"$REVIEW_STATE" merge \
+  --project "$PROJECT" \
+  --feature ".codesage/reviews/$RUN_ID/features/<feature_id>.json" \
+  --validated ".codesage/reviews/$RUN_ID/validated/<feature_id>.json" \
+  --verdicts ".codesage/reviews/$RUN_ID/verdicts/<feature_id>.json" \
+  --run-id "$RUN_ID" \
+  --mode review
 ```
 
-## Step 8: Report
+Omit `--verdicts` when verification is disabled. The helper writes `.codesage/findings/<feature_id>.json` plus the immutable run snapshot. It stores feature metadata and the content fingerprint. It appends one pending event when an open finding disappears, never marks it fixed, and adds no `not-seen` history to fixed, false-positive, or wont-fix findings.
 
-Print a terminal summary:
+## 8. Complete the run record
 
-```
-Review run run_20260516T203000Z complete.
-  Features: 34 reviewed (5 deep), 1 errored (see .codesage/reviews/<run_id>.json)
-  Findings: 23 new (19 confirmed, 4 uncertain), 9 recurring, 32 total open
-  Dropped: 3 failed evidence check, 4 refuted by verifier
-  By severity: 3 high, 18 medium, 11 low
-  By category: bug 14, security 8, perf 6, maintainability 4
-  Top features by finding count: feat_abc (5), feat_def (4), feat_xyz (3)
+Build the completion record from helper outputs rather than recounting findings by hand. Include feature counts, new/recurring/unverified/refuted/evidence-rejected counts, severity/category totals, errors, and high-severity IDs. Set `status: complete` only after every successful feature has merged; otherwise set `status: partial` and list errors.
 
-Next: /codesage-report --project <path>  to render Markdown
-      /codesage-triage --finding <id> --status false-positive
-      /codesage-revalidate --feature <id>  to re-check after a fix
-```
+Print the same summary plus exact next commands for report, triage, and revalidation.
 
-If any severity-high findings exist, list them with `finding_id` + `file:line` + title so the user can act immediately. If any findings were refuted, list their titles with one-line refutations — a wrong kill is worth catching.
+## Constraints
 
-## Notes
-
-- The reviewer and verifier subagents run READ-ONLY. They must not edit, write, or commit. Their `autoApprove: read` setting enforces this.
-- If `--jobs` × token budget × feature count looks excessive, warn the user upfront ("This will dispatch 35 subagents in batches of 4 plus ~1 verifier per new finding; expect ~50 LLM invocations and a few minutes of wall-clock"). `--deep` roughly doubles the reviewer count on the slices it triggers for.
-- Subagent dispatch inherits the host's model unless `--model` / `--verify-model` override it. The economical sweep on a large project: `--model haiku --verify-model opus` — cheap finders, strong judge. The evidence check (5a) and verification (Step 6) exist precisely so weaker reviewer models don't degrade what lands in `.codesage/findings/`.
-- The `.codesage/findings/` and `.codesage/reviews/` directories are gitignored automatically. `codesage init` writes `.codesage/.gitignore` containing `*` (plus `!.gitignore`), so the whole `.codesage/` tree stays out of version control.
+- Reviewer and verifier agents only use Read, Grep, and read-only CodeSage MCP tools.
+- User triage owns `false-positive` and `wont-fix`; later reviews suppress both.
+- Static review doesn't justify speculative performance claims. Keep `perf` opt-in.
+- All state stays under ignored `.codesage/findings/` and `.codesage/reviews/`.

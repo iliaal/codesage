@@ -44,7 +44,9 @@ Total findings in project: 47
 
 ## Pull feature metadata
 
-For each unique `feature_id` in the filtered set, call MCP `mcp__codesage__find_feature(project, file_path)` against the feature's entry file to enrich with the feature record's `title`, `kind`, `entry_path`, `trust_boundaries`. Don't fail the report if any one lookup misses — note the feature_id with `(metadata unavailable)`.
+Read `title`, `kind`, `entry_path`, and `feature_files` from each findings document. Current review runs persist these fields during merge, so reporting needs no MCP lookup.
+
+For a legacy document missing metadata, call `mcp__codesage__list_features(project, limit=200)` once and join records by `feature_id`. Don't guess an entry path from an arbitrary finding file. If the join misses, render the feature ID with `(metadata unavailable)`.
 
 ## Render Markdown
 
@@ -53,7 +55,7 @@ Output layout:
 ```markdown
 # Code review findings — <project basename>
 
-Generated 2026-05-16T20:50:00Z from .codesage/findings/.
+State updated 2026-05-16T20:50:00Z in .codesage/findings/.
 
 ## Summary
 
@@ -119,6 +121,6 @@ If not, print the rendered Markdown directly.
 
 ## Notes
 
-- The report is deterministic given the same `.codesage/findings/` state — re-running produces byte-identical output. Useful for diffing reports across review runs to spot drift.
+- Use the latest persisted `reviewed_at` value for the `State updated` line. Don't insert the current wall clock; identical findings state must render byte-identical output.
 - The trust-boundary distribution comes from each feature's record (`trust_boundaries: Vec<TrustBoundary>`), aggregated across the filtered features. It gives a quick read on whether the open findings cluster in security-sensitive code.
 - For just the high-severity section, run `--severity high`. For an audit-trail report including triaged-out findings, run `--status open,wont-fix,false-positive,fixed`.

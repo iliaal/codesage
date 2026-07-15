@@ -7,7 +7,8 @@
 #   1. Pre-flight checks (on master, clean tree, in sync with origin, tag free)
 #   2. Move `## [Unreleased]` content into a new `## [X.Y.Z] - YYYY-MM-DD` block
 #      and append the matching link reference.
-#   3. Bump `[workspace.package].version` and the Codex plugin version.
+#   3. Bump `[workspace.package].version`, both plugin manifests, and the
+#      Claude marketplace version.
 #   4. Build the release binary with `--features cuda` so Cargo.lock is up to date.
 #   5. Prompt, then commit + tag.
 #   6. Prompt, then refresh the local Codex plugin and push master + tag.
@@ -68,6 +69,8 @@ fi
 # cleanly rather than getting stamped into a version section.
 python3 "$ROOT/scripts/check-changelog.py" "$ROOT/CHANGELOG.md" ||
 	die "CHANGELOG [Unreleased] failed validation (see above)"
+python3 "$ROOT/scripts/check-plugin-versions.py" --root "$ROOT" ||
+	die "plugin versions don't match the current workspace version"
 
 current=$(awk -F'"' '/^\[workspace\.package\]/{f=1;next} f && /^version *=/{print $2; exit}' Cargo.toml)
 [[ -n "$current" ]] || die "could not read current version from Cargo.toml"
@@ -116,16 +119,43 @@ if n != 1:
     sys.exit("release: failed to bump [workspace.package].version in Cargo.toml")
 ct.write_text(new_ctext)
 
-plugin = pathlib.Path("plugins/codesage-tools/.codex-plugin/plugin.json")
-try:
-    plugin_data = json.loads(plugin.read_text())
-except (OSError, json.JSONDecodeError) as exc:
-    sys.exit(f"release: could not read Codex plugin manifest: {exc}")
-if plugin_data.get("name") != "codesage-tools":
-    sys.exit("release: Codex plugin manifest has unexpected name")
-plugin_data["version"] = version
-plugin.write_text(json.dumps(plugin_data, indent=2) + "\n")
+def load_json(path, label):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        sys.exit(f"release: could not read {label}: {exc}")
+
+def write_json(path, value):
+    path.write_text(json.dumps(value, indent=2) + "\n")
+
+for path, label in (
+    (pathlib.Path("plugins/codesage-tools/.codex-plugin/plugin.json"), "Codex plugin manifest"),
+    (pathlib.Path("plugins/codesage-tools/.claude-plugin/plugin.json"), "Claude plugin manifest"),
+):
+    plugin_data = load_json(path, label)
+    if plugin_data.get("name") != "codesage-tools":
+        sys.exit(f"release: {label} has unexpected name")
+    plugin_data["version"] = version
+    write_json(path, plugin_data)
+
+marketplace_path = pathlib.Path(".claude-plugin/marketplace.json")
+marketplace = load_json(marketplace_path, "Claude marketplace manifest")
+marketplace.setdefault("metadata", {})["version"] = version
+entries = [
+    plugin
+    for plugin in marketplace.get("plugins", [])
+    if plugin.get("name") == "codesage-tools"
+]
+if len(entries) != 1:
+    sys.exit(
+        f"release: Claude marketplace has {len(entries)} codesage-tools entries; expected 1"
+    )
+entries[0]["version"] = version
+write_json(marketplace_path, marketplace)
 PYEOF
+
+python3 "$ROOT/scripts/check-plugin-versions.py" --root "$ROOT" ||
+	die "release mutation left plugin versions inconsistent"
 
 echo
 echo "--- Cargo.toml diff ---"
@@ -134,8 +164,11 @@ echo
 echo "--- CHANGELOG.md diff (head) ---"
 git --no-pager diff CHANGELOG.md | head -80
 echo
-echo "--- Codex plugin manifest diff ---"
-git --no-pager diff plugins/codesage-tools/.codex-plugin/plugin.json
+echo "--- Plugin manifest diffs ---"
+git --no-pager diff \
+	plugins/codesage-tools/.codex-plugin/plugin.json \
+	plugins/codesage-tools/.claude-plugin/plugin.json \
+	.claude-plugin/marketplace.json
 echo
 
 echo "Building release binary with --features cuda (refreshes Cargo.lock)..."

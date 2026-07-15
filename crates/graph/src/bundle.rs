@@ -247,10 +247,8 @@ pub fn export_context_for_symbol(
 ///
 /// Layout:
 /// - `primary[]` — chunks from owned + entry files, capped at `limit`.
-/// - `related[]` — chunks from tests first, then context files. Caller/
-///   callee expansion of the entry symbol (when `include_callers` /
-///   `include_callees` is set and the feature has a real entry symbol)
-///   joins this list, capped by `limit`.
+/// - `related[]` — up to two requested caller/callee chunks, then chunks
+///   from tests and context files. The combined list is capped by `limit`.
 /// - `symbol_definitions[]` — entry-symbol definition (when present) +
 ///   any symbol definitions discovered while building primary chunks.
 /// - `target_description` — `"feature: <title> (<feature_id>)"`.
@@ -319,18 +317,6 @@ pub fn feature_bundle(
 
     let mut related: Vec<SearchResult> = Vec::new();
     let mut related_keys: HashSet<(String, u32)> = primary_keys.clone();
-    // Tests next (run-this-after-review signal), then context.
-    for role in [FeatureFileRole::Test, FeatureFileRole::Context] {
-        for f in feature.files.iter().filter(|f| f.role == role) {
-            if related.len() >= limit {
-                break;
-            }
-            add_first_chunk_of_file(db, &f.path, &mut related, &mut related_keys)?;
-        }
-        if related.len() >= limit {
-            break;
-        }
-    }
 
     // Symbol definitions: entry symbol (if any) + symbols overlapping the
     // primary chunks (annotated already by add_first_chunk_of_file).
@@ -373,17 +359,32 @@ pub fn feature_bundle(
     // Caller/callee expansion of the entry symbol when requested.
     if (include_callers || include_callees) && !symbol_definitions.is_empty() {
         // Use the entry symbol's definition(s) as the anchor — limited to
-        // the first few so the bundle stays bounded.
+        // the first few so tests still fit inside the existing related cap.
         let anchors: Vec<Symbol> = symbol_definitions.iter().take(3).cloned().collect();
         add_related_for_symbols(
             db,
             &anchors,
             include_callers,
             include_callees,
-            limit,
+            limit.min(2),
             &mut related,
             &mut related_keys,
         )?;
+    }
+
+    // Backfill tests (run-this-after-review signal), then context. Expansion
+    // goes first only when explicitly requested; without graph candidates,
+    // tests and context retain the full related budget.
+    for role in [FeatureFileRole::Test, FeatureFileRole::Context] {
+        for f in feature.files.iter().filter(|f| f.role == role) {
+            if related.len() >= limit {
+                break;
+            }
+            add_first_chunk_of_file(db, &f.path, &mut related, &mut related_keys)?;
+        }
+        if related.len() >= limit {
+            break;
+        }
     }
 
     Ok(finalize_bundle(ContextBundle {

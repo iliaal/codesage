@@ -184,7 +184,7 @@ fn entry_chunk_overlaps_entry_symbol_not_first_chunk() {
 }
 
 #[test]
-fn feature_bundle_include_callers_and_callees() {
+fn caller_expansion_reserves_related_capacity_when_tests_saturate() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(
@@ -198,6 +198,13 @@ fn feature_bundle_include_callers_and_callees() {
         "src/main.rs",
         "mod helpers;\nuse helpers::helper;\nfn main() { helper(); }\n",
     );
+    for index in 0..5 {
+        write(
+            root,
+            &format!("tests/integration_{index}.rs"),
+            &format!("#[test]\nfn integration_{index}() {{ assert!(true); }}\n"),
+        );
+    }
     let db = Database::open_in_memory().unwrap();
     full_index(root, &db, &[], false).unwrap();
     map_features(root, &db, &[]).unwrap();
@@ -208,6 +215,14 @@ fn feature_bundle_include_callers_and_callees() {
         "rust",
         "mod helpers;\nuse helpers::helper;\nfn main() { helper(); }\n",
     );
+    for index in 0..5 {
+        seed_chunk(
+            &db,
+            &format!("tests/integration_{index}.rs"),
+            "rust",
+            &format!("#[test]\nfn integration_{index}() {{ assert!(true); }}\n"),
+        );
+    }
 
     let features = db.features_for_file("src/main.rs").unwrap();
     let main_feature = features
@@ -215,7 +230,7 @@ fn feature_bundle_include_callers_and_callees() {
         .find(|f| f.entry_path == "src/main.rs")
         .expect("main feature mapped");
 
-    let bundle = feature_bundle(&db, &main_feature.feature_id, true, true, 10).unwrap();
+    let bundle = feature_bundle(&db, &main_feature.feature_id, true, true, 5).unwrap();
     let related_paths: Vec<&str> = bundle
         .related
         .iter()
@@ -224,6 +239,11 @@ fn feature_bundle_include_callers_and_callees() {
     assert!(
         related_paths.contains(&"src/helpers.rs"),
         "callee helper file should appear in related[], got {related_paths:?}"
+    );
+    assert_eq!(related_paths.len(), 5, "related[] must respect limit");
+    assert!(
+        related_paths.iter().any(|path| path.starts_with("tests/")),
+        "tests should backfill the capacity left by graph expansion"
     );
 }
 

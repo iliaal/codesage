@@ -180,7 +180,7 @@ Same as the pre-commit check, but scoped to everything on the branch instead of 
 
 ```bash
 # Fail the job if the patch raises any high-severity review objection.
-# Prereq: the index must exist in CI — run `codesage index && codesage git-index`
+# Prereq: the index must exist in CI; run `codesage index && codesage git-index`
 # in an earlier step, or cache .codesage/ between runs.
 git diff --name-only "origin/${GITHUB_BASE_REF:-main}...HEAD" \
   | codesage rehearse --json \
@@ -273,7 +273,9 @@ Start a new Codex thread after installation or reinstall so Codex loads the upda
 
 Codesage maps a project into behavior-keyed feature slices (routes, CLIs, libraries, test suites, jobs). The `codesage-tools` plugin ships a four-command workflow that dispatches read-only subagent reviews (one per slice, in parallel batches) and persists findings to gitignored JSON under `.codesage/findings/`. Each finding gets a stable `fnd_<hex>` ID so it can be referenced in commit messages and PR comments. Re-running keeps prior triage (`status` + audit-trail `history`) intact and merges new defects into the same per-feature file.
 
-The subagent is read-only (`autoApprove: read`); it consumes the existing MCP surface (`feature_bundle`, `assess_risk`, `find_references`, `find_coupling`) plus `Read`. Codesage's core stays read-only; findings are output that other tooling can consume.
+The subagent only gets `Read`, `Grep`, and read-only CodeSage MCP tools. The orchestrator batches risk across every owned file, then reviewers inspect changed and high-risk files instead of trusting the first five bundle chunks. Codesage's core stays read-only; findings are output that other tooling can consume.
+
+The plugin runs evidence validation, identity matching, content-freshness checks, and findings merges through `bin/codesage-review-state`. This keeps state transitions deterministic while reviewers handle the code judgment.
 
 ### `/codesage-review`
 
@@ -281,7 +283,9 @@ Dispatches subagents in parallel batches over the project's mapped feature slice
 
 ```
 /codesage-review <project> [--limit N] [--jobs N] [--feature <id>]
-                           [--kind <k>] [--severity <s>] [--categories <c,c,...>]
+                           [--kind <k>] [--focus all|product]
+                           [--severity <s>] [--categories <c,c,...>]
+                           [--deep] [--no-verify] [--max-verify-findings N]
 ```
 
 - `<project>`: absolute path to an onboarded codesage project (must contain `.codesage/index.db`)
@@ -289,10 +293,14 @@ Dispatches subagents in parallel batches over the project's mapped feature slice
 - `--jobs N`: parallel subagents per batch (default `4`, hard ceiling `8`)
 - `--feature <id>`: review one specific `feat_<hex>`, skipping discovery
 - `--kind <k>`: filter features by kind: `route`, `cli-command`, `service`, `library`, `test-suite`, `config`, `job`
+- `--focus <all|product>`: default `all`; `product` excludes test-suite slices plus `bench/` and `scripts/` entries for a smaller product-code sweep
 - `--severity <s>`: minimum severity to report: `low` / `medium` / `high` (default `medium`)
 - `--categories <c,c,...>`: comma-separated list (default `bug,security`); other values include `perf`, `maintainability`
+- `--deep`: use correctness, security, and lifecycle lenses on risky or large slices
+- `--no-verify`: skip adversarial verification of new findings
+- `--max-verify-findings <N>`: cap new findings checked by a feature's single batched verifier (default `5`, maximum `10`)
 
-Features whose `.codesage/findings/<feature_id>.json` is newer than the entry file's last commit (`git log -1 --format=%ct -- <entry_path>`) and whose last review run completed are skipped (already up-to-date). Sort order: `route` > `cli-command` > `service` > `library` > rest, then `high` confidence first.
+Each findings document stores a content fingerprint over the feature's entry, owned, context, and test files. Review skips a slice only when that fingerprint still matches, so triage edits can't make changed code appear fresh. Capped runs sort product paths and maximum owned-file risk first; full coverage remains the default.
 
 ### `/codesage-triage`
 
@@ -308,7 +316,7 @@ Pure local state edit. Appends a history entry on the named finding and updates 
 
 ### `/codesage-revalidate`
 
-Re-runs the subagent against a specific feature slice (or a single finding's owning slice) and reconciles. Auto-flips `open` → `fixed` when the defect no longer surfaces. Never mass-reopens `false-positive` or `wont-fix`.
+Re-runs the subagent against a specific feature slice (or a single finding's owning slice) and reconciles through the same evidence gate. A missing `open` finding stays open as `needs-confirmation`; omission alone never proves a fix. Current evidence can reopen a user-marked `fixed` finding. `false-positive` and `wont-fix` remain user-owned.
 
 ```
 /codesage-revalidate <project> [--feature <id>] [--finding <fnd_id>]
@@ -334,7 +342,7 @@ Deterministic Markdown render of the findings JSON. No LLM call.
 
 | Path | Content |
 |---|---|
-| `.codesage/findings/<feature_id>.json` | Per-feature findings + audit-trail `history[]` per finding (status, action, run_id, timestamp) |
+| `.codesage/findings/<feature_id>.json` | Feature metadata + content fingerprint + findings + transition-only audit-trail `history[]` |
 | `.codesage/findings/history/<feature_id>-<run_id>.json` | Per-run snapshot of the feature's findings, never modified after write |
 | `.codesage/reviews/<run_id>.json` | Run record: filters used, features planned, completion stats by severity/category, top features by finding count, severity-high list |
 
@@ -345,6 +353,9 @@ Both directories are gitignored automatically. `codesage init` (run during `/cod
 ```bash
 # Initial sweep over every mapped feature
 /codesage-review /path/to/project
+
+# Smaller sweep over product code only
+/codesage-review /path/to/project --focus product
 
 # Look at the result
 /codesage-report /path/to/project
