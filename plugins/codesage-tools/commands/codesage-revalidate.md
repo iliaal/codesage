@@ -27,7 +27,9 @@ Use `rev_$(date -u +%Y%m%dT%H%M%SZ)` as `RUN_ID`. For each feature:
 1. Read `entry_path`, `title`, `kind`, and `feature_files` from the findings document. For legacy documents missing metadata, call `mcp__codesage__list_features(project, limit=200)` once and join by `feature_id`.
 2. Write the feature record under `.codesage/reviews/<RUN_ID>/features/`.
 3. Project only the targeted findings. Include ID, location, severity, category, title, summary, evidence, suggested fix, and status. Strip `history`. Write their ID array to `.codesage/reviews/<RUN_ID>/targets/<feature_id>.json`.
-4. Call `mcp__codesage__assess_risk_batch` once for the feature's entry and owned paths.
+4. Call `mcp__codesage__assess_risk_batch` once for the feature's entry and owned paths. Write the batch-shaped result to `.codesage/reviews/<RUN_ID>/risk/<feature_id>.json`.
+5. Compute changed slice paths since `reviewed_at_sha`, when present, and union them with the targeted findings' paths. Write the array to `.codesage/reviews/<RUN_ID>/changed/<feature_id>.json`.
+6. Run `codesage-review-state plan-feature` with the feature, risk, and changed/target path files. Write `.codesage/reviews/<RUN_ID>/plans/<feature_id>.json` and pass it to the reviewer as `must_read`.
 
 ## Dispatch one reviewer per feature
 
@@ -39,13 +41,14 @@ Revalidate these prior findings. Return a prior finding with its existing findin
 Prior findings under revalidation: <projected JSON>
 Severity threshold: low
 Categories: bug,security,perf,maintainability
+Must-read paths: <the plan's must_read JSON array>
 ```
 
-An omission is a review result, not proof of a fix.
+An omission is a review result, not proof of a fix. The response must list every actually inspected path in `reviewed_files`; bundle membership doesn't count as inspection.
 
 ## Validate, verify news, and merge
 
-Save each parsed response and run `codesage-review-state validate` exactly as `/codesage-review` does. Send at most `--max-verify-findings` new findings to one `codesage-finding-verifier` per feature and save its verdict array. This applies the adversarial verifier to revalidation news instead of accepting regressions unchecked.
+Save each parsed response and run `codesage-review-state validate` exactly as `/codesage-review` does, including `--must-read .codesage/reviews/$RUN_ID/plans/<feature_id>.json`. On a missing-coverage error only, make one focused reviewer retry for the missing paths, combine its response with the original, and validate once more. A second miss marks the feature errored. Send at most `--max-verify-findings` new findings to one `codesage-finding-verifier` per feature and save its verdict array. This applies the adversarial verifier to revalidation news instead of accepting regressions unchecked.
 
 Merge with:
 

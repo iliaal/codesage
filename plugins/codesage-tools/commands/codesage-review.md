@@ -40,6 +40,9 @@ Use `run_$(date -u +%Y%m%dT%H%M%SZ)` as `RUN_ID`. Create:
 ```text
 .codesage/findings/history/
 .codesage/reviews/<RUN_ID>/features/
+.codesage/reviews/<RUN_ID>/risk/
+.codesage/reviews/<RUN_ID>/changed/
+.codesage/reviews/<RUN_ID>/plans/
 .codesage/reviews/<RUN_ID>/responses/
 .codesage/reviews/<RUN_ID>/validated/
 .codesage/reviews/<RUN_ID>/verdicts/
@@ -64,7 +67,7 @@ The helper reads each unique slice file once even when features overlap. Skip on
 
 Apply `--focus` and `--kind`.
 
-Collect every candidate's entry and owned paths. Call `mcp__codesage__assess_risk_batch` in chunks of at most 100 unique paths. Attach each full risk record to its feature and compute `max_owned_risk`.
+Collect every candidate's entry and owned paths. Call `mcp__codesage__assess_risk_batch` in chunks of at most 100 unique paths. Write each feature's batch-shaped subset to `.codesage/reviews/<RUN_ID>/risk/<feature_id>.json`, attach each full risk record to its feature, and compute `max_owned_risk`.
 
 Sort by:
 
@@ -87,8 +90,19 @@ For each planned feature:
    ```
 
    Use `[]` when the file doesn't exist. Never inline full histories or prior suggested fixes.
-2. If the findings document has `reviewed_at_sha`, compute changed slice files in the orchestrator with `git diff --name-only <sha> -- <feature paths>`. Include committed and working-tree changes. Reviewers don't receive Bash.
-3. Build a self-contained prompt with:
+2. If the findings document has `reviewed_at_sha`, compute changed slice files in the orchestrator with `git diff --name-only <sha> -- <feature paths>`. Include committed and working-tree changes. Reviewers don't receive Bash. Write the JSON array, or `[]`, to `.codesage/reviews/<RUN_ID>/changed/<feature_id>.json`.
+3. Compute a bounded, deterministic coverage plan:
+
+   ```bash
+   "$REVIEW_STATE" plan-feature \
+     --feature ".codesage/reviews/$RUN_ID/features/<feature_id>.json" \
+     --risk ".codesage/reviews/$RUN_ID/risk/<feature_id>.json" \
+     --changed ".codesage/reviews/$RUN_ID/changed/<feature_id>.json" \
+     --output ".codesage/reviews/$RUN_ID/plans/<feature_id>.json"
+   ```
+
+   The plan always puts the entry first when present, then changed entry/owned files, then remaining entry/owned files by descending risk and path. It requires at most five files normally and at most ten for high-risk, trust-heavy, large, or broadly changed slices. Context and test files remain available for targeted follow-up but aren't part of this bounded coverage contract.
+4. Build a self-contained prompt with:
 
    ```text
    Review CodeSage feature <feature_id> in project <absolute path>.
@@ -97,6 +111,7 @@ For each planned feature:
    Feature: <JSON containing id, title, kind, entry_path, files, trust_boundaries>
    Risk by file: <JSON from assess_risk_batch>
    Changed files since prior review: <JSON array, possibly empty>
+   Must-read paths: <the plan's must_read JSON array>
    Prior findings: <slim JSON array, possibly empty>
    Lens: <optional lens>
    Follow your agent definition and return one strict JSON object.
@@ -108,9 +123,9 @@ Process features in batches of `--jobs`; send all Agent calls in one message per
 
 Standard mode uses one `codesage-feature-reviewer` per feature. Deep mode uses separate lenses when `max_owned_risk >= 0.5`, the feature crosses at least three trust boundaries, the feature has at least eight owned files, or the entry exceeds 800 lines. Use `correctness`, `security`, and `lifecycle`; omit security when the category is disabled and lifecycle for config slices.
 
-Pass precomputed risk in every prompt. Reviewers must not repeat the batch risk call when risk is present.
+Pass precomputed risk and only the plan's `must_read` path array in every prompt. Keep the remaining plan metadata in the run record. Reviewers must not repeat the batch risk call when risk is present. Every response declares the files actually inspected; bundle membership alone doesn't count as inspection.
 
-Before dispatch, report the exact upper bound: reviewer count plus at most one verifier per feature. Warn when it exceeds 30 calls.
+Before dispatch, report the planned reviewer and verifier calls plus the worst-case conditional retry ceiling. The ceiling is two calls per initial reviewer, allowing one JSON repair, plus two calls per feature for one coverage retry and its JSON repair, plus at most one verifier per feature. Omit verifier calls under `--no-verify`. Warn when the ceiling exceeds 30 calls.
 
 ## 5. Parse and validate
 
@@ -136,10 +151,13 @@ Write parsed JSON to `.codesage/reviews/<RUN_ID>/responses/<feature_id>.json`, t
   --project "$PROJECT" \
   --response ".codesage/reviews/$RUN_ID/responses/<feature_id>.json" \
   --findings ".codesage/findings/<feature_id>.json" \
+  --must-read ".codesage/reviews/$RUN_ID/plans/<feature_id>.json" \
   --output ".codesage/reviews/$RUN_ID/validated/<feature_id>.json"
 ```
 
-The helper rejects fabricated or weakly-located evidence, corrects accepted loci, preserves identity by evidence fingerprint or close title match, prevents nearby defects from collapsing, and mints IDs for new findings. Use its `evidence_rejected` and new/recurring ID lists in the run stats.
+The helper rejects fabricated or weakly-located evidence, corrects accepted loci, preserves identity by evidence fingerprint or close title match, prevents nearby defects from collapsing, guards echoed IDs against unrelated prior findings, and mints IDs for new findings. It also rejects a response whose `reviewed_files` omits any `must_read` path.
+
+On that coverage error only, dispatch one focused `codesage-feature-reviewer` with the missing paths, feature metadata, risk records, and original review constraints. Ask it to inspect only those paths and return `reviewed_files` plus any additional findings. Combine the original and retry responses with `combine`, then validate once more. If required paths are still missing, or validation failed for another structural reason, mark the feature errored. Don't retry individual evidence rejections. Use `evidence_rejected`, `reviewed_files`, and the new/recurring ID lists in the run stats.
 
 ## 6. Verify new findings once per feature
 

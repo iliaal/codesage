@@ -6,9 +6,11 @@
 ### Changed
 - `feature_bundle` reserves up to two existing `related` slots for requested caller/callee chunks before backfilling tests and context, keeping the response limit unchanged.
 - `/codesage-review` ranks slices by maximum owned-file risk, sends slim feature-local priors and precomputed batch risk to reviewers, targets large files by hot symbols, and verifies new findings once per feature.
+- Required `/codesage-review` and `/codesage-revalidate` responses to cover a deterministic entry/changed/risk-ranked file set before findings merge.
 
 ### Fixed
 - Review findings now use deterministic evidence validation, identity matching, content-based freshness, feature metadata persistence, atomic merges, and transition-only history; revalidation no longer marks an omitted open finding fixed.
+- Fixed review evidence validation for short exact two-line code blocks, full ±15-line block bounds, and unrelated returned finding IDs.
 - Release automation keeps the Codex plugin, Claude plugin, and Claude marketplace versions aligned with the workspace version.
 
 ## [0.16.0] - 2026-07-12

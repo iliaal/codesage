@@ -271,11 +271,11 @@ Start a new Codex thread after installation or reinstall so Codex loads the upda
 
 ## 🔍 Feature-slice review
 
-Codesage maps a project into behavior-keyed feature slices (routes, CLIs, libraries, test suites, jobs). The `codesage-tools` plugin ships a four-command workflow that dispatches read-only subagent reviews (one per slice, in parallel batches) and persists findings to gitignored JSON under `.codesage/findings/`. Each finding gets a stable `fnd_<hex>` ID so it can be referenced in commit messages and PR comments. Re-running keeps prior triage (`status` + audit-trail `history`) intact and merges new defects into the same per-feature file.
+CodeSage maps a project into behavior-keyed feature slices (routes, CLIs, libraries, test suites, jobs). The `codesage-tools` plugin ships a four-command workflow that dispatches read-only subagent reviews (one per slice, in parallel batches) and persists findings to gitignored JSON under `.codesage/findings/`. Each finding gets a stable `fnd_<hex>` ID so it can be referenced in commit messages and PR comments. Re-running keeps prior triage (`status` + audit-trail `history`) intact and merges new defects into the same per-feature file.
 
-The subagent only gets `Read`, `Grep`, and read-only CodeSage MCP tools. The orchestrator batches risk across every owned file, then reviewers inspect changed and high-risk files instead of trusting the first five bundle chunks. Codesage's core stays read-only; findings are output that other tooling can consume.
+The subagent only gets `Read`, `Grep`, and read-only CodeSage MCP tools. The orchestrator batches risk across every owned file and computes a deterministic must-read plan: entry first, changed files next, then the highest-risk owned files. The plan covers at most five files for a normal slice and ten for a risky, trust-heavy, large, or broadly changed slice. The helper rejects responses that don't declare every required path as inspected. CodeSage's core stays read-only; findings are output that other tooling can consume.
 
-The plugin runs evidence validation, identity matching, content-freshness checks, and findings merges through `bin/codesage-review-state`. This keeps state transitions deterministic while reviewers handle the code judgment.
+The plugin runs evidence validation, identity matching, content-freshness checks, and findings merges through `bin/codesage-review-state`. It accepts exact short two-line code blocks while keeping strict single-line evidence rules, requires both block lines to stay inside the citation window, and reuses a prior ID only when evidence or nearby title and location identify the same defect. Reviewers still handle the code judgment.
 
 ### `/codesage-review`
 

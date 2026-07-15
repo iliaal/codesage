@@ -37,7 +37,7 @@ FINDING_FIELDS = (
 )
 SEVERITIES = {"low", "medium", "high"}
 CATEGORIES = {"bug", "security", "perf", "maintainability"}
-REVIEW_PROTOCOL_VERSION = "2"
+REVIEW_PROTOCOL_VERSION = "3"
 
 
 def slim_priors(document):
@@ -118,6 +118,81 @@ def feature_states(project, features):
     ]
 
 
+def plan_feature_review(feature, risk, changed_files):
+    if not isinstance(feature, dict):
+        raise ValueError("feature must be an object")
+    records = risk.get("files", []) if isinstance(risk, dict) else risk
+    if not isinstance(records, list):
+        raise ValueError("risk must be an array or an object with a files array")
+    if not isinstance(changed_files, list):
+        raise ValueError("changed files must be an array")
+
+    roles = {
+        item["path"]: item.get("role")
+        for item in feature_files(feature)
+        if item.get("role") in {"entry", "owned"}
+    }
+    entry_path = feature.get("entry_path")
+    if isinstance(entry_path, str) and entry_path:
+        roles[entry_path] = "entry"
+
+    scores = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("risk record must be an object")
+        path = record.get("file")
+        if path in roles:
+            scores[path] = float(record.get("score", 0.0))
+    for path in roles:
+        scores.setdefault(path, 0.0)
+
+    changed = {
+        path
+        for path in changed_files
+        if isinstance(path, str) and path in roles
+    }
+    owned_count = sum(role == "owned" for role in roles.values())
+    boundaries = feature.get("trust_boundaries", [])
+    boundary_count = len(boundaries) if isinstance(boundaries, list) else 0
+    max_risk = max(scores.values(), default=0.0)
+    expansion_reasons = []
+    if max_risk >= 0.5:
+        expansion_reasons.append("high-risk")
+    if boundary_count >= 3:
+        expansion_reasons.append("trust-boundaries")
+    if owned_count >= 8:
+        expansion_reasons.append("large-owned-set")
+    if len(changed) >= 5:
+        expansion_reasons.append("many-changed-files")
+    read_limit = 10 if expansion_reasons else 5
+
+    ordered = []
+    if entry_path in roles:
+        ordered.append(entry_path)
+    ordered.extend(
+        sorted(
+            changed - set(ordered),
+            key=lambda path: (-scores[path], path),
+        )
+    )
+    ordered.extend(
+        sorted(
+            set(roles) - set(ordered),
+            key=lambda path: (-scores[path], path),
+        )
+    )
+    must_read = ordered[:read_limit]
+    return {
+        "feature_id": feature.get("feature_id"),
+        "must_read": must_read,
+        "read_limit": read_limit,
+        "eligible_file_count": len(roles),
+        "omitted_file_count": max(len(roles) - len(must_read), 0),
+        "max_owned_risk": max_risk,
+        "expansion_reasons": expansion_reasons,
+    }
+
+
 def normalize_line(value):
     return " ".join(str(value).split())
 
@@ -138,8 +213,12 @@ def substantive(line, minimum=11):
     return len(line) >= minimum and any(character.isalnum() for character in line)
 
 
+def block_evidence_line(line):
+    return any(character.isalnum() for character in line)
+
+
 def evidence_fingerprint(finding):
-    lines = [line for line in evidence_lines(finding) if substantive(line)]
+    lines = [line for line in evidence_lines(finding) if block_evidence_line(line)]
     if not lines:
         return None
     content = "\n".join(lines).encode("utf-8")
@@ -157,9 +236,11 @@ def evidence_match(source, cited_line, finding):
     for index in range(len(quoted) - 1):
         first = quoted[index]
         second = quoted[index + 1]
-        if not substantive(first) or not substantive(second):
+        if not block_evidence_line(first) or not block_evidence_line(second):
             continue
-        for source_index in range(max(lower - 1, 0), min(upper, len(normalized_source) - 1)):
+        for source_index in range(
+            max(lower - 1, 0), min(upper - 1, len(normalized_source) - 1)
+        ):
             if (
                 normalized_source[source_index] == first
                 and normalized_source[source_index + 1] == second
@@ -206,11 +287,6 @@ def mint_finding_id(feature_id, finding, occupied):
 
 
 def match_prior(finding, priors, used_ids):
-    returned_id = finding.get("finding_id")
-    by_id = {prior.get("finding_id"): prior for prior in priors}
-    if returned_id in by_id and returned_id not in used_ids:
-        return by_id[returned_id]
-
     candidates = [
         prior
         for prior in priors
@@ -264,10 +340,15 @@ def same_candidate(left, right):
 def combine_responses(responses):
     if not responses:
         raise ValueError("at least one review response is required")
-    feature_id = responses[0].get("feature_id")
+    first_response = responses[0]
+    if not isinstance(first_response, dict):
+        raise ValueError("review response must be an object")
+    feature_id = first_response.get("feature_id")
     if not isinstance(feature_id, str) or not feature_id.startswith("feat_"):
         raise ValueError("response feature_id is missing or invalid")
     findings = []
+    reviewed_files = []
+    seen_reviewed_files = set()
     for response in responses:
         if not isinstance(response, dict):
             raise ValueError("review response must be an object")
@@ -277,7 +358,20 @@ def combine_responses(responses):
         if not isinstance(response_findings, list):
             raise ValueError("response findings must be an array")
         findings.extend(copy.deepcopy(response_findings))
-    return {"feature_id": feature_id, "findings": findings}
+        response_reviewed_files = response.get("reviewed_files", [])
+        if not isinstance(response_reviewed_files, list):
+            raise ValueError("response reviewed_files must be an array")
+        for path in response_reviewed_files:
+            if not isinstance(path, str) or not path:
+                raise ValueError("reviewed file path is empty or invalid")
+            if path not in seen_reviewed_files:
+                reviewed_files.append(path)
+                seen_reviewed_files.add(path)
+    return {
+        "feature_id": feature_id,
+        "reviewed_files": reviewed_files,
+        "findings": findings,
+    }
 
 
 def clean_finding(finding):
@@ -298,12 +392,49 @@ def clean_finding(finding):
     return cleaned
 
 
-def validate_response(project, response, existing):
+def must_read_paths(value):
+    paths = value.get("must_read") if isinstance(value, dict) else value
+    if not isinstance(paths, list):
+        raise ValueError("must-read input must be an array or an object with must_read")
+    if any(not isinstance(path, str) or not path for path in paths):
+        raise ValueError("must-read path is empty or invalid")
+    return list(dict.fromkeys(paths))
+
+
+def validate_reviewed_files(project, response, must_read):
+    raw_paths = response.get("reviewed_files")
+    if must_read is None and raw_paths is None:
+        return []
+    if not isinstance(raw_paths, list):
+        raise ValueError("response reviewed_files must be an array")
+    reviewed = []
+    for path in raw_paths:
+        source = project_file(project, path)
+        if not source.is_file():
+            raise ValueError(f"reviewed file does not exist: {path}")
+        if path not in reviewed:
+            reviewed.append(path)
+    if must_read is not None:
+        required = must_read_paths(must_read)
+        missing = [path for path in required if path not in reviewed]
+        if missing:
+            raise ValueError("missing required reviewed files: " + ", ".join(missing))
+    return reviewed
+
+
+def validate_response(project, response, existing, must_read=None):
     if not isinstance(response, dict):
         raise ValueError("review response must be an object")
     feature_id = response.get("feature_id")
     if not isinstance(feature_id, str) or not feature_id.startswith("feat_"):
         raise ValueError("response feature_id is missing or invalid")
+    if (
+        isinstance(must_read, dict)
+        and "feature_id" in must_read
+        and must_read.get("feature_id") != feature_id
+    ):
+        raise ValueError("must-read plan feature_id does not match response")
+    reviewed_files = validate_reviewed_files(project, response, must_read)
     raw_findings = response.get("findings", [])
     if not isinstance(raw_findings, list):
         raise ValueError("response findings must be an array")
@@ -373,6 +504,7 @@ def validate_response(project, response, existing):
 
     return {
         "feature_id": feature_id,
+        "reviewed_files": reviewed_files,
         "findings": findings,
         "new_finding_ids": new_ids,
         "recurring_finding_ids": recurring_ids,
@@ -621,10 +753,17 @@ def build_parser():
     states.add_argument("--features", required=True)
     states.add_argument("--findings-dir")
 
+    plan = subparsers.add_parser("plan-feature")
+    plan.add_argument("--feature", required=True)
+    plan.add_argument("--risk", required=True)
+    plan.add_argument("--changed")
+    plan.add_argument("--output")
+
     validate = subparsers.add_parser("validate")
     validate.add_argument("--project", required=True)
     validate.add_argument("--response", required=True)
     validate.add_argument("--findings")
+    validate.add_argument("--must-read")
     validate.add_argument("--output")
 
     combine = subparsers.add_parser("combine")
@@ -685,12 +824,26 @@ def run_cli(args):
         print_json({"results": results})
         return
 
+    if args.command == "plan-feature":
+        plan = plan_feature_review(
+            load_json(args.feature),
+            load_json(args.risk),
+            load_json(args.changed, []),
+        )
+        if args.output:
+            atomic_write_json(args.output, plan)
+        print_json(plan)
+        return
+
     if args.command == "validate":
         response = load_json(args.response)
         feature_id = response.get("feature_id")
         findings_path = args.findings or default_findings_path(args.project, feature_id)
         validated = validate_response(
-            args.project, response, load_json(findings_path, {"findings": []})
+            args.project,
+            response,
+            load_json(findings_path, {"findings": []}),
+            load_json(args.must_read) if args.must_read else None,
         )
         if args.output:
             atomic_write_json(args.output, validated)

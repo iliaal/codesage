@@ -15,6 +15,7 @@ The orchestrator supplies:
 - `feature`: ID, title, kind, entry path, every file path and role, and trust boundaries.
 - `risk_by_file`: entry and owned file assessments. It may be absent for a legacy caller.
 - `changed_files`: slice files changed since the previous content state.
+- `must_read`: a deterministic bounded array of entry/owned paths. It may be absent for a legacy caller.
 - `severity_threshold`: `low`, `medium`, or `high`.
 - `categories`: any of `bug`, `security`, `perf`, `maintainability`.
 - `prior_findings`: slim feature-local records. Re-emit an applicable open finding with its existing ID. Suppress `false-positive` and `wont-fix`.
@@ -22,10 +23,10 @@ The orchestrator supplies:
 
 ## Gather context
 
-1. Decide whether graph expansion is useful. Set `include_callers=true` and `include_callees=true` for routes, services, and CLI commands. Keep both false for libraries, config, jobs, and test suites; use targeted references on a hot symbol when a contract or call path matters.
+1. Decide whether graph expansion is useful. Set `include_callers=true` and `include_callees=true` for routes, services, and CLI commands. Keep both false for libraries, config, jobs, and test suites; use targeted references on a hot symbol when a contract or call path matters. Graph flags request candidates but can return no extra graph chunks when no entry anchor or useful edge resolves; use targeted references when the call path still matters.
 2. Call `mcp__codesage__feature_bundle` once with that choice. The bundle is a starting sample, not the complete owned-file list.
 3. Use supplied `risk_by_file`. If absent, call `mcp__codesage__assess_risk_batch` once for every entry and owned path. Don't repeat a risk call the orchestrator already made.
-4. Sort entry and owned files by risk. Inspect changed files first, then the highest-risk omitted files. Pay attention to trust boundaries and `top_symbols`.
+4. When `must_read` is supplied, inspect every listed path directly. Otherwise sort entry and owned files by risk, inspect changed files first, then the highest-risk omitted files. Pay attention to trust boundaries and `top_symbols`.
 
 If the bundle has no semantic chunks but the feature exists, continue with direct Reads from `feature.files`. Empty semantic output doesn't erase the structural file map.
 
@@ -36,6 +37,7 @@ If the bundle has no semantic chunks but the feature exists, continue with direc
 - For a low-risk slice, read three to five entry/owned files.
 - Read up to ten when max risk is at least `0.5`, the slice crosses three trust boundaries, or it owns at least eight files.
 - Risk order beats feature-table order. Don't stop after five bundle chunks when a higher-risk owned file was omitted.
+- A bundle chunk isn't proof that you inspected its source. Put a path in `reviewed_files` only after reading the relevant source directly.
 - Read tests that cover the paths you inspect. Don't report missing coverage until you verify the mapped tests don't exercise the behavior.
 
 Use `find_references` for a specific invocation question and `find_symbol` plus Read for an external contract. `list_dependencies` answers a one-hop import question. Keep every lookup tied to a candidate defect in the feature.
@@ -46,7 +48,7 @@ Use `find_references` for a specific invocation question and `find_symbol` plus 
 2. Walk empty, error, boundary, partial-failure, repeated-call, and concurrency paths where they apply.
 3. Check external contracts before asserting a defect. Read the definition or caller that settles the question.
 4. State the exact input or state that triggers each candidate. Drop candidates without a trigger.
-5. Re-read two to five evidence lines verbatim. The orchestrator requires either a nearby two-line block or one unique substantive line.
+5. Re-read two to five evidence lines verbatim. The orchestrator accepts an exact nearby two-line code block, including short idiomatic lines, or one unique substantive line.
 
 Lens mode narrows output:
 
@@ -77,6 +79,7 @@ Return exactly one fenced JSON object and no prose:
 {
   "feature_id": "feat_xxx",
   "reviewed_at": "2026-05-16T20:30:00Z",
+  "reviewed_files": ["src/handler.rs", "src/service.rs"],
   "findings": [
     {
       "file": "src/handler.rs",
@@ -95,6 +98,6 @@ Return exactly one fenced JSON object and no prose:
 }
 ```
 
-New findings have no `finding_id`. An applicable prior finding keeps its exact ID and uses current location and evidence. Empty findings are valid.
+New findings have no `finding_id`. An applicable prior finding keeps its exact ID and uses current location and evidence. Empty findings are valid. `reviewed_files` is required and contains repo-relative paths actually inspected during this response.
 
 Return an `error` field only when the feature ID is absent and no feature metadata exists. When semantic chunks are empty, use the supplied structural metadata instead of aborting.

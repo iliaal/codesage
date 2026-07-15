@@ -1,8 +1,10 @@
+import copy
 import importlib.machinery
 import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -127,6 +129,74 @@ class FeatureStateTests(unittest.TestCase):
         self.assertEqual(reads, [source])
 
 
+class ReviewPlanTests(unittest.TestCase):
+    def test_plan_prioritizes_entry_then_changed_then_risk_and_ignores_context(self):
+        review_state = load_review_state()
+        feature = {
+            "feature_id": "feat_1111111111111111",
+            "entry_path": "src/main.rs",
+            "files": [
+                {"path": "src/context.rs", "role": "context"},
+                {"path": "src/low.rs", "role": "owned"},
+                {"path": "src/main.rs", "role": "entry"},
+                {"path": "src/high.rs", "role": "owned"},
+                {"path": "src/mid.rs", "role": "owned"},
+                {"path": "src/changed.rs", "role": "owned"},
+            ],
+            "trust_boundaries": ["filesystem"],
+        }
+        risk = {
+            "files": [
+                {"file": "src/main.rs", "score": 0.1},
+                {"file": "src/changed.rs", "score": 0.05},
+                {"file": "src/high.rs", "score": 0.49},
+                {"file": "src/mid.rs", "score": 0.3},
+                {"file": "src/low.rs", "score": 0.0},
+            ]
+        }
+
+        plan = review_state.plan_feature_review(feature, risk, ["src/changed.rs"])
+
+        self.assertEqual(
+            plan["must_read"],
+            [
+                "src/main.rs",
+                "src/changed.rs",
+                "src/high.rs",
+                "src/mid.rs",
+                "src/low.rs",
+            ],
+        )
+        self.assertEqual(plan["read_limit"], 5)
+        self.assertEqual(plan["eligible_file_count"], 5)
+
+    def test_plan_expands_to_ten_for_high_risk_slice(self):
+        review_state = load_review_state()
+        files = [{"path": "src/main.rs", "role": "entry"}] + [
+            {"path": f"src/owned_{index}.rs", "role": "owned"}
+            for index in range(1, 12)
+        ]
+        feature = {
+            "feature_id": "feat_1111111111111111",
+            "entry_path": "src/main.rs",
+            "files": files,
+            "trust_boundaries": [],
+        }
+        risk = {
+            "files": [
+                {"file": item["path"], "score": 0.8 if index == 0 else index / 100}
+                for index, item in enumerate(files)
+            ]
+        }
+
+        plan = review_state.plan_feature_review(feature, risk, [])
+
+        self.assertEqual(plan["read_limit"], 10)
+        self.assertEqual(len(plan["must_read"]), 10)
+        self.assertEqual(plan["must_read"][0], "src/main.rs")
+        self.assertIn("high-risk", plan["expansion_reasons"])
+
+
 class EvidenceValidationTests(unittest.TestCase):
     def setUp(self):
         self.review_state = load_review_state()
@@ -179,6 +249,48 @@ class EvidenceValidationTests(unittest.TestCase):
         self.assertEqual(len(validated["findings"]), 1)
         self.assertEqual(validated["findings"][0]["line"], 2)
         self.assertEqual(validated["evidence_rejected"], [])
+
+    def test_short_two_line_code_evidence_passes_but_one_short_line_does_not(self):
+        source = self.project / "src" / "short.rs"
+        source.write_text("fn short() {\n    let x = 1;\n    let y = 2;\n}\n")
+        finding = self.finding(2, ["let x = 1;", "let y = 2;"])
+        finding["file"] = "src/short.rs"
+        short_pair = {
+            "feature_id": "feat_1111111111111111",
+            "findings": [finding],
+        }
+        short_single = copy.deepcopy(short_pair)
+        short_single["findings"][0]["evidence"] = ["let x = 1;"]
+
+        pair_validated = self.review_state.validate_response(
+            self.project, short_pair, {"findings": []}
+        )
+        single_validated = self.review_state.validate_response(
+            self.project, short_single, {"findings": []}
+        )
+
+        self.assertEqual(len(pair_validated["findings"]), 1)
+        self.assertEqual(pair_validated["findings"][0]["line"], 2)
+        self.assertEqual(single_validated["findings"], [])
+
+    def test_two_line_evidence_must_fit_entirely_inside_citation_window(self):
+        source = self.project / "src" / "window.rs"
+        lines = [f"let filler_{index} = {index};" for index in range(1, 41)]
+        source.write_text("\n".join(lines) + "\n")
+
+        inside = self.review_state.evidence_match(
+            source,
+            20,
+            {"evidence": [lines[33], lines[34]]},
+        )
+        outside = self.review_state.evidence_match(
+            source,
+            20,
+            {"evidence": [lines[34], lines[35]]},
+        )
+
+        self.assertEqual(inside, 34)
+        self.assertIsNone(outside)
 
     def test_brace_only_and_repeated_generic_evidence_are_rejected(self):
         response = {
@@ -247,8 +359,176 @@ class EvidenceValidationTests(unittest.TestCase):
                 ]
             )
 
+    def test_combine_responses_rejects_a_non_object_first_response(self):
+        with self.assertRaisesRegex(ValueError, "review response must be an object"):
+            self.review_state.combine_responses(["not-an-object"])
+
+    def test_combine_responses_unions_reviewed_files_in_response_order(self):
+        combined = self.review_state.combine_responses(
+            [
+                {
+                    "feature_id": "feat_1111111111111111",
+                    "reviewed_files": ["src/handler.rs", "src/worker.rs"],
+                    "findings": [],
+                },
+                {
+                    "feature_id": "feat_1111111111111111",
+                    "reviewed_files": ["src/worker.rs", "tests/handler.rs"],
+                    "findings": [],
+                },
+            ]
+        )
+
+        self.assertEqual(
+            combined["reviewed_files"],
+            ["src/handler.rs", "src/worker.rs", "tests/handler.rs"],
+        )
+
+    def test_validation_requires_every_planned_file_to_be_declared(self):
+        response = {
+            "feature_id": "feat_1111111111111111",
+            "reviewed_files": [],
+            "findings": [],
+        }
+
+        with self.assertRaisesRegex(ValueError, "missing required reviewed files"):
+            self.review_state.validate_response(
+                self.project,
+                response,
+                {"findings": []},
+                {"must_read": ["src/handler.rs"]},
+            )
+
+    def test_validation_accepts_and_preserves_complete_reviewed_files(self):
+        response = {
+            "feature_id": "feat_1111111111111111",
+            "reviewed_files": ["src/handler.rs", "src/handler.rs"],
+            "findings": [],
+        }
+        plan = {
+            "feature_id": "feat_1111111111111111",
+            "must_read": ["src/handler.rs"],
+        }
+
+        validated = self.review_state.validate_response(
+            self.project, response, {"findings": []}, plan
+        )
+
+        self.assertEqual(validated["reviewed_files"], ["src/handler.rs"])
+
+    def test_validation_rejects_a_plan_for_another_feature(self):
+        response = {
+            "feature_id": "feat_1111111111111111",
+            "reviewed_files": ["src/handler.rs"],
+            "findings": [],
+        }
+
+        with self.assertRaisesRegex(ValueError, "plan feature_id does not match"):
+            self.review_state.validate_response(
+                self.project,
+                response,
+                {"findings": []},
+                {
+                    "feature_id": "feat_2222222222222222",
+                    "must_read": ["src/handler.rs"],
+                },
+            )
+
 
 class IdentityTests(unittest.TestCase):
+    def test_returned_prior_id_is_rejected_for_an_unrelated_finding(self):
+        review_state = load_review_state()
+        original = "fn first() { dangerous_first_operation_with_untrusted_value(); }"
+        replacement = "fn second() { dangerous_second_operation_without_bounds_check(); }"
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            source = project / "src" / "lib.rs"
+            source.parent.mkdir()
+            source.write_text(original + "\n" + replacement + "\n")
+            existing = {
+                "findings": [
+                    {
+                        "finding_id": "fnd_aaaaaaaa",
+                        "file": "src/lib.rs",
+                        "line": 1,
+                        "severity": "medium",
+                        "category": "bug",
+                        "title": "First operation trusts input",
+                        "summary": "First summary",
+                        "evidence": [original],
+                        "status": "open",
+                    }
+                ]
+            }
+            response = {
+                "feature_id": "feat_1111111111111111",
+                "findings": [
+                    {
+                        "finding_id": "fnd_aaaaaaaa",
+                        "file": "src/lib.rs",
+                        "line": 2,
+                        "severity": "medium",
+                        "category": "bug",
+                        "title": "Second operation lacks bounds check",
+                        "summary": "Second summary",
+                        "evidence": [replacement],
+                        "suggested_fix": "Add the missing bound.",
+                    }
+                ],
+            }
+
+            validated = review_state.validate_response(project, response, existing)
+
+        self.assertNotEqual(validated["findings"][0]["finding_id"], "fnd_aaaaaaaa")
+        self.assertEqual(validated["recurring_finding_ids"], [])
+        self.assertEqual(len(validated["new_finding_ids"]), 1)
+
+    def test_returned_prior_id_and_same_title_do_not_override_changed_identity(self):
+        review_state = load_review_state()
+        title = "Operation lacks validation"
+        original = "fn first() { dangerous_first_operation_with_untrusted_value(); }"
+        replacement = "fn moved() { unrelated_operation_without_bounds_check(); }"
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            source = project / "src" / "lib.rs"
+            source.parent.mkdir()
+            source.write_text(original + "\n" + "\n" * 29 + replacement + "\n")
+            existing = {
+                "findings": [
+                    {
+                        "finding_id": "fnd_aaaaaaaa",
+                        "file": "src/lib.rs",
+                        "line": 1,
+                        "severity": "medium",
+                        "category": "bug",
+                        "title": title,
+                        "summary": "First summary",
+                        "evidence": [original],
+                        "status": "open",
+                    }
+                ]
+            }
+            response = {
+                "feature_id": "feat_1111111111111111",
+                "findings": [
+                    {
+                        "finding_id": "fnd_aaaaaaaa",
+                        "file": "src/lib.rs",
+                        "line": 31,
+                        "severity": "medium",
+                        "category": "bug",
+                        "title": title,
+                        "summary": "Different summary",
+                        "evidence": [replacement],
+                        "suggested_fix": "Add the missing bound.",
+                    }
+                ],
+            }
+
+            validated = review_state.validate_response(project, response, existing)
+
+        self.assertNotEqual(validated["findings"][0]["finding_id"], "fnd_aaaaaaaa")
+
     def test_nearby_same_category_findings_do_not_collapse_by_line(self):
         review_state = load_review_state()
         with tempfile.TemporaryDirectory() as directory:
@@ -600,6 +880,61 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(leftovers, [])
 
 
+class CliContractTests(unittest.TestCase):
+    def test_plan_feature_cli_writes_the_same_plan_it_prints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            feature_path = root / "feature.json"
+            risk_path = root / "risk.json"
+            changed_path = root / "changed.json"
+            output_path = root / "plan.json"
+            feature_path.write_text(
+                json.dumps(
+                    {
+                        "feature_id": "feat_1111111111111111",
+                        "entry_path": "src/main.rs",
+                        "files": [
+                            {"path": "src/main.rs", "role": "entry"},
+                            {"path": "src/high.rs", "role": "owned"},
+                        ],
+                    }
+                )
+            )
+            risk_path.write_text(
+                json.dumps(
+                    {
+                        "files": [
+                            {"file": "src/main.rs", "score": 0.1},
+                            {"file": "src/high.rs", "score": 0.6},
+                        ]
+                    }
+                )
+            )
+            changed_path.write_text("[]\n")
+
+            completed = subprocess.run(
+                [
+                    str(SCRIPT),
+                    "plan-feature",
+                    "--feature",
+                    str(feature_path),
+                    "--risk",
+                    str(risk_path),
+                    "--changed",
+                    str(changed_path),
+                    "--output",
+                    str(output_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            written = json.loads(output_path.read_text())
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout), written)
+
+
 class ProtocolContractTests(unittest.TestCase):
     def read(self, relative_path):
         return (PLUGIN_ROOT / relative_path).read_text()
@@ -607,10 +942,19 @@ class ProtocolContractTests(unittest.TestCase):
     def test_review_command_routes_state_transitions_through_helper(self):
         command = self.read("commands/codesage-review.md")
 
-        for subcommand in ("slim-priors", "feature-states", "combine", "validate", "merge"):
+        for subcommand in (
+            "slim-priors",
+            "feature-states",
+            "plan-feature",
+            "combine",
+            "validate",
+            "merge",
+        ):
             self.assertIn(subcommand, command)
         self.assertIn("--focus all|product", command)
         self.assertIn("one `codesage-finding-verifier`", command)
+        self.assertIn("--must-read", command)
+        self.assertIn("one focused `codesage-feature-reviewer`", command)
         self.assertNotIn("stat -c %Y", command)
 
     def test_revalidate_never_marks_open_fixed_from_omission(self):
@@ -618,6 +962,8 @@ class ProtocolContractTests(unittest.TestCase):
 
         self.assertIn("needs-confirmation", command)
         self.assertIn("--mode revalidate", command)
+        self.assertIn("plan-feature", command)
+        self.assertIn("--must-read", command)
         self.assertIn("not proof of a fix", command)
         self.assertNotIn("flip to `fixed` automatically", command)
 
@@ -630,6 +976,8 @@ class ProtocolContractTests(unittest.TestCase):
         self.assertNotIn("mcp__codesage__find_coupling", frontmatter)
         self.assertIn("at most 800 lines", reviewer)
         self.assertIn("no semantic chunks", reviewer)
+        self.assertIn("`must_read`", reviewer)
+        self.assertIn('"reviewed_files"', reviewer)
 
     def test_verifier_batches_findings_without_shell_access(self):
         verifier = self.read("agents/codesage-finding-verifier.md")
