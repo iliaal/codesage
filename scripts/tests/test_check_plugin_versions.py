@@ -68,6 +68,40 @@ class PluginVersionTests(unittest.TestCase):
         self.assertEqual(len(errors), 3)
         self.assertTrue(all("expected 1.2.3" in error for error in errors))
 
+    def test_stale_codex_base_version_is_reported_despite_cachebuster(self):
+        checker = load_checker()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_repo(root, codex="0.4.0+codex.local-20260715-120000")
+
+            errors = checker.version_errors(root)
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("Codex plugin version", errors[0])
+        self.assertIn("expected 1.2.3", errors[0])
+
+    def test_duplicate_marketplace_entries_are_reported(self):
+        checker = load_checker()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_repo(root)
+            write_json(
+                root / ".claude-plugin/marketplace.json",
+                {
+                    "name": "codesage",
+                    "metadata": {"version": "1.2.3"},
+                    "plugins": [
+                        {"name": "codesage-tools", "version": "1.2.3"},
+                        {"name": "codesage-tools", "version": "1.2.3"},
+                    ],
+                },
+            )
+
+            errors = checker.version_errors(root)
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("2 codesage-tools entries", errors[0])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -37,7 +37,7 @@ FINDING_FIELDS = (
 )
 SEVERITIES = {"low", "medium", "high"}
 CATEGORIES = {"bug", "security", "perf", "maintainability"}
-REVIEW_PROTOCOL_VERSION = "3"
+REVIEW_PROTOCOL_VERSION = "4"
 
 
 def slim_priors(document):
@@ -89,10 +89,12 @@ def file_content_digest(project, relative_path, cache):
     return value
 
 
-def feature_state(project, feature, content_cache=None):
+def feature_state(project, feature, content_cache=None, params=None):
     content_cache = {} if content_cache is None else content_cache
     digest = hashlib.sha256()
     digest.update(REVIEW_PROTOCOL_VERSION.encode("ascii"))
+    digest.update(b"\0")
+    digest.update((params or "").encode("utf-8"))
     digest.update(b"\0")
     for item in feature_files(feature):
         path = item["path"]
@@ -106,19 +108,26 @@ def feature_state(project, feature, content_cache=None):
     return f"sha256:{digest.hexdigest()}"
 
 
-def feature_states(project, features):
+def feature_states(project, features, params=None):
     content_cache = {}
     return [
         {
             "feature_id": feature.get("feature_id"),
-            "feature_state": feature_state(project, feature, content_cache),
+            "feature_state": feature_state(project, feature, content_cache, params),
             "files": feature_files(feature),
         }
         for feature in features
     ]
 
 
-def plan_feature_review(feature, risk, changed_files):
+def plan_path_exists(project, path):
+    try:
+        return project_file(project, path).is_file()
+    except (OSError, ValueError):
+        return False
+
+
+def plan_feature_review(feature, risk, changed_files, project=None):
     if not isinstance(feature, dict):
         raise ValueError("feature must be an object")
     records = risk.get("files", []) if isinstance(risk, dict) else risk
@@ -127,34 +136,45 @@ def plan_feature_review(feature, risk, changed_files):
     if not isinstance(changed_files, list):
         raise ValueError("changed files must be an array")
 
-    roles = {
+    all_roles = {
         item["path"]: item.get("role")
         for item in feature_files(feature)
-        if item.get("role") in {"entry", "owned"}
     }
     entry_path = feature.get("entry_path")
     if isinstance(entry_path, str) and entry_path:
-        roles[entry_path] = "entry"
+        all_roles[entry_path] = "entry"
+    if project is not None:
+        all_roles = {
+            path: role
+            for path, role in all_roles.items()
+            if plan_path_exists(project, path)
+        }
+    roles = {
+        path: role
+        for path, role in all_roles.items()
+        if role in {"entry", "owned"}
+    }
 
+    changed = {
+        path
+        for path in changed_files
+        if isinstance(path, str) and path in all_roles
+    }
     scores = {}
     for record in records:
         if not isinstance(record, dict):
             raise ValueError("risk record must be an object")
         path = record.get("file")
-        if path in roles:
+        if path in all_roles:
             scores[path] = float(record.get("score", 0.0))
-    for path in roles:
+    universe = set(roles) | changed
+    for path in universe:
         scores.setdefault(path, 0.0)
 
-    changed = {
-        path
-        for path in changed_files
-        if isinstance(path, str) and path in roles
-    }
     owned_count = sum(role == "owned" for role in roles.values())
     boundaries = feature.get("trust_boundaries", [])
     boundary_count = len(boundaries) if isinstance(boundaries, list) else 0
-    max_risk = max(scores.values(), default=0.0)
+    max_risk = max((scores[path] for path in roles), default=0.0)
     expansion_reasons = []
     if max_risk >= 0.5:
         expansion_reasons.append("high-risk")
@@ -186,8 +206,8 @@ def plan_feature_review(feature, risk, changed_files):
         "feature_id": feature.get("feature_id"),
         "must_read": must_read,
         "read_limit": read_limit,
-        "eligible_file_count": len(roles),
-        "omitted_file_count": max(len(roles) - len(must_read), 0),
+        "eligible_file_count": len(universe),
+        "omitted_file_count": max(len(universe) - len(must_read), 0),
         "max_owned_risk": max_risk,
         "expansion_reasons": expansion_reasons,
     }
@@ -233,19 +253,21 @@ def evidence_match(source, cited_line, finding):
     upper = min(cited_line + 15, len(normalized_source))
     matches = []
 
+    numbered = [
+        (index + 1, line)
+        for index, line in enumerate(normalized_source)
+        if line and lower <= index + 1 <= upper
+    ]
     for index in range(len(quoted) - 1):
         first = quoted[index]
         second = quoted[index + 1]
         if not block_evidence_line(first) or not block_evidence_line(second):
             continue
-        for source_index in range(
-            max(lower - 1, 0), min(upper - 1, len(normalized_source) - 1)
-        ):
-            if (
-                normalized_source[source_index] == first
-                and normalized_source[source_index + 1] == second
-            ):
-                matches.append(source_index + 1)
+        for position in range(len(numbered) - 1):
+            first_number, first_line = numbered[position]
+            second_line = numbered[position + 1][1]
+            if first_line == first and second_line == second:
+                matches.append(first_number)
 
     for line in quoted:
         if not substantive(line, minimum=40):
@@ -352,6 +374,8 @@ def combine_responses(responses):
     for response in responses:
         if not isinstance(response, dict):
             raise ValueError("review response must be an object")
+        if response.get("error"):
+            raise ValueError(f"review response reports an error: {response['error']}")
         if response.get("feature_id") != feature_id:
             raise ValueError("review responses have different feature IDs")
         response_findings = response.get("findings", [])
@@ -550,6 +574,7 @@ def merge_document(
     now,
     mode,
     target_finding_ids=None,
+    reviewed_state=None,
 ):
     feature_id = feature.get("feature_id")
     if validated.get("feature_id") != feature_id:
@@ -563,6 +588,7 @@ def merge_document(
     existing_ids = {
         finding.get("finding_id") for finding in existing.get("findings", [])
     }
+    out_of_scope = set()
     if mode == "revalidate":
         unknown_targets = target_finding_ids - existing_ids
         if unknown_targets:
@@ -571,14 +597,13 @@ def merge_document(
                 + ", ".join(sorted(unknown_targets))
             )
         recurring_ids = set(validated.get("recurring_finding_ids", []))
-        unexpected = recurring_ids - target_finding_ids
-        if unexpected:
-            raise ValueError(
-                "revalidation returned out-of-scope prior IDs: "
-                + ", ".join(sorted(unexpected))
-            )
+        out_of_scope = recurring_ids - target_finding_ids
 
-    returned = {finding["finding_id"]: finding for finding in validated.get("findings", [])}
+    returned = {
+        finding["finding_id"]: finding
+        for finding in validated.get("findings", [])
+        if finding["finding_id"] not in out_of_scope
+    }
     verdict_by_id = {
         verdict.get("finding_id"): verdict for verdict in verdicts.get("verdicts", [])
     }
@@ -587,7 +612,9 @@ def merge_document(
     summary = {
         "new": [],
         "recurring": [],
+        "reopened": [],
         "not_seen": [],
+        "out_of_scope": sorted(out_of_scope),
         "refuted": [],
         "unverified": [],
         "evidence_rejected": validated.get("evidence_rejected", []),
@@ -618,7 +645,21 @@ def merge_document(
                     current["status"] = "open"
                     event["from_status"] = "fixed"
                     event["to_status"] = "open"
+                    summary["reopened"].append(finding_id)
                 history.append(event)
+            elif current.get("status") == "fixed":
+                current["status"] = "open"
+                history.append(
+                    {
+                        "action": "review",
+                        "at": now,
+                        "run_id": run_id,
+                        "result": "reopened",
+                        "from_status": "fixed",
+                        "to_status": "open",
+                    }
+                )
+                summary["reopened"].append(finding_id)
             seen_prior_ids.add(finding_id)
             summary["recurring"].append(finding_id)
         elif current.get("status") == "open" and (
@@ -670,6 +711,17 @@ def merge_document(
         if verdict.get("verdict") == "unverified":
             summary["unverified"].append(finding_id)
 
+    if mode == "revalidate":
+        state_value = existing.get("reviewed_state")
+        sha_value = existing.get("reviewed_at_sha")
+    else:
+        state_value = (
+            reviewed_state
+            if reviewed_state is not None
+            else feature_state(project, feature)
+        )
+        sha_value = git_head(project)
+    boundaries = feature.get("trust_boundaries")
     document = copy.deepcopy(existing)
     document.update(
         {
@@ -679,9 +731,10 @@ def merge_document(
             "kind": feature.get("kind"),
             "entry_path": feature.get("entry_path"),
             "feature_files": feature_files(feature),
+            "trust_boundaries": boundaries if isinstance(boundaries, list) else [],
             "reviewed_at": now,
-            "reviewed_at_sha": git_head(project),
-            "reviewed_state": feature_state(project, feature),
+            "reviewed_at_sha": sha_value,
+            "reviewed_state": state_value,
             "findings": merged_findings,
         }
     )
@@ -747,16 +800,20 @@ def build_parser():
     state.add_argument("--project", required=True)
     state.add_argument("--feature", required=True)
     state.add_argument("--findings")
+    state.add_argument("--params")
 
     states = subparsers.add_parser("feature-states")
     states.add_argument("--project", required=True)
     states.add_argument("--features", required=True)
     states.add_argument("--findings-dir")
+    states.add_argument("--params")
 
     plan = subparsers.add_parser("plan-feature")
     plan.add_argument("--feature", required=True)
     plan.add_argument("--risk", required=True)
     plan.add_argument("--changed")
+    plan.add_argument("--project")
+    plan.add_argument("--params")
     plan.add_argument("--output")
 
     validate = subparsers.add_parser("validate")
@@ -779,6 +836,8 @@ def build_parser():
     merge.add_argument("--run-id", required=True)
     merge.add_argument("--mode", choices=("review", "revalidate"), default="review")
     merge.add_argument("--target-ids")
+    merge.add_argument("--plan")
+    merge.add_argument("--params")
     merge.add_argument("--now")
 
     return parser
@@ -791,7 +850,7 @@ def run_cli(args):
 
     if args.command == "feature-state":
         feature = load_json(args.feature)
-        current = feature_state(args.project, feature)
+        current = feature_state(args.project, feature, params=args.params)
         stored = None
         if args.findings:
             stored = load_json(args.findings, {}).get("reviewed_state")
@@ -814,7 +873,7 @@ def run_cli(args):
         findings_dir = Path(
             args.findings_dir or Path(args.project) / ".codesage" / "findings"
         )
-        results = feature_states(args.project, features)
+        results = feature_states(args.project, features, params=args.params)
         for result in results:
             stored = load_json(
                 findings_dir / f"{result['feature_id']}.json", {}
@@ -825,11 +884,17 @@ def run_cli(args):
         return
 
     if args.command == "plan-feature":
+        feature = load_json(args.feature)
         plan = plan_feature_review(
-            load_json(args.feature),
+            feature,
             load_json(args.risk),
             load_json(args.changed, []),
+            project=args.project,
         )
+        if args.project:
+            plan["feature_state"] = feature_state(
+                args.project, feature, params=args.params
+            )
         if args.output:
             atomic_write_json(args.output, plan)
         print_json(plan)
@@ -870,6 +935,15 @@ def run_cli(args):
         if target_finding_ids is not None and not isinstance(target_finding_ids, list):
             raise ValueError("target finding IDs must be an array")
         now = args.now or utc_now()
+        reviewed_state = None
+        if args.plan:
+            plan = load_json(args.plan)
+            plan_feature_id = plan.get("feature_id")
+            if plan_feature_id is not None and plan_feature_id != feature_id:
+                raise ValueError("plan feature_id does not match feature metadata")
+            reviewed_state = plan.get("feature_state")
+        if reviewed_state is None and args.mode == "review":
+            reviewed_state = feature_state(args.project, feature, params=args.params)
         document, summary = merge_document(
             args.project,
             feature,
@@ -880,6 +954,7 @@ def run_cli(args):
             now,
             args.mode,
             target_finding_ids,
+            reviewed_state=reviewed_state,
         )
         atomic_write_json(findings_path, document)
         snapshot = (
@@ -889,8 +964,20 @@ def run_cli(args):
             / "history"
             / f"{feature_id}-{args.run_id}.json"
         )
-        atomic_write_json(snapshot, document)
-        print_json({"findings_path": str(findings_path), "snapshot_path": str(snapshot), **summary})
+        result = {
+            "findings_path": str(findings_path),
+            "snapshot_path": str(snapshot),
+            **summary,
+        }
+        try:
+            atomic_write_json(snapshot, document)
+        except OSError as exc:
+            result["snapshot_error"] = str(exc)
+            print(
+                f"codesage-review-state: warning: snapshot write failed: {exc}",
+                file=sys.stderr,
+            )
+        print_json(result)
         return
 
     raise ValueError(f"unknown command: {args.command}")

@@ -129,7 +129,147 @@ class FeatureStateTests(unittest.TestCase):
         self.assertEqual(reads, [source])
 
 
+    def test_feature_state_binds_to_review_params(self):
+        review_state = load_review_state()
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            source = project / "src" / "lib.rs"
+            source.parent.mkdir()
+            source.write_text("fn value() {}\n")
+            feature = {
+                "feature_id": "feat_1111111111111111",
+                "files": [{"path": "src/lib.rs", "role": "entry"}],
+            }
+
+            default_state = review_state.feature_state(project, feature)
+            narrow = review_state.feature_state(
+                project, feature, params="categories=bug;severity=medium"
+            )
+            wide = review_state.feature_state(
+                project, feature, params="categories=bug,security;severity=low"
+            )
+            narrow_again = review_state.feature_state(
+                project, feature, params="categories=bug;severity=medium"
+            )
+
+        self.assertNotEqual(default_state, narrow)
+        self.assertNotEqual(narrow, wide)
+        self.assertEqual(narrow, narrow_again)
+
+
 class ReviewPlanTests(unittest.TestCase):
+    def test_plan_drops_deleted_files_when_project_supplied(self):
+        review_state = load_review_state()
+        feature = {
+            "feature_id": "feat_1111111111111111",
+            "entry_path": "src/main.rs",
+            "files": [
+                {"path": "src/main.rs", "role": "entry"},
+                {"path": "src/real.rs", "role": "owned"},
+                {"path": "src/deleted.rs", "role": "owned"},
+            ],
+            "trust_boundaries": [],
+        }
+        risk = {"files": [{"file": "src/real.rs", "score": 0.2}]}
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            (project / "src").mkdir()
+            (project / "src" / "main.rs").write_text("fn main() {}\n")
+            (project / "src" / "real.rs").write_text("fn real() {}\n")
+
+            unfiltered = review_state.plan_feature_review(feature, risk, [])
+            filtered = review_state.plan_feature_review(
+                feature, risk, [], project=project
+            )
+
+        self.assertIn("src/deleted.rs", unfiltered["must_read"])
+        self.assertEqual(filtered["must_read"], ["src/main.rs", "src/real.rs"])
+
+    def test_plan_includes_changed_context_and_test_files(self):
+        review_state = load_review_state()
+        feature = {
+            "feature_id": "feat_1111111111111111",
+            "entry_path": "src/main.rs",
+            "files": [
+                {"path": "src/main.rs", "role": "entry"},
+                {"path": "src/owned.rs", "role": "owned"},
+                {"path": "tests/helper.rs", "role": "context"},
+            ],
+            "trust_boundaries": [],
+        }
+        risk = {"files": [{"file": "src/owned.rs", "score": 0.3}]}
+
+        plan = review_state.plan_feature_review(feature, risk, ["tests/helper.rs"])
+
+        self.assertEqual(
+            plan["must_read"], ["src/main.rs", "tests/helper.rs", "src/owned.rs"]
+        )
+        self.assertEqual(plan["eligible_file_count"], 3)
+
+    def test_plan_expands_to_ten_for_trust_heavy_slice(self):
+        review_state = load_review_state()
+        feature = {
+            "feature_id": "feat_1111111111111111",
+            "entry_path": "src/main.rs",
+            "files": [
+                {"path": "src/main.rs", "role": "entry"},
+                {"path": "src/owned.rs", "role": "owned"},
+            ],
+            "trust_boundaries": ["filesystem", "network", "secrets"],
+        }
+        risk = {"files": [{"file": "src/owned.rs", "score": 0.1}]}
+
+        expanded = review_state.plan_feature_review(feature, risk, [])
+        feature["trust_boundaries"] = ["filesystem", "network"]
+        control = review_state.plan_feature_review(feature, risk, [])
+
+        self.assertEqual(expanded["read_limit"], 10)
+        self.assertIn("trust-boundaries", expanded["expansion_reasons"])
+        self.assertEqual(control["read_limit"], 5)
+
+    def test_plan_expands_to_ten_for_large_owned_set(self):
+        review_state = load_review_state()
+
+        def feature_with_owned(count):
+            return {
+                "feature_id": "feat_1111111111111111",
+                "entry_path": "src/main.rs",
+                "files": [{"path": "src/main.rs", "role": "entry"}]
+                + [
+                    {"path": f"src/owned_{index}.rs", "role": "owned"}
+                    for index in range(count)
+                ],
+                "trust_boundaries": [],
+            }
+
+        expanded = review_state.plan_feature_review(feature_with_owned(8), [], [])
+        control = review_state.plan_feature_review(feature_with_owned(7), [], [])
+
+        self.assertEqual(expanded["read_limit"], 10)
+        self.assertIn("large-owned-set", expanded["expansion_reasons"])
+        self.assertEqual(control["read_limit"], 5)
+
+    def test_plan_expands_to_ten_for_broadly_changed_slice(self):
+        review_state = load_review_state()
+        feature = {
+            "feature_id": "feat_1111111111111111",
+            "entry_path": "src/main.rs",
+            "files": [{"path": "src/main.rs", "role": "entry"}]
+            + [
+                {"path": f"src/owned_{index}.rs", "role": "owned"}
+                for index in range(6)
+            ],
+            "trust_boundaries": [],
+        }
+        changed = [f"src/owned_{index}.rs" for index in range(5)]
+
+        expanded = review_state.plan_feature_review(feature, [], changed)
+        control = review_state.plan_feature_review(feature, [], changed[:4])
+
+        self.assertEqual(expanded["read_limit"], 10)
+        self.assertIn("many-changed-files", expanded["expansion_reasons"])
+        self.assertEqual(control["read_limit"], 5)
+
     def test_plan_prioritizes_entry_then_changed_then_risk_and_ignores_context(self):
         review_state = load_review_state()
         feature = {
@@ -312,6 +452,32 @@ class EvidenceValidationTests(unittest.TestCase):
         self.assertEqual(validated["findings"], [])
         self.assertEqual(len(validated["evidence_rejected"]), 2)
 
+    def test_two_line_block_matches_across_blank_source_line(self):
+        source = self.project / "src" / "spaced.py"
+        source.write_text("def foo():\n\n    return bar\n")
+        finding = self.finding(1, ["def foo():", "    return bar"])
+        finding["file"] = "src/spaced.py"
+        response = {"feature_id": "feat_1111111111111111", "findings": [finding]}
+
+        validated = self.review_state.validate_response(
+            self.project, response, {"findings": []}
+        )
+
+        self.assertEqual(len(validated["findings"]), 1)
+        self.assertEqual(validated["findings"][0]["line"], 1)
+        self.assertEqual(validated["evidence_rejected"], [])
+
+    def test_combine_rejects_a_lens_response_reporting_an_error(self):
+        with self.assertRaises(ValueError) as caught:
+            self.review_state.combine_responses(
+                [
+                    {"feature_id": "feat_1111111111111111", "findings": []},
+                    {"feature_id": "feat_1111111111111111", "error": "lens aborted"},
+                ]
+            )
+
+        self.assertIn("lens aborted", str(caught.exception))
+
     def test_malformed_finding_is_rejected_without_crashing_validation(self):
         response = {
             "feature_id": "feat_1111111111111111",
@@ -436,6 +602,56 @@ class EvidenceValidationTests(unittest.TestCase):
 
 
 class IdentityTests(unittest.TestCase):
+    def test_nearby_similar_title_reuses_prior_id_despite_new_evidence(self):
+        review_state = load_review_state()
+        title = "Operation lacks validation"
+        replacement = "fn first() { dangerous_rewritten_operation_with_untrusted_value(); }"
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            source = project / "src" / "lib.rs"
+            source.parent.mkdir()
+            source.write_text(
+                "let a = 1;\nlet b = 2;\nlet c = 3;\nlet d = 4;\n" + replacement + "\n"
+            )
+            existing = {
+                "findings": [
+                    {
+                        "finding_id": "fnd_aaaaaaaa",
+                        "file": "src/lib.rs",
+                        "line": 1,
+                        "severity": "medium",
+                        "category": "bug",
+                        "title": title,
+                        "summary": "First summary",
+                        "evidence": [
+                            "fn first() { dangerous_first_operation_with_untrusted_value(); }"
+                        ],
+                        "status": "open",
+                    }
+                ]
+            }
+            response = {
+                "feature_id": "feat_1111111111111111",
+                "findings": [
+                    {
+                        "file": "src/lib.rs",
+                        "line": 5,
+                        "severity": "medium",
+                        "category": "bug",
+                        "title": title,
+                        "summary": "Rewritten but same defect",
+                        "evidence": [replacement],
+                        "suggested_fix": "Add the missing validation.",
+                    }
+                ],
+            }
+
+            validated = review_state.validate_response(project, response, existing)
+
+        self.assertEqual(validated["findings"][0]["finding_id"], "fnd_aaaaaaaa")
+        self.assertEqual(validated["recurring_finding_ids"], ["fnd_aaaaaaaa"])
+        self.assertEqual(validated["new_finding_ids"], [])
+
     def test_returned_prior_id_is_rejected_for_an_unrelated_finding(self):
         review_state = load_review_state()
         original = "fn first() { dangerous_first_operation_with_untrusted_value(); }"
@@ -880,6 +1096,238 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(leftovers, [])
 
 
+    def test_review_mode_reopens_fixed_prior_on_evidence_match(self):
+        review_state = load_review_state()
+        prior = self.finding("fnd_99999999", "fixed")
+        validated_finding = {
+            field: prior[field] for field in review_state.FINDING_FIELDS
+        }
+        feature = {
+            "feature_id": "feat_1111111111111111",
+            "title": "Library",
+            "kind": "library",
+            "entry_path": "src/lib.rs",
+            "files": [{"path": "src/lib.rs", "role": "entry"}],
+        }
+        validated = {
+            "feature_id": feature["feature_id"],
+            "findings": [validated_finding],
+            "new_finding_ids": [],
+            "recurring_finding_ids": ["fnd_99999999"],
+            "evidence_rejected": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            source = project / "src" / "lib.rs"
+            source.parent.mkdir()
+            source.write_text("fn value() {}\n")
+
+            merged, summary = review_state.merge_document(
+                project,
+                feature,
+                {"findings": [prior]},
+                validated,
+                {"verdicts": []},
+                "run_1",
+                "2026-07-15T00:00:00Z",
+                "review",
+            )
+
+        finding = merged["findings"][0]
+        self.assertEqual(finding["status"], "open")
+        self.assertEqual(finding["history"][-1]["action"], "review")
+        self.assertEqual(finding["history"][-1]["result"], "reopened")
+        self.assertEqual(finding["history"][-1]["from_status"], "fixed")
+        self.assertEqual(finding["history"][-1]["to_status"], "open")
+        self.assertEqual(summary["reopened"], ["fnd_99999999"])
+
+    def test_revalidation_ignores_rediscovered_untargeted_prior(self):
+        review_state = load_review_state()
+        targeted = self.finding("fnd_aaaaaaa1", "open")
+        untargeted = self.finding("fnd_bbbbbbb2", "wont-fix")
+        feature = {
+            "feature_id": "feat_1111111111111111",
+            "title": "Library",
+            "kind": "library",
+            "entry_path": "src/lib.rs",
+            "files": [{"path": "src/lib.rs", "role": "entry"}],
+        }
+        validated = {
+            "feature_id": feature["feature_id"],
+            "findings": [
+                {field: targeted[field] for field in review_state.FINDING_FIELDS},
+                {field: untargeted[field] for field in review_state.FINDING_FIELDS},
+            ],
+            "new_finding_ids": [],
+            "recurring_finding_ids": ["fnd_aaaaaaa1", "fnd_bbbbbbb2"],
+            "evidence_rejected": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            source = project / "src" / "lib.rs"
+            source.parent.mkdir()
+            source.write_text("fn value() {}\n")
+
+            merged, summary = review_state.merge_document(
+                project,
+                feature,
+                {"findings": [targeted, untargeted]},
+                validated,
+                {"verdicts": []},
+                "rev_1",
+                "2026-07-15T00:00:00Z",
+                "revalidate",
+                {"fnd_aaaaaaa1"},
+            )
+
+        by_id = {finding["finding_id"]: finding for finding in merged["findings"]}
+        self.assertEqual(summary["out_of_scope"], ["fnd_bbbbbbb2"])
+        self.assertEqual(by_id["fnd_bbbbbbb2"]["status"], "wont-fix")
+        self.assertEqual(len(by_id["fnd_bbbbbbb2"]["history"]), 1)
+        self.assertEqual(by_id["fnd_aaaaaaa1"]["history"][-1]["result"], "still-present")
+
+    def test_reemitted_false_positive_keeps_status_through_revalidation(self):
+        review_state = load_review_state()
+        prior = self.finding("fnd_ccccccc3", "false-positive")
+        feature = {
+            "feature_id": "feat_1111111111111111",
+            "title": "Library",
+            "kind": "library",
+            "entry_path": "src/lib.rs",
+            "files": [{"path": "src/lib.rs", "role": "entry"}],
+        }
+        validated = {
+            "feature_id": feature["feature_id"],
+            "findings": [
+                {field: prior[field] for field in review_state.FINDING_FIELDS}
+            ],
+            "new_finding_ids": [],
+            "recurring_finding_ids": ["fnd_ccccccc3"],
+            "evidence_rejected": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            source = project / "src" / "lib.rs"
+            source.parent.mkdir()
+            source.write_text("fn value() {}\n")
+
+            merged, summary = review_state.merge_document(
+                project,
+                feature,
+                {"findings": [prior]},
+                validated,
+                {"verdicts": []},
+                "rev_1",
+                "2026-07-15T00:00:00Z",
+                "revalidate",
+                {"fnd_ccccccc3"},
+            )
+
+        finding = merged["findings"][0]
+        self.assertEqual(finding["status"], "false-positive")
+        self.assertEqual(finding["history"][-1]["result"], "still-present")
+        self.assertNotIn("from_status", finding["history"][-1])
+        self.assertEqual(summary["reopened"], [])
+
+    def test_review_merge_stores_plan_state_and_trust_boundaries(self):
+        review_state = load_review_state()
+        feature = {
+            "feature_id": "feat_1111111111111111",
+            "title": "Library",
+            "kind": "library",
+            "entry_path": "src/lib.rs",
+            "files": [{"path": "src/lib.rs", "role": "entry"}],
+            "trust_boundaries": ["filesystem", "network"],
+        }
+        validated = {
+            "feature_id": feature["feature_id"],
+            "findings": [],
+            "new_finding_ids": [],
+            "recurring_finding_ids": [],
+            "evidence_rejected": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            source = project / "src" / "lib.rs"
+            source.parent.mkdir()
+            source.write_text("fn value() {}\n")
+
+            merged, _ = review_state.merge_document(
+                project,
+                feature,
+                {"findings": []},
+                validated,
+                {"verdicts": []},
+                "run_1",
+                "2026-07-15T00:00:00Z",
+                "review",
+                None,
+                reviewed_state="sha256:plan-time-state",
+            )
+
+        self.assertEqual(merged["reviewed_state"], "sha256:plan-time-state")
+        self.assertEqual(merged["trust_boundaries"], ["filesystem", "network"])
+
+    def test_revalidation_preserves_freshness_state(self):
+        review_state = load_review_state()
+        prior = self.finding("fnd_ddddddd4", "open")
+        feature = {
+            "feature_id": "feat_1111111111111111",
+            "title": "Library",
+            "kind": "library",
+            "entry_path": "src/lib.rs",
+            "files": [{"path": "src/lib.rs", "role": "entry"}],
+        }
+        existing = {
+            "findings": [prior],
+            "reviewed_state": "sha256:before-revalidation",
+            "reviewed_at_sha": "abc123def456",
+        }
+        validated = {
+            "feature_id": feature["feature_id"],
+            "findings": [],
+            "new_finding_ids": [],
+            "recurring_finding_ids": [],
+            "evidence_rejected": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            source = project / "src" / "lib.rs"
+            source.parent.mkdir()
+            source.write_text("fn value() {}\n")
+
+            merged, _ = review_state.merge_document(
+                project,
+                feature,
+                existing,
+                validated,
+                {"verdicts": []},
+                "rev_1",
+                "2026-07-15T00:00:00Z",
+                "revalidate",
+                {"fnd_ddddddd4"},
+            )
+
+        self.assertEqual(merged["reviewed_state"], "sha256:before-revalidation")
+        self.assertEqual(merged["reviewed_at_sha"], "abc123def456")
+
+    def test_atomic_write_failure_preserves_destination_and_cleans_temp(self):
+        review_state = load_review_state()
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "state.json"
+            review_state.atomic_write_json(destination, {"value": 1})
+
+            with mock.patch("json.dump", side_effect=RuntimeError("disk exploded")):
+                with self.assertRaises(RuntimeError):
+                    review_state.atomic_write_json(destination, {"value": 2})
+
+            loaded = json.loads(destination.read_text())
+            leftovers = list(Path(directory).glob(".state.json.*.tmp"))
+
+        self.assertEqual(loaded, {"value": 1})
+        self.assertEqual(leftovers, [])
+
+
 class CliContractTests(unittest.TestCase):
     def test_plan_feature_cli_writes_the_same_plan_it_prints(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -933,6 +1381,167 @@ class CliContractTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(json.loads(completed.stdout), written)
+
+
+    def test_validate_cli_rejects_missing_coverage_with_nonzero_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            (project / "src").mkdir(parents=True)
+            (project / "src" / "handler.rs").write_text("fn handle() {}\n")
+            (project / "src" / "other.rs").write_text("fn other() {}\n")
+            plan_path = root / "plan.json"
+            plan_path.write_text(
+                json.dumps(
+                    {
+                        "feature_id": "feat_1111111111111111",
+                        "must_read": ["src/handler.rs", "src/other.rs"],
+                    }
+                )
+            )
+            response_path = root / "response.json"
+            response_path.write_text(
+                json.dumps(
+                    {
+                        "feature_id": "feat_1111111111111111",
+                        "reviewed_files": ["src/handler.rs"],
+                        "findings": [],
+                    }
+                )
+            )
+
+            completed = subprocess.run(
+                [
+                    str(SCRIPT),
+                    "validate",
+                    "--project",
+                    str(project),
+                    "--response",
+                    str(response_path),
+                    "--must-read",
+                    str(plan_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(completed.returncode, 1, completed.stdout)
+        self.assertIn("codesage-review-state:", completed.stderr)
+        self.assertIn("missing required reviewed files", completed.stderr)
+        self.assertIn("src/other.rs", completed.stderr)
+
+    def test_validate_cli_accepts_complete_coverage_through_must_read_flag(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            (project / "src").mkdir(parents=True)
+            (project / "src" / "handler.rs").write_text("fn handle() {}\n")
+            (project / "src" / "other.rs").write_text("fn other() {}\n")
+            plan_path = root / "plan.json"
+            plan_path.write_text(
+                json.dumps(
+                    {
+                        "feature_id": "feat_1111111111111111",
+                        "must_read": ["src/handler.rs", "src/other.rs"],
+                    }
+                )
+            )
+            response_path = root / "response.json"
+            response_path.write_text(
+                json.dumps(
+                    {
+                        "feature_id": "feat_1111111111111111",
+                        "reviewed_files": ["src/handler.rs", "src/other.rs"],
+                        "findings": [],
+                    }
+                )
+            )
+            output_path = root / "validated.json"
+
+            completed = subprocess.run(
+                [
+                    str(SCRIPT),
+                    "validate",
+                    "--project",
+                    str(project),
+                    "--response",
+                    str(response_path),
+                    "--must-read",
+                    str(plan_path),
+                    "--output",
+                    str(output_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            written = json.loads(output_path.read_text())
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            written["reviewed_files"], ["src/handler.rs", "src/other.rs"]
+        )
+
+    def test_merge_cli_downgrades_snapshot_failure_to_warning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            (project / "src").mkdir(parents=True)
+            (project / "src" / "lib.rs").write_text("fn value() {}\n")
+            findings_dir = project / ".codesage" / "findings"
+            findings_dir.mkdir(parents=True)
+            (findings_dir / "history").write_text("not a directory\n")
+            feature_path = root / "feature.json"
+            feature_path.write_text(
+                json.dumps(
+                    {
+                        "feature_id": "feat_1111111111111111",
+                        "title": "Library",
+                        "kind": "library",
+                        "entry_path": "src/lib.rs",
+                        "files": [{"path": "src/lib.rs", "role": "entry"}],
+                    }
+                )
+            )
+            validated_path = root / "validated.json"
+            validated_path.write_text(
+                json.dumps(
+                    {
+                        "feature_id": "feat_1111111111111111",
+                        "findings": [],
+                        "new_finding_ids": [],
+                        "recurring_finding_ids": [],
+                        "evidence_rejected": [],
+                    }
+                )
+            )
+
+            completed = subprocess.run(
+                [
+                    str(SCRIPT),
+                    "merge",
+                    "--project",
+                    str(project),
+                    "--feature",
+                    str(feature_path),
+                    "--validated",
+                    str(validated_path),
+                    "--run-id",
+                    "run_1",
+                    "--mode",
+                    "review",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            merged_exists = (findings_dir / "feat_1111111111111111.json").is_file()
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue(merged_exists)
+        self.assertIn("snapshot write failed", completed.stderr)
+        self.assertIn("snapshot_error", completed.stdout)
 
 
 class ProtocolContractTests(unittest.TestCase):

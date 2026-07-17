@@ -248,6 +248,180 @@ fn caller_expansion_reserves_related_capacity_when_tests_saturate() {
 }
 
 #[test]
+fn caller_expansion_reserves_exactly_two_slots_with_three_callees() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"acme\"\nversion = \"0.1.0\"\n",
+    );
+    write(root, "src/alpha.rs", "pub fn alpha_helper() {}\n");
+    write(root, "src/beta.rs", "pub fn beta_helper() {}\n");
+    write(root, "src/gamma.rs", "pub fn gamma_helper() {}\n");
+    let main_src = "mod alpha;\nmod beta;\nmod gamma;\nuse alpha::alpha_helper;\nuse beta::beta_helper;\nuse gamma::gamma_helper;\nfn main() { alpha_helper(); beta_helper(); gamma_helper(); }\n";
+    write(root, "src/main.rs", main_src);
+    for index in 0..5 {
+        write(
+            root,
+            &format!("tests/integration_{index}.rs"),
+            &format!("#[test]\nfn integration_{index}() {{ assert!(true); }}\n"),
+        );
+    }
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+    map_features(root, &db, &[]).unwrap();
+    seed_chunk(&db, "src/alpha.rs", "rust", "pub fn alpha_helper() {}\n");
+    seed_chunk(&db, "src/beta.rs", "rust", "pub fn beta_helper() {}\n");
+    seed_chunk(&db, "src/gamma.rs", "rust", "pub fn gamma_helper() {}\n");
+    seed_chunk(&db, "src/main.rs", "rust", main_src);
+    for index in 0..5 {
+        seed_chunk(
+            &db,
+            &format!("tests/integration_{index}.rs"),
+            "rust",
+            &format!("#[test]\nfn integration_{index}() {{ assert!(true); }}\n"),
+        );
+    }
+
+    let features = db.features_for_file("src/main.rs").unwrap();
+    let main_feature = features
+        .iter()
+        .find(|f| f.entry_path == "src/main.rs")
+        .expect("main feature mapped");
+
+    let bundle = feature_bundle(&db, &main_feature.feature_id, true, true, 5).unwrap();
+    let related_paths: Vec<&str> = bundle
+        .related
+        .iter()
+        .map(|c| c.file_path.as_str())
+        .collect();
+    let callee_count = related_paths
+        .iter()
+        .filter(|path| path.starts_with("src/"))
+        .count();
+    let test_count = related_paths
+        .iter()
+        .filter(|path| path.starts_with("tests/"))
+        .count();
+    assert_eq!(
+        callee_count, 2,
+        "graph expansion must reserve exactly two related slots, got {related_paths:?}"
+    );
+    assert_eq!(test_count, 3, "tests must backfill the remaining slots");
+    assert_eq!(related_paths.len(), 5, "related[] must respect limit");
+}
+
+#[test]
+fn caller_expansion_with_limit_below_reservation_does_not_overflow() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"acme\"\nversion = \"0.1.0\"\n",
+    );
+    write(root, "src/helpers.rs", "pub fn helper() {}\n");
+    write(
+        root,
+        "src/main.rs",
+        "mod helpers;\nuse helpers::helper;\nfn main() { helper(); }\n",
+    );
+    write(
+        root,
+        "tests/integration.rs",
+        "#[test]\nfn ok() { assert!(true); }\n",
+    );
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+    map_features(root, &db, &[]).unwrap();
+    seed_chunk(&db, "src/helpers.rs", "rust", "pub fn helper() {}\n");
+    seed_chunk(
+        &db,
+        "src/main.rs",
+        "rust",
+        "mod helpers;\nuse helpers::helper;\nfn main() { helper(); }\n",
+    );
+    seed_chunk(
+        &db,
+        "tests/integration.rs",
+        "rust",
+        "#[test]\nfn ok() { assert!(true); }\n",
+    );
+
+    let features = db.features_for_file("src/main.rs").unwrap();
+    let main_feature = features
+        .iter()
+        .find(|f| f.entry_path == "src/main.rs")
+        .expect("main feature mapped");
+
+    let bundle = feature_bundle(&db, &main_feature.feature_id, true, true, 1).unwrap();
+    assert!(
+        bundle.related.len() <= 1,
+        "related[] must respect a limit below the two-slot reservation, got {:?}",
+        bundle
+            .related
+            .iter()
+            .map(|c| c.file_path.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn expansion_with_no_resolvable_callees_leaves_tests_full_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "Cargo.toml",
+        "[package]\nname = \"acme\"\nversion = \"0.1.0\"\n",
+    );
+    let main_src = "fn main() { println!(\"no calls to owned code\"); }\n";
+    write(root, "src/main.rs", main_src);
+    for index in 0..5 {
+        write(
+            root,
+            &format!("tests/integration_{index}.rs"),
+            &format!("#[test]\nfn integration_{index}() {{ assert!(true); }}\n"),
+        );
+    }
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+    map_features(root, &db, &[]).unwrap();
+    seed_chunk(&db, "src/main.rs", "rust", main_src);
+    for index in 0..5 {
+        seed_chunk(
+            &db,
+            &format!("tests/integration_{index}.rs"),
+            "rust",
+            &format!("#[test]\nfn integration_{index}() {{ assert!(true); }}\n"),
+        );
+    }
+
+    let features = db.features_for_file("src/main.rs").unwrap();
+    let main_feature = features
+        .iter()
+        .find(|f| f.entry_path == "src/main.rs")
+        .expect("main feature mapped");
+
+    let bundle = feature_bundle(&db, &main_feature.feature_id, true, true, 5).unwrap();
+    let related_paths: Vec<&str> = bundle
+        .related
+        .iter()
+        .map(|c| c.file_path.as_str())
+        .collect();
+    assert_eq!(
+        related_paths.len(),
+        5,
+        "tests keep the full related budget when expansion resolves nothing, got {related_paths:?}"
+    );
+    assert!(
+        related_paths.iter().all(|path| path.starts_with("tests/")),
+        "every related slot should be a test chunk, got {related_paths:?}"
+    );
+}
+
+#[test]
 fn entry_chunk_present_when_owned_lib_sorts_before_entry() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

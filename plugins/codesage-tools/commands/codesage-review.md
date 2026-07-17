@@ -31,43 +31,47 @@ Reject unknown values before dispatch. Set:
 ```bash
 REVIEW_STATE="${CLAUDE_PLUGIN_ROOT}/bin/codesage-review-state"
 test -x "$REVIEW_STATE"
+PARAMS="categories=<sorted csv>;severity=<severity>;focus=<all|product>;deep=<0|1>"
 ```
+
+`PARAMS` is the canonical review-scope string; pass the same value to every `feature-states`, `plan-feature`, and `merge` call so freshness fingerprints bind to this run's scope. Every `.codesage/...` path below lives under the project, not the session's working directory — always write it as `$PROJECT/.codesage/...`.
 
 ## 1. Create the run
 
 Use `run_$(date -u +%Y%m%dT%H%M%SZ)` as `RUN_ID`. Create:
 
 ```text
-.codesage/findings/history/
-.codesage/reviews/<RUN_ID>/features/
-.codesage/reviews/<RUN_ID>/risk/
-.codesage/reviews/<RUN_ID>/changed/
-.codesage/reviews/<RUN_ID>/plans/
-.codesage/reviews/<RUN_ID>/responses/
-.codesage/reviews/<RUN_ID>/validated/
-.codesage/reviews/<RUN_ID>/verdicts/
+$PROJECT/.codesage/findings/history/
+$PROJECT/.codesage/reviews/<RUN_ID>/features/
+$PROJECT/.codesage/reviews/<RUN_ID>/risk/
+$PROJECT/.codesage/reviews/<RUN_ID>/changed/
+$PROJECT/.codesage/reviews/<RUN_ID>/plans/
+$PROJECT/.codesage/reviews/<RUN_ID>/responses/
+$PROJECT/.codesage/reviews/<RUN_ID>/validated/
+$PROJECT/.codesage/reviews/<RUN_ID>/verdicts/
 ```
 
-Write `.codesage/reviews/<RUN_ID>.json` with the run ID, start time, filters, and `status: in_progress`.
+Write `$PROJECT/.codesage/reviews/<RUN_ID>.json` with the run ID, start time, filters, and `status: in_progress`.
 
 ## 2. Discover, check freshness, and rank
 
-Unless `--feature` names one slice, call `mcp__codesage__list_features(project, kind?, limit=200)`. For `--feature`, run `codesage feature-show --json <feature_id>` from the project and fail if the ID is unknown. Write the inventory to `.codesage/reviews/<RUN_ID>/features.json` and each complete feature record to `.codesage/reviews/<RUN_ID>/features/<feature_id>.json`.
+Unless `--feature` names one slice, call `mcp__codesage__list_features(project, kind?, limit=500)`. If exactly 500 records return, the inventory may be truncated: record `inventory_truncated: true` in the run record and say so in the summary — coverage beyond the cap is not claimed. For `--feature`, run `codesage feature-show --json <feature_id>` from the project and fail if the ID is unknown. Write the inventory to `$PROJECT/.codesage/reviews/<RUN_ID>/features.json` and each complete feature record to `$PROJECT/.codesage/reviews/<RUN_ID>/features/<feature_id>.json`.
 
 Hash freshness for the inventory in one process:
 
 ```bash
 "$REVIEW_STATE" feature-states \
   --project "$PROJECT" \
-  --features ".codesage/reviews/$RUN_ID/features.json" \
-  --findings-dir ".codesage/findings"
+  --features "$PROJECT/.codesage/reviews/$RUN_ID/features.json" \
+  --findings-dir "$PROJECT/.codesage/findings" \
+  --params "$PARAMS"
 ```
 
-The helper reads each unique slice file once even when features overlap. Skip only records where `up_to_date` is true. The fingerprint covers every entry, owned, context, and test file. Findings mtimes and triage edits don't affect it. Legacy documents without `reviewed_state` are reviewed once and upgraded during merge.
+The helper reads each unique slice file once even when features overlap. Skip only records where `up_to_date` is true — except when `--feature` names one slice: an explicit request always re-reviews, even a fresh one. The fingerprint covers every entry, owned, context, and test file plus the run's `PARAMS`, so widening categories or lowering the severity floor re-reviews content-unchanged slices. Findings mtimes and triage edits don't affect it. Legacy documents without `reviewed_state` are reviewed once and upgraded during merge.
 
 Apply `--focus` and `--kind`.
 
-Collect every candidate's entry and owned paths. Call `mcp__codesage__assess_risk_batch` in chunks of at most 100 unique paths. Write each feature's batch-shaped subset to `.codesage/reviews/<RUN_ID>/risk/<feature_id>.json`, attach each full risk record to its feature, and compute `max_owned_risk`.
+Collect every candidate's entry and owned paths. Call `mcp__codesage__assess_risk_batch` in chunks of at most 100 unique paths. Write each feature's batch-shaped subset to `$PROJECT/.codesage/reviews/<RUN_ID>/risk/<feature_id>.json`, attach each full risk record to its feature, and compute `max_owned_risk`.
 
 Sort by:
 
@@ -86,22 +90,24 @@ For each planned feature:
 
    ```bash
    "$REVIEW_STATE" slim-priors \
-     --findings ".codesage/findings/<feature_id>.json"
+     --findings "$PROJECT/.codesage/findings/<feature_id>.json"
    ```
 
    Use `[]` when the file doesn't exist. Never inline full histories or prior suggested fixes.
-2. If the findings document has `reviewed_at_sha`, compute changed slice files in the orchestrator with `git diff --name-only <sha> -- <feature paths>`. Include committed and working-tree changes. Reviewers don't receive Bash. Write the JSON array, or `[]`, to `.codesage/reviews/<RUN_ID>/changed/<feature_id>.json`.
+2. If the findings document has `reviewed_at_sha`, compute changed slice files in the orchestrator with `git -C "$PROJECT" diff --name-only <sha> -- <feature paths>`. Include committed and working-tree changes. Reviewers don't receive Bash. Write the JSON array, or `[]`, to `$PROJECT/.codesage/reviews/<RUN_ID>/changed/<feature_id>.json`.
 3. Compute a bounded, deterministic coverage plan:
 
    ```bash
    "$REVIEW_STATE" plan-feature \
-     --feature ".codesage/reviews/$RUN_ID/features/<feature_id>.json" \
-     --risk ".codesage/reviews/$RUN_ID/risk/<feature_id>.json" \
-     --changed ".codesage/reviews/$RUN_ID/changed/<feature_id>.json" \
-     --output ".codesage/reviews/$RUN_ID/plans/<feature_id>.json"
+     --feature "$PROJECT/.codesage/reviews/$RUN_ID/features/<feature_id>.json" \
+     --risk "$PROJECT/.codesage/reviews/$RUN_ID/risk/<feature_id>.json" \
+     --changed "$PROJECT/.codesage/reviews/$RUN_ID/changed/<feature_id>.json" \
+     --project "$PROJECT" \
+     --params "$PARAMS" \
+     --output "$PROJECT/.codesage/reviews/$RUN_ID/plans/<feature_id>.json"
    ```
 
-   The plan always puts the entry first when present, then changed entry/owned files, then remaining entry/owned files by descending risk and path. It requires at most five files normally and at most ten for high-risk, trust-heavy, large, or broadly changed slices. Context and test files remain available for targeted follow-up but aren't part of this bounded coverage contract.
+   The plan always puts the entry first when present, then changed slice files of any role, then remaining entry/owned files by descending risk and path. Files deleted from disk are dropped from the plan rather than demanded of the reviewer. It requires at most five files normally and at most ten for high-risk, trust-heavy, large, or broadly changed slices. Unchanged context and test files remain available for targeted follow-up but aren't part of this bounded coverage contract. The plan also records `feature_state`, the dispatch-time content fingerprint that the merge stores — content edited after this point isn't stamped as reviewed.
 4. Build a self-contained prompt with:
 
    ```text
@@ -129,30 +135,30 @@ Before dispatch, report the planned reviewer and verifier calls plus the worst-c
 
 ## 5. Parse and validate
 
-Extract the first fenced JSON object from each response. If parsing fails, use one small repair call that may only repair JSON syntax. Save a second failure as `.codesage/reviews/<RUN_ID>/responses/<feature_id>-raw.txt` and mark the feature errored.
+Extract the first fenced JSON object from each response. If parsing fails, use one small repair call that may only repair JSON syntax. Save a second failure as `$PROJECT/.codesage/reviews/<RUN_ID>/responses/<feature_id>-raw.txt` and mark the feature errored.
 
 For deep mode, save each lens response separately and combine them in fixed `correctness`, `security`, `lifecycle` order:
 
 ```bash
 "$REVIEW_STATE" combine \
   --responses \
-    ".codesage/reviews/$RUN_ID/responses/<feature_id>-correctness.json" \
-    ".codesage/reviews/$RUN_ID/responses/<feature_id>-security.json" \
-    ".codesage/reviews/$RUN_ID/responses/<feature_id>-lifecycle.json" \
-  --output ".codesage/reviews/$RUN_ID/responses/<feature_id>.json"
+    "$PROJECT/.codesage/reviews/$RUN_ID/responses/<feature_id>-correctness.json" \
+    "$PROJECT/.codesage/reviews/$RUN_ID/responses/<feature_id>-security.json" \
+    "$PROJECT/.codesage/reviews/$RUN_ID/responses/<feature_id>-lifecycle.json" \
+  --output "$PROJECT/.codesage/reviews/$RUN_ID/responses/<feature_id>.json"
 ```
 
-Include only the lenses that were dispatched, and pass their paths explicitly in lens order rather than relying on glob order. The validation step below removes duplicate candidates by evidence fingerprint or close title/location identity before assigning IDs.
+Include only the lenses that were dispatched, and pass their paths explicitly in lens order rather than relying on glob order. `combine` rejects any lens response carrying an `error` field — a failed lens fails the feature (retry that lens once or mark the feature errored); never combine around it. The validation step below removes duplicate candidates by evidence fingerprint or close title/location identity before assigning IDs.
 
-Write parsed JSON to `.codesage/reviews/<RUN_ID>/responses/<feature_id>.json`, then run:
+Write parsed JSON to `$PROJECT/.codesage/reviews/<RUN_ID>/responses/<feature_id>.json`, then run:
 
 ```bash
 "$REVIEW_STATE" validate \
   --project "$PROJECT" \
-  --response ".codesage/reviews/$RUN_ID/responses/<feature_id>.json" \
-  --findings ".codesage/findings/<feature_id>.json" \
-  --must-read ".codesage/reviews/$RUN_ID/plans/<feature_id>.json" \
-  --output ".codesage/reviews/$RUN_ID/validated/<feature_id>.json"
+  --response "$PROJECT/.codesage/reviews/$RUN_ID/responses/<feature_id>.json" \
+  --findings "$PROJECT/.codesage/findings/<feature_id>.json" \
+  --must-read "$PROJECT/.codesage/reviews/$RUN_ID/plans/<feature_id>.json" \
+  --output "$PROJECT/.codesage/reviews/$RUN_ID/validated/<feature_id>.json"
 ```
 
 The helper rejects fabricated or weakly-located evidence, corrects accepted loci, preserves identity by evidence fingerprint or close title match, prevents nearby defects from collapsing, guards echoed IDs against unrelated prior findings, and mints IDs for new findings. It also rejects a response whose `reviewed_files` omits any `must_read` path.
@@ -166,7 +172,7 @@ Skip this step under `--no-verify`. Otherwise, for each feature with new IDs:
 1. Sort new findings by severity, then file and line.
 2. Take at most `--max-verify-findings`.
 3. Dispatch one `codesage-finding-verifier` with the selected JSON array. Don't dispatch one verifier per finding.
-4. Save its strict response as `.codesage/reviews/<RUN_ID>/verdicts/<feature_id>.json`.
+4. Save its strict response as `$PROJECT/.codesage/reviews/<RUN_ID>/verdicts/<feature_id>.json`.
 
 The verifier returns one verdict per selected ID. Findings beyond the cap or missing from a failed verifier response remain open with an `unverified` history event. Never delete them because verification failed.
 
@@ -177,14 +183,16 @@ For every successfully reviewed feature, run:
 ```bash
 "$REVIEW_STATE" merge \
   --project "$PROJECT" \
-  --feature ".codesage/reviews/$RUN_ID/features/<feature_id>.json" \
-  --validated ".codesage/reviews/$RUN_ID/validated/<feature_id>.json" \
-  --verdicts ".codesage/reviews/$RUN_ID/verdicts/<feature_id>.json" \
+  --feature "$PROJECT/.codesage/reviews/$RUN_ID/features/<feature_id>.json" \
+  --validated "$PROJECT/.codesage/reviews/$RUN_ID/validated/<feature_id>.json" \
+  --verdicts "$PROJECT/.codesage/reviews/$RUN_ID/verdicts/<feature_id>.json" \
+  --plan "$PROJECT/.codesage/reviews/$RUN_ID/plans/<feature_id>.json" \
+  --params "$PARAMS" \
   --run-id "$RUN_ID" \
   --mode review
 ```
 
-Omit `--verdicts` when verification is disabled. The helper writes `.codesage/findings/<feature_id>.json` plus the immutable run snapshot. It stores feature metadata and the content fingerprint. It appends one pending event when an open finding disappears, never marks it fixed, and adds no `not-seen` history to fixed, false-positive, or wont-fix findings.
+Omit `--verdicts` when verification is disabled. The helper writes `$PROJECT/.codesage/findings/<feature_id>.json` plus the immutable run snapshot; a snapshot-only write failure is a warning (`snapshot_error` in the output), not a merge failure. It stores feature metadata, trust boundaries, and the plan's dispatch-time content fingerprint. It appends one pending event when an open finding disappears, never marks it fixed, and adds no `not-seen` history to fixed, false-positive, or wont-fix findings. A recurring finding whose prior is `fixed` reopens to `open` with a `reopened` event — current evidence disproves the fix claim in review mode too.
 
 ## 8. Complete the run record
 

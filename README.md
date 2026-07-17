@@ -286,6 +286,7 @@ Dispatches subagents in parallel batches over the project's mapped feature slice
                            [--kind <k>] [--focus all|product]
                            [--severity <s>] [--categories <c,c,...>]
                            [--deep] [--no-verify] [--max-verify-findings N]
+                           [--model <m>] [--verify-model <m>]
 ```
 
 - `<project>`: absolute path to an onboarded codesage project (must contain `.codesage/index.db`)
@@ -299,8 +300,9 @@ Dispatches subagents in parallel batches over the project's mapped feature slice
 - `--deep`: use correctness, security, and lifecycle lenses on risky or large slices
 - `--no-verify`: skip adversarial verification of new findings
 - `--max-verify-findings <N>`: cap new findings checked by a feature's single batched verifier (default `5`, maximum `10`)
+- `--model <m>` / `--verify-model <m>`: reviewer and verifier model overrides
 
-Each findings document stores a content fingerprint over the feature's entry, owned, context, and test files. Review skips a slice only when that fingerprint still matches, so triage edits can't make changed code appear fresh. Capped runs sort product paths and maximum owned-file risk first; full coverage remains the default.
+Each findings document stores a content fingerprint over the feature's entry, owned, context, and test files plus the run's category/severity/focus scope, captured at dispatch time. Review skips a slice only when that fingerprint still matches, so triage edits can't make changed code appear fresh and a widened scope re-reviews unchanged slices; an explicit `--feature` request always re-reviews. Capped runs sort product paths and maximum owned-file risk first; full coverage remains the default.
 
 ### `/codesage-triage`
 
@@ -319,7 +321,9 @@ Pure local state edit. Appends a history entry on the named finding and updates 
 Re-runs the subagent against a specific feature slice (or a single finding's owning slice) and reconciles through the same evidence gate. A missing `open` finding stays open as `needs-confirmation`; omission alone never proves a fix. Current evidence can reopen a user-marked `fixed` finding. `false-positive` and `wont-fix` remain user-owned.
 
 ```
-/codesage-revalidate <project> [--feature <id>] [--finding <fnd_id>]
+/codesage-revalidate <project> --finding <fnd_id> | --feature <feat_id> | --all
+                               [--status open|fixed|false-positive|wont-fix]
+                               [--max-verify-findings N]
 ```
 
 - `--feature <id>`: re-review one feature slice

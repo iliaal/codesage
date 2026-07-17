@@ -272,7 +272,21 @@ test_leak_check_range_uses_range_endpoint
 test_leak_check_invalid_regex_fails_closed
 test_release_script_updates_changelog_links
 test_check_changelog_terseness
-python3 -m unittest discover -s "$repo_root/scripts/tests" -p 'test_*.py'
-python3 -m unittest discover -s "$repo_root/plugins/codesage-tools/tests" -p 'test_*.py'
+run_python_suite() {
+	python3 - "$1" <<-'EOF'
+		import sys
+		import unittest
+
+		suite = unittest.defaultTestLoader.discover(sys.argv[1], pattern="test_*.py")
+		result = unittest.TextTestRunner(verbosity=1).run(suite)
+		if result.testsRun == 0:
+		    print(f"no tests discovered under {sys.argv[1]}", file=sys.stderr)
+		    sys.exit(1)
+		sys.exit(0 if result.wasSuccessful() else 1)
+	EOF
+}
+
+run_python_suite "$repo_root/scripts/tests"
+run_python_suite "$repo_root/plugins/codesage-tools/tests"
 
 printf 'script and plugin regression tests passed\n'

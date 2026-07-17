@@ -1,7 +1,7 @@
 ## [Unreleased]
 
 ### Added
-- `/codesage-review` adds `--focus all|product` and `--max-verify-findings`; product focus skips test-suite, `bench/`, and `scripts/` slices while full coverage remains the default.
+- `/codesage-review` adds `--focus all|product` and `--max-verify-findings`; product focus skips test-suite, `bench/`, and `scripts/` slices while full coverage remains the default. `/codesage-revalidate` gains `--max-verify-findings` and runs new regression findings through the same adversarial verifier.
 
 ### Changed
 - `feature_bundle` reserves up to two existing `related` slots for requested caller/callee chunks before backfilling tests and context, keeping the response limit unchanged.
@@ -10,7 +10,10 @@
 
 ### Fixed
 - Review findings now use deterministic evidence validation, identity matching, content-based freshness, feature metadata persistence, atomic merges, and transition-only history; revalidation no longer marks an omitted open finding fixed.
-- Fixed review evidence validation for short exact two-line code blocks, full ±15-line block bounds, and unrelated returned finding IDs.
+- Fixed review evidence validation for short exact two-line code blocks, full ±15-line block bounds, and unrelated returned finding IDs; evidence blocks now also match across blank source lines.
+- Review-mode merges reopen an evidence-matched `fixed` finding instead of silently absorbing it; revalidation drops rediscovered untargeted findings as `out_of_scope` instead of failing the whole feature, and no longer advances slice freshness.
+- Review freshness fingerprints bind to the run's category/severity/focus scope and dispatch-time content; coverage plans drop deleted files and include changed context/test files; findings documents persist `trust_boundaries`.
+- `/codesage-review` anchors all state paths at the project root, exempts an explicit `--feature` from the freshness skip, raises feature discovery to 500 slices with a truncation warning, and fails a deep-mode feature when a lens response reports an error.
 - Release automation keeps the Codex plugin, Claude plugin, and Claude marketplace versions aligned with the workspace version.
 
 ## [0.16.0] - 2026-07-12

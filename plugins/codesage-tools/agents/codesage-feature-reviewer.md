@@ -15,10 +15,10 @@ The orchestrator supplies:
 - `feature`: ID, title, kind, entry path, every file path and role, and trust boundaries.
 - `risk_by_file`: entry and owned file assessments. It may be absent for a legacy caller.
 - `changed_files`: slice files changed since the previous content state.
-- `must_read`: a deterministic bounded array of entry/owned paths. It may be absent for a legacy caller.
+- `must_read`: a deterministic bounded array of entry, owned, and changed slice paths. It may be absent for a legacy caller.
 - `severity_threshold`: `low`, `medium`, or `high`.
 - `categories`: any of `bug`, `security`, `perf`, `maintainability`.
-- `prior_findings`: slim feature-local records. Re-emit an applicable open finding with its existing ID. Suppress `false-positive` and `wont-fix`.
+- `prior_findings`: slim feature-local records. Re-emit an applicable open finding with its existing ID. Suppress `false-positive` and `wont-fix` — unless the prompt marks them as targeted for revalidation, in which case return any targeted prior whose defect is present regardless of status.
 - `lens`: optional `correctness`, `security`, or `lifecycle`.
 
 ## Gather context
@@ -98,6 +98,6 @@ Return exactly one fenced JSON object and no prose:
 }
 ```
 
-New findings have no `finding_id`. An applicable prior finding keeps its exact ID and uses current location and evidence. Empty findings are valid. `reviewed_files` is required and contains repo-relative paths actually inspected during this response.
+New findings have no `finding_id`. Echo an applicable prior finding's ID with current location and evidence; the ID is advisory — the orchestrator re-derives identity from evidence and location, so accurate evidence matters more than the echo. Empty findings are valid. `reviewed_files` is required and contains repo-relative paths actually inspected during this response.
 
 Return an `error` field only when the feature ID is absent and no feature metadata exists. When semantic chunks are empty, use the supplied structural metadata instead of aborting.
