@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.17.0] - 2026-07-17
+
 ### Added
 - `/codesage-review` adds `--focus all|product` and `--max-verify-findings`; product focus skips test-suite, `bench/`, and `scripts/` slices while full coverage remains the default. `/codesage-revalidate` gains `--max-verify-findings` and runs new regression findings through the same adversarial verifier.
 
@@ -622,5 +624,7 @@ Initial public release.
 
 [0.15.0]: https://github.com/iliaal/codesage/releases/tag/v0.15.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.16.0...HEAD
 [0.16.0]: https://github.com/iliaal/codesage/releases/tag/v0.16.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/iliaal/codesage/releases/tag/v0.17.0
