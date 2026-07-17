@@ -76,12 +76,13 @@ test_leak_check_invalid_regex_fails_closed() {
 }
 
 test_release_script_updates_changelog_links() {
-	local tmp origin fake_bin release_script version changelog codex_calls codex_version claude_version marketplace_metadata_version marketplace_plugin_version
+	local tmp origin fake_bin release_script version changelog codex_calls claude_calls codex_version claude_version marketplace_metadata_version marketplace_plugin_version
 	tmp="$(mktemp -d)"
 	trap 'rm -rf "$tmp"' RETURN
 	origin="${tmp}/origin.git"
 	fake_bin="${tmp}/bin"
 	codex_calls="${tmp}/codex-calls"
+	claude_calls="${tmp}/claude-calls"
 	release_script="$repo_root/scripts/release.sh"
 	version="1.2.3"
 
@@ -100,7 +101,19 @@ if [[ "$1" == "plugin" ]]; then
 fi
 printf '%s\n' "$*" >>"$CODEX_CALLS_FILE"
 EOF
-	chmod +x "${fake_bin}/cargo" "${fake_bin}/codesage" "${fake_bin}/codex"
+	cat >"${fake_bin}/claude" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == "plugin" ]]; then
+	local_head="$(git rev-parse HEAD)"
+	remote_head="$(git ls-remote origin refs/heads/master | awk '{print $1}')"
+	if [[ "$local_head" == "$remote_head" ]]; then
+		printf 'Claude refresh ran after release push\n' >&2
+		exit 42
+	fi
+fi
+printf '%s\n' "$*" >>"$CLAUDE_CALLS_FILE"
+EOF
+	chmod +x "${fake_bin}/cargo" "${fake_bin}/codesage" "${fake_bin}/codex" "${fake_bin}/claude"
 	chmod a-w "${fake_bin}/codesage"
 
 	git init --bare -q "$origin"
@@ -165,7 +178,7 @@ EOF
 	git commit -q -m initial
 	git push -q origin master
 
-	CODEX_CALLS_FILE="${codex_calls}" PATH="${fake_bin}:${PATH}" \
+	CODEX_CALLS_FILE="${codex_calls}" CLAUDE_CALLS_FILE="${claude_calls}" PATH="${fake_bin}:${PATH}" \
 		"${release_script}" --yes "${version}" >"${tmp}/release-script.out" 2>&1
 
 	changelog="$(cat CHANGELOG.md)"
@@ -188,6 +201,7 @@ EOF
 	fi
 	[[ "$(grep -Fxc "plugin marketplace add ${tmp}/work" "${codex_calls}")" -eq 1 ]]
 	[[ "$(grep -Fxc 'plugin add codesage-tools@codesage' "${codex_calls}")" -eq 1 ]]
+	[[ "$(grep -Fxc 'plugin update codesage-tools@codesage' "${claude_calls}")" -eq 1 ]]
 
 	python3 - <<'PYEOF'
 from pathlib import Path
@@ -205,11 +219,17 @@ PYEOF
 	git commit -q -m 'prepare declined-push release'
 	git push -q origin master
 	: >"${codex_calls}"
-	printf 'y\nn\n' | CODEX_CALLS_FILE="${codex_calls}" PATH="${fake_bin}:${PATH}" \
+	: >"${claude_calls}"
+	printf 'y\nn\n' | CODEX_CALLS_FILE="${codex_calls}" CLAUDE_CALLS_FILE="${claude_calls}" PATH="${fake_bin}:${PATH}" \
 		"${release_script}" 1.2.4 >"${tmp}/release-script-no-push.out" 2>&1
 	if [[ -s "${codex_calls}" ]]; then
 		printf 'release script refreshed Codex after push was declined\n' >&2
 		cat "${codex_calls}" >&2
+		return 1
+	fi
+	if [[ -s "${claude_calls}" ]]; then
+		printf 'release script refreshed Claude after push was declined\n' >&2
+		cat "${claude_calls}" >&2
 		return 1
 	fi
 	cd "$repo_root"

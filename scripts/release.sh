@@ -11,7 +11,8 @@
 #      Claude marketplace version.
 #   4. Build the release binary with `--features cuda` so Cargo.lock is up to date.
 #   5. Prompt, then commit + tag.
-#   6. Prompt, then refresh the local Codex plugin and push master + tag.
+#   6. Prompt, then refresh the local Codex and Claude Code plugins and
+#      push master + tag.
 #   7. Refresh whichever `codesage` is on PATH so the maintainer's local install
 #      jumps to the new version. Skipped silently if no install is found or the
 #      binary path is not writable.
@@ -211,6 +212,15 @@ if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
 	else
 		echo
 		echo "No 'codex' on PATH; skipping Codex plugin refresh."
+	fi
+	if command -v claude >/dev/null 2>&1; then
+		echo
+		echo "Refreshing Claude Code plugin codesage-tools@codesage ..."
+		claude plugin update codesage-tools@codesage || die "failed to refresh the Claude Code plugin"
+		echo "Claude plugin refreshed. Restart Claude Code sessions to load version ${VERSION}."
+	else
+		echo
+		echo "No 'claude' on PATH; skipping Claude plugin refresh."
 	fi
 	git push origin master
 	git push origin "v$VERSION"

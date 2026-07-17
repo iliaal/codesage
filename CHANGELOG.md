@@ -14,7 +14,7 @@
 - Review-mode merges reopen an evidence-matched `fixed` finding instead of silently absorbing it; revalidation drops rediscovered untargeted findings as `out_of_scope` instead of failing the whole feature, and no longer advances slice freshness.
 - Review freshness fingerprints bind to the run's category/severity/focus scope and dispatch-time content; coverage plans drop deleted files and include changed context/test files; findings documents persist `trust_boundaries`.
 - `/codesage-review` anchors all state paths at the project root, exempts an explicit `--feature` from the freshness skip, raises feature discovery to 500 slices with a truncation warning, and fails a deep-mode feature when a lens response reports an error.
-- Release automation keeps the Codex plugin, Claude plugin, and Claude marketplace versions aligned with the workspace version.
+- Release automation keeps the Codex plugin, Claude plugin, and Claude marketplace versions aligned with the workspace version, and refreshes both local plugin installs before pushing.
 
 ## [0.16.0] - 2026-07-12
 
