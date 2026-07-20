@@ -24,10 +24,12 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::Result;
-use codesage_protocol::{FeatureConfidence, FeatureKind, Language};
+use codesage_protocol::{FeatureKind, Language};
 use regex::Regex;
 
-use crate::mappers::shared::{is_safe_dir, is_safe_file, should_skip, walk_files};
+use crate::mappers::shared::{
+    is_safe_dir, is_safe_file, read_to_string_bounded, should_skip, walk_files,
+};
 use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile, SeedTest};
 
 pub struct GoMapper;
@@ -85,7 +87,7 @@ impl FeatureMapper for GoMapper {
 // ---- Discovery ----------------------------------------------------------
 
 fn read_module_path(go_mod: &Path) -> Option<String> {
-    let raw = fs::read_to_string(go_mod).ok()?;
+    let raw = read_to_string_bounded(go_mod).ok().flatten()?;
     let re = Regex::new(r"(?m)^\s*module\s+(\S+)").ok()?;
     re.captures(&raw)
         .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
@@ -174,7 +176,7 @@ fn read_go_package_name(root: &Path, dir_rel: &str) -> Option<String> {
         if !name.ends_with(".go") || name.ends_with("_test.go") {
             continue;
         }
-        let Ok(raw) = fs::read_to_string(&path) else {
+        let Ok(Some(raw)) = read_to_string_bounded(&path) else {
             continue;
         };
         if let Some(cap) = pkg_re.captures(&raw)
@@ -313,7 +315,7 @@ fn collect_import_context(
     let mut refs: Vec<SeedFile> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for file in owned_files {
-        let Ok(raw) = fs::read_to_string(root.join(file)) else {
+        let Ok(Some(raw)) = read_to_string_bounded(&root.join(file)) else {
             continue;
         };
         for imported in extract_go_imports(&raw) {
@@ -475,18 +477,13 @@ fn make_seed(
     };
 
     FeatureSeed {
-        title,
         summary,
-        kind,
         source,
-        confidence: FeatureConfidence::Medium,
-        entry_path,
         entry_symbol: if is_main {
             Some("main".to_string())
         } else {
             None
         },
-        entry_route: None,
         entry_command: command_name,
         // Scoped `go test ./<dir>/...` is the runnable test invocation for
         // every Go package feature. Lives on test_command so feature IDs
@@ -498,7 +495,6 @@ fn make_seed(
         } else {
             Some(test_command.clone())
         },
-        language: Language::Go,
         tags,
         owned_files,
         context_files,
@@ -508,6 +504,7 @@ fn make_seed(
         } else {
             vec![pkg.dir_rel.clone()]
         },
+        ..FeatureSeed::new(kind, Language::Go, title, entry_path)
     }
 }
 

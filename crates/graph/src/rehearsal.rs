@@ -8,7 +8,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::Result;
-use codesage_graph::{assess_risk_diff, recommend_tests};
+
+use crate::git_history::{assess_risk_diff, recommend_tests};
 use codesage_protocol::{
     FeatureFileRole, ReviewObjection, ReviewRehearsal, ReviewSeverity, TrustBoundary,
 };
@@ -490,7 +491,7 @@ mod tests {
                 .unwrap();
         }
 
-        let risk = codesage_graph::assess_risk_diff(&db, &clustered).unwrap();
+        let risk = crate::git_history::assess_risk_diff(&db, &clustered).unwrap();
         assert!(
             risk.files.iter().all(|a| a.file != "app/Risk/File0.php"),
             "fixture must prove File0 only survives in clustered top_files"

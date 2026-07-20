@@ -592,6 +592,10 @@ pub(crate) fn resolve_callee_definitions(
     Ok(filtered)
 }
 
+// Covers everything `list_file_dependencies().imports` would add: that list
+// is DISTINCT to_name over the same file's refs restricted to import/include,
+// a strict subset of the import/include/trait_use filter here — so the
+// expensive imported_by half of that call is never needed on this path.
 fn import_refs_for_file(db: &Database, caller_file: &str) -> Result<Vec<String>> {
     let mut refs = Vec::new();
     if let Some(file_id) = db.file_id_for_path(caller_file)? {
@@ -604,7 +608,6 @@ fn import_refs_for_file(db: &Database, caller_file: &str) -> Result<Vec<String>>
             }
         }
     }
-    refs.extend(db.list_file_dependencies(caller_file)?.imports);
     refs.sort();
     refs.dedup();
     Ok(refs)
@@ -773,6 +776,76 @@ mod context_export_tests {
             line: 5,
             col: 12,
         }
+    }
+
+    #[test]
+    fn import_refs_for_file_covers_list_file_dependencies_imports() {
+        let db = Database::open_in_memory().unwrap();
+        let file_id = db
+            .upsert_file(&FileInfo {
+                path: "app/a.php".to_string(),
+                language: Language::Php,
+                content_hash: "a".to_string(),
+            })
+            .unwrap();
+        let mk = |to: &str, kind| Reference {
+            from_file: "app/a.php".to_string(),
+            from_symbol: None,
+            to_name: to.to_string(),
+            kind,
+            line: 1,
+            col: 0,
+        };
+        db.insert_references(
+            file_id,
+            &[
+                mk("App\\Imported", ReferenceKind::Import),
+                mk("inc.php", ReferenceKind::Include),
+                mk("App\\SomeTrait", ReferenceKind::TraitUse),
+                mk("helper", ReferenceKind::Call),
+                // Same name referenced again on another line: exercises the
+                // by-name dedupe below. An identical (line, col) duplicate
+                // would be rejected by the uq_refs_identity backstop.
+                Reference {
+                    line: 2,
+                    ..mk("App\\Imported", ReferenceKind::Import)
+                },
+            ],
+        )
+        .unwrap();
+
+        let refs = import_refs_for_file(&db, "app/a.php").unwrap();
+        assert_eq!(
+            refs,
+            vec![
+                "App\\Imported".to_string(),
+                "App\\SomeTrait".to_string(),
+                "inc.php".to_string(),
+            ],
+            "import/include/trait_use names, sorted and deduped; calls excluded"
+        );
+
+        // The imports half of list_file_dependencies must stay a subset of
+        // this result — that is what lets import_refs_for_file skip the
+        // expensive imported_by UNION that call also computes.
+        let deps = db.list_file_dependencies("app/a.php").unwrap();
+        assert!(!deps.imports.is_empty(), "fixture must produce imports");
+        for imp in &deps.imports {
+            assert!(
+                refs.contains(imp),
+                "list_file_dependencies import {imp} missing from import_refs_for_file: {refs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn import_refs_for_file_empty_for_unindexed_file() {
+        let db = Database::open_in_memory().unwrap();
+        let refs = import_refs_for_file(&db, "no/such/file.rs").unwrap();
+        assert!(
+            refs.is_empty(),
+            "unindexed file must yield no imports: {refs:?}"
+        );
     }
 
     #[test]

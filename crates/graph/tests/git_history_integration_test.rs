@@ -367,6 +367,186 @@ fn incremental_falls_back_to_full_when_history_rewritten() {
     }
 }
 
+/// Mirrors `DECAY_HALFLIFE_DAYS * SECONDS_PER_DAY` in `git_history::indexer`.
+/// The decay-materiality bounds below are tight enough that a drift in the
+/// production constant fails this test — deliberate: the composition being
+/// asserted is exp(-Δt/τ) with exactly this τ.
+const DECAY_TAU_SECS: f64 = 180.0 * 86_400.0;
+
+#[test]
+fn full_then_incremental_matches_pristine_full_scan() {
+    // Equivalence contract of the incremental decay math: Full over the first
+    // commits followed by Incremental over the rest must produce the same
+    // per-file stats and co-change weights as one Full pass over everything.
+    // The incremental path scales stored weights by exp(-Δt/τ) before adding
+    // new-commit deltas, which composes exactly with the full pass's
+    // exp(-age/τ) — any drift here is a real decay bug, not test noise.
+    //
+    // Equivalence alone cannot prove decay ran: the phases execute moments
+    // apart, so a regression nulling `decay_git_history_to_now` also passes
+    // it (factor ≈ 1 either way). The decay-materiality block below closes
+    // that hole: a forced ≥3s stamped gap between the phases plus a file
+    // untouched by phase 2 pins the applied factor between two bounds a
+    // no-op decay violates.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_hermetic_repo(root);
+
+    let commit_pair = |subject: &str, body_a: &str, body_b: &str| {
+        std::fs::write(root.join("a.rs"), body_a).unwrap();
+        std::fs::write(root.join("b.rs"), body_b).unwrap();
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-qm", subject]);
+    };
+
+    // Three co-change commits: the (a.rs, b.rs) pair clears the min-count
+    // filter (3) within the full part alone.
+    commit_pair("feat: one", "fn a() {}\n", "fn b() {}\n");
+    commit_pair(
+        "feat: two",
+        "fn a() { let _ = 1; }\n",
+        "fn b() { let _ = 1; }\n",
+    );
+    commit_pair(
+        "feat: three",
+        "fn a() { let _ = 2; }\n",
+        "fn b() { let _ = 2; }\n",
+    );
+    // Phase-1-only file: untouched by phase 2, so after the incremental its
+    // churn row differs from the full-pass value by exactly the decay factor.
+    std::fs::write(root.join("c.rs"), "fn c() {}\n").unwrap();
+    run_git(root, &["add", "."]);
+    run_git(root, &["commit", "-qm", "feat: c only"]);
+
+    let db_incr = Database::open_in_memory().unwrap();
+    let full_part = git_history_index_with_options(&db_incr, root, &[], IndexMode::Full).unwrap();
+    assert_eq!(full_part.commits_scanned, 4);
+    assert_eq!(full_part.co_change_pairs, 1);
+
+    let (_, full_stamp) = db_incr
+        .get_git_index_state()
+        .unwrap()
+        .expect("state after full");
+    let c_churn_full = db_incr
+        .git_file("c.rs")
+        .unwrap()
+        .expect("c.rs after full")
+        .churn_score;
+
+    // Force a stamped gap of at least 3 seconds between the phases so the
+    // incremental's decay factor is bounded away from 1 by more than the
+    // ±2s timestamp-truncation skew between unix_now() and unixepoch().
+    std::thread::sleep(std::time::Duration::from_millis(3200));
+
+    // One more co-change commit — its delta count (1) is below the min-count
+    // filter, so only the pair-exists accumulate branch can surface it — plus
+    // a fix commit touching a single file to vary fix_count/total_commits.
+    commit_pair(
+        "fix: four",
+        "fn a() { let _ = 3; }\n",
+        "fn b() { let _ = 3; }\n",
+    );
+    std::fs::write(root.join("a.rs"), "fn a() { let _ = 4; }\n").unwrap();
+    run_git(root, &["add", "."]);
+    run_git(root, &["commit", "-qm", "feat: five"]);
+
+    let incr = git_history_index_with_options(&db_incr, root, &[], IndexMode::Incremental).unwrap();
+    assert_eq!(
+        incr.commits_scanned, 2,
+        "incremental must scan only the two commits after the recorded SHA"
+    );
+
+    // Decay materiality: c.rs took no phase-2 deltas, so its stored churn
+    // moved only by the decay scale. The applied factor is exp(-Δ'/τ) where
+    // Δ' is the real seconds between the two passes' unix_now() calls; the
+    // observed stamped gap Δ agrees with Δ' to within ±2s (each endpoint is
+    // an independent second-truncation). A nulled decay leaves the row
+    // bit-identical (w1 == w0), which the upper bound rejects.
+    let (_, incr_stamp) = db_incr
+        .get_git_index_state()
+        .unwrap()
+        .expect("state after incremental");
+    let c_churn_incr = db_incr
+        .git_file("c.rs")
+        .unwrap()
+        .expect("c.rs after incremental")
+        .churn_score;
+    let stamped_gap = (incr_stamp - full_stamp) as f64;
+    assert!(
+        stamped_gap >= 3.0,
+        "the sleep must guarantee a >=3s stamped gap, got {stamped_gap}"
+    );
+    let upper = c_churn_full * (-(stamped_gap - 2.0) / DECAY_TAU_SECS).exp();
+    let lower = c_churn_full * (-(stamped_gap + 2.0) / DECAY_TAU_SECS).exp();
+    // Discriminating margin: the no-op outcome (w1 == w0) sits at least
+    // w0·(1 - exp(-1s/τ)) ≈ 6.4e-8·w0 above `upper` — eight orders of
+    // magnitude beyond f64 rounding on the single multiply decay performs,
+    // so the comparison below is numerically meaningful.
+    assert!(
+        c_churn_full - upper > c_churn_full * 1e-8,
+        "bound must be distinguishable from the undecayed value: w0={c_churn_full} upper={upper}"
+    );
+    assert!(
+        c_churn_incr <= upper,
+        "incremental must decay stored weights across the phase gap: \
+         w0={c_churn_full} w1={c_churn_incr} upper={upper} gap={stamped_gap}s"
+    );
+    assert!(
+        c_churn_incr >= lower,
+        "decay overshoot: w1={c_churn_incr} lower={lower} gap={stamped_gap}s"
+    );
+
+    let db_full = Database::open_in_memory().unwrap();
+    git_history_index_with_options(&db_full, root, &[], IndexMode::Full).unwrap();
+
+    for path in ["a.rs", "b.rs", "c.rs"] {
+        let got = db_incr
+            .git_file(path)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{path} missing after incremental"));
+        let want = db_full
+            .git_file(path)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{path} missing from pristine full scan"));
+        assert_eq!(
+            got.total_commits, want.total_commits,
+            "{path}: total_commits"
+        );
+        assert_eq!(got.fix_count, want.fix_count, "{path}: fix_count");
+        // Both scans decay against wall-clock "now" moments apart; agreement
+        // to 1e-3 proves the scale-then-add composition is exact.
+        assert!(
+            (got.churn_score - want.churn_score).abs() < 1e-3,
+            "{path}: churn {} vs pristine {}",
+            got.churn_score,
+            want.churn_score
+        );
+    }
+
+    let got_pairs = db_incr.co_changes_for("a.rs", 10).unwrap();
+    let want_pairs = db_full.co_changes_for("a.rs", 10).unwrap();
+    assert_eq!(
+        got_pairs.len(),
+        1,
+        "one co-change pair expected: {got_pairs:?}"
+    );
+    assert_eq!(want_pairs.len(), 1);
+    assert_eq!(got_pairs[0].file, "b.rs");
+    // Count 4 proves the sub-threshold incremental delta accumulated onto the
+    // existing pair rather than being dropped by the min-count filter.
+    assert_eq!(
+        got_pairs[0].count, 4,
+        "pair-exists accumulate branch must fire"
+    );
+    assert_eq!(got_pairs[0].count, want_pairs[0].count);
+    assert!(
+        (got_pairs[0].weight - want_pairs[0].weight).abs() < 1e-3,
+        "co-change weight {} vs pristine {}",
+        got_pairs[0].weight,
+        want_pairs[0].weight
+    );
+}
+
 #[test]
 fn changed_files_since_errors_on_unknown_ref() {
     let dir = tempfile::tempdir().unwrap();

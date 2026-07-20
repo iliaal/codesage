@@ -25,11 +25,34 @@ use crate::mappers::{
     shared::walk_files,
     types::{FeatureMapper, FeatureSeed, MapperContext},
 };
-use crate::nearby_tests::nearby_tests;
+use crate::nearby_tests::{TestFileIndex, nearby_tests_indexed};
+
+/// [`map_features`] result plus per-mapper failure visibility.
+/// `mapper_errors` holds one `"<mapper>: <error>"` entry per mapper that
+/// failed during seed collection — non-empty means the run was partial:
+/// the failed mapper's seeds are missing and the stale-feature GC was
+/// skipped. Lives here (not on the protocol `FeatureMapStats`) so the
+/// wire/stats shape is unchanged and existing callers keep compiling.
+#[derive(Debug, Clone)]
+pub struct FeatureMapOutcome {
+    pub stats: FeatureMapStats,
+    pub mapper_errors: Vec<String>,
+}
 
 /// Run every registered mapper, build `FeatureRecord`s from seeds, persist
 /// them, and remove stale features. Returns stats for the caller.
 ///
+/// Compatibility wrapper over [`map_features_detailed`]; callers that need
+/// to distinguish a partial run (a mapper errored) from a clean one must
+/// use the detailed variant.
+pub fn map_features(
+    root: &Path,
+    db: &Database,
+    exclude_patterns: &[String],
+) -> Result<FeatureMapStats> {
+    Ok(map_features_detailed(root, db, exclude_patterns)?.stats)
+}
+
 /// `exclude_patterns` is the project's `[index].exclude_patterns` list. It
 /// is compiled into a `GlobSet` once and threaded into every mapper through
 /// `MapperContext` so feature output honors the same file-filter contract
@@ -41,12 +64,13 @@ use crate::nearby_tests::nearby_tests;
 /// pass** — otherwise a single mapper failure (corrupted composer.json,
 /// unreadable Cargo.toml, etc.) could silently delete every feature
 /// owned by that language. Stale-feature debt is reconciled on the
-/// next clean run.
-pub fn map_features(
+/// next clean run. Each failure is reported in
+/// [`FeatureMapOutcome::mapper_errors`].
+pub fn map_features_detailed(
     root: &Path,
     db: &Database,
     exclude_patterns: &[String],
-) -> Result<FeatureMapStats> {
+) -> Result<FeatureMapOutcome> {
     let excludes = if exclude_patterns.is_empty() {
         None
     } else {
@@ -58,7 +82,8 @@ pub fn map_features(
     };
     let collected = collect_seeds(&ctx)?;
     let seeds = collected.seeds;
-    let any_mapper_errored = collected.any_errored;
+    let mapper_errors = collected.errors;
+    let any_mapper_errored = !mapper_errors.is_empty();
     let mut keep_ids: Vec<String> = Vec::with_capacity(seeds.len());
     let mut created = 0usize;
     let mut updated = 0usize;
@@ -67,6 +92,9 @@ pub fn map_features(
     const MAPPER_WALK_CAP: usize = 50_000;
     let all_files = walk_files(root, root, MAPPER_WALK_CAP, ctx.excludes);
     let walk_truncated = all_files.len() >= MAPPER_WALK_CAP;
+    // Classify the inventory's test-shaped files once; every seed's
+    // nearby-test discovery scans this index instead of the full list.
+    let test_index = TestFileIndex::build(&all_files);
     // Framework route edges are derived from the filesystem before opening the
     // write transaction, then persisted atomically with feature rows below.
     let route_refs = laravel_route_handler_refs(root)?;
@@ -76,12 +104,12 @@ pub fn map_features(
             if !ctx.allowed(&seed.entry_path) {
                 continue;
             }
-            let mut record = build_record(db, seed, &all_files, walk_truncated)?;
+            let mut record = build_record(seed, &test_index, walk_truncated);
             // Final safety net: even when a mapper forgets to filter, no
             // FeatureFileRef should reference a path the structural
             // indexer excludes. Drop any leaked refs before persisting.
             retain_allowed_files_and_refresh_boundaries(db, &mut record, |path| ctx.allowed(path))?;
-            let exists = db.load_feature(&record.feature_id)?.is_some();
+            let exists = db.feature_exists(&record.feature_id)?;
             db.upsert_feature(&record)?;
             keep_ids.push(record.feature_id.clone());
             if exists {
@@ -119,39 +147,54 @@ pub fn map_features(
         }
         Ok(())
     })?;
-    Ok(FeatureMapStats {
-        created,
-        updated,
-        removed,
-        total_features: db.feature_count()?,
+    Ok(FeatureMapOutcome {
+        stats: FeatureMapStats {
+            created,
+            updated,
+            removed,
+            total_features: db.feature_count()?,
+        },
+        mapper_errors,
     })
 }
 
 struct CollectedSeeds {
     seeds: Vec<FeatureSeed>,
-    any_errored: bool,
+    /// One `"<mapper>: <error>"` entry per failed mapper. Non-empty tells
+    /// the caller to skip destructive cleanup (the pass was partial) and
+    /// surfaces on `FeatureMapOutcome::mapper_errors`.
+    errors: Vec<String>,
 }
 
-/// Collect seeds from every mapper, deduped by `(kind, source, entry_path,
-/// command|route|symbol)`. The `any_errored` flag lets the caller skip
-/// destructive cleanup when a mapper failed mid-pass.
-fn collect_seeds(ctx: &MapperContext) -> Result<CollectedSeeds> {
-    let mappers: Vec<Box<dyn FeatureMapper>> = vec![
+fn default_mappers() -> Vec<Box<dyn FeatureMapper>> {
+    vec![
         Box::new(RustMapper),
         Box::new(PhpMapper),
         Box::new(CCppMapper),
         Box::new(PythonMapper),
         Box::new(JsMapper),
         Box::new(GoMapper),
-    ];
+    ]
+}
+
+/// Collect seeds from every mapper, deduped by `(kind, source, entry_path,
+/// command|route|symbol)`.
+fn collect_seeds(ctx: &MapperContext) -> Result<CollectedSeeds> {
+    collect_seeds_from(default_mappers(), ctx)
+}
+
+fn collect_seeds_from(
+    mappers: Vec<Box<dyn FeatureMapper>>,
+    ctx: &MapperContext,
+) -> Result<CollectedSeeds> {
     let mut all: Vec<FeatureSeed> = Vec::new();
-    let mut any_errored = false;
+    let mut errors: Vec<String> = Vec::new();
     for m in mappers {
         match m.map(ctx) {
             Ok(s) => all.extend(s),
             Err(e) => {
-                any_errored = true;
                 tracing::warn!(mapper = m.name(), error = %e, "mapper failed");
+                errors.push(format!("{}: {e}", m.name()));
             }
         }
     }
@@ -169,18 +212,18 @@ fn collect_seeds(ctx: &MapperContext) -> Result<CollectedSeeds> {
             out.push(s);
         }
     }
-    Ok(CollectedSeeds {
-        seeds: out,
-        any_errored,
-    })
+    Ok(CollectedSeeds { seeds: out, errors })
 }
 
+// Trust boundaries stay empty here on purpose: the caller runs
+// `retain_allowed_files_and_refresh_boundaries` on every record before
+// persisting, and that pass recomputes the boundary set wholesale from the
+// retained files.
 fn build_record(
-    db: &Database,
     seed: &FeatureSeed,
-    all_files: &[String],
+    test_index: &TestFileIndex,
     walk_truncated: bool,
-) -> Result<FeatureRecord> {
+) -> FeatureRecord {
     let disc = seed.discriminator();
     let feature_id = feature_id::build(seed.kind, seed.source, &seed.entry_path, &disc);
 
@@ -233,7 +276,7 @@ fn build_record(
     let nearby = if walk_truncated {
         Vec::new()
     } else {
-        nearby_tests(seed, all_files)
+        nearby_tests_indexed(seed, test_index)
     };
     for path in nearby {
         files_by_path.entry(path.clone()).or_insert(FeatureFileRef {
@@ -246,7 +289,7 @@ fn build_record(
     let mut tags = seed.tags.clone();
     tags.sort();
     tags.dedup();
-    let mut record = FeatureRecord {
+    FeatureRecord {
         feature_id,
         title: seed.title.clone(),
         summary: seed.summary.clone(),
@@ -262,9 +305,7 @@ fn build_record(
         tags,
         trust_boundaries: Vec::new(),
         files,
-    };
-    refresh_record_trust_boundaries(db, &mut record)?;
-    Ok(record)
+    }
 }
 
 fn retain_allowed_files_and_refresh_boundaries(
@@ -309,6 +350,65 @@ mod tests {
     }
 
     #[test]
+    fn failing_mapper_surfaces_in_collect_errors() {
+        use codesage_protocol::Language;
+
+        struct HealthyMapper;
+        impl FeatureMapper for HealthyMapper {
+            fn name(&self) -> &'static str {
+                "healthy"
+            }
+            fn map(&self, _ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
+                Ok(vec![FeatureSeed {
+                    source: "healthy-seed",
+                    ..FeatureSeed::new(FeatureKind::Library, Language::Rust, "ok", "src/lib.rs")
+                }])
+            }
+        }
+        struct BrokenMapper;
+        impl FeatureMapper for BrokenMapper {
+            fn name(&self) -> &'static str {
+                "broken"
+            }
+            fn map(&self, _ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
+                anyhow::bail!("manifest exploded")
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let ctx = MapperContext::for_root(dir.path());
+        let collected =
+            collect_seeds_from(vec![Box::new(HealthyMapper), Box::new(BrokenMapper)], &ctx)
+                .unwrap();
+        assert_eq!(collected.seeds.len(), 1, "healthy mapper's seeds retained");
+        assert_eq!(
+            collected.errors,
+            vec!["broken: manifest exploded".to_string()],
+            "failed mapper must surface as name-prefixed error"
+        );
+    }
+
+    #[test]
+    fn clean_map_run_reports_no_mapper_errors() {
+        use codesage_storage::Database;
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[package]\nname = \"acme\"\nversion = \"0.1.0\"\n",
+        );
+        write(dir.path(), "src/lib.rs", "pub fn hi() {}\n");
+        let db = Database::open_in_memory().unwrap();
+        let outcome = map_features_detailed(dir.path(), &db, &[]).unwrap();
+        assert!(
+            outcome.mapper_errors.is_empty(),
+            "clean run must report zero mapper errors: {:?}",
+            outcome.mapper_errors
+        );
+        assert!(outcome.stats.total_features >= 1);
+    }
+
+    #[test]
     fn entry_file_repeated_in_owned_is_deduped_to_entry_role() {
         use crate::mappers::types::SeedFile;
         use codesage_protocol::{FeatureConfidence, FeatureFileRole, Language};
@@ -316,18 +416,10 @@ mod tests {
         // owned, including the file picked as the entry. build_record must
         // persist that file once, as Entry — not twice (Entry + Owned).
         let seed = FeatureSeed {
-            title: "svc".into(),
-            summary: String::new(),
-            kind: FeatureKind::CliCommand,
             source: "cmake-target",
             confidence: FeatureConfidence::High,
-            entry_path: "src/main.c".into(),
             entry_symbol: Some("main".into()),
-            entry_route: None,
             entry_command: Some("svc".into()),
-            test_command: None,
-            language: Language::C,
-            tags: Vec::new(),
             owned_files: vec![
                 SeedFile {
                     path: "src/main.c".into(),
@@ -338,12 +430,9 @@ mod tests {
                     reason: "target source".into(),
                 },
             ],
-            context_files: Vec::new(),
-            tests: Vec::new(),
-            test_prefixes: Vec::new(),
+            ..FeatureSeed::new(FeatureKind::CliCommand, Language::C, "svc", "src/main.c")
         };
-        let db = Database::open_in_memory().unwrap();
-        let record = build_record(&db, &seed, &[], false).unwrap();
+        let record = build_record(&seed, &TestFileIndex::build(&[]), false);
 
         let main_refs: Vec<_> = record
             .files
@@ -634,27 +723,20 @@ mod tests {
             .unwrap();
 
         let seed = FeatureSeed {
-            title: "svc".into(),
-            summary: String::new(),
-            kind: FeatureKind::CliCommand,
             source: "test-seed",
             confidence: FeatureConfidence::High,
-            entry_path: "main.c".into(),
             entry_symbol: Some("main".into()),
-            entry_route: None,
             entry_command: Some("svc".into()),
-            test_command: None,
-            language: Language::C,
-            tags: Vec::new(),
             owned_files: vec![SeedFile {
                 path: "helper_generated.c".into(),
                 reason: "target source".into(),
             }],
-            context_files: Vec::new(),
-            tests: Vec::new(),
-            test_prefixes: Vec::new(),
+            ..FeatureSeed::new(FeatureKind::CliCommand, Language::C, "svc", "main.c")
         };
-        let mut record = build_record(&db, &seed, &[], false).unwrap();
+        let mut record = build_record(&seed, &TestFileIndex::build(&[]), false);
+        // Establish the precondition: the record starts with the helper's
+        // boundary attached, so the retain pass below is what removes it.
+        refresh_record_trust_boundaries(&db, &mut record).unwrap();
         assert!(
             record
                 .trust_boundaries

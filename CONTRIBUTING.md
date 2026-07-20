@@ -30,7 +30,7 @@ Always build with `--features cuda` when you want GPU. Without it, a GPU-configu
 
 ## Tests
 
-Every bug fix and every feature needs a test. The workspace has ~120; new code should grow that number. Use integration tests for anything that crosses a crate boundary (parsing plus storage, indexing plus search).
+Every bug fix and every feature needs a test. The workspace has ~965; new code should grow that number. Use integration tests for anything that crosses a crate boundary (parsing plus storage, indexing plus search).
 
 Run `cargo test --workspace` before you send a pull request. Tests that need GPU are gated, so the suite passes on CPU-only machines.
 

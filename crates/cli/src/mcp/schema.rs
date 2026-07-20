@@ -66,6 +66,47 @@ fn strip_nonstandard_schema_formats(value: &mut serde_json::Value) {
 /// and therefore must not advertise `readOnlyHint: true`.
 const NON_READONLY_TOOLS: &[&str] = &["session_start", "session_end"];
 
+/// Schema for the `_meta` object the render layer may inject at the top level
+/// of ANY tool response (budget truncation, protected-array drops, stale-file
+/// annotations — see `render.rs`). Merged into every tool's outputSchema as an
+/// optional property so schema-consulting agents aren't surprised by it.
+fn meta_property_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Response envelope annotations, present only when the server \
+            trimmed or flagged this response. `_meta.truncated` means the response \
+            exceeded the per-call token budget and an array field was trimmed; it is \
+            distinct from any same-named field inside a tool's own result (e.g. \
+            impact_analysis's `truncated`, which reports that the tool's `limit` \
+            parameter capped the result set).",
+        "properties": {
+            "truncated": { "type": "boolean", "description": "response was trimmed to fit the token budget" },
+            "kind": { "type": "string", "description": "tool that produced the truncated response" },
+            "field": { "type": "string", "description": "name of the trimmed array field" },
+            "total_results": { "type": "integer", "minimum": 0, "description": "element count before trimming" },
+            "returned": { "type": "integer", "minimum": 0, "description": "element count kept" },
+            "approx_tokens_budget": { "type": "integer", "minimum": 0, "description": "approximate token budget applied" },
+            "hint": { "type": "string", "description": "suggested next step (refine query, narrow scope, paginate via offset)" },
+            "dropped_files": { "type": "array", "items": { "type": "string" }, "description": "identifiers of elements trimmed from a protected array (e.g. assess_risk_diff `files`)" },
+            "dropped_count": { "type": "integer", "minimum": 0, "description": "trimmed protected-array elements that had no identifier" },
+            "stale_files": { "type": "array", "items": { "type": "string" }, "description": "referenced files that changed on disk since indexing" },
+            "stale_warning": { "type": "string", "description": "human-readable staleness notice" }
+        }
+    })
+}
+
+/// Add the shared `_meta` fragment to an output schema's `properties` without
+/// marking it required. Output schemas are plain object schemas from schemars
+/// (no `additionalProperties: false`), so the merge never conflicts.
+fn merge_meta_property(schema: &mut serde_json::Map<String, serde_json::Value>) {
+    let props = schema
+        .entry("properties")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let serde_json::Value::Object(props) = props {
+        props.insert("_meta".to_string(), meta_property_schema());
+    }
+}
+
 /// Finalize the router's tool list for the MCP `tools/list` response: strip
 /// schemars' non-standard numeric `format` keys from each schema and stamp the
 /// read-only / closed-world annotations. The server never mutates project
@@ -85,7 +126,8 @@ pub(super) fn finalize_tools_for_listing(tools: &mut [rmcp::model::Tool]) {
         if let Some(output) = tool.output_schema.take() {
             let mut out = serde_json::Value::Object((*output).clone());
             strip_nonstandard_schema_formats(&mut out);
-            if let serde_json::Value::Object(map) = out {
+            if let serde_json::Value::Object(mut map) = out {
+                merge_meta_property(&mut map);
                 tool.output_schema = Some(Arc::new(map));
             }
         }
@@ -144,6 +186,63 @@ mod tests {
         assert!(item["delta"].get("minimum").is_none());
         // Standard formats are left untouched.
         assert_eq!(props["created_at"]["format"], json!("date-time"));
+    }
+
+    /// Every tool's outputSchema must declare the render-injected `_meta`
+    /// envelope as an optional property: agents that consult outputSchema
+    /// before calling would otherwise meet undeclared top-level fields on
+    /// truncated or stale responses.
+    #[test]
+    fn every_tool_output_schema_declares_optional_meta() {
+        let server = CodeSageServer::new();
+        let mut tools = server.tool_router.list_all();
+        finalize_tools_for_listing(&mut tools);
+        assert!(!tools.is_empty());
+        for tool in &tools {
+            let out = tool
+                .output_schema
+                .as_ref()
+                .unwrap_or_else(|| panic!("tool `{}` is missing outputSchema", tool.name));
+            let meta = out
+                .get("properties")
+                .and_then(|p| p.get("_meta"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "tool `{}` outputSchema lacks the `_meta` property",
+                        tool.name
+                    )
+                });
+            assert_eq!(meta["type"], json!("object"), "tool `{}`", tool.name);
+            for field in [
+                "truncated",
+                "total_results",
+                "returned",
+                "dropped_files",
+                "dropped_count",
+                "stale_files",
+                "stale_warning",
+            ] {
+                assert!(
+                    meta["properties"].get(field).is_some(),
+                    "tool `{}` _meta fragment lacks `{field}`",
+                    tool.name
+                );
+            }
+            // Optional: injected only on trimmed/flagged responses.
+            if let Some(required) = out.get("required").and_then(|r| r.as_array()) {
+                assert!(
+                    !required.iter().any(|v| v == "_meta"),
+                    "tool `{}` must not require `_meta`",
+                    tool.name
+                );
+            }
+            assert_ne!(
+                out.get("additionalProperties"),
+                Some(&json!(false)),
+                "tool `{}`: additionalProperties: false would reject render-injected fields",
+                tool.name
+            );
+        }
     }
 
     /// Every tool must advertise annotations through the `tools/list`

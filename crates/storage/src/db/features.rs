@@ -57,10 +57,13 @@ impl Database {
     /// mapping pass.
     pub fn upsert_feature(&self, feature: &FeatureRecord) -> Result<()> {
         self.conn.execute_batch("SAVEPOINT upsert_feature")?;
+        // prepare_cached throughout: five constant statements, run once per
+        // feature in a mapping pass (thousands of features on seed-dense
+        // repos). Same rationale as the structural index-loop inserts.
         let result = (|| -> Result<()> {
             let tags_json =
                 serde_json::to_string(&feature.tags).unwrap_or_else(|_| "[]".to_string());
-            self.conn.execute(
+            self.conn.prepare_cached(
                 "INSERT INTO features (
                     feature_id, title, summary, kind, source, confidence,
                     entry_path, entry_symbol, entry_route, entry_command,
@@ -80,7 +83,8 @@ impl Database {
                     tags          = excluded.tags,
                     test_command  = excluded.test_command,
                     updated_at    = unixepoch()",
-                params![
+            )?
+            .execute(params![
                     feature.feature_id,
                     feature.title,
                     feature.summary,
@@ -94,14 +98,12 @@ impl Database {
                     feature.language.as_str(),
                     tags_json,
                     feature.test_command,
-                ],
-            )?;
-            self.conn.execute(
-                "DELETE FROM feature_files WHERE feature_id = ?1",
-                params![feature.feature_id],
-            )?;
+            ])?;
+            self.conn
+                .prepare_cached("DELETE FROM feature_files WHERE feature_id = ?1")?
+                .execute(params![feature.feature_id])?;
             {
-                let mut files_stmt = self.conn.prepare(
+                let mut files_stmt = self.conn.prepare_cached(
                     "INSERT OR IGNORE INTO feature_files (feature_id, path, role, reason)
                      VALUES (?1, ?2, ?3, ?4)",
                 )?;
@@ -114,12 +116,11 @@ impl Database {
                     ])?;
                 }
             }
-            self.conn.execute(
-                "DELETE FROM feature_trust_boundaries WHERE feature_id = ?1",
-                params![feature.feature_id],
-            )?;
+            self.conn
+                .prepare_cached("DELETE FROM feature_trust_boundaries WHERE feature_id = ?1")?
+                .execute(params![feature.feature_id])?;
             {
-                let mut tb_stmt = self.conn.prepare(
+                let mut tb_stmt = self.conn.prepare_cached(
                     "INSERT OR IGNORE INTO feature_trust_boundaries (feature_id, boundary)
                      VALUES (?1, ?2)",
                 )?;
@@ -178,6 +179,20 @@ impl Database {
             .conn
             .query_row("SELECT COUNT(*) FROM features", [], |r| r.get(0))?;
         Ok(n as usize)
+    }
+
+    /// Cheap existence probe for a feature id. `load_feature` hydrates the
+    /// head row plus files and boundaries; the mapping pass only needs the
+    /// bool, once per feature, so the statement is cached.
+    pub fn feature_exists(&self, feature_id: &str) -> Result<bool> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT 1 FROM features WHERE feature_id = ?1 LIMIT 1")?;
+        match stmt.query_row(params![feature_id], |_| Ok(())) {
+            Ok(()) => Ok(true),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Load one feature with its files and boundaries. None when the id

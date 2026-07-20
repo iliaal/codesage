@@ -83,7 +83,7 @@ fn mcp_shim_starts_daemon_and_lists_tools() {
 
 #[test]
 fn shim_exits_when_daemon_dies() {
-    // CR-002 regression: pre-fix proxy_stdio used try_join! which only
+    // Regression: proxy_stdio previously used try_join!, which only
     // returns when BOTH copy directions finish. If the daemon crashes
     // but the MCP client keeps stdin open, the shim stayed alive with
     // no server behind it. Symptom for the agent: an MCP session that
@@ -132,9 +132,8 @@ fn shim_exits_when_daemon_dies() {
     assert_eq!(init["result"]["serverInfo"]["name"], "codesage");
 
     // Daemon is up. Kill it. The shim should detect the closed socket
-    // and exit on its own (M6 + CR-002). Without the CR-002 fix, the
-    // shim's stdin pump kept blocking even after socket EOF and the
-    // process hung indefinitely.
+    // and exit on its own. Previously the shim's stdin pump kept
+    // blocking even after socket EOF and the process hung indefinitely.
     kill_daemon(&runtime_dir);
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -260,7 +259,6 @@ fn daemon_cleans_runtime_files_on_sigterm() {
     // the socket alone races: a read_dir scan that lands between the
     // two operations sees the socket but no pid, exits the loop, and
     // then `pid_file.expect(...)` panics spuriously. Wait for both.
-    // fnd_84c7bd40.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut socket: Option<PathBuf> = None;
     let mut pid_file: Option<PathBuf> = None;
@@ -307,6 +305,60 @@ fn daemon_cleans_runtime_files_on_sigterm() {
 
     assert!(!socket.exists(), "socket file should be removed on SIGTERM");
     assert!(!pid_file.exists(), "pid file should be removed on SIGTERM");
+}
+
+#[test]
+fn daemon_sigterm_with_parked_client_exits_bounded_and_cleans_up() {
+    // Graceful shutdown drains in-flight connections for a bounded window.
+    // A parked client (connected but idle) must not stall SIGTERM shutdown
+    // forever: after the drain bound the daemon aborts the connection,
+    // removes its runtime files, and exits.
+    let runtime = tempfile::tempdir().unwrap();
+    let runtime_dir = runtime.path().to_path_buf();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime_dir.clone(),
+    };
+    let mut session = McpSession::start(&runtime_dir);
+    session.initialize();
+
+    // Locate the daemon's runtime files while the shim stays connected.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut socket: Option<PathBuf> = None;
+    let mut pid_file: Option<PathBuf> = None;
+    while Instant::now() < deadline && (socket.is_none() || pid_file.is_none()) {
+        thread::sleep(Duration::from_millis(50));
+        for entry in std::fs::read_dir(&runtime_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let p = entry.path();
+            match p.extension().and_then(|e| e.to_str()) {
+                Some("sock") => socket = Some(p.clone()),
+                Some("pid") => pid_file = Some(p.clone()),
+                _ => {}
+            }
+        }
+    }
+    let socket = socket.expect("daemon socket never appeared");
+    let pid_file = pid_file.expect("daemon pid file never appeared");
+
+    kill_daemon(&runtime_dir);
+
+    // 5s drain bound + margin. Failing here means shutdown hangs on the
+    // parked connection instead of bounding the wait.
+    let deadline = Instant::now() + Duration::from_secs(9);
+    while (socket.exists() || pid_file.exists()) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !socket.exists(),
+        "socket should be removed within the shutdown drain bound"
+    );
+    assert!(
+        !pid_file.exists(),
+        "pid file should be removed within the shutdown drain bound"
+    );
 }
 
 #[test]
@@ -556,7 +608,7 @@ fn status_finds_daemon_in_env_runtime_dir() {
     };
 
     // Wait for both socket and pid file — status reads the pid file and the
-    // daemon binds the socket before writing it (fnd_017ca191).
+    // daemon binds the socket before writing it.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut socket: Option<PathBuf> = None;
     let mut pid_file: Option<PathBuf> = None;

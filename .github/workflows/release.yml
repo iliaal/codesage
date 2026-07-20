@@ -23,6 +23,21 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      - name: Verify tag matches workspace version
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          cargo_version="$(awk -F'"' '
+            /^\[workspace\.package\]/ { in_pkg=1; next }
+            /^\[/ { in_pkg=0 }
+            in_pkg && /^version[[:space:]]*=/ { print $2; exit }
+          ' Cargo.toml)"
+          if [ "$cargo_version" != "$VERSION" ]; then
+            echo "::error::Tag $TAG implies version $VERSION but Cargo.toml [workspace.package] version is ${cargo_version:-unset}. Bump Cargo.toml before tagging." >&2
+            exit 1
+          fi
+
       - name: Extract CHANGELOG section for this version
         id: notes
         env:
@@ -41,13 +56,14 @@ jobs:
             found { print }
           ' CHANGELOG.md > release-notes.md
 
-          if [ ! -s release-notes.md ]; then
-            echo "::error::No CHANGELOG section found for [$version]. Update CHANGELOG.md before tagging." >&2
-            exit 1
-          fi
-
           # Trim leading and trailing blank lines for a tidier release body.
           sed -i -e '/./,$!d' -e ':a; /^\s*$/ { $d; N; ba; }' release-notes.md
+
+          # Checked after the trim so a whitespace-only section also fails.
+          if [ ! -s release-notes.md ]; then
+            echo "::error::No CHANGELOG section found for [$version], or the section is empty. Update CHANGELOG.md before tagging." >&2
+            exit 1
+          fi
 
           echo "--- release notes for ${TAG} ---"
           cat release-notes.md

@@ -108,6 +108,37 @@ fn push_language_filter(
     }
 }
 
+/// Available bytes on the filesystem holding `path`, or `None` when it can't
+/// be determined (non-unix target, statvfs failure). `f_bavail` — blocks
+/// available to unprivileged processes — times the fragment size matches what
+/// `df` reports as available.
+///
+/// The `useless_conversion` allow is platform-width, not a shortcut:
+/// `f_bavail` / `f_frsize` are u32 on macOS and u64 on Linux, so the
+/// widening is required on the narrow platforms and a same-type no-op that
+/// clippy flags on the wide ones.
+#[cfg(unix)]
+#[allow(clippy::useless_conversion)]
+fn available_disk_space(path: &str) -> Option<u64> {
+    let c_path = std::ffi::CString::new(path).ok()?;
+    // SAFETY: `c_path` is a valid NUL-terminated C string outliving the call,
+    // and `st` is an out-parameter that statvfs fully initializes when it
+    // returns 0; it is only read on that success path.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut st) };
+    if rc != 0 {
+        return None;
+    }
+    let blocks: u64 = st.f_bavail.into();
+    let frsize: u64 = st.f_frsize.into();
+    Some(blocks.saturating_mul(frsize))
+}
+
+#[cfg(not(unix))]
+fn available_disk_space(_path: &str) -> Option<u64> {
+    None
+}
+
 impl Database {
     /// FTS5 sidecar name for the active chunk table. Kept private to the
     /// storage layer — callers should go through `search_bm25` /
@@ -444,6 +475,9 @@ impl Database {
     /// `distance` carries the raw BM25 score; consumers should convert via
     /// rank-position when fusing, not raw value.
     ///
+    /// `languages` restricts rows to the given set (`language IN (...)`).
+    /// `None` or an empty slice means no language filter.
+    ///
     /// Query must be an FTS5 MATCH expression; pass pre-escaped. Callers that
     /// build a query from user input should go through a helper like
     /// `build_fts_match_query` to quote identifiers safely.
@@ -451,7 +485,7 @@ impl Database {
         &self,
         match_expr: &str,
         k: usize,
-        language: Option<&str>,
+        languages: Option<&[&str]>,
         paths: Option<&[&str]>,
     ) -> Result<Vec<RawSearchRow>> {
         if self.chunk_table.is_empty() {
@@ -462,10 +496,10 @@ impl Database {
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> =
             vec![Box::new(match_expr.to_string())];
 
-        if let Some(lang) = language {
-            let idx = param_values.len() + 1;
-            conditions.push(format!("language = ?{idx}"));
-            param_values.push(Box::new(lang.to_string()));
+        if let Some(langs) = languages
+            && !langs.is_empty()
+        {
+            push_language_filter(&mut conditions, &mut param_values, langs);
         }
 
         if let Some(path_patterns) = paths {
@@ -560,6 +594,27 @@ impl Database {
     }
 
     pub fn vacuum(&self) -> Result<()> {
+        // VACUUM rewrites the database into a temporary copy, needing up to
+        // ~2x the DB size in free space; running it into a full filesystem
+        // fails midway after heavy I/O. Bail early when the volume clearly
+        // lacks headroom. Advisory only: any stat/statvfs failure (in-memory
+        // DB, exotic filesystem, non-unix target) skips the check.
+        if let Some(path) = self.conn.path().filter(|p| !p.is_empty())
+            && let Ok(meta) = std::fs::metadata(path)
+            && let Some(available) = available_disk_space(path)
+        {
+            let required = (meta.len() as f64 * 1.2) as u64;
+            if available < required {
+                anyhow::bail!(
+                    "not enough free disk space for VACUUM: database is {} bytes and \
+                     VACUUM can need up to ~2x that; {} bytes available, {} required — \
+                     free up space and retry",
+                    meta.len(),
+                    available,
+                    required
+                );
+            }
+        }
         self.conn.execute_batch("VACUUM")?;
         Ok(())
     }
@@ -659,6 +714,23 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use crate::Database;
+
+    #[test]
+    fn vacuum_succeeds_on_file_backed_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vacuum.db");
+        let db = Database::open(&path).unwrap();
+        db.vacuum()
+            .expect("vacuum with ample free space must pass the pre-flight");
+    }
+
+    #[test]
+    fn vacuum_succeeds_on_in_memory_db() {
+        // No file path → the free-space pre-flight is skipped entirely.
+        let db = Database::open_in_memory().unwrap();
+        db.vacuum()
+            .expect("in-memory vacuum must skip the pre-flight");
+    }
 
     #[test]
     fn validity_token_differs_when_max_rowid_row_swapped_for_new_path() {

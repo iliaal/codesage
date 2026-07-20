@@ -164,11 +164,20 @@ mod tests {
                  stdlib flock semantics were supposed to prevent this"
             ),
         }
-        // Releasing the first lock lets the next attempt succeed.
+        // Releasing the first lock lets the next attempt succeed. Poll with
+        // a bound instead of asserting immediately: a concurrent test's fork
+        // duplicates the lock fd until exec, briefly extending the flock
+        // past our drop.
         drop(first);
-        match try_acquire(root).unwrap() {
-            LockOutcome::Acquired(_) => { /* expected — lock round-trips */ }
-            LockOutcome::AlreadyHeld => panic!("lock was not released on drop"),
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match try_acquire(root).unwrap() {
+                LockOutcome::Acquired(_) => break, // expected — lock round-trips
+                LockOutcome::AlreadyHeld if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                LockOutcome::AlreadyHeld => panic!("lock was not released on drop within 2s"),
+            }
         }
     }
 

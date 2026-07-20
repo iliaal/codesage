@@ -22,19 +22,49 @@ use codesage_protocol::Language;
 
 const MAX_TESTS_PER_SEED: usize = 5;
 
+/// Test-shaped subset of the repo file inventory, classified once per map
+/// run. Per-seed discovery then scans only this (much smaller) list instead
+/// of re-running the any-language shape check over every repo file for every
+/// seed — the hot path on seed-dense repos (php-src maps one seed per
+/// function against a ~20k-file inventory).
+pub struct TestFileIndex<'a> {
+    /// Sorted. In production the walk output is already sorted, so sorting
+    /// here is a no-op that makes the prefix range-scan valid for any caller.
+    test_shaped: Vec<&'a str>,
+}
+
+impl<'a> TestFileIndex<'a> {
+    pub fn build(all_files: &'a [String]) -> Self {
+        let mut test_shaped: Vec<&'a str> = all_files
+            .iter()
+            .filter(|f| is_test_file_any_language(f))
+            .map(|f| f.as_str())
+            .collect();
+        test_shaped.sort_unstable();
+        Self { test_shaped }
+    }
+
+    /// Contiguous run of test-shaped files under `pfx_slash` (which must end
+    /// in `/`), found by binary search — O(log n + hits) per declared prefix
+    /// instead of a full-inventory scan.
+    fn with_dir_prefix(&self, pfx_slash: &str) -> &[&'a str] {
+        let lo = self.test_shaped.partition_point(|f| *f < pfx_slash);
+        let run = self.test_shaped[lo..].partition_point(|f| f.starts_with(pfx_slash));
+        &self.test_shaped[lo..lo + run]
+    }
+
+    fn contains_exact(&self, path: &str) -> bool {
+        self.test_shaped.binary_search(&path).is_ok()
+    }
+}
+
 pub fn nearby_tests(seed: &FeatureSeed, all_files: &[String]) -> Vec<String> {
+    nearby_tests_indexed(seed, &TestFileIndex::build(all_files))
+}
+
+pub fn nearby_tests_indexed(seed: &FeatureSeed, index: &TestFileIndex) -> Vec<String> {
     let stem = file_stem(&seed.entry_path);
     let dir = parent_dir(&seed.entry_path);
-
-    // Partition the repo once: keep only same-language test files, preserving
-    // `all_files` order so cap-truncation picks the same winners a full re-scan
-    // would. Both loops below then iterate this small candidate set instead of
-    // re-scanning (and re-`is_test_file`-checking) every repo file per seed —
-    // the hot path on seed-dense repos (php-src maps one seed per function).
-    let candidates: Vec<&String> = all_files
-        .iter()
-        .filter(|f| matches_language(f, seed.language) && is_test_file(f, seed.language))
-        .collect();
 
     let mut out: Vec<String> = Vec::new();
 
@@ -42,39 +72,66 @@ pub fn nearby_tests(seed: &FeatureSeed, all_files: &[String]) -> Vec<String> {
     // `test_prefixes` (e.g. an autotools `<dir>/tests` prefix). These run BEFORE
     // the heuristic convention/stem scan so loose matches can't starve them —
     // pre-reorder, five stem matches could fill the cap and drop every declared
-    // test.
+    // test. The declared dir is matched by test SHAPE in any language, not only
+    // the seed's: a C-language PHP-extension seed declares a dir of .phpt tests
+    // that a seed-language filter would reject wholesale. Within the declared
+    // dirs, the seed's OWN-language tests take the cap slots first — otherwise
+    // alphabetically-earlier files of another language (five test_*.py before
+    // the crate's *.rs integration tests) exhaust the cap and starve the tests
+    // the seed actually runs.
+    let mut lang_hits: Vec<&str> = Vec::new();
+    let mut other_hits: Vec<&str> = Vec::new();
     for prefix in &seed.test_prefixes {
+        if lang_hits.len() >= MAX_TESTS_PER_SEED {
+            break;
+        }
         let pfx = prefix.trim_end_matches('/');
         if pfx.is_empty() {
             continue;
         }
         let pfx_slash = format!("{pfx}/");
-        for f in candidates.iter().copied() {
-            if out.len() >= MAX_TESTS_PER_SEED {
-                break;
-            }
-            if out.iter().any(|x| x == f) {
+        let exact = if index.contains_exact(pfx) {
+            Some(pfx)
+        } else {
+            None
+        };
+        for &f in exact.iter().chain(index.with_dir_prefix(&pfx_slash)) {
+            if lang_hits.contains(&f) || other_hits.contains(&f) {
                 continue;
             }
-            if f.starts_with(&pfx_slash) || f == pfx {
-                out.push(f.clone());
+            if matches_language(f, seed.language) && is_test_file(f, seed.language) {
+                lang_hits.push(f);
+            } else {
+                other_hits.push(f);
             }
         }
     }
-
-    // Heuristic convention/stem discovery fills the remaining slots.
-    for f in candidates.iter().copied() {
+    for f in lang_hits.into_iter().chain(other_hits) {
         if out.len() >= MAX_TESTS_PER_SEED {
             break;
         }
-        if f == &seed.entry_path {
+        out.push(f.to_string());
+    }
+
+    // Heuristic convention/stem discovery fills the remaining slots from the
+    // seed-language candidates. Index order matches walk order, so
+    // cap-truncation picks the same winners a full re-scan would.
+    let candidates = index
+        .test_shaped
+        .iter()
+        .filter(|f| matches_language(f, seed.language) && is_test_file(f, seed.language));
+    for f in candidates {
+        if out.len() >= MAX_TESTS_PER_SEED {
+            break;
+        }
+        if *f == seed.entry_path {
             continue;
         }
         if out.iter().any(|x| x == f) {
             continue;
         }
         if file_relates_to(seed, stem, &dir, f) {
-            out.push(f.clone());
+            out.push(f.to_string());
         }
     }
 
@@ -168,6 +225,26 @@ fn stem_at_word_boundary(cand_stem: &str, stem: &str) -> bool {
     false
 }
 
+/// Test-shaped in ANY language: the file carries some language's extension and
+/// that language's test conventions accept it. Requiring a language match keeps
+/// docs and fixture data out of declared test dirs while still accepting
+/// cross-language suites (.phpt under a C extension's tests dir).
+pub(crate) fn is_test_file_any_language(path: &str) -> bool {
+    const ALL: [Language; 9] = [
+        Language::Rust,
+        Language::Php,
+        Language::Python,
+        Language::Go,
+        Language::Java,
+        Language::JavaScript,
+        Language::TypeScript,
+        Language::C,
+        Language::Cpp,
+    ];
+    ALL.iter()
+        .any(|&l| matches_language(path, l) && is_test_file(path, l))
+}
+
 fn matches_language(path: &str, language: Language) -> bool {
     match language {
         Language::Rust => path.ends_with(".rs"),
@@ -191,7 +268,10 @@ fn matches_language(path: &str, language: Language) -> bool {
     }
 }
 
-fn is_test_file(path: &str, language: Language) -> bool {
+/// Canonical per-language test-shape predicate. Mappers must route their
+/// own "is this a test file?" checks through this (or the broader
+/// [`is_test_file_any_language`]) instead of re-encoding the conventions.
+pub(crate) fn is_test_file(path: &str, language: Language) -> bool {
     match language {
         Language::Rust => {
             path.starts_with("tests/") || path.contains("/tests/") || path.ends_with("_test.rs")
@@ -205,11 +285,7 @@ fn is_test_file(path: &str, language: Language) -> bool {
                 || path.contains("/test/")
         }
         Language::Python => {
-            let base = path.rsplit('/').next().unwrap_or(path);
-            base.starts_with("test_")
-                || base.ends_with("_test.py")
-                || path.starts_with("tests/")
-                || path.contains("/tests/")
+            is_python_test_basename(path) || path.starts_with("tests/") || path.contains("/tests/")
         }
         Language::Go => path.ends_with("_test.go"),
         Language::Java => {
@@ -225,6 +301,10 @@ fn is_test_file(path: &str, language: Language) -> bool {
                 || path.ends_with(".test.tsx")
                 || path.ends_with(".test.js")
                 || path.ends_with(".test.jsx")
+                || path.ends_with(".test.mts")
+                || path.ends_with(".test.cts")
+                || path.ends_with(".test.mjs")
+                || path.ends_with(".test.cjs")
                 || path.ends_with(".spec.ts")
                 || path.ends_with(".spec.tsx")
                 || path.ends_with(".spec.js")
@@ -233,15 +313,57 @@ fn is_test_file(path: &str, language: Language) -> bool {
                 || path.contains("/__tests__/")
                 || path.starts_with("tests/")
         }
-        Language::C | Language::Cpp => {
-            path.starts_with("tests/")
-                || path.contains("/tests/")
-                || path.contains("/test/")
-                || path.ends_with("_test.c")
-                || path.ends_with("_test.cpp")
-                || path.ends_with("_test.cc")
-        }
+        Language::C | Language::Cpp => is_c_or_cpp_test_path(path),
     }
+}
+
+/// The `test_*.py` / `*_test.py` basename convention, single-sourced so the
+/// Python mapper's pytest-file classifier and this module's Python arm can't
+/// drift apart. Callers guard the `.py` extension themselves.
+pub(crate) fn is_python_test_basename(path: &str) -> bool {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    base.starts_with("test_") || base.ends_with("_test.py")
+}
+
+/// Path looks like a C/C++ test fixture under conventional naming:
+/// directory under `tests/` / `test/` / `__tests__/` (any depth,
+/// case-insensitive); basename prefixed with `test_` or `test-`; basename
+/// suffixed `_tests.cpp` / `-test.c`; `FooTest.cpp` / `BarTests.cc`.
+/// Mirrors clawpatch's `isCOrCppTestPath`. The same shape drives CMake
+/// test-target classification, `main()`-suppression in the c-main walker,
+/// and this module's C/C++ test association.
+pub(crate) fn is_c_or_cpp_test_path(rel: &str) -> bool {
+    let base = rel.rsplit('/').next().unwrap_or(rel);
+    let lower = rel.to_ascii_lowercase();
+    if lower.starts_with("test/")
+        || lower.starts_with("tests/")
+        || lower.starts_with("__tests__/")
+        || lower.contains("/test/")
+        || lower.contains("/tests/")
+        || lower.contains("/__tests__/")
+    {
+        return true;
+    }
+    let base_lower = base.to_ascii_lowercase();
+    if base_lower.starts_with("test_") || base_lower.starts_with("test-") {
+        return true;
+    }
+    // foo_test.c / foo-tests.cpp
+    let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base);
+    let stem_lower = stem.to_ascii_lowercase();
+    if stem_lower.ends_with("_test")
+        || stem_lower.ends_with("-test")
+        || stem_lower.ends_with("_tests")
+        || stem_lower.ends_with("-tests")
+    {
+        return true;
+    }
+    // FooTest.cpp / BarTests.cc (case-sensitive Test/Tests suffix on the
+    // *original* stem so `foo_test.c` doesn't double-match here).
+    if stem.ends_with("Test") || stem.ends_with("Tests") {
+        return true;
+    }
+    false
 }
 
 /// When both paths live under `packages/<name>/` or `crates/<name>/`, require
@@ -293,26 +415,41 @@ fn file_stem(rel: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codesage_protocol::{FeatureConfidence, FeatureKind};
+    use codesage_protocol::FeatureKind;
 
     fn seed(entry: &str, language: Language) -> FeatureSeed {
         FeatureSeed {
-            title: String::new(),
-            summary: String::new(),
-            kind: FeatureKind::CliCommand,
             source: "test",
-            confidence: FeatureConfidence::Medium,
-            entry_path: entry.to_string(),
-            entry_symbol: None,
-            entry_route: None,
-            entry_command: None,
-            test_command: None,
-            language,
-            tags: Vec::new(),
-            owned_files: Vec::new(),
-            context_files: Vec::new(),
-            tests: Vec::new(),
-            test_prefixes: Vec::new(),
+            ..FeatureSeed::new(FeatureKind::CliCommand, language, "", entry)
+        }
+    }
+
+    #[test]
+    fn is_c_or_cpp_test_path_covers_documented_patterns() {
+        // Patterns mirror clawpatch's `isCOrCppTestPath`. Listed here so
+        // a future change that loosens the helper trips the test.
+        for path in [
+            "tests/main.c",
+            "test/main.cpp",
+            "__tests__/widget.c",
+            "src/__tests__/widget.cpp",
+            "src/test_widget.c",
+            "src/test-widget.c",
+            "src/widget_test.c",
+            "src/widget-test.c",
+            "src/widget_tests.cpp",
+            "src/WidgetTest.cpp",
+            "src/WidgetTests.cc",
+        ] {
+            assert!(is_c_or_cpp_test_path(path), "should match: {path}");
+        }
+        for path in [
+            "src/main.c",
+            "src/widget.cpp",
+            "include/widget.h",
+            "src/testimony.c", // `test` prefix but not separator-followed
+        ] {
+            assert!(!is_c_or_cpp_test_path(path), "should NOT match: {path}");
         }
     }
 
@@ -494,6 +631,94 @@ mod tests {
                 "tests/test_widget.py".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn c_seed_declared_prefix_attaches_phpt_tests() {
+        // php-src extension seeds are C-language but their declared test dirs
+        // hold .phpt files. The declared prefix is authoritative: it must
+        // attach those tests even though .phpt is not a C extension.
+        let mut s = seed("ext/foo/config.m4", Language::C);
+        s.test_prefixes = vec!["ext/foo/tests".to_string()];
+        let all = vec![
+            "ext/foo/config.m4".to_string(),
+            "ext/foo/foo.c".to_string(),
+            "ext/foo/tests/001.phpt".to_string(),
+            "ext/foo/tests/002.phpt".to_string(),
+        ];
+        let t = nearby_tests(&s, &all);
+        assert!(
+            t.contains(&"ext/foo/tests/001.phpt".to_string()),
+            ".phpt under the declared prefix must attach to a C seed: {t:?}"
+        );
+        assert!(
+            t.contains(&"ext/foo/tests/002.phpt".to_string()),
+            ".phpt under the declared prefix must attach to a C seed: {t:?}"
+        );
+    }
+
+    #[test]
+    fn declared_prefix_is_path_anchored() {
+        // Prefix "tests" anchors at the repo-relative path start; a nested
+        // "other/tests/" dir must not match it.
+        let mut s = seed("src/main.rs", Language::Rust);
+        s.test_prefixes = vec!["tests".to_string()];
+        let all = vec![
+            "src/main.rs".to_string(),
+            "other/tests/helper_test.py".to_string(),
+        ];
+        let t = nearby_tests(&s, &all);
+        assert!(
+            !t.contains(&"other/tests/helper_test.py".to_string()),
+            "nested dir must not match a root-anchored declared prefix: {t:?}"
+        );
+    }
+
+    #[test]
+    fn declared_prefix_skips_non_test_shaped_files() {
+        // Files under the declared prefix still need to look like a test in
+        // SOME language — docs and fixtures data must not attach.
+        let mut s = seed("ext/foo/config.m4", Language::C);
+        s.test_prefixes = vec!["ext/foo/tests".to_string()];
+        let all = vec![
+            "ext/foo/tests/README.md".to_string(),
+            "ext/foo/tests/001.phpt".to_string(),
+        ];
+        let t = nearby_tests(&s, &all);
+        assert!(
+            !t.contains(&"ext/foo/tests/README.md".to_string()),
+            "non-code file under declared prefix must not attach: {t:?}"
+        );
+        assert!(
+            t.contains(&"ext/foo/tests/001.phpt".to_string()),
+            "test-shaped file under declared prefix must attach: {t:?}"
+        );
+    }
+
+    #[test]
+    fn declared_prefix_prioritizes_seed_language_tests() {
+        // Starvation regression: the declared tests/ dir holds five
+        // alphabetically-earlier Python test files plus the Rust seed's own
+        // integration test. Pre-fix, the prefix loop filled the 5-slot cap
+        // in inventory order, so the .py files exhausted it and the one
+        // test the seed actually runs never attached. Own-language tests
+        // now take the cap slots first.
+        let mut s = seed("src/main.rs", Language::Rust);
+        s.test_prefixes = vec!["tests".to_string()];
+        // Sorted, matching walk_files' production output: the .py files
+        // precede the .rs integration test.
+        let mut all = vec!["src/main.rs".to_string()];
+        for i in 0..5 {
+            all.push(format!("tests/test_a{i}.py"));
+        }
+        all.push("tests/zz_integration.rs".to_string());
+        all.sort();
+        let t = nearby_tests(&s, &all);
+        assert!(
+            t.contains(&"tests/zz_integration.rs".to_string()),
+            "own-language test must not be starved by other-language files: {t:?}"
+        );
+        assert!(t.len() <= 5);
     }
 
     #[test]

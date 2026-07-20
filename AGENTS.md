@@ -26,8 +26,9 @@ The "fmt then edit then forget to re-fmt" class of break is real (commit `a43c51
 | `protocol` | Shared types (Symbol, Reference, SearchResult, etc.) | nothing |
 | `parser` | File discovery, language detection, tree-sitter symbol/reference extraction | protocol |
 | `storage` | SQLite schema, CRUD, sqlite-vec KNN | protocol |
-| `embed` | ONNX embedding inference (Embedder), cross-encoder reranking (Reranker), chunking | ort, tokenizers, hf-hub |
-| `graph` | Indexing orchestration, search pipeline, query API | parser, storage, embed, protocol |
+| `embed` | ONNX embedding inference (Embedder), cross-encoder reranking (Reranker), chunking | protocol, ort, tokenizers, hf-hub |
+| `features` | Feature-slice mapping, trust-boundary derivation | parser, storage, protocol |
+| `graph` | Indexing orchestration, search pipeline, query API | parser, storage, embed, features, protocol |
 | `cli` | `codesage` binary: CLI subcommands + MCP stdio shim + Unix-socket daemon | everything |
 
 ## Search pipeline
@@ -80,7 +81,7 @@ ONNX Runtime loads dynamically. CUDA libraries come from pip-installed `nvidia-*
 
 `codesage doctor` reports how many nvidia lib dirs were discovered and warns if none.
 
-If CUDA is requested (`device = "gpu"`) but fails to register, the process errors out instead of falling back to CPU. This is intentional -- silent CPU fallback produces different embeddings and slower performance.
+If CUDA is requested (`device = "gpu"`) but fails to register, the process errors out instead of falling back to CPU. This is intentional -- silent CPU fallback produces different embeddings and slower performance. The check inspects `/proc/self/maps` after session creation and hard-fails when libcuda/libcudart aren't mapped. To bypass it deliberately (tests, mixed CPU/GPU setups), set `CODESAGE_ALLOW_CPU_FALLBACK=1` -- the consequence is silently CPU-computed embeddings, so never leave it set on a GPU-configured project.
 
 Required pip packages: `onnxruntime-gpu`, `nvidia-cudnn-cu12`, `nvidia-cublas-cu12`, `nvidia-cuda-runtime-cu12`, `nvidia-cufft-cu12`, `nvidia-curand-cu12`, `nvidia-cuda-nvrtc-cu12`.
 
@@ -100,7 +101,7 @@ If CoreML registration fails, the process errors out instead of silently falling
 
 ## Versioning and changelog
 
-This repo follows [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/) and [SemVer 2.0.0](https://semver.org/spec/v2.0.0.html). Workspace version lives in `[workspace.package] version` in the root `Cargo.toml`; all six crates inherit it via `version.workspace = true`.
+This repo follows [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/) and [SemVer 2.0.0](https://semver.org/spec/v2.0.0.html). Workspace version lives in `[workspace.package] version` in the root `Cargo.toml`; all seven crates inherit it via `version.workspace = true`.
 
 **Every release-notable product change must update `CHANGELOG.md` in the same commit.** Release-notable means: new CLI flags or subcommands, new or changed MCP tools, behavior changes, breaking changes, new dependencies, schema migrations, hook template changes, config surface changes, and security fixes that affect shipped CodeSage behavior.
 
@@ -121,7 +122,7 @@ Write entries in terse style:
 
 1. Move everything under `## [Unreleased]` into a new `## [X.Y.Z] - YYYY-MM-DD` section. Leave `## [Unreleased]` empty above it.
 2. Append a link reference at the bottom of `CHANGELOG.md`: `[X.Y.Z]: https://github.com/iliaal/codesage/releases/tag/vX.Y.Z` and update the `[Unreleased]` compare URL to `...vX.Y.Z...HEAD`.
-3. Bump `[workspace.package] version` in the root `Cargo.toml`. All six crates inherit it.
+3. Bump `[workspace.package] version` in the root `Cargo.toml`. All seven crates inherit it.
 4. Commit: `git commit -am "release: vX.Y.Z"`.
 5. Tag: `git tag -a vX.Y.Z -m "codesage X.Y.Z"`.
 6. Push: `git push origin master && git push origin vX.Y.Z`.
@@ -152,12 +153,12 @@ PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go.
 - `assess_risk_diff` -- aggregate risk for a patch / set of files (V2b slice 2). Per-file `notes[]` may contain short codes (`"T"`, `"NG"`); resolve via the top-level `_legend` map.
 - `recommend_tests` -- tests an agent should run after editing a set of files (V2b slice 2)
 - `review_rehearsal` -- predict severity-ranked review objections for a patch (missing tests, high-risk / blast-radius / fix-prone / hotspot files, import cycles, trust-boundary expansion, feature-test gaps, and `scope-spread` when a patch touches ≥4 unrelated feature areas) with hot-symbol evidence. Composes `assess_risk_diff` + `recommend_tests` + drift + feature mapping; read-only, no AI prose. Use as the last step before a commit.
-- `session_start` / `session_end` -- snapshot structural state at the start of an editing session, diff at the end. Returns `pass: bool` plus new/resolved cycles, per-file risk regressions on the top-50 baseline, and added/removed files.
+- `session_start` / `session_end` -- snapshot structural state at the start of an editing session, diff at the end. Returns `pass: bool` plus new/resolved cycles, per-file risk regressions on the top-50 baseline, and added/removed files. Note the shape divergence: MCP `session_start` returns the compact `SessionStartReport` (`snapshot_path` + counts), while CLI `codesage session-start --json` prints the full `SessionSnapshot` (file list, cycles, top-risk files).
 - `list_features` -- list mapped feature slices, filterable by `kind` (`route`, `cli-command`, `library`, `test-suite`, `service`, `config`, `job`), `language`, or `tag` (0.7.0).
 - `find_feature` -- given a file path, return the feature(s) that own it. Routes "what slice owns this file?" without scanning by hand.
-- `feature_bundle` -- curated code bundle for one feature slice (entry + owned + tests + context as primary/related chunks, plus the entry symbol's definition and optionally its callers/callees). Same shape as `export_context` but anchored on the feature's pre-curated file list. Returns `not found` marker when the `feature_id` is unknown.
+- `feature_bundle` -- curated code bundle for one feature slice (entry + owned + tests + context as primary/related chunks, plus the entry symbol's definition and optionally its callers/callees). Same shape as `export_context` but anchored on the feature's pre-curated file list. Returns `found: false` when the `feature_id` is unknown.
 
-Every MCP tool advertises an `outputSchema` (0.7.0); agents that consult it know the result shape before they call.
+Every MCP tool advertises an `outputSchema` (0.7.0); agents that consult it know the result shape before they call. Each schema also declares an optional top-level `_meta` object the server may inject: budget-truncation details (`truncated`, `total_results`, `returned`, `dropped_files`) and staleness annotations (`stale_files`, `stale_warning`).
 
 ## MCP runtime
 
@@ -166,6 +167,8 @@ Every MCP tool advertises an `outputSchema` (0.7.0); agents that consult it know
 `codesage mcp --project <abs root>` makes the server default the per-call `project` argument to that root when a `tools/call` omits it. Set automatically by `codesage install` for agents without a CodeSage plugin (Codex, opencode), which otherwise have no way to inject the project path. With no `--project` (the Claude-plugin path) the shim raw-copies stdio with zero overhead.
 
 The daemon co-trusts every process under the same Unix UID. Runtime dirs, socket mode `0o600`, and `SO_PEERCRED` keep other users out, but a compromised same-UID agent can ask the daemon to read any onboarded project index. Use a separate Unix user for untrusted agents that need project isolation. MCP tools are capped for agent safety; CLI commands are the operator surface and intentionally keep broader limits unless a command documents its own cap.
+
+Consistency during reindex: the structural indexer commits in batches of 50 files, so cross-file queries issued while a large reindex is running can see a blend of pre- and post-change state. The per-response `_meta.stale_files` annotation flags results referencing files that changed on disk but aren't reindexed yet. Both windows close when the index pass finishes.
 
 Use `codesage mcp --direct` only when debugging the old single-process stdio path. Use `codesage daemon` to run the foreground daemon explicitly. Socket state lives under `$CODESAGE_DAEMON_RUNTIME_DIR`, `$XDG_RUNTIME_DIR/codesage`, or `/tmp/codesage-$UID`; the socket name includes the running binary's version and executable metadata so rebuilt binaries don't attach to stale daemons.
 
@@ -191,7 +194,7 @@ The daemon writes tracing to `mcp-<version>-<key>.log` in the runtime dir; check
 
 `install <codex|opencode|all> [--global]` registers CodeSage as an MCP server in agents that have no CodeSage plugin (Codex CLI, opencode), writing their native MCP config (`toml_edit` / `jsonc-parser` CST, comment-preserving and idempotent). It registers the command `codesage mcp --project <abs root>`; `uninstall` removes only CodeSage's entry. Claude Code is not a target — it keeps its `claude mcp add` / plugin registration.
 
-`map` runs the feature mappers (Cargo workspace, composer + Laravel routes, php-src `ext/*`, CMake / autotools, Python `pyproject` / `setup.py` / `__main__`, `package.json` bin + Next.js routes, Go `cmd/*`) and persists features. `codesage index` calls `map` between the structural and semantic passes; `--no-features` skips. `features-list` / `feature-show` / `feature-for` / `feature-bundle` are read-side query commands matching the new MCP tools. `trust-boundaries <file>` is the debugging surface for the per-file boundary tags that feed `assess_risk`.
+`map` runs the feature mappers (Cargo workspace, composer + Laravel routes, php-src `ext/*`, CMake / autotools, Python `pyproject` / `setup.py` / `__main__`, `package.json` bin + Next.js routes, Go `cmd/*`) and persists features. `codesage index` calls `map` between the structural and semantic passes; `--no-features` skips, and a no-op incremental pass (file-hash state unchanged since the last successful map) skips automatically. `features-list` / `feature-show` / `feature-for` / `feature-bundle` are read-side query commands matching the new MCP tools. `trust-boundaries <file>` is the debugging surface for the per-file boundary tags that feed `assess_risk`.
 
 `cleanup` drops orphaned vec tables from previous model switches, keeping only the active model. Use after benchmarking multiple models. Runs VACUUM automatically.
 

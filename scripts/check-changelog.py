@@ -4,6 +4,8 @@ iliaal/* Keep-a-Changelog convention.
 
 Checks (on the `## [Unreleased]` section only — released blocks are history):
   - every `### ` subsection is one of the canonical sections;
+  - no content sits between `## [Unreleased]` and the first `### ` heading
+    (a stray bullet outside any section would otherwise escape validation);
   - subsections appear in the canonical order, with no duplicates;
   - no subsection is empty (each has at least one `- ` bullet);
   - each bullet is terse: no bold lead-in, no justification/explanation
@@ -77,6 +79,13 @@ def lint(body: str) -> list[str]:
             sections.append(current)
         elif current is not None:
             current[1].append(line)
+        elif line.strip() and not re.match(r"^\[[^\]]+\]:\s*\S", line):
+            # Link-reference definitions are exempt: when `[Unreleased]` is the
+            # final `## ` block they trail into the extracted body.
+            problems.append(
+                f"entry outside a section (before the first `### ` heading) — "
+                f"{_excerpt(line.strip())}"
+            )
 
     seen: set[str] = set()
     last_rank = -1

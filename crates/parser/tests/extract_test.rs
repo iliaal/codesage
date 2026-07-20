@@ -249,7 +249,7 @@ fn rust_qualified_names() {
     assert_eq!(new_method.qualified_name, "Config::new");
 
     // Two `serialize` symbols now exist: the trait method signature
-    // (`Serializable::serialize`, CR-018a) and the impl (`Config::serialize`).
+    // (`Serializable::serialize`) and the impl (`Config::serialize`).
     let impl_serialize = syms
         .iter()
         .find(|s| s.name == "serialize" && s.qualified_name == "Config::serialize")
@@ -429,7 +429,7 @@ fn nested_function_in_python_method_is_not_a_method() {
 
 #[test]
 fn rust_trait_method_signature_is_captured() {
-    // CR-018a: `function_signature_item` (a trait method without a body) must
+    // `function_signature_item` (a trait method without a body) must
     // surface as a Method qualified by the trait name.
     let src = "trait Store {\n    fn get(&self, k: &str) -> u8;\n}\n";
     let syms = symbols_from_source(src, Language::Rust);
@@ -454,7 +454,6 @@ fn rust_default_trait_method_is_a_method() {
 
 #[test]
 fn typescript_abstract_class_and_methods() {
-    // CR-012: abstract_class_declaration + its members.
     let src = "abstract class Repo {\n  abstract find(id: number): string;\n  save(): void {}\n}\nexport default abstract class Base {}\n";
     let syms = symbols_from_source(src, Language::TypeScript);
     assert!(has_symbol(&syms, "Repo", SymbolKind::Class));
@@ -471,7 +470,7 @@ fn typescript_abstract_class_and_methods() {
 
 #[test]
 fn go_package_level_var_is_captured_but_not_locals() {
-    // CR-018b: package-level `var` -> Constant; locals must stay uncaptured.
+    // Package-level `var` -> Constant; locals must stay uncaptured.
     let src =
         "package main\nvar Registry = 1\nvar A, B int\nfunc f() { var local = 2; _ = local }\n";
     let syms = symbols_from_source(src, Language::Go);
@@ -486,7 +485,7 @@ fn go_package_level_var_is_captured_but_not_locals() {
 
 #[test]
 fn generator_functions_are_captured() {
-    // CR-018c: generator_function_declaration -> Function in JS and TS.
+    // `generator_function_declaration` -> Function in JS and TS.
     let js = symbols_from_source("function* gen() { yield 1; }\n", Language::JavaScript);
     assert!(has_symbol(&js, "gen", SymbolKind::Function));
     let ts = symbols_from_source("function* gen() { yield 1; }\n", Language::TypeScript);

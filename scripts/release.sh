@@ -4,7 +4,9 @@
 #   scripts/release.sh [-y|--yes] X.Y.Z
 #
 # Does:
-#   1. Pre-flight checks (on master, clean tree, in sync with origin, tag free)
+#   1. Pre-flight checks (on master, clean tree, in sync with origin, tag free).
+#      Exception: if a previous run already committed + tagged HEAD but never
+#      pushed, the script resumes at the push step instead of dying on the tag.
 #   2. Move `## [Unreleased]` content into a new `## [X.Y.Z] - YYYY-MM-DD` block
 #      and append the matching link reference.
 #   3. Bump `[workspace.package].version`, both plugin manifests, and the
@@ -12,7 +14,8 @@
 #   4. Build the release binary with `--features cuda` so Cargo.lock is up to date.
 #   5. Prompt, then commit + tag.
 #   6. Prompt, then refresh the local Codex and Claude Code plugins and
-#      push master + tag.
+#      push master + tag. A failed plugin refresh warns (with the manual
+#      re-run command) and continues; it never blocks the push.
 #   7. Refresh whichever `codesage` is on PATH so the maintainer's local install
 #      jumps to the new version. Skipped silently if no install is found or the
 #      binary path is not writable.
@@ -57,12 +60,28 @@ git diff-index --quiet HEAD -- || die "working tree has uncommitted changes"
 git fetch origin master --quiet
 local_sha=$(git rev-parse HEAD)
 remote_sha=$(git rev-parse origin/master)
-if [[ "$local_sha" != "$remote_sha" ]]; then
-	die "local master ($local_sha) differs from origin/master ($remote_sha)"
+
+# A previous run that committed + tagged but never finished pushing leaves the
+# tag at HEAD and absent from origin; that exact state is safe to resume at the
+# push phase. Any other pre-existing tag state is an error.
+RESUME=0
+if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+	tag_sha=$(git rev-parse "v$VERSION^{commit}")
+	if [[ "$tag_sha" != "$local_sha" ]]; then
+		die "tag v$VERSION already exists and points at $tag_sha, not HEAD"
+	fi
+	if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null 2>&1; then
+		die "tag v$VERSION already exists on origin"
+	fi
+	echo "Tag v$VERSION exists at HEAD and is not on origin -- resuming unpushed release."
+	RESUME=1
 fi
 
-if git rev-parse "v$VERSION" >/dev/null 2>&1; then
-	die "tag v$VERSION already exists"
+if [[ "$RESUME" -eq 1 ]]; then
+	git merge-base --is-ancestor origin/master HEAD ||
+		die "cannot resume: local master and origin/master have diverged"
+elif [[ "$local_sha" != "$remote_sha" ]]; then
+	die "local master ($local_sha) differs from origin/master ($remote_sha)"
 fi
 
 # CHANGELOG section ordering / validity gate (shared iliaal/* convention).
@@ -73,14 +92,15 @@ python3 "$ROOT/scripts/check-changelog.py" "$ROOT/CHANGELOG.md" ||
 python3 "$ROOT/scripts/check-plugin-versions.py" --root "$ROOT" ||
 	die "plugin versions don't match the current workspace version"
 
-current=$(awk -F'"' '/^\[workspace\.package\]/{f=1;next} f && /^version *=/{print $2; exit}' Cargo.toml)
-[[ -n "$current" ]] || die "could not read current version from Cargo.toml"
-echo "Current version: $current"
-echo "Target version:  $VERSION"
+if [[ "$RESUME" -eq 0 ]]; then
+	current=$(awk -F'"' '/^\[workspace\.package\]/{f=1;next} f && /^version *=/{print $2; exit}' Cargo.toml)
+	[[ -n "$current" ]] || die "could not read current version from Cargo.toml"
+	echo "Current version: $current"
+	echo "Target version:  $VERSION"
 
-DATE=$(date +%Y-%m-%d)
+	DATE=$(date +%Y-%m-%d)
 
-python3 - "$VERSION" "$DATE" <<'PYEOF'
+	python3 - "$VERSION" "$DATE" <<'PYEOF'
 import json, pathlib, re, sys
 
 version, date = sys.argv[1], sys.argv[2]
@@ -155,45 +175,46 @@ entries[0]["version"] = version
 write_json(marketplace_path, marketplace)
 PYEOF
 
-python3 "$ROOT/scripts/check-plugin-versions.py" --root "$ROOT" ||
-	die "release mutation left plugin versions inconsistent"
+	python3 "$ROOT/scripts/check-plugin-versions.py" --root "$ROOT" ||
+		die "release mutation left plugin versions inconsistent"
 
-echo
-echo "--- Cargo.toml diff ---"
-git --no-pager diff Cargo.toml
-echo
-echo "--- CHANGELOG.md diff (head) ---"
-git --no-pager diff CHANGELOG.md | head -80
-echo
-echo "--- Plugin manifest diffs ---"
-git --no-pager diff \
-	plugins/codesage-tools/.codex-plugin/plugin.json \
-	plugins/codesage-tools/.claude-plugin/plugin.json \
-	.claude-plugin/marketplace.json
-echo
+	echo
+	echo "--- Cargo.toml diff ---"
+	git --no-pager diff Cargo.toml
+	echo
+	echo "--- CHANGELOG.md diff (head) ---"
+	git --no-pager diff CHANGELOG.md | head -80
+	echo
+	echo "--- Plugin manifest diffs ---"
+	git --no-pager diff \
+		plugins/codesage-tools/.codex-plugin/plugin.json \
+		plugins/codesage-tools/.claude-plugin/plugin.json \
+		.claude-plugin/marketplace.json
+	echo
 
-echo "Building release binary with --features cuda (refreshes Cargo.lock)..."
-cargo build --release -p codesage --features cuda
+	echo "Building release binary with --features cuda (refreshes Cargo.lock)..."
+	cargo build --release -p codesage --features cuda
 
-echo
-echo "Ready to commit + tag:"
-echo "  commit message: release: v$VERSION"
-echo "  tag:            v$VERSION  (annotated: 'codesage $VERSION')"
-if [[ "$ASSUME_YES" -eq 1 ]]; then
-	echo "Proceed? [y/N] y  (--yes)"
-	ans=y
-else
-	read -r -p "Proceed? [y/N] " ans
+	echo
+	echo "Ready to commit + tag:"
+	echo "  commit message: release: v$VERSION"
+	echo "  tag:            v$VERSION  (annotated: 'codesage $VERSION')"
+	if [[ "$ASSUME_YES" -eq 1 ]]; then
+		echo "Proceed? [y/N] y  (--yes)"
+		ans=y
+	else
+		read -r -p "Proceed? [y/N] " ans
+	fi
+	[[ "$ans" == "y" || "$ans" == "Y" ]] || die "aborted before commit"
+
+	git commit -am "release: v$VERSION"
+	git tag -a "v$VERSION" -m "codesage $VERSION"
+
+	echo
+	echo "Commit + tag created:"
+	git --no-pager log -1 --oneline
+	git --no-pager tag -v "v$VERSION" 2>/dev/null | head -5 || git --no-pager show "v$VERSION" --no-patch --oneline
 fi
-[[ "$ans" == "y" || "$ans" == "Y" ]] || die "aborted before commit"
-
-git commit -am "release: v$VERSION"
-git tag -a "v$VERSION" -m "codesage $VERSION"
-
-echo
-echo "Commit + tag created:"
-git --no-pager log -1 --oneline
-git --no-pager tag -v "v$VERSION" 2>/dev/null | head -5 || git --no-pager show "v$VERSION" --no-patch --oneline
 
 echo
 if [[ "$ASSUME_YES" -eq 1 ]]; then
@@ -206,9 +227,13 @@ if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
 	if command -v codex >/dev/null 2>&1; then
 		echo
 		echo "Refreshing Codex plugin codesage-tools@codesage ..."
-		codex plugin marketplace add "${ROOT}" || die "failed to register the local CodeSage marketplace"
-		codex plugin add codesage-tools@codesage || die "failed to refresh the Codex plugin"
-		echo "Codex plugin refreshed. Start a new Codex thread to load version ${VERSION}."
+		if codex plugin marketplace add "${ROOT}" &&
+			codex plugin add codesage-tools@codesage; then
+			echo "Codex plugin refreshed. Start a new Codex thread to load version ${VERSION}."
+		else
+			echo "⚠ Codex plugin refresh FAILED; continuing with the release." >&2
+			echo "⚠ Re-run manually: codex plugin marketplace add ${ROOT} && codex plugin add codesage-tools@codesage" >&2
+		fi
 	else
 		echo
 		echo "No 'codex' on PATH; skipping Codex plugin refresh."
@@ -216,8 +241,12 @@ if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
 	if command -v claude >/dev/null 2>&1; then
 		echo
 		echo "Refreshing Claude Code plugin codesage-tools@codesage ..."
-		claude plugin update codesage-tools@codesage || die "failed to refresh the Claude Code plugin"
-		echo "Claude plugin refreshed. Restart Claude Code sessions to load version ${VERSION}."
+		if claude plugin update codesage-tools@codesage; then
+			echo "Claude plugin refreshed. Restart Claude Code sessions to load version ${VERSION}."
+		else
+			echo "⚠ Claude Code plugin refresh FAILED; continuing with the release." >&2
+			echo "⚠ Re-run manually: claude plugin update codesage-tools@codesage" >&2
+		fi
 	else
 		echo
 		echo "No 'claude' on PATH; skipping Claude plugin refresh."
@@ -240,14 +269,20 @@ fi
 # lands at the original path, and the next session picks it up.
 local_install="$(command -v codesage 2>/dev/null || true)"
 if [[ -n "$local_install" && -w "$local_install" ]]; then
-	backup="${local_install}.old-pre-${VERSION}"
-	echo
-	echo "Refreshing local install at $local_install ..."
-	mv "$local_install" "$backup"
-	cp target/release/codesage "$local_install"
-	rm -f "$backup"
-	installed_version="$("$local_install" --version 2>/dev/null || echo '?')"
-	echo "Local install: $installed_version"
+	if [[ -f target/release/codesage ]]; then
+		backup="${local_install}.old-pre-${VERSION}"
+		echo
+		echo "Refreshing local install at $local_install ..."
+		mv "$local_install" "$backup"
+		cp target/release/codesage "$local_install"
+		rm -f "$backup"
+		installed_version="$("$local_install" --version 2>/dev/null || echo '?')"
+		echo "Local install: $installed_version"
+	else
+		echo
+		echo "No target/release/codesage binary (resumed run?); skipping local install refresh."
+		echo "Run: cargo build --release -p codesage --features cuda && cp target/release/codesage $local_install"
+	fi
 elif [[ -n "$local_install" ]]; then
 	echo
 	echo "Found $local_install on PATH but it is not writable; skipping local install."

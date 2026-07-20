@@ -11,7 +11,6 @@
 //! `feedback_llm_utility_filter.md`).
 
 use std::collections::BTreeSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -20,7 +19,9 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::mappers::shared::{
-    AUTH_SENSITIVE_TAG, is_safe_dir, is_safe_file, route_is_auth_sensitive, should_skip, walk_files,
+    AUTH_SENSITIVE_TAG, CommentSyntax, SOURCE_FILE_CAP, StringMode, collect_source_files,
+    is_safe_dir, is_safe_file, list_dir_subdirs, read_to_string_bounded, route_is_auth_sensitive,
+    should_skip, strip_comments, walk_files,
 };
 use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile};
 
@@ -61,8 +62,9 @@ impl FeatureMapper for JsMapper {
         let mut seeds: Vec<FeatureSeed> = Vec::new();
         let pkg_path = root.join("package.json");
         let pkg_at_root = if is_safe_file(root, &pkg_path) {
-            fs::read_to_string(&pkg_path)
+            read_to_string_bounded(&pkg_path)
                 .ok()
+                .flatten()
                 .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         } else {
             None
@@ -242,29 +244,26 @@ fn package_seeds_for(ctx: &MapperContext, info: &PackageInfo, pm: NodePm) -> Vec
                 tags.push("workspace".to_string());
             }
             out.push(FeatureSeed {
-                title: format!("npm bin `{cmd}`"),
                 summary,
-                kind: FeatureKind::CliCommand,
                 source: "package-json-bin",
                 confidence: FeatureConfidence::High,
-                entry_path: entry_rel,
-                entry_symbol: None,
-                entry_route: None,
-                entry_command: Some(cmd),
-                test_command: None,
-                language,
+                entry_command: Some(cmd.clone()),
                 tags,
-                owned_files: Vec::new(),
                 context_files: vec![SeedFile {
                     path: info.manifest_rel.clone(),
                     reason: "package manifest".to_string(),
                 }],
-                tests: Vec::new(),
                 test_prefixes: vec![
                     "test".to_string(),
                     "tests".to_string(),
                     "__tests__".to_string(),
                 ],
+                ..FeatureSeed::new(
+                    FeatureKind::CliCommand,
+                    language,
+                    format!("npm bin `{cmd}`"),
+                    entry_rel,
+                )
             });
         }
     }
@@ -292,25 +291,21 @@ fn package_seeds_for(ctx: &MapperContext, info: &PackageInfo, pm: NodePm) -> Vec
                 FeatureKind::Config
             };
             out.push(FeatureSeed {
-                title: format!("npm script `{name}`"),
                 summary: format!("package.json script `{name}: {command}`"),
-                kind,
                 source: "package-json-script",
-                confidence: FeatureConfidence::Medium,
-                entry_path: info.manifest_rel.clone(),
                 entry_symbol: Some(name.clone()),
-                entry_route: None,
                 entry_command: Some(name.clone()),
-                test_command: None,
-                language: Language::JavaScript,
                 tags: vec!["javascript".to_string(), "package-script".to_string()],
-                owned_files: Vec::new(),
                 context_files: vec![SeedFile {
                     path: info.manifest_rel.clone(),
                     reason: "package manifest".to_string(),
                 }],
-                tests: Vec::new(),
-                test_prefixes: Vec::new(),
+                ..FeatureSeed::new(
+                    kind,
+                    Language::JavaScript,
+                    format!("npm script `{name}`"),
+                    info.manifest_rel.clone(),
+                )
             });
         }
     }
@@ -373,21 +368,14 @@ fn package_seeds_for(ctx: &MapperContext, info: &PackageInfo, pm: NodePm) -> Vec
             });
         }
         out.push(FeatureSeed {
-            title: format!("Node package `{package_name}`"),
             summary,
-            kind: FeatureKind::Library,
             source: "node-package",
-            confidence: FeatureConfidence::Medium,
-            entry_path: info.manifest_rel.clone(),
-            entry_symbol: Some(package_name),
-            entry_route: None,
+            entry_symbol: Some(package_name.clone()),
             // entry_command stays None on library features — it's part of
             // the feature_id hash and would destabilize identity whenever
             // the project's test script (or package manager) changed.
             // The runnable test invocation goes in test_command instead.
-            entry_command: None,
             test_command: test_cmd.clone(),
-            language: Language::JavaScript,
             tags: vec![
                 "javascript".to_string(),
                 "package".to_string(),
@@ -395,8 +383,13 @@ fn package_seeds_for(ctx: &MapperContext, info: &PackageInfo, pm: NodePm) -> Vec
             ],
             owned_files,
             context_files,
-            tests: Vec::new(),
             test_prefixes: vec!["__tests__".to_string(), "tests".to_string()],
+            ..FeatureSeed::new(
+                FeatureKind::Library,
+                Language::JavaScript,
+                format!("Node package `{package_name}`"),
+                info.manifest_rel.clone(),
+            )
         });
     }
 
@@ -435,7 +428,7 @@ fn discover_packages(root: &Path, root_pkg: Option<&Value>) -> Vec<PackageInfo> 
         if !is_safe_file(root, &abs) {
             continue;
         }
-        let Ok(raw) = fs::read_to_string(&abs) else {
+        let Ok(Some(raw)) = read_to_string_bounded(&abs) else {
             continue;
         };
         let Ok(pkg) = serde_json::from_str::<Value>(&raw) else {
@@ -462,7 +455,7 @@ fn workspace_patterns(root: &Path, root_pkg: Option<&Value>) -> Vec<String> {
     }
     let pnpm_ws = root.join("pnpm-workspace.yaml");
     if is_safe_file(root, &pnpm_ws)
-        && let Ok(raw) = fs::read_to_string(&pnpm_ws)
+        && let Ok(Some(raw)) = read_to_string_bounded(&pnpm_ws)
     {
         for p in parse_pnpm_workspace(&raw) {
             patterns.insert(p);
@@ -745,55 +738,21 @@ fn discover_into(root: &Path, prefix: &str, remaining_depth: usize, out: &mut Ve
     }
 }
 
-/// Enumerate immediate child directories under `<root>/<prefix>`, honoring
-/// `.gitignore`. Workspace discovery (`packages/*`, `apps/*`, …) drives
-/// `find_feature` routing, so a gitignored workspace must NOT be surfaced
-/// as a feature — it'd point at files the structural indexer skipped.
-/// Uses `ignore::WalkBuilder` with `max_depth(1)` to get gitignore-aware
-/// listing in one shot. Falls back to plain `fs::read_dir` only if the
-/// walker fails to construct.
+/// Enumerate immediate child directory NAMES under `<root>/<prefix>`,
+/// honoring `.gitignore` and the shared skip rules. Workspace discovery
+/// (`packages/*`, `apps/*`, …) drives `find_feature` routing, so a
+/// gitignored workspace must NOT be surfaced as a feature — it'd point at
+/// files the structural indexer skipped.
 fn safe_directory_entries(root: &Path, prefix: &str) -> Vec<String> {
     let dir = if prefix.is_empty() {
         root.to_path_buf()
     } else {
         root.join(prefix)
     };
-    if !is_safe_dir(root, &dir) {
-        return Vec::new();
-    }
-    let walker = ignore::WalkBuilder::new(&dir)
-        .max_depth(Some(1))
-        .hidden(true)
-        .git_ignore(true)
-        .require_git(false)
-        .build();
-    let mut out: Vec<String> = Vec::new();
-    for entry in walker.flatten() {
-        // WalkBuilder yields the root dir itself at depth 0; skip it.
-        if entry.path() == dir {
-            continue;
-        }
-        let Some(ft) = entry.file_type() else {
-            continue;
-        };
-        if !ft.is_dir() || ft.is_symlink() {
-            continue;
-        }
-        let Some(name) = entry.file_name().to_str().map(String::from) else {
-            continue;
-        };
-        let rel = if prefix.is_empty() {
-            name.clone()
-        } else {
-            format!("{prefix}/{name}")
-        };
-        if should_skip(&rel) {
-            continue;
-        }
-        out.push(name);
-    }
-    out.sort();
-    out
+    list_dir_subdirs(root, &dir, None)
+        .into_iter()
+        .filter_map(|rel| rel.rsplit('/').next().map(String::from))
+        .collect()
 }
 
 // ---- Per-package helpers ------------------------------------------------
@@ -913,28 +872,27 @@ fn package_relative_path(package_root: &str, path: &str) -> String {
 /// other seeds (or not at all). Excludes the manifest itself; callers
 /// dedupe it back in.
 fn workspace_source_files(ctx: &MapperContext, workspace_root: &str) -> Vec<String> {
-    const CAP: usize = 2_000;
     let root = ctx.root;
     let dir = if workspace_root.is_empty() {
         root.to_path_buf()
     } else {
         root.join(workspace_root)
     };
-    if !is_safe_dir(root, &dir) {
-        return Vec::new();
-    }
-    let mut out: Vec<String> = Vec::new();
-    for rel in walk_files(root, &dir, 10_000, ctx.excludes) {
-        if !is_reviewable_node_source(&rel) {
-            continue;
-        }
-        out.push(rel);
-        if out.len() >= CAP {
-            break;
-        }
-    }
-    out.sort();
-    out
+    collect_source_files(
+        ctx,
+        &[dir],
+        10_000,
+        has_node_source_ext,
+        |rel| !is_reviewable_node_source(rel),
+        SOURCE_FILE_CAP,
+    )
+}
+
+fn has_node_source_ext(path: &str) -> bool {
+    ends_with_any(
+        &path.to_ascii_lowercase(),
+        &[".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"],
+    )
 }
 
 /// Match what clawpatch's `isReviewableNodeSourceFile` accepts but without
@@ -942,11 +900,7 @@ fn workspace_source_files(ctx: &MapperContext, workspace_root: &str) -> Vec<Stri
 /// attach a sensible owned-file set to each workspace feature for routing.
 fn is_reviewable_node_source(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    let has_source_ext = ends_with_any(
-        &lower,
-        &[".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"],
-    );
-    if !has_source_ext {
+    if !has_node_source_ext(path) {
         return false;
     }
     if ends_with_any(
@@ -1038,30 +992,26 @@ fn next_app_routes_at(ctx: &MapperContext, package_rel: &str) -> Result<Vec<Feat
             tags.push("workspace".to_string());
         }
         out.push(FeatureSeed {
-            title: format!("Next.js {} `{url}`", if is_page { "page" } else { "route" }),
             summary: if package_rel.is_empty() {
                 format!("Next.js app router file at {rel}")
             } else {
                 format!("Next.js app router file at {rel} (package {package_rel})")
             },
-            kind: FeatureKind::Route,
             source: if is_page {
                 "next-app-page"
             } else {
                 "next-app-route"
             },
             confidence: FeatureConfidence::High,
-            entry_path: rel.clone(),
-            entry_symbol: None,
-            entry_route: Some(url),
-            entry_command: None,
-            test_command: None,
-            language,
+            entry_route: Some(url.clone()),
             tags,
-            owned_files: Vec::new(),
-            context_files: Vec::new(),
-            tests: Vec::new(),
             test_prefixes: vec!["__tests__".to_string(), "tests".to_string()],
+            ..FeatureSeed::new(
+                FeatureKind::Route,
+                language,
+                format!("Next.js {} `{url}`", if is_page { "page" } else { "route" }),
+                rel.clone(),
+            )
         });
     }
     Ok(out)
@@ -1123,26 +1073,22 @@ fn next_pages_routes_at(ctx: &MapperContext, package_rel: &str) -> Result<Vec<Fe
             tags.push("workspace".to_string());
         }
         out.push(FeatureSeed {
-            title: format!("Next.js page `{url}`"),
             summary: if package_rel.is_empty() {
                 format!("Next.js pages-router file at {rel}")
             } else {
                 format!("Next.js pages-router file at {rel} (package {package_rel})")
             },
-            kind: FeatureKind::Route,
             source: "next-pages-route",
             confidence: FeatureConfidence::High,
-            entry_path: rel.clone(),
-            entry_symbol: None,
-            entry_route: Some(url),
-            entry_command: None,
-            test_command: None,
-            language,
+            entry_route: Some(url.clone()),
             tags,
-            owned_files: Vec::new(),
-            context_files: Vec::new(),
-            tests: Vec::new(),
             test_prefixes: vec!["__tests__".to_string(), "tests".to_string()],
+            ..FeatureSeed::new(
+                FeatureKind::Route,
+                language,
+                format!("Next.js page `{url}`"),
+                rel.clone(),
+            )
         });
     }
     Ok(out)
@@ -1203,7 +1149,7 @@ fn read_turbo_config(root: &Path) -> Option<TurboConfig> {
     if !is_safe_file(root, &path) {
         return None;
     }
-    let raw = fs::read_to_string(&path).ok()?;
+    let raw = read_to_string_bounded(&path).ok().flatten()?;
     let value: Value = serde_json::from_str(&raw).ok()?;
     // Turbo 1.x uses `pipeline`, Turbo 2.x uses `tasks`. Either may
     // declare a `test` key.
@@ -1305,7 +1251,7 @@ fn react_router_routes(ctx: &MapperContext, packages: &[PackageInfo]) -> Result<
                     continue;
                 }
                 let abs = root.join(&rel);
-                let Ok(raw) = fs::read_to_string(&abs) else {
+                let Ok(Some(raw)) = read_to_string_bounded(&abs) else {
                     continue;
                 };
                 if !raw.contains("<Route") {
@@ -1334,19 +1280,13 @@ fn react_router_routes(ctx: &MapperContext, packages: &[PackageInfo]) -> Result<
                     }
                     let language = language_for_entry(&rel);
                     out.push(FeatureSeed {
-                        title: format!("React route `{path}`"),
                         summary: format!(
                             "React Router route '{path}' rendered by <{component}/> (declared in {rel})"
                         ),
-                        kind: FeatureKind::Route,
                         source: "react-router-route",
                         confidence: FeatureConfidence::High,
-                        entry_path: rel.clone(),
                         entry_symbol: Some(component),
-                        entry_route: Some(path),
-                        entry_command: None,
-                        test_command: None,
-                        language,
+                        entry_route: Some(path.clone()),
                         tags: vec![
                             if language == Language::TypeScript {
                                 "typescript"
@@ -1358,10 +1298,13 @@ fn react_router_routes(ctx: &MapperContext, packages: &[PackageInfo]) -> Result<
                             "react".to_string(),
                             "route".to_string(),
                         ],
-                        owned_files: Vec::new(),
-                        context_files: Vec::new(),
-                        tests: Vec::new(),
                         test_prefixes: vec!["__tests__".to_string(), "tests".to_string()],
+                        ..FeatureSeed::new(
+                            FeatureKind::Route,
+                            language,
+                            format!("React route `{path}`"),
+                            rel.clone(),
+                        )
                     });
                 }
             }
@@ -1573,17 +1516,9 @@ fn react_components(
                     "javascript"
                 };
                 out.push(FeatureSeed {
-                    title: format!("React component `{component_name}`"),
                     summary: format!("React component declared in {rel}"),
-                    kind: FeatureKind::Library,
                     source: "react-component",
-                    confidence: FeatureConfidence::Medium,
-                    entry_path: rel.clone(),
-                    entry_symbol: Some(component_name),
-                    entry_route: None,
-                    entry_command: None,
-                    test_command: None,
-                    language,
+                    entry_symbol: Some(component_name.clone()),
                     tags: vec![
                         lang_tag.to_string(),
                         "react".to_string(),
@@ -1593,9 +1528,13 @@ fn react_components(
                         path: rel.clone(),
                         reason: "component implementation".to_string(),
                     }],
-                    context_files: Vec::new(),
-                    tests: Vec::new(),
                     test_prefixes: vec!["__tests__".to_string(), "tests".to_string()],
+                    ..FeatureSeed::new(
+                        FeatureKind::Library,
+                        language,
+                        format!("React component `{component_name}`"),
+                        rel.clone(),
+                    )
                 });
                 per_pkg_count += 1;
             }
@@ -1682,7 +1621,7 @@ fn node_server_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
                 continue;
             }
             let abs = root.join(&rel);
-            let Ok(raw) = fs::read_to_string(&abs) else {
+            let Ok(Some(raw)) = read_to_string_bounded(&abs) else {
                 continue;
             };
             // Cheap pre-filter: skip the regex/parse cost when none of
@@ -1758,7 +1697,6 @@ fn node_server_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
                         tags.push(AUTH_SENSITIVE_TAG.to_string());
                     }
                     out.push(FeatureSeed {
-                        title: format!("{} route `{}`", framework.label(), route_label),
                         summary: format!(
                             "{} route {} declared in {} (receiver `{}`)",
                             framework.label(),
@@ -1766,20 +1704,17 @@ fn node_server_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
                             rel,
                             recv
                         ),
-                        kind: FeatureKind::Route,
                         source: framework.source(),
                         confidence: FeatureConfidence::High,
-                        entry_path: rel.clone(),
-                        entry_symbol: None,
-                        entry_route: Some(route_label),
-                        entry_command: None,
-                        test_command: None,
-                        language,
+                        entry_route: Some(route_label.clone()),
                         tags,
-                        owned_files: Vec::new(),
-                        context_files: Vec::new(),
-                        tests: Vec::new(),
                         test_prefixes: vec!["__tests__".to_string(), "tests".to_string()],
+                        ..FeatureSeed::new(
+                            FeatureKind::Route,
+                            language,
+                            format!("{} route `{}`", framework.label(), route_label),
+                            rel.clone(),
+                        )
                     });
                 }
             }
@@ -1788,23 +1723,13 @@ fn node_server_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
     Ok(out)
 }
 
+/// Test-shaped (canonical JS/TS rules — suffix conventions plus
+/// `__tests__/` and root `tests/` dirs) or a `.d.ts` type declaration.
+/// Every caller is an exclusion scan ("don't treat as source"), so the
+/// broad shape is the right one. The JS and TS arms of the canonical
+/// predicate are identical; one call covers both extension families.
 fn is_node_test_or_decl(rel: &str) -> bool {
-    let suffixes = [
-        ".test.ts",
-        ".test.tsx",
-        ".test.js",
-        ".test.jsx",
-        ".test.mts",
-        ".test.cts",
-        ".test.mjs",
-        ".test.cjs",
-        ".spec.ts",
-        ".spec.tsx",
-        ".spec.js",
-        ".spec.jsx",
-        ".d.ts",
-    ];
-    suffixes.iter().any(|s| rel.ends_with(s))
+    crate::nearby_tests::is_test_file(rel, Language::TypeScript) || rel.ends_with(".d.ts")
 }
 
 /// Blank out the content of `//` / `/* */` comments and `` ` ` ``
@@ -1813,112 +1738,28 @@ fn is_node_test_or_decl(rel: &str) -> bool {
 /// is still capturable while a `\`app.get("/x", h)\`` template literal
 /// won't false-match.
 fn strip_js_comments_and_templates(src: &str) -> String {
-    strip_js_impl(src, false)
+    strip_comments(
+        src,
+        CommentSyntax {
+            hash_line_comments: false,
+            strings: StringMode::Preserve,
+            template_literals: true,
+        },
+    )
 }
 
 /// Like [`strip_js_comments_and_templates`] but also blanks `"…"` and
 /// `'…'`. Used by the constructor scan, which is identifier-only and
 /// must not match a `"const app = express()"` string literal.
 fn strip_js_comments_strings_and_templates(src: &str) -> String {
-    strip_js_impl(src, true)
-}
-
-fn strip_js_impl(src: &str, blank_regular_strings: bool) -> String {
-    let mut out = String::with_capacity(src.len());
-    let mut chars = src.chars().peekable();
-    // Active quote, and whether its content should be blanked. Regular
-    // `"` / `'` strings always have their delimiters preserved; their
-    // body is blanked only when `blank_regular_strings` is set.
-    let mut quote: Option<(char, bool)> = None;
-    let mut escape = false;
-    while let Some(c) = chars.next() {
-        if let Some((q, blank)) = quote {
-            if escape {
-                out.push(blank_or_keep(c, blank));
-                escape = false;
-                continue;
-            }
-            if c == '\\' {
-                escape = true;
-                out.push(if blank { ' ' } else { '\\' });
-                continue;
-            }
-            if c == q {
-                quote = None;
-                out.push(c);
-                continue;
-            }
-            out.push(blank_or_keep(c, blank));
-            continue;
-        }
-        if c == '/' {
-            match chars.peek() {
-                Some('/') => {
-                    chars.next();
-                    out.push(' ');
-                    out.push(' ');
-                    while let Some(&nc) = chars.peek() {
-                        if nc == '\n' {
-                            break;
-                        }
-                        out.push(' ');
-                        chars.next();
-                    }
-                    continue;
-                }
-                Some('*') => {
-                    chars.next();
-                    out.push(' ');
-                    out.push(' ');
-                    while let Some(nc) = chars.next() {
-                        if nc == '*' {
-                            if chars.peek() == Some(&'/') {
-                                chars.next();
-                                out.push(' ');
-                                out.push(' ');
-                                break;
-                            }
-                            out.push(' ');
-                        } else if nc == '\n' {
-                            out.push('\n');
-                        } else {
-                            out.push(' ');
-                        }
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-        }
-        if c == '`' {
-            // Template literal — always blank, even when keeping
-            // regular strings. Embedded `${ … }` interpolation would
-            // need balanced-brace tracking; for our use the false
-            // negative (lost identifiers inside `${}`) is acceptable.
-            quote = Some(('`', true));
-            out.push(c);
-            continue;
-        }
-        if c == '"' || c == '\'' {
-            quote = Some((c, blank_regular_strings));
-            out.push(c);
-            continue;
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// Inside a blanked region, collapse every char to a space except
-/// newlines (preserved so line counts stay roughly aligned). Outside
-/// a blanked region, copy the char through verbatim — full Unicode
-/// scalar, no byte-level mangling.
-fn blank_or_keep(c: char, blank: bool) -> char {
-    if blank {
-        if c == '\n' { '\n' } else { ' ' }
-    } else {
-        c
-    }
+    strip_comments(
+        src,
+        CommentSyntax {
+            hash_line_comments: false,
+            strings: StringMode::BlankContents,
+            template_literals: true,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -2735,7 +2576,7 @@ app.get("/health", (_, res) => res.send("ok"));
 
     #[test]
     fn route_path_preserves_non_ascii_utf8() {
-        // Regression for fnd_b3a1c4e7: byte-level `b as char` mangled
+        // Regression: byte-level `b as char` mangled
         // non-ASCII UTF-8 (`é` C3 A9 → `Ã©` C3 83 C2 A9), corrupting
         // entry_route values and making find_feature(...) miss them.
         // Char-based walk should round-trip cleanly.

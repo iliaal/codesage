@@ -76,6 +76,21 @@ fn list_features_tag_filter_matches_substring_within_compound_tags() {
 }
 
 #[test]
+fn feature_exists_reports_presence_without_hydration() {
+    let db = Database::open_in_memory().expect("open in-memory db");
+    assert!(!db.feature_exists("feat_a").unwrap());
+
+    db.upsert_feature(&make_feature("feat_a", &["route"]))
+        .unwrap();
+    assert!(db.feature_exists("feat_a").unwrap());
+    assert!(!db.feature_exists("feat_missing").unwrap());
+
+    // Must agree with load_feature on both sides.
+    assert!(db.load_feature("feat_a").unwrap().is_some());
+    assert!(db.load_feature("feat_missing").unwrap().is_none());
+}
+
+#[test]
 fn list_features_hydrates_files_and_boundaries_for_each_feature() {
     let db = Database::open_in_memory().expect("open in-memory db");
     let mut first = make_feature("feat_a", &["framework:react-router"]);

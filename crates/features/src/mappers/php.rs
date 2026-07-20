@@ -4,7 +4,6 @@
 //! route extraction. Covers framework-agnostic Composer, php-src internals,
 //! and Laravel without per-app config.
 
-use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -13,7 +12,10 @@ use codesage_protocol::{FeatureConfidence, FeatureKind, Language, Reference, Ref
 use regex::Regex;
 use serde_json::Value;
 
-use crate::mappers::shared::{is_safe_dir, is_safe_file, rel_path};
+use crate::mappers::shared::{
+    CommentSyntax, SOURCE_FILE_CAP, StringMode, collect_source_files, is_safe_dir, is_safe_file,
+    list_dir_files, list_dir_subdirs, read_to_string_bounded, rel_path, strip_comments, walk_files,
+};
 use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile, SeedTest};
 
 pub struct PhpMapper;
@@ -62,7 +64,7 @@ fn read_composer(root: &Path) -> Option<Value> {
     if !is_safe_file(root, &path) {
         return None;
     }
-    let raw = fs::read_to_string(&path).ok()?;
+    let raw = read_to_string_bounded(&path).ok().flatten()?;
     serde_json::from_str(&raw).ok()
 }
 
@@ -84,25 +86,21 @@ fn composer_seeds(root: &Path, composer: &Value) -> Vec<FeatureSeed> {
                 .trim_end_matches(".php")
                 .to_string();
             out.push(FeatureSeed {
-                title: format!("Composer bin `{command}`"),
                 summary: format!("composer.json bin entry at {entry}"),
-                kind: FeatureKind::CliCommand,
                 source: "composer-bin",
                 confidence: FeatureConfidence::High,
-                entry_path: entry,
-                entry_symbol: None,
-                entry_route: None,
-                entry_command: Some(command),
-                test_command: None,
-                language: Language::Php,
+                entry_command: Some(command.clone()),
                 tags: vec!["php".to_string(), "cli".to_string()],
-                owned_files: Vec::new(),
                 context_files: vec![SeedFile {
                     path: "composer.json".to_string(),
                     reason: "package manifest".to_string(),
                 }],
-                tests: Vec::new(),
-                test_prefixes: Vec::new(),
+                ..FeatureSeed::new(
+                    FeatureKind::CliCommand,
+                    Language::Php,
+                    format!("Composer bin `{command}`"),
+                    entry,
+                )
             });
         }
     }
@@ -133,25 +131,22 @@ fn composer_seeds(root: &Path, composer: &Value) -> Vec<FeatureSeed> {
                     continue;
                 }
                 out.push(FeatureSeed {
-                    title: format!("PHP namespace `{ns_clean}`"),
                     summary: format!("PSR-4 autoload root at {entry}/ (namespace {ns_clean})"),
-                    kind: FeatureKind::Library,
                     source: "composer-psr4",
                     confidence: FeatureConfidence::High,
-                    entry_path: entry.clone(),
                     entry_symbol: Some(ns_clean.to_string()),
-                    entry_route: None,
-                    entry_command: None,
-                    test_command: None,
-                    language: Language::Php,
                     tags: vec!["php".to_string(), "library".to_string()],
-                    owned_files: Vec::new(),
                     context_files: vec![SeedFile {
                         path: "composer.json".to_string(),
                         reason: "PSR-4 autoload manifest".to_string(),
                     }],
-                    tests: Vec::new(),
                     test_prefixes: vec!["tests".to_string(), "test".to_string()],
+                    ..FeatureSeed::new(
+                        FeatureKind::Library,
+                        Language::Php,
+                        format!("PHP namespace `{ns_clean}`"),
+                        entry.clone(),
+                    )
                 });
             }
         }
@@ -169,11 +164,8 @@ fn php_src_extensions(root: &Path) -> Result<Vec<FeatureSeed>> {
     if !is_safe_dir(root, &ext_dir) {
         return Ok(out);
     }
-    for entry in fs::read_dir(&ext_dir)?.flatten() {
-        let p = entry.path();
-        if !is_safe_dir(root, &p) {
-            continue;
-        }
+    for sub_rel in list_dir_subdirs(root, &ext_dir, None) {
+        let p = root.join(&sub_rel);
         let has_m4 = is_safe_file(root, &p.join("config.m4"));
         let has_w32 = is_safe_file(root, &p.join("config.w32"));
         if !has_m4 && !has_w32 {
@@ -209,17 +201,9 @@ fn php_src_extensions(root: &Path) -> Result<Vec<FeatureSeed>> {
         // sources (mbstring, intl) doesn't blow up the bundle.
         let owned_files = list_c_sources(root, &p, 40);
         out.push(FeatureSeed {
-            title: format!("PHP extension `{name}` (php-src)"),
             summary: format!("php-src internals extension at {ext_rel}/"),
-            kind: FeatureKind::Library,
             source: "php-ext",
             confidence: FeatureConfidence::High,
-            entry_path: format!("{ext_rel}/{config_basename}"),
-            entry_symbol: None,
-            entry_route: None,
-            entry_command: None,
-            test_command: None,
-            language: Language::Php,
             tags: vec![
                 "php".to_string(),
                 "php-src".to_string(),
@@ -232,6 +216,12 @@ fn php_src_extensions(root: &Path) -> Result<Vec<FeatureSeed>> {
             }],
             tests,
             test_prefixes: vec![format!("{ext_rel}/tests")],
+            ..FeatureSeed::new(
+                FeatureKind::Library,
+                Language::Php,
+                format!("PHP extension `{name}` (php-src)"),
+                format!("{ext_rel}/{config_basename}"),
+            )
         });
         let api_context = php_src_api_context(root, &ext_rel, &name, config_basename);
         out.extend(php_extension_api_seeds(
@@ -250,27 +240,16 @@ fn php_src_extensions(root: &Path) -> Result<Vec<FeatureSeed>> {
 /// keep it). Used by the php-src ext mapper so `find_feature
 /// ext/curl/interface.c` returns the curl extension rather than empty.
 fn list_c_sources(root: &Path, dir: &Path, max: usize) -> Vec<SeedFile> {
-    let mut out = Vec::new();
-    let Ok(entries) = fs::read_dir(dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        if out.len() >= max {
-            break;
-        }
-        let p = entry.path();
-        if let Some(name) = p.file_name().and_then(|s| s.to_str())
-            && (name.ends_with(".c") || name.ends_with(".h") || name.ends_with(".cpp"))
-            && is_safe_file(root, &p)
-        {
-            out.push(SeedFile {
-                path: rel_path(root, &p),
-                reason: "extension source".to_string(),
-            });
-        }
-    }
-    out.sort_by(|a, b| a.path.cmp(&b.path));
-    out
+    list_dir_files(root, dir, None, |rel| {
+        rel.ends_with(".c") || rel.ends_with(".h") || rel.ends_with(".cpp")
+    })
+    .into_iter()
+    .take(max)
+    .map(|path| SeedFile {
+        path,
+        reason: "extension source".to_string(),
+    })
+    .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -292,22 +271,19 @@ fn php_extension_api_seeds(
     php_extension_api_entries(root, dir)
         .into_iter()
         .map(|entry| FeatureSeed {
-            title: entry.title,
             summary: entry.summary,
-            kind: FeatureKind::Library,
             source: entry.source,
             confidence: FeatureConfidence::High,
-            entry_path: entry.entry_path,
             entry_symbol: Some(entry.entry_symbol),
-            entry_route: None,
-            entry_command: None,
-            test_command: None,
-            language: Language::Php,
             tags: entry.tags,
-            owned_files: Vec::new(),
             context_files: context_files.clone(),
-            tests: Vec::new(),
             test_prefixes: test_prefixes.clone(),
+            ..FeatureSeed::new(
+                FeatureKind::Library,
+                Language::Php,
+                entry.title,
+                entry.entry_path,
+            )
         })
         .collect()
 }
@@ -321,36 +297,27 @@ fn php_extension_api_entries(root: &Path, dir: &Path) -> Vec<PhpApiEntry> {
 }
 
 fn php_extension_api_source_files(root: &Path, dir: &Path) -> Vec<String> {
-    let mut out = Vec::new();
-    let Ok(entries) = fs::read_dir(dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let p = entry.path();
-        let Some(fname) = p.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let Some(stem) = fname
-            .strip_suffix(".cpp")
-            .or_else(|| fname.strip_suffix(".cc"))
-            .or_else(|| fname.strip_suffix(".c"))
-        else {
-            continue;
-        };
-        if stem.ends_with("_arginfo") {
-            continue;
-        }
-        if is_safe_file(root, &p) {
-            out.push(rel_path(root, &p));
-        }
-    }
-    out.sort();
-    out
+    // No exclude globs here: this call chain (php-src ext dirs, root-level
+    // extension repos) never had a MapperContext, and the orchestrator's
+    // retain pass drops excluded paths from persisted records anyway.
+    let ctx = MapperContext::for_root(root);
+    collect_source_files(
+        &ctx,
+        &[dir.to_path_buf()],
+        10_000,
+        |rel| rel.ends_with(".c") || rel.ends_with(".cc") || rel.ends_with(".cpp"),
+        |rel| {
+            let base = rel.rsplit('/').next().unwrap_or(rel);
+            let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base);
+            stem.ends_with("_arginfo")
+        },
+        SOURCE_FILE_CAP,
+    )
 }
 
 fn php_api_entries_in_file(root: &Path, entry_path: &str) -> Vec<PhpApiEntry> {
     let path = root.join(entry_path);
-    let Ok(raw) = fs::read_to_string(path) else {
+    let Ok(Some(raw)) = read_to_string_bounded(&path) else {
         return Vec::new();
     };
     let code = strip_c_comments_and_strings(&strip_if_zero_blocks(&raw));
@@ -450,7 +417,7 @@ fn strip_if_zero_blocks(input: &str) -> String {
             && (trimmed.starts_with("#elif") || trimmed == "#else" || trimmed.starts_with("#else "))
         {
             // The `#if 0` arm is dead; a top-level `#elif`/`#else` switches to
-            // an active branch, so stop blanking from here. fnd: CR-039.
+            // an active branch, so stop blanking from here.
             in_if_zero = false;
         }
     }
@@ -479,91 +446,14 @@ fn blank_line_preserve_newline(line: &str) -> String {
 }
 
 fn strip_c_comments_and_strings(input: &str) -> String {
-    enum State {
-        Code,
-        LineComment,
-        BlockComment,
-        DoubleString,
-        SingleString,
-    }
-
-    let mut out = String::with_capacity(input.len());
-    let mut state = State::Code;
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match state {
-            State::Code => match ch {
-                '/' if chars.peek() == Some(&'/') => {
-                    out.push(' ');
-                    chars.next();
-                    out.push(' ');
-                    state = State::LineComment;
-                }
-                '/' if chars.peek() == Some(&'*') => {
-                    out.push(' ');
-                    chars.next();
-                    out.push(' ');
-                    state = State::BlockComment;
-                }
-                '"' => {
-                    out.push(' ');
-                    state = State::DoubleString;
-                }
-                '\'' => {
-                    out.push(' ');
-                    state = State::SingleString;
-                }
-                _ => {
-                    out.push(ch);
-                }
-            },
-            State::LineComment => {
-                if ch == '\n' {
-                    out.push('\n');
-                    state = State::Code;
-                } else {
-                    out.push(' ');
-                }
-            }
-            State::BlockComment => {
-                if ch == '*' && chars.peek() == Some(&'/') {
-                    out.push(' ');
-                    chars.next();
-                    out.push(' ');
-                    state = State::Code;
-                } else {
-                    out.push(if ch == '\n' { '\n' } else { ' ' });
-                }
-            }
-            State::DoubleString => {
-                if ch == '\\' {
-                    out.push(' ');
-                    if let Some(next) = chars.next() {
-                        out.push(if next == '\n' { '\n' } else { ' ' });
-                    }
-                } else if ch == '"' {
-                    out.push(' ');
-                    state = State::Code;
-                } else {
-                    out.push(if ch == '\n' { '\n' } else { ' ' });
-                }
-            }
-            State::SingleString => {
-                if ch == '\\' {
-                    out.push(' ');
-                    if let Some(next) = chars.next() {
-                        out.push(if next == '\n' { '\n' } else { ' ' });
-                    }
-                } else if ch == '\'' {
-                    out.push(' ');
-                    state = State::Code;
-                } else {
-                    out.push(if ch == '\n' { '\n' } else { ' ' });
-                }
-            }
-        }
-    }
-    out
+    strip_comments(
+        input,
+        CommentSyntax {
+            hash_line_comments: false,
+            strings: StringMode::Blank,
+            template_literals: false,
+        },
+    )
 }
 
 /// Blank out PHP comments (`//`, `#`, `/* */`) but keep string contents
@@ -574,90 +464,14 @@ fn strip_c_comments_and_strings(input: &str) -> String {
 /// every stripped char with a space (newlines stay so line numbers line
 /// up with downstream tools that consume the same offsets).
 fn strip_php_comments_preserving_strings(input: &str) -> String {
-    enum State {
-        Code,
-        LineComment,
-        BlockComment,
-        DoubleString,
-        SingleString,
-    }
-
-    let mut out = String::with_capacity(input.len());
-    let mut state = State::Code;
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match state {
-            State::Code => match ch {
-                '/' if chars.peek() == Some(&'/') => {
-                    out.push(' ');
-                    chars.next();
-                    out.push(' ');
-                    state = State::LineComment;
-                }
-                '#' if !matches!(chars.peek(), Some(&'[')) => {
-                    // PHP `#` line comment. The `#[Attribute]` syntax is
-                    // attribute-not-comment; preserve it so attributes
-                    // appearing on route definitions still parse.
-                    out.push(' ');
-                    state = State::LineComment;
-                }
-                '/' if chars.peek() == Some(&'*') => {
-                    out.push(' ');
-                    chars.next();
-                    out.push(' ');
-                    state = State::BlockComment;
-                }
-                '"' => {
-                    out.push('"');
-                    state = State::DoubleString;
-                }
-                '\'' => {
-                    out.push('\'');
-                    state = State::SingleString;
-                }
-                _ => out.push(ch),
-            },
-            State::LineComment => {
-                if ch == '\n' {
-                    out.push('\n');
-                    state = State::Code;
-                } else {
-                    out.push(' ');
-                }
-            }
-            State::BlockComment => {
-                if ch == '*' && chars.peek() == Some(&'/') {
-                    out.push(' ');
-                    chars.next();
-                    out.push(' ');
-                    state = State::Code;
-                } else {
-                    out.push(if ch == '\n' { '\n' } else { ' ' });
-                }
-            }
-            State::DoubleString => {
-                out.push(ch);
-                if ch == '\\' {
-                    if let Some(next) = chars.next() {
-                        out.push(next);
-                    }
-                } else if ch == '"' {
-                    state = State::Code;
-                }
-            }
-            State::SingleString => {
-                out.push(ch);
-                if ch == '\\' {
-                    if let Some(next) = chars.next() {
-                        out.push(next);
-                    }
-                } else if ch == '\'' {
-                    state = State::Code;
-                }
-            }
-        }
-    }
-    out
+    strip_comments(
+        input,
+        CommentSyntax {
+            hash_line_comments: true,
+            strings: StringMode::Preserve,
+            template_literals: false,
+        },
+    )
 }
 
 fn php_src_api_context(
@@ -746,24 +560,10 @@ fn push_seed_file(root: &Path, files: &mut Vec<SeedFile>, path: &str, reason: &s
 }
 
 fn list_phpt_files(root: &Path, dir: &Path, max: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    let Ok(entries) = fs::read_dir(dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        if out.len() >= max {
-            break;
-        }
-        let p = entry.path();
-        if let Some(name) = p.file_name().and_then(|s| s.to_str())
-            && name.ends_with(".phpt")
-            && is_safe_file(root, &p)
-        {
-            out.push(rel_path(root, &p));
-        }
-    }
-    out.sort();
-    out
+    list_dir_files(root, dir, None, |rel| rel.ends_with(".phpt"))
+        .into_iter()
+        .take(max)
+        .collect()
 }
 
 /// PHP extensions distributed via Composer/PIE live at the repo root
@@ -841,17 +641,10 @@ fn php_extension_at_root(root: &Path) -> Result<Vec<FeatureSeed>> {
         }
     }
     seeds.push(FeatureSeed {
-        title: format!("PHP extension `{ext_name}`"),
         summary: format!("PHP extension `{ext_name}` declared by {entry_config} (root-level)"),
-        kind: FeatureKind::Library,
         source: "php-ext-root",
         confidence: FeatureConfidence::High,
-        entry_path: entry_config.to_string(),
         entry_symbol: Some(ext_name.clone()),
-        entry_route: None,
-        entry_command: None,
-        test_command: None,
-        language: Language::Php,
         tags: vec![
             "php".to_string(),
             "php-extension".to_string(),
@@ -859,8 +652,13 @@ fn php_extension_at_root(root: &Path) -> Result<Vec<FeatureSeed>> {
         ],
         owned_files: umbrella_owned,
         context_files: umbrella_ctx,
-        tests: Vec::new(),
         test_prefixes: vec!["tests".to_string()],
+        ..FeatureSeed::new(
+            FeatureKind::Library,
+            Language::Php,
+            format!("PHP extension `{ext_name}`"),
+            entry_config.to_string(),
+        )
     });
     let api_context = root_php_extension_api_context(root, &ext_name, entry_config, &header_path);
     seeds.extend(php_extension_api_seeds(
@@ -872,18 +670,8 @@ fn php_extension_at_root(root: &Path) -> Result<Vec<FeatureSeed>> {
 
     // Per-module seeds: `<name>_<part>.{c,cpp,cc}` files at root.
     let prefix = format!("{ext_name}_");
-    let Ok(rd) = fs::read_dir(root) else {
-        return Ok(seeds);
-    };
     let mut module_files: Vec<(String, String)> = Vec::new(); // (filename, stem)
-    for entry in rd.flatten() {
-        let p = entry.path();
-        let Some(fname) = p.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if !fname.starts_with(&prefix) {
-            continue;
-        }
+    for fname in list_dir_files(root, root, None, |rel| rel.starts_with(&prefix)) {
         let Some(stem) = fname
             .strip_suffix(".cpp")
             .or_else(|| fname.strip_suffix(".cc"))
@@ -895,10 +683,8 @@ fn php_extension_at_root(root: &Path) -> Result<Vec<FeatureSeed>> {
         if stem.ends_with("_arginfo") {
             continue;
         }
-        if !is_safe_file(root, &p) {
-            continue;
-        }
-        module_files.push((fname.to_string(), stem.to_string()));
+        let stem = stem.to_string();
+        module_files.push((fname, stem));
     }
     module_files.sort();
     for (fname, stem) in module_files {
@@ -923,17 +709,10 @@ fn php_extension_at_root(root: &Path) -> Result<Vec<FeatureSeed>> {
             });
         }
         seeds.push(FeatureSeed {
-            title: format!("`{ext_name}` extension module `{part}`"),
             summary: format!("PHP extension `{ext_name}` module file {fname}"),
-            kind: FeatureKind::Library,
             source: "php-ext-module",
             confidence: FeatureConfidence::High,
-            entry_path: fname,
             entry_symbol: Some(stem),
-            entry_route: None,
-            entry_command: None,
-            test_command: None,
-            language,
             tags: vec![
                 "php".to_string(),
                 "php-extension".to_string(),
@@ -944,8 +723,13 @@ fn php_extension_at_root(root: &Path) -> Result<Vec<FeatureSeed>> {
                 path: header_path.clone(),
                 reason: "extension public header".to_string(),
             }],
-            tests: Vec::new(),
             test_prefixes: vec!["tests".to_string()],
+            ..FeatureSeed::new(
+                FeatureKind::Library,
+                language,
+                format!("`{ext_name}` extension module `{part}`"),
+                fname,
+            )
         });
     }
     Ok(seeds)
@@ -967,22 +751,13 @@ fn detect_root_extension_name(root: &Path) -> Option<String> {
             return Some(dir_name);
         }
     }
-    let rd = fs::read_dir(root).ok()?;
     let mut candidates: Vec<String> = Vec::new();
-    for entry in rd.flatten() {
-        let p = entry.path();
-        let Some(fname) = p.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if !fname.starts_with("php_") || !fname.ends_with(".h") {
-            continue;
-        }
-        if fname.contains("_arginfo") || fname.contains("_internal") {
-            continue;
-        }
-        if !is_safe_file(root, &p) {
-            continue;
-        }
+    for fname in list_dir_files(root, root, None, |rel| {
+        rel.starts_with("php_")
+            && rel.ends_with(".h")
+            && !rel.contains("_arginfo")
+            && !rel.contains("_internal")
+    }) {
         if let Some(stem) = fname
             .strip_prefix("php_")
             .and_then(|s| s.strip_suffix(".h"))
@@ -1064,12 +839,15 @@ fn parse_laravel_routes(root: &Path) -> Result<Vec<LaravelRoute>> {
             continue;
         }
         let rel = rel_path(root, &path);
-        let raw = fs::read_to_string(&path).unwrap_or_default();
+        let raw = read_to_string_bounded(&path)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         // Strip PHP comments before the route regexes so commented-out
         // `Route::get(...)` lines don't produce phantom feature seeds.
         // Strings are preserved (route patterns are string literals);
         // byte offsets are stable so `consumed_spans` cross-pass dedupe
-        // remains valid. fnd_4a2842c3.
+        // remains valid.
         let scanned = strip_php_comments_preserving_strings(&raw);
         let imports = parse_php_use_imports(&raw);
         let file_prefixes = file_default_route_prefixes(file);
@@ -1382,26 +1160,22 @@ fn laravel_route_seeds(routes: &[LaravelRoute]) -> Vec<FeatureSeed> {
         .map(|r| {
             let route = format!("{} {}", r.verb, r.pattern);
             FeatureSeed {
-                title: format!("Laravel route `{route}`"),
                 summary: format!("Route registered in {}", r.file),
-                kind: FeatureKind::Route,
                 source: "laravel-route",
                 confidence: FeatureConfidence::High,
-                entry_path: r.file.clone(),
-                entry_symbol: None,
-                entry_route: Some(route),
-                entry_command: None,
-                test_command: None,
-                language: Language::Php,
+                entry_route: Some(route.clone()),
                 tags: vec![
                     "php".to_string(),
                     "framework:laravel".to_string(),
                     "route".to_string(),
                 ],
-                owned_files: Vec::new(),
-                context_files: Vec::new(),
-                tests: Vec::new(),
                 test_prefixes: vec!["tests/Feature".to_string(), "tests".to_string()],
+                ..FeatureSeed::new(
+                    FeatureKind::Route,
+                    Language::Php,
+                    format!("Laravel route `{route}`"),
+                    r.file.clone(),
+                )
             }
         })
         .collect()
@@ -1442,7 +1216,10 @@ fn laravel_controllers(root: &Path, routes: &[LaravelRoute]) -> Result<Vec<Featu
     let mut out = Vec::with_capacity(files.len());
     for rel in files {
         let abs = root.join(&rel);
-        let raw = fs::read_to_string(&abs).unwrap_or_default();
+        let raw = read_to_string_bounded(&abs)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let class_short = rel
             .rsplit('/')
             .next()
@@ -1492,17 +1269,11 @@ fn laravel_controllers(root: &Path, routes: &[LaravelRoute]) -> Result<Vec<Featu
             .first()
             .map(|r| format!("{} {}", r.verb, r.pattern));
         out.push(FeatureSeed {
-            title: format!("Laravel controller `{class_short}`"),
             summary: route_summary,
-            kind: FeatureKind::Route,
             source: "laravel-controller",
             confidence: FeatureConfidence::High,
-            entry_path: rel.clone(),
-            entry_symbol: Some(class_short),
+            entry_symbol: Some(class_short.clone()),
             entry_route,
-            entry_command: None,
-            test_command: None,
-            language: Language::Php,
             tags: vec![
                 "php".to_string(),
                 "framework:laravel".to_string(),
@@ -1510,12 +1281,17 @@ fn laravel_controllers(root: &Path, routes: &[LaravelRoute]) -> Result<Vec<Featu
                 "http".to_string(),
             ],
             owned_files: vec![SeedFile {
-                path: rel,
+                path: rel.clone(),
                 reason: "controller".to_string(),
             }],
             context_files: dedup_seed_files(context_files),
-            tests: Vec::new(),
             test_prefixes: vec!["tests/Feature".to_string(), "tests/Unit".to_string()],
+            ..FeatureSeed::new(
+                FeatureKind::Route,
+                Language::Php,
+                format!("Laravel controller `{class_short}`"),
+                rel,
+            )
         });
     }
     Ok(out)
@@ -1540,17 +1316,9 @@ fn laravel_form_requests(root: &Path) -> Result<Vec<FeatureSeed>> {
             .unwrap_or("Request")
             .to_string();
         out.push(FeatureSeed {
-            title: format!("Laravel request `{class_short}`"),
             summary: format!("Laravel FormRequest {class_short} in {rel}"),
-            kind: FeatureKind::Route,
             source: "laravel-request",
-            confidence: FeatureConfidence::Medium,
-            entry_path: rel.clone(),
-            entry_symbol: Some(class_short),
-            entry_route: None,
-            entry_command: None,
-            test_command: None,
-            language: Language::Php,
+            entry_symbol: Some(class_short.clone()),
             tags: vec![
                 "php".to_string(),
                 "framework:laravel".to_string(),
@@ -1558,12 +1326,16 @@ fn laravel_form_requests(root: &Path) -> Result<Vec<FeatureSeed>> {
                 "validation".to_string(),
             ],
             owned_files: vec![SeedFile {
-                path: rel,
+                path: rel.clone(),
                 reason: "form request".to_string(),
             }],
-            context_files: Vec::new(),
-            tests: Vec::new(),
             test_prefixes: vec!["tests/Feature".to_string(), "tests/Unit".to_string()],
+            ..FeatureSeed::new(
+                FeatureKind::Route,
+                Language::Php,
+                format!("Laravel request `{class_short}`"),
+                rel,
+            )
         });
     }
     Ok(out)
@@ -1585,7 +1357,10 @@ fn laravel_artisan_commands(root: &Path) -> Result<Vec<FeatureSeed>> {
     let mut out = Vec::with_capacity(files.len());
     for rel in files {
         let abs = root.join(&rel);
-        let raw = fs::read_to_string(&abs).unwrap_or_default();
+        let raw = read_to_string_bounded(&abs)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let class_short = rel
             .rsplit('/')
             .next()
@@ -1597,20 +1372,14 @@ fn laravel_artisan_commands(root: &Path) -> Result<Vec<FeatureSeed>> {
             .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
         let cmd_name = signature.clone().unwrap_or_else(|| class_short.clone());
         out.push(FeatureSeed {
-            title: format!("Laravel command `{cmd_name}`"),
             summary: match &signature {
                 Some(s) => format!("Laravel Artisan command '{s}' in {rel}"),
                 None => format!("Laravel Artisan command {class_short}."),
             },
-            kind: FeatureKind::CliCommand,
             source: "laravel-artisan-command",
             confidence: FeatureConfidence::High,
-            entry_path: rel.clone(),
             entry_symbol: Some(class_short),
-            entry_route: None,
-            entry_command: Some(cmd_name),
-            test_command: None,
-            language: Language::Php,
+            entry_command: Some(cmd_name.clone()),
             tags: vec![
                 "php".to_string(),
                 "framework:laravel".to_string(),
@@ -1618,12 +1387,16 @@ fn laravel_artisan_commands(root: &Path) -> Result<Vec<FeatureSeed>> {
                 "cli".to_string(),
             ],
             owned_files: vec![SeedFile {
-                path: rel,
+                path: rel.clone(),
                 reason: "Artisan command".to_string(),
             }],
-            context_files: Vec::new(),
-            tests: Vec::new(),
             test_prefixes: vec!["tests/Feature".to_string(), "tests/Unit".to_string()],
+            ..FeatureSeed::new(
+                FeatureKind::CliCommand,
+                Language::Php,
+                format!("Laravel command `{cmd_name}`"),
+                rel,
+            )
         });
     }
     Ok(out)
@@ -1677,17 +1450,10 @@ fn composer_script_seeds(composer: &Value) -> Vec<FeatureSeed> {
             Vec::new()
         };
         out.push(FeatureSeed {
-            title: format!("Composer script `{name}`"),
             summary: format!("Composer script '{name}': {command}"),
-            kind,
             source: "composer-script",
-            confidence: FeatureConfidence::Medium,
-            entry_path: "composer.json".to_string(),
             entry_symbol: Some(name.clone()),
-            entry_route: None,
             entry_command: Some(name.clone()),
-            test_command: None,
-            language: Language::Php,
             tags: vec![
                 "php".to_string(),
                 "composer".to_string(),
@@ -1697,9 +1463,13 @@ fn composer_script_seeds(composer: &Value) -> Vec<FeatureSeed> {
                 path: "composer.json".to_string(),
                 reason: "composer script".to_string(),
             }],
-            context_files: Vec::new(),
             tests,
-            test_prefixes: Vec::new(),
+            ..FeatureSeed::new(
+                kind,
+                Language::Php,
+                format!("Composer script `{name}`"),
+                "composer.json",
+            )
         });
     }
     out
@@ -1756,7 +1526,6 @@ fn laravel_project_seed(root: &Path, composer: Option<&Value>) -> Result<Vec<Fea
     }
     let entry_path = owned[0].path.clone();
     Ok(vec![FeatureSeed {
-        title: format!("Laravel project `{project_name}`"),
         summary: format!(
             "Laravel project metadata in {}",
             owned
@@ -1765,15 +1534,9 @@ fn laravel_project_seed(root: &Path, composer: Option<&Value>) -> Result<Vec<Fea
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        kind: FeatureKind::Service,
         source: "laravel-project",
         confidence: FeatureConfidence::High,
-        entry_path,
-        entry_symbol: Some(project_name),
-        entry_route: None,
-        entry_command: None,
-        test_command: None,
-        language: Language::Php,
+        entry_symbol: Some(project_name.clone()),
         tags: vec![
             "php".to_string(),
             "framework:laravel".to_string(),
@@ -1781,8 +1544,13 @@ fn laravel_project_seed(root: &Path, composer: Option<&Value>) -> Result<Vec<Fea
         ],
         owned_files: owned,
         context_files: context,
-        tests: Vec::new(),
         test_prefixes: vec!["tests".to_string()],
+        ..FeatureSeed::new(
+            FeatureKind::Service,
+            Language::Php,
+            format!("Laravel project `{project_name}`"),
+            entry_path,
+        )
     }])
 }
 
@@ -1814,25 +1582,21 @@ fn laravel_class_dir_seeds(
             .unwrap_or("Class")
             .to_string();
         out.push(FeatureSeed {
-            title: format!("{title_prefix} `{class_short}`"),
             summary: format!("{summary_prefix} {class_short} in {rel}"),
-            kind,
             source,
-            confidence: FeatureConfidence::Medium,
-            entry_path: rel.clone(),
-            entry_symbol: Some(class_short),
-            entry_route: None,
-            entry_command: None,
-            test_command: None,
-            language: Language::Php,
+            entry_symbol: Some(class_short.clone()),
             tags: tags.iter().map(|s| s.to_string()).collect(),
             owned_files: vec![SeedFile {
-                path: rel,
+                path: rel.clone(),
                 reason: title_prefix.to_lowercase(),
             }],
-            context_files: Vec::new(),
-            tests: Vec::new(),
             test_prefixes: vec!["tests/Feature".to_string(), "tests/Unit".to_string()],
+            ..FeatureSeed::new(
+                kind,
+                Language::Php,
+                format!("{title_prefix} `{class_short}`"),
+                rel,
+            )
         });
     }
     Ok(out)
@@ -1931,22 +1695,17 @@ fn laravel_grouped_dir_seed(
         })
         .collect();
     Ok(vec![FeatureSeed {
-        title: format!("{title} (`{dir}`)"),
         summary: format!("{title} grouped from {dir} ({} files)", files.len()),
-        kind: FeatureKind::Config,
         source,
-        confidence: FeatureConfidence::Medium,
-        entry_path: dir.to_string(),
         entry_symbol: Some(dir.to_string()),
-        entry_route: None,
-        entry_command: None,
-        test_command: None,
-        language: Language::Php,
         tags: tags.iter().map(|s| s.to_string()).collect(),
         owned_files,
-        context_files: Vec::new(),
-        tests: Vec::new(),
-        test_prefixes: Vec::new(),
+        ..FeatureSeed::new(
+            FeatureKind::Config,
+            Language::Php,
+            format!("{title} (`{dir}`)"),
+            dir,
+        )
     }])
 }
 
@@ -1975,17 +1734,11 @@ fn laravel_test_suites(root: &Path) -> Result<Vec<FeatureSeed>> {
             })
             .collect();
         out.push(FeatureSeed {
-            title: format!("Laravel {suite} tests"),
             summary: format!("PHPUnit / Pest {suite} suite ({} files)", files.len()),
-            kind: FeatureKind::TestSuite,
             source: "laravel-test-suite",
             confidence: FeatureConfidence::High,
-            entry_path: rel.clone(),
             entry_symbol: Some(format!("tests/{suite}")),
-            entry_route: None,
-            entry_command: None,
             test_command: Some("composer test".to_string()),
-            language: Language::Php,
             tags: vec![
                 "php".to_string(),
                 "framework:laravel".to_string(),
@@ -1993,9 +1746,12 @@ fn laravel_test_suites(root: &Path) -> Result<Vec<FeatureSeed>> {
                 suite.to_lowercase(),
             ],
             owned_files,
-            context_files: Vec::new(),
-            tests: Vec::new(),
-            test_prefixes: Vec::new(),
+            ..FeatureSeed::new(
+                FeatureKind::TestSuite,
+                Language::Php,
+                format!("Laravel {suite} tests"),
+                rel.clone(),
+            )
         });
     }
     Ok(out)
@@ -2011,40 +1767,14 @@ fn php_declared_class_fqcn(source: &str) -> Option<String> {
 }
 
 fn walk_php_files(root: &Path, dir: &Path, max: usize) -> Vec<String> {
-    fn recurse(root: &Path, dir: &Path, max: usize, out: &mut Vec<String>) {
-        if out.len() >= max {
-            return;
-        }
-        let Ok(rd) = fs::read_dir(dir) else { return };
-        for entry in rd.flatten() {
-            if out.len() >= max {
-                return;
-            }
-            let p = entry.path();
-            if let Ok(meta) = fs::symlink_metadata(&p) {
-                if meta.file_type().is_symlink() {
-                    continue;
-                }
-                if meta.is_dir() {
-                    // Skip dependency / VCS trees even when a caller points us
-                    // at a directory that contains them. fnd: CR-021.
-                    let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                    if matches!(name, "vendor" | "node_modules" | ".git") {
-                        continue;
-                    }
-                    recurse(root, &p, max, out);
-                } else if meta.is_file()
-                    && p.extension().and_then(|s| s.to_str()) == Some("php")
-                    && is_safe_file(root, &p)
-                {
-                    out.push(rel_path(root, &p));
-                }
-            }
-        }
-    }
-    let mut out = Vec::new();
-    recurse(root, dir, max, &mut out);
-    out.sort();
+    // Raw-walk cap: `max` counts .php files, but walk_files caps total
+    // entries walked. 20x headroom covers directories where .php files are
+    // a minority without unbounding the walk.
+    let mut out: Vec<String> = walk_files(root, dir, max.saturating_mul(20), None)
+        .into_iter()
+        .filter(|rel| rel.ends_with(".php"))
+        .collect();
+    out.truncate(max);
     out
 }
 
@@ -2170,7 +1900,7 @@ Route::post('/api/login', [LoginController::class, 'store']);
 
     #[test]
     fn laravel_route_ignores_commented_out_routes() {
-        // Regression for fnd_4a2842c3: PHP comments around `Route::*`
+        // Regression: PHP comments around `Route::*`
         // calls used to slip through the route regex and produce phantom
         // laravel-route seeds. Cover `//`, `#`, and `/* */` since all
         // three are valid PHP comment forms.

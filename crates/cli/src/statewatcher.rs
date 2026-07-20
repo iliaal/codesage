@@ -7,10 +7,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use codesage_embed::config::EmbeddingConfig;
 use codesage_embed::model::Embedder;
-use codesage_graph::{
-    index_files, list_dependencies, remove_files, semantic_index_files, semantic_remove_files,
+use codesage_graph::{index_files, remove_files, semantic_index_files, semantic_remove_files};
+use codesage_parser::detect::{
+    detect_language, detect_language_with_dialect, is_unambiguous_cpp_extension,
 };
-use codesage_parser::detect::detect_language;
 use codesage_parser::discover::{WatchFilter, content_hash};
 use codesage_protocol::FileInfo;
 use codesage_storage::Database;
@@ -24,6 +24,11 @@ const DEFAULT_DEBOUNCE_MS: u64 = 1000;
 const BATCH_THRESHOLD: usize = 10;
 const BATCH_WINDOW: Duration = Duration::from_secs(3);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// After a completed bulk pass, suppress threshold-triggered bulk passes for
+/// this window. The burst's events keep arriving from the channel while the
+/// pass runs and would re-cross the threshold every `BATCH_THRESHOLD` replayed
+/// events — one checkout would otherwise trigger ~N/10 full-repo passes.
+const BULK_COOLDOWN: Duration = Duration::from_secs(3);
 const DEFAULT_IDLE_SECS: u64 = 1800;
 /// Give up on a set of removals after this many consecutive hard failures.
 /// A persistent failure (disk full, EACCES, corrupt table) will never clear,
@@ -123,10 +128,11 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     let project_root = config.project_root.clone();
 
+    // Errors are forwarded, not dropped: an Err from the backend (inotify
+    // queue overflow, rescan-needed) means events were lost, and the loop
+    // must schedule a reconciliation pass or those edits stay unindexed.
     let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-        if let Ok(event) = res {
-            let _ = tx.send(event);
-        }
+        let _ = tx.send(res);
     })
     .context("creating filesystem watcher")?;
 
@@ -147,9 +153,11 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
     let mut currently_indexing: HashSet<PathBuf> = HashSet::new();
     let mut recheck_queue: HashSet<PathBuf> = HashSet::new();
     let mut bulk_retry_at: Option<Instant> = None;
+    let mut bulk_cooldown_until: Option<Instant> = None;
     let mut removal_retry_at: Option<Instant> = None;
     let mut removal_fail_count: u32 = 0;
     let mut last_activity = Instant::now();
+    let mut header_is_cpp = header_dialect_is_cpp(&config.db_path);
 
     tracing::info!(
         root = %config.project_root.display(),
@@ -160,7 +168,7 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
 
     let exit_reason = loop {
         match rx.recv_timeout(POLL_INTERVAL) {
-            Ok(event) => {
+            Ok(Ok(event)) => {
                 for path in &event.paths {
                     // A newly created top-level directory needs its own watch:
                     // the root is watched non-recursively, so new top-level
@@ -186,6 +194,17 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
                     let rel_str = rel.to_string_lossy().to_string();
                     match event.kind {
                         EventKind::Create(_) | EventKind::Modify(_) => {
+                            // First C++ file of the session: from here on,
+                            // edited `.h` headers parse as C++, matching what
+                            // the discovery layer would derive for this tree.
+                            if !header_is_cpp
+                                && rel
+                                    .extension()
+                                    .and_then(|e| e.to_str())
+                                    .is_some_and(is_unambiguous_cpp_extension)
+                            {
+                                header_is_cpp = true;
+                            }
                             // A re-creation cancels a still-queued removal for
                             // the same path; otherwise a removal deferred on
                             // lock contention would fire later and delete the
@@ -205,20 +224,61 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
                 batch_event_times.retain(|t| now - *t < BATCH_WINDOW);
 
                 if batch_event_times.len() >= BATCH_THRESHOLD {
+                    let burst = batch_event_times.len();
+                    batch_event_times.clear();
+                    if in_bulk_cooldown(bulk_cooldown_until, now) {
+                        // Backlog replay: these events queued while the
+                        // just-finished bulk pass ran, and that pass already
+                        // observed the post-burst tree. Defer to one catch-up
+                        // pass at cooldown expiry instead of re-running a full
+                        // pass per BATCH_THRESHOLD replayed events. The Skipped
+                        // disposition keeps every event queued, so an edit
+                        // the pass raced past is never lost.
+                        bulk_retry_at = apply_bulk_outcome(
+                            WorkOutcome::Skipped,
+                            &mut pending,
+                            &mut removed_paths,
+                            Instant::now(),
+                            debounce,
+                            bulk_cooldown_until,
+                        );
+                        continue;
+                    }
                     tracing::info!(
-                        count = batch_event_times.len(),
+                        count = burst,
                         "batch threshold reached, triggering bulk incremental index"
                     );
-                    batch_event_times.clear();
+                    let outcome = run_bulk_incremental(&config, &mut embedder);
+                    bulk_cooldown_until = bulk_cooldown_after(outcome, Instant::now());
+                    if outcome == WorkOutcome::Done {
+                        // Unconditional: a bulk pass can also delete the last
+                        // C++ file, which must un-flip header parsing without
+                        // a watcher restart.
+                        header_is_cpp = header_dialect_is_cpp(&config.db_path);
+                    }
                     bulk_retry_at = apply_bulk_outcome(
-                        run_bulk_incremental(&config, &mut embedder),
+                        outcome,
                         &mut pending,
                         &mut removed_paths,
                         Instant::now(),
                         debounce,
+                        bulk_cooldown_until,
                     );
                     continue;
                 }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    "filesystem watcher reported an error; scheduling bulk reconciliation pass"
+                );
+                bulk_retry_at = schedule_watch_error_catchup(
+                    &mut pending,
+                    &mut removed_paths,
+                    Instant::now(),
+                    debounce,
+                    bulk_cooldown_until,
+                );
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break "watcher channel closed",
@@ -236,6 +296,7 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
                 &mut recheck_queue,
                 &filter,
                 &mut embedder,
+                header_is_cpp,
             );
             break "shutdown";
         }
@@ -250,12 +311,18 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
         if let Some(at) = bulk_retry_at
             && Instant::now() >= at
         {
+            let outcome = run_bulk_incremental(&config, &mut embedder);
+            bulk_cooldown_until = bulk_cooldown_after(outcome, Instant::now());
+            if outcome == WorkOutcome::Done {
+                header_is_cpp = header_dialect_is_cpp(&config.db_path);
+            }
             bulk_retry_at = apply_bulk_outcome(
-                run_bulk_incremental(&config, &mut embedder),
+                outcome,
                 &mut pending,
                 &mut removed_paths,
                 Instant::now(),
                 debounce,
+                bulk_cooldown_until,
             );
         }
 
@@ -266,7 +333,11 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
             removal_retry_at = None;
             removal_fail_count = 0;
         } else if removal_retry_at.is_none_or(|at| Instant::now() >= at) {
+            let may_unflip = removed_paths_may_unflip_header(header_is_cpp, &removed_paths);
             let outcome = handle_removals(&config, &removed_paths);
+            if outcome == WorkOutcome::Done && may_unflip {
+                header_is_cpp = header_dialect_is_cpp(&config.db_path);
+            }
             removal_retry_at = apply_removal_outcome(
                 outcome,
                 &mut removed_paths,
@@ -276,15 +347,18 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
             );
         }
 
-        drain_pending(
+        if drain_pending(
             &config,
             &mut pending,
             &mut currently_indexing,
             &mut recheck_queue,
             &filter,
             &mut embedder,
+            header_is_cpp,
             debounce,
-        );
+        ) {
+            header_is_cpp = header_dialect_is_cpp(&config.db_path);
+        }
 
         // Idle clock: only queued or in-flight work counts as activity, so
         // raw FS events that fail the source/ignore filters can't keep the
@@ -293,6 +367,7 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
             || !currently_indexing.is_empty()
             || !recheck_queue.is_empty()
             || !removed_paths.is_empty()
+            || bulk_retry_at.is_some()
         {
             last_activity = Instant::now();
         } else if is_idle(last_activity, config.idle_timeout) {
@@ -315,6 +390,7 @@ fn is_idle(last_activity: Instant, idle_timeout: Duration) -> bool {
     !idle_timeout.is_zero() && last_activity.elapsed() >= idle_timeout
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drain_pending(
     config: &StateWatcherConfig,
     pending: &mut HashMap<PathBuf, Instant>,
@@ -322,8 +398,9 @@ fn drain_pending(
     recheck_queue: &mut HashSet<PathBuf>,
     filter: &WatchFilter,
     embedder: &mut EmbedderHandle,
+    header_is_cpp: bool,
     debounce: Duration,
-) {
+) -> bool {
     let ready = compute_ready(pending, Instant::now(), debounce);
     process_ready(
         config,
@@ -332,8 +409,9 @@ fn drain_pending(
         recheck_queue,
         filter,
         embedder,
+        header_is_cpp,
         ready,
-    );
+    )
 }
 
 fn drain_pending_force(
@@ -343,6 +421,7 @@ fn drain_pending_force(
     recheck_queue: &mut HashSet<PathBuf>,
     filter: &WatchFilter,
     embedder: &mut EmbedderHandle,
+    header_is_cpp: bool,
 ) {
     let ready: Vec<PathBuf> = pending.keys().cloned().collect();
     process_ready(
@@ -352,6 +431,7 @@ fn drain_pending_force(
         recheck_queue,
         filter,
         embedder,
+        header_is_cpp,
         ready,
     );
 }
@@ -369,6 +449,10 @@ fn compute_ready(
         .collect()
 }
 
+/// Returns `true` when a completed reindex purged an unambiguous C++ file
+/// (vanished or emptied on disk) while headers were parsing as C++ — the
+/// caller must re-derive the header dialect, since that purge may have
+/// removed the last C++ file in the index.
 #[allow(clippy::too_many_arguments)]
 fn process_ready(
     config: &StateWatcherConfig,
@@ -377,8 +461,10 @@ fn process_ready(
     recheck_queue: &mut HashSet<PathBuf>,
     filter: &WatchFilter,
     embedder: &mut EmbedderHandle,
+    header_is_cpp: bool,
     ready: Vec<PathBuf>,
-) {
+) -> bool {
+    let mut rederive_header = false;
     for path in ready {
         pending.remove(&path);
 
@@ -394,7 +480,7 @@ fn process_ready(
         }
 
         currently_indexing.insert(path.clone());
-        let outcome = reindex_one(config, &path, embedder);
+        let outcome = reindex_one(config, &path, embedder, header_is_cpp);
         currently_indexing.remove(&path);
 
         // Lock contention: re-queue with a fresh stamp so the retry waits
@@ -402,6 +488,17 @@ fn process_ready(
         if outcome == WorkOutcome::Skipped {
             pending.insert(path, Instant::now());
             continue;
+        }
+
+        if outcome == WorkOutcome::Done
+            && header_is_cpp
+            && path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(is_unambiguous_cpp_extension)
+            && !file_has_content(&config.project_root.join(&path))
+        {
+            rederive_header = true;
         }
 
         if recheck_queue.remove(&path) {
@@ -421,61 +518,47 @@ fn process_ready(
                     pending.insert(path, Instant::now());
                 }
             }
-            continue;
-        }
-
-        // Cascade to direct importers.
-        if embedder.enabled()
-            && let Ok(db) = Database::open(&config.db_path)
-            && let Ok(deps) = list_dependencies(&db, &rel_str)
-        {
-            for importer in &deps.imported_by {
-                let importer_path = PathBuf::from(importer);
-                if !pending.contains_key(&importer_path)
-                    && !currently_indexing.contains(&importer_path)
-                {
-                    pending.insert(importer_path, Instant::now());
-                }
-            }
         }
     }
+    rederive_header
+}
+
+/// Present on disk with at least one byte. A vanished or emptied path had
+/// its index rows purged by `reindex_one`, which is what the header-dialect
+/// re-derivation gate cares about.
+fn file_has_content(abs: &Path) -> bool {
+    std::fs::metadata(abs).is_ok_and(|m| m.len() > 0)
 }
 
 fn reindex_one(
     config: &StateWatcherConfig,
     rel: &Path,
     embedder: &mut EmbedderHandle,
+    header_is_cpp: bool,
 ) -> WorkOutcome {
     let abs = config.project_root.join(rel);
     let rel_str = rel.to_string_lossy().to_string();
 
     let bytes = match std::fs::read(&abs) {
         Ok(b) => b,
+        // A vanished path is a removal, not a failure: notify's inotify
+        // backend reports a rename's old path as a Modify (MOVED_FROM), and
+        // editor swap patterns delete between event and read. Purge the rows
+        // or ghost symbols/chunks persist for the session.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return purge_one_locked(config, &rel_str);
+        }
         Err(e) => {
             tracing::warn!(path = %rel_str, error = %e, "failed to read file for reindex");
             return WorkOutcome::Failed;
         }
     };
     if bytes.is_empty() {
-        let _lock = match lockfile::try_acquire(&config.project_root) {
-            Ok(lockfile::LockOutcome::Acquired(lock)) => Some(lock),
-            Ok(lockfile::LockOutcome::AlreadyHeld) => {
-                tracing::debug!(
-                    path = %rel_str,
-                    "deferring empty-file purge: index lock held by another process"
-                );
-                return WorkOutcome::Skipped;
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "acquiring index lock for empty-file purge");
-                return WorkOutcome::Failed;
-            }
-        };
-        return purge_index_rows(config, std::slice::from_ref(&rel_str));
+        return purge_one_locked(config, &rel_str);
     }
 
     let hash = content_hash(&bytes);
-    let Some(lang) = detect_language(rel) else {
+    let Some(lang) = detect_language_with_dialect(rel, header_is_cpp) else {
         return WorkOutcome::Done;
     };
 
@@ -698,6 +781,105 @@ fn purge_index_rows(config: &StateWatcherConfig, paths: &[String]) -> WorkOutcom
     WorkOutcome::Done
 }
 
+/// Acquire the index lock and purge one path's structural + semantic rows.
+/// For paths whose on-disk state no longer warrants index rows: emptied
+/// files, and paths that vanished between the event and the read.
+fn purge_one_locked(config: &StateWatcherConfig, rel_str: &str) -> WorkOutcome {
+    let _lock = match lockfile::try_acquire(&config.project_root) {
+        Ok(lockfile::LockOutcome::Acquired(lock)) => Some(lock),
+        Ok(lockfile::LockOutcome::AlreadyHeld) => {
+            tracing::debug!(
+                path = %rel_str,
+                "deferring index purge: index lock held by another process"
+            );
+            return WorkOutcome::Skipped;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "acquiring index lock for purge");
+            return WorkOutcome::Failed;
+        }
+    };
+    purge_index_rows(config, &[rel_str.to_string()])
+}
+
+/// Whether this project's bare `.h` headers should be parsed as C++. Mirrors
+/// the discovery layer's rule — an unambiguous C++ extension anywhere in the
+/// file set flips headers — against the indexed `files` table, so a watcher
+/// reindex of an edited header stores the same language a full index would.
+/// Keyed on path extension rather than the stored language column because
+/// `.cu`/`.cuh` files are stored as C++ without implying the header flip.
+///
+/// Cost shape: one scan of the `files` path column (no hashes, no HashMap).
+/// It runs at watcher startup, after every completed bulk pass, and after a
+/// deletion that could have removed the last C++ file — the deletion sites
+/// are gated so pure-C repos never pay it on the event path. The open must
+/// not create a missing database: a reset deletes `index.db`, and a probe
+/// that recreates it empty would make warm-state existence checks pass again.
+fn header_dialect_is_cpp(db_path: &Path) -> bool {
+    let Ok(db) = Database::open_existing(db_path) else {
+        return false;
+    };
+    let Ok(paths) = db.all_file_paths() else {
+        return false;
+    };
+    paths.iter().any(|p| {
+        Path::new(p)
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(is_unambiguous_cpp_extension)
+    })
+}
+
+/// A completed removal pass can only lower the header dialect when the flag
+/// is currently set and one of the removed paths was itself an unambiguous
+/// C++ file — anything else leaves the indexed C++ set intact, so the
+/// re-derivation scan is skipped.
+fn removed_paths_may_unflip_header(header_is_cpp: bool, paths: &[String]) -> bool {
+    header_is_cpp
+        && paths.iter().any(|p| {
+            Path::new(p)
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(is_unambiguous_cpp_extension)
+        })
+}
+
+/// A notify backend error (inotify queue overflow, rescan-needed) means
+/// events were lost: the accumulated queues no longer describe everything
+/// that changed on disk. Schedule a full reconciliation through the bulk
+/// catch-up path — the `Skipped` disposition retains all queued state and
+/// arms `bulk_retry_at` one debounce out, deferred to the end of any active
+/// bulk cooldown. The rescan is never lost, only delayed: the pass that
+/// armed the cooldown already observed the tree, and the catch-up at
+/// cooldown expiry reconciles anything the overflow dropped after that.
+fn schedule_watch_error_catchup(
+    pending: &mut HashMap<PathBuf, Instant>,
+    removed_paths: &mut Vec<String>,
+    now: Instant,
+    debounce: Duration,
+    cooldown_until: Option<Instant>,
+) -> Option<Instant> {
+    apply_bulk_outcome(
+        WorkOutcome::Skipped,
+        pending,
+        removed_paths,
+        now,
+        debounce,
+        cooldown_until,
+    )
+}
+
+/// Cooldown window armed by a completed bulk pass. `Skipped`/`Failed` arm
+/// nothing: their state survives for the retry / per-file fallback, so a
+/// follow-up burst should still be allowed to trigger a fresh pass.
+fn bulk_cooldown_after(outcome: WorkOutcome, now: Instant) -> Option<Instant> {
+    (outcome == WorkOutcome::Done).then(|| now + BULK_COOLDOWN)
+}
+
+fn in_bulk_cooldown(cooldown_until: Option<Instant>, now: Instant) -> bool {
+    cooldown_until.is_some_and(|until| now < until)
+}
+
 /// SQLITE_BUSY / SQLITE_LOCKED are transient — a concurrent daemon reader or
 /// the index-lock holder had the DB write-locked. Retrying after a debounce
 /// clears them, so the caller must retain the work instead of dropping the
@@ -714,15 +896,18 @@ fn is_retryable_db_error(err: &anyhow::Error) -> bool {
 /// clears the state the pass covered. `Skipped` keeps it, restamps
 /// `pending` so the per-file drain doesn't race the bulk retry, and
 /// schedules that retry one debounce out — never sooner, so lock
-/// contention can't turn into a tight respin. `Failed` keeps the state
-/// with its original stamps: the per-file drain becomes the fallback,
-/// with per-file error logging.
+/// contention can't turn into a tight respin, and never inside an active
+/// bulk cooldown: a threshold crossing during the cooldown would otherwise
+/// re-arm a catch-up one debounce later and defeat the cooldown one retry
+/// at a time. `Failed` keeps the state with its original stamps: the
+/// per-file drain becomes the fallback, with per-file error logging.
 fn apply_bulk_outcome(
     outcome: WorkOutcome,
     pending: &mut HashMap<PathBuf, Instant>,
     removed_paths: &mut Vec<String>,
     now: Instant,
     debounce: Duration,
+    cooldown_until: Option<Instant>,
 ) -> Option<Instant> {
     match outcome {
         WorkOutcome::Done => {
@@ -731,10 +916,14 @@ fn apply_bulk_outcome(
             None
         }
         WorkOutcome::Skipped => {
-            for stamp in pending.values_mut() {
-                *stamp = now;
+            let retry_at = cooldown_until.map_or(now + debounce, |cd| (now + debounce).max(cd));
+            // Stamp so nothing becomes drain-ready before the retry fires;
+            // retry_at >= now + debounce keeps this stamp at or after `now`.
+            let stamp = retry_at - debounce;
+            for s in pending.values_mut() {
+                *s = stamp;
             }
-            Some(now + debounce)
+            Some(retry_at)
         }
         WorkOutcome::Failed => None,
     }
@@ -1115,8 +1304,14 @@ mod tests {
         pending.insert(PathBuf::from("a.rs"), now);
         let mut removed = vec!["gone.rs".to_string()];
 
-        let retry =
-            apply_bulk_outcome(WorkOutcome::Done, &mut pending, &mut removed, now, debounce);
+        let retry = apply_bulk_outcome(
+            WorkOutcome::Done,
+            &mut pending,
+            &mut removed,
+            now,
+            debounce,
+            None,
+        );
 
         assert_eq!(retry, None);
         assert!(pending.is_empty());
@@ -1139,6 +1334,7 @@ mod tests {
             &mut removed,
             now,
             debounce,
+            None,
         );
 
         // Everything retained, bulk retry scheduled a full debounce out.
@@ -1166,6 +1362,7 @@ mod tests {
             &mut removed,
             now,
             debounce,
+            None,
         );
 
         // No bulk retry, but the state survives with its original stamps so
@@ -1323,7 +1520,7 @@ mod tests {
 
         let _held = hold_lock(root);
         assert_eq!(
-            reindex_one(&config, Path::new("foo.rs"), &mut embedder),
+            reindex_one(&config, Path::new("foo.rs"), &mut embedder, false),
             WorkOutcome::Skipped
         );
     }
@@ -1368,7 +1565,7 @@ mod tests {
         let mut embedder = EmbedderHandle::new(None);
 
         assert_eq!(
-            reindex_one(&config, Path::new("foo.rs"), &mut embedder),
+            reindex_one(&config, Path::new("foo.rs"), &mut embedder, false),
             WorkOutcome::Done
         );
 
@@ -1421,7 +1618,7 @@ mod tests {
         let mut embedder = EmbedderHandle::new(None);
 
         assert_eq!(
-            reindex_one(&config, Path::new("foo.rs"), &mut embedder),
+            reindex_one(&config, Path::new("foo.rs"), &mut embedder, false),
             WorkOutcome::Done
         );
 
@@ -1482,6 +1679,7 @@ mod tests {
             &mut recheck_queue,
             &filter,
             &mut embedder,
+            false,
             vec![PathBuf::from("foo.rs")],
         );
 
@@ -1495,6 +1693,476 @@ mod tests {
         assert!(compute_ready(&pending, Instant::now(), debounce).is_empty());
         assert!(currently_indexing.is_empty());
         assert!(recheck_queue.is_empty());
+    }
+
+    #[test]
+    fn reindex_one_missing_file_purges_index_rows() {
+        // notify's inotify backend reports a rename's old path as a Modify
+        // event, so a vanished path reaches reindex_one; it must purge the
+        // stale rows rather than fail and strand them for the session.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        let src = "fn foo() {}\n";
+        std::fs::write(root.join("foo.rs"), src).unwrap();
+        let config = test_config(root);
+
+        let db = Database::open(&config.db_path).unwrap();
+        index_files(
+            root,
+            &db,
+            &[FileInfo {
+                path: "foo.rs".to_string(),
+                language: codesage_protocol::Language::Rust,
+                content_hash: content_hash(src.as_bytes()),
+            }],
+            false,
+        )
+        .unwrap();
+        assert!(db.get_file_hash("foo.rs").unwrap().is_some());
+        drop(db);
+
+        std::fs::remove_file(root.join("foo.rs")).unwrap();
+        let mut embedder = EmbedderHandle::new(None);
+
+        assert_eq!(
+            reindex_one(&config, Path::new("foo.rs"), &mut embedder, false),
+            WorkOutcome::Done
+        );
+        let db = Database::open(&config.db_path).unwrap();
+        assert!(
+            db.get_file_hash("foo.rs").unwrap().is_none(),
+            "vanished file must have its index rows purged"
+        );
+    }
+
+    #[test]
+    fn reindex_one_missing_file_defers_when_lock_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        let src = "fn foo() {}\n";
+        std::fs::write(root.join("foo.rs"), src).unwrap();
+        let config = test_config(root);
+
+        let db = Database::open(&config.db_path).unwrap();
+        index_files(
+            root,
+            &db,
+            &[FileInfo {
+                path: "foo.rs".to_string(),
+                language: codesage_protocol::Language::Rust,
+                content_hash: content_hash(src.as_bytes()),
+            }],
+            false,
+        )
+        .unwrap();
+        drop(db);
+
+        std::fs::remove_file(root.join("foo.rs")).unwrap();
+        let mut embedder = EmbedderHandle::new(None);
+
+        let _held = hold_lock(root);
+        assert_eq!(
+            reindex_one(&config, Path::new("foo.rs"), &mut embedder, false),
+            WorkOutcome::Skipped
+        );
+        let db = Database::open(&config.db_path).unwrap();
+        assert!(
+            db.get_file_hash("foo.rs").unwrap().is_some(),
+            "deferred purge must retain the rows for the retry"
+        );
+    }
+
+    #[test]
+    fn reindex_one_stores_header_as_cpp_in_cpp_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        std::fs::write(root.join("api.h"), "struct foo { int x; };\n").unwrap();
+        let config = test_config(root);
+        let mut embedder = EmbedderHandle::new(None);
+
+        assert_eq!(
+            reindex_one(&config, Path::new("api.h"), &mut embedder, true),
+            WorkOutcome::Done
+        );
+
+        let db = Database::open(&config.db_path).unwrap();
+        let lang = db
+            .all_files_with_id_and_language()
+            .unwrap()
+            .into_iter()
+            .find(|(_, p, _)| p == "api.h")
+            .map(|(_, _, l)| l);
+        assert_eq!(
+            lang,
+            Some(codesage_protocol::Language::Cpp),
+            "an edited .h in a C++ project must keep its C++ language row"
+        );
+    }
+
+    #[test]
+    fn reindex_one_stores_header_as_c_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        std::fs::write(root.join("api.h"), "struct foo { int x; };\n").unwrap();
+        let config = test_config(root);
+        let mut embedder = EmbedderHandle::new(None);
+
+        assert_eq!(
+            reindex_one(&config, Path::new("api.h"), &mut embedder, false),
+            WorkOutcome::Done
+        );
+
+        let db = Database::open(&config.db_path).unwrap();
+        let lang = db
+            .all_files_with_id_and_language()
+            .unwrap()
+            .into_iter()
+            .find(|(_, p, _)| p == "api.h")
+            .map(|(_, _, l)| l);
+        assert_eq!(lang, Some(codesage_protocol::Language::C));
+    }
+
+    #[test]
+    fn header_dialect_true_when_indexed_set_has_cpp_extension() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        let config = test_config(root);
+
+        let db = Database::open(&config.db_path).unwrap();
+        db.upsert_file(&FileInfo {
+            path: "src/main.cpp".to_string(),
+            language: codesage_protocol::Language::Cpp,
+            content_hash: "x".to_string(),
+        })
+        .unwrap();
+        db.upsert_file(&FileInfo {
+            path: "src/util.h".to_string(),
+            language: codesage_protocol::Language::Cpp,
+            content_hash: "x".to_string(),
+        })
+        .unwrap();
+        drop(db);
+
+        assert!(header_dialect_is_cpp(&config.db_path));
+    }
+
+    #[test]
+    fn header_dialect_false_for_c_and_cuda_only_sets() {
+        // kernel.cu is stored with language cpp but must not flip headers —
+        // mirrors the discovery layer keeping .cu out of the unambiguous set.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        let config = test_config(root);
+
+        let db = Database::open(&config.db_path).unwrap();
+        db.upsert_file(&FileInfo {
+            path: "src/main.c".to_string(),
+            language: codesage_protocol::Language::C,
+            content_hash: "x".to_string(),
+        })
+        .unwrap();
+        db.upsert_file(&FileInfo {
+            path: "src/kernel.cu".to_string(),
+            language: codesage_protocol::Language::Cpp,
+            content_hash: "x".to_string(),
+        })
+        .unwrap();
+        db.upsert_file(&FileInfo {
+            path: "src/api.h".to_string(),
+            language: codesage_protocol::Language::C,
+            content_hash: "x".to_string(),
+        })
+        .unwrap();
+        drop(db);
+
+        assert!(!header_dialect_is_cpp(&config.db_path));
+    }
+
+    #[test]
+    fn header_dialect_unflips_after_last_cpp_file_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        let config = test_config(root);
+
+        let db = Database::open(&config.db_path).unwrap();
+        db.upsert_file(&FileInfo {
+            path: "src/main.cpp".to_string(),
+            language: codesage_protocol::Language::Cpp,
+            content_hash: "x".to_string(),
+        })
+        .unwrap();
+        db.upsert_file(&FileInfo {
+            path: "src/util.h".to_string(),
+            language: codesage_protocol::Language::Cpp,
+            content_hash: "x".to_string(),
+        })
+        .unwrap();
+        drop(db);
+        assert!(header_dialect_is_cpp(&config.db_path));
+
+        // main.cpp is not on disk, so the removal pass purges its row; the
+        // remaining set (one bare header) no longer proves C++.
+        assert_eq!(
+            handle_removals(&config, &["src/main.cpp".to_string()]),
+            WorkOutcome::Done
+        );
+        assert!(
+            !header_dialect_is_cpp(&config.db_path),
+            "deleting the last C++ file must un-flip the header dialect"
+        );
+    }
+
+    #[test]
+    fn removal_unflip_gate_requires_flag_and_cpp_path() {
+        let cpp = vec!["src/a.cpp".to_string()];
+        let mixed = vec!["x.c".to_string(), "y.hpp".to_string()];
+        let c_and_cuda = vec!["src/a.c".to_string(), "k.cu".to_string()];
+
+        assert!(removed_paths_may_unflip_header(true, &cpp));
+        assert!(removed_paths_may_unflip_header(true, &mixed));
+        // .cu never flipped the dialect, so removing it can't un-flip it.
+        assert!(!removed_paths_may_unflip_header(true, &c_and_cuda));
+        assert!(!removed_paths_may_unflip_header(false, &cpp));
+        assert!(!removed_paths_may_unflip_header(true, &[]));
+    }
+
+    #[test]
+    fn header_dialect_probe_never_creates_a_missing_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        let db_path = root.join(".codesage").join("index.db");
+
+        assert!(!header_dialect_is_cpp(&db_path));
+        assert!(
+            !db_path.exists(),
+            "the dialect probe must not resurrect a reset index"
+        );
+    }
+
+    #[test]
+    fn process_ready_requests_header_rederive_when_cpp_file_vanishes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        let src = "int main() { return 0; }\n";
+        std::fs::write(root.join("main.cpp"), src).unwrap();
+        let config = test_config(root);
+        let filter = WatchFilter::new(root, &config.exclude_patterns).unwrap();
+        let mut embedder = EmbedderHandle::new(None);
+
+        let db = Database::open(&config.db_path).unwrap();
+        index_files(
+            root,
+            &db,
+            &[FileInfo {
+                path: "main.cpp".to_string(),
+                language: codesage_protocol::Language::Cpp,
+                content_hash: content_hash(src.as_bytes()),
+            }],
+            false,
+        )
+        .unwrap();
+        drop(db);
+
+        let mut pending = HashMap::new();
+        let mut currently_indexing = HashSet::new();
+        let mut recheck_queue = HashSet::new();
+
+        // Still present and non-empty: a plain reindex must not request a
+        // re-derivation.
+        let rederive = process_ready(
+            &config,
+            &mut pending,
+            &mut currently_indexing,
+            &mut recheck_queue,
+            &filter,
+            &mut embedder,
+            true,
+            vec![PathBuf::from("main.cpp")],
+        );
+        assert!(!rederive);
+
+        // Vanished (rename reported as Modify): the Done pass purged the
+        // rows, so the caller must re-derive the header dialect.
+        std::fs::remove_file(root.join("main.cpp")).unwrap();
+        let rederive = process_ready(
+            &config,
+            &mut pending,
+            &mut currently_indexing,
+            &mut recheck_queue,
+            &filter,
+            &mut embedder,
+            true,
+            vec![PathBuf::from("main.cpp")],
+        );
+        assert!(rederive, "a purged C++ file must trigger re-derivation");
+        assert!(!header_dialect_is_cpp(&config.db_path));
+    }
+
+    #[test]
+    fn bulk_cooldown_arms_on_done_only() {
+        let now = Instant::now();
+        assert_eq!(
+            bulk_cooldown_after(WorkOutcome::Done, now),
+            Some(now + BULK_COOLDOWN)
+        );
+        assert_eq!(bulk_cooldown_after(WorkOutcome::Skipped, now), None);
+        assert_eq!(bulk_cooldown_after(WorkOutcome::Failed, now), None);
+    }
+
+    #[test]
+    fn bulk_cooldown_window_boundaries() {
+        let now = Instant::now();
+        let cd = bulk_cooldown_after(WorkOutcome::Done, now);
+        assert!(in_bulk_cooldown(cd, now));
+        assert!(in_bulk_cooldown(
+            cd,
+            now + BULK_COOLDOWN - Duration::from_millis(1)
+        ));
+        assert!(!in_bulk_cooldown(cd, now + BULK_COOLDOWN));
+        assert!(!in_bulk_cooldown(None, now));
+    }
+
+    #[test]
+    fn backlog_replay_during_cooldown_defers_bulk_and_keeps_events() {
+        // Sequence: a Done bulk pass arms the cooldown; the burst's queued
+        // events replay and re-cross the threshold during it. The Skipped
+        // disposition must keep every replayed event pending (nothing lost)
+        // and schedule exactly one catch-up pass at cooldown expiry — not a
+        // debounce out, which would land inside the cooldown and defeat it.
+        let debounce = Duration::from_millis(500);
+        let done_at = Instant::now();
+        let cd = bulk_cooldown_after(WorkOutcome::Done, done_at);
+
+        let replay_at = done_at + Duration::from_millis(10);
+        assert!(in_bulk_cooldown(cd, replay_at));
+
+        let mut pending = HashMap::new();
+        pending.insert(PathBuf::from("late-edit.rs"), replay_at);
+        let mut removed = vec!["gone.rs".to_string()];
+
+        let retry = apply_bulk_outcome(
+            WorkOutcome::Skipped,
+            &mut pending,
+            &mut removed,
+            replay_at,
+            debounce,
+            cd,
+        );
+
+        assert_eq!(retry, Some(done_at + BULK_COOLDOWN));
+        assert!(pending.contains_key(Path::new("late-edit.rs")));
+        assert_eq!(removed, vec!["gone.rs".to_string()]);
+    }
+
+    #[test]
+    fn threshold_crossing_during_cooldown_never_arms_a_bulk_before_expiry() {
+        // A Done bulk pass at t=0 arms the 3s cooldown; a threshold crossing
+        // at t=0.1 must not produce a bulk pass before t=3 — the catch-up is
+        // clamped to cooldown expiry, and the restamped pending set stays
+        // drain-unready until then so the per-file path can't race it either.
+        let debounce = Duration::from_millis(1000);
+        let done_at = Instant::now();
+        let cd = bulk_cooldown_after(WorkOutcome::Done, done_at);
+
+        let cross_at = done_at + Duration::from_millis(100);
+        assert!(in_bulk_cooldown(cd, cross_at));
+
+        let mut pending = HashMap::new();
+        pending.insert(PathBuf::from("a.rs"), cross_at);
+        let mut removed: Vec<String> = Vec::new();
+
+        let retry = apply_bulk_outcome(
+            WorkOutcome::Skipped,
+            &mut pending,
+            &mut removed,
+            cross_at,
+            debounce,
+            cd,
+        )
+        .expect("catch-up must be scheduled");
+
+        assert_eq!(retry, done_at + BULK_COOLDOWN);
+        assert!(
+            !in_bulk_cooldown(cd, retry),
+            "the catch-up must fire only once the cooldown has expired"
+        );
+        assert!(
+            compute_ready(&pending, retry - Duration::from_millis(1), debounce).is_empty(),
+            "pending must stay drain-unready until the catch-up fires"
+        );
+        assert_eq!(compute_ready(&pending, retry, debounce).len(), 1);
+    }
+
+    #[test]
+    fn watch_error_schedules_bulk_catchup_and_retains_state() {
+        // A forwarded notify error must arm bulk_retry_at (the loop's
+        // catch-up path) while losing none of the queued work.
+        let debounce = Duration::from_millis(500);
+        let now = Instant::now();
+        let stale = now - Duration::from_secs(10);
+        let mut pending = HashMap::new();
+        pending.insert(PathBuf::from("a.rs"), stale);
+        let mut removed = vec!["gone.rs".to_string()];
+
+        let retry = schedule_watch_error_catchup(&mut pending, &mut removed, now, debounce, None);
+
+        assert_eq!(retry, Some(now + debounce));
+        assert!(pending.contains_key(Path::new("a.rs")));
+        assert_eq!(removed, vec!["gone.rs".to_string()]);
+        // Stamps refreshed: the per-file drain won't race the catch-up pass.
+        assert!(compute_ready(&pending, now, debounce).is_empty());
+    }
+
+    #[test]
+    fn watch_error_catchup_schedules_even_with_empty_queues() {
+        // An overflow can lose the only events describing a change, so the
+        // rescan must be scheduled even when nothing is queued locally.
+        let debounce = Duration::from_millis(500);
+        let now = Instant::now();
+        let mut pending = HashMap::new();
+        let mut removed: Vec<String> = Vec::new();
+
+        let retry = schedule_watch_error_catchup(&mut pending, &mut removed, now, debounce, None);
+
+        assert_eq!(retry, Some(now + debounce));
+    }
+
+    #[test]
+    fn watch_error_catchup_during_cooldown_defers_to_expiry() {
+        // Sequence: a Done bulk pass arms the cooldown; a notify error
+        // (queue overflow) arrives during it. The correctness rescan is
+        // never dropped — it's armed on bulk_retry_at — but it's clamped to
+        // cooldown expiry like any other catch-up, so an overflow can't be
+        // used to defeat the cooldown either.
+        let debounce = Duration::from_millis(500);
+        let done_at = Instant::now();
+        let cd = bulk_cooldown_after(WorkOutcome::Done, done_at);
+
+        let err_at = done_at + Duration::from_millis(10);
+        assert!(in_bulk_cooldown(cd, err_at));
+
+        let mut pending = HashMap::new();
+        pending.insert(PathBuf::from("late-edit.rs"), err_at);
+        let mut removed: Vec<String> = Vec::new();
+
+        let retry = schedule_watch_error_catchup(&mut pending, &mut removed, err_at, debounce, cd);
+
+        let retry_at = retry.expect("catch-up must be scheduled during cooldown");
+        assert_eq!(retry_at, done_at + BULK_COOLDOWN);
+        assert!(
+            !in_bulk_cooldown(cd, retry_at),
+            "the rescan fires at cooldown expiry, not inside the window"
+        );
+        assert!(pending.contains_key(Path::new("late-edit.rs")));
     }
 
     #[test]

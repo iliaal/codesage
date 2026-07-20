@@ -23,7 +23,7 @@ pub(super) struct ProjectState {
     /// mtime of `.codesage/config.toml` when this state was loaded; `None`
     /// means the file was absent (defaults in effect). Checked on every
     /// resolution so a model switch or a config fix takes effect without a
-    /// daemon restart (CR-004) — a stale cached config would keep embedding
+    /// daemon restart — a stale cached config would keep embedding
     /// into the old `chunks_{model}_{dim}` table and silently fork the
     /// semantic index.
     config_mtime: Option<std::time::SystemTime>,
@@ -43,6 +43,15 @@ impl ProjectState {
             None => true,
         }
     }
+
+    /// True when this cached state can still serve calls. Beyond the config
+    /// check, the index DB itself must still exist: `/codesage-reset` deletes
+    /// it under a live daemon, and serving the stale state would let a
+    /// downstream open recreate an empty index that answers every query with
+    /// zero results.
+    fn still_valid(&self) -> bool {
+        !self.config_changed() && self.db_path.exists()
+    }
 }
 
 fn config_toml_mtime(path: &Path) -> Option<std::time::SystemTime> {
@@ -59,10 +68,10 @@ struct LoadedEmbeddingConfig {
 /// for that key, the inner option holds the loaded model once init
 /// succeeds. Concurrent callers for the same key wait on the per-key
 /// mutex; callers for different keys run in parallel because they
-/// hold different slots. This is the fix for CR-001: previously
-/// `get_or_load_*` checked the map, dropped the lock, called `new()`,
-/// then raced to insert — two concurrent cold misses for the same
-/// model loaded two ORT sessions and the loser was thrown away.
+/// hold different slots. Previously `get_or_load_*` checked the map,
+/// dropped the lock, called `new()`, then raced to insert — two
+/// concurrent cold misses for the same model loaded two ORT sessions
+/// and the loser was thrown away.
 type ModelSlot<T> = Arc<Mutex<Option<Arc<Mutex<T>>>>>;
 
 /// A pooled model: its load slot plus the last time it was requested.
@@ -83,7 +92,7 @@ type ModelMap<T> = Mutex<HashMap<String, ModelEntry<T>>>;
 /// per-key slot lock is held, so concurrent calls for *different* keys
 /// never wait on each other.
 ///
-/// The CR-001 race was `check map → drop → load → insert`: two threads
+/// The race this closes was `check map → drop → load → insert`: two threads
 /// hitting the same cold key both ran `load()` and the loser's value
 /// got dropped. This helper closes that window — for a single key, the
 /// first thread to reach the slot lock runs `load()` exactly once; the
@@ -173,7 +182,7 @@ struct WatcherEntry {
 }
 
 /// Flips a watcher's `alive` flag to false when its thread exits by ANY
-/// path — including a panic unwinding out of `run_statewatcher` (CR-020).
+/// path — including a panic unwinding out of `run_statewatcher`.
 /// Without the guard a panicked watcher left `alive` true forever and
 /// `ensure_watcher`'s hot check never respawned it. Mirrors statewatcher's
 /// `StatusGuard` pattern.
@@ -187,7 +196,7 @@ impl Drop for AliveGuard {
 
 /// Removes a reserved watcher-map entry unless [`disarm`](Self::disarm)ed.
 /// `ensure_watcher` inserts the entry BEFORE dropping the map lock so a
-/// concurrent caller can't double-spawn (CR-021); this guard makes sure the
+/// concurrent caller can't double-spawn; this guard makes sure the
 /// reservation can't leak when a path between the insert and a successful
 /// thread spawn bails out. Identity is checked via `Arc::ptr_eq` on the
 /// `shutdown` handle so the guard never removes an entry it doesn't own.
@@ -283,13 +292,15 @@ impl CodeSageServer {
 
     fn resolve_project_inner(&self, project: &str) -> Result<ProjectState> {
         // Fast path: same raw arg string seen before — skip canonicalize().
-        // One stat of config.toml guards the cache: an edited (or created /
-        // deleted) config falls through to a reload, so model switches and
-        // config fixes take effect without a daemon restart (CR-004).
+        // Two stats guard the cache: config.toml (an edited / created /
+        // deleted config falls through to a reload, so model switches and
+        // config fixes take effect without a daemon restart) and
+        // index.db (a deleted index falls through to the cold path's
+        // not-onboarded gate instead of being silently recreated).
         {
             let guard = self.state.resolved.lock();
             if let Some(state) = guard.get(project)
-                && !state.config_changed()
+                && state.still_valid()
             {
                 return Ok(state.clone());
             }
@@ -307,7 +318,7 @@ impl CodeSageServer {
         {
             let guard = self.state.projects.lock();
             if let Some(state) = guard.get(&canonical)
-                && !state.config_changed()
+                && state.still_valid()
             {
                 let state = state.clone();
                 drop(guard);
@@ -343,7 +354,7 @@ impl CodeSageServer {
         // A load error is never cached: structural tools still work off this
         // state for the current call (semantic paths surface the error), but
         // the next resolution re-reads the config so fixing the file doesn't
-        // need a daemon restart (CR-004).
+        // need a daemon restart.
         if state.embedding_config_error.is_some() {
             return Ok(state);
         }
@@ -380,7 +391,7 @@ impl CodeSageServer {
         // no config I/O — this runs on every tool call. The (re)spawn path
         // reserves the map entry under the SAME lock before spawning, so two
         // concurrent first calls can't both spawn a watcher and orphan one
-        // entry's shutdown/alive handles (CR-021).
+        // entry's shutdown/alive handles.
         {
             let mut watchers = self.state.watchers.lock();
             if let Some(entry) = watchers.get(root)
@@ -393,7 +404,7 @@ impl CodeSageServer {
                 // config (model switch in config.toml). Signal it to drain;
                 // a later resolution respawns with the fresh config once it
                 // exits, so the watcher stops embedding into the old model's
-                // chunk table (CR-004).
+                // chunk table.
                 entry.shutdown.store(true, Ordering::SeqCst);
                 return;
             }
@@ -416,7 +427,21 @@ impl CodeSageServer {
         };
 
         // (Re)spawn path: load config and honor opt-out / disabled marker.
-        let project_config = crate::load_project_config(root).ok().unwrap_or_default();
+        // A config that fails to load must not fall back to defaults: the
+        // watcher would silently index with default exclude patterns while
+        // `codesage index` hard-errors on the same file. Skip the spawn; the
+        // next resolution retries once the file is fixed.
+        let project_config = match crate::load_project_config(root) {
+            Ok(config) => config,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    root = %root.display(),
+                    "could not load project config; not spawning watcher"
+                );
+                return;
+            }
+        };
         let config_watch = project_config.index.as_ref().and_then(|i| i.watch);
         if !crate::statewatcher::watch_enabled(root, config_watch) {
             return;
@@ -470,7 +495,7 @@ impl CodeSageServer {
     }
 
     fn get_or_load_embedder(&self, config: &EmbeddingConfig) -> Result<Arc<Mutex<Embedder>>> {
-        let batch_size = config.effective_batch_size().map_err(anyhow::Error::msg)?;
+        let batch_size = config.effective_batch_size()?;
         let key = format!("{}|{}|{}", config.model, config.device, batch_size.get());
         get_or_load_slot(&self.state.embedders, key, || {
             Embedder::new(config).with_context(|| {
@@ -509,11 +534,11 @@ impl CodeSageServer {
         let config = self.semantic_embedding_config(state)?;
         let embedder_arc = self.get_or_load_embedder(config)?;
         let embedder = embedder_arc.lock();
-        Database::open_for_model(&state.db_path, &config.model, embedder.dim())
+        Database::open_for_model_existing(&state.db_path, &config.model, embedder.dim())
     }
 
     pub(super) fn open_structural_db_for(&self, state: &ProjectState) -> Result<Database> {
-        Database::open(&state.db_path)
+        Database::open_existing(&state.db_path)
     }
 
     fn open_context_db_for(&self, state: &ProjectState) -> Result<Database> {
@@ -616,8 +641,11 @@ impl CodeSageServer {
         let state = self.resolve_project(project)?;
         let config = self.semantic_embedding_config(&state)?;
         if let Some(query_embedding) = self.test_query_embedding_override()? {
-            let db =
-                Database::open_for_model(&state.db_path, &config.model, query_embedding.len())?;
+            let db = Database::open_for_model_existing(
+                &state.db_path,
+                &config.model,
+                query_embedding.len(),
+            )?;
             return f(&db, &query_embedding, None);
         }
         let db = self.open_db_for(&state)?;
@@ -712,9 +740,9 @@ fn load_embedding_config(path: &Path) -> LoadedEmbeddingConfig {
 /// handle drops at the end of this call. Failures propagate so the caller
 /// can log them; drift telemetry never kills a tool call.
 fn write_drift_log_for_project(project_root: &Path, db_path: &Path) -> Result<()> {
-    let db = Database::open(db_path)?;
-    let report = crate::drift::check_drift(project_root, &db);
-    crate::drift::append_drift_log(project_root, ".codesage", &report)?;
+    let db = Database::open_existing(db_path)?;
+    let report = codesage_graph::drift::check_drift(project_root, &db);
+    codesage_graph::drift::append_drift_log(project_root, ".codesage", &report)?;
     Ok(())
 }
 
@@ -852,7 +880,7 @@ mod tests {
 
     #[test]
     fn alive_guard_flips_flag_when_thread_panics() {
-        // CR-020 regression: pre-fix the watcher thread stored `false` AFTER
+        // Regression: the watcher thread previously stored `false` AFTER
         // run_statewatcher returned, so a panic unwound past the store and
         // `alive` stayed true forever — ensure_watcher never respawned.
         let alive = Arc::new(AtomicBool::new(true));
@@ -871,7 +899,7 @@ mod tests {
 
     #[test]
     fn watcher_reservation_releases_on_drop_and_keeps_on_disarm() {
-        // CR-021: the reservation placed under the first lock must be
+        // The reservation placed under the first lock must be
         // removed on any bail-out path (watch disabled, spawn failure) and
         // kept once a thread owns it.
         let watchers: Mutex<HashMap<PathBuf, WatcherEntry>> = Mutex::new(HashMap::new());
@@ -979,8 +1007,82 @@ mod tests {
     }
 
     #[test]
+    fn resolve_project_errors_after_index_db_deleted_without_recreating_it() {
+        // The warm-daemon fast path must revalidate the DB file, not just
+        // config.toml: /codesage-reset deletes .codesage/index.db under a
+        // live daemon, and a cached ProjectState that survives the deletion
+        // would let the storage layer recreate an empty index that serves
+        // zero-result answers forever.
+        let (_dir, root) = onboarded_project(None);
+        let project = root.to_str().unwrap();
+        let server = CodeSageServer::new();
+
+        server.resolve_project_inner(project).unwrap();
+        // Second resolution serves from the fast-path cache.
+        server.resolve_project_inner(project).unwrap();
+
+        let db_path = root.join(".codesage/index.db");
+        std::fs::remove_file(&db_path).unwrap();
+
+        let err = server
+            .resolve_project_inner(project)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not onboarded"),
+            "deleted index.db must surface the not-onboarded error, got: {err}"
+        );
+        assert!(
+            !db_path.exists(),
+            "resolution must not recreate the index file"
+        );
+    }
+
+    #[test]
+    fn with_project_db_errors_after_index_db_deleted() {
+        let (_dir, root) = onboarded_project(None);
+        let project = root.to_str().unwrap();
+        let server = CodeSageServer::new();
+        server.resolve_project_inner(project).unwrap();
+
+        let db_path = root.join(".codesage/index.db");
+        std::fs::remove_file(&db_path).unwrap();
+
+        let err = server
+            .with_project_db(project, |db| db.file_count())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not onboarded"),
+            "tool call on a deleted index must error, not return empty results: {err:#}"
+        );
+        assert!(
+            !db_path.exists(),
+            "tool call must not recreate an empty index"
+        );
+    }
+
+    #[test]
+    fn ensure_watcher_skips_spawn_when_config_is_malformed() {
+        // A config that `codesage index` hard-errors on must not produce a
+        // watcher running with default exclude patterns.
+        let (_dir, root) = onboarded_project(Some("embedding = { this is not valid toml ==="));
+        let server = CodeSageServer::new();
+        let state = server
+            .resolve_project_inner(root.to_str().unwrap())
+            .unwrap();
+        assert!(state.embedding_config_error.is_some());
+
+        server.ensure_watcher(&root, &state);
+
+        assert!(
+            server.state.watchers.lock().is_empty(),
+            "unloadable config must skip the watcher spawn"
+        );
+    }
+
+    #[test]
     fn resolve_project_retries_after_config_error_is_fixed() {
-        // CR-004: an error state must never be cached — pre-fix, a transient
+        // An error state must never be cached — previously, a transient
         // config read/parse failure at first resolution pinned the semantic
         // error for the daemon's whole life.
         let (_dir, root) = onboarded_project(Some("embedding = { this is not valid toml ==="));
@@ -1009,7 +1111,7 @@ mod tests {
 
     #[test]
     fn resolve_project_reloads_config_on_mtime_change() {
-        // CR-004: a model switch in config.toml must be picked up by the
+        // A model switch in config.toml must be picked up by the
         // cached ProjectState — otherwise the daemon keeps embedding into
         // the old `chunks_{model}_{dim}` table until restarted.
         let (_dir, root) =
@@ -1071,7 +1173,7 @@ mod tests {
 
     #[test]
     fn slot_loader_runs_exactly_once_under_concurrent_first_callers() {
-        // CR-001 regression. Pre-fix: check map → drop lock → call new()
+        // Regression: the old path was check map → drop lock → call new()
         // → race to insert. Two cold misses for the same key both ran
         // the loader and the loser's value was thrown away. With the
         // per-key slot lock, only the first thread runs `load`; the rest

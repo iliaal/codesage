@@ -10,7 +10,9 @@ use anyhow::Result;
 use codesage_protocol::{FeatureConfidence, FeatureKind, Language};
 use regex::Regex;
 
-use crate::mappers::shared::{is_safe_dir, is_safe_file, rel_path, strip_line_comments};
+use crate::mappers::shared::{
+    is_safe_dir, is_safe_file, read_to_string_bounded, rel_path, strip_line_comments,
+};
 use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile};
 
 pub struct RustMapper;
@@ -81,22 +83,21 @@ fn seed_for_package(
         let entry = rel_path(root, &main_rs);
         if ctx.allowed(&entry) {
             seeds.push(FeatureSeed {
-                title: format!("Rust binary `{pkg_name}`"),
                 summary: format!("Cargo binary entrypoint at {entry}"),
-                kind: FeatureKind::CliCommand,
                 source,
                 confidence: FeatureConfidence::High,
-                entry_path: entry.clone(),
                 entry_symbol: Some("main".to_string()),
-                entry_route: None,
                 entry_command: Some(pkg_name.clone()),
-                test_command: None,
-                language: Language::Rust,
                 tags: vec!["rust".to_string(), "cli".to_string()],
                 owned_files: lib_rs_as_owned(ctx, pkg_dir),
                 context_files: cargo_toml_context(ctx, pkg_dir),
-                tests: Vec::new(),
                 test_prefixes: vec![rel_path(root, &pkg_dir.join("tests"))],
+                ..FeatureSeed::new(
+                    FeatureKind::CliCommand,
+                    Language::Rust,
+                    format!("Rust binary `{pkg_name}`"),
+                    entry.clone(),
+                )
             });
         }
     }
@@ -106,22 +107,19 @@ fn seed_for_package(
         let entry = rel_path(root, &lib_rs);
         if ctx.allowed(&entry) {
             seeds.push(FeatureSeed {
-                title: format!("Rust library `{pkg_name}`"),
                 summary: format!("Cargo library crate at {entry}"),
-                kind: FeatureKind::Library,
                 source,
                 confidence: FeatureConfidence::High,
-                entry_path: entry.clone(),
-                entry_symbol: None,
-                entry_route: None,
-                entry_command: None,
-                test_command: None,
-                language: Language::Rust,
                 tags: vec!["rust".to_string(), "library".to_string()],
                 owned_files: library_owned_files(ctx, pkg_dir, &entry),
                 context_files: cargo_toml_context(ctx, pkg_dir),
-                tests: Vec::new(),
                 test_prefixes: vec![rel_path(root, &pkg_dir.join("tests"))],
+                ..FeatureSeed::new(
+                    FeatureKind::Library,
+                    Language::Rust,
+                    format!("Rust library `{pkg_name}`"),
+                    entry.clone(),
+                )
             });
         }
     }
@@ -140,22 +138,20 @@ fn seed_for_package(
                     continue;
                 }
                 seeds.push(FeatureSeed {
-                    title: format!("Rust binary `{bin_name}` ({pkg_name})"),
                     summary: format!("Cargo bin target at {entry_rel}"),
-                    kind: FeatureKind::CliCommand,
                     source: "cargo-bin",
                     confidence: FeatureConfidence::High,
-                    entry_path: entry_rel,
                     entry_symbol: Some("main".to_string()),
-                    entry_route: None,
-                    entry_command: Some(bin_name),
-                    test_command: None,
-                    language: Language::Rust,
+                    entry_command: Some(bin_name.clone()),
                     tags: vec!["rust".to_string(), "cli".to_string()],
-                    owned_files: Vec::new(),
                     context_files: cargo_toml_context(ctx, pkg_dir),
-                    tests: Vec::new(),
                     test_prefixes: vec![rel_path(root, &pkg_dir.join("tests"))],
+                    ..FeatureSeed::new(
+                        FeatureKind::CliCommand,
+                        Language::Rust,
+                        format!("Rust binary `{bin_name}` ({pkg_name})"),
+                        entry_rel,
+                    )
                 });
             }
         }
@@ -175,22 +171,16 @@ fn seed_for_package(
                     continue;
                 }
                 seeds.push(FeatureSeed {
-                    title: format!("Rust integration test `{test_name}` ({pkg_name})"),
                     summary: format!("Integration test file at {entry_rel}"),
-                    kind: FeatureKind::TestSuite,
                     source: "rust-integration-test",
-                    confidence: FeatureConfidence::Medium,
-                    entry_path: entry_rel.clone(),
-                    entry_symbol: None,
-                    entry_route: None,
                     entry_command: Some(test_command.clone()),
-                    test_command: None,
-                    language: Language::Rust,
                     tags: vec!["rust".to_string(), "test".to_string()],
-                    owned_files: Vec::new(),
-                    context_files: Vec::new(),
-                    tests: Vec::new(),
-                    test_prefixes: Vec::new(),
+                    ..FeatureSeed::new(
+                        FeatureKind::TestSuite,
+                        Language::Rust,
+                        format!("Rust integration test `{test_name}` ({pkg_name})"),
+                        entry_rel.clone(),
+                    )
                 });
             }
         }
@@ -252,7 +242,7 @@ fn cargo_toml_context(ctx: &MapperContext, pkg_dir: &Path) -> Vec<SeedFile> {
 }
 
 fn read_package_name(manifest_path: &Path) -> Option<String> {
-    let raw = fs::read_to_string(manifest_path).ok()?;
+    let raw = read_to_string_bounded(manifest_path).ok().flatten()?;
     let stripped = strip_line_comments(&raw, '#');
     // Find `[package]` section then `name = "..."` within it.
     let pkg_start = Regex::new(r"(?m)^\s*\[package\]\s*$")
@@ -273,9 +263,8 @@ fn read_package_name(manifest_path: &Path) -> Option<String> {
 }
 
 fn cargo_workspace_members(root: &Path, manifest: &Path) -> Result<Vec<String>> {
-    let raw = match fs::read_to_string(manifest) {
-        Ok(s) => s,
-        Err(_) => return Ok(Vec::new()),
+    let Ok(Some(raw)) = read_to_string_bounded(manifest) else {
+        return Ok(Vec::new());
     };
     let stripped = strip_line_comments(&raw, '#');
     let Some(ws_start) = Regex::new(r"(?m)^\s*\[workspace\]\s*$")?.find(&stripped) else {
@@ -302,7 +291,7 @@ fn cargo_workspace_members(root: &Path, manifest: &Path) -> Result<Vec<String>> 
                 // `crates/*` is already covered by the dedicated crates_dir
                 // walk in `map`, so skip it here to avoid double-seeding;
                 // other prefixes (`libs/*`, `packages/*`) were previously
-                // dropped silently. fnd: CR-041.
+                // dropped silently.
                 if let Some(prefix) = s.strip_suffix("/*")
                     && prefix != "crates"
                     && !prefix.is_empty()

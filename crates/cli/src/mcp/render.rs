@@ -324,7 +324,7 @@ fn merge_stale_meta(structured: &mut serde_json::Value, stale: &[String]) {
 /// `files` / `clustered_directories` by name. Budget truncation prefers any
 /// other array; when a protected array is the only option, the dropped
 /// element identifiers are recorded under `_meta.dropped_files` so the
-/// invariant is at least visibly broken, never silently (CR-038).
+/// invariant is at least visibly broken, never silently.
 const PROTECTED_TRUNCATION_KEYS: &[&str] = &["files", "clustered_directories"];
 
 /// Best-effort path/name identifier for a truncated array element, used to
@@ -608,7 +608,7 @@ mod tests {
     fn cap_prefers_unprotected_array_over_protected_files() {
         // assess_risk_diff shape: `files` carries the one-entry-per-patch-file
         // invariant. Even when `files` is the LARGEST array, truncation must
-        // trim another array instead (CR-038) — rollups like test_gap_files
+        // trim another array instead — rollups like test_gap_files
         // cross-reference `files` by name.
         let files: Vec<Value> = (0..40)
             .map(|i| json!({"file": format!("src/f{i}.rs"), "blob": fat_string(1000)}))

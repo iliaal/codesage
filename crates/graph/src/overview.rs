@@ -82,7 +82,7 @@ pub fn build_project_overview(root: &Path, db: &Database) -> Result<ProjectOverv
         })
         .collect();
 
-    let top_risk_files = codesage_graph::top_risk_files(db, TOP_RISK_CAP)?;
+    let top_risk_files = crate::session::top_risk_files(db, TOP_RISK_CAP)?;
 
     let trust_boundary_clusters: Vec<TrustBoundaryCount> = db
         .trust_boundary_counts()?

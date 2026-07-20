@@ -2,7 +2,7 @@
 //! semantic freshness, git history, feature membership, and EVERY model's
 //! chunk table plus FTS sidecar — even when the database was opened
 //! structural-only (no active model), as `codesage index --no-semantic`
-//! does. Regression test for CR-035.
+//! does.
 
 use codesage_protocol::{
     FeatureConfidence, FeatureFileRef, FeatureFileRole, FeatureKind, FeatureRecord, FileInfo,
@@ -121,7 +121,7 @@ fn remove_file_purges_all_chunk_tables_fts_and_feature_files() {
         .unwrap();
     }
 
-    // Structural-only open: no active chunk table, the CR-035 failure mode.
+    // Structural-only open: no active chunk table — the failure mode under test.
     {
         let db = Database::open(&db_path).expect("structural-only open");
         db.remove_file("a.rs").expect("remove_file");

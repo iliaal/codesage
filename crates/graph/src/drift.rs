@@ -23,11 +23,9 @@ use std::process::Command;
 use codesage_storage::Database;
 use serde::Serialize;
 
-use crate::util::git_common_dir;
-
 /// Current drift state for a project's structural index.
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct DriftReport {
+pub struct DriftReport {
     /// SHA the structural index was last built against. `None` means the index
     /// has never been stamped (pre-migration, or no successful `codesage index`
     /// run yet).
@@ -47,7 +45,7 @@ pub(crate) struct DriftReport {
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum DriftKind {
+pub enum DriftKind {
     /// Not a git repo — nothing to measure.
     NotGit,
     /// Git repo but no structural index has ever been stamped.
@@ -76,7 +74,7 @@ impl DriftReport {
     }
 
     /// One-line human summary. Safe to print in non-JSON tooling output.
-    pub(crate) fn summary(&self) -> String {
+    pub fn summary(&self) -> String {
         match self.kind {
             DriftKind::NotGit => "not a git repository".to_string(),
             DriftKind::NeverIndexed => {
@@ -155,7 +153,7 @@ fn fmt_ts(unix: i64) -> String {
 /// Compute the drift report for `project_root`. Reads `structural_index_state`
 /// from `db` and queries git for the current HEAD. Never panics; returns
 /// `DriftKind::Unknown` when git/rusqlite surface a structured error.
-pub(crate) fn check_drift(project_root: &Path, db: &Database) -> DriftReport {
+pub fn check_drift(project_root: &Path, db: &Database) -> DriftReport {
     let (stored_sha, stored_at) = match db.get_structural_index_state() {
         Ok(Some((sha, at))) => (Some(sha), Some(at)),
         Ok(None) => (None, None),
@@ -200,7 +198,7 @@ pub(crate) fn check_drift(project_root: &Path, db: &Database) -> DriftReport {
 
 /// `git rev-parse HEAD`, returning the full SHA string. `None` when git fails
 /// or the repo has no HEAD (fresh `git init`, for example).
-pub(crate) fn git_head_sha(cwd: &Path) -> Option<String> {
+pub fn git_head_sha(cwd: &Path) -> Option<String> {
     let out = Command::new("git")
         .arg("rev-parse")
         .arg("HEAD")
@@ -217,6 +215,32 @@ pub(crate) fn git_head_sha(cwd: &Path) -> Option<String> {
     } else {
         Some(sha.to_string())
     }
+}
+
+/// Resolve the canonical git common directory (the actual `.git`, even from
+/// inside a worktree) for `cwd`. Returns `None` when not a git repo or git is
+/// unavailable. Result paths are absolute.
+pub fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .arg("rev-parse")
+        .arg("--git-common-dir")
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let dir = String::from_utf8(out.stdout).ok()?;
+    let dir = dir.trim();
+    if dir.is_empty() {
+        return None;
+    }
+    let path = Path::new(dir);
+    Some(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    })
 }
 
 enum CommitsBetween {
@@ -258,7 +282,7 @@ fn commits_between(cwd: &Path, a: &str, b: &str) -> CommitsBetween {
 /// Append one JSON-line drift record to `<project>/.codesage/drift.log`.
 /// Truncates the log to the last 10,000 lines on entry to keep growth
 /// bounded — roughly a year of once-per-session records.
-pub(crate) fn append_drift_log(
+pub fn append_drift_log(
     project_root: &Path,
     project_dir_name: &str,
     report: &DriftReport,
@@ -325,10 +349,9 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// Helper for tests: path to the drift log. Kept `pub(crate)` so integration
-/// tests from other crate modules can inspect it.
-#[allow(dead_code)]
-pub(crate) fn drift_log_path(project_root: &Path, project_dir_name: &str) -> PathBuf {
+/// Helper for tests and log tooling: path to the drift log. Public so callers
+/// outside this crate can inspect the file `append_drift_log` writes.
+pub fn drift_log_path(project_root: &Path, project_dir_name: &str) -> PathBuf {
     project_root.join(project_dir_name).join("drift.log")
 }
 

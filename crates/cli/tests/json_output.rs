@@ -81,6 +81,86 @@ fn find_references_json_uses_results_envelope() {
 }
 
 #[test]
+fn status_json_covers_prose_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    init_project(dir.path());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_codesage"))
+        .args(["status", "--json"])
+        .current_dir(dir.path())
+        .output()
+        .expect("spawn codesage status");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "status --json failed; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("status --json emitted invalid JSON ({e}):\n{stdout}"));
+    for key in [
+        "project_root",
+        "database",
+        "files",
+        "symbols",
+        "references",
+        "chunks",
+        "drift",
+        "drift_summary",
+        "semantic",
+    ] {
+        assert!(
+            v.get(key).is_some(),
+            "status --json must carry `{key}`, got:\n{stdout}"
+        );
+    }
+    assert!(
+        v["files"].is_u64(),
+        "counts serialize as numbers:\n{stdout}"
+    );
+    assert!(
+        v["drift"].get("kind").is_some(),
+        "drift must be the structured DriftReport:\n{stdout}"
+    );
+    // Fresh `codesage init` in a non-git tempdir: no chunk table yet.
+    assert_eq!(v["semantic"]["state"], "missing", "got:\n{stdout}");
+    assert!(
+        v["semantic"]["model"].is_string(),
+        "semantic.model must name the configured model:\n{stdout}"
+    );
+}
+
+#[test]
+fn status_prose_output_is_unchanged_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    init_project(dir.path());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_codesage"))
+        .arg("status")
+        .current_dir(dir.path())
+        .output()
+        .expect("spawn codesage status");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success());
+    for prefix in [
+        "Project root: ",
+        "Database: ",
+        "Files:      ",
+        "Symbols:    ",
+        "References: ",
+        "Chunks:     ",
+        "Drift:      ",
+        "Semantic:   ",
+    ] {
+        assert!(
+            stdout.lines().any(|l| l.starts_with(prefix)),
+            "prose status must keep the `{prefix}` line, got:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn similar_json_uses_results_envelope() {
     assert_results_envelope(&["similar", "no_such_symbol"]);
 }

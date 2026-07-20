@@ -533,7 +533,7 @@ fn parse_log(raw: &str) -> Vec<Commit> {
     let mut skipped_commits = 0usize;
     let mut skipped_changes = 0usize;
     // Keep a bounded sample of dropped commit SHAs so the warning can name
-    // which commits were skipped, not just how many. fnd: CR-043.
+    // which commits were skipped, not just how many.
     let mut skipped_shas: Vec<String> = Vec::new();
 
     for line in raw.lines() {

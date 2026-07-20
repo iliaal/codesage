@@ -569,23 +569,149 @@ fn verify_model_artifact_sha256(
     Ok(())
 }
 
+/// One-retry policy for pinned-artifact verification. A first hash mismatch
+/// is usually local cache corruption (bit rot, truncated write), so the
+/// cached file is evicted and fetched fresh; a mismatch on the freshly
+/// fetched bytes is the supply-chain signal the pins exist to catch and
+/// stays a hard failure.
+fn verify_with_refetch<P>(
+    cached: P,
+    mut verify: impl FnMut(&P) -> Result<()>,
+    evict: impl FnOnce(&P) -> Result<()>,
+    refetch: impl FnOnce() -> Result<P>,
+) -> Result<P> {
+    let Err(cache_err) = verify(&cached) else {
+        return Ok(cached);
+    };
+    evict(&cached).with_context(|| {
+        format!("evicting cached artifact that failed verification: {cache_err}")
+    })?;
+    let fresh = refetch()?;
+    verify(&fresh).context(
+        "artifact hash still mismatched after evicting the cached copy and re-downloading once",
+    )?;
+    Ok(fresh)
+}
+
+/// Remove a cached hf-hub artifact so the next fetch re-downloads it. The
+/// snapshot path hf-hub hands out is a symlink into the cache's `blobs/`
+/// directory; the blob holds the actual corrupted bytes and must go too.
+/// The blob target is only deleted after proving it resolves inside the
+/// cache boundary — a crafted or corrupted link (`../../../../some-file`)
+/// must not get an arbitrary external file deleted on the eviction path.
+/// On containment failure only the symlink itself is removed.
+fn evict_cached_artifact(path: &Path) -> Result<()> {
+    if let Ok(target) = std::fs::read_link(path) {
+        let blob = if target.is_absolute() {
+            target
+        } else {
+            path.parent().unwrap_or(Path::new("")).join(target)
+        };
+        match blob_within_cache_boundary(path, &blob) {
+            Some(true) => {
+                if let Err(e) = std::fs::remove_file(&blob)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    return Err(e)
+                        .with_context(|| format!("removing cached blob {}", blob.display()));
+                }
+            }
+            Some(false) => {
+                tracing::warn!(
+                    link = %path.display(),
+                    target = %blob.display(),
+                    "cached artifact symlink resolves outside the model cache; removing only the link"
+                );
+            }
+            // Dangling target: nothing to remove beyond the link itself.
+            None => {}
+        }
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("removing cached artifact {}", path.display())),
+    }
+}
+
+/// Containment check for blob eviction. The boundary is derived from the
+/// snapshot link itself: the nearest ancestor holding a `blobs/` directory
+/// is the hf-hub `models--*` cache entry that owns both the snapshot tree
+/// and the blob store. Both sides are canonicalized so `..` components and
+/// symlink hops can't smuggle the resolved target outside the boundary.
+/// `None` means the blob doesn't exist (dangling link); `Some(false)` means
+/// it exists but resolves outside the cache (or no boundary was found).
+fn blob_within_cache_boundary(link: &Path, blob: &Path) -> Option<bool> {
+    let blob_canon = blob.canonicalize().ok()?;
+    let boundary = link
+        .ancestors()
+        .skip(1)
+        .find(|ancestor| ancestor.join("blobs").is_dir());
+    let Some(boundary) = boundary else {
+        return Some(false);
+    };
+    let Ok(boundary_canon) = boundary.canonicalize() else {
+        return Some(false);
+    };
+    Some(blob_canon.starts_with(&boundary_canon))
+}
+
+fn verify_or_refetch_artifact(
+    model: &str,
+    revision: &str,
+    artifact: &'static str,
+    cached: PathBuf,
+    expected: &str,
+) -> Result<PathBuf> {
+    verify_with_refetch(
+        cached,
+        |path| verify_model_artifact_sha256(model, artifact, path, expected),
+        |path| {
+            tracing::warn!(
+                model,
+                artifact,
+                path = %path.display(),
+                "cached model artifact failed sha256 verification; evicting and re-downloading once"
+            );
+            evict_cached_artifact(path)
+        },
+        || hf_get_model_file(model, Some(revision), artifact),
+    )
+}
+
+/// Verify every pinned artifact, tolerating one locally-corrupted cache file
+/// per artifact via [`verify_with_refetch`]. Returns the verified tokenizer
+/// and model paths (re-downloaded ones when the cache was evicted).
 fn verify_pinned_model_artifacts(
     model: &str,
     pin: &ModelPin,
-    tokenizer_path: &Path,
-    model_path: &Path,
-    onnx_data_path: Option<&Path>,
-) -> Result<()> {
-    verify_model_artifact_sha256(
+    tokenizer_path: PathBuf,
+    model_path: PathBuf,
+    onnx_data_path: Option<PathBuf>,
+) -> Result<(PathBuf, PathBuf)> {
+    let tokenizer_path = verify_or_refetch_artifact(
         model,
+        pin.revision,
         "tokenizer.json",
         tokenizer_path,
         pin.tokenizer_sha256,
     )?;
-    verify_model_artifact_sha256(model, "onnx/model.onnx", model_path, pin.onnx_sha256)?;
+    let model_path = verify_or_refetch_artifact(
+        model,
+        pin.revision,
+        "onnx/model.onnx",
+        model_path,
+        pin.onnx_sha256,
+    )?;
     match (pin.onnx_data_sha256, onnx_data_path) {
         (Some(expected), Some(path)) => {
-            verify_model_artifact_sha256(model, "onnx/model.onnx_data", path, expected)?;
+            verify_or_refetch_artifact(
+                model,
+                pin.revision,
+                "onnx/model.onnx_data",
+                path,
+                expected,
+            )?;
         }
         (Some(_), None) => {
             anyhow::bail!(
@@ -601,7 +727,7 @@ fn verify_pinned_model_artifacts(
         }
         (None, None) => {}
     }
-    Ok(())
+    Ok((tokenizer_path, model_path))
 }
 
 /// Whether a model's declared input names include `token_type_ids`, i.e. the
@@ -629,9 +755,7 @@ pub(crate) fn load_onnx_session(model: &str, device: &str) -> Result<(Session, T
     #[cfg(not(target_vendor = "apple"))]
     init_ort_dylib();
 
-    if let Err(e) = crate::config::validate_device(device) {
-        anyhow::bail!("{e}");
-    }
+    crate::config::validate_device(device)?;
     let want_cuda = wants_cuda(device);
     if want_cuda {
         #[cfg(not(feature = "cuda"))]
@@ -665,15 +789,11 @@ pub(crate) fn load_onnx_session(model: &str, device: &str) -> Result<(Session, T
             None
         }
     };
-    if let Some(pin) = pin {
-        verify_pinned_model_artifacts(
-            model,
-            pin,
-            &tokenizer_path,
-            &model_path,
-            onnx_data_path.as_deref(),
-        )?;
-    }
+    let (tokenizer_path, model_path) = if let Some(pin) = pin {
+        verify_pinned_model_artifacts(model, pin, tokenizer_path, model_path, onnx_data_path)?
+    } else {
+        (tokenizer_path, model_path)
+    };
 
     let mut tokenizer =
         Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -757,7 +877,7 @@ impl Embedder {
             load_onnx_session(&config.model, &config.device)?;
         let dim = detect_dim(&session)?;
         let pooling = config.pooling_strategy();
-        let batch_size = config.effective_batch_size().map_err(anyhow::Error::msg)?;
+        let batch_size = config.effective_batch_size()?;
 
         tracing::info!(
             dim,
@@ -1021,6 +1141,205 @@ mod tests {
             err.to_string().contains("hash mismatch"),
             "error should explain the integrity failure: {err}"
         );
+    }
+
+    #[test]
+    fn verify_with_refetch_returns_cached_when_hash_matches() {
+        let mut evictions = 0u32;
+        let mut refetches = 0u32;
+        let out = verify_with_refetch(
+            "cached",
+            |_| Ok(()),
+            |_| {
+                evictions += 1;
+                Ok(())
+            },
+            || {
+                refetches += 1;
+                Ok("fresh")
+            },
+        )
+        .unwrap();
+        assert_eq!(out, "cached");
+        assert_eq!((evictions, refetches), (0, 0));
+    }
+
+    #[test]
+    fn verify_with_refetch_evicts_and_refetches_once_on_cache_corruption() {
+        let mut evictions = 0u32;
+        let out = verify_with_refetch(
+            "cached",
+            |p: &&str| {
+                if *p == "cached" {
+                    Err(anyhow::anyhow!("hash mismatch"))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {
+                evictions += 1;
+                Ok(())
+            },
+            || Ok("fresh"),
+        )
+        .unwrap();
+        assert_eq!(out, "fresh");
+        assert_eq!(evictions, 1);
+    }
+
+    #[test]
+    fn verify_with_refetch_fails_closed_when_mismatch_survives_redownload() {
+        let mut verifies = 0u32;
+        let mut refetches = 0u32;
+        let err = verify_with_refetch(
+            "cached",
+            |_: &&str| {
+                verifies += 1;
+                Err(anyhow::anyhow!("hash mismatch"))
+            },
+            |_| Ok(()),
+            || {
+                refetches += 1;
+                Ok("fresh")
+            },
+        )
+        .expect_err("a mismatch on freshly downloaded bytes must stay a hard failure");
+        assert_eq!(refetches, 1, "exactly one re-download attempt");
+        assert_eq!(verifies, 2);
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("hash mismatch"),
+            "original error must be preserved: {chain}"
+        );
+        assert!(
+            chain.contains("re-downloading"),
+            "context should say the retry happened: {chain}"
+        );
+    }
+
+    #[test]
+    fn verify_with_refetch_propagates_eviction_failure_without_refetching() {
+        let mut refetches = 0u32;
+        let err = verify_with_refetch(
+            "cached",
+            |_: &&str| Err(anyhow::anyhow!("hash mismatch")),
+            |_| Err(anyhow::anyhow!("permission denied")),
+            || {
+                refetches += 1;
+                Ok("fresh")
+            },
+        )
+        .expect_err("eviction failure must propagate");
+        assert_eq!(refetches, 0);
+        assert!(format!("{err:#}").contains("permission denied"));
+    }
+
+    #[test]
+    fn evicting_a_plain_cached_file_removes_it() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "codesage-evict-plain-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::write(&path, b"corrupted").unwrap();
+
+        evict_cached_artifact(&path).unwrap();
+
+        assert!(!path.exists(), "cached file should be gone");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evicting_a_cached_symlink_removes_blob_and_pointer() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "codesage-evict-symlink-test-{}-{unique}",
+            std::process::id()
+        ));
+        let blobs = root.join("blobs");
+        let snapshots = root.join("snapshots");
+        fs::create_dir_all(&blobs).unwrap();
+        fs::create_dir_all(&snapshots).unwrap();
+        let blob = blobs.join("deadbeef");
+        fs::write(&blob, b"corrupted").unwrap();
+        let pointer = snapshots.join("tokenizer.json");
+        std::os::unix::fs::symlink("../blobs/deadbeef", &pointer).unwrap();
+
+        evict_cached_artifact(&pointer).unwrap();
+
+        let pointer_gone = pointer.symlink_metadata().is_err();
+        let blob_gone = !blob.exists();
+        let _ = fs::remove_dir_all(&root);
+        assert!(pointer_gone, "snapshot symlink should be gone");
+        assert!(
+            blob_gone,
+            "blob holding the corrupted bytes should be gone too"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evicting_a_symlink_escaping_the_cache_removes_only_the_link() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "codesage-evict-escape-test-{}-{unique}",
+            std::process::id()
+        ));
+        // Cache layout with a victim file OUTSIDE the cache entry.
+        let cache = base.join("cache");
+        let blobs = cache.join("blobs");
+        let snapshots = cache.join("snapshots");
+        fs::create_dir_all(&blobs).unwrap();
+        fs::create_dir_all(&snapshots).unwrap();
+        let victim = base.join("victim.bin");
+        fs::write(&victim, b"precious").unwrap();
+        let pointer = snapshots.join("model.onnx");
+        std::os::unix::fs::symlink("../../victim.bin", &pointer).unwrap();
+
+        evict_cached_artifact(&pointer).unwrap();
+
+        let pointer_gone = pointer.symlink_metadata().is_err();
+        let victim_survives = victim.exists();
+        let _ = fs::remove_dir_all(&base);
+        assert!(pointer_gone, "the escaping symlink itself should be gone");
+        assert!(
+            victim_survives,
+            "a target outside the cache boundary must never be deleted"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evicting_a_dangling_symlink_removes_the_link() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "codesage-evict-dangling-test-{}-{unique}",
+            std::process::id()
+        ));
+        let blobs = root.join("blobs");
+        let snapshots = root.join("snapshots");
+        fs::create_dir_all(&blobs).unwrap();
+        fs::create_dir_all(&snapshots).unwrap();
+        let pointer = snapshots.join("tokenizer.json");
+        std::os::unix::fs::symlink("../blobs/never-written", &pointer).unwrap();
+
+        evict_cached_artifact(&pointer).unwrap();
+
+        let pointer_gone = pointer.symlink_metadata().is_err();
+        let _ = fs::remove_dir_all(&root);
+        assert!(pointer_gone, "dangling snapshot symlink should be gone");
     }
 
     #[test]

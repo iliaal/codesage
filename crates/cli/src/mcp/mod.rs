@@ -121,13 +121,13 @@ impl CodeSageServer {
     /// Every handler does blocking work — SQLite, ONNX inference, and on a cold
     /// miss a model load that includes a (network) HuggingFace download. Run
     /// directly on a runtime worker, enough concurrent calls block every worker
-    /// and the daemon stops answering even `initialize`/`ping` (CR-001).
+    /// and the daemon stops answering even `initialize`/`ping`.
     /// Offloading to the blocking pool keeps the async workers free.
     ///
     /// `spawn_blocking` also gives a panic boundary: rmcp dispatches tool calls
     /// with no `catch_unwind`, so a panic in a handler is otherwise silently
     /// swallowed and the client hangs forever waiting for a reply that never
-    /// comes (CR-003). Here a panic surfaces as a `JoinError` we turn into an
+    /// comes. Here a panic surfaces as a `JoinError` we turn into an
     /// error result the client actually receives.
     async fn blocking<F>(&self, f: F) -> CallToolResult
     where
@@ -195,7 +195,7 @@ impl CodeSageServer {
             s.render(
                 &params.project,
                 s.with_project_root_db(&params.project, |root, db| {
-                    crate::overview::build_project_overview(root, db)
+                    codesage_graph::build_project_overview(root, db)
                 }),
                 "project_overview",
             )
@@ -218,7 +218,7 @@ impl CodeSageServer {
                 &params.project,
                 validate_file_list_len(&file_paths, "review_rehearsal").and_then(|()| {
                     s.with_project_root_db(&params.project, |root, db| {
-                        crate::rehearsal::build_review_rehearsal(root, db, &file_paths)
+                        codesage_graph::build_review_rehearsal(root, db, &file_paths)
                     })
                 }),
                 "review_rehearsal",
@@ -384,7 +384,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "export_context",
-        description = "Build a curated context bundle for a free-form **query** or a single **symbol**: semantic search results, overlapping symbol definitions, and optionally caller/callee code, all wrapped as a structured bundle ready for LLM consumption. Use when the anchor is a phrase ('error handling in the parser') or one named symbol. For an already-mapped feature slice (entrypoint + owned files + tests + context already resolved), use `feature_bundle` instead — that anchors on `feature_id` and avoids re-running semantic search. Symbol entries inside the bundle carry `rationale[]` when the author left `WHY:` / `NOTE:` / `IMPORTANT:` / `FIXME:` / `HACK:` / `XXX:` / `TODO:` comments — preserve these in any synthesis the agent performs from the bundle. Currently extracted for Rust and Python.",
+        description = "Build a curated context bundle for a free-form **query** or a single **symbol**: semantic search results, overlapping symbol definitions, and optionally caller/callee code, all wrapped as a structured bundle ready for LLM consumption. Use when the anchor is a phrase ('error handling in the parser') or one named symbol. For an already-mapped feature slice (entrypoint + owned files + tests + context already resolved), use `feature_bundle` instead — that anchors on `feature_id` and avoids re-running semantic search. Symbol entries inside the bundle carry `rationale[]` when the author left `WHY:` / `NOTE:` / `IMPORTANT:` / `FIXME:` / `HACK:` / `XXX:` / `TODO:` comments — preserve these in any synthesis the agent performs from the bundle. Currently extracted for Rust and Python. A missing symbol target sets top-level `found: false` (with an empty bundle) — check that flag, not the `target_description` text.",
         output_schema = schema_for_type::<ContextBundle>()
     )]
     async fn export_context_tool(
@@ -425,7 +425,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "find_coupling",
-        description = "Files that historically change together with the given file, ranked by exponentially-decayed weight (τ=180d). Backed by git history. Use when planning a change to know which OTHER files (especially tests) tend to need updates too. Response is `{coupled: [...], file_indexed: bool, file_commits: u32, note?: string}` — read `coupled` for the ranked list. When `coupled` is empty, `note` disambiguates: file never indexed vs. file has history but no pair above the min-count=3 threshold vs. path shape mismatch. Index into `.coupled`, not the response directly. For the patch-level question 'which tests should I run after editing these files?' use `recommend_tests` instead (resolves test conventions + co-change in one call). For the single-file risk score that already folds in coupling pressure use `assess_risk`.",
+        description = "Files that historically change together with the given file, ranked by exponentially-decayed weight (τ=180d). Backed by git history. Use when planning a change to know which OTHER files (especially tests) tend to need updates too. Response is `{found: bool, coupled: [...], file_indexed: bool, file_commits: u32, note?: string}` — check `found` (false when the file has no git-history row), then read `coupled` for the ranked list. When `coupled` is empty, `note` disambiguates: file never indexed vs. file has history but no pair above the min-count=3 threshold vs. path shape mismatch. Index into `.coupled`, not the response directly. For the patch-level question 'which tests should I run after editing these files?' use `recommend_tests` instead (resolves test conventions + co-change in one call). For the single-file risk score that already folds in coupling pressure use `assess_risk`.",
         output_schema = schema_for_type::<CouplingReport>()
     )]
     async fn find_coupling_tool(
@@ -622,7 +622,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "feature_bundle",
-        description = "Curated code bundle for one feature_id. Same shape as `export_context` but anchored on the feature's already-resolved file list (entry + owned + tests + context) instead of semantic search results. `primary[]` carries chunks from owned/entry files, `related[]` carries tests and context. Set `include_callers` / `include_callees` to also expand the entry symbol's callers/callees into `related[]` (reuses the symbol graph used by `export_context`). Use after `list_features` / `find_feature` to get all the code an agent needs to review or modify the slice in one MCP call — avoids fan-out Read calls per file. Empty bundle with `target_description` ending `(not found)` means the feature_id doesn't exist; empty bundle with non-empty title means the feature exists but no files have been semantically indexed yet (run `codesage index`).",
+        description = "Curated code bundle for one feature_id. Same shape as `export_context` but anchored on the feature's already-resolved file list (entry + owned + tests + context) instead of semantic search results. `primary[]` carries chunks from owned/entry files, `related[]` carries tests and context. Set `include_callers` / `include_callees` to also expand the entry symbol's callers/callees into `related[]` (reuses the symbol graph used by `export_context`). Use after `list_features` / `find_feature` to get all the code an agent needs to review or modify the slice in one MCP call — avoids fan-out Read calls per file. Empty bundle with `target_description` ending `(not found)` means the feature_id doesn't exist — that case also sets top-level `found: false`, so check the flag rather than substring-matching. Empty bundle with `found: true` means the feature exists but no files have been semantically indexed yet (run `codesage index`).",
         output_schema = schema_for_type::<ContextBundle>()
     )]
     async fn feature_bundle_tool(

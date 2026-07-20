@@ -18,5 +18,27 @@
 # Slack tokens
 \bxox[baprs]-[0-9A-Za-z-]{10,}
 
-# Stripe live key
+# Stripe live + test keys
 \bsk_live_[0-9a-zA-Z]{24,}\b
+\bsk_test_[0-9a-zA-Z]{24,}\b
+
+# Anthropic API key
+\bsk-ant-[A-Za-z0-9_-]{20,}
+
+# OpenAI project key (bare sk- is too broad to block)
+\bsk-proj-[A-Za-z0-9_-]{20,}
+
+# Google API key
+\bAIza[0-9A-Za-z_-]{35}
+
+# Hugging Face token
+\bhf_[A-Za-z0-9]{30,}\b
+
+# npm access token
+\bnpm_[A-Za-z0-9]{36}\b
+
+# PyPI API token
+\bpypi-[A-Za-z0-9_-]{50,}
+
+# GitLab personal access token
+\bglpat-[A-Za-z0-9_-]{20,}

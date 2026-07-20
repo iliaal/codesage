@@ -393,7 +393,7 @@ impl FileCategory {
     pub fn classify(path: &str) -> Self {
         let lower_owned = path.to_lowercase();
         // Strip a leading `./` so relative paths (`./tests/foo.rs`) still match
-        // the directory-prefix checks below. fnd: CR-031.
+        // the directory-prefix checks below.
         let lower = lower_owned
             .strip_prefix("./")
             .unwrap_or(lower_owned.as_str());
@@ -416,7 +416,7 @@ impl FileCategory {
             // boundary (`FooTest.java`, `FooTests.java`, `FooTest.php`).
             // Matching against the lowercased path here would also catch
             // unrelated source files like `Latest.java`, `Manifests.java`,
-            // or `latest.php`. fnd_9931a623.
+            // or `latest.php`.
             || path.ends_with("Test.php")
             || path.ends_with("Test.java")
             || path.ends_with("Tests.java")
@@ -1544,7 +1544,7 @@ mod tests {
 
     #[test]
     fn file_category_does_not_misclassify_source_files_named_like_tests() {
-        // Regression for fnd_9931a623: the previous Java/PHP arms used
+        // Regression: the previous Java/PHP arms used
         // a lowercase-suffix match without a separator, so source files
         // whose names happen to end in `test.java`/`tests.java`/
         // `test.php` got classified as tests and dropped from
@@ -1646,7 +1646,7 @@ mod tests {
             other => panic!("known file extension must be a file target, got {other:?}"),
         }
 
-        // Regression for fnd_f736f669: `.java` was missing from the
+        // Regression: `.java` was missing from the
         // allow-list after Java was added to `Language`, so bare
         // `UserService.java` resolved as a symbol name and produced an
         // empty impact result.

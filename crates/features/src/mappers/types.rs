@@ -107,6 +107,36 @@ pub struct FeatureSeed {
 }
 
 impl FeatureSeed {
+    /// Base constructor covering the four fields every seed sets; the rest
+    /// default to empty/`None` (`confidence: Medium`, `source: ""`). Sites
+    /// fill their non-default fields with struct-update syntax:
+    /// `FeatureSeed { source: "...", ..FeatureSeed::new(...) }`.
+    pub fn new(
+        kind: FeatureKind,
+        language: Language,
+        title: impl Into<String>,
+        entry_path: impl Into<String>,
+    ) -> Self {
+        Self {
+            title: title.into(),
+            summary: String::new(),
+            kind,
+            source: "",
+            confidence: FeatureConfidence::Medium,
+            entry_path: entry_path.into(),
+            entry_symbol: None,
+            entry_route: None,
+            entry_command: None,
+            test_command: None,
+            language,
+            tags: Vec::new(),
+            owned_files: Vec::new(),
+            context_files: Vec::new(),
+            tests: Vec::new(),
+            test_prefixes: Vec::new(),
+        }
+    }
+
     /// Discriminator used in both the orchestrator's dedup key and the
     /// feature-id hash: the entry command, route, or symbol (first present),
     /// else empty.

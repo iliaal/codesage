@@ -1,6 +1,6 @@
 //! Shared helpers for CLI + doctor.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use tracing_subscriber::EnvFilter;
 
@@ -17,31 +17,9 @@ pub(crate) fn init_tracing() {
         .try_init();
 }
 
-/// Resolve the canonical git common directory (the actual `.git`, even from
-/// inside a worktree) for `cwd`. Returns `None` when not a git repo or git is
-/// unavailable. Result paths are absolute.
-pub(crate) fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
-    let out = std::process::Command::new("git")
-        .arg("rev-parse")
-        .arg("--git-common-dir")
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let dir = String::from_utf8(out.stdout).ok()?;
-    let dir = dir.trim();
-    if dir.is_empty() {
-        return None;
-    }
-    let path = Path::new(dir);
-    Some(if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    })
-}
+/// Canonical git-common-dir resolution lives in the graph crate beside the
+/// drift instrumentation; re-exported here so CLI modules keep one import path.
+pub(crate) use codesage_graph::drift::git_common_dir;
 
 /// True when `a` and `b` resolve to the same filesystem location. Tries
 /// `canonicalize` first (which follows symlinks and normalizes `..`); if

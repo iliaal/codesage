@@ -130,7 +130,7 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
         // Bound fan-out: a symbol referenced by hundreds of files explodes the
         // frontier and the per-symbol `references_for_symbol` queries at the
         // next depth. Dedup by qualified name and cap each level so a wide
-        // blast radius can't make impact analysis unbounded. fnd: CR-017.
+        // blast radius can't make impact analysis unbounded.
         const MAX_FRONTIER: usize = 512;
         let mut seen_symbols: HashSet<(String, String, u32)> = HashSet::new();
         next_frontier.retain(|s| seen_symbols.insert(symbol_identity_key(s)));

@@ -109,24 +109,14 @@ fn harden_db_path_permissions(path: &Path) -> Result<()> {
 
 #[cfg(unix)]
 fn harden_db_path_permissions_impl(path: &Path) -> Result<()> {
-    use std::fs::{self, OpenOptions};
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
 
     if let Some(parent) = path.parent()
         && parent.file_name().and_then(|n| n.to_str()) == Some(".codesage")
         && parent.exists()
     {
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-    }
-
-    if !path.exists() {
-        OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .read(true)
-            .mode(0o600)
-            .open(path)?;
     }
 
     for sidecar in db_sidecar_paths(path) {
@@ -141,6 +131,72 @@ fn harden_db_path_permissions_impl(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn harden_db_path_permissions_impl(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+/// Pre-create a missing DB file with private permissions so it is never born
+/// with umask-derived world/group bits (SQLite would otherwise create it).
+#[cfg(unix)]
+fn create_private_db_file(path: &Path) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if !path.exists() {
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .mode(0o600)
+            .open(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_private_db_file(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Open the SQLite connection behind every `Database` constructor. With
+/// `create` false the open refuses to materialize a missing file (no
+/// `SQLITE_OPEN_CREATE`): read-shaped callers on an existing project must
+/// surface "index gone" instead of silently recreating an empty index that
+/// answers every query with zero results.
+fn open_connection(path: &Path, create: bool) -> Result<Connection> {
+    init_vec_extension();
+    if create {
+        create_private_db_file(path)?;
+    } else if !path.exists() {
+        anyhow::bail!(
+            "index database {} does not exist (project not onboarded, or its index was deleted)",
+            path.display()
+        );
+    }
+    harden_db_path_permissions(path)?;
+    let conn = if create {
+        Connection::open(path)?
+    } else {
+        use rusqlite::OpenFlags;
+        Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::SqliteFailure(ffi_err, _)
+                if ffi_err.code == rusqlite::ErrorCode::CannotOpen =>
+            {
+                anyhow::anyhow!(
+                    "index database {} does not exist (project not onboarded, or its index was deleted)",
+                    path.display()
+                )
+            }
+            other => other.into(),
+        })?
+    };
+    init_db(&conn)?;
+    Ok(conn)
 }
 
 #[cfg(unix)]
@@ -315,10 +371,20 @@ impl Database {
     /// Open a DB for read-only (structural) queries. No chunk/vec table is created;
     /// semantic queries will fail until `open_for_model` is used instead.
     pub fn open(path: &Path) -> Result<Self> {
-        init_vec_extension();
+        let conn = open_connection(path, true)?;
         harden_db_path_permissions(path)?;
-        let conn = Connection::open(path)?;
-        init_db(&conn)?;
+        Ok(Database {
+            conn,
+            chunk_table: String::new(),
+        })
+    }
+
+    /// Like [`Database::open`], but refuses to create a missing database
+    /// file. Read paths on already-onboarded projects (the MCP daemon) use
+    /// this so a deleted index surfaces an error instead of being silently
+    /// recreated empty.
+    pub fn open_existing(path: &Path) -> Result<Self> {
+        let conn = open_connection(path, false)?;
         harden_db_path_permissions(path)?;
         Ok(Database {
             conn,
@@ -327,10 +393,24 @@ impl Database {
     }
 
     pub fn open_for_model(path: &Path, model: &str, dim: usize) -> Result<Self> {
-        init_vec_extension();
-        harden_db_path_permissions(path)?;
-        let conn = Connection::open(path)?;
-        init_db(&conn)?;
+        let conn = open_connection(path, true)?;
+        Self::finish_open_for_model(conn, path, model, dim)
+    }
+
+    /// Like [`Database::open_for_model`], but refuses to create a missing
+    /// database file (the chunk table for `model` is still ensured inside an
+    /// existing database). See [`Database::open_existing`] for why.
+    pub fn open_for_model_existing(path: &Path, model: &str, dim: usize) -> Result<Self> {
+        let conn = open_connection(path, false)?;
+        Self::finish_open_for_model(conn, path, model, dim)
+    }
+
+    fn finish_open_for_model(
+        conn: Connection,
+        path: &Path,
+        model: &str,
+        dim: usize,
+    ) -> Result<Self> {
         let requested_table = model_table_name(model, dim);
         let chunk_table =
             existing_chunk_table_name(&conn, &requested_table)?.unwrap_or(requested_table);
@@ -342,10 +422,7 @@ impl Database {
     }
 
     pub fn open_for_model_rebuild(path: &Path, model: &str, dim: usize) -> Result<Self> {
-        init_vec_extension();
-        harden_db_path_permissions(path)?;
-        let conn = Connection::open(path)?;
-        init_db(&conn)?;
+        let conn = open_connection(path, true)?;
         let requested_table = model_table_name(model, dim);
         let chunk_table =
             existing_chunk_table_name(&conn, &requested_table)?.unwrap_or(requested_table);
@@ -367,11 +444,10 @@ impl Database {
     /// configured model name without constructing the embedder just to discover
     /// dimension. If no matching table exists, chunk reads degrade to empty
     /// results; if multiple tables match, the caller must resolve the ambiguity.
+    /// A missing database file is an error, never created here — every caller
+    /// is a read path on a project expected to already be indexed.
     pub fn open_for_existing_model(path: &Path, model: &str) -> Result<Self> {
-        init_vec_extension();
-        harden_db_path_permissions(path)?;
-        let conn = Connection::open(path)?;
-        init_db(&conn)?;
+        let conn = open_connection(path, false)?;
         let matches = {
             let mut stmt = conn.prepare(
                 "SELECT sm.chunk_table FROM semantic_models sm
@@ -1544,6 +1620,147 @@ mod tests {
         let db_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700);
         assert_eq!(db_mode, 0o600);
+    }
+
+    #[test]
+    fn open_existing_refuses_to_create_missing_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+
+        let err = match Database::open_existing(&path) {
+            Ok(_) => panic!("expected missing-db error"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("not onboarded"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !path.exists(),
+            "a read-path open must not create the database file"
+        );
+    }
+
+    #[test]
+    fn open_existing_opens_an_already_created_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        Database::open(&path).unwrap();
+
+        let db = Database::open_existing(&path).unwrap();
+
+        assert_eq!(db.file_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn open_for_model_existing_refuses_to_create_missing_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+
+        let err = match Database::open_for_model_existing(
+            &path,
+            "codesage-test/model",
+            DEFAULT_EMBEDDING_DIM,
+        ) {
+            Ok(_) => panic!("expected missing-db error"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("not onboarded"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !path.exists(),
+            "a read-path open must not create the database file"
+        );
+    }
+
+    #[test]
+    fn open_for_model_existing_reads_chunks_from_an_existing_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let model = "codesage-test/model";
+        {
+            let db = Database::open_for_model(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+            let embedding = make_embedding(0.1);
+            db.insert_chunks(
+                "src/lib.rs",
+                "rust",
+                &[("fn target() {}", 1, 1, embedding.as_slice())],
+            )
+            .unwrap();
+        }
+
+        let db = Database::open_for_model_existing(&path, model, DEFAULT_EMBEDDING_DIM).unwrap();
+
+        assert_eq!(db.chunks_for_file("src/lib.rs").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn open_for_existing_model_refuses_to_create_missing_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+
+        let err = match Database::open_for_existing_model(&path, "codesage-test/model") {
+            Ok(_) => panic!("expected missing-db error"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("not onboarded"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !path.exists(),
+            "a read-path open must not create the database file"
+        );
+    }
+
+    #[test]
+    fn execute_batch_rolls_back_on_closure_error() {
+        let db = Database::open_in_memory().unwrap();
+
+        let err = db
+            .execute_batch(|db| {
+                db.upsert_file(&make_file("rollback.php"))?;
+                anyhow::bail!("closure boom")
+            })
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("closure boom"),
+            "caller must see the closure's own error: {err:#}"
+        );
+        assert_eq!(
+            db.file_count().unwrap(),
+            0,
+            "a failed batch must roll back its writes"
+        );
+    }
+
+    #[test]
+    fn execute_batch_failure_leaves_connection_usable() {
+        let db = Database::open_in_memory().unwrap();
+
+        let _ = db.execute_batch(|db| {
+            db.upsert_file(&make_file("first.php"))?;
+            anyhow::bail!("boom")
+        });
+
+        db.execute_batch(|db| {
+            db.upsert_file(&make_file("second.php"))?;
+            Ok(())
+        })
+        .expect("connection must not be stuck mid-transaction after a failed batch");
+
+        assert_eq!(db.file_count().unwrap(), 1);
+        assert_eq!(
+            db.get_file_hash("second.php").unwrap().as_deref(),
+            Some("abc123"),
+            "the follow-up batch's write must be committed"
+        );
     }
 
     #[test]

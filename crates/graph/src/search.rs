@@ -52,7 +52,6 @@ const RERANK_OVERFETCH: usize = 5;
 /// bound on deep pagination (`offset=1000` → 5000+ rows through the
 /// cross-encoder); cap it so rerank cost stays bounded. Pages past this depth
 /// return fewer / no results, which is acceptable for semantic search.
-/// fnd: CR-019.
 const MAX_SEMANTIC_FETCH: usize = 500;
 
 /// Extra KNN candidates to fetch before applying path globs. Path filters are
@@ -65,6 +64,14 @@ const MAX_PATH_FILTER_KNN_FETCH: usize = 5_000;
 /// RRF constant. Standard value from the original paper; larger values
 /// damp the influence of absolute rank position, smaller values amplify it.
 const RRF_K: f64 = 60.0;
+
+/// Minimum usable span of the semantic candidates' scores for the fused-score
+/// rescale in [`rrf_merge`]. Below this, the min-max rescale would compress
+/// every fused row into a band the flat +0.1 symbol boost dwarfs, so the
+/// synthetic-span fallback fires instead. 0.05 keeps genuinely-informative
+/// spans (typical KNN spreads are well above it) while catching both exact
+/// ties and the near-tie degenerate corpora an epsilon test let through.
+const MIN_FUSED_RESCALE_SPAN: f32 = 0.05;
 
 /// Doc-frequency threshold below which a query token counts as "rare" for
 /// the gate. 1% of the corpus is the memo's suggested cutoff — distinctive
@@ -277,13 +284,15 @@ fn rrf_merge(
         // valid score range.
         (0.0, 1.0)
     };
-    // When every semantic candidate shares one score (duplicated chunks, a
-    // tiny corpus), the span collapses and the rescale below would map every
-    // fused row onto that single value — defeating the whole point, since a
-    // flat +0.1 boost could then reorder the fused ranking freely. Open a
-    // small synthetic span below the shared score so fused order survives with
-    // headroom under the additive boost.
-    let (sem_min, sem_max) = if (sem_max - sem_min).abs() < f32::EPSILON {
+    // When the semantic candidates' scores (near-)collapse — exact ties from
+    // duplicated chunks, or scores a few ULPs apart on a tiny corpus — the
+    // rescale below would compress every fused row into a band far narrower
+    // than the flat +0.1 symbol boost, which could then reorder the fused
+    // ranking freely. Anything under MIN_FUSED_RESCALE_SPAN gets a synthetic
+    // span below the top score instead, so fused order survives with headroom
+    // under the additive boost. An exact-epsilon test here was not enough:
+    // spans like 1e-6 passed it and still collapsed the rescale.
+    let (sem_min, sem_max) = if sem_max - sem_min < MIN_FUSED_RESCALE_SPAN {
         ((sem_max - 0.2).clamp(0.0, 1.0), sem_max.clamp(0.0, 1.0))
     } else {
         (sem_min, sem_max)
@@ -349,10 +358,10 @@ fn bm25_search_candidates(
     db: &Database,
     match_expr: &str,
     fetch_limit: usize,
-    language: Option<&str>,
+    languages: Option<&[&str]>,
     paths: Option<&[&str]>,
 ) -> Result<Vec<RawSearchRow>> {
-    db.search_bm25(match_expr, fetch_limit, language, paths)
+    db.search_bm25(match_expr, fetch_limit, languages, paths)
 }
 
 /// Reranker callback for [`search`] / [`export_context`]. Takes the query
@@ -458,7 +467,7 @@ pub fn search(
 
     let page_window = limit.saturating_add(offset);
     // Cap the candidate pool so a deep `offset` can't balloon the cross-encoder
-    // workload, while still honoring a large explicit `limit`. fnd: CR-019.
+    // workload, while still honoring a large explicit `limit`.
     let semantic_fetch = page_window
         .saturating_mul(overfetch)
         .min(limit.max(MAX_SEMANTIC_FETCH));
@@ -502,13 +511,14 @@ pub fn search(
         if match_expr.is_empty() {
             rows
         } else {
-            let bm25_language: Option<&str> = req.languages.as_ref().and_then(|ls| {
-                if ls.len() == 1 {
-                    Some(ls[0].as_str())
-                } else {
-                    None
-                }
-            });
+            // Filter the BM25 leg to the FULL requested language set. Left
+            // unfiltered, foreign-language rows would occupy rrf_merge slots
+            // only to be retained away afterwards — pushing matching-language
+            // candidates out of the fused pool entirely.
+            let bm25_languages: Option<Vec<&str>> = req
+                .languages
+                .as_ref()
+                .map(|ls| ls.iter().map(|l| l.as_str()).collect());
             let bm25_paths: Option<Vec<&str>> = req
                 .paths
                 .as_ref()
@@ -517,7 +527,7 @@ pub fn search(
                 db,
                 &match_expr,
                 semantic_fetch,
-                bm25_language,
+                bm25_languages.as_deref(),
                 bm25_paths.as_deref(),
             ) {
                 Ok(bm25_rows) if !bm25_rows.is_empty() => {
@@ -801,14 +811,14 @@ fn apply_qualified_name_boost(results: &mut [SearchResult], known_symbols: &[Str
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 }
 
-// Default-off; opt-in via CODESAGE_QUALIFIED_NAME_BOOST=1 (or "true"). The
-// gate exists to A/B the §2.12 hypothesis without shipping the new boost
-// to existing users. Promote to default-on if the bench shows lift.
+// Default-off, unlike the other gates: this exists to A/B the §2.12
+// hypothesis without shipping the new boost to existing users. Promote to
+// default-on if the bench shows lift.
 fn qualified_name_boost_enabled() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| {
         matches!(
-            std::env::var("CODESAGE_QUALIFIED_NAME_BOOST").as_deref(),
+            std::env::var(tuning::QUALIFIED_NAME_BOOST).as_deref(),
             Ok("1") | Ok("true") | Ok("TRUE") | Ok("True") | Ok("yes")
         )
     })
@@ -1020,12 +1030,48 @@ fn apply_definition_boost(results: &mut [SearchResult], query: &str) {
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 }
 
-// Default-on; opt-out via CODESAGE_DEFINITION_BOOST=0 (or "false"). The
-// `is_symbol_query` gate makes this provably inert on NL queries (commit
-// subjects, "how does X work" prose); manual A/B on bare-symbol queries
-// against the nest index showed the definition chunk surfaces over reference
-// / method-body chunks (ApplicationConfig: rank-1 score 0.76 → def chunk
-// 1.45; MicroservicesModule: 0.65 → 2.57).
+/// Environment toggles for the search scoring pipeline, named once here so
+/// the `CODESAGE_*` strings aren't scattered as duplicated literals. Every
+/// toggle is read once per process and cached (`OnceLock`).
+///
+/// Boolean gates, default-on — disable with `=0` / `=false` (see
+/// `env_default_on`):
+///
+/// - `DEFINITION_BOOST`: keyword + symbol-name definition-chunk boost
+/// - `STEM_SCAN`: non-candidate stem-scan chunk injection
+/// - `TEST_QUERY_AWARE`: test-intent query classification (lifts the
+///   test-path demote on test-shaped queries)
+/// - `PATH_PENALTY`: test / compat / examples / barrel / `.d.ts` path demotes
+/// - `FILE_SATURATION`: per-file chunk-count decay
+/// - `DIR_SATURATION`: per-directory chunk-count decay
+/// - `ADAPTIVE_RERANK`: query-shape-adaptive rerank blend weight
+///
+/// Boolean gate, default-off — enable with `=1` / `=true` / `=yes`:
+///
+/// - `QUALIFIED_NAME_BOOST`: ×2 qualified-name symbol-match boost (§2.12 A/B)
+///
+/// Numeric overrides (invalid values fall back to the built-in default):
+///
+/// - `DIR_SATURATION_THRESHOLD`: integer ≥ 1, default 2
+/// - `DIR_SATURATION_DECAY`: float in (0.0, 1.0], default 0.75
+mod tuning {
+    pub(super) const QUALIFIED_NAME_BOOST: &str = "CODESAGE_QUALIFIED_NAME_BOOST";
+    pub(super) const DEFINITION_BOOST: &str = "CODESAGE_DEFINITION_BOOST";
+    pub(super) const STEM_SCAN: &str = "CODESAGE_STEM_SCAN";
+    pub(super) const TEST_QUERY_AWARE: &str = "CODESAGE_TEST_QUERY_AWARE";
+    pub(super) const PATH_PENALTY: &str = "CODESAGE_PATH_PENALTY";
+    pub(super) const FILE_SATURATION: &str = "CODESAGE_FILE_SATURATION";
+    pub(super) const DIR_SATURATION: &str = "CODESAGE_DIR_SATURATION";
+    pub(super) const DIR_SATURATION_THRESHOLD: &str = "CODESAGE_DIR_SATURATION_THRESHOLD";
+    pub(super) const DIR_SATURATION_DECAY: &str = "CODESAGE_DIR_SATURATION_DECAY";
+    pub(super) const ADAPTIVE_RERANK: &str = "CODESAGE_ADAPTIVE_RERANK";
+}
+
+// The `is_symbol_query` gate makes the definition boost provably inert on NL
+// queries (commit subjects, "how does X work" prose); manual A/B on
+// bare-symbol queries against the nest index showed the definition chunk
+// surfaces over reference / method-body chunks (ApplicationConfig: rank-1
+// score 0.76 → def chunk 1.45; MicroservicesModule: 0.65 → 2.57).
 /// True unless the named env var is explicitly set to `0` / `false`. The
 /// default-on gate shape shared by the post-retrieval scoring stages.
 pub(crate) fn env_default_on(var: &str) -> bool {
@@ -1035,7 +1081,7 @@ pub(crate) fn env_default_on(var: &str) -> bool {
 static DEFINITION_BOOST_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn definition_boost_enabled() -> bool {
-    *DEFINITION_BOOST_ENABLED.get_or_init(|| env_default_on("CODESAGE_DEFINITION_BOOST"))
+    *DEFINITION_BOOST_ENABLED.get_or_init(|| env_default_on(tuning::DEFINITION_BOOST))
 }
 
 /// Precomputed lookup from a file's stem — lowercased, and separator-
@@ -1212,12 +1258,10 @@ fn apply_non_candidate_stem_scan(
     Ok(())
 }
 
-// Default-on; opt-out via CODESAGE_STEM_SCAN=0. Same gate concept as the
-// definition-boost flag.
 static STEM_SCAN_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn stem_scan_enabled() -> bool {
-    *STEM_SCAN_ENABLED.get_or_init(|| env_default_on("CODESAGE_STEM_SCAN"))
+    *STEM_SCAN_ENABLED.get_or_init(|| env_default_on(tuning::STEM_SCAN))
 }
 
 // Path-penalty multipliers, ported from Semble's ranking/penalties.py. Applied
@@ -1323,13 +1367,12 @@ fn query_is_test_shaped(query: &str) -> bool {
         })
 }
 
-// Default-on; opt-out via CODESAGE_TEST_QUERY_AWARE=0 (or "false").
 // When disabled, query_is_test_shaped always returns false → path_penalty
 // behaves as the pre-§1.22 fixed 0.3x for test-like paths regardless of query.
 static TEST_QUERY_AWARE_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn test_query_aware_enabled() -> bool {
-    *TEST_QUERY_AWARE_ENABLED.get_or_init(|| env_default_on("CODESAGE_TEST_QUERY_AWARE"))
+    *TEST_QUERY_AWARE_ENABLED.get_or_init(|| env_default_on(tuning::TEST_QUERY_AWARE))
 }
 
 fn apply_path_penalties(results: &mut [SearchResult], query: &str) {
@@ -1340,12 +1383,10 @@ fn apply_path_penalties(results: &mut [SearchResult], query: &str) {
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 }
 
-// Cached gate: opt-out via CODESAGE_PATH_PENALTY=0 (or "false"). Default on.
-// Cached so we don't getenv on every search call.
 static PATH_PENALTY_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn path_penalty_enabled() -> bool {
-    *PATH_PENALTY_ENABLED.get_or_init(|| env_default_on("CODESAGE_PATH_PENALTY"))
+    *PATH_PENALTY_ENABLED.get_or_init(|| env_default_on(tuning::PATH_PENALTY))
 }
 
 // File saturation decay: ranking the same file's Nth chunk gets multiplied by
@@ -1398,7 +1439,7 @@ static DIR_SATURATION_DECAY: OnceLock<f32> = OnceLock::new();
 
 fn dir_saturation_threshold() -> usize {
     *DIR_SATURATION_THRESHOLD.get_or_init(|| {
-        std::env::var("CODESAGE_DIR_SATURATION_THRESHOLD")
+        std::env::var(tuning::DIR_SATURATION_THRESHOLD)
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&n| n >= 1)
@@ -1408,7 +1449,7 @@ fn dir_saturation_threshold() -> usize {
 
 fn dir_saturation_decay() -> f32 {
     *DIR_SATURATION_DECAY.get_or_init(|| {
-        std::env::var("CODESAGE_DIR_SATURATION_DECAY")
+        std::env::var(tuning::DIR_SATURATION_DECAY)
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
             .filter(|&v| v > 0.0 && v <= 1.0)
@@ -1457,18 +1498,16 @@ fn parent_dir_for_saturation(file_path: &str) -> String {
     }
 }
 
-/// Default-on; opt-out via `CODESAGE_DIR_SATURATION=0` (or "false").
 static DIR_SATURATION_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn dir_saturation_enabled() -> bool {
-    *DIR_SATURATION_ENABLED.get_or_init(|| env_default_on("CODESAGE_DIR_SATURATION"))
+    *DIR_SATURATION_ENABLED.get_or_init(|| env_default_on(tuning::DIR_SATURATION))
 }
 
-// Default-on; opt-out via CODESAGE_FILE_SATURATION=0 (or "false").
 static FILE_SATURATION_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn file_saturation_enabled() -> bool {
-    *FILE_SATURATION_ENABLED.get_or_init(|| env_default_on("CODESAGE_FILE_SATURATION"))
+    *FILE_SATURATION_ENABLED.get_or_init(|| env_default_on(tuning::FILE_SATURATION))
 }
 
 const RERANK_WEIGHT_DEFAULT: f32 = 0.5;
@@ -1521,11 +1560,10 @@ fn adaptive_rerank_weight(query: &str) -> f32 {
     RERANK_WEIGHT_DEFAULT
 }
 
-/// Default-on; opt-out via `CODESAGE_ADAPTIVE_RERANK=0` (or "false").
 static ADAPTIVE_RERANK_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn adaptive_rerank_weight_enabled() -> bool {
-    *ADAPTIVE_RERANK_ENABLED.get_or_init(|| env_default_on("CODESAGE_ADAPTIVE_RERANK"))
+    *ADAPTIVE_RERANK_ENABLED.get_or_init(|| env_default_on(tuning::ADAPTIVE_RERANK))
 }
 
 fn apply_reranking(rerank: &mut RerankFn<'_>, query: &str, results: &mut [SearchResult]) {
@@ -1817,6 +1855,44 @@ mod hybrid_tests {
     }
 
     #[test]
+    fn search_bm25_filters_by_language_set() {
+        let db = Database::open_in_memory().unwrap();
+        seed_chunks(&db);
+        db.insert_chunks(
+            "src/legacy.php",
+            "php",
+            &[(
+                "// ColdFusion PHP bridge",
+                1,
+                2,
+                mk_embedding(0.5).as_slice(),
+            )],
+        )
+        .unwrap();
+
+        // Single language in the set: only the rust hit.
+        let rows = db
+            .search_bm25("\"ColdFusion\"", 10, Some(&["rust"]), None)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file_path, "src/reg.rs");
+
+        // Two languages: both hits, nothing else.
+        let mut rows = db
+            .search_bm25("\"ColdFusion\"", 10, Some(&["rust", "php"]), None)
+            .unwrap();
+        rows.sort_by(|a, b| a.file_path.cmp(&b.file_path));
+        let paths: Vec<&str> = rows.iter().map(|r| r.file_path.as_str()).collect();
+        assert_eq!(paths, ["src/legacy.php", "src/reg.rs"]);
+
+        // Empty set behaves like no filter.
+        let rows = db
+            .search_bm25("\"ColdFusion\"", 10, Some(&[]), None)
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
     fn search_bm25_respects_path_filters() {
         let db = Database::open_in_memory().unwrap();
         seed_chunks(&db);
@@ -1895,6 +1971,82 @@ mod hybrid_tests {
         assert!(
             results.iter().all(|r| r.language != Language::Php),
             "BM25-fused results must not leak excluded languages: {results:?}"
+        );
+    }
+
+    #[test]
+    fn bm25_leg_filters_to_requested_language_set_so_matches_are_not_displaced() {
+        // Regression for the unfiltered multi-language BM25 leg: with 2+
+        // requested languages the BM25 candidates used to come back
+        // unfiltered, so foreign-language rows occupied the rrf_merge slots
+        // and were only retained away afterwards — pushing the
+        // matching-language BM25 hit out of the fused pool entirely.
+        let db = Database::open_in_memory().unwrap();
+        // Rust decoys sitting right on the query embedding, no rare token:
+        // they fill the semantic candidate pool.
+        db.insert_chunks(
+            "src/a.rs",
+            "rust",
+            &[("fn decoy_a() {}", 1, 5, mk_embedding(0.1).as_slice())],
+        )
+        .unwrap();
+        db.insert_chunks(
+            "src/b.rs",
+            "rust",
+            &[("fn decoy_b() {}", 1, 5, mk_embedding(0.1).as_slice())],
+        )
+        .unwrap();
+        db.insert_chunks(
+            "src/c.rs",
+            "rust",
+            &[("fn decoy_c() {}", 1, 5, mk_embedding(0.1).as_slice())],
+        )
+        .unwrap();
+        // The target: matching-language chunk with the rare literal, far from
+        // the query embedding so only the BM25 leg can surface it. Longer
+        // content keeps its BM25 rank below the dense foreign rows.
+        db.insert_chunks(
+            "src/target.rs",
+            "rust",
+            &[(
+                "// ColdFusion registration entry point with a long body of prose",
+                1,
+                5,
+                mk_embedding(0.9).as_slice(),
+            )],
+        )
+        .unwrap();
+        // Foreign-language rows stuffed with the token: an unfiltered BM25
+        // leg (k = 3) returns only these.
+        for path in ["php/a.php", "php/b.php", "php/c.php", "php/d.php"] {
+            db.insert_chunks(
+                path,
+                "php",
+                &[("ColdFusion ColdFusion", 1, 2, mk_embedding(0.5).as_slice())],
+            )
+            .unwrap();
+        }
+        db.insert_chunks(
+            "pkg/x.go",
+            "go",
+            &[("ColdFusion go side", 1, 2, mk_embedding(0.5).as_slice())],
+        )
+        .unwrap();
+
+        let mut req = search_req("ColdFusion::register");
+        req.languages = Some(vec![Language::Rust, Language::TypeScript]);
+        req.limit = Some(3);
+
+        let results = search(&db, &mk_embedding(0.1), None, &req).unwrap();
+
+        assert!(
+            results.iter().any(|r| r.file_path == "src/target.rs"),
+            "matching-language BM25 hit must not be displaced by \
+             foreign-language rows occupying the fused pool: {results:?}"
+        );
+        assert!(
+            results.iter().all(|r| r.language == Language::Rust),
+            "no foreign-language rows may survive: {results:?}"
         );
     }
 
@@ -2054,6 +2206,54 @@ mod hybrid_tests {
         // A single +0.1 boost on the mid row must not displace the top hit.
         // Without the fallback every score would be 0.98, so the boosted row
         // (1.08) would jump straight past the top.
+        apply_symbol_boost(&mut results, &["known_sym".to_string()]);
+        assert_eq!(results[0].file_path, "top.rs");
+    }
+
+    #[test]
+    fn fused_rescale_uses_synthetic_span_on_near_tied_semantic_scores() {
+        // Scores differing by a few ULPs (~1e-6 span) passed the old exact-tie
+        // epsilon check, so the min-max rescale compressed every fused row
+        // into a sub-microscopic band a flat +0.1 boost reordered at will.
+        // Near-ties must take the synthetic-span path exactly like exact ties.
+        let mk_row = |path: &str, content: &str, distance: f32| RawSearchRow {
+            file_path: path.into(),
+            language: "rust".into(),
+            content: content.into(),
+            start_line: 1,
+            end_line: 1,
+            distance,
+        };
+        // l2_to_score spans ~6e-7 across these four distances — wider than
+        // f32::EPSILON, far narrower than MIN_FUSED_RESCALE_SPAN.
+        let semantic = vec![
+            mk_row("top.rs", "fn top() {}", 0.2),
+            mk_row("second.rs", "fn second() {}", 0.2000005),
+            mk_row("mid.rs", "uses known_sym here", 0.200001),
+            mk_row("low.rs", "fn low() {}", 0.2000015),
+        ];
+        let fused = rrf_merge(semantic, Vec::new(), 10);
+        let mut results: Vec<SearchResult> = fused
+            .into_iter()
+            .map(|r| SearchResult {
+                file_path: r.file_path,
+                language: codesage_protocol::Language::Rust,
+                content: r.content,
+                start_line: r.start_line,
+                end_line: r.end_line,
+                score: l2_to_score(r.distance),
+                symbols: Vec::new(),
+            })
+            .collect();
+
+        assert_eq!(results[0].file_path, "top.rs");
+        assert!(
+            results[0].score - results.last().unwrap().score > 0.1,
+            "near-tied semantic scores must still yield a usable fused spread: {:?}",
+            results.iter().map(|r| r.score).collect::<Vec<_>>()
+        );
+
+        // A single +0.1 boost on the mid row must not displace the top hit.
         apply_symbol_boost(&mut results, &["known_sym".to_string()]);
         assert_eq!(results[0].file_path, "top.rs");
     }

@@ -26,6 +26,7 @@ toml = "1.1"
 toml_edit = "0.25"
 jsonc-parser = { version = "0.33", features = ["cst"] }
 anyhow.workspace = true
+ignore.workspace = true
 parking_lot.workspace = true
 rmcp.workspace = true
 tokio.workspace = true

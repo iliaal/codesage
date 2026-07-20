@@ -2,7 +2,7 @@ use std::sync::Once;
 
 use rusqlite::Connection;
 
-pub const SCHEMA: &str = r#"
+pub(crate) const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS files (
     id INTEGER PRIMARY KEY,
     path TEXT NOT NULL UNIQUE,
@@ -164,7 +164,7 @@ CREATE TABLE IF NOT EXISTS feature_trust_boundaries (
 );
 "#;
 
-pub fn semantic_schema(table_name: &str, dim: usize) -> String {
+pub(crate) fn semantic_schema(table_name: &str, dim: usize) -> String {
     format!(
         "CREATE VIRTUAL TABLE IF NOT EXISTS \"{table_name}\" USING vec0(\
          id INTEGER PRIMARY KEY, \
@@ -189,7 +189,7 @@ pub fn fts_table_name(chunk_table: &str) -> String {
 /// `doc_cfg`, `mb_convert_case`, `moduleref` intact instead of splitting
 /// them into half-useful tokens. No Porter stemmer — we match code
 /// identifiers verbatim, not English.
-pub fn fts_schema(table_name: &str) -> String {
+pub(crate) fn fts_schema(table_name: &str) -> String {
     format!(
         "CREATE VIRTUAL TABLE IF NOT EXISTS \"{table_name}\" USING fts5(\
          content, \
@@ -201,7 +201,7 @@ pub fn fts_schema(table_name: &str) -> String {
     )
 }
 
-pub fn fts_vocab_schema(fts_table_name: &str) -> String {
+pub(crate) fn fts_vocab_schema(fts_table_name: &str) -> String {
     let vocab_table = format!("{fts_table_name}_vocab");
     format!(
         "CREATE VIRTUAL TABLE IF NOT EXISTS \"{}\" USING fts5vocab(\"{}\", row);",
@@ -239,7 +239,7 @@ fn repair_fts_sidecar(
     // removed, a different one added leaves counts equal but content stale).
     // Count + MAX(rowid) together is a much stronger invariant for the
     // append/delete workload the indexer produces, and stays two cheap
-    // queries — no checksums. fnd: CR-037.
+    // queries — no checksums.
     if chunk_count == fts_count
         && table_max_id(conn, chunk_table, "id")? == table_max_id(conn, fts_table, "rowid")?
     {
@@ -254,7 +254,7 @@ fn repair_fts_sidecar(
     // the next process start re-runs the repair. A savepoint (not a raw
     // BEGIN/COMMIT) composes when this runs inside an outer transaction —
     // a bare BEGIN errors with "cannot start a transaction within a
-    // transaction." fnd: CR-024.
+    // transaction."
     let sql = format!(
         "SAVEPOINT repair_fts;
          DELETE FROM \"{fts_table}\";
@@ -276,7 +276,7 @@ pub fn model_table_name(model: &str, dim: usize) -> String {
     format!("{}{dim}", model_table_prefix(model))
 }
 
-pub fn model_table_prefix(model: &str) -> String {
+pub(crate) fn model_table_prefix(model: &str) -> String {
     let sanitized: String = model
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
@@ -294,7 +294,7 @@ unsafe extern "C" {
 
 static VEC_INIT: Once = Once::new();
 
-pub fn init_vec_extension() {
+pub(crate) fn init_vec_extension() {
     // SAFETY: sqlite-vec exposes a valid SQLite extension entrypoint with the
     // signature required by `sqlite3_auto_extension`, and registration is
     // process-global/idempotent behind `Once`.
@@ -349,7 +349,7 @@ type MigrationUp = fn(&Connection) -> rusqlite::Result<()>;
 /// `schema_migrations` without knowing the migration itself refuses to open
 /// the DB. Unknown migrations WITHOUT this prefix are treated as additive:
 /// the open proceeds with a loud warning so mixed-version setups keep
-/// working. fnd: CR-016.
+/// working.
 pub const BREAKING_MIGRATION_PREFIX: &str = "breaking_";
 
 const MIGRATIONS: &[(&str, MigrationUp)] = &[
@@ -380,6 +380,10 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
         migrate_0011_features_test_command,
     ),
     ("0012_symbol_fingerprints", migrate_0012_symbol_fingerprints),
+    (
+        "0013_structural_unique_keys",
+        migrate_0013_structural_unique_keys,
+    ),
 ];
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
@@ -541,6 +545,58 @@ fn migrate_0011_features_test_command(conn: &Connection) -> rusqlite::Result<()>
     if has_column == 0 {
         conn.execute_batch("ALTER TABLE features ADD COLUMN test_command TEXT;")?;
     }
+    Ok(())
+}
+
+/// Adds UNIQUE indexes as a DB-level backstop for the natural row identity of
+/// `symbols`, `refs`, and `symbol_fingerprints`. Dedup was previously pure
+/// app-level (`upsert_file` deletes a file's rows before re-insert), so a
+/// missed delete silently accumulated duplicates. Pre-existing duplicates are
+/// removed first (lowest id / rowid per key wins) so the index build cannot
+/// fail; on healthy DBs the DELETEs match nothing. These indexes must NOT be
+/// added to the base `SCHEMA` — init_db runs `SCHEMA` before migrations, and
+/// a unique index created there would fail on a legacy DB carrying duplicates
+/// before this dedupe gets its chance (the 6498ec2 ordering-bug class).
+///
+/// The dedupe DELETEs use one GROUP BY pass per table (a temp b-tree sort,
+/// O(n log n) regardless of duplicate distribution): measured 1.2s for the
+/// whole migration on a php-src-scale index (362k refs, 67k symbols). The
+/// correlated-EXISTS alternative was rejected — its probe degrades
+/// quadratically on hot `to_name` values (>120s on the same DB).
+///
+/// `refs` uniqueness is scoped to parser-extracted rows: synthetic
+/// `route_handler` edges live outside `upsert_file`'s delete-then-insert
+/// contract (the feature mapper rewrites them wholesale per kind), always
+/// carry `col = 0`, and two same-line registrations of one handler would
+/// collide on the positional key — so the partial index leaves them alone.
+///
+/// Additive, not `breaking_`-prefixed: older binaries run unchanged against
+/// the new indexes because their normal delete-then-insert flow never inserts
+/// duplicate rows.
+fn migrate_0013_structural_unique_keys(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "DELETE FROM symbols WHERE id NOT IN (
+             SELECT MIN(id) FROM symbols
+             GROUP BY file_id, name, qualified_name, kind,
+                      line_start, line_end, col_start, col_end
+         );
+         DELETE FROM refs WHERE kind <> 'route_handler' AND id NOT IN (
+             SELECT MIN(id) FROM refs WHERE kind <> 'route_handler'
+             GROUP BY from_file_id, to_name, kind, line, col
+         );
+         DELETE FROM symbol_fingerprints WHERE rowid NOT IN (
+             SELECT MIN(rowid) FROM symbol_fingerprints
+             GROUP BY file_id, name, kind, line_start, line_end
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS uq_symbols_identity
+             ON symbols(file_id, name, qualified_name, kind,
+                        line_start, line_end, col_start, col_end);
+         CREATE UNIQUE INDEX IF NOT EXISTS uq_refs_identity
+             ON refs(from_file_id, to_name, kind, line, col)
+             WHERE kind <> 'route_handler';
+         CREATE UNIQUE INDEX IF NOT EXISTS uq_symfp_identity
+             ON symbol_fingerprints(file_id, name, kind, line_start, line_end);",
+    )?;
     Ok(())
 }
 
@@ -757,7 +813,11 @@ fn migrate_0005_semantic_models(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-pub fn ensure_chunk_table(conn: &Connection, table_name: &str, dim: usize) -> rusqlite::Result<()> {
+pub(crate) fn ensure_chunk_table(
+    conn: &Connection,
+    table_name: &str,
+    dim: usize,
+) -> rusqlite::Result<()> {
     conn.execute_batch(&semantic_schema(table_name, dim))?;
     let fts = fts_table_name(table_name);
     conn.execute_batch(&fts_schema(&fts))?;
@@ -849,7 +909,7 @@ mod tests {
 
         // Diverge while keeping counts equal: drop chunk id=2, add id=3
         // to the chunk table only. Counts are 2 == 2 but MAX(id)=3 vs
-        // MAX(rowid)=2 — the pre-CR-037 count-only check skipped repair here.
+        // MAX(rowid)=2 — the previous count-only check skipped repair here.
         conn.execute(&format!("DELETE FROM \"{table}\" WHERE id = 2"), [])
             .unwrap();
         conn.execute(

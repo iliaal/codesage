@@ -1,5 +1,6 @@
 use std::num::NonZeroUsize;
 
+use anyhow::{Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 pub use codesage_protocol::DEFAULT_EMBEDDING_DIM;
@@ -41,12 +42,12 @@ pub fn wants_coreml(device: &str) -> bool {
 /// crate goes out of its way to make loud elsewhere (the `/proc/self/maps`
 /// guard in `model.rs`). Validating up front turns a near-miss into an
 /// actionable error instead of a 10x-slower run.
-pub fn validate_device(device: &str) -> Result<(), String> {
+pub fn validate_device(device: &str) -> Result<()> {
     match device.trim().to_ascii_lowercase().as_str() {
         "cpu" | "gpu" | "cuda" | "coreml" => Ok(()),
-        other => Err(format!(
+        other => bail!(
             "unknown device {other:?} in .codesage/config.toml: expected one of \"cpu\", \"gpu\", \"cuda\", \"coreml\""
-        )),
+        ),
     }
 }
 
@@ -127,25 +128,22 @@ impl Default for EmbeddingConfig {
 }
 
 impl EmbeddingConfig {
-    pub fn effective_batch_size(&self) -> Result<NonZeroUsize, String> {
+    pub fn effective_batch_size(&self) -> Result<NonZeroUsize> {
         self.effective_batch_size_with_env(std::env::var("CODESAGE_BATCH_SIZE").ok().as_deref())
     }
 
-    fn effective_batch_size_with_env(
-        &self,
-        env_value: Option<&str>,
-    ) -> Result<NonZeroUsize, String> {
+    fn effective_batch_size_with_env(&self, env_value: Option<&str>) -> Result<NonZeroUsize> {
         if let Some(n) = self.batch_size_override {
             return validate_batch_size(n, "batch size override");
         }
         if let Some(value) = env_value {
             let parsed = value.trim().parse::<usize>().map_err(|e| {
-                format!(
+                anyhow!(
                     "invalid CODESAGE_BATCH_SIZE value {value:?}: expected a positive integer ({e})"
                 )
             })?;
             let n = NonZeroUsize::new(parsed).ok_or_else(|| {
-                format!("invalid CODESAGE_BATCH_SIZE value {value:?}: expected a positive integer")
+                anyhow!("invalid CODESAGE_BATCH_SIZE value {value:?}: expected a positive integer")
             })?;
             return validate_batch_size(n, "CODESAGE_BATCH_SIZE");
         }
@@ -168,7 +166,7 @@ impl EmbeddingConfig {
         } else {
             // Mean is correct for MiniLM/E5-style models but wrong for any
             // CLS model not named `bge-*`. Warn once so a silent pooling
-            // mismatch on a custom model surfaces. fnd: CR-007.
+            // mismatch on a custom model surfaces.
             if !self.model.to_lowercase().contains("minilm") {
                 static WARNED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
@@ -189,15 +187,13 @@ pub fn default_batch_size() -> NonZeroUsize {
     NonZeroUsize::new(BATCH_SIZE).expect("BATCH_SIZE must be non-zero")
 }
 
-fn validate_batch_size(n: NonZeroUsize, source: &str) -> Result<NonZeroUsize, String> {
-    if n.get() > MAX_BATCH_SIZE {
-        Err(format!(
-            "{source} value {} exceeds max supported batch size {MAX_BATCH_SIZE}",
-            n.get()
-        ))
-    } else {
-        Ok(n)
-    }
+fn validate_batch_size(n: NonZeroUsize, source: &str) -> Result<NonZeroUsize> {
+    ensure!(
+        n.get() <= MAX_BATCH_SIZE,
+        "{source} value {} exceeds max supported batch size {MAX_BATCH_SIZE}",
+        n.get()
+    );
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -263,7 +259,10 @@ mod batch_size_tests {
 
         let err = cfg.effective_batch_size_with_env(Some("0")).unwrap_err();
 
-        assert!(err.contains("positive integer"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("positive integer"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -272,7 +271,10 @@ mod batch_size_tests {
 
         let err = cfg.effective_batch_size_with_env(Some("abc")).unwrap_err();
 
-        assert!(err.contains("positive integer"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("positive integer"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -285,7 +287,7 @@ mod batch_size_tests {
         let err = cfg.effective_batch_size_with_env(None).unwrap_err();
 
         assert!(
-            err.contains("exceeds max supported batch size"),
+            err.to_string().contains("exceeds max supported batch size"),
             "unexpected error: {err}"
         );
     }
@@ -299,7 +301,7 @@ mod batch_size_tests {
             .unwrap_err();
 
         assert!(
-            err.contains("exceeds max supported batch size"),
+            err.to_string().contains("exceeds max supported batch size"),
             "unexpected error: {err}"
         );
     }
@@ -312,7 +314,7 @@ mod batch_size_tests {
         let err = cfg.effective_batch_size_with_env(None).unwrap_err();
 
         assert!(
-            err.contains("exceeds max supported batch size"),
+            err.to_string().contains("exceeds max supported batch size"),
             "unexpected error: {err}"
         );
     }

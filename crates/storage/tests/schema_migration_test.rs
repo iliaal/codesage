@@ -203,6 +203,7 @@ fn fresh_db_records_migrations_exactly_once() {
         "0010_files_boundaries_derived_at",
         "0011_features_test_command",
         "0012_symbol_fingerprints",
+        "0013_structural_unique_keys",
     ] {
         let count: i64 = conn
             .query_row(
@@ -214,13 +215,13 @@ fn fresh_db_records_migrations_exactly_once() {
         assert_eq!(count, 1, "{migration} recorded on fresh DB");
     }
 
-    // Running init_db again must be a no-op: count stays at 12.
+    // Running init_db again must be a no-op: count stays at 13.
     init_db(&conn).expect("second init_db");
     let count_after: i64 = conn
         .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
-        count_after, 12,
+        count_after, 13,
         "second init_db must not re-apply migrations"
     );
 }
@@ -254,6 +255,7 @@ fn legacy_db_records_migration_after_upgrade() {
         "0010_files_boundaries_derived_at",
         "0011_features_test_command",
         "0012_symbol_fingerprints",
+        "0013_structural_unique_keys",
     ] {
         let count: i64 = conn
             .query_row(
@@ -480,6 +482,209 @@ fn breaking_migration_marker_from_newer_binary_refuses_open() {
         msg.contains("upgrade codesage"),
         "error must tell the operator how to recover: {msg}"
     );
+}
+
+#[test]
+fn unique_key_migration_dedupes_existing_duplicates() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_db(&conn).expect("initial current schema");
+
+    // Roll back to the pre-0013 state so duplicates can be seeded.
+    conn.execute_batch(
+        "DROP INDEX uq_symbols_identity;
+         DROP INDEX uq_refs_identity;
+         DROP INDEX uq_symfp_identity;
+         DELETE FROM schema_migrations WHERE name = '0013_structural_unique_keys';",
+    )
+    .unwrap();
+
+    conn.execute_batch(
+        "INSERT INTO files (id, path, language, content_hash) VALUES (1, 'a.rs', 'rust', 'h');
+         INSERT INTO symbols (id, file_id, name, qualified_name, kind,
+                              line_start, line_end, col_start, col_end)
+         VALUES (10, 1, 'foo', 'a::foo', 'function', 1, 3, 0, 10),
+                (11, 1, 'foo', 'a::foo', 'function', 1, 3, 0, 10),
+                (12, 1, 'bar', 'a::bar', 'function', 5, 8, 0, 10);
+         INSERT INTO refs (id, from_file_id, from_symbol, to_name, to_name_tail, kind, line, col)
+         VALUES (20, 1, NULL, 'baz', 'baz', 'call', 2, 4),
+                (21, 1, NULL, 'baz', 'baz', 'call', 2, 4),
+                (22, 1, NULL, 'qux', 'qux', 'call', 3, 4);
+         INSERT INTO symbol_fingerprints (file_id, name, kind, line_start, line_end, leaf_count, fp)
+         VALUES (1, 'foo', 'function', 1, 3, 7, zeroblob(512)),
+                (1, 'foo', 'function', 1, 3, 7, zeroblob(512)),
+                (1, 'bar', 'function', 5, 8, 9, zeroblob(512));",
+    )
+    .unwrap();
+
+    init_db(&conn).expect("0013 must dedupe then create the unique indexes");
+
+    // Lowest id per natural key survives.
+    let symbol_ids: Vec<i64> = {
+        let mut stmt = conn.prepare("SELECT id FROM symbols ORDER BY id").unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(
+        symbol_ids,
+        vec![10, 12],
+        "duplicate symbol row must be gone"
+    );
+
+    let ref_ids: Vec<i64> = {
+        let mut stmt = conn.prepare("SELECT id FROM refs ORDER BY id").unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(ref_ids, vec![20, 22], "duplicate ref row must be gone");
+
+    let fp_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM symbol_fingerprints", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(fp_count, 2, "duplicate fingerprint row must be gone");
+
+    for index in [
+        "uq_symbols_identity",
+        "uq_refs_identity",
+        "uq_symfp_identity",
+    ] {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name = ?1",
+                rusqlite::params![index],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "index {index} must exist after migration");
+    }
+}
+
+fn sample_file_info() -> codesage_protocol::FileInfo {
+    codesage_protocol::FileInfo {
+        path: "src/sample.rs".to_string(),
+        language: codesage_protocol::Language::Rust,
+        content_hash: "h1".to_string(),
+    }
+}
+
+fn sample_symbol() -> codesage_protocol::Symbol {
+    codesage_protocol::Symbol {
+        name: "foo".to_string(),
+        qualified_name: "sample::foo".to_string(),
+        kind: codesage_protocol::SymbolKind::Function,
+        file_path: "src/sample.rs".to_string(),
+        line_start: 1,
+        line_end: 3,
+        col_start: 0,
+        col_end: 10,
+        rationale: Vec::new(),
+    }
+}
+
+fn sample_reference(kind: codesage_protocol::ReferenceKind) -> codesage_protocol::Reference {
+    codesage_protocol::Reference {
+        from_file: "src/sample.rs".to_string(),
+        from_symbol: None,
+        to_name: "bar".to_string(),
+        kind,
+        line: 2,
+        col: 4,
+    }
+}
+
+#[test]
+fn unique_backstop_rejects_double_insert_without_delete() {
+    use codesage_protocol::ReferenceKind;
+    use codesage_storage::Database;
+    use codesage_storage::db::FingerprintInput;
+
+    let db = Database::open_in_memory().unwrap();
+    let file_id = db.upsert_file(&sample_file_info()).unwrap();
+
+    let symbols = vec![sample_symbol()];
+    db.insert_symbols(file_id, &symbols).unwrap();
+    assert!(
+        db.insert_symbols(file_id, &symbols).is_err(),
+        "re-inserting the same symbol without the per-file delete must hit \
+         the unique backstop"
+    );
+
+    let refs = vec![sample_reference(ReferenceKind::Call)];
+    db.insert_references(file_id, &refs).unwrap();
+    assert!(
+        db.insert_references(file_id, &refs).is_err(),
+        "re-inserting the same ref without the per-file delete must hit \
+         the unique backstop"
+    );
+
+    let fp: Vec<u64> = vec![0; 64];
+    let fps = vec![FingerprintInput {
+        name: "foo",
+        kind: "function",
+        line_start: 1,
+        line_end: 3,
+        leaf_count: 7,
+        fp: &fp,
+    }];
+    db.insert_fingerprints(file_id, &fps).unwrap();
+    assert!(
+        db.insert_fingerprints(file_id, &fps).is_err(),
+        "re-inserting the same fingerprint without the per-file delete must \
+         hit the unique backstop"
+    );
+}
+
+#[test]
+fn route_handler_refs_stay_exempt_from_unique_backstop() {
+    use codesage_protocol::ReferenceKind;
+    use codesage_storage::Database;
+
+    // Synthetic route_handler edges are rewritten wholesale per kind by the
+    // feature mapper (not per file by upsert_file) and always carry col = 0,
+    // so two same-line registrations of one handler are legitimate. The
+    // partial index must leave them ungoverned.
+    let db = Database::open_in_memory().unwrap();
+    let file_id = db.upsert_file(&sample_file_info()).unwrap();
+    let refs = vec![sample_reference(ReferenceKind::RouteHandler)];
+    db.insert_references(file_id, &refs).unwrap();
+    db.insert_references(file_id, &refs)
+        .expect("duplicate route_handler edges must not trip the backstop");
+}
+
+#[test]
+fn reindex_delete_then_insert_still_works_with_backstop() {
+    use codesage_protocol::ReferenceKind;
+    use codesage_storage::Database;
+    use codesage_storage::db::FingerprintInput;
+
+    let db = Database::open_in_memory().unwrap();
+    let fp: Vec<u64> = vec![0; 64];
+    for _pass in 0..2 {
+        // The normal indexer cycle: upsert_file deletes the file's prior
+        // rows, then the inserts repopulate them. Must stay clean under the
+        // new unique indexes.
+        let file_id = db.upsert_file(&sample_file_info()).unwrap();
+        db.insert_symbols(file_id, &[sample_symbol()]).unwrap();
+        db.insert_references(file_id, &[sample_reference(ReferenceKind::Call)])
+            .unwrap();
+        db.insert_fingerprints(
+            file_id,
+            &[FingerprintInput {
+                name: "foo",
+                kind: "function",
+                line_start: 1,
+                line_end: 3,
+                leaf_count: 7,
+                fp: &fp,
+            }],
+        )
+        .unwrap();
+    }
+    let n: usize = db.symbol_count().unwrap();
+    assert_eq!(n, 1, "reindex cycle must leave exactly one symbol row");
 }
 
 #[test]

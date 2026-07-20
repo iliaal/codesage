@@ -39,6 +39,12 @@ const RISK_FAIL_THRESHOLD: f64 = 0.10;
 /// full file lists; this caps hostile or corrupted snapshots.
 const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Tolerated forward skew on a snapshot's `created_at`. A backwards clock
+/// step (NTP correction, WSL2 resume) can leave the stamp ahead of the
+/// current wall clock; only skew beyond this bound is treated as a corrupt
+/// or hostile snapshot. The computed session duration clamps to ≥ 0.
+const MAX_SNAPSHOT_FUTURE_SKEW_SECS: i64 = 24 * 60 * 60;
+
 /// Take a snapshot of the current index state and persist it under
 /// `.codesage/sessions/<session_id>.json`. Overwrites any existing
 /// snapshot for the same id (re-running session_start is how you reset
@@ -208,7 +214,7 @@ pub fn session_end(project_root: &Path, db: &Database, session_id: &str) -> Resu
 
     Ok(SessionDiff {
         session_id: snapshot.session_id,
-        duration_seconds: now_unix - snapshot.created_at,
+        duration_seconds: (now_unix - snapshot.created_at).max(0),
         pass,
         file_count_before: snapshot.file_count,
         file_count_after: now_files.len() as u32,
@@ -272,7 +278,7 @@ fn compute_top_risk(
     // file is O(files × graph) and dominates session_start / project_overview
     // on large repos. Churn is the dominant risk component, so when the file
     // set is large, narrow to the highest-churn candidates before the BFS.
-    // Files absent from git history score ~0 anyway. fnd: CR-009.
+    // Files absent from git history score ~0 anyway.
     const CANDIDATE_BUDGET: usize = 400;
     let candidates: Vec<String> = if files.len() > CANDIDATE_BUDGET {
         let ranked = db.top_churn_files(CANDIDATE_BUDGET)?;
@@ -306,7 +312,7 @@ fn compute_top_risk(
 /// Risk scores for `files` via one `assess_risk_batch` call, which computes
 /// the import-cycle SCC set and the churn-percentile table once instead of
 /// per file (per-file `assess_risk` re-runs both — tens of ms each on large
-/// repos, unaffordable across a 400-candidate sweep). fnd: CR-001, CR-008.
+/// repos, unaffordable across a 400-candidate sweep).
 ///
 /// If the batch call fails as a whole, falls back to per-file scoring to
 /// preserve the skip-on-error semantics: files that error are logged and
@@ -442,8 +448,8 @@ fn read_snapshot(project_root: &Path, session_id: &str) -> Result<SessionSnapsho
     );
     let now = now_unix();
     ensure!(
-        snap.created_at <= now,
-        "session snapshot created_at is in the future ({})",
+        snap.created_at <= now + MAX_SNAPSHOT_FUTURE_SKEW_SECS,
+        "session snapshot created_at is implausibly far in the future ({})",
         snap.created_at
     );
     Ok(snap)
@@ -484,5 +490,49 @@ mod tests {
         assert!(validate_session_id("a/b").is_err());
         assert!(validate_session_id("").is_err());
         assert!(validate_session_id(".hidden").is_err());
+    }
+
+    fn snapshot_with_created_at(session_id: &str, created_at: i64) -> SessionSnapshot {
+        SessionSnapshot {
+            session_id: session_id.to_string(),
+            created_at,
+            file_count: 0,
+            symbol_count: 0,
+            files: Vec::new(),
+            cycles: Vec::new(),
+            top_risk_files: Vec::new(),
+            git_head: None,
+        }
+    }
+
+    #[test]
+    fn session_end_tolerates_small_future_created_at_with_zero_duration() {
+        // A backwards clock step (NTP correction, WSL2 resume) can leave the
+        // snapshot stamp slightly ahead of the wall clock; session_end must
+        // still work rather than hard-failing until time catches up.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let snap = snapshot_with_created_at("skew", now_unix() + 60);
+        write_snapshot(dir.path(), &snap).unwrap();
+
+        let diff = session_end(dir.path(), &db, "skew").expect("small skew must be tolerated");
+        assert_eq!(
+            diff.duration_seconds, 0,
+            "negative duration must clamp to 0"
+        );
+    }
+
+    #[test]
+    fn session_end_rejects_implausibly_future_created_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let snap = snapshot_with_created_at("far", now_unix() + 2 * 24 * 60 * 60);
+        write_snapshot(dir.path(), &snap).unwrap();
+
+        let err = session_end(dir.path(), &db, "far").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("future"),
+            "expected future-skew rejection, got: {err:#}"
+        );
     }
 }

@@ -799,7 +799,6 @@ impl Database {
     /// file searchable until the next semantic sweep. Savepoint-wrapped so a
     /// mid-delete failure can't leave the removal half-applied; a savepoint
     /// (not a bare BEGIN) composes with a caller's outer transaction.
-    /// fnd: CR-035.
     pub fn remove_file(&self, path: &str) -> Result<()> {
         self.conn.execute_batch("SAVEPOINT remove_file")?;
         let result = (|| -> Result<()> {

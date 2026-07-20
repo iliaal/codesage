@@ -18,15 +18,15 @@
 //! dilute `list_features` without unlocking a new agent action.
 
 use std::collections::BTreeSet;
-use std::fs;
+use std::path::PathBuf;
 
 use anyhow::Result;
 use codesage_protocol::{FeatureConfidence, FeatureKind, Language};
 use regex::Regex;
 
 use crate::mappers::shared::{
-    AUTH_SENSITIVE_TAG, is_safe_dir, is_safe_file, read_to_string_bounded, route_is_auth_sensitive,
-    strip_line_comments, walk_files,
+    AUTH_SENSITIVE_TAG, SOURCE_FILE_CAP, collect_source_files, is_safe_dir, is_safe_file,
+    read_to_string_bounded, route_is_auth_sensitive, strip_line_comments, walk_files,
 };
 use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile, SeedTest};
 
@@ -93,7 +93,7 @@ fn read_pyproject(root: &std::path::Path) -> Option<String> {
     if !is_safe_file(root, &path) {
         return None;
     }
-    fs::read_to_string(&path).ok()
+    read_to_string_bounded(&path).ok().flatten()
 }
 
 /// Detect the project's test driver. Priority order: uv → poetry → pdm →
@@ -197,29 +197,27 @@ fn python_project_seed(
         });
     }
     Ok(vec![FeatureSeed {
-        title: format!("Python project `{project_name}`"),
         summary: match test_cmd {
             Some(cmd) => format!("Python project rooted at {manifest} (test: `{cmd}`)"),
             None => format!("Python project rooted at {manifest}"),
         },
-        kind: FeatureKind::Library,
         source: "python-project",
-        confidence: FeatureConfidence::Medium,
-        entry_path: manifest.to_string(),
-        entry_symbol: Some(project_name),
-        entry_route: None,
+        entry_symbol: Some(project_name.clone()),
         // entry_command stays None on library features — it's part of the
         // feature_id hash and would destabilize identity whenever the
         // project's test runner changed. The runnable test invocation
         // goes in test_command instead.
-        entry_command: None,
         test_command: test_cmd.map(String::from),
-        language: Language::Python,
         tags: vec!["python".to_string(), "package".to_string()],
         owned_files,
         context_files,
-        tests: Vec::new(),
         test_prefixes: vec!["tests".to_string(), "test".to_string()],
+        ..FeatureSeed::new(
+            FeatureKind::Library,
+            Language::Python,
+            format!("Python project `{project_name}`"),
+            manifest,
+        )
     }])
 }
 
@@ -229,55 +227,34 @@ fn python_project_seed(
 /// those land on the `python-test-suite` feature instead — and generated
 /// stubs (`*_pb2.py`, `*.gen.py`).
 fn python_project_source_files(ctx: &MapperContext) -> Vec<String> {
-    const CAP: usize = 2_000;
     let root = ctx.root;
-    let scan_dirs: Vec<&str> = ["src", "lib"]
+    let scan_dirs: Vec<PathBuf> = ["src", "lib"]
         .into_iter()
-        .filter(|d| is_safe_dir(root, &root.join(d)))
+        .map(|d| root.join(d))
+        .filter(|d| is_safe_dir(root, d))
         .collect();
-    let mut out: Vec<String> = Vec::new();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    let consider = |rel: String, out: &mut Vec<String>, seen: &mut BTreeSet<String>| {
-        if !rel.ends_with(".py") {
-            return false;
-        }
-        if is_pytest_file(&rel) {
-            return false;
-        }
-        if rel.ends_with("_pb2.py") || rel.ends_with(".gen.py") {
-            return false;
-        }
-        if !seen.insert(rel.clone()) {
-            return false;
-        }
-        out.push(rel);
-        out.len() >= CAP
-    };
-    if scan_dirs.is_empty() {
-        // Project keeps its source at the repo root (no `src/` layout).
-        // Walk the whole root, bounded.
-        for rel in walk_files(root, root, 10_000, ctx.excludes) {
-            if consider(rel, &mut out, &mut seen) {
-                break;
-            }
-        }
+    // No `src/` layout: the project keeps its source at the repo root.
+    // Walk the whole root, bounded a bit wider than the per-dir case.
+    let (scan_dirs, walk_cap) = if scan_dirs.is_empty() {
+        (vec![root.to_path_buf()], 10_000)
     } else {
-        for dir in scan_dirs {
-            let abs = root.join(dir);
-            let mut hit_cap = false;
-            for rel in walk_files(root, &abs, 5_000, ctx.excludes) {
-                if consider(rel, &mut out, &mut seen) {
-                    hit_cap = true;
-                    break;
-                }
-            }
-            if hit_cap {
-                break;
-            }
-        }
-    }
-    out.sort();
-    out
+        (scan_dirs, 5_000)
+    };
+    collect_source_files(
+        ctx,
+        &scan_dirs,
+        walk_cap,
+        |rel| rel.ends_with(".py"),
+        |rel| {
+            // Broad canonical shape for this exclusion scan: anything under
+            // a tests/ dir (conftest.py, helpers, fixtures) belongs to the
+            // python-test-suite slice, not the project's owned sources.
+            crate::nearby_tests::is_test_file(rel, Language::Python)
+                || rel.ends_with("_pb2.py")
+                || rel.ends_with(".gen.py")
+        },
+        SOURCE_FILE_CAP,
+    )
 }
 
 fn pyproject_project_name(pyproject: Option<&str>) -> Option<String> {
@@ -319,7 +296,7 @@ fn pyproject_scripts_section(
     if !is_safe_file(root, &path) {
         return Ok(out);
     }
-    let Ok(raw) = fs::read_to_string(&path) else {
+    let Ok(Some(raw)) = read_to_string_bounded(&path) else {
         return Ok(out);
     };
     let body = strip_line_comments(&raw, '#');
@@ -350,25 +327,23 @@ fn pyproject_scripts_section(
             .clone()
             .unwrap_or_else(|| "pyproject.toml".to_string());
         out.push(FeatureSeed {
-            title: title_for(&name),
             summary: format!("pyproject.toml `[{section}]` entry `{name} = \"{target}\"`"),
-            kind: FeatureKind::CliCommand,
             source,
             confidence: FeatureConfidence::High,
-            entry_path,
             entry_symbol: Some(module),
-            entry_route: None,
-            entry_command: Some(name),
-            test_command: None,
-            language: Language::Python,
+            entry_command: Some(name.clone()),
             tags: vec!["python".to_string(), "cli".to_string()],
-            owned_files: Vec::new(),
             context_files: vec![SeedFile {
                 path: "pyproject.toml".to_string(),
                 reason: "package manifest".to_string(),
             }],
-            tests: Vec::new(),
             test_prefixes: vec!["tests".to_string()],
+            ..FeatureSeed::new(
+                FeatureKind::CliCommand,
+                Language::Python,
+                title_for(&name),
+                entry_path,
+            )
         });
     }
     Ok(out)
@@ -381,7 +356,10 @@ fn setup_py_entry_points(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
     if !is_safe_file(root, &path) {
         return Ok(out);
     }
-    let raw = fs::read_to_string(&path).unwrap_or_default();
+    let raw = read_to_string_bounded(&path)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     let console_re = Regex::new(r#"(?ms)['"]console_scripts['"]\s*:\s*\[([^\]]*)\]"#)?;
     let Some(cap) = console_re.captures(&raw) else {
         return Ok(out);
@@ -404,25 +382,23 @@ fn setup_py_entry_points(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
         let resolved = resolve_script_module_path(ctx, &module);
         let entry_path = resolved.clone().unwrap_or_else(|| "setup.py".to_string());
         out.push(FeatureSeed {
-            title: format!("Python script `{name}` (setup.py)"),
             summary: format!("setup.py console_scripts entry `{name}={target}`"),
-            kind: FeatureKind::CliCommand,
             source: "setup-py-script",
             confidence: FeatureConfidence::High,
-            entry_path,
             entry_symbol: Some(module),
-            entry_route: None,
-            entry_command: Some(name),
-            test_command: None,
-            language: Language::Python,
+            entry_command: Some(name.clone()),
             tags: vec!["python".to_string(), "cli".to_string()],
-            owned_files: Vec::new(),
             context_files: vec![SeedFile {
                 path: "setup.py".to_string(),
                 reason: "package manifest".to_string(),
             }],
-            tests: Vec::new(),
             test_prefixes: vec!["tests".to_string()],
+            ..FeatureSeed::new(
+                FeatureKind::CliCommand,
+                Language::Python,
+                format!("Python script `{name}` (setup.py)"),
+                entry_path,
+            )
         });
     }
     Ok(out)
@@ -440,7 +416,7 @@ fn setup_cfg_entry_points(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
     if !is_safe_file(root, &path) {
         return Ok(out);
     }
-    let Ok(raw) = fs::read_to_string(&path) else {
+    let Ok(Some(raw)) = read_to_string_bounded(&path) else {
         return Ok(out);
     };
     let body = strip_line_comments(&raw, '#');
@@ -470,27 +446,25 @@ fn setup_cfg_entry_points(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
         let resolved = resolve_script_module_path(ctx, &module);
         let entry_path = resolved.clone().unwrap_or_else(|| "setup.cfg".to_string());
         out.push(FeatureSeed {
-            title: format!("Python script `{name}` (setup.cfg)"),
             summary: format!(
                 "setup.cfg `[options.entry_points] console_scripts` entry `{name} = {target}`"
             ),
-            kind: FeatureKind::CliCommand,
             source: "setup-cfg-script",
             confidence: FeatureConfidence::High,
-            entry_path,
             entry_symbol: Some(module),
-            entry_route: None,
-            entry_command: Some(name),
-            test_command: None,
-            language: Language::Python,
+            entry_command: Some(name.clone()),
             tags: vec!["python".to_string(), "cli".to_string()],
-            owned_files: Vec::new(),
             context_files: vec![SeedFile {
                 path: "setup.cfg".to_string(),
                 reason: "package manifest".to_string(),
             }],
-            tests: Vec::new(),
             test_prefixes: vec!["tests".to_string()],
+            ..FeatureSeed::new(
+                FeatureKind::CliCommand,
+                Language::Python,
+                format!("Python script `{name}` (setup.cfg)"),
+                entry_path,
+            )
         });
     }
     Ok(out)
@@ -619,22 +593,17 @@ fn main_guard_modules(files: &[PyFile]) -> Result<Vec<FeatureSeed>> {
             .and_then(|name| name.strip_suffix(".py"))
             .unwrap_or("script");
         out.push(FeatureSeed {
-            title: format!("Python module `{stem}` (__main__)"),
             summary: format!("Top-level `if __name__ == \"__main__\":` at {rel}"),
-            kind: FeatureKind::CliCommand,
             source: "python-main-guard",
-            confidence: FeatureConfidence::Medium,
-            entry_path: rel.clone(),
             entry_symbol: Some("__main__".to_string()),
-            entry_route: None,
             entry_command: Some(stem.to_string()),
-            test_command: None,
-            language: Language::Python,
             tags: vec!["python".to_string(), "cli".to_string()],
-            owned_files: Vec::new(),
-            context_files: Vec::new(),
-            tests: Vec::new(),
-            test_prefixes: Vec::new(),
+            ..FeatureSeed::new(
+                FeatureKind::CliCommand,
+                Language::Python,
+                format!("Python module `{stem}` (__main__)"),
+                rel.clone(),
+            )
         });
     }
     Ok(out)
@@ -1042,22 +1011,19 @@ fn push_python_route_seed(
         tags.push(AUTH_SENSITIVE_TAG.to_string());
     }
     ctx.out.push(FeatureSeed {
-        title: format!("{} route `{}`", ctx.framework.label(), route_label),
         summary,
-        kind: FeatureKind::Route,
         source: ctx.framework.source(),
         confidence: FeatureConfidence::High,
-        entry_path: ctx.rel.to_string(),
         entry_symbol: fn_name.map(String::from),
-        entry_route: Some(route_label),
-        entry_command: None,
-        test_command: None,
-        language: Language::Python,
+        entry_route: Some(route_label.clone()),
         tags,
-        owned_files: Vec::new(),
-        context_files: Vec::new(),
-        tests: Vec::new(),
         test_prefixes: vec!["tests".to_string()],
+        ..FeatureSeed::new(
+            FeatureKind::Route,
+            Language::Python,
+            format!("{} route `{}`", ctx.framework.label(), route_label),
+            ctx.rel,
+        )
     });
 }
 
@@ -1142,22 +1108,19 @@ fn push_django_route_seed(
         tags.push(AUTH_SENSITIVE_TAG.to_string());
     }
     out.push(FeatureSeed {
-        title: format!("Django route `{route}`"),
         summary,
-        kind: FeatureKind::Route,
         source: "django-route",
         confidence: FeatureConfidence::High,
-        entry_path: rel.to_string(),
         entry_symbol: symbol.map(String::from),
         entry_route: Some(route.to_string()),
-        entry_command: None,
-        test_command: None,
-        language: Language::Python,
         tags,
-        owned_files: Vec::new(),
-        context_files: Vec::new(),
-        tests: Vec::new(),
         test_prefixes: vec!["tests".to_string()],
+        ..FeatureSeed::new(
+            FeatureKind::Route,
+            Language::Python,
+            format!("Django route `{route}`"),
+            rel,
+        )
     });
 }
 
@@ -1528,30 +1491,29 @@ fn pytest_test_suites(ctx: &MapperContext, test_cmd: Option<&str>) -> Result<Vec
             None => format!("Pytest suite at `{label}` ({} files)", files.len()),
         };
         out.push(FeatureSeed {
-            title: format!("Python tests `{label}`"),
             summary,
-            kind: FeatureKind::TestSuite,
             source: "python-test-suite",
             confidence: FeatureConfidence::High,
-            entry_path: entry,
             entry_symbol: Some(label.clone()),
-            entry_route: None,
             // Test-suite features identify by the suite label (`tests` /
             // `test` / source-root name). The runnable command goes in
             // test_command, keeping entry_command free for the argv[0]-
             // shape contract (this seed has no such command).
-            entry_command: None,
             test_command: test_cmd.map(String::from),
-            language: Language::Python,
             tags: vec!["python".to_string(), "tests".to_string()],
             owned_files: owned,
-            context_files: Vec::new(),
             tests,
             test_prefixes: if suite_root.is_empty() {
                 Vec::new()
             } else {
                 vec![suite_root]
             },
+            ..FeatureSeed::new(
+                FeatureKind::TestSuite,
+                Language::Python,
+                format!("Python tests `{label}`"),
+                entry,
+            )
         });
     }
     Ok(out)
@@ -1559,7 +1521,9 @@ fn pytest_test_suites(ctx: &MapperContext, test_cmd: Option<&str>) -> Result<Vec
 
 /// Match `test_*.py` and `*_test.py`. Excludes fixture/testdata paths and
 /// generated python (`*_pb2.py`, `*.gen.py`) — even when they live under a
-/// test root, they're not the test files an agent runs.
+/// test root, they're not the test files an agent runs. The basename
+/// convention itself is single-sourced in `nearby_tests`; this adds the
+/// runnable-file carve-outs on top.
 fn is_pytest_file(rel: &str) -> bool {
     let lower = rel.to_ascii_lowercase();
     if !lower.ends_with(".py") {
@@ -1573,8 +1537,7 @@ fn is_pytest_file(rel: &str) -> bool {
             return false;
         }
     }
-    let basename = rel.rsplit_once('/').map(|(_, tail)| tail).unwrap_or(rel);
-    basename.starts_with("test_") || basename.ends_with("_test.py")
+    crate::nearby_tests::is_python_test_basename(rel)
 }
 
 #[cfg(test)]

@@ -92,7 +92,7 @@ fn java_interface_and_impl_symbols_and_references() {
 #[test]
 fn java_enum_and_record_symbols_and_references() {
     let syms = symbols_for("enum_and_record.java");
-    // 5 prior symbols + 2 enum constants (ACTIVE, DISABLED) now captured (CR-018).
+    // 5 type/member symbols plus the 2 enum constants (ACTIVE, DISABLED).
     assert_eq!(syms.len(), 7);
     assert!(has_symbol(&syms, "Status", SymbolKind::Enum));
     assert!(has_symbol(&syms, "ACTIVE", SymbolKind::Constant));
@@ -157,7 +157,7 @@ fn java_annotations_and_annotation_type_and_multi_declarator_fields() {
 #[test]
 fn java_nested_types_are_captured() {
     let syms = symbols_for("nested_types.java");
-    // 11 prior symbols + 2 Mode enum constants (FAST, SLOW) now captured (CR-018).
+    // 11 type/member symbols plus the 2 Mode enum constants (FAST, SLOW).
     assert_eq!(syms.len(), 13);
     assert!(has_symbol(&syms, "Outer", SymbolKind::Class));
     assert!(has_symbol(&syms, "helper", SymbolKind::Constant));

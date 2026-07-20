@@ -34,18 +34,37 @@ pub fn chunk_text(content: &str, config: &ChunkConfig) -> Vec<Chunk> {
         return Vec::new();
     }
 
-    let raw = split_recursive(content, config.chunk_size, 0);
+    // A zero chunk_size would make the char-fallback loop in
+    // `split_recursive` compute `end == pos` and never advance — an infinite
+    // loop on any non-empty input. Clamp once at the entry so every consumer
+    // (split, merge, overlap) sees the same floor.
+    let chunk_size = config.chunk_size.max(1);
 
-    let mut merged = merge_small_chunks(raw, config.min_chunk_size, config.chunk_size);
+    let raw = split_recursive(content, chunk_size, 0);
 
-    apply_overlap(&mut merged, content, config.overlap, config.chunk_size);
+    let mut merged = merge_small_chunks(raw, config.min_chunk_size, chunk_size);
+
+    apply_overlap(&mut merged, content, config.overlap, chunk_size);
+
+    // Rescanning content[..pos] per chunk boundary is O(file × chunks);
+    // one newline-offset pass plus a binary search per boundary keeps large
+    // files linear. Overlap can move a chunk's start behind its
+    // predecessor's, so boundaries aren't monotonic and a running cursor
+    // wouldn't be safe.
+    let newline_offsets: Vec<usize> = content
+        .bytes()
+        .enumerate()
+        .filter_map(|(i, b)| (b == b'\n').then_some(i))
+        .collect();
+    // Line number at a byte offset = 1 + newlines strictly before it.
+    let line_at = |pos: usize| 1 + newline_offsets.partition_point(|&nl| nl < pos) as u32;
 
     merged
         .into_iter()
         .map(|seg| {
             let start = snap_to_char_boundary(content, seg.start);
             let end = find_char_boundary(content, seg.end);
-            let start_line = 1 + content[..start].matches('\n').count() as u32;
+            let start_line = line_at(start);
             // A chunk's own trailing newline terminates its last line rather
             // than starting a new one; counting it would report an end_line
             // one past the chunk's content (a "aaa\n" chunk is line 1, not
@@ -55,7 +74,7 @@ pub fn chunk_text(content: &str, config: &ChunkConfig) -> Vec<Chunk> {
             } else {
                 end
             };
-            let end_line = 1 + content[..count_end].matches('\n').count() as u32;
+            let end_line = line_at(count_end);
             Chunk {
                 text: content[start..end].to_string(),
                 start_line,
@@ -177,7 +196,7 @@ fn merge_small_chunks(segments: Vec<Segment>, min_size: usize, max_size: usize) 
     for seg in segments {
         // Merge when either neighbor is sub-`min_size` and the result still
         // fits `max_size` — so a small segment following a large one is also
-        // absorbed, not just a small predecessor. fnd: CR-016.
+        // absorbed, not just a small predecessor.
         if let Some(last) = merged.last_mut()
             && (segment_len(last) < min_size || segment_len(&seg) < min_size)
             && segment_len(last) + segment_len(&seg) <= max_size
@@ -442,6 +461,95 @@ mod tests {
                 chunk.text.len()
             );
         }
+    }
+
+    /// Reference implementation for line numbering: full rescan of
+    /// `content[..pos]` per boundary, with the same trailing-newline
+    /// end_line exclusion as production.
+    fn naive_line_numbers(content: &str, start: usize, end: usize) -> (u32, u32) {
+        let start_line = 1 + content[..start].matches('\n').count() as u32;
+        let count_end = if end > start && content.as_bytes()[end - 1] == b'\n' {
+            end - 1
+        } else {
+            end
+        };
+        let end_line = 1 + content[..count_end].matches('\n').count() as u32;
+        (start_line, end_line)
+    }
+
+    fn mixed_line_fixture(lines: usize, trailing_newline: bool) -> String {
+        let mut s = String::new();
+        for i in 0..lines {
+            if i % 9 == 0 {
+                s.push('\n');
+                continue;
+            }
+            let pad = "x".repeat((i * 37) % 110);
+            s.push_str(&format!("line{i:03} é中λ {pad}\n"));
+        }
+        if !trailing_newline {
+            s.pop();
+        }
+        s
+    }
+
+    #[test]
+    fn line_numbers_match_naive_full_rescan() {
+        let configs = [
+            ChunkConfig {
+                chunk_size: 300,
+                min_chunk_size: 50,
+                overlap: 80,
+            },
+            ChunkConfig::default(),
+        ];
+        for trailing_newline in [true, false] {
+            let text = mixed_line_fixture(120, trailing_newline);
+            assert!(
+                text.len() > 2 * DEFAULT_CHUNK_SIZE,
+                "fixture must span multiple default-size chunks"
+            );
+            for config in &configs {
+                let chunks = chunk_text(&text, config);
+                assert!(
+                    chunks.len() >= 3,
+                    "fixture must produce a multi-chunk split (got {})",
+                    chunks.len()
+                );
+                for (i, chunk) in chunks.iter().enumerate() {
+                    let (want_start, want_end) =
+                        naive_line_numbers(&text, chunk.start_byte, chunk.end_byte);
+                    assert_eq!(
+                        (chunk.start_line, chunk.end_line),
+                        (want_start, want_end),
+                        "chunk {i} [{}..{}] (trailing_newline={trailing_newline}, chunk_size={})",
+                        chunk.start_byte,
+                        chunk.end_byte,
+                        config.chunk_size
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_chunk_size_terminates_with_sane_output() {
+        // Regression: chunk_size = 0 used to hang the char-fallback splitting
+        // loop. The entry clamp treats it as 1.
+        let config = ChunkConfig {
+            chunk_size: 0,
+            min_chunk_size: DEFAULT_MIN_CHUNK_SIZE,
+            overlap: DEFAULT_CHUNK_OVERLAP,
+        };
+        let text = "fn a() {}\nfn b() {}";
+        let chunks = chunk_text(text, &config);
+        assert!(!chunks.is_empty());
+        let total: usize = chunks.iter().map(|c| c.text.len()).sum();
+        assert!(
+            total >= text.len(),
+            "chunks must cover the input: {total} < {}",
+            text.len()
+        );
     }
 
     #[test]

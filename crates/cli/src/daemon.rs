@@ -7,12 +7,13 @@ use anyhow::{Result, bail};
 #[cfg(unix)]
 mod unix {
     use std::{
+        ffi::OsString,
         fs::{self, OpenOptions},
         io::{self, Write},
         os::unix::fs::{MetadataExt, PermissionsExt},
         path::{Path, PathBuf},
         pin::Pin,
-        process::{Command, Stdio},
+        process::{Child, Command, Stdio},
         sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -27,6 +28,7 @@ mod unix {
         io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf, copy},
         net::{UnixListener, UnixStream},
         signal::unix::{SignalKind, signal},
+        task::JoinSet,
         time::sleep,
     };
 
@@ -34,6 +36,39 @@ mod unix {
 
     const START_TIMEOUT: Duration = Duration::from_secs(5);
     const RETRY_DELAY: Duration = Duration::from_millis(25);
+
+    /// Total cap on waiting for a daemon this shim spawned itself. One
+    /// START_TIMEOUT covers a warm start, but a cold model load on a slow or
+    /// contended disk can exceed it — and bailing while the child is still
+    /// alive reports a spurious failure an instant before the daemon binds,
+    /// leaving it running orphaned. While the spawned child lives, the wait
+    /// loops in START_TIMEOUT rounds up to this cap so a truly wedged child
+    /// still fails. Matches the waiter branch's worst case (3 attempts x
+    /// START_TIMEOUT), so both paths give up on the same horizon.
+    const SPAWNER_WAIT_CAP: Duration = START_TIMEOUT.saturating_mul(3);
+
+    /// Bound on how long shutdown waits for in-flight client connections to
+    /// finish after the accept loop stops. Long enough for a typical tool
+    /// call to complete its response, short enough that `daemon stop`'s 10s
+    /// SIGTERM window is never exceeded even when a parked client holds its
+    /// connection open for the whole drain.
+    const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
+
+    /// Await every task in `clients`, bounded by `timeout`. Returns how many
+    /// tasks were still in flight when the bound expired (those are aborted);
+    /// `0` means a clean drain.
+    async fn drain_client_tasks(clients: &mut JoinSet<()>, timeout: Duration) -> usize {
+        if clients.is_empty() {
+            return 0;
+        }
+        let all_done = async { while clients.join_next().await.is_some() {} };
+        if tokio::time::timeout(timeout, all_done).await.is_err() {
+            let remaining = clients.len();
+            clients.abort_all();
+            return remaining;
+        }
+        0
+    }
 
     /// Default idle backstop: shut the daemon down after this long with zero
     /// connected clients. The daemon is meant to be a warm pool shared across
@@ -351,6 +386,10 @@ mod unix {
         let mut idle_tick = tokio::time::interval(idle_poll);
         idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Track connection tasks so shutdown can wait for in-flight requests
+        // instead of aborting them mid-response when the runtime drops.
+        let mut clients: JoinSet<()> = JoinSet::new();
+
         let shutdown_reason = loop {
             tokio::select! {
                 accepted = listener.accept() => {
@@ -400,7 +439,7 @@ mod unix {
                     *last_activity.lock().unwrap() = Instant::now();
                     let active_for_conn = active.clone();
                     let last_activity_for_conn = last_activity.clone();
-                    tokio::spawn(async move {
+                    clients.spawn(async move {
                         if let Err(e) = serve_client(server, stream).await {
                             tracing::debug!(error = %e, "MCP daemon client connection ended");
                         }
@@ -410,6 +449,10 @@ mod unix {
                         *last_activity_for_conn.lock().unwrap() = Instant::now();
                     });
                 }
+                // Reap finished connection tasks so the tracked set doesn't
+                // grow for the daemon's lifetime. When the set is empty the
+                // pattern mismatch disables this arm for the iteration.
+                Some(_) = clients.join_next() => {}
                 _ = idle_tick.tick() => {
                     if !idle_timeout.is_zero()
                         && active.load(Ordering::SeqCst) == 0
@@ -432,11 +475,46 @@ mod unix {
         // daemon exit would orphan inotify threads.
         state.shutdown_all_watchers();
 
+        // Let in-flight client connections finish (bounded) before removing
+        // the runtime files; returning immediately would drop the runtime and
+        // abort them mid-request, so the client sees a truncated stream. The
+        // listener stays bound while draining: a late shim parks in the
+        // accept backlog instead of racing a replacement daemon for the
+        // socket path.
+        let in_flight = clients.len();
+        let abandoned = if in_flight > 0 {
+            tracing::info!(in_flight, "draining in-flight client connections");
+            let still_in_flight = drain_client_tasks(&mut clients, SHUTDOWN_DRAIN).await;
+            if still_in_flight > 0 {
+                tracing::warn!(
+                    still_in_flight,
+                    "client connections still in flight after {:?}; aborting them",
+                    SHUTDOWN_DRAIN
+                );
+            }
+            still_in_flight
+        } else {
+            0
+        };
+
         // Best-effort cleanup. The runtime dir is left in place because
         // other daemon keys may share it.
         let _ = fs::remove_file(&paths.socket);
         let _ = fs::remove_file(&paths.pid);
-        Ok(())
+
+        // Exit without dropping the tokio Runtime: its drop joins the
+        // blocking pool, and abort_all cannot interrupt a spawn_blocking
+        // tool body (ONNX inference, SQLite) that is already running. A
+        // wedged one would hold the process past `daemon stop`'s 10s
+        // SIGTERM window. Cleanup above is complete; abandon the blocking
+        // work and leave.
+        if abandoned > 0 {
+            tracing::warn!(
+                abandoned,
+                "exiting with aborted connections whose blocking tool tasks may still be running; abandoning them"
+            );
+        }
+        std::process::exit(0)
     }
 
     /// Default per-connection idle ceiling. A per-request timeout would
@@ -595,8 +673,14 @@ mod unix {
                         );
                     }
                     remove_stale_socket(paths).await?;
-                    spawn_daemon(paths)?;
-                    return wait_for_socket(&paths.socket, START_TIMEOUT, paths).await;
+                    let mut child = spawn_daemon(paths)?;
+                    return wait_for_spawned_daemon(
+                        &mut child,
+                        paths,
+                        START_TIMEOUT,
+                        SPAWNER_WAIT_CAP,
+                    )
+                    .await;
                 }
                 None => {
                     match wait_for_socket(&paths.socket, START_TIMEOUT, paths).await {
@@ -709,7 +793,7 @@ mod unix {
     const LOG_ROTATE_AT_BYTES: u64 = 4 * 1024 * 1024;
     const LOG_KEEP_GENERATIONS: usize = 3;
 
-    fn spawn_daemon(paths: &DaemonPaths) -> Result<()> {
+    fn spawn_daemon(paths: &DaemonPaths) -> Result<Child> {
         let exe = std::env::current_exe().context("resolving current executable")?;
         rotate_log_if_large(&paths.log);
         let log = OpenOptions::new()
@@ -737,8 +821,85 @@ mod unix {
             ))
             .stderr(Stdio::from(log))
             .spawn()
-            .context("starting codesage MCP daemon")?;
-        Ok(())
+            .context("starting codesage MCP daemon")
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SpawnerWaitDecision {
+        /// Child alive, cap not reached: wait another socket round.
+        KeepWaiting,
+        /// Child exited: the daemon died during startup, fail now.
+        ChildExited,
+        /// Child alive but the total cap elapsed: wedged, give up.
+        CapExceeded,
+    }
+
+    /// Retry decision after one failed socket-wait round on the spawner
+    /// path. A dead child wins over the cap: its exit is the informative
+    /// failure and waiting longer cannot help.
+    fn spawner_wait_decision(
+        child_alive: bool,
+        waited: Duration,
+        cap: Duration,
+    ) -> SpawnerWaitDecision {
+        if !child_alive {
+            SpawnerWaitDecision::ChildExited
+        } else if waited >= cap {
+            SpawnerWaitDecision::CapExceeded
+        } else {
+            SpawnerWaitDecision::KeepWaiting
+        }
+    }
+
+    /// Wait for the daemon `child` (spawned by this shim) to bind its
+    /// socket. A single [`wait_for_socket`] round is too short for a cold
+    /// model load, so loop it while the child process is still alive,
+    /// bounded by `cap` in total. A round can also end early — before
+    /// `round` elapses — when a stale same-key pid file trips
+    /// `wait_for_socket`'s liveness bail; the child overwrites that file
+    /// once it binds, so looping on child liveness rides out that window
+    /// too. `try_wait` also reaps the child on the exited path, so no
+    /// zombie lingers for the shim's lifetime.
+    async fn wait_for_spawned_daemon(
+        child: &mut Child,
+        paths: &DaemonPaths,
+        round: Duration,
+        cap: Duration,
+    ) -> Result<UnixStream> {
+        let started = Instant::now();
+        loop {
+            let wait_err = match wait_for_socket(&paths.socket, round, paths).await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => e,
+            };
+            let exit = child
+                .try_wait()
+                .context("checking spawned daemon liveness")?;
+            match spawner_wait_decision(exit.is_none(), started.elapsed(), cap) {
+                SpawnerWaitDecision::KeepWaiting => {
+                    tracing::info!(
+                        waited = ?started.elapsed(),
+                        "spawned daemon not ready yet but still alive; waiting another round"
+                    );
+                }
+                SpawnerWaitDecision::ChildExited => {
+                    let status = exit.map_or_else(|| "unknown".to_string(), |s| s.to_string());
+                    return Err(wait_err.context(format!(
+                        "spawned codesage daemon exited during startup ({status}); \
+                         see {} for the failure",
+                        paths.log.display()
+                    )));
+                }
+                SpawnerWaitDecision::CapExceeded => {
+                    return Err(wait_err.context(format!(
+                        "spawned codesage daemon still alive but not ready after {:?}; \
+                         see {} for daemon-side progress",
+                        started.elapsed(),
+                        paths.log.display()
+                    )));
+                }
+            }
+        }
     }
 
     fn rotate_log_if_large(log: &Path) {
@@ -1095,10 +1256,10 @@ mod unix {
         tokio::pin!(stdin_to_socket);
         tokio::pin!(socket_to_stdout);
 
-        // CR-002: pre-fix used try_join! which waits for BOTH futures.
-        // If the daemon closed its write half but the MCP client kept
-        // stdin open, the stdin pump blocked on read forever and the
-        // shim hung with no server behind it.
+        // select!, not try_join!: try_join! waits for BOTH futures, so
+        // if the daemon closed its write half but the MCP client kept
+        // stdin open, the stdin pump would block on read forever and
+        // the shim would hang with no server behind it.
         //
         // Two reasons we exit the process instead of returning Ok:
         //   1. tokio::io::stdin() is backed by a blocking-pool thread
@@ -1194,17 +1355,34 @@ mod unix {
     /// otherwise look only under `/run/user/$UID/codesage`, missing the daemon
     /// and falsely reporting "not running" (and `stop` would fail to stop it).
     fn candidate_runtime_dirs() -> Vec<PathBuf> {
+        candidate_runtime_dirs_from(
+            std::env::var_os("CODESAGE_DAEMON_RUNTIME_DIR"),
+            std::env::var_os("XDG_RUNTIME_DIR"),
+            &std::env::temp_dir(),
+        )
+    }
+
+    /// Env-free core of [`candidate_runtime_dirs`], parameterized so tests
+    /// can exercise the resolution logic without mutating process-global
+    /// environment (a `set_var` here races every concurrent test that calls
+    /// `tempfile::tempdir()` or reads the same vars).
+    fn candidate_runtime_dirs_from(
+        override_dir: Option<OsString>,
+        xdg_runtime_dir: Option<OsString>,
+        system_tmp: &Path,
+    ) -> Vec<PathBuf> {
         // Treat set-but-empty env vars as unset. Documented workaround for the
         // WSL2 `/run/user/$UID` trap is to inject `XDG_RUNTIME_DIR=""` in the
         // client MCP env so the shim falls through to `/tmp`; without this
         // guard `PathBuf::from("").join("codesage")` collapses to a relative
         // `codesage/` that gets created next to whatever cwd the shim was
         // spawned in.
+        let nonempty = |var: Option<OsString>| var.filter(|v| !v.is_empty());
         let mut dirs: Vec<PathBuf> = Vec::new();
-        if let Some(dir) = nonempty_env("CODESAGE_DAEMON_RUNTIME_DIR") {
+        if let Some(dir) = nonempty(override_dir) {
             dirs.push(PathBuf::from(dir));
         }
-        if let Some(dir) = nonempty_env("XDG_RUNTIME_DIR") {
+        if let Some(dir) = nonempty(xdg_runtime_dir) {
             dirs.push(PathBuf::from(dir).join("codesage"));
         }
         // Suffix the /tmp fallback with the real numeric UID, not the UID/USER
@@ -1215,7 +1393,7 @@ mod unix {
         // stable regardless of environment (and matches the SO_PEERCRED check).
         let uid = unsafe { libc::getuid() };
         let tmp = PathBuf::from("/tmp").join(format!("codesage-{uid}"));
-        let legacy_tmp = std::env::temp_dir().join(format!("codesage-{uid}"));
+        let legacy_tmp = system_tmp.join(format!("codesage-{uid}"));
         if !dirs.contains(&tmp) {
             dirs.push(tmp.clone());
         }
@@ -1334,10 +1512,6 @@ mod unix {
         newest.map(|(_, paths)| paths)
     }
 
-    fn nonempty_env(key: &str) -> Option<std::ffi::OsString> {
-        std::env::var_os(key).filter(|v| !v.is_empty())
-    }
-
     fn daemon_key_for_exe(exe: &Path) -> Result<String> {
         let meta = fs::metadata(exe).with_context(|| format!("reading {}", exe.display()))?;
         let modified = meta
@@ -1394,19 +1568,6 @@ mod unix {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use std::ffi::OsString;
-        use std::sync::Mutex;
-
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-        fn restore_env(key: &str, value: Option<OsString>) {
-            unsafe {
-                match value {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
 
         #[test]
         fn daemon_paths_are_scoped_by_executable_metadata() {
@@ -1429,21 +1590,12 @@ mod unix {
             // produce a relative `codesage/` runtime dir because var_os
             // returns Some("") for set-but-empty vars. The shim then
             // mkdir'd `codesage/` next to whatever cwd it spawned in.
-            //
-            let _guard = ENV_LOCK.lock().unwrap();
-            let old_runtime_dir = std::env::var_os("CODESAGE_DAEMON_RUNTIME_DIR");
-            let old_xdg = std::env::var_os("XDG_RUNTIME_DIR");
-
-            // SAFETY: tests in this file may not run in parallel with other
-            // code that reads these vars; ENV_LOCK serializes against the
-            // sibling test that touches the same vars (none today, but the
-            // guard documents the invariant).
-            unsafe {
-                std::env::set_var("CODESAGE_DAEMON_RUNTIME_DIR", "");
-                std::env::set_var("XDG_RUNTIME_DIR", "");
-            }
-
-            let resolved = default_runtime_dir();
+            let candidates = candidate_runtime_dirs_from(
+                Some(OsString::new()),
+                Some(OsString::new()),
+                &std::env::temp_dir(),
+            );
+            let resolved = candidates.first().expect("fallback candidate");
             assert!(
                 resolved.is_absolute(),
                 "empty env vars must fall through to an absolute /tmp fallback, got {}",
@@ -1454,26 +1606,12 @@ mod unix {
                 "expected /tmp fallback, got {}",
                 resolved.display()
             );
-
-            restore_env("CODESAGE_DAEMON_RUNTIME_DIR", old_runtime_dir);
-            restore_env("XDG_RUNTIME_DIR", old_xdg);
         }
 
         #[test]
         fn fallback_runtime_dir_does_not_depend_on_tmpdir() {
-            let _guard = ENV_LOCK.lock().unwrap();
             let scratch = tempfile::tempdir().unwrap();
-            let old_runtime_dir = std::env::var_os("CODESAGE_DAEMON_RUNTIME_DIR");
-            let old_xdg = std::env::var_os("XDG_RUNTIME_DIR");
-            let old_tmpdir = std::env::var_os("TMPDIR");
-
-            unsafe {
-                std::env::remove_var("CODESAGE_DAEMON_RUNTIME_DIR");
-                std::env::remove_var("XDG_RUNTIME_DIR");
-                std::env::set_var("TMPDIR", scratch.path());
-            }
-
-            let candidates = candidate_runtime_dirs();
+            let candidates = candidate_runtime_dirs_from(None, None, scratch.path());
             let uid = unsafe { libc::getuid() };
             let expected = PathBuf::from("/tmp").join(format!("codesage-{uid}"));
             assert_eq!(
@@ -1481,10 +1619,6 @@ mod unix {
                 Some(&expected),
                 "canonical fallback must be stable across different TMPDIR values: {candidates:?}"
             );
-
-            restore_env("CODESAGE_DAEMON_RUNTIME_DIR", old_runtime_dir);
-            restore_env("XDG_RUNTIME_DIR", old_xdg);
-            restore_env("TMPDIR", old_tmpdir);
         }
 
         #[test]
@@ -1537,7 +1671,7 @@ mod unix {
 
         #[test]
         fn paths_from_pid_file_round_trips_key() {
-            // CR-007: status/stop reconstruct a daemon's paths from a
+            // `status`/`stop` reconstruct a daemon's paths from a
             // foreign-key pid file (a daemon left by a different build).
             let exe = std::env::current_exe().unwrap();
             let runtime = std::path::Path::new("/tmp/codesage-test-runtime");
@@ -1773,6 +1907,240 @@ mod unix {
             assert!(!sock.exists(), "socket file should be removed");
             assert!(!lock.exists(), "lock file should be removed");
             assert!(log.exists(), "log file should be left for diagnostics");
+        }
+
+        // ---------- shutdown connection drain ----------
+
+        #[tokio::test]
+        async fn drain_client_tasks_waits_for_in_flight_connections() {
+            let mut clients = JoinSet::new();
+            let done = Arc::new(AtomicUsize::new(0));
+            for _ in 0..3 {
+                let done = done.clone();
+                clients.spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    done.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+
+            let still_in_flight = drain_client_tasks(&mut clients, Duration::from_secs(5)).await;
+
+            assert_eq!(still_in_flight, 0, "all connections finish within bound");
+            assert_eq!(
+                done.load(Ordering::SeqCst),
+                3,
+                "shutdown must wait for every in-flight connection to complete"
+            );
+        }
+
+        #[tokio::test]
+        async fn drain_client_tasks_bounds_the_wait_on_stuck_connections() {
+            let mut clients = JoinSet::new();
+            clients.spawn(async {
+                std::future::pending::<()>().await;
+            });
+
+            let started = Instant::now();
+            let still_in_flight =
+                drain_client_tasks(&mut clients, Duration::from_millis(100)).await;
+
+            assert_eq!(
+                still_in_flight, 1,
+                "the stuck connection must be reported as still in flight"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "drain must not hang past its bound"
+            );
+        }
+
+        #[tokio::test]
+        async fn drain_client_tasks_is_noop_when_no_connections() {
+            let mut clients: JoinSet<()> = JoinSet::new();
+            assert_eq!(
+                drain_client_tasks(&mut clients, Duration::from_secs(5)).await,
+                0
+            );
+        }
+
+        #[tokio::test]
+        async fn drain_reports_wedged_blocking_work_without_joining_it() {
+            // A tool body wedged inside spawn_blocking survives abort_all —
+            // aborting the connection task cannot interrupt a blocking
+            // thread that already started. The drain must return promptly
+            // and report the connection as still in flight; joining the
+            // blocking work is only avoidable at shutdown by exiting the
+            // process instead of dropping the runtime.
+            let mut clients = JoinSet::new();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let entered = Arc::new(AtomicUsize::new(0));
+            let entered_task = entered.clone();
+            clients.spawn(async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    entered_task.fetch_add(1, Ordering::SeqCst);
+                    let _ = release_rx.recv();
+                })
+                .await;
+            });
+            // Wait for the blocking body to actually start so the abort
+            // provably races a running (not queued) blocking task.
+            while entered.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            let started = Instant::now();
+            let still_in_flight =
+                drain_client_tasks(&mut clients, Duration::from_millis(100)).await;
+
+            assert_eq!(
+                still_in_flight, 1,
+                "the wedged connection must be reported as abandoned"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "drain must not wait for the wedged blocking body"
+            );
+            // Release the blocking thread so this test runtime's drop
+            // (which does join the blocking pool) can complete.
+            release_tx.send(()).unwrap();
+        }
+
+        // ---------- spawner wait-for-daemon ----------
+
+        fn test_daemon_paths(dir: &Path) -> DaemonPaths {
+            DaemonPaths {
+                socket: dir.join("mcp-test.sock"),
+                lock: dir.join("mcp-test.lock"),
+                pid: dir.join("mcp-test.pid"),
+                log: dir.join("mcp-test.log"),
+                runtime_dir: dir.to_path_buf(),
+            }
+        }
+
+        fn reap(mut child: Child) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        #[test]
+        fn spawner_wait_decision_table() {
+            use SpawnerWaitDecision::*;
+            let cap = Duration::from_secs(15);
+            assert_eq!(
+                spawner_wait_decision(true, Duration::from_secs(5), cap),
+                KeepWaiting
+            );
+            // Boundary: reaching the cap exactly is a give-up.
+            assert_eq!(spawner_wait_decision(true, cap, cap), CapExceeded);
+            assert_eq!(
+                spawner_wait_decision(true, Duration::from_secs(20), cap),
+                CapExceeded
+            );
+            // A dead child fails immediately regardless of elapsed time —
+            // even past the cap, its exit is the more informative failure.
+            assert_eq!(
+                spawner_wait_decision(false, Duration::ZERO, cap),
+                ChildExited
+            );
+            assert_eq!(
+                spawner_wait_decision(false, Duration::from_secs(20), cap),
+                ChildExited
+            );
+        }
+
+        #[tokio::test]
+        async fn spawner_keeps_waiting_while_child_alive_and_binds_late() {
+            // Slow-bind simulation: the child stand-in stays alive while a
+            // helper thread binds the socket only after the first wait round
+            // has already timed out. The old single-shot wait failed here.
+            let dir = tempfile::tempdir().unwrap();
+            let paths = test_daemon_paths(dir.path());
+            let mut child = Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .spawn()
+                .unwrap();
+
+            let socket = paths.socket.clone();
+            let binder = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                std::os::unix::net::UnixListener::bind(&socket).unwrap()
+            });
+
+            let res = wait_for_spawned_daemon(
+                &mut child,
+                &paths,
+                Duration::from_millis(50),
+                Duration::from_secs(10),
+            )
+            .await;
+            let _listener = binder.join().unwrap();
+            reap(child);
+            assert!(
+                res.is_ok(),
+                "late bind with a live child must succeed: {:?}",
+                res.err()
+            );
+        }
+
+        #[tokio::test]
+        async fn spawner_fails_immediately_when_child_died() {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = test_daemon_paths(dir.path());
+            let mut child = Command::new("true").stdin(Stdio::null()).spawn().unwrap();
+            // Guarantee the child is observably dead before the wait; the
+            // status is cached, so the later try_wait still sees it.
+            child.wait().unwrap();
+
+            let started = Instant::now();
+            let err = wait_for_spawned_daemon(
+                &mut child,
+                &paths,
+                Duration::from_millis(100),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                format!("{err:#}").contains("exited during startup"),
+                "want child-exit failure, got: {err:#}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "a dead child must fail after one round, not the full cap"
+            );
+        }
+
+        #[tokio::test]
+        async fn spawner_gives_up_at_cap_when_child_wedged() {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = test_daemon_paths(dir.path());
+            let mut child = Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .spawn()
+                .unwrap();
+
+            let started = Instant::now();
+            let err = wait_for_spawned_daemon(
+                &mut child,
+                &paths,
+                Duration::from_millis(50),
+                Duration::from_millis(150),
+            )
+            .await
+            .unwrap_err();
+            reap(child);
+
+            assert!(
+                format!("{err:#}").contains("still alive but not ready"),
+                "want cap-exceeded failure, got: {err:#}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the cap must bound the total wait"
+            );
         }
 
         // ---------- sibling reap decision table ----------

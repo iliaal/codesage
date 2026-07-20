@@ -13,8 +13,9 @@ use codesage_protocol::{FeatureConfidence, FeatureKind, Language};
 use regex::Regex;
 use tree_sitter::Parser;
 
-use crate::mappers::shared::{is_safe_file, walk_files};
+use crate::mappers::shared::{is_safe_file, read_to_string_bounded, walk_files};
 use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile};
+use crate::nearby_tests::is_c_or_cpp_test_path;
 
 /// Single mapper that emits both C and C++ seeds; the language tag is
 /// chosen per-file based on extension. Run only once per repo, regardless
@@ -77,45 +78,6 @@ fn is_c_or_cpp_compilable(rel: &str) -> bool {
 /// distinct `Cuda` language); the `cuda` tag on the seed is what marks them.
 fn is_cuda_source(rel: &str) -> bool {
     rel.ends_with(".cu") || rel.ends_with(".cuh")
-}
-
-/// Path looks like a C/C++ test fixture under conventional naming:
-/// directory under `tests/` / `test/` / `__tests__/`; basename prefixed
-/// with `test_` or `test-`; basename suffixed `_tests.cpp` / `-test.c`;
-/// `FooTest.cpp` / `BarTests.cc`. Mirrors clawpatch's `isCOrCppTestPath`
-/// so the same shape we use to skip `main()` detection in `tests/`
-/// drives CMake test-target classification too.
-fn is_c_or_cpp_test_path(rel: &str) -> bool {
-    let base = rel.rsplit('/').next().unwrap_or(rel);
-    let lower = rel.to_ascii_lowercase();
-    if lower.starts_with("test/")
-        || lower.starts_with("tests/")
-        || lower.contains("/test/")
-        || lower.contains("/tests/")
-        || lower.contains("/__tests__/")
-    {
-        return true;
-    }
-    let base_lower = base.to_ascii_lowercase();
-    if base_lower.starts_with("test_") || base_lower.starts_with("test-") {
-        return true;
-    }
-    // foo_test.c / foo-tests.cpp
-    let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base);
-    let stem_lower = stem.to_ascii_lowercase();
-    if stem_lower.ends_with("_test")
-        || stem_lower.ends_with("-test")
-        || stem_lower.ends_with("_tests")
-        || stem_lower.ends_with("-tests")
-    {
-        return true;
-    }
-    // FooTest.cpp / BarTests.cc (case-sensitive Test/Tests suffix on the
-    // *original* stem so `foo_test.c` doesn't double-match here).
-    if stem.ends_with("Test") || stem.ends_with("Tests") {
-        return true;
-    }
-    false
 }
 
 /// Classify a CMake `add_executable(...)` target as a test suite when the
@@ -263,7 +225,10 @@ fn autotools_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<Featur
     let sources_re_template = r"(?m)^\s*{NAME}_SOURCES\s*=\s*(.+)$";
     for mf in makefile_am_files {
         let path = root.join(mf);
-        let body = fs::read_to_string(&path).unwrap_or_default();
+        let body = read_to_string_bounded(&path)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         // Join continuation lines (autoconf uses trailing backslashes).
         let body = collapse_backslash_continuations(&body);
         let dir = parent_dir(mf);
@@ -296,17 +261,11 @@ fn autotools_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<Featur
                 let owned_files = filter_target_sources(ctx, &dir, &sources);
                 let context_files = filter_target_context(ctx, mf, "build target declaration");
                 out.push(FeatureSeed {
-                    title: format!("Autotools binary `{name}`"),
                     summary: format!("Makefile.am `bin_PROGRAMS` target declared in {mf}"),
-                    kind: FeatureKind::CliCommand,
                     source: "autotools-bin",
                     confidence: FeatureConfidence::High,
-                    entry_path: entry,
                     entry_symbol: Some("main".to_string()),
-                    entry_route: None,
                     entry_command: Some(name.to_string()),
-                    test_command: None,
-                    language,
                     tags: vec![
                         if language == Language::Cpp {
                             "cpp"
@@ -318,8 +277,13 @@ fn autotools_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<Featur
                     ],
                     owned_files,
                     context_files,
-                    tests: Vec::new(),
                     test_prefixes: vec![format!("{}tests", dir)],
+                    ..FeatureSeed::new(
+                        FeatureKind::CliCommand,
+                        language,
+                        format!("Autotools binary `{name}`"),
+                        entry,
+                    )
                 });
             }
         }
@@ -354,17 +318,9 @@ fn autotools_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<Featur
                 let owned_files = filter_target_sources(ctx, &dir, &sources);
                 let context_files = filter_target_context(ctx, mf, "build target declaration");
                 out.push(FeatureSeed {
-                    title: format!("Autotools library `{name}`"),
                     summary: format!("Makefile.am `lib_LTLIBRARIES` target declared in {mf}"),
-                    kind: FeatureKind::Library,
                     source: "autotools-lib",
                     confidence: FeatureConfidence::High,
-                    entry_path: entry,
-                    entry_symbol: None,
-                    entry_route: None,
-                    entry_command: None,
-                    test_command: None,
-                    language,
                     tags: vec![
                         if language == Language::Cpp {
                             "cpp"
@@ -376,8 +332,13 @@ fn autotools_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<Featur
                     ],
                     owned_files,
                     context_files,
-                    tests: Vec::new(),
                     test_prefixes: vec![format!("{}tests", dir)],
+                    ..FeatureSeed::new(
+                        FeatureKind::Library,
+                        language,
+                        format!("Autotools library `{name}`"),
+                        entry,
+                    )
                 });
             }
         }
@@ -406,7 +367,10 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
     // than by a regex.
     for cm in cmake_files {
         let path = root.join(cm);
-        let raw = fs::read_to_string(&path).unwrap_or_default();
+        let raw = read_to_string_bounded(&path)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let body = strip_cmake_comments(&raw);
         let dir = parent_dir(cm);
         // Resolve `${PROJECT_NAME}` references in target declarations against
@@ -512,42 +476,39 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
                     })
                     .collect();
                 out.push(FeatureSeed {
-                    title: format!("CMake test suite `{name}`"),
                     summary: format!("CMake test executable `{name}` declared in {cm}"),
-                    kind: FeatureKind::TestSuite,
                     source: "cmake-test",
                     confidence: FeatureConfidence::High,
-                    entry_path: entry,
-                    entry_symbol: None,
-                    entry_route: None,
-                    entry_command: None,
-                    test_command: None,
-                    language,
                     tags: cmake_target_tags(language, "test", is_cuda),
                     owned_files,
                     context_files,
                     tests,
                     test_prefixes: vec![format!("{}tests", dir)],
+                    ..FeatureSeed::new(
+                        FeatureKind::TestSuite,
+                        language,
+                        format!("CMake test suite `{name}`"),
+                        entry,
+                    )
                 });
                 continue;
             }
             out.push(FeatureSeed {
-                title: format!("CMake binary `{name}`"),
                 summary: format!("CMake `add_executable({name})` declared in {cm}"),
-                kind: FeatureKind::CliCommand,
                 source: "cmake-bin",
                 confidence: FeatureConfidence::High,
-                entry_path: entry,
                 entry_symbol: Some("main".to_string()),
-                entry_route: None,
-                entry_command: Some(name),
-                test_command: None,
-                language,
+                entry_command: Some(name.clone()),
                 tags: cmake_target_tags(language, "cli", is_cuda),
                 owned_files,
                 context_files,
-                tests: Vec::new(),
                 test_prefixes: vec![format!("{}tests", dir)],
+                ..FeatureSeed::new(
+                    FeatureKind::CliCommand,
+                    language,
+                    format!("CMake binary `{name}`"),
+                    entry,
+                )
             });
         }
         let lib_calls: Vec<(String, bool)> = cmake_command_args(&body, "add_library")
@@ -610,22 +571,19 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
             }
             let context_files = filter_target_context(ctx, cm, "CMake target declaration");
             out.push(FeatureSeed {
-                title: format!("CMake library `{name}`"),
                 summary: format!("CMake `add_library({name})` declared in {cm}"),
-                kind: FeatureKind::Library,
                 source: "cmake-lib",
                 confidence: FeatureConfidence::High,
-                entry_path: entry,
-                entry_symbol: None,
-                entry_route: None,
-                entry_command: None,
-                test_command: None,
-                language,
                 tags: cmake_target_tags(language, "library", is_cuda),
                 owned_files,
                 context_files,
-                tests: Vec::new(),
                 test_prefixes: vec![format!("{}tests", dir)],
+                ..FeatureSeed::new(
+                    FeatureKind::Library,
+                    language,
+                    format!("CMake library `{name}`"),
+                    entry,
+                )
             });
         }
     }
@@ -654,15 +612,22 @@ fn main_function_targets(
         // googletest with --gtest_main, etc.). Without this guard the c-main
         // walker emits `C++ binary foo_test` slices that swamp legitimate
         // CLIs whenever the project's exclude_patterns don't already cover
-        // tests/.
-        if is_test_like_path(rel) {
+        // tests/. Uses the broad canonical shape: for an exclusion scan a
+        // rare false positive (a real CLI named `test_tool.c`) is cheaper
+        // than test harnesses flooding the feature list.
+        if is_c_or_cpp_test_path(rel) {
             continue;
         }
         let abs = root.join(rel);
-        let Ok(source) = fs::read(&abs) else { continue };
-        if source.len() > 2_000_000 {
+        // Size-gate BEFORE reading (the old shape read the whole file and
+        // then discarded it, allocating multi-MB buffers for generated
+        // sources). Bytes, not read_to_string_bounded: C sources are
+        // routinely non-UTF-8 (Latin-1 comments) and tree-sitter parses
+        // raw bytes fine.
+        if !fs::metadata(&abs).is_ok_and(|m| m.len() <= 2_000_000) {
             continue; // skip huge generated sources
         }
+        let Ok(source) = fs::read(&abs) else { continue };
         let parser = if lang_for_path(rel) == Language::Cpp {
             &mut cpp_parser
         } else {
@@ -682,29 +647,24 @@ fn main_function_targets(
             .unwrap_or(rel)
             .to_string();
         out.push(FeatureSeed {
-            title: format!(
-                "{} binary `{bin_name}`",
-                if language == Language::Cpp {
-                    "C++"
-                } else {
-                    "C"
-                }
-            ),
             summary: format!("Has a top-level `main()` at {rel}"),
-            kind: FeatureKind::CliCommand,
             source: "c-main",
-            confidence: FeatureConfidence::Medium,
-            entry_path: rel.clone(),
             entry_symbol: Some("main".to_string()),
-            entry_route: None,
-            entry_command: Some(bin_name),
-            test_command: None,
-            language,
+            entry_command: Some(bin_name.clone()),
             tags: cmake_target_tags(language, "cli", is_cuda_source(rel)),
-            owned_files: Vec::new(),
-            context_files: Vec::new(),
-            tests: Vec::new(),
-            test_prefixes: Vec::new(),
+            ..FeatureSeed::new(
+                FeatureKind::CliCommand,
+                language,
+                format!(
+                    "{} binary `{bin_name}`",
+                    if language == Language::Cpp {
+                        "C++"
+                    } else {
+                        "C"
+                    }
+                ),
+                rel.clone(),
+            )
         });
     }
     Ok(out)
@@ -852,21 +812,6 @@ fn is_valid_target_name(s: &str) -> bool {
 /// produce phantom `owned_files` entries.
 fn is_pathological_source(s: &str) -> bool {
     s.contains('$') || s.starts_with('/')
-}
-
-/// Heuristic for "this looks like a test file" used to suppress
-/// `c-main` slices. Conservative on purpose: a test runner's `main()`
-/// is not a CLI worth surfacing, but a binary called `mytool_test`
-/// might be — we accept the rare false negative.
-fn is_test_like_path(rel: &str) -> bool {
-    for seg in rel.split('/') {
-        if matches!(seg, "tests" | "test" | "__tests__" | "Tests") {
-            return true;
-        }
-    }
-    let base = rel.rsplit('/').next().unwrap_or(rel);
-    let stem = base.split('.').next().unwrap_or(base);
-    stem.ends_with("_test") || stem.ends_with("Test")
 }
 
 /// Remove CMake bracket comments (`#[[ ... ]]`, `#[=[ ... ]=]` with any
@@ -1713,39 +1658,40 @@ mod tests {
     }
 
     #[test]
-    fn is_c_or_cpp_test_path_covers_documented_patterns() {
-        // Patterns mirror clawpatch's `isCOrCppTestPath`. Listed here so
-        // a future change that loosens the helper trips the test.
-        for path in [
-            "tests/main.c",
-            "test/main.cpp",
-            "src/__tests__/widget.cpp",
-            "src/test_widget.c",
-            "src/test-widget.c",
-            "src/widget_test.c",
-            "src/widget-test.c",
-            "src/widget_tests.cpp",
-            "src/WidgetTest.cpp",
-            "src/WidgetTests.cc",
-        ] {
-            assert!(super::is_c_or_cpp_test_path(path), "should match: {path}");
-        }
-        for path in [
-            "src/main.c",
-            "src/widget.cpp",
-            "include/widget.h",
-            "src/testimony.c", // `test` prefix but not separator-followed
-        ] {
-            assert!(
-                !super::is_c_or_cpp_test_path(path),
-                "should NOT match: {path}"
-            );
-        }
+    fn c_main_in_test_prefixed_file_is_suppressed() {
+        // Regression for the is_test_like_path → is_c_or_cpp_test_path
+        // unification. The two forks disagreed on `test_*.c` basenames
+        // (and `*-test.c` / `*_tests.c` / `FooTests.cpp`): the old narrow
+        // main-suppression predicate let a `test_foo.c` harness with its
+        // own `main()` surface as a `c-main` CLI seed. The broad shape
+        // won: exclusion scans prefer suppressing a rare
+        // legitimately-named CLI over flooding the feature list with test
+        // harness binaries.
+        let dir = tempdir().unwrap();
+        write(dir.path(), "src/tool.c", "int main(void) { return 0; }\n");
+        write(
+            dir.path(),
+            "src/test_harness.c",
+            "int main(void) { return 0; }\n",
+        );
+        let seeds = CCppMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        assert!(
+            seeds
+                .iter()
+                .any(|s| s.source == "c-main" && s.entry_path == "src/tool.c"),
+            "regular main() file must still seed: {seeds:?}"
+        );
+        assert!(
+            !seeds.iter().any(|s| s.entry_path == "src/test_harness.c"),
+            "test_-prefixed main() file must be suppressed: {seeds:?}"
+        );
     }
 
     #[test]
     fn strip_cmake_comments_preserves_non_ascii_paths() {
-        // Regression for fnd_2fbb868e: byte-by-byte `b as char` mangled
+        // Regression: byte-by-byte `b as char` mangled
         // multibyte UTF-8 source paths into Latin-1 codepoints, so any
         // CMakeLists.txt with a non-ASCII source path produced mojibake
         // and the resulting cmake-bin features couldn't be matched back

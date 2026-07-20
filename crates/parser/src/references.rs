@@ -17,7 +17,6 @@ static JS_REF_QUERY: &str = include_str!("queries/javascript_refs.scm");
 // class inheritance: TS wraps the superclass in an `extends_clause` node that
 // does not exist in the JavaScript grammar, so it cannot live in the shared
 // JS file (the query would fail to compile against tree-sitter-javascript).
-// fnd: CR-013.
 static TS_REF_QUERY: &str = include_str!("queries/typescript_refs.scm");
 static GO_REF_QUERY: &str = include_str!("queries/go_refs.scm");
 
@@ -337,8 +336,7 @@ pub fn extract_references(
 /// of a single bare quote — possible from malformed/truncated source where
 /// the parser still emits a partial node. Without it,
 /// `s[1..s.len() - 1]` on a 1-byte string panics with
-/// `slice index starts at 1 but ends at 0` and aborts the indexer worker
-/// (fnd_87af7e67).
+/// `slice index starts at 1 but ends at 0` and aborts the indexer worker.
 fn strip_surrounding_quotes(s: &str) -> &str {
     if s.len() < 2 {
         return s;
@@ -374,7 +372,7 @@ mod tests {
 
     #[test]
     fn does_not_panic_on_single_bare_quote() {
-        // Regression for fnd_87af7e67: the previous inline `[1..len-1]`
+        // Regression: the previous inline `[1..len-1]`
         // slice panicked on `"\""`, aborting the rayon-parallel indexer
         // worker for the entire run when tree-sitter emitted a 1-byte
         // string capture on malformed input.

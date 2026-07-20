@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use codesage_storage::Database;
 
-use crate::drift::{DriftKind, check_drift};
+use codesage_graph::drift::{DriftKind, check_drift};
+
 use crate::{DB_FILE, PROJECT_DIR, find_project_root_opt, load_project_config};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -404,18 +405,41 @@ fn check_hooks(root: &Path) -> Check {
     };
 
     let mut installed = Vec::new();
+    let mut foreign = Vec::new();
     let mut missing = Vec::new();
+    let mut dead_binaries: Vec<String> = Vec::new();
     for name in REQUIRED_HOOKS {
         let p = hooks_dir.join(name);
-        let codesage = p.exists()
-            && std::fs::read_to_string(&p)
-                .map(|c| c.contains("codesage install-hooks"))
-                .unwrap_or(false);
-        if codesage {
-            installed.push(*name);
-        } else {
-            missing.push(*name);
+        match std::fs::read_to_string(&p) {
+            Ok(body) if body.contains("codesage install-hooks") => {
+                installed.push(*name);
+                if let Some(bin) = hook_embedded_binary(&body)
+                    && !dead_binaries.contains(&bin)
+                    && !is_executable_file(Path::new(&bin))
+                {
+                    dead_binaries.push(bin);
+                }
+            }
+            // The slot is occupied by someone else's hook. `install-hooks`
+            // refuses to clobber it, so this is not "missing" — the fix is
+            // chaining, not re-running the installer.
+            Ok(_) => foreign.push(*name),
+            Err(_) => missing.push(*name),
         }
+    }
+
+    // A hook whose baked-in binary path no longer resolves runs and fails
+    // silently on every commit — worse than a missing hook, which at least
+    // shows up as "missing" above. Surface it as its own warning.
+    if !dead_binaries.is_empty() {
+        return Check {
+            name: "hooks",
+            status: Status::Warn,
+            message: format!(
+                "{kind}: installed hooks invoke {} which is missing or not executable (re-run `codesage install-hooks`)",
+                dead_binaries.join(", ")
+            ),
+        };
     }
 
     if installed.len() == REQUIRED_HOOKS.len() {
@@ -427,6 +451,31 @@ fn check_hooks(root: &Path) -> Check {
                 REQUIRED_HOOKS.len(),
                 hooks_dir.display()
             ),
+        }
+    } else if !foreign.is_empty() {
+        // Distinct from "missing": the slot exists but belongs to another
+        // tool, so `codesage install-hooks` will (correctly) refuse to
+        // overwrite it and re-running the installer changes nothing.
+        let mut parts = Vec::new();
+        if !installed.is_empty() {
+            parts.push(format!("installed=[{}]", installed.join(",")));
+        }
+        parts.push(format!(
+            "foreign=[{}] — existing non-codesage hook(s); codesage is not wired there. \
+             Chain `codesage index --lock-wait 60` and `codesage git-index --incremental \
+             --lock-wait 60` into them, or move them aside and re-run `codesage install-hooks`",
+            foreign.join(",")
+        ));
+        if !missing.is_empty() {
+            parts.push(format!(
+                "missing=[{}] (run `codesage install-hooks`)",
+                missing.join(",")
+            ));
+        }
+        Check {
+            name: "hooks",
+            status: Status::Warn,
+            message: format!("{kind}: {}", parts.join(" ")),
         }
     } else if installed.is_empty() {
         Check {
@@ -447,6 +496,51 @@ fn check_hooks(root: &Path) -> Check {
                 missing.join(",")
             ),
         }
+    }
+}
+
+/// Extract the codesage binary path baked into an installed hook body: the
+/// shell-single-quoted token preceding ` index --lock-wait` on the invocation
+/// line (see `generate_post_commit_hook_body`). Returns `None` for bodies
+/// that carry the marker but no recognizable invocation, in which case the
+/// binary check is skipped rather than guessed.
+fn hook_embedded_binary(body: &str) -> Option<String> {
+    for line in body.lines() {
+        let Some(idx) = line.find(" index --lock-wait") else {
+            continue;
+        };
+        let before = &line[..idx];
+        let start = match before.find("$NICE ") {
+            Some(p) => p + "$NICE ".len(),
+            None => before.find('\'')?,
+        };
+        let token = before[start..].trim();
+        if !(token.len() >= 2 && token.starts_with('\'') && token.ends_with('\'')) {
+            return None;
+        }
+        // Reverse of `shell_single_quote`: strip the outer quotes, then
+        // collapse the '"'"' escape back to a literal single quote.
+        let inner = &token[1..token.len() - 1];
+        return Some(inner.replace("'\"'\"'", "'"));
+    }
+    None
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
     }
 }
 
@@ -676,6 +770,128 @@ mod tests {
         let check = check_hooks(dir.path());
 
         assert_eq!(check.status, Status::Pass);
+    }
+
+    fn write_hook_body(root: &Path, name: &str, body: &str) {
+        let hooks = root.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(hooks.join(name), body).unwrap();
+    }
+
+    #[test]
+    fn check_hooks_distinguishes_foreign_hook_from_missing() {
+        // A slot held by someone else's hook is not "missing": install-hooks
+        // refuses to clobber it, so re-running the installer fixes nothing.
+        // Doctor must name it as foreign with the chaining remediation.
+        let dir = init_git_repo();
+        write_hook_body(
+            dir.path(),
+            "post-commit",
+            "#!/bin/sh\n# someone else's hook\nexit 0\n",
+        );
+
+        let check = check_hooks(dir.path());
+
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check.message.contains("foreign=[post-commit]"),
+            "foreign slot must be named as foreign: {}",
+            check.message
+        );
+        assert!(
+            check
+                .message
+                .contains("missing=[post-merge,post-checkout,post-rewrite]"),
+            "absent hooks must still be listed as missing: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("chain") || check.message.contains("Chain"),
+            "foreign warning must carry the chaining remediation: {}",
+            check.message
+        );
+    }
+
+    #[test]
+    fn check_hooks_all_foreign_is_not_reported_as_no_hooks() {
+        let dir = init_git_repo();
+        for hook in REQUIRED_HOOKS {
+            write_hook_body(dir.path(), hook, "#!/bin/sh\n# husky or friends\nexit 0\n");
+        }
+
+        let check = check_hooks(dir.path());
+
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check
+                .message
+                .contains("foreign=[post-commit,post-merge,post-checkout,post-rewrite]"),
+            "all four slots are foreign, message: {}",
+            check.message
+        );
+        assert!(
+            !check.message.contains("no codesage hooks at"),
+            "foreign-held slots must not read as plain missing: {}",
+            check.message
+        );
+        assert!(
+            !check.message.contains("missing=["),
+            "nothing is missing when every slot exists: {}",
+            check.message
+        );
+    }
+
+    #[test]
+    fn check_hooks_warns_when_embedded_binary_is_gone() {
+        let dir = init_git_repo();
+        let body =
+            crate::commands::hooks::generate_post_commit_hook_body("/nonexistent/path/codesage");
+        for hook in REQUIRED_HOOKS {
+            write_hook_body(dir.path(), hook, &body);
+        }
+
+        let check = check_hooks(dir.path());
+
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check.message.contains("/nonexistent/path/codesage"),
+            "message should name the dead binary path: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("not executable"),
+            "dead-binary warning must be distinct from a missing-hook warning: {}",
+            check.message
+        );
+    }
+
+    #[test]
+    fn check_hooks_passes_when_embedded_binary_is_executable() {
+        // Uses the real hook template so this doubles as a contract test
+        // between generate_post_commit_hook_body and hook_embedded_binary.
+        let dir = init_git_repo();
+        let body = crate::commands::hooks::generate_post_commit_hook_body("/bin/sh");
+        for hook in REQUIRED_HOOKS {
+            write_hook_body(dir.path(), hook, &body);
+        }
+
+        let check = check_hooks(dir.path());
+
+        assert_eq!(check.status, Status::Pass, "message: {}", check.message);
+    }
+
+    #[test]
+    fn hook_embedded_binary_unquotes_shell_escaped_paths() {
+        let body = crate::commands::hooks::generate_post_commit_hook_body("/tmp/a'b/codesage");
+        assert_eq!(
+            hook_embedded_binary(&body).as_deref(),
+            Some("/tmp/a'b/codesage")
+        );
+        // Marker-only bodies (e.g. hand-written hooks) yield no path.
+        assert_eq!(
+            hook_embedded_binary("#!/bin/sh\n# installed by codesage install-hooks\n"),
+            None
+        );
     }
 
     #[test]

@@ -20,5 +20,5 @@ pub mod nearby_tests;
 pub mod trust_boundary;
 pub mod trust_boundary_rules;
 
-pub use mapper::map_features;
+pub use mapper::{FeatureMapOutcome, map_features, map_features_detailed};
 pub use trust_boundary::{derive_for_file, derive_for_files, derive_for_index, store_for_file};
