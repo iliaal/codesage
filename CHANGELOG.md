@@ -4,15 +4,15 @@
 - `codesage index --no-features` skips the feature-mapping stage.
 - `codesage status --json` and `codesage export --json`.
 - `codesage doctor` warns when installed git hooks invoke a codesage binary that is missing or not executable, and distinguishes a foreign (non-codesage) hook from a missing one.
-- Unique-index backstop on the structural tables (schema migration 0013): existing duplicate symbol/reference/fingerprint rows are deduplicated and future double-inserts fail instead of silently accumulating.
+- Schema migration 0013 removes duplicate symbol, reference, and fingerprint rows and adds unique indexes that reject future duplicates.
 - `codesage cleanup` checks free disk space before VACUUM and fails up front with a clear message instead of mid-operation.
 
 ### Changed
-- `codesage index` skips feature mapping on incremental passes that changed no structural state or build manifests (file-hash + manifest fingerprint gate); partial mapper failures keep the next run mapping; full indexes and `codesage map` always remap.
+- `codesage index` skips feature mapping when an incremental pass changed no source files or build manifests. Full indexes and `codesage map` always remap, and a partial mapper failure leaves the next run to remap.
 - Git hooks append to `.codesage/hooks.log` (truncated past 1 MiB) instead of discarding output, and run the index and git-index passes independently instead of short-circuiting.
 - Every MCP tool's outputSchema declares the optional `_meta` envelope (truncation, staleness); `find_coupling`, `export_context`, and `feature_bundle` descriptions document the structured `found` field.
 - Daemon shutdown waits up to 5 seconds for in-flight MCP requests to finish before exiting.
-- `search` applies the requested language set to BM25-fused candidates and rescales near-tied semantic scores on a synthetic span so flat boosts cannot reorder them.
+- `search` applies every requested language filter to BM25-fused candidates, and near-tied results keep their ranking instead of being reshuffled by symbol boosts.
 - Feature mappers honor gitignore and exclude patterns in directory scans, cap file reads at 1 MiB, and share one test-file definition across languages.
 - Pre-commit leak patterns cover Anthropic, OpenAI, Google, Hugging Face, npm, PyPI, and GitLab token shapes.
 
@@ -20,10 +20,9 @@
 - Watcher: edited `.h` headers track the project's C/C++ dialect in both directions; renamed or deleted files are purged from the index instead of stranded; edit bursts and filesystem-event overflows trigger one cooldown-respecting catch-up reindex instead of repeated full passes; a malformed `config.toml` skips the watcher with a warning instead of silently dropping `exclude_patterns`.
 - The daemon no longer recreates a deleted `.codesage/index.db` as an empty index; reads report the project as not onboarded.
 - `codesage mcp` waits for a slow daemon cold-start (up to 15 seconds while the child process is alive) instead of failing at 5 seconds and orphaning it.
-- `.phpt` files under a feature's declared test directory attach to C/C++ PHP-extension feature slices, with the slice's own language prioritized when the per-feature cap bites.
+- `.phpt` files under a feature's declared test directory attach to C/C++ PHP-extension feature slices, and when the per-feature test cap fills, the slice's own language wins.
 - `session_end` tolerates small backwards clock steps instead of failing until wall time catches up.
 - A corrupted cached model artifact is evicted and re-downloaded once before failing closed.
-- `scripts/release.sh` resumes an unpushed release instead of dying on the existing tag, and local plugin-refresh failures no longer abort the release.
 
 ### Security
 - Git hooks refuse to write through a symlinked or non-regular `.codesage/hooks.log`.
