@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.18.0] - 2026-07-20
+
 ### Added
 - `codesage index --no-features` skips the feature-mapping stage.
 - `codesage status --json` and `codesage export --json`.
@@ -654,5 +656,7 @@ Initial public release.
 
 [0.16.0]: https://github.com/iliaal/codesage/releases/tag/v0.16.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.17.0...HEAD
 [0.17.0]: https://github.com/iliaal/codesage/releases/tag/v0.17.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/iliaal/codesage/releases/tag/v0.18.0
