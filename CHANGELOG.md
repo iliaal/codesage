@@ -1,5 +1,8 @@
 ## [Unreleased]
 
+### Fixed
+- Laravel route URIs: array-options group prefixes (`Route::group(['prefix' => 'admin'], ...)`) are applied, nested group prefixes compose, and a root route maps to `/` instead of an empty URI.
+
 ## [0.18.0] - 2026-07-20
 
 ### Added

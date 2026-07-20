@@ -811,27 +811,31 @@ fn parse_laravel_routes(root: &Path) -> Result<Vec<LaravelRoute>> {
     // `prefix(...)` out per registration. The chain is non-greedy
     // method() segments terminated by `->`.
     let route_re = Regex::new(
-        r#"(?ms)Route::((?:[A-Za-z_]\w*\s*\([^;]*?\)\s*->\s*)*)(get|post|put|patch|delete|options|any|match|resource|apiResource)\s*\(\s*(?:\[[^\]]*\]\s*,\s*)?['"]([^'"]+)['"](?:\s*,\s*(?:\[\s*)?(\\?[A-Za-z_][A-Za-z0-9_\\]*)::class(?:\s*,\s*['"]([^'"]+)['"])?)?"#,
+        r#"(?ms)Route::((?:[A-Za-z_]\w*\s*\((?:[^;{}'"]|'[^']*'|"[^"]*")*?\)\s*->\s*)*)(get|post|put|patch|delete|options|any|match|resource|apiResource)\s*\(\s*(?:\[[^\]]*\]\s*,\s*)?['"]([^'"]+)['"](?:\s*,\s*(?:\[\s*)?(\\?[A-Za-z_][A-Za-z0-9_\\]*)::class(?:\s*,\s*['"]([^'"]+)['"])?)?"#,
     )?;
-    // `Route::<chain>?controller(X::class)<chain>?->group(function (...) { body })`.
-    // Body capture is non-greedy with `(?s)` so a stray `}` inside a
-    // string literal won't truncate the body before its real close.
+    // `Route::<chain>?controller(X::class)<chain>?->group([options,]? function (…) {`.
+    // The match stops at the opening brace; the body extent comes from
+    // `php_block_end`, because a regex cannot balance nested braces and a
+    // non-greedy body would end at the first *inner* group's closer.
     let controller_group_re = Regex::new(
-        r#"(?ms)Route::((?:[A-Za-z_]\w*\s*\([^;]*?\)\s*->\s*)*)controller\s*\(\s*(\\?[A-Za-z_][A-Za-z0-9_\\]*)::class\s*\)\s*->\s*((?:[A-Za-z_]\w*\s*\([^;]*?\)\s*->\s*)*)group\s*\(\s*function\s*\([^)]*\)\s*\{(.*?)\}\s*\)\s*;"#,
+        r#"(?ms)Route::((?:[A-Za-z_]\w*\s*\((?:[^;{}'"]|'[^']*'|"[^"]*")*?\)\s*->\s*)*)controller\s*\(\s*(\\?[A-Za-z_][A-Za-z0-9_\\]*)::class\s*\)\s*->\s*((?:[A-Za-z_]\w*\s*\((?:[^;{}'"]|'[^']*'|"[^"]*")*?\)\s*->\s*)*)group\s*\(\s*(?:(\[(?:[^\[\]]|\[[^\]]*\])*\])\s*,\s*)?(?:function\s*\([^)]*\)(?:\s*use\s*\([^)]*\))?|fn\s*\([^)]*\))\s*\{"#,
     )?;
     // Inner route inside a `controller(...)->group(...)` body: the
     // closing `Route::verb('/path', 'action')` shape (no class — it
     // comes from the outer controller).
     let group_inner_re = Regex::new(
-        r#"(?ms)Route::((?:[A-Za-z_]\w*\s*\([^;]*?\)\s*->\s*)*)(get|post|put|patch|delete|options|any)\s*\(\s*['"]([^'"]+)['"](?:\s*,\s*['"]([^'"]+)['"])?"#,
+        r#"(?ms)Route::((?:[A-Za-z_]\w*\s*\((?:[^;{}'"]|'[^']*'|"[^"]*")*?\)\s*->\s*)*)(get|post|put|patch|delete|options|any)\s*\(\s*['"]([^'"]+)['"](?:\s*,\s*['"]([^'"]+)['"])?"#,
     )?;
-    // Any `Route::<chain>group(function (...) { body });`. Used to catch
+    // Any `Route::<chain>group([options,]? function (…) {`. Catches
     // prefix/middleware-only groups (no controller). The chain segment's
     // `[^;]*?` can't span the `;` inside the closure body, so a `group(...)`
     // call is never mistaken for a chain element and always binds as the
-    // literal group opener.
+    // literal group opener. The optional leading array is the array-options
+    // form (`Route::group(['prefix' => 'admin'], ...)`); its inner alternation
+    // admits one level of nesting so a `'middleware' => ['auth']` value does
+    // not terminate the literal early. Body extent comes from `php_block_end`.
     let group_re = Regex::new(
-        r#"(?ms)Route::((?:[A-Za-z_]\w*\s*\([^;]*?\)\s*->\s*)*)group\s*\(\s*function\s*\([^)]*\)\s*\{(.*?)\}\s*\)\s*;"#,
+        r#"(?ms)Route::((?:[A-Za-z_]\w*\s*\((?:[^;{}'"]|'[^']*'|"[^"]*")*?\)\s*->\s*)*)group\s*\(\s*(?:(\[(?:[^\[\]]|\[[^\]]*\])*\])\s*,\s*)?(?:function\s*\([^)]*\)(?:\s*use\s*\([^)]*\))?|fn\s*\([^)]*\))\s*\{"#,
     )?;
     for file in ["web.php", "api.php", "console.php", "channels.php"] {
         let path = routes_dir.join(file);
@@ -846,187 +850,263 @@ fn parse_laravel_routes(root: &Path) -> Result<Vec<LaravelRoute>> {
         // Strip PHP comments before the route regexes so commented-out
         // `Route::get(...)` lines don't produce phantom feature seeds.
         // Strings are preserved (route patterns are string literals);
-        // byte offsets are stable so `consumed_spans` cross-pass dedupe
-        // remains valid.
+        // byte offsets are stable so group-span containment checks and
+        // reported line numbers remain valid.
         let scanned = strip_php_comments_preserving_strings(&raw);
         let imports = parse_php_use_imports(&raw);
         let file_prefixes = file_default_route_prefixes(file);
 
-        // Pass 1: Route::controller(X::class)->group(fn () { … })
-        // bodies. Each inner route inherits the outer controller. We
-        // also remember which byte spans were consumed so the
-        // top-level scan in pass 2 doesn't double-emit them.
-        let mut consumed_spans: Vec<(usize, usize)> = Vec::new();
-        for cap in controller_group_re.captures_iter(&scanned) {
-            let span = cap.get(0).map(|m| (m.start(), m.end()));
-            let outer_chain = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-            let raw_class = cap.get(2).map(|m| m.as_str()).unwrap_or("");
-            let inner_chain = cap.get(3).map(|m| m.as_str()).unwrap_or("");
-            let body = cap.get(4).map(|m| m.as_str()).unwrap_or("");
-            let body_base = cap.get(4).map(|m| m.start()).unwrap_or(0);
-            let controller_class = resolve_imported_class(&imports, raw_class);
-            if controller_class.is_none() {
-                continue;
+        let scan = RouteScan {
+            scanned: &scanned,
+            rel: &rel,
+            imports: &imports,
+            route_re: &route_re,
+            group_re: &group_re,
+            controller_group_re: &controller_group_re,
+            group_inner_re: &group_inner_re,
+        };
+        scan_route_region(&scan, &scanned, 0, &file_prefixes, None, 0, &mut out);
+    }
+    Ok(out)
+}
+
+/// Deepest route-group nesting walked. Real apps nest a handful of
+/// levels; the cap only bounds pathological or generated input.
+const MAX_ROUTE_GROUP_DEPTH: usize = 8;
+
+/// Immutable per-file context for the recursive route scan.
+struct RouteScan<'a> {
+    scanned: &'a str,
+    rel: &'a str,
+    imports: &'a std::collections::HashMap<String, String>,
+    route_re: &'a Regex,
+    group_re: &'a Regex,
+    controller_group_re: &'a Regex,
+    group_inner_re: &'a Regex,
+}
+
+/// One route group awaiting descent, with the prefix chain its inner
+/// routes inherit.
+struct PendingGroup<'r> {
+    start: usize,
+    end: usize,
+    body: &'r str,
+    body_start: usize,
+    prefixes: Vec<String>,
+    controller: Option<String>,
+    /// Controller groups sort ahead of the plain-group match covering the
+    /// identical span, so the plain duplicate drops out as "nested".
+    controller_first: u8,
+}
+
+fn span_contains(outer: (usize, usize), start: usize, end: usize) -> bool {
+    start >= outer.0 && end <= outer.1
+}
+
+/// Byte index of the `}` closing the block whose `{` sits at `open`, or
+/// `None` when the source is unbalanced. Quoted strings are skipped so a
+/// brace inside a route pattern or message can't unbalance the count.
+/// Both ends are ASCII, so the returned index is a char boundary.
+fn php_block_end(text: &str, open: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if bytes.get(open) != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut i = open;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if b == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b == q {
+                    quote = None;
+                }
             }
-            let outer_prefixes: Vec<String> = file_prefixes
+            None => match b {
+                b'\'' | b'"' => quote = Some(b),
+                b'{' => depth += 1,
+                b'}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Walk one region of a routes file, descending into each nested
+/// `Route::group(...)` so an inner group's prefix composes onto its
+/// ancestors' instead of replacing them. `base` is the region's byte
+/// offset within the file, keeping reported line numbers absolute.
+fn scan_route_region(
+    scan: &RouteScan<'_>,
+    region: &str,
+    base: usize,
+    prefixes: &[String],
+    controller: Option<&str>,
+    depth: usize,
+    out: &mut Vec<LaravelRoute>,
+) {
+    if depth > MAX_ROUTE_GROUP_DEPTH {
+        return;
+    }
+
+    // Collect every group match in this region, then keep only the
+    // outermost ones. A group nested inside another is reached by the
+    // recursive call instead, which is what lets its prefix compose.
+    let mut candidates: Vec<PendingGroup<'_>> = Vec::new();
+
+    for cap in scan.controller_group_re.captures_iter(region) {
+        let Some(whole) = cap.get(0) else { continue };
+        let raw_class = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+        let Some(class) = resolve_imported_class(scan.imports, raw_class) else {
+            continue;
+        };
+        let Some(close) = php_block_end(region, whole.end() - 1) else {
+            continue;
+        };
+        candidates.push(PendingGroup {
+            start: whole.start(),
+            end: close + 1,
+            body: &region[whole.end()..close],
+            body_start: whole.end(),
+            prefixes: prefixes
                 .iter()
                 .cloned()
-                .chain(fluent_route_prefixes(outer_chain))
-                .chain(fluent_route_prefixes(inner_chain))
-                .collect();
-            for inner in group_inner_re.captures_iter(body) {
-                let inner_chain_local = inner.get(1).map(|m| m.as_str()).unwrap_or("");
-                let verb = inner
-                    .get(2)
-                    .map(|m| m.as_str().to_uppercase())
-                    .unwrap_or_default();
-                let pattern = inner.get(3).map(|m| m.as_str()).unwrap_or("");
-                let action = inner.get(4).map(|m| m.as_str().to_string());
-                if verb.is_empty() || pattern.is_empty() {
-                    continue;
-                }
-                let line = inner
-                    .get(0)
-                    .map(|m| line_at(&scanned, body_base + m.start()))
-                    .unwrap_or(1);
-                let prefixes: Vec<String> = outer_prefixes
-                    .iter()
-                    .cloned()
-                    .chain(fluent_route_prefixes(inner_chain_local))
-                    .collect();
-                out.push(LaravelRoute {
-                    file: rel.clone(),
-                    verb,
-                    pattern: route_uri_with_prefixes(&prefixes, pattern),
-                    controller_class: controller_class.clone(),
-                    action,
-                    line,
-                });
-            }
-            if let Some(s) = span {
-                consumed_spans.push(s);
-            }
-        }
+                .chain(fluent_route_prefixes(
+                    cap.get(1).map(|m| m.as_str()).unwrap_or(""),
+                ))
+                .chain(fluent_route_prefixes(
+                    cap.get(3).map(|m| m.as_str()).unwrap_or(""),
+                ))
+                .chain(array_route_prefixes(
+                    cap.get(4).map(|m| m.as_str()).unwrap_or(""),
+                ))
+                .collect(),
+            controller: Some(class),
+            controller_first: 0,
+        });
+    }
 
-        // Pass 1b: prefix/middleware-only groups —
-        // `Route::prefix('admin')->group(function () { … })` with no
-        // controller. Inner routes must inherit the group's prefix chain;
-        // without this they emit with their own (empty) chain and lose the
-        // group prefix. Controller groups are handled by pass 1, so skip a
-        // chain that names `controller(` and any span already consumed.
-        for cap in group_re.captures_iter(&scanned) {
-            let span = cap.get(0).map(|m| (m.start(), m.end()));
-            if let Some((s, e)) = span
-                && consumed_spans.iter().any(|(cs, ce)| s >= *cs && e <= *ce)
-            {
-                continue;
-            }
-            let outer_chain = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-            if outer_chain.contains("controller(") {
-                continue;
-            }
-            let body = cap.get(2).map(|m| m.as_str()).unwrap_or("");
-            let body_base = cap.get(2).map(|m| m.start()).unwrap_or(0);
-            let outer_prefixes: Vec<String> = file_prefixes
-                .iter()
-                .cloned()
-                .chain(fluent_route_prefixes(outer_chain))
-                .collect();
-            for inner in route_re.captures_iter(body) {
-                let inner_abs = inner
-                    .get(0)
-                    .map(|m| (body_base + m.start(), body_base + m.end()));
-                // Guard against re-emitting a route a controller-group pass
-                // already consumed (nested groups).
-                if let Some((s, e)) = inner_abs
-                    && consumed_spans.iter().any(|(cs, ce)| s >= *cs && e <= *ce)
-                {
-                    continue;
-                }
-                let inner_chain = inner.get(1).map(|m| m.as_str()).unwrap_or("");
-                let verb = inner
-                    .get(2)
-                    .map(|m| m.as_str().to_uppercase())
-                    .unwrap_or_default();
-                let pattern = inner.get(3).map(|m| m.as_str()).unwrap_or("");
-                let raw_class = inner.get(4).map(|m| m.as_str()).unwrap_or("");
-                let action = inner.get(5).map(|m| m.as_str().to_string());
-                if verb.is_empty() || pattern.is_empty() {
-                    continue;
-                }
-                let line = inner
-                    .get(0)
-                    .map(|m| line_at(&scanned, body_base + m.start()))
-                    .unwrap_or(1);
-                let controller_class = if raw_class.is_empty() {
-                    None
-                } else {
-                    resolve_imported_class(&imports, raw_class)
-                };
-                let prefixes: Vec<String> = outer_prefixes
-                    .iter()
-                    .cloned()
-                    .chain(fluent_route_prefixes(inner_chain))
-                    .collect();
-                out.push(LaravelRoute {
-                    file: rel.clone(),
-                    verb,
-                    pattern: route_uri_with_prefixes(&prefixes, pattern),
-                    controller_class,
-                    action,
-                    line,
-                });
-            }
-            if let Some(s) = span {
-                consumed_spans.push(s);
-            }
+    for cap in scan.group_re.captures_iter(region) {
+        let Some(whole) = cap.get(0) else { continue };
+        let chain = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        // A `controller(...)` group whose class did not resolve. Leave its
+        // body to this level's own scan rather than claiming it.
+        if chain.contains("controller(") {
+            continue;
         }
-
-        // Pass 2: top-level `Route::<chain>?<verb>('/path' [, X::class])`
-        // matches that didn't fall inside a controller-group body.
-        for cap in route_re.captures_iter(&scanned) {
-            if let Some(m) = cap.get(0) {
-                let (start, end) = (m.start(), m.end());
-                if consumed_spans.iter().any(|(s, e)| start >= *s && end <= *e) {
-                    continue;
-                }
-            }
-            let chain = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-            let verb = cap
-                .get(2)
-                .map(|m| m.as_str().to_uppercase())
-                .unwrap_or_default();
-            let pattern = cap.get(3).map(|m| m.as_str()).unwrap_or("");
-            let raw_class = cap.get(4).map(|m| m.as_str()).unwrap_or("");
-            let action = cap.get(5).map(|m| m.as_str().to_string());
-            if verb.is_empty() || pattern.is_empty() {
-                continue;
-            }
-            let line = cap
-                .get(0)
-                .map(|m| line_at(&scanned, m.start()))
-                .unwrap_or(1);
-            let controller_class = if raw_class.is_empty() {
-                None
-            } else {
-                resolve_imported_class(&imports, raw_class)
-            };
-            let prefixes: Vec<String> = file_prefixes
+        let Some(close) = php_block_end(region, whole.end() - 1) else {
+            continue;
+        };
+        candidates.push(PendingGroup {
+            start: whole.start(),
+            end: close + 1,
+            body: &region[whole.end()..close],
+            body_start: whole.end(),
+            prefixes: prefixes
                 .iter()
                 .cloned()
                 .chain(fluent_route_prefixes(chain))
-                .collect();
-            out.push(LaravelRoute {
-                file: rel.clone(),
-                verb,
-                pattern: route_uri_with_prefixes(&prefixes, pattern),
-                controller_class,
-                action,
-                line,
-            });
-        }
+                .chain(array_route_prefixes(
+                    cap.get(2).map(|m| m.as_str()).unwrap_or(""),
+                ))
+                .collect(),
+            controller: controller.map(str::to_string),
+            controller_first: 1,
+        });
     }
-    Ok(out)
+
+    // Outermost-first ordering: a container always precedes what it holds,
+    // so a single sweep against the last kept span drops nested entries.
+    candidates.sort_by_key(|g| (g.start, std::cmp::Reverse(g.end), g.controller_first));
+    let mut owned: Vec<(usize, usize)> = Vec::new();
+    for group in candidates {
+        if owned
+            .last()
+            .is_some_and(|last| span_contains(*last, group.start, group.end))
+        {
+            continue;
+        }
+        owned.push((group.start, group.end));
+        scan_route_region(
+            scan,
+            group.body,
+            base + group.body_start,
+            &group.prefixes,
+            group.controller.as_deref(),
+            depth + 1,
+            out,
+        );
+    }
+
+    // Routes belonging to this level: everything not inside a nested group.
+    // Within a controller group the trailing argument is a bare action
+    // string, a shape only `group_inner_re` captures.
+    let re = if controller.is_some() {
+        scan.group_inner_re
+    } else {
+        scan.route_re
+    };
+    for cap in re.captures_iter(region) {
+        let Some(whole) = cap.get(0) else { continue };
+        if owned
+            .iter()
+            .any(|o| span_contains(*o, whole.start(), whole.end()))
+        {
+            continue;
+        }
+        let verb = cap
+            .get(2)
+            .map(|m| m.as_str().to_uppercase())
+            .unwrap_or_default();
+        let pattern = cap.get(3).map(|m| m.as_str()).unwrap_or("");
+        if verb.is_empty() || pattern.is_empty() {
+            continue;
+        }
+        let full: Vec<String> = prefixes
+            .iter()
+            .cloned()
+            .chain(fluent_route_prefixes(
+                cap.get(1).map(|m| m.as_str()).unwrap_or(""),
+            ))
+            .collect();
+        let (controller_class, action) = match controller {
+            Some(class) => (
+                Some(class.to_string()),
+                cap.get(4).map(|m| m.as_str().to_string()),
+            ),
+            None => {
+                let raw_class = cap.get(4).map(|m| m.as_str()).unwrap_or("");
+                (
+                    if raw_class.is_empty() {
+                        None
+                    } else {
+                        resolve_imported_class(scan.imports, raw_class)
+                    },
+                    cap.get(5).map(|m| m.as_str().to_string()),
+                )
+            }
+        };
+        out.push(LaravelRoute {
+            file: scan.rel.to_string(),
+            verb,
+            pattern: route_uri_with_prefixes(&full, pattern),
+            controller_class,
+            action,
+            line: line_at(scan.scanned, base + whole.start()),
+        });
+    }
 }
 
 /// Parse `use Some\Class\Name;` and `use Some\Class\Name as Alias;`
@@ -1094,6 +1174,21 @@ fn fluent_route_prefixes(chain: &str) -> Vec<String> {
         .collect()
 }
 
+/// Prefix declared in the array-options form of a route group,
+/// `Route::group(['prefix' => 'admin'], …)`. Laravel treats this as
+/// equivalent to the fluent `->prefix('admin')->group(…)` chain.
+fn array_route_prefixes(options: &str) -> Vec<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r#"['"]prefix['"]\s*=>\s*['"]([^'"]*)['"]"#)
+            .expect("valid route group options prefix regex")
+    });
+    re.captures_iter(options)
+        .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
 /// Implicit file-level prefix. Laravel's default route service provider
 /// auto-prefixes routes in `routes/api.php` with `api/`; web.php and
 /// the others carry no implicit prefix.
@@ -1119,8 +1214,15 @@ fn route_uri_with_prefixes(prefixes: &[String], uri: &str) -> String {
         parts.push(cleaned.to_string());
     }
     let joined = parts.join("/");
-    if uri.starts_with('/') || joined.is_empty() {
-        format!("/{joined}").trim_end_matches('/').to_string()
+    if joined.is_empty() {
+        // Root route (`Route::get('/', …)`) with no enclosing prefix. Every
+        // segment trimmed away to nothing, so the URI is just `/`.
+        return "/".to_string();
+    }
+    // Segments are `/`-trimmed and empties dropped, so `joined` never has a
+    // trailing slash to strip here.
+    if uri.starts_with('/') {
+        format!("/{joined}")
     } else {
         joined
     }
@@ -2595,6 +2697,209 @@ Route::prefix('admin')->group(function () {
             !routes.iter().any(|r| r == &"GET /users"),
             "inner route double-emitted without prefix: {routes:?}"
         );
+    }
+
+    #[test]
+    fn laravel_array_options_group_inherits_prefix_on_inner_routes() {
+        let dir = tempdir().unwrap();
+        laravel_marker(dir.path());
+        write(
+            dir.path(),
+            "routes/web.php",
+            r#"<?php
+use App\Http\Controllers\UserController;
+Route::group(['prefix' => 'billing', 'middleware' => 'throttle:60,1'], function () {
+    Route::get('/ping', [UserController::class, 'ping']);
+});
+Route::group(['prefix' => 'admin', 'middleware' => ['auth', 'verified']], function () {
+    Route::get('/dashboard', [UserController::class, 'dashboard']);
+});
+"#,
+        );
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let routes: Vec<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "laravel-route")
+            .filter_map(|s| s.entry_route.as_deref())
+            .collect();
+        assert!(
+            routes.iter().any(|r| r == &"GET /billing/ping"),
+            "array-options group prefix not inherited: {routes:?}"
+        );
+        // Nested array in the options (middleware => [...]) must not defeat
+        // the options-literal match.
+        assert!(
+            routes.iter().any(|r| r == &"GET /admin/dashboard"),
+            "array-options group with nested array lost its prefix: {routes:?}"
+        );
+        assert!(
+            !routes
+                .iter()
+                .any(|r| r == &"GET /ping" || r == &"GET /dashboard"),
+            "inner route emitted without its group prefix: {routes:?}"
+        );
+    }
+
+    #[test]
+    fn laravel_nested_group_prefixes_compose() {
+        let dir = tempdir().unwrap();
+        laravel_marker(dir.path());
+        write(
+            dir.path(),
+            "routes/web.php",
+            r#"<?php
+use App\Http\Controllers\UserController;
+Route::prefix('admin')->group(function () {
+    Route::get('/home', [UserController::class, 'home']);
+    Route::prefix('deep')->group(function () {
+        Route::get('/nested', [UserController::class, 'nested']);
+        Route::group(['prefix' => 'inner'], function () {
+            Route::delete('/purge', [UserController::class, 'purge']);
+        });
+    });
+});
+"#,
+        );
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let routes: Vec<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "laravel-route")
+            .filter_map(|s| s.entry_route.as_deref())
+            .collect();
+        for want in [
+            "GET /admin/home",
+            "GET /admin/deep/nested",
+            "DELETE /admin/deep/inner/purge",
+        ] {
+            assert!(
+                routes.iter().any(|r| r == &want),
+                "missing composed route {want}: {routes:?}"
+            );
+        }
+        // No route may escape with a partial prefix chain.
+        for unwanted in ["GET /nested", "GET /deep/nested", "DELETE /purge"] {
+            assert!(
+                !routes.iter().any(|r| r == &unwanted),
+                "route emitted with truncated prefix chain {unwanted}: {routes:?}"
+            );
+        }
+        assert_eq!(routes.len(), 3, "unexpected duplicate emission: {routes:?}");
+    }
+
+    #[test]
+    fn laravel_controller_group_nested_in_prefix_group_keeps_both() {
+        let dir = tempdir().unwrap();
+        laravel_marker(dir.path());
+        write(
+            dir.path(),
+            "routes/web.php",
+            r#"<?php
+use App\Http\Controllers\UserController;
+Route::group(['prefix' => 'admin'], function () {
+    Route::controller(UserController::class)->prefix('users')->group(function () {
+        Route::get('/list', 'index');
+    });
+});
+"#,
+        );
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let routes: Vec<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "laravel-route")
+            .filter_map(|s| s.entry_route.as_deref())
+            .collect();
+        assert!(
+            routes.iter().any(|r| r == &"GET /admin/users/list"),
+            "controller group nested in a prefix group lost a prefix: {routes:?}"
+        );
+        assert_eq!(routes.len(), 1, "route double-emitted: {routes:?}");
+    }
+
+    #[test]
+    fn laravel_group_prefix_may_carry_route_parameters_and_braces_in_strings() {
+        let dir = tempdir().unwrap();
+        laravel_marker(dir.path());
+        write(
+            dir.path(),
+            "routes/web.php",
+            r#"<?php
+use App\Http\Controllers\UserController;
+Route::prefix('tenants/{tenant}')->group(function () {
+    Route::get('/reports', [UserController::class, 'reports']);
+    Route::prefix('{team}')->group(function () {
+        Route::get('/members', [UserController::class, 'members']);
+    });
+});
+Route::group(['prefix' => 'legacy'], function () {
+    // A brace inside a string literal must not close the group body early.
+    Route::get('/render', [UserController::class, 'render']);
+    Route::post('/save', [UserController::class, 'save']);
+});
+"#,
+        );
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let routes: Vec<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "laravel-route")
+            .filter_map(|s| s.entry_route.as_deref())
+            .collect();
+        for want in [
+            "GET /tenants/{tenant}/reports",
+            "GET /tenants/{tenant}/{team}/members",
+            "GET /legacy/render",
+            "POST /legacy/save",
+        ] {
+            assert!(
+                routes.iter().any(|r| r == &want),
+                "missing {want}: {routes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn laravel_root_route_keeps_its_slash() {
+        assert_eq!(route_uri_with_prefixes(&[], "/"), "/");
+        assert_eq!(
+            route_uri_with_prefixes(&["admin".to_string()], "/"),
+            "/admin"
+        );
+        assert_eq!(route_uri_with_prefixes(&[], "/users"), "/users");
+        // Prefix-relative form (no leading slash) keeps its shape.
+        assert_eq!(
+            route_uri_with_prefixes(&["admin".to_string()], "posts"),
+            "admin/posts"
+        );
+
+        let dir = tempdir().unwrap();
+        laravel_marker(dir.path());
+        write(
+            dir.path(),
+            "routes/web.php",
+            r#"<?php
+use App\Http\Controllers\UserController;
+Route::get('/', [UserController::class, 'welcome']);
+"#,
+        );
+        let seeds = PhpMapper.map(&MapperContext::for_root(dir.path())).unwrap();
+        let routes: Vec<&str> = seeds
+            .iter()
+            .filter(|s| s.source == "laravel-route")
+            .filter_map(|s| s.entry_route.as_deref())
+            .collect();
+        assert!(
+            routes.iter().any(|r| r == &"GET /"),
+            "root route lost its URI: {routes:?}"
+        );
+    }
+
+    #[test]
+    fn php_block_end_skips_braces_inside_strings() {
+        let src = "{ $a = '}'; $b = \"}\"; { } }";
+        let end = php_block_end(src, 0).expect("balanced block");
+        assert_eq!(&src[end..=end], "}");
+        assert_eq!(end, src.len() - 1, "closed at the wrong brace");
+        assert!(php_block_end("{ unbalanced", 0).is_none());
+        assert!(php_block_end("no brace here", 0).is_none());
     }
 
     #[test]
