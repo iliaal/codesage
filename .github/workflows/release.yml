@@ -5,15 +5,22 @@ on:
     tags:
       - 'v*.*.*'
 
-permissions:
-  contents: write
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   github-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # Creates the release for the pushed tag.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Resolve version from tag
         id: ver
@@ -25,8 +32,11 @@ jobs:
 
       - name: Extract CHANGELOG section for this version
         id: notes
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          version='${{ steps.ver.outputs.version }}'
+          version="$VERSION"
           # Print lines between '## [VERSION]' and the next top-level '## ' heading.
           # Strip the version heading itself; release UI already shows it.
           # Skip markdown link references like '[Unreleased]: https://...' that
@@ -46,14 +56,15 @@ jobs:
           # Trim leading and trailing blank lines for a tidier release body.
           sed -i -e '/./,$!d' -e ':a; /^\s*$/ { $d; N; ba; }' release-notes.md
 
-          echo "--- release notes for ${{ steps.ver.outputs.tag }} ---"
+          echo "--- release notes for ${TAG} ---"
           cat release-notes.md
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
         run: |
-          tag='${{ steps.ver.outputs.tag }}'
+          tag="$TAG"
           # Pre-1.0: every release marked as a normal release (not pre-release).
           # GitHub auto-attaches source tarball + zip for the tag.
           gh release create "$tag" \

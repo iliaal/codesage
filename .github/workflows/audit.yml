@@ -15,16 +15,21 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   cargo-audit:
     name: cargo audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # taiki-e/install-action downloads a pre-built binary, faster than
       # `cargo install --locked cargo-audit` which has to compile from source.
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@7572810d7dd469b651bb7793945692cf78da5dd7 # v2.85.0
         with:
           tool: cargo-audit
       - run: cargo audit
