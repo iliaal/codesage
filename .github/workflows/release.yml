@@ -5,15 +5,22 @@ on:
     tags:
       - 'v*.*.*'
 
-permissions:
-  contents: write
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   github-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # Creates the release for the pushed tag.
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Resolve version from tag
         id: ver
