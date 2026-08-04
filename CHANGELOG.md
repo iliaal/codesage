@@ -3,6 +3,7 @@
 ### Added
 - `codesage coverage` reports what a project contains that indexing cannot see: indexable files per language, and files skipped because no supported language matched, per extension. `--json` for machine output, `--top N` to cap the extension list.
 - Schema migration 0014 widens `idx_git_files_churn` to `(churn_score DESC, path)` so the top-churn query keeps a streaming index scan now that it orders by `path` as a tie-break.
+- `find_references` rows can carry kind `import_binding`: the symbol an import introduces (`Foo`), recorded alongside the existing `import` row naming the module (`./foo.js`). Existing projects need `codesage index --full` to pick up the new rows; an incremental pass skips unchanged files.
 
 ### Changed
 - `search` ranks the current major-version tree above older ones when a package ships several side by side (`v3/` next to `v4/`), unless the query itself names a version. Disable with `CODESAGE_VERSION_DEMOTE=0`.
@@ -18,6 +19,7 @@
 ### Fixed
 - `codesage search` no longer aborts with exit 134 after printing results. Teardown ran ONNX Runtime's C++ static destructors, which intermittently corrupt the heap; the process now exits without walking the atexit table. Reproduced at 2/100 under concurrent load before the fix, 0/100 after.
 - `impact_analysis` reports dependents for symbols referenced by their short name, such as a PHP base class inherited within its own namespace; one with 30 subclasses previously reported zero. `assess_risk` blast-radius and test-gap terms read the same traversal.
+- `impact_analysis` finds JavaScript and TypeScript dependents that import a symbol and then use it in a form no call or instantiation pattern captures — `Foo.staticMethod()`, `x instanceof Foo`, `obj.Foo = Foo`. Only the module specifier was recorded, so those files named the symbol nowhere and dropped out. Measured on axios: mean recall 0.37 to 0.57 with precision holding at 0.84.
 - `impact_analysis` resolves JavaScript, TypeScript and C/C++ imports written as file paths (`./headers.js`, `dir/foo.h`). Only Rust-style `::` module paths matched before, so a symbol declared in both a `.d.ts` and its `.js` lost every dependent: in axios, `AxiosError` reported none instead of 23. `assess_risk` blast radius and `export_context` callers read the same resolution.
 - `impact_analysis --symbol` accepts a bare name whose definitions all share one qualified name, instead of failing with `qualify with one of: Foo, Foo`. Languages without namespaces give every definition the bare name, so the instruction named no reachable choice; genuinely distinct qualified names still require disambiguation.
 - Capped ranked results break ties on a stable secondary key and repeat identically for an unchanged query: `impact_analysis`, `find_similar`, hybrid `search` fusion, co-changers, top-churn candidates, BM25 candidates, and paginated full-scan search.

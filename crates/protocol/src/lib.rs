@@ -263,6 +263,14 @@ pub enum ReferenceKind {
     /// `impact_analysis`/`find_references` traverse routing.
     #[serde(alias = "routehandler")]
     RouteHandler,
+    /// The binding an import introduces, as opposed to the module it names:
+    /// `import Foo from './foo.js'` records `./foo.js` as an `Import` and
+    /// `Foo` as an `ImportBinding`. Kept distinct so file-level dependency
+    /// listings keep showing modules while symbol lookups can still reach a
+    /// file that imports a symbol and only uses it in a form no call or
+    /// instantiation pattern captures.
+    #[serde(alias = "importbinding")]
+    ImportBinding,
 }
 
 str_enum!(ReferenceKind {
@@ -274,6 +282,7 @@ str_enum!(ReferenceKind {
     TraitUse => "trait_use",
     TypeHint => "type_hint",
     RouteHandler => "route_handler",
+    ImportBinding => "import_binding",
 });
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

@@ -21,3 +21,14 @@
 
 ; Pattern 6: instantiation (new Foo())
 (new_expression constructor: (identifier) @ref)
+
+; Patterns 7-9: the imported BINDING names. Pattern 0 captures only the module
+; specifier, so a file that imports a symbol and then uses it in a form no other
+; pattern captures — `Foo.staticMethod()` (pattern 3 sees only `staticMethod`),
+; `x instanceof Foo`, `obj.Foo = Foo` — produced no reference row naming that
+; symbol at all, and the file dropped out of its dependents.
+; Appended at the end: pattern indices are positional and map to kinds by
+; number in references.rs, so inserting above would renumber every kind.
+(import_statement (import_clause (identifier) @ref))
+(import_statement (import_clause (named_imports (import_specifier name: (identifier) @ref))))
+(import_statement (import_clause (namespace_import (identifier) @ref)))

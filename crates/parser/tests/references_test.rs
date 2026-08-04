@@ -113,3 +113,41 @@ fn php_extracts_instance_nullsafe_and_static_method_calls() {
             .any(|r| r.to_name == "show" && r.kind == ReferenceKind::Call && r.line == 38)
     );
 }
+
+#[test]
+fn javascript_import_bindings_are_captured_separately_from_the_module() {
+    // The module specifier alone left a file that imports a symbol and uses it
+    // only as `Foo.staticMethod()` or `x instanceof Foo` with no row naming
+    // that symbol, so it dropped out of the symbol's dependents.
+    let src = "import Foo from './foo.js';\n\
+               import { Bar, Baz as Qux } from './bar.js';\n\
+               import * as ns from './ns.js';\n";
+    let refs = refs_from_source(src, Language::JavaScript);
+
+    // The modules stay `Import` so file-level dependency listings are unchanged.
+    assert!(has_ref(&refs, "./foo.js", ReferenceKind::Import));
+    assert!(has_ref(&refs, "./bar.js", ReferenceKind::Import));
+
+    assert!(has_ref(&refs, "Foo", ReferenceKind::ImportBinding));
+    assert!(has_ref(&refs, "Bar", ReferenceKind::ImportBinding));
+    assert!(has_ref(&refs, "ns", ReferenceKind::ImportBinding));
+    // A renamed import binds under the local alias but names the exported
+    // symbol, which is what a dependents query is asking about.
+    assert!(has_ref(&refs, "Baz", ReferenceKind::ImportBinding));
+
+    // Bindings must not leak into the module list.
+    assert!(!has_ref(&refs, "Foo", ReferenceKind::Import));
+}
+
+#[test]
+fn typescript_import_bindings_are_captured_separately_from_the_module() {
+    let src = "import Foo from './foo.js';\n\
+               import { Bar } from './bar.js';\n\
+               import * as ns from './ns.js';\n";
+    let refs = refs_from_source(src, Language::TypeScript);
+    assert!(has_ref(&refs, "./foo.js", ReferenceKind::Import));
+    assert!(has_ref(&refs, "Foo", ReferenceKind::ImportBinding));
+    assert!(has_ref(&refs, "Bar", ReferenceKind::ImportBinding));
+    assert!(has_ref(&refs, "ns", ReferenceKind::ImportBinding));
+    assert!(!has_ref(&refs, "Foo", ReferenceKind::Import));
+}

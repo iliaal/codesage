@@ -28,3 +28,10 @@
 
 ; Pattern 6: class inheritance (class Foo extends Bar) -- TS extends_clause form
 (extends_clause value: (identifier) @ref)
+
+; Patterns 7-9: the imported BINDING names. See javascript_refs.scm for why —
+; the module specifier alone leaves `Foo.staticMethod()` / `instanceof Foo`
+; users with no row naming the symbol.
+(import_statement (import_clause (identifier) @ref))
+(import_statement (import_clause (named_imports (import_specifier name: (identifier) @ref))))
+(import_statement (import_clause (namespace_import (identifier) @ref)))
