@@ -1,3 +1,4 @@
+mod brief_gate;
 mod commands;
 mod coverage;
 mod daemon;
@@ -129,6 +130,12 @@ enum Commands {
         /// Output as JSON (always prints, even when empty)
         #[arg(long)]
         json: bool,
+        /// Treat this as a served fire in the given session and suppress
+        /// repeats: same payload already served, same path within the
+        /// cooldown, or the session's token budget spent. A suppressed fire
+        /// prints nothing, --json included.
+        #[arg(long)]
+        session: Option<String>,
     },
     /// Shortest call chain from one symbol to another
     Trace {
@@ -916,7 +923,11 @@ fn run(cli: Cli) -> Result<()> {
             path,
             json,
         } => commands::query::cmd_search(&query, limit, offset, language.as_deref(), path, json),
-        Commands::Brief { file, json } => query::cmd_brief(&file, json),
+        Commands::Brief {
+            file,
+            json,
+            session,
+        } => query::cmd_brief(&file, json, session.as_deref()),
         Commands::Trace {
             from,
             to,

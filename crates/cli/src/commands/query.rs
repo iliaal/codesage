@@ -595,7 +595,7 @@ fn print_result_block(r: &codesage_protocol::SearchResult) {
 /// stack trace or a nonzero exit, because all three land in the agent's context
 /// as noise it cannot act on. Every failure path below returns Ok(()) having
 /// printed nothing. That is deliberate, not sloppy error handling.
-pub(crate) fn cmd_brief(file: &str, json: bool) -> Result<()> {
+pub(crate) fn cmd_brief(file: &str, json: bool, session: Option<&str>) -> Result<()> {
     let Ok(root) = find_project_root() else {
         return Ok(());
     };
@@ -612,6 +612,20 @@ pub(crate) fn cmd_brief(file: &str, json: bool) -> Result<()> {
         return Ok(());
     };
 
+    let rendered = render_brief(&brief);
+
+    if let Some(session) = session {
+        // `--session` declares this a served fire rather than an operator query,
+        // so the repeat gate applies to BOTH output formats and a suppressed
+        // fire prints nothing at all — including under --json, which otherwise
+        // always prints. The gate hashes the rendered text in either mode, so
+        // switching format does not re-arm a payload already served.
+        let dir = crate::daemon::default_runtime_dir();
+        if !crate::brief_gate::should_serve(&dir, session, rel, &rendered) {
+            return Ok(());
+        }
+    }
+
     if json {
         // The JSON form always prints, empty or not: a machine caller asked for
         // it explicitly and can branch on `empty` itself.
@@ -623,10 +637,13 @@ pub(crate) fn cmd_brief(file: &str, json: bool) -> Result<()> {
 
     // Nothing worth an agent's context. Say nothing at all rather than "no
     // findings", which costs the same tokens and reads as a result.
-    if brief.empty {
-        return Ok(());
-    }
+    print!("{rendered}");
+    Ok(())
+}
 
+/// The served text form. Empty exactly when `brief.empty`, which the gate relies
+/// on: an empty payload is never a fire and must never charge the budget.
+fn render_brief(brief: &codesage_protocol::EditBrief) -> String {
     let mut out = String::new();
     if let Some(p) = brief.churn_percentile.filter(|_| brief.hotspot) {
         out.push_str(&format!("hotspot: churn percentile {:.0}%", p * 100.0));
@@ -645,8 +662,7 @@ pub(crate) fn cmd_brief(file: &str, json: bool) -> Result<()> {
     if !brief.coupled.is_empty() {
         out.push_str(&format!("changes with: {}\n", brief.coupled.join(", ")));
     }
-    print!("{out}");
-    Ok(())
+    out
 }
 
 #[cfg(test)]

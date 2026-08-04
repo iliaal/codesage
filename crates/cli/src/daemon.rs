@@ -1478,7 +1478,7 @@ mod unix {
         dirs
     }
 
-    fn default_runtime_dir() -> PathBuf {
+    pub(crate) fn default_runtime_dir() -> PathBuf {
         candidate_runtime_dirs()
             .into_iter()
             .next()
@@ -2277,7 +2277,9 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub(crate) use unix::{run_daemon, run_daemon_status, run_daemon_stop, run_mcp_shim};
+pub(crate) use unix::{
+    default_runtime_dir, run_daemon, run_daemon_status, run_daemon_stop, run_mcp_shim,
+};
 
 #[cfg(not(unix))]
 pub(crate) async fn run_mcp_shim(
@@ -2306,4 +2308,10 @@ pub(crate) async fn run_daemon_status(_runtime_dir: Option<PathBuf>) -> Result<(
 #[cfg(not(unix))]
 pub(crate) async fn run_daemon_stop(_runtime_dir: Option<PathBuf>) -> Result<()> {
     bail!("codesage MCP daemon requires Unix domain sockets")
+}
+
+/// Where per-user runtime state lives when there is no daemon to co-locate with.
+#[cfg(not(unix))]
+pub(crate) fn default_runtime_dir() -> PathBuf {
+    std::env::temp_dir().join("codesage")
 }
