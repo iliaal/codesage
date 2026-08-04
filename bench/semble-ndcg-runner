@@ -261,7 +261,33 @@ def main():
             entry["degraded"] = dict(lang_degraded)
         lang_tbl[lang] = entry
 
+    # Pin the inputs. A results file that does not record what produced it
+    # cannot be reproduced or diffed later, which is the same failure that got
+    # the previous published numbers withdrawn.
+    def _rev(path):
+        try:
+            r = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"],
+                               capture_output=True, text=True, timeout=10)
+            return r.stdout.strip() or None
+        except Exception:  # noqa: BLE001 - provenance is best-effort, never fatal
+            return None
+
+    try:
+        bin_version = subprocess.run([args.codesage_bin, "--version"],
+                                     capture_output=True, text=True, timeout=30).stdout.strip()
+    except Exception:  # noqa: BLE001
+        bin_version = None
+
+    provenance = {
+        "codesage_version": bin_version,
+        "codesage_commit": _rev(Path(__file__).resolve().parent.parent),
+        "semble_commit": _rev(args.repos.parent.parent),
+        "corpus_root": str(args.corpus),
+        "limit": args.limit,
+    }
+
     out = {
+        "provenance": provenance,
         "per_repo": per_repo,
         "by_language": lang_tbl,
         "skipped": skipped,

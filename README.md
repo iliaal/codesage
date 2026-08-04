@@ -70,9 +70,9 @@ The trade-off: CUDA-accelerated embeddings on Linux need the `nvidia-*-cu12` pip
 
 Retrieval quality is measured against semble's published corpus. See [External-corpus benchmark](#external-corpus-benchmark-semble) below for the current per-language table and its artifact.
 
-**The git-mined ripgrep and nest figures that stood here were removed on 2026-08-04.** They were measured at codesage 0.4.5; the current release is 24 versions and 93 retrieval-affecting changes later, so they described a ranker that no longer exists. Neither corpus is available to re-measure, which makes them unreproducible in principle rather than merely stale. The same applies to the code-review-graph head-to-head that shared those corpora.
+**The git-mined ripgrep and nest figures that stood here were removed on 2026-08-04.** They were measured at codesage 0.4.5, with 16 tagged releases since (`git tag --sort=v:refname`), so they describe a ranker that has been substantially rewritten. Neither corpus is present in `CODESAGE_BENCH_CORPUS_DIR`, so they cannot be re-measured at all. The same applies to the code-review-graph head-to-head that shared those corpora.
 
-The architectural observation that comparison supported is still worth stating, independently of the numbers: CodeSage embeds chunks (~50-line regions) rather than individual function bodies, so a commit-style query describing behavior that spans several functions matches a chunk more reliably than any one function.
+One design difference is worth stating as a **hypothesis**, not a result: CodeSage embeds chunks (~50-line regions) rather than individual function bodies, which should suit a commit-style query describing behavior spread across several functions. The measurement that motivated that claim is the one being withdrawn here, so it is untested at the current release.
 
 ### External-corpus benchmark (semble)
 
@@ -414,25 +414,27 @@ Parsing happens in parallel via Rayon; SQLite writes are batched. Re-running `co
 
 ## Search pipeline
 
-A query flows through five stages:
+A query flows through seven stages:
 
 ```mermaid
 flowchart LR
     Q[Query string] --> E[Embed<br/>Jina code v2]
     E --> K[KNN retrieval<br/>sqlite-vec<br/>overfetch 5x]
     K --> B[Symbol boost<br/>+0.1 per token match]
-    B --> R[Cross-encoder rerank<br/>ms-marco<br/>blend 50/50]
+    B --> R[Cross-encoder rerank<br/>ms-marco<br/>adaptive blend]
     R --> A[Symbol annotation]
     A --> T[Top-N results]
 ```
 
-1. Embed the query with Jina embeddings v2 base-code (768d) via ONNX Runtime.
-2. Prepend file path and symbol context to chunks before embedding.
-3. Boost chunks whose content matches known symbol names.
-4. Re-score the top candidates with ms-marco-MiniLM-L6-v2 and blend 50/50 with the semantic score.
-5. Annotate each result with overlapping function and class names.
+1. Embed the query with Jina embeddings v2 base-code (768d) via ONNX Runtime. Chunks carry file path and symbol context, prepended before they were embedded at index time.
+2. Retrieve nearest neighbours from sqlite-vec, overfetching 5x when the reranker is active.
+3. For code-literal queries only (backticks, `::`, glob patterns, or a rare indexed token), merge BM25 candidates by reciprocal rank fusion. Most queries skip this.
+4. Boost chunks whose content matches known symbol names, then apply definition, path, version and saturation adjustments.
+5. Re-score with ms-marco-MiniLM-L6-v2 and blend with the semantic score. The weight adapts to query shape: 0.35 for a bare identifier, 0.6 for natural language, 0.5 otherwise. Skipped when BM25 fusion ran, since the rare-token match is already the stronger signal there.
+6. Annotate each result with overlapping function and class names.
+7. Truncate to the requested limit.
 
-The reranker is optional. Set or remove it in `config.toml`; stages 1-3 and the annotation still run without it.
+The reranker is optional. Set or remove it in `config.toml`; every other stage still runs without it.
 
 ## Configuration
 
@@ -485,7 +487,7 @@ If CoreML registration fails, the process errors out instead of silently falling
 
 ## 🏗️ Architecture
 
-A Rust workspace with six crates:
+A Rust workspace with seven crates:
 
 ```mermaid
 flowchart TD
@@ -495,6 +497,7 @@ flowchart TD
     parser[parser<br/>tree-sitter + discovery]
     storage[storage<br/>SQLite + sqlite-vec + FTS5]
     embed[embed<br/>ONNX + reranker + chunking]
+    feat[features<br/>feature slices + trust boundaries]
     protocol[protocol<br/>shared types]
 
     cli --> daemon
@@ -503,9 +506,13 @@ flowchart TD
     gr --> parser
     gr --> storage
     gr --> embed
+    gr --> feat
+    feat --> parser
+    feat --> storage
     parser --> protocol
     storage --> protocol
     embed --> protocol
+    feat --> protocol
     gr --> protocol
 ```
 
@@ -515,6 +522,7 @@ flowchart TD
 | `parser` | File discovery, tree-sitter parsing, symbol and reference extraction |
 | `storage` | SQLite with sqlite-vec KNN and FTS5 |
 | `embed` | ONNX embedding inference, cross-encoder reranking, chunking |
+| `features` | Feature-slice mapping and trust-boundary derivation |
 | `graph` | Indexing orchestration and search pipeline |
 | `cli` | Binary with CLI subcommands, stdio MCP shim, and Unix-socket MCP daemon |
 
@@ -533,7 +541,7 @@ Corpora aren't bundled. Bring your own, or point the plugin at `$CODESAGE_BENCH_
 
 Honest inventory of what CodeSage does not do well, measured on our canary corpora and from 30 days of real Claude Code session logs (the harness in `bench/analyze-codesage-quality.py` produces the same numbers locally).
 
-**Language surface is narrower than competitors'.** Nine languages today (Java added after C++ in 0.4.5). Graphify ships 25, code-review-graph 23, SocratiCode 18+. The gap matters most if your stack is Ruby, Kotlin, Swift, or Scala. Measured cost: on the semble retrieval corpus (1,251 queries × 63 repos × 19 languages), 47% of queries target a language codesage does not parse (588 of 1,251), with zero recall on those. The tree-sitter query files live under `crates/parser/src/queries/` and contributions there are the cleanest way to extend coverage.
+**Language surface is narrower than competitors'.** Nine languages today (Java added after C++ in 0.4.5). Graphify ships 25, SocratiCode 18+, and code-review-graph more than CodeSage (its README no longer states an exact count). The gap matters most if your stack is Ruby, Kotlin, Swift, or Scala. Measured cost: on the semble retrieval corpus (1,251 queries × 63 repos × 19 languages), 47% of queries target a language codesage does not parse (588 of 1,251), with zero recall on those. The tree-sitter query files live under `crates/parser/src/queries/` and contributions there are the cleanest way to extend coverage.
 
 **Retrieval misses on cross-file refactor queries.** The failure mode is a commit subject like *printer: drop dependency on serde_derive* that describes a rename spanning several files with no distinctive literal to match on. Single-identifier lookups (`find_symbol`, `find_references`) are reliable. Pure semantic searches (`search`) are reliable. Diffuse multi-file refactor descriptions expressed in prose are the failure mode.
 
