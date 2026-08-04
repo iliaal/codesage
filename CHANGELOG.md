@@ -8,6 +8,7 @@
 - `search` demotes declaration headers in C projects so the implementing `.c` file outranks them; C++ headers, which are frequently the implementation, are untouched, and `-inl.h` headers are exempt.
 - `search` demotes test and benchmark files that C and C++ keep as siblings (`*_test.cc`, `*_benchmark.cc`, `*_test.h`), which previously escaped the test penalty and took rank 1 on library queries. They also stop skewing git co-change coupling.
 - `search` applies path penalties after cross-encoder reranking rather than before. Blending previously restored about 60% of every penalty on natural-language queries.
+- `CODESAGE_HYBRID=always|never` forces or disables BM25+RRF fusion for ablation. Default keeps the rare-literal gate.
 - `CODESAGE_STEM_MATCH_BOOST=1` boosts a result whose filename stem is named by an identifier-shaped query token. Off by default; it measured as noise overall (+0.001), though Rust gained 0.008.
 - `CODESAGE_FUSED_RERANK=1` reranks BM25-fused queries at a reduced blend weight instead of skipping the cross-encoder. Off by default; it measured net-negative on the semble corpus.
 - The daemon log reports the connected count, silence duration, and per-connection idle ceiling when it stays alive only for connected but silent clients.

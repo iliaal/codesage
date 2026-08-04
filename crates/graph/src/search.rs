@@ -489,7 +489,15 @@ pub fn search(
     // (ripgrep, nestjs/nest) measured these as the specific failure mode
     // semantic-only retrieval misses. See
     // `notes/20260411-code-intelligence-landscape.md` §1.4 for the memo chain.
-    let hybrid_gate = query_has_rare_literal(db, &req.query).unwrap_or(false);
+    // `CODESAGE_HYBRID` overrides the gate for ablation: `always` fuses every
+    // query, `never` disables fusion outright, and the default keys off the
+    // rare-literal test above. It exists to settle default-on vs conditional
+    // with a measurement rather than an argument.
+    let hybrid_gate = match hybrid_mode() {
+        HybridMode::Always => true,
+        HybridMode::Never => false,
+        HybridMode::Gated => query_has_rare_literal(db, &req.query).unwrap_or(false),
+    };
 
     let rows = if let Some(path_patterns) = &req.paths {
         path_filtered_knn_candidates(
@@ -1103,6 +1111,7 @@ mod tuning {
     pub(super) const PLATFORM_DEMOTE: &str = "CODESAGE_PLATFORM_DEMOTE";
     pub(super) const FUSED_RERANK: &str = "CODESAGE_FUSED_RERANK";
     pub(super) const STEM_MATCH_BOOST: &str = "CODESAGE_STEM_MATCH_BOOST";
+    pub(super) const HYBRID: &str = "CODESAGE_HYBRID";
 }
 
 // The `is_symbol_query` gate makes the definition boost provably inert on NL
@@ -1132,6 +1141,27 @@ static PLATFORM_DEMOTE_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn platform_demote_enabled() -> bool {
     *PLATFORM_DEMOTE_ENABLED.get_or_init(|| env_default_off(tuning::PLATFORM_DEMOTE))
+}
+
+/// How the BM25+RRF fusion gate behaves. Default `Gated` keys off
+/// `query_has_rare_literal`; the other two exist so the default-on question is
+/// answerable by measurement.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HybridMode {
+    Gated,
+    Always,
+    Never,
+}
+
+static HYBRID_MODE: OnceLock<HybridMode> = OnceLock::new();
+
+fn hybrid_mode() -> HybridMode {
+    *HYBRID_MODE.get_or_init(|| match std::env::var(tuning::HYBRID).as_deref() {
+        Ok("always") => HybridMode::Always,
+        Ok("never") => HybridMode::Never,
+        // Anything else, including unset and typos, keeps shipped behavior.
+        _ => HybridMode::Gated,
+    })
 }
 
 static STEM_MATCH_BOOST_ENABLED: OnceLock<bool> = OnceLock::new();
