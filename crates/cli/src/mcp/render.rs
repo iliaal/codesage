@@ -28,7 +28,8 @@ impl CodeSageServer {
         r: Result<T>,
         kind: &str,
     ) -> CallToolResult {
-        self.annotate_staleness(project, render_with_kind(r, kind))
+        let rendered = render_with_kind(r, kind);
+        self.annotate_staleness(project, self.annotate_coverage(project, kind, rendered))
     }
 
     /// [`Self::render`] with an explicit char budget (context-bundle tools).
@@ -40,6 +41,65 @@ impl CodeSageServer {
         budget_chars: usize,
     ) -> CallToolResult {
         self.annotate_staleness(project, render_with_budget(r, kind, budget_chars))
+    }
+
+    /// Tools whose empty result is ambiguous between "no such code" and "that
+    /// code was never indexed". `impact_analysis` is deliberately absent: `[]`
+    /// there means a leaf nothing imports, which its own description already
+    /// states, so a coverage note would be noise on a correct answer.
+    const COVERAGE_ANNOTATED_TOOLS: [&str; 2] = ["search", "find_symbol"];
+
+    /// On an empty result, record what the index actually holds under
+    /// `_meta.coverage`. An agent that searches and gets nothing back cannot
+    /// otherwise tell a genuine absence from a language or directory that was
+    /// never indexed, and silently reads the empty list as proof the code does
+    /// not exist. Best-effort: any failure leaves the result untouched.
+    fn annotate_coverage(
+        &self,
+        project: &str,
+        kind: &str,
+        mut result: CallToolResult,
+    ) -> CallToolResult {
+        if result.is_error == Some(true) || !Self::COVERAGE_ANNOTATED_TOOLS.contains(&kind) {
+            return result;
+        }
+        let Some(structured) = result.structured_content.as_ref() else {
+            return result;
+        };
+        if !has_empty_results(structured) {
+            return result;
+        }
+        let counts = match self.with_project_db(project, |db| db.file_counts_by_language()) {
+            Ok(c) if !c.is_empty() => c,
+            Ok(_) => return result,
+            Err(e) => {
+                tracing::debug!(error = %e, "coverage annotation skipped");
+                return result;
+            }
+        };
+        let total: usize = counts.iter().map(|(_, n)| n).sum();
+        if let Some(mut structured) = result.structured_content.take() {
+            merge_coverage_meta(&mut structured, total, &counts);
+            result.structured_content = Some(structured);
+        }
+        let breakdown = counts
+            .iter()
+            .map(|(lang, n)| format!("{lang} {n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let note = format!(
+            "No matches. The index holds {total} file(s): {breakdown}. An empty result means no \
+             match *within* that set — it is not evidence the code is absent. If the language or \
+             directory you expected is missing above, it was never indexed: check \
+             `[index] exclude_patterns` in .codesage/config.toml, run `codesage coverage` to see \
+             what indexing cannot reach, and `codesage index` to refresh."
+        );
+        let existing = std::mem::take(&mut result.content);
+        let mut content = Vec::with_capacity(existing.len() + 1);
+        content.push(ContentBlock::text(note));
+        content.extend(existing);
+        result.content = content;
+        result
     }
 
     /// If staleness checking is enabled and the result references indexed files
@@ -317,6 +377,53 @@ fn collect_referenced_paths(value: &serde_json::Value, out: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+/// True when the structured payload carries a `results` array with no entries.
+/// A payload with no `results` key at all is not "empty" — it is a different
+/// shape, and guessing at it would annotate tools this was never meant for.
+fn has_empty_results(structured: &serde_json::Value) -> bool {
+    structured
+        .get("results")
+        .and_then(|r| r.as_array())
+        .is_some_and(|a| a.is_empty())
+}
+
+/// Record index composition under `_meta.coverage`, merging into any existing
+/// `_meta` rather than overwriting it.
+fn merge_coverage_meta(
+    structured: &mut serde_json::Value,
+    total: usize,
+    counts: &[(String, usize)],
+) {
+    let serde_json::Value::Object(map) = structured else {
+        return;
+    };
+    let meta = map
+        .entry("_meta")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let serde_json::Value::Object(meta) = meta else {
+        return;
+    };
+    let by_language: serde_json::Map<String, serde_json::Value> = counts
+        .iter()
+        .map(|(lang, n)| (lang.clone(), serde_json::Value::from(*n)))
+        .collect();
+    let mut coverage = serde_json::Map::new();
+    coverage.insert("indexed_files".to_string(), serde_json::Value::from(total));
+    coverage.insert(
+        "indexed_by_language".to_string(),
+        serde_json::Value::Object(by_language),
+    );
+    coverage.insert(
+        "note".to_string(),
+        serde_json::Value::String(
+            "empty result means no match within the indexed set, not that the code is absent; \
+             a language missing from indexed_by_language was never indexed"
+                .to_string(),
+        ),
+    );
+    meta.insert("coverage".to_string(), serde_json::Value::Object(coverage));
 }
 
 /// Record the stale paths under `_meta.stale_files` (+ a human `stale_warning`),
@@ -1035,6 +1142,73 @@ mod tests {
         );
         let stale_files = &annotated.structured_content.unwrap()["_meta"]["stale_files"];
         assert_eq!(stale_files, &json!(["src/changed.rs"]));
+    }
+
+    #[test]
+    fn coverage_annotates_only_empty_results_of_the_listed_tools() {
+        // An agent that gets `[]` back cannot otherwise tell a genuine absence
+        // from a language that was never indexed, and reads the empty list as
+        // proof the code does not exist.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let codesage_dir = root.join(".codesage");
+        std::fs::create_dir_all(&codesage_dir).unwrap();
+        let db = Database::open(&codesage_dir.join("index.db")).unwrap();
+        for (rel, lang) in [
+            ("src/a.rs", Language::Rust),
+            ("src/b.rs", Language::Rust),
+            ("app/c.php", Language::Php),
+        ] {
+            db.upsert_file(&codesage_protocol::FileInfo {
+                path: rel.to_string(),
+                language: lang,
+                content_hash: codesage_parser::discover::content_hash(b"x"),
+            })
+            .unwrap();
+        }
+        drop(db);
+
+        let server = CodeSageServer::with_state(Arc::new(CodeSageServerState::new()));
+        let project = root.to_str().unwrap();
+
+        let coverage_of = |kind: &str, payload: serde_json::Value| {
+            let rendered = render_with_kind(Ok(payload), kind);
+            let annotated = server.annotate_coverage(project, kind, rendered);
+            annotated
+                .structured_content
+                .and_then(|s| s.get("_meta").and_then(|m| m.get("coverage")).cloned())
+        };
+
+        let cov = coverage_of("search", json!({ "results": [] }))
+            .expect("empty search should carry a coverage hint");
+        assert_eq!(cov["indexed_files"], json!(3));
+        assert_eq!(cov["indexed_by_language"]["rust"], json!(2));
+        assert_eq!(cov["indexed_by_language"]["php"], json!(1));
+
+        assert!(
+            coverage_of("find_symbol", json!({ "results": [] })).is_some(),
+            "find_symbol is in the annotated set"
+        );
+        // A non-empty result is not ambiguous, so it must stay untouched.
+        assert!(
+            coverage_of(
+                "search",
+                json!({ "results": [{ "file_path": "src/a.rs" }] })
+            )
+            .is_none(),
+            "a non-empty result must not be annotated"
+        );
+        // `impact_analysis` returning [] means a leaf nothing imports — a
+        // correct answer that a coverage note would only muddy.
+        assert!(
+            coverage_of("impact_analysis", json!({ "results": [] })).is_none(),
+            "impact_analysis is deliberately outside the annotated set"
+        );
+        // A payload with no `results` key is a different shape, not an empty one.
+        assert!(
+            coverage_of("search", json!({ "found": false })).is_none(),
+            "a payload without `results` must not be treated as empty"
+        );
     }
 
     #[test]

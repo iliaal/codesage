@@ -870,6 +870,25 @@ impl Database {
         Ok(n as usize)
     }
 
+    /// Indexed file count per language, descending. Aggregated in SQL rather
+    /// than by loading every row like `all_files_with_id_and_language`, because
+    /// this runs on the empty-result annotation path where the caller already
+    /// got nothing back and must not pay a full table read for the
+    /// explanation.
+    pub fn file_counts_by_language(&self) -> Result<Vec<(String, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT language, COUNT(*) AS n FROM files
+             GROUP BY language
+             ORDER BY n DESC, language ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn symbol_count(&self) -> Result<usize> {
         let n: i64 = self
             .conn
