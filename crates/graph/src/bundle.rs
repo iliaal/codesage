@@ -576,35 +576,21 @@ pub(crate) fn resolve_callee_definitions(
     }
     let import_refs = import_refs_for_file(db, caller_file)?;
 
-    // A definition in the caller's own file is a valid target in either branch
-    // below: a same-file call emits no import edge, so without this the local
+    // A definition in the caller's own file is a valid target: a same-file
+    // call emits no import edge, so without this the local
     // definition is filtered out and the reverse edge (read by
     // `impact_analysis` / `assess_risk` through `references_for_symbol`) is
     // lost. Mirrors the same-file preference in `resolve_def_summary`.
     let is_local = |s: &Symbol| s.file_path == caller_file;
 
-    // Path specifiers identify WHICH same-named definition this file means,
-    // because they name a file. A bare imported binding name — which JS/TS now
-    // records alongside the specifier — matches every candidate equally, so
-    // consulting it while path evidence exists would throw away the precision
-    // the path gives and resurrect the fan-out this filter exists to prevent.
-    let by_path: Vec<Symbol> = candidates
-        .iter()
-        .filter(|s| {
-            is_local(s)
-                || import_refs
-                    .iter()
-                    .filter(|imp| is_path_specifier(imp))
-                    .any(|imp| import_path_targets_file(imp, caller_file, &s.file_path))
-        })
-        .cloned()
-        .collect();
-    if !by_path.is_empty() {
-        return Ok(by_path);
-    }
-
-    // No path evidence: fall back to name evidence, which is the only kind
-    // PHP (`use App\Foo`) and Rust (`crate::a::Foo`) produce.
+    // One filter over both kinds of evidence. Letting path specifiers win
+    // outright was tried and removed: it measured identically on axios and
+    // monolog (F1 0.61 / 0.79 either way) while carrying a real failure mode,
+    // because `import_refs_for_file` pools every specifier in the file without
+    // recording which binding each introduced — so an unrelated import could
+    // match a same-named candidate and suppress the correct one. Dropping a
+    // real dependent is the unsafe direction for a what-to-review signal;
+    // over-inclusion is not.
     let filtered: Vec<Symbol> = candidates
         .into_iter()
         .filter(|s| {

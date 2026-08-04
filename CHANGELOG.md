@@ -8,6 +8,7 @@
 - `find_references` rows can carry kind `import_binding`: the symbol an import introduces (`Foo`), recorded alongside the existing `import` row naming the module (`./foo.js`). Existing projects need `codesage index --full` to pick up the new rows; an incremental pass skips unchanged files.
 
 ### Changed
+- `search` drops the leading namespace components of a `::`- or `\\`-qualified query name instead of OR-joining them, so `Illuminate\\Routing\\Router` no longer lets two namespace terms outvote the class. Only applies when the trailing component is distinctive enough to stand alone; a lowercase tail (`ModuleRef::create`) keeps the prefix so the BM25 leg still fires. Dotted names are unchanged.
 - `search` ranks the current major-version tree above older ones when a package ships several side by side (`v3/` next to `v4/`), unless the query itself names a version. Disable with `CODESAGE_VERSION_DEMOTE=0`.
 - `search` demotes declaration headers in C projects so the implementing `.c` file outranks them; C++ headers, which are frequently the implementation, are untouched, and `-inl.h` headers are exempt.
 - `search` demotes test and benchmark files that C and C++ keep as siblings (`*_test.cc`, `*_benchmark.cc`, `*_test.h`), which previously escaped the test penalty and took rank 1 on library queries. They also stop skewing git co-change coupling.

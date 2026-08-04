@@ -101,8 +101,9 @@ pub fn trace_call_path(db: &Database, req: &CallPathRequest) -> Result<CallPathR
 
     let note = if hit_bound {
         format!(
-            "no call chain within {} hops (search stopped at a bound, so a longer path may exist)",
-            req.max_depth
+            "no call chain within {} hop{} (search stopped at a bound, so a longer path may exist)",
+            req.max_depth,
+            if req.max_depth == 1 { "" } else { "s" }
         )
     } else {
         format!(

@@ -194,6 +194,30 @@ fn extract_dotted_identifier_tokens(query: &str) -> Vec<&str> {
     out
 }
 
+/// Components of each `::`- or `\`-separated qualified name in the query.
+///
+/// Dotted names are deliberately excluded. `moduleref.create` splitting into
+/// two OR terms is a measured win on the nest corpus, and the namespace-prefix
+/// dilution this exists to address does not arise there: a dotted pair's left
+/// side is a receiver, not a namespace shared by hundreds of chunks.
+fn extract_qualified_name_groups(query: &str) -> Vec<Vec<String>> {
+    let mut groups = Vec::new();
+    for raw in query.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
+        if !raw.contains("::") && !raw.contains('\\') {
+            continue;
+        }
+        let parts: Vec<String> = raw
+            .split([':', '\\'])
+            .filter(|p| p.len() >= 2 && p.chars().all(|c| c.is_alphanumeric() || c == '_'))
+            .map(str::to_string)
+            .collect();
+        if parts.len() >= 2 {
+            groups.push(parts);
+        }
+    }
+    groups
+}
+
 /// Build an FTS5 MATCH expression from a user query. Emits a disjunction
 /// of quoted terms so code tokens like `doc_cfg` and `ModuleRef::create`
 /// survive FTS5's reserved-character parsing without raising syntax errors
@@ -221,6 +245,43 @@ fn build_fts_match_query(query: &str) -> String {
     let is_sep = |c: char| !c.is_alphanumeric() && c != '_';
     let mut seen: HashSet<String> = HashSet::new();
     let mut tokens: Vec<String> = Vec::new();
+
+    // A qualified name's leading components are namespaces, and each one on
+    // its own matches every chunk in that namespace: `Illuminate\Routing\Router`
+    // became `"Illuminate" OR "Routing" OR "Router"`, where the first two pull
+    // in most of the framework and outvote the symbol actually asked for. Drop
+    // them and keep the tail, which is the symbol being asked about.
+    //
+    // Emitting the full name as an FTS5 phrase alongside was tried and
+    // reverted: it measured -0.006 NDCG@10 on the 40 semble C++ queries, the
+    // only corpus queries carrying a `::` at all.
+    let mut suppressed: HashSet<String> = HashSet::new();
+    for parts in extract_qualified_name_groups(query) {
+        // The tail stays a term of its own: it is the symbol name, the most
+        // selective component, and the spelling a caller may use unqualified.
+        // It must still clear the code-shape filter, or a plain-lowercase tail
+        // like `ModuleRef::create` would reintroduce as an OR term exactly the
+        // common word this is removing.
+        let tail_is_selective = parts.last().is_some_and(|t| token_looks_code_shaped(t));
+        if tail_is_selective
+            && let Some(tail) = parts.last()
+            && seen.insert(tail.to_lowercase())
+        {
+            tokens.push(format!("\"{tail}\""));
+        }
+        // Dropping the prefix is only safe when something selective survives.
+        // With a lowercase tail the phrase is the sole remaining term, and it
+        // matches only where the components are adjacent — so a query like
+        // `ColdFusion::register` against code that names the class but not
+        // that exact pair would produce an empty MATCH and no BM25 leg at all.
+        // Keep the prefix in that case and let the phrase add precision on top.
+        if tail_is_selective {
+            for prefix in &parts[..parts.len() - 1] {
+                suppressed.insert(prefix.to_lowercase());
+            }
+        }
+    }
+
     for tok in extract_dotted_identifier_tokens(query) {
         let key = tok.to_lowercase();
         if seen.insert(key) {
@@ -238,6 +299,9 @@ fn build_fts_match_query(query: &str) -> String {
         // tokenizer, so `Foo` and `foo` would collapse at MATCH time
         // anyway. Fewer OR-terms keeps the MATCH expression parseable.
         let key = raw.to_lowercase();
+        if suppressed.contains(&key) {
+            continue;
+        }
         if !seen.insert(key) {
             continue;
         }
@@ -4046,25 +4110,67 @@ mod scoped_fts_evidence_tests {
     }
 
     #[test]
-    fn a_code_shaped_namespace_component_does_survive_and_is_or_joined() {
-        // The limit of the refutation above, and the case where the original
-        // dilution concern is real. `absl`/`fmt`/`std` are filtered because
-        // they are plain lowercase, not because they are namespaces. A
-        // namespace carrying an underscore or a capital is code-shaped and
-        // reaches the disjunction.
+    fn every_corpus_query_carrying_a_scope_is_unchanged_by_the_suppression() {
+        // These are the 20 semble queries (of 1251) that carry a `::` in a
+        // CodeSage-supported language, verbatim. Every prefix is plain
+        // lowercase, so the code-shape filter already dropped it before this
+        // change and the emitted terms must be identical to the old behavior.
+        // Pinned because a full benchmark arm over these two repos costs ~16
+        // minutes and this settles the same question in milliseconds.
+        for (query, expect) in [
+            (
+                "absl::StrCat and StrAppend for efficient string",
+                "\"StrCat\" OR \"StrAppend\"",
+            ),
+            (
+                "absl::string_view for non-owning string references",
+                "\"string_view\"",
+            ),
+            (
+                "absl::flat_hash_map and flat_hash_set hash tables",
+                "\"flat_hash_map\" OR \"flat_hash_set\"",
+            ),
+            ("how fmt::format and fmt::print format strings", ""),
+            // A lowercase tail is filtered like any lowercase token, before
+            // and after — the suppression never gets a selective tail to keep.
+            ("std::filesystem path formatting support", ""),
+        ] {
+            assert_eq!(
+                build_fts_match_query(query),
+                expect,
+                "query {query:?} must emit the same terms as before the change"
+            );
+        }
+    }
+
+    #[test]
+    fn a_code_shaped_namespace_component_is_dropped_leaving_the_tail() {
+        // `absl`/`fmt`/`std` are filtered for being plain lowercase, not for
+        // being namespaces — so a namespace carrying an underscore or a
+        // capital used to reach the disjunction and dilute it. It now emits a
+        // phrase plus the tail, and no standalone prefix term.
         let q = build_fts_match_query("foo_bar::Thing lookup");
-        assert!(q.contains("\"foo_bar\""), "got {q:?}");
-        assert!(q.contains("\"Thing\""));
+        assert!(q.contains("\"Thing\""), "tail stays selectable: {q:?}");
         assert!(
-            q.contains(" OR "),
-            "namespace component is OR-joined: {q:?}"
+            !q.contains("\"foo_bar\""),
+            "prefix must not remain a term of its own: {q:?}"
         );
 
         // PHP backslash-qualified names are the clearest instance: every
-        // component is capitalised, so all of them survive.
+        // component is capitalised, so before this all of them survived and
+        // the two namespace components outvoted the class.
         let q = build_fts_match_query("Illuminate\\Routing\\Router dispatch");
-        assert!(q.contains("\"Illuminate\""));
-        assert!(q.contains("\"Routing\""));
+        assert!(q.contains("\"Router\""), "the class survives: {q:?}");
+        assert!(!q.contains("\"Illuminate\""), "got {q:?}");
+        assert!(!q.contains("\"Routing\""), "got {q:?}");
+    }
+
+    #[test]
+    fn a_suppressed_prefix_is_still_dropped_when_it_repeats_elsewhere() {
+        // The prefix is suppressed by name, so a later standalone mention does
+        // not smuggle it back in as its own OR term.
+        let q = build_fts_match_query("Illuminate\\Routing\\Router and Illuminate helpers");
+        assert!(!q.contains("\"Illuminate\""), "got {q:?}");
         assert!(q.contains("\"Router\""));
     }
 

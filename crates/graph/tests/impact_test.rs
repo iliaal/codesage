@@ -846,3 +846,54 @@ fn call_path_finds_the_shortest_chain_and_reports_why_it_cannot() {
     assert!(!missing.found);
     assert!(missing.note.unwrap().contains("not found"));
 }
+
+#[test]
+fn call_path_depth_bound_is_inclusive_and_cycles_terminate() {
+    use codesage_protocol::CallPathRequest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // a <-> b mutual recursion, and a one-hop a -> sink.
+    std::fs::write(root.join("sink.rs"), b"pub fn sink() {}\n").unwrap();
+    std::fs::write(
+        root.join("a.rs"),
+        b"use crate::b::bee;\nuse crate::sink::sink;\npub fn ay() { bee(); sink(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("b.rs"),
+        b"use crate::a::ay;\npub fn bee() { ay(); }\n",
+    )
+    .unwrap();
+
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+
+    // A direct call must be found at max_depth 1 — the bound counts hops, so
+    // an off-by-one here would make the shallowest useful query return nothing.
+    let direct = codesage_graph::trace_call_path(
+        &db,
+        &CallPathRequest {
+            from: "ay".to_string(),
+            to: "sink".to_string(),
+            max_depth: 1,
+        },
+    )
+    .unwrap();
+    assert!(direct.found, "one hop at max_depth 1: {:?}", direct.note);
+    assert_eq!(direct.length, 1);
+
+    // A mutual-recursion cycle must not hang path reconstruction.
+    let cyclic = codesage_graph::trace_call_path(
+        &db,
+        &CallPathRequest {
+            from: "ay".to_string(),
+            to: "bee".to_string(),
+            max_depth: 6,
+        },
+    )
+    .unwrap();
+    assert!(cyclic.found);
+    assert_eq!(cyclic.steps.first().unwrap().name, "ay");
+    assert_eq!(cyclic.steps.last().unwrap().name, "bee");
+}
