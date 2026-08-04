@@ -4,6 +4,11 @@
 - Schema migration 0014 widens `idx_git_files_churn` to `(churn_score DESC, path)` so the top-churn query keeps a streaming index scan now that it orders by `path` as a tie-break.
 
 ### Changed
+- `search` ranks the current major-version tree above older ones when a package ships several side by side (`v3/` next to `v4/`), unless the query itself names a version. Disable with `CODESAGE_VERSION_DEMOTE=0`.
+- `search` demotes declaration headers in C projects so the implementing `.c` file outranks them; C++ headers, which are frequently the implementation, are untouched, and `-inl.h` headers are exempt.
+- `search` demotes test and benchmark files that C and C++ keep as siblings (`*_test.cc`, `*_benchmark.cc`, `*_test.h`), which previously escaped the test penalty and took rank 1 on library queries. They also stop skewing git co-change coupling.
+- `search` applies path penalties after cross-encoder reranking rather than before. Blending previously restored about 60% of every penalty on natural-language queries.
+- `CODESAGE_FUSED_RERANK=1` reranks BM25-fused queries at a reduced blend weight instead of skipping the cross-encoder. Off by default; it measured net-negative on the semble corpus.
 - The daemon log reports the connected count, silence duration, and per-connection idle ceiling when it stays alive only for connected but silent clients.
 - `assess_risk` no longer reports a test gap when a test file reaches the file within two reverse-dependency hops; the note names the three checks that ran (sibling convention, co-change history, dependency hops) instead of asserting the file is untested, and a file reached only indirectly gets a note naming the test and its hop distance.
 

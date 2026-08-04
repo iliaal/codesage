@@ -349,6 +349,17 @@ pub const TEST_LIKE_EXCLUDE_PATTERNS: &[&str] = &[
     "**/*_test.py",
     "**/*_test.rs",
     "**/*_test.go",
+    // C/C++ keeps tests as siblings rather than under tests/, so the directory
+    // patterns above never catch them. abseil is the reference case: without
+    // these, *_test.cc files took rank 1 on container and type queries.
+    "**/*_test.cc",
+    "**/*_test.cpp",
+    "**/*_test.cxx",
+    "**/*_test.h",
+    "**/*_test.hpp",
+    "**/*_benchmark.cc",
+    "**/*_benchmark.cpp",
+    "**/*_bench.cc",
     "**/*.phpt",
     "**/benches/**",
     "**/benchmarks/**",

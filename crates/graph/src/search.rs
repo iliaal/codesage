@@ -590,21 +590,37 @@ pub fn search(
         apply_definition_boost(&mut results, &req.query);
     }
 
+    // When a rare-token match drove the fused ranking it should stay the
+    // dominant signal, so fused queries pin the blend to the SHORT_ID weight
+    // (0.35) rather than skipping the cross-encoder outright. Skipping cost
+    // scope-qualified C++ queries the reranker entirely: `absl::`/`fmt::` is
+    // ordinary namespacing, not the rare literal the code-literal gate is
+    // calibrated for, and those queries scored 0.777 against 0.870 for the
+    // rest of the C++ corpus. Keyed on `fused`, not `hybrid_gate`: a gated
+    // query whose BM25 leg came back empty is still purely semantic.
+    // The ripgrep canary in `project_hybrid_bm25_rrf.md` (reranker demoting
+    // `lib.rs` out of top-10 on ``use `doc_cfg` `` queries) is what the
+    // reduced weight has to keep passing.
+    if let Some(mut rerank) = rerank
+        && (!fused || fused_rerank_enabled())
+    {
+        let weight_override = fused.then_some(RERANK_WEIGHT_SHORT_ID);
+        apply_reranking(&mut rerank, &req.query, &mut results, weight_override);
+    }
+
+    // Path penalties run AFTER reranking so they land on the final blended
+    // score. Ahead of it they were diluted: the merge is
+    // `(1-w)*score + w*ce_norm` with `ce_norm` renormalized to [0,1], so a
+    // pre-blend demote survived at only `1-w` strength — 40% on natural
+    // language queries, where most of these penalties matter. Reranking reads
+    // only chunk content and scores every candidate, so the set it sees is
+    // unchanged by the move.
     if path_penalty_enabled() {
         apply_path_penalties(&mut results, &req.query);
     }
 
-    // Skip reranking when BM25 fusion actually ran. The cross-encoder judges
-    // query/doc semantic similarity; when a rare-token match drove the fused
-    // ranking, it's already the dominant signal and reranking typically flips
-    // the BM25 win back down — the exact failure mode the memo at
-    // `project_hybrid_bm25_rrf.md` warned about. Measured on the ripgrep
-    // canary: reranker demotes `lib.rs` (rank 5 post-RRF) out of top-10
-    // on `use \`doc_cfg\`` queries. Keyed on `fused`, not `hybrid_gate`:
-    // a gated query whose BM25 leg came back empty is still purely semantic
-    // and must not lose reranking too.
-    if !fused && let Some(mut rerank) = rerank {
-        apply_reranking(&mut rerank, &req.query, &mut results);
+    if version_demote_enabled() {
+        apply_version_demote(&mut results, &req.query);
     }
 
     if file_saturation_enabled() {
@@ -1075,6 +1091,9 @@ mod tuning {
     pub(super) const DIR_SATURATION_THRESHOLD: &str = "CODESAGE_DIR_SATURATION_THRESHOLD";
     pub(super) const DIR_SATURATION_DECAY: &str = "CODESAGE_DIR_SATURATION_DECAY";
     pub(super) const ADAPTIVE_RERANK: &str = "CODESAGE_ADAPTIVE_RERANK";
+    pub(super) const VERSION_DEMOTE: &str = "CODESAGE_VERSION_DEMOTE";
+    pub(super) const PLATFORM_DEMOTE: &str = "CODESAGE_PLATFORM_DEMOTE";
+    pub(super) const FUSED_RERANK: &str = "CODESAGE_FUSED_RERANK";
 }
 
 // The `is_symbol_query` gate makes the definition boost provably inert on NL
@@ -1086,6 +1105,43 @@ mod tuning {
 /// default-on gate shape shared by the post-retrieval scoring stages.
 pub(crate) fn env_default_on(var: &str) -> bool {
     !matches!(std::env::var(var).as_deref(), Ok("0") | Ok("false"))
+}
+
+/// True only when the named env var is explicitly set to `1` / `true`. The
+/// gate shape for stages that are not validated well enough to ship on.
+pub(crate) fn env_default_off(var: &str) -> bool {
+    matches!(std::env::var(var).as_deref(), Ok("1") | Ok("true"))
+}
+
+static VERSION_DEMOTE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn version_demote_enabled() -> bool {
+    *VERSION_DEMOTE_ENABLED.get_or_init(|| env_default_on(tuning::VERSION_DEMOTE))
+}
+
+static PLATFORM_DEMOTE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn platform_demote_enabled() -> bool {
+    *PLATFORM_DEMOTE_ENABLED.get_or_init(|| env_default_off(tuning::PLATFORM_DEMOTE))
+}
+
+static FUSED_RERANK_ENABLED: OnceLock<bool> = OnceLock::new();
+
+// Default OFF: measured net-negative. Scope-qualified C++ queries really do
+// miss the cross-encoder — 20 of 60 cpp corpus queries trip the code-literal
+// gate and scored 0.777 against 0.870 for the rest — but reranking them at
+// 0.35 does not recover it. On the semble corpus the change is -0.0012 pooled
+// (c -0.008, cpp +0.004, ts -0.002) and turns 3 regressions into 6, trading
+// wins of +0.37/+0.15/+0.13 against losses of -0.50/-0.37/-0.11. That spread
+// with no net gain is the failure mode `project_hybrid_bm25_rrf.md` predicted:
+// where BM25 fired, it is already the better signal.
+//
+// Kept as a gate rather than reverted because the underlying gap is real and
+// the plumbing is the expensive part; a future attempt likely needs a
+// different remedy (a narrower gate that excludes `::` from the code-literal
+// test, say) rather than a different weight.
+fn fused_rerank_enabled() -> bool {
+    *FUSED_RERANK_ENABLED.get_or_init(|| env_default_off(tuning::FUSED_RERANK))
 }
 
 static DEFINITION_BOOST_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -1347,6 +1403,74 @@ pub(crate) fn path_penalty_for_query(path: &str, query_is_test_shaped: bool) -> 
     penalty
 }
 
+// Declaration headers in C projects describe an API; the `.c` file implements
+// it, and the implementation is what a behavior query wants. Measured on the
+// semble corpus, 22% of files ranked above a C target were headers while only
+// 2% of C targets were.
+//
+// Gating on the row language is what makes this safe, and it must not be
+// relaxed to "any header": in C++ the header IS the implementation
+// (nlohmann-json, abseil and fmtlib are header-only, and every C++ target in
+// that corpus is a header). Simulated ungated the demote costs C++ 0.134.
+// The discovery layer already resolves a bare `.h` to Cpp for any project
+// carrying an unambiguous C++ extension, so `Language::C` here means the
+// project really is C.
+//
+// `-inl.h` / `_inl.h` carry inline definitions rather than declarations —
+// libuv's `heap-inl.h` is a legitimate target — so they are exempt.
+fn declaration_header_penalty(path: &str, language: Language) -> f32 {
+    if language != Language::C {
+        return 1.0;
+    }
+    let normalized = path.replace('\\', "/");
+    let basename = normalized.rsplit('/').next().unwrap_or(&normalized);
+    if !basename.ends_with(".h") {
+        return 1.0;
+    }
+    if basename.ends_with("-inl.h") || basename.ends_with("_inl.h") {
+        return 1.0;
+    }
+    SOFT_PENALTY_MILD
+}
+
+// Host-platform directories. A project carrying parallel per-platform trees
+// (libuv's `src/unix/` and `src/win/`) answers most behavior queries with the
+// tree that actually runs on the caller's machine.
+//
+// Default OFF. The mechanism is verified — win/tcp.c outranking unix/tcp.c is
+// a clean mirror pair across 10 libuv queries — but every measured point comes
+// from that one repo, and its ground truth may encode the same host assumption
+// the rule does. Needs validation on C repos outside the corpus before this
+// can be considered for default-on.
+const FOREIGN_PLATFORM_DIR_NAMES: &[&str] = &["win", "win32", "windows"];
+
+fn foreign_platform_penalty(path: &str) -> f32 {
+    if cfg!(windows) {
+        return 1.0;
+    }
+    let normalized = path.replace('\\', "/");
+    if has_dir_segment(&normalized, FOREIGN_PLATFORM_DIR_NAMES) {
+        SOFT_PENALTY_MILD
+    } else {
+        1.0
+    }
+}
+
+// Whole-token match so "windowsize" or "rewind" can't trip the guard.
+const PLATFORM_INTENT_KEYWORDS: &[&str] = &[
+    "windows", "win32", "win64", "iocp", "msvc", "mingw", "winapi",
+];
+
+fn query_names_foreign_platform(query: &str) -> bool {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .any(|t| {
+            let lower = t.to_ascii_lowercase();
+            PLATFORM_INTENT_KEYWORDS.contains(&lower.as_str())
+        })
+}
+
 // Extra multiplier applied to test-like paths when the query is non-test-shaped.
 // Stacks on top of SOFT_PENALTY_STRONG, so total = 0.3 * 0.5 = 0.15x.
 // 0.15x is empirically motivated: the §2.11 axios case had 9 test files at
@@ -1387,10 +1511,85 @@ fn test_query_aware_enabled() -> bool {
 
 fn apply_path_penalties(results: &mut [SearchResult], query: &str) {
     let is_test_query = query_is_test_shaped(query);
+    let demote_foreign_platform = platform_demote_enabled() && !query_names_foreign_platform(query);
+    // The header demote expresses a preference for the implementing `.c` over
+    // the header declaring it, so it only means anything when a `.c` is in the
+    // running. Header-only projects whose dialect resolves to C — fmtlib's
+    // `include/fmt` is all `.h` — would otherwise have every candidate demoted
+    // uniformly except the `-inl.h` exemption, which promotes that one file to
+    // rank 1 for free. Measured: it cost fmtlib three queries.
+    let has_c_implementation = results
+        .iter()
+        .any(|r| r.language == Language::C && r.file_path.ends_with(".c"));
     for result in results.iter_mut() {
-        result.score *= path_penalty_for_query(&result.file_path, is_test_query);
+        let mut penalty = path_penalty_for_query(&result.file_path, is_test_query);
+        if has_c_implementation {
+            penalty *= declaration_header_penalty(&result.file_path, result.language);
+        }
+        if demote_foreign_platform {
+            penalty *= foreign_platform_penalty(&result.file_path);
+        }
+        result.score *= penalty;
     }
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+}
+
+/// Numeric version directory (`v3/`, `v4/`) carried by a path, if any.
+fn version_dir_of(path: &str) -> Option<u32> {
+    path.replace('\\', "/")
+        .split('/')
+        .filter_map(|seg| seg.strip_prefix('v').or_else(|| seg.strip_prefix('V')))
+        .filter(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+        .filter_map(|rest| rest.parse::<u32>().ok())
+        .max()
+}
+
+/// True when the query itself names a version, e.g. "v3 compatibility error
+/// types". Such a query is asking for the old line on purpose and must be left
+/// alone.
+fn query_names_version(query: &str) -> bool {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .any(|t| {
+            let lower = t.to_ascii_lowercase();
+            matches!(lower.as_str(), "legacy" | "compat" | "deprecated")
+                || lower.strip_prefix('v').is_some_and(|rest| {
+                    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+                })
+        })
+}
+
+// Packages that ship several major versions side by side (zod's `v3/` and
+// `v4/`) give the ranker no reason to prefer the current one, so the older
+// tree wins on raw similarity. Demote candidates below the highest version
+// present in the candidate set.
+//
+// The maximum is taken from the candidates rather than a repo census, which
+// keeps the rule stateless and makes it a no-op whenever the candidates all
+// share one version. Mild rather than strong, because an old line can still be
+// actively maintained.
+fn apply_version_demote(results: &mut [SearchResult], query: &str) {
+    if query_names_version(query) {
+        return;
+    }
+    let Some(max_version) = results
+        .iter()
+        .filter_map(|r| version_dir_of(&r.file_path))
+        .max()
+    else {
+        return;
+    };
+    let mut demoted = false;
+    for result in results.iter_mut() {
+        if version_dir_of(&result.file_path).is_some_and(|v| v < max_version) {
+            result.score *= SOFT_PENALTY_MILD;
+            demoted = true;
+        }
+    }
+    if demoted {
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    }
 }
 
 static PATH_PENALTY_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -1576,7 +1775,15 @@ fn adaptive_rerank_weight_enabled() -> bool {
     *ADAPTIVE_RERANK_ENABLED.get_or_init(|| env_default_on(tuning::ADAPTIVE_RERANK))
 }
 
-fn apply_reranking(rerank: &mut RerankFn<'_>, query: &str, results: &mut [SearchResult]) {
+/// `weight_override` forces a blend weight instead of deriving one from the
+/// query shape. Fused (BM25/RRF) queries use it to keep the rare-token prior
+/// dominant while still consulting the cross-encoder.
+fn apply_reranking(
+    rerank: &mut RerankFn<'_>,
+    query: &str,
+    results: &mut [SearchResult],
+    weight_override: Option<f32>,
+) {
     if results.is_empty() {
         return;
     }
@@ -1591,7 +1798,7 @@ fn apply_reranking(rerank: &mut RerankFn<'_>, query: &str, results: &mut [Search
     let ce_max = ce_scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let ce_range = ce_max - ce_min;
 
-    let weight = adaptive_rerank_weight(query);
+    let weight = weight_override.unwrap_or_else(|| adaptive_rerank_weight(query));
     for (result, &ce_raw) in results.iter_mut().zip(ce_scores.iter()) {
         let ce_norm = if ce_range > 1e-6 {
             (ce_raw - ce_min) / ce_range
@@ -2093,10 +2300,11 @@ mod hybrid_tests {
     }
 
     #[test]
-    fn fused_query_skips_reranking() {
-        // "ColdFusion" is in src/reg.rs, so BM25 has hits, fusion runs, and
-        // the reranker is skipped — the rare-token match is the dominant
-        // signal.
+    fn fused_query_skips_reranking_by_default() {
+        // "ColdFusion" is in src/reg.rs, so BM25 has hits and fusion runs. The
+        // reranker stays skipped: reranking fused queries at the reduced
+        // weight measured net-negative on the semble corpus (see
+        // `fused_rerank_enabled`), so where BM25 fired it keeps the ranking.
         let db = Database::open_in_memory().unwrap();
         seed_chunks(&db);
         let emb = mk_embedding(0.1);
@@ -2107,6 +2315,64 @@ mod hybrid_tests {
         });
         search(&db, &emb, Some(rerank), &search_req("ColdFusion::register")).unwrap();
         assert!(!called, "reranking must be skipped when RRF fusion ran");
+    }
+
+    #[test]
+    fn reduced_fused_weight_protects_a_win_that_the_natlang_weight_would_lose() {
+        // The point of pinning fused queries to RERANK_WEIGHT_SHORT_ID rather
+        // than letting them take the natural-language weight. A rare-token
+        // winner leading by 0.60 with the cross-encoder ranking it last
+        // survives at 0.35 and does not at 0.6.
+        //
+        // This is a margin, not an invariant. Against a maximally hostile
+        // cross-encoder the lead has to clear w/(1-w) — about 0.54 at weight
+        // 0.35, and an unreachable 1.5 at 0.6 — so a narrow fused win can
+        // still be flipped. The empirical guard is the ripgrep canary in
+        // `project_hybrid_bm25_rrf.md`, not this test.
+        use super::{RERANK_WEIGHT_NATLANG, RERANK_WEIGHT_SHORT_ID, apply_reranking};
+
+        let mk = |file: &str, score: f32| SearchResult {
+            file_path: file.to_string(),
+            language: codesage_protocol::Language::Rust,
+            content: file.to_string(),
+            start_line: 1,
+            end_line: 10,
+            score,
+            symbols: Vec::new(),
+        };
+        // Cross-encoder ranks the fused winner last.
+        let ce = |_q: &str, docs: &[&str]| {
+            Ok(docs
+                .iter()
+                .map(|d| if d.contains("reg.rs") { 0.0 } else { 1.0 })
+                .collect())
+        };
+
+        let mut kept = vec![mk("src/reg.rs", 0.95), mk("src/lib.rs", 0.35)];
+        let mut rerank: RerankFn = Box::new(ce);
+        apply_reranking(
+            &mut rerank,
+            "ColdFusion::register",
+            &mut kept,
+            Some(RERANK_WEIGHT_SHORT_ID),
+        );
+        assert_eq!(
+            kept[0].file_path, "src/reg.rs",
+            "fused winner should survive at the SHORT_ID weight"
+        );
+
+        let mut lost = vec![mk("src/reg.rs", 0.95), mk("src/lib.rs", 0.35)];
+        let mut rerank: RerankFn = Box::new(ce);
+        apply_reranking(
+            &mut rerank,
+            "ColdFusion::register",
+            &mut lost,
+            Some(RERANK_WEIGHT_NATLANG),
+        );
+        assert_eq!(
+            lost[0].file_path, "src/lib.rs",
+            "same disagreement should flip the order at the natural-language weight"
+        );
     }
 
     #[test]
@@ -3069,7 +3335,7 @@ mod rerank_blend_tests {
                 .map(|d| if *d == "doc b" { 10.0 } else { 0.0 })
                 .collect())
         });
-        apply_reranking(&mut rerank, QUERY, &mut results);
+        apply_reranking(&mut rerank, QUERY, &mut results, None);
 
         let w = RERANK_WEIGHT_NATLANG;
         assert_eq!(results[0].file_path, "b.rs");
@@ -3096,7 +3362,7 @@ mod rerank_blend_tests {
             mk("c.rs", "doc c", 0.1),
         ];
         let mut rerank: RerankFn = Box::new(|_q, docs| Ok(vec![3.25; docs.len()]));
-        apply_reranking(&mut rerank, QUERY, &mut results);
+        apply_reranking(&mut rerank, QUERY, &mut results, None);
 
         let order: Vec<&str> = results.iter().map(|r| r.file_path.as_str()).collect();
         assert_eq!(order, ["a.rs", "b.rs", "c.rs"]);
@@ -3117,7 +3383,7 @@ mod rerank_blend_tests {
     fn rerank_error_leaves_results_untouched() {
         let mut results = vec![mk("a.rs", "doc a", 0.9), mk("b.rs", "doc b", 0.5)];
         let mut rerank: RerankFn = Box::new(|_q, _docs| anyhow::bail!("ORT unavailable"));
-        apply_reranking(&mut rerank, QUERY, &mut results);
+        apply_reranking(&mut rerank, QUERY, &mut results, None);
         assert_eq!(results[0].file_path, "a.rs");
         assert!((results[0].score - 0.9).abs() < 1e-6);
         assert!((results[1].score - 0.5).abs() < 1e-6);
@@ -3321,5 +3587,185 @@ mod dir_saturation_tests {
         let before = results[0].score;
         apply_qualified_name_boost(&mut results, &[]);
         assert!((results[0].score - before).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod language_and_version_penalty_tests {
+    use super::{
+        SOFT_PENALTY_MILD, apply_version_demote, declaration_header_penalty,
+        foreign_platform_penalty, query_names_foreign_platform, query_names_version,
+        version_dir_of,
+    };
+    use codesage_protocol::{Language, SearchResult};
+
+    fn mk(file: &str, score: f32) -> SearchResult {
+        SearchResult {
+            file_path: file.to_string(),
+            language: Language::TypeScript,
+            content: String::new(),
+            start_line: 1,
+            end_line: 10,
+            score,
+            symbols: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn demotes_declaration_headers_only_in_c_projects() {
+        // curl: cfilters.h took rank 1 over the connect.c that implements it.
+        assert_eq!(
+            declaration_header_penalty("lib/cfilters.h", Language::C),
+            SOFT_PENALTY_MILD
+        );
+        assert_eq!(
+            declaration_header_penalty("lib/connect.c", Language::C),
+            1.0
+        );
+    }
+
+    #[test]
+    fn leaves_cpp_headers_alone() {
+        // nlohmann-json, abseil and fmtlib are header-only: the header IS the
+        // implementation, and every C++ target in the semble corpus is one.
+        // Demoting here cost C++ 0.134 in simulation.
+        assert_eq!(
+            declaration_header_penalty("include/nlohmann/json.hpp", Language::Cpp),
+            1.0
+        );
+        assert_eq!(
+            declaration_header_penalty("absl/strings/str_split.h", Language::Cpp),
+            1.0
+        );
+    }
+
+    #[test]
+    fn exempts_inline_definition_headers() {
+        // libuv's heap-inl.h carries definitions and is a legitimate target.
+        assert_eq!(
+            declaration_header_penalty("src/heap-inl.h", Language::C),
+            1.0
+        );
+        assert_eq!(
+            declaration_header_penalty("src/queue_inl.h", Language::C),
+            1.0
+        );
+    }
+
+    #[test]
+    fn reads_numeric_version_directories() {
+        assert_eq!(
+            version_dir_of("packages/zod/src/v4/core/schemas.ts"),
+            Some(4)
+        );
+        assert_eq!(version_dir_of("packages/zod/src/v3/types.ts"), Some(3));
+        assert_eq!(version_dir_of("src/validate.ts"), None);
+        // Not a version segment: needs digits after the `v`.
+        assert_eq!(version_dir_of("src/view/index.ts"), None);
+    }
+
+    #[test]
+    fn demotes_older_version_trees() {
+        let mut results = vec![
+            mk("src/v3/types.ts", 1.0),
+            mk("src/v4/core/schemas.ts", 0.9),
+        ];
+        apply_version_demote(&mut results, "how ZodType parses and validates input");
+        assert_eq!(results[0].file_path, "src/v4/core/schemas.ts");
+        assert!((results[1].score - SOFT_PENALTY_MILD).abs() < 1e-6);
+    }
+
+    #[test]
+    fn keeps_old_version_when_the_query_asks_for_it() {
+        // "v3 compatibility error types and ZodError" wants v3 on purpose.
+        assert!(query_names_version(
+            "v3 compatibility error types and ZodError"
+        ));
+        assert!(!query_names_version(
+            "how ZodType parses and validates input"
+        ));
+
+        let mut results = vec![
+            mk("src/v3/errors.ts", 1.0),
+            mk("src/v4/core/errors.ts", 0.9),
+        ];
+        apply_version_demote(&mut results, "v3 compatibility error types and ZodError");
+        assert_eq!(results[0].file_path, "src/v3/errors.ts");
+        assert!((results[0].score - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn version_demote_is_inert_without_competing_versions() {
+        let mut results = vec![mk("src/v4/a.ts", 1.0), mk("src/v4/b.ts", 0.9)];
+        apply_version_demote(&mut results, "schema parsing");
+        assert!((results[0].score - 1.0).abs() < 1e-6);
+        assert!((results[1].score - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn foreign_platform_guard_matches_whole_tokens() {
+        assert!(query_names_foreign_platform("windows named pipe handling"));
+        assert!(query_names_foreign_platform("IOCP completion port"));
+        // "window size" must not read as Windows intent.
+        assert!(!query_names_foreign_platform(
+            "tty terminal raw mode and window size"
+        ));
+    }
+
+    #[test]
+    #[cfg_attr(windows, ignore = "rule is host-conditional and inert on Windows")]
+    fn demotes_foreign_platform_directories() {
+        assert_eq!(foreign_platform_penalty("src/win/tcp.c"), SOFT_PENALTY_MILD);
+        assert_eq!(foreign_platform_penalty("src/unix/tcp.c"), 1.0);
+        // Substring of a longer segment must not match.
+        assert_eq!(foreign_platform_penalty("src/window/tcp.c"), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod header_demote_scope_tests {
+    use super::apply_path_penalties;
+    use codesage_protocol::{Language, SearchResult};
+
+    fn mk(file: &str, language: Language, score: f32) -> SearchResult {
+        SearchResult {
+            file_path: file.to_string(),
+            language,
+            content: String::new(),
+            start_line: 1,
+            end_line: 10,
+            score,
+            symbols: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn header_demote_is_inert_without_a_c_implementation_in_play() {
+        // fmtlib's benchmark root is all `.h`, and its dialect resolves to C
+        // because nothing there carries an unambiguous C++ extension. Demoting
+        // every candidate but the `-inl.h` exemption promoted format-inl.h to
+        // rank 1 and cost three queries.
+        let mut results = vec![
+            mk("include/fmt/format-inl.h", Language::C, 0.80),
+            mk("include/fmt/compile.h", Language::C, 0.90),
+            mk("include/fmt/base.h", Language::C, 0.85),
+        ];
+        apply_path_penalties(&mut results, "compile-time format string checking");
+        assert_eq!(results[0].file_path, "include/fmt/compile.h");
+        assert!(
+            (results[0].score - 0.90).abs() < 1e-6,
+            "no demote should apply"
+        );
+    }
+
+    #[test]
+    fn header_demote_fires_when_a_c_file_competes() {
+        // curl: connect.c implements what cfilters.h declares.
+        let mut results = vec![
+            mk("lib/cfilters.h", Language::C, 0.90),
+            mk("lib/connect.c", Language::C, 0.85),
+        ];
+        apply_path_penalties(&mut results, "connection filter chain setup");
+        assert_eq!(results[0].file_path, "lib/connect.c");
     }
 }
