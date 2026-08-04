@@ -94,11 +94,11 @@ Per language, over the 33 repos in the 9 languages codesage parses. CodeSage's c
 | c | **0.743** | 0.741 | 0.771 | 3 | 60 |
 | typescript | **0.682** | 0.706 | 0.671 | 3 | 60 |
 
-Artifact: `bench/history/semble-per-language-2026-08-04-clean.json`. The run reported no skipped repos and no degraded queries; a run with either is not publishable (see below).
+Artifact: `bench/public-corpus-results/semble-per-language-2026-08-04-clean.json`. The run reported no skipped repos and no degraded queries; a run with either is not publishable (see below).
 
 **No pooled number is quoted, deliberately.** semble's overall figure covers 63 repos across 19 languages; this covers the 33 repos in the 9 languages codesage parses. Different repo sets are not comparable, so the per-language rows are the only comparable unit. 47% of the corpus targets a language codesage does not parse (588 of 1,251 queries). That is a coverage gap, not a retrieval-quality measurement, and averaging it in would state the wrong thing.
 
-**Weakest rows are TypeScript (0.682) and C (0.743).** Both improved in the current unreleased line and both still trail. TypeScript's residual is `zod`, which ships v3 and v4 side by side and where the remaining confusion is between sibling v4 implementations rather than between versions.
+**Weakest rows are TypeScript (0.682) and C (0.743).** Both improved in 0.19.0 and both still trail. TypeScript's residual is `zod`, which ships v3 and v4 side by side and where the remaining confusion is between sibling v4 implementations rather than between versions.
 
 ### Why the previously published numbers were withdrawn
 
