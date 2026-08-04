@@ -19,13 +19,26 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
         ImpactTarget::Symbol { name } => {
             let syms = db.find_symbols(name, None)?;
             if !is_qualified_symbol_name(name) && syms.len() > 1 {
-                let candidates: Vec<String> =
+                // Only distinct qualified names are disambiguable. Languages
+                // without namespaces (JS/TS) give every definition the bare
+                // name, so a `.d.ts` declaration beside its `.js`
+                // implementation used to produce "qualify with one of: Foo,
+                // Foo" — an instruction no input can satisfy. When the names
+                // collapse to one, seed on every definition and let the union
+                // of dependents stand; over-inclusion is the safe direction
+                // for an advisory what-to-review signal.
+                let mut candidates: Vec<String> =
                     syms.iter().map(|s| s.qualified_name.clone()).collect();
-                anyhow::bail!(
-                    "ambiguous symbol '{name}': {} definitions — qualify with one of: {}",
-                    syms.len(),
-                    candidates.join(", ")
-                );
+                candidates.sort();
+                candidates.dedup();
+                if candidates.len() > 1 {
+                    anyhow::bail!(
+                        "ambiguous symbol '{name}': {} definitions — qualify with one of: {}, \
+                         or target a single file instead",
+                        syms.len(),
+                        candidates.join(", ")
+                    );
+                }
             }
             syms
         }

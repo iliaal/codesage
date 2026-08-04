@@ -438,6 +438,50 @@ fn impact_by_ambiguous_bare_name_requires_disambiguation() {
     );
 }
 
+#[test]
+fn impact_by_bare_name_proceeds_when_definitions_share_a_qualified_name() {
+    // A `.d.ts` declaration beside its `.js` implementation is the norm in
+    // JS/TS, and neither carries a namespace, so both definitions qualify to
+    // the same bare name. Erroring here told the caller to "qualify with one
+    // of: Headers, Headers".
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("index.d.ts"),
+        b"export class Headers {\n  get(): void;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("headers.js"),
+        b"class Headers {\n  get() { return 1; }\n}\nmodule.exports = Headers;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("client.js"),
+        b"import Headers from './headers.js';\nexport function send() { return new Headers(); }\n",
+    )
+    .unwrap();
+
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+
+    let req = ImpactRequest {
+        target: ImpactTarget::Symbol {
+            name: "Headers".to_string(),
+        },
+        depth: 1,
+        source_only: false,
+    };
+
+    let report = impact_analysis(&db, &req).expect("identical qualified names are not ambiguous");
+    let paths: Vec<&str> = report.iter().map(|e| e.file_path.as_str()).collect();
+    assert!(
+        paths.iter().any(|p| p.ends_with("client.js")),
+        "consumer of the shared-name symbol should be reported, got {paths:?}"
+    );
+}
+
 fn setup_ambiguous_helper_rust_project() -> (tempfile::TempDir, Database) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

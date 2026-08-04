@@ -586,7 +586,7 @@ pub(crate) fn resolve_callee_definitions(
             s.file_path == caller_file
                 || import_refs
                     .iter()
-                    .any(|imp| import_ref_targets_symbol(imp, to_name, s))
+                    .any(|imp| import_ref_targets_symbol(imp, caller_file, to_name, s))
         })
         .collect();
     Ok(filtered)
@@ -615,9 +615,24 @@ fn import_refs_for_file(db: &Database, caller_file: &str) -> Result<Vec<String>>
 
 /// True when `import_ref` (e.g. `crate::helpers_a::helper`) names `sym` in
 /// `sym_file` even if the symbol table only stores the bare tail (`helper`).
-fn import_ref_targets_symbol(import_ref: &str, callee_name: &str, sym: &Symbol) -> bool {
+fn import_ref_targets_symbol(
+    import_ref: &str,
+    caller_file: &str,
+    callee_name: &str,
+    sym: &Symbol,
+) -> bool {
     if import_ref == sym.qualified_name || import_ref == sym.name {
         return true;
+    }
+    // Path-style specifiers name a file, not a symbol: JS/TS records
+    // `import X from './headers.js'` as `./headers.js`, C/C++ records
+    // `#include "dir/foo.h"` as `dir/foo.h`. Neither can ever equal a symbol
+    // name, so before this branch every candidate was filtered out and any
+    // symbol with two same-named definitions lost all its reverse edges. In
+    // JS/TS that is the common case, not a corner: a `.d.ts` declaration
+    // beside its `.js` implementation gives two definitions of one name.
+    if is_path_specifier(import_ref) {
+        return import_path_targets_file(import_ref, caller_file, &sym.file_path);
     }
     let Some((module, tail)) = import_ref.rsplit_once("::") else {
         return import_ref == callee_name && import_ref == sym.name;
@@ -636,6 +651,78 @@ fn import_ref_targets_symbol(import_ref: &str, callee_name: &str, sym: &Symbol) 
         format!("src/{module_path}/mod.rs"),
     ];
     candidates.iter().any(|c| c == &sym.file_path)
+}
+
+fn is_path_specifier(s: &str) -> bool {
+    s.starts_with("./") || s.starts_with("../") || s.contains('/')
+}
+
+/// Extensions a path specifier may omit or misname. TypeScript ESM is the
+/// reason `.js` maps to `.ts`: the spec requires the *emitted* extension in the
+/// specifier, so `./foo.js` routinely refers to `foo.ts` on disk.
+const IMPORT_EXTENSIONS: [&str; 10] = [
+    "js", "mjs", "cjs", "jsx", "ts", "tsx", "d.ts", "h", "hpp", "py",
+];
+
+fn import_path_targets_file(spec: &str, caller_file: &str, sym_file: &str) -> bool {
+    if spec.starts_with("./") || spec.starts_with("../") {
+        let base = caller_file.rsplit_once('/').map_or("", |(dir, _)| dir);
+        return match lexical_join(base, spec) {
+            Some(resolved) => file_matches(&resolved, sym_file),
+            None => false,
+        };
+    }
+    // Non-relative: a C include resolves against the compiler's include path,
+    // not the caller's directory, so match on the tail instead of guessing a
+    // root. Anchored on a separator so `utils.h` cannot claim `net_utils.h`.
+    file_matches(spec, sym_file) || sym_file.ends_with(&format!("/{spec}"))
+}
+
+/// Joins `spec` onto `base`, resolving `.` and `..` textually. Returns `None`
+/// when the specifier escapes above the project root, which cannot name an
+/// indexed file.
+fn lexical_join(base: &str, spec: &str) -> Option<String> {
+    let mut parts: Vec<&str> = if base.is_empty() {
+        Vec::new()
+    } else {
+        base.split('/').collect()
+    };
+    for seg in spec.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    Some(parts.join("/"))
+}
+
+fn file_matches(resolved: &str, sym_file: &str) -> bool {
+    if resolved == sym_file {
+        return true;
+    }
+    // Specifier carried no extension: `./foo` -> `foo.ts`.
+    for ext in IMPORT_EXTENSIONS {
+        if sym_file == format!("{resolved}.{ext}") {
+            return true;
+        }
+        // Directory specifier: `./utils` -> `utils/index.js`.
+        if sym_file == format!("{resolved}/index.{ext}") {
+            return true;
+        }
+    }
+    // Specifier named an extension that differs from the file on disk
+    // (TypeScript ESM's `.js` for a `.ts` source).
+    if let Some((stem, _)) = resolved.rsplit_once('.') {
+        for ext in IMPORT_EXTENSIONS {
+            if sym_file == format!("{stem}.{ext}") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn is_callee_reference(kind: ReferenceKind) -> bool {
