@@ -13,6 +13,7 @@ the finding id. A test earns its keep by failing against the pre-fix code.
 
 from __future__ import annotations
 
+import importlib.machinery
 import importlib.util
 import json
 import os
@@ -760,6 +761,88 @@ try:
 except ValueError:
     raised = True
 check(raised, "harness: failed subprocess results cannot be scored")
+
+
+# --------------------------------------------------------------------
+# semble-ndcg-runner — a degraded run must never read as a clean number.
+# Every case below was a silent false-pass at some point: the exit-134
+# teardown abort (cs-search-teardown-abort-evy) scored crashed queries 0.000,
+# and the first fix for it still accepted `{}` / `{"results": null}` as clean.
+
+# semble-ndcg-runner has no .py suffix, so spec_from_file_location cannot infer
+# a loader and returns None. Name the source loader explicitly.
+_ndcg_spec = importlib.util.spec_from_loader(
+    "semble_ndcg_runner",
+    importlib.machinery.SourceFileLoader(
+        "semble_ndcg_runner", str(HERE / "semble-ndcg-runner")
+    ),
+)
+ndcg_runner = importlib.util.module_from_spec(_ndcg_spec)
+_ndcg_spec.loader.exec_module(ndcg_runner)
+
+
+class _FakeProc:
+    def __init__(self, stdout, returncode):
+        self.stdout = stdout
+        self.returncode = returncode
+
+
+def _run_search(monkey_stdout, returncode=0, raise_timeout=False):
+    """Drive search() against a stubbed subprocess.run."""
+    import subprocess as _sp
+
+    real = _sp.run
+
+    def fake(*a, **kw):
+        if raise_timeout:
+            raise _sp.TimeoutExpired(cmd="x", timeout=1, output=monkey_stdout)
+        return _FakeProc(monkey_stdout, returncode)
+
+    ndcg_runner.subprocess.run = fake
+    try:
+        return ndcg_runner.search("/bin/true", ".", "q", 10)
+    finally:
+        ndcg_runner.subprocess.run = real
+
+
+GOOD = json.dumps({"results": [{"file_path": "a.rs"}]})
+
+paths, status = _run_search(GOOD, 0)
+check((paths, status) == (["a.rs"], "ok"), "ndcg-runner: clean run is ok")
+
+# The teardown abort: complete output, nonzero exit. Results must survive.
+paths, status = _run_search(GOOD, 134)
+check(
+    (paths, status) == (["a.rs"], "crashed-with-output"),
+    "ndcg-runner: exit 134 keeps its results and is flagged",
+)
+
+# Valid JSON, unusable envelope. Previously scored as a clean zero.
+for payload, label in (
+    ("{}", "missing results key"),
+    (json.dumps({"results": None}), "null results"),
+    (json.dumps({"results": [1, 2]}), "non-object rows"),
+):
+    paths, status = _run_search(payload, 0)
+    check(
+        (paths, status) == ([], "invalid-output"),
+        f"ndcg-runner: {label} is invalid-output, not a clean zero",
+    )
+
+# Garbage stdout still separates crash from clean-exit garbage.
+paths, status = _run_search("not json", 0)
+check((paths, status) == ([], "unparseable"), "ndcg-runner: clean-exit garbage")
+paths, status = _run_search("not json", 134)
+check((paths, status) == ([], "crashed"), "ndcg-runner: crash with no output")
+
+# A hung process that already printed results keeps them.
+paths, status = _run_search(GOOD, raise_timeout=True)
+check(
+    (paths, status) == (["a.rs"], "timeout-with-output"),
+    "ndcg-runner: timeout salvages complete stdout",
+)
+paths, status = _run_search("", raise_timeout=True)
+check((paths, status) == ([], "timeout"), "ndcg-runner: timeout with no output")
 
 
 if failures:

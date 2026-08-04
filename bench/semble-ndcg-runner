@@ -22,14 +22,18 @@ Usage:
   semble-ndcg-runner --corpus ~/.cache/semble-bench \
       --annotations ~/ai/codesage_ref/semble/benchmarks/annotations \
       --repos ~/ai/codesage_ref/semble/benchmarks/repos.json \
-      --codesage-bin ./target/release/codesage [--limit 10] [--json out.json]
+      --codesage-bin /abs/path/to/target/release/codesage \
+      [--limit 10] [--json out.json]
+
+`--codesage-bin` must be ABSOLUTE: each search runs with cwd set to the corpus
+repo, so a relative path resolves against that repo and dies with FileNotFound.
 """
 import argparse
 import json
 import math
 import subprocess
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 SUPPORTED = {
@@ -81,27 +85,76 @@ def target_path(entry):
 
 
 def search(binary, repo_dir, query, limit, timeout=120):
-    """Ranked, deduped file paths for one query — mirrors run_cs's contract."""
+    """Ranked, deduped file paths for one query, plus how the process exited.
+
+    Returns (paths, status) where status is one of "ok", "crashed-with-output",
+    "timeout-with-output", "timeout", "unparseable", "invalid-output", or
+    "crashed".
+
+    Only "ok" means a clean run. Everything else is counted and surfaced, so a
+    degraded run can never be read as a clean number.
+
+    A nonzero exit does NOT discard usable results. `codesage search` can write
+    a complete result set and then abort at teardown (SIGABRT / exit 134, see
+    cs-search-teardown-abort-evy), and the previous `return []` on nonzero exit
+    scored those queries a clean 0.000 — indistinguishable from genuinely bad
+    retrieval, and the same silent-zero failure this runner already refuses to
+    tolerate for empty semantic indexes. It measurably depressed published
+    numbers: monolog scored 0.8388 that way against 0.8889 when the exit code
+    is ignored, on an identical binary and query set.
+    """
+    timed_out = False
     try:
         proc = subprocess.run(
             [binary, "search", "--json", "--limit", str(limit), query],
             cwd=repo_dir, capture_output=True, text=True, timeout=timeout,
         )
-    except subprocess.TimeoutExpired:
-        return []
-    if proc.returncode != 0:
-        return []
+        stdout, returncode = proc.stdout, proc.returncode
+    except subprocess.TimeoutExpired as exc:
+        # A hung process may already have written a complete result set;
+        # discarding it depresses the average exactly like the old
+        # nonzero-exit branch did.
+        timed_out = True
+        stdout = exc.stdout or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", "replace")
+        returncode = None
+
     try:
-        data = json.loads(proc.stdout)
+        data = json.loads(stdout)
     except json.JSONDecodeError:
-        return []
-    rows = data.get("results", data) if isinstance(data, dict) else data
+        if timed_out:
+            return [], "timeout"
+        # No usable stdout. A nonzero exit here is a real failure.
+        return [], "crashed" if returncode != 0 else "unparseable"
+
+    # Well-formed JSON is not the same as a usable result set: `{}` and
+    # `{"results": null}` both parse and would otherwise be scored 0.000 as a
+    # clean run -- the same silent-zero this function exists to prevent.
+    if isinstance(data, dict):
+        if "results" not in data:
+            return [], "invalid-output"
+        rows = data["results"]
+    else:
+        rows = data
+    if not isinstance(rows, list):
+        return [], "invalid-output"
+
     seen = {}
-    for r in rows or []:
+    for r in rows:
+        if not isinstance(r, dict):
+            return [], "invalid-output"
         fp = r.get("file_path")
         if fp:
             seen.setdefault(fp, None)
-    return list(seen)[:limit]
+
+    if timed_out:
+        status = "timeout-with-output"
+    elif returncode != 0:
+        status = "crashed-with-output"
+    else:
+        status = "ok"
+    return list(seen)[:limit], status
 
 
 def main():
@@ -115,11 +168,22 @@ def main():
     ap.add_argument("--only", nargs="*", help="restrict to these repo names")
     args = ap.parse_args()
 
+    # Fail fast rather than per-query: every search runs with cwd=repo_dir, so
+    # a relative binary path resolves against the corpus repo and raises
+    # FileNotFoundError on the first query.
+    bin_path = Path(args.codesage_bin)
+    if not bin_path.is_absolute():
+        bin_path = bin_path.resolve()
+    if not bin_path.exists():
+        sys.exit(f"codesage binary not found: {bin_path}")
+    args.codesage_bin = str(bin_path)
+
     specs = [r for r in json.loads(args.repos.read_text()) if r["language"] in SUPPORTED]
     if args.only:
         specs = [r for r in specs if r["name"] in args.only]
 
     per_repo, by_lang, skipped = {}, defaultdict(list), []
+    run_warnings = []
     for spec in specs:
         name, lang = spec["name"], spec["language"]
         # semble scopes each benchmark to `benchmark_root`, not the repo root
@@ -156,31 +220,52 @@ def main():
 
         tasks = json.loads(ann.read_text())
         scores = []
+        statuses = Counter()
         for t in tasks:
             targets = [target_path(x) for x in
                        (t.get("relevant", []) + t.get("secondary", []))]
-            got = search(args.codesage_bin, repo_dir, t["query"], args.limit)
+            got, status = search(args.codesage_bin, repo_dir, t["query"], args.limit)
+            statuses[status] += 1
             ranks = [r for tp in targets if (r := file_rank(got, tp)) is not None]
             scores.append(ndcg_at_k(ranks, len(targets), args.limit))
         mean = sum(scores) / len(scores) if scores else 0.0
+        # Surface every non-clean query. A run with crashes is still reported,
+        # but never as a bare number a reader would take for a clean result.
+        degraded = {k: v for k, v in statuses.items() if k != "ok"}
         per_repo[name] = {"language": lang, "queries": len(scores), "ndcg@10": round(mean, 4)}
-        by_lang[lang].append((mean, len(scores)))
-        print(f"  {name:<22} {lang:<11} n={len(scores):<4} ndcg@10={mean:.3f}", file=sys.stderr)
+        if degraded:
+            per_repo[name]["degraded"] = dict(degraded)
+            for k, v in degraded.items():
+                run_warnings.append(f"{name}: {v} query(s) {k}")
+        by_lang[lang].append((mean, len(scores), dict(degraded)))
+        flag = f"  [{', '.join(f'{v} {k}' for k, v in degraded.items())}]" if degraded else ""
+        print(f"  {name:<22} {lang:<11} n={len(scores):<4} ndcg@10={mean:.3f}{flag}",
+              file=sys.stderr)
 
     lang_tbl = {}
     for lang, rows in sorted(by_lang.items()):
-        n = sum(c for _, c in rows)
+        n = sum(c for _, c, _ in rows)
         # Query-weighted, matching how a per-language cell aggregates repos.
-        lang_tbl[lang] = {
+        entry = {
             "repos": len(rows),
             "queries": n,
-            "ndcg@10": round(sum(m * c for m, c in rows) / n, 4) if n else 0.0,
+            "ndcg@10": round(sum(m * c for m, c, _ in rows) / n, 4) if n else 0.0,
         }
+        # Carry degradation into the per-language table too. This is the
+        # surface that actually gets published, so a reader copying a row must
+        # see that some of its queries did not run cleanly.
+        lang_degraded = Counter()
+        for _, _, d in rows:
+            lang_degraded.update(d)
+        if lang_degraded:
+            entry["degraded"] = dict(lang_degraded)
+        lang_tbl[lang] = entry
 
     out = {
         "per_repo": per_repo,
         "by_language": lang_tbl,
         "skipped": skipped,
+        "warnings": run_warnings,
         "note": "supported-language subset of semble's corpus; no pooled overall is "
                 "reported because the unsupported 10 languages are not run",
     }
