@@ -4,6 +4,9 @@
 - `codesage brief <file>` prints what is worth knowing before editing a file: whether it is a churn hotspot, the tests named after it or co-changed with it, and the files that historically change with it. Prints nothing when there is nothing to say; `--json` always prints. Reads the index without writing to it or to the project.
 - `codesage brief --session <id>` suppresses repeats within a session: a payload already served for that path, a path served in the last 15 minutes, or anything past a 1500-token session budget. A suppressed fire prints nothing, `--json` included. Session state lives in the runtime dir and expires after a day.
 
+### Changed
+- `codesage brief` lists only tests named after the file under `tests`. A test that merely co-changes with it now appears under `changes with`, where previously `README.md` could be reported as tested by `test_review_state.py`.
+
 ## [0.19.0] - 2026-08-04
 
 ### Added

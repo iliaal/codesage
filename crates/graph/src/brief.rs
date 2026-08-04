@@ -70,20 +70,25 @@ pub fn build_edit_brief(
     brief.coupled = coupling.coupled.into_iter().map(|c| c.file).collect();
 
     let recs = recommend_tests(db, std::slice::from_ref(&file_path.to_string()))?;
-    // `primary` is only served when the test is NAMED AFTER this file, which is
-    // what the sibling convention actually promises. Rust's convention resolves
-    // to every integration test under `<crate>/tests/*.rs`, so it returns the
-    // same seven files for every source file in the crate — measured, not
-    // assumed. Serving that on each edit is the noise this whole design exists
-    // to avoid, and it would make `empty` unreachable in a Rust crate.
+    // Only sibling-convention matches, and only when the test is NAMED AFTER
+    // this file. Two separate reasons, both measured on real payloads:
     //
-    // Co-change matches need no such filter: they are a measured correlation
-    // with THIS file, so they are specific by construction.
+    // Rust's convention resolves to every integration test under
+    // `<crate>/tests/*.rs`, so it returns the same seven files for every source
+    // file in the crate. Serving that per edit would make `empty` unreachable in
+    // a Rust crate.
+    //
+    // `recs.coupled` is excluded outright. A co-changed test is a correlation,
+    // not a test OF this file, and the word "tests" claims the second thing.
+    // Reading the 67 distinct payloads this produces across three repos turned
+    // up `README.md -> tests: test_review_state.py`, `Cargo.toml ->
+    // tests: risk_test.rs`, `regression-tests.sh -> tests: impact_test.rs`.
+    // Nothing is lost by dropping them: a test that genuinely co-changes is
+    // already eligible for `coupled` below, which is the honest label for it.
     brief.tests = recs
         .primary
         .into_iter()
         .filter(|t| test_names_source(t, file_path))
-        .chain(recs.coupled.into_iter().map(|t| t.file))
         .take(MAX_TESTS)
         .collect();
 
