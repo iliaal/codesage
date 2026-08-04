@@ -12,7 +12,12 @@
 # commit by accident.
 /bench/results-*
 /bench/corpora/
-/bench/history/
+/bench/history/*
+# Exception: results over semble's PUBLISHED corpus carry only public OSS repo
+# names and aggregate scores (no query text, no case IDs), and the README cites
+# them as the artifact behind its per-language table. A published number needs a
+# committed artifact or it is unreproducible, which is what this audit removed.
+!/bench/history/semble-*.json
 /bench/private/
 /bench/*.scorecard.md
 /bench/analyze-*.py
