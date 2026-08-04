@@ -668,14 +668,18 @@ fn import_path_targets_file(spec: &str, caller_file: &str, sym_file: &str) -> bo
     if spec.starts_with("./") || spec.starts_with("../") {
         let base = caller_file.rsplit_once('/').map_or("", |(dir, _)| dir);
         return match lexical_join(base, spec) {
-            Some(resolved) => file_matches(&resolved, sym_file),
+            Some(resolved) => relative_file_matches(&resolved, sym_file),
             None => false,
         };
     }
-    // Non-relative: a C include resolves against the compiler's include path,
-    // not the caller's directory, so match on the tail instead of guessing a
-    // root. Anchored on a separator so `utils.h` cannot claim `net_utils.h`.
-    file_matches(spec, sym_file) || sym_file.ends_with(&format!("/{spec}"))
+    // Non-relative specifiers are one of two things: a C include, which names a
+    // real file and always carries its extension, or a package path, which
+    // names nothing in this repo. So match exactly or on a separator-anchored
+    // suffix, and never guess an extension — otherwise the npm specifier
+    // `pkg/sub` claims the unrelated project file `pkg/sub.ts`, and a Go dot
+    // import of `github.com/x/y` claims `github.com/x/y.ts`. The separator
+    // anchor is what stops `net/utils.h` from claiming `net_utils.h`.
+    spec == sym_file || sym_file.ends_with(&format!("/{spec}"))
 }
 
 /// Joins `spec` onto `base`, resolving `.` and `..` textually. Returns `None`
@@ -699,30 +703,31 @@ fn lexical_join(base: &str, spec: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
-fn file_matches(resolved: &str, sym_file: &str) -> bool {
+fn relative_file_matches(resolved: &str, sym_file: &str) -> bool {
     if resolved == sym_file {
         return true;
     }
-    // Specifier carried no extension: `./foo` -> `foo.ts`.
-    for ext in IMPORT_EXTENSIONS {
-        if sym_file == format!("{resolved}.{ext}") {
-            return true;
+    // Look for the extension in the last path segment only. A specifier like
+    // `./dir.v1/foo` has its last dot in the *directory* part, and splitting on
+    // that yields the stem `dir`, which then matches an unrelated `dir.ts`.
+    let segment_start = resolved.rfind('/').map_or(0, |i| i + 1);
+    match resolved[segment_start..].rfind('.') {
+        // The specifier carries an extension. It may still differ from the file
+        // on disk — TypeScript ESM requires the emitted `.js` for a `.ts`
+        // source — so swap it. Do not also append, or `./foo.js` claims
+        // `foo.js.ts`.
+        Some(dot) => {
+            let stem = &resolved[..segment_start + dot];
+            IMPORT_EXTENSIONS
+                .iter()
+                .any(|ext| sym_file == format!("{stem}.{ext}"))
         }
-        // Directory specifier: `./utils` -> `utils/index.js`.
-        if sym_file == format!("{resolved}/index.{ext}") {
-            return true;
-        }
+        // No extension: `./foo` -> `foo.ts`, or the directory-index form
+        // `./utils` -> `utils/index.js`.
+        None => IMPORT_EXTENSIONS.iter().any(|ext| {
+            sym_file == format!("{resolved}.{ext}") || sym_file == format!("{resolved}/index.{ext}")
+        }),
     }
-    // Specifier named an extension that differs from the file on disk
-    // (TypeScript ESM's `.js` for a `.ts` source).
-    if let Some((stem, _)) = resolved.rsplit_once('.') {
-        for ext in IMPORT_EXTENSIONS {
-            if sym_file == format!("{stem}.{ext}") {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 fn is_callee_reference(kind: ReferenceKind) -> bool {
@@ -766,6 +771,156 @@ fn add_related_from_file(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod import_path_tests {
+    use super::*;
+
+    #[test]
+    fn relative_specifier_resolves_against_the_caller_directory() {
+        assert!(import_path_targets_file(
+            "./headers.js",
+            "lib/core/client.js",
+            "lib/core/headers.js"
+        ));
+        assert!(import_path_targets_file(
+            "../helpers/util.js",
+            "lib/core/client.js",
+            "lib/helpers/util.js"
+        ));
+        // Same basename in a different directory is not the same file.
+        assert!(!import_path_targets_file(
+            "./headers.js",
+            "lib/core/client.js",
+            "lib/other/headers.js"
+        ));
+    }
+
+    #[test]
+    fn specifier_extension_may_differ_from_the_file_on_disk() {
+        // TypeScript ESM requires the emitted extension in the specifier.
+        assert!(import_path_targets_file(
+            "./foo.js",
+            "src/client.ts",
+            "src/foo.ts"
+        ));
+        // Omitted entirely, and the directory-index form.
+        assert!(import_path_targets_file(
+            "./foo",
+            "src/client.ts",
+            "src/foo.tsx"
+        ));
+        assert!(import_path_targets_file(
+            "./utils",
+            "src/client.js",
+            "src/utils/index.js"
+        ));
+    }
+
+    #[test]
+    fn go_import_path_does_not_match_an_unrelated_file() {
+        // The last dot of `github.com/x/y` sits in the directory part. Splitting
+        // the extension over the whole path produced the stem `github`, which
+        // matched any same-named source file elsewhere in a mixed repo.
+        assert!(!import_path_targets_file(
+            "github.com/x/y",
+            "cmd/app/main.go",
+            "github.py"
+        ));
+        assert!(!import_path_targets_file(
+            "github.com/x/y",
+            "cmd/app/main.go",
+            "github.h"
+        ));
+    }
+
+    #[test]
+    fn escaping_above_the_root_resolves_to_nothing() {
+        assert!(!import_path_targets_file(
+            "../../x.js",
+            "a/client.js",
+            "x.js"
+        ));
+        // The same specifier from two directories deep is in range.
+        assert!(import_path_targets_file(
+            "../../x.js",
+            "a/b/client.js",
+            "x.js"
+        ));
+    }
+
+    #[test]
+    fn declaration_files_resolve_through_both_branches() {
+        // Specifier carries no extension, so one is appended.
+        assert!(import_path_targets_file(
+            "./foo",
+            "src/client.ts",
+            "src/foo.d.ts"
+        ));
+        // Specifier carries `.js`, which is swapped.
+        assert!(import_path_targets_file(
+            "./foo.js",
+            "src/client.ts",
+            "src/foo.d.ts"
+        ));
+    }
+
+    #[test]
+    fn specifier_with_an_extension_is_not_also_appended_to() {
+        // `./foo.js` must not claim `foo.js.ts`.
+        assert!(!import_path_targets_file(
+            "./foo.js",
+            "src/client.ts",
+            "src/foo.js.ts"
+        ));
+    }
+
+    #[test]
+    fn a_dot_in_a_directory_component_is_not_an_extension() {
+        // Stem must come from the last segment: `dir.v1/foo` is not `dir`.
+        assert!(!import_path_targets_file(
+            "./dir.v1/foo",
+            "src/client.ts",
+            "src/dir.ts"
+        ));
+        assert!(import_path_targets_file(
+            "./dir.v1/foo",
+            "src/client.ts",
+            "src/dir.v1/foo.ts"
+        ));
+    }
+
+    #[test]
+    fn package_specifiers_do_not_claim_same_named_project_files() {
+        // An npm subpath import, not a relative path to `pkg/sub.ts`.
+        assert!(!import_path_targets_file(
+            "pkg/sub",
+            "src/client.ts",
+            "pkg/sub.ts"
+        ));
+        // A Go dot import names a package directory, not a source file.
+        assert!(!import_path_targets_file(
+            "github.com/x/y",
+            "cmd/app/main.go",
+            "github.com/x/y.ts"
+        ));
+    }
+
+    #[test]
+    fn non_relative_include_matches_on_a_separator_boundary() {
+        assert!(import_path_targets_file(
+            "net/utils.h",
+            "src/main.c",
+            "include/net/utils.h"
+        ));
+        // `utils.h` must not be claimed by `net_utils.h`.
+        assert!(!import_path_targets_file(
+            "net/utils.h",
+            "src/main.c",
+            "include/net_utils.h"
+        ));
+    }
 }
 
 #[cfg(test)]

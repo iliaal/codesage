@@ -81,12 +81,23 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
                 if entry.0 > depth {
                     entry.0 = depth;
                 }
-                if entry.1.len() < 10 {
-                    entry.1.push(ImpactReason {
-                        via_symbol: sym.name.clone(),
-                        kind: r.kind,
-                        line: r.line,
-                    });
+                // Seeding on several definitions that share one qualified name
+                // walks the same reference row once per definition, so the
+                // identical reason arrives repeatedly. Reason count feeds the
+                // ranking below, which would let a duplicate decide which files
+                // survive a result limit.
+                let reason = ImpactReason {
+                    via_symbol: sym.name.clone(),
+                    kind: r.kind,
+                    line: r.line,
+                };
+                let already = entry.1.iter().any(|e| {
+                    e.via_symbol == reason.via_symbol
+                        && e.kind == reason.kind
+                        && e.line == reason.line
+                });
+                if !already && entry.1.len() < 10 {
+                    entry.1.push(reason);
                 }
                 if depth < req.depth as u32 {
                     pending_callers.push((r.from_file, r.from_symbol, r.line));

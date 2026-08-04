@@ -466,6 +466,15 @@ fn impact_by_bare_name_proceeds_when_definitions_share_a_qualified_name() {
     let db = Database::open_in_memory().unwrap();
     full_index(root, &db, &[], false).unwrap();
 
+    // Pin the precondition. Without it, a parser change that stopped emitting a
+    // symbol for the `.d.ts` would leave one definition, and the test would
+    // pass while exercising none of the behavior it exists to cover.
+    let defs = db.find_symbols("Headers", None).unwrap();
+    assert_eq!(defs.len(), 2, "expected a .d.ts and a .js definition");
+    let distinct: std::collections::HashSet<&str> =
+        defs.iter().map(|s| s.qualified_name.as_str()).collect();
+    assert_eq!(distinct.len(), 1, "both should qualify to the bare name");
+
     let req = ImpactRequest {
         target: ImpactTarget::Symbol {
             name: "Headers".to_string(),
@@ -479,6 +488,28 @@ fn impact_by_bare_name_proceeds_when_definitions_share_a_qualified_name() {
     assert!(
         paths.iter().any(|p| p.ends_with("client.js")),
         "consumer of the shared-name symbol should be reported, got {paths:?}"
+    );
+
+    // Both definitions resolve the same reference row, so the reason arrives
+    // once per seed. Reason count feeds result ranking.
+    let consumer = report
+        .iter()
+        .find(|e| e.file_path.ends_with("client.js"))
+        .unwrap();
+    let mut keys: Vec<(String, u32)> = consumer
+        .reasons
+        .iter()
+        .map(|r| (r.via_symbol.clone(), r.line))
+        .collect();
+    let before = keys.len();
+    keys.sort();
+    keys.dedup();
+    assert_eq!(
+        keys.len(),
+        before,
+        "duplicate impact reasons for {}: {:?}",
+        consumer.file_path,
+        consumer.reasons
     );
 }
 
