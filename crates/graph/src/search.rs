@@ -4010,3 +4010,40 @@ mod stem_match_token_edge_tests {
         assert_eq!(stem_match_tokens("Äbcd"), vec!["äbcd"]);
     }
 }
+
+#[cfg(test)]
+mod scoped_fts_evidence_tests {
+    use super::build_fts_match_query;
+
+    #[test]
+    fn namespace_components_never_reach_the_match_expression() {
+        // The premise behind "scope-qualified terms are OR-joined, diluting
+        // the signal" does not hold: a lowercase namespace prefix is not
+        // code-shaped, so it is filtered before any OR-join. There is no
+        // `absl` term to conjoin with `StrSplit`.
+        for (query, expect_absent) in [
+            ("absl::StrSplit for splitting", "absl"),
+            ("how fmt::format works", "fmt"),
+            ("std::vector usage", "std"),
+            ("call ModuleRef::create", "create"),
+        ] {
+            let q = build_fts_match_query(query);
+            assert!(
+                !q.contains(&format!("\"{expect_absent}\"")),
+                "{query:?} produced {q:?}, which still carries {expect_absent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_term_or_reflects_multi_concept_queries_not_scope_splitting() {
+        // Where more than one term survives, the terms are distinct
+        // identifiers the query actually asks about, so the OR is correct.
+        let q = build_fts_match_query("absl::StrSplit and StrJoin for splitting and joining");
+        assert!(q.contains("\"StrSplit\""));
+        assert!(q.contains("\"StrJoin\""));
+        assert!(q.contains(" OR "));
+        // and still no namespace component
+        assert!(!q.contains("\"absl\""));
+    }
+}
