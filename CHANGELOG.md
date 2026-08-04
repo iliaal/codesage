@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.19.0] - 2026-08-04
+
 ### Added
 - `codesage coverage` reports what a project contains that indexing cannot see: indexable files per language, and files skipped because no supported language matched, per extension. `--json` for machine output, `--top N` to cap the extension list.
 - `trace_call_path` MCP tool and `codesage trace <from> <to>` CLI: shortest call chain between two symbols, with the call site of each hop. Walks call, instantiation and route-handler edges only: a type hint or an import is not a call. `--max-depth` bounds the search (capped at 6 over MCP); an unfound result reports whether it stopped at that bound.
@@ -687,5 +689,7 @@ Initial public release.
 
 [0.17.0]: https://github.com/iliaal/codesage/releases/tag/v0.17.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.18.0...HEAD
 [0.18.0]: https://github.com/iliaal/codesage/releases/tag/v0.18.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/iliaal/codesage/releases/tag/v0.19.0
