@@ -374,6 +374,14 @@ mod unix {
         let idle_timeout = daemon_idle_timeout();
         let active = Arc::new(AtomicUsize::new(0));
         let last_activity = Arc::new(Mutex::new(Instant::now()));
+        // Last byte read from any client, stamped by every `ActivityStream`.
+        // The backstop below deliberately does not reap on this — the stdio
+        // shim is a raw proxy, so killing the daemon under a live-but-quiet
+        // session kills that session's MCP server. It exists so the log can
+        // distinguish "busy" from "held open by a parked shim", which is
+        // otherwise indistinguishable from outside the process.
+        let daemon_last_byte = Arc::new(Mutex::new(Instant::now()));
+        let mut silence_reported = false;
         // Poll often enough to honor short idle timeouts in tests, but never
         // busier than once a minute for the production default.
         let idle_poll = if idle_timeout.is_zero() {
@@ -437,10 +445,12 @@ mod unix {
                     let server = CodeSageServer::with_state(state.clone());
                     active.fetch_add(1, Ordering::SeqCst);
                     *last_activity.lock().unwrap() = Instant::now();
+                    *daemon_last_byte.lock().unwrap() = Instant::now();
                     let active_for_conn = active.clone();
                     let last_activity_for_conn = last_activity.clone();
+                    let last_byte_for_conn = daemon_last_byte.clone();
                     clients.spawn(async move {
-                        if let Err(e) = serve_client(server, stream).await {
+                        if let Err(e) = serve_client(server, stream, last_byte_for_conn).await {
                             tracing::debug!(error = %e, "MCP daemon client connection ended");
                         }
                         active_for_conn.fetch_sub(1, Ordering::SeqCst);
@@ -454,11 +464,40 @@ mod unix {
                 // pattern mismatch disables this arm for the iteration.
                 Some(_) = clients.join_next() => {}
                 _ = idle_tick.tick() => {
-                    if !idle_timeout.is_zero()
-                        && active.load(Ordering::SeqCst) == 0
-                        && last_activity.lock().unwrap().elapsed() >= idle_timeout
-                    {
-                        break "idle";
+                    if !idle_timeout.is_zero() {
+                        let connected = active.load(Ordering::SeqCst);
+                        if connected == 0 {
+                            if last_activity.lock().unwrap().elapsed() >= idle_timeout {
+                                break "idle";
+                            }
+                        } else {
+                            // Connections are open, so the backstop cannot
+                            // fire. Report it once the silence passes the
+                            // backstop window: past that point the daemon is
+                            // holding its pools for clients that have said
+                            // nothing, and only the per-connection ceiling
+                            // (CODESAGE_CLIENT_IDLE_MAX_SECS, 4h default) will
+                            // eventually release them.
+                            let silent = daemon_last_byte.lock().unwrap().elapsed();
+                            // Latch so a parked session logs once per silent
+                            // window rather than every tick for hours. The end
+                            // of the window is already observable: the
+                            // per-connection ceiling logs when it drops the
+                            // client. Re-armed below as soon as bytes arrive.
+                            if silent >= idle_timeout && !silence_reported {
+                                silence_reported = true;
+                                tracing::info!(
+                                    connected,
+                                    silent_secs = silent.as_secs(),
+                                    client_idle_max_secs = client_idle_max().as_secs(),
+                                    "daemon held open by connected but silent clients; \
+                                     pools stay warm until they disconnect or hit the \
+                                     per-connection idle ceiling"
+                                );
+                            } else if silent < idle_timeout {
+                                silence_reported = false;
+                            }
+                        }
                     }
                 }
                 _ = sigterm.recv() => break "SIGTERM",
@@ -561,6 +600,12 @@ mod unix {
     struct ActivityStream {
         inner: UnixStream,
         last_activity: Arc<Mutex<Instant>>,
+        /// Shared across every connection so the accept loop can answer "has
+        /// *any* client said anything recently?". The per-connection
+        /// `last_activity` above drives that connection's own idle ceiling;
+        /// this one exists purely so an operator can tell a busy daemon from
+        /// one held open by a parked shim.
+        daemon_last_byte: Arc<Mutex<Instant>>,
     }
 
     impl AsyncRead for ActivityStream {
@@ -573,7 +618,9 @@ mod unix {
             let before = buf.filled().len();
             let r = Pin::new(&mut this.inner).poll_read(cx, buf);
             if matches!(r, Poll::Ready(Ok(()))) && buf.filled().len() > before {
-                *this.last_activity.lock().unwrap() = Instant::now();
+                let now = Instant::now();
+                *this.last_activity.lock().unwrap() = now;
+                *this.daemon_last_byte.lock().unwrap() = now;
             }
             r
         }
@@ -597,18 +644,46 @@ mod unix {
         }
     }
 
-    async fn serve_client(server: CodeSageServer, stream: UnixStream) -> Result<()> {
+    async fn serve_client(
+        server: CodeSageServer,
+        stream: UnixStream,
+        daemon_last_byte: Arc<Mutex<Instant>>,
+    ) -> Result<()> {
         let last_activity = Arc::new(Mutex::new(Instant::now()));
         let tracked = ActivityStream {
             inner: stream,
             last_activity: last_activity.clone(),
+            daemon_last_byte,
         };
-        let service = server
-            .serve(tracked)
-            .await
-            .map_err(|e| anyhow::anyhow!("MCP daemon server error: {e}"))?;
-
         let idle_max = client_idle_max();
+
+        // Bound the handshake. `serve` resolves once the client sends
+        // `initialize`; a peer that connects and then says nothing would
+        // otherwise park this task forever, and because the idle ceiling below
+        // only starts after this await, that connection holds the daemon's
+        // active-client count above zero permanently — blocking the whole-daemon
+        // backstop for good, not merely delaying it. A real shim cannot do this
+        // (it exits when its stdin closes), so this bounds a misbehaving or
+        // half-open peer, not normal traffic. Reuses the idle ceiling: a client
+        // that has not spoken within it is idle by definition, and `0` keeps
+        // that knob's "disabled" meaning.
+        let serve_fut = server.serve(tracked);
+        let service = if idle_max.is_zero() {
+            serve_fut
+                .await
+                .map_err(|e| anyhow::anyhow!("MCP daemon server error: {e}"))?
+        } else {
+            match tokio::time::timeout(idle_max, serve_fut).await {
+                Ok(res) => res.map_err(|e| anyhow::anyhow!("MCP daemon server error: {e}"))?,
+                Err(_) => {
+                    tracing::warn!(
+                        "MCP client never completed the initialize handshake within {:?}; dropping",
+                        idle_max
+                    );
+                    return Ok(());
+                }
+            }
+        };
         let wait = service.waiting();
         tokio::pin!(wait);
 

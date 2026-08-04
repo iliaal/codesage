@@ -14,6 +14,27 @@ use codesage_storage::db::CoChangeRow;
 use super::tests_rec::test_sibling_exists;
 use crate::impact::impact_analysis;
 
+/// Reverse-dependency traversal depth shared by the blast-radius count and the
+/// structural test-coverage check. Both read the same walk, and both notes
+/// quote this number, so it lives in one place rather than as a literal in
+/// three.
+const DEPENDENT_DEPTH: usize = 2;
+
+/// Claim only what was measured: three checks ran, and this names all three
+/// rather than asserting the file is untested. A test can still exercise the
+/// file from beyond the traversal depth or through a dynamic call the
+/// structural graph does not model.
+///
+/// Spelled with a literal depth so it stays a `const` usable in
+/// [`ALIASABLE_NOTES`], which matches notes by exact string; the assertion
+/// below fails the build if `DEPENDENT_DEPTH` drifts away from the text.
+const TEST_GAP_NOTE: &str =
+    "test gap: no test found by sibling convention, co-change history, or within 2 dependency hops";
+const _: () = assert!(
+    DEPENDENT_DEPTH == 2,
+    "TEST_GAP_NOTE spells the traversal depth literally; update the note text"
+);
+
 type CycleToken = (i64, i64, i64, i64, i64, i64);
 type CycleComponentCache = HashMap<String, (CycleToken, Arc<Vec<Vec<String>>>)>;
 
@@ -85,7 +106,8 @@ pub fn find_coupling(db: &Database, file_path: &str, limit: usize) -> Result<Cou
 /// - fix ratio (fix_count / total_commits, capped at 1.0) — weight 0.18
 /// - dependent file pressure (capped via 20 dependents) — weight 0.09
 /// - coupled file pressure (capped via 10 coupled) — weight 0.09
-/// - test gap (no test among coupled or as adjacent file) — weight 0.13
+/// - test gap (no sibling test, no test among coupled, and no test within
+///   `DEPENDENT_DEPTH` reverse-dependency hops) — weight 0.13
 /// - cycle membership ((cycle_size - 1) / 4, capped at size 5) — weight 0.09
 /// - trust boundary count (capped at 5 distinct boundaries) — weight 0.10
 ///
@@ -155,28 +177,44 @@ fn assess_risk_with_context(
     let coupled_files = coupled.len() as u32;
     let top_coupled: Vec<CoChangeEntry> = coupled.into_iter().map(to_co_change_entry).collect();
 
-    // Reverse-dependency pressure via existing impact analysis (depth=2).
-    let dependent_files = impact_analysis(
+    // Reverse-dependency pressure and structural test coverage share one
+    // traversal: `impact_analysis` applies `source_only` as a final filter, so
+    // an unfiltered walk yields both the source-file count and any test file
+    // that reaches this one. Two calls would double the cost for the same rows.
+    let dependents = impact_analysis(
         db,
         &ImpactRequest {
             target: ImpactTarget::File {
                 path: file_path.to_string(),
             },
-            depth: 2,
-            source_only: true,
+            depth: DEPENDENT_DEPTH,
+            source_only: false,
         },
     )
-    .with_context(|| format!("computing dependent_files for risk({file_path})"))?
-    .len() as u32;
+    .with_context(|| format!("computing dependent_files for risk({file_path})"))?;
 
-    // Test gap: do any coupled files look like tests, or does a sibling file matching
-    // common test conventions exist in the index?
+    let dependent_files = dependents
+        .iter()
+        .filter(|e| e.category == FileCategory::Source)
+        .count() as u32;
+
+    // Test gap: a sibling test by language convention, a test among the top
+    // co-changers, or a test that reaches this file through the dependency
+    // graph. The third term matters because the first two are convention and
+    // history: a newly added helper called by a well-tested caller has neither
+    // a sibling nor a co-change record, and without this would be reported as
+    // untested. Keep the nearest test dependent so the note can name a test the
+    // agent can actually run.
     let has_coupled_test = top_coupled
         .iter()
         .any(|e| matches!(FileCategory::classify(&e.file), FileCategory::Test));
     let has_sibling_test = test_sibling_exists(db, file_path)
         .with_context(|| format!("checking sibling test for risk({file_path})"))?;
-    let test_gap = !has_coupled_test && !has_sibling_test;
+    let dependent_test = dependents
+        .iter()
+        .filter(|e| e.category == FileCategory::Test)
+        .min_by_key(|e| e.distance);
+    let test_gap = !has_coupled_test && !has_sibling_test && dependent_test.is_none();
 
     let dep_pressure = (dependent_files as f64 / 20.0).min(1.0);
     let coup_pressure = (coupled_files as f64 / 10.0).min(1.0);
@@ -245,7 +283,7 @@ fn assess_risk_with_context(
     }
     if dependent_files >= 10 {
         notes.push(format!(
-            "wide blast radius: {dependent_files} files depend on this (depth-2)"
+            "wide blast radius: {dependent_files} files depend on this (depth-{DEPENDENT_DEPTH})"
         ));
     }
     if coupled_files >= 5 {
@@ -254,7 +292,19 @@ fn assess_risk_with_context(
         ));
     }
     if test_gap {
-        notes.push("test gap: no obvious test file (sibling or co-changer)".to_string());
+        notes.push(TEST_GAP_NOTE.to_string());
+    } else if !has_sibling_test
+        && !has_coupled_test
+        && let Some(t) = dependent_test
+    {
+        // Coverage found only through the dependency graph. Claim reachability,
+        // not execution: this is a static reference chain, so the test may
+        // import the file without exercising the changed symbol. Naming the
+        // file and hop count lets the agent confirm in one read.
+        notes.push(format!(
+            "no direct test; test {} reaches this file in {} dependency hop(s)",
+            t.file_path, t.distance
+        ));
     }
     if in_cycle {
         // Sample up to 5 other members for the rationale line so the note
@@ -557,7 +607,8 @@ pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiff
     }
     if !test_gap_files.is_empty() {
         summary_notes.push(format!(
-            "{} file(s) lack test coverage (no sibling test, no test in co-change history)",
+            "{} file(s) with no test found by sibling convention, co-change history, \
+             or within {DEPENDENT_DEPTH} dependency hops",
             test_gap_files.len()
         ));
     }
@@ -659,10 +710,7 @@ pub fn assess_risk_batch(db: &Database, file_paths: &[String]) -> Result<RiskBat
 /// here is also the deterministic short-code order: the first eligible
 /// match gets `T`, next gets `NG`, etc., so output is stable.
 const ALIASABLE_NOTES: &[(&str, &str)] = &[
-    (
-        "T",
-        "test gap: no obvious test file (sibling or co-changer)",
-    ),
+    ("T", TEST_GAP_NOTE),
     (
         "NG",
         "no git history for this file (file too new, or `codesage git-index` hasn't been run)",

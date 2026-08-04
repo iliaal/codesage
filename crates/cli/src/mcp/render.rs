@@ -224,12 +224,20 @@ fn render_with_budget<T: serde::Serialize>(
 /// bounded in practice; this is a hard backstop against a pathological result.
 const STALENESS_MAX_FILES: usize = 50;
 
-/// JSON keys whose string value (or string array elements) is a
-/// project-relative file path in a tool result. Deliberately excludes
-/// `imports` / `imported_by` (bare module names) and `clustered_directories`
-/// (directories, not files). Over-inclusion is harmless — `compute_stale_files`
-/// filters against the indexed file set — but under-inclusion silently misses
-/// drift, so err toward listing a key.
+/// JSON keys whose string value is a project-relative file path in a tool
+/// result — including strings nested in arrays under that key, so
+/// `Vec<Vec<String>>` shapes like `new_cycles` are reached.
+///
+/// Deliberately excludes `imports` (bare module names, `refs.to_name`),
+/// `clustered_directories` (directories), `omitted_files` (detail already
+/// dropped from the response, so the agent is not reading them), and `source`
+/// (`FeatureRecord.source` is a mapper token like `cargo-bin`, not a path).
+/// Note `imported_by` **is** listed: unlike `imports` it is `SELECT f.path`
+/// off the `files` table, so it carries real indexed paths.
+///
+/// Over-inclusion is harmless — `compute_stale_files` filters against the
+/// indexed file set — but under-inclusion silently misses drift, so err
+/// toward listing a key.
 const PATH_KEYS: &[&str] = &[
     "file_path",
     "path",
@@ -243,6 +251,22 @@ const PATH_KEYS: &[&str] = &[
     "wide_blast_files",
     "fix_heavy_files",
     "hotspot_files",
+    // `review_rehearsal` carries its patch file list as bare strings under
+    // `files`, both top-level and per-objection. Without this key the tool
+    // documented as the last step before a commit — run precisely when the
+    // working tree is dirtiest — never raised the staleness banner. Harmless
+    // for the `files: Vec<RiskAssessment>` / `Vec<FeatureFileRef>` shapes:
+    // non-string array items are skipped here and still picked up by the
+    // recursion through their own `file` / `path` keys.
+    "files",
+    // `list_dependencies` answers "who imports this file" with indexed paths;
+    // those are exactly the files an agent opens next.
+    "imported_by",
+    // `recommend_tests` "always run these" list — bare test-file paths.
+    "primary",
+    // `session_end` reports cycles as arrays of arrays of paths.
+    "new_cycles",
+    "resolved_cycles",
 ];
 
 /// Staleness checking is on by default; `CODESAGE_STALENESS_CHECK` set to a
@@ -257,22 +281,31 @@ fn staleness_enabled() -> bool {
 /// Walk a serialized tool result, collecting project-relative file paths from
 /// the [`PATH_KEYS`] fields wherever they appear (recursing through nested
 /// objects and arrays).
+/// Collect the strings under a matched [`PATH_KEYS`] key, descending through
+/// nested arrays so `Vec<Vec<String>>` (session cycles) is reached.
+///
+/// Descends arrays only, never objects: an object under a path key is a record
+/// (`files: Vec<RiskAssessment>`), whose own path fields the caller's recursion
+/// already visits by key. Walking into it here would scoop up every string it
+/// holds — note prose, categories, titles — as if they were paths.
+fn push_path_strings(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                push_path_strings(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_referenced_paths(value: &serde_json::Value, out: &mut Vec<String>) {
     match value {
         serde_json::Value::Object(map) => {
             for (k, v) in map {
                 if PATH_KEYS.contains(&k.as_str()) {
-                    match v {
-                        serde_json::Value::String(s) => out.push(s.clone()),
-                        serde_json::Value::Array(items) => {
-                            for item in items {
-                                if let serde_json::Value::String(s) = item {
-                                    out.push(s.clone());
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
+                    push_path_strings(v, out);
                 }
                 collect_referenced_paths(v, out);
             }
@@ -818,6 +851,73 @@ mod tests {
         // file_path, from_file, and cycle_files[*] collected; `imports`
         // (bare module name) and `clustered_directories` (a dir) excluded.
         assert_eq!(paths, vec!["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"]);
+    }
+
+    #[test]
+    fn collect_referenced_paths_covers_review_rehearsal_file_lists() {
+        // Shape of a `review_rehearsal` result: bare string paths under
+        // `files`, top-level and inside each objection.
+        let v = json!({
+            "files": ["src/a.rs", "src/b.rs"],
+            "objections": [
+                { "category": "test-gap", "files": ["src/c.rs"] },
+                { "category": "risk", "files": ["src/d.rs"] }
+            ]
+        });
+        let mut paths = Vec::new();
+        collect_referenced_paths(&v, &mut paths);
+        paths.sort();
+        assert_eq!(paths, vec!["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"]);
+    }
+
+    #[test]
+    fn collect_referenced_paths_reaches_nested_cycle_arrays() {
+        // session_end reports cycles as arrays of arrays of paths; a
+        // direct-items-only harvester saw none of them.
+        let v = json!({
+            "new_cycles": [["a.rs", "b.rs"], ["c.rs"]],
+            "resolved_cycles": [["d.rs"]],
+            "imported_by": ["e.rs"],
+            "primary": ["f_test.rs"]
+        });
+        let mut paths = Vec::new();
+        collect_referenced_paths(&v, &mut paths);
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["a.rs", "b.rs", "c.rs", "d.rs", "e.rs", "f_test.rs"]
+        );
+    }
+
+    #[test]
+    fn collect_referenced_paths_does_not_scoop_object_strings_under_a_path_key() {
+        // `files` holds records here; only their own path-keyed fields count.
+        // Note prose and categories must not be mistaken for paths.
+        let v = json!({
+            "files": [
+                { "file": "a.rs", "notes": ["test gap: no test found"], "category": "hotspot" }
+            ]
+        });
+        let mut paths = Vec::new();
+        collect_referenced_paths(&v, &mut paths);
+        assert_eq!(paths, vec!["a.rs"]);
+    }
+
+    #[test]
+    fn collect_referenced_paths_files_key_tolerates_object_arrays() {
+        // `assess_risk_diff` / `feature_bundle` also use `files`, but with
+        // object items. The key must not break them: objects contribute
+        // nothing directly and are still walked for their own path keys.
+        let v = json!({
+            "files": [
+                { "file": "src/a.rs", "score": 0.5 },
+                { "path": "src/b.rs", "role": "owned" }
+            ]
+        });
+        let mut paths = Vec::new();
+        collect_referenced_paths(&v, &mut paths);
+        paths.sort();
+        assert_eq!(paths, vec!["src/a.rs", "src/b.rs"]);
     }
 
     #[test]

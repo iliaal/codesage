@@ -72,7 +72,12 @@ CREATE TABLE IF NOT EXISTS git_files (
     indexed_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
-CREATE INDEX IF NOT EXISTS idx_git_files_churn ON git_files(churn_score DESC);
+-- Covers `ORDER BY churn_score DESC, path LIMIT ?` as a streaming scan. The
+-- `path` term is what makes the top-N deterministic when churn scores tie
+-- (common: every file with one commit at the same time decays identically);
+-- carrying it in the index keeps SQLite from falling back to a full scan plus
+-- a temp b-tree sorter to satisfy it.
+CREATE INDEX IF NOT EXISTS idx_git_files_churn ON git_files(churn_score DESC, path);
 
 CREATE TABLE IF NOT EXISTS git_co_changes (
     file_a TEXT NOT NULL,
@@ -384,7 +389,23 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
         "0013_structural_unique_keys",
         migrate_0013_structural_unique_keys,
     ),
+    (
+        "0014_git_files_churn_path",
+        migrate_0014_git_files_churn_path,
+    ),
 ];
+
+/// Widen `idx_git_files_churn` to `(churn_score DESC, path)` so the top-churn
+/// query's tie-breaking `path` term is served by the index instead of a full
+/// scan into a temp b-tree. Safe to re-run: drops and recreates, and the fresh
+/// `SCHEMA` already declares the wide form.
+fn migrate_0014_git_files_churn_path(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_git_files_churn;
+         CREATE INDEX IF NOT EXISTS idx_git_files_churn
+             ON git_files(churn_score DESC, path);",
+    )
+}
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(

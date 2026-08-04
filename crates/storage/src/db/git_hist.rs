@@ -105,7 +105,7 @@ impl Database {
     pub fn top_churn_files(&self, limit: usize) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT path FROM git_files ORDER BY churn_score DESC LIMIT ?1")?;
+            .prepare("SELECT path FROM git_files ORDER BY churn_score DESC, path LIMIT ?1")?;
         let rows: Vec<String> = stmt
             .query_map(rusqlite::params![limit as i64], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -272,7 +272,7 @@ impl Database {
                  UNION ALL
                  SELECT file_a AS other, weight, count, last_observed_at
                  FROM git_co_changes WHERE file_b = ?1
-             ) ORDER BY weight DESC LIMIT ?2",
+             ) ORDER BY weight DESC, other LIMIT ?2",
         )?;
         let rows = stmt
             .query_map(rusqlite::params![path, limit as i64], |row| {
@@ -339,6 +339,88 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::Database;
+
+    /// Tied weights at the LIMIT boundary must not let the cap pick an
+    /// arbitrary subset: without a secondary sort key, which peers survive
+    /// `LIMIT` is whatever order SQLite produced, so an agent re-running the
+    /// same query can get a different answer with no underlying change.
+    #[test]
+    fn co_changes_break_weight_ties_deterministically_under_limit() {
+        let db = Database::open_in_memory().unwrap();
+        // Five peers all at the same weight; only three fit under the cap.
+        // Pairs are stored sorted (file_a < file_b); every peer sorts before
+        // "target.rs", so these all land on the UNION's second branch.
+        for other in ["e.rs", "c.rs", "a.rs", "d.rs", "b.rs"] {
+            db.upsert_git_co_change(other, "target.rs", 1.0, 3, Some(1_700_000_000))
+                .unwrap();
+        }
+
+        let first = db.co_changes_for("target.rs", 3).unwrap();
+        let files: Vec<&str> = first.iter().map(|r| r.file.as_str()).collect();
+        assert_eq!(
+            files,
+            vec!["a.rs", "b.rs", "c.rs"],
+            "tied peers must be capped in a total order, not an arbitrary one"
+        );
+
+        for _ in 0..5 {
+            let again = db.co_changes_for("target.rs", 3).unwrap();
+            let again_files: Vec<&str> = again.iter().map(|r| r.file.as_str()).collect();
+            assert_eq!(files, again_files, "repeated identical query changed order");
+        }
+    }
+
+    /// The tie-breaking `path` term must be served by the index, not by a
+    /// full scan into a temp b-tree sorter. Widening idx_git_files_churn to
+    /// (churn_score DESC, path) in migration 0014 is what keeps this a
+    /// streaming scan that can stop at LIMIT.
+    #[test]
+    fn top_churn_query_plan_uses_the_index_without_a_sorter() {
+        let db = Database::open_in_memory().unwrap();
+        for i in 0..200 {
+            db.upsert_git_file(&format!("f{i}.rs"), 2.0, 0, 1, None)
+                .unwrap();
+        }
+        db.conn.execute_batch("ANALYZE;").unwrap();
+
+        let mut stmt = db
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT path FROM git_files \
+                 ORDER BY churn_score DESC, path LIMIT 10",
+            )
+            .unwrap();
+        let plan: String = stmt
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ");
+
+        assert!(
+            plan.contains("idx_git_files_churn"),
+            "top-churn query should ride the churn index, plan was: {plan}"
+        );
+        assert!(
+            !plan.to_uppercase().contains("TEMP B-TREE"),
+            "index should satisfy the ORDER BY without a sorter, plan was: {plan}"
+        );
+    }
+
+    /// Same hazard on the top-churn candidate set that bounds risk scoring.
+    #[test]
+    fn top_churn_files_break_score_ties_deterministically() {
+        let db = Database::open_in_memory().unwrap();
+        for p in ["e.rs", "c.rs", "a.rs", "d.rs", "b.rs"] {
+            db.upsert_git_file(p, 2.0, 0, 1, None).unwrap();
+        }
+
+        let top = db.top_churn_files(3).unwrap();
+        assert_eq!(top, vec!["a.rs", "b.rs", "c.rs"]);
+        for _ in 0..5 {
+            assert_eq!(top, db.top_churn_files(3).unwrap());
+        }
+    }
 
     #[test]
     fn churn_percentiles_bit_identical_to_per_file_query_with_ties() {

@@ -164,10 +164,16 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
         .filter(|e| !req.source_only || e.category == FileCategory::Source)
         .collect();
 
+    // `file_reasons` is a HashMap, so its iteration order is reseeded per map
+    // instance — tied entries would otherwise land in a different order on
+    // every call, and callers truncate (`ImpactOptions::limit`, the MCP budget
+    // cap), so an unchanged query could return a different set of files. Ties
+    // are routine here: every depth-1 file with the same reason count ties.
     entries.sort_by(|a, b| {
         a.distance
             .cmp(&b.distance)
             .then_with(|| b.reasons.len().cmp(&a.reasons.len()))
+            .then_with(|| a.file_path.cmp(&b.file_path))
     });
     Ok(entries)
 }

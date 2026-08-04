@@ -317,7 +317,17 @@ fn rrf_merge(
             .or_insert((contrib, row));
     }
     let mut ranked: Vec<(f64, RawSearchRow)> = scores.into_values().collect();
-    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+    // `scores` is a HashMap, so ties must be broken explicitly or the
+    // truncation below keeps an arbitrary subset that varies per call. Exact
+    // f64 ties are reachable here, not just theoretical: with RRF_K=60 and
+    // BM25_WEIGHT=2.0 a semantic rank-1 (1/62) plus a BM25 rank-63 (2/124)
+    // sums bit-identically to a BM25 rank-1 (2/62), and the fetch depth
+    // reaches those ranks.
+    ranked.sort_by(|a, b| {
+        b.0.total_cmp(&a.0)
+            .then_with(|| a.1.file_path.cmp(&b.1.file_path))
+            .then_with(|| a.1.start_line.cmp(&b.1.start_line))
+    });
     ranked.truncate(limit);
     // Convert each fused RRF score to the `distance` field downstream code
     // reads through `l2_to_score`. Order alone is not enough: the boost

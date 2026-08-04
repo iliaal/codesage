@@ -201,6 +201,73 @@ fn test_gap_true_when_no_test_sibling_and_no_coupled_test() {
     assert!(r.notes.iter().any(|n| n.contains("test gap")));
 }
 
+/// A test that reaches the file through the dependency graph closes the gap
+/// even with no sibling test and no co-change history — the newly-added-helper
+/// case that convention-plus-history reports as untested.
+#[test]
+fn test_gap_false_when_a_test_depends_on_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("Repository.php"),
+        b"<?php\nnamespace App;\nclass Repository {\n  public function find($id) { return null; }\n}\n",
+    )
+    .unwrap();
+    // Named for Controller, not Repository, so the sibling-convention lookup
+    // for Repository.php cannot match it. Its only link is a structural one.
+    std::fs::write(
+        root.join("ControllerTest.php"),
+        b"<?php\nnamespace App;\nuse App\\Repository;\nclass ControllerTest {\n  public function testFind(Repository $r) { return $r->find(1); }\n}\n",
+    )
+    .unwrap();
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+    db.upsert_git_file("Repository.php", 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+
+    let r = assess_risk(&db, "Repository.php").unwrap();
+    assert!(
+        !r.test_gap,
+        "a test depending on the file must close the gap, notes: {:?}",
+        r.notes
+    );
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.contains("reaches this file") && n.contains("ControllerTest.php")),
+        "expected the indirect-coverage note naming the test, got {:?}",
+        r.notes
+    );
+    assert!(
+        !r.notes.iter().any(|n| n.contains("test gap")),
+        "must not also claim a test gap, got {:?}",
+        r.notes
+    );
+}
+
+/// The gap note names the three checks that ran rather than asserting the file
+/// is untested. Guards against a future edit reintroducing an absolute claim.
+#[test]
+fn test_gap_note_states_what_was_measured() {
+    let (_dir, db) = setup_project();
+    db.upsert_git_file("Repository.php", 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+
+    let r = assess_risk(&db, "Repository.php").unwrap();
+    assert!(r.test_gap);
+    let note = r
+        .notes
+        .iter()
+        .find(|n| n.contains("test gap"))
+        .unwrap_or_else(|| panic!("expected a test-gap note, got {:?}", r.notes));
+    for expected in ["sibling convention", "co-change history", "dependency hops"] {
+        assert!(
+            note.contains(expected),
+            "test-gap note must name the {expected} check, got {note:?}"
+        );
+    }
+}
+
 #[test]
 fn high_coupling_triggers_coupling_note() {
     let (_dir, db) = setup_project();

@@ -104,10 +104,16 @@ pub fn find_similar(
     }
 
     let mut out: Vec<SimilarSymbol> = best.into_values().collect();
+    // Ties are the norm, not the exception — exact clones all score 1.0 — and
+    // `best` is a HashMap, so without a total order the truncation below keeps
+    // an arbitrary subset that changes between identical calls. `total_cmp`
+    // rather than `partial_cmp().unwrap_or(Equal)`: the latter is intransitive
+    // if a NaN ever reaches it, which can panic the sort and hang the client.
     out.sort_by(|a, b| {
         b.jaccard
-            .partial_cmp(&a.jaccard)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(&a.jaccard)
+            .then_with(|| a.file_path.cmp(&b.file_path))
+            .then_with(|| a.line_start.cmp(&b.line_start))
     });
     out.truncate(limit);
     Ok(out)
