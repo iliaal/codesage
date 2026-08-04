@@ -14,6 +14,7 @@
 - `assess_risk` no longer reports a test gap when a test file reaches the file within two reverse-dependency hops; the note names the three checks that ran (sibling convention, co-change history, dependency hops) instead of asserting the file is untested, and a file reached only indirectly gets a note naming the test and its hop distance.
 
 ### Fixed
+- `codesage search` no longer aborts with exit 134 after printing results. Teardown ran ONNX Runtime's C++ static destructors, which intermittently corrupt the heap; the process now exits without walking the atexit table. Reproduced at 2/100 under concurrent load before the fix, 0/100 after.
 - `impact_analysis` reports dependents for symbols referenced by their short name, such as a PHP base class inherited within its own namespace; one with 30 subclasses previously reported zero. `assess_risk` blast-radius and test-gap terms read the same traversal.
 - Capped ranked results break ties on a stable secondary key and repeat identically for an unchanged query: `impact_analysis`, `find_similar`, hybrid `search` fusion, co-changers, top-churn candidates, BM25 candidates, and paginated full-scan search.
 - A client that connects to the daemon but never completes the MCP `initialize` handshake is dropped after `CODESAGE_CLIENT_IDLE_MAX_SECS` instead of holding an active-client slot indefinitely and suppressing the daemon idle backstop.
