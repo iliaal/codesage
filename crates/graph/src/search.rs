@@ -623,6 +623,14 @@ pub fn search(
         apply_version_demote(&mut results, &req.query);
     }
 
+    // Also after reranking, and for a stronger reason than the penalties: a
+    // filename-stem match is metadata the cross-encoder cannot see. It scores
+    // chunk content only, so blending a pre-rerank stem boost would dilute a
+    // signal the reranker had no way to form an opinion about.
+    if stem_match_boost_enabled() {
+        apply_stem_match_boost(&mut results, &req.query);
+    }
+
     if file_saturation_enabled() {
         apply_file_saturation(&mut results);
     }
@@ -1094,6 +1102,7 @@ mod tuning {
     pub(super) const VERSION_DEMOTE: &str = "CODESAGE_VERSION_DEMOTE";
     pub(super) const PLATFORM_DEMOTE: &str = "CODESAGE_PLATFORM_DEMOTE";
     pub(super) const FUSED_RERANK: &str = "CODESAGE_FUSED_RERANK";
+    pub(super) const STEM_MATCH_BOOST: &str = "CODESAGE_STEM_MATCH_BOOST";
 }
 
 // The `is_symbol_query` gate makes the definition boost provably inert on NL
@@ -1123,6 +1132,23 @@ static PLATFORM_DEMOTE_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn platform_demote_enabled() -> bool {
     *PLATFORM_DEMOTE_ENABLED.get_or_init(|| env_default_off(tuning::PLATFORM_DEMOTE))
+}
+
+static STEM_MATCH_BOOST_ENABLED: OnceLock<bool> = OnceLock::new();
+
+// Default OFF, and the A/B is why rather than caution: measured on the semble
+// corpus it is +0.001 pooled, which is noise. Per language, rust +0.008 and
+// cpp -0.004; c, php and typescript do not move. Four queries improve, one
+// regresses, and the regression is large (nlohmann "ADL-based to_json and
+// from_json", 1.000 -> 0.500) because adl_serializer.hpp is the target while
+// the query names to_json and from_json.
+//
+// Worth keeping rather than deleting: rust +0.008 with no rust regression is
+// the only positive movement any proposal has produced for the language with
+// the largest remaining gap (0.785 against semble's 0.856), so this is a
+// reasonable per-project opt-in for Rust-heavy repos. It is not a default.
+fn stem_match_boost_enabled() -> bool {
+    *STEM_MATCH_BOOST_ENABLED.get_or_init(|| env_default_off(tuning::STEM_MATCH_BOOST))
 }
 
 static FUSED_RERANK_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -1532,6 +1558,83 @@ fn apply_path_penalties(results: &mut [SearchResult], query: &str) {
         result.score *= penalty;
     }
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+}
+
+// Bounded multiplier for a query token that names a candidate's file stem.
+// Deliberately mild: a move-to-front variant scored better on abseil but cost
+// nlohmann's "ADL-based to_json and from_json conversion hooks" a full rank
+// (to_json.hpp / from_json.hpp jumping over the adl_serializer.hpp target).
+//
+// What 1.2x actually bounds is the score ratio, not the rank movement: a
+// boosted candidate passes every result scoring below `its_score * 1.2`. Where
+// results are tightly clustered that can still be several positions. It caps
+// how far a boost can reach, not how many places it can travel.
+const STEM_MATCH_BOOST: f32 = 1.2;
+// Counted in characters, not bytes — see `stem_match_tokens`.
+const STEM_MATCH_MIN_TOKEN_LEN: usize = 4;
+
+/// Query tokens specific enough to be worth matching against a file stem.
+///
+/// The gate is an identifier signal: an underscore, a digit, or mixed case
+/// carrying at least one lowercase letter. That admits `path_router`,
+/// `StrSplit`, `ABSL_LOG` and `Semaphore` while rejecting the bare all-caps
+/// acronyms that are ordinary prose vocabulary — `JSON`, `HTTP`, `MIME`. The
+/// exclusion is load-bearing: boosting on `JSON` pulls nlohmann's `json.hpp`
+/// up on nearly every query in that repo, which flipped a 9-query regression
+/// in the advisory simulation.
+///
+/// Note `ABSL_LOG` qualifies through the underscore rather than through case,
+/// which is why the rule is "has an identifier signal" and not "is not
+/// all-caps".
+fn stem_match_tokens(query: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in query.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        // chars(), not len(): `len()` is bytes, so a 3-character token like
+        // `Äbc` measures 4 and would slip past the minimum.
+        if token.chars().count() < STEM_MATCH_MIN_TOKEN_LEN {
+            continue;
+        }
+        let has_underscore = token.contains('_');
+        let has_digit = token.chars().any(|c| c.is_ascii_digit());
+        let has_upper = token.chars().any(char::is_uppercase);
+        let has_lower = token.chars().any(char::is_lowercase);
+        if has_underscore || has_digit || (has_upper && has_lower) {
+            out.push(normalize_stem(token));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+// Generalizes DEFINITION_FILE_STEM_BONUS, which only reaches results that
+// already matched the definition regex. That regex structurally cannot fire
+// for a C++ free function (`absl::StrSplit` has no class/struct keyword) or a
+// macro-attributed declaration (`class ABSL_LOCKABLE Mutex` breaks the
+// keyword+name pattern), which is exactly where the filename is the clearest
+// available signal.
+fn apply_stem_match_boost(results: &mut [SearchResult], query: &str) {
+    let tokens = stem_match_tokens(query);
+    if tokens.is_empty() {
+        return;
+    }
+    let mut boosted = false;
+    for result in results.iter_mut() {
+        let Some(stem) = std::path::Path::new(&result.file_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+        else {
+            continue;
+        };
+        let stem_norm = normalize_stem(stem);
+        if tokens.contains(&stem_norm) {
+            result.score *= STEM_MATCH_BOOST;
+            boosted = true;
+        }
+    }
+    if boosted {
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    }
 }
 
 /// Numeric version directory (`v3/`, `v4/`) carried by a path, if any.
@@ -3767,5 +3870,113 @@ mod header_demote_scope_tests {
         ];
         apply_path_penalties(&mut results, "connection filter chain setup");
         assert_eq!(results[0].file_path, "lib/connect.c");
+    }
+}
+
+#[cfg(test)]
+mod stem_match_boost_tests {
+    use super::{STEM_MATCH_BOOST, apply_stem_match_boost, stem_match_tokens};
+    use codesage_protocol::{Language, SearchResult};
+
+    fn mk(file: &str, score: f32) -> SearchResult {
+        SearchResult {
+            file_path: file.to_string(),
+            language: Language::Rust,
+            content: String::new(),
+            start_line: 1,
+            end_line: 10,
+            score,
+            symbols: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn admits_identifier_shaped_tokens() {
+        // `Router` qualifies on mixed case, the same rule that admits the
+        // cited `Semaphore` case. A leading capital is not distinguished from
+        // an internal one, so sentence-initial words can enter; requiring an
+        // internal capital would reject `Semaphore` too. The corpus A/B is
+        // what decides whether that extra noise costs anything.
+        assert_eq!(
+            stem_match_tokens("Router path_router implementation"),
+            vec!["pathrouter", "router"]
+        );
+        // Mixed case with a lowercase letter.
+        assert_eq!(
+            stem_match_tokens("absl::StrSplit and StrJoin"),
+            vec!["strjoin", "strsplit"]
+        );
+        // Underscore qualifies even though the token is all-caps.
+        assert_eq!(
+            stem_match_tokens("logging macros ABSL_LOG"),
+            vec!["absllog"]
+        );
+    }
+
+    #[test]
+    fn rejects_bare_acronyms_and_plain_words() {
+        // Boosting json.hpp on the word JSON regressed 9 nlohmann queries.
+        assert!(stem_match_tokens("JSON parser and tokenizer").is_empty());
+        assert!(stem_match_tokens("HTTP client request sending").is_empty());
+        assert!(stem_match_tokens("how formatters transform log records").is_empty());
+        // Too short to be specific.
+        assert!(stem_match_tokens("Foo").is_empty());
+    }
+
+    #[test]
+    fn boosts_the_file_the_query_names() {
+        // Covers the helper's own matching, not a gap in the definition
+        // boost: for a bare `Semaphore` query that boost already discriminates
+        // these two via DEFINITION_FILE_STEM_BONUS. The gap this stage exists
+        // to fill is the case where the definition regex cannot fire at all —
+        // a C++ free function, or a macro-attributed declaration.
+        let mut r = vec![
+            mk("tokio/src/sync/batch_semaphore.rs", 0.90),
+            mk("tokio/src/sync/semaphore.rs", 0.85),
+        ];
+        apply_stem_match_boost(&mut r, "Semaphore");
+        assert_eq!(r[0].file_path, "tokio/src/sync/semaphore.rs");
+        assert!((r[0].score - 0.85 * STEM_MATCH_BOOST).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalizes_underscores_so_strsplit_matches_str_split() {
+        let mut r = vec![
+            mk("absl/strings/str_join.h", 0.90),
+            mk("absl/strings/str_split.h", 0.80),
+        ];
+        apply_stem_match_boost(&mut r, "absl::StrSplit for string splitting");
+        assert_eq!(r[0].file_path, "absl/strings/str_split.h");
+    }
+
+    #[test]
+    fn bounded_boost_cannot_leapfrog_a_clear_winner() {
+        // 1.2x cannot overturn THIS lead. It does not generalize to "the
+        // target loses at most one place": the multiplier bounds the score
+        // ratio a boost can overcome, so against tightly clustered results a
+        // boosted candidate can pass several at once. Measured, the real
+        // nlohmann "ADL-based to_json and from_json" query regresses
+        // 1.000 -> 0.500, where the target's lead is far under the 0.40 here.
+        let mut r = vec![
+            mk("include/nlohmann/adl_serializer.hpp", 1.00),
+            mk("include/nlohmann/to_json.hpp", 0.60),
+        ];
+        apply_stem_match_boost(&mut r, "ADL-based to_json conversion hooks");
+        assert_eq!(r[0].file_path, "include/nlohmann/adl_serializer.hpp");
+    }
+}
+
+#[cfg(test)]
+mod stem_match_token_edge_tests {
+    use super::stem_match_tokens;
+
+    #[test]
+    fn minimum_length_counts_characters_not_bytes() {
+        // `Äbc` is 3 characters but 4 UTF-8 bytes; a byte-length gate would
+        // admit it through the mixed-case rule despite being under the
+        // documented four-character minimum.
+        assert!(stem_match_tokens("Äbc").is_empty());
+        // Four real characters still qualify.
+        assert_eq!(stem_match_tokens("Äbcd"), vec!["äbcd"]);
     }
 }
