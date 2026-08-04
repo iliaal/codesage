@@ -39,7 +39,7 @@
 ; Patterns 10-11: re-export and CommonJS destructuring bindings.
 ; See javascript_refs.scm — the module string alone leaves barrel files and
 ; `const { a } = require(...)` consumers naming no symbol.
-(export_statement (export_clause (export_specifier name: (identifier) @ref)) source: (string))
+(export_statement (export_clause (export_specifier name: (identifier) @ref)))
 (variable_declarator
   name: (object_pattern (shorthand_property_identifier_pattern) @ref)
   value: (call_expression
@@ -56,3 +56,16 @@
     function: (identifier) @_req
     arguments: (arguments (string)))
   (#eq? @_req "require"))
+
+; Patterns 13-14: destructuring a module's exports off a VALUE rather than a
+; `require(...)` call. A barrel does `const { Foo } = axios;` after importing
+; the default export, so the symbols it unwraps are named nowhere else in the
+; file. Restricted to a bare identifier on the right: broadening to arbitrary
+; expressions would bind every `const { data } = resp.body` to any symbol
+; named `data`.
+(variable_declarator
+  name: (object_pattern (shorthand_property_identifier_pattern) @ref)
+  value: (identifier))
+(variable_declarator
+  name: (object_pattern (pair_pattern key: (property_identifier) @ref))
+  value: (identifier))

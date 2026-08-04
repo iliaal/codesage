@@ -194,3 +194,47 @@ fn typescript_reexport_and_commonjs_destructuring_name_their_bindings() {
     assert!(has_ref(&refs, "x", ReferenceKind::ImportBinding));
     assert!(has_ref(&refs, "a", ReferenceKind::ImportBinding));
 }
+
+#[test]
+fn javascript_barrel_destructure_and_local_reexport_name_their_symbols() {
+    // The shape axios' index.js uses: import the default, unwrap named symbols
+    // off it, re-export them. Neither the destructure (RHS is a value, not a
+    // `require` call) nor the sourceless `export { ... }` named those symbols,
+    // so a barrel every consumer imports through contributed no edges.
+    let src = "import axios from './lib/axios.js';\n\
+               const { Axios, CancelToken, formToJSON: toJSON } = axios;\n\
+               export { axios as default, Axios, CancelToken };\n";
+    let refs = refs_from_source(src, Language::JavaScript);
+
+    assert!(
+        has_ref(&refs, "Axios", ReferenceKind::ImportBinding),
+        "{refs:?}"
+    );
+    assert!(has_ref(&refs, "CancelToken", ReferenceKind::ImportBinding));
+    // Aliased destructuring still names the source symbol, not the alias.
+    assert!(has_ref(&refs, "formToJSON", ReferenceKind::ImportBinding));
+    assert!(!has_ref(&refs, "toJSON", ReferenceKind::ImportBinding));
+}
+
+#[test]
+fn javascript_destructuring_a_non_module_value_is_still_captured() {
+    // Deliberate scope note: the pattern cannot tell a module namespace from
+    // any other object, so this DOES bind `data`. Resolution downstream is what
+    // decides whether an edge survives; the risk is measured, not assumed.
+    let src = "const { data } = response;\n";
+    let refs = refs_from_source(src, Language::JavaScript);
+    assert!(has_ref(&refs, "data", ReferenceKind::ImportBinding));
+}
+
+#[test]
+fn typescript_barrel_destructure_and_local_reexport_name_their_symbols() {
+    let src = "import axios from './axios.js';\n\
+               const { Axios, CancelToken } = axios;\n\
+               export { Axios, CancelToken };\n";
+    let refs = refs_from_source(src, Language::TypeScript);
+    assert!(
+        has_ref(&refs, "Axios", ReferenceKind::ImportBinding),
+        "{refs:?}"
+    );
+    assert!(has_ref(&refs, "CancelToken", ReferenceKind::ImportBinding));
+}

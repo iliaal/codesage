@@ -34,11 +34,13 @@
 (import_statement (import_clause (namespace_import (identifier) @ref)))
 
 ; Patterns 10-11: bindings that arrive by a route other than `import`.
-; A re-export names the symbols it forwards, and CommonJS destructuring names
+; `export { x }` names the symbols it forwards, with or without a `from` clause
+; — a barrel that re-exports a locally destructured binding has no source, and
+; that is the only place those names appear. CommonJS destructuring names
 ; what it pulls off the module object; both previously recorded only the module
 ; string, so a barrel file or a `const { a } = require(...)` consumer named no
 ; symbol and vanished from that symbol's dependents.
-(export_statement (export_clause (export_specifier name: (identifier) @ref)) source: (string))
+(export_statement (export_clause (export_specifier name: (identifier) @ref)))
 (variable_declarator
   name: (object_pattern (shorthand_property_identifier_pattern) @ref)
   value: (call_expression
@@ -55,3 +57,16 @@
     function: (identifier) @_req
     arguments: (arguments (string)))
   (#eq? @_req "require"))
+
+; Patterns 13-14: destructuring a module's exports off a VALUE rather than a
+; `require(...)` call. A barrel does `const { Foo } = axios;` after importing
+; the default export, so the symbols it unwraps are named nowhere else in the
+; file. Restricted to a bare identifier on the right: broadening to arbitrary
+; expressions would bind every `const { data } = resp.body` to any symbol
+; named `data`.
+(variable_declarator
+  name: (object_pattern (shorthand_property_identifier_pattern) @ref)
+  value: (identifier))
+(variable_declarator
+  name: (object_pattern (pair_pattern key: (property_identifier) @ref))
+  value: (identifier))
