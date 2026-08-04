@@ -1,6 +1,7 @@
 ## [Unreleased]
 
 ### Added
+- `codesage coverage` reports what a project contains that indexing cannot see: indexable files per language, and files skipped because no supported language matched, per extension. `--json` for machine output, `--top N` to cap the extension list.
 - Schema migration 0014 widens `idx_git_files_churn` to `(churn_score DESC, path)` so the top-churn query keeps a streaming index scan now that it orders by `path` as a tie-break.
 
 ### Changed

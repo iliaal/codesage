@@ -1,4 +1,5 @@
 mod commands;
+mod coverage;
 mod daemon;
 mod doctor;
 #[cfg(target_os = "android")]
@@ -242,6 +243,15 @@ enum Commands {
         /// Preview what would be dropped without making changes
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Report what this project contains that indexing cannot see
+    Coverage {
+        /// Emit machine-readable JSON instead of human-readable output
+        #[arg(long)]
+        json: bool,
+        /// Show at most this many uncovered extensions (0 = all)
+        #[arg(long, default_value_t = 15)]
+        top: usize,
     },
     /// Diagnose CodeSage installation: binary, CUDA, models, DB, hooks, MCP registration
     Doctor {
@@ -936,6 +946,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Install { target, global } => runtime::cmd_install(&target, global),
         Commands::Uninstall { target, global } => runtime::cmd_uninstall(&target, global),
         Commands::Cleanup { dry_run } => index::cmd_cleanup(dry_run),
+        Commands::Coverage { json, top } => coverage::run(json, top),
         Commands::Doctor { json } => doctor::run(json),
         Commands::GitIndex {
             json,

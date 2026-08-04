@@ -4036,14 +4036,48 @@ mod scoped_fts_evidence_tests {
     }
 
     #[test]
-    fn multi_term_or_reflects_multi_concept_queries_not_scope_splitting() {
-        // Where more than one term survives, the terms are distinct
-        // identifiers the query actually asks about, so the OR is correct.
+    fn a_lowercase_namespace_query_yields_only_the_identifier_terms() {
+        // One mechanical case, not a corpus-wide claim: with a lowercase
+        // namespace the surviving terms are the identifiers the query names.
         let q = build_fts_match_query("absl::StrSplit and StrJoin for splitting and joining");
         assert!(q.contains("\"StrSplit\""));
         assert!(q.contains("\"StrJoin\""));
-        assert!(q.contains(" OR "));
-        // and still no namespace component
         assert!(!q.contains("\"absl\""));
+    }
+
+    #[test]
+    fn a_code_shaped_namespace_component_does_survive_and_is_or_joined() {
+        // The limit of the refutation above, and the case where the original
+        // dilution concern is real. `absl`/`fmt`/`std` are filtered because
+        // they are plain lowercase, not because they are namespaces. A
+        // namespace carrying an underscore or a capital is code-shaped and
+        // reaches the disjunction.
+        let q = build_fts_match_query("foo_bar::Thing lookup");
+        assert!(q.contains("\"foo_bar\""), "got {q:?}");
+        assert!(q.contains("\"Thing\""));
+        assert!(
+            q.contains(" OR "),
+            "namespace component is OR-joined: {q:?}"
+        );
+
+        // PHP backslash-qualified names are the clearest instance: every
+        // component is capitalised, so all of them survive.
+        let q = build_fts_match_query("Illuminate\\Routing\\Router dispatch");
+        assert!(q.contains("\"Illuminate\""));
+        assert!(q.contains("\"Routing\""));
+        assert!(q.contains("\"Router\""));
+    }
+
+    #[test]
+    fn the_dotted_pair_route_bypasses_the_code_shape_filter() {
+        // extract_dotted_identifier_tokens runs BEFORE the filter, so a
+        // lowercase dotted pair reaches the disjunction where the same
+        // components behind `::` would not.
+        let q = build_fts_match_query("fix moduleref.create edge case");
+        assert!(q.contains("\"moduleref\""));
+        assert!(
+            q.contains("\"create\""),
+            "dotted route admits lowercase: {q:?}"
+        );
     }
 }

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 use anyhow::Result;
-use codesage_protocol::{FileInfo, Language};
+use codesage_protocol::{CoverageSurvey, FileInfo, Language};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use sha2::{Digest, Sha256};
 
@@ -542,6 +542,148 @@ mod watch_filter_tests {
         assert_eq!(
             project_relative_path(&root, &root.join("src/lib.rs")).as_deref(),
             Some("src/lib.rs")
+        );
+    }
+}
+
+/// Walk `root` and report coverage without reading or hashing file contents.
+///
+/// Deliberately a second walk rather than instrumentation inside
+/// `discover_files_with_excludes`: that function is the indexing hot path and
+/// runs on every incremental pass, while this answers a question asked rarely.
+/// It mirrors the same ignore rules (hidden, gitignore, exclude patterns) so
+/// its denominator matches what indexing would actually consider.
+pub fn survey_coverage(root: &Path, exclude_patterns: &[String]) -> Result<CoverageSurvey> {
+    let excludes = if exclude_patterns.is_empty() {
+        None
+    } else {
+        Some(build_exclude_set(exclude_patterns)?)
+    };
+
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder.hidden(true).git_ignore(true);
+    let walker = builder.build();
+
+    let mut survey = CoverageSurvey::default();
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            // A traversal error on one path must not abort the survey; a
+            // partial answer beats none for a diagnostic.
+            Err(_) => continue,
+        };
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        let Some(rel_path) = project_relative_path(root, path) else {
+            continue;
+        };
+        if let Some(ref exc) = excludes
+            && exclude_matches_path(exc, &rel_path, false)
+        {
+            survey.excluded += 1;
+            continue;
+        }
+        match detect_language_with_dialect(path, false) {
+            Some(language) => {
+                *survey
+                    .covered_by_language
+                    .entry(language.to_string())
+                    .or_default() += 1;
+                survey.covered_total += 1;
+            }
+            None => {
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| format!(".{e}"))
+                    .unwrap_or_else(|| "<none>".to_string());
+                *survey.uncovered_by_extension.entry(ext).or_default() += 1;
+                survey.uncovered_total += 1;
+            }
+        }
+    }
+    Ok(survey)
+}
+
+#[cfg(test)]
+mod coverage_survey_tests {
+    use super::survey_coverage;
+    use std::fs;
+
+    fn write(dir: &std::path::Path, rel: &str, body: &str) {
+        let p = dir.join(rel);
+        if let Some(parent) = p.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(p, body).unwrap();
+    }
+
+    #[test]
+    fn counts_what_indexing_would_and_would_not_see() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(r, "src/main.rs", "fn main() {}");
+        write(r, "src/lib.rs", "pub fn a() {}");
+        write(r, "app/User.php", "<?php class User {}");
+        // Unsupported languages: the gap nothing currently reports.
+        write(r, "lib/thing.rb", "class Thing; end");
+        write(r, "lib/other.rb", "class Other; end");
+        write(r, "App.swift", "struct App {}");
+        // Extensionless script: CodeSage keys language off extension, so a
+        // hashbang'd CLI tool is invisible to it.
+        write(r, "bin/deploy", "#!/usr/bin/env bash\necho hi");
+
+        let s = survey_coverage(r, &[]).unwrap();
+
+        assert_eq!(s.covered_total, 3, "rust x2 + php x1");
+        assert_eq!(s.covered_by_language.get("rust"), Some(&2));
+        assert_eq!(s.covered_by_language.get("php"), Some(&1));
+
+        assert_eq!(s.uncovered_total, 4, "2 ruby + 1 swift + 1 extensionless");
+        assert_eq!(s.uncovered_by_extension.get(".rb"), Some(&2));
+        assert_eq!(s.uncovered_by_extension.get(".swift"), Some(&1));
+        assert_eq!(
+            s.uncovered_by_extension.get("<none>"),
+            Some(&1),
+            "extensionless files must be reported, not silently dropped"
+        );
+    }
+
+    #[test]
+    fn excluded_files_are_counted_separately_from_uncovered() {
+        // An exclude is a deliberate choice; an unparseable extension is a
+        // capability gap. Folding them together would hide the gap behind
+        // the operator's own configuration.
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(r, "src/main.rs", "fn main() {}");
+        write(r, "vendor/dep.rs", "fn dep() {}");
+        write(r, "notes.rb", "puts 1");
+
+        let s = survey_coverage(r, &["**/vendor/**".to_string()]).unwrap();
+
+        assert_eq!(s.excluded, 1);
+        assert_eq!(s.covered_total, 1, "vendor/dep.rs excluded, not covered");
+        assert_eq!(s.uncovered_total, 1, "notes.rb");
+    }
+
+    #[test]
+    fn covered_fraction_reports_the_gap_and_survives_an_empty_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(r, "a.rs", "fn a() {}");
+        write(r, "b.rb", "puts 1");
+        let s = survey_coverage(r, &[]).unwrap();
+        assert!((s.covered_fraction() - 0.5).abs() < 1e-9);
+
+        let empty = tempfile::tempdir().unwrap();
+        let s = survey_coverage(empty.path(), &[]).unwrap();
+        assert_eq!(
+            s.covered_fraction(),
+            1.0,
+            "empty repo must not divide by zero"
         );
     }
 }

@@ -323,6 +323,39 @@ pub struct DependencyEntry {
     pub imported_by: Vec<String>,
 }
 
+/// What a repository contains that indexing will not see.
+///
+/// Answers "what didn't I index", which neither `IndexStats` counter does:
+/// `files_skipped` counts files unchanged since the last pass (freshness, not
+/// coverage), and `files_failed` counts parse errors on files that were at
+/// least recognized. Files whose extension maps to no supported language are
+/// dropped at discovery and never reach either counter, so the largest
+/// coverage gap is the one nothing reports.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CoverageSurvey {
+    /// Files that WOULD be indexed, per language.
+    pub covered_by_language: std::collections::BTreeMap<String, usize>,
+    /// Files skipped because no supported language matched, per extension.
+    /// Extensionless files are keyed as `<none>`.
+    pub uncovered_by_extension: std::collections::BTreeMap<String, usize>,
+    /// Files matching a configured exclude pattern. Deliberate, not a gap.
+    pub excluded: usize,
+    pub covered_total: usize,
+    pub uncovered_total: usize,
+}
+
+impl CoverageSurvey {
+    /// Share of walked, non-excluded files that indexing can see, 0.0..=1.0.
+    /// Returns 1.0 for an empty repo rather than dividing by zero.
+    pub fn covered_fraction(&self) -> f64 {
+        let total = self.covered_total + self.uncovered_total;
+        if total == 0 {
+            return 1.0;
+        }
+        self.covered_total as f64 / total as f64
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct IndexStats {
     pub files_indexed: usize,
