@@ -172,6 +172,21 @@ fn javascript_reexport_and_commonjs_destructuring_name_their_bindings() {
 }
 
 #[test]
+fn javascript_aliased_commonjs_destructuring_names_the_source_symbol() {
+    // `{ a: localA }` is a pair_pattern, not the shorthand form, so it needs
+    // its own pattern. The KEY is the exported symbol a dependents query asks
+    // about; the local alias is not.
+    let src = "const { a: localA, b } = require('./m.js');\nlocalA();\n";
+    let refs = refs_from_source(src, Language::JavaScript);
+    assert!(
+        has_ref(&refs, "a", ReferenceKind::ImportBinding),
+        "{refs:?}"
+    );
+    assert!(has_ref(&refs, "b", ReferenceKind::ImportBinding));
+    assert!(!has_ref(&refs, "localA", ReferenceKind::ImportBinding));
+}
+
+#[test]
 fn typescript_reexport_and_commonjs_destructuring_name_their_bindings() {
     let src = "export { x } from './m.js';\n\
                const { a } = require('./n.js');\n";

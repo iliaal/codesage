@@ -46,3 +46,13 @@
     function: (identifier) @_req
     arguments: (arguments (string)))
   (#eq? @_req "require"))
+
+; Pattern 12: aliased CommonJS destructuring, `const { a: localA } = require(...)`.
+; The shorthand form above is a `shorthand_property_identifier_pattern`; an
+; alias is a `pair_pattern`, whose KEY names the exported symbol.
+(variable_declarator
+  name: (object_pattern (pair_pattern key: (property_identifier) @ref))
+  value: (call_expression
+    function: (identifier) @_req
+    arguments: (arguments (string)))
+  (#eq? @_req "require"))

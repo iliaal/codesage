@@ -104,9 +104,19 @@ impl CodeSageServer {
         // indexed" about a project indexed with `--no-semantic`, where none of
         // them were searched — recreating the false confidence this exists to
         // prevent.
+        // Scoped to the ACTIVE model: `semantic_files` retains rows for every
+        // model that ever indexed this project, so an unscoped count would
+        // report a previous model's files for a search running against a newly
+        // configured model's empty table — the same false confidence again.
         let semantic_files = if kind == "search" {
-            self.with_project_db(project, |db| db.semantic_file_count())
-                .ok()
+            self.resolve_project(project).ok().and_then(|st| {
+                let model = st.embedding_config.model.clone();
+                if model.is_empty() {
+                    return None;
+                }
+                self.with_project_db(project, |db| db.semantic_file_count_for_model(&model))
+                    .ok()
+            })
         } else {
             None
         };

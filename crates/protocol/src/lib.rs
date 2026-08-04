@@ -1329,7 +1329,6 @@ pub struct ImpactSummary {
     pub by_category: Vec<CategoryCount>,
 }
 
-/// Adaptive `impact_analysis` output. `results` is the existing reverse-impact
 /// One symbol on a call chain, with the line in the *previous* step's body
 /// where it is invoked. `call_line` is None on the first step, which is the
 /// origin and is not called by anything in the path.
@@ -1374,6 +1373,7 @@ fn default_call_path_depth() -> usize {
     6
 }
 
+/// Adaptive `impact_analysis` output. `results` is the existing reverse-impact
 /// list (so callers reading `.results` keep working); the other fields populate
 /// only when the matching [`ImpactOptions`] flag is set.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]

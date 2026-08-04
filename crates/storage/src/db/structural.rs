@@ -931,7 +931,12 @@ impl Database {
         // stores the module (whose `to_name_tail` is `Foo`) and the binding
         // `Foo` — and counting both scored a single statement twice in the
         // top-symbol ranking. The two rows share a (file, line), so keying on
-        // that collapses them while leaving genuinely separate uses intact.
+        // that collapses them. Known cost: two real calls on ONE line
+        // (`Foo(); Foo();`, or minified source) collapse too, because `col` is
+        // deliberately left out — including it would separate the module from
+        // its binding again, since they sit at different columns of the same
+        // statement. Under-counting compact source beats double-counting every
+        // extensionless import.
         let sql = format!(
             "SELECT name, COUNT(*) AS c FROM (
                 SELECT DISTINCT name, from_file_id, line FROM (

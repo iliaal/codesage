@@ -897,3 +897,92 @@ fn call_path_depth_bound_is_inclusive_and_cycles_terminate() {
     assert_eq!(cyclic.steps.first().unwrap().name, "ay");
     assert_eq!(cyclic.steps.last().unwrap().name, "bee");
 }
+
+#[test]
+fn call_path_refuses_edges_that_are_not_calls() {
+    use codesage_protocol::CallPathRequest;
+
+    // A type annotation is not control reaching the callee. Reporting it as a
+    // call chain would answer "does request input reach this sink" with a
+    // confident yes on the strength of a parameter type.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("Dangerous.php"),
+        b"<?php\nnamespace App;\nclass Dangerous {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("Handler.php"),
+        b"<?php\nnamespace App;\nuse App\\Dangerous;\nfunction handle(Dangerous $value) {}\n",
+    )
+    .unwrap();
+
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+
+    let report = codesage_graph::trace_call_path(
+        &db,
+        &CallPathRequest {
+            from: "handle".to_string(),
+            to: "Dangerous".to_string(),
+            max_depth: 3,
+        },
+    )
+    .unwrap();
+    assert!(
+        !report.found,
+        "a type hint must not read as a call chain, got {:?}",
+        report.steps.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn call_path_does_not_credit_an_outer_symbol_with_a_nested_symbols_calls() {
+    use codesage_protocol::CallPathRequest;
+
+    // `outer`'s line range spans `inner`, so a range query alone attributes
+    // `inner`'s call to `outer` and invents the edge `outer -> sink`.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("sink.rs"), b"pub fn sink() {}\n").unwrap();
+    std::fs::write(
+        root.join("nest.rs"),
+        b"use crate::sink::sink;\npub fn outer() {\n    fn inner() { sink(); }\n}\n",
+    )
+    .unwrap();
+
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+
+    let report = codesage_graph::trace_call_path(
+        &db,
+        &CallPathRequest {
+            from: "outer".to_string(),
+            to: "sink".to_string(),
+            max_depth: 1,
+        },
+    )
+    .unwrap();
+    assert!(
+        !report.found,
+        "outer does not call sink; inner does. got {:?}",
+        report.steps.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+
+    // The real caller still resolves.
+    let real = codesage_graph::trace_call_path(
+        &db,
+        &CallPathRequest {
+            from: "inner".to_string(),
+            to: "sink".to_string(),
+            max_depth: 1,
+        },
+    )
+    .unwrap();
+    assert!(
+        real.found,
+        "inner -> sink must still resolve: {:?}",
+        real.note
+    );
+}

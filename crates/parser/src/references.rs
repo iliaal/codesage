@@ -239,7 +239,7 @@ fn js_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
         4 => Some(ReferenceKind::Import),             // re-export (export ... from "src")
         5 => Some(ReferenceKind::Inheritance),        // class Foo extends Bar (JS heritage)
         6 => Some(ReferenceKind::Instantiation),      // new Foo()
-        7..=11 => Some(ReferenceKind::ImportBinding), // import / re-export bindings
+        7..=12 => Some(ReferenceKind::ImportBinding), // import / re-export bindings
         _ => None,
     }
 }
@@ -257,7 +257,7 @@ fn ts_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
         4 => Some(ReferenceKind::Import),             // re-export (export ... from "src")
         5 => Some(ReferenceKind::Instantiation),      // new Foo()
         6 => Some(ReferenceKind::Inheritance),        // class Foo extends Bar (TS extends_clause)
-        7..=11 => Some(ReferenceKind::ImportBinding), // import / re-export bindings
+        7..=12 => Some(ReferenceKind::ImportBinding), // import / re-export bindings
         _ => None,
     }
 }

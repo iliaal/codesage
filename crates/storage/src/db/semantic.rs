@@ -397,6 +397,23 @@ impl Database {
         Ok(n as usize)
     }
 
+    /// Files with semantic chunks under `model`'s tables only.
+    ///
+    /// [`Self::semantic_file_count`] spans every model that ever indexed this
+    /// project, which overstates what a search can actually reach: after a
+    /// model switch the old model's rows remain until `codesage cleanup`, so
+    /// the unscoped count would report the previous model's 10,000 files for a
+    /// search running against a new model's empty table.
+    pub fn semantic_file_count_for_model(&self, model: &str) -> Result<usize> {
+        let prefix = crate::schema::model_table_prefix(model);
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT path) FROM semantic_files WHERE chunk_table LIKE ?1 || '%'",
+            [&prefix],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
     pub fn all_semantic_file_hashes(&self) -> Result<std::collections::HashMap<String, String>> {
         if self.chunk_table.is_empty() {
             return Ok(std::collections::HashMap::new());

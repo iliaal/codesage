@@ -10,16 +10,42 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::Result;
-use codesage_protocol::{CallPathReport, CallPathRequest, CallPathStep, Symbol};
+use codesage_protocol::{CallPathReport, CallPathRequest, CallPathStep, ReferenceKind, Symbol};
 use codesage_storage::Database;
 
-use crate::bundle::{is_callee_reference, resolve_callee_definitions};
+use crate::bundle::resolve_callee_definitions;
+
+/// Edges that represent control actually reaching the callee.
+///
+/// Deliberately narrower than `bundle::is_callee_reference`, which also accepts
+/// `TypeHint`, `Import`, `ImportBinding`, `Include`, `Inheritance` and
+/// `TraitUse`. Those are fine for "what code is related to this" but wrong
+/// here: with them, `function handle(Dangerous $value) {}` reports a one-hop
+/// call chain from `handle` to `Dangerous` on the strength of a type
+/// annotation. This tool is read for "how does request input reach this exec
+/// call", so a fabricated edge is not a cosmetic error — it is a false answer
+/// to a security question.
+///
+/// `RouteHandler` stays because it is a real dispatch edge: the framework
+/// invokes the handler, and a trace from a route to a sink is the main thing
+/// this tool is for.
+fn is_call_edge(kind: ReferenceKind) -> bool {
+    matches!(
+        kind,
+        ReferenceKind::Call | ReferenceKind::Instantiation | ReferenceKind::RouteHandler
+    )
+}
 
 /// Symbols expanded before the search gives up. A hub function reached early
 /// can otherwise fan out across most of a large index; the cap keeps a miss
 /// bounded in time, and `bounded` in the report tells the caller the answer is
 /// "stopped looking", not "no path".
 const MAX_VISITED: usize = 4000;
+
+/// Call sites resolved per expanded symbol. Resolution runs a query per
+/// reference, so without this a hub symbol turns one expansion into thousands
+/// of queries and `MAX_VISITED` never gets a chance to stop it.
+const MAX_REFS_PER_SYMBOL: usize = 200;
 
 /// A definition's identity. `Symbol` carries no id, so key on the triple that
 /// locates one — matching `impact.rs`'s `symbol_identity_key`.
@@ -122,9 +148,35 @@ fn callees_of(db: &Database, sym: &Symbol) -> Result<Vec<(Symbol, u32)>> {
     let refs = db.references_in_file_range(&sym.file_path, sym.line_start, sym.line_end)?;
     let mut out = Vec::new();
     let mut seen: HashSet<SymbolKey> = HashSet::new();
+    let mut examined = 0usize;
     for r in refs {
-        if !is_callee_reference(r.kind) {
+        if !is_call_edge(r.kind) {
             continue;
+        }
+        // A line range covers nested definitions too, so a call made by an
+        // inner function would otherwise be attributed to the outer one:
+        // `fn outer() { fn inner() { sink(); } }` reported `outer -> sink`.
+        // Indexing records the INNERMOST enclosing symbol, so compare against
+        // it. A row with no owner (file scope, or a language whose extractor
+        // does not set it) is kept rather than guessed away.
+        if let Some(owner) = &r.from_symbol
+            && owner != &sym.qualified_name
+        {
+            continue;
+        }
+        // Bound the work per symbol. `MAX_VISITED` caps how many symbols are
+        // expanded but not how many references each expansion resolves, and
+        // resolution issues queries per reference — a hub symbol with hundreds
+        // of call sites otherwise multiplies out into millions of queries
+        // before the outer cap is consulted again.
+        examined += 1;
+        if examined > MAX_REFS_PER_SYMBOL {
+            tracing::debug!(
+                symbol = %sym.qualified_name,
+                cap = MAX_REFS_PER_SYMBOL,
+                "call-path fan-out capped"
+            );
+            break;
         }
         for def in resolve_callee_definitions(db, &sym.file_path, &r.to_name)? {
             // A symbol whose body spans the call site is its own container,

@@ -3,7 +3,7 @@
 ### Added
 - `codesage coverage` reports what a project contains that indexing cannot see: indexable files per language, and files skipped because no supported language matched, per extension. `--json` for machine output, `--top N` to cap the extension list.
 - Schema migration 0014 widens `idx_git_files_churn` to `(churn_score DESC, path)` so the top-churn query keeps a streaming index scan now that it orders by `path` as a tie-break.
-- `trace_call_path` MCP tool and `codesage trace <from> <to>` CLI: shortest call chain between two symbols, with the call site of each hop. `--max-depth` bounds the search; an unfound result reports whether it stopped at that bound.
+- `trace_call_path` MCP tool and `codesage trace <from> <to>` CLI: shortest call chain between two symbols, with the call site of each hop. Walks call, instantiation and route-handler edges only — a type hint or an import is not a call. `--max-depth` bounds the search (capped at 6 over MCP); an unfound result reports whether it stopped at that bound.
 - `search` and `find_symbol` annotate an empty result with `_meta.coverage`: the indexed file count and the per-language breakdown, plus a note that an empty result means no match within the indexed set rather than proof the code is absent. A language missing from the breakdown was never indexed.
 - `find_references` rows can carry kind `import_binding`: the symbol an import introduces (`Foo`), recorded alongside the existing `import` row naming the module (`./foo.js`). Existing projects need `codesage index --full` to pick up the new rows; an incremental pass skips unchanged files.
 

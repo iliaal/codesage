@@ -121,7 +121,6 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Analyze change impact for a symbol or file
     /// Shortest call chain from one symbol to another
     Trace {
         /// Origin symbol
@@ -135,6 +134,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Analyze change impact for a symbol or file
     Impact {
         /// Symbol name or file path (auto-detected)
         target: String,

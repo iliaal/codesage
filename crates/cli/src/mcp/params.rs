@@ -194,7 +194,9 @@ pub struct TracePathParams {
     pub from: String,
     #[schemars(description = "Target symbol the chain should reach")]
     pub to: String,
-    #[schemars(description = "Maximum hops to search before giving up (default 6)")]
+    #[schemars(
+        description = "Maximum hops to search before giving up (default 6, and 6 is also the ceiling over MCP — a larger value is silently capped, so `bounded: true` at 6 cannot be retried deeper from here; use the `codesage trace` CLI for a longer search)"
+    )]
     #[serde(default, deserialize_with = "deser_optional_usize")]
     pub max_depth: Option<usize>,
 }
