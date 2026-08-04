@@ -340,6 +340,16 @@ pub struct CoverageSurvey {
     pub uncovered_by_extension: std::collections::BTreeMap<String, usize>,
     /// Files matching a configured exclude pattern. Deliberate, not a gap.
     pub excluded: usize,
+    /// Recognized language, but over the indexer's size cap.
+    pub oversized: usize,
+    /// Recognized language, but the indexer could not open the file.
+    pub unreadable: usize,
+    /// Files in a supported language that gitignore hides from indexing.
+    /// Usually intentional; the most common answer to "why isn't this indexed".
+    pub gitignored_source: usize,
+    /// Directories the walk could not traverse. Non-zero means the numbers
+    /// below describe an incomplete tree.
+    pub walk_errors: usize,
     pub covered_total: usize,
     pub uncovered_total: usize,
 }

@@ -21,7 +21,20 @@ pub fn run(json: bool, top: usize) -> Result<()> {
     let survey = survey_coverage(&root, &excludes)?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&survey)?);
+        // --top caps the extension list in JSON too; it silently applied only
+        // to the human output before, so `--json --top 1` returned everything.
+        let mut out = survey.clone();
+        if top > 0 && out.uncovered_by_extension.len() > top {
+            let mut kept: Vec<(String, usize)> = out
+                .uncovered_by_extension
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect();
+            kept.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            kept.truncate(top);
+            out.uncovered_by_extension = kept.into_iter().collect();
+        }
+        println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
 
@@ -32,10 +45,31 @@ pub fn run(json: bool, top: usize) -> Result<()> {
         survey.covered_total + survey.uncovered_total,
         pct
     );
-    println!("Excluded by config: {}", survey.excluded);
+    println!("Excluded by config:  {}", survey.excluded);
+    if survey.gitignored_source > 0 {
+        println!(
+            "Gitignored source:  {} (usually intentional)",
+            survey.gitignored_source
+        );
+    }
+    if survey.oversized > 0 {
+        println!(
+            "Over the size cap:  {} (recognized language, too large to index)",
+            survey.oversized
+        );
+    }
+    if survey.unreadable > 0 {
+        println!("Unreadable:         {}", survey.unreadable);
+    }
+    if survey.walk_errors > 0 {
+        println!(
+            "\nWARNING: {} directories could not be traversed. The numbers above\ndescribe an incomplete tree.",
+            survey.walk_errors
+        );
+    }
 
     if !survey.covered_by_language.is_empty() {
-        println!("\nIndexed, by language:");
+        println!("\nIndexable, by language:");
         let mut langs: Vec<_> = survey.covered_by_language.iter().collect();
         langs.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
         for (lang, n) in langs {

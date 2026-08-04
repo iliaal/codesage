@@ -546,6 +546,34 @@ mod watch_filter_tests {
     }
 }
 
+/// True when a path, or any directory above it, matches an exclude glob.
+///
+/// Mirrors the outcome of the indexer's `filter_entry` pruning without
+/// pruning: a glob naming a directory removes everything beneath it.
+fn path_or_ancestor_excluded(excludes: &GlobSet, rel_path: &str) -> bool {
+    if exclude_matches_path(excludes, rel_path, false) {
+        return true;
+    }
+    let mut prefix = String::new();
+    for segment in rel_path
+        .split('/')
+        .rev()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(segment);
+        if exclude_matches_path(excludes, &prefix, true) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Walk `root` and report coverage without reading or hashing file contents.
 ///
 /// Deliberately a second walk rather than instrumentation inside
@@ -554,23 +582,42 @@ mod watch_filter_tests {
 /// It mirrors the same ignore rules (hidden, gitignore, exclude patterns) so
 /// its denominator matches what indexing would actually consider.
 pub fn survey_coverage(root: &Path, exclude_patterns: &[String]) -> Result<CoverageSurvey> {
+    use std::collections::HashSet;
+
     let excludes = if exclude_patterns.is_empty() {
         None
     } else {
         Some(build_exclude_set(exclude_patterns)?)
     };
 
-    let mut builder = ignore::WalkBuilder::new(root);
-    builder.hidden(true).git_ignore(true);
-    let walker = builder.build();
+    // Indexing PRUNES excluded directories, which is why a directory-shaped
+    // glob like `vendor` keeps `vendor/dep.rs` out of the index even though
+    // that file does not match the glob itself. The survey cannot prune and
+    // still report how many files an exclude removed, so it descends and
+    // classifies by ancestor instead: same verdict per file, plus a count.
+    // Affordable because this walk is rare and explicitly invoked.
+    let make_walker = |honor_gitignore: bool| {
+        let mut builder = ignore::WalkBuilder::new(root);
+        builder.hidden(true).git_ignore(honor_gitignore);
+        builder.build()
+    };
 
     let mut survey = CoverageSurvey::default();
-    for entry in walker {
+    // Every path the indexing-equivalent pass accounted for, in any bucket.
+    // The gitignore pass reports only what is missing from this set.
+    let mut accounted: HashSet<String> = HashSet::new();
+    let mut c_headers = 0usize;
+
+    for entry in make_walker(true) {
         let entry = match entry {
             Ok(e) => e,
-            // A traversal error on one path must not abort the survey; a
-            // partial answer beats none for a diagnostic.
-            Err(_) => continue,
+            Err(_) => {
+                // Indexing aborts on a traversal error. A diagnostic should
+                // still answer, but it must report the answer as partial
+                // rather than presenting an incomplete tree as complete.
+                survey.walk_errors += 1;
+                continue;
+            }
         };
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
@@ -579,31 +626,95 @@ pub fn survey_coverage(root: &Path, exclude_patterns: &[String]) -> Result<Cover
         let Some(rel_path) = project_relative_path(root, path) else {
             continue;
         };
+        accounted.insert(rel_path.clone());
+
         if let Some(ref exc) = excludes
-            && exclude_matches_path(exc, &rel_path, false)
+            && path_or_ancestor_excluded(exc, &rel_path)
         {
             survey.excluded += 1;
             continue;
         }
-        match detect_language_with_dialect(path, false) {
-            Some(language) => {
-                *survey
-                    .covered_by_language
-                    .entry(language.to_string())
-                    .or_default() += 1;
-                survey.covered_total += 1;
-            }
-            None => {
-                let ext = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| format!(".{e}"))
-                    .unwrap_or_else(|| "<none>".to_string());
-                *survey.uncovered_by_extension.entry(ext).or_default() += 1;
-                survey.uncovered_total += 1;
-            }
+
+        let Some(language) = detect_language_with_dialect(path, false) else {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| format!(".{e}"))
+                .unwrap_or_else(|| "<none>".to_string());
+            *survey.uncovered_by_extension.entry(ext).or_default() += 1;
+            survey.uncovered_total += 1;
+            continue;
+        };
+
+        // Recognizing the extension is not enough. Indexing drops files over
+        // MAX_INDEXABLE_FILE_BYTES and files it cannot read, so counting a
+        // 20MB .py as covered would overstate coverage in the one direction
+        // that misleads.
+        if let Ok(meta) = entry.metadata()
+            && meta.len() > MAX_INDEXABLE_FILE_BYTES
+        {
+            survey.oversized += 1;
+            continue;
+        }
+        if std::fs::File::open(path).is_err() {
+            survey.unreadable += 1;
+            continue;
+        }
+
+        if rel_path.ends_with(".h") {
+            c_headers += 1;
+        }
+        *survey
+            .covered_by_language
+            .entry(language.to_string())
+            .or_default() += 1;
+        survey.covered_total += 1;
+    }
+
+    // A gitignored source file is the most likely answer to "why didn't you
+    // index this", and a walk configured the way indexing configures it cannot
+    // see one. Second pass with gitignore off, reporting only the difference.
+    for entry in make_walker(false).flatten() {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+        let Some(rel_path) = project_relative_path(root, entry.path()) else {
+            continue;
+        };
+        if accounted.contains(&rel_path) {
+            continue;
+        }
+        // A file that is both gitignored AND config-excluded is not a
+        // surprise worth reporting -- build output under `target/` is the
+        // common case, and counting it drowns the signal this bucket exists
+        // for: a source file someone forgot they had ignored.
+        if let Some(ref exc) = excludes
+            && path_or_ancestor_excluded(exc, &rel_path)
+        {
+            continue;
+        }
+        // Only report ignored files indexing could otherwise have handled;
+        // an ignored .png is noise.
+        if detect_language_with_dialect(entry.path(), false).is_some() {
+            survey.gitignored_source += 1;
         }
     }
+
+    // `.h` defaults to C and flips to C++ project-wide when an unambiguous C++
+    // extension is present, exactly as discovery does. Without this the survey
+    // reports every header as C in a C++ project.
+    let cpp_key = Language::Cpp.to_string();
+    let c_key = Language::C.to_string();
+    if c_headers > 0 && survey.covered_by_language.contains_key(&cpp_key) {
+        if let Some(c_total) = survey.covered_by_language.get_mut(&c_key) {
+            *c_total = c_total.saturating_sub(c_headers);
+            if *c_total == 0 {
+                survey.covered_by_language.remove(&c_key);
+            }
+        }
+        *survey.covered_by_language.entry(cpp_key).or_default() += c_headers;
+    }
+
     Ok(survey)
 }
 
@@ -649,6 +760,106 @@ mod coverage_survey_tests {
             Some(&1),
             "extensionless files must be reported, not silently dropped"
         );
+    }
+
+    #[test]
+    fn a_recognized_file_over_the_size_cap_is_not_counted_as_covered() {
+        // Indexing drops files over MAX_INDEXABLE_FILE_BYTES, so counting one
+        // as covered overstates coverage in the direction that misleads.
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(r, "small.rs", "fn a() {}");
+        let big = "x".repeat((super::MAX_INDEXABLE_FILE_BYTES + 1) as usize);
+        write(r, "huge.py", &big);
+
+        let s = survey_coverage(r, &[]).unwrap();
+        assert_eq!(s.covered_total, 1, "only small.rs is indexable");
+        assert_eq!(
+            s.oversized, 1,
+            "huge.py must be reported, not counted covered"
+        );
+        assert_eq!(s.covered_by_language.get("python"), None);
+    }
+
+    #[test]
+    fn a_directory_shaped_exclude_prunes_its_files() {
+        // The indexer prunes excluded DIRECTORIES via filter_entry. Testing
+        // only completed file paths would leave vendor/dep.rs counted as
+        // covered, because that file does not match a bare `vendor` glob.
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(r, "src/main.rs", "fn main() {}");
+        write(r, "vendor/dep.rs", "fn dep() {}");
+        write(r, "vendor/nested/deep.rs", "fn deep() {}");
+
+        let s = survey_coverage(r, &["vendor".to_string()]).unwrap();
+        assert_eq!(
+            s.covered_total, 1,
+            "a directory-shaped exclude must prune its whole subtree"
+        );
+    }
+
+    #[test]
+    fn gitignored_source_is_reported_rather_than_vanishing() {
+        // A gitignored source file is invisible to a walk configured the way
+        // indexing configures it, so without a second pass it appears in no
+        // bucket at all -- and it is the likeliest answer to "why isn't this
+        // indexed".
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        // The ignore crate only applies .gitignore inside a git repository.
+        fs::create_dir_all(r.join(".git")).unwrap();
+        write(r, ".gitignore", "generated/\n*.png\n");
+        write(r, "src/main.rs", "fn main() {}");
+        write(r, "generated/api.rs", "pub fn generated() {}");
+        write(r, "logo.png", "not really a png");
+
+        let s = survey_coverage(r, &[]).unwrap();
+        assert_eq!(s.covered_total, 1, "only src/main.rs reaches indexing");
+        assert_eq!(
+            s.gitignored_source, 1,
+            "the gitignored .rs must be reported; the .png must not"
+        );
+    }
+
+    #[test]
+    fn gitignored_and_excluded_is_not_reported_as_a_surprise() {
+        // Build output is both gitignored and config-excluded. Counting it
+        // drowns the signal this bucket exists for: on this repo it was 32
+        // generated files under target/ against 4 real ones.
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        fs::create_dir_all(r.join(".git")).unwrap();
+        write(r, ".gitignore", "target/\nscratch/\n");
+        write(r, "src/main.rs", "fn main() {}");
+        write(r, "target/debug/build/generated.rs", "pub fn gen() {}");
+        write(r, "scratch/idea.rs", "fn idea() {}");
+
+        let s = survey_coverage(r, &["**/target/**".to_string()]).unwrap();
+        assert_eq!(
+            s.gitignored_source, 1,
+            "scratch/idea.rs is a real surprise; target/ build output is not"
+        );
+    }
+
+    #[test]
+    fn headers_follow_the_project_wide_cpp_flip() {
+        // discover_files_with_excludes flips `.h` to C++ when the project
+        // carries an unambiguous C++ extension. A survey that skipped the flip
+        // would report every header as C in a C++ project.
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(r, "src/app.cc", "int main() {}");
+        write(r, "src/app.h", "#pragma once");
+
+        let s = survey_coverage(r, &[]).unwrap();
+        assert_eq!(
+            s.covered_by_language.get("cpp"),
+            Some(&2),
+            "{:?}",
+            s.covered_by_language
+        );
+        assert_eq!(s.covered_by_language.get("c"), None);
     }
 
     #[test]
