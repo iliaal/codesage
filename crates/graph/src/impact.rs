@@ -337,12 +337,22 @@ fn build_impact_summary(entries: &[ImpactEntry]) -> ImpactSummary {
 }
 
 pub(crate) fn references_for_symbol(db: &Database, sym: &Symbol) -> Result<Vec<Reference>> {
-    let key = if sym.qualified_name != sym.name {
-        &sym.qualified_name
-    } else {
-        &sym.name
-    };
-    let raw = db.find_references(key, None)?;
+    // Look up by the SHORT name, never the qualified one. `find_references`
+    // treats a qualified key as an exact `to_name` match, but a reference is
+    // recorded under whatever spelling the source used: a PHP subclass in the
+    // same namespace writes `extends Foo` with no `use`, so its row says `Foo`,
+    // not `App\Foo`. Keying on the qualified name therefore matched only the
+    // rows that happen to spell it out — in monolog, `Logger` kept the 15
+    // `use Monolog\Logger` rows and dropped the 87 call/instantiation rows,
+    // and `AbstractProcessingHandler` (30 subclasses, never imported because
+    // they share its namespace) resolved to zero dependents.
+    //
+    // The short name goes through the `to_name_tail` branch, which matches both
+    // spellings. Precision is not lost: the import-aware resolution below is
+    // exactly the mechanism that narrows a broad tail match back down, and it
+    // already had to handle this for symbols whose qualified name equals their
+    // short name.
+    let raw = db.find_references(&sym.name, None)?;
 
     // Import-aware reverse resolution. `find_references` matches by
     // `to_name_tail`, so an unqualified name fans out to *every* same-named

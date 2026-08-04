@@ -595,3 +595,90 @@ fn export_context_unknown_symbol_returns_empty_bundle() {
     assert!(bundle.symbol_definitions.is_empty());
     assert!(bundle.target_description.contains("not found"));
 }
+
+/// A same-namespace subclass writes `extends Base` with no `use` statement, so
+/// the reference row records the short name. Keying the reverse lookup on the
+/// symbol's qualified name matched `to_name` exactly and found none of them,
+/// so a widely-inherited base class reported zero dependents.
+#[test]
+fn same_namespace_inheritance_is_not_lost_to_the_qualified_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("BaseHandler.php"),
+        b"<?php\nnamespace App\\Handler;\nabstract class BaseHandler {\n  abstract public function handle();\n}\n",
+    )
+    .unwrap();
+    // Same namespace as the base, so PHP needs no `use` and the ref is short.
+    for (file, cls) in [
+        ("AlphaHandler.php", "AlphaHandler"),
+        ("BetaHandler.php", "BetaHandler"),
+    ] {
+        std::fs::write(
+            root.join(file),
+            format!(
+                "<?php\nnamespace App\\Handler;\nclass {cls} extends BaseHandler {{\n  public function handle() {{ return 1; }}\n}}\n"
+            ),
+        )
+        .unwrap();
+    }
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+
+    let entries = impact_analysis(
+        &db,
+        &ImpactRequest {
+            target: ImpactTarget::Symbol {
+                name: "BaseHandler".to_string(),
+            },
+            depth: 1,
+            source_only: false,
+        },
+    )
+    .unwrap();
+
+    let files: std::collections::HashSet<&str> =
+        entries.iter().map(|e| e.file_path.as_str()).collect();
+    assert!(
+        files.contains("AlphaHandler.php") && files.contains("BetaHandler.php"),
+        "both same-namespace subclasses must appear as dependents, got {files:?}"
+    );
+}
+
+/// A trait used by a class in its own namespace has the same shape as the
+/// inheritance case: `use SomeTrait;` inside the class body records the short
+/// name, and the qualified lookup missed it.
+#[test]
+fn same_namespace_trait_use_is_not_lost_to_the_qualified_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("LoggingTrait.php"),
+        b"<?php\nnamespace App\\Support;\ntrait LoggingTrait {\n  public function logIt($m) { return $m; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("Reporter.php"),
+        b"<?php\nnamespace App\\Support;\nclass Reporter {\n  use LoggingTrait;\n  public function run() { return $this->logIt('x'); }\n}\n",
+    )
+    .unwrap();
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+
+    let entries = impact_analysis(
+        &db,
+        &ImpactRequest {
+            target: ImpactTarget::Symbol {
+                name: "LoggingTrait".to_string(),
+            },
+            depth: 1,
+            source_only: false,
+        },
+    )
+    .unwrap();
+    assert!(
+        entries.iter().any(|e| e.file_path == "Reporter.php"),
+        "the trait's user must appear as a dependent, got {:?}",
+        entries.iter().map(|e| &e.file_path).collect::<Vec<_>>()
+    );
+}
