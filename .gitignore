@@ -10,6 +10,13 @@
 # (runner script, extractor, cleanup). Results, corpora, history, and
 # scorecards stay local so private-repo names and case IDs never reach a
 # commit by accident.
+#
+# bench/public-corpus-results/ is the deliberate exception and is TRACKED. It
+# holds results over published third-party corpora only, where the repo names
+# are already public and no query text or case IDs are stored. It is a separate
+# directory rather than a filename pattern under bench/history/ because a
+# pattern like `semble-*.json` would also match a private run someone named
+# `semble-private-client.json`; a directory makes the contract checkable.
 /bench/results-*
 /bench/corpora/
 /bench/history/

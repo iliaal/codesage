@@ -19,13 +19,26 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
         ImpactTarget::Symbol { name } => {
             let syms = db.find_symbols(name, None)?;
             if !is_qualified_symbol_name(name) && syms.len() > 1 {
-                let candidates: Vec<String> =
+                // Only distinct qualified names are disambiguable. Languages
+                // without namespaces (JS/TS) give every definition the bare
+                // name, so a `.d.ts` declaration beside its `.js`
+                // implementation used to produce "qualify with one of: Foo,
+                // Foo" — an instruction no input can satisfy. When the names
+                // collapse to one, seed on every definition and let the union
+                // of dependents stand; over-inclusion is the safe direction
+                // for an advisory what-to-review signal.
+                let mut candidates: Vec<String> =
                     syms.iter().map(|s| s.qualified_name.clone()).collect();
-                anyhow::bail!(
-                    "ambiguous symbol '{name}': {} definitions — qualify with one of: {}",
-                    syms.len(),
-                    candidates.join(", ")
-                );
+                candidates.sort();
+                candidates.dedup();
+                if candidates.len() > 1 {
+                    anyhow::bail!(
+                        "ambiguous symbol '{name}': {} definitions — qualify with one of: {}, \
+                         or target a single file instead",
+                        syms.len(),
+                        candidates.join(", ")
+                    );
+                }
             }
             syms
         }
@@ -68,12 +81,23 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
                 if entry.0 > depth {
                     entry.0 = depth;
                 }
-                if entry.1.len() < 10 {
-                    entry.1.push(ImpactReason {
-                        via_symbol: sym.name.clone(),
-                        kind: r.kind,
-                        line: r.line,
-                    });
+                // Seeding on several definitions that share one qualified name
+                // walks the same reference row once per definition, so the
+                // identical reason arrives repeatedly. Reason count feeds the
+                // ranking below, which would let a duplicate decide which files
+                // survive a result limit.
+                let reason = ImpactReason {
+                    via_symbol: sym.name.clone(),
+                    kind: r.kind,
+                    line: r.line,
+                };
+                let already = entry.1.iter().any(|e| {
+                    e.via_symbol == reason.via_symbol
+                        && e.kind == reason.kind
+                        && e.line == reason.line
+                });
+                if !already && entry.1.len() < 10 {
+                    entry.1.push(reason);
                 }
                 if depth < req.depth as u32 {
                     pending_callers.push((r.from_file, r.from_symbol, r.line));
@@ -164,10 +188,16 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
         .filter(|e| !req.source_only || e.category == FileCategory::Source)
         .collect();
 
+    // `file_reasons` is a HashMap, so its iteration order is reseeded per map
+    // instance — tied entries would otherwise land in a different order on
+    // every call, and callers truncate (`ImpactOptions::limit`, the MCP budget
+    // cap), so an unchanged query could return a different set of files. Ties
+    // are routine here: every depth-1 file with the same reason count ties.
     entries.sort_by(|a, b| {
         a.distance
             .cmp(&b.distance)
             .then_with(|| b.reasons.len().cmp(&a.reasons.len()))
+            .then_with(|| a.file_path.cmp(&b.file_path))
     });
     Ok(entries)
 }
@@ -331,12 +361,22 @@ fn build_impact_summary(entries: &[ImpactEntry]) -> ImpactSummary {
 }
 
 pub(crate) fn references_for_symbol(db: &Database, sym: &Symbol) -> Result<Vec<Reference>> {
-    let key = if sym.qualified_name != sym.name {
-        &sym.qualified_name
-    } else {
-        &sym.name
-    };
-    let raw = db.find_references(key, None)?;
+    // Look up by the SHORT name, never the qualified one. `find_references`
+    // treats a qualified key as an exact `to_name` match, but a reference is
+    // recorded under whatever spelling the source used: a PHP subclass in the
+    // same namespace writes `extends Foo` with no `use`, so its row says `Foo`,
+    // not `App\Foo`. Keying on the qualified name therefore matched only the
+    // rows that happen to spell it out — in monolog, `Logger` kept the 15
+    // `use Monolog\Logger` rows and dropped the 87 call/instantiation rows,
+    // and `AbstractProcessingHandler` (30 subclasses, never imported because
+    // they share its namespace) resolved to zero dependents.
+    //
+    // The short name goes through the `to_name_tail` branch, which matches both
+    // spellings. Precision is not lost: the import-aware resolution below is
+    // exactly the mechanism that narrows a broad tail match back down, and it
+    // already had to handle this for symbols whose qualified name equals their
+    // short name.
+    let raw = db.find_references(&sym.name, None)?;
 
     // Import-aware reverse resolution. `find_references` matches by
     // `to_name_tail`, so an unqualified name fans out to *every* same-named

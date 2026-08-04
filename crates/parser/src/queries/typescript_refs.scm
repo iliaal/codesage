@@ -28,3 +28,31 @@
 
 ; Pattern 6: class inheritance (class Foo extends Bar) -- TS extends_clause form
 (extends_clause value: (identifier) @ref)
+
+; Patterns 7-9: the imported BINDING names. See javascript_refs.scm for why —
+; the module specifier alone leaves `Foo.staticMethod()` / `instanceof Foo`
+; users with no row naming the symbol.
+(import_statement (import_clause (identifier) @ref))
+(import_statement (import_clause (named_imports (import_specifier name: (identifier) @ref))))
+(import_statement (import_clause (namespace_import (identifier) @ref)))
+
+; Patterns 10-11: re-export and CommonJS destructuring bindings.
+; See javascript_refs.scm — the module string alone leaves barrel files and
+; `const { a } = require(...)` consumers naming no symbol.
+(export_statement (export_clause (export_specifier name: (identifier) @ref)) source: (string))
+(variable_declarator
+  name: (object_pattern (shorthand_property_identifier_pattern) @ref)
+  value: (call_expression
+    function: (identifier) @_req
+    arguments: (arguments (string)))
+  (#eq? @_req "require"))
+
+; Pattern 12: aliased CommonJS destructuring, `const { a: localA } = require(...)`.
+; The shorthand form above is a `shorthand_property_identifier_pattern`; an
+; alias is a `pair_pattern`, whose KEY names the exported symbol.
+(variable_declarator
+  name: (object_pattern (pair_pattern key: (property_identifier) @ref))
+  value: (call_expression
+    function: (identifier) @_req
+    arguments: (arguments (string)))
+  (#eq? @_req "require"))

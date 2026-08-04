@@ -870,6 +870,25 @@ impl Database {
         Ok(n as usize)
     }
 
+    /// Indexed file count per language, descending. Aggregated in SQL rather
+    /// than by loading every row like `all_files_with_id_and_language`, because
+    /// this runs on the empty-result annotation path where the caller already
+    /// got nothing back and must not pay a full table read for the
+    /// explanation.
+    pub fn file_counts_by_language(&self) -> Result<Vec<(String, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT language, COUNT(*) AS n FROM files
+             GROUP BY language
+             ORDER BY n DESC, language ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn symbol_count(&self) -> Result<usize> {
         let n: i64 = self
             .conn
@@ -907,14 +926,27 @@ impl Database {
         // name. A ref whose `to_name_tail` matches the queried short name
         // counts the same as a direct `to_name` match (the indexer keeps
         // tail in sync via `name_tail()`).
+        // Count distinct source sites, not rows. One import statement can emit
+        // two rows naming the same short name — `import Foo from "./Foo"`
+        // stores the module (whose `to_name_tail` is `Foo`) and the binding
+        // `Foo` — and counting both scored a single statement twice in the
+        // top-symbol ranking. The two rows share a (file, line), so keying on
+        // that collapses them. Known cost: two real calls on ONE line
+        // (`Foo(); Foo();`, or minified source) collapse too, because `col` is
+        // deliberately left out — including it would separate the module from
+        // its binding again, since they sit at different columns of the same
+        // statement. Under-counting compact source beats double-counting every
+        // extensionless import.
         let sql = format!(
-            "SELECT name, c FROM (
-                SELECT to_name AS name, COUNT(*) AS c FROM refs
-                WHERE to_name IN ({ph}) GROUP BY to_name
-                UNION ALL
-                SELECT to_name_tail AS name, COUNT(*) AS c FROM refs
-                WHERE to_name_tail IN ({ph}) AND to_name_tail <> to_name GROUP BY to_name_tail
-            )",
+            "SELECT name, COUNT(*) AS c FROM (
+                SELECT DISTINCT name, from_file_id, line FROM (
+                    SELECT to_name AS name, from_file_id, line FROM refs
+                    WHERE to_name IN ({ph})
+                    UNION ALL
+                    SELECT to_name_tail AS name, from_file_id, line FROM refs
+                    WHERE to_name_tail IN ({ph}) AND to_name_tail <> to_name
+                )
+            ) GROUP BY name",
             ph = placeholders.join(",")
         );
         let mut stmt = self.conn.prepare(&sql)?;

@@ -255,14 +255,29 @@ impl Database {
              WHERE embedding MATCH ?1 AND k = ?2{lang_clause}
              ORDER BY distance"
         );
+        // vec0 rejects any ORDER BY beyond a bare `distance` on a KNN query,
+        // so the tie-break is applied to the returned rows below rather than
+        // in SQL.
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = if let Some(lang) = language {
+        let mut rows = if let Some(lang) = language {
             stmt.query_map(params![embedding_bytes, k as i64, lang], row_to_raw_search)?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         } else {
             stmt.query_map(params![embedding_bytes, k as i64], row_to_raw_search)?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
+        // Chunks at an identical distance (duplicate or near-duplicate code)
+        // would otherwise come back in whatever order the vec index produced,
+        // so a repeated query could hand downstream truncation a different
+        // top-N. Total-order the ties here; vec0 will not accept the extra
+        // ORDER BY terms in SQL.
+        rows.sort_by(|a, b| {
+            a.distance
+                .total_cmp(&b.distance)
+                .then_with(|| a.file_path.cmp(&b.file_path))
+                .then_with(|| a.start_line.cmp(&b.start_line))
+                .then_with(|| a.end_line.cmp(&b.end_line))
+        });
         Ok(rows)
     }
 
@@ -303,7 +318,7 @@ impl Database {
                     vec_distance_L2(embedding, ?1) as distance
              FROM \"{t}\"
              {where_clause}
-             ORDER BY distance
+             ORDER BY distance, file_path, start_line, end_line
              LIMIT ?{} OFFSET ?{}",
             param_values.len() + 1,
             param_values.len() + 2,
@@ -379,6 +394,23 @@ impl Database {
                 .query_row("SELECT COUNT(DISTINCT path) FROM semantic_files", [], |r| {
                     r.get(0)
                 })?;
+        Ok(n as usize)
+    }
+
+    /// Files with semantic chunks under `model`'s tables only.
+    ///
+    /// [`Self::semantic_file_count`] spans every model that ever indexed this
+    /// project, which overstates what a search can actually reach: after a
+    /// model switch the old model's rows remain until `codesage cleanup`, so
+    /// the unscoped count would report the previous model's 10,000 files for a
+    /// search running against a new model's empty table.
+    pub fn semantic_file_count_for_model(&self, model: &str) -> Result<usize> {
+        let prefix = crate::schema::model_table_prefix(model);
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT path) FROM semantic_files WHERE chunk_table LIKE ?1 || '%'",
+            [&prefix],
+            |r| r.get(0),
+        )?;
         Ok(n as usize)
     }
 
@@ -511,7 +543,7 @@ impl Database {
             "SELECT file_path, language, content, start_line, end_line, bm25(\"{t}\") AS score
              FROM \"{t}\"
              WHERE {}
-             ORDER BY score LIMIT ?{limit_idx}",
+             ORDER BY score, file_path, start_line, end_line LIMIT ?{limit_idx}",
             conditions.join(" AND ")
         );
         param_values.push(Box::new(k as i64));

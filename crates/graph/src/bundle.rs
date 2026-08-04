@@ -575,18 +575,29 @@ pub(crate) fn resolve_callee_definitions(
         return Ok(candidates);
     }
     let import_refs = import_refs_for_file(db, caller_file)?;
+
+    // A definition in the caller's own file is a valid target: a same-file
+    // call emits no import edge, so without this the local
+    // definition is filtered out and the reverse edge (read by
+    // `impact_analysis` / `assess_risk` through `references_for_symbol`) is
+    // lost. Mirrors the same-file preference in `resolve_def_summary`.
+    let is_local = |s: &Symbol| s.file_path == caller_file;
+
+    // One filter over both kinds of evidence. Letting path specifiers win
+    // outright was tried and removed: it measured identically on axios and
+    // monolog (F1 0.61 / 0.79 either way) while carrying a real failure mode,
+    // because `import_refs_for_file` pools every specifier in the file without
+    // recording which binding each introduced — so an unrelated import could
+    // match a same-named candidate and suppress the correct one. Dropping a
+    // real dependent is the unsafe direction for a what-to-review signal;
+    // over-inclusion is not.
     let filtered: Vec<Symbol> = candidates
         .into_iter()
         .filter(|s| {
-            // A definition in the caller's own file is a valid target: a
-            // same-file call emits no import edge, so without this the local
-            // definition is filtered out and the reverse edge (read by
-            // `impact_analysis` / `assess_risk` through `references_for_symbol`)
-            // is lost. Mirrors the same-file preference in `resolve_def_summary`.
-            s.file_path == caller_file
+            is_local(s)
                 || import_refs
                     .iter()
-                    .any(|imp| import_ref_targets_symbol(imp, to_name, s))
+                    .any(|imp| import_ref_targets_symbol(imp, caller_file, to_name, s))
         })
         .collect();
     Ok(filtered)
@@ -600,9 +611,18 @@ fn import_refs_for_file(db: &Database, caller_file: &str) -> Result<Vec<String>>
     let mut refs = Vec::new();
     if let Some(file_id) = db.file_id_for_path(caller_file)? {
         for (to_name, kind) in db.refs_outgoing_for_file_id(file_id)? {
+            // `ImportBinding` is safe to admit here only because the caller
+            // consults path evidence first: a bare binding name matches every
+            // same-named candidate, so it must never compete with a specifier
+            // that identifies one. As pure fallback it recovers the files whose
+            // specifier points at a re-exporting barrel rather than at the
+            // defining module.
             if matches!(
                 kind,
-                ReferenceKind::Import | ReferenceKind::Include | ReferenceKind::TraitUse
+                ReferenceKind::Import
+                    | ReferenceKind::ImportBinding
+                    | ReferenceKind::Include
+                    | ReferenceKind::TraitUse
             ) {
                 refs.push(to_name);
             }
@@ -615,9 +635,24 @@ fn import_refs_for_file(db: &Database, caller_file: &str) -> Result<Vec<String>>
 
 /// True when `import_ref` (e.g. `crate::helpers_a::helper`) names `sym` in
 /// `sym_file` even if the symbol table only stores the bare tail (`helper`).
-fn import_ref_targets_symbol(import_ref: &str, callee_name: &str, sym: &Symbol) -> bool {
+fn import_ref_targets_symbol(
+    import_ref: &str,
+    caller_file: &str,
+    callee_name: &str,
+    sym: &Symbol,
+) -> bool {
     if import_ref == sym.qualified_name || import_ref == sym.name {
         return true;
+    }
+    // Path-style specifiers name a file, not a symbol: JS/TS records
+    // `import X from './headers.js'` as `./headers.js`, C/C++ records
+    // `#include "dir/foo.h"` as `dir/foo.h`. Neither can ever equal a symbol
+    // name, so before this branch every candidate was filtered out and any
+    // symbol with two same-named definitions lost all its reverse edges. In
+    // JS/TS that is the common case, not a corner: a `.d.ts` declaration
+    // beside its `.js` implementation gives two definitions of one name.
+    if is_path_specifier(import_ref) {
+        return import_path_targets_file(import_ref, caller_file, &sym.file_path);
     }
     let Some((module, tail)) = import_ref.rsplit_once("::") else {
         return import_ref == callee_name && import_ref == sym.name;
@@ -638,12 +673,90 @@ fn import_ref_targets_symbol(import_ref: &str, callee_name: &str, sym: &Symbol) 
     candidates.iter().any(|c| c == &sym.file_path)
 }
 
-fn is_callee_reference(kind: ReferenceKind) -> bool {
+fn is_path_specifier(s: &str) -> bool {
+    s.starts_with("./") || s.starts_with("../") || s.contains('/')
+}
+
+/// Extensions a path specifier may omit or misname. TypeScript ESM is the
+/// reason `.js` maps to `.ts`: the spec requires the *emitted* extension in the
+/// specifier, so `./foo.js` routinely refers to `foo.ts` on disk.
+const IMPORT_EXTENSIONS: [&str; 10] = [
+    "js", "mjs", "cjs", "jsx", "ts", "tsx", "d.ts", "h", "hpp", "py",
+];
+
+fn import_path_targets_file(spec: &str, caller_file: &str, sym_file: &str) -> bool {
+    if spec.starts_with("./") || spec.starts_with("../") {
+        let base = caller_file.rsplit_once('/').map_or("", |(dir, _)| dir);
+        return match lexical_join(base, spec) {
+            Some(resolved) => relative_file_matches(&resolved, sym_file),
+            None => false,
+        };
+    }
+    // Non-relative specifiers are one of two things: a C include, which names a
+    // real file and always carries its extension, or a package path, which
+    // names nothing in this repo. So match exactly or on a separator-anchored
+    // suffix, and never guess an extension — otherwise the npm specifier
+    // `pkg/sub` claims the unrelated project file `pkg/sub.ts`, and a Go dot
+    // import of `github.com/x/y` claims `github.com/x/y.ts`. The separator
+    // anchor is what stops `net/utils.h` from claiming `net_utils.h`.
+    spec == sym_file || sym_file.ends_with(&format!("/{spec}"))
+}
+
+/// Joins `spec` onto `base`, resolving `.` and `..` textually. Returns `None`
+/// when the specifier escapes above the project root, which cannot name an
+/// indexed file.
+fn lexical_join(base: &str, spec: &str) -> Option<String> {
+    let mut parts: Vec<&str> = if base.is_empty() {
+        Vec::new()
+    } else {
+        base.split('/').collect()
+    };
+    for seg in spec.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    Some(parts.join("/"))
+}
+
+fn relative_file_matches(resolved: &str, sym_file: &str) -> bool {
+    if resolved == sym_file {
+        return true;
+    }
+    // Look for the extension in the last path segment only. A specifier like
+    // `./dir.v1/foo` has its last dot in the *directory* part, and splitting on
+    // that yields the stem `dir`, which then matches an unrelated `dir.ts`.
+    let segment_start = resolved.rfind('/').map_or(0, |i| i + 1);
+    match resolved[segment_start..].rfind('.') {
+        // The specifier carries an extension. It may still differ from the file
+        // on disk — TypeScript ESM requires the emitted `.js` for a `.ts`
+        // source — so swap it. Do not also append, or `./foo.js` claims
+        // `foo.js.ts`.
+        Some(dot) => {
+            let stem = &resolved[..segment_start + dot];
+            IMPORT_EXTENSIONS
+                .iter()
+                .any(|ext| sym_file == format!("{stem}.{ext}"))
+        }
+        // No extension: `./foo` -> `foo.ts`, or the directory-index form
+        // `./utils` -> `utils/index.js`.
+        None => IMPORT_EXTENSIONS.iter().any(|ext| {
+            sym_file == format!("{resolved}.{ext}") || sym_file == format!("{resolved}/index.{ext}")
+        }),
+    }
+}
+
+pub(crate) fn is_callee_reference(kind: ReferenceKind) -> bool {
     matches!(
         kind,
         ReferenceKind::Call
             | ReferenceKind::Instantiation
             | ReferenceKind::Import
+            | ReferenceKind::ImportBinding
             | ReferenceKind::Include
             | ReferenceKind::Inheritance
             | ReferenceKind::TraitUse
@@ -679,6 +792,156 @@ fn add_related_from_file(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod import_path_tests {
+    use super::*;
+
+    #[test]
+    fn relative_specifier_resolves_against_the_caller_directory() {
+        assert!(import_path_targets_file(
+            "./headers.js",
+            "lib/core/client.js",
+            "lib/core/headers.js"
+        ));
+        assert!(import_path_targets_file(
+            "../helpers/util.js",
+            "lib/core/client.js",
+            "lib/helpers/util.js"
+        ));
+        // Same basename in a different directory is not the same file.
+        assert!(!import_path_targets_file(
+            "./headers.js",
+            "lib/core/client.js",
+            "lib/other/headers.js"
+        ));
+    }
+
+    #[test]
+    fn specifier_extension_may_differ_from_the_file_on_disk() {
+        // TypeScript ESM requires the emitted extension in the specifier.
+        assert!(import_path_targets_file(
+            "./foo.js",
+            "src/client.ts",
+            "src/foo.ts"
+        ));
+        // Omitted entirely, and the directory-index form.
+        assert!(import_path_targets_file(
+            "./foo",
+            "src/client.ts",
+            "src/foo.tsx"
+        ));
+        assert!(import_path_targets_file(
+            "./utils",
+            "src/client.js",
+            "src/utils/index.js"
+        ));
+    }
+
+    #[test]
+    fn go_import_path_does_not_match_an_unrelated_file() {
+        // The last dot of `github.com/x/y` sits in the directory part. Splitting
+        // the extension over the whole path produced the stem `github`, which
+        // matched any same-named source file elsewhere in a mixed repo.
+        assert!(!import_path_targets_file(
+            "github.com/x/y",
+            "cmd/app/main.go",
+            "github.py"
+        ));
+        assert!(!import_path_targets_file(
+            "github.com/x/y",
+            "cmd/app/main.go",
+            "github.h"
+        ));
+    }
+
+    #[test]
+    fn escaping_above_the_root_resolves_to_nothing() {
+        assert!(!import_path_targets_file(
+            "../../x.js",
+            "a/client.js",
+            "x.js"
+        ));
+        // The same specifier from two directories deep is in range.
+        assert!(import_path_targets_file(
+            "../../x.js",
+            "a/b/client.js",
+            "x.js"
+        ));
+    }
+
+    #[test]
+    fn declaration_files_resolve_through_both_branches() {
+        // Specifier carries no extension, so one is appended.
+        assert!(import_path_targets_file(
+            "./foo",
+            "src/client.ts",
+            "src/foo.d.ts"
+        ));
+        // Specifier carries `.js`, which is swapped.
+        assert!(import_path_targets_file(
+            "./foo.js",
+            "src/client.ts",
+            "src/foo.d.ts"
+        ));
+    }
+
+    #[test]
+    fn specifier_with_an_extension_is_not_also_appended_to() {
+        // `./foo.js` must not claim `foo.js.ts`.
+        assert!(!import_path_targets_file(
+            "./foo.js",
+            "src/client.ts",
+            "src/foo.js.ts"
+        ));
+    }
+
+    #[test]
+    fn a_dot_in_a_directory_component_is_not_an_extension() {
+        // Stem must come from the last segment: `dir.v1/foo` is not `dir`.
+        assert!(!import_path_targets_file(
+            "./dir.v1/foo",
+            "src/client.ts",
+            "src/dir.ts"
+        ));
+        assert!(import_path_targets_file(
+            "./dir.v1/foo",
+            "src/client.ts",
+            "src/dir.v1/foo.ts"
+        ));
+    }
+
+    #[test]
+    fn package_specifiers_do_not_claim_same_named_project_files() {
+        // An npm subpath import, not a relative path to `pkg/sub.ts`.
+        assert!(!import_path_targets_file(
+            "pkg/sub",
+            "src/client.ts",
+            "pkg/sub.ts"
+        ));
+        // A Go dot import names a package directory, not a source file.
+        assert!(!import_path_targets_file(
+            "github.com/x/y",
+            "cmd/app/main.go",
+            "github.com/x/y.ts"
+        ));
+    }
+
+    #[test]
+    fn non_relative_include_matches_on_a_separator_boundary() {
+        assert!(import_path_targets_file(
+            "net/utils.h",
+            "src/main.c",
+            "include/net/utils.h"
+        ));
+        // `utils.h` must not be claimed by `net_utils.h`.
+        assert!(!import_path_targets_file(
+            "net/utils.h",
+            "src/main.c",
+            "include/net_utils.h"
+        ));
+    }
 }
 
 #[cfg(test)]

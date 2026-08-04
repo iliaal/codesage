@@ -113,3 +113,84 @@ fn php_extracts_instance_nullsafe_and_static_method_calls() {
             .any(|r| r.to_name == "show" && r.kind == ReferenceKind::Call && r.line == 38)
     );
 }
+
+#[test]
+fn javascript_import_bindings_are_captured_separately_from_the_module() {
+    // The module specifier alone left a file that imports a symbol and uses it
+    // only as `Foo.staticMethod()` or `x instanceof Foo` with no row naming
+    // that symbol, so it dropped out of the symbol's dependents.
+    let src = "import Foo from './foo.js';\n\
+               import { Bar, Baz as Qux } from './bar.js';\n\
+               import * as ns from './ns.js';\n";
+    let refs = refs_from_source(src, Language::JavaScript);
+
+    // The modules stay `Import` so file-level dependency listings are unchanged.
+    assert!(has_ref(&refs, "./foo.js", ReferenceKind::Import));
+    assert!(has_ref(&refs, "./bar.js", ReferenceKind::Import));
+
+    assert!(has_ref(&refs, "Foo", ReferenceKind::ImportBinding));
+    assert!(has_ref(&refs, "Bar", ReferenceKind::ImportBinding));
+    assert!(has_ref(&refs, "ns", ReferenceKind::ImportBinding));
+    // A renamed import binds under the local alias but names the exported
+    // symbol, which is what a dependents query is asking about.
+    assert!(has_ref(&refs, "Baz", ReferenceKind::ImportBinding));
+
+    // Bindings must not leak into the module list.
+    assert!(!has_ref(&refs, "Foo", ReferenceKind::Import));
+}
+
+#[test]
+fn typescript_import_bindings_are_captured_separately_from_the_module() {
+    let src = "import Foo from './foo.js';\n\
+               import { Bar } from './bar.js';\n\
+               import * as ns from './ns.js';\n";
+    let refs = refs_from_source(src, Language::TypeScript);
+    assert!(has_ref(&refs, "./foo.js", ReferenceKind::Import));
+    assert!(has_ref(&refs, "Foo", ReferenceKind::ImportBinding));
+    assert!(has_ref(&refs, "Bar", ReferenceKind::ImportBinding));
+    assert!(has_ref(&refs, "ns", ReferenceKind::ImportBinding));
+    assert!(!has_ref(&refs, "Foo", ReferenceKind::Import));
+}
+
+#[test]
+fn javascript_reexport_and_commonjs_destructuring_name_their_bindings() {
+    // A barrel file forwards symbols; a CommonJS consumer destructures them.
+    // Both used to record only the module string, so neither appeared in the
+    // forwarded symbol's dependents.
+    let src = "export { x, y as z } from './m.js';\n\
+               const { a, b } = require('./n.js');\n\
+               a.staticMethod();\n";
+    let refs = refs_from_source(src, Language::JavaScript);
+
+    assert!(has_ref(&refs, "./m.js", ReferenceKind::Import));
+    assert!(has_ref(&refs, "./n.js", ReferenceKind::Import));
+    assert!(has_ref(&refs, "x", ReferenceKind::ImportBinding));
+    // A renamed re-export names the source symbol, matching the import case.
+    assert!(has_ref(&refs, "y", ReferenceKind::ImportBinding));
+    assert!(has_ref(&refs, "a", ReferenceKind::ImportBinding));
+    assert!(has_ref(&refs, "b", ReferenceKind::ImportBinding));
+}
+
+#[test]
+fn javascript_aliased_commonjs_destructuring_names_the_source_symbol() {
+    // `{ a: localA }` is a pair_pattern, not the shorthand form, so it needs
+    // its own pattern. The KEY is the exported symbol a dependents query asks
+    // about; the local alias is not.
+    let src = "const { a: localA, b } = require('./m.js');\nlocalA();\n";
+    let refs = refs_from_source(src, Language::JavaScript);
+    assert!(
+        has_ref(&refs, "a", ReferenceKind::ImportBinding),
+        "{refs:?}"
+    );
+    assert!(has_ref(&refs, "b", ReferenceKind::ImportBinding));
+    assert!(!has_ref(&refs, "localA", ReferenceKind::ImportBinding));
+}
+
+#[test]
+fn typescript_reexport_and_commonjs_destructuring_name_their_bindings() {
+    let src = "export { x } from './m.js';\n\
+               const { a } = require('./n.js');\n";
+    let refs = refs_from_source(src, Language::TypeScript);
+    assert!(has_ref(&refs, "x", ReferenceKind::ImportBinding));
+    assert!(has_ref(&refs, "a", ReferenceKind::ImportBinding));
+}

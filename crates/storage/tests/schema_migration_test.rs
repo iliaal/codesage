@@ -190,7 +190,7 @@ fn fresh_db_records_migrations_exactly_once() {
     assert_eq!(has_table, 1);
 
     // Each migration name must be present exactly once after first init.
-    for migration in [
+    let expected_migrations = [
         "0001_refs_name_tail",
         "0002_structural_index_state",
         "0003_semantic_files",
@@ -204,7 +204,9 @@ fn fresh_db_records_migrations_exactly_once() {
         "0011_features_test_command",
         "0012_symbol_fingerprints",
         "0013_structural_unique_keys",
-    ] {
+        "0014_git_files_churn_path",
+    ];
+    for migration in expected_migrations {
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM schema_migrations WHERE name = ?1",
@@ -215,13 +217,14 @@ fn fresh_db_records_migrations_exactly_once() {
         assert_eq!(count, 1, "{migration} recorded on fresh DB");
     }
 
-    // Running init_db again must be a no-op: count stays at 13.
+    // Running init_db again must be a no-op: the count stays where it was.
     init_db(&conn).expect("second init_db");
     let count_after: i64 = conn
         .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
-        count_after, 13,
+        count_after,
+        expected_migrations.len() as i64,
         "second init_db must not re-apply migrations"
     );
 }
@@ -256,6 +259,7 @@ fn legacy_db_records_migration_after_upgrade() {
         "0011_features_test_command",
         "0012_symbol_fingerprints",
         "0013_structural_unique_keys",
+        "0014_git_files_churn_path",
     ] {
         let count: i64 = conn
             .query_row(

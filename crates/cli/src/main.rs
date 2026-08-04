@@ -1,4 +1,5 @@
 mod commands;
+mod coverage;
 mod daemon;
 mod doctor;
 #[cfg(target_os = "android")]
@@ -116,6 +117,19 @@ enum Commands {
         /// Filter by file path glob
         #[arg(long)]
         path: Option<Vec<String>>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Shortest call chain from one symbol to another
+    Trace {
+        /// Origin symbol
+        from: String,
+        /// Target symbol
+        to: String,
+        /// Maximum hops to search before giving up
+        #[arg(long, default_value = "6")]
+        max_depth: usize,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -242,6 +256,15 @@ enum Commands {
         /// Preview what would be dropped without making changes
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Report what this project contains that indexing cannot see
+    Coverage {
+        /// Emit machine-readable JSON instead of human-readable output
+        #[arg(long)]
+        json: bool,
+        /// Show at most this many uncovered extensions (0 = all)
+        #[arg(long, default_value_t = 15)]
+        top: usize,
     },
     /// Diagnose CodeSage installation: binary, CUDA, models, DB, hooks, MCP registration
     Doctor {
@@ -717,19 +740,33 @@ fn main() {
         }
     };
 
-    // Skip Drop glue. ORT Session teardown interacts with sqlite-vec's
-    // extension destructors in a way that intermittently aborts at
-    // process exit with "corrupted double-linked list" (glibc heap-
-    // corruption diagnostic). The crash was observed at ~1.1% rate in
-    // the §2.10 semble-corpus benchmark run (2 SIGABRT out of 177 read-
-    // only `codesage search` queries) — the query results were always
-    // correct; only the teardown faulted. For a CLI command the OS
-    // reclaims memory on exit and every write path commits explicitly
-    // via execute_batch, so there's nothing useful for Drop to do.
-    // Explicit exit avoids the race entirely. The MCP server path
-    // (`codesage mcp`) loops indefinitely and never reaches this exit;
-    // when it terminates via signal, the same skip applies.
-    std::process::exit(code);
+    // Leave the process without running any teardown. ORT's session/arena
+    // teardown interacts with sqlite-vec's extension destructors in a way that
+    // intermittently aborts with "corrupted double-linked list" (a glibc
+    // heap-corruption diagnostic). Results are always correct and already
+    // flushed; only the teardown faults.
+    //
+    // `std::process::exit` is NOT enough, which is why this used to still
+    // abort. It skips Rust `Drop` glue, but it is a normal `exit(3)`: it still
+    // runs libc `atexit` handlers and the C++ static destructors ORT registers
+    // through `__cxa_atexit`, and those destructors are where the fault lives.
+    // `_exit(2)` bypasses that table and goes straight to the kernel.
+    //
+    // Safe here because nothing is left to do: stdout and stderr were flushed
+    // explicitly above, `run()` has already returned so its `Database` and
+    // `Session` values were dropped normally, SQLite commits durably per
+    // transaction rather than at exit, and no production path registers an
+    // atexit hook or relies on a tempfile destructor. The OS reclaims memory
+    // and file descriptors regardless.
+    //
+    // The MCP server path (`codesage mcp`) loops indefinitely and never
+    // reaches this exit; when it terminates via signal, no teardown runs
+    // either.
+    flush_stdio();
+    // SAFETY: `_exit` is async-signal-safe and always succeeds. Every buffer
+    // this process owns has been flushed on the two lines above and in the
+    // earlier `flush_stdio()` call.
+    unsafe { libc::_exit(code) }
 }
 
 pub(crate) fn flush_stdio() {
@@ -864,6 +901,12 @@ fn run(cli: Cli) -> Result<()> {
             path,
             json,
         } => commands::query::cmd_search(&query, limit, offset, language.as_deref(), path, json),
+        Commands::Trace {
+            from,
+            to,
+            max_depth,
+            json,
+        } => query::cmd_trace(&from, &to, max_depth, json),
         Commands::Impact {
             target,
             file,
@@ -922,6 +965,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Install { target, global } => runtime::cmd_install(&target, global),
         Commands::Uninstall { target, global } => runtime::cmd_uninstall(&target, global),
         Commands::Cleanup { dry_run } => index::cmd_cleanup(dry_run),
+        Commands::Coverage { json, top } => coverage::run(json, top),
         Commands::Doctor { json } => doctor::run(json),
         Commands::GitIndex {
             json,

@@ -18,7 +18,7 @@ const MCP_TEST_QUERY_EMBEDDING_ENV: &str = "CODESAGE_MCP_TEST_QUERY_EMBEDDING";
 #[derive(Debug, Clone)]
 pub(super) struct ProjectState {
     pub(super) db_path: PathBuf,
-    embedding_config: EmbeddingConfig,
+    pub(super) embedding_config: EmbeddingConfig,
     embedding_config_error: Option<String>,
     /// mtime of `.codesage/config.toml` when this state was loaded; `None`
     /// means the file was absent (defaults in effect). Checked on every

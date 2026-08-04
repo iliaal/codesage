@@ -28,7 +28,27 @@ impl CodeSageServer {
         r: Result<T>,
         kind: &str,
     ) -> CallToolResult {
-        self.annotate_staleness(project, render_with_kind(r, kind))
+        self.render_coverage_gated(project, r, kind, true)
+    }
+
+    /// [`Self::render`] with an explicit say over the coverage annotation.
+    /// `search` passes `false` when the caller asked for a page past the end
+    /// or a zero limit: the result is empty by request, and telling that
+    /// caller "no matches" would be a lie about the corpus.
+    pub(super) fn render_coverage_gated<T: serde::Serialize>(
+        &self,
+        project: &str,
+        r: Result<T>,
+        kind: &str,
+        allow_coverage: bool,
+    ) -> CallToolResult {
+        let rendered = render_with_kind(r, kind);
+        let covered = if allow_coverage {
+            self.annotate_coverage(project, kind, rendered)
+        } else {
+            rendered
+        };
+        self.annotate_staleness(project, covered)
     }
 
     /// [`Self::render`] with an explicit char budget (context-bundle tools).
@@ -40,6 +60,106 @@ impl CodeSageServer {
         budget_chars: usize,
     ) -> CallToolResult {
         self.annotate_staleness(project, render_with_budget(r, kind, budget_chars))
+    }
+
+    /// Tools whose empty result is ambiguous between "no such code" and "that
+    /// code was never indexed". `impact_analysis` is deliberately absent: `[]`
+    /// there means a leaf nothing imports, which its own description already
+    /// states, so a coverage note would be noise on a correct answer.
+    const COVERAGE_ANNOTATED_TOOLS: [&str; 2] = ["search", "find_symbol"];
+
+    /// On an empty result, record what the index actually holds under
+    /// `_meta.coverage`. An agent that searches and gets nothing back cannot
+    /// otherwise tell a genuine absence from a language or directory that was
+    /// never indexed, and silently reads the empty list as proof the code does
+    /// not exist. Best-effort: any failure leaves the result untouched.
+    fn annotate_coverage(
+        &self,
+        project: &str,
+        kind: &str,
+        mut result: CallToolResult,
+    ) -> CallToolResult {
+        if result.is_error == Some(true) || !Self::COVERAGE_ANNOTATED_TOOLS.contains(&kind) {
+            return result;
+        }
+        let Some(structured) = result.structured_content.as_ref() else {
+            return result;
+        };
+        if !has_empty_results(structured) {
+            return result;
+        }
+        // A zero-file index is NOT a reason to stay quiet — it is the case
+        // where an empty result misleads hardest, because nothing was ever
+        // looked at.
+        let counts = match self.with_project_db(project, |db| db.file_counts_by_language()) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(error = %e, "coverage annotation skipped");
+                return result;
+            }
+        };
+        let total: usize = counts.iter().map(|(_, n)| n).sum();
+        // `search` runs over semantic chunks, not the structural file table.
+        // Reporting the structural count for it would say "10,000 files
+        // indexed" about a project indexed with `--no-semantic`, where none of
+        // them were searched — recreating the false confidence this exists to
+        // prevent.
+        // Scoped to the ACTIVE model: `semantic_files` retains rows for every
+        // model that ever indexed this project, so an unscoped count would
+        // report a previous model's files for a search running against a newly
+        // configured model's empty table — the same false confidence again.
+        let semantic_files = if kind == "search" {
+            self.resolve_project(project).ok().and_then(|st| {
+                let model = st.embedding_config.model.clone();
+                if model.is_empty() {
+                    return None;
+                }
+                self.with_project_db(project, |db| db.semantic_file_count_for_model(&model))
+                    .ok()
+            })
+        } else {
+            None
+        };
+        if let Some(mut structured) = result.structured_content.take() {
+            merge_coverage_meta(&mut structured, total, &counts, semantic_files);
+            result.structured_content = Some(structured);
+        }
+        let note = if total == 0 {
+            "No matches, and nothing is indexed: this project has zero indexed files, so the \
+             empty result says nothing about the code. Run `codesage index`."
+                .to_string()
+        } else {
+            let breakdown = counts
+                .iter()
+                .map(|(lang, n)| format!("{lang} {n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let semantic_note = match semantic_files {
+                Some(0) => " None of them have semantic chunks, so this search matched nothing \
+                             because nothing was semantically indexed — run `codesage index` \
+                             without `--no-semantic`."
+                    .to_string(),
+                Some(n) if n < total => {
+                    format!(
+                        " Only {n} of them are semantically indexed, and `search` sees only those."
+                    )
+                }
+                _ => String::new(),
+            };
+            format!(
+                "No matches. The index holds {total} file(s): {breakdown}.{semantic_note} An empty \
+                 result means no match *within* that set — it is not evidence the code is absent. \
+                 If the language or directory you expected is missing above, it was never indexed: \
+                 check `[index] exclude_patterns` in .codesage/config.toml, run `codesage coverage` \
+                 to see what indexing cannot reach, and `codesage index` to refresh."
+            )
+        };
+        let existing = std::mem::take(&mut result.content);
+        let mut content = Vec::with_capacity(existing.len() + 1);
+        content.push(ContentBlock::text(note));
+        content.extend(existing);
+        result.content = content;
+        result
     }
 
     /// If staleness checking is enabled and the result references indexed files
@@ -224,12 +344,20 @@ fn render_with_budget<T: serde::Serialize>(
 /// bounded in practice; this is a hard backstop against a pathological result.
 const STALENESS_MAX_FILES: usize = 50;
 
-/// JSON keys whose string value (or string array elements) is a
-/// project-relative file path in a tool result. Deliberately excludes
-/// `imports` / `imported_by` (bare module names) and `clustered_directories`
-/// (directories, not files). Over-inclusion is harmless — `compute_stale_files`
-/// filters against the indexed file set — but under-inclusion silently misses
-/// drift, so err toward listing a key.
+/// JSON keys whose string value is a project-relative file path in a tool
+/// result — including strings nested in arrays under that key, so
+/// `Vec<Vec<String>>` shapes like `new_cycles` are reached.
+///
+/// Deliberately excludes `imports` (bare module names, `refs.to_name`),
+/// `clustered_directories` (directories), `omitted_files` (detail already
+/// dropped from the response, so the agent is not reading them), and `source`
+/// (`FeatureRecord.source` is a mapper token like `cargo-bin`, not a path).
+/// Note `imported_by` **is** listed: unlike `imports` it is `SELECT f.path`
+/// off the `files` table, so it carries real indexed paths.
+///
+/// Over-inclusion is harmless — `compute_stale_files` filters against the
+/// indexed file set — but under-inclusion silently misses drift, so err
+/// toward listing a key.
 const PATH_KEYS: &[&str] = &[
     "file_path",
     "path",
@@ -243,6 +371,22 @@ const PATH_KEYS: &[&str] = &[
     "wide_blast_files",
     "fix_heavy_files",
     "hotspot_files",
+    // `review_rehearsal` carries its patch file list as bare strings under
+    // `files`, both top-level and per-objection. Without this key the tool
+    // documented as the last step before a commit — run precisely when the
+    // working tree is dirtiest — never raised the staleness banner. Harmless
+    // for the `files: Vec<RiskAssessment>` / `Vec<FeatureFileRef>` shapes:
+    // non-string array items are skipped here and still picked up by the
+    // recursion through their own `file` / `path` keys.
+    "files",
+    // `list_dependencies` answers "who imports this file" with indexed paths;
+    // those are exactly the files an agent opens next.
+    "imported_by",
+    // `recommend_tests` "always run these" list — bare test-file paths.
+    "primary",
+    // `session_end` reports cycles as arrays of arrays of paths.
+    "new_cycles",
+    "resolved_cycles",
 ];
 
 /// Staleness checking is on by default; `CODESAGE_STALENESS_CHECK` set to a
@@ -257,22 +401,31 @@ fn staleness_enabled() -> bool {
 /// Walk a serialized tool result, collecting project-relative file paths from
 /// the [`PATH_KEYS`] fields wherever they appear (recursing through nested
 /// objects and arrays).
+/// Collect the strings under a matched [`PATH_KEYS`] key, descending through
+/// nested arrays so `Vec<Vec<String>>` (session cycles) is reached.
+///
+/// Descends arrays only, never objects: an object under a path key is a record
+/// (`files: Vec<RiskAssessment>`), whose own path fields the caller's recursion
+/// already visits by key. Walking into it here would scoop up every string it
+/// holds — note prose, categories, titles — as if they were paths.
+fn push_path_strings(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                push_path_strings(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_referenced_paths(value: &serde_json::Value, out: &mut Vec<String>) {
     match value {
         serde_json::Value::Object(map) => {
             for (k, v) in map {
                 if PATH_KEYS.contains(&k.as_str()) {
-                    match v {
-                        serde_json::Value::String(s) => out.push(s.clone()),
-                        serde_json::Value::Array(items) => {
-                            for item in items {
-                                if let serde_json::Value::String(s) = item {
-                                    out.push(s.clone());
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
+                    push_path_strings(v, out);
                 }
                 collect_referenced_paths(v, out);
             }
@@ -284,6 +437,62 @@ fn collect_referenced_paths(value: &serde_json::Value, out: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+/// True when the structured payload carries a `results` array with no entries.
+/// A payload with no `results` key at all is not "empty" — it is a different
+/// shape, and guessing at it would annotate tools this was never meant for.
+fn has_empty_results(structured: &serde_json::Value) -> bool {
+    structured
+        .get("results")
+        .and_then(|r| r.as_array())
+        .is_some_and(|a| a.is_empty())
+}
+
+/// Record index composition under `_meta.coverage`, merging into any existing
+/// `_meta` rather than overwriting it.
+fn merge_coverage_meta(
+    structured: &mut serde_json::Value,
+    total: usize,
+    counts: &[(String, usize)],
+    semantic_files: Option<usize>,
+) {
+    let serde_json::Value::Object(map) = structured else {
+        return;
+    };
+    let meta = map
+        .entry("_meta")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let serde_json::Value::Object(meta) = meta else {
+        return;
+    };
+    let by_language: serde_json::Map<String, serde_json::Value> = counts
+        .iter()
+        .map(|(lang, n)| (lang.clone(), serde_json::Value::from(*n)))
+        .collect();
+    let mut coverage = serde_json::Map::new();
+    coverage.insert("indexed_files".to_string(), serde_json::Value::from(total));
+    coverage.insert(
+        "indexed_by_language".to_string(),
+        serde_json::Value::Object(by_language),
+    );
+    if let Some(n) = semantic_files {
+        // `search` only sees semantically-indexed files; structural coverage
+        // alone would overstate what was actually searched.
+        coverage.insert(
+            "semantically_indexed_files".to_string(),
+            serde_json::Value::from(n),
+        );
+    }
+    coverage.insert(
+        "note".to_string(),
+        serde_json::Value::String(
+            "empty result means no match within the indexed set, not that the code is absent; \
+             a language missing from indexed_by_language was never indexed"
+                .to_string(),
+        ),
+    );
+    meta.insert("coverage".to_string(), serde_json::Value::Object(coverage));
 }
 
 /// Record the stale paths under `_meta.stale_files` (+ a human `stale_warning`),
@@ -821,6 +1030,73 @@ mod tests {
     }
 
     #[test]
+    fn collect_referenced_paths_covers_review_rehearsal_file_lists() {
+        // Shape of a `review_rehearsal` result: bare string paths under
+        // `files`, top-level and inside each objection.
+        let v = json!({
+            "files": ["src/a.rs", "src/b.rs"],
+            "objections": [
+                { "category": "test-gap", "files": ["src/c.rs"] },
+                { "category": "risk", "files": ["src/d.rs"] }
+            ]
+        });
+        let mut paths = Vec::new();
+        collect_referenced_paths(&v, &mut paths);
+        paths.sort();
+        assert_eq!(paths, vec!["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"]);
+    }
+
+    #[test]
+    fn collect_referenced_paths_reaches_nested_cycle_arrays() {
+        // session_end reports cycles as arrays of arrays of paths; a
+        // direct-items-only harvester saw none of them.
+        let v = json!({
+            "new_cycles": [["a.rs", "b.rs"], ["c.rs"]],
+            "resolved_cycles": [["d.rs"]],
+            "imported_by": ["e.rs"],
+            "primary": ["f_test.rs"]
+        });
+        let mut paths = Vec::new();
+        collect_referenced_paths(&v, &mut paths);
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["a.rs", "b.rs", "c.rs", "d.rs", "e.rs", "f_test.rs"]
+        );
+    }
+
+    #[test]
+    fn collect_referenced_paths_does_not_scoop_object_strings_under_a_path_key() {
+        // `files` holds records here; only their own path-keyed fields count.
+        // Note prose and categories must not be mistaken for paths.
+        let v = json!({
+            "files": [
+                { "file": "a.rs", "notes": ["test gap: no test found"], "category": "hotspot" }
+            ]
+        });
+        let mut paths = Vec::new();
+        collect_referenced_paths(&v, &mut paths);
+        assert_eq!(paths, vec!["a.rs"]);
+    }
+
+    #[test]
+    fn collect_referenced_paths_files_key_tolerates_object_arrays() {
+        // `assess_risk_diff` / `feature_bundle` also use `files`, but with
+        // object items. The key must not break them: objects contribute
+        // nothing directly and are still walked for their own path keys.
+        let v = json!({
+            "files": [
+                { "file": "src/a.rs", "score": 0.5 },
+                { "path": "src/b.rs", "role": "owned" }
+            ]
+        });
+        let mut paths = Vec::new();
+        collect_referenced_paths(&v, &mut paths);
+        paths.sort();
+        assert_eq!(paths, vec!["src/a.rs", "src/b.rs"]);
+    }
+
+    #[test]
     fn merge_stale_meta_preserves_existing_meta() {
         let mut v = json!({ "results": [], "_meta": { "truncated": true } });
         merge_stale_meta(&mut v, &["src/a.rs".to_string()]);
@@ -935,6 +1211,111 @@ mod tests {
         );
         let stale_files = &annotated.structured_content.unwrap()["_meta"]["stale_files"];
         assert_eq!(stale_files, &json!(["src/changed.rs"]));
+    }
+
+    #[test]
+    fn coverage_annotates_only_empty_results_of_the_listed_tools() {
+        // An agent that gets `[]` back cannot otherwise tell a genuine absence
+        // from a language that was never indexed, and reads the empty list as
+        // proof the code does not exist.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let codesage_dir = root.join(".codesage");
+        std::fs::create_dir_all(&codesage_dir).unwrap();
+        let db = Database::open(&codesage_dir.join("index.db")).unwrap();
+        for (rel, lang) in [
+            ("src/a.rs", Language::Rust),
+            ("src/b.rs", Language::Rust),
+            ("app/c.php", Language::Php),
+        ] {
+            db.upsert_file(&codesage_protocol::FileInfo {
+                path: rel.to_string(),
+                language: lang,
+                content_hash: codesage_parser::discover::content_hash(b"x"),
+            })
+            .unwrap();
+        }
+        drop(db);
+
+        let server = CodeSageServer::with_state(Arc::new(CodeSageServerState::new()));
+        let project = root.to_str().unwrap();
+
+        let coverage_of = |kind: &str, payload: serde_json::Value| {
+            let rendered = render_with_kind(Ok(payload), kind);
+            let annotated = server.annotate_coverage(project, kind, rendered);
+            annotated
+                .structured_content
+                .and_then(|s| s.get("_meta").and_then(|m| m.get("coverage")).cloned())
+        };
+
+        let cov = coverage_of("search", json!({ "results": [] }))
+            .expect("empty search should carry a coverage hint");
+        assert_eq!(cov["indexed_files"], json!(3));
+        assert_eq!(cov["indexed_by_language"]["rust"], json!(2));
+        assert_eq!(cov["indexed_by_language"]["php"], json!(1));
+
+        assert!(
+            coverage_of("find_symbol", json!({ "results": [] })).is_some(),
+            "find_symbol is in the annotated set"
+        );
+        // A non-empty result is not ambiguous, so it must stay untouched.
+        assert!(
+            coverage_of(
+                "search",
+                json!({ "results": [{ "file_path": "src/a.rs" }] })
+            )
+            .is_none(),
+            "a non-empty result must not be annotated"
+        );
+        // `impact_analysis` returning [] means a leaf nothing imports — a
+        // correct answer that a coverage note would only muddy.
+        assert!(
+            coverage_of("impact_analysis", json!({ "results": [] })).is_none(),
+            "impact_analysis is deliberately outside the annotated set"
+        );
+        // A payload with no `results` key is a different shape, not an empty one.
+        assert!(
+            coverage_of("search", json!({ "found": false })).is_none(),
+            "a payload without `results` must not be treated as empty"
+        );
+
+        // `search` reads the SEMANTIC set, not the structural file table.
+        // Nothing here was semantically indexed, so it must say so rather than
+        // report 3 files as though they had been searched.
+        let sem = coverage_of("search", json!({ "results": [] })).unwrap();
+        assert_eq!(sem["semantically_indexed_files"], json!(0));
+        // `find_symbol` is structural, so the semantic count does not apply.
+        let structural = coverage_of("find_symbol", json!({ "results": [] })).unwrap();
+        assert!(structural.get("semantically_indexed_files").is_none());
+    }
+
+    #[test]
+    fn coverage_speaks_up_loudest_when_nothing_is_indexed() {
+        // The zero-file index is where an empty result misleads hardest:
+        // nothing was ever looked at. Staying silent here would be backwards.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let codesage_dir = root.join(".codesage");
+        std::fs::create_dir_all(&codesage_dir).unwrap();
+        drop(Database::open(&codesage_dir.join("index.db")).unwrap());
+
+        let server = CodeSageServer::with_state(Arc::new(CodeSageServerState::new()));
+        let project = root.to_str().unwrap();
+        let rendered = render_with_kind(Ok(json!({ "results": [] })), "find_symbol");
+        let annotated = server.annotate_coverage(project, "find_symbol", rendered);
+
+        let cov = annotated
+            .structured_content
+            .as_ref()
+            .and_then(|s| s.get("_meta").and_then(|m| m.get("coverage")))
+            .expect("an empty index must still be annotated");
+        assert_eq!(cov["indexed_files"], json!(0));
+        let banner = annotated.content.first().and_then(|c| c.as_text()).unwrap();
+        assert!(
+            banner.text.contains("nothing is indexed"),
+            "got {:?}",
+            banner.text
+        );
     }
 
     #[test]

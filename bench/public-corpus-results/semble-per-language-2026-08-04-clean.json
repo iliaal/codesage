@@ -1,0 +1,227 @@
+{
+  "provenance": {
+    "_note": "Backfilled 2026-08-04. This run predates the runner emitting a provenance block; the fields below were recorded by hand from the run's inputs, not captured programmatically. Later runs emit this automatically.",
+    "codesage_version": "codesage 0.18.0 (release), features: cpu, cuda; device configured: gpu",
+    "codesage_code_state": "5aaf49e (last code-affecting commit before the run; 165ac74 teardown fix and the CODESAGE_HYBRID toggle both included)",
+    "semble_commit": "d899d610039d6e84de0bb2f236c5e8d75c5c5049",
+    "corpus_root": "~/.cache/semble-bench",
+    "limit": 10
+  },
+  "per_repo": {
+    "aiohttp": {
+      "language": "python",
+      "queries": 21,
+      "ndcg@10": 0.9083
+    },
+    "fastapi": {
+      "language": "python",
+      "queries": 20,
+      "ndcg@10": 0.774
+    },
+    "flask": {
+      "language": "python",
+      "queries": 21,
+      "ndcg@10": 0.8572
+    },
+    "httpx": {
+      "language": "python",
+      "queries": 21,
+      "ndcg@10": 0.9041
+    },
+    "model2vec": {
+      "language": "python",
+      "queries": 20,
+      "ndcg@10": 0.8457
+    },
+    "pydantic": {
+      "language": "python",
+      "queries": 20,
+      "ndcg@10": 0.6955
+    },
+    "requests": {
+      "language": "python",
+      "queries": 20,
+      "ndcg@10": 0.9331
+    },
+    "starlette": {
+      "language": "python",
+      "queries": 21,
+      "ndcg@10": 0.9201
+    },
+    "axios": {
+      "language": "javascript",
+      "queries": 20,
+      "ndcg@10": 0.9232
+    },
+    "express": {
+      "language": "javascript",
+      "queries": 20,
+      "ndcg@10": 0.9446
+    },
+    "redux": {
+      "language": "javascript",
+      "queries": 20,
+      "ndcg@10": 0.9175
+    },
+    "gin": {
+      "language": "go",
+      "queries": 20,
+      "ndcg@10": 0.8403
+    },
+    "cobra": {
+      "language": "go",
+      "queries": 20,
+      "ndcg@10": 0.9091
+    },
+    "chi": {
+      "language": "go",
+      "queries": 18,
+      "ndcg@10": 0.8951
+    },
+    "gson": {
+      "language": "java",
+      "queries": 20,
+      "ndcg@10": 0.835
+    },
+    "commons-lang": {
+      "language": "java",
+      "queries": 21,
+      "ndcg@10": 0.9402
+    },
+    "jackson-databind": {
+      "language": "java",
+      "queries": 20,
+      "ndcg@10": 0.7693
+    },
+    "guzzle": {
+      "language": "php",
+      "queries": 20,
+      "ndcg@10": 0.8643
+    },
+    "monolog": {
+      "language": "php",
+      "queries": 20,
+      "ndcg@10": 0.8888
+    },
+    "laravel-framework": {
+      "language": "php",
+      "queries": 20,
+      "ndcg@10": 0.7624
+    },
+    "tokio": {
+      "language": "rust",
+      "queries": 20,
+      "ndcg@10": 0.8368
+    },
+    "trpc": {
+      "language": "typescript",
+      "queries": 20,
+      "ndcg@10": 0.7852
+    },
+    "click": {
+      "language": "python",
+      "queries": 20,
+      "ndcg@10": 0.9381
+    },
+    "serde": {
+      "language": "rust",
+      "queries": 20,
+      "ndcg@10": 0.8512
+    },
+    "zod": {
+      "language": "typescript",
+      "queries": 20,
+      "ndcg@10": 0.5254
+    },
+    "nlohmann-json": {
+      "language": "cpp",
+      "queries": 20,
+      "ndcg@10": 0.9323
+    },
+    "axum": {
+      "language": "rust",
+      "queries": 20,
+      "ndcg@10": 0.6683
+    },
+    "vitest": {
+      "language": "typescript",
+      "queries": 20,
+      "ndcg@10": 0.7349
+    },
+    "abseil-cpp": {
+      "language": "cpp",
+      "queries": 20,
+      "ndcg@10": 0.8709
+    },
+    "fmtlib": {
+      "language": "cpp",
+      "queries": 20,
+      "ndcg@10": 0.8249
+    },
+    "curl": {
+      "language": "c",
+      "queries": 20,
+      "ndcg@10": 0.7243
+    },
+    "redis": {
+      "language": "c",
+      "queries": 20,
+      "ndcg@10": 0.8477
+    },
+    "libuv": {
+      "language": "c",
+      "queries": 20,
+      "ndcg@10": 0.658
+    }
+  },
+  "by_language": {
+    "c": {
+      "repos": 3,
+      "queries": 60,
+      "ndcg@10": 0.7434
+    },
+    "cpp": {
+      "repos": 3,
+      "queries": 60,
+      "ndcg@10": 0.876
+    },
+    "go": {
+      "repos": 3,
+      "queries": 58,
+      "ndcg@10": 0.881
+    },
+    "java": {
+      "repos": 3,
+      "queries": 61,
+      "ndcg@10": 0.8497
+    },
+    "javascript": {
+      "repos": 3,
+      "queries": 60,
+      "ndcg@10": 0.9284
+    },
+    "php": {
+      "repos": 3,
+      "queries": 60,
+      "ndcg@10": 0.8385
+    },
+    "python": {
+      "repos": 9,
+      "queries": 184,
+      "ndcg@10": 0.8647
+    },
+    "rust": {
+      "repos": 3,
+      "queries": 60,
+      "ndcg@10": 0.7854
+    },
+    "typescript": {
+      "repos": 3,
+      "queries": 60,
+      "ndcg@10": 0.6818
+    }
+  },
+  "skipped": [],
+  "warnings": [],
+  "note": "supported-language subset of semble's corpus; no pooled overall is reported because the unsupported 10 languages are not run"
+}

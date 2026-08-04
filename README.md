@@ -9,7 +9,7 @@
 
 ![CodeSage: structural and semantic code intelligence for AI agents](images/codesage-hero.jpg)
 
-CodeSage is a code intelligence engine for AI coding agents. It combines structural graph queries (symbols, references, dependencies) and semantic search (embedding retrieval with cross-encoder reranking) in a single Rust binary, usable as a CLI or over MCP. Nine languages today (PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go). On the [semble](https://github.com/MinishLab/semble) retrieval corpus, codesage `search` scores **recall@10 = 0.932 / NDCG@10 = 0.788** across 602 queries on the 8 supported-language repos (see [External-corpus benchmark](#external-corpus-benchmark-semble) below).
+CodeSage is a code intelligence engine for AI coding agents. It combines structural graph queries (symbols, references, dependencies) and semantic search (embedding retrieval with cross-encoder reranking) in a single Rust binary, usable as a CLI or over MCP. Nine languages today (PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go). On the [semble](https://github.com/MinishLab/semble) retrieval corpus, codesage `search` scores **NDCG@10 between 0.68 and 0.93 depending on language**, measured per language across 663 queries (see [External-corpus benchmark](#external-corpus-benchmark-semble) below).
 
 ## 🔍 What you can do with it
 
@@ -68,21 +68,11 @@ The trade-off: CUDA-accelerated embeddings on Linux need the `nvidia-*-cu12` pip
 
 ## 📊 Benchmarks
 
-Ground-truth retrieval on git-mined corpora, 30 cases per repo, `search` top-10:
+Retrieval quality is measured against semble's published corpus. See [External-corpus benchmark](#external-corpus-benchmark-semble) below for the current per-language table and its artifact.
 
-| repo | miss rate | mean recall@10 |
-|---|---:|---:|
-| BurntSushi/ripgrep @ `4519153e5e46` (101 files, 52K LoC) | 13% | 0.79 |
-| nestjs/nest @ `8eec029772fa` (1,672 files, 110K LoC) | 3% | 0.94 |
+**The git-mined ripgrep and nest figures that stood here were removed on 2026-08-04.** They were measured at codesage 0.4.5, with 16 tagged releases since (`git tag --sort=v:refname`), so they describe a ranker that has been substantially rewritten. Neither corpus is present in `CODESAGE_BENCH_CORPUS_DIR`, so they cannot be re-measured at all. The same applies to the code-review-graph head-to-head that shared those corpora.
 
-Head-to-head against code-review-graph 2.3.2 (same corpora, same queries, code-review-graph configured with matching test-directory exclusions for fairness):
-
-| repo | CodeSage miss | code-review-graph miss | CodeSage per-query wall-clock | code-review-graph per-query wall-clock |
-|---|---:|---:|---:|---:|
-| ripgrep | **13%** | 17% | ~0.25 s | 0.80 s |
-| nest | **3%** | 40% | ~0.25 s | 1.10 s |
-
-The nest gap is architectural: CodeSage embeds chunks (~50-line regions), code-review-graph embeds nodes (functions). Commit-style queries that describe behavior spanning multiple functions match chunks more reliably than individual function bodies.
+One design difference is worth stating as a **hypothesis**, not a result: CodeSage embeds chunks (~50-line regions) rather than individual function bodies, which should suit a commit-style query describing behavior spread across several functions. The measurement that motivated that claim is the one being withdrawn here, so it is untested at the current release.
 
 ### External-corpus benchmark (semble)
 
@@ -90,18 +80,51 @@ The nest gap is architectural: CodeSage embeds chunks (~50-line regions), code-r
 
 Running codesage `search` (`jina-embeddings-v2-base-code` + `ms-marco-MiniLM-L6-v2` reranker, GPU) on the corpus at its pinned SHAs:
 
-| Sample | n queries | recall@10 (primary) | NDCG@10 | mean first-hit rank |
-|---|--:|--:|--:|--:|
-| Supported-language repos (30 of 63) | 602 | **0.932** | **0.788** | 1.79 |
-| Full corpus (63 repos, missing parsers = miss) | 1,251 | 0.448 | 0.379 | n/a |
+Per language, over the 33 repos in the 9 languages codesage parses. CodeSage's column is measured here; semble's and CodeRankEmbed's are their published figures.
 
-The headline number is the 602-query / 8-language slice. That's what compares apples-to-apples against the languages codesage actually parses. The full-corpus number reflects the parser-coverage gap (36% of corpus targets Java, Ruby, Kotlin, Scala, C#, Swift, Elixir, Haskell, Lua, Zig, or Bash, none currently supported); it is a language-coverage number, not a retrieval-quality number.
+| language | **CodeSage** | semble | CodeRankEmbed | repos | queries |
+|---|--:|--:|--:|--:|--:|
+| javascript | **0.928** | 0.917 | 0.925 | 3 | 60 |
+| go | **0.881** | 0.895 | 0.713 | 3 | 58 |
+| cpp | **0.876** | 0.915 | 0.897 | 3 | 60 |
+| python | **0.865** | 0.867 | 0.878 | 9 | 184 |
+| java | **0.850** | 0.849 | 0.790 | 3 | 61 |
+| php | **0.839** | 0.858 | 0.847 | 3 | 60 |
+| rust | **0.785** | 0.856 | 0.754 | 3 | 60 |
+| c | **0.743** | 0.741 | 0.771 | 3 | 60 |
+| typescript | **0.682** | 0.706 | 0.671 | 3 | 60 |
 
-By-language headline (8 supported): JavaScript 0.892, Go 0.887, PHP 0.885 lead; TypeScript 0.595 trails (zod + vitest specifically, where a test-file flood dominates top-10 on phrase-matched queries).
+Artifact: `bench/history/semble-per-language-2026-08-04-clean.json`. The run reported no skipped repos and no degraded queries; a run with either is not publishable (see below).
+
+**No pooled number is quoted, deliberately.** semble's overall figure covers 63 repos across 19 languages; this covers the 33 repos in the 9 languages codesage parses. Different repo sets are not comparable, so the per-language rows are the only comparable unit. 47% of the corpus targets a language codesage does not parse (588 of 1,251 queries). That is a coverage gap, not a retrieval-quality measurement, and averaging it in would state the wrong thing.
+
+**Weakest rows are TypeScript (0.682) and C (0.743).** Both improved in the current unreleased line and both still trail. TypeScript's residual is `zod`, which ships v3 and v4 side by side and where the remaining confusion is between sibling v4 implementations rather than between versions.
+
+### Why the previously published numbers were withdrawn
+
+This section used to claim `recall@10 = 0.932 / NDCG@10 = 0.788` over 602 queries. Those figures were withdrawn on 2026-08-04 and are not comparable to the table above:
+
+- They were measured across **whole repositories**. semble's `repos.json` carries a `benchmark_root` per repo (29 of the 33 supported repos point at a subdirectory: `monolog` to `src/Monolog`, `curl` to `lib`), and that subdirectory is what their harness indexes. Scoring the whole repo makes the ranker compete against tests, docs and sibling packages the other arms never see.
+- The harness scored a **crashed query as 0.000**. `codesage search` could write a complete result set and then abort at teardown; those queries were silently counted as total misses. That alone moved `monolog` from a true 0.8888 to a published 0.8388, and propagated into the PHP row.
+
+Both causes are fixed. The abort is gone from the CLI, and the harness now keeps results from a nonzero exit and reports a `degraded` count per repo and per language, so a crashed run cannot be read as a clean one.
 
 This is **not** a "codesage > semble" claim. A head-to-head would require running semble end-to-end on the same 63 repos under matched conditions, which is out of scope here. The number is codesage measured against semble's published ground truth.
 
-Run yourself with `bench/codesage-bench-runner <corpus.yaml>` (corpus format: `project_root` + `cases` list of `{id, query, expected_files}`). Scorecards from these runs live under `bench/history/`; corpora are not bundled so private-repo names don't leak by accident. Not a statement about every workload; bring your own corpus for your codebase.
+Reproduce the table above with:
+
+```sh
+python3 bench/semble-ndcg-runner \
+  --corpus ~/.cache/semble-bench \
+  --annotations <semble>/benchmarks/annotations \
+  --repos <semble>/benchmarks/repos.json \
+  --codesage-bin "$PWD/target/release/codesage" \
+  --json results.json
+```
+
+Index each repo inside its `benchmark_root`, not at the repo root, and pass `--codesage-bin` as an absolute path: each search runs with its cwd set to the corpus repo.
+
+For your own codebase, `bench/codesage-bench-runner <corpus.yaml>` takes a `project_root` plus a `cases` list of `{id, query, expected_files}`. Corpora are not bundled, so private repo names don't leak by accident.
 
 ## 🚀 Getting started
 
@@ -391,25 +414,27 @@ Parsing happens in parallel via Rayon; SQLite writes are batched. Re-running `co
 
 ## Search pipeline
 
-A query flows through five stages:
+A query flows through seven stages:
 
 ```mermaid
 flowchart LR
     Q[Query string] --> E[Embed<br/>Jina code v2]
     E --> K[KNN retrieval<br/>sqlite-vec<br/>overfetch 5x]
     K --> B[Symbol boost<br/>+0.1 per token match]
-    B --> R[Cross-encoder rerank<br/>ms-marco<br/>blend 50/50]
+    B --> R[Cross-encoder rerank<br/>ms-marco<br/>adaptive blend]
     R --> A[Symbol annotation]
     A --> T[Top-N results]
 ```
 
-1. Embed the query with Jina embeddings v2 base-code (768d) via ONNX Runtime.
-2. Prepend file path and symbol context to chunks before embedding.
-3. Boost chunks whose content matches known symbol names.
-4. Re-score the top candidates with ms-marco-MiniLM-L6-v2 and blend 50/50 with the semantic score.
-5. Annotate each result with overlapping function and class names.
+1. Embed the query with Jina embeddings v2 base-code (768d) via ONNX Runtime. Chunks carry file path and symbol context, prepended before they were embedded at index time.
+2. Retrieve nearest neighbours from sqlite-vec, overfetching 5x when the reranker is active.
+3. For code-literal queries only (backticks, `::`, glob patterns, or a rare indexed token), merge BM25 candidates by reciprocal rank fusion. Most queries skip this.
+4. Boost chunks whose content matches known symbol names, then apply definition, path, version and saturation adjustments.
+5. Re-score with ms-marco-MiniLM-L6-v2 and blend with the semantic score. The weight adapts to query shape: 0.35 for a bare identifier, 0.6 for natural language, 0.5 otherwise. Skipped when BM25 fusion ran, since the rare-token match is already the stronger signal there.
+6. Annotate each result with overlapping function and class names.
+7. Truncate to the requested limit.
 
-The reranker is optional. Set or remove it in `config.toml`; stages 1-3 and the annotation still run without it.
+The reranker is optional. Set or remove it in `config.toml`; every other stage still runs without it.
 
 ## Configuration
 
@@ -462,7 +487,7 @@ If CoreML registration fails, the process errors out instead of silently falling
 
 ## 🏗️ Architecture
 
-A Rust workspace with six crates:
+A Rust workspace with seven crates:
 
 ```mermaid
 flowchart TD
@@ -472,6 +497,7 @@ flowchart TD
     parser[parser<br/>tree-sitter + discovery]
     storage[storage<br/>SQLite + sqlite-vec + FTS5]
     embed[embed<br/>ONNX + reranker + chunking]
+    feat[features<br/>feature slices + trust boundaries]
     protocol[protocol<br/>shared types]
 
     cli --> daemon
@@ -480,9 +506,13 @@ flowchart TD
     gr --> parser
     gr --> storage
     gr --> embed
+    gr --> feat
+    feat --> parser
+    feat --> storage
     parser --> protocol
     storage --> protocol
     embed --> protocol
+    feat --> protocol
     gr --> protocol
 ```
 
@@ -492,6 +522,7 @@ flowchart TD
 | `parser` | File discovery, tree-sitter parsing, symbol and reference extraction |
 | `storage` | SQLite with sqlite-vec KNN and FTS5 |
 | `embed` | ONNX embedding inference, cross-encoder reranking, chunking |
+| `features` | Feature-slice mapping and trust-boundary derivation |
 | `graph` | Indexing orchestration and search pipeline |
 | `cli` | Binary with CLI subcommands, stdio MCP shim, and Unix-socket MCP daemon |
 
@@ -510,15 +541,15 @@ Corpora aren't bundled. Bring your own, or point the plugin at `$CODESAGE_BENCH_
 
 Honest inventory of what CodeSage does not do well, measured on our canary corpora and from 30 days of real Claude Code session logs (the harness in `bench/analyze-codesage-quality.py` produces the same numbers locally).
 
-**Language surface is narrower than competitors'.** Nine languages today (Java added after C++ in 0.4.5). Graphify ships 25, code-review-graph 23, SocratiCode 18+. The gap matters most if your stack is Ruby, Kotlin, Swift, or Scala. Measured cost: on the semble retrieval corpus (1,251 queries × 63 repos × 19 languages), 36% of queries target a language codesage does not parse, with zero recall on those. The tree-sitter query files live under `crates/parser/src/queries/` and contributions there are the cleanest way to extend coverage.
+**Language surface is narrower than competitors'.** Nine languages today (Java added after C++ in 0.4.5). Graphify ships 25, SocratiCode 18+, and code-review-graph more than CodeSage (its README no longer states an exact count). The gap matters most if your stack is Ruby, Kotlin, Swift, or Scala. Measured cost: on the semble retrieval corpus (1,251 queries × 63 repos × 19 languages), 47% of queries target a language codesage does not parse (588 of 1,251), with zero recall on those. The tree-sitter query files live under `crates/parser/src/queries/` and contributions there are the cleanest way to extend coverage.
 
-**Retrieval misses on cross-file refactor queries.** On the ripgrep corpus, 13% of cases miss top-10; four of those six misses are commit subjects like *printer: drop dependency on serde_derive* that describe a rename spanning multiple files without a distinctive literal signal. Single-identifier lookups (`find_symbol`, `find_references`) are reliable. Pure semantic searches (`search`) are reliable. Diffuse multi-file refactor descriptions expressed in prose are the failure mode.
+**Retrieval misses on cross-file refactor queries.** The failure mode is a commit subject like *printer: drop dependency on serde_derive* that describes a rename spanning several files with no distinctive literal to match on. Single-identifier lookups (`find_symbol`, `find_references`) are reliable. Pure semantic searches (`search`) are reliable. Diffuse multi-file refactor descriptions expressed in prose are the failure mode.
 
 **`impact_analysis` biases toward over-prediction.** The tool walks reference edges up to a configurable depth and reports every reachable file. Agents get false positives but almost never false negatives (short of a stale index). We picked that side of the precision/recall trade because an agent can filter a list of 20 candidates faster than it can recover from a missed dependency that bites in review. If you want high precision at the cost of recall, drop `--depth` to 1 and `--source-only`.
 
-**MCP tool-selection rate is low today.** When CodeSage MCP tools are available in a Claude Code session alongside `Grep`, the agent picks `Grep` on code-identifier queries: 1.1% CodeSage-pick rate over 30 days of sessions, 0/10 on a controlled active harness. We sharpened tool descriptions and per-project CLAUDE.md guidance to call this out; the next measurement cycle will show whether the intervention landed. For a hook-level workaround today, see the LSP enforcement kit in the [Complementary tools](#complementary-tools) section.
+**MCP tool-selection rate is low today.** When CodeSage MCP tools are available in a Claude Code session alongside `Grep`, the agent picks `Grep` on code-identifier queries: 1.1% CodeSage-pick rate over 30 days of sessions, 0/10 on a controlled active harness (measured 2026-04-24, not re-measured since). We sharpened tool descriptions and per-project CLAUDE.md guidance to call this out; the next measurement cycle will show whether the intervention landed. For a hook-level workaround today, see the LSP enforcement kit in the [Complementary tools](#complementary-tools) section.
 
-**`find_coupling` returns empty on young files.** Measured 59% empty-response rate in real usage. Each empty result now carries a `note` field (`"no commits tracked"`, `"below min-count=3 threshold"`, `"path shape mismatch"`) so the agent can tell the cause. The underlying data just doesn't exist for recently-added files; the tool reports that honestly instead of inventing signal.
+**`find_coupling` returns empty on young files.** Each empty result now carries a `note` field (`"no commits tracked"`, `"below min-count=3 threshold"`, `"path shape mismatch"`) so the agent can tell the cause. The underlying data just doesn't exist for recently-added files; the tool reports that honestly instead of inventing signal.
 
 ## 🔗 Pairs with
 

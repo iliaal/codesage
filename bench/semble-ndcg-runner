@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""Score `codesage search` on semble's published annotation corpus, NDCG@10.
+
+semble publishes a per-language NDCG@10 table across ten arms (semble,
+CodeRankEmbed, ColGREP, BM25, ck, codebase-memory-mcp, grepai, probe, cs,
+ripgrep). This runs CodeSage on the same corpus with the same metric so the
+numbers are directly comparable.
+
+Scope: semble's corpus spans 19 languages; CodeSage parses 9. Running the
+unsupported 10 would score ~0 and drag a pooled average into meaninglessness,
+so this reports PER LANGUAGE over the supported subset and never quotes a
+single "overall" number against semble's 63-repo overall.
+
+Scoring is copied verbatim from semble's own harness rather than reimplemented,
+so a difference in the number cannot come from a difference in the metric:
+  - dcg / ndcg_at_k          semble benchmarks/metrics.py
+  - path_matches / file_rank semble benchmarks/metrics.py + data.py
+  - dedup-by-location, top_k semble benchmarks/tools.py::run_cs
+File-level ranking is the same basis the cs and ripgrep arms use.
+
+Usage:
+  semble-ndcg-runner --corpus ~/.cache/semble-bench \
+      --annotations ~/ai/codesage_ref/semble/benchmarks/annotations \
+      --repos ~/ai/codesage_ref/semble/benchmarks/repos.json \
+      --codesage-bin /abs/path/to/target/release/codesage \
+      [--limit 10] [--json out.json]
+
+`--codesage-bin` must be ABSOLUTE: each search runs with cwd set to the corpus
+repo, so a relative path resolves against that repo and dies with FileNotFound.
+"""
+import argparse
+import json
+import math
+import subprocess
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+
+SUPPORTED = {
+    "python", "php", "c", "cpp", "java",
+    "rust", "javascript", "typescript", "go",
+}
+
+
+# --- semble benchmarks/metrics.py, verbatim ---------------------------------
+def dcg(relevances):
+    return sum(rel / math.log2(i + 2) for i, rel in enumerate(relevances))
+
+
+def ndcg_at_k(relevant_ranks, n_relevant, k):
+    if n_relevant == 0:
+        return 0.0
+    relevances = [0] * k
+    for rank in relevant_ranks:
+        if 1 <= rank <= k:
+            relevances[rank - 1] = 1
+    ideal = dcg([1] * min(k, n_relevant))
+    return dcg(relevances) / ideal if ideal > 0 else 0.0
+
+
+# --- semble benchmarks/data.py, verbatim ------------------------------------
+def path_matches(file_path, target_path):
+    norm_file = file_path.replace("\\", "/")
+    norm_target = target_path.replace("\\", "/")
+    return (
+        norm_file == norm_target
+        or norm_file.endswith(f"/{norm_target}")
+        or norm_target.endswith(f"/{norm_file}")
+    )
+
+
+def file_rank(file_paths, target_path):
+    for i, fp in enumerate(file_paths, 1):
+        if path_matches(fp, target_path):
+            return i
+    return None
+
+
+# ---------------------------------------------------------------------------
+def target_path(entry):
+    """Annotation targets are paths, optionally carrying a `:start-end` span."""
+    if isinstance(entry, dict):
+        entry = entry.get("path", "")
+    return str(entry).split(":", 1)[0]
+
+
+def search(binary, repo_dir, query, limit, timeout=120):
+    """Ranked, deduped file paths for one query, plus how the process exited.
+
+    Returns (paths, status) where status is one of "ok", "crashed-with-output",
+    "timeout-with-output", "timeout", "unparseable", "invalid-output", or
+    "crashed".
+
+    Only "ok" means a clean run. Everything else is counted and surfaced, so a
+    degraded run can never be read as a clean number.
+
+    A nonzero exit does NOT discard usable results. `codesage search` can write
+    a complete result set and then abort at teardown (SIGABRT / exit 134, see
+    cs-search-teardown-abort-evy), and the previous `return []` on nonzero exit
+    scored those queries a clean 0.000 — indistinguishable from genuinely bad
+    retrieval, and the same silent-zero failure this runner already refuses to
+    tolerate for empty semantic indexes. It measurably depressed published
+    numbers: monolog scored 0.8388 that way against 0.8889 when the exit code
+    is ignored, on an identical binary and query set.
+    """
+    timed_out = False
+    try:
+        proc = subprocess.run(
+            [binary, "search", "--json", "--limit", str(limit), query],
+            cwd=repo_dir, capture_output=True, text=True, timeout=timeout,
+        )
+        stdout, returncode = proc.stdout, proc.returncode
+    except subprocess.TimeoutExpired as exc:
+        # A hung process may already have written a complete result set;
+        # discarding it depresses the average exactly like the old
+        # nonzero-exit branch did.
+        timed_out = True
+        stdout = exc.stdout or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", "replace")
+        returncode = None
+
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        if timed_out:
+            return [], "timeout"
+        # No usable stdout. A nonzero exit here is a real failure.
+        return [], "crashed" if returncode != 0 else "unparseable"
+
+    # Well-formed JSON is not the same as a usable result set: `{}` and
+    # `{"results": null}` both parse and would otherwise be scored 0.000 as a
+    # clean run -- the same silent-zero this function exists to prevent.
+    if isinstance(data, dict):
+        if "results" not in data:
+            return [], "invalid-output"
+        rows = data["results"]
+    else:
+        rows = data
+    if not isinstance(rows, list):
+        return [], "invalid-output"
+
+    seen = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            return [], "invalid-output"
+        fp = r.get("file_path")
+        if fp:
+            seen.setdefault(fp, None)
+
+    if timed_out:
+        status = "timeout-with-output"
+    elif returncode != 0:
+        status = "crashed-with-output"
+    else:
+        status = "ok"
+    return list(seen)[:limit], status
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--corpus", required=True, type=Path)
+    ap.add_argument("--annotations", required=True, type=Path)
+    ap.add_argument("--repos", required=True, type=Path)
+    ap.add_argument("--codesage-bin", required=True)
+    ap.add_argument("--limit", type=int, default=10)
+    ap.add_argument("--json", type=Path)
+    ap.add_argument("--only", nargs="*", help="restrict to these repo names")
+    args = ap.parse_args()
+
+    # Fail fast rather than per-query: every search runs with cwd=repo_dir, so
+    # a relative binary path resolves against the corpus repo and raises
+    # FileNotFoundError on the first query.
+    bin_path = Path(args.codesage_bin)
+    if not bin_path.is_absolute():
+        bin_path = bin_path.resolve()
+    if not bin_path.exists():
+        sys.exit(f"codesage binary not found: {bin_path}")
+    args.codesage_bin = str(bin_path)
+
+    specs = [r for r in json.loads(args.repos.read_text()) if r["language"] in SUPPORTED]
+    if args.only:
+        specs = [r for r in specs if r["name"] in args.only]
+
+    per_repo, by_lang, skipped = {}, defaultdict(list), []
+    run_warnings = []
+    for spec in specs:
+        name, lang = spec["name"], spec["language"]
+        # semble scopes each benchmark to `benchmark_root`, not the repo root
+        # (29 of the 33 supported repos use one). Indexing and searching the
+        # whole repo is a different, harder task -- far more distractors -- so
+        # scoring that way understates every arm and is not comparable to their
+        # published table.
+        root = spec.get("benchmark_root")
+        repo_dir = args.corpus / name / root if root else args.corpus / name
+        ann = args.annotations / f"{name}.json"
+        if not repo_dir.exists() or not ann.exists():
+            skipped.append(f"{name} (missing checkout or annotations)")
+            continue
+        db = repo_dir / ".codesage" / "index.db"
+        if not db.exists():
+            skipped.append(f"{name} (not indexed)")
+            continue
+        # A repo whose semantic pass never finished returns no results and
+        # would score a clean 0.000, which is indistinguishable from genuinely
+        # bad retrieval. Refuse to score it instead of burying a broken index
+        # in the average.
+        try:
+            import sqlite3
+
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            n_sem = con.execute("SELECT count(*) FROM semantic_files").fetchone()[0]
+            con.close()
+        except Exception as exc:  # noqa: BLE001 - report, never score
+            skipped.append(f"{name} (index unreadable: {exc})")
+            continue
+        if n_sem == 0:
+            skipped.append(f"{name} (semantic index empty - not scored)")
+            continue
+
+        tasks = json.loads(ann.read_text())
+        scores = []
+        statuses = Counter()
+        for t in tasks:
+            targets = [target_path(x) for x in
+                       (t.get("relevant", []) + t.get("secondary", []))]
+            got, status = search(args.codesage_bin, repo_dir, t["query"], args.limit)
+            statuses[status] += 1
+            ranks = [r for tp in targets if (r := file_rank(got, tp)) is not None]
+            scores.append(ndcg_at_k(ranks, len(targets), args.limit))
+        mean = sum(scores) / len(scores) if scores else 0.0
+        # Surface every non-clean query. A run with crashes is still reported,
+        # but never as a bare number a reader would take for a clean result.
+        degraded = {k: v for k, v in statuses.items() if k != "ok"}
+        per_repo[name] = {"language": lang, "queries": len(scores), "ndcg@10": round(mean, 4)}
+        if degraded:
+            per_repo[name]["degraded"] = dict(degraded)
+            for k, v in degraded.items():
+                run_warnings.append(f"{name}: {v} query(s) {k}")
+        by_lang[lang].append((mean, len(scores), dict(degraded)))
+        flag = f"  [{', '.join(f'{v} {k}' for k, v in degraded.items())}]" if degraded else ""
+        print(f"  {name:<22} {lang:<11} n={len(scores):<4} ndcg@10={mean:.3f}{flag}",
+              file=sys.stderr)
+
+    lang_tbl = {}
+    for lang, rows in sorted(by_lang.items()):
+        n = sum(c for _, c, _ in rows)
+        # Query-weighted, matching how a per-language cell aggregates repos.
+        entry = {
+            "repos": len(rows),
+            "queries": n,
+            "ndcg@10": round(sum(m * c for m, c, _ in rows) / n, 4) if n else 0.0,
+        }
+        # Carry degradation into the per-language table too. This is the
+        # surface that actually gets published, so a reader copying a row must
+        # see that some of its queries did not run cleanly.
+        lang_degraded = Counter()
+        for _, _, d in rows:
+            lang_degraded.update(d)
+        if lang_degraded:
+            entry["degraded"] = dict(lang_degraded)
+        lang_tbl[lang] = entry
+
+    # Pin the inputs. A results file that does not record what produced it
+    # cannot be reproduced or diffed later, which is the same failure that got
+    # the previous published numbers withdrawn.
+    def _rev(path):
+        try:
+            r = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"],
+                               capture_output=True, text=True, timeout=10)
+            return r.stdout.strip() or None
+        except Exception:  # noqa: BLE001 - provenance is best-effort, never fatal
+            return None
+
+    try:
+        bin_version = subprocess.run([args.codesage_bin, "--version"],
+                                     capture_output=True, text=True, timeout=30).stdout.strip()
+    except Exception:  # noqa: BLE001
+        bin_version = None
+
+    provenance = {
+        "codesage_version": bin_version,
+        "codesage_commit": _rev(Path(__file__).resolve().parent.parent),
+        "semble_commit": _rev(args.repos.parent.parent),
+        "corpus_root": str(args.corpus),
+        "limit": args.limit,
+    }
+
+    out = {
+        "provenance": provenance,
+        "per_repo": per_repo,
+        "by_language": lang_tbl,
+        "skipped": skipped,
+        "warnings": run_warnings,
+        "note": "supported-language subset of semble's corpus; no pooled overall is "
+                "reported because the unsupported 10 languages are not run",
+    }
+    print(json.dumps(out, indent=2))
+    if args.json:
+        args.json.write_text(json.dumps(out, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

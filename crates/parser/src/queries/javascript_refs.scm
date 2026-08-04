@@ -21,3 +21,37 @@
 
 ; Pattern 6: instantiation (new Foo())
 (new_expression constructor: (identifier) @ref)
+
+; Patterns 7-9: the imported BINDING names. Pattern 0 captures only the module
+; specifier, so a file that imports a symbol and then uses it in a form no other
+; pattern captures — `Foo.staticMethod()` (pattern 3 sees only `staticMethod`),
+; `x instanceof Foo`, `obj.Foo = Foo` — produced no reference row naming that
+; symbol at all, and the file dropped out of its dependents.
+; Appended at the end: pattern indices are positional and map to kinds by
+; number in references.rs, so inserting above would renumber every kind.
+(import_statement (import_clause (identifier) @ref))
+(import_statement (import_clause (named_imports (import_specifier name: (identifier) @ref))))
+(import_statement (import_clause (namespace_import (identifier) @ref)))
+
+; Patterns 10-11: bindings that arrive by a route other than `import`.
+; A re-export names the symbols it forwards, and CommonJS destructuring names
+; what it pulls off the module object; both previously recorded only the module
+; string, so a barrel file or a `const { a } = require(...)` consumer named no
+; symbol and vanished from that symbol's dependents.
+(export_statement (export_clause (export_specifier name: (identifier) @ref)) source: (string))
+(variable_declarator
+  name: (object_pattern (shorthand_property_identifier_pattern) @ref)
+  value: (call_expression
+    function: (identifier) @_req
+    arguments: (arguments (string)))
+  (#eq? @_req "require"))
+
+; Pattern 12: aliased CommonJS destructuring, `const { a: localA } = require(...)`.
+; The shorthand form above is a `shorthand_property_identifier_pattern`; an
+; alias is a `pair_pattern`, whose KEY names the exported symbol.
+(variable_declarator
+  name: (object_pattern (pair_pattern key: (property_identifier) @ref))
+  value: (call_expression
+    function: (identifier) @_req
+    arguments: (arguments (string)))
+  (#eq? @_req "require"))

@@ -194,6 +194,30 @@ fn extract_dotted_identifier_tokens(query: &str) -> Vec<&str> {
     out
 }
 
+/// Components of each `::`- or `\`-separated qualified name in the query.
+///
+/// Dotted names are deliberately excluded. `moduleref.create` splitting into
+/// two OR terms is a measured win on the nest corpus, and the namespace-prefix
+/// dilution this exists to address does not arise there: a dotted pair's left
+/// side is a receiver, not a namespace shared by hundreds of chunks.
+fn extract_qualified_name_groups(query: &str) -> Vec<Vec<String>> {
+    let mut groups = Vec::new();
+    for raw in query.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
+        if !raw.contains("::") && !raw.contains('\\') {
+            continue;
+        }
+        let parts: Vec<String> = raw
+            .split([':', '\\'])
+            .filter(|p| p.len() >= 2 && p.chars().all(|c| c.is_alphanumeric() || c == '_'))
+            .map(str::to_string)
+            .collect();
+        if parts.len() >= 2 {
+            groups.push(parts);
+        }
+    }
+    groups
+}
+
 /// Build an FTS5 MATCH expression from a user query. Emits a disjunction
 /// of quoted terms so code tokens like `doc_cfg` and `ModuleRef::create`
 /// survive FTS5's reserved-character parsing without raising syntax errors
@@ -221,6 +245,43 @@ fn build_fts_match_query(query: &str) -> String {
     let is_sep = |c: char| !c.is_alphanumeric() && c != '_';
     let mut seen: HashSet<String> = HashSet::new();
     let mut tokens: Vec<String> = Vec::new();
+
+    // A qualified name's leading components are namespaces, and each one on
+    // its own matches every chunk in that namespace: `Illuminate\Routing\Router`
+    // became `"Illuminate" OR "Routing" OR "Router"`, where the first two pull
+    // in most of the framework and outvote the symbol actually asked for. Drop
+    // them and keep the tail, which is the symbol being asked about.
+    //
+    // Emitting the full name as an FTS5 phrase alongside was tried and
+    // reverted: it measured -0.006 NDCG@10 on the 40 semble C++ queries, the
+    // only corpus queries carrying a `::` at all.
+    let mut suppressed: HashSet<String> = HashSet::new();
+    for parts in extract_qualified_name_groups(query) {
+        // The tail stays a term of its own: it is the symbol name, the most
+        // selective component, and the spelling a caller may use unqualified.
+        // It must still clear the code-shape filter, or a plain-lowercase tail
+        // like `ModuleRef::create` would reintroduce as an OR term exactly the
+        // common word this is removing.
+        let tail_is_selective = parts.last().is_some_and(|t| token_looks_code_shaped(t));
+        if tail_is_selective
+            && let Some(tail) = parts.last()
+            && seen.insert(tail.to_lowercase())
+        {
+            tokens.push(format!("\"{tail}\""));
+        }
+        // Dropping the prefix is only safe when something selective survives.
+        // With a lowercase tail the phrase is the sole remaining term, and it
+        // matches only where the components are adjacent — so a query like
+        // `ColdFusion::register` against code that names the class but not
+        // that exact pair would produce an empty MATCH and no BM25 leg at all.
+        // Keep the prefix in that case and let the phrase add precision on top.
+        if tail_is_selective {
+            for prefix in &parts[..parts.len() - 1] {
+                suppressed.insert(prefix.to_lowercase());
+            }
+        }
+    }
+
     for tok in extract_dotted_identifier_tokens(query) {
         let key = tok.to_lowercase();
         if seen.insert(key) {
@@ -238,6 +299,9 @@ fn build_fts_match_query(query: &str) -> String {
         // tokenizer, so `Foo` and `foo` would collapse at MATCH time
         // anyway. Fewer OR-terms keeps the MATCH expression parseable.
         let key = raw.to_lowercase();
+        if suppressed.contains(&key) {
+            continue;
+        }
         if !seen.insert(key) {
             continue;
         }
@@ -317,7 +381,17 @@ fn rrf_merge(
             .or_insert((contrib, row));
     }
     let mut ranked: Vec<(f64, RawSearchRow)> = scores.into_values().collect();
-    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+    // `scores` is a HashMap, so ties must be broken explicitly or the
+    // truncation below keeps an arbitrary subset that varies per call. Exact
+    // f64 ties are reachable here, not just theoretical: with RRF_K=60 and
+    // BM25_WEIGHT=2.0 a semantic rank-1 (1/62) plus a BM25 rank-63 (2/124)
+    // sums bit-identically to a BM25 rank-1 (2/62), and the fetch depth
+    // reaches those ranks.
+    ranked.sort_by(|a, b| {
+        b.0.total_cmp(&a.0)
+            .then_with(|| a.1.file_path.cmp(&b.1.file_path))
+            .then_with(|| a.1.start_line.cmp(&b.1.start_line))
+    });
     ranked.truncate(limit);
     // Convert each fused RRF score to the `distance` field downstream code
     // reads through `l2_to_score`. Order alone is not enough: the boost
@@ -479,7 +553,15 @@ pub fn search(
     // (ripgrep, nestjs/nest) measured these as the specific failure mode
     // semantic-only retrieval misses. See
     // `notes/20260411-code-intelligence-landscape.md` §1.4 for the memo chain.
-    let hybrid_gate = query_has_rare_literal(db, &req.query).unwrap_or(false);
+    // `CODESAGE_HYBRID` overrides the gate for ablation: `always` fuses every
+    // query, `never` disables fusion outright, and the default keys off the
+    // rare-literal test above. It exists to settle default-on vs conditional
+    // with a measurement rather than an argument.
+    let hybrid_gate = match hybrid_mode() {
+        HybridMode::Always => true,
+        HybridMode::Never => false,
+        HybridMode::Gated => query_has_rare_literal(db, &req.query).unwrap_or(false),
+    };
 
     let rows = if let Some(path_patterns) = &req.paths {
         path_filtered_knn_candidates(
@@ -580,21 +662,45 @@ pub fn search(
         apply_definition_boost(&mut results, &req.query);
     }
 
+    // When a rare-token match drove the fused ranking it should stay the
+    // dominant signal, so fused queries pin the blend to the SHORT_ID weight
+    // (0.35) rather than skipping the cross-encoder outright. Skipping cost
+    // scope-qualified C++ queries the reranker entirely: `absl::`/`fmt::` is
+    // ordinary namespacing, not the rare literal the code-literal gate is
+    // calibrated for, and those queries scored 0.777 against 0.870 for the
+    // rest of the C++ corpus. Keyed on `fused`, not `hybrid_gate`: a gated
+    // query whose BM25 leg came back empty is still purely semantic.
+    // The ripgrep canary in `project_hybrid_bm25_rrf.md` (reranker demoting
+    // `lib.rs` out of top-10 on ``use `doc_cfg` `` queries) is what the
+    // reduced weight has to keep passing.
+    if let Some(mut rerank) = rerank
+        && (!fused || fused_rerank_enabled())
+    {
+        let weight_override = fused.then_some(RERANK_WEIGHT_SHORT_ID);
+        apply_reranking(&mut rerank, &req.query, &mut results, weight_override);
+    }
+
+    // Path penalties run AFTER reranking so they land on the final blended
+    // score. Ahead of it they were diluted: the merge is
+    // `(1-w)*score + w*ce_norm` with `ce_norm` renormalized to [0,1], so a
+    // pre-blend demote survived at only `1-w` strength — 40% on natural
+    // language queries, where most of these penalties matter. Reranking reads
+    // only chunk content and scores every candidate, so the set it sees is
+    // unchanged by the move.
     if path_penalty_enabled() {
         apply_path_penalties(&mut results, &req.query);
     }
 
-    // Skip reranking when BM25 fusion actually ran. The cross-encoder judges
-    // query/doc semantic similarity; when a rare-token match drove the fused
-    // ranking, it's already the dominant signal and reranking typically flips
-    // the BM25 win back down — the exact failure mode the memo at
-    // `project_hybrid_bm25_rrf.md` warned about. Measured on the ripgrep
-    // canary: reranker demotes `lib.rs` (rank 5 post-RRF) out of top-10
-    // on `use \`doc_cfg\`` queries. Keyed on `fused`, not `hybrid_gate`:
-    // a gated query whose BM25 leg came back empty is still purely semantic
-    // and must not lose reranking too.
-    if !fused && let Some(mut rerank) = rerank {
-        apply_reranking(&mut rerank, &req.query, &mut results);
+    if version_demote_enabled() {
+        apply_version_demote(&mut results, &req.query);
+    }
+
+    // Also after reranking, and for a stronger reason than the penalties: a
+    // filename-stem match is metadata the cross-encoder cannot see. It scores
+    // chunk content only, so blending a pre-rerank stem boost would dilute a
+    // signal the reranker had no way to form an opinion about.
+    if stem_match_boost_enabled() {
+        apply_stem_match_boost(&mut results, &req.query);
     }
 
     if file_saturation_enabled() {
@@ -1065,6 +1171,11 @@ mod tuning {
     pub(super) const DIR_SATURATION_THRESHOLD: &str = "CODESAGE_DIR_SATURATION_THRESHOLD";
     pub(super) const DIR_SATURATION_DECAY: &str = "CODESAGE_DIR_SATURATION_DECAY";
     pub(super) const ADAPTIVE_RERANK: &str = "CODESAGE_ADAPTIVE_RERANK";
+    pub(super) const VERSION_DEMOTE: &str = "CODESAGE_VERSION_DEMOTE";
+    pub(super) const PLATFORM_DEMOTE: &str = "CODESAGE_PLATFORM_DEMOTE";
+    pub(super) const FUSED_RERANK: &str = "CODESAGE_FUSED_RERANK";
+    pub(super) const STEM_MATCH_BOOST: &str = "CODESAGE_STEM_MATCH_BOOST";
+    pub(super) const HYBRID: &str = "CODESAGE_HYBRID";
 }
 
 // The `is_symbol_query` gate makes the definition boost provably inert on NL
@@ -1076,6 +1187,81 @@ mod tuning {
 /// default-on gate shape shared by the post-retrieval scoring stages.
 pub(crate) fn env_default_on(var: &str) -> bool {
     !matches!(std::env::var(var).as_deref(), Ok("0") | Ok("false"))
+}
+
+/// True only when the named env var is explicitly set to `1` / `true`. The
+/// gate shape for stages that are not validated well enough to ship on.
+pub(crate) fn env_default_off(var: &str) -> bool {
+    matches!(std::env::var(var).as_deref(), Ok("1") | Ok("true"))
+}
+
+static VERSION_DEMOTE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn version_demote_enabled() -> bool {
+    *VERSION_DEMOTE_ENABLED.get_or_init(|| env_default_on(tuning::VERSION_DEMOTE))
+}
+
+static PLATFORM_DEMOTE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn platform_demote_enabled() -> bool {
+    *PLATFORM_DEMOTE_ENABLED.get_or_init(|| env_default_off(tuning::PLATFORM_DEMOTE))
+}
+
+/// How the BM25+RRF fusion gate behaves. Default `Gated` keys off
+/// `query_has_rare_literal`; the other two exist so the default-on question is
+/// answerable by measurement.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HybridMode {
+    Gated,
+    Always,
+    Never,
+}
+
+static HYBRID_MODE: OnceLock<HybridMode> = OnceLock::new();
+
+fn hybrid_mode() -> HybridMode {
+    *HYBRID_MODE.get_or_init(|| match std::env::var(tuning::HYBRID).as_deref() {
+        Ok("always") => HybridMode::Always,
+        Ok("never") => HybridMode::Never,
+        // Anything else, including unset and typos, keeps shipped behavior.
+        _ => HybridMode::Gated,
+    })
+}
+
+static STEM_MATCH_BOOST_ENABLED: OnceLock<bool> = OnceLock::new();
+
+// Default OFF, and the A/B is why rather than caution: measured on the semble
+// corpus it is +0.001 pooled, which is noise. Per language, rust +0.008 and
+// cpp -0.004; c, php and typescript do not move. Four queries improve, one
+// regresses, and the regression is large (nlohmann "ADL-based to_json and
+// from_json", 1.000 -> 0.500) because adl_serializer.hpp is the target while
+// the query names to_json and from_json.
+//
+// Worth keeping rather than deleting: rust +0.008 with no rust regression is
+// the only positive movement any proposal has produced for the language with
+// the largest remaining gap (0.785 against semble's 0.856), so this is a
+// reasonable per-project opt-in for Rust-heavy repos. It is not a default.
+fn stem_match_boost_enabled() -> bool {
+    *STEM_MATCH_BOOST_ENABLED.get_or_init(|| env_default_off(tuning::STEM_MATCH_BOOST))
+}
+
+static FUSED_RERANK_ENABLED: OnceLock<bool> = OnceLock::new();
+
+// Default OFF: measured net-negative. Scope-qualified C++ queries really do
+// miss the cross-encoder — 20 of 60 cpp corpus queries trip the code-literal
+// gate and scored 0.777 against 0.870 for the rest — but reranking them at
+// 0.35 does not recover it. On the semble corpus the change is -0.0012 pooled
+// (c -0.008, cpp +0.004, ts -0.002) and turns 3 regressions into 6, trading
+// wins of +0.37/+0.15/+0.13 against losses of -0.50/-0.37/-0.11. That spread
+// with no net gain is the failure mode `project_hybrid_bm25_rrf.md` predicted:
+// where BM25 fired, it is already the better signal.
+//
+// Kept as a gate rather than reverted because the underlying gap is real and
+// the plumbing is the expensive part; a future attempt likely needs a
+// different remedy (a narrower gate that excludes `::` from the code-literal
+// test, say) rather than a different weight.
+fn fused_rerank_enabled() -> bool {
+    *FUSED_RERANK_ENABLED.get_or_init(|| env_default_off(tuning::FUSED_RERANK))
 }
 
 static DEFINITION_BOOST_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -1337,6 +1523,74 @@ pub(crate) fn path_penalty_for_query(path: &str, query_is_test_shaped: bool) -> 
     penalty
 }
 
+// Declaration headers in C projects describe an API; the `.c` file implements
+// it, and the implementation is what a behavior query wants. Measured on the
+// semble corpus, 22% of files ranked above a C target were headers while only
+// 2% of C targets were.
+//
+// Gating on the row language is what makes this safe, and it must not be
+// relaxed to "any header": in C++ the header IS the implementation
+// (nlohmann-json, abseil and fmtlib are header-only, and every C++ target in
+// that corpus is a header). Simulated ungated the demote costs C++ 0.134.
+// The discovery layer already resolves a bare `.h` to Cpp for any project
+// carrying an unambiguous C++ extension, so `Language::C` here means the
+// project really is C.
+//
+// `-inl.h` / `_inl.h` carry inline definitions rather than declarations —
+// libuv's `heap-inl.h` is a legitimate target — so they are exempt.
+fn declaration_header_penalty(path: &str, language: Language) -> f32 {
+    if language != Language::C {
+        return 1.0;
+    }
+    let normalized = path.replace('\\', "/");
+    let basename = normalized.rsplit('/').next().unwrap_or(&normalized);
+    if !basename.ends_with(".h") {
+        return 1.0;
+    }
+    if basename.ends_with("-inl.h") || basename.ends_with("_inl.h") {
+        return 1.0;
+    }
+    SOFT_PENALTY_MILD
+}
+
+// Host-platform directories. A project carrying parallel per-platform trees
+// (libuv's `src/unix/` and `src/win/`) answers most behavior queries with the
+// tree that actually runs on the caller's machine.
+//
+// Default OFF. The mechanism is verified — win/tcp.c outranking unix/tcp.c is
+// a clean mirror pair across 10 libuv queries — but every measured point comes
+// from that one repo, and its ground truth may encode the same host assumption
+// the rule does. Needs validation on C repos outside the corpus before this
+// can be considered for default-on.
+const FOREIGN_PLATFORM_DIR_NAMES: &[&str] = &["win", "win32", "windows"];
+
+fn foreign_platform_penalty(path: &str) -> f32 {
+    if cfg!(windows) {
+        return 1.0;
+    }
+    let normalized = path.replace('\\', "/");
+    if has_dir_segment(&normalized, FOREIGN_PLATFORM_DIR_NAMES) {
+        SOFT_PENALTY_MILD
+    } else {
+        1.0
+    }
+}
+
+// Whole-token match so "windowsize" or "rewind" can't trip the guard.
+const PLATFORM_INTENT_KEYWORDS: &[&str] = &[
+    "windows", "win32", "win64", "iocp", "msvc", "mingw", "winapi",
+];
+
+fn query_names_foreign_platform(query: &str) -> bool {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .any(|t| {
+            let lower = t.to_ascii_lowercase();
+            PLATFORM_INTENT_KEYWORDS.contains(&lower.as_str())
+        })
+}
+
 // Extra multiplier applied to test-like paths when the query is non-test-shaped.
 // Stacks on top of SOFT_PENALTY_STRONG, so total = 0.3 * 0.5 = 0.15x.
 // 0.15x is empirically motivated: the §2.11 axios case had 9 test files at
@@ -1377,10 +1631,162 @@ fn test_query_aware_enabled() -> bool {
 
 fn apply_path_penalties(results: &mut [SearchResult], query: &str) {
     let is_test_query = query_is_test_shaped(query);
+    let demote_foreign_platform = platform_demote_enabled() && !query_names_foreign_platform(query);
+    // The header demote expresses a preference for the implementing `.c` over
+    // the header declaring it, so it only means anything when a `.c` is in the
+    // running. Header-only projects whose dialect resolves to C — fmtlib's
+    // `include/fmt` is all `.h` — would otherwise have every candidate demoted
+    // uniformly except the `-inl.h` exemption, which promotes that one file to
+    // rank 1 for free. Measured: it cost fmtlib three queries.
+    let has_c_implementation = results
+        .iter()
+        .any(|r| r.language == Language::C && r.file_path.ends_with(".c"));
     for result in results.iter_mut() {
-        result.score *= path_penalty_for_query(&result.file_path, is_test_query);
+        let mut penalty = path_penalty_for_query(&result.file_path, is_test_query);
+        if has_c_implementation {
+            penalty *= declaration_header_penalty(&result.file_path, result.language);
+        }
+        if demote_foreign_platform {
+            penalty *= foreign_platform_penalty(&result.file_path);
+        }
+        result.score *= penalty;
     }
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+}
+
+// Bounded multiplier for a query token that names a candidate's file stem.
+// Deliberately mild: a move-to-front variant scored better on abseil but cost
+// nlohmann's "ADL-based to_json and from_json conversion hooks" a full rank
+// (to_json.hpp / from_json.hpp jumping over the adl_serializer.hpp target).
+//
+// What 1.2x actually bounds is the score ratio, not the rank movement: a
+// boosted candidate passes every result scoring below `its_score * 1.2`. Where
+// results are tightly clustered that can still be several positions. It caps
+// how far a boost can reach, not how many places it can travel.
+const STEM_MATCH_BOOST: f32 = 1.2;
+// Counted in characters, not bytes — see `stem_match_tokens`.
+const STEM_MATCH_MIN_TOKEN_LEN: usize = 4;
+
+/// Query tokens specific enough to be worth matching against a file stem.
+///
+/// The gate is an identifier signal: an underscore, a digit, or mixed case
+/// carrying at least one lowercase letter. That admits `path_router`,
+/// `StrSplit`, `ABSL_LOG` and `Semaphore` while rejecting the bare all-caps
+/// acronyms that are ordinary prose vocabulary — `JSON`, `HTTP`, `MIME`. The
+/// exclusion is load-bearing: boosting on `JSON` pulls nlohmann's `json.hpp`
+/// up on nearly every query in that repo, which flipped a 9-query regression
+/// in the advisory simulation.
+///
+/// Note `ABSL_LOG` qualifies through the underscore rather than through case,
+/// which is why the rule is "has an identifier signal" and not "is not
+/// all-caps".
+fn stem_match_tokens(query: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in query.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        // chars(), not len(): `len()` is bytes, so a 3-character token like
+        // `Äbc` measures 4 and would slip past the minimum.
+        if token.chars().count() < STEM_MATCH_MIN_TOKEN_LEN {
+            continue;
+        }
+        let has_underscore = token.contains('_');
+        let has_digit = token.chars().any(|c| c.is_ascii_digit());
+        let has_upper = token.chars().any(char::is_uppercase);
+        let has_lower = token.chars().any(char::is_lowercase);
+        if has_underscore || has_digit || (has_upper && has_lower) {
+            out.push(normalize_stem(token));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+// Generalizes DEFINITION_FILE_STEM_BONUS, which only reaches results that
+// already matched the definition regex. That regex structurally cannot fire
+// for a C++ free function (`absl::StrSplit` has no class/struct keyword) or a
+// macro-attributed declaration (`class ABSL_LOCKABLE Mutex` breaks the
+// keyword+name pattern), which is exactly where the filename is the clearest
+// available signal.
+fn apply_stem_match_boost(results: &mut [SearchResult], query: &str) {
+    let tokens = stem_match_tokens(query);
+    if tokens.is_empty() {
+        return;
+    }
+    let mut boosted = false;
+    for result in results.iter_mut() {
+        let Some(stem) = std::path::Path::new(&result.file_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+        else {
+            continue;
+        };
+        let stem_norm = normalize_stem(stem);
+        if tokens.contains(&stem_norm) {
+            result.score *= STEM_MATCH_BOOST;
+            boosted = true;
+        }
+    }
+    if boosted {
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    }
+}
+
+/// Numeric version directory (`v3/`, `v4/`) carried by a path, if any.
+fn version_dir_of(path: &str) -> Option<u32> {
+    path.replace('\\', "/")
+        .split('/')
+        .filter_map(|seg| seg.strip_prefix('v').or_else(|| seg.strip_prefix('V')))
+        .filter(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+        .filter_map(|rest| rest.parse::<u32>().ok())
+        .max()
+}
+
+/// True when the query itself names a version, e.g. "v3 compatibility error
+/// types". Such a query is asking for the old line on purpose and must be left
+/// alone.
+fn query_names_version(query: &str) -> bool {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .any(|t| {
+            let lower = t.to_ascii_lowercase();
+            matches!(lower.as_str(), "legacy" | "compat" | "deprecated")
+                || lower.strip_prefix('v').is_some_and(|rest| {
+                    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+                })
+        })
+}
+
+// Packages that ship several major versions side by side (zod's `v3/` and
+// `v4/`) give the ranker no reason to prefer the current one, so the older
+// tree wins on raw similarity. Demote candidates below the highest version
+// present in the candidate set.
+//
+// The maximum is taken from the candidates rather than a repo census, which
+// keeps the rule stateless and makes it a no-op whenever the candidates all
+// share one version. Mild rather than strong, because an old line can still be
+// actively maintained.
+fn apply_version_demote(results: &mut [SearchResult], query: &str) {
+    if query_names_version(query) {
+        return;
+    }
+    let Some(max_version) = results
+        .iter()
+        .filter_map(|r| version_dir_of(&r.file_path))
+        .max()
+    else {
+        return;
+    };
+    let mut demoted = false;
+    for result in results.iter_mut() {
+        if version_dir_of(&result.file_path).is_some_and(|v| v < max_version) {
+            result.score *= SOFT_PENALTY_MILD;
+            demoted = true;
+        }
+    }
+    if demoted {
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    }
 }
 
 static PATH_PENALTY_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -1566,7 +1972,15 @@ fn adaptive_rerank_weight_enabled() -> bool {
     *ADAPTIVE_RERANK_ENABLED.get_or_init(|| env_default_on(tuning::ADAPTIVE_RERANK))
 }
 
-fn apply_reranking(rerank: &mut RerankFn<'_>, query: &str, results: &mut [SearchResult]) {
+/// `weight_override` forces a blend weight instead of deriving one from the
+/// query shape. Fused (BM25/RRF) queries use it to keep the rare-token prior
+/// dominant while still consulting the cross-encoder.
+fn apply_reranking(
+    rerank: &mut RerankFn<'_>,
+    query: &str,
+    results: &mut [SearchResult],
+    weight_override: Option<f32>,
+) {
     if results.is_empty() {
         return;
     }
@@ -1581,7 +1995,7 @@ fn apply_reranking(rerank: &mut RerankFn<'_>, query: &str, results: &mut [Search
     let ce_max = ce_scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let ce_range = ce_max - ce_min;
 
-    let weight = adaptive_rerank_weight(query);
+    let weight = weight_override.unwrap_or_else(|| adaptive_rerank_weight(query));
     for (result, &ce_raw) in results.iter_mut().zip(ce_scores.iter()) {
         let ce_norm = if ce_range > 1e-6 {
             (ce_raw - ce_min) / ce_range
@@ -2083,10 +2497,11 @@ mod hybrid_tests {
     }
 
     #[test]
-    fn fused_query_skips_reranking() {
-        // "ColdFusion" is in src/reg.rs, so BM25 has hits, fusion runs, and
-        // the reranker is skipped — the rare-token match is the dominant
-        // signal.
+    fn fused_query_skips_reranking_by_default() {
+        // "ColdFusion" is in src/reg.rs, so BM25 has hits and fusion runs. The
+        // reranker stays skipped: reranking fused queries at the reduced
+        // weight measured net-negative on the semble corpus (see
+        // `fused_rerank_enabled`), so where BM25 fired it keeps the ranking.
         let db = Database::open_in_memory().unwrap();
         seed_chunks(&db);
         let emb = mk_embedding(0.1);
@@ -2097,6 +2512,64 @@ mod hybrid_tests {
         });
         search(&db, &emb, Some(rerank), &search_req("ColdFusion::register")).unwrap();
         assert!(!called, "reranking must be skipped when RRF fusion ran");
+    }
+
+    #[test]
+    fn reduced_fused_weight_protects_a_win_that_the_natlang_weight_would_lose() {
+        // The point of pinning fused queries to RERANK_WEIGHT_SHORT_ID rather
+        // than letting them take the natural-language weight. A rare-token
+        // winner leading by 0.60 with the cross-encoder ranking it last
+        // survives at 0.35 and does not at 0.6.
+        //
+        // This is a margin, not an invariant. Against a maximally hostile
+        // cross-encoder the lead has to clear w/(1-w) — about 0.54 at weight
+        // 0.35, and an unreachable 1.5 at 0.6 — so a narrow fused win can
+        // still be flipped. The empirical guard is the ripgrep canary in
+        // `project_hybrid_bm25_rrf.md`, not this test.
+        use super::{RERANK_WEIGHT_NATLANG, RERANK_WEIGHT_SHORT_ID, apply_reranking};
+
+        let mk = |file: &str, score: f32| SearchResult {
+            file_path: file.to_string(),
+            language: codesage_protocol::Language::Rust,
+            content: file.to_string(),
+            start_line: 1,
+            end_line: 10,
+            score,
+            symbols: Vec::new(),
+        };
+        // Cross-encoder ranks the fused winner last.
+        let ce = |_q: &str, docs: &[&str]| {
+            Ok(docs
+                .iter()
+                .map(|d| if d.contains("reg.rs") { 0.0 } else { 1.0 })
+                .collect())
+        };
+
+        let mut kept = vec![mk("src/reg.rs", 0.95), mk("src/lib.rs", 0.35)];
+        let mut rerank: RerankFn = Box::new(ce);
+        apply_reranking(
+            &mut rerank,
+            "ColdFusion::register",
+            &mut kept,
+            Some(RERANK_WEIGHT_SHORT_ID),
+        );
+        assert_eq!(
+            kept[0].file_path, "src/reg.rs",
+            "fused winner should survive at the SHORT_ID weight"
+        );
+
+        let mut lost = vec![mk("src/reg.rs", 0.95), mk("src/lib.rs", 0.35)];
+        let mut rerank: RerankFn = Box::new(ce);
+        apply_reranking(
+            &mut rerank,
+            "ColdFusion::register",
+            &mut lost,
+            Some(RERANK_WEIGHT_NATLANG),
+        );
+        assert_eq!(
+            lost[0].file_path, "src/lib.rs",
+            "same disagreement should flip the order at the natural-language weight"
+        );
     }
 
     #[test]
@@ -3059,7 +3532,7 @@ mod rerank_blend_tests {
                 .map(|d| if *d == "doc b" { 10.0 } else { 0.0 })
                 .collect())
         });
-        apply_reranking(&mut rerank, QUERY, &mut results);
+        apply_reranking(&mut rerank, QUERY, &mut results, None);
 
         let w = RERANK_WEIGHT_NATLANG;
         assert_eq!(results[0].file_path, "b.rs");
@@ -3086,7 +3559,7 @@ mod rerank_blend_tests {
             mk("c.rs", "doc c", 0.1),
         ];
         let mut rerank: RerankFn = Box::new(|_q, docs| Ok(vec![3.25; docs.len()]));
-        apply_reranking(&mut rerank, QUERY, &mut results);
+        apply_reranking(&mut rerank, QUERY, &mut results, None);
 
         let order: Vec<&str> = results.iter().map(|r| r.file_path.as_str()).collect();
         assert_eq!(order, ["a.rs", "b.rs", "c.rs"]);
@@ -3107,7 +3580,7 @@ mod rerank_blend_tests {
     fn rerank_error_leaves_results_untouched() {
         let mut results = vec![mk("a.rs", "doc a", 0.9), mk("b.rs", "doc b", 0.5)];
         let mut rerank: RerankFn = Box::new(|_q, _docs| anyhow::bail!("ORT unavailable"));
-        apply_reranking(&mut rerank, QUERY, &mut results);
+        apply_reranking(&mut rerank, QUERY, &mut results, None);
         assert_eq!(results[0].file_path, "a.rs");
         assert!((results[0].score - 0.9).abs() < 1e-6);
         assert!((results[1].score - 0.5).abs() < 1e-6);
@@ -3311,5 +3784,406 @@ mod dir_saturation_tests {
         let before = results[0].score;
         apply_qualified_name_boost(&mut results, &[]);
         assert!((results[0].score - before).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod language_and_version_penalty_tests {
+    use super::{
+        SOFT_PENALTY_MILD, apply_version_demote, declaration_header_penalty,
+        foreign_platform_penalty, query_names_foreign_platform, query_names_version,
+        version_dir_of,
+    };
+    use codesage_protocol::{Language, SearchResult};
+
+    fn mk(file: &str, score: f32) -> SearchResult {
+        SearchResult {
+            file_path: file.to_string(),
+            language: Language::TypeScript,
+            content: String::new(),
+            start_line: 1,
+            end_line: 10,
+            score,
+            symbols: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn demotes_declaration_headers_only_in_c_projects() {
+        // curl: cfilters.h took rank 1 over the connect.c that implements it.
+        assert_eq!(
+            declaration_header_penalty("lib/cfilters.h", Language::C),
+            SOFT_PENALTY_MILD
+        );
+        assert_eq!(
+            declaration_header_penalty("lib/connect.c", Language::C),
+            1.0
+        );
+    }
+
+    #[test]
+    fn leaves_cpp_headers_alone() {
+        // nlohmann-json, abseil and fmtlib are header-only: the header IS the
+        // implementation, and every C++ target in the semble corpus is one.
+        // Demoting here cost C++ 0.134 in simulation.
+        assert_eq!(
+            declaration_header_penalty("include/nlohmann/json.hpp", Language::Cpp),
+            1.0
+        );
+        assert_eq!(
+            declaration_header_penalty("absl/strings/str_split.h", Language::Cpp),
+            1.0
+        );
+    }
+
+    #[test]
+    fn exempts_inline_definition_headers() {
+        // libuv's heap-inl.h carries definitions and is a legitimate target.
+        assert_eq!(
+            declaration_header_penalty("src/heap-inl.h", Language::C),
+            1.0
+        );
+        assert_eq!(
+            declaration_header_penalty("src/queue_inl.h", Language::C),
+            1.0
+        );
+    }
+
+    #[test]
+    fn reads_numeric_version_directories() {
+        assert_eq!(
+            version_dir_of("packages/zod/src/v4/core/schemas.ts"),
+            Some(4)
+        );
+        assert_eq!(version_dir_of("packages/zod/src/v3/types.ts"), Some(3));
+        assert_eq!(version_dir_of("src/validate.ts"), None);
+        // Not a version segment: needs digits after the `v`.
+        assert_eq!(version_dir_of("src/view/index.ts"), None);
+    }
+
+    #[test]
+    fn demotes_older_version_trees() {
+        let mut results = vec![
+            mk("src/v3/types.ts", 1.0),
+            mk("src/v4/core/schemas.ts", 0.9),
+        ];
+        apply_version_demote(&mut results, "how ZodType parses and validates input");
+        assert_eq!(results[0].file_path, "src/v4/core/schemas.ts");
+        assert!((results[1].score - SOFT_PENALTY_MILD).abs() < 1e-6);
+    }
+
+    #[test]
+    fn keeps_old_version_when_the_query_asks_for_it() {
+        // "v3 compatibility error types and ZodError" wants v3 on purpose.
+        assert!(query_names_version(
+            "v3 compatibility error types and ZodError"
+        ));
+        assert!(!query_names_version(
+            "how ZodType parses and validates input"
+        ));
+
+        let mut results = vec![
+            mk("src/v3/errors.ts", 1.0),
+            mk("src/v4/core/errors.ts", 0.9),
+        ];
+        apply_version_demote(&mut results, "v3 compatibility error types and ZodError");
+        assert_eq!(results[0].file_path, "src/v3/errors.ts");
+        assert!((results[0].score - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn version_demote_is_inert_without_competing_versions() {
+        let mut results = vec![mk("src/v4/a.ts", 1.0), mk("src/v4/b.ts", 0.9)];
+        apply_version_demote(&mut results, "schema parsing");
+        assert!((results[0].score - 1.0).abs() < 1e-6);
+        assert!((results[1].score - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn foreign_platform_guard_matches_whole_tokens() {
+        assert!(query_names_foreign_platform("windows named pipe handling"));
+        assert!(query_names_foreign_platform("IOCP completion port"));
+        // "window size" must not read as Windows intent.
+        assert!(!query_names_foreign_platform(
+            "tty terminal raw mode and window size"
+        ));
+    }
+
+    #[test]
+    #[cfg_attr(windows, ignore = "rule is host-conditional and inert on Windows")]
+    fn demotes_foreign_platform_directories() {
+        assert_eq!(foreign_platform_penalty("src/win/tcp.c"), SOFT_PENALTY_MILD);
+        assert_eq!(foreign_platform_penalty("src/unix/tcp.c"), 1.0);
+        // Substring of a longer segment must not match.
+        assert_eq!(foreign_platform_penalty("src/window/tcp.c"), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod header_demote_scope_tests {
+    use super::apply_path_penalties;
+    use codesage_protocol::{Language, SearchResult};
+
+    fn mk(file: &str, language: Language, score: f32) -> SearchResult {
+        SearchResult {
+            file_path: file.to_string(),
+            language,
+            content: String::new(),
+            start_line: 1,
+            end_line: 10,
+            score,
+            symbols: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn header_demote_is_inert_without_a_c_implementation_in_play() {
+        // fmtlib's benchmark root is all `.h`, and its dialect resolves to C
+        // because nothing there carries an unambiguous C++ extension. Demoting
+        // every candidate but the `-inl.h` exemption promoted format-inl.h to
+        // rank 1 and cost three queries.
+        let mut results = vec![
+            mk("include/fmt/format-inl.h", Language::C, 0.80),
+            mk("include/fmt/compile.h", Language::C, 0.90),
+            mk("include/fmt/base.h", Language::C, 0.85),
+        ];
+        apply_path_penalties(&mut results, "compile-time format string checking");
+        assert_eq!(results[0].file_path, "include/fmt/compile.h");
+        assert!(
+            (results[0].score - 0.90).abs() < 1e-6,
+            "no demote should apply"
+        );
+    }
+
+    #[test]
+    fn header_demote_fires_when_a_c_file_competes() {
+        // curl: connect.c implements what cfilters.h declares.
+        let mut results = vec![
+            mk("lib/cfilters.h", Language::C, 0.90),
+            mk("lib/connect.c", Language::C, 0.85),
+        ];
+        apply_path_penalties(&mut results, "connection filter chain setup");
+        assert_eq!(results[0].file_path, "lib/connect.c");
+    }
+}
+
+#[cfg(test)]
+mod stem_match_boost_tests {
+    use super::{STEM_MATCH_BOOST, apply_stem_match_boost, stem_match_tokens};
+    use codesage_protocol::{Language, SearchResult};
+
+    fn mk(file: &str, score: f32) -> SearchResult {
+        SearchResult {
+            file_path: file.to_string(),
+            language: Language::Rust,
+            content: String::new(),
+            start_line: 1,
+            end_line: 10,
+            score,
+            symbols: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn admits_identifier_shaped_tokens() {
+        // `Router` qualifies on mixed case, the same rule that admits the
+        // cited `Semaphore` case. A leading capital is not distinguished from
+        // an internal one, so sentence-initial words can enter; requiring an
+        // internal capital would reject `Semaphore` too. The corpus A/B is
+        // what decides whether that extra noise costs anything.
+        assert_eq!(
+            stem_match_tokens("Router path_router implementation"),
+            vec!["pathrouter", "router"]
+        );
+        // Mixed case with a lowercase letter.
+        assert_eq!(
+            stem_match_tokens("absl::StrSplit and StrJoin"),
+            vec!["strjoin", "strsplit"]
+        );
+        // Underscore qualifies even though the token is all-caps.
+        assert_eq!(
+            stem_match_tokens("logging macros ABSL_LOG"),
+            vec!["absllog"]
+        );
+    }
+
+    #[test]
+    fn rejects_bare_acronyms_and_plain_words() {
+        // Boosting json.hpp on the word JSON regressed 9 nlohmann queries.
+        assert!(stem_match_tokens("JSON parser and tokenizer").is_empty());
+        assert!(stem_match_tokens("HTTP client request sending").is_empty());
+        assert!(stem_match_tokens("how formatters transform log records").is_empty());
+        // Too short to be specific.
+        assert!(stem_match_tokens("Foo").is_empty());
+    }
+
+    #[test]
+    fn boosts_the_file_the_query_names() {
+        // Covers the helper's own matching, not a gap in the definition
+        // boost: for a bare `Semaphore` query that boost already discriminates
+        // these two via DEFINITION_FILE_STEM_BONUS. The gap this stage exists
+        // to fill is the case where the definition regex cannot fire at all —
+        // a C++ free function, or a macro-attributed declaration.
+        let mut r = vec![
+            mk("tokio/src/sync/batch_semaphore.rs", 0.90),
+            mk("tokio/src/sync/semaphore.rs", 0.85),
+        ];
+        apply_stem_match_boost(&mut r, "Semaphore");
+        assert_eq!(r[0].file_path, "tokio/src/sync/semaphore.rs");
+        assert!((r[0].score - 0.85 * STEM_MATCH_BOOST).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalizes_underscores_so_strsplit_matches_str_split() {
+        let mut r = vec![
+            mk("absl/strings/str_join.h", 0.90),
+            mk("absl/strings/str_split.h", 0.80),
+        ];
+        apply_stem_match_boost(&mut r, "absl::StrSplit for string splitting");
+        assert_eq!(r[0].file_path, "absl/strings/str_split.h");
+    }
+
+    #[test]
+    fn bounded_boost_cannot_leapfrog_a_clear_winner() {
+        // 1.2x cannot overturn THIS lead. It does not generalize to "the
+        // target loses at most one place": the multiplier bounds the score
+        // ratio a boost can overcome, so against tightly clustered results a
+        // boosted candidate can pass several at once. Measured, the real
+        // nlohmann "ADL-based to_json and from_json" query regresses
+        // 1.000 -> 0.500, where the target's lead is far under the 0.40 here.
+        let mut r = vec![
+            mk("include/nlohmann/adl_serializer.hpp", 1.00),
+            mk("include/nlohmann/to_json.hpp", 0.60),
+        ];
+        apply_stem_match_boost(&mut r, "ADL-based to_json conversion hooks");
+        assert_eq!(r[0].file_path, "include/nlohmann/adl_serializer.hpp");
+    }
+}
+
+#[cfg(test)]
+mod stem_match_token_edge_tests {
+    use super::stem_match_tokens;
+
+    #[test]
+    fn minimum_length_counts_characters_not_bytes() {
+        // `Äbc` is 3 characters but 4 UTF-8 bytes; a byte-length gate would
+        // admit it through the mixed-case rule despite being under the
+        // documented four-character minimum.
+        assert!(stem_match_tokens("Äbc").is_empty());
+        // Four real characters still qualify.
+        assert_eq!(stem_match_tokens("Äbcd"), vec!["äbcd"]);
+    }
+}
+
+#[cfg(test)]
+mod scoped_fts_evidence_tests {
+    use super::build_fts_match_query;
+
+    #[test]
+    fn namespace_components_never_reach_the_match_expression() {
+        // The premise behind "scope-qualified terms are OR-joined, diluting
+        // the signal" does not hold: a lowercase namespace prefix is not
+        // code-shaped, so it is filtered before any OR-join. There is no
+        // `absl` term to conjoin with `StrSplit`.
+        for (query, expect_absent) in [
+            ("absl::StrSplit for splitting", "absl"),
+            ("how fmt::format works", "fmt"),
+            ("std::vector usage", "std"),
+            ("call ModuleRef::create", "create"),
+        ] {
+            let q = build_fts_match_query(query);
+            assert!(
+                !q.contains(&format!("\"{expect_absent}\"")),
+                "{query:?} produced {q:?}, which still carries {expect_absent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lowercase_namespace_query_yields_only_the_identifier_terms() {
+        // One mechanical case, not a corpus-wide claim: with a lowercase
+        // namespace the surviving terms are the identifiers the query names.
+        let q = build_fts_match_query("absl::StrSplit and StrJoin for splitting and joining");
+        assert!(q.contains("\"StrSplit\""));
+        assert!(q.contains("\"StrJoin\""));
+        assert!(!q.contains("\"absl\""));
+    }
+
+    #[test]
+    fn every_corpus_query_carrying_a_scope_is_unchanged_by_the_suppression() {
+        // These are the 20 semble queries (of 1251) that carry a `::` in a
+        // CodeSage-supported language, verbatim. Every prefix is plain
+        // lowercase, so the code-shape filter already dropped it before this
+        // change and the emitted terms must be identical to the old behavior.
+        // Pinned because a full benchmark arm over these two repos costs ~16
+        // minutes and this settles the same question in milliseconds.
+        for (query, expect) in [
+            (
+                "absl::StrCat and StrAppend for efficient string",
+                "\"StrCat\" OR \"StrAppend\"",
+            ),
+            (
+                "absl::string_view for non-owning string references",
+                "\"string_view\"",
+            ),
+            (
+                "absl::flat_hash_map and flat_hash_set hash tables",
+                "\"flat_hash_map\" OR \"flat_hash_set\"",
+            ),
+            ("how fmt::format and fmt::print format strings", ""),
+            // A lowercase tail is filtered like any lowercase token, before
+            // and after — the suppression never gets a selective tail to keep.
+            ("std::filesystem path formatting support", ""),
+        ] {
+            assert_eq!(
+                build_fts_match_query(query),
+                expect,
+                "query {query:?} must emit the same terms as before the change"
+            );
+        }
+    }
+
+    #[test]
+    fn a_code_shaped_namespace_component_is_dropped_leaving_the_tail() {
+        // `absl`/`fmt`/`std` are filtered for being plain lowercase, not for
+        // being namespaces — so a namespace carrying an underscore or a
+        // capital used to reach the disjunction and dilute it. It now emits a
+        // phrase plus the tail, and no standalone prefix term.
+        let q = build_fts_match_query("foo_bar::Thing lookup");
+        assert!(q.contains("\"Thing\""), "tail stays selectable: {q:?}");
+        assert!(
+            !q.contains("\"foo_bar\""),
+            "prefix must not remain a term of its own: {q:?}"
+        );
+
+        // PHP backslash-qualified names are the clearest instance: every
+        // component is capitalised, so before this all of them survived and
+        // the two namespace components outvoted the class.
+        let q = build_fts_match_query("Illuminate\\Routing\\Router dispatch");
+        assert!(q.contains("\"Router\""), "the class survives: {q:?}");
+        assert!(!q.contains("\"Illuminate\""), "got {q:?}");
+        assert!(!q.contains("\"Routing\""), "got {q:?}");
+    }
+
+    #[test]
+    fn a_suppressed_prefix_is_still_dropped_when_it_repeats_elsewhere() {
+        // The prefix is suppressed by name, so a later standalone mention does
+        // not smuggle it back in as its own OR term.
+        let q = build_fts_match_query("Illuminate\\Routing\\Router and Illuminate helpers");
+        assert!(!q.contains("\"Illuminate\""), "got {q:?}");
+        assert!(q.contains("\"Router\""));
+    }
+
+    #[test]
+    fn the_dotted_pair_route_bypasses_the_code_shape_filter() {
+        // extract_dotted_identifier_tokens runs BEFORE the filter, so a
+        // lowercase dotted pair reaches the disjunction where the same
+        // components behind `::` would not.
+        let q = build_fts_match_query("fix moduleref.create edge case");
+        assert!(q.contains("\"moduleref\""));
+        assert!(
+            q.contains("\"create\""),
+            "dotted route admits lowercase: {q:?}"
+        );
     }
 }

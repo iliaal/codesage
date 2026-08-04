@@ -1,6 +1,33 @@
 ## [Unreleased]
 
+### Added
+- `codesage coverage` reports what a project contains that indexing cannot see: indexable files per language, and files skipped because no supported language matched, per extension. `--json` for machine output, `--top N` to cap the extension list.
+- Schema migration 0014 widens `idx_git_files_churn` to `(churn_score DESC, path)` so the top-churn query keeps a streaming index scan now that it orders by `path` as a tie-break.
+- `trace_call_path` MCP tool and `codesage trace <from> <to>` CLI: shortest call chain between two symbols, with the call site of each hop. Walks call, instantiation and route-handler edges only — a type hint or an import is not a call. `--max-depth` bounds the search (capped at 6 over MCP); an unfound result reports whether it stopped at that bound.
+- `search` and `find_symbol` annotate an empty result with `_meta.coverage`: the indexed file count and the per-language breakdown, plus a note that an empty result means no match within the indexed set rather than proof the code is absent. A language missing from the breakdown was never indexed.
+- `find_references` rows can carry kind `import_binding`: the symbol an import introduces (`Foo`), recorded alongside the existing `import` row naming the module (`./foo.js`). Existing projects need `codesage index --full` to pick up the new rows; an incremental pass skips unchanged files.
+
+### Changed
+- `search` drops the leading namespace components of a `::`- or `\\`-qualified query name instead of OR-joining them, so `Illuminate\\Routing\\Router` no longer lets two namespace terms outvote the class. Only applies when the trailing component is distinctive enough to stand alone; a lowercase tail (`ModuleRef::create`) keeps the prefix so the BM25 leg still fires. Dotted names are unchanged.
+- `search` ranks the current major-version tree above older ones when a package ships several side by side (`v3/` next to `v4/`), unless the query itself names a version. Disable with `CODESAGE_VERSION_DEMOTE=0`.
+- `search` demotes declaration headers in C projects so the implementing `.c` file outranks them; C++ headers, which are frequently the implementation, are untouched, and `-inl.h` headers are exempt.
+- `search` demotes test and benchmark files that C and C++ keep as siblings (`*_test.cc`, `*_benchmark.cc`, `*_test.h`), which previously escaped the test penalty and took rank 1 on library queries. They also stop skewing git co-change coupling.
+- `search` applies path penalties after cross-encoder reranking rather than before. Blending previously restored about 60% of every penalty on natural-language queries.
+- `CODESAGE_HYBRID=always|never` forces or disables BM25+RRF fusion for ablation. Default keeps the rare-literal gate.
+- `CODESAGE_STEM_MATCH_BOOST=1` boosts a result whose filename stem is named by an identifier-shaped query token. Off by default; it measured as noise overall (+0.001), though Rust gained 0.008.
+- `CODESAGE_FUSED_RERANK=1` reranks BM25-fused queries at a reduced blend weight instead of skipping the cross-encoder. Off by default; it measured net-negative on the semble corpus.
+- The daemon log reports the connected count, silence duration, and per-connection idle ceiling when it stays alive only for connected but silent clients.
+- `assess_risk` no longer reports a test gap when a test file reaches the file within two reverse-dependency hops; the note names the three checks that ran (sibling convention, co-change history, dependency hops) instead of asserting the file is untested, and a file reached only indirectly gets a note naming the test and its hop distance.
+
 ### Fixed
+- `codesage search` no longer aborts with exit 134 after printing results. Teardown ran ONNX Runtime's C++ static destructors, which intermittently corrupt the heap; the process now exits without walking the atexit table. Reproduced at 2/100 under concurrent load before the fix, 0/100 after.
+- `impact_analysis` reports dependents for symbols referenced by their short name, such as a PHP base class inherited within its own namespace; one with 30 subclasses previously reported zero. `assess_risk` blast-radius and test-gap terms read the same traversal.
+- `impact_analysis` finds JavaScript and TypeScript dependents that import a symbol and then use it in a form no call or instantiation pattern captures — `Foo.staticMethod()`, `x instanceof Foo`, `obj.Foo = Foo`. Only the module specifier was recorded, so those files named the symbol nowhere and dropped out. Measured on axios: mean recall 0.37 to 0.57 with precision holding at 0.84.
+- `impact_analysis` resolves JavaScript, TypeScript and C/C++ imports written as file paths (`./headers.js`, `dir/foo.h`). Only Rust-style `::` module paths matched before, so a symbol declared in both a `.d.ts` and its `.js` lost every dependent: in axios, `AxiosError` reported none instead of 23. `assess_risk` blast radius and `export_context` callers read the same resolution.
+- `impact_analysis --symbol` accepts a bare name whose definitions all share one qualified name, instead of failing with `qualify with one of: Foo, Foo`. Languages without namespaces give every definition the bare name, so the instruction named no reachable choice; genuinely distinct qualified names still require disambiguation.
+- Capped ranked results break ties on a stable secondary key and repeat identically for an unchanged query: `impact_analysis`, `find_similar`, hybrid `search` fusion, co-changers, top-churn candidates, BM25 candidates, and paginated full-scan search.
+- A client that connects to the daemon but never completes the MCP `initialize` handshake is dropped after `CODESAGE_CLIENT_IDLE_MAX_SECS` instead of holding an active-client slot indefinitely and suppressing the daemon idle backstop.
+- The staleness banner now covers file paths it previously skipped: `review_rehearsal` patch lists, `list_dependencies` `imported_by`, `recommend_tests` `primary`, and the nested cycle arrays in `session_end`.
 - Laravel route URIs: array-options group prefixes (`Route::group(['prefix' => 'admin'], ...)`) are applied, nested group prefixes compose, and a root route maps to `/` instead of an empty URI.
 
 ## [0.18.0] - 2026-07-20

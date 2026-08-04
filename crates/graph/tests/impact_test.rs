@@ -438,6 +438,81 @@ fn impact_by_ambiguous_bare_name_requires_disambiguation() {
     );
 }
 
+#[test]
+fn impact_by_bare_name_proceeds_when_definitions_share_a_qualified_name() {
+    // A `.d.ts` declaration beside its `.js` implementation is the norm in
+    // JS/TS, and neither carries a namespace, so both definitions qualify to
+    // the same bare name. Erroring here told the caller to "qualify with one
+    // of: Headers, Headers".
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("index.d.ts"),
+        b"export class Headers {\n  get(): void;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("headers.js"),
+        b"class Headers {\n  get() { return 1; }\n}\nmodule.exports = Headers;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("client.js"),
+        b"import Headers from './headers.js';\nexport function send() { return new Headers(); }\n",
+    )
+    .unwrap();
+
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+
+    // Pin the precondition. Without it, a parser change that stopped emitting a
+    // symbol for the `.d.ts` would leave one definition, and the test would
+    // pass while exercising none of the behavior it exists to cover.
+    let defs = db.find_symbols("Headers", None).unwrap();
+    assert_eq!(defs.len(), 2, "expected a .d.ts and a .js definition");
+    let distinct: std::collections::HashSet<&str> =
+        defs.iter().map(|s| s.qualified_name.as_str()).collect();
+    assert_eq!(distinct.len(), 1, "both should qualify to the bare name");
+
+    let req = ImpactRequest {
+        target: ImpactTarget::Symbol {
+            name: "Headers".to_string(),
+        },
+        depth: 1,
+        source_only: false,
+    };
+
+    let report = impact_analysis(&db, &req).expect("identical qualified names are not ambiguous");
+    let paths: Vec<&str> = report.iter().map(|e| e.file_path.as_str()).collect();
+    assert!(
+        paths.iter().any(|p| p.ends_with("client.js")),
+        "consumer of the shared-name symbol should be reported, got {paths:?}"
+    );
+
+    // Both definitions resolve the same reference row, so the reason arrives
+    // once per seed. Reason count feeds result ranking.
+    let consumer = report
+        .iter()
+        .find(|e| e.file_path.ends_with("client.js"))
+        .unwrap();
+    let mut keys: Vec<(String, u32)> = consumer
+        .reasons
+        .iter()
+        .map(|r| (r.via_symbol.clone(), r.line))
+        .collect();
+    let before = keys.len();
+    keys.sort();
+    keys.dedup();
+    assert_eq!(
+        keys.len(),
+        before,
+        "duplicate impact reasons for {}: {:?}",
+        consumer.file_path,
+        consumer.reasons
+    );
+}
+
 fn setup_ambiguous_helper_rust_project() -> (tempfile::TempDir, Database) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -594,4 +669,320 @@ fn export_context_unknown_symbol_returns_empty_bundle() {
     assert!(bundle.primary.is_empty());
     assert!(bundle.symbol_definitions.is_empty());
     assert!(bundle.target_description.contains("not found"));
+}
+
+/// A same-namespace subclass writes `extends Base` with no `use` statement, so
+/// the reference row records the short name. Keying the reverse lookup on the
+/// symbol's qualified name matched `to_name` exactly and found none of them,
+/// so a widely-inherited base class reported zero dependents.
+#[test]
+fn same_namespace_inheritance_is_not_lost_to_the_qualified_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("BaseHandler.php"),
+        b"<?php\nnamespace App\\Handler;\nabstract class BaseHandler {\n  abstract public function handle();\n}\n",
+    )
+    .unwrap();
+    // Same namespace as the base, so PHP needs no `use` and the ref is short.
+    for (file, cls) in [
+        ("AlphaHandler.php", "AlphaHandler"),
+        ("BetaHandler.php", "BetaHandler"),
+    ] {
+        std::fs::write(
+            root.join(file),
+            format!(
+                "<?php\nnamespace App\\Handler;\nclass {cls} extends BaseHandler {{\n  public function handle() {{ return 1; }}\n}}\n"
+            ),
+        )
+        .unwrap();
+    }
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+
+    let entries = impact_analysis(
+        &db,
+        &ImpactRequest {
+            target: ImpactTarget::Symbol {
+                name: "BaseHandler".to_string(),
+            },
+            depth: 1,
+            source_only: false,
+        },
+    )
+    .unwrap();
+
+    let files: std::collections::HashSet<&str> =
+        entries.iter().map(|e| e.file_path.as_str()).collect();
+    assert!(
+        files.contains("AlphaHandler.php") && files.contains("BetaHandler.php"),
+        "both same-namespace subclasses must appear as dependents, got {files:?}"
+    );
+}
+
+/// A trait used by a class in its own namespace has the same shape as the
+/// inheritance case: `use SomeTrait;` inside the class body records the short
+/// name, and the qualified lookup missed it.
+#[test]
+fn same_namespace_trait_use_is_not_lost_to_the_qualified_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("LoggingTrait.php"),
+        b"<?php\nnamespace App\\Support;\ntrait LoggingTrait {\n  public function logIt($m) { return $m; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("Reporter.php"),
+        b"<?php\nnamespace App\\Support;\nclass Reporter {\n  use LoggingTrait;\n  public function run() { return $this->logIt('x'); }\n}\n",
+    )
+    .unwrap();
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+
+    let entries = impact_analysis(
+        &db,
+        &ImpactRequest {
+            target: ImpactTarget::Symbol {
+                name: "LoggingTrait".to_string(),
+            },
+            depth: 1,
+            source_only: false,
+        },
+    )
+    .unwrap();
+    assert!(
+        entries.iter().any(|e| e.file_path == "Reporter.php"),
+        "the trait's user must appear as a dependent, got {:?}",
+        entries.iter().map(|e| &e.file_path).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn call_path_finds_the_shortest_chain_and_reports_why_it_cannot() {
+    use codesage_protocol::CallPathRequest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // handler -> service -> repo -> sink, plus an unrelated island.
+    std::fs::write(
+        root.join("sink.rs"),
+        b"pub fn run_command() {}\npub fn unrelated() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("repo.rs"),
+        b"use crate::sink::run_command;\npub fn persist() { run_command(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("service.rs"),
+        b"use crate::repo::persist;\npub fn apply() { persist(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("handler.rs"),
+        b"use crate::service::apply;\npub fn handle() { apply(); }\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("island.rs"), b"pub fn orphan() {}\n").unwrap();
+
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+
+    let report = codesage_graph::trace_call_path(
+        &db,
+        &CallPathRequest {
+            from: "handle".to_string(),
+            to: "run_command".to_string(),
+            max_depth: 6,
+        },
+    )
+    .unwrap();
+    assert!(report.found, "expected a chain, got {:?}", report.note);
+    let names: Vec<&str> = report.steps.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["handle", "apply", "persist", "run_command"]);
+    assert_eq!(report.length, 3);
+    // Every step after the origin carries the line it is invoked on.
+    assert!(report.steps[0].call_line.is_none());
+    assert!(report.steps[1..].iter().all(|s| s.call_line.is_some()));
+
+    // A genuinely unreachable target is reported as unreachable, not as a
+    // bound — the caller needs to tell "no path" from "stopped looking".
+    let none = codesage_graph::trace_call_path(
+        &db,
+        &CallPathRequest {
+            from: "handle".to_string(),
+            to: "orphan".to_string(),
+            max_depth: 6,
+        },
+    )
+    .unwrap();
+    assert!(!none.found);
+    assert!(!none.bounded, "not a bound: {:?}", none.note);
+
+    // Too shallow a bound must say so, so an empty answer is not read as proof.
+    let shallow = codesage_graph::trace_call_path(
+        &db,
+        &CallPathRequest {
+            from: "handle".to_string(),
+            to: "run_command".to_string(),
+            max_depth: 1,
+        },
+    )
+    .unwrap();
+    assert!(!shallow.found);
+    assert!(shallow.bounded, "expected bounded: {:?}", shallow.note);
+
+    let missing = codesage_graph::trace_call_path(
+        &db,
+        &CallPathRequest {
+            from: "no_such_fn".to_string(),
+            to: "run_command".to_string(),
+            max_depth: 6,
+        },
+    )
+    .unwrap();
+    assert!(!missing.found);
+    assert!(missing.note.unwrap().contains("not found"));
+}
+
+#[test]
+fn call_path_depth_bound_is_inclusive_and_cycles_terminate() {
+    use codesage_protocol::CallPathRequest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // a <-> b mutual recursion, and a one-hop a -> sink.
+    std::fs::write(root.join("sink.rs"), b"pub fn sink() {}\n").unwrap();
+    std::fs::write(
+        root.join("a.rs"),
+        b"use crate::b::bee;\nuse crate::sink::sink;\npub fn ay() { bee(); sink(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("b.rs"),
+        b"use crate::a::ay;\npub fn bee() { ay(); }\n",
+    )
+    .unwrap();
+
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+
+    // A direct call must be found at max_depth 1 — the bound counts hops, so
+    // an off-by-one here would make the shallowest useful query return nothing.
+    let direct = codesage_graph::trace_call_path(
+        &db,
+        &CallPathRequest {
+            from: "ay".to_string(),
+            to: "sink".to_string(),
+            max_depth: 1,
+        },
+    )
+    .unwrap();
+    assert!(direct.found, "one hop at max_depth 1: {:?}", direct.note);
+    assert_eq!(direct.length, 1);
+
+    // A mutual-recursion cycle must not hang path reconstruction.
+    let cyclic = codesage_graph::trace_call_path(
+        &db,
+        &CallPathRequest {
+            from: "ay".to_string(),
+            to: "bee".to_string(),
+            max_depth: 6,
+        },
+    )
+    .unwrap();
+    assert!(cyclic.found);
+    assert_eq!(cyclic.steps.first().unwrap().name, "ay");
+    assert_eq!(cyclic.steps.last().unwrap().name, "bee");
+}
+
+#[test]
+fn call_path_refuses_edges_that_are_not_calls() {
+    use codesage_protocol::CallPathRequest;
+
+    // A type annotation is not control reaching the callee. Reporting it as a
+    // call chain would answer "does request input reach this sink" with a
+    // confident yes on the strength of a parameter type.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("Dangerous.php"),
+        b"<?php\nnamespace App;\nclass Dangerous {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("Handler.php"),
+        b"<?php\nnamespace App;\nuse App\\Dangerous;\nfunction handle(Dangerous $value) {}\n",
+    )
+    .unwrap();
+
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+
+    let report = codesage_graph::trace_call_path(
+        &db,
+        &CallPathRequest {
+            from: "handle".to_string(),
+            to: "Dangerous".to_string(),
+            max_depth: 3,
+        },
+    )
+    .unwrap();
+    assert!(
+        !report.found,
+        "a type hint must not read as a call chain, got {:?}",
+        report.steps.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn call_path_does_not_credit_an_outer_symbol_with_a_nested_symbols_calls() {
+    use codesage_protocol::CallPathRequest;
+
+    // `outer`'s line range spans `inner`, so a range query alone attributes
+    // `inner`'s call to `outer` and invents the edge `outer -> sink`.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("sink.rs"), b"pub fn sink() {}\n").unwrap();
+    std::fs::write(
+        root.join("nest.rs"),
+        b"use crate::sink::sink;\npub fn outer() {\n    fn inner() { sink(); }\n}\n",
+    )
+    .unwrap();
+
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+
+    let report = codesage_graph::trace_call_path(
+        &db,
+        &CallPathRequest {
+            from: "outer".to_string(),
+            to: "sink".to_string(),
+            max_depth: 1,
+        },
+    )
+    .unwrap();
+    assert!(
+        !report.found,
+        "outer does not call sink; inner does. got {:?}",
+        report.steps.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+
+    // The real caller still resolves.
+    let real = codesage_graph::trace_call_path(
+        &db,
+        &CallPathRequest {
+            from: "inner".to_string(),
+            to: "sink".to_string(),
+            max_depth: 1,
+        },
+    )
+    .unwrap();
+    assert!(
+        real.found,
+        "inner -> sink must still resolve: {:?}",
+        real.note
+    );
 }

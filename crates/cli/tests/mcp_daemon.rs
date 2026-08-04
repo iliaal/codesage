@@ -233,6 +233,69 @@ fn concurrent_shims_share_one_daemon() {
 }
 
 #[test]
+fn silent_client_that_never_initializes_is_dropped() {
+    // A peer that connects and never sends `initialize` parks the connection
+    // task inside the handshake await. The per-connection idle ceiling only
+    // starts *after* that await, so before the handshake was bounded such a
+    // peer held the daemon's active-client count above zero permanently and
+    // the whole-daemon idle backstop could never fire again.
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+
+    let runtime = tempfile::tempdir().unwrap();
+    let runtime_dir = runtime.path().to_path_buf();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime_dir.clone(),
+    };
+    let bin = env!("CARGO_BIN_EXE_codesage");
+    let mut daemon = ChildGuard {
+        child: Command::new(bin)
+            .arg("daemon")
+            .arg("--runtime-dir")
+            .arg(&runtime_dir)
+            .env("CODESAGE_CLIENT_IDLE_MAX_SECS", "2")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn codesage daemon"),
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut socket: Option<PathBuf> = None;
+    while Instant::now() < deadline && socket.is_none() {
+        thread::sleep(Duration::from_millis(50));
+        for entry in std::fs::read_dir(&runtime_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("sock") {
+                socket = Some(p);
+            }
+        }
+    }
+    let socket = socket.expect("daemon should bind a socket");
+
+    let mut stream = UnixStream::connect(&socket).expect("connect to daemon socket");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+
+    // Say nothing. The daemon must close the connection on its own; a read
+    // returning 0 bytes is that EOF.
+    let mut buf = [0u8; 64];
+    let n = stream.read(&mut buf).expect("read should return, not hang");
+    assert_eq!(
+        n, 0,
+        "expected the daemon to drop a client that never completed the handshake"
+    );
+
+    let _ = daemon.child.kill();
+}
+
+#[test]
 fn daemon_cleans_runtime_files_on_sigterm() {
     // M6: SIGTERM should let the daemon remove its socket + pid files
     // instead of leaving stale artefacts. Without graceful shutdown the

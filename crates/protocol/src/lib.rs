@@ -263,6 +263,14 @@ pub enum ReferenceKind {
     /// `impact_analysis`/`find_references` traverse routing.
     #[serde(alias = "routehandler")]
     RouteHandler,
+    /// The binding an import introduces, as opposed to the module it names:
+    /// `import Foo from './foo.js'` records `./foo.js` as an `Import` and
+    /// `Foo` as an `ImportBinding`. Kept distinct so file-level dependency
+    /// listings keep showing modules while symbol lookups can still reach a
+    /// file that imports a symbol and only uses it in a form no call or
+    /// instantiation pattern captures.
+    #[serde(alias = "importbinding")]
+    ImportBinding,
 }
 
 str_enum!(ReferenceKind {
@@ -274,6 +282,7 @@ str_enum!(ReferenceKind {
     TraitUse => "trait_use",
     TypeHint => "type_hint",
     RouteHandler => "route_handler",
+    ImportBinding => "import_binding",
 });
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -321,6 +330,49 @@ pub struct DependencyEntry {
     pub note: Option<String>,
     pub imports: Vec<String>,
     pub imported_by: Vec<String>,
+}
+
+/// What a repository contains that indexing will not see.
+///
+/// Answers "what didn't I index", which neither `IndexStats` counter does:
+/// `files_skipped` counts files unchanged since the last pass (freshness, not
+/// coverage), and `files_failed` counts parse errors on files that were at
+/// least recognized. Files whose extension maps to no supported language are
+/// dropped at discovery and never reach either counter, so the largest
+/// coverage gap is the one nothing reports.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CoverageSurvey {
+    /// Files that WOULD be indexed, per language.
+    pub covered_by_language: std::collections::BTreeMap<String, usize>,
+    /// Files skipped because no supported language matched, per extension.
+    /// Extensionless files are keyed as `<none>`.
+    pub uncovered_by_extension: std::collections::BTreeMap<String, usize>,
+    /// Files matching a configured exclude pattern. Deliberate, not a gap.
+    pub excluded: usize,
+    /// Recognized language, but over the indexer's size cap.
+    pub oversized: usize,
+    /// Recognized language, but the indexer could not open the file.
+    pub unreadable: usize,
+    /// Files in a supported language that gitignore hides from indexing.
+    /// Usually intentional; the most common answer to "why isn't this indexed".
+    pub gitignored_source: usize,
+    /// Directories the walk could not traverse. Non-zero means the numbers
+    /// below describe an incomplete tree.
+    pub walk_errors: usize,
+    pub covered_total: usize,
+    pub uncovered_total: usize,
+}
+
+impl CoverageSurvey {
+    /// Share of walked, non-excluded files that indexing can see, 0.0..=1.0.
+    /// Returns 1.0 for an empty repo rather than dividing by zero.
+    pub fn covered_fraction(&self) -> f64 {
+        let total = self.covered_total + self.uncovered_total;
+        if total == 0 {
+            return 1.0;
+        }
+        self.covered_total as f64 / total as f64
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1275,6 +1327,50 @@ pub struct ImpactSummary {
     pub total_affected: usize,
     pub by_distance: Vec<DistanceCount>,
     pub by_category: Vec<CategoryCount>,
+}
+
+/// One symbol on a call chain, with the line in the *previous* step's body
+/// where it is invoked. `call_line` is None on the first step, which is the
+/// origin and is not called by anything in the path.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CallPathStep {
+    pub name: String,
+    pub qualified_name: String,
+    pub file_path: String,
+    pub line_start: u32,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub call_line: Option<u32>,
+}
+
+/// Shortest call chain between two symbols, or the reason there is none.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CallPathReport {
+    pub found: bool,
+    /// Symbols from origin to target inclusive. Empty when `found` is false.
+    pub steps: Vec<CallPathStep>,
+    /// Edge count — one less than `steps.len()`.
+    pub length: usize,
+    /// Why an unfound path is unfound: the origin or target did not resolve,
+    /// or the search hit its depth or breadth bound before reaching the
+    /// target. Distinguishes "no such path" from "stopped looking".
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub note: Option<String>,
+    /// True when a bound stopped the search, so `found: false` is not proof
+    /// that no path exists.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub bounded: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CallPathRequest {
+    pub from: String,
+    pub to: String,
+    #[serde(default = "default_call_path_depth")]
+    pub max_depth: usize,
+}
+
+fn default_call_path_depth() -> usize {
+    6
 }
 
 /// Adaptive `impact_analysis` output. `results` is the existing reverse-impact
