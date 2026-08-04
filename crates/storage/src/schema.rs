@@ -308,6 +308,21 @@ pub(crate) fn init_vec_extension() {
     });
 }
 
+/// Pragmas for a connection that will only ever read.
+///
+/// [`init_db`] cannot be used on a read-only handle: `journal_mode=WAL` is
+/// itself a write, and the migration runner that follows it writes too. This
+/// sets only the pragmas that are connection-local and need no write access —
+/// the busy timeout so a concurrent indexer's checkpoint window does not fail
+/// the read outright, and the same mmap/cache sizing the read path benefits
+/// from.
+pub fn init_db_read_only(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+    conn.execute_batch("PRAGMA mmap_size=268435456;")?;
+    conn.execute_batch("PRAGMA cache_size=-65536;")?;
+    Ok(())
+}
+
 pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch("PRAGMA journal_mode=WAL;")?;
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;

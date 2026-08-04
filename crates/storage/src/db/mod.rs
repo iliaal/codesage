@@ -392,6 +392,69 @@ impl Database {
         })
     }
 
+    /// Open an existing index for reading only.
+    ///
+    /// Differs from [`Database::open`] in three ways that matter to a caller
+    /// firing on every edit, or running where the checkout is not writable:
+    ///
+    /// - **No permission change.** `open` hardens the `.codesage` directory to
+    ///   0700 and the database to 0600 on every call. As the owner that
+    ///   succeeds regardless of the current mode, so a plain read silently
+    ///   widens permissions an operator narrowed, and costs two `chmod`
+    ///   syscalls per invocation. On a read-only filesystem it returns `EROFS`
+    ///   and the read fails outright.
+    /// - **Read-only flags**, so the handle cannot modify an index it is only
+    ///   reading.
+    /// - **No schema batch and no migrations.** `journal_mode=WAL` is itself a
+    ///   write, and the migration runner writes too. A caller using this must
+    ///   therefore tolerate whatever schema is on disk rather than assume the
+    ///   current one.
+    ///
+    /// A WAL database needs a writable `-shm` for ordinary read-only access.
+    /// When that is unavailable the open retries with SQLite's `immutable=1`,
+    /// which is sound precisely in the case that forced it: nothing can be
+    /// writing to a database on a filesystem nobody can write to.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        use rusqlite::OpenFlags;
+        init_vec_extension();
+        if !path.exists() {
+            anyhow::bail!(
+                "index database {} does not exist (project not onboarded, or its index was deleted)",
+                path.display()
+            );
+        }
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        // Opening is lazy, so a WAL database that cannot create its `-shm`
+        // sidecar fails on the FIRST QUERY, not here. Probe before handing the
+        // handle back, and only then fall back.
+        let probe = |conn: &Connection| -> rusqlite::Result<()> {
+            conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map(|_| ())
+        };
+        let conn = match Connection::open_with_flags(path, flags) {
+            Ok(conn) if probe(&conn).is_ok() => conn,
+            _ => {
+                let uri = format!("file:{}?immutable=1", path.display());
+                let conn = Connection::open_with_flags(&uri, flags).map_err(|e| {
+                    anyhow::anyhow!("could not open {} read-only: {e}", path.display())
+                })?;
+                probe(&conn).map_err(|e| {
+                    anyhow::anyhow!("could not read {} read-only: {e}", path.display())
+                })?;
+                conn
+            }
+        };
+        crate::schema::init_db_read_only(&conn)?;
+        Ok(Database {
+            conn,
+            chunk_table: String::new(),
+        })
+    }
+
     pub fn open_for_model(path: &Path, model: &str, dim: usize) -> Result<Self> {
         let conn = open_connection(path, true)?;
         Self::finish_open_for_model(conn, path, model, dim)
@@ -532,6 +595,108 @@ mod tests {
         FeatureConfidence, FeatureKind, FeatureRecord, FileInfo, Language, Reference, Symbol,
         TrustBoundary,
     };
+
+    #[test]
+    #[ignore = "timing probe, run explicitly"]
+    fn bench_open_read_only_vs_open() {
+        // Step 1 of the serve-don't-recommend memo asks what the no-op path
+        // costs. Compare the two opens on the same file.
+        let path = std::path::Path::new("../../.codesage/index.db");
+        if !path.exists() {
+            eprintln!("skip: no index at {}", path.display());
+            return;
+        }
+        // First open in the process pays init_vec_extension's one-time
+        // registration, which a hook (fresh process per fire) pays EVERY fire.
+        let t = std::time::Instant::now();
+        drop(Database::open_read_only(path).unwrap());
+        eprintln!(
+            "cold-first open_read_only: {:.2}ms",
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+
+        for (label, n) in [("warm", 20)] {
+            let mut rw = Vec::new();
+            let mut ro = Vec::new();
+            for _ in 0..n {
+                let t = std::time::Instant::now();
+                drop(Database::open(path).unwrap());
+                rw.push(t.elapsed().as_secs_f64() * 1000.0);
+                let t = std::time::Instant::now();
+                drop(Database::open_read_only(path).unwrap());
+                ro.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            rw.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            ro.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            eprintln!(
+                "{label}: open p50={:.2}ms p95={:.2}ms | open_read_only p50={:.2}ms p95={:.2}ms",
+                rw[n / 2],
+                rw[(n * 95) / 100],
+                ro[n / 2],
+                ro[(n * 95) / 100]
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_read_only_reads_without_touching_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // `Database::open` hardens permissions on every call, so a plain read
+        // silently widens a mode an operator narrowed and costs two chmods per
+        // invocation. A per-edit hook must do neither.
+        let dir = tempfile::tempdir().unwrap();
+        let cs = dir.path().join(".codesage");
+        std::fs::create_dir_all(&cs).unwrap();
+        let db_path = cs.join("index.db");
+
+        {
+            let db = Database::open(&db_path).unwrap();
+            db.upsert_file(&make_file("app/Svc.php")).unwrap();
+        }
+        // Checkpoint so no -wal remains; a writable -shm is otherwise needed.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        std::fs::set_permissions(&cs, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let db = Database::open_read_only(&db_path).unwrap();
+        assert!(db.file_id_for_path("app/Svc.php").unwrap().is_some());
+
+        let db_mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+        let dir_mode = std::fs::metadata(&cs).unwrap().permissions().mode() & 0o777;
+        assert_eq!(db_mode, 0o400, "read-only open must not chmod the database");
+        assert_eq!(dir_mode, 0o500, "read-only open must not chmod .codesage");
+
+        // Restore so tempdir cleanup can remove the tree.
+        std::fs::set_permissions(&cs, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn plain_open_does_widen_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The behaviour the read-only path exists to avoid, pinned so the
+        // contrast is a test rather than a claim in a comment.
+        let dir = tempfile::tempdir().unwrap();
+        let cs = dir.path().join(".codesage");
+        std::fs::create_dir_all(&cs).unwrap();
+        let db_path = cs.join("index.db");
+        drop(Database::open(&db_path).unwrap());
+
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        drop(Database::open(&db_path).unwrap());
+
+        let mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "plain open re-hardens to 0600");
+    }
 
     fn make_file(path: &str) -> FileInfo {
         FileInfo {
