@@ -1,3 +1,4 @@
+mod brief;
 mod bundle;
 mod call_path;
 pub mod drift;
@@ -13,6 +14,7 @@ mod semantic;
 mod session;
 mod similar;
 
+pub use brief::build_edit_brief;
 pub use bundle::{export_context, export_context_for_symbol, feature_bundle};
 pub use call_path::trace_call_path;
 pub use git_history::{

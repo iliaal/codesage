@@ -1,5 +1,8 @@
 ## [Unreleased]
 
+### Added
+- `codesage brief <file>` prints what is worth knowing before editing a file: whether it is a churn hotspot, the tests named after it or co-changed with it, and the files that historically change with it. Prints nothing when there is nothing to say; `--json` always prints. Reads the index without writing to it or to the project.
+
 ## [0.19.0] - 2026-08-04
 
 ### Added

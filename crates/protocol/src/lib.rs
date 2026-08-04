@@ -1329,6 +1329,50 @@ pub struct ImpactSummary {
     pub by_category: Vec<CategoryCount>,
 }
 
+/// What is worth telling an agent about a file it is ABOUT to edit, assembled
+/// in one invocation from facts that are already counted.
+///
+/// Deliberately excludes anything derived from `assess_risk`: that walks import
+/// cycles and per-symbol reference counts and was measured at 464-675ms on real
+/// indexes, which is not a per-edit budget. It also excludes `test_gap`, whose
+/// false-positive rate measured 15-25%.
+///
+/// Every field here is history- or convention-derived, so an unsaved edit to
+/// the file does not invalidate it. `stale` is therefore informational, not a
+/// reason to suppress.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct EditBrief {
+    pub file_path: String,
+    /// True when there is nothing worth an agent's context. A caller that
+    /// serves this unasked must emit NOTHING in that case.
+    pub empty: bool,
+    /// The file ranks high on churn AND has enough commits for that rank to
+    /// mean something. Churn percentile is a within-repo rank, so on its own it
+    /// always promotes the top quartile of any repo, however young — a file
+    /// with two commits can sit at the 90th percentile. Renderers should key on
+    /// this rather than re-deriving a threshold from `churn_percentile`.
+    pub hotspot: bool,
+    /// 0.0-1.0. Present only when the file has git history indexed.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub churn_percentile: Option<f64>,
+    /// Commits touching this file whose message looks like a fix.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub fix_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub commits: Option<u32>,
+    /// Files that historically change with this one, most-coupled first.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub coupled: Vec<String>,
+    /// Tests to run after the edit: sibling-convention matches first, then
+    /// co-change matches.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub tests: Vec<String>,
+    /// The file on disk differs from what was indexed. Does not invalidate
+    /// anything above, which is why these signals were the ones chosen.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub stale: bool,
+}
+
 /// One symbol on a call chain, with the line in the *previous* step's body
 /// where it is invoked. `call_line` is None on the first step, which is the
 /// origin and is not called by anything in the path.

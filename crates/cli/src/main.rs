@@ -121,6 +121,15 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// What to know about a file before editing it (history facts + tests).
+    /// Prints nothing when there is nothing worth saying.
+    Brief {
+        /// File path, repo-relative
+        file: String,
+        /// Output as JSON (always prints, even when empty)
+        #[arg(long)]
+        json: bool,
+    },
     /// Shortest call chain from one symbol to another
     Trace {
         /// Origin symbol
@@ -535,6 +544,12 @@ pub(crate) fn open_db(root: &Path) -> Result<Database> {
     Database::open(&db_path(root)).context("failed to open index database")
 }
 
+/// Read-only handle for paths that must not mutate the project. See
+/// [`Database::open_read_only`]: no chmod, no migrations.
+pub(crate) fn open_db_read_only(root: &Path) -> Result<Database> {
+    Database::open_read_only(&db_path(root)).context("failed to open index database read-only")
+}
+
 pub(crate) fn open_db_for_model(root: &Path, model: &str, dim: usize) -> Result<Database> {
     Database::open_for_model(&db_path(root), model, dim).context("failed to open index database")
 }
@@ -901,6 +916,7 @@ fn run(cli: Cli) -> Result<()> {
             path,
             json,
         } => commands::query::cmd_search(&query, limit, offset, language.as_deref(), path, json),
+        Commands::Brief { file, json } => query::cmd_brief(&file, json),
         Commands::Trace {
             from,
             to,

@@ -11,7 +11,9 @@ use codesage_protocol::{
     ImpactOptions, ImpactRequest, ImpactTarget, Language, ReferenceKind, SearchRequest, SymbolKind,
 };
 
-use crate::{find_project_root, load_query_stack, load_symbol_context_db, open_db};
+use crate::{
+    find_project_root, load_query_stack, load_symbol_context_db, open_db, open_db_read_only,
+};
 
 pub(crate) fn cmd_find_symbol(name: &str, kind_str: Option<&str>, json: bool) -> Result<()> {
     let root = find_project_root()?;
@@ -583,6 +585,68 @@ fn print_result_block(r: &codesage_protocol::SearchResult) {
     println!("{}", r.content);
     println!("```");
     println!();
+}
+
+/// `codesage brief <file>` — what a serve-side caller can say about a file
+/// someone is about to edit.
+///
+/// The contract that matters here is the one this exists to satisfy: **failure
+/// is silence.** A hook wired to every edit must never surface an error, a
+/// stack trace or a nonzero exit, because all three land in the agent's context
+/// as noise it cannot act on. Every failure path below returns Ok(()) having
+/// printed nothing. That is deliberate, not sloppy error handling.
+pub(crate) fn cmd_brief(file: &str, json: bool) -> Result<()> {
+    let Ok(root) = find_project_root() else {
+        return Ok(());
+    };
+    let Ok(db) = open_db_read_only(&root) else {
+        return Ok(());
+    };
+
+    let rel = file.trim_start_matches("./");
+    let on_disk = std::fs::read(root.join(rel))
+        .ok()
+        .map(|b| codesage_parser::discover::content_hash(&b));
+
+    let Ok(brief) = codesage_graph::build_edit_brief(&db, rel, on_disk.as_deref()) else {
+        return Ok(());
+    };
+
+    if json {
+        // The JSON form always prints, empty or not: a machine caller asked for
+        // it explicitly and can branch on `empty` itself.
+        if let Ok(s) = serde_json::to_string(&brief) {
+            println!("{s}");
+        }
+        return Ok(());
+    }
+
+    // Nothing worth an agent's context. Say nothing at all rather than "no
+    // findings", which costs the same tokens and reads as a result.
+    if brief.empty {
+        return Ok(());
+    }
+
+    let mut out = String::new();
+    if let Some(p) = brief.churn_percentile.filter(|_| brief.hotspot) {
+        out.push_str(&format!("hotspot: churn percentile {:.0}%", p * 100.0));
+        // A zero fix count is not evidence of anything, so it is left off
+        // rather than rendered as "0 of N commits were fixes".
+        if let (Some(f), Some(c)) = (brief.fix_count, brief.commits)
+            && f > 0
+        {
+            out.push_str(&format!(", {f} of {c} commits were fixes"));
+        }
+        out.push('\n');
+    }
+    if !brief.tests.is_empty() {
+        out.push_str(&format!("tests: {}\n", brief.tests.join(", ")));
+    }
+    if !brief.coupled.is_empty() {
+        out.push_str(&format!("changes with: {}\n", brief.coupled.join(", ")));
+    }
+    print!("{out}");
+    Ok(())
 }
 
 #[cfg(test)]
