@@ -35,3 +35,14 @@
 (import_statement (import_clause (identifier) @ref))
 (import_statement (import_clause (named_imports (import_specifier name: (identifier) @ref))))
 (import_statement (import_clause (namespace_import (identifier) @ref)))
+
+; Patterns 10-11: re-export and CommonJS destructuring bindings.
+; See javascript_refs.scm — the module string alone leaves barrel files and
+; `const { a } = require(...)` consumers naming no symbol.
+(export_statement (export_clause (export_specifier name: (identifier) @ref)) source: (string))
+(variable_declarator
+  name: (object_pattern (shorthand_property_identifier_pattern) @ref)
+  value: (call_expression
+    function: (identifier) @_req
+    arguments: (arguments (string)))
+  (#eq? @_req "require"))

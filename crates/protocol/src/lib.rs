@@ -1330,6 +1330,50 @@ pub struct ImpactSummary {
 }
 
 /// Adaptive `impact_analysis` output. `results` is the existing reverse-impact
+/// One symbol on a call chain, with the line in the *previous* step's body
+/// where it is invoked. `call_line` is None on the first step, which is the
+/// origin and is not called by anything in the path.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CallPathStep {
+    pub name: String,
+    pub qualified_name: String,
+    pub file_path: String,
+    pub line_start: u32,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub call_line: Option<u32>,
+}
+
+/// Shortest call chain between two symbols, or the reason there is none.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CallPathReport {
+    pub found: bool,
+    /// Symbols from origin to target inclusive. Empty when `found` is false.
+    pub steps: Vec<CallPathStep>,
+    /// Edge count — one less than `steps.len()`.
+    pub length: usize,
+    /// Why an unfound path is unfound: the origin or target did not resolve,
+    /// or the search hit its depth or breadth bound before reaching the
+    /// target. Distinguishes "no such path" from "stopped looking".
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub note: Option<String>,
+    /// True when a bound stopped the search, so `found: false` is not proof
+    /// that no path exists.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub bounded: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CallPathRequest {
+    pub from: String,
+    pub to: String,
+    #[serde(default = "default_call_path_depth")]
+    pub max_depth: usize,
+}
+
+fn default_call_path_depth() -> usize {
+    6
+}
+
 /// list (so callers reading `.results` keep working); the other fields populate
 /// only when the matching [`ImpactOptions`] flag is set.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]

@@ -764,7 +764,7 @@ fn relative_file_matches(resolved: &str, sym_file: &str) -> bool {
     }
 }
 
-fn is_callee_reference(kind: ReferenceKind) -> bool {
+pub(crate) fn is_callee_reference(kind: ReferenceKind) -> bool {
     matches!(
         kind,
         ReferenceKind::Call

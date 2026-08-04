@@ -28,8 +28,27 @@ impl CodeSageServer {
         r: Result<T>,
         kind: &str,
     ) -> CallToolResult {
+        self.render_coverage_gated(project, r, kind, true)
+    }
+
+    /// [`Self::render`] with an explicit say over the coverage annotation.
+    /// `search` passes `false` when the caller asked for a page past the end
+    /// or a zero limit: the result is empty by request, and telling that
+    /// caller "no matches" would be a lie about the corpus.
+    pub(super) fn render_coverage_gated<T: serde::Serialize>(
+        &self,
+        project: &str,
+        r: Result<T>,
+        kind: &str,
+        allow_coverage: bool,
+    ) -> CallToolResult {
         let rendered = render_with_kind(r, kind);
-        self.annotate_staleness(project, self.annotate_coverage(project, kind, rendered))
+        let covered = if allow_coverage {
+            self.annotate_coverage(project, kind, rendered)
+        } else {
+            rendered
+        };
+        self.annotate_staleness(project, covered)
     }
 
     /// [`Self::render`] with an explicit char budget (context-bundle tools).
@@ -69,31 +88,62 @@ impl CodeSageServer {
         if !has_empty_results(structured) {
             return result;
         }
+        // A zero-file index is NOT a reason to stay quiet — it is the case
+        // where an empty result misleads hardest, because nothing was ever
+        // looked at.
         let counts = match self.with_project_db(project, |db| db.file_counts_by_language()) {
-            Ok(c) if !c.is_empty() => c,
-            Ok(_) => return result,
+            Ok(c) => c,
             Err(e) => {
                 tracing::debug!(error = %e, "coverage annotation skipped");
                 return result;
             }
         };
         let total: usize = counts.iter().map(|(_, n)| n).sum();
+        // `search` runs over semantic chunks, not the structural file table.
+        // Reporting the structural count for it would say "10,000 files
+        // indexed" about a project indexed with `--no-semantic`, where none of
+        // them were searched — recreating the false confidence this exists to
+        // prevent.
+        let semantic_files = if kind == "search" {
+            self.with_project_db(project, |db| db.semantic_file_count())
+                .ok()
+        } else {
+            None
+        };
         if let Some(mut structured) = result.structured_content.take() {
-            merge_coverage_meta(&mut structured, total, &counts);
+            merge_coverage_meta(&mut structured, total, &counts, semantic_files);
             result.structured_content = Some(structured);
         }
-        let breakdown = counts
-            .iter()
-            .map(|(lang, n)| format!("{lang} {n}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let note = format!(
-            "No matches. The index holds {total} file(s): {breakdown}. An empty result means no \
-             match *within* that set — it is not evidence the code is absent. If the language or \
-             directory you expected is missing above, it was never indexed: check \
-             `[index] exclude_patterns` in .codesage/config.toml, run `codesage coverage` to see \
-             what indexing cannot reach, and `codesage index` to refresh."
-        );
+        let note = if total == 0 {
+            "No matches, and nothing is indexed: this project has zero indexed files, so the \
+             empty result says nothing about the code. Run `codesage index`."
+                .to_string()
+        } else {
+            let breakdown = counts
+                .iter()
+                .map(|(lang, n)| format!("{lang} {n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let semantic_note = match semantic_files {
+                Some(0) => " None of them have semantic chunks, so this search matched nothing \
+                             because nothing was semantically indexed — run `codesage index` \
+                             without `--no-semantic`."
+                    .to_string(),
+                Some(n) if n < total => {
+                    format!(
+                        " Only {n} of them are semantically indexed, and `search` sees only those."
+                    )
+                }
+                _ => String::new(),
+            };
+            format!(
+                "No matches. The index holds {total} file(s): {breakdown}.{semantic_note} An empty \
+                 result means no match *within* that set — it is not evidence the code is absent. \
+                 If the language or directory you expected is missing above, it was never indexed: \
+                 check `[index] exclude_patterns` in .codesage/config.toml, run `codesage coverage` \
+                 to see what indexing cannot reach, and `codesage index` to refresh."
+            )
+        };
         let existing = std::mem::take(&mut result.content);
         let mut content = Vec::with_capacity(existing.len() + 1);
         content.push(ContentBlock::text(note));
@@ -395,6 +445,7 @@ fn merge_coverage_meta(
     structured: &mut serde_json::Value,
     total: usize,
     counts: &[(String, usize)],
+    semantic_files: Option<usize>,
 ) {
     let serde_json::Value::Object(map) = structured else {
         return;
@@ -415,6 +466,14 @@ fn merge_coverage_meta(
         "indexed_by_language".to_string(),
         serde_json::Value::Object(by_language),
     );
+    if let Some(n) = semantic_files {
+        // `search` only sees semantically-indexed files; structural coverage
+        // alone would overstate what was actually searched.
+        coverage.insert(
+            "semantically_indexed_files".to_string(),
+            serde_json::Value::from(n),
+        );
+    }
     coverage.insert(
         "note".to_string(),
         serde_json::Value::String(
@@ -1208,6 +1267,44 @@ mod tests {
         assert!(
             coverage_of("search", json!({ "found": false })).is_none(),
             "a payload without `results` must not be treated as empty"
+        );
+
+        // `search` reads the SEMANTIC set, not the structural file table.
+        // Nothing here was semantically indexed, so it must say so rather than
+        // report 3 files as though they had been searched.
+        let sem = coverage_of("search", json!({ "results": [] })).unwrap();
+        assert_eq!(sem["semantically_indexed_files"], json!(0));
+        // `find_symbol` is structural, so the semantic count does not apply.
+        let structural = coverage_of("find_symbol", json!({ "results": [] })).unwrap();
+        assert!(structural.get("semantically_indexed_files").is_none());
+    }
+
+    #[test]
+    fn coverage_speaks_up_loudest_when_nothing_is_indexed() {
+        // The zero-file index is where an empty result misleads hardest:
+        // nothing was ever looked at. Staying silent here would be backwards.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let codesage_dir = root.join(".codesage");
+        std::fs::create_dir_all(&codesage_dir).unwrap();
+        drop(Database::open(&codesage_dir.join("index.db")).unwrap());
+
+        let server = CodeSageServer::with_state(Arc::new(CodeSageServerState::new()));
+        let project = root.to_str().unwrap();
+        let rendered = render_with_kind(Ok(json!({ "results": [] })), "find_symbol");
+        let annotated = server.annotate_coverage(project, "find_symbol", rendered);
+
+        let cov = annotated
+            .structured_content
+            .as_ref()
+            .and_then(|s| s.get("_meta").and_then(|m| m.get("coverage")))
+            .expect("an empty index must still be annotated");
+        assert_eq!(cov["indexed_files"], json!(0));
+        let banner = annotated.content.first().and_then(|c| c.as_text()).unwrap();
+        assert!(
+            banner.text.contains("nothing is indexed"),
+            "got {:?}",
+            banner.text
         );
     }
 

@@ -13,13 +13,14 @@ use codesage_graph::{
     assess_risk, assess_risk_batch, assess_risk_diff, export_context, export_context_for_symbol,
     feature_bundle, find_coupling, find_references, find_similar, find_symbol,
     impact_analysis_report, list_dependencies, recommend_tests, search, session_end, session_start,
+    trace_call_path,
 };
 use codesage_protocol::{
-    ContextBundle, CouplingReport, DependencyEntry, ExportRequest, FeatureListResults,
-    FindReferencesRequest, FindReferencesResults, FindSimilarResults, FindSymbolRequest,
-    FindSymbolResults, ImpactOptions, ImpactReport, ImpactRequest, ImpactTarget, ProjectOverview,
-    ReviewRehearsal, RiskAssessment, RiskBatchAssessment, RiskDiffAssessment, SearchRequest,
-    SearchResults, SessionDiff, SessionStartReport, TestRecommendations,
+    CallPathReport, CallPathRequest, ContextBundle, CouplingReport, DependencyEntry, ExportRequest,
+    FeatureListResults, FindReferencesRequest, FindReferencesResults, FindSimilarResults,
+    FindSymbolRequest, FindSymbolResults, ImpactOptions, ImpactReport, ImpactRequest, ImpactTarget,
+    ProjectOverview, ReviewRehearsal, RiskAssessment, RiskBatchAssessment, RiskDiffAssessment,
+    SearchRequest, SearchResults, SessionDiff, SessionStartReport, TestRecommendations,
 };
 use rmcp::{
     ServerHandler, ServiceExt,
@@ -333,7 +334,11 @@ impl CodeSageServer {
                 paths: params.paths,
             };
             let query_for_embed = req.query.clone();
-            s.render(
+            // A page past the end, or a zero limit, empties the result by
+            // request. Coverage would report that as "no matches", which is
+            // false about the corpus.
+            let paged = req.offset.unwrap_or(0) > 0 || req.limit == Some(0);
+            s.render_coverage_gated(
                 &params.project,
                 req.paths
                     .as_ref()
@@ -345,6 +350,31 @@ impl CodeSageServer {
                         })
                     }),
                 "search",
+                !paged,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        name = "trace_call_path",
+        description = "Shortest call chain from one symbol to another: how does `from` end up calling `to`? Breadth-first over resolved callee edges, so `steps` is a shortest path, each entry naming the symbol, its file:line, and `call_line` — the line in the PREVIOUS step's body where it is invoked. Answers the question `find_references` needs N manual round-trips for, and that `impact_analysis` cannot answer at all because it returns an unordered set rather than a route. Use for `how does request input reach this exec/query/write?` during security review, and for orienting in an unfamiliar callstack. On `found: false` read `note` and `bounded`: `bounded: true` means the search stopped at its depth or breadth limit, so a longer chain may still exist and a bigger `max_depth` may find it — an empty result is NOT proof no path exists. Direction matters: this walks callee edges forward from `from`, so swap the arguments to ask the reverse question.",
+        output_schema = schema_for_type::<CallPathReport>()
+    )]
+    async fn trace_call_path_tool(
+        &self,
+        Parameters(params): Parameters<TracePathParams>,
+    ) -> CallToolResult {
+        self.blocking(move |s| {
+            let req = CallPathRequest {
+                from: params.from.clone(),
+                to: params.to.clone(),
+                max_depth: capped_limit(params.max_depth, 6, MAX_MCP_IMPACT_DEPTH),
+            };
+            s.render(
+                &params.project,
+                s.with_project_db(&params.project, |db| trace_call_path(db, &req)),
+                "trace_call_path",
             )
         })
         .await

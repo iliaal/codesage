@@ -32,3 +32,16 @@
 (import_statement (import_clause (identifier) @ref))
 (import_statement (import_clause (named_imports (import_specifier name: (identifier) @ref))))
 (import_statement (import_clause (namespace_import (identifier) @ref)))
+
+; Patterns 10-11: bindings that arrive by a route other than `import`.
+; A re-export names the symbols it forwards, and CommonJS destructuring names
+; what it pulls off the module object; both previously recorded only the module
+; string, so a barrel file or a `const { a } = require(...)` consumer named no
+; symbol and vanished from that symbol's dependents.
+(export_statement (export_clause (export_specifier name: (identifier) @ref)) source: (string))
+(variable_declarator
+  name: (object_pattern (shorthand_property_identifier_pattern) @ref)
+  value: (call_expression
+    function: (identifier) @_req
+    arguments: (arguments (string)))
+  (#eq? @_req "require"))

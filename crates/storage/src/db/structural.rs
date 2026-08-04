@@ -926,14 +926,22 @@ impl Database {
         // name. A ref whose `to_name_tail` matches the queried short name
         // counts the same as a direct `to_name` match (the indexer keeps
         // tail in sync via `name_tail()`).
+        // Count distinct source sites, not rows. One import statement can emit
+        // two rows naming the same short name — `import Foo from "./Foo"`
+        // stores the module (whose `to_name_tail` is `Foo`) and the binding
+        // `Foo` — and counting both scored a single statement twice in the
+        // top-symbol ranking. The two rows share a (file, line), so keying on
+        // that collapses them while leaving genuinely separate uses intact.
         let sql = format!(
-            "SELECT name, c FROM (
-                SELECT to_name AS name, COUNT(*) AS c FROM refs
-                WHERE to_name IN ({ph}) GROUP BY to_name
-                UNION ALL
-                SELECT to_name_tail AS name, COUNT(*) AS c FROM refs
-                WHERE to_name_tail IN ({ph}) AND to_name_tail <> to_name GROUP BY to_name_tail
-            )",
+            "SELECT name, COUNT(*) AS c FROM (
+                SELECT DISTINCT name, from_file_id, line FROM (
+                    SELECT to_name AS name, from_file_id, line FROM refs
+                    WHERE to_name IN ({ph})
+                    UNION ALL
+                    SELECT to_name_tail AS name, from_file_id, line FROM refs
+                    WHERE to_name_tail IN ({ph}) AND to_name_tail <> to_name
+                )
+            ) GROUP BY name",
             ph = placeholders.join(",")
         );
         let mut stmt = self.conn.prepare(&sql)?;

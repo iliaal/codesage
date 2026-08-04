@@ -757,3 +757,92 @@ fn same_namespace_trait_use_is_not_lost_to_the_qualified_lookup() {
         entries.iter().map(|e| &e.file_path).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn call_path_finds_the_shortest_chain_and_reports_why_it_cannot() {
+    use codesage_protocol::CallPathRequest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // handler -> service -> repo -> sink, plus an unrelated island.
+    std::fs::write(
+        root.join("sink.rs"),
+        b"pub fn run_command() {}\npub fn unrelated() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("repo.rs"),
+        b"use crate::sink::run_command;\npub fn persist() { run_command(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("service.rs"),
+        b"use crate::repo::persist;\npub fn apply() { persist(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("handler.rs"),
+        b"use crate::service::apply;\npub fn handle() { apply(); }\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("island.rs"), b"pub fn orphan() {}\n").unwrap();
+
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+
+    let report = codesage_graph::trace_call_path(
+        &db,
+        &CallPathRequest {
+            from: "handle".to_string(),
+            to: "run_command".to_string(),
+            max_depth: 6,
+        },
+    )
+    .unwrap();
+    assert!(report.found, "expected a chain, got {:?}", report.note);
+    let names: Vec<&str> = report.steps.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["handle", "apply", "persist", "run_command"]);
+    assert_eq!(report.length, 3);
+    // Every step after the origin carries the line it is invoked on.
+    assert!(report.steps[0].call_line.is_none());
+    assert!(report.steps[1..].iter().all(|s| s.call_line.is_some()));
+
+    // A genuinely unreachable target is reported as unreachable, not as a
+    // bound — the caller needs to tell "no path" from "stopped looking".
+    let none = codesage_graph::trace_call_path(
+        &db,
+        &CallPathRequest {
+            from: "handle".to_string(),
+            to: "orphan".to_string(),
+            max_depth: 6,
+        },
+    )
+    .unwrap();
+    assert!(!none.found);
+    assert!(!none.bounded, "not a bound: {:?}", none.note);
+
+    // Too shallow a bound must say so, so an empty answer is not read as proof.
+    let shallow = codesage_graph::trace_call_path(
+        &db,
+        &CallPathRequest {
+            from: "handle".to_string(),
+            to: "run_command".to_string(),
+            max_depth: 1,
+        },
+    )
+    .unwrap();
+    assert!(!shallow.found);
+    assert!(shallow.bounded, "expected bounded: {:?}", shallow.note);
+
+    let missing = codesage_graph::trace_call_path(
+        &db,
+        &CallPathRequest {
+            from: "no_such_fn".to_string(),
+            to: "run_command".to_string(),
+            max_depth: 6,
+        },
+    )
+    .unwrap();
+    assert!(!missing.found);
+    assert!(missing.note.unwrap().contains("not found"));
+}

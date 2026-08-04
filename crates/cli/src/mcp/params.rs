@@ -187,6 +187,19 @@ pub struct SessionParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct TracePathParams {
+    #[schemars(description = PROJECT_ARG_DESC)]
+    pub project: String,
+    #[schemars(description = "Origin symbol name (bare or qualified)")]
+    pub from: String,
+    #[schemars(description = "Target symbol the chain should reach")]
+    pub to: String,
+    #[schemars(description = "Maximum hops to search before giving up (default 6)")]
+    #[serde(default, deserialize_with = "deser_optional_usize")]
+    pub max_depth: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ImpactParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,

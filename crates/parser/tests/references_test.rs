@@ -151,3 +151,31 @@ fn typescript_import_bindings_are_captured_separately_from_the_module() {
     assert!(has_ref(&refs, "ns", ReferenceKind::ImportBinding));
     assert!(!has_ref(&refs, "Foo", ReferenceKind::Import));
 }
+
+#[test]
+fn javascript_reexport_and_commonjs_destructuring_name_their_bindings() {
+    // A barrel file forwards symbols; a CommonJS consumer destructures them.
+    // Both used to record only the module string, so neither appeared in the
+    // forwarded symbol's dependents.
+    let src = "export { x, y as z } from './m.js';\n\
+               const { a, b } = require('./n.js');\n\
+               a.staticMethod();\n";
+    let refs = refs_from_source(src, Language::JavaScript);
+
+    assert!(has_ref(&refs, "./m.js", ReferenceKind::Import));
+    assert!(has_ref(&refs, "./n.js", ReferenceKind::Import));
+    assert!(has_ref(&refs, "x", ReferenceKind::ImportBinding));
+    // A renamed re-export names the source symbol, matching the import case.
+    assert!(has_ref(&refs, "y", ReferenceKind::ImportBinding));
+    assert!(has_ref(&refs, "a", ReferenceKind::ImportBinding));
+    assert!(has_ref(&refs, "b", ReferenceKind::ImportBinding));
+}
+
+#[test]
+fn typescript_reexport_and_commonjs_destructuring_name_their_bindings() {
+    let src = "export { x } from './m.js';\n\
+               const { a } = require('./n.js');\n";
+    let refs = refs_from_source(src, Language::TypeScript);
+    assert!(has_ref(&refs, "x", ReferenceKind::ImportBinding));
+    assert!(has_ref(&refs, "a", ReferenceKind::ImportBinding));
+}

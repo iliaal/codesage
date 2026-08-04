@@ -122,6 +122,19 @@ enum Commands {
         json: bool,
     },
     /// Analyze change impact for a symbol or file
+    /// Shortest call chain from one symbol to another
+    Trace {
+        /// Origin symbol
+        from: String,
+        /// Target symbol
+        to: String,
+        /// Maximum hops to search before giving up
+        #[arg(long, default_value = "6")]
+        max_depth: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     Impact {
         /// Symbol name or file path (auto-detected)
         target: String,
@@ -888,6 +901,12 @@ fn run(cli: Cli) -> Result<()> {
             path,
             json,
         } => commands::query::cmd_search(&query, limit, offset, language.as_deref(), path, json),
+        Commands::Trace {
+            from,
+            to,
+            max_depth,
+            json,
+        } => query::cmd_trace(&from, &to, max_depth, json),
         Commands::Impact {
             target,
             file,

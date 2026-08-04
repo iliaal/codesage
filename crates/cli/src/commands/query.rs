@@ -191,6 +191,67 @@ pub(crate) fn cmd_similar(symbol: &str, min_jaccard: f32, limit: usize, json: bo
     Ok(())
 }
 
+pub(crate) fn cmd_trace(from: &str, to: &str, max_depth: usize, json: bool) -> Result<()> {
+    let root = find_project_root()?;
+    let db = open_db(&root)?;
+    let report = codesage_graph::trace_call_path(
+        &db,
+        &codesage_protocol::CallPathRequest {
+            from: from.to_string(),
+            to: to.to_string(),
+            max_depth,
+        },
+    )?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    if !report.found {
+        println!(
+            "No call chain from '{}' to '{}'{}.",
+            from,
+            to,
+            if report.bounded {
+                " within the search bound"
+            } else {
+                ""
+            }
+        );
+        if let Some(note) = &report.note {
+            println!("  {note}");
+        }
+        return Ok(());
+    }
+
+    println!(
+        "Call chain from '{}' to '{}' ({} hop{}):",
+        from,
+        to,
+        report.length,
+        if report.length == 1 { "" } else { "s" }
+    );
+    for (i, step) in report.steps.iter().enumerate() {
+        let arrow = if i == 0 { " " } else { "\u{2192}" };
+        match step.call_line {
+            Some(line) => println!(
+                "  {arrow} {} ({}:{}) called at {}:{}",
+                step.qualified_name,
+                step.file_path,
+                step.line_start,
+                report.steps[i - 1].file_path,
+                line
+            ),
+            None => println!(
+                "  {arrow} {} ({}:{})",
+                step.qualified_name, step.file_path, step.line_start
+            ),
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_impact(
     target: &str,
