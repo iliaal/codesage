@@ -20,9 +20,16 @@ hex.workspace = true
 wait-timeout = "0.2"
 
 [target.'cfg(not(target_vendor = "apple"))'.dependencies]
-# ort's default API jumped from 24 to 27 in rc.13; keep CodeSage's existing
-# ONNX Runtime >= 1.24 contract explicit instead of following that moving default.
-ort = { version = "2.0.0-rc.13", default-features = false, features = ["api-24", "copy-dylibs", "download-binaries", "load-dynamic", "ndarray", "preload-dylibs", "tls-native", "tracing"] }
+# ort's default API level moved 24 -> 27 in rc.13. The runtime loaded here is
+# whatever pip's onnxruntime-gpu ships (1.24.x), which does not expose API 27, so
+# the level is pinned instead of following the default. `model.rs`'s
+# `ort_api_floor_matches_supported_runtime` fails if the two ever drift apart.
+#
+# No `download-binaries`: `load-dynamic` implies `ort-sys/disable-linking`, so a
+# downloaded ONNX Runtime would never be linked. It stays on the Apple target,
+# which links statically. `load-dynamic` also supplies `std`, which is why the
+# Apple entry names `std` and this one does not.
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["api-24", "copy-dylibs", "load-dynamic", "ndarray", "preload-dylibs", "tls-native", "tracing"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 ort = { version = "2.0.0-rc.13", default-features = false, features = ["api-24", "copy-dylibs", "coreml", "download-binaries", "ndarray", "std", "tls-native", "tracing"] }
