@@ -1,13 +1,10 @@
 ## [Unreleased]
 
 ### Added
-- `codesage brief <file>` prints what is worth knowing before editing a file: whether it is a churn hotspot, the tests named after it or co-changed with it, and the files that historically change with it. Prints nothing when there is nothing to say; `--json` always prints. Reads the index without writing to it or to the project.
-- `codesage brief --session <id>` suppresses repeats within a session: a payload already served for that path, a path served in the last 15 minutes, or anything past a 1500-token session budget. A suppressed fire prints nothing, `--json` included. Session state lives in the runtime dir and expires after a day.
-- `codesage brief --session` appends one line per invocation to `brief-fires.jsonl` in the runtime dir, naming why each fire was served or suppressed (`served`, `empty`, `repeat`, `cooldown`, `budget`, `error`, `unavailable`) plus a digest of what was served. Rotates at 4 MiB, keeping one previous generation.
-- `CODESAGE_BRIEF_DEBUG=1` prints on stderr why `codesage brief` said nothing. Output stays empty without it.
-
-### Changed
-- `codesage brief` lists only tests named after the file under `tests`. A test that merely co-changes with it now appears under `changes with`, where previously `README.md` could be reported as tested by `test_review_state.py`.
+- `codesage brief <file>` prints what is worth knowing before editing a file: whether it is a churn hotspot, the tests named after it, and the files that historically change with it. A test that only co-changes is listed under `changes with` rather than `tests`. Prints nothing when there is nothing to say; `--json` always prints. Reads the index without writing to it or to the project.
+- `codesage brief --session <id>` suppresses repeats within a session: a payload already served for that path, a path served in the last 15 minutes, or anything past a 1500-token session budget. A suppressed invocation prints nothing, `--json` included. Session state lives in the runtime dir and expires after a day.
+- `codesage brief --session` appends one line per invocation to `brief-fires.jsonl` in the runtime dir, naming why each one was served or suppressed (`served`, `empty`, `repeat`, `cooldown`, `budget`, `error`, `unavailable`) plus a digest of what was served. Rotates at 4 MiB, keeping one previous generation.
+- `CODESAGE_BRIEF_DEBUG=1` prints on stderr why `codesage brief` said nothing. Silent without it.
 
 ## [0.19.0] - 2026-08-04
 
