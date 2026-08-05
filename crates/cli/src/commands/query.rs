@@ -595,11 +595,18 @@ fn print_result_block(r: &codesage_protocol::SearchResult) {
 /// stack trace or a nonzero exit, because all three land in the agent's context
 /// as noise it cannot act on. Every failure path below returns Ok(()) having
 /// printed nothing. That is deliberate, not sloppy error handling.
+///
+/// Silence toward the agent is not silence toward the operator. A failure a
+/// session recorded is still counted in the fire log, and `CODESAGE_BRIEF_DEBUG=1`
+/// puts the cause on stderr — without one of those, a payload path that quietly
+/// stopped working looks exactly like a file with nothing to say.
 pub(crate) fn cmd_brief(file: &str, json: bool, session: Option<&str>) -> Result<()> {
     let Ok(root) = find_project_root() else {
+        debug_brief("no project root found from cwd");
         return Ok(());
     };
     let Ok(db) = open_db_read_only(&root) else {
+        debug_brief("index could not be opened read-only");
         return Ok(());
     };
 
@@ -608,8 +615,27 @@ pub(crate) fn cmd_brief(file: &str, json: bool, session: Option<&str>) -> Result
         .ok()
         .map(|b| codesage_parser::discover::content_hash(&b));
 
-    let Ok(brief) = codesage_graph::build_edit_brief(&db, rel, on_disk.as_deref()) else {
-        return Ok(());
+    let brief = match codesage_graph::build_edit_brief(&db, rel, on_disk.as_deref()) {
+        Ok(brief) => brief,
+        Err(e) => {
+            debug_brief(&format!("building the brief for {rel} failed: {e:#}"));
+            // Counted, not dropped. The fire log is the denominator of every
+            // later efficacy measurement, and a fire that failed is still a
+            // fire; leaving it out makes a broken payload path read as a quiet
+            // one.
+            if let Some(session) = session {
+                let dir = crate::daemon::default_runtime_dir();
+                crate::brief_gate::log_fire(
+                    &dir,
+                    session,
+                    &root,
+                    rel,
+                    crate::brief_gate::Decision::Error,
+                    "",
+                );
+            }
+            return Ok(());
+        }
     };
 
     let rendered = render_brief(&brief);
@@ -621,7 +647,12 @@ pub(crate) fn cmd_brief(file: &str, json: bool, session: Option<&str>) -> Result
         // always prints. The gate hashes the rendered text in either mode, so
         // switching format does not re-arm a payload already served.
         let dir = crate::daemon::default_runtime_dir();
-        if !crate::brief_gate::should_serve(&dir, session, rel, &rendered) {
+        let decision = crate::brief_gate::evaluate(&dir, session, rel, &rendered);
+        // Logged before the early return, silent fires included: they are ~90%
+        // of all fires and leave no trace anywhere else, so a denominator not
+        // written here is unrecoverable afterwards.
+        crate::brief_gate::log_fire(&dir, session, &root, rel, decision, &rendered);
+        if decision != crate::brief_gate::Decision::Served {
             return Ok(());
         }
     }
@@ -639,6 +670,14 @@ pub(crate) fn cmd_brief(file: &str, json: bool, session: Option<&str>) -> Result
     // findings", which costs the same tokens and reads as a result.
     print!("{rendered}");
     Ok(())
+}
+
+/// Why `brief` said nothing, for an operator running it by hand. Never on the
+/// agent-facing path: stdout stays the payload and nothing else.
+fn debug_brief(msg: &str) {
+    if std::env::var_os("CODESAGE_BRIEF_DEBUG").is_some_and(|v| !v.is_empty()) {
+        eprintln!("brief: {msg}");
+    }
 }
 
 /// The served text form. Empty exactly when `brief.empty`, which the gate relies
