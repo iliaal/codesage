@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.20.0] - 2026-08-04
+
 ### Added
 - `codesage brief <file>` prints what is worth knowing before editing a file: whether it is a churn hotspot, the tests named after it, and the files that historically change with it. A test that only co-changes is listed under `changes with` rather than `tests`. Prints nothing when there is nothing to say; `--json` always prints. Reads the index without writing to it or to the project.
 - `codesage brief --session <id>` suppresses repeats within a session: a payload already served for that path, a path served in the last 15 minutes, or anything past a 1500-token session budget. A suppressed invocation prints nothing, `--json` included. Session state lives in the runtime dir and expires after a day.
@@ -697,5 +699,7 @@ Initial public release.
 
 [0.18.0]: https://github.com/iliaal/codesage/releases/tag/v0.18.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.19.0...HEAD
 [0.19.0]: https://github.com/iliaal/codesage/releases/tag/v0.19.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/iliaal/codesage/releases/tag/v0.20.0
