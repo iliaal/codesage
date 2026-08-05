@@ -20,7 +20,9 @@ hex.workspace = true
 wait-timeout = "0.2"
 
 [target.'cfg(not(target_vendor = "apple"))'.dependencies]
-ort = { version = "2.0.0-rc.12", features = ["load-dynamic", "preload-dylibs"] }
+# ort's default API jumped from 24 to 27 in rc.13; keep CodeSage's existing
+# ONNX Runtime >= 1.24 contract explicit instead of following that moving default.
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["api-24", "copy-dylibs", "download-binaries", "load-dynamic", "ndarray", "preload-dylibs", "tls-native", "tracing"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
-ort = { version = "2.0.0-rc.12", features = ["coreml"] }
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["api-24", "copy-dylibs", "coreml", "download-binaries", "ndarray", "std", "tls-native", "tracing"] }

@@ -351,9 +351,11 @@ pub fn preload_cuda_libs() {
 
         prepend_ld_library_path(lib_dirs);
 
-        let all_libs: Vec<&str> = ort::execution_providers::cuda::CUDA_DYLIBS
+        // ort::ep::cuda::preload_dylibs accepts one CUDA root and one cuDNN root,
+        // but pip's nvidia-* packages place the libraries in separate directories.
+        let all_libs: Vec<&str> = ort::ep::cuda::CUDA_DYLIBS
             .iter()
-            .chain(ort::execution_providers::cuda::CUDNN_DYLIBS.iter())
+            .chain(ort::ep::cuda::CUDNN_DYLIBS.iter())
             .copied()
             .collect();
         for lib_name in all_libs {
@@ -815,11 +817,7 @@ pub(crate) fn load_onnx_session(model: &str, device: &str) -> Result<(Session, T
         {
             preload_cuda_libs();
             builder = builder
-                .with_execution_providers([
-                    ort::execution_providers::CUDAExecutionProvider::default()
-                        .build()
-                        .error_on_failure(),
-                ])
+                .with_execution_providers([ort::ep::CUDA::default().build().error_on_failure()])
                 .map_err(|e| anyhow::anyhow!("CUDA provider failed to register: {e}"))?;
         }
     }
@@ -1054,6 +1052,11 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn ort_api_floor_matches_supported_runtime() {
+        assert_eq!(ort::MINOR_VERSION, 24);
+    }
 
     #[test]
     fn nvidia_lib_root_can_point_directly_at_shared_libraries() {
