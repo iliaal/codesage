@@ -4,6 +4,10 @@
 
 - Upgrade the `rmcp` MCP SDK to 3.x (MCP 2026-07-28 spec model types). Clients negotiating 2026-07-28 now receive the spec's `resultType` field on `tools/list` and `tools/call`; wire output for 2024-11-05 / 2025-06-18 / 2025-11-25 is unchanged.
 
+### Security
+
+- Bump transitive `h2` to 0.4.16 (from 0.4.13), clearing RUSTSEC-2026-0258 (unbounded empty DATA frames). Pulled via `reqwest` → `hyper` on the Hugging Face model-download path.
+
 ## [0.20.0] - 2026-08-04
 
 ### Added
