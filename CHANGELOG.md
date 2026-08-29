@@ -3,7 +3,7 @@
 ### Added
 
 - `codesage init` refuses to initialize in the filesystem root, the home directory, or credential directories (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.password-store`); `--force` overrides with a warning.
-- The Claude Code plugin ships a PreToolUse hook that serves `codesage brief` inline before an Edit/Write in an onboarded project (session-gated, silent when there is nothing to say, never blocks the tool call). A `bench/brief-efficacy/` analyzer pairs the fire ledger with session transcripts and scores served briefs against an unconditioned base rate.
+- The Claude Code plugin ships a PreToolUse hook that serves `codesage brief` inline before an Edit/Write in an onboarded project (session-gated, silent when there is nothing to say, never blocks the tool call).
 
 ### Changed
 
