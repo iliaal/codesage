@@ -7,16 +7,21 @@
 
 ### Changed
 
-- `assess_risk` no longer lets an unmeasurable file read as low risk: a file with zero indexed symbols gets a "0 dependents means unknown, not zero" note (legend `NS`), a reverse-dependency walk that hit its traversal cap marks the dependent count as a lower bound and the test-gap note as incomplete (`TU`), and a failed cycle-detection pass notes that cycle membership is unknown (`CF`) instead of silently dropping the term.
+- `assess_risk` notes state what was measured: a file with zero indexed symbols gets a "0 dependents means unknown, not zero" note (legend `NS`), and a capped reverse-dependency walk marks the dependent count as a lower bound and the test-gap check as incomplete (`TU`).
+- `assess_risk` reports a failed cycle-detection pass as "cycle membership is unknown" (`CF`) instead of silently dropping the term.
 - `assess_risk_diff` summary notes claim the 2-hop test check only for files where it actually completed, splitting verified from unmeasured gap counts.
 - `recommend_tests` reports a `.phpt` test directory omitted for size as "run that directory's suite" instead of "no test files found", and `assess_risk` counts those withheld tests as existing siblings rather than opening a false test gap.
 - `review_rehearsal` propagates trust-boundary, feature, and test-recommendation query failures instead of rendering a clean rehearsal over a broken engine.
 - Upgrade the `rmcp` MCP SDK to 3.x (MCP 2026-07-28 spec model types). Clients negotiating 2026-07-28 now receive the spec's `resultType` field on `tools/list` and `tools/call`; wire output for 2024-11-05 / 2025-06-18 / 2025-11-25 is unchanged.
+- `assess_risk`, `assess_risk_batch`, and `assess_risk_diff` take a `verbose` param (default false); the per-signal decomposition scalars (`churn_score` through `cycle_size`) and `top_coupled` are returned only when it is true. `score`, `notes`, `trust_boundaries`, `top_symbols`, and `cycle_files` are unchanged. The `codesage risk` / `risk-batch` / `risk-diff` CLI output is unchanged.
+- Symbol rows (`find_symbol`, `export_context`, `feature_bundle`, `impact_analysis` siblings) no longer carry `col_start` / `col_end`, and `qualified_name` is omitted when it equals `name`; reference rows (`find_references`) no longer carry `col`.
 
 ### Fixed
 
 - MCP budget truncation trims every oversized array largest-first until the response fits, instead of only the single largest one; `session_end`, `export_context`, `feature_bundle`, `impact_analysis`, `list_dependencies`, and `recommend_tests` could previously exceed the budget through their second and third arrays. Extra trims are reported in `_meta.also_truncated_fields` as `name (kept/total)`.
-- Watcher: an inotify queue overflow or FSEvents must-rescan now triggers the catch-up reindex (notify delivers both as a flagged event, not an error, so the 0.18.0 catch-up never fired on real overflow); a directory moved or renamed out of the tree purges every indexed file beneath it instead of leaving ghost rows; a directory renamed or moved in is adopted and its pre-existing files queued, with oversized adoptions routed to one bulk pass; a symlinked project root is canonicalized so macOS FSEvents paths match; the removal path never recreates a deleted `index.db`.
+- Watcher: an inotify queue overflow or an FSEvents rescan request now triggers the catch-up reindex; both previously arrived as flagged events the error-path catch-up never saw.
+- Watcher: a directory moved or renamed out of the tree purges every indexed file beneath it; one renamed or moved in is adopted with its pre-existing files, and oversized adoptions route to a single bulk pass.
+- Watcher: a symlinked project root is canonicalized so macOS FSEvents path spellings match, and no removal path recreates a deleted `index.db`.
 
 ### Security
 

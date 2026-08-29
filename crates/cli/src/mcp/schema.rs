@@ -247,6 +247,74 @@ mod tests {
         }
     }
 
+    /// The payload trim must show in the advertised schemas: the risk fields
+    /// gated behind `verbose` stay described but optional, the switch itself
+    /// is not a wire field, and the dropped column fields are not advertised
+    /// on symbol or reference rows.
+    #[test]
+    fn output_schemas_reflect_payload_trim() {
+        let server = CodeSageServer::new();
+        let mut tools = server.tool_router.list_all();
+        finalize_tools_for_listing(&mut tools);
+        let schema = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name.as_ref() == name)
+                .and_then(|t| t.output_schema.clone())
+                .unwrap_or_else(|| panic!("tool `{name}` must advertise an outputSchema"))
+        };
+        let input_schema = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name.as_ref() == name)
+                .map(|t| t.input_schema.clone())
+                .unwrap_or_else(|| panic!("tool `{name}` missing"))
+        };
+
+        let risk = schema("assess_risk");
+        let required = risk["required"].as_array().expect("required array");
+        for key in [
+            "churn_score",
+            "churn_percentile",
+            "fix_ratio",
+            "total_commits",
+            "fix_count",
+            "dependent_files",
+            "coupled_files",
+            "test_gap",
+            "in_cycle",
+            "cycle_size",
+            "top_coupled",
+        ] {
+            assert!(
+                risk["properties"].get(key).is_some(),
+                "assess_risk schema must still describe `{key}`"
+            );
+            assert!(
+                !required.iter().any(|r| r == key),
+                "`{key}` is verbose-only and must not be required"
+            );
+        }
+        assert!(
+            risk["properties"].get("verbose").is_none(),
+            "the verbose switch is a request param, not a response field"
+        );
+        for tool in ["assess_risk", "assess_risk_batch", "assess_risk_diff"] {
+            let input = input_schema(tool);
+            assert_eq!(
+                input["properties"]["verbose"]["type"],
+                json!(["boolean", "null"]),
+                "{tool} must accept an optional boolean `verbose`"
+            );
+        }
+
+        let symbols = serde_json::to_string(&*schema("find_symbol")).unwrap();
+        assert!(!symbols.contains("col_start"), "{symbols}");
+        assert!(!symbols.contains("col_end"), "{symbols}");
+        let refs = serde_json::to_string(&*schema("find_references")).unwrap();
+        assert!(!refs.contains("\"col\""), "{refs}");
+    }
+
     /// Every tool must advertise annotations through the `tools/list`
     /// finalization path: `readOnlyHint: true` + `openWorldHint: false` for
     /// the query surface, `readOnlyHint: false` for the session tools (they

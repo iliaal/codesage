@@ -151,6 +151,8 @@ pub fn find_coupling(db: &Database, file_path: &str, limit: usize) -> Result<Cou
 ///
 /// Output includes the decomposition so the agent can quote specific signals
 /// in PR descriptions or risk callouts. Empty git history → score=0 with a note.
+/// Every field is populated and `verbose` starts true; a caller that wants
+/// the trimmed wire shape flips it with [`RiskAssessment::set_verbose`].
 ///
 /// The seven weights sum to 1.0 so the maximum score is bounded; relative
 /// shape is preserved when tuning so the structural signals (churn, fix
@@ -184,6 +186,7 @@ fn assess_risk_with_context(
                 found: false,
                 file: file_path.to_string(),
                 score: 0.0,
+                verbose: true,
                 churn_score: 0.0,
                 churn_percentile: 0.0,
                 fix_ratio: 0.0,
@@ -482,6 +485,7 @@ fn assess_risk_with_context(
             found: true,
             file: file_path.to_string(),
             score,
+            verbose: true,
             churn_score,
             churn_percentile,
             fix_ratio,

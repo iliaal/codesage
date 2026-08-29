@@ -1163,7 +1163,9 @@ fn every_schema_bearing_tool_returns_populated_structured_content() {
         ),
         (
             "assess_risk",
-            serde_json::json!({"file_path": "src/helper.rs"}),
+            // `top_coupled` is verbose-only; the default trim is pinned by
+            // `assess_risk_default_response_omits_verbose_fields`.
+            serde_json::json!({"file_path": "src/helper.rs", "verbose": true}),
             &["found", "score", "notes", "top_coupled", "top_symbols"],
         ),
         (
@@ -1323,6 +1325,132 @@ fn carries_data(value: &Value) -> bool {
         Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
         Value::Bool(b) => *b,
         Value::Null => false,
+    }
+}
+
+/// The risk tools hide the per-signal decomposition and `top_coupled` unless
+/// the caller passes `verbose: true` (`cycle_files` is exempt — the staleness
+/// scan needs it). Pinned over the daemon wire, on the same fixture the
+/// populated-content test uses, so the data-bearing branch (a file with
+/// co-change history) is what gets trimmed.
+#[test]
+fn assess_risk_default_response_omits_verbose_fields() {
+    let project = tempfile::tempdir().unwrap();
+    onboard_rich_fixture(project.path());
+    let root = project.path().display().to_string();
+
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut session = McpSession::start(runtime.path());
+    session.initialize();
+
+    const VERBOSE_ONLY: [&str; 11] = [
+        "churn_score",
+        "churn_percentile",
+        "fix_ratio",
+        "total_commits",
+        "fix_count",
+        "dependent_files",
+        "coupled_files",
+        "test_gap",
+        "in_cycle",
+        "cycle_size",
+        "top_coupled",
+    ];
+
+    let call = |session: &mut McpSession,
+                id: u64,
+                tool: &str,
+                mut args: serde_json::Map<String, Value>| {
+        args.insert("project".to_string(), Value::String(root.clone()));
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": tool, "arguments": args },
+        });
+        let resp = session.request(id, &request.to_string());
+        assert_ne!(
+            resp["result"]["isError"],
+            Value::Bool(true),
+            "{tool} failed: {resp}"
+        );
+        resp["result"]["structuredContent"].clone()
+    };
+    let object = |v: Value| v.as_object().cloned().expect("object");
+
+    // assess_risk: default trims, verbose restores.
+    let default = object(call(
+        &mut session,
+        2,
+        "assess_risk",
+        object(serde_json::json!({"file_path": "src/helper.rs"})),
+    ));
+    assert_eq!(default["found"], Value::Bool(true), "{default:?}");
+    assert!(carries_data(&default["score"]), "{default:?}");
+    assert!(carries_data(&default["notes"]), "{default:?}");
+    for key in VERBOSE_ONLY {
+        assert!(
+            !default.contains_key(key),
+            "assess_risk default response must omit `{key}`: {default:?}"
+        );
+    }
+    let verbose = object(call(
+        &mut session,
+        3,
+        "assess_risk",
+        object(serde_json::json!({"file_path": "src/helper.rs", "verbose": true})),
+    ));
+    for key in VERBOSE_ONLY {
+        assert!(
+            verbose.contains_key(key),
+            "assess_risk verbose response must carry `{key}`: {verbose:?}"
+        );
+    }
+    assert!(
+        carries_data(&verbose["top_coupled"]),
+        "fixture has co-change history, verbose must surface it: {verbose:?}"
+    );
+    assert_eq!(
+        default["score"], verbose["score"],
+        "trim must not change the score"
+    );
+
+    // assess_risk_batch and assess_risk_diff apply the same gate per entry.
+    let files = serde_json::json!(["src/helper.rs", "src/util.rs"]);
+    for (id, tool) in [(4u64, "assess_risk_batch"), (5, "assess_risk_diff")] {
+        let default = object(call(
+            &mut session,
+            id,
+            tool,
+            object(serde_json::json!({"file_paths": files})),
+        ));
+        let entries = default["files"].as_array().expect("files array");
+        assert!(!entries.is_empty(), "{tool}: {default:?}");
+        for entry in entries {
+            let entry = entry.as_object().expect("entry object");
+            for key in VERBOSE_ONLY {
+                assert!(
+                    !entry.contains_key(key),
+                    "{tool} default entry must omit `{key}`: {entry:?}"
+                );
+            }
+        }
+        let verbose = object(call(
+            &mut session,
+            id + 10,
+            tool,
+            object(serde_json::json!({"file_paths": files, "verbose": true})),
+        ));
+        let entries = verbose["files"].as_array().expect("files array");
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.get("churn_percentile").is_some() && e.get("test_gap").is_some()),
+            "{tool} verbose entries must carry the decomposition: {verbose:?}"
+        );
     }
 }
 

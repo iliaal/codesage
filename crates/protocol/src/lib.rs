@@ -93,15 +93,28 @@ pub struct FileInfo {
     pub content_hash: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+/// The `#[serde]` attributes on this struct feed only the `JsonSchema` derive;
+/// the wire format is the manual `Serialize` / `Deserialize` impls below,
+/// which exist because `qualified_name` is dropped whenever it repeats `name`
+/// (a per-field `skip_serializing_if` cannot see a sibling field).
+#[derive(Debug, Clone, PartialEq, Eq, schemars::JsonSchema)]
 pub struct Symbol {
     pub name: String,
+    /// Fully qualified name (`Class::method`, `Ns\Class`). Omitted from JSON
+    /// when identical to `name`; a missing field means "same as `name`".
+    #[serde(default)]
     pub qualified_name: String,
     pub kind: SymbolKind,
     pub file_path: String,
     pub line_start: u32,
     pub line_end: u32,
+    /// Byte column of the definition node. Kept in SQLite but never emitted
+    /// over JSON: it is the indentation column, not something an agent acts on.
+    #[serde(skip)]
     pub col_start: u32,
+    /// Byte column where the definition node ends (the closing brace). Same
+    /// treatment as `col_start`.
+    #[serde(skip)]
     pub col_end: u32,
     /// Decision-shape comments attached to this symbol's definition: lines
     /// the author wrote to explain WHY this code exists or NOTE-worthy
@@ -121,6 +134,61 @@ pub struct Symbol {
     /// JSON serialization in that case so existing consumers see no diff.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub rationale: Vec<RationaleEntry>,
+}
+
+impl Serialize for Symbol {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let emit_qualified = self.qualified_name != self.name;
+        let emit_rationale = !self.rationale.is_empty();
+        let len = 5 + usize::from(emit_qualified) + usize::from(emit_rationale);
+        let mut s = serializer.serialize_struct("Symbol", len)?;
+        s.serialize_field("name", &self.name)?;
+        if emit_qualified {
+            s.serialize_field("qualified_name", &self.qualified_name)?;
+        }
+        s.serialize_field("kind", &self.kind)?;
+        s.serialize_field("file_path", &self.file_path)?;
+        s.serialize_field("line_start", &self.line_start)?;
+        s.serialize_field("line_end", &self.line_end)?;
+        if emit_rationale {
+            s.serialize_field("rationale", &self.rationale)?;
+        }
+        s.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Symbol {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            name: String,
+            #[serde(default)]
+            qualified_name: Option<String>,
+            kind: SymbolKind,
+            file_path: String,
+            line_start: u32,
+            line_end: u32,
+            #[serde(default)]
+            col_start: u32,
+            #[serde(default)]
+            col_end: u32,
+            #[serde(default)]
+            rationale: Vec<RationaleEntry>,
+        }
+        let w = Wire::deserialize(deserializer)?;
+        Ok(Symbol {
+            qualified_name: w.qualified_name.unwrap_or_else(|| w.name.clone()),
+            name: w.name,
+            kind: w.kind,
+            file_path: w.file_path,
+            line_start: w.line_start,
+            line_end: w.line_end,
+            col_start: w.col_start,
+            col_end: w.col_end,
+            rationale: w.rationale,
+        })
+    }
 }
 
 /// Marker class for a rationale comment. Lower-case JSON for stable
@@ -292,6 +360,9 @@ pub struct Reference {
     pub to_name: String,
     pub kind: ReferenceKind,
     pub line: u32,
+    /// Byte column of the reference. Kept in SQLite but never emitted over
+    /// JSON; `line` is what agents navigate by.
+    #[serde(skip)]
     pub col: u32,
 }
 
@@ -714,7 +785,19 @@ pub struct TopSymbol {
 
 /// Risk decomposition for a file. Score is the weighted sum; components let the agent
 /// see WHY a file is risky, not just the magnitude.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+///
+/// The engine always fills every field. What reaches the wire depends on
+/// [`RiskAssessment::verbose`]: the per-signal scalars (`churn_score` through
+/// `cycle_size`) and `top_coupled` are emitted only when it is true. The CLI
+/// keeps it true; the MCP tools clear it unless the caller passed
+/// `verbose: true`, because agents branch on `score`, `notes`,
+/// `trust_boundaries`, and `top_symbols` and the rest was measured at ~48% of
+/// an `assess_risk_batch` payload. `cycle_files` is NOT gated: the `notes[]`
+/// cycle lines name its members, and the staleness scan discovers those
+/// members only through the serialized field. `Serialize` is hand-written
+/// below to apply the switch; the `#[serde]` attributes here drive
+/// `Deserialize` and the `JsonSchema` derive.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct RiskAssessment {
     /// False when the requested file does not exist in the structural or
     /// git-history index. A missing path is unknown, not low-risk.
@@ -722,31 +805,58 @@ pub struct RiskAssessment {
     pub found: bool,
     pub file: String,
     pub score: f64,
+    /// Wire switch, not a measurement: when false the decomposition scalars
+    /// and `top_coupled` are left out of the serialized form. Never
+    /// serialized itself.
+    #[serde(skip, default = "default_found")]
+    pub verbose: bool,
+    /// Present only when the caller asked for `verbose` output.
+    #[serde(default)]
     pub churn_score: f64,
+    /// Present only when the caller asked for `verbose` output.
+    #[serde(default)]
     pub churn_percentile: f64,
+    /// Present only when the caller asked for `verbose` output.
+    #[serde(default)]
     pub fix_ratio: f64,
+    /// Present only when the caller asked for `verbose` output.
+    #[serde(default)]
     pub total_commits: u32,
+    /// Present only when the caller asked for `verbose` output.
+    #[serde(default)]
     pub fix_count: u32,
+    /// Present only when the caller asked for `verbose` output.
+    #[serde(default)]
     pub dependent_files: u32,
+    /// Present only when the caller asked for `verbose` output.
+    #[serde(default)]
     pub coupled_files: u32,
+    /// Present only when the caller asked for `verbose` output.
+    #[serde(default)]
     pub test_gap: bool,
     /// True when the file participates in a non-trivial import cycle (SCC of
     /// size ≥ 2 in the file-level import graph). Cycle membership is a strong
     /// structural signal that a change here can ripple unexpectedly through
     /// the cycle's other members; included as a 0.10-weighted input to `score`.
+    /// Present only when the caller asked for `verbose` output.
     #[serde(default)]
     pub in_cycle: bool,
     /// Number of files in the SCC this file belongs to (including this file).
     /// Zero when `in_cycle` is false. Larger cycles get a larger contribution
-    /// to `score`, capped at size 5.
+    /// to `score`, capped at size 5. Present only when the caller asked for
+    /// `verbose` output.
     #[serde(default)]
     pub cycle_size: u32,
     /// Other members of the import cycle (excluding this file), so the agent
     /// can name them in PR descriptions or follow up to assess whether the
-    /// cycle should be broken. Empty when `in_cycle` is false.
+    /// cycle should be broken. Empty when `in_cycle` is false. Not gated by
+    /// `verbose`: the `notes[]` cycle lines name these files, and the
+    /// response staleness scan reaches them only through this field.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub cycle_files: Vec<String>,
-    /// Top co-changers, useful for the agent to know which tests/files to also touch.
+    /// Top co-changers, useful for the agent to know which tests/files to also
+    /// touch. Present only when the caller asked for `verbose` output; use
+    /// `find_coupling` or `recommend_tests` for the same data on demand.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub top_coupled: Vec<CoChangeEntry>,
     /// Trust-boundary tags derived from this file's imports/includes/calls.
@@ -768,6 +878,63 @@ pub struct RiskAssessment {
     /// from JSON in that case so older agents see no schema churn.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub top_symbols: Vec<TopSymbol>,
+}
+
+impl RiskAssessment {
+    /// Flip the wire verbosity switch; see the struct docs for what it hides.
+    pub fn set_verbose(&mut self, verbose: bool) {
+        self.verbose = verbose;
+    }
+}
+
+impl Serialize for RiskAssessment {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let emit_cycle_files = !self.cycle_files.is_empty();
+        let emit_top_coupled = self.verbose && !self.top_coupled.is_empty();
+        let emit_trust = !self.trust_boundaries.is_empty();
+        let emit_notes = !self.notes.is_empty();
+        let emit_top_symbols = !self.top_symbols.is_empty();
+        let len = 3
+            + if self.verbose { 10 } else { 0 }
+            + usize::from(emit_cycle_files)
+            + usize::from(emit_top_coupled)
+            + usize::from(emit_trust)
+            + usize::from(emit_notes)
+            + usize::from(emit_top_symbols);
+        let mut s = serializer.serialize_struct("RiskAssessment", len)?;
+        s.serialize_field("found", &self.found)?;
+        s.serialize_field("file", &self.file)?;
+        s.serialize_field("score", &self.score)?;
+        if self.verbose {
+            s.serialize_field("churn_score", &self.churn_score)?;
+            s.serialize_field("churn_percentile", &self.churn_percentile)?;
+            s.serialize_field("fix_ratio", &self.fix_ratio)?;
+            s.serialize_field("total_commits", &self.total_commits)?;
+            s.serialize_field("fix_count", &self.fix_count)?;
+            s.serialize_field("dependent_files", &self.dependent_files)?;
+            s.serialize_field("coupled_files", &self.coupled_files)?;
+            s.serialize_field("test_gap", &self.test_gap)?;
+            s.serialize_field("in_cycle", &self.in_cycle)?;
+            s.serialize_field("cycle_size", &self.cycle_size)?;
+        }
+        if emit_cycle_files {
+            s.serialize_field("cycle_files", &self.cycle_files)?;
+        }
+        if emit_top_coupled {
+            s.serialize_field("top_coupled", &self.top_coupled)?;
+        }
+        if emit_trust {
+            s.serialize_field("trust_boundaries", &self.trust_boundaries)?;
+        }
+        if emit_notes {
+            s.serialize_field("notes", &self.notes)?;
+        }
+        if emit_top_symbols {
+            s.serialize_field("top_symbols", &self.top_symbols)?;
+        }
+        s.end()
+    }
 }
 
 /// Aggregate risk for a set of files (typically the file list of a patch or PR).
@@ -839,6 +1006,21 @@ pub struct RiskDiffAssessment {
     pub legend: BTreeMap<String, String>,
 }
 
+impl RiskDiffAssessment {
+    /// Apply [`RiskAssessment::set_verbose`] to every per-file entry,
+    /// including the detailed `top_files` kept inside directory clusters.
+    pub fn set_verbose(&mut self, verbose: bool) {
+        for f in &mut self.files {
+            f.set_verbose(verbose);
+        }
+        for cluster in &mut self.clustered_directories {
+            for f in &mut cluster.top_files {
+                f.set_verbose(verbose);
+            }
+        }
+    }
+}
+
 /// Result of `assess_risk_batch`: per-file decomposition for a list of
 /// files, no patch-level aggregation. Use when the agent has a list of
 /// files (e.g. from impact analysis or coupling) and wants individual
@@ -867,6 +1049,15 @@ pub struct RiskBatchAssessment {
         rename = "_legend"
     )]
     pub legend: BTreeMap<String, String>,
+}
+
+impl RiskBatchAssessment {
+    /// Apply [`RiskAssessment::set_verbose`] to every per-file entry.
+    pub fn set_verbose(&mut self, verbose: bool) {
+        for f in &mut self.files {
+            f.set_verbose(verbose);
+        }
+    }
 }
 
 /// A strongly-connected component in the file-level import graph that
@@ -1857,5 +2048,293 @@ mod tests {
         let report: CouplingReport =
             serde_json::from_str(r#"{"coupled":[],"file_indexed":true,"file_commits":4}"#).unwrap();
         assert!(report.found);
+    }
+
+    /// Shaped like a real hotspot: ten coupled files (the `co_changes_for`
+    /// cap), a small cycle, two boundaries, notes, one top symbol.
+    fn risk_fixture() -> RiskAssessment {
+        RiskAssessment {
+            found: true,
+            file: "src/lib.rs".to_string(),
+            score: 0.61,
+            verbose: true,
+            churn_score: 12.5,
+            churn_percentile: 0.94,
+            fix_ratio: 0.31,
+            total_commits: 16,
+            fix_count: 5,
+            dependent_files: 5,
+            coupled_files: 10,
+            test_gap: false,
+            in_cycle: true,
+            cycle_size: 3,
+            cycle_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            top_coupled: (0..10)
+                .map(|i| CoChangeEntry {
+                    file: format!("src/coupled_{i}.rs"),
+                    weight: 7.5 - f64::from(i) * 0.4,
+                    count: 12 - i,
+                    last_observed_at: Some(1_788_000_000),
+                })
+                .collect(),
+            trust_boundaries: vec![TrustBoundary::Filesystem, TrustBoundary::Database],
+            notes: vec![
+                "hotspot: churn percentile 94%".to_string(),
+                "in import cycle of 3 files: src/a.rs, src/b.rs".to_string(),
+            ],
+            top_symbols: vec![TopSymbol {
+                name: "run".to_string(),
+                line: 10,
+                kind: "function".to_string(),
+                why: "hot: 142 lines, 38 refs, in 3-file cycle".to_string(),
+            }],
+        }
+    }
+
+    const RISK_VERBOSE_ONLY_KEYS: [&str; 11] = [
+        "churn_score",
+        "churn_percentile",
+        "fix_ratio",
+        "total_commits",
+        "fix_count",
+        "dependent_files",
+        "coupled_files",
+        "test_gap",
+        "in_cycle",
+        "cycle_size",
+        "top_coupled",
+    ];
+
+    fn json_keys(json: &str) -> Vec<String> {
+        // serde_json's Map is sorted, so read key order off the wire text.
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let mut keyed: Vec<(usize, String)> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| (json.find(&format!("\"{k}\":")).unwrap(), k.clone()))
+            .collect();
+        keyed.sort();
+        keyed.into_iter().map(|(_, k)| k).collect()
+    }
+
+    /// The MCP default hides the decomposition and `top_coupled` but keeps
+    /// `cycle_files` (the staleness scan and the cycle notes depend on it);
+    /// `verbose` keeps the pre-trim field set and order.
+    #[test]
+    fn risk_assessment_verbose_switch_gates_wire_fields() {
+        let full = risk_fixture();
+        let full_json = serde_json::to_string(&full).unwrap();
+        assert_eq!(
+            json_keys(&full_json),
+            [
+                "found",
+                "file",
+                "score",
+                "churn_score",
+                "churn_percentile",
+                "fix_ratio",
+                "total_commits",
+                "fix_count",
+                "dependent_files",
+                "coupled_files",
+                "test_gap",
+                "in_cycle",
+                "cycle_size",
+                "cycle_files",
+                "top_coupled",
+                "trust_boundaries",
+                "notes",
+                "top_symbols",
+            ]
+        );
+        assert!(!full_json.contains("\"verbose\""));
+
+        let mut trimmed = risk_fixture();
+        trimmed.set_verbose(false);
+        let trimmed_json = serde_json::to_string(&trimmed).unwrap();
+        assert_eq!(
+            json_keys(&trimmed_json),
+            [
+                "found",
+                "file",
+                "score",
+                "cycle_files",
+                "trust_boundaries",
+                "notes",
+                "top_symbols"
+            ]
+        );
+        for key in RISK_VERBOSE_ONLY_KEYS {
+            assert!(
+                !trimmed_json.contains(&format!("\"{key}\"")),
+                "`{key}` leaked into the trimmed payload: {trimmed_json}"
+            );
+        }
+
+        // Size claim the trim exists for: the hidden fields were measured at
+        // ~48% of a real `assess_risk_batch` payload, so this fixture must
+        // shed at least that much.
+        let saved = full_json.len() - trimmed_json.len();
+        assert!(
+            saved * 100 >= full_json.len() * 48,
+            "expected >=48% reduction, got {saved}/{} bytes",
+            full_json.len()
+        );
+    }
+
+    /// Guards the hand-written `Serialize`: a field added to the struct but
+    /// forgotten in the impl would come back at its default here and fail the
+    /// `Debug` comparison.
+    #[test]
+    fn risk_assessment_verbose_round_trips_every_field() {
+        let full = risk_fixture();
+        let json = serde_json::to_string(&full).unwrap();
+        let back: RiskAssessment = serde_json::from_str(&json).unwrap();
+        assert_eq!(format!("{back:?}"), format!("{full:?}"));
+    }
+
+    /// A trimmed payload (what an agent gets by default) still deserializes:
+    /// the hidden scalars fall back to their defaults.
+    #[test]
+    fn risk_assessment_trimmed_payload_deserializes() {
+        let mut trimmed = risk_fixture();
+        trimmed.set_verbose(false);
+        let json = serde_json::to_string(&trimmed).unwrap();
+        let back: RiskAssessment = serde_json::from_str(&json).unwrap();
+        assert!(back.found);
+        assert_eq!(back.score, 0.61);
+        assert_eq!(back.churn_score, 0.0);
+        assert_eq!(back.cycle_size, 0);
+        assert_eq!(
+            back.cycle_files.len(),
+            2,
+            "cycle_files is not verbose-gated"
+        );
+        assert!(back.top_coupled.is_empty());
+        assert_eq!(back.notes.len(), 2);
+    }
+
+    /// Batch and diff containers propagate the switch into every entry,
+    /// including the detail kept inside directory clusters.
+    #[test]
+    fn risk_containers_propagate_verbose_switch() {
+        let mut batch = RiskBatchAssessment {
+            files: vec![risk_fixture(), risk_fixture()],
+            legend: BTreeMap::new(),
+        };
+        batch.set_verbose(false);
+        let json = serde_json::to_string(&batch).unwrap();
+        assert!(!json.contains("\"top_coupled\""), "{json}");
+
+        let mut diff = RiskDiffAssessment {
+            files: vec![risk_fixture()],
+            clustered_directories: vec![ClusteredDirectory {
+                directory: "src".to_string(),
+                count: 5,
+                top_files: vec![risk_fixture()],
+                omitted_files: vec!["src/x.rs".to_string()],
+            }],
+            ..RiskDiffAssessment::default()
+        };
+        diff.set_verbose(false);
+        let json = serde_json::to_string(&diff).unwrap();
+        assert!(!json.contains("\"top_coupled\""), "{json}");
+        assert!(!json.contains("\"churn_score\""), "{json}");
+    }
+
+    fn symbol_fixture(qualified_name: &str) -> Symbol {
+        Symbol {
+            name: "open".to_string(),
+            qualified_name: qualified_name.to_string(),
+            kind: SymbolKind::Method,
+            file_path: "src/db.rs".to_string(),
+            line_start: 10,
+            line_end: 20,
+            col_start: 4,
+            col_end: 5,
+            rationale: Vec::new(),
+        }
+    }
+
+    /// `qualified_name` travels only when it adds information; columns never
+    /// do. Both directions restore the struct.
+    #[test]
+    fn symbol_wire_drops_columns_and_redundant_qualified_name() {
+        let bare = symbol_fixture("open");
+        let json = serde_json::to_string(&bare).unwrap();
+        assert_eq!(
+            json,
+            r#"{"name":"open","kind":"method","file_path":"src/db.rs","line_start":10,"line_end":20}"#
+        );
+        let back: Symbol = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.qualified_name, "open");
+        assert_eq!(back.col_start, 0);
+
+        let qualified = symbol_fixture("Database::open");
+        let json = serde_json::to_string(&qualified).unwrap();
+        assert_eq!(
+            json_keys(&json),
+            [
+                "name",
+                "qualified_name",
+                "kind",
+                "file_path",
+                "line_start",
+                "line_end"
+            ]
+        );
+        let back: Symbol = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.qualified_name, "Database::open");
+        assert_eq!(back.name, "open");
+
+        // Pre-trim payloads that still carry columns are accepted.
+        let legacy: Symbol = serde_json::from_str(
+            r#"{"name":"open","qualified_name":"open","kind":"method","file_path":"src/db.rs","line_start":10,"line_end":20,"col_start":4,"col_end":5}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.col_start, 4);
+        assert_eq!(legacy.col_end, 5);
+    }
+
+    #[test]
+    fn symbol_wire_keeps_rationale_when_present() {
+        let mut sym = symbol_fixture("open");
+        sym.rationale.push(RationaleEntry {
+            kind: RationaleKind::Why,
+            text: "keeps the pool warm".to_string(),
+            line_start: 8,
+            line_end: 9,
+        });
+        let json = serde_json::to_string(&sym).unwrap();
+        assert!(json.contains("\"rationale\""), "{json}");
+        assert!(!json.contains("\"col_start\""), "{json}");
+        assert!(!json.contains("\"col_end\""), "{json}");
+        let back: Symbol = serde_json::from_str(&json).unwrap();
+        // The wire drops the columns by design, so the round-trip restores
+        // everything except them; they come back at their default.
+        let expected = Symbol {
+            col_start: 0,
+            col_end: 0,
+            ..sym
+        };
+        assert_eq!(back, expected);
+    }
+
+    #[test]
+    fn reference_wire_drops_column() {
+        let r = Reference {
+            from_file: "src/a.rs".to_string(),
+            from_symbol: Some("a::run".to_string()),
+            to_name: "open".to_string(),
+            kind: ReferenceKind::Call,
+            line: 12,
+            col: 8,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains("\"col\""), "{json}");
+        let back: Reference = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.col, 0);
+        assert_eq!(back.line, 12);
     }
 }

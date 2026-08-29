@@ -140,12 +140,16 @@ pub struct CouplingParams {
     pub limit: Option<usize>,
 }
 
+const RISK_VERBOSE_DESC: &str = "Include per-signal decomposition (churn_score, churn_percentile, fix_ratio, total_commits, fix_count, dependent_files, coupled_files, test_gap, in_cycle, cycle_size) and coupled files (`top_coupled`) on each RiskAssessment; default false.";
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RiskParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
     #[schemars(description = "Repo-relative file path to assess")]
     pub file_path: String,
+    #[schemars(description = RISK_VERBOSE_DESC)]
+    pub verbose: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -156,6 +160,8 @@ pub struct RiskDiffParams {
         description = "Repo-relative file paths in the patch (typically the output of `git diff --name-only`)"
     )]
     pub file_paths: Vec<String>,
+    #[schemars(description = RISK_VERBOSE_DESC)]
+    pub verbose: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -163,9 +169,11 @@ pub struct RiskBatchParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
     #[schemars(
-        description = "Repo-relative file paths to score individually. Returns one RiskAssessment per path, in input order. Use when you have a list of files (e.g. from impact analysis or coupling) and want each one's individual risk decomposition — saves the per-file MCP round-trip overhead vs N separate `assess_risk` calls. For patch-level aggregation (max/mean, summary_notes, cycles), use `assess_risk_diff` instead."
+        description = "Repo-relative file paths to score individually. Returns one RiskAssessment per path, in input order. Use when you have a list of files (e.g. from impact analysis or coupling) and want each one's individual score — saves the per-file MCP round-trip overhead vs N separate `assess_risk` calls. For patch-level aggregation (max/mean, summary_notes, cycles), use `assess_risk_diff` instead."
     )]
     pub file_paths: Vec<String>,
+    #[schemars(description = RISK_VERBOSE_DESC)]
+    pub verbose: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]

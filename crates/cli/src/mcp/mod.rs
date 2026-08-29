@@ -476,15 +476,20 @@ impl CodeSageServer {
 
     #[tool(
         name = "assess_risk",
-        description = "Risk score for changing one file: blends seven signals — churn percentile, fix ratio, blast radius (depth-2 reverse deps), historical coupling, test-gap, import-cycle membership, and trust-boundary count — into a 0..1 score. Response also carries `in_cycle` / `cycle_size` / `cycle_files`, the `trust_boundaries[]` list, and `top_symbols[]` (up to 5 symbols inside the file ranked by line count + reference count + cycle membership). Notes are paste-ready for PR descriptions; the `crosses N trust boundaries` line fires when ≥3 boundaries cross. Use BEFORE writing a patch to calibrate caution and BEFORE submitting to flag concerns. For per-file scoring across N files in one call use `assess_risk_batch`; for patch-level aggregation (max/mean, summary_notes, cycles touching the patch) use `assess_risk_diff`.",
+        description = "Risk score for changing one file: blends seven signals — churn percentile, fix ratio, blast radius (depth-2 reverse deps), historical coupling, test-gap, import-cycle membership, and trust-boundary count — into a 0..1 score. Response carries `score`, `notes[]`, the `trust_boundaries[]` list, `top_symbols[]` (up to 5 symbols inside the file ranked by line count + reference count + cycle membership), and `cycle_files[]` when the file sits in an import cycle. Notes are paste-ready for PR descriptions: the `crosses N trust boundaries` line fires when ≥3 boundaries cross, and the `in import cycle of N files` line names up to five members. Pass `verbose: true` to also get the per-signal decomposition (`churn_score`, `churn_percentile`, `fix_ratio`, `total_commits`, `fix_count`, `dependent_files`, `coupled_files`, `test_gap`, `in_cycle`, `cycle_size`) and `top_coupled[]`; the default omits them. Use BEFORE writing a patch to calibrate caution and BEFORE submitting to flag concerns. For per-file scoring across N files in one call use `assess_risk_batch`; for patch-level aggregation (max/mean, summary_notes, cycles touching the patch) use `assess_risk_diff`.",
         output_schema = schema_for_type::<RiskAssessment>()
     )]
     async fn assess_risk_tool(&self, Parameters(params): Parameters<RiskParams>) -> CallToolResult {
         self.blocking(move |s| {
             let file_path = params.file_path.clone();
+            let verbose = params.verbose.unwrap_or(false);
             s.render(
                 &params.project,
-                s.with_project_db(&params.project, |db| assess_risk(db, &file_path)),
+                s.with_project_db(&params.project, |db| assess_risk(db, &file_path))
+                    .map(|mut a| {
+                        a.set_verbose(verbose);
+                        a
+                    }),
                 "assess_risk",
             )
         })
@@ -493,7 +498,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "assess_risk_diff",
-        description = "Aggregate risk for a SET of files (the file list of a patch or PR). Returns per-file decomposition plus rollups: max_score, mean_score, max_risk_file, and lists of files in each risk category (test_gap, hotspot, fix-heavy, wide blast radius). Use BEFORE submitting a patch: if max_score is high or any test_gap_files exist, add tests, split the patch, or flag concerns. summary_notes are paste-ready for a PR description. On large patches that touch ≥5 files from one directory, per-file entries for that directory move from `files` into a `clustered_directories[]` entry (top-3 by score preserved in detail, rest by name); rollup arrays still list every clustered file by name, so cross-referencing still works. `cycles_touching_patch[]` lists import cycles (files that mutually depend via import/include/inheritance/trait_use) that include at least one patch file, each with `members`, `size`, and `max_churn_file` (best refactor target). Honest caveat: we can't distinguish cycles the patch introduced from cycles that already existed; phrase PR feedback as 'this patch touches an existing cycle' unless you've verified the base branch.",
+        description = "Aggregate risk for a SET of files (the file list of a patch or PR). Returns per-file entries (same shape as `assess_risk`, including its `verbose` gating) plus rollups: max_score, mean_score, max_risk_file, and lists of files in each risk category (test_gap, hotspot, fix-heavy, wide blast radius). Use BEFORE submitting a patch: if max_score is high or any test_gap_files exist, add tests, split the patch, or flag concerns. summary_notes are paste-ready for a PR description. On large patches that touch ≥5 files from one directory, per-file entries for that directory move from `files` into a `clustered_directories[]` entry (top-3 by score preserved in detail, rest by name); rollup arrays still list every clustered file by name, so cross-referencing still works. `cycles_touching_patch[]` lists import cycles (files that mutually depend via import/include/inheritance/trait_use) that include at least one patch file, each with `members`, `size`, and `max_churn_file` (best refactor target). Honest caveat: we can't distinguish cycles the patch introduced from cycles that already existed; phrase PR feedback as 'this patch touches an existing cycle' unless you've verified the base branch.",
         output_schema = schema_for_type::<RiskDiffAssessment>()
     )]
     async fn assess_risk_diff_tool(
@@ -502,11 +507,17 @@ impl CodeSageServer {
     ) -> CallToolResult {
         self.blocking(move |s| {
             let file_paths = params.file_paths.clone();
+            let verbose = params.verbose.unwrap_or(false);
             s.render(
                 &params.project,
-                validate_non_empty_file_list(&file_paths, "assess_risk_diff").and_then(|()| {
-                    s.with_project_db(&params.project, |db| assess_risk_diff(db, &file_paths))
-                }),
+                validate_non_empty_file_list(&file_paths, "assess_risk_diff")
+                    .and_then(|()| {
+                        s.with_project_db(&params.project, |db| assess_risk_diff(db, &file_paths))
+                    })
+                    .map(|mut a| {
+                        a.set_verbose(verbose);
+                        a
+                    }),
                 "assess_risk_diff",
             )
         })
@@ -515,7 +526,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "assess_risk_batch",
-        description = "Risk score for EACH of N files, returned per-file with no patch-level aggregation. Use when you have a list of files (impact analysis output, coupling neighbours, the files of a feature you're touching one-by-one) and want each individual score — cuts the per-file MCP round-trip overhead vs calling `assess_risk` N times. Each entry is a full RiskAssessment with the same shape as `assess_risk`. The response also includes a top-level `_legend` short-code map: when ≥3 files in the batch share a categorical note (test-gap, no-git-history), per-file `notes[]` entries are aliased to short codes (e.g. `\"T\"`, `\"NG\"`) and the legend resolves them. For patch-level aggregation (max/mean, hotspot/test-gap rollups, cycles), use `assess_risk_diff` instead — they answer different questions.",
+        description = "Risk score for EACH of N files, returned per-file with no patch-level aggregation. Use when you have a list of files (impact analysis output, coupling neighbours, the files of a feature you're touching one-by-one) and want each individual score — cuts the per-file MCP round-trip overhead vs calling `assess_risk` N times. Each entry is a RiskAssessment with the same shape as `assess_risk`, including its `verbose` gating of the decomposition scalars and `top_coupled`. The response also includes a top-level `_legend` short-code map: when ≥3 files in the batch share a categorical note (test-gap, no-git-history), per-file `notes[]` entries are aliased to short codes (e.g. `\"T\"`, `\"NG\"`) and the legend resolves them. For patch-level aggregation (max/mean, hotspot/test-gap rollups, cycles), use `assess_risk_diff` instead — they answer different questions.",
         output_schema = schema_for_type::<RiskBatchAssessment>()
     )]
     async fn assess_risk_batch_tool(
@@ -524,11 +535,17 @@ impl CodeSageServer {
     ) -> CallToolResult {
         self.blocking(move |s| {
             let file_paths = params.file_paths.clone();
+            let verbose = params.verbose.unwrap_or(false);
             s.render(
                 &params.project,
-                validate_non_empty_file_list(&file_paths, "assess_risk_batch").and_then(|()| {
-                    s.with_project_db(&params.project, |db| assess_risk_batch(db, &file_paths))
-                }),
+                validate_non_empty_file_list(&file_paths, "assess_risk_batch")
+                    .and_then(|()| {
+                        s.with_project_db(&params.project, |db| assess_risk_batch(db, &file_paths))
+                    })
+                    .map(|mut a| {
+                        a.set_verbose(verbose);
+                        a
+                    }),
                 "assess_risk_batch",
             )
         })
