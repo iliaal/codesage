@@ -7,8 +7,12 @@ use codesage_protocol::{CoupledTestEntry, FileCategory, TestRecommendations};
 use codesage_storage::Database;
 
 /// All sibling test files for `file_path` that exist in the index, by language
-/// convention. Used by `recommend_tests` and (via .is_empty()) by `test_sibling_exists`.
-fn test_sibling_paths(db: &Database, file_path: &str) -> Result<Vec<String>> {
+/// convention, plus a flag for tests that exist but were withheld from the
+/// list (the >[`PHPT_LIST_CAP`] `.phpt` case). Used by `recommend_tests` and
+/// by `test_sibling_exists`, which must count withheld tests as existing —
+/// "too many tests to list" and "no tests" are opposite claims.
+fn test_sibling_paths(db: &Database, file_path: &str) -> Result<(Vec<String>, bool)> {
+    let mut suppressed = false;
     let stem = file_path
         .rsplit('/')
         .next()
@@ -16,7 +20,7 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<Vec<String>> {
         .map(|(s, _)| s.to_string())
         .unwrap_or_default();
     if stem.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     }
     let dir = file_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
 
@@ -82,8 +86,10 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<Vec<String>> {
     // The naming convention is loose (bug12345.phpt, gh21709.phpt, feature
     // descriptions) so we list the directory like Rust integration tests
     // rather than try to name-match. The agent or coupled-test signal can
-    // narrow further. Skip if the tests dir would dump >50 files (typical
-    // for ext/standard/tests) — too noisy as a "primary" recommendation.
+    // narrow further. Skip if the tests dir would dump >PHPT_LIST_CAP files
+    // (typical for ext/standard/tests) — too noisy as a "primary"
+    // recommendation — but report the suppression so callers don't read the
+    // omission as "this file has no tests".
     if (file_path.ends_with(".c") || file_path.ends_with(".h"))
         && let Some((dir, _)) = file_path.rsplit_once('/')
     {
@@ -93,8 +99,10 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<Vec<String>> {
             .into_iter()
             .filter(|p| p.ends_with(".phpt") && !found.contains(p))
             .collect();
-        if candidates.len() <= 50 {
+        if candidates.len() <= PHPT_LIST_CAP {
             found.extend(candidates);
+        } else {
+            suppressed = true;
         }
     }
 
@@ -129,14 +137,20 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<Vec<String>> {
         }
     }
 
-    Ok(found)
+    Ok((found, suppressed))
 }
+
+/// Largest `.phpt` directory listing surfaced verbatim in `primary`. Above
+/// this the directory is named in a note instead of dumped file-by-file.
+const PHPT_LIST_CAP: usize = 50;
 
 /// Heuristic: do any indexed files look like tests for `file_path`? Exposed as
 /// `pub(super)` so `risk::assess_risk` can consume it without re-implementing
-/// sibling detection.
+/// sibling detection. A `.phpt` directory withheld from listing by
+/// [`PHPT_LIST_CAP`] still counts: those tests exist.
 pub(super) fn test_sibling_exists(db: &Database, file_path: &str) -> Result<bool> {
-    Ok(!test_sibling_paths(db, file_path)?.is_empty())
+    let (paths, suppressed) = test_sibling_paths(db, file_path)?;
+    Ok(!paths.is_empty() || suppressed)
 }
 
 /// Tests an agent should run after editing the given files. Two layers:
@@ -149,9 +163,14 @@ pub fn recommend_tests(db: &Database, file_paths: &[String]) -> Result<TestRecom
 
     let mut primary: HashSet<String> = HashSet::new();
     let mut coupled: Vec<CoupledTestEntry> = Vec::new();
+    let mut suppressed_sources: Vec<String> = Vec::new();
 
     for path in file_paths {
-        for sibling in test_sibling_paths(db, path)? {
+        let (siblings, suppressed) = test_sibling_paths(db, path)?;
+        if suppressed {
+            suppressed_sources.push(path.clone());
+        }
+        for sibling in siblings {
             primary.insert(sibling);
         }
         let co = db.co_changes_for(path, 20)?;
@@ -184,7 +203,7 @@ pub fn recommend_tests(db: &Database, file_paths: &[String]) -> Result<TestRecom
     primary_sorted.sort();
 
     let mut notes = Vec::new();
-    if primary_sorted.is_empty() && coupled.is_empty() {
+    if primary_sorted.is_empty() && coupled.is_empty() && suppressed_sources.is_empty() {
         notes.push(
             "no test files found via sibling conventions or co-change history; \
              run `codesage git-index` if you haven't, or add tests for these files"
@@ -201,6 +220,15 @@ pub fn recommend_tests(db: &Database, file_paths: &[String]) -> Result<TestRecom
             notes.push(format!(
                 "{} additional test file(s) suggested by co-change history",
                 coupled.len()
+            ));
+        }
+        if !suppressed_sources.is_empty() {
+            // Withheld, not absent: without this note the cap would turn a
+            // heavily-tested extension file into an "untested" report.
+            notes.push(format!(
+                "tests/ directory next to {} holds more than {PHPT_LIST_CAP} .phpt files — \
+                 omitted from `primary` to keep output bounded; run that directory's suite",
+                suppressed_sources.join(", ")
             ));
         }
     }

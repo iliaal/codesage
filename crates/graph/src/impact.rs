@@ -14,7 +14,28 @@ pub(crate) fn is_qualified_symbol_name(name: &str) -> bool {
     name.contains('\\') || name.contains('.') || name.contains("::")
 }
 
+/// Per-level frontier cap. A symbol referenced by hundreds of files explodes
+/// the frontier and the per-symbol `references_for_symbol` queries at the next
+/// depth, so each level is deduped and capped. When the cap fires, deeper
+/// levels are incomplete — `impact_analysis_walk` reports that so consumers
+/// (`assess_risk`'s blast-radius and test-reach checks) can say "lower bound"
+/// instead of presenting a truncated count as the whole answer.
+pub(crate) const MAX_FRONTIER: usize = 512;
+
 pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactEntry>> {
+    Ok(impact_analysis_walk(db, req, MAX_FRONTIER)?.0)
+}
+
+/// [`impact_analysis`] plus a `frontier_capped` flag: `true` when any level's
+/// frontier was truncated at `max_frontier`, meaning entries at deeper
+/// distances may be missing and every derived count is a lower bound.
+/// `max_frontier` is a parameter only so tests can force the cap without
+/// building a 512-symbol fixture.
+pub(crate) fn impact_analysis_walk(
+    db: &Database,
+    req: &ImpactRequest,
+    max_frontier: usize,
+) -> Result<(Vec<ImpactEntry>, bool)> {
     let seed_symbols: Vec<Symbol> = match &req.target {
         ImpactTarget::Symbol { name } => {
             let syms = db.find_symbols(name, None)?;
@@ -46,7 +67,7 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
     };
 
     if seed_symbols.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     }
 
     let origin_files: HashSet<String> = match &req.target {
@@ -61,6 +82,7 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
     let mut file_reasons: HashMap<String, (u32, Vec<ImpactReason>)> = HashMap::new();
     let mut frontier: Vec<Symbol> = seed_symbols;
     let mut visited_symbols: HashSet<(String, String, u32)> = HashSet::new();
+    let mut frontier_capped = false;
 
     for depth in 1..=req.depth as u32 {
         // First pass: collect refs, update file_reasons, record (from_file, line) pairs
@@ -151,21 +173,20 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
             }
         }
 
-        // Bound fan-out: a symbol referenced by hundreds of files explodes the
-        // frontier and the per-symbol `references_for_symbol` queries at the
-        // next depth. Dedup by qualified name and cap each level so a wide
-        // blast radius can't make impact analysis unbounded.
-        const MAX_FRONTIER: usize = 512;
+        // Bound fan-out: dedup by qualified name and cap each level so a wide
+        // blast radius can't make impact analysis unbounded (see
+        // [`MAX_FRONTIER`]).
         let mut seen_symbols: HashSet<(String, String, u32)> = HashSet::new();
         next_frontier.retain(|s| seen_symbols.insert(symbol_identity_key(s)));
-        if next_frontier.len() > MAX_FRONTIER {
+        if next_frontier.len() > max_frontier {
             tracing::debug!(
                 frontier = next_frontier.len(),
-                cap = MAX_FRONTIER,
+                cap = max_frontier,
                 depth,
                 "impact_analysis frontier capped"
             );
-            next_frontier.truncate(MAX_FRONTIER);
+            next_frontier.truncate(max_frontier);
+            frontier_capped = true;
         }
 
         if next_frontier.is_empty() {
@@ -199,7 +220,7 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
             .then_with(|| b.reasons.len().cmp(&a.reasons.len()))
             .then_with(|| a.file_path.cmp(&b.file_path))
     });
-    Ok(entries)
+    Ok((entries, frontier_capped))
 }
 
 /// Cap on `sibling_symbols` to keep dense files from blowing up the response.
@@ -419,4 +440,82 @@ fn symbol_identity_key(sym: &Symbol) -> (String, String, u32) {
         sym.qualified_name.clone(),
         sym.line_start,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One class with two callers, so the depth-1 pass leaves two symbols in
+    /// the next frontier.
+    fn setup_project() -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Repository.php"),
+            b"<?php\nnamespace App;\nclass Repository {\n  public function find($id) { return null; }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Controller.php"),
+            b"<?php\nnamespace App;\nuse App\\Repository;\nclass Controller {\n  public function show(Repository $r, $id) { return $r->find($id); }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Service.php"),
+            b"<?php\nnamespace App;\nuse App\\Repository;\nclass Service {\n  public function run(Repository $r) { return $r->find(1); }\n}\n",
+        )
+        .unwrap();
+        let db = Database::open_in_memory().unwrap();
+        crate::full_index(root, &db, &[], false).unwrap();
+        (dir, db)
+    }
+
+    fn file_request() -> ImpactRequest {
+        ImpactRequest {
+            target: ImpactTarget::File {
+                path: "Repository.php".to_string(),
+            },
+            depth: 2,
+            source_only: false,
+        }
+    }
+
+    #[test]
+    fn walk_reports_frontier_cap_and_keeps_shallow_entries() {
+        let (_dir, db) = setup_project();
+        let (entries, capped) = impact_analysis_walk(&db, &file_request(), 1).unwrap();
+        assert!(
+            capped,
+            "two depth-1 callers with a frontier cap of 1 must report capped"
+        );
+        // Depth-1 entries are recorded before the frontier truncation, so the
+        // capped walk still returns both direct dependents.
+        let files: Vec<&str> = entries.iter().map(|e| e.file_path.as_str()).collect();
+        assert!(files.contains(&"Controller.php"), "entries: {files:?}");
+        assert!(files.contains(&"Service.php"), "entries: {files:?}");
+    }
+
+    #[test]
+    fn walk_reports_no_cap_under_the_default_frontier() {
+        let (_dir, db) = setup_project();
+        let (entries, capped) = impact_analysis_walk(&db, &file_request(), MAX_FRONTIER).unwrap();
+        assert!(!capped, "two callers must not trip the default cap");
+        assert_eq!(entries.len(), 2, "entries: {entries:?}");
+    }
+
+    #[test]
+    fn walk_on_file_with_no_symbols_is_empty_and_uncapped() {
+        let (_dir, db) = setup_project();
+        let req = ImpactRequest {
+            target: ImpactTarget::File {
+                path: "no-symbols.yaml".to_string(),
+            },
+            depth: 2,
+            source_only: false,
+        };
+        let (entries, capped) = impact_analysis_walk(&db, &req, MAX_FRONTIER).unwrap();
+        assert!(entries.is_empty());
+        assert!(!capped);
+    }
 }

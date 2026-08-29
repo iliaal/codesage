@@ -1092,6 +1092,41 @@ fn recommend_tests_skips_phpt_tests_dir_when_oversized() {
         "tests dir over the 50-file threshold should not be returned as primary, got {} entries",
         r.primary.len()
     );
+    // Withheld is not absent: the note must say the tests exist but were not
+    // listed, and the "no test files found" claim must not fire.
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.contains(".phpt") && n.contains("omitted")),
+        "expected a suppression note naming the .phpt directory, got {:?}",
+        r.notes
+    );
+    assert!(
+        !r.notes.iter().any(|n| n.contains("no test files found")),
+        "60 existing .phpt tests must not be reported as 'no test files found', got {:?}",
+        r.notes
+    );
+}
+
+/// The oversized-.phpt suppression must also not open a test gap in
+/// `assess_risk`: the tests exist, they were only withheld from the listing.
+#[test]
+fn oversized_phpt_dir_still_counts_as_sibling_test_for_risk() {
+    let (_dir, db) = setup_project();
+    index_test_file(&db, "ext/standard/array.c");
+    db.upsert_git_file("ext/standard/array.c", 5.0, 0, 10, Some(1_700_000_000))
+        .unwrap();
+    for i in 0..60 {
+        let p = format!("ext/standard/tests/test_{i:03}.phpt");
+        index_test_file(&db, &p);
+    }
+
+    let r = assess_risk(&db, "ext/standard/array.c").unwrap();
+    assert!(
+        !r.test_gap,
+        "60 .phpt tests next to the file must close the test gap, notes: {:?}",
+        r.notes
+    );
 }
 
 #[test]
@@ -1224,11 +1259,24 @@ fn find_coupling_populated_result_carries_index_state() {
 
 #[test]
 fn risk_diff_legend_aliases_repeated_test_gap_notes() {
-    // 4 files with no co-located test → all get the same "test gap: …" note.
-    // Threshold for aliasing is 3 occurrences, so this should fire and produce
-    // a single `_legend` entry with the 4 per-file notes replaced by `"T"`.
-    let (_dir, db) = setup_project();
-    let files = ["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"];
+    // 4 files with indexed symbols but no co-located test → all get the same
+    // full three-check "test gap: …" note (files WITHOUT symbols get the
+    // distinct unmeasured variant, aliased as `TU`, not `T`). Threshold for
+    // aliasing is 3 occurrences, so this should fire and produce a single
+    // `_legend` entry with the 4 per-file notes replaced by `"T"`.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let files = ["ClassA.php", "ClassB.php", "ClassC.php", "ClassD.php"];
+    for p in &files {
+        let class = p.trim_end_matches(".php");
+        std::fs::write(
+            root.join(p),
+            format!("<?php\nnamespace App;\nclass {class} {{\n  public function run() {{ return 1; }}\n}}\n"),
+        )
+        .unwrap();
+    }
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
     for p in &files {
         db.upsert_git_file(p, 1.0, 0, 5, Some(1_700_000_000))
             .unwrap();
@@ -1332,18 +1380,22 @@ fn risk_batch_empty_returns_default() {
 
 #[test]
 fn risk_batch_legend_aliases_no_git_history_at_threshold() {
-    // 4 files with no git history at all → each gets the categorical
-    // "no git history…" note. Should alias to `NG`.
-    let (_dir, db) = setup_project();
-    let input = vec![
-        "x/1.rs".to_string(),
-        "x/2.rs".to_string(),
-        "x/3.rs".to_string(),
-        "x/4.rs".to_string(),
-    ];
-    for path in &input {
-        index_test_file(&db, path);
+    // 4 indexed files (with symbols) and no git history at all → each gets the
+    // categorical "no git history…" note. Should alias to `NG`.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let files = ["ClassA.php", "ClassB.php", "ClassC.php", "ClassD.php"];
+    for p in &files {
+        let class = p.trim_end_matches(".php");
+        std::fs::write(
+            root.join(p),
+            format!("<?php\nnamespace App;\nclass {class} {{\n  public function run() {{ return 1; }}\n}}\n"),
+        )
+        .unwrap();
     }
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+    let input: Vec<String> = files.iter().map(|s| s.to_string()).collect();
     let r = codesage_graph::assess_risk_batch(&db, &input).unwrap();
 
     // 4 files with no git history also have no test sibling, so both
@@ -1678,5 +1730,167 @@ fn top_symbols_empty_when_file_has_no_symbols() {
     assert!(
         !json.contains("top_symbols"),
         "empty top_symbols must be omitted from JSON, got {json}"
+    );
+}
+
+// ----- zero-dependents honesty -----
+
+/// A file with no indexed symbols never enters the reverse-dependency walk, so
+/// its zero dependents means "unmeasured", not "leaf". The assessment must say
+/// so instead of letting the zero read as low blast radius, and the test-gap
+/// note must not claim a dependency-hop check that never ran.
+#[test]
+fn zero_dependents_without_symbols_is_flagged_unknown() {
+    let (_dir, db) = setup_project();
+    // Tracked in git, absent from the structural index: the shape of a config
+    // file, generated file, or unsupported language.
+    db.upsert_git_file("deploy/settings.yaml", 2.0, 0, 6, Some(1_700_000_000))
+        .unwrap();
+
+    let r = assess_risk(&db, "deploy/settings.yaml").unwrap();
+    assert!(r.found);
+    assert_eq!(r.dependent_files, 0);
+    assert!(
+        r.notes.iter().any(
+            |n| n.contains("structural signals unavailable") && n.contains("unknown, not zero")
+        ),
+        "zero dependents on a symbol-less file must be flagged as unmeasured, got {:?}",
+        r.notes
+    );
+    assert!(r.test_gap);
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.contains("test gap") && n.contains("could not run")),
+        "the test-gap note must not claim the dependency-hop check ran, got {:?}",
+        r.notes
+    );
+    assert!(
+        !r.notes
+            .iter()
+            .any(|n| n.contains("within 2 dependency hops")),
+        "must not claim a completed 2-hop check, got {:?}",
+        r.notes
+    );
+}
+
+/// A genuine leaf — indexed symbols, but nothing imports it — keeps the plain
+/// zero and the full three-check test-gap note. The honesty note is reserved
+/// for the case where the walk could not run.
+#[test]
+fn zero_dependents_with_symbols_is_a_genuine_leaf() {
+    let (_dir, db) = setup_project();
+    // Controller.php defines symbols but nothing references it.
+    db.upsert_git_file("Controller.php", 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+
+    let r = assess_risk(&db, "Controller.php").unwrap();
+    assert_eq!(r.dependent_files, 0);
+    assert!(
+        !r.notes
+            .iter()
+            .any(|n| n.contains("structural signals unavailable")),
+        "a measured zero must not be flagged as unmeasured, got {:?}",
+        r.notes
+    );
+    assert!(r.test_gap);
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.contains("within 2 dependency hops")),
+        "a completed walk keeps the full three-check note, got {:?}",
+        r.notes
+    );
+}
+
+/// Aggregate honesty must match per-file honesty: when every counted test-gap
+/// file is symbol-less (hop check never ran), the diff summary must not claim
+/// the gap was verified "within 2 dependency hops".
+#[test]
+fn diff_summary_does_not_claim_hop_check_for_unmeasured_files() {
+    let (_dir, db) = setup_project();
+    let input: Vec<String> = ["conf/a.yaml", "conf/b.yaml", "conf/c.yaml"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for p in &input {
+        db.upsert_git_file(p, 1.0, 0, 5, Some(1_700_000_000))
+            .unwrap();
+    }
+
+    let r = codesage_graph::assess_risk_diff(&db, &input).unwrap();
+    assert_eq!(r.test_gap_files.len(), 3);
+    let note = r
+        .summary_notes
+        .iter()
+        .find(|n| n.contains("no test found"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a test-gap summary note, got {:?}",
+                r.summary_notes
+            )
+        });
+    assert!(
+        note.contains("could not be completed"),
+        "summary must disclose the unrunnable hop check, got {note:?}"
+    );
+    assert!(
+        !note.contains("or within 2 dependency hops"),
+        "summary must not claim a hop check that never ran, got {note:?}"
+    );
+}
+
+/// Mixed patch: one gap file with a completed hop check, three unmeasured.
+/// The summary must split the counts instead of flattening to either side.
+#[test]
+fn diff_summary_splits_verified_and_unmeasured_gap_counts() {
+    let (_dir, db) = setup_project();
+    let mut input: Vec<String> = ["conf/a.yaml", "conf/b.yaml", "conf/c.yaml"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for p in &input {
+        db.upsert_git_file(p, 1.0, 0, 5, Some(1_700_000_000))
+            .unwrap();
+    }
+    // Repository.php has indexed symbols, so its hop check completes.
+    db.upsert_git_file("Repository.php", 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+    input.push("Repository.php".to_string());
+
+    let r = codesage_graph::assess_risk_diff(&db, &input).unwrap();
+    assert_eq!(r.test_gap_files.len(), 4);
+    let note = r
+        .summary_notes
+        .iter()
+        .find(|n| n.contains("no test found"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a test-gap summary note, got {:?}",
+                r.summary_notes
+            )
+        });
+    assert!(
+        note.contains("ran clean for 1") && note.contains("could not be completed for 3"),
+        "summary must split verified vs unmeasured gap counts, got {note:?}"
+    );
+}
+
+/// The fully-verified wording survives when every gap file's hop check ran.
+#[test]
+fn diff_summary_keeps_hop_claim_when_all_gap_checks_completed() {
+    let (_dir, db) = setup_project();
+    let input = vec!["Repository.php".to_string()];
+    db.upsert_git_file("Repository.php", 1.0, 0, 5, Some(1_700_000_000))
+        .unwrap();
+
+    let r = codesage_graph::assess_risk_diff(&db, &input).unwrap();
+    assert_eq!(r.test_gap_files.len(), 1);
+    assert!(
+        r.summary_notes
+            .iter()
+            .any(|n| n.contains("or within 2 dependency hops")),
+        "completed checks keep the full claim, got {:?}",
+        r.summary_notes
     );
 }

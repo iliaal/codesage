@@ -6,6 +6,10 @@
 
 ### Changed
 
+- `assess_risk` no longer lets an unmeasurable file read as low risk: a file with zero indexed symbols gets a "0 dependents means unknown, not zero" note (legend `NS`), a reverse-dependency walk that hit its traversal cap marks the dependent count as a lower bound and the test-gap note as incomplete (`TU`), and a failed cycle-detection pass notes that cycle membership is unknown (`CF`) instead of silently dropping the term.
+- `assess_risk_diff` summary notes claim the 2-hop test check only for files where it actually completed, splitting verified from unmeasured gap counts.
+- `recommend_tests` reports a `.phpt` test directory omitted for size as "run that directory's suite" instead of "no test files found", and `assess_risk` counts those withheld tests as existing siblings rather than opening a false test gap.
+- `review_rehearsal` propagates trust-boundary, feature, and test-recommendation query failures instead of rendering a clean rehearsal over a broken engine.
 - Upgrade the `rmcp` MCP SDK to 3.x (MCP 2026-07-28 spec model types). Clients negotiating 2026-07-28 now receive the spec's `resultType` field on `tools/list` and `tools/call`; wire output for 2024-11-05 / 2025-06-18 / 2025-11-25 is unchanged.
 
 ### Security

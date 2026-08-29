@@ -12,7 +12,7 @@ use codesage_storage::Database;
 use codesage_storage::db::CoChangeRow;
 
 use super::tests_rec::test_sibling_exists;
-use crate::impact::impact_analysis;
+use crate::impact::{MAX_FRONTIER, impact_analysis_walk};
 
 /// Reverse-dependency traversal depth shared by the blast-radius count and the
 /// structural test-coverage check. Both read the same walk, and both notes
@@ -34,6 +34,44 @@ const _: () = assert!(
     DEPENDENT_DEPTH == 2,
     "TEST_GAP_NOTE spells the traversal depth literally; update the note text"
 );
+
+/// Fired when the reverse-dependency walk had nothing to seed on: the file has
+/// no indexed symbols (unsupported language, excluded from the structural
+/// index, or tracked only in git history). Without this, `dependent_files: 0`
+/// reads as "leaf, safe to change" when the honest answer is "unmeasured".
+const NO_STRUCTURAL_SIGNALS_NOTE: &str = "structural signals unavailable: file has no indexed \
+     symbols, so the reverse-dependency walk and the dependency-hop test check could not run \
+     (0 dependents means unknown, not zero)";
+
+/// Fired when import-cycle detection errored. The score's cycle term is
+/// omitted rather than failing the call, but omission must not read as
+/// "not in a cycle".
+const CYCLE_SIGNAL_FAILED_NOTE: &str =
+    "import-cycle detection failed; cycle membership is unknown and omitted from the score";
+
+/// [`TEST_GAP_NOTE`] variant for files the dependency-hop check could not
+/// measure. A `const` so it stays exact-string aliasable in
+/// [`ALIASABLE_NOTES`]; patches full of config/data files repeat it heavily.
+const TEST_GAP_UNMEASURED_NOTE: &str = "test gap: no test found by sibling convention or \
+     co-change history; the dependency-hop check could not run (file has no indexed symbols)";
+
+/// Test-gap note honesty: [`TEST_GAP_NOTE`] claims three checks ran, so it is
+/// only used when all three actually did. When the dependency-hop check could
+/// not run (no symbols) or was truncated (frontier cap), the note says so
+/// instead of presenting the partial check as a completed one.
+fn test_gap_note(no_symbols: bool, walk_capped: bool) -> String {
+    if no_symbols {
+        TEST_GAP_UNMEASURED_NOTE.to_string()
+    } else if walk_capped {
+        format!(
+            "test gap: no test found by sibling convention or co-change history; the \
+             {DEPENDENT_DEPTH}-hop dependency check was truncated at its traversal cap, so a \
+             test beyond the cap may exist"
+        )
+    } else {
+        TEST_GAP_NOTE.to_string()
+    }
+}
 
 type CycleToken = (i64, i64, i64, i64, i64, i64);
 type CycleComponentCache = HashMap<String, (CycleToken, Arc<Vec<Vec<String>>>)>;
@@ -118,44 +156,55 @@ pub fn find_coupling(db: &Database, file_path: &str, limit: usize) -> Result<Cou
 /// shape is preserved when tuning so the structural signals (churn, fix
 /// ratio) keep dominating over the security-shaped trust-boundary term.
 pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
-    assess_risk_with_context(db, file_path, None, None)
+    Ok(assess_risk_with_context(db, file_path, None, None, MAX_FRONTIER)?.0)
 }
 
+/// Returns the assessment plus a `gap_check_partial` flag: `true` when
+/// `test_gap` fired but the dependency-hop check either could not run (no
+/// indexed symbols) or was truncated (frontier cap). `assess_risk_diff` reads
+/// it so the aggregate summary claims only the checks that actually completed.
+/// `max_frontier` exists so tests can force the capped path through the real
+/// walk without a 512-symbol fixture; production callers pass
+/// [`MAX_FRONTIER`].
 fn assess_risk_with_context(
     db: &Database,
     file_path: &str,
     precomputed_cycles: Option<&[CycleEntry]>,
     precomputed_percentiles: Option<&HashMap<String, f64>>,
-) -> Result<RiskAssessment> {
+    max_frontier: usize,
+) -> Result<(RiskAssessment, bool)> {
     let git = db.git_file(file_path)?;
     let structural_found = db
         .file_id_for_path(file_path)
         .with_context(|| format!("checking indexed file existence for risk({file_path})"))?
         .is_some();
     if !structural_found && git.is_none() {
-        return Ok(RiskAssessment {
-            found: false,
-            file: file_path.to_string(),
-            score: 0.0,
-            churn_score: 0.0,
-            churn_percentile: 0.0,
-            fix_ratio: 0.0,
-            total_commits: 0,
-            fix_count: 0,
-            dependent_files: 0,
-            coupled_files: 0,
-            test_gap: false,
-            in_cycle: false,
-            cycle_size: 0,
-            cycle_files: Vec::new(),
-            top_coupled: Vec::new(),
-            trust_boundaries: Vec::new(),
-            notes: vec![
-                "file is not indexed (path may be wrong, excluded, deleted, or index is stale)"
-                    .to_string(),
-            ],
-            top_symbols: Vec::new(),
-        });
+        return Ok((
+            RiskAssessment {
+                found: false,
+                file: file_path.to_string(),
+                score: 0.0,
+                churn_score: 0.0,
+                churn_percentile: 0.0,
+                fix_ratio: 0.0,
+                total_commits: 0,
+                fix_count: 0,
+                dependent_files: 0,
+                coupled_files: 0,
+                test_gap: false,
+                in_cycle: false,
+                cycle_size: 0,
+                cycle_files: Vec::new(),
+                top_coupled: Vec::new(),
+                trust_boundaries: Vec::new(),
+                notes: vec![
+                    "file is not indexed (path may be wrong, excluded, deleted, or index is stale)"
+                        .to_string(),
+                ],
+                top_symbols: Vec::new(),
+            },
+            false,
+        ));
     }
 
     let churn_score = git.as_ref().map(|g| g.churn_score).unwrap_or(0.0);
@@ -181,7 +230,7 @@ fn assess_risk_with_context(
     // traversal: `impact_analysis` applies `source_only` as a final filter, so
     // an unfiltered walk yields both the source-file count and any test file
     // that reaches this one. Two calls would double the cost for the same rows.
-    let dependents = impact_analysis(
+    let (dependents, walk_capped) = impact_analysis_walk(
         db,
         &ImpactRequest {
             target: ImpactTarget::File {
@@ -190,8 +239,18 @@ fn assess_risk_with_context(
             depth: DEPENDENT_DEPTH,
             source_only: false,
         },
+        max_frontier,
     )
     .with_context(|| format!("computing dependent_files for risk({file_path})"))?;
+
+    // Zero dependents is only evidence of a leaf when the walk actually had
+    // seeds. A file with no indexed symbols never entered the traversal, so
+    // its zero is "could not measure", not "nothing imports this".
+    let no_symbols = dependents.is_empty()
+        && db
+            .symbols_for_file(file_path)
+            .with_context(|| format!("checking indexed symbols for risk({file_path})"))?
+            .is_empty();
 
     let dependent_files = dependents
         .iter()
@@ -224,6 +283,7 @@ fn assess_risk_with_context(
     // edge enumeration error), we log and continue with no cycle data
     // rather than failing the whole risk call. The structural sensor is
     // additive to the existing git/coupling signals, not load-bearing.
+    let mut cycle_signal_failed = false;
     let (in_cycle, cycle_size, cycle_files) = if let Some(cycles) = precomputed_cycles {
         cycle_membership(cycles, file_path)
     } else {
@@ -232,6 +292,7 @@ fn assess_risk_with_context(
             Ok(None) => (false, 0, Vec::new()),
             Err(e) => {
                 tracing::warn!(error = %e, file = %file_path, "cycle detection failed; omitting cycle signal from risk score");
+                cycle_signal_failed = true;
                 (false, 0, Vec::new())
             }
         }
@@ -269,6 +330,18 @@ fn assess_risk_with_context(
                 .to_string(),
         );
     }
+    if no_symbols {
+        notes.push(NO_STRUCTURAL_SIGNALS_NOTE.to_string());
+    }
+    if walk_capped {
+        notes.push(format!(
+            "reverse-dependency walk was truncated at its internal frontier cap; \
+             {dependent_files} dependents is a lower bound"
+        ));
+    }
+    if cycle_signal_failed {
+        notes.push(CYCLE_SIGNAL_FAILED_NOTE.to_string());
+    }
     if churn_percentile >= 0.75 {
         notes.push(format!(
             "hotspot: churn percentile {:.0}%",
@@ -292,7 +365,7 @@ fn assess_risk_with_context(
         ));
     }
     if test_gap {
-        notes.push(TEST_GAP_NOTE.to_string());
+        notes.push(test_gap_note(no_symbols, walk_capped));
     } else if !has_sibling_test
         && !has_coupled_test
         && let Some(t) = dependent_test
@@ -402,26 +475,31 @@ fn assess_risk_with_context(
         }
     };
 
-    Ok(RiskAssessment {
-        found: true,
-        file: file_path.to_string(),
-        score,
-        churn_score,
-        churn_percentile,
-        fix_ratio,
-        total_commits,
-        fix_count,
-        dependent_files,
-        coupled_files,
-        test_gap,
-        in_cycle,
-        cycle_size,
-        cycle_files,
-        top_coupled,
-        trust_boundaries,
-        notes,
-        top_symbols,
-    })
+    let gap_check_partial = test_gap && (no_symbols || walk_capped);
+
+    Ok((
+        RiskAssessment {
+            found: true,
+            file: file_path.to_string(),
+            score,
+            churn_score,
+            churn_percentile,
+            fix_ratio,
+            total_commits,
+            fix_count,
+            dependent_files,
+            coupled_files,
+            test_gap,
+            in_cycle,
+            cycle_size,
+            cycle_files,
+            top_coupled,
+            trust_boundaries,
+            notes,
+            top_symbols,
+        },
+        gap_check_partial,
+    ))
 }
 
 fn cycle_membership(cycles: &[CycleEntry], file_path: &str) -> (bool, u32, Vec<String>) {
@@ -538,10 +616,12 @@ pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiff
 
     // Cycles are graph-wide SCCs; compute once for the patch, then reuse the
     // result for per-file scores and the patch-level cycle list.
+    let mut cycles_failed = false;
     let cycles_touching_patch = match find_cycles_touching(db, file_paths) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(error = %e, "cycle detection failed; omitting cycles_touching_patch");
+            cycles_failed = true;
             Vec::new()
         }
     };
@@ -552,10 +632,27 @@ pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiff
         .churn_percentiles()
         .context("bulk churn percentiles for risk diff")?;
 
-    let files: Vec<RiskAssessment> = file_paths
+    let assessed: Vec<(RiskAssessment, bool)> = file_paths
         .iter()
-        .map(|p| assess_risk_with_context(db, p, Some(&cycles_touching_patch), Some(&percentiles)))
+        .map(|p| {
+            assess_risk_with_context(
+                db,
+                p,
+                Some(&cycles_touching_patch),
+                Some(&percentiles),
+                MAX_FRONTIER,
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
+    // gap_check_partial is only ever true on files whose test_gap fired, so
+    // this count is a subset of `test_gap_files` by construction.
+    let partial_gap_count = assessed.iter().filter(|(_, partial)| *partial).count();
+    let mut files: Vec<RiskAssessment> = assessed.into_iter().map(|(a, _)| a).collect();
+    if cycles_failed {
+        for f in files.iter_mut() {
+            f.notes.push(CYCLE_SIGNAL_FAILED_NOTE.to_string());
+        }
+    }
 
     let max_score = files.iter().map(|f| f.score).fold(0.0_f64, f64::max);
     let mean_score = files.iter().map(|f| f.score).sum::<f64>() / files.len() as f64;
@@ -605,12 +702,31 @@ pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiff
             fix_heavy_files.len()
         ));
     }
+    // The hop-check claim mirrors the per-file honesty rule: only files whose
+    // dependency-hop check actually completed get the "within N hops" wording.
+    // For symbol-less or cap-truncated files the aggregate says so, instead of
+    // re-asserting the certainty the per-file notes just disclaimed.
     if !test_gap_files.is_empty() {
-        summary_notes.push(format!(
-            "{} file(s) with no test found by sibling convention, co-change history, \
-             or within {DEPENDENT_DEPTH} dependency hops",
-            test_gap_files.len()
-        ));
+        let total = test_gap_files.len();
+        if partial_gap_count == 0 {
+            summary_notes.push(format!(
+                "{total} file(s) with no test found by sibling convention, co-change history, \
+                 or within {DEPENDENT_DEPTH} dependency hops"
+            ));
+        } else if partial_gap_count == total {
+            summary_notes.push(format!(
+                "{total} file(s) with no test found by sibling convention or co-change \
+                 history; the {DEPENDENT_DEPTH}-hop dependency check could not be completed \
+                 for these files"
+            ));
+        } else {
+            summary_notes.push(format!(
+                "{total} file(s) with no test found by sibling convention or co-change \
+                 history; the {DEPENDENT_DEPTH}-hop dependency check ran clean for {} of \
+                 them and could not be completed for {partial_gap_count}",
+                total - partial_gap_count
+            ));
+        }
     }
     if !wide_blast_files.is_empty() {
         summary_notes.push(format!(
@@ -627,6 +743,13 @@ pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiff
         ));
     }
 
+    if cycles_failed {
+        summary_notes.push(
+            "import-cycle detection failed; cycle signals are omitted from this assessment, \
+             not proven absent"
+                .to_string(),
+        );
+    }
     if !cycles_touching_patch.is_empty() {
         let biggest = cycles_touching_patch
             .iter()
@@ -685,10 +808,12 @@ pub fn assess_risk_batch(db: &Database, file_paths: &[String]) -> Result<RiskBat
     if file_paths.is_empty() {
         return Ok(RiskBatchAssessment::default());
     }
+    let mut cycles_failed = false;
     let cycles = match find_cycles_touching(db, file_paths) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(error = %e, "cycle detection failed; omitting batch cycle signal");
+            cycles_failed = true;
             Vec::new()
         }
     };
@@ -697,8 +822,16 @@ pub fn assess_risk_batch(db: &Database, file_paths: &[String]) -> Result<RiskBat
         .context("bulk churn percentiles for risk batch")?;
     let mut files: Vec<RiskAssessment> = file_paths
         .iter()
-        .map(|p| assess_risk_with_context(db, p, Some(&cycles), Some(&percentiles)))
+        .map(|p| {
+            assess_risk_with_context(db, p, Some(&cycles), Some(&percentiles), MAX_FRONTIER)
+                .map(|(a, _)| a)
+        })
         .collect::<Result<Vec<_>>>()?;
+    if cycles_failed {
+        for f in files.iter_mut() {
+            f.notes.push(CYCLE_SIGNAL_FAILED_NOTE.to_string());
+        }
+    }
     let mut refs: Vec<&mut RiskAssessment> = files.iter_mut().collect();
     let legend = alias_categorical_notes_in_place(&mut refs);
     Ok(RiskBatchAssessment { files, legend })
@@ -715,6 +848,9 @@ const ALIASABLE_NOTES: &[(&str, &str)] = &[
         "NG",
         "no git history for this file (file too new, or `codesage git-index` hasn't been run)",
     ),
+    ("NS", NO_STRUCTURAL_SIGNALS_NOTE),
+    ("TU", TEST_GAP_UNMEASURED_NOTE),
+    ("CF", CYCLE_SIGNAL_FAILED_NOTE),
 ];
 
 /// In-place alias of categorical notes that appear in ≥3 files of the
@@ -968,6 +1104,84 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         crate::full_index(root, &db, &[], false).unwrap();
         (dir, db)
+    }
+
+    /// The full three-check note is reserved for a completed walk. The capped
+    /// and no-symbols variants must not claim the hop check as an absolute.
+    #[test]
+    fn test_gap_note_variants_claim_only_what_ran() {
+        let full = test_gap_note(false, false);
+        assert_eq!(full, TEST_GAP_NOTE);
+        assert!(full.contains("within 2 dependency hops"));
+
+        let capped = test_gap_note(false, true);
+        assert!(capped.contains("truncated"), "got {capped:?}");
+        assert!(
+            !capped.contains("within 2 dependency hops"),
+            "a truncated walk must not claim full hop coverage: {capped:?}"
+        );
+
+        let no_symbols = test_gap_note(true, false);
+        assert!(no_symbols.contains("could not run"), "got {no_symbols:?}");
+        assert!(
+            !no_symbols.contains("within 2 dependency hops"),
+            "a walk that never ran must not claim hop coverage: {no_symbols:?}"
+        );
+    }
+
+    /// End-to-end capped walk through the production path: the fixture's two
+    /// depth-1 callers overflow a frontier cap of 1, so the assessment must
+    /// carry the lower-bound note and the truncated test-gap variant instead
+    /// of the completed-three-check claim. Only the cap is injected; the walk,
+    /// gap logic, and note plumbing are all real.
+    #[test]
+    fn capped_walk_emits_lower_bound_and_truncated_gap_notes() {
+        let (_dir, db) = setup_project();
+        db.upsert_git_file("Repository.php", 1.0, 0, 5, Some(1_700_000_000))
+            .unwrap();
+
+        let (r, gap_check_partial) =
+            assess_risk_with_context(&db, "Repository.php", None, None, 1).unwrap();
+
+        assert!(r.test_gap, "fixture has no tests anywhere");
+        assert!(
+            gap_check_partial,
+            "a capped walk with test_gap must report a partial gap check"
+        );
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("test gap") && n.contains("truncated")),
+            "expected the truncated test-gap variant, got {:?}",
+            r.notes
+        );
+        assert!(
+            r.notes.iter().any(|n| n.contains("lower bound")),
+            "expected the dependent-count lower-bound note, got {:?}",
+            r.notes
+        );
+        assert!(
+            !r.notes
+                .iter()
+                .any(|n| n.contains("within 2 dependency hops")),
+            "a truncated walk must not claim a completed hop check, got {:?}",
+            r.notes
+        );
+
+        // Same fixture under the production cap: the walk completes, the full
+        // three-check note returns, and the honesty notes disappear.
+        let (r_full, partial_full) =
+            assess_risk_with_context(&db, "Repository.php", None, None, MAX_FRONTIER).unwrap();
+        assert!(!partial_full);
+        assert!(
+            r_full
+                .notes
+                .iter()
+                .any(|n| n.contains("within 2 dependency hops")),
+            "uncapped walk keeps the completed-check note, got {:?}",
+            r_full.notes
+        );
+        assert!(!r_full.notes.iter().any(|n| n.contains("lower bound")));
     }
 
     #[test]

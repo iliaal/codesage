@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::git_history::{assess_risk_diff, recommend_tests};
 use codesage_protocol::{
@@ -227,7 +227,12 @@ pub fn build_review_rehearsal(
     // --- trust-boundary expansion, queried directly per input file so the
     // signal is complete even when risk detail was clustered away ---
     for f in files {
-        let tb = db.trust_boundaries_for_file_path(f).unwrap_or_default();
+        // Propagate, don't default: a DB error silently read as "no
+        // boundaries" would drop the security objection exactly when the
+        // engine is broken.
+        let tb = db
+            .trust_boundaries_for_file_path(f)
+            .with_context(|| format!("loading trust boundaries for rehearsal({f})"))?;
         if tb.len() >= TRUST_BOUNDARY_THRESHOLD {
             let names: Vec<&str> = tb.iter().map(TrustBoundary::as_str).collect();
             objections.push(ReviewObjection {
@@ -256,7 +261,11 @@ pub fn build_review_rehearsal(
     let mut area_files: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut orphan_files: Vec<String> = Vec::new();
     for f in files {
-        let feats = db.features_for_file(f).unwrap_or_default();
+        // Propagate, don't default: an error here would silently disable the
+        // feature-test-gap and scope-spread checks for this file.
+        let feats = db
+            .features_for_file(f)
+            .with_context(|| format!("loading features for rehearsal({f})"))?;
         if feats.is_empty() {
             orphan_files.push(f.clone());
         }
@@ -346,7 +355,7 @@ pub fn build_review_rehearsal(
             .then_with(|| a.category.cmp(&b.category))
     });
 
-    let summary_notes = build_summary(db, files, &risk, &objections);
+    let summary_notes = build_summary(db, files, &risk, &objections)?;
 
     Ok(ReviewRehearsal {
         files: files.to_vec(),
@@ -372,7 +381,7 @@ fn build_summary(
     files: &[String],
     risk: &codesage_protocol::RiskDiffAssessment,
     objections: &[ReviewObjection],
-) -> Vec<String> {
+) -> Result<Vec<String>> {
     let mut notes = Vec::new();
 
     let (mut h, mut m, mut l) = (0usize, 0usize, 0usize);
@@ -394,16 +403,17 @@ fn build_summary(
 
     notes.extend(risk.summary_notes.iter().cloned());
 
-    if let Ok(tests) = recommend_tests(db, files) {
-        if !tests.primary.is_empty() {
-            notes.push(format!("Run tests: {}", tests.primary.join(", ")));
-        } else if !tests.coupled.is_empty() {
-            let coupled: Vec<String> = tests.coupled.iter().map(|c| c.file.clone()).collect();
-            notes.push(format!("Coupled tests to consider: {}", coupled.join(", ")));
-        }
+    // Propagate, don't swallow: an error read as "no tests to recommend"
+    // would print a clean summary off a failed engine call.
+    let tests = recommend_tests(db, files).context("recommending tests for rehearsal summary")?;
+    if !tests.primary.is_empty() {
+        notes.push(format!("Run tests: {}", tests.primary.join(", ")));
+    } else if !tests.coupled.is_empty() {
+        let coupled: Vec<String> = tests.coupled.iter().map(|c| c.file.clone()).collect();
+        notes.push(format!("Coupled tests to consider: {}", coupled.join(", ")));
     }
 
-    notes
+    Ok(notes)
 }
 
 #[cfg(test)]
