@@ -269,38 +269,3 @@ V2b slice 2 (next): `bus_factor`, `change_pattern`, `find_hotspots` MCP tools. C
 
 V2c (deferred): docs/decision layer (process traces, architecture summaries). Revisited after V2b slice 2 lands.
 
-<!-- BEGIN beads-managed (br v6) -->
-## Beads ledger (`br`)
-
-This repo is onboarded to the central `br` ledger. A PATH wrapper routes every
-`br` call from here into a private store under `~/ai/beads/<slug>/`; this work tree
-carries **no** `.beads` artifacts (do not create any). Full protocol lives in
-`~/ai/wiki/tools/beads-review-ledger.md`.
-
-**Allowed commands** (the wrapper denies everything else): `create update comments
-close reopen list show count stats search where info`, `doctor health`,
-`sync --import-only|--status`, `config get|list`. Never pass `--db`,
-`--no-auto-flush`, `--no-auto-import`, `--no-db`, `--allow-stale`, or `--prefix`.
-
-**JSON envelopes**: `br list --json` → `{issues, total}`; `br show ID --json` →
-a one-element array with comments under `.[0].comments`. Pipe `br` JSON to `jq`
-only as `rtk proxy br … | rtk proxy jq …` (raw, unfiltered output).
-
-**Finding schema** (review-cycle records):
-- Native status `open`/`closed` only — `in_progress` is banned (it silently
-  disappears from `--status open`). Priority is severity: P0 critical, P1
-  important, P2 minor.
-- Exactly one `type:{security|correctness|memory|perf|build|test|style}` label and
-  one `cycle:<id>` label. Open findings carry exactly one
-  `state:{proposed|disputed|fixed|needs-human}`; closed findings carry no `state:*`
-  and a `close_reason` of `fixed|false-positive|wont-fix|duplicate`.
-- Description first line is `file: <path>:<line>`, repo-relative.
-- Attribution: `br create --actor <id>`, `br comments add --author <id>`.
-- Closing is two steps (0.2.19 refuses a terminal status in `update`): first
-  `br update ID` clearing `state:*` and the assignee, then `br close ID --reason <r>`.
-- Never `--set-labels` (it erases other labels); use `--add-label`/`--remove-label`.
-
-**Human gate** — create as `state:needs-human` and get pre-change approval for: P0,
-`type:security`, `type:memory`, destructive operations, schema/data migrations, or
-public API changes.
-<!-- END beads-managed (br v6) -->
