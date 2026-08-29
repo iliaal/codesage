@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.21.0] - 2026-08-29
+
 ### Added
 
 - `codesage init` refuses to initialize in the filesystem root, the home directory, or credential directories (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.password-store`); `--force` overrides with a warning.
@@ -730,5 +732,7 @@ Initial public release.
 
 [0.19.0]: https://github.com/iliaal/codesage/releases/tag/v0.19.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.20.0...HEAD
 [0.20.0]: https://github.com/iliaal/codesage/releases/tag/v0.20.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/iliaal/codesage/releases/tag/v0.21.0
