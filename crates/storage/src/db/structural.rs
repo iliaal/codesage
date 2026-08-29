@@ -88,8 +88,10 @@ fn blob_to_fp(b: &[u8]) -> Vec<u64> {
     if !b.len().is_multiple_of(8) {
         return Vec::new();
     }
-    b.chunks_exact(8)
-        .map(|c| u64::from_le_bytes(c.try_into().expect("chunks_exact(8) yields 8 bytes")))
+    b.as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
         .collect()
 }
 
