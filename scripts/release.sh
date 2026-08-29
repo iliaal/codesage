@@ -13,9 +13,9 @@
 #      Claude marketplace version.
 #   4. Build the release binary with `--features cuda` so Cargo.lock is up to date.
 #   5. Prompt, then commit + tag.
-#   6. Prompt, then refresh the local Codex and Claude Code plugins and
-#      push master + tag. A failed plugin refresh warns (with the manual
-#      re-run command) and continues; it never blocks the push.
+#   6. Prompt, then refresh the required Codex and Claude Code plugins and push
+#      master + tag. If either CLI is unavailable or its integration fails to
+#      refresh, stop before the push so the release can be resumed after repair.
 #   7. Refresh whichever `codesage` is on PATH so the maintainer's local install
 #      jumps to the new version. Skipped silently if no install is found or the
 #      binary path is not writable.
@@ -56,6 +56,11 @@ branch=$(git rev-parse --abbrev-ref HEAD)
 [[ "$branch" == "master" ]] || die "not on master (current: $branch)"
 
 git diff-index --quiet HEAD -- || die "working tree has uncommitted changes"
+
+command -v codex >/dev/null 2>&1 ||
+	die "required 'codex' CLI not found on PATH; install it before releasing"
+command -v claude >/dev/null 2>&1 ||
+	die "required 'claude' CLI not found on PATH; install it before releasing"
 
 git fetch origin master --quiet
 local_sha=$(git rev-parse HEAD)
@@ -224,33 +229,19 @@ else
 	read -r -p "Push master + v$VERSION to origin? [y/N] " ans
 fi
 if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
-	if command -v codex >/dev/null 2>&1; then
-		echo
-		echo "Refreshing Codex plugin codesage-tools@codesage ..."
-		if codex plugin marketplace add "${ROOT}" &&
-			codex plugin add codesage-tools@codesage; then
-			echo "Codex plugin refreshed. Start a new Codex thread to load version ${VERSION}."
-		else
-			echo "⚠ Codex plugin refresh FAILED; continuing with the release." >&2
-			echo "⚠ Re-run manually: codex plugin marketplace add ${ROOT} && codex plugin add codesage-tools@codesage" >&2
-		fi
-	else
-		echo
-		echo "No 'codex' on PATH; skipping Codex plugin refresh."
-	fi
-	if command -v claude >/dev/null 2>&1; then
-		echo
-		echo "Refreshing Claude Code plugin codesage-tools@codesage ..."
-		if claude plugin update codesage-tools@codesage; then
-			echo "Claude plugin refreshed. Restart Claude Code sessions to load version ${VERSION}."
-		else
-			echo "⚠ Claude Code plugin refresh FAILED; continuing with the release." >&2
-			echo "⚠ Re-run manually: claude plugin update codesage-tools@codesage" >&2
-		fi
-	else
-		echo
-		echo "No 'claude' on PATH; skipping Claude plugin refresh."
-	fi
+	echo
+	echo "Refreshing Codex plugin codesage-tools@codesage ..."
+	codex plugin marketplace add "${ROOT}" ||
+		die "Codex marketplace refresh failed; release not pushed. Repair it, then rerun scripts/release.sh --yes ${VERSION}."
+	codex plugin add codesage-tools@codesage ||
+		die "Codex plugin refresh failed; release not pushed. Repair it, then rerun scripts/release.sh --yes ${VERSION}."
+	echo "Codex plugin refreshed. Start a new Codex thread to load version ${VERSION}."
+
+	echo
+	echo "Refreshing Claude Code plugin codesage-tools@codesage ..."
+	claude plugin update codesage-tools@codesage ||
+		die "Claude Code plugin refresh failed; release not pushed. Repair it, then rerun scripts/release.sh --yes ${VERSION}."
+	echo "Claude plugin refreshed. Restart Claude Code sessions to load version ${VERSION}."
 	git push origin master
 	git push origin "v$VERSION"
 	echo

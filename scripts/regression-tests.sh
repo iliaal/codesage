@@ -76,7 +76,7 @@ test_leak_check_invalid_regex_fails_closed() {
 }
 
 test_release_script_updates_changelog_links() {
-	local tmp origin fake_bin release_script version changelog codex_calls claude_calls codex_version claude_version marketplace_metadata_version marketplace_plugin_version
+	local tmp origin fake_bin missing_codex_bin missing_claude_bin release_script version changelog codex_calls claude_calls codex_version claude_version marketplace_metadata_version marketplace_plugin_version remote_before_failed_refresh remote_after_failed_refresh head_before_missing_cli
 	tmp="$(mktemp -d)"
 	trap 'rm -rf "$tmp"' RETURN
 	origin="${tmp}/origin.git"
@@ -91,6 +91,10 @@ test_release_script_updates_changelog_links() {
 	printf '#!/usr/bin/env bash\nprintf "codesage fake\\n"\n' >"${fake_bin}/codesage"
 	cat >"${fake_bin}/codex" <<'EOF'
 #!/usr/bin/env bash
+if [[ "${FAIL_CODEX_REFRESH:-0}" == "1" ]]; then
+	printf 'simulated Codex refresh failure\n' >&2
+	exit 43
+fi
 if [[ "$1" == "plugin" ]]; then
 	local_head="$(git rev-parse HEAD)"
 	remote_head="$(git ls-remote origin refs/heads/master | awk '{print $1}')"
@@ -103,6 +107,10 @@ printf '%s\n' "$*" >>"$CODEX_CALLS_FILE"
 EOF
 	cat >"${fake_bin}/claude" <<'EOF'
 #!/usr/bin/env bash
+if [[ "${FAIL_CLAUDE_REFRESH:-0}" == "1" ]]; then
+	printf 'simulated Claude refresh failure\n' >&2
+	exit 44
+fi
 if [[ "$1" == "plugin" ]]; then
 	local_head="$(git rev-parse HEAD)"
 	remote_head="$(git ls-remote origin refs/heads/master | awk '{print $1}')"
@@ -178,6 +186,32 @@ EOF
 	git commit -q -m initial
 	git push -q origin master
 
+	missing_codex_bin="${tmp}/bin-no-codex"
+	missing_claude_bin="${tmp}/bin-no-claude"
+	mkdir -p "${missing_codex_bin}" "${missing_claude_bin}"
+	ln -s "$(command -v git)" "${missing_codex_bin}/git"
+	ln -s "$(command -v git)" "${missing_claude_bin}/git"
+	ln -s "${fake_bin}/codex" "${missing_claude_bin}/codex"
+	head_before_missing_cli="$(git rev-parse HEAD)"
+	if PATH="${missing_codex_bin}" /bin/bash "${release_script}" --yes "${version}" >"${tmp}/release-script-missing-codex.out" 2>&1; then
+		printf 'release script continued without the Codex CLI\n' >&2
+		cat "${tmp}/release-script-missing-codex.out" >&2
+		return 1
+	fi
+	grep -Fq "required 'codex' CLI not found on PATH" "${tmp}/release-script-missing-codex.out"
+	[[ "$(git rev-parse HEAD)" == "${head_before_missing_cli}" ]]
+	if PATH="${missing_claude_bin}" /bin/bash "${release_script}" --yes "${version}" >"${tmp}/release-script-missing-claude.out" 2>&1; then
+		printf 'release script continued without the Claude CLI\n' >&2
+		cat "${tmp}/release-script-missing-claude.out" >&2
+		return 1
+	fi
+	grep -Fq "required 'claude' CLI not found on PATH" "${tmp}/release-script-missing-claude.out"
+	[[ "$(git rev-parse HEAD)" == "${head_before_missing_cli}" ]]
+	if git rev-parse "v${version}" >/dev/null 2>&1; then
+		printf 'missing-CLI preflight created tag v%s\n' "${version}" >&2
+		return 1
+	fi
+
 	CODEX_CALLS_FILE="${codex_calls}" CLAUDE_CALLS_FILE="${claude_calls}" PATH="${fake_bin}:${PATH}" \
 		"${release_script}" --yes "${version}" >"${tmp}/release-script.out" 2>&1
 
@@ -232,6 +266,27 @@ PYEOF
 		cat "${claude_calls}" >&2
 		return 1
 	fi
+	remote_before_failed_refresh="$(git ls-remote origin refs/heads/master | awk '{print $1}')"
+	if FAIL_CODEX_REFRESH=1 CODEX_CALLS_FILE="${codex_calls}" CLAUDE_CALLS_FILE="${claude_calls}" PATH="${fake_bin}:${PATH}" \
+		"${release_script}" --yes 1.2.4 >"${tmp}/release-script-refresh-failure.out" 2>&1; then
+		printf 'release script continued after a Codex plugin refresh failure\n' >&2
+		cat "${tmp}/release-script-refresh-failure.out" >&2
+		return 1
+	fi
+	remote_after_failed_refresh="$(git ls-remote origin refs/heads/master | awk '{print $1}')"
+	[[ "${remote_after_failed_refresh}" == "${remote_before_failed_refresh}" ]]
+	grep -Fq 'Codex marketplace refresh failed; release not pushed.' "${tmp}/release-script-refresh-failure.out"
+	[[ ! -s "${claude_calls}" ]]
+	: >"${codex_calls}"
+	if FAIL_CLAUDE_REFRESH=1 CODEX_CALLS_FILE="${codex_calls}" CLAUDE_CALLS_FILE="${claude_calls}" PATH="${fake_bin}:${PATH}" \
+		"${release_script}" --yes 1.2.4 >"${tmp}/release-script-claude-refresh-failure.out" 2>&1; then
+		printf 'release script continued after a Claude plugin refresh failure\n' >&2
+		cat "${tmp}/release-script-claude-refresh-failure.out" >&2
+		return 1
+	fi
+	remote_after_failed_refresh="$(git ls-remote origin refs/heads/master | awk '{print $1}')"
+	[[ "${remote_after_failed_refresh}" == "${remote_before_failed_refresh}" ]]
+	grep -Fq 'Claude Code plugin refresh failed; release not pushed.' "${tmp}/release-script-claude-refresh-failure.out"
 	cd "$repo_root"
 }
 
