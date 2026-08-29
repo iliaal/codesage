@@ -566,9 +566,9 @@ fn cap_to_budget_with(
     match value {
         serde_json::Value::Array(items) => {
             let total = items.len();
-            let kept = truncate_array(items, budget_chars);
+            let (kept, nested) = truncate_array_reporting(items, budget_chars);
             let returned = kept.len();
-            serde_json::json!({
+            let mut out = serde_json::json!({
                 "results": kept,
                 "_meta": {
                     "truncated": true,
@@ -578,7 +578,16 @@ fn cap_to_budget_with(
                     "approx_tokens_budget": approx_tokens_budget,
                     "hint": "output exceeded budget; refine query, narrow scope (paths/language), or call with offset to paginate",
                 }
-            })
+            });
+            if let Some(nested) = nested {
+                let meta = &mut out["_meta"];
+                meta.as_object_mut().expect("json! object").insert(
+                    "also_truncated_fields".to_string(),
+                    serde_json::json!([nested.label("results")]),
+                );
+                merge_dropped_identities(meta, &nested.dropped_named, nested.dropped_total);
+            }
+            out
         }
         serde_json::Value::Object(mut map) => {
             // Trim top-level arrays, largest first, until the payload fits.
@@ -591,6 +600,8 @@ fn cap_to_budget_with(
             let mut meta: Option<serde_json::Value> = None;
             let mut also_truncated: Vec<String> = Vec::new();
             let mut trimmed: Vec<String> = Vec::new();
+            let mut nested_dropped: Vec<String> = Vec::new();
+            let mut nested_dropped_total = 0usize;
             loop {
                 let current_len = serde_json::to_string(&map).map(|s| s.len()).unwrap_or(0);
                 if meta.is_some() && current_len <= budget_chars {
@@ -620,10 +631,15 @@ fn cap_to_budget_with(
                 } else {
                     Vec::new()
                 };
-                let kept = truncate_array(items, remaining);
+                let (kept, nested) = truncate_array_reporting(items, remaining);
                 let returned = kept.len();
                 map.insert(key.clone(), serde_json::Value::Array(kept));
                 trimmed.push(key.clone());
+                if let Some(nested) = nested {
+                    also_truncated.push(nested.label(&key));
+                    nested_dropped.extend(nested.dropped_named);
+                    nested_dropped_total += nested.dropped_total;
+                }
                 if meta.is_some() {
                     // `total_results` / `returned` stay scoped to the headline
                     // `field` so their meaning does not shift; the additional
@@ -663,6 +679,7 @@ fn cap_to_budget_with(
                         serde_json::json!(also_truncated),
                     );
                 }
+                merge_dropped_identities(&mut meta, &nested_dropped, nested_dropped_total);
                 map.insert("_meta".to_string(), meta);
             }
             serde_json::Value::Object(map)
@@ -704,9 +721,42 @@ fn largest_trimmable_array(
     }
 }
 
-fn truncate_array(items: Vec<serde_json::Value>, budget_chars: usize) -> Vec<serde_json::Value> {
+/// A depth-1 trim applied inside a kept array element, reported so the agent
+/// sees that the element it received is itself incomplete.
+struct NestedTrim {
+    index: usize,
+    field: String,
+    kept: usize,
+    total: usize,
+    /// Identifiers of the dropped entries, populated only when the nested
+    /// array is one of [`PROTECTED_TRUNCATION_KEYS`] — same visibility
+    /// contract as a protected array trimmed at the top level.
+    dropped_named: Vec<String>,
+    /// How many entries were dropped from a protected nested array; 0 when the
+    /// trimmed array was unprotected.
+    dropped_total: usize,
+}
+
+impl NestedTrim {
+    /// `files[0].cycle_files (50/4200)` — the outer array's key, the element
+    /// index, and the nested field's kept/total counts.
+    fn label(&self, outer_key: &str) -> String {
+        format!(
+            "{outer_key}[{}].{} ({}/{})",
+            self.index, self.field, self.kept, self.total
+        )
+    }
+}
+
+/// Keep the longest prefix of `items` that fits in `budget_chars`. Returns the
+/// kept prefix plus any nested trim performed on a surviving element.
+fn truncate_array_reporting(
+    items: Vec<serde_json::Value>,
+    budget_chars: usize,
+) -> (Vec<serde_json::Value>, Option<NestedTrim>) {
     let mut kept = Vec::new();
     let mut used = 0;
+    let mut nested = None;
     for mut item in items {
         let s = serde_json::to_string(&item).map(|s| s.len()).unwrap_or(0);
         if used + s > budget_chars {
@@ -715,43 +765,201 @@ fn truncate_array(items: Vec<serde_json::Value>, budget_chars: usize) -> Vec<ser
             }
             // First item alone overflows: try to shrink its `content` field
             // before giving up. Without this, a single 50KB chunk blows past
-            // the 32KB token budget. If the item has no `content` string, we
-            // surrender and keep the oversized item — refusing to return
-            // anything is worse than a slightly over-budget response.
-            shrink_content_field(&mut item, budget_chars.saturating_sub(used));
+            // the 32KB token budget.
+            let remaining = budget_chars.saturating_sub(used);
+            shrink_content_field(&mut item, remaining);
+            let shrunk = serde_json::to_string(&item).map(|s| s.len()).unwrap_or(0);
+            if shrunk > remaining {
+                // Content could not absorb the cut — either there is none, or
+                // the fields around it exceed the budget by themselves. The
+                // weight is in an array one level down, invisible to the
+                // top-level cap (`assess_risk_batch`'s `files[0].cycle_files`
+                // is populated uncapped, so one element can hold an entire
+                // import SCC). Trim that array, then give `content` the room
+                // that freed. Depth 1 only.
+                nested = shrink_largest_nested_array(&mut item, remaining).map(|mut t| {
+                    t.index = kept.len();
+                    t
+                });
+                shrink_content_field(&mut item, remaining);
+            }
             kept.push(item);
             break;
         }
         used += s;
         kept.push(item);
     }
-    kept
+    (kept, nested)
+}
+
+/// How many dropped entries of a protected *nested* array get named in
+/// `_meta.dropped_files`. Unlike a top-level protected array — bounded by the
+/// caller's own file list — a nested one can hold a whole import SCC, and
+/// naming every dropped entry would put back the bytes the trim just saved.
+/// The rest are covered by `_meta.dropped_count`.
+const NESTED_DROPPED_SAMPLE: usize = 10;
+
+/// Best-effort identifier for a nested entry. Unlike the top-level shapes,
+/// a nested protected array is often a plain path list (`review_rehearsal`'s
+/// per-objection `files`), where the entry is its own identifier.
+fn nested_element_identifier(entry: &serde_json::Value) -> Option<String> {
+    match entry {
+        serde_json::Value::String(s) => Some(s.clone()),
+        other => element_identifier(other),
+    }
+}
+
+/// Trim the largest array field of `item` (an object) so the serialized
+/// element fits within `budget_chars`. Reuses [`largest_trimmable_array`], so
+/// an unprotected array is always preferred and a protected one is trimmed
+/// only as the sole option — and when it is, the dropped entries are named on
+/// the returned [`NestedTrim`]. Returns `None` when the element is not an
+/// object, holds no array, or nothing had to be dropped.
+fn shrink_largest_nested_array(
+    item: &mut serde_json::Value,
+    budget_chars: usize,
+) -> Option<NestedTrim> {
+    let map = item.as_object_mut()?;
+    let (key, key_len, protected) = largest_trimmable_array(map, &[])?;
+    let item_len = serde_json::to_string(&*map).map(|s| s.len()).unwrap_or(0);
+    let remaining = budget_chars.saturating_sub(item_len.saturating_sub(key_len));
+    let serde_json::Value::Array(entries) = map.remove(&key)? else {
+        return None;
+    };
+    let total = entries.len();
+    let identifiers: Vec<Option<String>> = if protected {
+        entries.iter().map(nested_element_identifier).collect()
+    } else {
+        Vec::new()
+    };
+    let mut inner = Vec::new();
+    // `remaining` was measured against the array including its brackets, which
+    // the per-entry lengths below do not carry.
+    let mut used = 2;
+    for entry in entries {
+        // +1 for the separating comma, which the entry lengths also omit.
+        let s = serde_json::to_string(&entry).map(|s| s.len()).unwrap_or(0) + 1;
+        if used + s > remaining {
+            break;
+        }
+        used += s;
+        inner.push(entry);
+    }
+    let count = inner.len();
+    map.insert(key.clone(), serde_json::Value::Array(inner));
+    if count == total {
+        return None;
+    }
+    let dropped = identifiers.get(count..).unwrap_or(&[]);
+    Some(NestedTrim {
+        index: 0,
+        field: key,
+        kept: count,
+        total,
+        dropped_named: dropped
+            .iter()
+            .flatten()
+            .take(NESTED_DROPPED_SAMPLE)
+            .cloned()
+            .collect(),
+        dropped_total: dropped.len(),
+    })
+}
+
+/// Record a protected array's dropped-entry identities on a `_meta` object,
+/// merging with whatever the top-level pass already put under the same keys.
+/// `dropped_count` counts every dropped entry once any of them lacked an
+/// identifier, matching the top-level protected path.
+fn merge_dropped_identities(meta: &mut serde_json::Value, named: &[String], dropped_total: usize) {
+    if dropped_total == 0 {
+        return;
+    }
+    let Some(obj) = meta.as_object_mut() else {
+        return;
+    };
+    if !named.is_empty() {
+        let slot = obj
+            .entry("dropped_files")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if let serde_json::Value::Array(list) = slot {
+            list.extend(named.iter().map(|s| serde_json::Value::String(s.clone())));
+        }
+    }
+    if named.len() < dropped_total {
+        let prev = obj
+            .get("dropped_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        obj.insert(
+            "dropped_count".to_string(),
+            serde_json::json!(prev + dropped_total as u64),
+        );
+    }
+}
+
+const TRUNCATION_MARKER: &str = "\n…[truncated by MCP budget]";
+
+/// Serialized cost of one char inside a JSON string, matching serde_json's
+/// escaping: two-char escapes for the named controls, `\u00xx` for the rest
+/// below 0x20, raw UTF-8 otherwise.
+fn escaped_char_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+fn escaped_len(s: &str) -> usize {
+    s.chars().map(escaped_char_len).sum()
 }
 
 /// Best-effort: if `item` is an object with a `content: String` field,
-/// truncate that string so the serialized item fits roughly within
-/// `budget_chars`. Marks the truncation visibly so an agent reading the
-/// payload knows it's incomplete.
+/// truncate that string so the serialized item fits within `budget_chars`.
+/// Marks the truncation visibly so an agent reading the payload knows it's
+/// incomplete. No-op when the element already fits, and when the fields
+/// around `content` blow the budget on their own — cutting content cannot
+/// rescue that element, so the caller trims the array carrying the weight and
+/// calls back with the reduced overhead.
 fn shrink_content_field(item: &mut serde_json::Value, budget_chars: usize) {
     let serde_json::Value::Object(map) = item else {
         return;
     };
-    let Some(serde_json::Value::String(content)) = map.get_mut("content") else {
-        return;
+    let content = match map.get_mut("content") {
+        Some(serde_json::Value::String(s)) => std::mem::take(s),
+        _ => return,
     };
-    if content.len() <= budget_chars {
+    // Reserve what the rest of the element actually costs, measured with the
+    // content emptied, rather than a fixed few hundred bytes. A fixed reserve
+    // undercounts a record carrying many sibling fields: the shrink then lands
+    // over budget and hands the residue to the nested trimmer, dropping
+    // entries the content could have absorbed on its own.
+    let overhead = serde_json::to_string(&*map).map(|s| s.len()).unwrap_or(0);
+    let marker = escaped_len(TRUNCATION_MARKER);
+    if budget_chars <= overhead + marker || overhead + escaped_len(&content) <= budget_chars {
+        map.insert("content".to_string(), serde_json::Value::String(content));
         return;
     }
-    // Reserve a few hundred bytes for the rest of the JSON envelope.
-    let target = budget_chars.saturating_sub(256);
-    let cut = content
-        .char_indices()
-        .nth(target)
-        .map(|(i, _)| i)
-        .unwrap_or(target.min(content.len()));
-    let mut shrunk = content[..cut].to_string();
-    shrunk.push_str("\n…[truncated by MCP budget]");
-    *content = shrunk;
+    let room = budget_chars - overhead - marker;
+    let mut used = 0;
+    let mut cut = content.len();
+    for (i, c) in content.char_indices() {
+        let w = escaped_char_len(c);
+        if used + w > room {
+            cut = i;
+            break;
+        }
+        used += w;
+    }
+    let shrunk = if cut == content.len() {
+        content
+    } else {
+        let mut s = content[..cut].to_string();
+        s.push_str(TRUNCATION_MARKER);
+        s
+    };
+    // Re-insert on the existing key, which keeps its position in the map.
+    map.insert("content".to_string(), serde_json::Value::String(shrunk));
 }
 
 #[cfg(test)]
@@ -767,6 +975,12 @@ mod tests {
 
     fn fat_string(n: usize) -> String {
         "x".repeat(n)
+    }
+
+    /// Prefix-only view of [`truncate_array_reporting`], for the cases that
+    /// assert on the kept elements and not on the nested-trim report.
+    fn truncate_array(items: Vec<Value>, budget_chars: usize) -> Vec<Value> {
+        truncate_array_reporting(items, budget_chars).0
     }
 
     #[test]
@@ -1017,6 +1231,214 @@ mod tests {
         let meta = &out.as_object().unwrap()["_meta"];
         assert_eq!(meta["field"], json!("related"));
         assert!(meta.get("also_truncated_fields").is_none());
+    }
+
+    #[test]
+    fn cap_trims_nested_array_inside_the_surviving_element() {
+        // assess_risk_batch on a file inside a huge import SCC: `cycle_files`
+        // is populated uncapped and sits nested inside `files[0]`, invisible
+        // to the top-level cap. `files` is protected and has a single entry,
+        // so nothing can be dropped at the top level — the nested array is
+        // the only thing that can give.
+        let cycle: Vec<Value> = (0..4200)
+            .map(|i| json!(format!("src/module{i}/handler.rs")))
+            .collect();
+        let v = json!({
+            "files": [{
+                "file_path": "src/hot.rs",
+                "score": 0.87,
+                "cycle_files": cycle,
+            }],
+            "_legend": { "T": "no direct test file" },
+        });
+        let out = cap_to_budget_with(v, "assess_risk_batch", MCP_BUDGET_CHARS);
+        let obj = out.as_object().expect("still an object");
+        let files = obj["files"].as_array().expect("files array");
+        assert_eq!(files.len(), 1, "the single risk entry must survive");
+        let kept = files[0]["cycle_files"]
+            .as_array()
+            .expect("cycle_files array")
+            .len();
+        assert!(kept > 0 && kept < 4200, "nested array not trimmed: {kept}");
+        assert!(
+            serde_json::to_string(&obj["files"]).unwrap().len() <= MCP_BUDGET_CHARS,
+            "trimmed payload must fit the budget"
+        );
+        // Same envelope allowance as cap_trims_every_oversized_array_not_just_the_largest:
+        // the `_meta` marker is appended after the budget check.
+        let serialized = serde_json::to_string(&out).unwrap();
+        assert!(
+            serialized.len() < MCP_BUDGET_CHARS + 1024,
+            "capped response must land at the budget, got {} chars",
+            serialized.len()
+        );
+        let also: Vec<&str> = obj["_meta"]["also_truncated_fields"]
+            .as_array()
+            .expect("also_truncated_fields")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(also, vec![format!("files[0].cycle_files ({kept}/4200)")]);
+        // The staleness scan reads whatever cycle_files paths remain; the
+        // trimmed shape must still walk cleanly.
+        let mut paths = Vec::new();
+        collect_referenced_paths(&out, &mut paths);
+        assert!(paths.contains(&"src/hot.rs".to_string()));
+        assert_eq!(
+            paths.iter().filter(|p| p.starts_with("src/module")).count(),
+            kept
+        );
+    }
+
+    #[test]
+    fn nested_trim_prefers_an_unprotected_array_over_a_protected_one() {
+        // Same preference the top-level pass applies: `files` carries a
+        // per-element invariant, so an unprotected sibling absorbs the cut
+        // even when it is the smaller of the two.
+        let mut item = json!({
+            "severity": "high",
+            "files": (0..200).map(|i| json!(format!("src/patch{i}.rs"))).collect::<Vec<_>>(),
+            "cycle_files": (0..400).map(|i| json!(format!("src/cycle{i}.rs"))).collect::<Vec<_>>(),
+        });
+        let trim = shrink_largest_nested_array(&mut item, 3_000).expect("nested trim");
+        assert_eq!(trim.field, "cycle_files");
+        assert_eq!(
+            item["files"].as_array().unwrap().len(),
+            200,
+            "protected nested array must survive while an unprotected one exists"
+        );
+        assert!(
+            trim.dropped_named.is_empty(),
+            "unprotected: no drop identity"
+        );
+        assert_eq!(trim.dropped_total, 0);
+    }
+
+    #[test]
+    fn nested_trim_names_dropped_entries_of_a_protected_array() {
+        // review_rehearsal shape: each objection carries its own bare-path
+        // `files` list. When that protected array is the element's only
+        // array, trimming it must report the dropped identities the same way
+        // the top-level protected path does — sampled, then counted, so the
+        // report does not put back the bytes the trim saved.
+        let objection = json!({
+            "severity": "high",
+            "files": (0..900).map(|i| json!(format!("src/area{i}/handler.rs"))).collect::<Vec<_>>(),
+        });
+        let v = json!({ "objections": [objection], "pass": false });
+        let out = cap_to_budget_with(v, "review_rehearsal", 4_000);
+        let obj = out.as_object().expect("still an object");
+        let kept = obj["objections"][0]["files"]
+            .as_array()
+            .expect("files array")
+            .len();
+        assert!(kept > 0 && kept < 900, "nested protected array not trimmed");
+        let meta = &obj["_meta"];
+        let also: Vec<&str> = meta["also_truncated_fields"]
+            .as_array()
+            .expect("also_truncated_fields")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(also, vec![format!("objections[0].files ({kept}/900)")]);
+        let dropped = meta["dropped_files"].as_array().expect("dropped_files");
+        assert_eq!(
+            dropped.len(),
+            NESTED_DROPPED_SAMPLE,
+            "identity list sampled"
+        );
+        assert_eq!(dropped[0], json!(format!("src/area{kept}/handler.rs")));
+        assert_eq!(
+            meta["dropped_count"],
+            json!(900 - kept),
+            "every dropped entry counted, not just the named sample"
+        );
+    }
+
+    #[test]
+    fn content_shrink_absorbs_the_cut_before_any_nested_trim() {
+        // A fixed envelope reserve undercounted sibling fields, so an element
+        // whose `content` could have absorbed the whole cut still lost nested
+        // entries. Budget 4000 against a 5000-byte content and ten nested
+        // paths: the content gives, the nested array keeps all ten.
+        let item = json!({
+            "file_path": "src/big.rs",
+            "content": fat_string(5_000),
+            "cycle_files": (0..10).map(|i| json!(format!("src/{}{i}.rs", fat_string(90)))).collect::<Vec<_>>(),
+        });
+        let (kept, nested) = truncate_array_reporting(vec![item], 4_000);
+        assert!(nested.is_none(), "nested trim fired unnecessarily");
+        assert_eq!(
+            kept[0]["cycle_files"].as_array().unwrap().len(),
+            10,
+            "all nested entries must survive a content-absorbable cut"
+        );
+        let len = serde_json::to_string(&kept[0]).unwrap().len();
+        assert!(len <= 4_000, "shrunk element still over budget: {len}");
+        assert!(
+            kept[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("[truncated by MCP budget]")
+        );
+    }
+
+    #[test]
+    fn nested_trim_leaves_a_small_content_field_intact() {
+        // Measuring the reserve against the siblings cuts both ways: when an
+        // array dominates the element, the room left for `content` is zero
+        // and cutting it saves nothing. The array must give instead, and a
+        // content field that costs 12 bytes must come back whole.
+        let item = json!({
+            "file_path": "src/a.rs",
+            "content": "fn main() {}",
+            "cycle_files": (0..4000).map(|i| json!(format!("src/mod{i}/lib.rs"))).collect::<Vec<_>>(),
+        });
+        let (kept, nested) = truncate_array_reporting(vec![item], 8_000);
+        assert_eq!(nested.expect("nested trim").field, "cycle_files");
+        assert_eq!(
+            kept[0]["content"],
+            json!("fn main() {}"),
+            "a content field that fits must survive untouched"
+        );
+        let len = serde_json::to_string(&kept[0]).unwrap().len();
+        assert!(len <= 8_000, "element still over budget: {len}");
+    }
+
+    #[test]
+    fn nested_trim_charges_the_array_brackets() {
+        // The per-entry accounting omits the array's own `[]`, which put an
+        // exact fit one byte over. Sweep the boundary window rather than
+        // pinning one hand-computed budget.
+        let entries: Vec<Value> = ["aaaaaaaa", "bbbbbbbb", "cccccccc", "dddddddd", "eeeeeeee"]
+            .iter()
+            .map(|s| json!(s))
+            .collect();
+        for budget in 30..=120 {
+            let mut item = json!({ "id": "x", "list": entries });
+            shrink_largest_nested_array(&mut item, budget);
+            let len = serde_json::to_string(&item).unwrap().len();
+            assert!(len <= budget, "budget {budget}: element is {len} chars");
+        }
+    }
+
+    #[test]
+    fn cap_leaves_under_budget_nested_arrays_byte_identical() {
+        // The nested trim is a last resort inside the over-budget path; an
+        // under-budget response must serialize byte-for-byte unchanged.
+        let v = json!({
+            "files": [{
+                "file_path": "src/a.rs",
+                "cycle_files": ["src/b.rs", "src/c.rs"],
+                "notes": ["in import cycle of 3 files"],
+            }],
+            "_legend": {},
+        });
+        let out = cap_to_budget_with(v.clone(), "assess_risk_batch", MCP_BUDGET_CHARS);
+        assert_eq!(
+            serde_json::to_string(&out).unwrap(),
+            serde_json::to_string(&v).unwrap()
+        );
     }
 
     #[test]

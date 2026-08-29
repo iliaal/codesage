@@ -19,6 +19,7 @@
 ### Fixed
 
 - MCP budget truncation trims every oversized array largest-first until the response fits, instead of only the single largest one; `session_end`, `export_context`, `feature_bundle`, `impact_analysis`, `list_dependencies`, and `recommend_tests` could previously exceed the budget through their second and third arrays. Extra trims are reported in `_meta.also_truncated_fields` as `name (kept/total)`.
+- MCP budget truncation reaches one level into a surviving oversized element and trims its largest nested array, after an oversized `content` field absorbs what it can. An `assess_risk_batch` file in a large import cycle no longer carries its whole `cycle_files` list past the budget; the nested trim is reported as `files[0].cycle_files (kept/total)` in `_meta.also_truncated_fields`.
 - Watcher: an inotify queue overflow or an FSEvents rescan request now triggers the catch-up reindex; both previously arrived as flagged events the error-path catch-up never saw.
 - Watcher: a directory moved or renamed out of the tree purges every indexed file beneath it; one renamed or moved in is adopted with its pre-existing files, and oversized adoptions route to a single bulk pass.
 - Watcher: a symlinked project root is canonicalized so macOS FSEvents path spellings match, and no removal path recreates a deleted `index.db`.
