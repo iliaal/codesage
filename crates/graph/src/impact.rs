@@ -8,7 +8,6 @@ use codesage_protocol::{
 use codesage_storage::Database;
 
 use crate::bundle::resolve_callee_definitions;
-use crate::lookups::list_dependencies;
 
 pub(crate) fn is_qualified_symbol_name(name: &str) -> bool {
     name.contains('\\') || name.contains('.') || name.contains("::")
@@ -266,7 +265,11 @@ pub fn impact_analysis_report(
         if opts.include_forward {
             let mut fwd: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
             for f in &target_files {
-                for imp in list_dependencies(db, f)?.imports {
+                // Storage call, not `lookups::list_dependencies`: only the
+                // `imports` half is read here, and the wrapper's per-file
+                // `imported_by` resolution sweep would run once per target
+                // file for nothing.
+                for imp in db.list_file_dependencies(f)?.imports {
                     fwd.insert(imp);
                 }
             }

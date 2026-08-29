@@ -22,6 +22,7 @@
 - Watcher: an inotify queue overflow or an FSEvents rescan request now triggers the catch-up reindex; both previously arrived as flagged events the error-path catch-up never saw.
 - Watcher: a directory moved or renamed out of the tree purges every indexed file beneath it; one renamed or moved in is adopted with its pre-existing files, and oversized adoptions route to a single bulk pass.
 - Watcher: a symlinked project root is canonicalized so macOS FSEvents path spellings match, and no removal path recreates a deleted `index.db`.
+- `list_dependencies` `imported_by` now resolves imports that name a file or module rather than a symbol: JS/TS relative specifiers (`./util.js`), C/C++ includes relative to the includer, and Rust `use crate::…` module paths (including workspace members). These previously returned an empty list even though `impact_analysis` resolved them.
 
 ### Security
 

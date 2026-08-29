@@ -660,17 +660,87 @@ fn import_ref_targets_symbol(
     if tail != callee_name && tail != sym.name {
         return false;
     }
-    let module_path = module
-        .strip_prefix("crate::")
-        .unwrap_or(module)
-        .replace("::", "/");
-    let candidates = [
+    rust_module_candidates(module, caller_file)
+        .iter()
+        .any(|c| c == &sym.file_path)
+}
+
+/// File paths a Rust `use` module path may resolve to. `crate::` is relative
+/// to the importer's own crate root: when the importer path shows a `src/`
+/// root, resolve against that root ONLY — adding the generic repo-root
+/// guesses alongside would let `crates/a/src/lib.rs` claim the root crate's
+/// `src/util.rs`. The generic layouts remain the fallback for importers with
+/// no derivable src root (e.g. a root-level `lib.rs`).
+fn rust_module_candidates(module: &str, importer_file: &str) -> Vec<String> {
+    let module = module.strip_prefix("crate::").unwrap_or(module);
+    if module.is_empty() || module == "crate" {
+        return Vec::new();
+    }
+    let module_path = module.replace("::", "/");
+    if let Some(src_root) = importer_src_root(importer_file) {
+        return vec![
+            format!("{src_root}{module_path}.rs"),
+            format!("{src_root}{module_path}/mod.rs"),
+        ];
+    }
+    vec![
         format!("{module_path}.rs"),
         format!("{module_path}/mod.rs"),
         format!("src/{module_path}.rs"),
         format!("src/{module_path}/mod.rs"),
-    ];
-    candidates.iter().any(|c| c == &sym.file_path)
+    ]
+}
+
+/// The `src/` root the importer lives under, trailing slash included:
+/// `crates/app/src/lib.rs` → `crates/app/src/`, `src/lib.rs` → `src/`.
+fn importer_src_root(importer_file: &str) -> Option<&str> {
+    if let Some(idx) = importer_file.rfind("/src/") {
+        return Some(&importer_file[..idx + "/src/".len()]);
+    }
+    importer_file.strip_prefix("src/").map(|_| "src/")
+}
+
+/// File-level counterpart of [`import_ref_targets_symbol`]: true when the
+/// import/include ref recorded in `importer_file` resolves to `target_file`.
+/// Backs `list_dependencies`' `imported_by`, whose SQL half only joins refs
+/// that name a symbol — path specifiers (`./util.js`, `dir/foo.h`) and Rust
+/// `use crate::…` module paths name a file or module and never join.
+pub(crate) fn import_ref_targets_file(
+    import_ref: &str,
+    importer_file: &str,
+    target_file: &str,
+) -> bool {
+    if import_ref.starts_with("./") || import_ref.starts_with("../") {
+        return import_path_targets_file(import_ref, importer_file, target_file);
+    }
+    if import_ref.contains("::") {
+        // `use crate::util` names util.rs directly; `use crate::util::helper`
+        // names it through the parent of the imported item. External paths
+        // (`std::io::Read`) derive candidates that match no indexed file.
+        if rust_module_candidates(import_ref, importer_file)
+            .iter()
+            .any(|c| c == target_file)
+        {
+            return true;
+        }
+        return import_ref.rsplit_once("::").is_some_and(|(module, _)| {
+            rust_module_candidates(module, importer_file)
+                .iter()
+                .any(|c| c == target_file)
+        });
+    }
+    // Quoted-include style: `util.h` or `sub/foo.h`. Resolve against the
+    // includer's directory, then the project root — both exact. No stem or
+    // suffix match: `sub/foo.h` must not claim every `*/sub/foo.h` in the
+    // project. Includes reached through other `-I` paths stay unresolved.
+    if import_ref.contains('/') || import_ref.contains('.') {
+        let base = importer_file.rsplit_once('/').map_or("", |(dir, _)| dir);
+        if lexical_join(base, import_ref).is_some_and(|resolved| resolved == target_file) {
+            return true;
+        }
+        return import_ref == target_file;
+    }
+    false
 }
 
 fn is_path_specifier(s: &str) -> bool {
@@ -894,6 +964,109 @@ mod import_path_tests {
             "./foo.js",
             "src/client.ts",
             "src/foo.js.ts"
+        ));
+    }
+
+    #[test]
+    fn rust_use_paths_resolve_to_module_files() {
+        // Item import: the parent module names the file.
+        assert!(import_ref_targets_file(
+            "crate::util::helper",
+            "src/lib.rs",
+            "src/util.rs"
+        ));
+        assert!(import_ref_targets_file(
+            "crate::util::helper",
+            "lib.rs",
+            "util/mod.rs"
+        ));
+        // Whole-module import: the path itself names the file.
+        assert!(import_ref_targets_file(
+            "crate::util",
+            "src/lib.rs",
+            "src/util.rs"
+        ));
+        // Workspace member: `crate::` is the importer's own src root.
+        assert!(import_ref_targets_file(
+            "crate::util::helper",
+            "crates/app/src/lib.rs",
+            "crates/app/src/util.rs"
+        ));
+        // A sibling crate's same-named module is not in `crate::`. The
+        // repo-root `src/` guess cannot fire here (no such path), and the
+        // src-root candidate is derived from the importer.
+        assert!(!import_ref_targets_file(
+            "crate::util::helper",
+            "crates/app/src/lib.rs",
+            "crates/other/src/util.rs"
+        ));
+        // An importer with its own src root must not claim the ROOT crate's
+        // module either: the generic `src/` guess is a fallback, not an
+        // always-on candidate.
+        assert!(!import_ref_targets_file(
+            "crate::util::helper",
+            "crates/app/src/lib.rs",
+            "src/util.rs"
+        ));
+        // External paths derive candidates that match no indexed file.
+        assert!(!import_ref_targets_file(
+            "std::io::Read",
+            "src/lib.rs",
+            "src/io.rs"
+        ));
+    }
+
+    #[test]
+    fn bare_includes_resolve_against_the_includer_directory() {
+        assert!(import_ref_targets_file(
+            "util.h",
+            "src/main.c",
+            "src/util.h"
+        ));
+        assert!(import_ref_targets_file("util.h", "main.c", "util.h"));
+        // Exact join only: no claiming a same-named header elsewhere.
+        assert!(!import_ref_targets_file(
+            "util.h",
+            "src/main.c",
+            "other/util.h"
+        ));
+        // A bare symbol name is not a file.
+        assert!(!import_ref_targets_file("util", "main.py", "util.py"));
+    }
+
+    #[test]
+    fn directory_includes_resolve_exactly_never_by_suffix() {
+        // Includer-directory join.
+        assert!(import_ref_targets_file(
+            "sub/foo.h",
+            "app/main.c",
+            "app/sub/foo.h"
+        ));
+        // Project-root join (`-I.` style include).
+        assert!(import_ref_targets_file(
+            "sub/foo.h",
+            "app/main.c",
+            "sub/foo.h"
+        ));
+        // No suffix match: an unrelated tree's `*/sub/foo.h` stays unclaimed.
+        assert!(!import_ref_targets_file(
+            "sub/foo.h",
+            "app/main.c",
+            "vendor/sub/foo.h"
+        ));
+    }
+
+    #[test]
+    fn path_specifiers_route_through_the_relative_matcher() {
+        assert!(import_ref_targets_file(
+            "./util.js",
+            "lib/main.js",
+            "lib/util.js"
+        ));
+        assert!(!import_ref_targets_file(
+            "./util.js",
+            "lib/main.js",
+            "other/util.js"
         ));
     }
 

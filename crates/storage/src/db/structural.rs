@@ -562,6 +562,26 @@ impl Database {
         Ok(rows)
     }
 
+    /// Every import/include reference project-wide as `(from_path, to_name)`
+    /// pairs, unresolved. One set-based query backing `list_dependencies`'
+    /// path/module-import resolution sweep, which would otherwise be a
+    /// per-file N+1 over `refs_outgoing_for_file_id`.
+    pub fn import_include_refs_all(&self) -> Result<Vec<(String, String)>> {
+        let sql = r#"
+            SELECT DISTINCT f.path, r.to_name
+            FROM refs r
+            JOIN files f ON r.from_file_id = f.id
+            WHERE r.kind IN ('import', 'include')
+        "#;
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn import_cycle_cache_key(&self) -> Option<String> {
         self.conn
             .path()

@@ -831,6 +831,52 @@ mod tests {
     }
 
     #[test]
+    fn import_include_refs_all_returns_only_import_kinds() {
+        let db = Database::open_in_memory().unwrap();
+        let a = db.upsert_file(&make_file("a.js")).unwrap();
+        db.insert_references(
+            a,
+            &[
+                Reference {
+                    from_file: "a.js".to_string(),
+                    to_name: "./b.js".to_string(),
+                    kind: ReferenceKind::Import,
+                    ..make_reference("unused", ReferenceKind::Import)
+                },
+                Reference {
+                    from_file: "a.js".to_string(),
+                    to_name: "helper".to_string(),
+                    kind: ReferenceKind::Call,
+                    ..make_reference("unused", ReferenceKind::Call)
+                },
+            ],
+        )
+        .unwrap();
+        let c = db.upsert_file(&make_file("main.c")).unwrap();
+        db.insert_references(
+            c,
+            &[Reference {
+                from_file: "main.c".to_string(),
+                to_name: "util.h".to_string(),
+                kind: ReferenceKind::Include,
+                ..make_reference("unused", ReferenceKind::Include)
+            }],
+        )
+        .unwrap();
+
+        let mut rows = db.import_include_refs_all().unwrap();
+        rows.sort();
+
+        assert_eq!(
+            rows,
+            vec![
+                ("a.js".to_string(), "./b.js".to_string()),
+                ("main.c".to_string(), "util.h".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn list_file_dependencies_reports_unknown_path() {
         let db = Database::open_in_memory().unwrap();
 
