@@ -13,6 +13,10 @@
 - `review_rehearsal` propagates trust-boundary, feature, and test-recommendation query failures instead of rendering a clean rehearsal over a broken engine.
 - Upgrade the `rmcp` MCP SDK to 3.x (MCP 2026-07-28 spec model types). Clients negotiating 2026-07-28 now receive the spec's `resultType` field on `tools/list` and `tools/call`; wire output for 2024-11-05 / 2025-06-18 / 2025-11-25 is unchanged.
 
+### Fixed
+
+- Watcher: an inotify queue overflow or FSEvents must-rescan now triggers the catch-up reindex (notify delivers both as a flagged event, not an error, so the 0.18.0 catch-up never fired on real overflow); a directory moved or renamed out of the tree purges every indexed file beneath it instead of leaving ghost rows; a directory renamed or moved in is adopted and its pre-existing files queued, with oversized adoptions routed to one bulk pass; a symlinked project root is canonicalized so macOS FSEvents paths match; the removal path never recreates a deleted `index.db`.
+
 ### Security
 
 - Bump transitive `h2` to 0.4.16 (from 0.4.13), clearing RUSTSEC-2026-0258 (unbounded empty DATA frames). Pulled via `reqwest` → `hyper` on the Hugging Face model-download path.

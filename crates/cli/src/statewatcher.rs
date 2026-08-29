@@ -14,6 +14,7 @@ use codesage_parser::detect::{
 use codesage_parser::discover::{WatchFilter, content_hash};
 use codesage_protocol::FileInfo;
 use codesage_storage::Database;
+use notify::event::ModifyKind;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -124,7 +125,13 @@ impl Drop for StatusGuard {
     }
 }
 
-pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
+pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
+    // macOS FSEvents reports canonical paths (symlinks resolved, /var =>
+    // /private/var); a symlink-spelled root would fail every strip_prefix
+    // below and silently drop all events. Resolve once so registration,
+    // filtering, and event mapping agree on one spelling.
+    config.project_root = canonical_root(&config.project_root);
+
     let (tx, rx) = mpsc::channel();
     let project_root = config.project_root.clone();
 
@@ -149,6 +156,11 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
 
     let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
     let mut removed_paths: Vec<String> = Vec::new();
+    // Root-relative prefixes of vanished non-source paths (directory moves
+    // and deletes). A directory moved out of the tree emits one event for
+    // the directory itself and none for the files under it; the affected
+    // rows are resolved from the index at removal time.
+    let mut removed_prefixes: Vec<String> = Vec::new();
     let mut batch_event_times: Vec<Instant> = Vec::new();
     let mut currently_indexing: HashSet<PathBuf> = HashSet::new();
     let mut recheck_queue: HashSet<PathBuf> = HashSet::new();
@@ -169,12 +181,67 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
     let exit_reason = loop {
         match rx.recv_timeout(POLL_INTERVAL) {
             Ok(Ok(event)) => {
+                // Dropped-event signals arrive as an Ok event flagged Rescan
+                // (kind Other; inotify attaches no path, FSEvents does),
+                // never through the Err arm: inotify surfaces queue overflow
+                // this way, FSEvents its must-scan-subdirs flag. Same
+                // disposition as a backend error — reconcile, or the dropped
+                // edits stay unindexed.
+                if event.need_rescan() {
+                    tracing::warn!(
+                        "watch backend requested rescan (events dropped); \
+                         scheduling bulk reconciliation pass"
+                    );
+                    bulk_retry_at = schedule_watch_error_catchup(
+                        &mut pending,
+                        &mut removed_paths,
+                        Instant::now(),
+                        debounce,
+                        bulk_cooldown_until,
+                    );
+                    continue;
+                }
+
                 for path in &event.paths {
-                    // A newly created top-level directory needs its own watch:
-                    // the root is watched non-recursively, so new top-level
-                    // trees aren't covered until we recurse into them.
-                    if matches!(event.kind, EventKind::Create(_)) && path.is_dir() {
+                    // A directory that appeared needs adoption: the root is
+                    // watched non-recursively, so new top-level trees aren't
+                    // covered until we recurse into them. A rename-in arrives
+                    // as Modify(Name), not Create, and no backend replays
+                    // files that landed before the watch registered — scan
+                    // the tree and queue what's already there.
+                    if path.is_dir() && is_dir_adoption_kind(&event.kind) {
                         maybe_watch_new_dir(&mut watcher, &config.project_root, path, &filter);
+                        match scan_dir_source_files(
+                            &config.project_root,
+                            path,
+                            &filter,
+                            BATCH_THRESHOLD,
+                        ) {
+                            DirScan::Files(files) => {
+                                let now = Instant::now();
+                                for rel in files {
+                                    let rel_str = rel.to_string_lossy().to_string();
+                                    removed_paths.retain(|p| *p != rel_str);
+                                    if let std::collections::hash_map::Entry::Vacant(e) =
+                                        pending.entry(rel)
+                                    {
+                                        e.insert(now);
+                                        batch_event_times.push(now);
+                                    }
+                                }
+                            }
+                            // Too large to enqueue file by file — one bulk
+                            // reconciliation pass covers the whole tree.
+                            DirScan::OverThreshold => {
+                                bulk_retry_at = schedule_watch_error_catchup(
+                                    &mut pending,
+                                    &mut removed_paths,
+                                    Instant::now(),
+                                    debounce,
+                                    bulk_cooldown_until,
+                                );
+                            }
+                        }
                         continue;
                     }
 
@@ -182,6 +249,26 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
                         Ok(p) => p.to_path_buf(),
                         Err(_) => continue,
                     };
+
+                    // Any vanished path may have been a directory holding
+                    // indexed files: a rename-out is one Modify(Name(From))
+                    // for the directory, nothing for its contents, and a
+                    // directory can be named like a source file. Queue it as
+                    // a prefix; the removal pass resolves affected rows from
+                    // the index, and a plain file prefix expands to nothing
+                    // extra.
+                    if matches!(
+                        event.kind,
+                        EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+                    ) && !rel.as_os_str().is_empty()
+                        && !path.exists()
+                        && !filter.is_ignored(path, true)
+                    {
+                        let rel_str = rel.to_string_lossy().to_string();
+                        if !removed_prefixes.contains(&rel_str) {
+                            removed_prefixes.push(rel_str);
+                        }
+                    }
 
                     if !is_source_file(&rel) {
                         continue;
@@ -255,6 +342,9 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
                         // C++ file, which must un-flip header parsing without
                         // a watcher restart.
                         header_is_cpp = header_dialect_is_cpp(&config.db_path);
+                        // The bulk pass purged every orphaned row, which
+                        // covers any queued directory prefixes.
+                        removed_prefixes.clear();
                     }
                     bulk_retry_at = apply_bulk_outcome(
                         outcome,
@@ -286,8 +376,8 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
 
         if config.shutdown.load(Ordering::Relaxed) {
             tracing::info!("shutdown requested, draining pending work");
-            if !removed_paths.is_empty() {
-                let _ = handle_removals(&config, &removed_paths);
+            if !removed_paths.is_empty() || !removed_prefixes.is_empty() {
+                let _ = handle_removals(&config, &removed_paths, &removed_prefixes);
             }
             drain_pending_force(
                 &config,
@@ -315,6 +405,7 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
             bulk_cooldown_until = bulk_cooldown_after(outcome, Instant::now());
             if outcome == WorkOutcome::Done {
                 header_is_cpp = header_dialect_is_cpp(&config.db_path);
+                removed_prefixes.clear();
             }
             bulk_retry_at = apply_bulk_outcome(
                 outcome,
@@ -329,18 +420,22 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
         // Deletions have no natural retrigger: a removal dropped on lock
         // contention would leave ghost symbols/chunks for the whole
         // session, so keep the paths queued and retry a debounce later.
-        if removed_paths.is_empty() {
+        if removed_paths.is_empty() && removed_prefixes.is_empty() {
             removal_retry_at = None;
             removal_fail_count = 0;
         } else if removal_retry_at.is_none_or(|at| Instant::now() >= at) {
-            let may_unflip = removed_paths_may_unflip_header(header_is_cpp, &removed_paths);
-            let outcome = handle_removals(&config, &removed_paths);
+            // A prefix purge has unknown contents, so it must conservatively
+            // re-derive the header dialect on success.
+            let may_unflip = removed_paths_may_unflip_header(header_is_cpp, &removed_paths)
+                || (header_is_cpp && !removed_prefixes.is_empty());
+            let outcome = handle_removals(&config, &removed_paths, &removed_prefixes);
             if outcome == WorkOutcome::Done && may_unflip {
                 header_is_cpp = header_dialect_is_cpp(&config.db_path);
             }
             removal_retry_at = apply_removal_outcome(
                 outcome,
                 &mut removed_paths,
+                &mut removed_prefixes,
                 &mut removal_fail_count,
                 Instant::now(),
                 debounce,
@@ -367,6 +462,7 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
             || !currently_indexing.is_empty()
             || !recheck_queue.is_empty()
             || !removed_paths.is_empty()
+            || !removed_prefixes.is_empty()
             || bulk_retry_at.is_some()
         {
             last_activity = Instant::now();
@@ -700,21 +796,12 @@ fn indexed_hashes_are_fresh(
     )
 }
 
-fn handle_removals(config: &StateWatcherConfig, paths: &[String]) -> WorkOutcome {
-    if paths.is_empty() {
-        return WorkOutcome::Done;
-    }
-
-    // A path that exists on disk was re-created after its removal was queued
-    // (git checkout back-and-forth, atomic-save editors). Deleting its rows
-    // would silently drop a live file's symbols/chunks for the session, so
-    // only purge paths that are genuinely gone.
-    let to_remove: Vec<String> = paths
-        .iter()
-        .filter(|p| !config.project_root.join(p).exists())
-        .cloned()
-        .collect();
-    if to_remove.is_empty() {
+fn handle_removals(
+    config: &StateWatcherConfig,
+    paths: &[String],
+    prefixes: &[String],
+) -> WorkOutcome {
+    if paths.is_empty() && prefixes.is_empty() {
         return WorkOutcome::Done;
     }
 
@@ -730,11 +817,45 @@ fn handle_removals(config: &StateWatcherConfig, paths: &[String]) -> WorkOutcome
         }
     };
 
+    // Resolve queued directory prefixes into concrete indexed paths under
+    // the lock: a concurrent indexer can commit new rows under a prefix
+    // right up until the lock is ours, and a pre-lock snapshot would miss
+    // them while the caller clears the prefix.
+    let mut candidates: Vec<String> = paths.to_vec();
+    if !prefixes.is_empty() {
+        let Some(expanded) = expand_removed_prefixes(&config.db_path, prefixes) else {
+            return WorkOutcome::Failed;
+        };
+        for p in expanded {
+            if !candidates.contains(&p) {
+                candidates.push(p);
+            }
+        }
+    }
+
+    // A path that exists on disk was re-created after its removal was queued
+    // (git checkout back-and-forth, atomic-save editors). Deleting its rows
+    // would silently drop a live file's symbols/chunks for the session, so
+    // only purge paths that are genuinely gone.
+    let to_remove: Vec<String> = candidates
+        .into_iter()
+        .filter(|p| !config.project_root.join(p).exists())
+        .collect();
+    if to_remove.is_empty() {
+        return WorkOutcome::Done;
+    }
+
     purge_index_rows(config, &to_remove)
 }
 
 fn purge_index_rows(config: &StateWatcherConfig, paths: &[String]) -> WorkOutcome {
-    let db = match Database::open(&config.db_path) {
+    // A reset deleted index.db: there are no rows to purge, and the open
+    // must not recreate the database (warm-state existence checks would
+    // pass again).
+    if !config.db_path.exists() {
+        return WorkOutcome::Done;
+    }
+    let db = match Database::open_existing(&config.db_path) {
         Ok(db) => db,
         Err(e) => {
             tracing::warn!(error = %e, "opening DB for removal");
@@ -930,15 +1051,17 @@ fn apply_bulk_outcome(
 }
 
 /// Apply a removal pass outcome to the accumulated removal state, returning
-/// when (if at all) the removal should be retried. `Done` clears the paths and
-/// resets the failure counter. `Skipped` (transient lock contention) keeps the
-/// paths and reschedules without counting toward the give-up ceiling. `Failed`
-/// counts toward the ceiling; after `MAX_REMOVAL_FAILURES` consecutive hard
-/// failures it gives up — clearing the paths so the loop stops reporting
-/// activity and the watcher can idle out instead of pinning the pooled model.
+/// when (if at all) the removal should be retried. `Done` clears the paths
+/// and prefixes and resets the failure counter. `Skipped` (transient lock
+/// contention) keeps the state and reschedules without counting toward the
+/// give-up ceiling. `Failed` counts toward the ceiling; after
+/// `MAX_REMOVAL_FAILURES` consecutive hard failures it gives up — clearing
+/// the state so the loop stops reporting activity and the watcher can idle
+/// out instead of pinning the pooled model.
 fn apply_removal_outcome(
     outcome: WorkOutcome,
     removed_paths: &mut Vec<String>,
+    removed_prefixes: &mut Vec<String>,
     fail_count: &mut u32,
     now: Instant,
     debounce: Duration,
@@ -946,6 +1069,7 @@ fn apply_removal_outcome(
     match outcome {
         WorkOutcome::Done => {
             removed_paths.clear();
+            removed_prefixes.clear();
             *fail_count = 0;
             None
         }
@@ -956,10 +1080,12 @@ fn apply_removal_outcome(
                 tracing::error!(
                     failures = *fail_count,
                     paths = ?removed_paths,
+                    prefixes = ?removed_prefixes,
                     "giving up on index removals after repeated hard failures; \
                      index may retain stale rows until the next full reindex"
                 );
                 removed_paths.clear();
+                removed_prefixes.clear();
                 *fail_count = 0;
                 None
             } else {
@@ -1055,6 +1181,107 @@ fn watch_tree(watcher: &mut RecommendedWatcher, root: &Path, filter: &WatchFilte
             tracing::warn!(path = %path.display(), error = %e, "watching subtree");
         }
     }
+}
+
+/// Event kinds that can introduce a directory needing adoption. A rename
+/// into the tree arrives as `Modify(Name(To))` (inotify MOVED_TO), never
+/// as `Create` — matching `Create` alone would leave a `mv dir project/`
+/// tree unwatched forever.
+fn is_dir_adoption_kind(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(_))
+    )
+}
+
+/// Cap on directory entries examined during an adoption scan. The scan runs
+/// synchronously on the event loop and a renamed-in tree can be arbitrarily
+/// large; past this, one bulk reconciliation pass is cheaper than walking.
+const ADOPTION_SCAN_ENTRY_CAP: usize = 2048;
+
+/// Outcome of an adoption scan over a newly appeared directory.
+#[derive(Debug, PartialEq, Eq)]
+enum DirScan {
+    /// Every non-ignored source file under the directory, root-relative.
+    Files(Vec<PathBuf>),
+    /// The tree holds at least `file_threshold` source files (or blew the
+    /// entry cap): enqueueing per file would cross the bulk threshold
+    /// anyway, so the caller should schedule one bulk pass instead.
+    OverThreshold,
+}
+
+/// Non-ignored source files under a newly appeared directory, as
+/// root-relative paths. Watch registration races population: no backend
+/// replays files that landed before the watch existed, and a directory
+/// renamed in arrives fully populated with no per-file events at all.
+fn scan_dir_source_files(
+    root: &Path,
+    dir: &Path,
+    filter: &WatchFilter,
+    file_threshold: usize,
+) -> DirScan {
+    let mut found = Vec::new();
+    if dir.strip_prefix(root).is_err() || filter.is_ignored(dir, true) {
+        return DirScan::Files(found);
+    }
+    let mut examined = 0usize;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let entries = match std::fs::read_dir(&d) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            examined += 1;
+            if examined > ADOPTION_SCAN_ENTRY_CAP {
+                return DirScan::OverThreshold;
+            }
+            let path = entry.path();
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if is_dir {
+                if !filter.is_ignored(&path, true) {
+                    stack.push(path);
+                }
+            } else if let Ok(rel) = path.strip_prefix(root)
+                && is_source_file(rel)
+                && !filter.is_ignored(&path, false)
+            {
+                found.push(rel.to_path_buf());
+                if found.len() >= file_threshold {
+                    return DirScan::OverThreshold;
+                }
+            }
+        }
+    }
+    DirScan::Files(found)
+}
+
+/// Indexed paths at or under any of the given root-relative prefixes.
+/// `None` when the index exists but can't be read — the caller retains the
+/// prefixes and retries. A missing database has nothing to purge, and the
+/// probe must not recreate it (a reset deletes `index.db`).
+fn expand_removed_prefixes(db_path: &Path, prefixes: &[String]) -> Option<Vec<String>> {
+    if !db_path.exists() {
+        return Some(Vec::new());
+    }
+    let db = Database::open_existing(db_path).ok()?;
+    let all = db.all_file_paths().ok()?;
+    Some(
+        all.into_iter()
+            .filter(|p| {
+                prefixes.iter().any(|pre| {
+                    p == pre || (p.starts_with(pre.as_str()) && p[pre.len()..].starts_with('/'))
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The root's canonical spelling, or the given one when resolution fails
+/// (the caller's spelling still works for a root that exists but can't be
+/// canonicalized, e.g. permission-restricted ancestors).
+fn canonical_root(root: &Path) -> PathBuf {
+    std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
 }
 
 /// Extend the watch set when a new top-level directory appears. Deeper new
@@ -1377,11 +1604,13 @@ mod tests {
         let debounce = Duration::from_millis(500);
         let now = Instant::now();
         let mut removed = vec!["gone.rs".to_string()];
+        let mut prefixes = vec!["gonedir".to_string()];
         let mut fails = 0;
 
         let retry = apply_removal_outcome(
             WorkOutcome::Skipped,
             &mut removed,
+            &mut prefixes,
             &mut fails,
             now,
             debounce,
@@ -1389,6 +1618,7 @@ mod tests {
 
         assert_eq!(retry, Some(now + debounce));
         assert_eq!(removed, vec!["gone.rs".to_string()]);
+        assert_eq!(prefixes, vec!["gonedir".to_string()]);
         // Lock contention is not a hard failure — the give-up ceiling stays put.
         assert_eq!(fails, 0);
     }
@@ -1398,22 +1628,37 @@ mod tests {
         let debounce = Duration::from_millis(500);
         let now = Instant::now();
         let mut removed = vec!["gone.rs".to_string()];
+        let mut prefixes = vec!["gonedir".to_string()];
         let mut fails = 0;
 
-        // Every hard failure short of the ceiling retains the paths and reschedules.
+        // Every hard failure short of the ceiling retains the state and reschedules.
         for _ in 0..(MAX_REMOVAL_FAILURES - 1) {
-            let retry =
-                apply_removal_outcome(WorkOutcome::Failed, &mut removed, &mut fails, now, debounce);
+            let retry = apply_removal_outcome(
+                WorkOutcome::Failed,
+                &mut removed,
+                &mut prefixes,
+                &mut fails,
+                now,
+                debounce,
+            );
             assert_eq!(retry, Some(now + debounce));
             assert_eq!(removed.len(), 1);
+            assert_eq!(prefixes.len(), 1);
         }
 
-        // The ceiling hit: give up, drop the paths so the loop stops reporting
+        // The ceiling hit: give up, drop the state so the loop stops reporting
         // activity and the watcher can idle out instead of pinning the model.
-        let retry =
-            apply_removal_outcome(WorkOutcome::Failed, &mut removed, &mut fails, now, debounce);
+        let retry = apply_removal_outcome(
+            WorkOutcome::Failed,
+            &mut removed,
+            &mut prefixes,
+            &mut fails,
+            now,
+            debounce,
+        );
         assert_eq!(retry, None);
         assert!(removed.is_empty());
+        assert!(prefixes.is_empty());
         assert_eq!(fails, 0);
     }
 
@@ -1422,13 +1667,21 @@ mod tests {
         let debounce = Duration::from_millis(500);
         let now = Instant::now();
         let mut removed = vec!["gone.rs".to_string()];
+        let mut prefixes = vec!["gonedir".to_string()];
         let mut fails = 3;
 
-        let retry =
-            apply_removal_outcome(WorkOutcome::Done, &mut removed, &mut fails, now, debounce);
+        let retry = apply_removal_outcome(
+            WorkOutcome::Done,
+            &mut removed,
+            &mut prefixes,
+            &mut fails,
+            now,
+            debounce,
+        );
 
         assert_eq!(retry, None);
         assert!(removed.is_empty());
+        assert!(prefixes.is_empty());
         assert_eq!(fails, 0);
     }
 
@@ -1441,7 +1694,7 @@ mod tests {
 
         let _held = hold_lock(root);
         let paths = vec!["gone.rs".to_string()];
-        assert_eq!(handle_removals(&config, &paths), WorkOutcome::Skipped);
+        assert_eq!(handle_removals(&config, &paths, &[]), WorkOutcome::Skipped);
     }
 
     #[test]
@@ -1451,10 +1704,9 @@ mod tests {
         std::fs::create_dir_all(root.join(".codesage")).unwrap();
         let config = test_config(root);
 
-        // `Database::open` creates the schema on a fresh path; removing
-        // paths absent from the index is a no-op success.
+        // No index.db on a fresh path: nothing to purge, no-op success.
         let paths = vec!["gone.rs".to_string()];
-        assert_eq!(handle_removals(&config, &paths), WorkOutcome::Done);
+        assert_eq!(handle_removals(&config, &paths, &[]), WorkOutcome::Done);
     }
 
     #[test]
@@ -1481,7 +1733,7 @@ mod tests {
         // foo.rs is present on disk, so the removal is a no-op and the rows
         // survive.
         assert_eq!(
-            handle_removals(&config, &["foo.rs".to_string()]),
+            handle_removals(&config, &["foo.rs".to_string()], &[]),
             WorkOutcome::Done
         );
         let db = Database::open(&config.db_path).unwrap();
@@ -1910,7 +2162,7 @@ mod tests {
         // main.cpp is not on disk, so the removal pass purges its row; the
         // remaining set (one bare header) no longer proves C++.
         assert_eq!(
-            handle_removals(&config, &["src/main.cpp".to_string()]),
+            handle_removals(&config, &["src/main.cpp".to_string()], &[]),
             WorkOutcome::Done
         );
         assert!(
@@ -2183,5 +2435,263 @@ mod tests {
         std::fs::remove_file(watch_disabled_path(&dir)).unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overflow_arrives_as_ok_event_with_rescan_flag() {
+        // notify's inotify backend surfaces Q_OVERFLOW (and FSEvents its
+        // must-scan-subdirs flag) as Ok(Event{kind: Other, flag: Rescan}),
+        // never through the Err arm — the loop's catch-up must key on
+        // need_rescan(), not only on forwarded errors.
+        // Path attachment differs by backend (inotify none, FSEvents the
+        // affected path); only the flag is the contract.
+        let overflow = Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        assert!(overflow.need_rescan());
+        assert!(!Event::new(EventKind::Other).need_rescan());
+    }
+
+    #[test]
+    fn dir_adoption_matches_create_and_rename_events() {
+        use notify::event::{CreateKind, DataChange, MetadataKind, RemoveKind, RenameMode};
+
+        assert!(is_dir_adoption_kind(&EventKind::Create(CreateKind::Folder)));
+        assert!(is_dir_adoption_kind(&EventKind::Create(CreateKind::File)));
+        // inotify MOVED_TO: a directory renamed into the tree.
+        assert!(is_dir_adoption_kind(&EventKind::Modify(ModifyKind::Name(
+            RenameMode::To
+        ))));
+        assert!(is_dir_adoption_kind(&EventKind::Modify(ModifyKind::Name(
+            RenameMode::Both
+        ))));
+        // Content edits and removals never introduce a directory.
+        assert!(!is_dir_adoption_kind(&EventKind::Modify(ModifyKind::Data(
+            DataChange::Content
+        ))));
+        assert!(!is_dir_adoption_kind(&EventKind::Modify(
+            ModifyKind::Metadata(MetadataKind::WriteTime)
+        )));
+        assert!(!is_dir_adoption_kind(&EventKind::Remove(
+            RemoveKind::Folder
+        )));
+    }
+
+    #[test]
+    fn scan_dir_source_files_collects_nested_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("newdir/sub")).unwrap();
+        std::fs::write(root.join("newdir/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.join("newdir/sub/b.go"), "package b\n").unwrap();
+        std::fs::write(root.join("newdir/notes.md"), "n\n").unwrap();
+        let filter = WatchFilter::new(root, &[]).unwrap();
+
+        let DirScan::Files(mut found) =
+            scan_dir_source_files(root, &root.join("newdir"), &filter, BATCH_THRESHOLD)
+        else {
+            panic!("small tree must stay under the threshold");
+        };
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                PathBuf::from("newdir/a.rs"),
+                PathBuf::from("newdir/sub/b.go")
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_dir_source_files_over_threshold_requests_bulk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("newdir")).unwrap();
+        for i in 0..3 {
+            std::fs::write(root.join(format!("newdir/f{i}.rs")), "fn f() {}\n").unwrap();
+        }
+        let filter = WatchFilter::new(root, &[]).unwrap();
+
+        assert_eq!(
+            scan_dir_source_files(root, &root.join("newdir"), &filter, 3),
+            DirScan::OverThreshold
+        );
+        // One under the threshold still enumerates.
+        assert!(matches!(
+            scan_dir_source_files(root, &root.join("newdir"), &filter, 4),
+            DirScan::Files(f) if f.len() == 3
+        ));
+    }
+
+    #[test]
+    fn scan_dir_source_files_skips_ignored_and_hidden_subtrees() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("newdir/vendor")).unwrap();
+        std::fs::create_dir_all(root.join("newdir/.git")).unwrap();
+        std::fs::write(root.join("newdir/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.join("newdir/vendor/v.rs"), "fn v() {}\n").unwrap();
+        std::fs::write(root.join("newdir/.git/g.rs"), "fn g() {}\n").unwrap();
+        let filter = WatchFilter::new(root, &["**/vendor/**".to_string()]).unwrap();
+
+        assert_eq!(
+            scan_dir_source_files(root, &root.join("newdir"), &filter, BATCH_THRESHOLD),
+            DirScan::Files(vec![PathBuf::from("newdir/a.rs")])
+        );
+    }
+
+    #[test]
+    fn scan_dir_source_files_rejects_outside_root_and_ignored_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("x.rs"), "fn x() {}\n").unwrap();
+        std::fs::write(root.join("target/t.rs"), "fn t() {}\n").unwrap();
+        let filter = WatchFilter::new(&root, &["**/target/**".to_string()]).unwrap();
+
+        assert_eq!(
+            scan_dir_source_files(&root, &outside, &filter, BATCH_THRESHOLD),
+            DirScan::Files(vec![])
+        );
+        assert_eq!(
+            scan_dir_source_files(&root, &root.join("target"), &filter, BATCH_THRESHOLD),
+            DirScan::Files(vec![])
+        );
+    }
+
+    #[test]
+    fn expand_removed_prefixes_matches_on_path_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        let config = test_config(root);
+
+        let db = Database::open(&config.db_path).unwrap();
+        for path in ["foo/a.rs", "foo/bar/b.rs", "foobar/c.rs", "other.rs"] {
+            db.upsert_file(&FileInfo {
+                path: path.to_string(),
+                language: codesage_protocol::Language::Rust,
+                content_hash: "x".to_string(),
+            })
+            .unwrap();
+        }
+        drop(db);
+
+        let mut expanded = expand_removed_prefixes(&config.db_path, &["foo".to_string()]).unwrap();
+        expanded.sort();
+        // "foobar/c.rs" shares the byte prefix but not the path boundary.
+        assert_eq!(
+            expanded,
+            vec!["foo/a.rs".to_string(), "foo/bar/b.rs".to_string()]
+        );
+
+        assert!(
+            expand_removed_prefixes(&config.db_path, &["nomatch".to_string()])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn expand_removed_prefixes_missing_db_is_empty_and_not_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        let db_path = root.join(".codesage").join("index.db");
+
+        let expanded = expand_removed_prefixes(&db_path, &["foo".to_string()]).unwrap();
+        assert!(expanded.is_empty());
+        assert!(
+            !db_path.exists(),
+            "the prefix expansion must not resurrect a reset index"
+        );
+    }
+
+    #[test]
+    fn handle_removals_expands_prefix_and_purges_descendants() {
+        // A directory moved out of the tree queues one prefix; the removal
+        // pass must resolve and purge every indexed row under it while
+        // sparing files that exist on disk (re-created after the move).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        std::fs::create_dir_all(root.join("keep")).unwrap();
+        std::fs::write(root.join("keep/alive.rs"), "fn a() {}\n").unwrap();
+        let config = test_config(root);
+
+        let db = Database::open(&config.db_path).unwrap();
+        for path in ["gone/a.rs", "gone/sub/b.rs", "keep/alive.rs"] {
+            db.upsert_file(&FileInfo {
+                path: path.to_string(),
+                language: codesage_protocol::Language::Rust,
+                content_hash: "x".to_string(),
+            })
+            .unwrap();
+        }
+        drop(db);
+
+        assert_eq!(
+            handle_removals(&config, &[], &["gone".to_string(), "keep".to_string()]),
+            WorkOutcome::Done
+        );
+
+        let db = Database::open(&config.db_path).unwrap();
+        assert!(db.get_file_hash("gone/a.rs").unwrap().is_none());
+        assert!(db.get_file_hash("gone/sub/b.rs").unwrap().is_none());
+        assert!(
+            db.get_file_hash("keep/alive.rs").unwrap().is_some(),
+            "a file present on disk must survive a prefix purge"
+        );
+    }
+
+    #[test]
+    fn handle_removals_prefix_deferred_when_lock_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        let config = test_config(root);
+
+        // The lock is checked before any expansion, so a held lock defers
+        // the whole pass and the caller keeps the prefixes queued.
+        let _held = hold_lock(root);
+        assert_eq!(
+            handle_removals(&config, &[], &["gone".to_string()]),
+            WorkOutcome::Skipped
+        );
+    }
+
+    #[test]
+    fn purge_missing_db_is_done_and_not_recreated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        let config = test_config(root);
+
+        // "gone.rs" is absent on disk, so the purge path runs — against a
+        // reset (missing) index.db it must succeed as a no-op without
+        // resurrecting the database.
+        assert_eq!(
+            handle_removals(&config, &["gone.rs".to_string()], &[]),
+            WorkOutcome::Done
+        );
+        assert!(
+            !config.db_path.exists(),
+            "a removal against a reset index must not recreate index.db"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_root_resolves_symlinked_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        let link = tmp.path().join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert_eq!(canonical_root(&link), std::fs::canonicalize(&real).unwrap());
+        // A vanished root falls back to the given spelling.
+        let gone = tmp.path().join("gone");
+        assert_eq!(canonical_root(&gone), gone);
     }
 }
