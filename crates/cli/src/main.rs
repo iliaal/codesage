@@ -48,7 +48,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Initialize CodeSage for the current project
-    Init,
+    Init {
+        /// Initialize even in a directory codesage would refuse (filesystem
+        /// root, home directory, credential directories)
+        #[arg(long)]
+        force: bool,
+    },
     /// Index the project (incremental by default). Use --full to reindex everything,
     /// --no-semantic to skip embeddings, --verbose for per-phase progress via tracing.
     Index {
@@ -892,7 +897,7 @@ fn run(cli: Cli) -> Result<()> {
     use commands::{features, hooks, index, query, risk, runtime, session};
 
     match cli.command {
-        Commands::Init => runtime::cmd_init(),
+        Commands::Init { force } => runtime::cmd_init(force),
         Commands::Index {
             full,
             no_semantic,

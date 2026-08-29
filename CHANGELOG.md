@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Added
+
+- `codesage init` refuses to initialize in the filesystem root, the home directory, or credential directories (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.docker`, `~/.password-store`); `--force` overrides with a warning.
+
 ### Changed
 
 - Upgrade the `rmcp` MCP SDK to 3.x (MCP 2026-07-28 spec model types). Clients negotiating 2026-07-28 now receive the spec's `resultType` field on `tools/list` and `tools/call`; wire output for 2024-11-05 / 2025-06-18 / 2025-11-25 is unchanged.

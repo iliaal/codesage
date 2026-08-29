@@ -146,8 +146,60 @@ pub(crate) fn cmd_uninstall(target: &str, global: bool) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_init() -> Result<()> {
+/// Directories under `$HOME` that hold credentials or key material. Indexing
+/// one would embed secrets into a same-UID-readable index, so `init` refuses
+/// them without `--force`.
+const SENSITIVE_HOME_DIRS: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".kube",
+    ".docker",
+    ".password-store",
+];
+
+/// Why a directory is refused as an indexing root, or `None` if acceptable.
+///
+/// Both sides are canonicalized so a symlinked `$HOME` or credential dir
+/// doesn't dodge a lexical comparison. Foot-gun protection, not a security
+/// boundary — `--force` bypasses it by design.
+fn init_root_refusal(cwd: &std::path::Path) -> Option<String> {
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    if cwd.parent().is_none() {
+        return Some("the filesystem root".to_string());
+    }
+    let home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(std::path::PathBuf::from)?;
+    let home = home.canonicalize().unwrap_or(home);
+    if cwd == home {
+        return Some("your home directory".to_string());
+    }
+    for dir in SENSITIVE_HOME_DIRS {
+        let sensitive = home.join(dir);
+        let sensitive = sensitive.canonicalize().unwrap_or(sensitive);
+        if cwd.starts_with(&sensitive) {
+            return Some(format!("~/{dir}, which holds credentials"));
+        }
+    }
+    None
+}
+
+pub(crate) fn cmd_init(force: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
+
+    if let Some(reason) = init_root_refusal(&cwd) {
+        if force {
+            eprintln!("warning: initializing in {reason} (--force)");
+        } else {
+            bail!(
+                "refusing to initialize in {reason}: indexing here would embed \
+                 everything readable below it into a queryable index. Run from \
+                 the project root instead, or pass --force to override."
+            );
+        }
+    }
+
     let project_dir = cwd.join(PROJECT_DIR);
 
     match std::fs::symlink_metadata(&project_dir) {
@@ -346,5 +398,20 @@ mod tests {
         );
         assert_eq!(toml_basic_string("line\nfeed"), "\"line\\nfeed\"");
         assert_eq!(toml_basic_string("del\u{7f}"), "\"del\\u007F\"");
+    }
+
+    #[test]
+    fn init_refuses_dangerous_roots() {
+        assert!(init_root_refusal(std::path::Path::new("/")).is_some());
+        if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+            assert!(init_root_refusal(&home).is_some());
+            assert!(init_root_refusal(&home.join(".ssh")).is_some());
+            assert!(init_root_refusal(&home.join(".aws/config-dir")).is_some());
+            assert!(init_root_refusal(&home.join("projects/app")).is_none());
+            // A directory that merely shares a name prefix with a sensitive
+            // dir must not be refused (.sshfs is not .ssh).
+            assert!(init_root_refusal(&home.join(".sshfs")).is_none());
+        }
+        assert!(init_root_refusal(std::path::Path::new("/tmp/some/project")).is_none());
     }
 }
