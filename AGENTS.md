@@ -145,6 +145,7 @@ PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go.
 - `find_references` -- references to a symbol; each row's `from_symbol` names the enclosing caller (null at file scope)
 - `find_similar` -- near-clone detection: functions/methods structurally similar to a named one (MinHash over AST shape, identifiers/literals ignored), ranked by Jaccard. Test files excluded. Needs fingerprints from a reindex.
 - `list_dependencies` -- file-level imports/imported-by
+- `trace_call_path` -- shortest call chain from one symbol to another, breadth-first over resolved callee edges. Each step names the symbol, its file:line, and `call_line` (the line in the previous step's body where it is invoked). `found: false` carries `note` and `bounded`; `bounded: true` means the search stopped at a limit, so an empty answer is not proof no path exists.
 - `impact_analysis` -- files affected by changing a symbol or file, with distance and reasons. Opt-in `include_forward` (forward deps), `include_siblings` (same-file symbols), `limit`, and `summary_only` controls; result is an object with `results` plus the requested extras.
 - `export_context` -- curated code bundle for a query or symbol, optionally with callers/callees
 - `find_coupling` -- files that historically change with a given file (V2b)
@@ -188,7 +189,7 @@ The daemon writes tracing to `mcp-<version>-<key>.log` in the runtime dir; check
 
 ## CLI commands
 
-`init`, `index`, `overview`, `search`, `find-symbol`, `find-references`, `dependencies`, `impact`, `export`, `status`, `mcp`, `daemon`, `watch`, `install-hooks`, `install`, `uninstall`, `cleanup`, `git-index`, `coupling`, `risk`, `risk-batch`, `risk-diff`, `similar`, `tests-for`, `rehearse`, `session-start`, `session-end`, `doctor`, `map`, `features-list`, `feature-show`, `feature-for`, `feature-bundle`, `trust-boundaries`.
+`init`, `index`, `overview`, `search`, `find-symbol`, `find-references`, `dependencies`, `impact`, `trace`, `export`, `status`, `mcp`, `daemon`, `watch`, `install-hooks`, `install`, `uninstall`, `cleanup`, `git-index`, `coupling`, `risk`, `risk-batch`, `risk-diff`, `similar`, `tests-for`, `rehearse`, `session-start`, `session-end`, `doctor`, `map`, `features-list`, `feature-show`, `feature-for`, `feature-bundle`, `trust-boundaries`.
 
 `watch run|status|stop|start [project]` controls the live filesystem watcher. The daemon auto-starts a per-project watcher on the first MCP tool call for that project (reusing the daemon's pooled embedder), debounces edits, and reindexes structural + semantic on change; it self-exits after idle (`CODESAGE_WATCH_IDLE_SECS`) and is reaped on daemon shutdown. Disable per project with `[index] watch = false` or globally with `CODESAGE_WATCH=0`. `watch run` is a foreground instance with its own embedder for debugging; `watch stop` writes a `.codesage/watch.disabled` marker the running watcher honors; `watch start` clears it. The watcher complements the git hooks, it does not replace them: it refreshes structural + semantic content live during a session, but git history intelligence (`git-index`, feeding `assess_risk` / `find_coupling`) and feature mapping still refresh only via the hooks or a full `codesage index`, and the watcher only runs while a daemon is alive.
 
@@ -227,7 +228,7 @@ Three modes, selected via flags on `codesage git-index`:
 Two MCP tools consume the tables:
 
 - `find_coupling(project, file_path, limit)` -- top-N files that historically change together with the input, weight-sorted. CLI: `codesage coupling <file>`.
-- `assess_risk(project, file_path)` -- composite risk score (0..1) from churn percentile + fix ratio + depth-2 reverse-dep pressure + coupling pressure + test gap. Returns decomposition and human-readable notes for PR descriptions. CLI: `codesage risk <file>`.
+- `assess_risk(project, file_path, verbose?)` -- composite risk score (0..1) from churn percentile + fix ratio + depth-2 reverse-dep pressure + coupling pressure + test gap. Returns the score plus human-readable notes for PR descriptions; `verbose: true` (shared with `assess_risk_batch` / `assess_risk_diff`) adds the per-signal decomposition and `top_coupled`. CLI: `codesage risk <file>` (always verbose).
 
 The indexer filters the same `DEFAULT_EXCLUDE_PATTERNS` as the structural indexer, plus NEWS/UPGRADING/CHANGELOG variants (they touch every commit so they pollute coupling).
 
@@ -267,3 +268,39 @@ V2b shipped (0.7.0): feature-slice mapping + trust-boundary derivation + `output
 V2b slice 2 (next): `bus_factor`, `change_pattern`, `find_hotspots` MCP tools. Conditional on slice 1 validating on large real codebases.
 
 V2c (deferred): docs/decision layer (process traces, architecture summaries). Revisited after V2b slice 2 lands.
+
+<!-- BEGIN beads-managed (br v6) -->
+## Beads ledger (`br`)
+
+This repo is onboarded to the central `br` ledger. A PATH wrapper routes every
+`br` call from here into a private store under `~/ai/beads/<slug>/`; this work tree
+carries **no** `.beads` artifacts (do not create any). Full protocol lives in
+`~/ai/wiki/tools/beads-review-ledger.md`.
+
+**Allowed commands** (the wrapper denies everything else): `create update comments
+close reopen list show count stats search where info`, `doctor health`,
+`sync --import-only|--status`, `config get|list`. Never pass `--db`,
+`--no-auto-flush`, `--no-auto-import`, `--no-db`, `--allow-stale`, or `--prefix`.
+
+**JSON envelopes**: `br list --json` → `{issues, total}`; `br show ID --json` →
+a one-element array with comments under `.[0].comments`. Pipe `br` JSON to `jq`
+only as `rtk proxy br … | rtk proxy jq …` (raw, unfiltered output).
+
+**Finding schema** (review-cycle records):
+- Native status `open`/`closed` only — `in_progress` is banned (it silently
+  disappears from `--status open`). Priority is severity: P0 critical, P1
+  important, P2 minor.
+- Exactly one `type:{security|correctness|memory|perf|build|test|style}` label and
+  one `cycle:<id>` label. Open findings carry exactly one
+  `state:{proposed|disputed|fixed|needs-human}`; closed findings carry no `state:*`
+  and a `close_reason` of `fixed|false-positive|wont-fix|duplicate`.
+- Description first line is `file: <path>:<line>`, repo-relative.
+- Attribution: `br create --actor <id>`, `br comments add --author <id>`.
+- Closing is two steps (0.2.19 refuses a terminal status in `update`): first
+  `br update ID` clearing `state:*` and the assignee, then `br close ID --reason <r>`.
+- Never `--set-labels` (it erases other labels); use `--add-label`/`--remove-label`.
+
+**Human gate** — create as `state:needs-human` and get pre-change approval for: P0,
+`type:security`, `type:memory`, destructive operations, schema/data migrations, or
+public API changes.
+<!-- END beads-managed (br v6) -->
