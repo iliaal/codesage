@@ -15,6 +15,7 @@
 
 ### Fixed
 
+- MCP budget truncation trims every oversized array largest-first until the response fits, instead of only the single largest one; `session_end`, `export_context`, `feature_bundle`, `impact_analysis`, `list_dependencies`, and `recommend_tests` could previously exceed the budget through their second and third arrays. Extra trims are reported in `_meta.also_truncated_fields` as `name (kept/total)`.
 - Watcher: an inotify queue overflow or FSEvents must-rescan now triggers the catch-up reindex (notify delivers both as a flagged event, not an error, so the 0.18.0 catch-up never fired on real overflow); a directory moved or renamed out of the tree purges every indexed file beneath it instead of leaving ghost rows; a directory renamed or moved in is adopted and its pre-existing files queued, with oversized adoptions routed to one bulk pass; a symlinked project root is canonicalized so macOS FSEvents paths match; the removal path never recreates a deleted `index.db`.
 
 ### Security

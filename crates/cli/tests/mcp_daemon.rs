@@ -1026,6 +1026,543 @@ fn tools_call_search_round_trips_tool_error_without_protocol_failure() {
     );
 }
 
+/// Every tool that advertises an `outputSchema` must answer a representative
+/// successful call with a **populated, data-bearing** `structuredContent`.
+///
+/// Claude Code treats `structuredContent` as THE result once a tool declares
+/// an output schema, so a tool that ships `{}` there renders as an empty
+/// object no matter how good its text block is.
+///
+/// Two things make this test non-vacuous, and both matter:
+///
+/// 1. The fixture (see [`onboard_rich_fixture`]) carries real data for every
+///    tool — git history with a co-change pair, a sibling test file, a Python
+///    import chain with edges in both directions, a near-clone pair, seeded
+///    semantic chunks. Against a bare `src/lib.rs`, half this surface answers
+///    `{"results": []}` or `{"found": false}`, which is a populated object and
+///    would pass a shape-only assertion without ever running the tool's
+///    data-bearing branch.
+/// 2. Each tool names the specific keys that must be non-empty, not just "some
+///    non-`_meta` key exists".
+///
+/// Tools with a real precondition are driven through it rather than exempted:
+/// `feature_bundle` gets an id resolved from `list_features`, and `session_end`
+/// runs after `session_start` plus an actual tree change and reindex.
+#[test]
+fn every_schema_bearing_tool_returns_populated_structured_content() {
+    let project = tempfile::tempdir().unwrap();
+    onboard_rich_fixture(project.path());
+    seed_fixture_chunks(project.path());
+    let root = project.path().display().to_string();
+
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut session = McpSession::start_with_env(
+        runtime.path(),
+        // Lets `search` run without a model download; the seeded chunk table
+        // is 4-dimensional to match.
+        &[("CODESAGE_MCP_TEST_QUERY_EMBEDDING", "0.1,0.2,0.3,0.4")],
+    );
+    session.initialize();
+
+    let listed = session.request(
+        2,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+    );
+    let advertised: Vec<String> = listed["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("tools/list must return an array: {listed}"))
+        .iter()
+        .filter(|t| t.get("outputSchema").is_some())
+        .map(|t| t["name"].as_str().expect("tool name").to_string())
+        .collect();
+    assert!(
+        !advertised.is_empty(),
+        "no tool advertises an outputSchema: {listed}"
+    );
+
+    // Feature ids are content hashes, so `feature_bundle` has to be handed a
+    // real one — a made-up id lands on the `found: false` branch, which is a
+    // populated object too and would never exercise the loaded-bundle path.
+    let features = session.request(
+        3,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"list_features","arguments":{{"project":"{root}"}}}}}}"#
+        ),
+    );
+    let feature_id = features["result"]["structuredContent"]["results"][0]["feature_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("fixture Cargo.toml should map a library feature: {features}"))
+        .to_string();
+
+    // (tool, arguments, keys that must carry data). `session_end` must follow
+    // `session_start` on the same id, so the table is ordered, not a map.
+    let calls: Vec<(&str, Value, &[&str])> = vec![
+        (
+            "project_overview",
+            serde_json::json!({}),
+            // `top_risk_files` is empty until git history is indexed, so it
+            // doubles as proof the fixture's git-index pass took effect.
+            &["languages", "file_count", "top_risk_files", "entrypoints"],
+        ),
+        (
+            "review_rehearsal",
+            serde_json::json!({"file_paths": ["src/helper.rs"]}),
+            &["files", "objections", "summary_notes"],
+        ),
+        (
+            "find_symbol",
+            serde_json::json!({"name": "outer_step"}),
+            &["results"],
+        ),
+        (
+            "find_references",
+            serde_json::json!({"name": "inner_step"}),
+            &["results"],
+        ),
+        (
+            "find_similar",
+            serde_json::json!({"name": "twin_a"}),
+            &["results"],
+        ),
+        (
+            "list_dependencies",
+            // The one fixture file with edges in BOTH directions: it imports
+            // `py/util.py` and is imported by `py/main.py`. Rust `use crate::`
+            // paths do not resolve back to files, so a Rust-only fixture
+            // leaves `imported_by` empty on every file.
+            serde_json::json!({"file_path": "py/app.py"}),
+            &["imports", "imported_by"],
+        ),
+        (
+            "search",
+            serde_json::json!({"query": "shared value helper", "limit": 3}),
+            &["results"],
+        ),
+        (
+            "trace_call_path",
+            serde_json::json!({"from": "outer_step", "to": "inner_step"}),
+            &["found", "steps", "length"],
+        ),
+        (
+            "impact_analysis",
+            serde_json::json!({"target": "inner_step"}),
+            &["results"],
+        ),
+        (
+            "export_context",
+            serde_json::json!({"target": "outer_step", "is_symbol": true}),
+            &["symbol_definitions", "primary"],
+        ),
+        (
+            "find_coupling",
+            serde_json::json!({"file_path": "src/helper.rs"}),
+            &["found", "coupled", "file_commits"],
+        ),
+        (
+            "assess_risk",
+            serde_json::json!({"file_path": "src/helper.rs"}),
+            &["found", "score", "notes", "top_coupled", "top_symbols"],
+        ),
+        (
+            "assess_risk_diff",
+            serde_json::json!({"file_paths": ["src/helper.rs", "src/util.rs"]}),
+            &["files", "max_score", "max_risk_file", "summary_notes"],
+        ),
+        (
+            "assess_risk_batch",
+            serde_json::json!({"file_paths": ["src/helper.rs", "src/util.rs"]}),
+            &["files"],
+        ),
+        (
+            "recommend_tests",
+            serde_json::json!({"file_paths": ["src/helper.rs"]}),
+            &["primary", "notes"],
+        ),
+        ("list_features", serde_json::json!({}), &["results"]),
+        (
+            "find_feature",
+            serde_json::json!({"file_path": "src/helper.rs"}),
+            &["results"],
+        ),
+        (
+            "feature_bundle",
+            serde_json::json!({"feature_id": feature_id}),
+            &["found", "target_description", "primary"],
+        ),
+        (
+            "session_start",
+            serde_json::json!({"session_id": "inv"}),
+            &["session_id", "file_count", "symbol_count", "snapshot_path"],
+        ),
+        (
+            "session_end",
+            serde_json::json!({"session_id": "inv"}),
+            // Non-empty only because the loop adds a file and reindexes right
+            // before this call; on an unchanged tree every array here is [].
+            &["session_id", "new_files", "summary_notes"],
+        ),
+    ];
+
+    let covered: Vec<String> = calls.iter().map(|(name, _, _)| name.to_string()).collect();
+    let mut missing: Vec<&String> = advertised
+        .iter()
+        .filter(|name| !covered.contains(name))
+        .collect();
+    missing.sort();
+    assert!(
+        missing.is_empty(),
+        "these tools advertise an outputSchema but have no representative call here: {missing:?}"
+    );
+
+    for (index, (tool, args, required)) in calls.iter().enumerate() {
+        if *tool == "session_end" {
+            // Drive the real precondition instead of exempting the tool: a
+            // session diff over an unchanged tree is all-empty by definition.
+            std::fs::write(
+                project.path().join("src/added_mid_session.rs"),
+                "pub fn added_mid_session() -> u32 {\n    3\n}\n",
+            )
+            .unwrap();
+            append_line(
+                &project.path().join("src/lib.rs"),
+                "pub mod added_mid_session;",
+            );
+            run_codesage(project.path(), &["index", "--no-semantic"]);
+        }
+
+        let id = index as u64 + 10;
+        let mut arguments = args.as_object().expect("args object").clone();
+        arguments.insert("project".to_string(), Value::String(root.clone()));
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": tool, "arguments": arguments },
+        });
+        let resp = session.request(id, &request.to_string());
+
+        assert!(
+            resp.get("error").is_none(),
+            "{tool} must answer with a tool result, got JSON-RPC error: {resp}"
+        );
+        assert_ne!(
+            resp["result"]["isError"],
+            Value::Bool(true),
+            "{tool} representative call failed: {resp}"
+        );
+
+        let structured = resp["result"]["structuredContent"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{tool} must ship structuredContent as an object: {resp}"));
+        let payload_keys: Vec<&String> = structured.keys().filter(|k| *k != "_meta").collect();
+        assert!(
+            !payload_keys.is_empty(),
+            "{tool} shipped empty structuredContent, which Claude Code renders as `{{}}`: {resp}"
+        );
+        for key in *required {
+            let value = structured.get(*key).unwrap_or_else(|| {
+                panic!("{tool}: structuredContent has no `{key}`: {structured:?}")
+            });
+            assert!(
+                carries_data(value),
+                "{tool}: `{key}` carries no data ({value}) — the fixture is not exercising this \
+                 tool's data-bearing branch, so the assertion is vacuous"
+            );
+        }
+
+        // The text block must not disagree with the structured payload: an
+        // agent reading either one has to see the same facts. `_meta` is
+        // exempt — coverage and staleness annotations are merged into the
+        // structured value after the text is rendered, and their human-facing
+        // half is prepended as its own banner block.
+        let content = resp["result"]["content"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{tool} must ship a content array: {resp}"));
+        let text = content
+            .last()
+            .and_then(|c| c["text"].as_str())
+            .unwrap_or_else(|| panic!("{tool} last content block must be text: {resp}"));
+        let parsed: Value = serde_json::from_str(text)
+            .unwrap_or_else(|e| panic!("{tool} text block must be JSON ({e}): {text}"));
+        let from_text = parsed
+            .as_object()
+            .unwrap_or_else(|| panic!("{tool} text block must be a JSON object: {text}"));
+        for (key, value) in structured {
+            if key == "_meta" {
+                continue;
+            }
+            assert_eq!(
+                from_text.get(key),
+                Some(value),
+                "{tool}: text block disagrees with structuredContent on `{key}`"
+            );
+        }
+        for key in from_text.keys() {
+            if key == "_meta" {
+                continue;
+            }
+            assert!(
+                structured.contains_key(key),
+                "{tool}: `{key}` is in the text block but missing from structuredContent"
+            );
+        }
+    }
+}
+
+/// Whether a response field actually carries a result rather than the shape of
+/// one. `[]`, `""`, `{}`, `0`, `false` and `null` all mean "the tool ran but
+/// found nothing", which is exactly the vacuous pass this guards against.
+fn carries_data(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(map) => !map.is_empty(),
+        Value::String(s) => !s.is_empty(),
+        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
+        Value::Bool(b) => *b,
+        Value::Null => false,
+    }
+}
+
+/// `trace_call_path` (MCP) and `codesage trace --json` (CLI) must carry the
+/// same per-step evidence. `call_line` is the whole point of the tool — it
+/// names the line in the caller's body where the next hop is invoked — and it
+/// is `skip_serializing_if = "Option::is_none"`, exactly the kind of field
+/// that can vanish from one surface unnoticed. Both shapes are pinned
+/// explicitly, then checked against each other.
+#[test]
+fn trace_call_path_mcp_and_cli_json_agree_on_step_fields() {
+    let project = tempfile::tempdir().unwrap();
+    onboard_rich_fixture(project.path());
+
+    let cli = Command::new(env!("CARGO_BIN_EXE_codesage"))
+        .args(["trace", "outer_step", "inner_step", "--json"])
+        .current_dir(project.path())
+        .output()
+        .expect("run codesage trace");
+    assert!(
+        cli.status.success(),
+        "codesage trace failed: {}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_report: Value = serde_json::from_slice(&cli.stdout).expect("trace --json output");
+
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut session = McpSession::start(runtime.path());
+    session.initialize();
+    let resp = session.request(
+        2,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"trace_call_path","arguments":{{"project":"{}","from":"outer_step","to":"inner_step"}}}}}}"#,
+            project.path().display()
+        ),
+    );
+    assert_ne!(
+        resp["result"]["isError"],
+        Value::Bool(true),
+        "trace_call_path failed: {resp}"
+    );
+    let mcp_report = resp["result"]["structuredContent"].clone();
+
+    // The fixture has a real cross-file edge, so both surfaces must find it.
+    // Without this the comparisons below would pass vacuously over two empty
+    // `steps` arrays.
+    assert_eq!(cli_report["found"], Value::Bool(true), "CLI: {cli_report}");
+    assert_eq!(mcp_report["found"], Value::Bool(true), "MCP: {mcp_report}");
+
+    let cli_steps = cli_report["steps"].as_array().expect("CLI steps");
+    let mcp_steps = mcp_report["steps"].as_array().expect("MCP steps");
+    assert_eq!(
+        cli_steps.len(),
+        mcp_steps.len(),
+        "step count differs: CLI {cli_report} vs MCP {mcp_report}"
+    );
+    assert!(
+        cli_steps.len() >= 2,
+        "need a hop to check call_line evidence: {cli_report}"
+    );
+
+    // Pin each shape absolutely, not just relative to the other — two
+    // surfaces that lose the same field together would still agree.
+    for (surface, steps) in [("CLI", cli_steps), ("MCP", mcp_steps)] {
+        for (i, step) in steps.iter().enumerate() {
+            for field in ["name", "qualified_name", "file_path", "line_start"] {
+                assert!(
+                    step.get(field).is_some(),
+                    "{surface} step {i} lost `{field}`: {step}"
+                );
+            }
+        }
+        assert!(
+            steps[0].get("call_line").is_none(),
+            "{surface}: the origin step has no caller, so call_line must be omitted: {}",
+            steps[0]
+        );
+        assert!(
+            steps[1]["call_line"].is_u64(),
+            "{surface}: hop 1 must name the call-site line: {}",
+            steps[1]
+        );
+    }
+
+    // Field-set parity key by key, so a field added or dropped on one surface
+    // only is caught even if both still satisfy the pins above.
+    for (i, (c, m)) in cli_steps.iter().zip(mcp_steps).enumerate() {
+        let ckeys: Vec<&String> = c.as_object().expect("CLI step object").keys().collect();
+        let mkeys: Vec<&String> = m.as_object().expect("MCP step object").keys().collect();
+        assert_eq!(ckeys, mkeys, "step {i} field sets diverge");
+        assert_eq!(c, m, "step {i} values diverge");
+    }
+    let ckeys: Vec<&String> = cli_report.as_object().unwrap().keys().collect();
+    let mkeys: Vec<&String> = mcp_report
+        .as_object()
+        .unwrap()
+        .keys()
+        .filter(|k| *k != "_meta")
+        .collect();
+    assert_eq!(ckeys, mkeys, "top-level field sets diverge");
+}
+
+/// A fixture with real data for every MCP tool, so an assertion that a tool
+/// returned something is not satisfied by an empty result. It carries:
+///
+/// - a cross-file call edge `outer_step` → `inner_step` (`trace_call_path`,
+///   `impact_analysis`, `find_references`)
+/// - a structurally identical `twin_a` / `twin_b` pair (`find_similar`)
+/// - a Python import chain where `py/app.py` both imports and is imported, the
+///   only shape that gives `list_dependencies` non-empty edges in both
+///   directions (Rust `use crate::` paths do not resolve back to files)
+/// - a sibling test file (`recommend_tests`, and the feature-test-gap
+///   objection in `review_rehearsal`)
+/// - four commits, each touching `src/helper.rs` and `src/util.rs` together,
+///   which clears the min-count-3 co-change threshold (`find_coupling`) and
+///   gives churn a percentile to report (`assess_risk`, `project_overview`'s
+///   `top_risk_files`)
+/// - a Cargo manifest, so the feature mapper produces a slice
+///   (`list_features`, `find_feature`, `feature_bundle`)
+///
+/// Indexed structurally only: no model download, no network.
+fn onboard_rich_fixture(root: &std::path::Path) {
+    let write = |rel: &str, body: &str| {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    };
+
+    write(
+        "Cargo.toml",
+        "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write(
+        "src/lib.rs",
+        "pub mod helper;\npub mod util;\n\n\
+         use crate::helper::inner_step;\n\n\
+         pub fn outer_step() -> u32 {\n    inner_step()\n}\n\n\
+         pub fn twin_a(n: u32) -> u32 {\n    let mut total = 0;\n    \
+         for i in 0..n {\n        total += i * 2;\n    }\n    total\n}\n\n\
+         pub fn twin_b(m: u32) -> u32 {\n    let mut sum = 0;\n    \
+         for j in 0..m {\n        sum += j * 2;\n    }\n    sum\n}\n",
+    );
+    write(
+        "src/helper.rs",
+        "use crate::util::shared_value;\n\npub fn inner_step() -> u32 {\n    shared_value()\n}\n",
+    );
+    write("src/util.rs", "pub fn shared_value() -> u32 {\n    7\n}\n");
+    write(
+        "tests/helper_test.rs",
+        "use fixture::helper::inner_step;\n\n\
+         #[test]\nfn inner_step_returns_seven() {\n    assert_eq!(inner_step(), 7);\n}\n",
+    );
+    write("py/util.py", "def shared_value():\n    return 7\n");
+    write(
+        "py/app.py",
+        "from util import shared_value\n\n\ndef use_shared():\n    return shared_value()\n",
+    );
+    write(
+        "py/main.py",
+        "from app import use_shared\n\n\ndef entry():\n    return use_shared()\n",
+    );
+
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args([
+                "-c",
+                "user.email=fixture@codesage.test",
+                "-c",
+                "user.name=fixture",
+            ])
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q", "."]);
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "initial"]);
+    // Three more commits touching the same pair, clearing the min-count-3
+    // co-change threshold so `find_coupling` has a row to return.
+    for rev in 2..=4 {
+        for rel in ["src/helper.rs", "src/util.rs"] {
+            append_line(&root.join(rel), &format!("// rev {rev}"));
+        }
+        git(&["commit", "-qam", &format!("rev {rev}")]);
+    }
+
+    run_codesage(root, &["init"]);
+    run_codesage(root, &["index", "--no-semantic"]);
+    run_codesage(root, &["git-index", "--full"]);
+}
+
+fn append_line(path: &std::path::Path, line: &str) {
+    let mut body = std::fs::read_to_string(path).unwrap();
+    body.push_str(line);
+    body.push('\n');
+    std::fs::write(path, body).unwrap();
+}
+
+fn run_codesage(root: &std::path::Path, args: &[&str]) {
+    let out = Command::new(env!("CARGO_BIN_EXE_codesage"))
+        .args(args)
+        .current_dir(root)
+        .output()
+        .expect("run codesage");
+    assert!(
+        out.status.success(),
+        "codesage {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Seed semantic chunks for the fixture's Rust files so `search`,
+/// `export_context` and `feature_bundle` have content to return without a
+/// model download. Line spans cover each file whole, so a symbol lookup
+/// anywhere in them resolves to an overlapping chunk.
+fn seed_fixture_chunks(root: &std::path::Path) {
+    let db_path = root.join(".codesage").join("index.db");
+    let db = Database::open_for_model(&db_path, "jinaai/jina-embeddings-v2-base-code", 4).unwrap();
+    let embedding = [0.1_f32, 0.2, 0.3, 0.4];
+    for rel in ["src/lib.rs", "src/helper.rs", "src/util.rs"] {
+        let body = std::fs::read_to_string(root.join(rel)).unwrap();
+        let lines = body.lines().count().max(1) as u32;
+        db.insert_chunks(
+            rel,
+            "rust",
+            &[(body.as_str(), 1, lines, embedding.as_slice())],
+        )
+        .unwrap();
+    }
+}
+
 /// One MCP shim (stdin/stdout JSON-RPC) with a line-reader thread, so
 /// tools/call tests don't re-inline the pump plumbing per test.
 struct McpSession {

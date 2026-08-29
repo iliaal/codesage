@@ -581,37 +581,37 @@ fn cap_to_budget_with(
             })
         }
         serde_json::Value::Object(mut map) => {
-            // Pick the largest top-level array field and trim it. Protected
-            // arrays (per-element invariants, see PROTECTED_TRUNCATION_KEYS)
-            // are only eligible when no other array exists to trim.
-            let mut largest_key: Option<String> = None;
-            let mut largest_len = 0;
-            let mut largest_protected_key: Option<String> = None;
-            let mut largest_protected_len = 0;
-            for (k, v) in &map {
-                if let serde_json::Value::Array(arr) = v {
-                    let s = serde_json::to_string(arr).map(|s| s.len()).unwrap_or(0);
-                    if PROTECTED_TRUNCATION_KEYS.contains(&k.as_str()) {
-                        if s > largest_protected_len {
-                            largest_protected_len = s;
-                            largest_protected_key = Some(k.clone());
-                        }
-                    } else if s > largest_len {
-                        largest_len = s;
-                        largest_key = Some(k.clone());
-                    }
+            // Trim top-level arrays, largest first, until the payload fits.
+            // One pass is not enough: several response shapes carry more than
+            // one array that grows with the repo (`session_end`'s `new_files`
+            // + `removed_files`, `export_context`'s `primary` + `related`,
+            // `list_dependencies`' `imports` + `imported_by`). Trimming only
+            // the largest left every runner-up at full size, so the response
+            // stayed over budget by however much they weighed.
+            let mut meta: Option<serde_json::Value> = None;
+            let mut also_truncated: Vec<String> = Vec::new();
+            let mut trimmed: Vec<String> = Vec::new();
+            loop {
+                let current_len = serde_json::to_string(&map).map(|s| s.len()).unwrap_or(0);
+                if meta.is_some() && current_len <= budget_chars {
+                    break;
                 }
-            }
-            let chosen = match (largest_key, largest_protected_key) {
-                (Some(k), _) => Some((k, largest_len, false)),
-                (None, Some(k)) => Some((k, largest_protected_len, true)),
-                (None, None) => None,
-            };
-            if let Some((key, key_len, protected)) = chosen
-                && let Some(serde_json::Value::Array(items)) = map.remove(&key)
-            {
+                let Some((key, key_len, protected)) = largest_trimmable_array(&map, &trimmed)
+                else {
+                    break;
+                };
+                // A protected array (per-element invariant, see
+                // PROTECTED_TRUNCATION_KEYS) stays eligible only as the sole
+                // option on the first pass. Once another array has absorbed a
+                // trim, the invariant outranks the remaining overshoot.
+                if protected && meta.is_some() {
+                    break;
+                }
+                let Some(serde_json::Value::Array(items)) = map.remove(&key) else {
+                    break;
+                };
                 let total = items.len();
-                let other_chars = initial_len.saturating_sub(key_len);
+                let other_chars = current_len.saturating_sub(key_len);
                 let remaining = budget_chars.saturating_sub(other_chars);
                 // truncate_array keeps a prefix, so identifiers collected
                 // up-front let us name exactly the dropped tail elements.
@@ -623,7 +623,15 @@ fn cap_to_budget_with(
                 let kept = truncate_array(items, remaining);
                 let returned = kept.len();
                 map.insert(key.clone(), serde_json::Value::Array(kept));
-                let mut meta = serde_json::json!({
+                trimmed.push(key.clone());
+                if meta.is_some() {
+                    // `total_results` / `returned` stay scoped to the headline
+                    // `field` so their meaning does not shift; the additional
+                    // fields carry their own counts here instead.
+                    also_truncated.push(format!("{key} ({returned}/{total})"));
+                    continue;
+                }
+                let mut first = serde_json::json!({
                     "truncated": true,
                     "kind": kind,
                     "field": key,
@@ -635,7 +643,7 @@ fn cap_to_budget_with(
                 if protected {
                     let dropped = &identifiers[returned..];
                     let named: Vec<&str> = dropped.iter().filter_map(|id| id.as_deref()).collect();
-                    let meta_obj = meta.as_object_mut().expect("json! object");
+                    let meta_obj = first.as_object_mut().expect("json! object");
                     if !named.is_empty() {
                         meta_obj.insert("dropped_files".to_string(), serde_json::json!(named));
                     }
@@ -646,11 +654,53 @@ fn cap_to_budget_with(
                         );
                     }
                 }
+                meta = Some(first);
+            }
+            if let Some(mut meta) = meta {
+                if !also_truncated.is_empty() {
+                    meta.as_object_mut().expect("json! object").insert(
+                        "also_truncated_fields".to_string(),
+                        serde_json::json!(also_truncated),
+                    );
+                }
                 map.insert("_meta".to_string(), meta);
             }
             serde_json::Value::Object(map)
         }
         other => other,
+    }
+}
+
+/// Largest top-level array in `map` that is not already in `skip`, as
+/// `(key, serialized_len, is_protected)`. Unprotected arrays win outright;
+/// a protected one is returned only when no unprotected array is left.
+fn largest_trimmable_array(
+    map: &serde_json::Map<String, serde_json::Value>,
+    skip: &[String],
+) -> Option<(String, usize, bool)> {
+    let mut open: Option<(String, usize)> = None;
+    let mut protected: Option<(String, usize)> = None;
+    for (k, v) in map {
+        if k == "_meta" || skip.iter().any(|s| s == k) {
+            continue;
+        }
+        let serde_json::Value::Array(arr) = v else {
+            continue;
+        };
+        let len = serde_json::to_string(arr).map(|s| s.len()).unwrap_or(0);
+        let slot = if PROTECTED_TRUNCATION_KEYS.contains(&k.as_str()) {
+            &mut protected
+        } else {
+            &mut open
+        };
+        if slot.as_ref().is_none_or(|(_, best)| len > *best) {
+            *slot = Some((k.clone(), len));
+        }
+    }
+    match (open, protected) {
+        (Some((k, len)), _) => Some((k, len, false)),
+        (None, Some((k, len))) => Some((k, len, true)),
+        (None, None) => None,
     }
 }
 
@@ -877,6 +927,96 @@ mod tests {
         let returned = meta["returned"].as_u64().unwrap() as usize;
         assert_eq!(meta["dropped_count"], json!(40 - returned));
         assert!(meta.get("dropped_files").is_none());
+    }
+
+    #[test]
+    fn cap_trims_every_oversized_array_not_just_the_largest() {
+        // session_end shape: `new_files` and `removed_files` both grow with
+        // the repo. Trimming only the largest left the runner-up at full
+        // size, so the response stayed far over budget.
+        let big = |n: usize, prefix: &str| -> Vec<Value> {
+            (0..n)
+                .map(|i| json!(format!("{prefix}/{i}/{}", fat_string(200))))
+                .collect()
+        };
+        let v = json!({
+            "session_id": "s",
+            "new_files": big(300, "src/new"),
+            "removed_files": big(300, "src/old"),
+            "pass": true,
+        });
+        let out = cap_to_budget_with(v, "session_end", MCP_BUDGET_CHARS);
+        let serialized = serde_json::to_string(&out).unwrap();
+        // The cap measures element payloads, not the JSON envelope around
+        // them (key names, brackets, separators), so it lands a little over.
+        // What matters is that the overshoot is a fixed envelope cost rather
+        // than the full weight of every array after the first: trimming only
+        // `new_files` left `removed_files` whole, ~65 KB against a 32 KB
+        // budget, and that residue scales with the repo.
+        assert!(
+            serialized.len() < MCP_BUDGET_CHARS + 1024,
+            "capped response must land at the budget, got {} chars",
+            serialized.len()
+        );
+        let obj = out.as_object().expect("still an object");
+        assert!(obj["new_files"].as_array().unwrap().len() < 300);
+        assert!(obj["removed_files"].as_array().unwrap().len() < 300);
+        let meta = &obj["_meta"];
+        assert_eq!(meta["truncated"], json!(true));
+        // The second field trimmed must be named with its kept/total counts,
+        // so an agent can tell that more than the headline `field` lost
+        // entries, and by how much.
+        let also: Vec<&str> = meta["also_truncated_fields"]
+            .as_array()
+            .expect("also_truncated_fields")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(also.len(), 1, "got {also:?}");
+        let headline = meta["field"].as_str().unwrap();
+        let other = if headline == "new_files" {
+            "removed_files"
+        } else {
+            "new_files"
+        };
+        assert!(
+            also[0].starts_with(other) && also[0].ends_with("/300)"),
+            "expected `{other} (kept/300)`, got {also:?}"
+        );
+    }
+
+    #[test]
+    fn cap_leaves_protected_files_alone_after_another_array_absorbed_a_trim() {
+        // Second-pass trimming must not reach into `files`: once
+        // `summary_notes` has been trimmed, the per-element invariant on
+        // `files` outranks the remaining overshoot (PROTECTED_TRUNCATION_KEYS).
+        let files: Vec<Value> = (0..40)
+            .map(|i| json!({"file": format!("src/f{i}.rs"), "blob": fat_string(1000)}))
+            .collect();
+        let notes: Vec<Value> = (0..20).map(|i| json!(format!("note {i}"))).collect();
+        let v = json!({ "files": files, "summary_notes": notes, "max_score": 0.9 });
+        let out = cap_to_budget_with(v, "assess_risk_diff", MCP_BUDGET_CHARS);
+        let obj = out.as_object().expect("still an object");
+        assert_eq!(obj["files"].as_array().unwrap().len(), 40);
+        assert!(
+            obj["_meta"].get("also_truncated_fields").is_none(),
+            "no second field should be trimmed: {:?}",
+            obj["_meta"]
+        );
+    }
+
+    #[test]
+    fn cap_single_oversized_array_reports_no_also_truncated_fields() {
+        // The common case must keep its existing _meta shape: one `field`,
+        // no `also_truncated_fields` noise.
+        let related: Vec<Value> = (0..50)
+            .map(|i| json!({"i": i, "blob": fat_string(1000)}))
+            .collect();
+        let v = json!({ "target_description": "t", "related": related });
+        let out = cap_to_budget_with(v, "export_context", MCP_BUDGET_CHARS);
+        let meta = &out.as_object().unwrap()["_meta"];
+        assert_eq!(meta["field"], json!("related"));
+        assert!(meta.get("also_truncated_fields").is_none());
     }
 
     #[test]
