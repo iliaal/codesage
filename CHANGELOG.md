@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.22.0] - 2026-08-30
+
 ### Security
 
 - Writers under a project's `.codesage/` no longer follow a symlink a cloned repo planted there, at the leaf or at `.codesage` itself: the drift log and its rotation, session snapshots, `watch.status`, `watch.disabled`, `indexing.lock`, `feature-map.state`, the index database's open and hardening, the generated git hooks, and the plugin's onboard and review-state writers.
@@ -740,5 +742,7 @@ Initial public release.
 
 [0.20.0]: https://github.com/iliaal/codesage/releases/tag/v0.20.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.21.0...HEAD
 [0.21.0]: https://github.com/iliaal/codesage/releases/tag/v0.21.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/iliaal/codesage/releases/tag/v0.22.0
