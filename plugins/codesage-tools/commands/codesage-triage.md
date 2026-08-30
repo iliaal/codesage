@@ -22,6 +22,15 @@ From `$ARGUMENTS`:
 
 Reject invalid combinations early (missing finding_id, unknown status). Don't proceed if any are malformed.
 
+> **Before touching any `.codesage/` path:** `.codesage/` is repository content, so a cloned
+> repo can ship it — or any directory under it — as a symlink. Refuse to read, write, create,
+> or delete through one. Check with `test -L <path>` (not `test -e`, which follows links) on
+> `.codesage` itself and on each subdirectory you are about to use, and stop with an error if
+> any is a symlink. Apply the same check to every **leaf** you touch: a `*.json` findings
+> file, or any temporary file you create beside it, may itself be a planted symlink or a
+> directory. Read or write a leaf only if it is a regular file (or absent, when creating),
+> and give temporary files a freshly generated unique name rather than a predictable one.
+
 ## Locate the finding
 
 Walk `.codesage/findings/*.json` and find the file containing a finding with the matching `finding_id`. If no match, report `finding not found in <project>/.codesage/findings/` and stop. Suggest:

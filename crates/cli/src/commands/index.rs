@@ -175,7 +175,7 @@ fn feature_map_state_path(root: &Path) -> PathBuf {
 }
 
 fn read_feature_map_state(root: &Path) -> Option<u64> {
-    std::fs::read_to_string(feature_map_state_path(root))
+    crate::fsguard::read_state_to_string(&feature_map_state_path(root))
         .ok()?
         .trim()
         .parse()
@@ -183,7 +183,15 @@ fn read_feature_map_state(root: &Path) -> Option<u64> {
 }
 
 fn write_feature_map_state(root: &Path, fingerprint: u64) {
-    if let Err(e) = std::fs::write(feature_map_state_path(root), format!("{fingerprint}\n")) {
+    // `.codesage/feature-map.state` is repository-supplied like the rest of the
+    // directory, so a planted symlink here would turn this marker write into an
+    // arbitrary-path truncate on the documented `codesage index` path.
+    let write = |path: &Path| -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut f = crate::fsguard::create_no_follow(path)?;
+        writeln!(f, "{fingerprint}")
+    };
+    if let Err(e) = write(&feature_map_state_path(root)) {
         tracing::warn!(error = %e, "failed to record feature-map state");
     }
 }
@@ -885,6 +893,38 @@ mod tests {
             before, after,
             "excluded manifests are not mapper inputs and must not churn the fingerprint"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_feature_map_state_refuses_a_symlinked_marker() {
+        // Sink-level: reverting `write_feature_map_state` to `fs::write` must
+        // turn this red, so it exercises the real function, not the helper.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(PROJECT_DIR)).unwrap();
+        let victim = root.join("victim.rc");
+        std::fs::write(&victim, b"# victim\n").unwrap();
+        std::os::unix::fs::symlink(&victim, feature_map_state_path(root)).unwrap();
+
+        write_feature_map_state(root, 0xDEAD_BEEF);
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"# victim\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_feature_map_state_refuses_a_symlinked_source() {
+        // Points at an ordinary file rather than /dev/zero so that reverting
+        // the guard fails this test instead of hanging the suite.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(PROJECT_DIR)).unwrap();
+        let victim = root.join("victim");
+        std::fs::write(&victim, b"12345\n").unwrap();
+        std::os::unix::fs::symlink(&victim, feature_map_state_path(root)).unwrap();
+
+        assert_eq!(read_feature_map_state(root), None);
     }
 
     #[test]

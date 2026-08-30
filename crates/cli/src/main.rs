@@ -5,6 +5,7 @@ mod daemon;
 mod doctor;
 #[cfg(target_os = "android")]
 mod flock_override;
+mod fsguard;
 mod installer;
 mod lockfile;
 mod mcp;
@@ -601,7 +602,7 @@ pub(crate) fn acquire_index_lock(
 
 pub(crate) fn load_project_config(root: &Path) -> Result<ProjectConfig> {
     let config_path = root.join(PROJECT_DIR).join("config.toml");
-    let content = match std::fs::read_to_string(&config_path) {
+    let content = match fsguard::read_state_to_string(&config_path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(ProjectConfig::default());

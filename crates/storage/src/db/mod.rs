@@ -112,15 +112,24 @@ fn harden_db_path_permissions_impl(path: &Path) -> Result<()> {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
+    // lstat, never stat: `.codesage/` lives inside the repository work tree, so
+    // a cloned repo can ship `.codesage`, `index.db` or either sidecar as a
+    // symlink. chmod(2) resolves symlinks and std has no lchmod, so following
+    // one would rewrite the mode of an arbitrary file the user owns.
     if let Some(parent) = path.parent()
         && parent.file_name().and_then(|n| n.to_str()) == Some(".codesage")
-        && parent.exists()
+        && fs::symlink_metadata(parent)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
     {
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     }
 
     for sidecar in db_sidecar_paths(path) {
-        if sidecar.exists() {
+        if fs::symlink_metadata(&sidecar)
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+        {
             fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600))?;
         }
     }
@@ -133,6 +142,48 @@ fn harden_db_path_permissions_impl(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Refuse to reach the index database through a symlink.
+///
+/// `.codesage/` ships inside the repository work tree, so a cloned repo can
+/// plant `index.db` as a symlink (git stores those as mode-120000 blobs and
+/// checkout materializes them). Neither layer below refuses one on its own:
+/// `OpenOptions` has no `O_NOFOLLOW` by default, and SQLite's unix VFS resolves
+/// the path itself in `unixFullPathname` before its own `O_NOFOLLOW` is applied,
+/// so the pager opens the *resolved* target. Guarding the one funnel every
+/// `Database` constructor goes through covers create- and read-mode opens
+/// alike.
+fn reject_symlinked_db_path(path: &Path) -> Result<()> {
+    // The `.codesage` directory itself is plantable as a symlink, and guarding
+    // only the final component would still let it redirect the whole directory
+    // (creating `index.db` and its `-wal`/`-shm` siblings wherever it points).
+    if let Some(parent) = path.parent()
+        && parent.file_name().and_then(|n| n.to_str()) == Some(".codesage")
+        && std::fs::symlink_metadata(parent)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+    {
+        anyhow::bail!(
+            "refusing to use index database {}: {} is a symlink",
+            path.display(),
+            parent.display()
+        );
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => anyhow::bail!(
+            "refusing to use index database {}: it is a symlink",
+            path.display()
+        ),
+        // A repo can also ship this name as a directory (or any other
+        // non-regular entry); SQLite would fail later with a confusing error.
+        Ok(meta) if !meta.is_file() => anyhow::bail!(
+            "refusing to use index database {}: it is not a regular file",
+            path.display()
+        ),
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Pre-create a missing DB file with private permissions so it is never born
 /// with umask-derived world/group bits (SQLite would otherwise create it).
 #[cfg(unix)]
@@ -141,12 +192,17 @@ fn create_private_db_file(path: &Path) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
 
     if !path.exists() {
+        // `!path.exists()` is follow-semantics, so a *dangling* symlink planted
+        // at `.codesage/index.db` reads as "missing" here. O_NOFOLLOW makes the
+        // create fail with ELOOP instead of materializing the database at the
+        // link's target.
         OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .read(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)?;
     }
     Ok(())
@@ -164,6 +220,7 @@ fn create_private_db_file(_path: &Path) -> Result<()> {
 /// answers every query with zero results.
 fn open_connection(path: &Path, create: bool) -> Result<Connection> {
     init_vec_extension();
+    reject_symlinked_db_path(path)?;
     if create {
         create_private_db_file(path)?;
     } else if !path.exists() {
@@ -417,6 +474,7 @@ impl Database {
     pub fn open_read_only(path: &Path) -> Result<Self> {
         use rusqlite::OpenFlags;
         init_vec_extension();
+        reject_symlinked_db_path(path)?;
         if !path.exists() {
             anyhow::bail!(
                 "index database {} does not exist (project not onboarded, or its index was deleted)",
@@ -1831,6 +1889,117 @@ mod tests {
         let db_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(dir_mode, 0o700);
         assert_eq!(db_mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_refuses_a_symlinked_index_db() {
+        // A cloned repo ships `.codesage/`, so `index.db` can be a symlink.
+        // SQLite's unix VFS resolves the link itself and opens the target, so
+        // the refusal has to happen before the connection is opened.
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"victim contents").unwrap();
+        let cs = dir.path().join(".codesage");
+        std::fs::create_dir_all(&cs).unwrap();
+        let db_path = cs.join("index.db");
+        std::os::unix::fs::symlink(&victim, &db_path).unwrap();
+
+        for err in [
+            Database::open(&db_path).err(),
+            Database::open_existing(&db_path).err(),
+            Database::open_read_only(&db_path).err(),
+        ] {
+            let err = err.expect("expected a symlink refusal");
+            assert!(
+                err.to_string().contains("is a symlink"),
+                "unexpected error: {err:#}"
+            );
+        }
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim contents");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_does_not_materialize_a_db_through_a_dangling_symlink() {
+        // `!path.exists()` is follow-semantics, so a dangling symlink reads as
+        // "missing" — the create must still refuse it.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("outside.db");
+        let cs = dir.path().join(".codesage");
+        std::fs::create_dir_all(&cs).unwrap();
+        let db_path = cs.join("index.db");
+        std::os::unix::fs::symlink(&target, &db_path).unwrap();
+
+        assert!(Database::open(&db_path).is_err());
+        assert!(
+            !target.exists(),
+            "the database was materialized at the symlink's target"
+        );
+
+        // `open_connection` refuses before `create_private_db_file` runs, so
+        // exercise the O_NOFOLLOW pre-create directly too -- otherwise
+        // reverting that flag alone would leave this test green.
+        assert!(create_private_db_file(&db_path).is_err());
+        assert!(!target.exists(), "the pre-create followed the symlink");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn harden_does_not_chmod_through_symlinked_sidecars() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.sh");
+        std::fs::write(&victim, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cs = dir.path().join(".codesage");
+        std::fs::create_dir_all(&cs).unwrap();
+        let db_path = cs.join("index.db");
+        std::os::unix::fs::symlink(&victim, cs.join("index.db-wal")).unwrap();
+        std::os::unix::fs::symlink(&victim, cs.join("index.db-shm")).unwrap();
+
+        // SQLite opens `-wal`/`-shm` with its own O_NOFOLLOW, so the connection
+        // itself fails here; the harden step runs first either way, and it is
+        // the permission change that must not land.
+        let _ = Database::open(&db_path);
+
+        let mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "chmod followed the sidecar symlink");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn harden_does_not_chmod_through_a_symlinked_codesage_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let victim_dir = dir.path().join("victim_dir");
+        std::fs::create_dir(&victim_dir).unwrap();
+        std::fs::set_permissions(&victim_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let project = dir.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::os::unix::fs::symlink(&victim_dir, project.join(".codesage")).unwrap();
+
+        // The open is now refused outright; the chmod must not have landed either.
+        let db_path = project.join(".codesage").join("index.db");
+        let err = match Database::open(&db_path) {
+            Ok(_) => panic!("expected a symlink refusal"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("is a symlink"),
+            "unexpected error: {err:#}"
+        );
+
+        // The refusal happens before hardening, so call hardening directly as
+        // well -- reverting its lstat alone must still turn this test red.
+        harden_db_path_permissions(&db_path).unwrap();
+
+        let mode = std::fs::metadata(&victim_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "chmod followed the .codesage symlink");
     }
 
     #[test]

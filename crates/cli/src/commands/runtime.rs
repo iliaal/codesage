@@ -295,8 +295,10 @@ pub(crate) fn cmd_watch_run(project: Option<PathBuf>, debounce_ms: Option<u64>) 
     let emb_config = config.embedding.clone().unwrap_or_default();
     let debounce = debounce_ms.unwrap_or_else(statewatcher::resolve_debounce_ms);
 
-    // An explicit foreground run overrides a prior `watch stop`.
-    let _ = std::fs::remove_file(statewatcher::watch_disabled_path(&root));
+    // An explicit foreground run overrides a prior `watch stop`. A clone can
+    // ship `watch.disabled` as a directory, which no removal clears: surface
+    // that instead of announcing startup and then exiting.
+    clear_watch_disabled_marker(&root)?;
 
     let shutdown = statewatcher::register_shutdown_flag();
 
@@ -330,10 +332,28 @@ pub(crate) fn cmd_watch_run(project: Option<PathBuf>, debounce_ms: Option<u64>) 
     statewatcher::run_statewatcher(watcher_config)
 }
 
+/// Clear a `watch.disabled` marker, tolerating only its absence.
+///
+/// Remove unconditionally rather than gating on `exists()`, which follows
+/// links: a dangling marker symlink reads as absent there, so it would survive
+/// `watch start` and then block every later `watch stop`.
+fn clear_watch_disabled_marker(root: &std::path::Path) -> Result<()> {
+    let marker = statewatcher::watch_disabled_path(root);
+    match crate::fsguard::remove_state_file(&marker) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => {
+            Err(anyhow::Error::from(e)).with_context(|| format!("removing {}", marker.display()))
+        }
+    }
+}
+
 pub(crate) fn cmd_watch_status(project: Option<PathBuf>, json: bool) -> Result<()> {
     let root = resolve_watch_root(project)?;
     let status = statewatcher::read_status(&root);
-    let disabled = statewatcher::watch_disabled_path(&root).exists();
+    // lstat, not `exists()`: a dangling marker symlink must read the same way
+    // here as it does to `watch_enabled()`.
+    let disabled = statewatcher::watch_disabled_marker_present(&root);
 
     if json {
         let obj = serde_json::json!({
@@ -366,17 +386,17 @@ pub(crate) fn cmd_watch_stop(project: Option<PathBuf>) -> Result<()> {
     // The marker both stops any running watcher (its loop polls for it) and
     // suppresses auto-restart on the next tool call.
     let marker = statewatcher::watch_disabled_path(&root);
-    std::fs::write(&marker, "").with_context(|| format!("writing {}", marker.display()))?;
+    // O_NOFOLLOW, not `fs::write`: a repo-planted `watch.disabled` symlink would
+    // otherwise let this O_CREAT|O_TRUNC truncate an arbitrary host file.
+    crate::fsguard::create_no_follow(&marker)
+        .with_context(|| format!("writing {}", marker.display()))?;
     println!("watcher stopped and disabled for {}", root.display());
     Ok(())
 }
 
 pub(crate) fn cmd_watch_start(project: Option<PathBuf>) -> Result<()> {
     let root = resolve_watch_root(project)?;
-    let marker = statewatcher::watch_disabled_path(&root);
-    if marker.exists() {
-        std::fs::remove_file(&marker).with_context(|| format!("removing {}", marker.display()))?;
-    }
+    clear_watch_disabled_marker(&root)?;
     println!(
         "watcher enabled for {}; the daemon starts it on the next tool call, \
          or run `codesage watch run` for a foreground instance",

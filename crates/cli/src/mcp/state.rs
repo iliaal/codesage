@@ -686,7 +686,7 @@ impl CodeSageServer {
 /// loud-fail behavior: a user running `codesage index` interactively wants to
 /// know their config is broken.
 fn load_embedding_config(path: &Path) -> LoadedEmbeddingConfig {
-    let content = match std::fs::read_to_string(path) {
+    let content = match crate::fsguard::read_state_to_string(path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return LoadedEmbeddingConfig {

@@ -1083,6 +1083,58 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(len(by_id["fnd_88888888"]["history"]), 1)
         self.assertEqual(summary["not_seen"], ["fnd_77777777"])
 
+    def test_atomic_write_refuses_a_symlinked_findings_dir(self):
+        # `.codesage/findings` ships with the repo, so it can be a directory
+        # symlink; mkdir/temp/replace would then land outside the project.
+        review_state = load_review_state()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outside = root / "outside"
+            outside.mkdir()
+            codesage = root / "project" / ".codesage"
+            codesage.mkdir(parents=True)
+            (codesage / "findings").symlink_to(outside, target_is_directory=True)
+
+            destination = codesage / "findings" / "feat.json"
+            with self.assertRaises(OSError):
+                review_state.atomic_write_json(destination, {"value": 42})
+
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_load_json_refuses_a_symlinked_source(self):
+        # The real target of concern is a character device such as /dev/zero,
+        # but this points at an ordinary file on purpose: reverting the guard
+        # must fail this test deterministically rather than hang the suite.
+        review_state = load_review_state()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outside = root / "outside.json"
+            outside.write_text(json.dumps({"value": "victim"}))
+            codesage = root / ".codesage"
+            (codesage / "findings").mkdir(parents=True)
+            source = codesage / "findings" / "feat.json"
+            source.symlink_to(outside)
+
+            with self.assertRaises(OSError):
+                review_state.load_json(source)
+
+    def test_load_json_refuses_an_oversized_source(self):
+        review_state = load_review_state()
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "big.json"
+            source.write_bytes(b"x" * (review_state.MAX_STATE_BYTES + 1))
+
+            with self.assertRaises(OSError):
+                review_state.load_json(source)
+
+    def test_load_json_reads_an_ordinary_document(self):
+        review_state = load_review_state()
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "ok.json"
+            source.write_text(json.dumps({"value": 42}))
+
+            self.assertEqual(review_state.load_json(source), {"value": 42})
+
     def test_atomic_write_leaves_complete_json_without_temporary_file(self):
         review_state = load_review_state()
         with tempfile.TemporaryDirectory() as directory:

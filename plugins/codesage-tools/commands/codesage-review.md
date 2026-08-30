@@ -36,6 +36,15 @@ PARAMS="categories=<sorted csv>;severity=<severity>;focus=<all|product>;deep=<0|
 
 `PARAMS` is the canonical review-scope string; pass the same value to every `feature-states`, `plan-feature`, and `merge` call so freshness fingerprints bind to this run's scope. Every `.codesage/...` path below lives under the project, not the session's working directory — always write it as `$PROJECT/.codesage/...`.
 
+> **Before touching any `.codesage/` path:** `.codesage/` is repository content, so a cloned
+> repo can ship it — or any directory under it — as a symlink. Refuse to read, write, create,
+> or delete through one. Check with `test -L <path>` (not `test -e`, which follows links) on
+> `.codesage` itself and on each subdirectory you are about to use, and stop with an error if
+> any is a symlink. Apply the same check to every **leaf** you touch: a `*.json` findings
+> file, or any temporary file you create beside it, may itself be a planted symlink or a
+> directory. Read or write a leaf only if it is a regular file (or absent, when creating),
+> and give temporary files a freshly generated unique name rather than a predictable one.
+
 ## 1. Create the run
 
 Use `run_$(date -u +%Y%m%dT%H%M%SZ)` as `RUN_ID`. Create:

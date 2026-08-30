@@ -288,10 +288,28 @@ pub fn append_drift_log(
     report: &DriftReport,
 ) -> anyhow::Result<()> {
     let dir = project_root.join(project_dir_name);
-    if !dir.exists() {
+    // lstat, not `exists()`: a repo-planted `.codesage` *directory* symlink
+    // would otherwise redirect the whole log path out of the project tree, and
+    // the per-file guard below only inspects the final component.
+    if !std::fs::symlink_metadata(&dir)
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
         return Ok(());
     }
     let path = dir.join("drift.log");
+
+    // Refuse a symlinked or otherwise non-regular target, for the log itself
+    // and for the sibling the rotation renames over it. `.codesage/` is part of
+    // the repository work tree, so a hostile repo can ship either name as a
+    // git symlink (mode 120000): the append would put a repo-controlled JSON
+    // line at an arbitrary file's EOF, and the rotation's write-then-rename
+    // would replace an arbitrary file wholesale. Same posture as the hooks.log
+    // guard in the post-commit hook template and the session snapshot writer:
+    // skip the telemetry write, never follow the link.
+    if !drift_log_target_is_writable(&path) {
+        return Ok(());
+    }
 
     // Bounded rotation: if the log has grown past 10k lines, keep the tail.
     if let Ok(meta) = std::fs::metadata(&path) {
@@ -319,14 +337,44 @@ pub fn append_drift_log(
     Ok(())
 }
 
+/// True when both `drift.log` and the `drift.log.tmp` the rotation writes are
+/// safe to touch: each is either absent or an existing regular file. A symlink,
+/// fifo, or directory at either name means the write would land somewhere the
+/// project does not own, so the caller skips the record entirely.
+fn drift_log_target_is_writable(path: &Path) -> bool {
+    let regular_or_absent = |p: &Path| match std::fs::symlink_metadata(p) {
+        Ok(meta) => meta.is_file(),
+        Err(err) => err.kind() == std::io::ErrorKind::NotFound,
+    };
+    regular_or_absent(path) && regular_or_absent(&rotation_tmp_path(path))
+}
+
+fn rotation_tmp_path(path: &Path) -> PathBuf {
+    path.with_extension("log.tmp")
+}
+
+/// Largest drift log the rotation will read back into memory.
+///
+/// Rotation only ever keeps the last 10k records, so anything past this is
+/// discarded wholesale rather than loaded: the log is repository-supplied
+/// content, and a cloned repo can commit an arbitrarily large regular file at
+/// this path. Well above the 1 MiB rotation trigger, so ordinary logs still
+/// rotate by keeping their tail.
+const MAX_ROTATE_BYTES: u64 = 8 << 20;
+
 fn rotate_log(path: &Path) -> anyhow::Result<()> {
+    if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > MAX_ROTATE_BYTES {
+        // Too large to tail cheaply: start the log over instead of reading it.
+        std::fs::write(path, b"")?;
+        return Ok(());
+    }
     let contents = std::fs::read_to_string(path)?;
     let lines: Vec<&str> = contents.lines().collect();
     if lines.len() <= 10_000 {
         return Ok(());
     }
     let tail = lines[lines.len() - 10_000..].join("\n");
-    let tmp = path.with_extension("log.tmp");
+    let tmp = rotation_tmp_path(path);
     std::fs::write(&tmp, format!("{tail}\n"))?;
     std::fs::rename(&tmp, path)?;
     Ok(())
@@ -467,5 +515,125 @@ mod tests {
         };
         assert!(!r.is_drift());
         assert_eq!(r.summary(), "not a git repository");
+    }
+
+    #[cfg(unix)]
+    fn drift_report() -> DriftReport {
+        DriftReport {
+            kind: DriftKind::BehindHead,
+            stored_sha: Some("\"; touch /tmp/pwned; #".to_string()),
+            head_sha: Some("deadbeef".to_string()),
+            stored_at: None,
+            commits_between: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_drift_log_refuses_a_symlinked_log() {
+        // A hostile repo ships `.codesage/drift.log` as a symlink; the append
+        // would put one repo-controlled JSON line at the target's EOF.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let victim = root.join("victim.rc");
+        std::fs::write(&victim, b"# victim\n").unwrap();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        std::os::unix::fs::symlink(&victim, root.join(".codesage/drift.log")).unwrap();
+
+        append_drift_log(root, ".codesage", &drift_report()).unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"# victim\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_drift_log_refuses_a_dangling_symlinked_log() {
+        // A dangling link would otherwise have the append *create* the file at
+        // an attacker-chosen path.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let target = root.join("created-by-attacker");
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        std::os::unix::fs::symlink(&target, root.join(".codesage/drift.log")).unwrap();
+
+        append_drift_log(root, ".codesage", &drift_report()).unwrap();
+
+        assert!(!target.exists(), "the append created the symlink's target");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_drift_log_refuses_a_symlinked_rotation_tmp() {
+        // The >1 MiB rotation writes `drift.log.tmp` and renames it over the
+        // log; a symlink there turns the write into a full-file replacement.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let victim = root.join("victim.rc");
+        std::fs::write(&victim, b"# victim\n").unwrap();
+        let cs = root.join(".codesage");
+        std::fs::create_dir_all(&cs).unwrap();
+        std::fs::write(cs.join("drift.log"), b"{}\n").unwrap();
+        std::os::unix::fs::symlink(&victim, cs.join("drift.log.tmp")).unwrap();
+
+        append_drift_log(root, ".codesage", &drift_report()).unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"# victim\n");
+        assert_eq!(
+            std::fs::read_to_string(cs.join("drift.log")).unwrap(),
+            "{}\n",
+            "the record must be skipped, not appended, while the tmp name is unsafe"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_drift_log_refuses_a_symlinked_project_dir() {
+        // `.codesage` itself can be a planted directory symlink.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".codesage")).unwrap();
+
+        append_drift_log(&root, ".codesage", &drift_report()).unwrap();
+
+        assert!(
+            std::fs::read_dir(&outside).unwrap().next().is_none(),
+            "the record was written through the symlinked project dir"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotation_discards_an_oversized_log_without_reading_it() {
+        // The log is repo-supplied; a huge regular file must not be slurped.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cs = root.join(".codesage");
+        std::fs::create_dir_all(&cs).unwrap();
+        let log = cs.join("drift.log");
+        std::fs::write(&log, vec![b'x'; (MAX_ROTATE_BYTES + 1) as usize]).unwrap();
+
+        rotate_log(&log).unwrap();
+
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_drift_log_writes_an_ordinary_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+
+        append_drift_log(root, ".codesage", &drift_report()).unwrap();
+
+        let log = std::fs::read_to_string(root.join(".codesage/drift.log")).unwrap();
+        assert_eq!(log.lines().count(), 1, "expected exactly one record: {log}");
+        assert!(
+            log.contains("\"head\":\"deadbeef\""),
+            "unexpected record: {log}"
+        );
     }
 }

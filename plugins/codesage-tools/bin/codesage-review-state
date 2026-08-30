@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -741,8 +742,31 @@ def merge_document(
     return document, summary
 
 
+def reject_symlinked_components(destination):
+    """Refuse to write through a repository-planted symlink.
+
+    `.codesage/findings` and its `history/` subdirectory live inside the
+    repository work tree, so a cloned repo can ship either as a directory
+    symlink; `mkdir(exist_ok=True)`, the temp file, and `os.replace` would then
+    all land outside the project. Only components at or below `.codesage` are
+    checked -- the path leading to the project root may legitimately run
+    through symlinks the user owns.
+    """
+    destination = Path(destination)
+    parts = destination.parts
+    if ".codesage" not in parts:
+        return
+    anchor = len(parts) - 1 - parts[::-1].index(".codesage")
+    current = Path(*parts[:anchor]) if anchor else Path(destination.anchor or ".")
+    for part in parts[anchor:]:
+        current = current / part
+        if current.is_symlink():
+            raise OSError(f"refusing to use {destination}: {current} is a symlink")
+
+
 def atomic_write_json(destination, value):
     destination = Path(destination)
+    reject_symlinked_components(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = None
     try:
@@ -766,14 +790,36 @@ def atomic_write_json(destination, value):
         raise
 
 
+# Largest findings/state document this tool will read. These are our own JSON
+# files; the cap exists because they live inside the repository work tree and a
+# cloned repo controls what is at those names.
+MAX_STATE_BYTES = 1 << 24
+
+
 def load_json(path, default=None):
     if path is None:
         return copy.deepcopy(default)
     source = Path(path)
-    if not source.exists() and default is not None:
-        return copy.deepcopy(default)
-    with source.open(encoding="utf-8") as handle:
-        return json.load(handle)
+    reject_symlinked_components(source)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(source, flags)
+    except FileNotFoundError:
+        if default is not None:
+            return copy.deepcopy(default)
+        raise
+    with os.fdopen(fd, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(f"refusing to read {source}: not a regular file")
+        if info.st_size > MAX_STATE_BYTES:
+            raise OSError(
+                f"refusing to read {source}: {info.st_size} bytes exceeds {MAX_STATE_BYTES}"
+            )
+        raw = handle.read(MAX_STATE_BYTES + 1)
+    if len(raw) > MAX_STATE_BYTES:
+        raise OSError(f"refusing to read {source}: exceeded {MAX_STATE_BYTES} bytes")
+    return json.loads(raw.decode("utf-8"))
 
 
 def print_json(value):

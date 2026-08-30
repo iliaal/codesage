@@ -100,6 +100,9 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
          # installed by codesage install-hooks\n\
          root=\"$(git rev-parse --show-toplevel 2>/dev/null)\" || exit 0\n\
          [ -d \"$root/.codesage\" ] || exit 0\n\
+         # `-d` follows symlinks, so a hostile repo can ship .codesage as a\n\
+         # directory symlink and redirect every state path below it.\n\
+         [ -L \"$root/.codesage\" ] && exit 0\n\
          NICE=\"nice -n 19\"\n\
          IONICE=\"\"\n\
          command -v ionice >/dev/null 2>&1 && IONICE=\"ionice -c 3\"\n\
@@ -418,6 +421,22 @@ mod tests {
         assert!(
             body.contains("[ -d \"$root/.codesage\" ]"),
             "expected guard on .codesage directory presence"
+        );
+    }
+
+    #[test]
+    fn post_commit_hook_refuses_a_symlinked_codesage_dir() {
+        // `-d` follows symlinks, so the `-L` guard must sit beside it.
+        let body = generate_post_commit_hook_body("/x");
+        assert!(
+            body.contains("[ -L \"$root/.codesage\" ] && exit 0"),
+            "expected the .codesage directory-symlink guard, got:\n{body}"
+        );
+        let dir_guard = body.find("[ -L \"$root/.codesage\" ]").unwrap();
+        let log_assign = body.find("log=\"$root/.codesage/hooks.log\"").unwrap();
+        assert!(
+            dir_guard < log_assign,
+            "the directory guard must precede the log path assignment:\n{body}"
         );
     }
 

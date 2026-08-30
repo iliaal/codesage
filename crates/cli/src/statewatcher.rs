@@ -121,7 +121,7 @@ struct StatusGuard(PathBuf);
 
 impl Drop for StatusGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = crate::fsguard::remove_state_file(&self.0);
     }
 }
 
@@ -1354,19 +1354,27 @@ fn write_status(root: &Path, mode: WatcherMode) -> Result<()> {
     };
     let path = watch_status_path(root);
     let json = serde_json::to_string(&status)?;
-    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
+    // `.codesage/` is repository-supplied content in a freshly cloned tree, so
+    // `watch.status` may be a planted symlink pointing anywhere on the host.
+    // Open with O_NOFOLLOW instead of `fs::write`: it fails with ELOOP rather
+    // than truncating the link's target, and unlike an lstat-then-write check
+    // it leaves no TOCTOU window.
+    let mut file = crate::fsguard::create_no_follow(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    std::io::Write::write_all(&mut file, json.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
 pub fn read_status(root: &Path) -> Option<WatchStatus> {
     let path = watch_status_path(root);
-    let raw = std::fs::read_to_string(&path).ok()?;
+    let raw = crate::fsguard::read_state_to_string(&path).ok()?;
     let status: WatchStatus = serde_json::from_str(&raw).ok()?;
     // An abrupt daemon/process death leaves the status file behind without the
     // owning thread running its cleanup. Treat a status whose recorded pid is
     // gone as inactive, and prune the stale file.
     if !process_alive(status.pid) {
-        let _ = std::fs::remove_file(&path);
+        let _ = crate::fsguard::remove_state_file(&path);
         return None;
     }
     Some(status)
@@ -1396,7 +1404,27 @@ pub fn watch_enabled(root: &Path, config_watch: Option<bool>) -> bool {
     {
         return false;
     }
-    !watch_disabled_path(root).exists()
+    !watch_disabled_marker_present(root)
+}
+
+/// Is a `watch.disabled` marker present at all?
+///
+/// lstat, not `exists()`: a dangling marker symlink reads as absent to
+/// `exists()`, so the marker would look cleared to some callers while every
+/// attempt to rewrite it fails. One helper keeps `watch_enabled` and
+/// `watch status` reporting the same thing.
+pub fn watch_disabled_marker_present(root: &Path) -> bool {
+    // lstat the `.codesage` parent too: lstat on the full path still resolves
+    // every component *before* the last, so a symlinked project dir would have
+    // this report on an entry outside the tree.
+    let dir = root.join(".codesage");
+    if !std::fs::symlink_metadata(&dir)
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    std::fs::symlink_metadata(watch_disabled_path(root)).is_ok()
 }
 
 // ---- standalone signal handling ---------------------------------------------
@@ -1439,6 +1467,54 @@ pub fn register_shutdown_flag() -> Arc<AtomicBool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_presence_ignores_a_symlinked_project_dir() {
+        // lstat on the full path still resolves every component before the
+        // last, so the `.codesage` parent needs its own check.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("watch.disabled"), b"").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".codesage")).unwrap();
+
+        assert!(
+            !watch_disabled_marker_present(&root),
+            "reported a marker that lives outside the project"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_status_refuses_a_symlinked_status_file() {
+        // `.codesage/watch.status` ships with a cloned repo; `fs::write`
+        // through a planted symlink truncates the target.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let victim = root.join("victim.key");
+        std::fs::write(&victim, b"PRIVATE KEY").unwrap();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        std::os::unix::fs::symlink(&victim, watch_status_path(root)).unwrap();
+
+        assert!(write_status(root, WatcherMode::Foreground).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"PRIVATE KEY");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_status_writes_an_ordinary_status_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+
+        write_status(root, WatcherMode::Foreground).unwrap();
+
+        let status = read_status(root).expect("status must round-trip");
+        assert_eq!(status.pid, std::process::id());
+    }
 
     #[test]
     fn is_source_file_accepts_known_langs() {

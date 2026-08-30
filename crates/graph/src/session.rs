@@ -401,6 +401,7 @@ fn snapshot_path(project_root: &Path, session_id: &str) -> PathBuf {
 fn write_snapshot(project_root: &Path, snap: &SessionSnapshot) -> Result<()> {
     let path = snapshot_path(project_root, &snap.session_id);
     if let Some(parent) = path.parent() {
+        reject_symlinked_parents(project_root, parent)?;
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating sessions dir {}", parent.display()))?;
     }
@@ -421,6 +422,7 @@ fn write_snapshot(project_root: &Path, snap: &SessionSnapshot) -> Result<()> {
             .unwrap_or("snapshot")
     );
     let tmp_path = parent.join(tmp_name);
+    reject_snapshot_symlink(&tmp_path)?;
     std::fs::write(&tmp_path, &json)
         .with_context(|| format!("writing temp snapshot {}", tmp_path.display()))?;
     std::fs::rename(&tmp_path, &path)
@@ -430,6 +432,9 @@ fn write_snapshot(project_root: &Path, snap: &SessionSnapshot) -> Result<()> {
 
 fn read_snapshot(project_root: &Path, session_id: &str) -> Result<SessionSnapshot> {
     let path = snapshot_path(project_root, session_id);
+    if let Some(parent) = path.parent() {
+        reject_symlinked_parents(project_root, parent)?;
+    }
     reject_snapshot_symlink(&path)?;
     let meta = std::fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
     ensure!(
@@ -457,15 +462,53 @@ fn read_snapshot(project_root: &Path, session_id: &str) -> Result<SessionSnapsho
 
 /// Refuse to read or write through a symlinked snapshot path — same posture as
 /// the MCP daemon's runtime-dir guard.
-fn reject_snapshot_symlink(path: &Path) -> Result<()> {
-    if !path.exists() {
+/// Refuse to read or write a snapshot through a symlinked parent directory.
+///
+/// [`reject_snapshot_symlink`] inspects only the final path component, so a
+/// repo-planted `.codesage/sessions` (or `.codesage` itself) directory symlink
+/// would otherwise redirect `create_dir_all`, the temp write and the rename
+/// outside the project tree. Only components under `project_root` are checked;
+/// the root's own path may legitimately run through symlinks the user owns.
+fn reject_symlinked_parents(project_root: &Path, target: &Path) -> Result<()> {
+    let Ok(rel) = target.strip_prefix(project_root) else {
         return Ok(());
+    };
+    let mut cur = project_root.to_path_buf();
+    for comp in rel.components() {
+        cur.push(comp.as_os_str());
+        if let Ok(meta) = std::fs::symlink_metadata(&cur)
+            && meta.file_type().is_symlink()
+        {
+            bail!(
+                "refusing to use session snapshot dir {}: {} is a symlink",
+                target.display(),
+                cur.display()
+            );
+        }
     }
-    let meta =
-        std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    Ok(())
+}
+
+fn reject_snapshot_symlink(path: &Path) -> Result<()> {
+    // lstat directly rather than gating on `Path::exists()`, which follows
+    // links: a *dangling* symlink reads as absent there, and the write would
+    // then create the file at the link's target.
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("stat {}", path.display())),
+    };
     if meta.file_type().is_symlink() {
         bail!(
             "refusing to use session snapshot {}: it is a symlink",
+            path.display()
+        );
+    }
+    // A cloned repo can also ship a directory at this name: the temp file
+    // would be written and only the rename would fail, leaving state behind.
+    if !meta.is_file() {
+        bail!(
+            "refusing to use session snapshot {}: it is not a regular file",
             path.display()
         );
     }
@@ -534,5 +577,126 @@ mod tests {
             format!("{err:#}").contains("future"),
             "expected future-skew rejection, got: {err:#}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_snapshot_refuses_a_symlinked_sessions_dir() {
+        // `.codesage/sessions` ships with the repo, so it can be a directory
+        // symlink; `create_dir_all` and the rename would follow it out of tree.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let outside = root.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let cs = root.join(".codesage");
+        std::fs::create_dir(&cs).unwrap();
+        std::os::unix::fs::symlink(&outside, cs.join(SESSIONS_DIR)).unwrap();
+
+        let err = write_snapshot(root, &snapshot_with_created_at("s1", now_unix())).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("is a symlink"),
+            "expected a symlink refusal, got: {err:#}"
+        );
+        assert!(
+            std::fs::read_dir(&outside).unwrap().next().is_none(),
+            "the snapshot was written through the symlinked sessions dir"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_snapshot_refuses_a_symlinked_codesage_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".codesage")).unwrap();
+
+        let err = write_snapshot(&root, &snapshot_with_created_at("s1", now_unix())).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("is a symlink"),
+            "expected a symlink refusal, got: {err:#}"
+        );
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_snapshot_refuses_a_dangling_symlinked_temp_file() {
+        // The temp name is derived from the session id, so it is predictable
+        // and plantable. A dangling link reads as absent to `Path::exists()`.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let target = root.join("created-by-attacker");
+        let sessions = root.join(".codesage").join(SESSIONS_DIR);
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::os::unix::fs::symlink(&target, sessions.join(".s1.json.tmp")).unwrap();
+
+        let err = write_snapshot(root, &snapshot_with_created_at("s1", now_unix())).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("is a symlink"),
+            "expected a symlink refusal, got: {err:#}"
+        );
+        assert!(!target.exists(), "the temp write created the link's target");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_snapshot_refuses_a_dangling_final_snapshot_symlink() {
+        // `reject_snapshot_symlink` used to gate on `Path::exists()`, which
+        // follows links, so a dangling link read as absent.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let target = root.join("created-by-attacker");
+        let sessions = root.join(".codesage").join(SESSIONS_DIR);
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::os::unix::fs::symlink(&target, sessions.join("s1.json")).unwrap();
+
+        let err = write_snapshot(root, &snapshot_with_created_at("s1", now_unix())).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("is a symlink"),
+            "expected a symlink refusal, got: {err:#}"
+        );
+        assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_snapshot_refuses_a_directory_at_the_snapshot_path() {
+        // A cloned directory here used to pass the symlink-only check: the
+        // temp file was written and only the rename failed.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let sessions = root.join(".codesage").join(SESSIONS_DIR);
+        std::fs::create_dir_all(sessions.join("s1.json")).unwrap();
+
+        let err = write_snapshot(root, &snapshot_with_created_at("s1", now_unix())).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("not a regular file"),
+            "expected a file-type refusal, got: {err:#}"
+        );
+        assert!(
+            std::fs::read_dir(&sessions)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .all(|e| e.file_name() == "s1.json"),
+            "a temp file was left behind"
+        );
+    }
+
+    #[test]
+    fn write_snapshot_round_trips_through_an_ordinary_sessions_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap = snapshot_with_created_at("s1", now_unix());
+        write_snapshot(dir.path(), &snap).unwrap();
+
+        let read = read_snapshot(dir.path(), "s1").unwrap();
+        assert_eq!(read.session_id, "s1");
     }
 }

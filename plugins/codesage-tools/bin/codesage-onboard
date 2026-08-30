@@ -128,6 +128,13 @@ if [ ! -f "$config" ]; then
     echo "error: $config missing after init" >&2
     exit 1
 fi
+# `-f` follows symlinks. A repo that ships its own `.codesage/` makes `init`
+# return "Already initialized", so a planted symlink here would have the
+# device rewrite below truncate whatever it points at.
+if [ -L "$project/.codesage" ] || [ -L "$config" ]; then
+    echo "error: $config or its parent is a symlink -- refusing to write through it" >&2
+    exit 1
+fi
 
 # --- Step 3: set device in config.toml ---
 echo "==> [3/7] set device = $device"
@@ -211,6 +218,12 @@ fi
 # Per-repo opt-out: `.codesage/no-agent-hint` marks a repo as indexed-only
 # (e.g. a worktree that's queried from a different orchestration directory).
 # When present, step 7 is skipped regardless of --refresh-hint.
+# `-f` follows links, so probe the project dir first: a symlinked `.codesage`
+# would otherwise let this read an opt-out marker outside the repository.
+if [ -L "$project/.codesage" ]; then
+    echo "error: $project/.codesage is a symlink -- refusing to read project state through it" >&2
+    exit 1
+fi
 if [ -f "$project/.codesage/no-agent-hint" ]; then
     skip_hint=1
 fi
@@ -318,7 +331,19 @@ HINT
 
         case "$hint_mode" in
             agents)
+                # A cloned repo can ship AGENTS.md as a symlink; the awk
+                # rewrite and the append below both follow it.
+                if [ -L "$hint_file" ]; then
+                    echo "error: $hint_file is a symlink -- refusing to write the hint through it" >&2
+                    exit 1
+                fi
                 # Replace existing marked block in AGENTS.md, or append if not present.
+                # Use a freshly created temp rather than the predictable
+                # `$hint_file.new`, which a clone can plant as a symlink: the
+                # redirect would truncate its target and `mv` would then swap
+                # the link in for AGENTS.md.
+                hint_new="$(mktemp "$(dirname "$hint_file")/.codesage-hint.XXXXXX")"
+                trap 'rm -f "$hint_new"' EXIT
                 if grep -q '^<!-- codesage-onboard-hint-begin' "$hint_file" 2>/dev/null; then
                     awk -v block_file="$hint_tmp" '
                         BEGIN { in_block = 0; injected = 0 }
@@ -332,8 +357,8 @@ HINT
                         /^<!-- codesage-onboard-hint-end/ && in_block { in_block = 0; next }
                         in_block { next }
                         { print }
-                    ' "$hint_file" > "${hint_file}.new"
-                    mv "${hint_file}.new" "$hint_file"
+                    ' "$hint_file" > "$hint_new"
+                    mv "$hint_new" "$hint_file"
                 else
                     # Append with a separator if AGENTS.md doesn't end with a blank line.
                     if [ -s "$hint_file" ] && [ "$(tail -c 1 "$hint_file" | wc -l)" -eq 0 ]; then
@@ -344,7 +369,17 @@ HINT
                 fi
                 ;;
             claude)
+                # A cloned repo can ship `.claude` as a directory symlink or
+                # the hint file as a symlink; `mkdir -p` and `cp` both follow.
+                if [ -L "$project/.claude" ]; then
+                    echo "error: $project/.claude is a symlink -- refusing to write the hint through it" >&2
+                    exit 1
+                fi
                 mkdir -p "$project/.claude"
+                if [ -L "$hint_file" ] || { [ -e "$hint_file" ] && [ ! -f "$hint_file" ]; }; then
+                    echo "error: $hint_file is not a regular file -- refusing to write the hint" >&2
+                    exit 1
+                fi
                 cp "$hint_tmp" "$hint_file"
                 # Keep the local hint out of the project's commit history.
                 if [ -e "$project/.git" ]; then

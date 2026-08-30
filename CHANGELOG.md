@@ -1,5 +1,11 @@
 ## [Unreleased]
 
+### Security
+
+- Writers under a project's `.codesage/` no longer follow a symlink a cloned repo planted there, at the leaf or at `.codesage` itself: the drift log and its rotation, session snapshots, `watch.status`, `watch.disabled`, `indexing.lock`, `feature-map.state`, the index database's open and hardening, the generated git hooks, and the plugin's onboard and review-state writers.
+- Reads of `.codesage/` state (`config.toml`, `watch.status`, `feature-map.state`, the drift log, plugin findings) require a regular file and a size cap.
+- `codesage mcp` on non-Unix targets now fails with an explicit error when it would touch project state, instead of falling back to unguarded file access.
+
 ## [0.21.0] - 2026-08-29
 
 ### Added

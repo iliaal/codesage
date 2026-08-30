@@ -70,12 +70,10 @@ pub fn try_acquire(project_root: &Path) -> Result<LockOutcome> {
         }));
     }
     let path = codesage_dir.join("indexing.lock");
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
+    // A cloned repo ships its own `.codesage/`, so `indexing.lock` can be a
+    // planted symlink; without O_NOFOLLOW this create would materialize a file
+    // at the link's target, before any project config is even loaded.
+    let file = crate::fsguard::open_lockfile(&path)
         .with_context(|| format!("opening lockfile {}", path.display()))?;
     // `File::try_lock` returns `Ok(())` on success and
     // `Err(TryLockError::WouldBlock)` on contention. Any other error
@@ -146,6 +144,22 @@ fn empty_file_handle() -> Result<File> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn acquire_refuses_a_symlinked_lockfile() {
+        // A cloned repo can ship `.codesage/indexing.lock` as a dangling
+        // symlink; following it would create a file at an arbitrary path
+        // before any project config is loaded.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        let target = root.join("created-by-attacker");
+        std::os::unix::fs::symlink(&target, root.join(".codesage/indexing.lock")).unwrap();
+
+        assert!(try_acquire(root).is_err());
+        assert!(!target.exists(), "the lock open created the link's target");
+    }
 
     #[test]
     fn second_acquire_gets_already_held() {

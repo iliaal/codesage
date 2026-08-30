@@ -179,7 +179,16 @@ fn check_db(root: &Path) -> Check {
 
 fn check_disk(root: &Path) -> Check {
     let db_path = root.join(PROJECT_DIR).join(DB_FILE);
-    let size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+    // lstat the leaf AND the `.codesage` parent: lstat on the full path still
+    // resolves every earlier component, so a symlinked project dir would
+    // otherwise report an outside file's size and pass a disk check that the
+    // database check rejects.
+    let size = crate::fsguard::reject_symlinked_project_dir(&db_path)
+        .ok()
+        .and_then(|()| std::fs::symlink_metadata(&db_path).ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .unwrap_or(0);
     Check {
         name: "disk",
         status: Status::Pass,

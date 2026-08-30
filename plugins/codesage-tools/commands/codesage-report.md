@@ -8,6 +8,15 @@ argument-hint: "<project-path> [--status open,wont-fix] [--severity high,medium]
 
 Format the project's findings into a Markdown report suitable for pasting into a PR description, a ticket, or a stakeholder email. No LLM call — this is a pure file walk + format.
 
+> **Before touching any `.codesage/` path:** `.codesage/` is repository content, so a cloned
+> repo can ship it — or any directory under it — as a symlink. Refuse to read, write, create,
+> or delete through one. Check with `test -L <path>` (not `test -e`, which follows links) on
+> `.codesage` itself and on each subdirectory you are about to use, and stop with an error if
+> any is a symlink. Apply the same check to every **leaf** you touch: a `*.json` findings
+> file, or any temporary file you create beside it, may itself be a planted symlink or a
+> directory. Read or write a leaf only if it is a regular file (or absent, when creating),
+> and give temporary files a freshly generated unique name rather than a predictable one.
+
 ## Parse arguments
 
 First positional: absolute project path (required).
