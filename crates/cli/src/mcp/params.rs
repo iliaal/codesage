@@ -342,6 +342,11 @@ pub struct EmbedTextsParams {
         description = "Embedding model the caller indexes with; must equal the project's configured model"
     )]
     pub model: String,
+    #[schemars(
+        description = "The full semantic fingerprint the caller will attest these vectors under; required with non-empty texts and must equal the daemon's own"
+    )]
+    #[serde(default)]
+    pub fingerprint: Option<String>,
     #[schemars(description = "Chunk texts to embed, in order; empty to probe model and dimension")]
     pub texts: Vec<String>,
 }
@@ -351,6 +356,10 @@ pub struct EmbedTextsParams {
 pub struct EmbedTextsResult {
     pub model: String,
     pub dim: usize,
+    /// The semantic fingerprint of the vectors this daemon's session
+    /// produces: configured setup, model-file digest, and the execution
+    /// provider the session actually initialised on.
+    pub fingerprint: String,
     pub embeddings: Vec<Vec<f32>>,
 }
 

@@ -19,7 +19,8 @@ use rmcp::service::{RoleClient, RunningService};
 
 use crate::mcp::params::EmbedTextsResult;
 use crate::mcp::{
-    EMBED_TEXTS_OVER_CAP, MAX_MCP_EMBED_TEXT_BYTES, MAX_MCP_EMBED_TEXTS, MAX_MCP_EMBED_TOTAL_BYTES,
+    EMBED_TEXTS_FINGERPRINT_MISMATCH, EMBED_TEXTS_OVER_CAP, MAX_MCP_EMBED_TEXT_BYTES,
+    MAX_MCP_EMBED_TEXTS, MAX_MCP_EMBED_TOTAL_BYTES,
 };
 
 /// Constructor for the private embedder a [`DaemonEmbedder`] falls back to
@@ -39,6 +40,12 @@ pub(crate) struct DaemonEmbedder {
     project: String,
     model: String,
     dim: usize,
+    /// The semantic fingerprint the daemon reported at the probe: the
+    /// identity of the vectors its session produces.
+    daemon_fingerprint: String,
+    /// The fingerprint the pass attests under, once bound. Sent with every
+    /// embed request so the daemon refuses the moment its own moves.
+    expected_fingerprint: Option<String>,
     /// Private-embedder fallback for texts the daemon refuses as over cap
     /// — a single text past the per-text byte cap, or a refusal from a
     /// daemon of another build with tighter caps. Constructed on first use.
@@ -118,6 +125,8 @@ impl DaemonEmbedder {
             project: project.to_string(),
             model: model.to_string(),
             dim: 0,
+            daemon_fingerprint: String::new(),
+            expected_fingerprint: None,
             private_init: None,
             private: None,
         };
@@ -128,8 +137,19 @@ impl DaemonEmbedder {
             probe.model
         );
         ensure!(probe.dim > 0, "daemon reported a zero embedding dimension");
+        ensure!(
+            !probe.fingerprint.is_empty(),
+            "daemon reported no semantic fingerprint"
+        );
         this.dim = probe.dim;
+        this.daemon_fingerprint = probe.fingerprint;
         Ok(this)
+    }
+
+    /// The semantic fingerprint the daemon reported for its session.
+    #[cfg(test)]
+    fn daemon_fingerprint(&self) -> &str {
+        &self.daemon_fingerprint
     }
 
     /// Dimension the daemon's session produces for this model.
@@ -185,6 +205,9 @@ impl DaemonEmbedder {
         let mut arguments = serde_json::Map::new();
         arguments.insert("project".into(), self.project.clone().into());
         arguments.insert("model".into(), self.model.clone().into());
+        if let Some(expected) = &self.expected_fingerprint {
+            arguments.insert("fingerprint".into(), expected.clone().into());
+        }
         arguments.insert(
             "texts".into(),
             serde_json::Value::Array(texts.iter().map(|t| (*t).into()).collect()),
@@ -226,6 +249,13 @@ fn is_over_cap_refusal(err: &anyhow::Error) -> bool {
     format!("{err:#}").contains(EMBED_TEXTS_OVER_CAP)
 }
 
+/// Whether a daemon error says the daemon's fingerprint is not the one this
+/// pass attests under. Never a fallback case: a private session would embed
+/// under yet another identity.
+fn is_fingerprint_refusal(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains(EMBED_TEXTS_FINGERPRINT_MISMATCH)
+}
+
 /// Split `lens` (byte length per text, in order) into daemon batches that
 /// each stay within `max_count` texts and `max_total` bytes, and the indices
 /// of texts over `max_text` bytes, which never go to the daemon at all.
@@ -258,7 +288,29 @@ fn plan_embed_batches(
 }
 
 impl TextEmbedder for DaemonEmbedder {
+    /// Refuse a daemon whose session does not produce `expected`: same model
+    /// name and dimension, but a pooling, device, or model-file change on
+    /// the daemon's side. Nothing is embedded privately in its place — the
+    /// pass aborts unattested, and the user re-runs once the two agree.
+    fn bind_fingerprint(&mut self, expected: &codesage_graph::SemanticFingerprint) -> Result<()> {
+        ensure!(
+            self.daemon_fingerprint == expected.as_str(),
+            "{EMBED_TEXTS_FINGERPRINT_MISMATCH} daemon session produces {:?}, this pass attests \
+             {:?}; the daemon's config or model files moved — re-run `codesage index` once they \
+             agree",
+            self.daemon_fingerprint,
+            expected.as_str()
+        );
+        self.expected_fingerprint = Some(expected.as_str().to_string());
+        Ok(())
+    }
+
     fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        ensure!(
+            self.expected_fingerprint.is_some(),
+            "{EMBED_TEXTS_FINGERPRINT_MISMATCH} no fingerprint bound before embedding through the \
+             daemon"
+        );
         let lens: Vec<usize> = texts.iter().map(|t| t.len()).collect();
         let (batches, oversize) = plan_embed_batches(
             &lens,
@@ -286,6 +338,11 @@ impl TextEmbedder for DaemonEmbedder {
                         );
                     }
                     result.embeddings
+                }
+                // The daemon's fingerprint moved mid-pass: abort, and never
+                // embed the batch privately under a third identity.
+                Err(e) if is_fingerprint_refusal(&e) => {
+                    return Err(e.context("daemon semantic fingerprint moved during the pass"));
                 }
                 // A daemon of another build may hold tighter caps than this
                 // binary planned for; its refusal is not a failure of the run.
@@ -353,6 +410,43 @@ mod tests {
         /// Refuse any text longer than this with the shared over-cap prefix,
         /// as a daemon of another build with tighter caps would.
         text_cap: Option<usize>,
+        /// The fingerprint this daemon's session produces, reported at the
+        /// probe and required on every non-empty request.
+        fingerprint: String,
+        /// When set, the fingerprint the session produces from the first
+        /// non-empty request on: a same-model config change landing on the
+        /// daemon between the probe and a later batch.
+        fingerprint_after_probe: Option<String>,
+    }
+
+    impl FakeDaemon {
+        fn new(dim: usize, model: &str) -> Self {
+            Self {
+                dim,
+                model: model.to_string(),
+                text_cap: None,
+                fingerprint: fp_a().as_str().to_string(),
+                fingerprint_after_probe: None,
+            }
+        }
+    }
+
+    /// The fingerprint every client in these tests attests under.
+    fn fp_a() -> codesage_graph::SemanticFingerprint {
+        codesage_graph::SemanticFingerprint::with_artifact_digest(
+            &codesage_embed::config::EmbeddingConfig::default(),
+            4,
+            "digest-a",
+        )
+    }
+
+    /// The same model name and dimension, pooling the other way.
+    fn fp_b() -> codesage_graph::SemanticFingerprint {
+        let config = codesage_embed::config::EmbeddingConfig {
+            pooling: Some(codesage_embed::config::PoolingStrategy::Cls),
+            ..codesage_embed::config::EmbeddingConfig::default()
+        };
+        codesage_graph::SemanticFingerprint::with_artifact_digest(&config, 4, "digest-a")
     }
 
     impl ServerHandler for FakeDaemon {
@@ -376,6 +470,22 @@ mod tests {
                 .into());
             }
             let texts: Vec<String> = serde_json::from_value(args["texts"].clone()).unwrap();
+            let produces = if texts.is_empty() {
+                self.fingerprint.as_str()
+            } else {
+                self.fingerprint_after_probe
+                    .as_deref()
+                    .unwrap_or(self.fingerprint.as_str())
+            };
+            let expected = args.get("fingerprint").and_then(|v| v.as_str());
+            if (!texts.is_empty() && expected.is_none()) || expected.is_some_and(|e| e != produces)
+            {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "{EMBED_TEXTS_FINGERPRINT_MISMATCH} daemon session produces {produces:?}, \
+                     caller attests {expected:?}"
+                ))])
+                .into());
+            }
             if let Some(cap) = self.text_cap
                 && let Some(big) = texts.iter().find(|t| t.len() > cap)
             {
@@ -402,6 +512,7 @@ mod tests {
             Ok(CallToolResult::structured(json!({
                 "model": self.model,
                 "dim": self.dim,
+                "fingerprint": produces,
                 "embeddings": embeddings,
             }))
             .into())
@@ -433,14 +544,12 @@ mod tests {
 
     #[test]
     fn embeds_through_the_socket_and_reports_the_probed_dimension() {
-        let (_dir, socket, handle) = spawn_fake(FakeDaemon {
-            dim: 4,
-            model: "m".into(),
-            text_cap: None,
-        });
+        let (_dir, socket, handle) = spawn_fake(FakeDaemon::new(4, "m"));
         {
             let mut client = DaemonEmbedder::connect_to(&socket, "/p", "m").unwrap();
             assert_eq!(client.dim(), 4);
+            assert_eq!(client.daemon_fingerprint(), fp_a().as_str());
+            client.bind_fingerprint(&fp_a()).unwrap();
             let out = client.embed_batch(&["ab", "abcd"]).unwrap();
             assert_eq!(out.len(), 2);
             assert_eq!(out[0][0], 2.0);
@@ -453,11 +562,7 @@ mod tests {
 
     #[test]
     fn model_mismatch_is_refused_at_connect() {
-        let (_dir, socket, handle) = spawn_fake(FakeDaemon {
-            dim: 4,
-            model: "served".into(),
-            text_cap: None,
-        });
+        let (_dir, socket, handle) = spawn_fake(FakeDaemon::new(4, "served"));
         let err = DaemonEmbedder::connect_to(&socket, "/p", "wanted")
             .err()
             .expect("mismatched model must not connect")
@@ -509,17 +614,14 @@ mod tests {
 
     #[test]
     fn oversize_texts_go_to_the_private_fallback_never_the_daemon() {
-        let (_dir, socket, handle) = spawn_fake(FakeDaemon {
-            dim: 4,
-            model: "m".into(),
-            text_cap: None,
-        });
+        let (_dir, socket, handle) = spawn_fake(FakeDaemon::new(4, "m"));
         {
             let mut client = DaemonEmbedder::connect_to(&socket, "/p", "m")
                 .unwrap()
                 .with_private_fallback(Box::new(|| {
                     Ok(Box::new(FakePrivate { dim: 4 }) as Box<dyn TextEmbedder>)
                 }));
+            client.bind_fingerprint(&fp_a()).unwrap();
             let big = "x".repeat(MAX_MCP_EMBED_TEXT_BYTES + 1);
             let out = client.embed_batch(&["ab", &big, "abcd"]).unwrap();
             assert_eq!(out.len(), 3);
@@ -539,9 +641,8 @@ mod tests {
         // The daemon (another build) refuses texts over 3 bytes; this
         // client's own caps are wider, so the refusal arrives at call time.
         let (_dir, socket, handle) = spawn_fake(FakeDaemon {
-            dim: 4,
-            model: "m".into(),
             text_cap: Some(3),
+            ..FakeDaemon::new(4, "m")
         });
         {
             let mut client = DaemonEmbedder::connect_to(&socket, "/p", "m")
@@ -549,6 +650,7 @@ mod tests {
                 .with_private_fallback(Box::new(|| {
                     Ok(Box::new(FakePrivate { dim: 4 }) as Box<dyn TextEmbedder>)
                 }));
+            client.bind_fingerprint(&fp_a()).unwrap();
             assert!(!client.private_loaded());
             let out = client.embed_batch(&["ab", "abcd"]).unwrap();
             assert_eq!(out.len(), 2);
@@ -561,15 +663,69 @@ mod tests {
     #[test]
     fn a_cap_refusal_without_a_fallback_is_an_error_naming_it() {
         let (_dir, socket, handle) = spawn_fake(FakeDaemon {
-            dim: 4,
-            model: "m".into(),
             text_cap: Some(3),
+            ..FakeDaemon::new(4, "m")
         });
         {
             let mut client = DaemonEmbedder::connect_to(&socket, "/p", "m").unwrap();
+            client.bind_fingerprint(&fp_a()).unwrap();
             let err = format!("{:#}", client.embed_batch(&["abcd"]).unwrap_err());
             assert!(err.contains("no private embedder is configured"), "{err}");
             assert!(err.contains(EMBED_TEXTS_OVER_CAP), "{err}");
+        }
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_daemon_producing_another_fingerprint_is_refused_at_bind_without_a_private_fallback() {
+        // Same model name, same dimension, pooling the other way: the probe
+        // passes the model check and the bind must still refuse.
+        let (_dir, socket, handle) = spawn_fake(FakeDaemon {
+            fingerprint: fp_b().as_str().to_string(),
+            ..FakeDaemon::new(4, "m")
+        });
+        {
+            let mut client = DaemonEmbedder::connect_to(&socket, "/p", "m")
+                .unwrap()
+                .with_private_fallback(Box::new(|| {
+                    Ok(Box::new(FakePrivate { dim: 4 }) as Box<dyn TextEmbedder>)
+                }));
+            let err = format!("{:#}", client.bind_fingerprint(&fp_a()).unwrap_err());
+            assert!(err.contains(EMBED_TEXTS_FINGERPRINT_MISMATCH), "{err}");
+            assert!(
+                err.contains("pooling=cls") && err.contains("pooling=mean"),
+                "{err}"
+            );
+            assert!(!client.private_loaded(), "no private embedder stands in");
+            // Embedding without a successful bind never reaches the daemon
+            // or the fallback either.
+            let err = format!("{:#}", client.embed_batch(&["ab"]).unwrap_err());
+            assert!(err.contains(EMBED_TEXTS_FINGERPRINT_MISMATCH), "{err}");
+            assert!(!client.private_loaded());
+        }
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_fingerprint_that_moves_mid_pass_aborts_the_batch_without_a_private_fallback() {
+        // The probe and the bind agree on A; the daemon's config changes
+        // under the same model name before the next batch and its session
+        // now produces B. The batch must fail, not be embedded elsewhere.
+        let (_dir, socket, handle) = spawn_fake(FakeDaemon {
+            fingerprint_after_probe: Some(fp_b().as_str().to_string()),
+            ..FakeDaemon::new(4, "m")
+        });
+        {
+            let mut client = DaemonEmbedder::connect_to(&socket, "/p", "m")
+                .unwrap()
+                .with_private_fallback(Box::new(|| {
+                    Ok(Box::new(FakePrivate { dim: 4 }) as Box<dyn TextEmbedder>)
+                }));
+            client.bind_fingerprint(&fp_a()).unwrap();
+            let err = format!("{:#}", client.embed_batch(&["ab", "abcd"]).unwrap_err());
+            assert!(err.contains(EMBED_TEXTS_FINGERPRINT_MISMATCH), "{err}");
+            assert!(err.contains("moved during the pass"), "{err}");
+            assert!(!client.private_loaded(), "no private embedder stands in");
         }
         handle.join().unwrap();
     }

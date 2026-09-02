@@ -501,6 +501,26 @@ fn resolved_embedder_pool_key(config: &EmbeddingConfig) -> Result<String> {
     embedder_pool_key(config, &digest)
 }
 
+/// The `embed_texts` fingerprint gate: a caller's `expected` fingerprint
+/// must equal the one this session `produces`; a non-empty request must
+/// carry one. A probe (empty texts) may omit it. Refusals carry
+/// [`super::EMBED_TEXTS_FINGERPRINT_MISMATCH`] so the client aborts rather
+/// than embedding privately.
+fn check_expected_fingerprint(expected: Option<&str>, produces: &str, probe: bool) -> Result<()> {
+    match expected {
+        Some(expected) if expected != produces => bail!(
+            "{} daemon session produces {produces:?}, caller attests {expected:?}",
+            super::EMBED_TEXTS_FINGERPRINT_MISMATCH
+        ),
+        None if !probe => bail!(
+            "{} caller sent no fingerprint with a non-empty request; daemon session produces \
+             {produces:?}",
+            super::EMBED_TEXTS_FINGERPRINT_MISMATCH
+        ),
+        _ => Ok(()),
+    }
+}
+
 impl CodeSageServerState {
     pub(crate) fn new() -> Self {
         Self {
@@ -926,11 +946,20 @@ impl CodeSageServer {
     /// `embed_texts` tool. `model` must be the project's configured model:
     /// the caller is about to write these vectors into that model's chunk
     /// table, and a daemon whose config moved on would silently fork the
-    /// index. An empty `texts` probes model and dimension only.
+    /// index. An empty `texts` probes model, dimension, and fingerprint.
+    ///
+    /// `expected_fingerprint` is the full semantic fingerprint the caller
+    /// will attest the vectors under. Model and dimension alone let a
+    /// same-model pooling, device, or model-file change on this side slip
+    /// into a table recorded under the caller's original identity, so a
+    /// non-empty request without one, or with one that differs from the
+    /// fingerprint this session produces, is refused under
+    /// [`super::EMBED_TEXTS_FINGERPRINT_MISMATCH`].
     pub(super) fn embed_texts_for(
         &self,
         project: &str,
         model: &str,
+        expected_fingerprint: Option<&str>,
         texts: &[String],
     ) -> Result<EmbedTextsResult> {
         let state = self.resolve_project(project)?;
@@ -945,6 +974,12 @@ impl CodeSageServer {
         }
         let embedder_arc = self.get_or_load_embedder(config)?;
         let mut embedder = embedder_arc.lock();
+        let dim = embedder.dim();
+        // The artifact digest is already cached from the pool key the load
+        // above resolved, so this reads no model file.
+        let fingerprint = codesage_graph::SemanticFingerprint::compute(config, dim)?
+            .with_execution_provider(embedder.execution_provider());
+        check_expected_fingerprint(expected_fingerprint, fingerprint.as_str(), texts.is_empty())?;
         let embeddings = if texts.is_empty() {
             Vec::new()
         } else {
@@ -953,7 +988,8 @@ impl CodeSageServer {
         };
         Ok(EmbedTextsResult {
             model: config.model.clone(),
-            dim: embedder.dim(),
+            dim,
+            fingerprint: fingerprint.as_str().to_string(),
             embeddings,
         })
     }
@@ -1426,6 +1462,42 @@ mod tests {
             "the surviving entry is the new one, not the stopped watcher's"
         );
         assert!(entry.thread.is_none(), "the reservation has no thread yet");
+    }
+
+    #[test]
+    fn embed_texts_fingerprint_gate_refuses_a_mismatch_and_an_unbound_batch() {
+        let ok = check_expected_fingerprint(Some("v3;a"), "v3;a", false);
+        assert!(ok.is_ok());
+        assert!(
+            check_expected_fingerprint(None, "v3;a", true).is_ok(),
+            "a probe may omit it"
+        );
+
+        let err = check_expected_fingerprint(Some("v3;a"), "v3;b", false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with(super::super::EMBED_TEXTS_FINGERPRINT_MISMATCH),
+            "{err}"
+        );
+        assert!(err.contains("v3;a") && err.contains("v3;b"), "{err}");
+
+        let err = check_expected_fingerprint(Some("v3;a"), "v3;b", true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with(super::super::EMBED_TEXTS_FINGERPRINT_MISMATCH),
+            "{err}"
+        );
+
+        let err = check_expected_fingerprint(None, "v3;a", false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with(super::super::EMBED_TEXTS_FINGERPRINT_MISMATCH),
+            "{err}"
+        );
+        assert!(err.contains("no fingerprint"), "{err}");
     }
 
     #[test]

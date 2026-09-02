@@ -57,6 +57,11 @@ pub(crate) const MAX_MCP_EMBED_TOTAL_BYTES: usize =
 /// private-embedder fallback on it, so a daemon of another build still
 /// speaks the same refusal.
 pub(crate) const EMBED_TEXTS_OVER_CAP: &str = "embed_texts: over cap:";
+/// Prefix of every `embed_texts` fingerprint refusal: the caller's expected
+/// semantic fingerprint is not the one this daemon's session produces. The
+/// CLI client aborts its pass on it and never embeds privately in its place,
+/// because the vectors it would produce carry another identity.
+pub(crate) const EMBED_TEXTS_FINGERPRINT_MISMATCH: &str = "embed_texts: fingerprint mismatch:";
 
 /// Refuse an `embed_texts` request whose count, any single text, or total
 /// bytes exceed the caps. The message names the cap that was hit.
@@ -432,7 +437,12 @@ impl CodeSageServer {
             }
             // Raw vectors, not a rendered digest: the budget cap and coverage
             // annotation the other tools go through would corrupt them.
-            match s.embed_texts_for(&params.project, &params.model, &params.texts) {
+            match s.embed_texts_for(
+                &params.project,
+                &params.model,
+                params.fingerprint.as_deref(),
+                &params.texts,
+            ) {
                 Ok(result) => match serde_json::to_value(&result) {
                     Ok(value) => CallToolResult::structured(value),
                     Err(e) => CallToolResult::error(vec![ContentBlock::text(format!(
