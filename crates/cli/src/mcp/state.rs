@@ -421,30 +421,65 @@ impl Drop for WatcherReservation<'_> {
 /// whose key no longer matches the project's current config is retired
 /// (shutdown signalled) so the next resolution respawns it with the fresh
 /// config instead of embedding into the old model's chunk table forever.
+///
+/// Every input of the semantic fingerprint is in the key — model, device,
+/// batch size, pooling, and the identity of the model files on disk —
+/// because a watcher that survives any of them changing keeps producing
+/// vectors the new fingerprint disowns. The file identity is path, size, and
+/// mtime of the cached artifacts (the key the content digest is cached by),
+/// never a read of their bytes: this runs on every tool call and must not
+/// block on hashing a model or on a download. An uncached model keys as
+/// `uncached`; the first load changes the key and restarts the watcher once.
 fn watcher_config_key(state: &ProjectState) -> String {
     if state.embedding_config.model.is_empty() || state.embedding_config_error.is_some() {
-        "structural-only".to_string()
-    } else {
-        format!(
-            "{}|{}",
-            state.embedding_config.model, state.embedding_config.device
-        )
+        return "structural-only".to_string();
+    }
+    let identity = cached_artifact_identity(&state.embedding_config.model);
+    watcher_key(&state.embedding_config, &identity)
+}
+
+fn watcher_key(config: &EmbeddingConfig, artifact_identity: &str) -> String {
+    match embedder_pool_key(config, artifact_identity) {
+        Ok(key) => key,
+        Err(e) => format!("invalid-config|{e}"),
+    }
+}
+
+/// Path/size/mtime of the model files already in the local cache; a label
+/// when they are not there or cannot be stat'ed. Never downloads or reads.
+fn cached_artifact_identity(model: &str) -> String {
+    match codesage_embed::model::cached_model_artifacts(model) {
+        Some(artifacts) => artifacts
+            .stat_key()
+            .unwrap_or_else(|| "unreadable".to_string()),
+        None => "uncached".to_string(),
     }
 }
 
 /// Pool key for a resident [`Embedder`]: everything `Embedder::new` bakes
 /// into the session's output. Pooling is part of it — a project that
 /// switches `[embedding].pooling` under the same model name must get a fresh
-/// session, not the one still pooling the other way.
-fn embedder_pool_key(config: &EmbeddingConfig) -> Result<String> {
+/// session, not the one still pooling the other way — and so is the digest
+/// of the model files, so a same-name model whose bytes changed on disk gets
+/// a session over the new bytes rather than the one loaded from the old.
+fn embedder_pool_key(config: &EmbeddingConfig, artifact_digest: &str) -> Result<String> {
     let batch_size = config.effective_batch_size()?;
     Ok(format!(
-        "{}|{}|{}|{:?}",
+        "{}|{}|{}|{:?}|{artifact_digest}",
         config.model,
         config.device,
         batch_size.get(),
         config.pooling_strategy()
     ))
+}
+
+/// [`embedder_pool_key`] over the model files a load would open, resolving
+/// them (downloading on a cache miss) exactly as `Embedder::new` is about to.
+fn resolved_embedder_pool_key(config: &EmbeddingConfig) -> Result<String> {
+    let artifacts = codesage_embed::model::resolve_model_artifacts(&config.model)
+        .with_context(|| format!("resolving model files for {:?}", config.model))?;
+    let digest = codesage_embed::fingerprint::model_artifact_digest(&artifacts)?;
+    embedder_pool_key(config, &digest)
 }
 
 impl CodeSageServerState {
@@ -710,7 +745,7 @@ impl CodeSageServer {
     }
 
     fn get_or_load_embedder(&self, config: &EmbeddingConfig) -> Result<Arc<Mutex<Embedder>>> {
-        let key = embedder_pool_key(config)?;
+        let key = resolved_embedder_pool_key(config)?;
         get_or_load_slot(&self.state.embedders, key, || {
             Embedder::new(config).with_context(|| {
                 format!(
@@ -1165,17 +1200,63 @@ mod tests {
     }
 
     #[test]
-    fn embedder_pool_key_separates_pooling_strategies() {
+    fn embedder_pool_key_separates_pooling_strategies_and_model_bytes() {
         let mut config = EmbeddingConfig::default();
-        let mean = embedder_pool_key(&config).unwrap();
+        let mean = embedder_pool_key(&config, "digest-a").unwrap();
         config.pooling = Some(codesage_embed::config::PoolingStrategy::Cls);
-        let cls = embedder_pool_key(&config).unwrap();
+        let cls = embedder_pool_key(&config, "digest-a").unwrap();
         assert_ne!(
             mean, cls,
             "a pooling switch under one model name must not share a session"
         );
         config.pooling = Some(codesage_embed::config::PoolingStrategy::Mean);
-        assert_eq!(embedder_pool_key(&config).unwrap(), mean);
+        assert_eq!(embedder_pool_key(&config, "digest-a").unwrap(), mean);
+        assert_ne!(
+            embedder_pool_key(&config, "digest-b").unwrap(),
+            mean,
+            "a same-name model whose files changed must not share a session"
+        );
+    }
+
+    #[test]
+    fn watcher_key_changes_with_pooling_and_retires_the_running_watcher() {
+        let mut config = EmbeddingConfig::default();
+        let mean_key = watcher_key(&config, "digest-a");
+        config.pooling = Some(codesage_embed::config::PoolingStrategy::Cls);
+        let cls_key = watcher_key(&config, "digest-a");
+        assert_ne!(
+            mean_key, cls_key,
+            "a pooling change must not keep the watcher embedding the old way"
+        );
+        assert_ne!(
+            watcher_key(&config, "digest-b"),
+            cls_key,
+            "changed model bytes must not keep the watcher"
+        );
+
+        // The running watcher was spawned under mean pooling; the next
+        // resolution under CLS must signal it and take the slot.
+        let watchers: Mutex<HashMap<PathBuf, WatcherEntry>> = Mutex::new(HashMap::new());
+        let root = PathBuf::from("/proj");
+        let (old_shutdown, _old_alive) =
+            fake_watcher(&watchers, &root, &mean_key, Duration::from_millis(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(true));
+        let slot = reserve_watcher_slot(
+            &watchers,
+            &root,
+            &cls_key,
+            &shutdown,
+            &alive,
+            Duration::from_secs(5),
+        );
+        assert!(matches!(slot, WatcherSlot::Reserved), "{slot:?}");
+        assert!(
+            old_shutdown.load(Ordering::SeqCst),
+            "the old-pooling watcher must have been signalled to stop"
+        );
+        let entry = watchers.lock();
+        assert_eq!(entry.get(&root).unwrap().config_key, cls_key);
     }
 
     #[test]
