@@ -10,10 +10,6 @@
 - `codesage index` constructs the embedder only when a pass has files to embed; a no-change incremental run never loads the model or maps CUDA (2.7–4.5 s and 1.16 GB → 0.08 s and 150 MB). `init_for_main` keeps only the env writes at startup; the CUDA/cuDNN preload moves to the first ONNX session. (cs-ox8)
 - Git hooks skip the binary when HEAD and the worktree content digest are unchanged (`.codesage/hook-state`, written only after both passes succeed). The `index` pass names no device: it embeds through the daemon's resident session or on the configured device.
 
-### Removed
-
-- `CODESAGE_ALLOW_CPU_FALLBACK`: a `device = "cuda"` or `coreml` session sets ONNX Runtime's `session.disable_cpu_ep_fallback` and fails at creation when any node would run on the CPU; the fingerprint's device component is the configured provider.
-
 ### Fixed
 
 - Stored chunk vectors are reused only when the chunk table records a matching semantic fingerprint (model, pinned revision and ONNX digest, dimension, pooling, chunker version); `codesage index --full` re-embeds every chunk and records the fingerprint on completion. The daemon's embedder pool key includes the pooling strategy.
@@ -33,7 +29,7 @@
 - The semantic fingerprint covers the execution provider (`cpu`, `cuda`, `coreml`; CPU- and CUDA-produced vectors never share a table), `EMBEDDING_PIPELINE_VERSION`, the 512-token truncation, and the L2 normalisation; every existing chunk table re-embeds once on its next `index`.
 - The git hook's worktree digest lists tracked changes and untracked files NUL-delimited into one list, checksums each under a single 256 MB budget carried across `xargs` batches through a file, digests the name list (a deleted tracked file changes the stamp), and no longer runs `git diff --binary`; a `readlink` failure fails the digest, and the temp files are removed on `EXIT`, `INT`, and `TERM`.
 - `embed_texts` carries the caller's full semantic fingerprint on every request and returns the daemon's own; the daemon refuses a mismatch or an unbound non-empty request with a distinct error, and the CLI client aborts the pass unattested instead of embedding privately when the daemon's fingerprint differs at bind or moves between batches.
-- Every semantic pass binds its embedder to the fingerprint it attests before writing a row and refuses one whose execution provider differs.
+- The semantic fingerprint's device component is the execution provider the session actually initialised on; a `device = "cuda"` load that falls back to the CPU under `CODESAGE_ALLOW_CPU_FALLBACK=1` logs a WARN, fingerprints as `cpu`, and every semantic pass refuses an embedder whose provider differs from the fingerprint it attests before writing a row.
 - The model-artifact stat key records canonical paths (absolute, symlinks resolved); a relative `HF_HOME` keys the same as its absolute spelling and a relocated cache directory keys differently.
 - The daemon's last-client watcher stop re-reads the client count under the watcher registry lock immediately before signalling and aborts when a client has connected since the disconnect that scheduled it.
 - The daemon client's private fallback for texts the daemon refuses as over cap is bound to the pass fingerprint before it embeds; a session producing another identity is an error, never a silently embedded batch.
