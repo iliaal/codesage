@@ -10,6 +10,11 @@ pub const DEFAULT_CHUNK_SIZE: usize = 1500;
 pub const DEFAULT_MIN_CHUNK_SIZE: usize = 350;
 pub const DEFAULT_CHUNK_OVERLAP: usize = 200;
 
+/// Version of the splitting algorithm below. Bump it when a change to
+/// `chunk_text` can produce different chunk texts for the same input; it is
+/// part of the semantic fingerprint that gates stored-vector reuse.
+pub const CHUNKER_VERSION: u32 = 1;
+
 #[derive(Debug, Clone)]
 pub struct ChunkConfig {
     pub chunk_size: usize,

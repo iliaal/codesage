@@ -205,6 +205,7 @@ fn fresh_db_records_migrations_exactly_once() {
         "0012_symbol_fingerprints",
         "0013_structural_unique_keys",
         "0014_git_files_churn_path",
+        "0015_semantic_models_fingerprint",
     ];
     for migration in expected_migrations {
         let count: i64 = conn

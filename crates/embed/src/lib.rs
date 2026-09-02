@@ -1,5 +1,6 @@
 pub mod chunk;
 pub mod config;
+pub mod fingerprint;
 pub mod model;
 pub mod reranker;
 

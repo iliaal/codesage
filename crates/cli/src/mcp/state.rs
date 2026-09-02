@@ -263,6 +263,21 @@ fn watcher_config_key(state: &ProjectState) -> String {
     }
 }
 
+/// Pool key for a resident [`Embedder`]: everything `Embedder::new` bakes
+/// into the session's output. Pooling is part of it — a project that
+/// switches `[embedding].pooling` under the same model name must get a fresh
+/// session, not the one still pooling the other way.
+fn embedder_pool_key(config: &EmbeddingConfig) -> Result<String> {
+    let batch_size = config.effective_batch_size()?;
+    Ok(format!(
+        "{}|{}|{}|{:?}",
+        config.model,
+        config.device,
+        batch_size.get(),
+        config.pooling_strategy()
+    ))
+}
+
 impl CodeSageServerState {
     pub(crate) fn new() -> Self {
         Self {
@@ -525,8 +540,7 @@ impl CodeSageServer {
     }
 
     fn get_or_load_embedder(&self, config: &EmbeddingConfig) -> Result<Arc<Mutex<Embedder>>> {
-        let batch_size = config.effective_batch_size()?;
-        let key = format!("{}|{}|{}", config.model, config.device, batch_size.get());
+        let key = embedder_pool_key(config)?;
         get_or_load_slot(&self.state.embedders, key, || {
             Embedder::new(config).with_context(|| {
                 format!(
@@ -972,6 +986,20 @@ mod tests {
             !alive.load(Ordering::SeqCst),
             "alive must flip to false even when the thread panics"
         );
+    }
+
+    #[test]
+    fn embedder_pool_key_separates_pooling_strategies() {
+        let mut config = EmbeddingConfig::default();
+        let mean = embedder_pool_key(&config).unwrap();
+        config.pooling = Some(codesage_embed::config::PoolingStrategy::Cls);
+        let cls = embedder_pool_key(&config).unwrap();
+        assert_ne!(
+            mean, cls,
+            "a pooling switch under one model name must not share a session"
+        );
+        config.pooling = Some(codesage_embed::config::PoolingStrategy::Mean);
+        assert_eq!(embedder_pool_key(&config).unwrap(), mean);
     }
 
     #[test]

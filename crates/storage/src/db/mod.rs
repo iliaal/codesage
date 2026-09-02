@@ -636,6 +636,46 @@ impl Database {
             .filter(|dim| *dim > 0))
     }
 
+    /// The semantic fingerprint recorded for this handle's chunk table:
+    /// `None` when the handle has no chunk table, the table predates the
+    /// column, or no completed population has recorded one yet. A reader
+    /// must treat `None` as "unknown", never as "matches".
+    pub fn semantic_fingerprint(&self) -> Result<Option<String>> {
+        if self.chunk_table.is_empty() {
+            return Ok(None);
+        }
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT fingerprint FROM semantic_models WHERE chunk_table = ?1",
+                params![self.chunk_table],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Record the fingerprint whose vectors this handle's chunk table now
+    /// holds in full. Called at the end of a completed population, never at
+    /// its start, so an interrupted rebuild leaves the previous value (or
+    /// none) and the next incremental pass refuses reuse.
+    pub fn record_semantic_fingerprint(&self, fingerprint: &str) -> Result<()> {
+        anyhow::ensure!(
+            !self.chunk_table.is_empty(),
+            "cannot record a semantic fingerprint on a handle without a chunk table"
+        );
+        let updated = self.conn.execute(
+            "UPDATE semantic_models SET fingerprint = ?2 WHERE chunk_table = ?1",
+            params![self.chunk_table, fingerprint],
+        )?;
+        anyhow::ensure!(
+            updated == 1,
+            "no semantic_models row for chunk table {:?}",
+            self.chunk_table
+        );
+        Ok(())
+    }
+
     pub fn execute_batch(&self, f: impl FnOnce(&Self) -> Result<()>) -> Result<()> {
         self.conn.execute_batch("BEGIN")?;
         match f(self) {
@@ -666,6 +706,77 @@ mod tests {
         FeatureConfidence, FeatureKind, FeatureRecord, FileInfo, Language, Reference, Symbol,
         TrustBoundary,
     };
+
+    #[test]
+    fn semantic_fingerprint_is_unknown_until_recorded_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = Database::open_for_model(&path, "fp/model", DEFAULT_EMBEDDING_DIM).unwrap();
+        assert_eq!(db.semantic_fingerprint().unwrap(), None);
+        db.record_semantic_fingerprint("v1;model=fp/model;dim=384")
+            .unwrap();
+        assert_eq!(
+            db.semantic_fingerprint().unwrap().as_deref(),
+            Some("v1;model=fp/model;dim=384")
+        );
+        drop(db);
+
+        // Reopening re-records model/dim through the upsert; the fingerprint
+        // is a separate column and must not be clobbered by that.
+        let db = Database::open_for_model(&path, "fp/model", DEFAULT_EMBEDDING_DIM).unwrap();
+        assert_eq!(
+            db.semantic_fingerprint().unwrap().as_deref(),
+            Some("v1;model=fp/model;dim=384")
+        );
+        let structural = Database::open(&path).unwrap();
+        assert_eq!(structural.semantic_fingerprint().unwrap(), None);
+        assert!(structural.record_semantic_fingerprint("x").is_err());
+    }
+
+    #[test]
+    fn legacy_semantic_models_table_gains_the_fingerprint_column() {
+        // A database written before migration 0015: the table lacks the
+        // column and every earlier migration is already recorded.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            init_vec_extension();
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE semantic_models (
+                     chunk_table TEXT PRIMARY KEY,
+                     model TEXT NOT NULL,
+                     dim INTEGER NOT NULL,
+                     indexed_at INTEGER NOT NULL DEFAULT (unixepoch())
+                 );
+                 INSERT INTO semantic_models (chunk_table, model, dim)
+                 VALUES ('chunks_legacy_384', 'legacy', 384);",
+            )
+            .unwrap();
+        }
+        let db = Database::open(&path).unwrap();
+        let has_column: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('semantic_models') WHERE name = 'fingerprint'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_column, 1, "migration must add the column");
+        let stored: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT fingerprint FROM semantic_models WHERE chunk_table = 'chunks_legacy_384'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored, None,
+            "a legacy row reads as unknown, never as a match"
+        );
+    }
 
     #[test]
     #[ignore = "timing probe, run explicitly"]

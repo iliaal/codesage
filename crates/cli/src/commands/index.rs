@@ -9,8 +9,8 @@ use anyhow::{Result, bail, ensure};
 use codesage_embed::config::EmbeddingConfig;
 use codesage_embed::model::Embedder;
 use codesage_graph::{
-    LazyEmbedder, TextEmbedder, full_index, incremental_index, semantic_full_index,
-    semantic_incremental_index,
+    LazyEmbedder, SemanticFingerprint, TextEmbedder, full_index, incremental_index,
+    semantic_full_index, semantic_incremental_index,
 };
 use codesage_parser::discover::build_exclude_set;
 use codesage_storage::Database;
@@ -299,7 +299,7 @@ fn open_index_db_and_embedder(
     full: bool,
     emb_config: &EmbeddingConfig,
     device: DeviceOptions,
-) -> Result<(Database, Box<dyn TextEmbedder>)> {
+) -> Result<(Database, Box<dyn TextEmbedder>, SemanticFingerprint)> {
     // Surface a bad batch size now, as the eager constructor always did,
     // rather than only on the first run that has something to embed.
     emb_config.effective_batch_size()?;
@@ -331,10 +331,12 @@ fn open_index_db_and_embedder(
         } else {
             open_db_for_model(root, &emb_config.model, dim)?
         };
-        return Ok((db, embedder));
+        let fingerprint = SemanticFingerprint::compute(emb_config, dim);
+        return Ok((db, embedder, fingerprint));
     };
 
     let db = open_db_for_model(root, &emb_config.model, dim)?;
+    let fingerprint = SemanticFingerprint::compute(emb_config, dim);
     let init_config = emb_config.clone();
     let root = root.to_path_buf();
     let lazy = LazyEmbedder::new(Box::new(move |files_to_embed| {
@@ -360,7 +362,7 @@ fn open_index_db_and_embedder(
         );
         Ok(embedder)
     }));
-    Ok((db, Box::new(lazy)))
+    Ok((db, Box::new(lazy), fingerprint))
 }
 
 /// The running daemon's resident session for `model`, with its dimension,
@@ -429,8 +431,9 @@ pub(crate) fn cmd_index(
     let (db, mut embedder) = if no_semantic {
         (open_db(&root)?, None)
     } else {
-        let (db, embedder) = open_index_db_and_embedder(&root, full, &emb_config, device)?;
-        (db, Some(embedder))
+        let (db, embedder, fingerprint) =
+            open_index_db_and_embedder(&root, full, &emb_config, device)?;
+        (db, Some((embedder, fingerprint)))
     };
 
     let stats = if full {
@@ -561,11 +564,25 @@ pub(crate) fn cmd_index(
         }
     }
 
-    if let Some(embedder) = embedder.as_mut() {
+    if let Some((embedder, fingerprint)) = embedder.as_mut() {
         let sem_stats = if full {
-            semantic_full_index(&root, &db, embedder.as_mut(), &excludes, verbose)?
+            semantic_full_index(
+                &root,
+                &db,
+                embedder.as_mut(),
+                &excludes,
+                fingerprint,
+                verbose,
+            )?
         } else {
-            semantic_incremental_index(&root, &db, embedder.as_mut(), &excludes, verbose)?
+            semantic_incremental_index(
+                &root,
+                &db,
+                embedder.as_mut(),
+                &excludes,
+                fingerprint,
+                verbose,
+            )?
         };
         if verbose {
             tracing::info!(

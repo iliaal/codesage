@@ -117,7 +117,8 @@ CREATE TABLE IF NOT EXISTS semantic_models (
     chunk_table TEXT PRIMARY KEY,
     model TEXT NOT NULL,
     dim INTEGER NOT NULL,
-    indexed_at INTEGER NOT NULL DEFAULT (unixepoch())
+    indexed_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    fingerprint TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_semantic_models_model ON semantic_models(model);
@@ -408,7 +409,27 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
         "0014_git_files_churn_path",
         migrate_0014_git_files_churn_path,
     ),
+    (
+        "0015_semantic_models_fingerprint",
+        migrate_0015_semantic_models_fingerprint,
+    ),
 ];
+
+/// `semantic_models.fingerprint`: the embedding setup (model, pinned files,
+/// dimension, pooling, chunker) whose vectors the chunk table holds. NULL on a
+/// table populated before the column existed, which readers treat as
+/// "unknown" — stored vectors are not reused until a full rebuild records it.
+fn migrate_0015_semantic_models_fingerprint(conn: &Connection) -> rusqlite::Result<()> {
+    let has_column: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('semantic_models') WHERE name = 'fingerprint'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_column == 0 {
+        conn.execute_batch("ALTER TABLE semantic_models ADD COLUMN fingerprint TEXT;")?;
+    }
+    Ok(())
+}
 
 /// Widen `idx_git_files_churn` to `(churn_score DESC, path)` so the top-churn
 /// query's tie-breaking `path` term is served by the index instead of a full

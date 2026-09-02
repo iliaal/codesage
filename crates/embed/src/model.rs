@@ -528,6 +528,23 @@ fn model_pin(model: &str) -> Option<&'static ModelPin> {
     MODEL_PINS.iter().find(|pin| pin.model == model)
 }
 
+/// The pinned revision and ONNX file digest a validated model loads at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PinnedModelIdentity {
+    pub revision: &'static str,
+    pub onnx_sha256: &'static str,
+}
+
+/// Identity of the files `model` is pinned to, `None` for a model outside the
+/// pin table (loadable only under `CODESAGE_ALLOW_ANY_MODEL`). Static lookup;
+/// never touches the network or the model cache.
+pub fn pinned_model_identity(model: &str) -> Option<PinnedModelIdentity> {
+    model_pin(model).map(|pin| PinnedModelIdentity {
+        revision: pin.revision,
+        onnx_sha256: pin.onnx_sha256,
+    })
+}
+
 pub fn allow_any_model_from_env() -> bool {
     matches!(
         std::env::var("CODESAGE_ALLOW_ANY_MODEL").as_deref(),

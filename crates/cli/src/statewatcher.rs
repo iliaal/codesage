@@ -7,7 +7,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use codesage_embed::config::EmbeddingConfig;
 use codesage_embed::model::Embedder;
-use codesage_graph::{index_files, remove_files, semantic_index_files, semantic_remove_files};
+use codesage_graph::{
+    SemanticFingerprint, index_files, remove_files, semantic_index_files, semantic_remove_files,
+};
 use codesage_parser::detect::{
     detect_language, detect_language_with_dialect, is_unambiguous_cpp_extension,
 };
@@ -709,7 +711,15 @@ fn semantic_reindex_batch(
             return WorkOutcome::Failed;
         }
     };
-    match semantic_index_files(&config.project_root, &db, &mut *emb, files, false) {
+    let fingerprint = SemanticFingerprint::compute(&config.embed_config, emb.dim());
+    match semantic_index_files(
+        &config.project_root,
+        &db,
+        &mut *emb,
+        files,
+        &fingerprint,
+        false,
+    ) {
         Ok(stats) => {
             if stats.files_processed > 0 {
                 tracing::info!(
@@ -1354,11 +1364,13 @@ fn run_bulk_incremental(config: &StateWatcherConfig, embedder: &mut EmbedderHand
                 return WorkOutcome::Failed;
             }
         };
+        let fingerprint = SemanticFingerprint::compute(&config.embed_config, emb.dim());
         if let Err(e) = codesage_graph::semantic_incremental_index(
             &config.project_root,
             &db,
             &mut *emb,
             &config.exclude_patterns,
+            &fingerprint,
             false,
         ) {
             tracing::warn!(error = %e, "bulk incremental semantic reindex failed");
