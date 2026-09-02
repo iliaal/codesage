@@ -18,6 +18,12 @@
 - The live watcher re-queues paths whose semantic pass failed (embedder load, DB open, embedding) with a doubling delay for up to five retries, logged at WARN, instead of dropping them until the next filesystem event.
 - Daemon watcher stop joins each watcher thread before freeing its registry slot, and a start request for a root whose watcher is still stopping waits for it (5 s per call) instead of spawning a second watcher.
 - `embed_texts` refuses a text over 48,000 bytes and a call over 24 MiB in total; the CLI client batches under the same caps and embeds refused texts with a private session.
+- The semantic fingerprint's model component is a SHA-256 over the model files on disk (tokenizer, ONNX graph, external-weights sidecar), cached per process by path, size, and mtime; the pin table is the loader's separate gate. An unpinned model or one loaded under `CODESAGE_ALLOW_ANY_MODEL=1` no longer fingerprints as `unpinned`.
+- A chunk table whose fingerprint is absent or differs is stale end to end: `codesage status` reports `stale` with a `fingerprint` field, `search` and `export` and the MCP semantic tools refuse with exit 65 naming `codesage index --full`, and an incremental `index` re-embeds every file instead of only content-changed ones.
+- `codesage index --full` clears the table fingerprint at start and records the new one only when no file failed; a partial rebuild leaves the table unattested.
+- The daemon's watcher restart key and embedder pool key include pooling, batch size, and the model-file digest; a pooling change or a same-name model edit replaces the watcher and the session.
+- The git hook's untracked-file digest is NUL-delimited end to end (`git ls-files -z` into `xargs -0`); a name with a newline is hashed by content instead of recorded as special. Files over 8 MB, or past a 256 MB read budget, contribute size and mtime.
+- `scripts/refresh-onboarded-repos.sh` reports an index exit 75 (lock held) as retry-later, still refreshes that repo's hooks and hint, and exits 75 itself when nothing else failed.
 
 ## [0.22.0] - 2026-08-30
 
