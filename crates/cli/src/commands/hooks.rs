@@ -102,10 +102,12 @@ pub(crate) fn cmd_install_hooks(with_leak_check: bool) -> Result<()> {
 /// nothing the hook indexes has changed (a release commit that touched
 /// only ignored files, a checkout back to the same tree, a rewrite that
 /// kept HEAD), and the binary is not invoked at all. The digest covers
-/// CONTENT — `git diff HEAD --binary` for every tracked change plus a
-/// checksum of every untracked file — not `git status`, whose output is
-/// status letters and paths: a second edit to an already-modified file left
-/// that unchanged and a same-HEAD hook skipped the reindex. Every stage's
+/// CONTENT — every tracked file that differs from HEAD and every untracked
+/// file, listed NUL-delimited and checksummed by content under one shared
+/// byte budget, plus the name list itself so a deletion or rename is
+/// visible — not `git status`, whose output is status letters and paths: a
+/// second edit to an already-modified file left that unchanged and a
+/// same-HEAD hook skipped the reindex. Every stage's
 /// exit status is checked; any failure leaves the stamp empty, which never
 /// matches and is never written, so the binary runs. The stamp is taken
 /// before the run and written after it, so a worktree that moves during the
@@ -148,22 +150,31 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
          # permanent skip.\n\
          state=\"$root/.codesage/hook-state\"\n\
          if [ -L \"$state\" ] || {{ [ -e \"$state\" ] && [ ! -f \"$state\" ]; }}; then state=/dev/null; fi\n\
-         # Content digest of the worktree relative to HEAD: every tracked\n\
-         # change as a binary patch, plus name and checksum of every untracked\n\
-         # file. Each stage's status is checked; one failure fails the digest.\n\
-         # The untracked listing is NUL-delimited end to end: a quoted name\n\
-         # (newline, non-UTF-8) fails `-f` and was recorded as special, so a\n\
-         # later edit to that file left the stamp unchanged. A file over 8 MB,\n\
-         # or past a 256 MB per-batch read budget, contributes its size and\n\
-         # mtime instead of its content.\n\
+         # Content digest of the worktree relative to HEAD: the name of every\n\
+         # tracked file that differs from HEAD (modified, staged, deleted) and\n\
+         # of every untracked file, NUL-delimited end to end, then a checksum\n\
+         # of each one's content. The name list is digested too, so a\n\
+         # deletion or rename changes the stamp. A file over 8 MB, or past\n\
+         # the 256 MB total read budget, contributes its size and mtime\n\
+         # instead of its content. The budget is ONE number for the whole\n\
+         # digest, carried across xargs batches through a file: a per-batch\n\
+         # counter reset every time xargs split a long list, and the\n\
+         # whole-patch read before it had no bound at all.\n\
+         # Each stage's status is checked; one failure fails the digest.\n\
          worktree_digest() {{\n\
-           tracked=\"$(git diff HEAD --binary --no-ext-diff --no-color -- . ':(exclude).codesage')\" || return 1\n\
            list=\"$(mktemp)\" || return 1\n\
-           git ls-files -z -o --exclude-standard -- . ':(exclude).codesage' >\"$list\" || {{ rm -f \"$list\"; return 1; }}\n\
+           budget=\"$(mktemp)\" || {{ rm -f \"$list\"; return 1; }}\n\
+           trap 'rm -f \"$list\" \"$budget\"' EXIT INT TERM\n\
+           {{ git diff --name-only -z HEAD -- . ':(exclude).codesage' && git ls-files -z -o --exclude-standard -- . ':(exclude).codesage'; }} >\"$list\" || return 1\n\
+           printf 268435456 >\"$budget\" || return 1\n\
+           # shellcheck disable=SC2016 # the inner script runs in its own sh; nothing here expands\n\
            sums=\"$(xargs -0 sh -c '\n\
-             budget=268435456\n\
+             budget_file=\"$1\"; shift\n\
+             budget=\"$(cat \"$budget_file\")\" || exit 1\n\
              for f; do\n\
-               if [ -L \"$f\" ]; then printf \"%s -> %s\\n\" \"$f\" \"$(readlink -- \"$f\")\" || exit 1\n\
+               if [ -L \"$f\" ]; then\n\
+                 target=\"$(readlink -- \"$f\")\" || exit 1\n\
+                 printf \"%s -> %s\\n\" \"$f\" \"$target\"\n\
                elif [ -f \"$f\" ]; then\n\
                  size=\"$(wc -c <\"$f\")\" || exit 1\n\
                  size=$((size))\n\
@@ -176,10 +187,10 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
                  fi\n\
                else printf \"%s (special)\\n\" \"$f\"\n\
                fi\n\
-             done' sh <\"$list\")\"; rc=$?\n\
-           rm -f \"$list\"\n\
-           [ \"$rc\" -eq 0 ] || return 1\n\
-           printf '%s\\n%s\\n' \"$tracked\" \"$sums\" | cksum\n\
+             done\n\
+             printf \"%s\" \"$budget\" >\"$budget_file\" || exit 1' sh \"$budget\" <\"$list\")\" || return 1\n\
+           names=\"$(cksum <\"$list\")\" || return 1\n\
+           printf '%s\\n%s\\n' \"$names\" \"$sums\" | cksum\n\
          }}\n\
          head=\"$(git rev-parse HEAD 2>/dev/null)\" || head=\"\"\n\
          stamp=\"\"\n\
@@ -205,9 +216,11 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
          # (no HEAD, or a digest stage failed) is never recorded.\n\
          ( cd \"$root\" || exit 0\n\
            echo \"[$(date)] $(basename \"$0\") hook start\" >>\"$log\"\n\
+           # shellcheck disable=SC2086 # IONICE and NICE are command words, split on purpose\n\
            $IONICE $NICE {bin} index --lock-wait 60 --device cpu >>\"$log\" 2>&1; rc=$?\n\
            echo \"[$(date)] index exit=$rc\" >>\"$log\"\n\
            index_rc=$rc\n\
+           # shellcheck disable=SC2086\n\
            $IONICE $NICE {bin} git-index --incremental --lock-wait 60 >>\"$log\" 2>&1; rc=$?\n\
            echo \"[$(date)] git-index exit=$rc\" >>\"$log\"\n\
            [ -n \"$stamp\" ] && [ \"$index_rc\" -eq 0 ] && [ \"$rc\" -eq 0 ] && printf '%s\\n' \"$stamp\" >\"$state\" ) >>\"$log\" 2>&1 &\n\
@@ -507,45 +520,61 @@ mod tests {
             body.contains("state=\"$root/.codesage/hook-state\""),
             "expected the hook-state path, got:\n{body}"
         );
-        // Content, not status: the tracked side is a binary patch against
-        // HEAD and the untracked side checksums each file. `git status
-        // --porcelain` must be gone — its output is unchanged by a second
-        // edit to an already-modified file.
+        // Content, not status: every tracked change and every untracked
+        // file is listed NUL-delimited and checksummed by content. `git
+        // status --porcelain` must be gone — its output is unchanged by a
+        // second edit to an already-modified file — and so must `git diff
+        // --binary`, which read every changed byte outside the budget.
         assert!(
             !body.contains("git status"),
             "the stamp must not be keyed on `git status` output:\n{body}"
         );
         assert!(
-            body.contains(
-                "tracked=\"$(git diff HEAD --binary --no-ext-diff --no-color -- . ':(exclude).codesage')\" || return 1"
-            ),
-            "tracked changes must be digested as content with the stage checked, got:\n{body}"
+            !body.contains("--binary"),
+            "tracked changes must not be read whole through `git diff --binary`:\n{body}"
         );
         assert!(
             body.contains(
-                "git ls-files -z -o --exclude-standard -- . ':(exclude).codesage' >\"$list\" || { rm -f \"$list\"; return 1; }"
+                "{ git diff --name-only -z HEAD -- . ':(exclude).codesage' && git ls-files -z -o --exclude-standard -- . ':(exclude).codesage'; } >\"$list\" || return 1"
             ),
-            "untracked listing must be NUL-delimited and stage-checked, got:\n{body}"
+            "tracked and untracked names must be listed NUL-delimited into one list with both stages checked, got:\n{body}"
         );
         assert!(
             body.contains("sums=\"$(xargs -0 sh -c '"),
-            "untracked names must be consumed NUL-delimited, never line-split, got:\n{body}"
+            "names must be consumed NUL-delimited, never line-split, got:\n{body}"
         );
         assert!(
-            !body.contains("while IFS= read -r f"),
+            !body.contains("while IFS= read -r f") && !body.contains("tr '\\0'"),
             "a newline-delimited read cannot carry a git-quoted name, got:\n{body}"
         );
         assert!(
             body.contains("cksum -- \"$f\" || exit 1"),
-            "untracked file content must be checksummed with the stage checked, got:\n{body}"
+            "file content must be checksummed with the stage checked, got:\n{body}"
         );
         assert!(
             body.contains("[ \"$size\" -gt 8388608 ] || [ \"$size\" -gt \"$budget\" ]"),
             "a large file or an exhausted budget must fall back to size+mtime, got:\n{body}"
         );
+        // One budget for the whole digest: read from and written back to a
+        // file so a second xargs batch continues where the first stopped.
         assert!(
-            body.contains("[ \"$rc\" -eq 0 ] || return 1"),
-            "an untracked checksum failure must fail the digest, got:\n{body}"
+            body.contains("budget=\"$(cat \"$budget_file\")\" || exit 1")
+                && body.contains("printf \"%s\" \"$budget\" >\"$budget_file\" || exit 1")
+                && body.contains("' sh \"$budget\" <\"$list\")\" || return 1"),
+            "the byte budget must be carried across xargs batches through a file, got:\n{body}"
+        );
+        assert!(
+            body.contains("names=\"$(cksum <\"$list\")\" || return 1")
+                && body.contains("printf '%s\\n%s\\n' \"$names\" \"$sums\" | cksum"),
+            "the name list itself must be part of the digest so a deletion is visible, got:\n{body}"
+        );
+        assert!(
+            body.contains("target=\"$(readlink -- \"$f\")\" || exit 1"),
+            "a readlink failure must fail the digest, not vanish behind printf, got:\n{body}"
+        );
+        assert!(
+            body.contains("trap 'rm -f \"$list\" \"$budget\"' EXIT INT TERM"),
+            "the temp files must be removed on every exit, got:\n{body}"
         );
         assert!(
             body.contains("digest=\"$(worktree_digest 2>/dev/null)\" && stamp=\"$head $digest\""),
@@ -871,6 +900,132 @@ mod tests {
         assert!(run_script(&hook, root).success());
         let content = wait_for_log(&log, "hook skip:");
         assert_eq!(content.matches("hook start").count(), 2, "{content}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_commit_hook_keys_a_large_modified_tracked_file_on_size_and_mtime_not_content() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_repo_with_one_commit(root);
+        // Commit a large tracked file, then modify it in the worktree: the
+        // old digest ran `git diff --binary` over the whole change, unbounded
+        // and outside the untracked side's budget. Now it is keyed exactly as
+        // a large untracked file is.
+        let big = root.join("big.bin");
+        let size = 8 * 1024 * 1024 + 1;
+        std::fs::write(&big, vec![b'0'; size]).unwrap();
+        for args in [vec!["add", "big.bin"], vec!["commit", "-q", "-m", "big"]] {
+            let status = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        }
+        let hook = install_hook_with_stub(root, "#!/bin/sh\nexit 0\n");
+        let log = root.join(".codesage/hooks.log");
+        let state = root.join(".codesage/hook-state");
+
+        let stamp_time = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let write_big = |byte: u8, mtime: SystemTime| {
+            std::fs::write(&big, vec![byte; size]).unwrap();
+            std::fs::File::open(&big)
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+        };
+        write_big(b'a', stamp_time);
+        assert!(run_script(&hook, root).success());
+        wait_for_passes(&log, 1);
+        let first = wait_for_stamp(&state, "");
+
+        // Same size, same mtime, every byte different: a content read would
+        // see it; the size+mtime key does not, and the hook skips.
+        write_big(b'b', stamp_time);
+        assert!(run_script(&hook, root).success());
+        let content = wait_for_log(&log, "hook skip:");
+        assert_eq!(
+            content.matches("hook start").count(),
+            1,
+            "a large tracked change's content must not be read into the digest:\n{content}"
+        );
+
+        // A moved mtime is visible.
+        write_big(b'b', stamp_time + Duration::from_secs(60));
+        assert!(run_script(&hook, root).success());
+        wait_for_passes(&log, 2);
+        let second = wait_for_stamp(&state, &first);
+        assert_ne!(first, second);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_commit_hook_sees_a_deleted_tracked_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_repo_with_one_commit(root);
+        let hook = install_hook_with_stub(root, "#!/bin/sh\nexit 0\n");
+        let log = root.join(".codesage/hooks.log");
+        let state = root.join(".codesage/hook-state");
+
+        assert!(run_script(&hook, root).success());
+        wait_for_passes(&log, 1);
+        let first = wait_for_stamp(&state, "");
+
+        // The deleted path has no content to checksum; only the name list
+        // can carry the change.
+        std::fs::remove_file(root.join("a.txt")).unwrap();
+        assert!(run_script(&hook, root).success());
+        let content = wait_for_passes(&log, 2);
+        assert_eq!(
+            content.matches("hook skip:").count(),
+            0,
+            "deleting a tracked file must defeat the skip:\n{content}"
+        );
+        let second = wait_for_stamp(&state, &first);
+        assert_ne!(first, second);
+
+        // Unchanged again: skipped.
+        assert!(run_script(&hook, root).success());
+        let content = wait_for_log(&log, "hook skip:");
+        assert_eq!(content.matches("hook start").count(), 2, "{content}");
+    }
+
+    /// `shellcheck -s sh` over the generated hook. Skips (with a note) when
+    /// shellcheck is not installed; CI installs it.
+    #[cfg(unix)]
+    #[test]
+    fn post_commit_hook_passes_shellcheck() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let Ok(mut child) = Command::new("shellcheck")
+            .args(["-s", "sh", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        else {
+            eprintln!("shellcheck not installed; skipping the hook lint");
+            return;
+        };
+        let body = generate_post_commit_hook_body("/usr/local/bin/codesage");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(body.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "shellcheck -s sh rejected the generated hook:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[cfg(unix)]
