@@ -623,6 +623,19 @@ impl Database {
         &self.chunk_table
     }
 
+    /// Embedding dimension recorded in `semantic_models` for this handle's
+    /// chunk table, or `None` when the handle has no chunk table or the
+    /// table predates the metadata. Lets an incremental indexer open the
+    /// model's table without constructing the model to ask it.
+    pub fn recorded_semantic_dim(&self) -> Result<Option<usize>> {
+        if self.chunk_table.is_empty() {
+            return Ok(None);
+        }
+        Ok(semantic_model_metadata(&self.conn, &self.chunk_table)?
+            .and_then(|(_, dim)| usize::try_from(dim).ok())
+            .filter(|dim| *dim > 0))
+    }
+
     pub fn execute_batch(&self, f: impl FnOnce(&Self) -> Result<()>) -> Result<()> {
         self.conn.execute_batch("BEGIN")?;
         match f(self) {
@@ -1265,6 +1278,22 @@ mod tests {
         assert_eq!(db.file_count().unwrap(), 1);
         assert_eq!(db.symbol_count().unwrap(), 1);
         assert_eq!(db.reference_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn recorded_semantic_dim_reads_the_model_row_without_the_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        drop(Database::open_for_model(&path, "some/model", 768).unwrap());
+
+        let by_model = Database::open_for_existing_model(&path, "some/model").unwrap();
+        assert_eq!(by_model.recorded_semantic_dim().unwrap(), Some(768));
+
+        let other = Database::open_for_existing_model(&path, "other/model").unwrap();
+        assert_eq!(other.recorded_semantic_dim().unwrap(), None);
+
+        let structural = Database::open(&path).unwrap();
+        assert_eq!(structural.recorded_semantic_dim().unwrap(), None);
     }
 
     fn make_embedding(seed: f32) -> Vec<f32> {

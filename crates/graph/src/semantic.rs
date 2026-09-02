@@ -5,6 +5,83 @@ use anyhow::{Context, Result, ensure};
 use codesage_embed::chunk::{ChunkConfig, chunk_text};
 use codesage_embed::model::Embedder;
 use codesage_protocol::{FileInfo, SemanticIndexStats, Symbol};
+
+/// Anything that turns chunk texts into vectors. [`Embedder`] is the
+/// in-process implementation; [`LazyEmbedder`] defers constructing one until
+/// a pass has something to embed, and the CLI adds a daemon-backed one.
+pub trait TextEmbedder {
+    /// Called once per pass with the number of files about to be embedded,
+    /// after the pass has established that the number is non-zero and before
+    /// the first [`TextEmbedder::embed_batch`]. Implementations that acquire a
+    /// backend lazily do so here.
+    fn prepare(&mut self, _files_to_embed: usize) -> Result<()> {
+        Ok(())
+    }
+
+    fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
+}
+
+impl TextEmbedder for Embedder {
+    fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        Embedder::embed_batch(self, texts)
+    }
+}
+
+/// Constructor for a deferred backend. Receives the number of files the pass
+/// is about to embed (`None` when a caller embeds without a preceding
+/// [`TextEmbedder::prepare`]).
+pub type EmbedderInit = Box<dyn FnOnce(Option<usize>) -> Result<Box<dyn TextEmbedder>>>;
+
+/// A [`TextEmbedder`] that constructs its backend on first use.
+///
+/// An incremental pass computes its file set before it embeds anything, and
+/// on a no-change pass that set is empty. Building the model eagerly made
+/// every such pass pay a full ONNX session load — and, on a GPU device, a
+/// CUDA context — to embed nothing. With this wrapper the constructor runs
+/// only from [`TextEmbedder::prepare`] (or the first `embed_batch`), which the
+/// indexing passes reach only with a non-empty file set.
+pub struct LazyEmbedder {
+    inner: Option<Box<dyn TextEmbedder>>,
+    init: Option<EmbedderInit>,
+}
+
+impl LazyEmbedder {
+    pub fn new(init: EmbedderInit) -> Self {
+        Self {
+            inner: None,
+            init: Some(init),
+        }
+    }
+
+    /// Whether the backend has been constructed.
+    pub fn is_loaded(&self) -> bool {
+        self.inner.is_some()
+    }
+
+    fn ensure(&mut self, files_to_embed: Option<usize>) -> Result<&mut dyn TextEmbedder> {
+        if self.inner.is_none() {
+            let init = self
+                .init
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("embedder construction already failed once"))?;
+            self.inner = Some(init(files_to_embed)?);
+        }
+        Ok(self
+            .inner
+            .as_deref_mut()
+            .expect("inner set by the branch above"))
+    }
+}
+
+impl TextEmbedder for LazyEmbedder {
+    fn prepare(&mut self, files_to_embed: usize) -> Result<()> {
+        self.ensure(Some(files_to_embed))?.prepare(files_to_embed)
+    }
+
+    fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        self.ensure(None)?.embed_batch(texts)
+    }
+}
 use codesage_storage::Database;
 use rayon::prelude::*;
 
@@ -187,7 +264,7 @@ fn write_semantic_updates_with_batch(
 fn process_semantic_batch(
     root: &Path,
     db: &Database,
-    embedder: &mut Embedder,
+    embedder: &mut dyn TextEmbedder,
     config: &ChunkConfig,
     batch: &[&FileInfo],
     stats: &mut SemanticIndexStats,
@@ -248,7 +325,7 @@ fn process_semantic_batch(
 fn semantic_index(
     root: &Path,
     db: &Database,
-    embedder: &mut Embedder,
+    embedder: &mut dyn TextEmbedder,
     exclude_patterns: &[String],
     strategy: IndexStrategy,
     verbose: bool,
@@ -297,6 +374,7 @@ fn semantic_index(
     if verbose {
         tracing::info!(files_to_embed = to_index.len(), "semantic indexing");
     }
+    embedder.prepare(to_index.len())?;
 
     let n_batches = to_index.len().div_ceil(COMMIT_BATCH_SIZE);
     for (i, batch) in to_index.chunks(COMMIT_BATCH_SIZE).enumerate() {
@@ -320,7 +398,7 @@ fn semantic_index(
 pub fn semantic_full_index(
     root: &Path,
     db: &Database,
-    embedder: &mut Embedder,
+    embedder: &mut dyn TextEmbedder,
     exclude_patterns: &[String],
     verbose: bool,
 ) -> Result<SemanticIndexStats> {
@@ -337,7 +415,7 @@ pub fn semantic_full_index(
 pub fn semantic_incremental_index(
     root: &Path,
     db: &Database,
-    embedder: &mut Embedder,
+    embedder: &mut dyn TextEmbedder,
     exclude_patterns: &[String],
     verbose: bool,
 ) -> Result<SemanticIndexStats> {
@@ -354,7 +432,7 @@ pub fn semantic_incremental_index(
 pub fn semantic_index_files(
     root: &Path,
     db: &Database,
-    embedder: &mut Embedder,
+    embedder: &mut dyn TextEmbedder,
     files: &[FileInfo],
     verbose: bool,
 ) -> Result<SemanticIndexStats> {
@@ -368,6 +446,7 @@ pub fn semantic_index_files(
     if verbose {
         tracing::info!(count = files.len(), "semantic indexing specific files");
     }
+    embedder.prepare(files.len())?;
 
     let file_refs: Vec<&FileInfo> = files.iter().collect();
     let n_batches = file_refs.len().div_ceil(COMMIT_BATCH_SIZE);
@@ -416,6 +495,95 @@ mod tests {
         let mut v = vec![0.0; codesage_storage::db::DEFAULT_EMBEDDING_DIM];
         v[0] = seed;
         v
+    }
+
+    struct FakeEmbedder {
+        prepared_with: Vec<usize>,
+        batches: usize,
+    }
+
+    impl TextEmbedder for FakeEmbedder {
+        fn prepare(&mut self, files_to_embed: usize) -> Result<()> {
+            self.prepared_with.push(files_to_embed);
+            Ok(())
+        }
+
+        fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            self.batches += 1;
+            Ok(texts.iter().map(|_| embedding(0.5)).collect())
+        }
+    }
+
+    /// Records every construction on a shared counter so a test can assert
+    /// the constructor never ran.
+    fn counting_lazy(
+        constructions: std::sync::Arc<std::sync::Mutex<Vec<Option<usize>>>>,
+    ) -> LazyEmbedder {
+        LazyEmbedder::new(Box::new(move |n| {
+            constructions.lock().unwrap().push(n);
+            Ok(Box::new(FakeEmbedder {
+                prepared_with: Vec::new(),
+                batches: 0,
+            }) as Box<dyn TextEmbedder>)
+        }))
+    }
+
+    #[test]
+    fn no_change_incremental_pass_never_constructs_the_embedder() {
+        let root = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let constructions = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut lazy = counting_lazy(constructions.clone());
+
+        let stats = semantic_incremental_index(root.path(), &db, &mut lazy, &[], false).unwrap();
+
+        assert_eq!(stats.files_processed, 0);
+        assert!(constructions.lock().unwrap().is_empty());
+        assert!(!lazy.is_loaded());
+    }
+
+    #[test]
+    fn unchanged_files_never_construct_the_embedder() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let files = discover_files_with_excludes(root.path(), &[]).unwrap();
+        assert_eq!(files.len(), 1);
+        db.upsert_semantic_file_hash(&files[0].path, &files[0].content_hash)
+            .unwrap();
+        let constructions = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut lazy = counting_lazy(constructions.clone());
+
+        let stats = semantic_incremental_index(root.path(), &db, &mut lazy, &[], false).unwrap();
+
+        assert_eq!(stats.files_skipped, 1);
+        assert!(constructions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn changed_file_constructs_the_embedder_once_with_the_file_count() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.path().join("b.rs"), "fn b() {}\n").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let constructions = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut lazy = counting_lazy(constructions.clone());
+
+        let stats = semantic_incremental_index(root.path(), &db, &mut lazy, &[], false).unwrap();
+
+        assert_eq!(stats.files_processed, 2);
+        assert_eq!(stats.chunks_created, 2);
+        assert_eq!(*constructions.lock().unwrap(), vec![Some(2)]);
+        assert!(lazy.is_loaded());
+    }
+
+    #[test]
+    fn lazy_embedder_failure_does_not_retry_construction() {
+        let mut lazy = LazyEmbedder::new(Box::new(|_| anyhow::bail!("no model")));
+        let first = lazy.prepare(1).unwrap_err().to_string();
+        let second = lazy.embed_batch(&["x"]).unwrap_err().to_string();
+        assert_eq!(first, "no model");
+        assert!(second.contains("already failed"), "{second}");
     }
 
     #[test]

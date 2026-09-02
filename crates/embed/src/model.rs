@@ -328,28 +328,36 @@ fn verify_cuda_libs_mapped(maps: &str) -> anyhow::Result<()> {
 /// `getenv` from another thread is UB; pinning the work to single-threaded
 /// startup eliminates the race even though the syntactic `unsafe` remains.
 ///
-/// `Embedder::new` / `Reranker::new` still call these helpers under
-/// `Once::call_once` as a defensive fallback (so direct library users aren't
-/// silently broken), but in the bin path the work has already happened by
-/// then and the call is a cheap no-op.
+/// This is the environment-only half of startup and costs microseconds. The
+/// expensive half — dlopen of the CUDA/cuDNN stack — lives in
+/// [`preload_native_libs`], which writes no environment and therefore runs
+/// lazily from the session loader, so a command that never builds a session
+/// never maps those libraries.
+///
+/// `load_onnx_session` still calls `init_ort_dylib` under `Once::call_once` as
+/// a defensive fallback (so direct library users aren't silently broken), but
+/// in the bin path the work has already happened by then and the call is a
+/// cheap no-op.
 pub fn init_for_main() {
     #[cfg(not(target_vendor = "apple"))]
     init_ort_dylib();
-    #[cfg(feature = "cuda")]
-    {
-        preload_cuda_libs();
-    }
 }
 
+/// dlopen the CUDA/cuDNN stack from the discovered NVIDIA library
+/// directories, once per process. Maps ~200 MB RSS and ~1.9 GB virtual, so
+/// it runs only from the session loader when a session actually requests the
+/// CUDA execution provider — never at startup.
+///
+/// Writes no environment variables: this runs from whatever thread builds the
+/// session, where a `set_var` would race every concurrent `getenv` in the
+/// process. Library-path discovery is the job of [`init_for_main`].
 #[cfg(feature = "cuda")]
-pub fn preload_cuda_libs() {
+pub fn preload_native_libs() {
     CUDA_PRELOAD.call_once(|| {
         let lib_dirs = discover_nvidia_lib_dirs();
         if lib_dirs.is_empty() {
             return;
         }
-
-        prepend_ld_library_path(lib_dirs);
 
         // ort::ep::cuda::preload_dylibs accepts one CUDA root and one cuDNN root,
         // but pip's nvidia-* packages place the libraries in separate directories.
@@ -815,7 +823,7 @@ pub(crate) fn load_onnx_session(model: &str, device: &str) -> Result<(Session, T
     if want_cuda {
         #[cfg(feature = "cuda")]
         {
-            preload_cuda_libs();
+            preload_native_libs();
             builder = builder
                 .with_execution_providers([ort::ep::CUDA::default().build().error_on_failure()])
                 .map_err(|e| anyhow::anyhow!("CUDA provider failed to register: {e}"))?;

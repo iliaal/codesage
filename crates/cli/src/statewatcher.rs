@@ -733,7 +733,7 @@ fn reindex_one(
         match semantic_index_files(
             &config.project_root,
             &db,
-            &mut emb,
+            &mut *emb,
             std::slice::from_ref(&file_info),
             false,
         ) {
@@ -1142,7 +1142,7 @@ fn run_bulk_incremental(config: &StateWatcherConfig, embedder: &mut EmbedderHand
         if let Err(e) = codesage_graph::semantic_incremental_index(
             &config.project_root,
             &db,
-            &mut emb,
+            &mut *emb,
             &config.exclude_patterns,
             false,
         ) {

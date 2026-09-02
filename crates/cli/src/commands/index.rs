@@ -5,9 +5,12 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
+use codesage_embed::config::EmbeddingConfig;
+use codesage_embed::model::Embedder;
 use codesage_graph::{
-    full_index, incremental_index, semantic_full_index, semantic_incremental_index,
+    LazyEmbedder, TextEmbedder, full_index, incremental_index, semantic_full_index,
+    semantic_incremental_index,
 };
 use codesage_parser::discover::build_exclude_set;
 use codesage_storage::Database;
@@ -15,8 +18,8 @@ use codesage_storage::Database;
 use crate::util::format_bytes;
 use crate::{
     DB_FILE, PROJECT_DIR, acquire_index_lock, db_path, find_project_root, get_exclude_patterns,
-    load_index_embedder, load_project_config, open_context_db_for_existing_model, open_db,
-    open_db_for_model, open_db_for_model_rebuild,
+    load_project_config, open_context_db_for_existing_model, open_db, open_db_for_model,
+    open_db_for_model_rebuild,
 };
 
 /// FNV-1a fold shared by the structural and manifest fingerprint passes.
@@ -242,6 +245,111 @@ fn can_skip_feature_mapping(
     current_fingerprint().is_some_and(|cur| cur == last)
 }
 
+/// `--device` / `--device-max-files`: which device a private embedder for
+/// this run should use, and up to how many files that choice applies.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DeviceOptions {
+    pub(crate) device: Option<String>,
+    pub(crate) max_files: usize,
+}
+
+/// Which device a private embedder for this run should use.
+///
+/// `override_device` (the `--device` flag) wins only when the run is known to
+/// embed at most `max_files` files, or when `max_files` is 0 (unbounded). A
+/// pass whose file count is unknown — the first semantic index for a model,
+/// which must construct the model before it can open the table — keeps the
+/// configured device, because it is about to embed everything. The hook
+/// passes `--device cpu` for exactly the case the bound describes: a handful
+/// of changed files, where a CUDA context bring-up costs more than the
+/// embedding itself.
+fn effective_device(
+    configured: &str,
+    override_device: Option<&str>,
+    max_files: usize,
+    files_to_embed: Option<usize>,
+) -> String {
+    match override_device {
+        Some(d) if max_files == 0 || files_to_embed.is_some_and(|n| n <= max_files) => {
+            d.to_string()
+        }
+        _ => configured.to_string(),
+    }
+}
+
+/// Dimension the existing index already records for `model`, or `None` when
+/// this model has never indexed the project (or the lookup itself fails, in
+/// which case the eager path reports the same error the old code did).
+fn recorded_semantic_dim(root: &Path, model: &str) -> Option<usize> {
+    let db = open_context_db_for_existing_model(root, model).ok()?;
+    db.recorded_semantic_dim().ok().flatten()
+}
+
+/// Open the index for `emb_config.model` and produce the embedder the
+/// semantic pass will use.
+///
+/// On an incremental run against a model that already has a recorded table,
+/// the dimension comes from that record and the embedder is a
+/// [`LazyEmbedder`]: no ONNX session, no CUDA context, until the semantic
+/// pass has computed a non-empty file set. A full rebuild, or a model with no
+/// recorded table yet, needs the model for its dimension and builds it
+/// eagerly — it is about to embed every file anyway.
+fn open_index_db_and_embedder(
+    root: &Path,
+    full: bool,
+    emb_config: &EmbeddingConfig,
+    device: DeviceOptions,
+) -> Result<(Database, Box<dyn TextEmbedder>)> {
+    // Surface a bad batch size now, as the eager constructor always did,
+    // rather than only on the first run that has something to embed.
+    emb_config.effective_batch_size()?;
+
+    let recorded_dim = if full {
+        None
+    } else {
+        recorded_semantic_dim(root, &emb_config.model)
+    };
+
+    let Some(dim) = recorded_dim else {
+        let mut cfg = emb_config.clone();
+        cfg.device = effective_device(
+            &cfg.device,
+            device.device.as_deref(),
+            device.max_files,
+            None,
+        );
+        let embedder = Embedder::new(&cfg)?;
+        let db = if full {
+            open_db_for_model_rebuild(root, &cfg.model, embedder.dim())?
+        } else {
+            open_db_for_model(root, &cfg.model, embedder.dim())?
+        };
+        return Ok((db, Box::new(embedder)));
+    };
+
+    let db = open_db_for_model(root, &emb_config.model, dim)?;
+    let init_config = emb_config.clone();
+    let lazy = LazyEmbedder::new(Box::new(move |files_to_embed| {
+        let mut cfg = init_config;
+        cfg.device = effective_device(
+            &cfg.device,
+            device.device.as_deref(),
+            device.max_files,
+            files_to_embed,
+        );
+        let embedder = Embedder::new(&cfg)?;
+        ensure!(
+            embedder.dim() == dim,
+            "model {} produces {}-dimensional vectors but the index records {dim} for it; \
+             run `codesage index --full` to rebuild the table",
+            cfg.model,
+            embedder.dim()
+        );
+        Ok(Box::new(embedder) as Box<dyn TextEmbedder>)
+    }));
+    Ok((db, Box::new(lazy)))
+}
+
 pub(crate) fn cmd_index(
     full: bool,
     no_semantic: bool,
@@ -249,8 +357,12 @@ pub(crate) fn cmd_index(
     verbose: bool,
     batch_size_override: Option<NonZeroUsize>,
     lock_wait: Duration,
+    device: DeviceOptions,
 ) -> Result<()> {
     let root = find_project_root()?;
+    if let Some(device) = device.device.as_deref() {
+        codesage_embed::config::validate_device(device)?;
+    }
     // Acquire the project-level indexing lock before loading embedders or
     // touching the DB. Skips work cleanly (exit 0) if another codesage
     // indexer is already running on this project — the concurrency-audit
@@ -284,12 +396,11 @@ pub(crate) fn cmd_index(
         );
     }
 
-    let mut embedder = load_index_embedder(no_semantic, &emb_config)?;
-
-    let db = match embedder.as_ref() {
-        Some(e) if full => open_db_for_model_rebuild(&root, &emb_config.model, e.dim())?,
-        Some(e) => open_db_for_model(&root, &emb_config.model, e.dim())?,
-        None => open_db(&root)?,
+    let (db, mut embedder) = if no_semantic {
+        (open_db(&root)?, None)
+    } else {
+        let (db, embedder) = open_index_db_and_embedder(&root, full, &emb_config, device)?;
+        (db, Some(embedder))
     };
 
     let stats = if full {
@@ -422,9 +533,9 @@ pub(crate) fn cmd_index(
 
     if let Some(embedder) = embedder.as_mut() {
         let sem_stats = if full {
-            semantic_full_index(&root, &db, embedder, &excludes, verbose)?
+            semantic_full_index(&root, &db, embedder.as_mut(), &excludes, verbose)?
         } else {
-            semantic_incremental_index(&root, &db, embedder, &excludes, verbose)?
+            semantic_incremental_index(&root, &db, embedder.as_mut(), &excludes, verbose)?
         };
         if verbose {
             tracing::info!(
@@ -704,6 +815,19 @@ mod tests {
 
     fn fp_of(v: u64) -> impl FnOnce() -> Option<u64> {
         move || Some(v)
+    }
+
+    #[test]
+    fn device_override_applies_only_within_the_file_bound() {
+        assert_eq!(effective_device("gpu", None, 32, Some(3)), "gpu");
+        assert_eq!(effective_device("gpu", Some("cpu"), 32, Some(3)), "cpu");
+        assert_eq!(effective_device("gpu", Some("cpu"), 32, Some(32)), "cpu");
+        assert_eq!(effective_device("gpu", Some("cpu"), 32, Some(33)), "gpu");
+        // Unknown count (eager first-ever index): keep the configured device.
+        assert_eq!(effective_device("gpu", Some("cpu"), 32, None), "gpu");
+        // 0 = unbounded override, count known or not.
+        assert_eq!(effective_device("gpu", Some("cpu"), 0, Some(5_000)), "cpu");
+        assert_eq!(effective_device("gpu", Some("cpu"), 0, None), "cpu");
     }
 
     #[test]

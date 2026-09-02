@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use codesage_embed::config::{EmbeddingConfig, ProjectConfig};
+use codesage_embed::config::ProjectConfig;
 use codesage_embed::model::Embedder;
 use codesage_parser::discover::DEFAULT_EXCLUDE_PATTERNS;
 use codesage_storage::Database;
@@ -77,6 +77,17 @@ enum Commands {
         /// immediately when another indexer holds it (0 = skip, the default)
         #[arg(long, value_name = "SECS", default_value_t = 0)]
         lock_wait: u64,
+        /// Embed on this device (cpu, gpu, cuda, coreml) instead of the
+        /// configured one when the run embeds at most --device-max-files
+        /// files. Applies to a private embedder only; when a daemon answers,
+        /// its resident session is used regardless.
+        #[arg(long, value_name = "DEVICE")]
+        device: Option<String>,
+        /// File-count bound for --device (0 = always). The first semantic
+        /// index for a model cannot count ahead and keeps the configured
+        /// device unless the bound is 0.
+        #[arg(long, value_name = "N", default_value_t = 32)]
+        device_max_files: usize,
     },
     /// Find symbol definitions by name
     FindSymbol {
@@ -662,17 +673,6 @@ pub(crate) fn load_symbol_context_db(root: &Path) -> Result<Database> {
     open_context_db_for_existing_model(root, &emb_config.model)
 }
 
-pub(crate) fn load_index_embedder(
-    no_semantic: bool,
-    emb_config: &EmbeddingConfig,
-) -> Result<Option<Embedder>> {
-    if no_semantic {
-        Ok(None)
-    } else {
-        Ok(Some(Embedder::new(emb_config)?))
-    }
-}
-
 fn print_version_info() {
     let version = env!("CARGO_PKG_VERSION");
     let arch = std::env::consts::ARCH;
@@ -734,23 +734,18 @@ fn main() {
     // because concurrent `getenv` from another thread is UB. Doing it here
     // (before clap, before any tokio runtime, before any thread spawn)
     // keeps the writes race-free even though the calls themselves remain
-    // marked unsafe.
+    // marked unsafe. This is the environment-only half of startup and costs
+    // microseconds; the CUDA/cuDNN dlopen (`preload_native_libs`, ~200 MB
+    // RSS, ~1.9 GB virtual) runs lazily from the session loader, so a
+    // command that never builds an ONNX session — including a no-change
+    // incremental `index` — never maps those libraries or touches the GPU.
     //
     // Skipped for the `codesage mcp` stdio shim (no `--direct` flag): the
-    // shim only proxies bytes between stdin and the daemon's Unix socket;
-    // it never constructs an Embedder or Reranker, so eagerly preloading
-    // ORT + the full CUDA/cuDNN stack just to immediately `tokio::io::copy`
-    // pinned ~200 MB RSS per shim and ~1.9 GB virtual into every Claude
-    // Code subagent. The `Once::call_once` fallback inside `Embedder::new`
-    // / `Reranker::new` covers any future shim codepath that grew to
-    // actually run inference (none today).
-    // Only commands that build an Embedder/Reranker need the ORT + CUDA preload.
-    // Structural/metadata commands (status, risk, find-symbol, …) must skip it:
-    // `preload_cuda_libs` dlopen's the CUDA/cuDNN stack, whose native constructors
-    // can hard-abort (SIGABRT) under a restricted sandbox — e.g. a Codex review
-    // that runs `codesage status` as its `.codesage/index.db` onboarding probe.
-    // The `Once::call_once` fallback in Embedder::new / Reranker::new still covers
-    // any embedder codepath that reaches inference without a main-thread preload.
+    // shim only proxies bytes between stdin and the daemon's Unix socket and
+    // never constructs an Embedder or Reranker. Structural/metadata commands
+    // (status, risk, find-symbol, …) skip it too; the `Once::call_once`
+    // fallback inside `load_onnx_session` covers any embedder codepath that
+    // reaches inference without a main-thread init.
     if !is_shim_invocation() && uses_embedder() {
         codesage_embed::model::init_for_main();
     }
@@ -906,6 +901,8 @@ fn run(cli: Cli) -> Result<()> {
             verbose,
             batch_size,
             lock_wait,
+            device,
+            device_max_files,
         } => index::cmd_index(
             full,
             no_semantic,
@@ -913,6 +910,10 @@ fn run(cli: Cli) -> Result<()> {
             verbose,
             batch_size,
             Duration::from_secs(lock_wait),
+            index::DeviceOptions {
+                device,
+                max_files: device_max_files,
+            },
         ),
         Commands::FindSymbol { name, kind, json } => {
             query::cmd_find_symbol(&name, kind.as_deref(), json)
