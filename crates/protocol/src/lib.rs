@@ -501,7 +501,13 @@ pub struct SemanticIndexStats {
     #[serde(default)]
     pub files_failed: usize,
     pub files_removed: usize,
+    /// Chunks written for the processed files, embedded or reused.
     pub chunks_created: usize,
+    /// Chunks whose text already had a vector in the index, so no model call
+    /// was made for them. `chunks_created - chunks_reused` is the number of
+    /// texts actually embedded this pass.
+    #[serde(default)]
+    pub chunks_reused: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]

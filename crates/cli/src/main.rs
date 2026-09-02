@@ -510,7 +510,8 @@ enum WatchAction {
     Run {
         /// Project root to watch (defaults to the current project)
         project: Option<PathBuf>,
-        /// Debounce window in milliseconds (default 1000, env REINDEX_DEBOUNCE)
+        /// Quiet window per file in milliseconds before it is re-indexed
+        /// (default 30000, env REINDEX_DEBOUNCE)
         #[arg(long)]
         reindex_debounce: Option<u64>,
     },
@@ -1148,17 +1149,19 @@ mod tests {
 
     #[cfg(not(feature = "cuda"))]
     #[test]
-    fn index_embedder_setup_errors_when_gpu_requested_without_cuda() {
+    fn query_embedder_errors_when_gpu_requested_without_cuda() {
         // Must be an allowlisted model name: the validated-model gate runs
         // before the cuda-feature guard, and this test targets the latter.
-        // No download happens — the guard bails before any hf-hub call.
+        // No download happens — the guard bails before any hf-hub call. The
+        // test binary has no daemon of its own, so the private path is taken.
         let cfg = EmbeddingConfig {
             model: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
             device: "gpu".to_string(),
             ..EmbeddingConfig::default()
         };
+        let dir = tempfile::tempdir().unwrap();
 
-        let err = match load_index_embedder(false, &cfg) {
+        let err = match query_embedder(dir.path(), &cfg) {
             Ok(_) => panic!("expected gpu setup to fail without cuda feature"),
             Err(err) => err,
         };
@@ -1167,18 +1170,6 @@ mod tests {
             err.to_string().contains("without cuda feature"),
             "unexpected error: {err:#}"
         );
-    }
-
-    #[cfg(not(feature = "cuda"))]
-    #[test]
-    fn index_embedder_setup_skips_model_when_no_semantic() {
-        let cfg = EmbeddingConfig {
-            model: "codesage-test/does-not-exist".to_string(),
-            device: "gpu".to_string(),
-            ..EmbeddingConfig::default()
-        };
-
-        assert!(load_index_embedder(true, &cfg).unwrap().is_none());
     }
 
     #[test]

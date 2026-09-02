@@ -1281,6 +1281,45 @@ mod tests {
     }
 
     #[test]
+    fn chunk_embeddings_round_trip_through_the_vec_table() {
+        let db = Database::open_in_memory().unwrap();
+        let a = make_embedding(0.2);
+        let b = make_embedding(0.7);
+        db.insert_chunks(
+            "a.rs",
+            "rust",
+            &[
+                ("fn a() {}", 1, 1, a.as_slice()),
+                ("fn b() {}", 2, 2, b.as_slice()),
+            ],
+        )
+        .unwrap();
+        db.insert_chunks("other.rs", "rust", &[("fn o() {}", 1, 1, a.as_slice())])
+            .unwrap();
+
+        let mut rows = db.chunk_embeddings_for_file("a.rs").unwrap();
+        rows.sort_by(|x, y| x.0.cmp(&y.0));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "fn a() {}");
+        assert_eq!(rows[0].1, a);
+        assert_eq!(rows[1].0, "fn b() {}");
+        assert_eq!(rows[1].1, b);
+        assert!(
+            db.chunk_embeddings_for_file("missing.rs")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            Database::open_in_memory()
+                .unwrap()
+                .chunk_embeddings_for_file("a.rs")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(crate::db::semantic::embedding_from_bytes(&[0, 0, 0]).is_err());
+    }
+
+    #[test]
     fn recorded_semantic_dim_reads_the_model_row_without_the_model() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.db");

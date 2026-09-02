@@ -461,14 +461,22 @@ mod unix {
                     let active_for_conn = active.clone();
                     let last_activity_for_conn = last_activity.clone();
                     let last_byte_for_conn = daemon_last_byte.clone();
+                    let state_for_conn = state.clone();
                     clients.spawn(async move {
                         if let Err(e) = serve_client(server, stream, last_byte_for_conn).await {
                             tracing::debug!(error = %e, "MCP daemon client connection ended");
                         }
-                        active_for_conn.fetch_sub(1, Ordering::SeqCst);
+                        let remaining = active_for_conn.fetch_sub(1, Ordering::SeqCst) - 1;
                         // Reset the idle clock on disconnect so the timeout
                         // measures continuous idleness, not uptime.
                         *last_activity_for_conn.lock().unwrap() = Instant::now();
+                        // With no client left there is nobody to keep an
+                        // index fresh for: stop every live watcher now rather
+                        // than letting it re-embed saved files for the rest of
+                        // its idle window. The next semantic query respawns it.
+                        if remaining == 0 {
+                            state_for_conn.shutdown_all_watchers();
+                        }
                     });
                 }
                 // Reap finished connection tasks so the tracked set doesn't

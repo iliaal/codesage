@@ -21,6 +21,10 @@ pub(super) struct ProjectState {
     pub(super) db_path: PathBuf,
     pub(super) embedding_config: EmbeddingConfig,
     embedding_config_error: Option<String>,
+    /// `[index] watch` from the project config: `Some(true)` asks for a live
+    /// watcher on the first call of any kind, `Some(false)` refuses one, and
+    /// `None` (the default) starts it on the first semantic query only.
+    watch: Option<bool>,
     /// mtime of `.codesage/config.toml` when this state was loaded; `None`
     /// means the file was absent (defaults in effect). Checked on every
     /// resolution so a model switch or a config fix takes effect without a
@@ -63,6 +67,21 @@ fn config_toml_mtime(path: &Path) -> Option<std::time::SystemTime> {
 struct LoadedEmbeddingConfig {
     config: EmbeddingConfig,
     semantic_error: Option<String>,
+    watch: Option<bool>,
+}
+
+/// Whether a tool call should make sure a live watcher runs. A watcher
+/// re-embeds every saved file, so it is not worth starting for a session
+/// that only reads structure: it starts on the first semantic query, or on
+/// any call when the project config opts in with `[index] watch = true`.
+/// `Some(false)` is honored again in `watch_enabled`; it is refused here too
+/// so the spawn path is never entered for it.
+fn watcher_start_wanted(config_watch: Option<bool>, semantic_query: bool) -> bool {
+    match config_watch {
+        Some(true) => true,
+        Some(false) => false,
+        None => semantic_query,
+    }
 }
 
 /// One model "slot" per key — the outer mutex serializes the cold load
@@ -282,13 +301,21 @@ impl CodeSageServerState {
 impl CodeSageServer {
     pub(super) fn resolve_project(&self, project: &str) -> Result<ProjectState> {
         let state = self.resolve_project_inner(project)?;
-        // Ensure a live watcher on every resolution (cheap when one is already
-        // running) so an idle-exited watcher respawns the next time an agent
-        // touches the project. Root is `<...>/.codesage/index.db` → two parents.
-        if let Some(root) = state.db_path.parent().and_then(|p| p.parent()) {
-            self.ensure_watcher(root, &state);
-        }
+        self.maybe_start_watcher(&state, false);
         Ok(state)
+    }
+
+    /// Spawn (or respawn after an idle exit) the project's live watcher when
+    /// [`watcher_start_wanted`] says this call warrants one. Cheap when a
+    /// watcher is already running. Root is `<...>/.codesage/index.db` → two
+    /// parents.
+    fn maybe_start_watcher(&self, state: &ProjectState, semantic_query: bool) {
+        if !watcher_start_wanted(state.watch, semantic_query) {
+            return;
+        }
+        if let Some(root) = state.db_path.parent().and_then(|p| p.parent()) {
+            self.ensure_watcher(root, state);
+        }
     }
 
     fn resolve_project_inner(&self, project: &str) -> Result<ProjectState> {
@@ -350,6 +377,7 @@ impl CodeSageServer {
             db_path: db_path.clone(),
             embedding_config: embedding_config.config,
             embedding_config_error: embedding_config.semantic_error,
+            watch: embedding_config.watch,
             config_mtime,
         };
         // A load error is never cached: structural tools still work off this
@@ -471,6 +499,7 @@ impl CodeSageServer {
             mode: crate::statewatcher::WatcherMode::Daemon,
             embedder,
             shutdown: shutdown.clone(),
+            backpressure: true,
         };
 
         let alive_clone = alive.clone();
@@ -676,6 +705,8 @@ impl CodeSageServer {
         F: FnOnce(&Database, &[f32], Option<codesage_graph::RerankFn<'_>>) -> Result<R>,
     {
         let state = self.resolve_project(project)?;
+        // A semantic query is what a live watcher exists to keep fresh.
+        self.maybe_start_watcher(&state, true);
         let config = self.semantic_embedding_config(&state)?;
         if let Some(query_embedding) = self.test_query_embedding_override()? {
             let db = Database::open_for_model_existing(
@@ -729,6 +760,7 @@ fn load_embedding_config(path: &Path) -> LoadedEmbeddingConfig {
             return LoadedEmbeddingConfig {
                 config: EmbeddingConfig::default(),
                 semantic_error: None,
+                watch: None,
             };
         }
         Err(e) => {
@@ -743,17 +775,24 @@ fn load_embedding_config(path: &Path) -> LoadedEmbeddingConfig {
                     "could not read project config `{}`: {e}",
                     path.display()
                 )),
+                watch: None,
             };
         }
     };
     #[derive(serde::Deserialize)]
+    struct IndexSection {
+        watch: Option<bool>,
+    }
+    #[derive(serde::Deserialize)]
     struct Config {
         embedding: Option<EmbeddingConfig>,
+        index: Option<IndexSection>,
     }
     match toml::from_str::<Config>(&content) {
         Ok(parsed) => LoadedEmbeddingConfig {
             config: parsed.embedding.unwrap_or_default(),
             semantic_error: None,
+            watch: parsed.index.and_then(|i| i.watch),
         },
         Err(e) => {
             tracing::warn!(
@@ -767,6 +806,7 @@ fn load_embedding_config(path: &Path) -> LoadedEmbeddingConfig {
                     "could not parse project config `{}`: {e}",
                     path.display()
                 )),
+                watch: None,
             }
         }
     }
@@ -1096,6 +1136,51 @@ mod tests {
             !db_path.exists(),
             "tool call must not recreate an empty index"
         );
+    }
+
+    #[test]
+    fn watcher_starts_on_semantic_queries_or_explicit_opt_in_only() {
+        // Default: structural calls never start a watcher, semantic ones do.
+        assert!(!watcher_start_wanted(None, false));
+        assert!(watcher_start_wanted(None, true));
+        // Explicit opt-in: any call.
+        assert!(watcher_start_wanted(Some(true), false));
+        assert!(watcher_start_wanted(Some(true), true));
+        // Explicit opt-out: never, not even for a semantic query.
+        assert!(!watcher_start_wanted(Some(false), false));
+        assert!(!watcher_start_wanted(Some(false), true));
+    }
+
+    #[test]
+    fn resolve_project_does_not_spawn_a_watcher_for_a_structural_call() {
+        let (_dir, root) = onboarded_project(None);
+        let server = CodeSageServer::new();
+        let state = server.resolve_project(root.to_str().unwrap()).unwrap();
+        assert_eq!(state.watch, None);
+        assert!(
+            server.state.watchers.lock().is_empty(),
+            "a structural resolution must not start a live watcher"
+        );
+    }
+
+    #[test]
+    fn index_watch_setting_is_read_into_project_state() {
+        let (_dir, root) = onboarded_project(Some("[index]\nwatch = false\n"));
+        let server = CodeSageServer::new();
+        let state = server
+            .resolve_project_inner(root.to_str().unwrap())
+            .unwrap();
+        assert_eq!(state.watch, Some(false));
+        assert!(state.embedding_config_error.is_none());
+
+        let (_dir2, root2) = onboarded_project(Some(
+            "[index]\nwatch = true\n[embedding]\nmodel = \"m\"\ndevice = \"cpu\"\n",
+        ));
+        let state2 = server
+            .resolve_project_inner(root2.to_str().unwrap())
+            .unwrap();
+        assert_eq!(state2.watch, Some(true));
+        assert_eq!(state2.embedding_config.model, "m");
     }
 
     #[test]

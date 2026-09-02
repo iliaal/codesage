@@ -322,6 +322,7 @@ pub(crate) fn cmd_watch_run(project: Option<PathBuf>, debounce_ms: Option<u64>) 
         mode: statewatcher::WatcherMode::Foreground,
         embedder,
         shutdown,
+        backpressure: true,
     };
 
     eprintln!(

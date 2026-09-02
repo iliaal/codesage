@@ -48,11 +48,14 @@ pub type EmbedderInit = Box<dyn FnOnce(Option<usize>) -> Result<Box<dyn TextEmbe
 /// on a no-change pass that set is empty. Building the model eagerly made
 /// every such pass pay a full ONNX session load — and, on a GPU device, a
 /// CUDA context — to embed nothing. With this wrapper the constructor runs
-/// only from [`TextEmbedder::prepare`] (or the first `embed_batch`), which the
-/// indexing passes reach only with a non-empty file set.
+/// from the first `embed_batch`, which a pass reaches only with chunk texts
+/// that have no stored vector yet; [`TextEmbedder::prepare`] merely records
+/// the announced file count for the constructor, so a pass whose every chunk
+/// is reused never builds a backend either.
 pub struct LazyEmbedder {
     inner: Option<Box<dyn TextEmbedder>>,
     init: Option<EmbedderInit>,
+    announced_files: Option<usize>,
 }
 
 impl LazyEmbedder {
@@ -60,6 +63,7 @@ impl LazyEmbedder {
         Self {
             inner: None,
             init: Some(init),
+            announced_files: None,
         }
     }
 
@@ -85,11 +89,16 @@ impl LazyEmbedder {
 
 impl TextEmbedder for LazyEmbedder {
     fn prepare(&mut self, files_to_embed: usize) -> Result<()> {
-        self.ensure(Some(files_to_embed))?.prepare(files_to_embed)
+        self.announced_files = Some(files_to_embed);
+        match self.inner.as_deref_mut() {
+            Some(inner) => inner.prepare(files_to_embed),
+            None => Ok(()),
+        }
     }
 
     fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        self.ensure(None)?.embed_batch(texts)
+        let announced = self.announced_files;
+        self.ensure(announced)?.embed_batch(texts)
     }
 }
 use codesage_storage::Database;
@@ -323,11 +332,49 @@ fn process_semantic_batch(
         }
     }
 
-    let all_texts: Vec<&str> = chunked
-        .iter()
-        .flat_map(|f| f.chunks.iter().map(|(text, _, _)| text.as_str()))
+    // Chunk-level dedup: a saved file usually changes a few chunks, and the
+    // stored content IS the embedded text (header included), so any chunk
+    // whose text already has a vector in this table keeps it. Only the rest
+    // go to the model — for a watcher re-embedding an edited 300-chunk file
+    // that is the difference between 300 GPU embeddings and three.
+    let mut all_embeddings: Vec<Option<Vec<f32>>> = Vec::new();
+    let mut to_embed: Vec<&str> = Vec::new();
+    let mut to_embed_slots: Vec<usize> = Vec::new();
+    for cf in &chunked {
+        let existing: HashMap<String, Vec<f32>> = db
+            .chunk_embeddings_for_file(&cf.path)?
+            .into_iter()
+            .collect();
+        for (text, _, _) in &cf.chunks {
+            match existing.get(text) {
+                Some(vector) => {
+                    stats.chunks_reused += 1;
+                    all_embeddings.push(Some(vector.clone()));
+                }
+                None => {
+                    to_embed_slots.push(all_embeddings.len());
+                    to_embed.push(text.as_str());
+                    all_embeddings.push(None);
+                }
+            }
+        }
+    }
+    if !to_embed.is_empty() {
+        let fresh = embedder.embed_batch(&to_embed)?;
+        ensure!(
+            fresh.len() == to_embed.len(),
+            "embedder returned {} vectors for {} texts",
+            fresh.len(),
+            to_embed.len()
+        );
+        for (slot, vector) in to_embed_slots.into_iter().zip(fresh) {
+            all_embeddings[slot] = Some(vector);
+        }
+    }
+    let all_embeddings: Vec<Vec<f32>> = all_embeddings
+        .into_iter()
+        .map(|v| v.expect("every slot filled by reuse or embedding"))
         .collect();
-    let all_embeddings = embedder.embed_batch(&all_texts)?;
     write_semantic_updates(db, &selected, &chunked, &all_embeddings, stats)?;
     Ok(())
 }
@@ -583,14 +630,89 @@ mod tests {
 
         assert_eq!(stats.files_processed, 2);
         assert_eq!(stats.chunks_created, 2);
+        assert_eq!(stats.chunks_reused, 0);
         assert_eq!(*constructions.lock().unwrap(), vec![Some(2)]);
         assert!(lazy.is_loaded());
     }
 
     #[test]
+    fn edited_file_reembeds_only_the_chunks_whose_text_changed() {
+        let root = tempfile::tempdir().unwrap();
+        // Two paragraphs far enough apart to land in separate chunks.
+        let first = "// first\n".repeat(120);
+        let second = "// second\n".repeat(120);
+        std::fs::write(root.path().join("a.rs"), format!("{first}\n\n{second}")).unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut fake = FakeEmbedder {
+            prepared_with: Vec::new(),
+            batches: 0,
+        };
+
+        let stats = semantic_incremental_index(root.path(), &db, &mut fake, &[], false).unwrap();
+        let initial_chunks = stats.chunks_created;
+        assert!(initial_chunks >= 2, "fixture must chunk into >= 2 pieces");
+        assert_eq!(stats.chunks_reused, 0);
+        assert_eq!(fake.batches, 1);
+
+        // Edit the second paragraph only; the first chunk's text is unchanged.
+        let edited_second = "// edited\n".repeat(120);
+        std::fs::write(
+            root.path().join("a.rs"),
+            format!("{first}\n\n{edited_second}"),
+        )
+        .unwrap();
+        let stats = semantic_incremental_index(root.path(), &db, &mut fake, &[], false).unwrap();
+
+        assert_eq!(stats.files_processed, 1);
+        assert!(
+            stats.chunks_reused >= 1,
+            "unchanged chunk must be reused: {stats:?}"
+        );
+        assert!(
+            stats.chunks_reused < stats.chunks_created,
+            "edited chunk must be re-embedded: {stats:?}"
+        );
+        assert_eq!(fake.batches, 2);
+        assert_eq!(
+            db.chunks_for_file("a.rs").unwrap().len(),
+            stats.chunks_created,
+            "the file's rows are rewritten as one set"
+        );
+    }
+
+    #[test]
+    fn touched_file_with_identical_chunks_never_constructs_the_embedder() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut fake = FakeEmbedder {
+            prepared_with: Vec::new(),
+            batches: 0,
+        };
+        semantic_incremental_index(root.path(), &db, &mut fake, &[], false).unwrap();
+        assert_eq!(fake.batches, 1);
+
+        // Force the file back into the selection with a stale semantic hash
+        // while its chunk text stays byte-identical (a touch, a revert, a
+        // mode change): every chunk is reused and no backend is ever built.
+        db.upsert_semantic_file_hash("a.rs", "stale").unwrap();
+        let constructions = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut lazy = counting_lazy(constructions.clone());
+
+        let stats = semantic_incremental_index(root.path(), &db, &mut lazy, &[], false).unwrap();
+
+        assert_eq!(stats.files_processed, 1);
+        assert_eq!(stats.chunks_reused, stats.chunks_created);
+        assert!(constructions.lock().unwrap().is_empty());
+        assert!(!lazy.is_loaded());
+    }
+
+    #[test]
     fn lazy_embedder_failure_does_not_retry_construction() {
         let mut lazy = LazyEmbedder::new(Box::new(|_| anyhow::bail!("no model")));
-        let first = lazy.prepare(1).unwrap_err().to_string();
+        lazy.prepare(1).expect("prepare only records the count");
+        assert!(!lazy.is_loaded());
+        let first = lazy.embed_batch(&["x"]).unwrap_err().to_string();
         let second = lazy.embed_batch(&["x"]).unwrap_err().to_string();
         assert_eq!(first, "no model");
         assert!(second.contains("already failed"), "{second}");

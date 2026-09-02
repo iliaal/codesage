@@ -21,7 +21,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::lockfile;
 
-const DEFAULT_DEBOUNCE_MS: u64 = 1000;
+/// Per-path quiet window before a saved file is re-indexed. Thirty seconds,
+/// not one: an editor saves the same file every few seconds during active
+/// work, and each save used to cost a full structural parse plus a GPU
+/// embedding pass — 714 re-embeds of whole files (154,900 chunks) in one
+/// day of editing one project. The window restarts on every event, so a
+/// file is indexed once the author pauses, and every path that fell quiet in
+/// the same poll is embedded in one batched call.
+const DEFAULT_DEBOUNCE_MS: u64 = 30_000;
+/// Longest a ready batch stays deferred under backpressure before it runs
+/// anyway. Load that never drops (a machine that is simply busy) must not
+/// turn into an index that never updates.
+const BACKPRESSURE_MAX_DEFER: Duration = Duration::from_secs(15 * 60);
 const BATCH_THRESHOLD: usize = 10;
 const BATCH_WINDOW: Duration = Duration::from_secs(3);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -65,6 +76,10 @@ pub struct StateWatcherConfig {
     pub mode: WatcherMode,
     pub embedder: Option<EmbedderProvider>,
     pub shutdown: Arc<AtomicBool>,
+    /// Defer indexing while the host is busy (see [`backpressure_reason`]).
+    /// Tests turn it off so a loaded CI runner cannot make a drain look like
+    /// a lock skip.
+    pub backpressure: bool,
 }
 
 /// Resolves the embedder through the provider on every use, holding no ref
@@ -170,6 +185,7 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
     let mut removal_fail_count: u32 = 0;
     let mut last_activity = Instant::now();
     let mut header_is_cpp = header_dialect_is_cpp(&config.db_path);
+    let mut deferred_since: Option<Instant> = None;
 
     tracing::info!(
         root = %config.project_root.display(),
@@ -335,7 +351,7 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
                         count = burst,
                         "batch threshold reached, triggering bulk incremental index"
                     );
-                    let outcome = run_bulk_incremental(&config, &mut embedder);
+                    let outcome = run_bulk_guarded(&config, &mut embedder, &mut deferred_since);
                     bulk_cooldown_until = bulk_cooldown_after(outcome, Instant::now());
                     if outcome == WorkOutcome::Done {
                         // Unconditional: a bulk pass can also delete the last
@@ -401,7 +417,7 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
         if let Some(at) = bulk_retry_at
             && Instant::now() >= at
         {
-            let outcome = run_bulk_incremental(&config, &mut embedder);
+            let outcome = run_bulk_guarded(&config, &mut embedder, &mut deferred_since);
             bulk_cooldown_until = bulk_cooldown_after(outcome, Instant::now());
             if outcome == WorkOutcome::Done {
                 header_is_cpp = header_dialect_is_cpp(&config.db_path);
@@ -451,6 +467,7 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
             &mut embedder,
             header_is_cpp,
             debounce,
+            &mut deferred_since,
         ) {
             header_is_cpp = header_dialect_is_cpp(&config.db_path);
         }
@@ -496,8 +513,25 @@ fn drain_pending(
     embedder: &mut EmbedderHandle,
     header_is_cpp: bool,
     debounce: Duration,
+    deferred_since: &mut Option<Instant>,
 ) -> bool {
     let ready = compute_ready(pending, Instant::now(), debounce);
+    if ready.is_empty() {
+        return false;
+    }
+    // Backpressure: a ready batch waits while the host is busy, re-armed for
+    // one more debounce window, until the pressure lifts or the deferral cap
+    // says a stale index is now the worse outcome.
+    if config.backpressure {
+        let reason = backpressure_reason(&config.project_root);
+        if should_defer(reason.as_deref(), deferred_since, Instant::now()) {
+            let now = Instant::now();
+            for path in ready {
+                pending.insert(path, now);
+            }
+            return false;
+        }
+    }
     process_ready(
         config,
         pending,
@@ -561,6 +595,10 @@ fn process_ready(
     ready: Vec<PathBuf>,
 ) -> bool {
     let mut rederive_header = false;
+    // Files whose structural pass landed and whose semantic rows are stale.
+    // They are embedded together below: one lock, one DB handle, and one
+    // model call per commit batch instead of one per file.
+    let mut semantic_todo: Vec<(PathBuf, FileInfo)> = Vec::new();
     for path in ready {
         pending.remove(&path);
 
@@ -576,8 +614,12 @@ fn process_ready(
         }
 
         currently_indexing.insert(path.clone());
-        let outcome = reindex_one(config, &path, embedder, header_is_cpp);
+        let mut stale = None;
+        let outcome = reindex_one(config, &path, embedder.enabled(), header_is_cpp, &mut stale);
         currently_indexing.remove(&path);
+        if let Some(info) = stale {
+            semantic_todo.push((path.clone(), info));
+        }
 
         // Lock contention: re-queue with a fresh stamp so the retry waits
         // out a full debounce window instead of spinning on the held lock.
@@ -616,7 +658,79 @@ fn process_ready(
             }
         }
     }
+
+    if !semantic_todo.is_empty() {
+        let files: Vec<FileInfo> = semantic_todo.iter().map(|(_, f)| f.clone()).collect();
+        if semantic_reindex_batch(config, embedder, &files) == WorkOutcome::Skipped {
+            // Lock contention or a busy database: the structural rows landed,
+            // the semantic rows did not. Re-queue the paths; the next drain
+            // finds the structural hash fresh and only the semantic one stale.
+            let now = Instant::now();
+            for (path, _) in semantic_todo {
+                pending.insert(path, now);
+            }
+        }
+    }
     rederive_header
+}
+
+/// Embed every file in `files` in one pass under one lock. Chunks whose text
+/// is unchanged keep their stored vectors (see `codesage_graph::semantic`),
+/// so a batch of saved files costs one model call per fifty files for the
+/// chunks that actually changed.
+fn semantic_reindex_batch(
+    config: &StateWatcherConfig,
+    embedder: &mut EmbedderHandle,
+    files: &[FileInfo],
+) -> WorkOutcome {
+    let Some(emb_arc) = embedder.get() else {
+        return WorkOutcome::Failed;
+    };
+    let _lock = match lockfile::try_acquire(&config.project_root) {
+        Ok(lockfile::LockOutcome::Acquired(lock)) => Some(lock),
+        Ok(lockfile::LockOutcome::AlreadyHeld) => {
+            tracing::debug!(
+                files = files.len(),
+                "deferring semantic reindex: index lock held by another process"
+            );
+            return WorkOutcome::Skipped;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "acquiring index lock for semantic reindex");
+            return WorkOutcome::Failed;
+        }
+    };
+    let mut emb = emb_arc.lock();
+    let db = match Database::open_for_model(&config.db_path, &config.embed_config.model, emb.dim())
+    {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!(error = %e, "opening DB for semantic reindex");
+            return WorkOutcome::Failed;
+        }
+    };
+    match semantic_index_files(&config.project_root, &db, &mut *emb, files, false) {
+        Ok(stats) => {
+            if stats.files_processed > 0 {
+                tracing::info!(
+                    files = stats.files_processed,
+                    chunks = stats.chunks_created,
+                    embedded = stats.chunks_created.saturating_sub(stats.chunks_reused),
+                    reused = stats.chunks_reused,
+                    "semantic reindex"
+                );
+            }
+            WorkOutcome::Done
+        }
+        Err(e) if is_retryable_db_error(&e) => {
+            tracing::debug!(error = %e, "semantic reindex deferred: database busy, will retry");
+            WorkOutcome::Skipped
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "semantic reindex failed");
+            WorkOutcome::Failed
+        }
+    }
 }
 
 /// Present on disk with at least one byte. A vanished or emptied path had
@@ -626,11 +740,15 @@ fn file_has_content(abs: &Path) -> bool {
     std::fs::metadata(abs).is_ok_and(|m| m.len() > 0)
 }
 
+/// Structural re-index of one saved file. When `semantic_enabled` and the
+/// file's semantic rows are stale, `stale_semantic` receives its `FileInfo`
+/// so the caller can embed it together with the rest of the ready batch.
 fn reindex_one(
     config: &StateWatcherConfig,
     rel: &Path,
-    embedder: &mut EmbedderHandle,
+    semantic_enabled: bool,
     header_is_cpp: bool,
+    stale_semantic: &mut Option<FileInfo>,
 ) -> WorkOutcome {
     let abs = config.project_root.join(rel);
     let rel_str = rel.to_string_lossy().to_string();
@@ -658,7 +776,17 @@ fn reindex_one(
         return WorkOutcome::Done;
     };
 
-    if indexed_hashes_are_fresh(config, &rel_str, &hash, embedder.enabled()) {
+    let file_info = FileInfo {
+        path: rel_str.clone(),
+        language: lang,
+        content_hash: hash.clone(),
+    };
+
+    if semantic_enabled && !semantic_hash_is_fresh(config, &rel_str, &hash) {
+        *stale_semantic = Some(file_info.clone());
+    }
+
+    if structural_hash_is_fresh(config, &rel_str, &hash) {
         return WorkOutcome::Done;
     }
 
@@ -669,18 +797,14 @@ fn reindex_one(
                 path = %rel_str,
                 "deferring reindex: index lock held by another process"
             );
+            *stale_semantic = None;
             return WorkOutcome::Skipped;
         }
         Err(e) => {
             tracing::warn!(error = %e, "acquiring index lock");
+            *stale_semantic = None;
             return WorkOutcome::Failed;
         }
-    };
-
-    let file_info = FileInfo {
-        path: rel_str.clone(),
-        language: lang,
-        content_hash: hash,
     };
 
     match Database::open(&config.db_path) {
@@ -703,81 +827,38 @@ fn reindex_one(
                 }
                 Err(e) if is_retryable_db_error(&e) => {
                     tracing::debug!(path = %rel_str, error = %e, "structural reindex deferred: database busy, will retry");
+                    *stale_semantic = None;
                     return WorkOutcome::Skipped;
                 }
                 Err(e) => {
                     tracing::warn!(path = %rel_str, error = %e, "structural reindex failed");
+                    *stale_semantic = None;
                     return WorkOutcome::Failed;
                 }
             }
         }
         Err(e) => {
             tracing::warn!(path = %rel_str, error = %e, "opening DB for structural reindex");
+            *stale_semantic = None;
             return WorkOutcome::Failed;
-        }
-    }
-
-    if let Some(emb_arc) = embedder.get() {
-        let mut emb = emb_arc.lock();
-        let db = match Database::open_for_model(
-            &config.db_path,
-            &config.embed_config.model,
-            emb.dim(),
-        ) {
-            Ok(db) => db,
-            Err(e) => {
-                tracing::warn!(path = %rel_str, error = %e, "opening DB for semantic reindex");
-                return WorkOutcome::Failed;
-            }
-        };
-        match semantic_index_files(
-            &config.project_root,
-            &db,
-            &mut *emb,
-            std::slice::from_ref(&file_info),
-            false,
-        ) {
-            Ok(stats) => {
-                if stats.files_processed > 0 {
-                    tracing::info!(
-                        path = %rel_str,
-                        chunks = stats.chunks_created,
-                        "semantic reindex"
-                    );
-                }
-            }
-            Err(e) if is_retryable_db_error(&e) => {
-                tracing::debug!(path = %rel_str, error = %e, "semantic reindex deferred: database busy, will retry");
-                return WorkOutcome::Skipped;
-            }
-            Err(e) => {
-                tracing::warn!(path = %rel_str, error = %e, "semantic reindex failed");
-                return WorkOutcome::Failed;
-            }
         }
     }
 
     WorkOutcome::Done
 }
 
-fn indexed_hashes_are_fresh(
+fn structural_hash_is_fresh(
     config: &StateWatcherConfig,
     rel_str: &str,
     content_hash: &str,
-    semantic_enabled: bool,
 ) -> bool {
     let Ok(db) = Database::open(&config.db_path) else {
         return false;
     };
-    let structural_fresh =
-        matches!(db.get_file_hash(rel_str), Ok(Some(stored)) if stored == content_hash);
-    if !structural_fresh {
-        return false;
-    }
-    if !semantic_enabled {
-        return true;
-    }
+    matches!(db.get_file_hash(rel_str), Ok(Some(stored)) if stored == content_hash)
+}
 
+fn semantic_hash_is_fresh(config: &StateWatcherConfig, rel_str: &str, content_hash: &str) -> bool {
     let semantic_db =
         match Database::open_for_existing_model(&config.db_path, &config.embed_config.model) {
             Ok(db) => db,
@@ -1093,6 +1174,140 @@ fn apply_removal_outcome(
             }
         }
     }
+}
+
+/// [`run_bulk_incremental`] behind the same backpressure gate as the per-file
+/// drain: a deferred pass reports `Skipped`, which re-arms the retry.
+fn run_bulk_guarded(
+    config: &StateWatcherConfig,
+    embedder: &mut EmbedderHandle,
+    deferred_since: &mut Option<Instant>,
+) -> WorkOutcome {
+    if config.backpressure {
+        let reason = backpressure_reason(&config.project_root);
+        if should_defer(reason.as_deref(), deferred_since, Instant::now()) {
+            return WorkOutcome::Skipped;
+        }
+    }
+    run_bulk_incremental(config, embedder)
+}
+
+/// Decide whether a ready batch waits. `reason` is `Some` while the host is
+/// under pressure; `deferred_since` tracks the first deferral of the current
+/// streak so the wait is bounded by [`BACKPRESSURE_MAX_DEFER`]. Returns
+/// `true` to defer.
+fn should_defer(reason: Option<&str>, deferred_since: &mut Option<Instant>, now: Instant) -> bool {
+    let Some(reason) = reason else {
+        *deferred_since = None;
+        return false;
+    };
+    let since = *deferred_since.get_or_insert(now);
+    if now.duration_since(since) >= BACKPRESSURE_MAX_DEFER {
+        tracing::info!(
+            reason,
+            deferred_for = ?now.duration_since(since),
+            "backpressure cap reached; indexing despite load"
+        );
+        *deferred_since = None;
+        return false;
+    }
+    tracing::debug!(reason, "deferring reindex under backpressure");
+    true
+}
+
+/// Why indexing should wait right now, or `None`. Three signals, each cheap:
+/// a git operation in flight (`index.lock` in the repository's git dir — a
+/// checkout or rebase is about to rewrite the files we would index), a
+/// one-minute load average above the CPU count, or a `cargo`/`rustc`/`pytest`
+/// process running with its working directory under the project root. A
+/// stale embedding for a few minutes costs less than contending with any of
+/// them.
+fn backpressure_reason(root: &Path) -> Option<String> {
+    if git_index_lock_present(root) {
+        return Some("git index.lock present".to_string());
+    }
+    let ncpu = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    if let Some(load) = load_average_1m()
+        && load > ncpu as f64
+    {
+        return Some(format!("load average {load:.1} exceeds {ncpu} cpus"));
+    }
+    build_process_under(root).map(|name| format!("{name} running under the project root"))
+}
+
+/// Whether `<git dir>/index.lock` exists for `root`. `.git` may be a
+/// directory or, in a linked worktree, a `gitdir: <path>` pointer file.
+fn git_index_lock_present(root: &Path) -> bool {
+    let dot_git = root.join(".git");
+    let git_dir = match std::fs::metadata(&dot_git) {
+        Ok(meta) if meta.is_dir() => dot_git,
+        Ok(_) => {
+            let Ok(pointer) = std::fs::read_to_string(&dot_git) else {
+                return false;
+            };
+            let Some(rest) = pointer.trim().strip_prefix("gitdir:") else {
+                return false;
+            };
+            let target = PathBuf::from(rest.trim());
+            if target.is_absolute() {
+                target
+            } else {
+                root.join(target)
+            }
+        }
+        Err(_) => return false,
+    };
+    git_dir.join("index.lock").exists()
+}
+
+/// One-minute load average from `/proc/loadavg`; `None` off Linux or when
+/// unreadable.
+fn load_average_1m() -> Option<f64> {
+    let raw = std::fs::read_to_string("/proc/loadavg").ok()?;
+    raw.split_whitespace().next()?.parse().ok()
+}
+
+/// Names a build or test process whose working directory is `root` or below
+/// it, when one exists. Scans `/proc` by `comm`, so it costs one directory
+/// walk per ready batch and nothing between batches. Only the process names
+/// that saturate a machine for minutes are recognised; an `ls` under the
+/// root is not pressure.
+fn build_process_under(root: &Path) -> Option<String> {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    let root = canonical_root(root);
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid == std::process::id() {
+            continue;
+        }
+        let proc_dir = entry.path();
+        let Ok(comm) = std::fs::read_to_string(proc_dir.join("comm")) else {
+            continue;
+        };
+        let comm = comm.trim();
+        if !is_build_process_name(comm) {
+            continue;
+        }
+        let Ok(cwd) = std::fs::read_link(proc_dir.join("cwd")) else {
+            continue;
+        };
+        if cwd.starts_with(&root) {
+            return Some(comm.to_string());
+        }
+    }
+    None
+}
+
+fn is_build_process_name(comm: &str) -> bool {
+    matches!(
+        comm,
+        "cargo" | "rustc" | "pytest" | "py.test" | "pytest-xdist"
+    ) || comm.starts_with("cargo-")
 }
 
 fn run_bulk_incremental(config: &StateWatcherConfig, embedder: &mut EmbedderHandle) -> WorkOutcome {
@@ -1589,6 +1804,7 @@ mod tests {
             mode: WatcherMode::Foreground,
             embedder: None,
             shutdown: Arc::new(AtomicBool::new(false)),
+            backpressure: false,
         }
     }
 
@@ -1844,11 +2060,10 @@ mod tests {
         std::fs::create_dir_all(root.join(".codesage")).unwrap();
         std::fs::write(root.join("foo.rs"), "fn main() {}\n").unwrap();
         let config = test_config(root);
-        let mut embedder = EmbedderHandle::new(None);
 
         let _held = hold_lock(root);
         assert_eq!(
-            reindex_one(&config, Path::new("foo.rs"), &mut embedder, false),
+            reindex_one(&config, Path::new("foo.rs"), false, false, &mut None),
             WorkOutcome::Skipped
         );
     }
@@ -1890,10 +2105,9 @@ mod tests {
         drop(semantic_db);
 
         std::fs::write(root.join("foo.rs"), "").unwrap();
-        let mut embedder = EmbedderHandle::new(None);
 
         assert_eq!(
-            reindex_one(&config, Path::new("foo.rs"), &mut embedder, false),
+            reindex_one(&config, Path::new("foo.rs"), false, false, &mut None),
             WorkOutcome::Done
         );
 
@@ -1943,10 +2157,9 @@ mod tests {
         );
 
         std::fs::write(root.join("foo.rs"), "").unwrap();
-        let mut embedder = EmbedderHandle::new(None);
 
         assert_eq!(
-            reindex_one(&config, Path::new("foo.rs"), &mut embedder, false),
+            reindex_one(&config, Path::new("foo.rs"), false, false, &mut None),
             WorkOutcome::Done
         );
 
@@ -1978,8 +2191,262 @@ mod tests {
         .unwrap();
         drop(db);
 
-        assert!(indexed_hashes_are_fresh(&config, "foo.rs", &hash, false));
-        assert!(!indexed_hashes_are_fresh(&config, "foo.rs", &hash, true));
+        assert!(structural_hash_is_fresh(&config, "foo.rs", &hash));
+        assert!(!semantic_hash_is_fresh(&config, "foo.rs", &hash));
+    }
+
+    #[test]
+    fn reindex_one_reports_a_stale_semantic_file_for_the_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        let src = "fn foo() {}\n";
+        std::fs::write(root.join("foo.rs"), src).unwrap();
+        let config = test_config(root);
+        let hash = content_hash(src.as_bytes());
+
+        // Semantic disabled: structural lands, nothing is reported.
+        let mut stale = None;
+        assert_eq!(
+            reindex_one(&config, Path::new("foo.rs"), false, false, &mut stale),
+            WorkOutcome::Done
+        );
+        assert!(stale.is_none());
+        assert!(structural_hash_is_fresh(&config, "foo.rs", &hash));
+
+        // Semantic enabled, structural already fresh: no lock is taken (the
+        // held lock would otherwise force Skipped) and the file is handed to
+        // the batch because its semantic rows are stale.
+        let _held = hold_lock(root);
+        let mut stale = None;
+        assert_eq!(
+            reindex_one(&config, Path::new("foo.rs"), true, false, &mut stale),
+            WorkOutcome::Done
+        );
+        let info = stale.expect("stale semantic file must be reported");
+        assert_eq!(info.path, "foo.rs");
+        assert_eq!(info.content_hash, hash);
+        drop(_held);
+
+        // Once the semantic hash is recorded, nothing is reported.
+        let semantic_db = Database::open_for_model(
+            &config.db_path,
+            &config.embed_config.model,
+            codesage_storage::db::DEFAULT_EMBEDDING_DIM,
+        )
+        .unwrap();
+        semantic_db
+            .upsert_semantic_file_hash("foo.rs", &hash)
+            .unwrap();
+        drop(semantic_db);
+        let mut stale = None;
+        assert_eq!(
+            reindex_one(&config, Path::new("foo.rs"), true, false, &mut stale),
+            WorkOutcome::Done
+        );
+        assert!(stale.is_none());
+    }
+
+    #[test]
+    fn reindex_one_withdraws_the_semantic_report_when_structural_is_skipped() {
+        // A file whose structural rows never landed must not be embedded:
+        // the chunk headers are built from symbols the structural pass writes.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        std::fs::write(root.join("foo.rs"), "fn foo() {}\n").unwrap();
+        let config = test_config(root);
+        let _held = hold_lock(root);
+        let mut stale = None;
+        assert_eq!(
+            reindex_one(&config, Path::new("foo.rs"), true, false, &mut stale),
+            WorkOutcome::Skipped
+        );
+        assert!(stale.is_none());
+    }
+
+    #[test]
+    fn should_defer_waits_under_pressure_until_the_cap() {
+        let t0 = Instant::now();
+        let mut since = None;
+        assert!(!should_defer(None, &mut since, t0));
+        assert!(since.is_none());
+
+        assert!(should_defer(Some("busy"), &mut since, t0));
+        assert_eq!(since, Some(t0));
+        assert!(should_defer(
+            Some("busy"),
+            &mut since,
+            t0 + Duration::from_secs(60)
+        ));
+        assert_eq!(since, Some(t0), "the streak keeps its first stamp");
+
+        // Cap reached: run anyway and start a fresh streak next time.
+        assert!(!should_defer(
+            Some("busy"),
+            &mut since,
+            t0 + BACKPRESSURE_MAX_DEFER
+        ));
+        assert!(since.is_none());
+
+        // Pressure lifting clears the streak too.
+        assert!(should_defer(Some("busy"), &mut since, t0));
+        assert!(!should_defer(None, &mut since, t0 + Duration::from_secs(1)));
+        assert!(since.is_none());
+    }
+
+    #[test]
+    fn git_index_lock_is_found_through_a_dir_and_a_worktree_pointer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert!(!git_index_lock_present(root), "no .git at all");
+
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        assert!(!git_index_lock_present(root));
+        std::fs::write(root.join(".git/index.lock"), "").unwrap();
+        assert!(git_index_lock_present(root));
+
+        // Linked worktree: `.git` is a pointer file to the real git dir.
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let gitdir = tmp.path().join("real-gitdir");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        assert!(!git_index_lock_present(&wt));
+        std::fs::write(gitdir.join("index.lock"), "").unwrap();
+        assert!(git_index_lock_present(&wt));
+
+        // Relative pointer resolves against the worktree root.
+        let wt2 = tmp.path().join("wt2");
+        std::fs::create_dir_all(&wt2).unwrap();
+        std::fs::write(wt2.join(".git"), "gitdir: ../real-gitdir").unwrap();
+        assert!(git_index_lock_present(&wt2));
+    }
+
+    #[test]
+    fn build_process_names_are_the_long_running_ones() {
+        for name in ["cargo", "rustc", "pytest", "py.test", "cargo-clippy"] {
+            assert!(is_build_process_name(name), "{name}");
+        }
+        for name in ["ls", "git", "python3", "codesage", "vim"] {
+            assert!(!is_build_process_name(name), "{name}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn build_process_under_finds_a_cargo_named_process_in_the_tree() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let sub = root.join("crates").join("x");
+        std::fs::create_dir_all(&sub).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+
+        // A process whose `comm` is `cargo`: a symlink to sleep named cargo.
+        let fake_cargo = elsewhere.path().join("cargo");
+        symlink("/bin/sleep", &fake_cargo).unwrap();
+
+        let mut outside = std::process::Command::new(&fake_cargo)
+            .arg("30")
+            .current_dir(elsewhere.path())
+            .spawn()
+            .unwrap();
+        // Give /proc time to reflect the exec'd comm.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            build_process_under(root),
+            None,
+            "cwd outside the root is not pressure"
+        );
+
+        let mut inside = std::process::Command::new(&fake_cargo)
+            .arg("30")
+            .current_dir(&sub)
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(build_process_under(root).as_deref(), Some("cargo"));
+
+        let _ = inside.kill();
+        let _ = inside.wait();
+        let _ = outside.kill();
+        let _ = outside.wait();
+    }
+
+    #[test]
+    fn drain_pending_defers_ready_paths_under_backpressure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/index.lock"), "").unwrap();
+        std::fs::write(root.join("foo.rs"), "fn main() {}\n").unwrap();
+        let mut config = test_config(root);
+        config.backpressure = true;
+        let filter = WatchFilter::new(root, &config.exclude_patterns).unwrap();
+        let mut embedder = EmbedderHandle::new(None);
+
+        let debounce = Duration::from_millis(100);
+        let stale = Instant::now() - Duration::from_secs(10);
+        let mut pending = HashMap::new();
+        pending.insert(PathBuf::from("foo.rs"), stale);
+        let mut currently_indexing = HashSet::new();
+        let mut recheck_queue = HashSet::new();
+        let mut deferred_since = None;
+
+        let rederive = drain_pending(
+            &config,
+            &mut pending,
+            &mut currently_indexing,
+            &mut recheck_queue,
+            &filter,
+            &mut embedder,
+            false,
+            debounce,
+            &mut deferred_since,
+        );
+        assert!(!rederive);
+        assert!(deferred_since.is_some(), "a deferral streak must start");
+        let stamp = pending
+            .get(Path::new("foo.rs"))
+            .copied()
+            .expect("path stays pending");
+        assert!(stamp > stale, "re-armed for another debounce window");
+        assert!(compute_ready(&pending, Instant::now(), debounce).is_empty());
+        let db = Database::open(&config.db_path).unwrap();
+        assert!(
+            db.get_file_hash("foo.rs").unwrap().is_none(),
+            "nothing may be indexed while git holds index.lock"
+        );
+        drop(db);
+
+        // Pressure lifts: the next drain (after the debounce) indexes it.
+        std::fs::remove_file(root.join(".git/index.lock")).unwrap();
+        pending.insert(PathBuf::from("foo.rs"), stale);
+        let mut config = config;
+        // The load-average and process probes read the real host; disable
+        // the gate once the deterministic signal is gone so this assertion
+        // cannot depend on the runner's load.
+        config.backpressure = false;
+        drain_pending(
+            &config,
+            &mut pending,
+            &mut currently_indexing,
+            &mut recheck_queue,
+            &filter,
+            &mut embedder,
+            false,
+            debounce,
+            &mut deferred_since,
+        );
+        let db = Database::open(&config.db_path).unwrap();
+        assert!(db.get_file_hash("foo.rs").unwrap().is_some());
+    }
+
+    #[test]
+    fn default_debounce_is_thirty_seconds_of_quiet() {
+        assert_eq!(DEFAULT_DEBOUNCE_MS, 30_000);
     }
 
     #[test]
@@ -2051,10 +2518,9 @@ mod tests {
         drop(db);
 
         std::fs::remove_file(root.join("foo.rs")).unwrap();
-        let mut embedder = EmbedderHandle::new(None);
 
         assert_eq!(
-            reindex_one(&config, Path::new("foo.rs"), &mut embedder, false),
+            reindex_one(&config, Path::new("foo.rs"), false, false, &mut None),
             WorkOutcome::Done
         );
         let db = Database::open(&config.db_path).unwrap();
@@ -2088,11 +2554,10 @@ mod tests {
         drop(db);
 
         std::fs::remove_file(root.join("foo.rs")).unwrap();
-        let mut embedder = EmbedderHandle::new(None);
 
         let _held = hold_lock(root);
         assert_eq!(
-            reindex_one(&config, Path::new("foo.rs"), &mut embedder, false),
+            reindex_one(&config, Path::new("foo.rs"), false, false, &mut None),
             WorkOutcome::Skipped
         );
         let db = Database::open(&config.db_path).unwrap();
@@ -2109,10 +2574,9 @@ mod tests {
         std::fs::create_dir_all(root.join(".codesage")).unwrap();
         std::fs::write(root.join("api.h"), "struct foo { int x; };\n").unwrap();
         let config = test_config(root);
-        let mut embedder = EmbedderHandle::new(None);
 
         assert_eq!(
-            reindex_one(&config, Path::new("api.h"), &mut embedder, true),
+            reindex_one(&config, Path::new("api.h"), false, true, &mut None),
             WorkOutcome::Done
         );
 
@@ -2137,10 +2601,9 @@ mod tests {
         std::fs::create_dir_all(root.join(".codesage")).unwrap();
         std::fs::write(root.join("api.h"), "struct foo { int x; };\n").unwrap();
         let config = test_config(root);
-        let mut embedder = EmbedderHandle::new(None);
 
         assert_eq!(
-            reindex_one(&config, Path::new("api.h"), &mut embedder, false),
+            reindex_one(&config, Path::new("api.h"), false, false, &mut None),
             WorkOutcome::Done
         );
 

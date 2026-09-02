@@ -51,6 +51,21 @@ pub fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
     bytes.to_vec()
 }
 
+/// Inverse of [`embedding_to_bytes`]: decode a vec0 float32 blob. A blob whose
+/// length is not a multiple of four is not a vector this crate wrote and is
+/// refused rather than truncated.
+pub fn embedding_from_bytes(bytes: &[u8]) -> Result<Vec<f32>> {
+    anyhow::ensure!(
+        bytes.len().is_multiple_of(4),
+        "embedding blob of {} bytes is not a float32 vector",
+        bytes.len()
+    );
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect())
+}
+
 /// Map a `(file_path, language, content, start_line, end_line, distance)` row —
 /// the column order returned by the KNN, fullscan, and BM25 searches — into a
 /// `RawSearchRow`. `distance` is read as `f64` and narrowed so a BM25 `score`
@@ -649,6 +664,28 @@ impl Database {
         }
         self.conn.execute_batch("VACUUM")?;
         Ok(())
+    }
+
+    /// `(content, embedding)` for every chunk of `file_path`, so a re-index
+    /// of an edited file can keep the vectors of chunks whose text did not
+    /// change instead of embedding the whole file again.
+    pub fn chunk_embeddings_for_file(&self, file_path: &str) -> Result<Vec<(String, Vec<f32>)>> {
+        if self.chunk_table.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT content, embedding FROM \"{}\" WHERE file_path = ?1",
+            quote_ident(&self.chunk_table)
+        );
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let rows = stmt
+            .query_map(params![file_path], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(content, bytes)| Ok((content, embedding_from_bytes(&bytes)?)))
+            .collect()
     }
 
     pub fn chunks_for_file(&self, file_path: &str) -> Result<Vec<RawSearchRow>> {
