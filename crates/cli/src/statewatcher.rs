@@ -102,16 +102,32 @@ impl EmbedderHandle {
         self.provider.is_some()
     }
 
-    fn get(&mut self) -> Option<Arc<Mutex<Embedder>>> {
-        let provider = self.provider.as_ref()?;
+    /// Resolve the embedder for one use. The three outcomes are distinct on
+    /// purpose: a watcher with no provider has no semantic rows to write, a
+    /// provider that fails to load leaves the rows stale, and only the last
+    /// one may be reported as work done.
+    fn get(&mut self) -> EmbedderLookup {
+        let Some(provider) = self.provider.as_ref() else {
+            return EmbedderLookup::Disabled;
+        };
         match provider() {
-            Ok(emb) => Some(emb),
+            Ok(emb) => EmbedderLookup::Loaded(emb),
             Err(e) => {
                 tracing::warn!(error = %e, "loading embedder for watcher");
-                None
+                EmbedderLookup::LoadFailed
             }
         }
     }
+}
+
+/// Outcome of one [`EmbedderHandle::get`].
+enum EmbedderLookup {
+    /// Semantic indexing is off for this watcher: nothing to embed.
+    Disabled,
+    Loaded(Arc<Mutex<Embedder>>),
+    /// Semantic indexing is on and the model did not load; the semantic rows
+    /// of every path in the pass are stale until a retry.
+    LoadFailed,
 }
 
 /// Failed semantic passes a path is retried after before the watcher gives
@@ -789,8 +805,13 @@ fn semantic_reindex_batch(
     embedder: &mut EmbedderHandle,
     files: &[FileInfo],
 ) -> WorkOutcome {
-    let Some(emb_arc) = embedder.get() else {
-        return WorkOutcome::Failed;
+    let emb_arc = match embedder.get() {
+        EmbedderLookup::Loaded(emb) => emb,
+        // Disabled cannot reach here (`reindex_one` reports no stale semantic
+        // file without an embedder); treating it as a failure keeps the
+        // paths queued rather than marking rows current that were never
+        // written.
+        EmbedderLookup::Disabled | EmbedderLookup::LoadFailed => return WorkOutcome::Failed,
     };
     let _lock = match lockfile::try_acquire(&config.project_root) {
         Ok(lockfile::LockOutcome::Acquired(lock)) => Some(lock),
@@ -1465,7 +1486,18 @@ fn run_bulk_incremental(config: &StateWatcherConfig, embedder: &mut EmbedderHand
         return WorkOutcome::Failed;
     }
 
-    if let Some(emb_arc) = embedder.get() {
+    let emb_arc = match embedder.get() {
+        EmbedderLookup::Disabled => return WorkOutcome::Done,
+        EmbedderLookup::Loaded(emb) => emb,
+        EmbedderLookup::LoadFailed => {
+            // The structural rows landed; the semantic rows did not. `Done`
+            // here cleared the pending paths and left them stale until the
+            // next filesystem event, bypassing the per-file requeue.
+            tracing::warn!("bulk incremental semantic reindex skipped: embedder did not load");
+            return WorkOutcome::Failed;
+        }
+    };
+    {
         let mut emb = emb_arc.lock();
         let db = match Database::open_for_model(
             &config.db_path,
@@ -2728,6 +2760,77 @@ mod tests {
             "second retry waits at least one extra debounce"
         );
         assert!(currently_indexing.is_empty());
+    }
+
+    #[test]
+    fn bulk_incremental_with_a_failing_embedder_is_failed_and_keeps_the_paths_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        std::fs::write(root.join("foo.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(root.join("bar.rs"), "fn bar() {}\n").unwrap();
+        let mut config = test_config(root);
+        let provider: EmbedderProvider =
+            Arc::new(|| anyhow::bail!("simulated embedder load failure"));
+        config.embedder = Some(provider);
+        let mut embedder = EmbedderHandle::new(config.embedder.clone());
+
+        let outcome = run_bulk_incremental(&config, &mut embedder);
+        assert_eq!(
+            outcome,
+            WorkOutcome::Failed,
+            "an embedder that does not load is not a completed semantic pass"
+        );
+        let db = Database::open(&config.db_path).unwrap();
+        assert!(
+            db.get_file_hash("foo.rs").unwrap().is_some(),
+            "the structural pass must still land"
+        );
+        drop(db);
+
+        // The paths the burst queued survive the outcome and are drain-ready
+        // on the next tick, where the per-file path applies its backoff.
+        let debounce = Duration::from_millis(config.debounce_ms);
+        let now = Instant::now();
+        let stale = now - Duration::from_secs(10);
+        let mut pending = HashMap::new();
+        pending.insert(PathBuf::from("foo.rs"), stale);
+        pending.insert(PathBuf::from("bar.rs"), stale);
+        let mut removed = Vec::new();
+        let retry = apply_bulk_outcome(outcome, &mut pending, &mut removed, now, debounce, None);
+        assert_eq!(retry, None);
+        assert_eq!(pending.len(), 2, "a failed bulk pass drops no path");
+        assert_eq!(compute_ready(&pending, now, debounce).len(), 2);
+        assert_eq!(
+            bulk_cooldown_after(outcome, now),
+            None,
+            "a failed pass arms no cooldown"
+        );
+    }
+
+    #[test]
+    fn bulk_incremental_with_semantic_disabled_is_done() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        std::fs::write(root.join("foo.rs"), "fn main() {}\n").unwrap();
+        let config = test_config(root);
+        let mut embedder = EmbedderHandle::new(None);
+
+        let outcome = run_bulk_incremental(&config, &mut embedder);
+        assert_eq!(
+            outcome,
+            WorkOutcome::Done,
+            "nothing to embed is a completed pass"
+        );
+
+        let debounce = Duration::from_millis(config.debounce_ms);
+        let now = Instant::now();
+        let mut pending = HashMap::new();
+        pending.insert(PathBuf::from("foo.rs"), now - Duration::from_secs(10));
+        let mut removed = Vec::new();
+        apply_bulk_outcome(outcome, &mut pending, &mut removed, now, debounce, None);
+        assert!(pending.is_empty());
     }
 
     #[test]
