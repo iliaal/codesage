@@ -8,7 +8,16 @@
 
 - The live statewatcher re-embeds only chunks whose text changed, waits for 30 s of quiet, batches dirty paths into one pass, and defers while `.git/index.lock`, high load, or a cargo/rustc/pytest tree is present. It starts on the first semantic query, not on session start, and stops with the last client. An 8-save burst: 90 chunks → 1 embedded. (cs-r23)
 - `codesage index` constructs the embedder only when a pass has files to embed; a no-change incremental run never loads the model or maps CUDA (2.7–4.5 s and 1.16 GB → 0.08 s and 150 MB). `init_for_main` keeps only the env writes at startup; the CUDA/cuDNN preload moves to the first ONNX session. (cs-ox8)
-- Git hooks skip the binary when HEAD and the worktree status digest are unchanged (`.codesage/hook-state`, written only after both passes succeed) and embed on CPU when at most 32 files changed.
+- Git hooks skip the binary when HEAD and the worktree content digest are unchanged (`.codesage/hook-state`, written only after both passes succeed) and embed on CPU when at most 32 files changed.
+
+### Fixed
+
+- Stored chunk vectors are reused only when the chunk table records a matching semantic fingerprint (model, pinned revision and ONNX digest, dimension, pooling, chunker version); `codesage index --full` re-embeds every chunk and records the fingerprint on completion. The daemon's embedder pool key includes the pooling strategy.
+- The git hook's skip stamp digests worktree content (`git diff HEAD --binary` plus a checksum of every untracked file) instead of `git status` output, checks every stage's exit status, and is never written when a stage fails or a pass exits nonzero.
+- `codesage index`, `map`, `cleanup`, and `git-index` exit 75 when another indexer holds the project lock for the whole `--lock-wait` window; the hook records no skip stamp for that run.
+- The live watcher re-queues paths whose semantic pass failed (embedder load, DB open, embedding) with a doubling delay for up to five retries, logged at WARN, instead of dropping them until the next filesystem event.
+- Daemon watcher stop joins each watcher thread before freeing its registry slot, and a start request for a root whose watcher is still stopping waits for it (5 s per call) instead of spawning a second watcher.
+- `embed_texts` refuses a text over 48,000 bytes and a call over 24 MiB in total; the CLI client batches under the same caps and embeds refused texts with a private session.
 
 ## [0.22.0] - 2026-08-30
 
