@@ -194,11 +194,180 @@ pub(crate) struct CodeSageServerState {
 /// thread exits (idle timeout, disabled marker, error), so `ensure_watcher`
 /// can tell a dead entry from a running one and respawn. `config_key`
 /// records the embedding config the watcher was spawned with so a config
-/// change can retire it (see [`watcher_config_key`]).
+/// change can retire it (see [`watcher_config_key`]). `thread` is the
+/// spawned thread's join handle, taken by whichever stop path waits it out;
+/// `None` while the spawn is still in flight or once the handle is taken.
+///
+/// An entry with `shutdown` set and `alive` still true is STOPPING: its
+/// thread is force-draining. The slot stays occupied until the thread has
+/// exited, so a start request for the same root waits instead of spawning a
+/// second watcher beside it (see [`reserve_watcher_slot`]).
 struct WatcherEntry {
     shutdown: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
     config_key: String,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// How long a start request waits for a stopping watcher on the same root
+/// before giving up on spawning for this call. Bounded because it runs
+/// inside a tool call; the next call retries.
+const WATCHER_RESTART_WAIT: Duration = Duration::from_secs(5);
+
+/// How long the last-client stop waits for each watcher to finish its drain
+/// before leaving its slot in place as still-stopping.
+pub(crate) const WATCHER_STOP_WAIT: Duration = Duration::from_secs(60);
+
+/// Poll interval for the alive-flag waits below. The watcher loop notices
+/// `shutdown` within its own 500 ms poll, so finer polling buys nothing.
+const WATCHER_EXIT_POLL: Duration = Duration::from_millis(20);
+
+/// Block until `alive` reads false or `deadline` passes. True when the
+/// thread has exited.
+fn wait_for_watcher_exit(alive: &AtomicBool, deadline: Instant) -> bool {
+    loop {
+        if !alive.load(Ordering::SeqCst) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep(WATCHER_EXIT_POLL.min(deadline - now));
+    }
+}
+
+/// Signal every live watcher, then wait (up to `wait` in total) for each to
+/// exit, joining its thread and freeing its slot only once it has. A slot
+/// whose thread outlives the wait stays in the map as stopping, with its
+/// handle put back for whoever finishes the wait later; nothing may spawn
+/// into that slot meanwhile. Returns how many watchers were still stopping
+/// at the deadline.
+fn stop_all_watchers(watchers: &Mutex<HashMap<PathBuf, WatcherEntry>>, wait: Duration) -> usize {
+    let deadline = Instant::now() + wait;
+    let mut stopping = Vec::new();
+    {
+        let mut guard = watchers.lock();
+        for (root, entry) in guard.iter_mut() {
+            entry.shutdown.store(true, Ordering::SeqCst);
+            tracing::info!(root = %root.display(), "signalling watcher shutdown");
+            stopping.push((root.clone(), entry.alive.clone(), entry.thread.take()));
+        }
+    }
+    let mut still_stopping = 0;
+    for (root, alive, thread) in stopping {
+        if wait_for_watcher_exit(&alive, deadline) {
+            if let Some(handle) = thread
+                && handle.join().is_err()
+            {
+                tracing::warn!(root = %root.display(), "watcher thread panicked during shutdown");
+            }
+            let mut guard = watchers.lock();
+            // Only the slot this stop owns: a start request may already have
+            // replaced a dead entry with a fresh watcher.
+            if guard
+                .get(&root)
+                .is_some_and(|entry| Arc::ptr_eq(&entry.alive, &alive))
+            {
+                guard.remove(&root);
+            }
+            tracing::info!(root = %root.display(), "watcher stopped");
+        } else {
+            still_stopping += 1;
+            tracing::warn!(
+                root = %root.display(),
+                waited_secs = wait.as_secs(),
+                "watcher still draining after the stop wait; its slot stays reserved until it exits"
+            );
+            let mut guard = watchers.lock();
+            if let Some(entry) = guard
+                .get_mut(&root)
+                .filter(|entry| Arc::ptr_eq(&entry.alive, &alive))
+            {
+                entry.thread = thread;
+            }
+        }
+    }
+    still_stopping
+}
+
+/// Decision of [`reserve_watcher_slot`].
+#[derive(Debug, PartialEq, Eq)]
+enum WatcherSlot {
+    /// A live watcher with this config already owns the slot.
+    Running,
+    /// The slot is reserved for the caller, who must spawn into it (or let
+    /// its [`WatcherReservation`] release it).
+    Reserved,
+    /// A watcher on this root is still stopping past the wait. Nothing was
+    /// reserved; the caller must not spawn. A later call retries.
+    StillStopping,
+}
+
+/// Claim the watcher slot for `root` with the given `shutdown`/`alive`
+/// tokens. A live watcher with a matching `config_key` keeps the slot; one
+/// with a stale key is signalled to stop. A stopping watcher — signalled by
+/// a config change or by the last client's disconnect — is waited out (up to
+/// `wait`) before the slot is handed over, so a shim reconnecting while the
+/// previous watcher force-drains never gets a second watcher on the same
+/// root: overlapping watchers reindex the same saves twice and race on the
+/// status file.
+fn reserve_watcher_slot(
+    watchers: &Mutex<HashMap<PathBuf, WatcherEntry>>,
+    root: &Path,
+    config_key: &str,
+    shutdown: &Arc<AtomicBool>,
+    alive: &Arc<AtomicBool>,
+    wait: Duration,
+) -> WatcherSlot {
+    let deadline = Instant::now() + wait;
+    loop {
+        let mut guard = watchers.lock();
+        if let Some(entry) = guard.get_mut(root)
+            && entry.alive.load(Ordering::SeqCst)
+        {
+            if !entry.shutdown.load(Ordering::SeqCst) {
+                if entry.config_key == config_key {
+                    return WatcherSlot::Running;
+                }
+                // Spawned with an outdated embedding config (model switch
+                // in config.toml). Retire it; the wait below sees it out so
+                // the respawn never overlaps the drain.
+                entry.shutdown.store(true, Ordering::SeqCst);
+            }
+            let old_alive = entry.alive.clone();
+            let thread = entry.thread.take();
+            drop(guard);
+            if !wait_for_watcher_exit(&old_alive, deadline) {
+                let mut guard = watchers.lock();
+                if let Some(entry) = guard
+                    .get_mut(root)
+                    .filter(|entry| Arc::ptr_eq(&entry.alive, &old_alive))
+                {
+                    entry.thread = thread;
+                }
+                return WatcherSlot::StillStopping;
+            }
+            if let Some(handle) = thread
+                && handle.join().is_err()
+            {
+                tracing::warn!(root = %root.display(), "watcher thread panicked before restart");
+            }
+            // Re-check under the lock: another start request may have
+            // replaced the dead entry while this one waited.
+            continue;
+        }
+        guard.insert(
+            root.to_path_buf(),
+            WatcherEntry {
+                shutdown: shutdown.clone(),
+                alive: alive.clone(),
+                config_key: config_key.to_string(),
+                thread: None,
+            },
+        );
+        return WatcherSlot::Reserved;
+    }
 }
 
 /// Flips a watcher's `alive` flag to false when its thread exits by ANY
@@ -300,16 +469,14 @@ impl CodeSageServerState {
             + evict_idle_from_map(&self.rerankers, timeout)
     }
 
-    /// Signal every live watcher to drain and exit. Called from the daemon's
-    /// shutdown path. Threads notice within one poll interval; we don't join
-    /// (the process exit reaps any straggler), so this never blocks shutdown.
-    pub(crate) fn shutdown_all_watchers(&self) {
-        let mut guard = self.watchers.lock();
-        for (root, entry) in guard.iter() {
-            entry.shutdown.store(true, Ordering::SeqCst);
-            tracing::info!(root = %root.display(), "signalling watcher shutdown");
-        }
-        guard.clear();
+    /// Signal every live watcher to drain and exit, then wait up to `wait`
+    /// for them to do so, freeing each registry slot only once its thread
+    /// has been joined. Called when the last client disconnects and on
+    /// daemon exit. A watcher still draining at the deadline keeps its slot
+    /// as stopping, so a start request for that root waits rather than
+    /// spawning beside it. Blocks; call from a blocking context.
+    pub(crate) fn shutdown_all_watchers(&self, wait: Duration) -> usize {
+        stop_all_watchers(&self.watchers, wait)
     }
 }
 
@@ -435,31 +602,25 @@ impl CodeSageServer {
         // no config I/O — this runs on every tool call. The (re)spawn path
         // reserves the map entry under the SAME lock before spawning, so two
         // concurrent first calls can't both spawn a watcher and orphan one
-        // entry's shutdown/alive handles.
-        {
-            let mut watchers = self.state.watchers.lock();
-            if let Some(entry) = watchers.get(root)
-                && entry.alive.load(Ordering::SeqCst)
-            {
-                if entry.config_key == config_key {
-                    return;
-                }
-                // The live watcher was spawned with an outdated embedding
-                // config (model switch in config.toml). Signal it to drain;
-                // a later resolution respawns with the fresh config once it
-                // exits, so the watcher stops embedding into the old model's
-                // chunk table.
-                entry.shutdown.store(true, Ordering::SeqCst);
+        // entry's shutdown/alive handles; a stopping watcher is waited out
+        // first so the respawn never overlaps its drain.
+        match reserve_watcher_slot(
+            &self.state.watchers,
+            root,
+            &config_key,
+            &shutdown,
+            &alive,
+            WATCHER_RESTART_WAIT,
+        ) {
+            WatcherSlot::Running => return,
+            WatcherSlot::StillStopping => {
+                tracing::info!(
+                    root = %root.display(),
+                    "previous watcher still draining; not spawning a replacement on this call"
+                );
                 return;
             }
-            watchers.insert(
-                root.to_path_buf(),
-                WatcherEntry {
-                    shutdown: shutdown.clone(),
-                    alive: alive.clone(),
-                    config_key,
-                },
-            );
+            WatcherSlot::Reserved => {}
         }
         // Every early return below must release the reservation, else the
         // hot check would treat a never-spawned watcher as alive forever.
@@ -529,7 +690,16 @@ impl CodeSageServer {
             });
 
         match spawned {
-            Ok(_join) => {
+            Ok(join) => {
+                {
+                    let mut watchers = self.state.watchers.lock();
+                    if let Some(entry) = watchers
+                        .get_mut(root)
+                        .filter(|entry| Arc::ptr_eq(&entry.shutdown, &shutdown))
+                    {
+                        entry.thread = Some(join);
+                    }
+                }
                 reservation.disarm();
                 tracing::info!(root = %root.display(), "live watcher started");
             }
@@ -1015,6 +1185,7 @@ mod tests {
                 shutdown: shutdown.clone(),
                 alive: Arc::new(AtomicBool::new(true)),
                 config_key: "k".to_string(),
+                thread: None,
             };
             (shutdown, entry)
         };
@@ -1055,6 +1226,197 @@ mod tests {
             watchers.lock().contains_key(&root),
             "foreign entry must survive another reservation's drop"
         );
+    }
+
+    /// A stand-in watcher thread: spins until `shutdown`, then keeps running
+    /// for `drain` (the force-drain a real watcher performs), then exits and
+    /// flips `alive` through the same guard the real spawn uses.
+    fn fake_watcher(
+        watchers: &Mutex<HashMap<PathBuf, WatcherEntry>>,
+        root: &Path,
+        config_key: &str,
+        drain: Duration,
+    ) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(true));
+        let (shutdown_t, alive_t) = (shutdown.clone(), alive.clone());
+        let thread = std::thread::spawn(move || {
+            let _guard = AliveGuard(alive_t);
+            while !shutdown_t.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            std::thread::sleep(drain);
+        });
+        watchers.lock().insert(
+            root.to_path_buf(),
+            WatcherEntry {
+                shutdown: shutdown.clone(),
+                alive: alive.clone(),
+                config_key: config_key.to_string(),
+                thread: Some(thread),
+            },
+        );
+        (shutdown, alive)
+    }
+
+    #[test]
+    fn stop_then_start_race_yields_exactly_one_watcher() {
+        // Last client disconnects (stop) while a reconnecting shim resolves
+        // the same project (start). The old watcher force-drains for a
+        // while; the start must wait for it, not spawn beside it.
+        let watchers: Arc<Mutex<HashMap<PathBuf, WatcherEntry>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let root = PathBuf::from("/proj");
+        let (_old_shutdown, old_alive) =
+            fake_watcher(&watchers, &root, "k", Duration::from_millis(300));
+
+        let stopper = {
+            let watchers = watchers.clone();
+            std::thread::spawn(move || stop_all_watchers(&watchers, Duration::from_secs(10)))
+        };
+        // Let the stop signal land so the start observes a STOPPING entry.
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            old_alive.load(Ordering::SeqCst),
+            "old watcher must still be draining"
+        );
+
+        let new_shutdown = Arc::new(AtomicBool::new(false));
+        let new_alive = Arc::new(AtomicBool::new(true));
+        let slot = reserve_watcher_slot(
+            &watchers,
+            &root,
+            "k",
+            &new_shutdown,
+            &new_alive,
+            Duration::from_secs(10),
+        );
+
+        assert_eq!(slot, WatcherSlot::Reserved);
+        assert!(
+            !old_alive.load(Ordering::SeqCst),
+            "the slot may be handed over only after the old watcher has exited"
+        );
+        assert_eq!(stopper.join().unwrap(), 0, "the stop saw every watcher out");
+        let guard = watchers.lock();
+        assert_eq!(guard.len(), 1, "exactly one watcher slot");
+        let entry = guard.get(&root).expect("the new reservation owns the slot");
+        assert!(
+            Arc::ptr_eq(&entry.alive, &new_alive),
+            "the surviving entry is the new one, not the stopped watcher's"
+        );
+        assert!(entry.thread.is_none(), "the reservation has no thread yet");
+    }
+
+    #[test]
+    fn start_during_a_stop_that_outlives_the_wait_spawns_nothing() {
+        let watchers: Mutex<HashMap<PathBuf, WatcherEntry>> = Mutex::new(HashMap::new());
+        let root = PathBuf::from("/proj");
+        let (old_shutdown, old_alive) =
+            fake_watcher(&watchers, &root, "k", Duration::from_millis(400));
+        old_shutdown.store(true, Ordering::SeqCst);
+
+        let slot = reserve_watcher_slot(
+            &watchers,
+            &root,
+            "k",
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(AtomicBool::new(true)),
+            Duration::from_millis(50),
+        );
+
+        assert_eq!(slot, WatcherSlot::StillStopping);
+        {
+            let guard = watchers.lock();
+            assert_eq!(guard.len(), 1);
+            let entry = guard.get(&root).unwrap();
+            assert!(
+                Arc::ptr_eq(&entry.alive, &old_alive),
+                "the stopping entry keeps its slot"
+            );
+            assert!(
+                entry.thread.is_some(),
+                "the join handle is put back for the next waiter"
+            );
+        }
+
+        // Once the drain finishes, the next start request takes the slot.
+        assert!(wait_for_watcher_exit(
+            &old_alive,
+            Instant::now() + Duration::from_secs(5)
+        ));
+        let new_alive = Arc::new(AtomicBool::new(true));
+        let slot = reserve_watcher_slot(
+            &watchers,
+            &root,
+            "k",
+            &Arc::new(AtomicBool::new(false)),
+            &new_alive,
+            Duration::from_millis(50),
+        );
+        assert_eq!(slot, WatcherSlot::Reserved);
+        let guard = watchers.lock();
+        assert_eq!(guard.len(), 1);
+        assert!(Arc::ptr_eq(&guard.get(&root).unwrap().alive, &new_alive));
+    }
+
+    #[test]
+    fn stop_all_keeps_a_slot_whose_thread_outlives_the_wait() {
+        let watchers: Mutex<HashMap<PathBuf, WatcherEntry>> = Mutex::new(HashMap::new());
+        let root = PathBuf::from("/proj");
+        let (_shutdown, alive) = fake_watcher(&watchers, &root, "k", Duration::from_millis(300));
+
+        let still = stop_all_watchers(&watchers, Duration::from_millis(30));
+
+        assert_eq!(still, 1);
+        assert!(alive.load(Ordering::SeqCst));
+        assert!(
+            watchers.lock().contains_key(&root),
+            "a draining watcher must keep its slot so nothing spawns beside it"
+        );
+        assert!(wait_for_watcher_exit(
+            &alive,
+            Instant::now() + Duration::from_secs(5)
+        ));
+        // A second stop finds it exited and frees the slot.
+        assert_eq!(stop_all_watchers(&watchers, Duration::from_millis(30)), 0);
+        assert!(watchers.lock().is_empty());
+    }
+
+    #[test]
+    fn reserve_returns_running_for_a_live_watcher_with_the_same_config() {
+        let watchers: Mutex<HashMap<PathBuf, WatcherEntry>> = Mutex::new(HashMap::new());
+        let root = PathBuf::from("/proj");
+        let (shutdown, alive) = fake_watcher(&watchers, &root, "k", Duration::ZERO);
+
+        let slot = reserve_watcher_slot(
+            &watchers,
+            &root,
+            "k",
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(AtomicBool::new(true)),
+            Duration::from_millis(50),
+        );
+        assert_eq!(slot, WatcherSlot::Running);
+        assert!(!shutdown.load(Ordering::SeqCst));
+
+        // A stale config key retires it and waits it out before reserving.
+        let new_alive = Arc::new(AtomicBool::new(true));
+        let slot = reserve_watcher_slot(
+            &watchers,
+            &root,
+            "k2",
+            &Arc::new(AtomicBool::new(false)),
+            &new_alive,
+            Duration::from_secs(5),
+        );
+        assert_eq!(slot, WatcherSlot::Reserved);
+        assert!(shutdown.load(Ordering::SeqCst));
+        assert!(!alive.load(Ordering::SeqCst));
+        assert!(Arc::ptr_eq(
+            &watchers.lock().get(&root).unwrap().alive,
+            &new_alive
+        ));
     }
 
     /// Onboarded project scaffold: `.codesage/index.db` exists, optional

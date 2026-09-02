@@ -3,7 +3,7 @@ mod render;
 mod schema;
 mod state;
 
-pub(crate) use state::CodeSageServerState;
+pub(crate) use state::{CodeSageServerState, WATCHER_STOP_WAIT};
 
 use std::path::Path;
 use std::sync::Arc;

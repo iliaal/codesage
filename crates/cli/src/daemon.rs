@@ -473,9 +473,21 @@ mod unix {
                         // With no client left there is nobody to keep an
                         // index fresh for: stop every live watcher now rather
                         // than letting it re-embed saved files for the rest of
-                        // its idle window. The next semantic query respawns it.
+                        // its idle window. The next semantic query respawns it
+                        // — after this stop has joined the old thread, which is
+                        // why the wait runs off the async runtime and a start
+                        // request meanwhile waits on the slot.
                         if remaining == 0 {
-                            state_for_conn.shutdown_all_watchers();
+                            let state = state_for_conn.clone();
+                            let stop = tokio::task::spawn_blocking(move || {
+                                state.shutdown_all_watchers(
+                                    crate::mcp::WATCHER_STOP_WAIT,
+                                )
+                            })
+                            .await;
+                            if let Err(e) = stop {
+                                tracing::warn!(error = %e, "watcher stop task failed");
+                            }
                         }
                     });
                 }
@@ -530,9 +542,18 @@ mod unix {
         );
 
         // Signal any per-project live watchers to drain and exit before we
-        // tear down. They share this process, so leaving them running past
-        // daemon exit would orphan inotify threads.
-        state.shutdown_all_watchers();
+        // tear down, waiting a bounded time for them. They share this
+        // process, so leaving them running past daemon exit would orphan
+        // inotify threads; one still draining at the deadline is reaped by
+        // the process exit as before.
+        let still_stopping = state.shutdown_all_watchers(SHUTDOWN_DRAIN);
+        if still_stopping > 0 {
+            tracing::warn!(
+                still_stopping,
+                "watchers still draining after {:?}; process exit will reap them",
+                SHUTDOWN_DRAIN
+            );
+        }
 
         // Let in-flight client connections finish (bounded) before removing
         // the runtime files; returning immediately would drop the runtime and
