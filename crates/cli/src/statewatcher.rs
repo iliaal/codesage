@@ -116,6 +116,29 @@ impl EmbedderHandle {
     }
 }
 
+/// Failed semantic passes a path is retried after before the watcher gives
+/// up on it until its next save. Each retry waits longer (see
+/// [`semantic_retry_extra_delay`]); with the 30 s default debounce the five
+/// retries land at roughly 30 s, 60 s, 2 min, 4 min and 8 min.
+const MAX_SEMANTIC_RETRIES: u32 = 5;
+
+/// Longest extra wait a semantic retry adds on top of the debounce window.
+const MAX_SEMANTIC_RETRY_EXTRA: Duration = Duration::from_secs(600);
+
+/// Extra wait beyond the debounce window before retry number `attempt` (1
+/// for the first retry) of a failed semantic pass: `debounce × (2^(attempt-1)
+/// − 1)`, capped. The first retry is one plain debounce out; each later one
+/// doubles, so a model that will not load or a database that stays broken
+/// costs a handful of attempts rather than one per tick.
+fn semantic_retry_extra_delay(attempt: u32, debounce: Duration) -> Duration {
+    let factor = 2u32
+        .saturating_pow(attempt.saturating_sub(1))
+        .saturating_sub(1);
+    debounce
+        .saturating_mul(factor)
+        .min(MAX_SEMANTIC_RETRY_EXTRA)
+}
+
 /// Outcome of a lock-guarded indexing pass. Callers must only discard
 /// accumulated work (`pending` / `removed_paths`) on `Done`: a `Skipped`
 /// pass did nothing, and dropping the state would silently lose the
@@ -181,6 +204,9 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
     let mut batch_event_times: Vec<Instant> = Vec::new();
     let mut currently_indexing: HashSet<PathBuf> = HashSet::new();
     let mut recheck_queue: HashSet<PathBuf> = HashSet::new();
+    // Failed semantic passes per path, for the bounded retry in
+    // `process_ready`. Cleared when the path's semantic rows land.
+    let mut semantic_retries: HashMap<PathBuf, u32> = HashMap::new();
     let mut bulk_retry_at: Option<Instant> = None;
     let mut bulk_cooldown_until: Option<Instant> = None;
     let mut removal_retry_at: Option<Instant> = None;
@@ -402,6 +428,7 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
                 &mut pending,
                 &mut currently_indexing,
                 &mut recheck_queue,
+                &mut semantic_retries,
                 &filter,
                 &mut embedder,
                 header_is_cpp,
@@ -465,6 +492,7 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
             &mut pending,
             &mut currently_indexing,
             &mut recheck_queue,
+            &mut semantic_retries,
             &filter,
             &mut embedder,
             header_is_cpp,
@@ -511,6 +539,7 @@ fn drain_pending(
     pending: &mut HashMap<PathBuf, Instant>,
     currently_indexing: &mut HashSet<PathBuf>,
     recheck_queue: &mut HashSet<PathBuf>,
+    semantic_retries: &mut HashMap<PathBuf, u32>,
     filter: &WatchFilter,
     embedder: &mut EmbedderHandle,
     header_is_cpp: bool,
@@ -539,6 +568,7 @@ fn drain_pending(
         pending,
         currently_indexing,
         recheck_queue,
+        semantic_retries,
         filter,
         embedder,
         header_is_cpp,
@@ -546,11 +576,13 @@ fn drain_pending(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drain_pending_force(
     config: &StateWatcherConfig,
     pending: &mut HashMap<PathBuf, Instant>,
     currently_indexing: &mut HashSet<PathBuf>,
     recheck_queue: &mut HashSet<PathBuf>,
+    semantic_retries: &mut HashMap<PathBuf, u32>,
     filter: &WatchFilter,
     embedder: &mut EmbedderHandle,
     header_is_cpp: bool,
@@ -561,6 +593,7 @@ fn drain_pending_force(
         pending,
         currently_indexing,
         recheck_queue,
+        semantic_retries,
         filter,
         embedder,
         header_is_cpp,
@@ -591,6 +624,7 @@ fn process_ready(
     pending: &mut HashMap<PathBuf, Instant>,
     currently_indexing: &mut HashSet<PathBuf>,
     recheck_queue: &mut HashSet<PathBuf>,
+    semantic_retries: &mut HashMap<PathBuf, u32>,
     filter: &WatchFilter,
     embedder: &mut EmbedderHandle,
     header_is_cpp: bool,
@@ -663,17 +697,89 @@ fn process_ready(
 
     if !semantic_todo.is_empty() {
         let files: Vec<FileInfo> = semantic_todo.iter().map(|(_, f)| f.clone()).collect();
-        if semantic_reindex_batch(config, embedder, &files) == WorkOutcome::Skipped {
-            // Lock contention or a busy database: the structural rows landed,
-            // the semantic rows did not. Re-queue the paths; the next drain
-            // finds the structural hash fresh and only the semantic one stale.
-            let now = Instant::now();
-            for (path, _) in semantic_todo {
-                pending.insert(path, now);
+        match semantic_reindex_batch(config, embedder, &files) {
+            WorkOutcome::Done => {
+                for (path, _) in &semantic_todo {
+                    semantic_retries.remove(path);
+                }
+            }
+            WorkOutcome::Skipped => {
+                // Lock contention or a busy database: the structural rows
+                // landed, the semantic rows did not. Re-queue the paths; the
+                // next drain finds the structural hash fresh and only the
+                // semantic one stale.
+                let now = Instant::now();
+                for (path, _) in semantic_todo {
+                    pending.insert(path, now);
+                }
+            }
+            WorkOutcome::Failed => {
+                // Same stale state as Skipped — the structural rows landed
+                // and the semantic ones did not — but dropping the paths here
+                // left them stale until the next filesystem event. Re-queue
+                // with a growing delay, up to a bound, so a model that will
+                // not load is retried a few times rather than every tick or
+                // never.
+                requeue_failed_semantic(
+                    pending,
+                    semantic_retries,
+                    semantic_todo.into_iter().map(|(path, _)| path),
+                    Duration::from_millis(config.debounce_ms),
+                    Instant::now(),
+                );
             }
         }
     }
     rederive_header
+}
+
+/// Re-queue `paths` after a failed semantic pass, each one retry deeper.
+/// A path past [`MAX_SEMANTIC_RETRIES`] is dropped with its counter cleared:
+/// its semantic rows stay stale until its next save re-queues it afresh.
+fn requeue_failed_semantic(
+    pending: &mut HashMap<PathBuf, Instant>,
+    semantic_retries: &mut HashMap<PathBuf, u32>,
+    paths: impl IntoIterator<Item = PathBuf>,
+    debounce: Duration,
+    now: Instant,
+) {
+    let mut requeued = 0usize;
+    let mut abandoned: Vec<String> = Vec::new();
+    let mut longest_extra = Duration::ZERO;
+    let mut deepest_attempt = 0u32;
+    for path in paths {
+        let attempt = semantic_retries.entry(path.clone()).or_insert(0);
+        *attempt += 1;
+        if *attempt > MAX_SEMANTIC_RETRIES {
+            semantic_retries.remove(&path);
+            abandoned.push(path.to_string_lossy().into_owned());
+            continue;
+        }
+        let extra = semantic_retry_extra_delay(*attempt, debounce);
+        deepest_attempt = deepest_attempt.max(*attempt);
+        longest_extra = longest_extra.max(extra);
+        // A stamp in the future is not drain-ready until `debounce` has
+        // elapsed past it; `compute_ready` saturates, never panics, on it.
+        pending.insert(path, now + extra);
+        requeued += 1;
+    }
+    if requeued > 0 {
+        tracing::warn!(
+            files = requeued,
+            attempt = deepest_attempt,
+            max_attempts = MAX_SEMANTIC_RETRIES,
+            retry_after_secs = (longest_extra + debounce).as_secs(),
+            "semantic reindex failed; structural rows landed, semantic rows are stale — re-queued for retry"
+        );
+    }
+    if !abandoned.is_empty() {
+        tracing::warn!(
+            files = abandoned.len(),
+            paths = ?abandoned,
+            max_attempts = MAX_SEMANTIC_RETRIES,
+            "semantic reindex failed repeatedly; giving up on these paths until they change again"
+        );
+    }
 }
 
 /// Embed every file in `files` in one pass under one lock. Chunks whose text
@@ -2405,6 +2511,7 @@ mod tests {
         pending.insert(PathBuf::from("foo.rs"), stale);
         let mut currently_indexing = HashSet::new();
         let mut recheck_queue = HashSet::new();
+        let mut semantic_retries = HashMap::new();
         let mut deferred_since = None;
 
         let rederive = drain_pending(
@@ -2412,6 +2519,7 @@ mod tests {
             &mut pending,
             &mut currently_indexing,
             &mut recheck_queue,
+            &mut semantic_retries,
             &filter,
             &mut embedder,
             false,
@@ -2446,6 +2554,7 @@ mod tests {
             &mut pending,
             &mut currently_indexing,
             &mut recheck_queue,
+            &mut semantic_retries,
             &filter,
             &mut embedder,
             false,
@@ -2454,6 +2563,150 @@ mod tests {
         );
         let db = Database::open(&config.db_path).unwrap();
         assert!(db.get_file_hash("foo.rs").unwrap().is_some());
+    }
+
+    #[test]
+    fn semantic_retry_delay_doubles_from_one_debounce_and_caps() {
+        let debounce = Duration::from_secs(30);
+        assert_eq!(semantic_retry_extra_delay(1, debounce), Duration::ZERO);
+        assert_eq!(
+            semantic_retry_extra_delay(2, debounce),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            semantic_retry_extra_delay(3, debounce),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            semantic_retry_extra_delay(4, debounce),
+            Duration::from_secs(210)
+        );
+        assert_eq!(
+            semantic_retry_extra_delay(5, debounce),
+            Duration::from_secs(450)
+        );
+        assert_eq!(
+            semantic_retry_extra_delay(40, debounce),
+            MAX_SEMANTIC_RETRY_EXTRA,
+            "the extra wait is bounded"
+        );
+    }
+
+    #[test]
+    fn requeue_failed_semantic_bounds_the_retries_and_then_drops_the_path() {
+        let debounce = Duration::from_millis(100);
+        let now = Instant::now();
+        let mut pending = HashMap::new();
+        let mut retries = HashMap::new();
+        let path = PathBuf::from("foo.rs");
+
+        for attempt in 1..=MAX_SEMANTIC_RETRIES {
+            requeue_failed_semantic(&mut pending, &mut retries, [path.clone()], debounce, now);
+            assert_eq!(retries.get(&path), Some(&attempt));
+            let stamp = pending.get(&path).copied().expect("re-queued");
+            assert_eq!(
+                stamp,
+                now + semantic_retry_extra_delay(attempt, debounce),
+                "attempt {attempt} waits its backoff"
+            );
+            // Not drain-ready before the (delayed) debounce elapses.
+            assert!(compute_ready(&pending, now, debounce).is_empty());
+            assert_eq!(
+                compute_ready(&pending, stamp + debounce, debounce),
+                vec![path.clone()],
+                "attempt {attempt} becomes ready once its window has passed"
+            );
+            pending.remove(&path);
+        }
+
+        requeue_failed_semantic(&mut pending, &mut retries, [path.clone()], debounce, now);
+        assert!(
+            !pending.contains_key(&path),
+            "past the bound the path is dropped, not spun on"
+        );
+        assert!(
+            !retries.contains_key(&path),
+            "the counter is cleared so the next save starts fresh"
+        );
+    }
+
+    #[test]
+    fn process_ready_requeues_the_path_when_the_semantic_pass_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        std::fs::write(root.join("foo.rs"), "fn main() {}\n").unwrap();
+        // Semantic enabled, but the embedder cannot be produced (a model
+        // that fails to load): the structural pass lands and the semantic
+        // pass is `Failed`. Before the fix that dropped the path.
+        let mut config = test_config(root);
+        let provider: EmbedderProvider =
+            Arc::new(|| anyhow::bail!("simulated embedder load failure"));
+        config.embedder = Some(provider);
+        let filter = WatchFilter::new(root, &config.exclude_patterns).unwrap();
+        let mut embedder = EmbedderHandle::new(config.embedder.clone());
+
+        let debounce = Duration::from_millis(config.debounce_ms);
+        let stale = Instant::now() - Duration::from_secs(10);
+        let mut pending = HashMap::new();
+        pending.insert(PathBuf::from("foo.rs"), stale);
+        let mut currently_indexing = HashSet::new();
+        let mut recheck_queue = HashSet::new();
+        let mut semantic_retries = HashMap::new();
+
+        let before = Instant::now();
+        process_ready(
+            &config,
+            &mut pending,
+            &mut currently_indexing,
+            &mut recheck_queue,
+            &mut semantic_retries,
+            &filter,
+            &mut embedder,
+            false,
+            vec![PathBuf::from("foo.rs")],
+        );
+
+        let db = Database::open(&config.db_path).unwrap();
+        assert!(
+            db.get_file_hash("foo.rs").unwrap().is_some(),
+            "the structural pass must still land"
+        );
+        drop(db);
+        let stamp = pending
+            .get(Path::new("foo.rs"))
+            .copied()
+            .expect("a failed semantic pass must keep the path pending");
+        assert!(stamp >= before, "re-stamped, not left drain-ready");
+        assert_eq!(semantic_retries.get(Path::new("foo.rs")), Some(&1));
+        assert!(
+            compute_ready(&pending, stamp + debounce, debounce).contains(&PathBuf::from("foo.rs")),
+            "retried on the next tick after one debounce"
+        );
+
+        // The retry fails again: still pending, one attempt deeper, and the
+        // wait grows.
+        process_ready(
+            &config,
+            &mut pending,
+            &mut currently_indexing,
+            &mut recheck_queue,
+            &mut semantic_retries,
+            &filter,
+            &mut embedder,
+            false,
+            vec![PathBuf::from("foo.rs")],
+        );
+        let second = pending
+            .get(Path::new("foo.rs"))
+            .copied()
+            .expect("still pending after the second failure");
+        assert_eq!(semantic_retries.get(Path::new("foo.rs")), Some(&2));
+        assert!(
+            second >= before + debounce,
+            "second retry waits at least one extra debounce"
+        );
+        assert!(currently_indexing.is_empty());
     }
 
     #[test]
@@ -2477,6 +2730,7 @@ mod tests {
         pending.insert(PathBuf::from("foo.rs"), stale);
         let mut currently_indexing = HashSet::new();
         let mut recheck_queue = HashSet::new();
+        let mut semantic_retries = HashMap::new();
 
         let _held = hold_lock(root);
         process_ready(
@@ -2484,6 +2738,7 @@ mod tests {
             &mut pending,
             &mut currently_indexing,
             &mut recheck_queue,
+            &mut semantic_retries,
             &filter,
             &mut embedder,
             false,
@@ -2778,6 +3033,7 @@ mod tests {
         let mut pending = HashMap::new();
         let mut currently_indexing = HashSet::new();
         let mut recheck_queue = HashSet::new();
+        let mut semantic_retries = HashMap::new();
 
         // Still present and non-empty: a plain reindex must not request a
         // re-derivation.
@@ -2786,6 +3042,7 @@ mod tests {
             &mut pending,
             &mut currently_indexing,
             &mut recheck_queue,
+            &mut semantic_retries,
             &filter,
             &mut embedder,
             true,
@@ -2801,6 +3058,7 @@ mod tests {
             &mut pending,
             &mut currently_indexing,
             &mut recheck_queue,
+            &mut semantic_retries,
             &filter,
             &mut embedder,
             true,
