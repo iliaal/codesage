@@ -530,15 +530,19 @@ fn semantic_index(
     let mut stats = SemanticIndexStats::default();
     let table_state = semantic_table_state(db, fingerprint)?;
     let reuse_stored = stored_vectors_reusable(strategy, &table_state);
-    if strategy == IndexStrategy::Full {
-        // Every row is about to be rewritten; until they all have been, the
-        // table holds vectors no fingerprint describes.
-        db.clear_semantic_fingerprint()?;
-    }
     // A table whose fingerprint is absent or differs holds vectors this run
     // cannot vouch for in ANY file, not only the ones whose content moved:
     // an incremental pass over it re-embeds every file, as `--full` would.
     let stale_table = !table_state.is_current();
+    if strategy == IndexStrategy::Full || stale_table {
+        // Every row is about to be rewritten; until they all have been, the
+        // table holds vectors no fingerprint describes. On a stale table the
+        // OLD record must go before the first new row lands: a pass that
+        // dies midway otherwise leaves this run's vectors attested under the
+        // previous setup, and reverting the config to that setup would read
+        // the mix as current.
+        db.clear_semantic_fingerprint()?;
+    }
     let selection = if stale_table {
         IndexStrategy::Full
     } else {
@@ -685,6 +689,13 @@ pub fn semantic_index_files(
     }
     let table_state = semantic_table_state(db, fingerprint)?;
     let reuse_stored = stored_vectors_reusable(IndexStrategy::Incremental, &table_state);
+    if !table_state.is_current() {
+        // The rows about to be written are this setup's; the record, if any,
+        // is another's. Forget it before the first write so no reader takes
+        // the mix for that setup's table. Never re-recorded here: this pass
+        // does not see the whole table.
+        db.clear_semantic_fingerprint()?;
+    }
 
     if verbose {
         tracing::info!(count = files.len(), "semantic indexing specific files");
@@ -1203,6 +1214,115 @@ mod tests {
             "a partial --full leaves the table unattested"
         );
         assert!(!semantic_table_state(&db, &test_fp()).unwrap().is_current());
+    }
+
+    /// Fails every `embed_batch` call from `fail_on_call` onwards: a process
+    /// dying midway through a pass, as far as the table can tell.
+    struct CrashingEmbedder {
+        calls: usize,
+        fail_on_call: usize,
+    }
+
+    impl TextEmbedder for CrashingEmbedder {
+        fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            self.calls += 1;
+            if self.calls >= self.fail_on_call {
+                anyhow::bail!("simulated crash on embed call {}", self.calls);
+            }
+            Ok(texts.iter().map(|_| embedding(0.25)).collect())
+        }
+    }
+
+    #[test]
+    fn a_crash_midway_through_a_stale_incremental_pass_leaves_the_table_unattested() {
+        let root = tempfile::tempdir().unwrap();
+        // More files than one commit batch, so the first batch lands before
+        // the second fails.
+        for i in 0..(COMMIT_BATCH_SIZE + 1) {
+            std::fs::write(
+                root.path().join(format!("f{i:03}.rs")),
+                format!("fn f{i}() {{ let x = {i}; }}\n"),
+            )
+            .unwrap();
+        }
+        let db = Database::open_in_memory().unwrap();
+        let mut fake = FakeEmbedder {
+            prepared_with: Vec::new(),
+            batches: 0,
+        };
+        // The table is complete and attested under setup A.
+        semantic_incremental_index(root.path(), &db, &mut fake, &[], &other_fp(), false).unwrap();
+        assert_eq!(
+            db.semantic_fingerprint().unwrap().as_deref(),
+            Some(other_fp().as_str())
+        );
+        let rows_under_a = db.chunk_count().unwrap();
+        assert!(rows_under_a > COMMIT_BATCH_SIZE);
+
+        // Setup B runs an ordinary incremental pass — which the mismatch
+        // turns into a full re-embed — and dies after the first batch.
+        let mut crashing = CrashingEmbedder {
+            calls: 0,
+            fail_on_call: 2,
+        };
+        let err =
+            semantic_incremental_index(root.path(), &db, &mut crashing, &[], &test_fp(), false)
+                .unwrap_err();
+        assert!(err.to_string().contains("simulated crash"), "{err:#}");
+        assert_eq!(crashing.calls, 2);
+        assert_eq!(
+            db.chunk_count().unwrap(),
+            rows_under_a,
+            "the first batch was rewritten under B, the rest still hold A's rows"
+        );
+
+        // Neither setup may read the mix as its own table: A's record is
+        // gone before B's first write, and B never completed.
+        assert_eq!(db.semantic_fingerprint().unwrap(), None);
+        let under_a = require_current_semantic_table(&db, &other_fp()).unwrap_err();
+        assert!(
+            under_a.downcast_ref::<StaleSemanticTable>().is_some(),
+            "reverting the config to A must not make the mixed table current: {under_a:#}"
+        );
+        assert!(
+            require_current_semantic_table(&db, &test_fp())
+                .unwrap_err()
+                .downcast_ref::<StaleSemanticTable>()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn per_file_pass_over_a_mismatched_table_forgets_the_record_before_writing() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.path().join("b.rs"), "fn b() {}\n").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut fake = FakeEmbedder {
+            prepared_with: Vec::new(),
+            batches: 0,
+        };
+        semantic_incremental_index(root.path(), &db, &mut fake, &[], &other_fp(), false).unwrap();
+        let files = discover_files_with_excludes(root.path(), &[]).unwrap();
+        let only_a: Vec<FileInfo> = files.into_iter().filter(|f| f.path == "a.rs").collect();
+
+        // The watcher re-embeds one file under B while the table records A.
+        semantic_index_files(root.path(), &db, &mut fake, &only_a, &test_fp(), false).unwrap();
+        assert_eq!(
+            db.semantic_fingerprint().unwrap(),
+            None,
+            "a.rs holds B's vectors and b.rs holds A's; no record may describe that"
+        );
+        assert!(require_current_semantic_table(&db, &other_fp()).is_err());
+        assert!(require_current_semantic_table(&db, &test_fp()).is_err());
+
+        // Under a current table the record survives a per-file pass.
+        semantic_full_index(root.path(), &db, &mut fake, &[], &test_fp(), false).unwrap();
+        semantic_index_files(root.path(), &db, &mut fake, &only_a, &test_fp(), false).unwrap();
+        assert_eq!(
+            db.semantic_fingerprint().unwrap().as_deref(),
+            Some(test_fp().as_str())
+        );
     }
 
     #[test]
