@@ -12,6 +12,7 @@ use codesage_storage::Database;
 use parking_lot::Mutex;
 
 use super::CodeSageServer;
+use super::params::EmbedTextsResult;
 
 const MCP_TEST_QUERY_EMBEDDING_ENV: &str = "CODESAGE_MCP_TEST_QUERY_EMBEDDING";
 
@@ -634,6 +635,42 @@ impl CodeSageServer {
     /// (slow) ORT call. Pre-daemon each shim had a per-process embedder
     /// pool so calls were already parallel; this preserves that property
     /// under the shared-daemon model.
+    /// Embed `texts` with the project's resident embedder for the hidden
+    /// `embed_texts` tool. `model` must be the project's configured model:
+    /// the caller is about to write these vectors into that model's chunk
+    /// table, and a daemon whose config moved on would silently fork the
+    /// index. An empty `texts` probes model and dimension only.
+    pub(super) fn embed_texts_for(
+        &self,
+        project: &str,
+        model: &str,
+        texts: &[String],
+    ) -> Result<EmbedTextsResult> {
+        let state = self.resolve_project(project)?;
+        let config = self.semantic_embedding_config(&state)?;
+        if config.model != model {
+            bail!(
+                "daemon serves model {:?} for this project, caller asked for {:?}; \
+                 re-run after the config change settles or embed privately",
+                config.model,
+                model
+            );
+        }
+        let embedder_arc = self.get_or_load_embedder(config)?;
+        let mut embedder = embedder_arc.lock();
+        let embeddings = if texts.is_empty() {
+            Vec::new()
+        } else {
+            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            embedder.embed_batch(&refs)?
+        };
+        Ok(EmbedTextsResult {
+            model: config.model.clone(),
+            dim: embedder.dim(),
+            embeddings,
+        })
+    }
+
     pub(super) fn with_project_query<F, R>(&self, project: &str, query: &str, f: F) -> Result<R>
     where
         F: FnOnce(&Database, &[f32], Option<codesage_graph::RerankFn<'_>>) -> Result<R>,

@@ -19,11 +19,21 @@ pub trait TextEmbedder {
     }
 
     fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
+
+    fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
+        self.embed_batch(&[text])?
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("embedder returned no vector for one text"))
+    }
 }
 
 impl TextEmbedder for Embedder {
     fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         Embedder::embed_batch(self, texts)
+    }
+
+    fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
+        Embedder::embed_one(self, text)
     }
 }
 

@@ -42,7 +42,7 @@ regex = "1"
 
 clap = { version = "4", features = ["derive"] }
 
-rmcp = { version = "3.1", features = ["server", "transport-io", "macros"] }
+rmcp = { version = "3.1", features = ["server", "client", "transport-io", "macros"] }
 tokio = { version = "1", features = ["full"] }
 schemars = "1.2"
 

@@ -2,6 +2,8 @@ mod brief_gate;
 mod commands;
 mod coverage;
 mod daemon;
+#[cfg(unix)]
+mod daemon_embed;
 mod doctor;
 #[cfg(target_os = "android")]
 mod flock_override;
@@ -18,7 +20,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use codesage_embed::config::ProjectConfig;
+use codesage_embed::config::{EmbeddingConfig, ProjectConfig};
 use codesage_embed::model::Embedder;
 use codesage_parser::discover::DEFAULT_EXCLUDE_PATTERNS;
 use codesage_storage::Database;
@@ -646,25 +648,45 @@ pub(crate) fn get_user_exclude_patterns(config: &ProjectConfig) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Load config, construct embedder, open DB for its model, and optionally load a reranker.
+/// Load config, obtain an embedder, open DB for its model, and optionally load a reranker.
 /// Shared by `cmd_search` and `cmd_export`.
+///
+/// The embedder is the running daemon's resident session when one answers
+/// (see `daemon_embed`), otherwise a private `Embedder`. The reranker is
+/// always private: the daemon exposes no rerank entry point yet.
 pub(crate) fn load_query_stack(
     root: &Path,
 ) -> Result<(
     Database,
-    Embedder,
+    Box<dyn codesage_graph::TextEmbedder>,
     Option<codesage_embed::reranker::Reranker>,
 )> {
     let config = load_project_config(root)?;
     let emb_config = config.embedding.unwrap_or_default();
-    let embedder = Embedder::new(&emb_config)?;
-    let db = open_db_for_model(root, &emb_config.model, embedder.dim())?;
+    let (embedder, dim) = query_embedder(root, &emb_config)?;
+    let db = open_db_for_model(root, &emb_config.model, dim)?;
     let reranker = emb_config
         .reranker
         .as_ref()
         .map(|model| codesage_embed::reranker::Reranker::new(model, &emb_config.device))
         .transpose()?;
     Ok((db, embedder, reranker))
+}
+
+/// The daemon's session for `emb_config.model` when a daemon answers, else a
+/// private embedder; with the dimension either one produces.
+pub(crate) fn query_embedder(
+    root: &Path,
+    emb_config: &EmbeddingConfig,
+) -> Result<(Box<dyn codesage_graph::TextEmbedder>, usize)> {
+    #[cfg(unix)]
+    if let Some(daemon) = daemon_embed::DaemonEmbedder::connect(root, &emb_config.model) {
+        let dim = daemon.dim();
+        return Ok((Box::new(daemon), dim));
+    }
+    let embedder = Embedder::new(emb_config)?;
+    let dim = embedder.dim();
+    Ok((Box::new(embedder), dim))
 }
 
 pub(crate) fn load_symbol_context_db(root: &Path) -> Result<Database> {

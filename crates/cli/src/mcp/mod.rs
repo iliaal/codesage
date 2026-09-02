@@ -1,4 +1,4 @@
-mod params;
+pub(crate) mod params;
 mod render;
 mod schema;
 mod state;
@@ -40,6 +40,15 @@ const MAX_MCP_CONTEXT_LIMIT: usize = 20;
 const MAX_MCP_FEATURE_LIMIT: usize = 500;
 const MAX_MCP_FEATURE_SCAN_LIMIT: usize = 5_000;
 const MAX_MCP_OFFSET: usize = 1_000;
+/// Per-call ceiling for the hidden `embed_texts` tool. The CLI sends one
+/// commit batch (50 files) per call, so this is headroom, not a target.
+pub(crate) const MAX_MCP_EMBED_TEXTS: usize = 4_096;
+
+/// Tools the router dispatches but `tools/list` never advertises: the CLI
+/// calls them over the daemon socket so that one process holds the model
+/// (and on a GPU device, the one CUDA context), and an agent has no use for
+/// raw vectors.
+const HIDDEN_TOOLS: &[&str] = &["embed_texts"];
 
 fn capped_limit(value: Option<usize>, default: usize, max: usize) -> usize {
     value.unwrap_or(default).min(max)
@@ -175,9 +184,20 @@ impl ServerHandler for CodeSageServer {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> std::result::Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        Ok(rmcp::model::ListToolsResult::with_all_items(
+            self.advertised_tools(),
+        ))
+    }
+}
+
+impl CodeSageServer {
+    /// The `tools/list` payload: every routed tool except [`HIDDEN_TOOLS`],
+    /// finalized for listing.
+    fn advertised_tools(&self) -> Vec<rmcp::model::Tool> {
         let mut tools = self.tool_router.list_all();
+        tools.retain(|t| !HIDDEN_TOOLS.contains(&t.name.as_ref()));
         finalize_tools_for_listing(&mut tools);
-        Ok(rmcp::model::ListToolsResult::with_all_items(tools))
+        tools
     }
 }
 
@@ -352,6 +372,37 @@ impl CodeSageServer {
                 "search",
                 !paged,
             )
+        })
+        .await
+    }
+
+    #[tool(
+        name = "embed_texts",
+        description = "Internal: embed chunk texts with this daemon's resident embedding session. Called by the codesage CLI so index and search reuse one loaded model instead of each process creating its own; not advertised to agents.",
+        output_schema = schema_for_type::<EmbedTextsResult>()
+    )]
+    async fn embed_texts_tool(
+        &self,
+        Parameters(params): Parameters<EmbedTextsParams>,
+    ) -> CallToolResult {
+        self.blocking(move |s| {
+            if params.texts.len() > MAX_MCP_EMBED_TEXTS {
+                return CallToolResult::error(vec![ContentBlock::text(format!(
+                    "embed_texts: {} texts exceeds the per-call cap of {MAX_MCP_EMBED_TEXTS}",
+                    params.texts.len()
+                ))]);
+            }
+            // Raw vectors, not a rendered digest: the budget cap and coverage
+            // annotation the other tools go through would corrupt them.
+            match s.embed_texts_for(&params.project, &params.model, &params.texts) {
+                Ok(result) => match serde_json::to_value(&result) {
+                    Ok(value) => CallToolResult::structured(value),
+                    Err(e) => CallToolResult::error(vec![ContentBlock::text(format!(
+                        "embed_texts: serializing result: {e}"
+                    ))]),
+                },
+                Err(e) => CallToolResult::error(vec![ContentBlock::text(format!("{e:#}"))]),
+            }
         })
         .await
     }
@@ -1006,6 +1057,23 @@ mod tests {
     /// is not a JSON object (which the MCP spec requires; rmcp rejects it
     /// at registration time but the assertion here makes the contract
     /// explicit in test output).
+    #[test]
+    fn embed_texts_is_routed_but_never_advertised() {
+        let server = CodeSageServer::new();
+        let routed = server.tool_router.list_all();
+        assert!(
+            routed.iter().any(|t| t.name.as_ref() == "embed_texts"),
+            "router must dispatch embed_texts"
+        );
+        let advertised = server.advertised_tools();
+        assert!(
+            !advertised.iter().any(|t| t.name.as_ref() == "embed_texts"),
+            "tools/list must not advertise embed_texts"
+        );
+        assert_eq!(advertised.len(), routed.len() - HIDDEN_TOOLS.len());
+        assert!(advertised.iter().any(|t| t.name.as_ref() == "search"));
+    }
+
     #[test]
     fn every_tool_advertises_an_output_schema() {
         let server = CodeSageServer::new();

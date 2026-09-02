@@ -332,6 +332,28 @@ pub struct FeatureBundleParams {
     pub limit: Option<usize>,
 }
 
+/// Input of the hidden `embed_texts` tool: the CLI's request to embed with
+/// the daemon's resident session instead of a private one.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct EmbedTextsParams {
+    #[schemars(description = PROJECT_ARG_DESC)]
+    pub project: String,
+    #[schemars(
+        description = "Embedding model the caller indexes with; must equal the project's configured model"
+    )]
+    pub model: String,
+    #[schemars(description = "Chunk texts to embed, in order; empty to probe model and dimension")]
+    pub texts: Vec<String>,
+}
+
+/// Output of the hidden `embed_texts` tool.
+#[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct EmbedTextsResult {
+    pub model: String,
+    pub dim: usize,
+    pub embeddings: Vec<Vec<f32>>,
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ProjectOverviewParams {
     #[schemars(description = PROJECT_ARG_DESC)]

@@ -197,6 +197,18 @@ mod unix {
         }
     }
 
+    /// Socket of a daemon spawned from THIS binary that is accepting
+    /// connections right now, or `None`. Never spawns one: a CLI command that
+    /// finds no daemon embeds privately rather than paying a daemon start it
+    /// would not wait for. The key derives from the executable's identity, so
+    /// a daemon left over from an older install is not a match.
+    pub(crate) fn running_daemon_socket() -> Option<PathBuf> {
+        let paths = DaemonPaths::for_current_exe(None).ok()?;
+        std::os::unix::net::UnixStream::connect(&paths.socket)
+            .is_ok()
+            .then_some(paths.socket)
+    }
+
     pub(crate) async fn run_mcp_shim(
         runtime_dir: Option<PathBuf>,
         default_project: Option<String>,
@@ -2279,7 +2291,14 @@ mod unix {
 #[cfg(unix)]
 pub(crate) use unix::{
     default_runtime_dir, run_daemon, run_daemon_status, run_daemon_stop, run_mcp_shim,
+    running_daemon_socket,
 };
+
+/// No daemon exists off Unix, so no CLI command can borrow its session.
+#[cfg(not(unix))]
+pub(crate) fn running_daemon_socket() -> Option<PathBuf> {
+    None
+}
 
 #[cfg(not(unix))]
 pub(crate) async fn run_mcp_shim(
