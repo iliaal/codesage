@@ -244,10 +244,29 @@ fn wait_for_watcher_exit(alive: &AtomicBool, deadline: Instant) -> bool {
 /// into that slot meanwhile. Returns how many watchers were still stopping
 /// at the deadline.
 fn stop_all_watchers(watchers: &Mutex<HashMap<PathBuf, WatcherEntry>>, wait: Duration) -> usize {
+    stop_all_watchers_if(watchers, wait, || true).expect("an unconditional stop never aborts")
+}
+
+/// [`stop_all_watchers`], gated: `still_wanted` is evaluated under the
+/// registry lock immediately before the first shutdown signal, and a `false`
+/// aborts the whole stop with `None` and no watcher signalled. The
+/// last-client stop passes the client count here: a client that connected
+/// between the disconnect that scheduled the stop and this point would
+/// otherwise see its watcher running and then stopped under it, because a
+/// start request only waits on the slot once the signal has landed.
+fn stop_all_watchers_if(
+    watchers: &Mutex<HashMap<PathBuf, WatcherEntry>>,
+    wait: Duration,
+    still_wanted: impl FnOnce() -> bool,
+) -> Option<usize> {
     let deadline = Instant::now() + wait;
     let mut stopping = Vec::new();
     {
         let mut guard = watchers.lock();
+        if !still_wanted() {
+            tracing::info!("watcher stop aborted: a client connected before it landed");
+            return None;
+        }
         for (root, entry) in guard.iter_mut() {
             entry.shutdown.store(true, Ordering::SeqCst);
             tracing::info!(root = %root.display(), "signalling watcher shutdown");
@@ -288,7 +307,7 @@ fn stop_all_watchers(watchers: &Mutex<HashMap<PathBuf, WatcherEntry>>, wait: Dur
             }
         }
     }
-    still_stopping
+    Some(still_stopping)
 }
 
 /// Decision of [`reserve_watcher_slot`].
@@ -512,6 +531,20 @@ impl CodeSageServerState {
     /// spawning beside it. Blocks; call from a blocking context.
     pub(crate) fn shutdown_all_watchers(&self, wait: Duration) -> usize {
         stop_all_watchers(&self.watchers, wait)
+    }
+
+    /// The last-client variant of [`Self::shutdown_all_watchers`]: stops
+    /// only if `active_clients` still reads zero under the registry lock,
+    /// and returns `None` without signalling any watcher when a client has
+    /// connected since the disconnect that scheduled this stop.
+    pub(crate) fn shutdown_watchers_if_no_client(
+        &self,
+        wait: Duration,
+        active_clients: &std::sync::atomic::AtomicUsize,
+    ) -> Option<usize> {
+        stop_all_watchers_if(&self.watchers, wait, || {
+            active_clients.load(Ordering::SeqCst) == 0
+        })
     }
 }
 
@@ -1393,6 +1426,38 @@ mod tests {
             "the surviving entry is the new one, not the stopped watcher's"
         );
         assert!(entry.thread.is_none(), "the reservation has no thread yet");
+    }
+
+    #[test]
+    fn last_client_stop_aborts_when_a_client_connected_before_it_landed() {
+        // The last client disconnects and schedules the stop; a new client
+        // connects BEFORE the stop signal lands. The stop must observe that
+        // client and leave the watcher untouched, or the reconnecting
+        // client sees its watcher running and then stopped under it.
+        let watchers: Mutex<HashMap<PathBuf, WatcherEntry>> = Mutex::new(HashMap::new());
+        let root = PathBuf::from("/proj");
+        let (shutdown, alive) = fake_watcher(&watchers, &root, "k", Duration::ZERO);
+        let active = std::sync::atomic::AtomicUsize::new(0);
+
+        active.fetch_add(1, Ordering::SeqCst);
+        let stopped = stop_all_watchers_if(&watchers, Duration::from_secs(5), || {
+            active.load(Ordering::SeqCst) == 0
+        });
+
+        assert_eq!(stopped, None, "a stop with a client connected must abort");
+        assert!(!shutdown.load(Ordering::SeqCst), "no shutdown signalled");
+        assert!(alive.load(Ordering::SeqCst), "the watcher keeps running");
+        assert!(watchers.lock().contains_key(&root));
+
+        // That client leaves: the next stop goes through.
+        active.fetch_sub(1, Ordering::SeqCst);
+        let stopped = stop_all_watchers_if(&watchers, Duration::from_secs(5), || {
+            active.load(Ordering::SeqCst) == 0
+        });
+        assert_eq!(stopped, Some(0));
+        assert!(shutdown.load(Ordering::SeqCst));
+        assert!(!alive.load(Ordering::SeqCst));
+        assert!(watchers.lock().is_empty());
     }
 
     #[test]

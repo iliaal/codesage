@@ -459,6 +459,7 @@ mod unix {
                     *last_activity.lock().unwrap() = Instant::now();
                     *daemon_last_byte.lock().unwrap() = Instant::now();
                     let active_for_conn = active.clone();
+                    let active_for_stop = active.clone();
                     let last_activity_for_conn = last_activity.clone();
                     let last_byte_for_conn = daemon_last_byte.clone();
                     let state_for_conn = state.clone();
@@ -476,12 +477,16 @@ mod unix {
                         // its idle window. The next semantic query respawns it
                         // — after this stop has joined the old thread, which is
                         // why the wait runs off the async runtime and a start
-                        // request meanwhile waits on the slot.
+                        // request meanwhile waits on the slot. The count is
+                        // re-read under the registry lock right before the
+                        // signal: a client that connected since this
+                        // disconnect aborts the stop.
                         if remaining == 0 {
                             let state = state_for_conn.clone();
                             let stop = tokio::task::spawn_blocking(move || {
-                                state.shutdown_all_watchers(
+                                state.shutdown_watchers_if_no_client(
                                     crate::mcp::WATCHER_STOP_WAIT,
+                                    &active_for_stop,
                                 )
                             })
                             .await;
