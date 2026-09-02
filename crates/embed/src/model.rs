@@ -299,8 +299,7 @@ fn verify_cuda_libs_mapped(maps: &str) -> anyhow::Result<()> {
              Fixes: (1) confirm the binary was built with `--features cuda`; \
              (2) install nvidia-*-cu12 pip packages (cuda-runtime, cudnn, cublas, cudart, \
              nvrtc); (3) set CODESAGE_NVIDIA_LIBS to the directory containing them; \
-             (4) check `codesage doctor` for nvidia-lib discovery details. \
-             To override (e.g. for tests), set CODESAGE_ALLOW_CPU_FALLBACK=1.",
+             (4) check `codesage doctor` for nvidia-lib discovery details.",
             missing_libcuda = !has_libcuda,
             missing_cudart = !has_cudart,
         );
@@ -313,8 +312,7 @@ fn verify_cuda_libs_mapped(maps: &str) -> anyhow::Result<()> {
              Missing: libcudnn=true, libcublas=true\n\
              Fixes: install nvidia-cudnn-cu12 and nvidia-cublas-cu12, set \
              CODESAGE_NVIDIA_LIBS to the directory containing them, and check \
-             `codesage doctor` for nvidia-lib discovery details. \
-             To override (e.g. for tests), set CODESAGE_ALLOW_CPU_FALLBACK=1."
+             `codesage doctor` for nvidia-lib discovery details."
         );
     }
     Ok(())
@@ -881,35 +879,40 @@ pub(crate) struct LoadedSession {
     pub(crate) session: Session,
     pub(crate) tokenizer: Tokenizer,
     pub(crate) has_token_type_ids: bool,
-    /// `cpu`, `cuda`, or `coreml`: the provider that succeeded, which under
-    /// `CODESAGE_ALLOW_CPU_FALLBACK=1` may differ from the configured one.
+    /// `cpu`, `cuda`, or `coreml`: the configured provider, which is the one
+    /// every node runs on — a graph that cannot be placed entirely on it
+    /// fails at session creation (see [`apply_session_config`]).
     pub(crate) execution_provider: &'static str,
 }
 
-/// The provider a session runs on after the CUDA-library check. `configured`
-/// is the provider the device string selects; `cuda_check` is the result of
-/// the mapped-libraries guard (only meaningful when CUDA was requested). A
-/// failed check is fatal unless the fallback is allowed, in which case the
-/// session runs on the CPU and the second element says so.
-#[cfg(any(test, all(feature = "cuda", target_os = "linux")))]
-fn effective_execution_provider(
-    configured: &'static str,
-    cuda_check: Result<()>,
-    allow_cpu_fallback: bool,
-) -> Result<(&'static str, bool)> {
-    match cuda_check {
-        Ok(()) => Ok((configured, false)),
-        Err(_) if allow_cpu_fallback => Ok(("cpu", true)),
-        Err(e) => Err(e),
+/// ONNX Runtime session option that turns a node the configured execution
+/// provider cannot run into a session-creation failure. Without it ORT
+/// assigns such nodes to the CPU provider silently, so a `device = "cuda"`
+/// session could run CPU-heavy partitions while its vectors were attested as
+/// CUDA output. `onnxruntime_session_options_config_keys.h` names the key.
+pub(crate) const DISABLE_CPU_EP_FALLBACK_KEY: &str = "session.disable_cpu_ep_fallback";
+
+/// The session-option entries a session configured on `provider` sets. The
+/// CPU provider IS the fallback, so it sets none.
+fn session_config_entries(provider: &str) -> &'static [(&'static str, &'static str)] {
+    if provider == "cpu" {
+        &[]
+    } else {
+        &[(DISABLE_CPU_EP_FALLBACK_KEY, "1")]
     }
 }
 
-#[cfg(all(feature = "cuda", target_os = "linux"))]
-fn cpu_fallback_allowed_from_env() -> bool {
-    matches!(
-        std::env::var("CODESAGE_ALLOW_CPU_FALLBACK").as_deref(),
-        Ok("1") | Ok("true")
-    )
+/// Apply [`session_config_entries`] for `provider` to `builder`.
+fn apply_session_config(
+    mut builder: ort::session::builder::SessionBuilder,
+    provider: &str,
+) -> Result<ort::session::builder::SessionBuilder> {
+    for (key, value) in session_config_entries(provider) {
+        builder = builder.with_config_entry(key, value).map_err(|e| {
+            anyhow::anyhow!("setting ONNX Runtime session option {key}={value}: {e}")
+        })?;
+    }
+    Ok(builder)
 }
 
 /// [`load_onnx_session`], also reporting the execution provider the session
@@ -1000,41 +1003,32 @@ pub(crate) fn load_onnx_session_with_provider(model: &str, device: &str) -> Resu
         }
     }
 
-    let session = builder.commit_from_file(&model_path)?;
+    // Every provider the device string can select is registered by now (a
+    // CUDA or CoreML request this binary cannot serve bailed above), so a
+    // node ORT cannot place on it is a creation failure, never a silent CPU
+    // partition: the provider the fingerprint names is the one that ran.
+    let execution_provider = crate::fingerprint::configured_execution_provider(device);
+    builder = apply_session_config(builder, execution_provider)?;
 
-    // Hard-fail when device = "gpu" was requested but ORT silently fell back to
-    // CPU. Failure mode observed 2026-05-02 on a flip-all script: CUDA
+    let session = builder.commit_from_file(&model_path).with_context(|| {
+        format!(
+            "creating the ONNX session for {model:?} on the {execution_provider} execution \
+             provider (a graph that cannot run entirely on it is refused)"
+        )
+    })?;
+
+    // Hard-fail when device = "gpu" was requested but the CUDA libraries never
+    // loaded. Failure mode observed 2026-05-02 on a flip-all script: CUDA
     // registration logged "Successfully registered" but the process had ZERO
     // cuda libs mapped per /proc/self/maps and ran for 10+ minutes on a
     // 256-file project. Rather than time-based heuristics, assert the CUDA
     // loader actually ran by checking the process has libcuda + libcudart +
-    // (libcudnn OR libcublas) mapped. No-op on non-Linux. Bypass with
-    // CODESAGE_ALLOW_CPU_FALLBACK=1 (e.g. for unit tests) — the session then
-    // reports `cpu` as its provider, so the vectors it produces are never
-    // attested as CUDA output.
-    let configured = crate::fingerprint::configured_execution_provider(device);
+    // (libcudnn OR libcublas) mapped. No-op on non-Linux. There is no bypass:
+    // a CUDA session that did not load CUDA is an error, not a CPU session.
     #[cfg(all(feature = "cuda", target_os = "linux"))]
-    let execution_provider = if want_cuda {
-        let (provider, fell_back) = effective_execution_provider(
-            configured,
-            require_cuda_libs_mapped(),
-            cpu_fallback_allowed_from_env(),
-        )?;
-        if fell_back {
-            tracing::warn!(
-                model,
-                configured_device = device,
-                execution_provider = provider,
-                "CODESAGE_ALLOW_CPU_FALLBACK: CUDA was requested but its libraries are not \
-                 mapped; this session runs on the CPU and fingerprints as a CPU setup"
-            );
-        }
-        provider
-    } else {
-        configured
-    };
-    #[cfg(not(all(feature = "cuda", target_os = "linux")))]
-    let execution_provider = configured;
+    if want_cuda {
+        require_cuda_libs_mapped()?;
+    }
 
     let has_token_type_ids = wants_token_type_ids(session.inputs().iter().map(|i| i.name()));
 
@@ -1700,40 +1694,107 @@ mod tests {
     }
 
     #[test]
-    fn a_forced_cpu_fallback_fingerprints_as_the_cpu_setup() {
-        let cuda = EmbeddingConfig {
-            device: "cuda".to_string(),
-            ..EmbeddingConfig::default()
-        };
-        let configured = crate::fingerprint::configured_execution_provider(&cuda.device);
-        assert_eq!(configured, "cuda");
-        let as_configured =
-            crate::fingerprint::SemanticFingerprint::with_artifact_digest(&cuda, 384, "d");
-
-        // Libraries mapped: the session runs where it was asked to.
-        let (provider, fell_back) =
-            effective_execution_provider(configured, Ok(()), false).unwrap();
-        assert_eq!((provider, fell_back), ("cuda", false));
+    fn a_non_cpu_provider_disables_the_cpu_fallback_and_the_cpu_provider_sets_nothing() {
         assert_eq!(
-            as_configured.with_execution_provider(provider),
-            as_configured
+            session_config_entries("cuda"),
+            &[(DISABLE_CPU_EP_FALLBACK_KEY, "1")]
         );
+        assert_eq!(
+            session_config_entries("coreml"),
+            &[(DISABLE_CPU_EP_FALLBACK_KEY, "1")]
+        );
+        assert!(session_config_entries("cpu").is_empty());
+        assert_eq!(
+            DISABLE_CPU_EP_FALLBACK_KEY,
+            "session.disable_cpu_ep_fallback"
+        );
+        for device in ["cuda", "gpu", "coreml"] {
+            let provider = crate::fingerprint::configured_execution_provider(device);
+            assert_ne!(provider, "cpu", "{device}");
+            assert!(!session_config_entries(provider).is_empty(), "{device}");
+        }
+    }
 
-        // Libraries missing, fallback refused: the load fails as before.
-        let err =
-            effective_execution_provider(configured, Err(anyhow::anyhow!("no libcuda")), false)
-                .unwrap_err();
-        assert!(err.to_string().contains("no libcuda"));
+    /// The value ORT holds for `key` in `builder`'s session options, read
+    /// back through the C API rather than inferred from what was requested.
+    fn session_config_entry(
+        builder: &ort::session::builder::SessionBuilder,
+        key: &str,
+    ) -> Option<String> {
+        use ort::AsPointer;
+        let api = ort::api();
+        let key = std::ffi::CString::new(key).unwrap();
+        let mut present: std::ffi::c_int = 0;
+        let status =
+            unsafe { (api.HasSessionConfigEntry)(builder.ptr(), key.as_ptr(), &mut present) };
+        assert!(status.0.is_null(), "HasSessionConfigEntry failed");
+        if present == 0 {
+            return None;
+        }
+        let mut size: usize = 0;
+        let status = unsafe {
+            (api.GetSessionConfigEntry)(
+                builder.ptr(),
+                key.as_ptr(),
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        };
+        assert!(status.0.is_null(), "GetSessionConfigEntry (size) failed");
+        let mut buf = vec![0u8; size];
+        let status = unsafe {
+            (api.GetSessionConfigEntry)(
+                builder.ptr(),
+                key.as_ptr(),
+                buf.as_mut_ptr().cast::<std::ffi::c_char>(),
+                &mut size,
+            )
+        };
+        assert!(status.0.is_null(), "GetSessionConfigEntry failed");
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        Some(String::from_utf8(buf[..end].to_vec()).unwrap())
+    }
 
-        // Libraries missing, fallback allowed: the session runs on the CPU
-        // and its fingerprint is the CPU one, not the configured CUDA one.
-        let (provider, fell_back) =
-            effective_execution_provider(configured, Err(anyhow::anyhow!("no libcuda")), true)
-                .unwrap();
-        assert_eq!((provider, fell_back), ("cpu", true));
-        let effective = as_configured.with_execution_provider(provider);
-        assert_ne!(effective, as_configured);
-        assert!(effective.as_str().contains("device=cpu"), "{effective}");
+    #[test]
+    fn the_session_options_carry_the_cpu_fallback_switch_for_a_non_cpu_provider() {
+        #[cfg(not(target_vendor = "apple"))]
+        init_ort_dylib();
+        let cuda = apply_session_config(Session::builder().unwrap(), "cuda").unwrap();
+        assert_eq!(
+            session_config_entry(&cuda, DISABLE_CPU_EP_FALLBACK_KEY).as_deref(),
+            Some("1")
+        );
+        let cpu = apply_session_config(Session::builder().unwrap(), "cpu").unwrap();
+        assert_eq!(
+            session_config_entry(&cpu, DISABLE_CPU_EP_FALLBACK_KEY),
+            None
+        );
+    }
+
+    #[test]
+    fn no_cpu_fallback_switch_is_read_from_the_environment() {
+        // The removed `CODESAGE_ALLOW_CPU_FALLBACK` path let a `device =
+        // "cuda"` session run on the CPU. Nothing in this crate may read it
+        // again: a failed CUDA session is an error, not a fallback.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut hits = Vec::new();
+        for entry in std::fs::read_dir(&src_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).unwrap();
+                for (i, line) in text.lines().enumerate() {
+                    if line.contains(concat!("CODESAGE_ALLOW_", "CPU_FALLBACK"))
+                        && !line.contains("removed")
+                    {
+                        hits.push(format!("{}:{}", path.display(), i + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            hits.is_empty(),
+            "fallback switch still referenced: {hits:?}"
+        );
     }
 
     #[test]

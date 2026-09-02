@@ -42,10 +42,10 @@ pub trait TextEmbedder {
 }
 
 impl TextEmbedder for Embedder {
-    /// The session's execution provider is the one component of the
-    /// fingerprint the config cannot vouch for: under
-    /// `CODESAGE_ALLOW_CPU_FALLBACK=1` a `device = "cuda"` session may run
-    /// on the CPU, and its vectors must never be attested as CUDA output.
+    /// The session runs every node on its configured execution provider
+    /// (a graph ORT cannot place there fails at creation), so the one
+    /// component to check is that the pass fingerprints that same provider:
+    /// a table attested under another device never receives its vectors.
     fn bind_fingerprint(&mut self, expected: &SemanticFingerprint) -> Result<()> {
         let actual = self.execution_provider();
         ensure!(
