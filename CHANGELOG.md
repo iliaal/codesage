@@ -8,7 +8,7 @@
 
 - The live statewatcher re-embeds only chunks whose text changed, waits for 30 s of quiet, batches dirty paths into one pass, and defers while `.git/index.lock`, high load, or a cargo/rustc/pytest tree is present. It starts on the first semantic query, not on session start, and stops with the last client. An 8-save burst: 90 chunks → 1 embedded. (cs-r23)
 - `codesage index` constructs the embedder only when a pass has files to embed; a no-change incremental run never loads the model or maps CUDA (2.7–4.5 s and 1.16 GB → 0.08 s and 150 MB). `init_for_main` keeps only the env writes at startup; the CUDA/cuDNN preload moves to the first ONNX session. (cs-ox8)
-- Git hooks skip the binary when HEAD and the worktree content digest are unchanged (`.codesage/hook-state`, written only after both passes succeed) and embed on CPU when at most 32 files changed.
+- Git hooks skip the binary when HEAD and the worktree content digest are unchanged (`.codesage/hook-state`, written only after both passes succeed). The `index` pass names no device: it embeds through the daemon's resident session or on the configured device.
 
 ### Fixed
 
@@ -26,7 +26,7 @@
 - `scripts/refresh-onboarded-repos.sh` reports an index exit 75 (lock held) as retry-later, still refreshes that repo's hooks and hint, and exits 75 itself when nothing else failed.
 - `codesage index`, `status`, `search`, the MCP semantic tools, and the daemon watcher derive the semantic fingerprint from the table's recorded attestation (digest plus model-file paths, sizes, mtimes) and read the model files only when that stat key differs; a no-change `index` reads none. `status` never downloads a model and reports fingerprint `unknown` when the files are not cached. (cs-ox8)
 - An incremental or per-file semantic pass over a table whose fingerprint is absent or differs clears the old record before its first write; a pass interrupted midway leaves the table unattested under every setup, and `search` refuses it until `codesage index --full` completes.
-- The semantic fingerprint covers `EMBEDDING_PIPELINE_VERSION`, the 512-token truncation, and the L2 normalisation of every vector; every existing chunk table re-embeds once on its next `index`.
+- The semantic fingerprint covers the execution provider (`cpu`, `cuda`, `coreml`; CPU- and CUDA-produced vectors never share a table), `EMBEDDING_PIPELINE_VERSION`, the 512-token truncation, and the L2 normalisation; every existing chunk table re-embeds once on its next `index`.
 - The git hook's worktree digest lists tracked changes and untracked files NUL-delimited into one list, checksums each under a single 256 MB budget carried across `xargs` batches through a file, digests the name list (a deleted tracked file changes the stamp), and no longer runs `git diff --binary`; a `readlink` failure fails the digest, and the temp files are removed on `EXIT`, `INT`, and `TERM`.
 
 ## [0.22.0] - 2026-08-30

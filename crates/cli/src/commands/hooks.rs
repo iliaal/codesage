@@ -115,12 +115,11 @@ pub(crate) fn cmd_install_hooks(with_leak_check: bool) -> Result<()> {
 /// `EXIT_LOCK_HELD` when another indexer held the lock for the whole wait —
 /// withholds the stamp, so the next hook retries.
 ///
-/// The index pass carries `--device cpu`: an incremental pass embeds a
-/// handful of changed files, and on that count a CUDA context bring-up costs
-/// more than the embedding. The flag applies only within the binary's
-/// `--device-max-files` bound (default 32), so a checkout that touches a
-/// whole subtree still embeds on the configured device, and a full rebuild
-/// is never run by the hook.
+/// The index pass names no device: the few changed files an incremental
+/// hook run embeds go through the running daemon's resident session when one
+/// answers, and otherwise to the configured device. A CPU pass over a table
+/// of CUDA-produced vectors would mix two backends' output (they are not
+/// bit-identical) under one fingerprint, so no fallback is offered.
 pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
     let bin = shell_single_quote(bin);
     format!(
@@ -208,8 +207,8 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
          # output and exit status append to the log. The daemon's filesystem\n\
          # watcher contends for the same lock around commit time but never\n\
          # runs feature mapping or git-history indexing, so --lock-wait\n\
-         # polls it out instead of skipping. --device cpu keeps a few changed\n\
-         # files off the GPU; the binary ignores it past --device-max-files.\n\
+         # polls it out instead of skipping. The device is the configured\n\
+         # one (or the daemon's resident session); the hook never overrides it.\n\
          # The stamp is recorded only after both passes exit 0, so a failed\n\
          # run — or one that exited 75 because another indexer held the lock\n\
          # for the whole wait — is retried by the next hook. An empty stamp\n\
@@ -217,7 +216,7 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
          ( cd \"$root\" || exit 0\n\
            echo \"[$(date)] $(basename \"$0\") hook start\" >>\"$log\"\n\
            # shellcheck disable=SC2086 # IONICE and NICE are command words, split on purpose\n\
-           $IONICE $NICE {bin} index --lock-wait 60 --device cpu >>\"$log\" 2>&1; rc=$?\n\
+           $IONICE $NICE {bin} index --lock-wait 60 >>\"$log\" 2>&1; rc=$?\n\
            echo \"[$(date)] index exit=$rc\" >>\"$log\"\n\
            index_rc=$rc\n\
            # shellcheck disable=SC2086\n\
@@ -432,10 +431,12 @@ mod tests {
         // failure silently starve git-index of every incremental update.
         let body = generate_post_commit_hook_body("/usr/local/bin/codesage");
         assert!(
-            body.contains(
-                "'/usr/local/bin/codesage' index --lock-wait 60 --device cpu >>\"$log\" 2>&1; rc=$?"
-            ),
-            "expected logged `index --lock-wait --device cpu` invocation, got:\n{body}"
+            body.contains("'/usr/local/bin/codesage' index --lock-wait 60 >>\"$log\" 2>&1; rc=$?"),
+            "expected logged `index --lock-wait` invocation, got:\n{body}"
+        );
+        assert!(
+            !body.contains("--device"),
+            "the hook must never override the configured device, got:\n{body}"
         );
         assert!(
             body.contains(

@@ -79,17 +79,6 @@ enum Commands {
         /// immediately when another indexer holds it (0 = skip, the default)
         #[arg(long, value_name = "SECS", default_value_t = 0)]
         lock_wait: u64,
-        /// Embed on this device (cpu, gpu, cuda, coreml) instead of the
-        /// configured one when the run embeds at most --device-max-files
-        /// files. Applies to a private embedder only; when a daemon answers,
-        /// its resident session is used regardless.
-        #[arg(long, value_name = "DEVICE")]
-        device: Option<String>,
-        /// File-count bound for --device (0 = always). The first semantic
-        /// index for a model cannot count ahead and keeps the configured
-        /// device unless the bound is 0.
-        #[arg(long, value_name = "N", default_value_t = 32)]
-        device_max_files: usize,
     },
     /// Find symbol definitions by name
     FindSymbol {
@@ -979,8 +968,6 @@ fn run(cli: Cli) -> Result<()> {
             verbose,
             batch_size,
             lock_wait,
-            device,
-            device_max_files,
         } => index::cmd_index(
             full,
             no_semantic,
@@ -988,10 +975,6 @@ fn run(cli: Cli) -> Result<()> {
             verbose,
             batch_size,
             Duration::from_secs(lock_wait),
-            index::DeviceOptions {
-                device,
-                max_files: device_max_files,
-            },
         ),
         Commands::FindSymbol { name, kind, json } => {
             query::cmd_find_symbol(&name, kind.as_deref(), json)

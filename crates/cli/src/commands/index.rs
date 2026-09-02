@@ -246,38 +246,6 @@ fn can_skip_feature_mapping(
     current_fingerprint().is_some_and(|cur| cur == last)
 }
 
-/// `--device` / `--device-max-files`: which device a private embedder for
-/// this run should use, and up to how many files that choice applies.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct DeviceOptions {
-    pub(crate) device: Option<String>,
-    pub(crate) max_files: usize,
-}
-
-/// Which device a private embedder for this run should use.
-///
-/// `override_device` (the `--device` flag) wins only when the run is known to
-/// embed at most `max_files` files, or when `max_files` is 0 (unbounded). A
-/// pass whose file count is unknown — the first semantic index for a model,
-/// which must construct the model before it can open the table — keeps the
-/// configured device, because it is about to embed everything. The hook
-/// passes `--device cpu` for exactly the case the bound describes: a handful
-/// of changed files, where a CUDA context bring-up costs more than the
-/// embedding itself.
-fn effective_device(
-    configured: &str,
-    override_device: Option<&str>,
-    max_files: usize,
-    files_to_embed: Option<usize>,
-) -> String {
-    match override_device {
-        Some(d) if max_files == 0 || files_to_embed.is_some_and(|n| n <= max_files) => {
-            d.to_string()
-        }
-        _ => configured.to_string(),
-    }
-}
-
 /// The fingerprint an index pass compares and attests against, resolved
 /// through the table's recorded attestation so a no-change pass reads no
 /// model file. Downloads on a cache miss, as the loader it stands in for.
@@ -315,7 +283,6 @@ fn open_index_db_and_embedder(
     root: &Path,
     full: bool,
     emb_config: &EmbeddingConfig,
-    device: DeviceOptions,
 ) -> Result<(Database, Box<dyn TextEmbedder>, SemanticFingerprint)> {
     // Surface a bad batch size now, as the eager constructor always did,
     // rather than only on the first run that has something to embed.
@@ -331,14 +298,7 @@ fn open_index_db_and_embedder(
         let (embedder, dim) = match daemon_embedder(root, emb_config) {
             Some(pair) => pair,
             None => {
-                let mut cfg = emb_config.clone();
-                cfg.device = effective_device(
-                    &cfg.device,
-                    device.device.as_deref(),
-                    device.max_files,
-                    None,
-                );
-                let embedder = Embedder::new(&cfg)?;
+                let embedder = Embedder::new(emb_config)?;
                 let dim = embedder.dim();
                 (Box::new(embedder) as Box<dyn TextEmbedder>, dim)
             }
@@ -356,18 +316,11 @@ fn open_index_db_and_embedder(
     let fingerprint = resolved_fingerprint(&db, emb_config, dim)?;
     let init_config = emb_config.clone();
     let root = root.to_path_buf();
-    let lazy = LazyEmbedder::new(Box::new(move |files_to_embed| {
+    let lazy = LazyEmbedder::new(Box::new(move |_files_to_embed| {
         let (embedder, produced) = match daemon_embedder(&root, &init_config) {
             Some(pair) => pair,
             None => {
-                let mut cfg = init_config;
-                cfg.device = effective_device(
-                    &cfg.device,
-                    device.device.as_deref(),
-                    device.max_files,
-                    files_to_embed,
-                );
-                let embedder = Embedder::new(&cfg)?;
+                let embedder = Embedder::new(&init_config)?;
                 let dim = embedder.dim();
                 (Box::new(embedder) as Box<dyn TextEmbedder>, dim)
             }
@@ -409,12 +362,8 @@ pub(crate) fn cmd_index(
     verbose: bool,
     batch_size_override: Option<NonZeroUsize>,
     lock_wait: Duration,
-    device: DeviceOptions,
 ) -> Result<()> {
     let root = find_project_root()?;
-    if let Some(device) = device.device.as_deref() {
-        codesage_embed::config::validate_device(device)?;
-    }
     // Acquire the project-level indexing lock before loading embedders or
     // touching the DB. `--lock-wait` bounds a polling wait first: the
     // daemon's watcher debounce-indexes around commit time but never runs
@@ -446,8 +395,7 @@ pub(crate) fn cmd_index(
     let (db, mut embedder) = if no_semantic {
         (open_db(&root)?, None)
     } else {
-        let (db, embedder, fingerprint) =
-            open_index_db_and_embedder(&root, full, &emb_config, device)?;
+        let (db, embedder, fingerprint) = open_index_db_and_embedder(&root, full, &emb_config)?;
         (db, Some((embedder, fingerprint)))
     };
 
@@ -923,19 +871,6 @@ mod tests {
 
     fn fp_of(v: u64) -> impl FnOnce() -> Option<u64> {
         move || Some(v)
-    }
-
-    #[test]
-    fn device_override_applies_only_within_the_file_bound() {
-        assert_eq!(effective_device("gpu", None, 32, Some(3)), "gpu");
-        assert_eq!(effective_device("gpu", Some("cpu"), 32, Some(3)), "cpu");
-        assert_eq!(effective_device("gpu", Some("cpu"), 32, Some(32)), "cpu");
-        assert_eq!(effective_device("gpu", Some("cpu"), 32, Some(33)), "gpu");
-        // Unknown count (eager first-ever index): keep the configured device.
-        assert_eq!(effective_device("gpu", Some("cpu"), 32, None), "gpu");
-        // 0 = unbounded override, count known or not.
-        assert_eq!(effective_device("gpu", Some("cpu"), 0, Some(5_000)), "cpu");
-        assert_eq!(effective_device("gpu", Some("cpu"), 0, None), "cpu");
     }
 
     #[test]
