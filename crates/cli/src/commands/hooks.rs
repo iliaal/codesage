@@ -151,16 +151,34 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
          # Content digest of the worktree relative to HEAD: every tracked\n\
          # change as a binary patch, plus name and checksum of every untracked\n\
          # file. Each stage's status is checked; one failure fails the digest.\n\
+         # The untracked listing is NUL-delimited end to end: a quoted name\n\
+         # (newline, non-UTF-8) fails `-f` and was recorded as special, so a\n\
+         # later edit to that file left the stamp unchanged. A file over 8 MB,\n\
+         # or past a 256 MB per-batch read budget, contributes its size and\n\
+         # mtime instead of its content.\n\
          worktree_digest() {{\n\
            tracked=\"$(git diff HEAD --binary --no-ext-diff --no-color -- . ':(exclude).codesage')\" || return 1\n\
-           untracked=\"$(git ls-files -o --exclude-standard -- . ':(exclude).codesage')\" || return 1\n\
-           sums=\"$(printf '%s\\n' \"$untracked\" | while IFS= read -r f; do\n\
-             [ -n \"$f\" ] || continue\n\
-             if [ -L \"$f\" ]; then printf '%s -> %s\\n' \"$f\" \"$(readlink \"$f\")\" || exit 1\n\
-             elif [ -f \"$f\" ]; then cksum \"$f\" || exit 1\n\
-             else printf '%s (special)\\n' \"$f\"\n\
-             fi\n\
-           done)\" || return 1\n\
+           list=\"$(mktemp)\" || return 1\n\
+           git ls-files -z -o --exclude-standard -- . ':(exclude).codesage' >\"$list\" || {{ rm -f \"$list\"; return 1; }}\n\
+           sums=\"$(xargs -0 sh -c '\n\
+             budget=268435456\n\
+             for f; do\n\
+               if [ -L \"$f\" ]; then printf \"%s -> %s\\n\" \"$f\" \"$(readlink -- \"$f\")\" || exit 1\n\
+               elif [ -f \"$f\" ]; then\n\
+                 size=\"$(wc -c <\"$f\")\" || exit 1\n\
+                 size=$((size))\n\
+                 if [ \"$size\" -gt 8388608 ] || [ \"$size\" -gt \"$budget\" ]; then\n\
+                   mtime=\"$(stat -c %Y -- \"$f\" 2>/dev/null || stat -f %m -- \"$f\")\" || exit 1\n\
+                   printf \"%s size=%s mtime=%s\\n\" \"$f\" \"$size\" \"$mtime\"\n\
+                 else\n\
+                   budget=$((budget - size))\n\
+                   cksum -- \"$f\" || exit 1\n\
+                 fi\n\
+               else printf \"%s (special)\\n\" \"$f\"\n\
+               fi\n\
+             done' sh <\"$list\")\"; rc=$?\n\
+           rm -f \"$list\"\n\
+           [ \"$rc\" -eq 0 ] || return 1\n\
            printf '%s\\n%s\\n' \"$tracked\" \"$sums\" | cksum\n\
          }}\n\
          head=\"$(git rev-parse HEAD 2>/dev/null)\" || head=\"\"\n\
@@ -505,13 +523,29 @@ mod tests {
         );
         assert!(
             body.contains(
-                "untracked=\"$(git ls-files -o --exclude-standard -- . ':(exclude).codesage')\" || return 1"
+                "git ls-files -z -o --exclude-standard -- . ':(exclude).codesage' >\"$list\" || { rm -f \"$list\"; return 1; }"
             ),
-            "untracked listing must be stage-checked, got:\n{body}"
+            "untracked listing must be NUL-delimited and stage-checked, got:\n{body}"
         );
         assert!(
-            body.contains("elif [ -f \"$f\" ]; then cksum \"$f\" || exit 1"),
+            body.contains("sums=\"$(xargs -0 sh -c '"),
+            "untracked names must be consumed NUL-delimited, never line-split, got:\n{body}"
+        );
+        assert!(
+            !body.contains("while IFS= read -r f"),
+            "a newline-delimited read cannot carry a git-quoted name, got:\n{body}"
+        );
+        assert!(
+            body.contains("cksum -- \"$f\" || exit 1"),
             "untracked file content must be checksummed with the stage checked, got:\n{body}"
+        );
+        assert!(
+            body.contains("[ \"$size\" -gt 8388608 ] || [ \"$size\" -gt \"$budget\" ]"),
+            "a large file or an exhausted budget must fall back to size+mtime, got:\n{body}"
+        );
+        assert!(
+            body.contains("[ \"$rc\" -eq 0 ] || return 1"),
+            "an untracked checksum failure must fail the digest, got:\n{body}"
         );
         assert!(
             body.contains("digest=\"$(worktree_digest 2>/dev/null)\" && stamp=\"$head $digest\""),
@@ -762,6 +796,128 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// Number of `hook start` lines once the log records `n` completed
+    /// git-index passes; waits for the backgrounded subshell.
+    #[cfg(unix)]
+    fn wait_for_passes(log: &std::path::Path, n: usize) -> String {
+        use std::time::Duration;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let content = std::fs::read_to_string(log).unwrap_or_default();
+            if content.matches("hook start").count() == n
+                && content.matches("] git-index exit=0").count() == n
+            {
+                return content;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "log never reached {n} completed passes:\n{content}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_stamp(state: &std::path::Path, previous: &str) -> String {
+        use std::time::Duration;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let now = std::fs::read_to_string(state).unwrap_or_default();
+            if !now.is_empty() && now != previous {
+                return now;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stamp never moved past {previous:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_commit_hook_digests_an_untracked_file_with_a_newline_in_its_name_by_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_repo_with_one_commit(root);
+        let hook = install_hook_with_stub(root, "#!/bin/sh\nexit 0\n");
+        let log = root.join(".codesage/hooks.log");
+        let state = root.join(".codesage/hook-state");
+
+        // `git ls-files` prints this name C-quoted on a newline-delimited
+        // listing; `-f` on the quoted spelling fails, and the file used to be
+        // recorded as "(special)" — a constant, whatever its content.
+        let odd = root.join("odd\nname.txt");
+        std::fs::write(&odd, "u1\n").unwrap();
+        assert!(run_script(&hook, root).success());
+        wait_for_passes(&log, 1);
+        let first = wait_for_stamp(&state, "");
+
+        // Same name, same length, different content: the passes must run.
+        std::fs::write(&odd, "u2\n").unwrap();
+        assert!(run_script(&hook, root).success());
+        let content = wait_for_passes(&log, 2);
+        assert_eq!(
+            content.matches("hook skip:").count(),
+            0,
+            "an edit to an untracked file with a newline in its name was skipped:\n{content}"
+        );
+        let second = wait_for_stamp(&state, &first);
+        assert_ne!(first, second);
+
+        // Unchanged: skipped.
+        assert!(run_script(&hook, root).success());
+        let content = wait_for_log(&log, "hook skip:");
+        assert_eq!(content.matches("hook start").count(), 2, "{content}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_commit_hook_keys_a_large_untracked_file_on_size_and_mtime_not_content() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_repo_with_one_commit(root);
+        let hook = install_hook_with_stub(root, "#!/bin/sh\nexit 0\n");
+        let log = root.join(".codesage/hooks.log");
+        let state = root.join(".codesage/hook-state");
+
+        // Just over the 8 MB per-file bound. Content is never read for it.
+        let big = root.join("big.bin");
+        let size = 8 * 1024 * 1024 + 1;
+        let stamp_time = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let write_big = |byte: u8, mtime: SystemTime| {
+            std::fs::write(&big, vec![byte; size]).unwrap();
+            std::fs::File::open(&big)
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+        };
+        write_big(b'a', stamp_time);
+        assert!(run_script(&hook, root).success());
+        wait_for_passes(&log, 1);
+        let first = wait_for_stamp(&state, "");
+
+        // Same size, same mtime, every byte different: the digest is the
+        // same and the hook skips — the bound means the content is not read.
+        write_big(b'b', stamp_time);
+        assert!(run_script(&hook, root).success());
+        let content = wait_for_log(&log, "hook skip:");
+        assert_eq!(
+            content.matches("hook start").count(),
+            1,
+            "a large file's content must not be part of the digest:\n{content}"
+        );
+
+        // A moved mtime is visible.
+        write_big(b'b', stamp_time + Duration::from_secs(60));
+        assert!(run_script(&hook, root).success());
+        wait_for_passes(&log, 2);
+        let second = wait_for_stamp(&state, &first);
+        assert_ne!(first, second);
     }
 
     #[cfg(unix)]
