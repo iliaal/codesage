@@ -871,6 +871,50 @@ pub(crate) fn wants_token_type_ids<'a>(mut input_names: impl Iterator<Item = &'a
 /// libraries actually mapped (the silent-CPU-fallback guard). Returns the
 /// session, tokenizer, and whether the model takes a `token_type_ids` input.
 pub(crate) fn load_onnx_session(model: &str, device: &str) -> Result<(Session, Tokenizer, bool)> {
+    let loaded = load_onnx_session_with_provider(model, device)?;
+    Ok((loaded.session, loaded.tokenizer, loaded.has_token_type_ids))
+}
+
+/// What [`load_onnx_session_with_provider`] produced, including the
+/// execution provider the session actually runs on.
+pub(crate) struct LoadedSession {
+    pub(crate) session: Session,
+    pub(crate) tokenizer: Tokenizer,
+    pub(crate) has_token_type_ids: bool,
+    /// `cpu`, `cuda`, or `coreml`: the provider that succeeded, which under
+    /// `CODESAGE_ALLOW_CPU_FALLBACK=1` may differ from the configured one.
+    pub(crate) execution_provider: &'static str,
+}
+
+/// The provider a session runs on after the CUDA-library check. `configured`
+/// is the provider the device string selects; `cuda_check` is the result of
+/// the mapped-libraries guard (only meaningful when CUDA was requested). A
+/// failed check is fatal unless the fallback is allowed, in which case the
+/// session runs on the CPU and the second element says so.
+#[cfg(any(test, all(feature = "cuda", target_os = "linux")))]
+fn effective_execution_provider(
+    configured: &'static str,
+    cuda_check: Result<()>,
+    allow_cpu_fallback: bool,
+) -> Result<(&'static str, bool)> {
+    match cuda_check {
+        Ok(()) => Ok((configured, false)),
+        Err(_) if allow_cpu_fallback => Ok(("cpu", true)),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn cpu_fallback_allowed_from_env() -> bool {
+    matches!(
+        std::env::var("CODESAGE_ALLOW_CPU_FALLBACK").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+/// [`load_onnx_session`], also reporting the execution provider the session
+/// initialised on.
+pub(crate) fn load_onnx_session_with_provider(model: &str, device: &str) -> Result<LoadedSession> {
     let allow_any = allow_any_model_from_env();
     validate_model_allowed(model, allow_any)?;
     let pin = if allow_any { None } else { model_pin(model) };
@@ -965,20 +1009,41 @@ pub(crate) fn load_onnx_session(model: &str, device: &str) -> Result<(Session, T
     // 256-file project. Rather than time-based heuristics, assert the CUDA
     // loader actually ran by checking the process has libcuda + libcudart +
     // (libcudnn OR libcublas) mapped. No-op on non-Linux. Bypass with
-    // CODESAGE_ALLOW_CPU_FALLBACK=1 (e.g. for unit tests).
+    // CODESAGE_ALLOW_CPU_FALLBACK=1 (e.g. for unit tests) — the session then
+    // reports `cpu` as its provider, so the vectors it produces are never
+    // attested as CUDA output.
+    let configured = crate::fingerprint::configured_execution_provider(device);
     #[cfg(all(feature = "cuda", target_os = "linux"))]
-    if want_cuda
-        && !matches!(
-            std::env::var("CODESAGE_ALLOW_CPU_FALLBACK").as_deref(),
-            Ok("1") | Ok("true")
-        )
-    {
-        require_cuda_libs_mapped()?;
-    }
+    let execution_provider = if want_cuda {
+        let (provider, fell_back) = effective_execution_provider(
+            configured,
+            require_cuda_libs_mapped(),
+            cpu_fallback_allowed_from_env(),
+        )?;
+        if fell_back {
+            tracing::warn!(
+                model,
+                configured_device = device,
+                execution_provider = provider,
+                "CODESAGE_ALLOW_CPU_FALLBACK: CUDA was requested but its libraries are not \
+                 mapped; this session runs on the CPU and fingerprints as a CPU setup"
+            );
+        }
+        provider
+    } else {
+        configured
+    };
+    #[cfg(not(all(feature = "cuda", target_os = "linux")))]
+    let execution_provider = configured;
 
     let has_token_type_ids = wants_token_type_ids(session.inputs().iter().map(|i| i.name()));
 
-    Ok((session, tokenizer, has_token_type_ids))
+    Ok(LoadedSession {
+        session,
+        tokenizer,
+        has_token_type_ids,
+        execution_provider,
+    })
 }
 
 pub struct Embedder {
@@ -988,13 +1053,18 @@ pub struct Embedder {
     pooling: PoolingStrategy,
     has_token_type_ids: bool,
     batch_size: NonZeroUsize,
+    execution_provider: &'static str,
 }
 
 impl Embedder {
     pub fn new(config: &EmbeddingConfig) -> Result<Self> {
         tracing::info!(model = %config.model, "loading embedding model");
-        let (session, tokenizer, has_token_type_ids) =
-            load_onnx_session(&config.model, &config.device)?;
+        let LoadedSession {
+            session,
+            tokenizer,
+            has_token_type_ids,
+            execution_provider,
+        } = load_onnx_session_with_provider(&config.model, &config.device)?;
         let dim = detect_dim(&session)?;
         let pooling = config.pooling_strategy();
         let batch_size = config.effective_batch_size()?;
@@ -1004,6 +1074,7 @@ impl Embedder {
             pooling = ?pooling,
             token_type_ids = has_token_type_ids,
             batch_size = batch_size.get(),
+            execution_provider,
             "embedding model loaded"
         );
 
@@ -1014,11 +1085,18 @@ impl Embedder {
             pooling,
             has_token_type_ids,
             batch_size,
+            execution_provider,
         })
     }
 
     pub fn dim(&self) -> usize {
         self.dim
+    }
+
+    /// The execution provider this session actually initialised on (`cpu`,
+    /// `cuda`, `coreml`) — the one a fingerprint over its vectors must name.
+    pub fn execution_provider(&self) -> &'static str {
+        self.execution_provider
     }
 
     pub fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
@@ -1619,6 +1697,43 @@ mod tests {
         );
         assert!(hf_download_timeout_from_env_value(Some("0")).is_err());
         assert!(hf_download_timeout_from_env_value(Some("abc")).is_err());
+    }
+
+    #[test]
+    fn a_forced_cpu_fallback_fingerprints_as_the_cpu_setup() {
+        let cuda = EmbeddingConfig {
+            device: "cuda".to_string(),
+            ..EmbeddingConfig::default()
+        };
+        let configured = crate::fingerprint::configured_execution_provider(&cuda.device);
+        assert_eq!(configured, "cuda");
+        let as_configured =
+            crate::fingerprint::SemanticFingerprint::with_artifact_digest(&cuda, 384, "d");
+
+        // Libraries mapped: the session runs where it was asked to.
+        let (provider, fell_back) =
+            effective_execution_provider(configured, Ok(()), false).unwrap();
+        assert_eq!((provider, fell_back), ("cuda", false));
+        assert_eq!(
+            as_configured.with_execution_provider(provider),
+            as_configured
+        );
+
+        // Libraries missing, fallback refused: the load fails as before.
+        let err =
+            effective_execution_provider(configured, Err(anyhow::anyhow!("no libcuda")), false)
+                .unwrap_err();
+        assert!(err.to_string().contains("no libcuda"));
+
+        // Libraries missing, fallback allowed: the session runs on the CPU
+        // and its fingerprint is the CPU one, not the configured CUDA one.
+        let (provider, fell_back) =
+            effective_execution_provider(configured, Err(anyhow::anyhow!("no libcuda")), true)
+                .unwrap();
+        assert_eq!((provider, fell_back), ("cpu", true));
+        let effective = as_configured.with_execution_provider(provider);
+        assert_ne!(effective, as_configured);
+        assert!(effective.as_str().contains("device=cpu"), "{effective}");
     }
 
     #[test]

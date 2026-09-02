@@ -22,6 +22,16 @@ pub trait TextEmbedder {
         Ok(())
     }
 
+    /// Called once per pass, after [`TextEmbedder::prepare`] and before the
+    /// first [`TextEmbedder::embed_batch`], with the fingerprint the pass
+    /// compares and attests under. An implementation that knows the identity
+    /// of the vectors it will produce refuses here when that identity is not
+    /// `expected` — the pass then aborts before a row is written, rather
+    /// than attesting another setup's vectors under this one.
+    fn bind_fingerprint(&mut self, _expected: &SemanticFingerprint) -> Result<()> {
+        Ok(())
+    }
+
     fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
 
     fn embed_one(&mut self, text: &str) -> Result<Vec<f32>> {
@@ -32,6 +42,22 @@ pub trait TextEmbedder {
 }
 
 impl TextEmbedder for Embedder {
+    /// The session's execution provider is the one component of the
+    /// fingerprint the config cannot vouch for: under
+    /// `CODESAGE_ALLOW_CPU_FALLBACK=1` a `device = "cuda"` session may run
+    /// on the CPU, and its vectors must never be attested as CUDA output.
+    fn bind_fingerprint(&mut self, expected: &SemanticFingerprint) -> Result<()> {
+        let actual = self.execution_provider();
+        ensure!(
+            expected.execution_provider() == actual,
+            "the embedding session runs on the {actual} execution provider but this pass \
+             fingerprints its vectors as {:?}; set `device` in .codesage/config.toml to the \
+             provider that actually runs, or make the configured one available",
+            expected.execution_provider()
+        );
+        Ok(())
+    }
+
     fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         Embedder::embed_batch(self, texts)
     }
@@ -60,6 +86,9 @@ pub struct LazyEmbedder {
     inner: Option<Box<dyn TextEmbedder>>,
     init: Option<EmbedderInit>,
     announced_files: Option<usize>,
+    /// The fingerprint bound before the backend existed, forwarded to it
+    /// the moment it is constructed.
+    bound: Option<SemanticFingerprint>,
 }
 
 impl LazyEmbedder {
@@ -68,6 +97,7 @@ impl LazyEmbedder {
             inner: None,
             init: Some(init),
             announced_files: None,
+            bound: None,
         }
     }
 
@@ -82,7 +112,11 @@ impl LazyEmbedder {
                 .init
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("embedder construction already failed once"))?;
-            self.inner = Some(init(files_to_embed)?);
+            let mut inner = init(files_to_embed)?;
+            if let Some(expected) = &self.bound {
+                inner.bind_fingerprint(expected)?;
+            }
+            self.inner = Some(inner);
         }
         Ok(self
             .inner
@@ -96,6 +130,14 @@ impl TextEmbedder for LazyEmbedder {
         self.announced_files = Some(files_to_embed);
         match self.inner.as_deref_mut() {
             Some(inner) => inner.prepare(files_to_embed),
+            None => Ok(()),
+        }
+    }
+
+    fn bind_fingerprint(&mut self, expected: &SemanticFingerprint) -> Result<()> {
+        self.bound = Some(expected.clone());
+        match self.inner.as_deref_mut() {
+            Some(inner) => inner.bind_fingerprint(expected),
             None => Ok(()),
         }
     }
@@ -676,6 +718,7 @@ fn semantic_index(
         tracing::info!(files_to_embed = to_index.len(), "semantic indexing");
     }
     embedder.prepare(to_index.len())?;
+    embedder.bind_fingerprint(fingerprint)?;
 
     let n_batches = to_index.len().div_ceil(COMMIT_BATCH_SIZE);
     for (i, batch) in to_index.chunks(COMMIT_BATCH_SIZE).enumerate() {
@@ -772,6 +815,7 @@ pub fn semantic_index_files(
         tracing::info!(count = files.len(), "semantic indexing specific files");
     }
     embedder.prepare(files.len())?;
+    embedder.bind_fingerprint(fingerprint)?;
 
     let file_refs: Vec<&FileInfo> = files.iter().collect();
     let n_batches = file_refs.len().div_ceil(COMMIT_BATCH_SIZE);
@@ -1036,6 +1080,103 @@ mod tests {
         let second = lazy.embed_batch(&["x"]).unwrap_err().to_string();
         assert_eq!(first, "no model");
         assert!(second.contains("already failed"), "{second}");
+    }
+
+    /// A backend that runs on `provider` and refuses any other identity,
+    /// as [`Embedder`] does with its session's execution provider.
+    struct ProviderBoundEmbedder {
+        provider: &'static str,
+        bound_with: Vec<String>,
+        batches: usize,
+    }
+
+    impl TextEmbedder for ProviderBoundEmbedder {
+        fn bind_fingerprint(&mut self, expected: &SemanticFingerprint) -> Result<()> {
+            self.bound_with
+                .push(expected.execution_provider().to_string());
+            ensure!(
+                expected.execution_provider() == self.provider,
+                "session runs on {} but the pass fingerprints {}",
+                self.provider,
+                expected.execution_provider()
+            );
+            Ok(())
+        }
+
+        fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            self.batches += 1;
+            Ok(texts.iter().map(|_| embedding(0.5)).collect())
+        }
+    }
+
+    #[test]
+    fn a_backend_on_another_provider_aborts_the_pass_before_any_row() {
+        // The pass fingerprints as CUDA; the session fell back to the CPU.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let cuda_fp = test_fp().with_execution_provider("cuda");
+        let mut cpu = ProviderBoundEmbedder {
+            provider: "cpu",
+            bound_with: Vec::new(),
+            batches: 0,
+        };
+
+        let err = semantic_incremental_index(root.path(), &db, &mut cpu, &[], &cuda_fp, false)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("session runs on cpu"), "{err}");
+        assert_eq!(cpu.bound_with, vec!["cuda".to_string()]);
+        assert_eq!(cpu.batches, 0, "no text reached the backend");
+        assert!(
+            db.all_chunk_file_paths().unwrap().is_empty(),
+            "no row written"
+        );
+        assert_eq!(db.semantic_fingerprint().unwrap(), None, "nothing attested");
+
+        // The per-file pass refuses the same way.
+        let files = discover_files_with_excludes(root.path(), &[]).unwrap();
+        let err = semantic_index_files(root.path(), &db, &mut cpu, &files, &cuda_fp, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("session runs on cpu"), "{err}");
+        assert_eq!(cpu.batches, 0);
+
+        // Fingerprinting the provider the session actually runs on proceeds.
+        let cpu_fp = cuda_fp.with_execution_provider("cpu");
+        semantic_incremental_index(root.path(), &db, &mut cpu, &[], &cpu_fp, false).unwrap();
+        assert_eq!(cpu.batches, 1);
+        assert_eq!(
+            db.semantic_fingerprint().unwrap().as_deref(),
+            Some(cpu_fp.as_str())
+        );
+    }
+
+    #[test]
+    fn lazy_embedder_forwards_the_bound_fingerprint_to_the_constructed_backend() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let cuda_fp = test_fp().with_execution_provider("cuda");
+        let mut lazy = LazyEmbedder::new(Box::new(|_| {
+            Ok(Box::new(ProviderBoundEmbedder {
+                provider: "cpu",
+                bound_with: Vec::new(),
+                batches: 0,
+            }) as Box<dyn TextEmbedder>)
+        }));
+
+        let err = semantic_incremental_index(root.path(), &db, &mut lazy, &[], &cuda_fp, false)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("session runs on cpu"),
+            "the bind must reach the backend constructed after it: {err}"
+        );
+        assert!(db.all_chunk_file_paths().unwrap().is_empty());
+        assert_eq!(db.semantic_fingerprint().unwrap(), None);
     }
 
     #[test]

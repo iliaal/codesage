@@ -66,6 +66,19 @@ pub struct SemanticFingerprint {
     text: String,
     artifact_digest: String,
     artifact_stat_key: Option<String>,
+    /// The inputs `text` was rendered from, kept so one component can be
+    /// rebound (the execution provider, once a session reports the one it
+    /// actually runs on) without re-deriving the rest.
+    inputs: FingerprintInputs,
+}
+
+#[derive(Debug, Clone)]
+struct FingerprintInputs {
+    model: String,
+    dim: usize,
+    pooling: &'static str,
+    execution_provider: String,
+    pipeline: PipelineIdentity,
 }
 
 impl PartialEq for SemanticFingerprint {
@@ -129,39 +142,56 @@ impl SemanticFingerprint {
         fingerprint
     }
 
-    /// The persisted form is built here and nowhere else.
+    /// The fingerprint for `config` as configured; see [`render`] for the
+    /// persisted form.
     pub fn with_pipeline(
         config: &EmbeddingConfig,
         dim: usize,
         artifact_digest: &str,
         pipeline: &PipelineIdentity,
     ) -> Self {
-        let chunk = ChunkConfig::default();
         let pooling = match config.pooling_strategy() {
             crate::config::PoolingStrategy::Mean => "mean",
             crate::config::PoolingStrategy::Cls => "cls",
         };
-        let normalized = if pipeline.normalized { "l2" } else { "none" };
         // The execution provider is part of the identity: CPU and CUDA
         // kernels do not produce bit-identical vectors, so a table must hold
         // one backend's output only. Spellings that select the same provider
-        // (`gpu`, `cuda`) fingerprint the same.
-        let device = execution_provider(&config.device);
+        // (`gpu`, `cuda`) fingerprint the same. This is the provider the
+        // config ASKS for; a session that ended up elsewhere rebinds it with
+        // [`Self::with_execution_provider`].
+        let inputs = FingerprintInputs {
+            model: config.model.clone(),
+            dim,
+            pooling,
+            execution_provider: configured_execution_provider(&config.device).to_string(),
+            pipeline: *pipeline,
+        };
         Self {
-            text: format!(
-                "v3;model={};artifacts={artifact_digest};dim={dim};pooling={pooling};\
-                 device={device};pipeline={};maxseq={};norm={normalized};\
-                 chunker={CHUNKER_VERSION};chunk={}/{}/{}",
-                config.model,
-                pipeline.version,
-                pipeline.max_seq_length,
-                chunk.chunk_size,
-                chunk.min_chunk_size,
-                chunk.overlap
-            ),
+            text: render(&inputs, artifact_digest),
             artifact_digest: artifact_digest.to_string(),
             artifact_stat_key: None,
+            inputs,
         }
+    }
+
+    /// This fingerprint with its device component replaced by `provider`,
+    /// the execution provider a session actually initialised. Everything
+    /// else — digest, stat key, pipeline — is carried over unchanged.
+    pub fn with_execution_provider(&self, provider: &str) -> Self {
+        let mut inputs = self.inputs.clone();
+        inputs.execution_provider = provider.to_string();
+        Self {
+            text: render(&inputs, &self.artifact_digest),
+            artifact_digest: self.artifact_digest.clone(),
+            artifact_stat_key: self.artifact_stat_key.clone(),
+            inputs,
+        }
+    }
+
+    /// The execution provider this fingerprint's vectors are attributed to.
+    pub fn execution_provider(&self) -> &str {
+        &self.inputs.execution_provider
     }
 
     /// The persisted form.
@@ -188,8 +218,33 @@ impl fmt::Display for SemanticFingerprint {
     }
 }
 
-/// The execution provider a configured `device` string selects.
-fn execution_provider(device: &str) -> &'static str {
+/// The persisted form is built here and nowhere else.
+fn render(inputs: &FingerprintInputs, artifact_digest: &str) -> String {
+    let chunk = ChunkConfig::default();
+    let normalized = if inputs.pipeline.normalized {
+        "l2"
+    } else {
+        "none"
+    };
+    format!(
+        "v3;model={};artifacts={artifact_digest};dim={};pooling={};\
+         device={};pipeline={};maxseq={};norm={normalized};\
+         chunker={CHUNKER_VERSION};chunk={}/{}/{}",
+        inputs.model,
+        inputs.dim,
+        inputs.pooling,
+        inputs.execution_provider,
+        inputs.pipeline.version,
+        inputs.pipeline.max_seq_length,
+        chunk.chunk_size,
+        chunk.min_chunk_size,
+        chunk.overlap
+    )
+}
+
+/// The execution provider a configured `device` string selects — what the
+/// config asks for, not necessarily what a session ends up running on.
+pub fn configured_execution_provider(device: &str) -> &'static str {
     if wants_cuda(device) {
         "cuda"
     } else if wants_coreml(device) {
@@ -431,6 +486,33 @@ mod tests {
         );
         assert!(fp(&gpu).as_str().contains("device=cuda"), "{}", fp(&gpu));
         assert!(fp(&cpu).as_str().contains("device=cpu"), "{}", fp(&cpu));
+    }
+
+    #[test]
+    fn rebinding_the_execution_provider_changes_only_the_device_component() {
+        let cuda = EmbeddingConfig {
+            device: "cuda".to_string(),
+            ..EmbeddingConfig::default()
+        };
+        let cpu = EmbeddingConfig {
+            device: "cpu".to_string(),
+            ..EmbeddingConfig::default()
+        };
+        let as_cuda = SemanticFingerprint::with_attested_digest(&cuda, 384, "d", "stat");
+        assert_eq!(as_cuda.execution_provider(), "cuda");
+
+        // A session under device=cuda that actually ran on the CPU
+        // fingerprints as the CPU setup would, never as the configured one.
+        let fell_back = as_cuda.with_execution_provider("cpu");
+        assert_ne!(fell_back, as_cuda, "the fallback is another identity");
+        assert_eq!(
+            fell_back,
+            SemanticFingerprint::with_artifact_digest(&cpu, 384, "d")
+        );
+        assert_eq!(fell_back.execution_provider(), "cpu");
+        assert_eq!(fell_back.artifact_digest(), "d");
+        assert_eq!(fell_back.artifact_stat_key(), Some("stat"));
+        assert_eq!(as_cuda.with_execution_provider("cuda"), as_cuda);
     }
 
     #[test]
