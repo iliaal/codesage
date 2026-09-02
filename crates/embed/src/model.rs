@@ -543,11 +543,16 @@ impl ModelArtifacts {
     /// Path, size, and mtime of every artifact: the same key the digest
     /// cache is invalidated by, without reading a byte. For a per-call
     /// change detector that must stay cheap; `None` when a file cannot be
-    /// stat'ed.
+    /// stat'ed or its path cannot be canonicalised.
+    ///
+    /// The path component is canonical — absolute, symlinks resolved — so a
+    /// relative `HF_HOME` keys the same files as its absolute spelling, and
+    /// the same relative spelling from another directory keys other files.
     pub fn stat_key(&self) -> Option<String> {
         let mut parts = Vec::new();
         for (label, path) in self.labelled_files() {
-            let meta = std::fs::metadata(path).ok()?;
+            let path = std::fs::canonicalize(path).ok()?;
+            let meta = std::fs::metadata(&path).ok()?;
             let modified = meta
                 .modified()
                 .ok()?
@@ -1549,6 +1554,57 @@ mod tests {
             onnx_data: None,
         };
         assert_eq!(missing.stat_key(), None);
+    }
+
+    #[test]
+    fn artifact_stat_key_is_keyed_by_canonical_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        std::fs::write(real.join("tokenizer.json"), b"{}").unwrap();
+        std::fs::write(real.join("model.onnx"), b"aaaa").unwrap();
+        let absolute = ModelArtifacts {
+            tokenizer: real.join("tokenizer.json"),
+            onnx: real.join("model.onnx"),
+            onnx_data: None,
+        };
+        // The same files spelled through `.` and `..` segments and through
+        // a symlinked directory, as a relative HF_HOME resolves them.
+        let dotted = ModelArtifacts {
+            tokenizer: real.join(".").join("tokenizer.json"),
+            onnx: real.join("sub").join("..").join("model.onnx"),
+            onnx_data: None,
+        };
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let linked = ModelArtifacts {
+            tokenizer: link.join("tokenizer.json"),
+            onnx: link.join("model.onnx"),
+            onnx_data: None,
+        };
+        let base = absolute.stat_key().unwrap();
+        assert_eq!(dotted.stat_key().unwrap(), base, "dotted spelling");
+        assert_eq!(linked.stat_key().unwrap(), base, "symlinked spelling");
+        assert!(
+            !base.contains("/./") && !base.contains("/../") && !base.contains("/link/"),
+            "the key records the canonical path: {base}"
+        );
+
+        // The directory moves: same names, same sizes, same mtimes, another
+        // location — another key, and the old spelling keys nothing.
+        let moved = dir.path().join("moved");
+        std::fs::rename(&real, &moved).unwrap();
+        let relocated = ModelArtifacts {
+            tokenizer: moved.join("tokenizer.json"),
+            onnx: moved.join("model.onnx"),
+            onnx_data: None,
+        };
+        assert_ne!(
+            relocated.stat_key().unwrap(),
+            base,
+            "a moved dir keys differently"
+        );
+        assert_eq!(absolute.stat_key(), None);
     }
 
     #[test]
