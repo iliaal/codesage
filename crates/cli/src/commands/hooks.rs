@@ -93,6 +93,25 @@ pub(crate) fn cmd_install_hooks(with_leak_check: bool) -> Result<()> {
 /// history. `--lock-wait` makes each hook pass poll the lock for up to
 /// 60s instead of skipping, so a watcher pass in flight delays the hook
 /// by seconds rather than silently starving the hook-only passes.
+///
+/// Before launching anything the hook compares HEAD plus a `cksum` of
+/// `git status --porcelain` (with `.codesage/` itself excluded, so the log
+/// and stamp this hook writes never perturb the digest in a clone whose
+/// `.codesage/.gitignore` is missing) against `.codesage/hook-state`, which the
+/// previous hook run wrote after both passes exited 0. A match means
+/// nothing the hook indexes has changed (a release commit that touched
+/// only ignored files, a checkout back to the same tree, a rewrite that
+/// kept HEAD), and the binary is not invoked at all — a `git status` costs
+/// milliseconds where a process start plus lock handshake costs a second.
+/// The stamp is taken before the run and written after it, so a worktree
+/// that moves during the run never matches the next time.
+///
+/// The index pass carries `--device cpu`: an incremental pass embeds a
+/// handful of changed files, and on that count a CUDA context bring-up costs
+/// more than the embedding. The flag applies only within the binary's
+/// `--device-max-files` bound (default 32), so a checkout that touches a
+/// whole subtree still embeds on the configured device, and a full rebuild
+/// is never run by the hook.
 pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
     let bin = shell_single_quote(bin);
     format!(
@@ -114,6 +133,20 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
          if [ -L \"$log\" ] || {{ [ -e \"$log\" ] && [ ! -f \"$log\" ]; }}; then log=/dev/null; fi\n\
          # Keep the log bounded: truncate before this run once it passes 1MB.\n\
          [ -f \"$log\" ] && [ \"$(wc -c <\"$log\")\" -gt 1048576 ] && : >\"$log\"\n\
+         # Early exit: the previous successful run recorded the HEAD it indexed\n\
+         # and a digest of the worktree status. When both still match, nothing\n\
+         # this hook indexes has changed and the binary is not started at all.\n\
+         # Same symlink guard as the log: a planted state file must never turn\n\
+         # the stamp write into a write elsewhere, nor a forged stamp into a\n\
+         # permanent skip.\n\
+         state=\"$root/.codesage/hook-state\"\n\
+         if [ -L \"$state\" ] || {{ [ -e \"$state\" ] && [ ! -f \"$state\" ]; }}; then state=/dev/null; fi\n\
+         head=\"$(git rev-parse HEAD 2>/dev/null)\" || head=\"\"\n\
+         stamp=\"$head $(git status --porcelain -- . ':(exclude).codesage' 2>/dev/null | cksum)\"\n\
+         if [ -n \"$head\" ] && [ -f \"$state\" ] && [ \"$(cat \"$state\" 2>/dev/null)\" = \"$stamp\" ]; then\n\
+           echo \"[$(date)] $(basename \"$0\") hook skip: HEAD and worktree unchanged since last index\" >>\"$log\"\n\
+           exit 0\n\
+         fi\n\
          # Run structural+semantic index then git-history index sequentially\n\
          # in one background subshell. Both subcommands take the same\n\
          # project lock and would silently skip on contention if launched in\n\
@@ -121,13 +154,18 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
          # output and exit status append to the log. The daemon's filesystem\n\
          # watcher contends for the same lock around commit time but never\n\
          # runs feature mapping or git-history indexing, so --lock-wait\n\
-         # polls it out instead of skipping.\n\
+         # polls it out instead of skipping. --device cpu keeps a few changed\n\
+         # files off the GPU; the binary ignores it past --device-max-files.\n\
+         # The stamp is recorded only after both passes exit 0, so a failed\n\
+         # run is retried by the next hook.\n\
          ( cd \"$root\" || exit 0\n\
            echo \"[$(date)] $(basename \"$0\") hook start\" >>\"$log\"\n\
-           $IONICE $NICE {bin} index --lock-wait 60 >>\"$log\" 2>&1; rc=$?\n\
+           $IONICE $NICE {bin} index --lock-wait 60 --device cpu >>\"$log\" 2>&1; rc=$?\n\
            echo \"[$(date)] index exit=$rc\" >>\"$log\"\n\
+           index_rc=$rc\n\
            $IONICE $NICE {bin} git-index --incremental --lock-wait 60 >>\"$log\" 2>&1; rc=$?\n\
-           echo \"[$(date)] git-index exit=$rc\" >>\"$log\" ) >>\"$log\" 2>&1 &\n\
+           echo \"[$(date)] git-index exit=$rc\" >>\"$log\"\n\
+           [ -n \"$head\" ] && [ \"$index_rc\" -eq 0 ] && [ \"$rc\" -eq 0 ] && printf '%s\\n' \"$stamp\" >\"$state\" ) >>\"$log\" 2>&1 &\n\
          exit 0\n",
     )
 }
@@ -336,8 +374,10 @@ mod tests {
         // failure silently starve git-index of every incremental update.
         let body = generate_post_commit_hook_body("/usr/local/bin/codesage");
         assert!(
-            body.contains("'/usr/local/bin/codesage' index --lock-wait 60 >>\"$log\" 2>&1; rc=$?"),
-            "expected logged `index --lock-wait` invocation, got:\n{body}"
+            body.contains(
+                "'/usr/local/bin/codesage' index --lock-wait 60 --device cpu >>\"$log\" 2>&1; rc=$?"
+            ),
+            "expected logged `index --lock-wait --device cpu` invocation, got:\n{body}"
         );
         assert!(
             body.contains(
@@ -413,6 +453,173 @@ mod tests {
             "'/tmp/a'\"'\"'b/codesage'"
         );
         assert_eq!(shell_single_quote("/tmp/codesage"), "'/tmp/codesage'");
+    }
+
+    #[test]
+    fn post_commit_hook_early_exit_keys_on_head_and_status_digest() {
+        let body = generate_post_commit_hook_body("/x");
+        assert!(
+            body.contains("state=\"$root/.codesage/hook-state\""),
+            "expected the hook-state path, got:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "stamp=\"$head $(git status --porcelain -- . ':(exclude).codesage' 2>/dev/null | cksum)\""
+            ),
+            "stamp must combine HEAD with a worktree-status digest, got:\n{body}"
+        );
+        assert!(
+            body.contains("if [ -n \"$head\" ] && [ -f \"$state\" ] && [ \"$(cat \"$state\" 2>/dev/null)\" = \"$stamp\" ]; then"),
+            "expected the skip comparison, got:\n{body}"
+        );
+        // The skip must be decided before the binary is launched, and the
+        // stamp written only after both passes exited 0.
+        let skip = body.find("hook skip:").unwrap();
+        let launch = body.find("hook start").unwrap();
+        let record = body.find("printf '%s\\n' \"$stamp\" >\"$state\"").unwrap();
+        assert!(skip < launch && launch < record, "{body}");
+        assert!(
+            body.contains("[ \"$index_rc\" -eq 0 ] && [ \"$rc\" -eq 0 ] && printf"),
+            "stamp must require both passes to succeed, got:\n{body}"
+        );
+        // Same symlink guard as the log, before the first use of $state.
+        assert!(
+            body.contains(
+                "if [ -L \"$state\" ] || { [ -e \"$state\" ] && [ ! -f \"$state\" ]; }; then state=/dev/null; fi"
+            ),
+            "expected the state symlink guard, got:\n{body}"
+        );
+        let guard = body.find("[ -L \"$state\" ]").unwrap();
+        let first_read = body.find("cat \"$state\"").unwrap();
+        assert!(guard < first_read, "{body}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_commit_hook_skips_the_binary_when_head_and_worktree_are_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "t"],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        }
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        let status = std::process::Command::new("git")
+            .args(["add", "a.txt"])
+            .current_dir(root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .args(["commit", "-q", "-m", "one"])
+            .current_dir(root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git commit failed");
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+
+        let stub = root.join("codesage-stub");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\necho \"stub ran: $1\" >> \"$(git rev-parse --show-toplevel)/.codesage/stub.mark\"\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let hook = root.join(".git/hooks/post-commit");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hook,
+            generate_post_commit_hook_body(stub.to_str().unwrap()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let log = root.join(".codesage/hooks.log");
+        let mark = root.join(".codesage/stub.mark");
+        let wait_for = |needle: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let content = std::fs::read_to_string(&log).unwrap_or_default();
+                if content.contains(needle) {
+                    return content;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "log never recorded {needle:?}:\n{content}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+
+        // First run: no stamp yet, both passes run, stamp recorded.
+        assert!(run_script(&hook, root).success());
+        wait_for("] git-index exit=0");
+        let state = root.join(".codesage/hook-state");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !state.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "hook-state never written"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let stamp = std::fs::read_to_string(&state).unwrap();
+        assert!(
+            stamp.starts_with(&format!("{} ", head_sha(root))),
+            "{stamp:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&mark).unwrap(),
+            "stub ran: index\nstub ran: git-index\n"
+        );
+
+        // Second run with the same HEAD and worktree: skipped before the binary.
+        assert!(run_script(&hook, root).success());
+        let content = wait_for("hook skip:");
+        assert_eq!(content.matches("hook start").count(), 1, "{content}");
+        assert_eq!(
+            std::fs::read_to_string(&mark).unwrap(),
+            "stub ran: index\nstub ran: git-index\n",
+            "the binary must not run on an unchanged tree"
+        );
+
+        // A worktree change with the same HEAD defeats the skip.
+        std::fs::write(root.join("a.txt"), "changed\n").unwrap();
+        assert!(run_script(&hook, root).success());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let content = std::fs::read_to_string(&log).unwrap_or_default();
+            if content.matches("hook start").count() == 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dirty worktree must re-run the passes:\n{content}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[cfg(unix)]
+    fn head_sha(root: &std::path::Path) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
 
     #[test]
