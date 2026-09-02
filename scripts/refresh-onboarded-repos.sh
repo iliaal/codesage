@@ -112,16 +112,28 @@ if [ "$dry_run" -eq 1 ]; then
 	exit 0
 fi
 
+# `codesage index` exits 75 (EX_TEMPFAIL) when another indexer held the
+# project lock for the whole wait: nothing was indexed and nothing broke.
+# That repo is reported for a later retry, and its hook and hint refresh
+# still run — they do not need the index.
+EXIT_LOCK_HELD=75
+
 failures=()
+retry_later=()
 for root in "${active[@]:-}"; do
 	[ -z "$root" ] && continue
 	echo "--- $root ---"
 
 	if [ "$do_index" -eq 1 ]; then
 		echo "    [1/3] codesage index ${index_args[*]:-}"
-		if ! (cd "$root" && "$codesage_bin" index ${index_args[@]+"${index_args[@]}"} 2>&1 | sed 's/^/        /'); then
-			failures+=("$root (index)")
-			echo "        FAILED"
+		rc=0
+		(cd "$root" && "$codesage_bin" index ${index_args[@]+"${index_args[@]}"} 2>&1 | sed 's/^/        /') || rc=$?
+		if [ "$rc" -eq "$EXIT_LOCK_HELD" ]; then
+			retry_later+=("$root (index: lock held, retry later)")
+			echo "        LOCK HELD (exit $rc): retry later"
+		elif [ "$rc" -ne 0 ]; then
+			failures+=("$root (index, exit $rc)")
+			echo "        FAILED (exit $rc)"
 			continue
 		fi
 	else
@@ -153,8 +165,13 @@ for root in "${active[@]:-}"; do
 done
 
 echo
+if [ "${#retry_later[@]}" -gt 0 ]; then
+	echo "==> retry later (another indexer held the lock; nothing was indexed there):"
+	for f in "${retry_later[@]}"; do echo "    - $f"; done
+fi
 if [ "${#failures[@]}" -eq 0 ]; then
 	echo "==> done. ${#active[@]} repo(s) refreshed."
+	[ "${#retry_later[@]}" -eq 0 ] || exit "$EXIT_LOCK_HELD"
 else
 	echo "==> done with failures:"
 	for f in "${failures[@]}"; do echo "    - $f"; done
