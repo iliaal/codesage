@@ -403,10 +403,25 @@ fn ensure_semantic_model_compatible(
 
 fn clear_semantic_fingerprint_for(conn: &Connection, chunk_table: &str) -> Result<()> {
     conn.execute(
-        "UPDATE semantic_models SET fingerprint = NULL WHERE chunk_table = ?1",
+        "UPDATE semantic_models
+         SET fingerprint = NULL, artifact_digest = NULL, artifact_stat_key = NULL
+         WHERE chunk_table = ?1",
         params![chunk_table],
     )?;
     Ok(())
+}
+
+/// What a completed semantic pass records about the vectors a chunk table
+/// holds: the fingerprint text every reader compares, plus the model-file
+/// digest it was built over and the stat key (paths, sizes, mtimes) of
+/// those files, so the next process can answer "unchanged" without reading
+/// hundreds of megabytes. Both extras are optional: a row attested by an
+/// older build has neither.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticAttestation {
+    pub fingerprint: String,
+    pub artifact_digest: Option<String>,
+    pub artifact_stat_key: Option<String>,
 }
 
 fn record_semantic_model_table(
@@ -668,18 +683,64 @@ impl Database {
             .flatten())
     }
 
+    /// The full attestation recorded for this handle's chunk table, `None`
+    /// under the same conditions as [`Database::semantic_fingerprint`].
+    pub fn semantic_attestation(&self) -> Result<Option<SemanticAttestation>> {
+        if self.chunk_table.is_empty() {
+            return Ok(None);
+        }
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT fingerprint, artifact_digest, artifact_stat_key
+                 FROM semantic_models WHERE chunk_table = ?1",
+                params![self.chunk_table],
+                |row| {
+                    let fingerprint: Option<String> = row.get(0)?;
+                    let artifact_digest: Option<String> = row.get(1)?;
+                    let artifact_stat_key: Option<String> = row.get(2)?;
+                    Ok(fingerprint.map(|fingerprint| SemanticAttestation {
+                        fingerprint,
+                        artifact_digest,
+                        artifact_stat_key,
+                    }))
+                },
+            )
+            .optional()?
+            .flatten())
+    }
+
     /// Record the fingerprint whose vectors this handle's chunk table now
-    /// holds in full. Called at the end of a completed population, never at
-    /// its start, so an interrupted rebuild leaves the previous value (or
-    /// none) and the next incremental pass refuses reuse.
+    /// holds in full, without a model-file digest or stat key: the next
+    /// process reads the model files once to compare. Called at the end of
+    /// a completed population, never at its start, so an interrupted rebuild
+    /// leaves the previous value (or none) and the next incremental pass
+    /// refuses reuse.
     pub fn record_semantic_fingerprint(&self, fingerprint: &str) -> Result<()> {
+        self.record_semantic_attestation(&SemanticAttestation {
+            fingerprint: fingerprint.to_string(),
+            artifact_digest: None,
+            artifact_stat_key: None,
+        })
+    }
+
+    /// [`Database::record_semantic_fingerprint`] with the model-file digest
+    /// and stat key beside it.
+    pub fn record_semantic_attestation(&self, attestation: &SemanticAttestation) -> Result<()> {
         anyhow::ensure!(
             !self.chunk_table.is_empty(),
             "cannot record a semantic fingerprint on a handle without a chunk table"
         );
         let updated = self.conn.execute(
-            "UPDATE semantic_models SET fingerprint = ?2 WHERE chunk_table = ?1",
-            params![self.chunk_table, fingerprint],
+            "UPDATE semantic_models
+             SET fingerprint = ?2, artifact_digest = ?3, artifact_stat_key = ?4
+             WHERE chunk_table = ?1",
+            params![
+                self.chunk_table,
+                attestation.fingerprint,
+                attestation.artifact_digest,
+                attestation.artifact_stat_key
+            ],
         )?;
         anyhow::ensure!(
             updated == 1,
@@ -760,6 +821,52 @@ mod tests {
     }
 
     #[test]
+    fn semantic_attestation_round_trips_and_clears_as_one_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = Database::open_for_model(&path, "fp/model", DEFAULT_EMBEDDING_DIM).unwrap();
+        assert_eq!(db.semantic_attestation().unwrap(), None);
+
+        let full = SemanticAttestation {
+            fingerprint: "v3;model=fp/model;dim=384".to_string(),
+            artifact_digest: Some("abc".to_string()),
+            artifact_stat_key: Some("onnx=/m.onnx:10:1.000000000".to_string()),
+        };
+        db.record_semantic_attestation(&full).unwrap();
+        assert_eq!(db.semantic_attestation().unwrap(), Some(full.clone()));
+        assert_eq!(
+            db.semantic_fingerprint().unwrap().as_deref(),
+            Some(full.fingerprint.as_str())
+        );
+
+        // A text-only record replaces the extras: a stale stat key must
+        // never vouch for a digest recorded under another fingerprint.
+        db.record_semantic_fingerprint("v3;model=fp/model;dim=384;x")
+            .unwrap();
+        assert_eq!(
+            db.semantic_attestation().unwrap(),
+            Some(SemanticAttestation {
+                fingerprint: "v3;model=fp/model;dim=384;x".to_string(),
+                artifact_digest: None,
+                artifact_stat_key: None,
+            })
+        );
+
+        db.record_semantic_attestation(&full).unwrap();
+        db.clear_semantic_fingerprint().unwrap();
+        assert_eq!(db.semantic_attestation().unwrap(), None);
+        let raw: (Option<String>, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT artifact_digest, artifact_stat_key FROM semantic_models WHERE chunk_table = ?1",
+                params![db.chunk_table],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(raw, (None, None), "clearing must drop the extras too");
+    }
+
+    #[test]
     fn rebuild_open_and_clear_forget_the_fingerprint() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.db");
@@ -816,6 +923,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_column, 1, "migration must add the column");
+        let extra_columns: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('semantic_models')
+                 WHERE name IN ('artifact_digest', 'artifact_stat_key')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(extra_columns, 2, "migration 0016 must add both columns");
         let stored: Option<String> = db
             .conn
             .query_row(

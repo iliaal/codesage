@@ -9,8 +9,9 @@ use anyhow::{Result, bail, ensure};
 use codesage_embed::config::EmbeddingConfig;
 use codesage_embed::model::Embedder;
 use codesage_graph::{
-    LazyEmbedder, SemanticFingerprint, SemanticTableState, TextEmbedder, full_index,
-    incremental_index, semantic_full_index, semantic_incremental_index, semantic_table_state,
+    ArtifactLookup, LazyEmbedder, SemanticFingerprint, SemanticTableState, TextEmbedder,
+    full_index, incremental_index, resolve_semantic_fingerprint, semantic_full_index,
+    semantic_incremental_index, semantic_table_state,
 };
 use codesage_parser::discover::build_exclude_set;
 use codesage_storage::Database;
@@ -277,6 +278,22 @@ fn effective_device(
     }
 }
 
+/// The fingerprint an index pass compares and attests against, resolved
+/// through the table's recorded attestation so a no-change pass reads no
+/// model file. Downloads on a cache miss, as the loader it stands in for.
+pub(crate) fn resolved_fingerprint(
+    db: &Database,
+    emb_config: &EmbeddingConfig,
+    dim: usize,
+) -> Result<SemanticFingerprint> {
+    resolve_semantic_fingerprint(db, emb_config, dim, ArtifactLookup::Resolve)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "model files for {:?} could not be resolved",
+            emb_config.model
+        )
+    })
+}
+
 /// Dimension the existing index already records for `model`, or `None` when
 /// this model has never indexed the project (or the lookup itself fails, in
 /// which case the eager path reports the same error the old code did).
@@ -331,12 +348,12 @@ fn open_index_db_and_embedder(
         } else {
             open_db_for_model(root, &emb_config.model, dim)?
         };
-        let fingerprint = SemanticFingerprint::compute(emb_config, dim)?;
+        let fingerprint = resolved_fingerprint(&db, emb_config, dim)?;
         return Ok((db, embedder, fingerprint));
     };
 
     let db = open_db_for_model(root, &emb_config.model, dim)?;
-    let fingerprint = SemanticFingerprint::compute(emb_config, dim)?;
+    let fingerprint = resolved_fingerprint(&db, emb_config, dim)?;
     let init_config = emb_config.clone();
     let root = root.to_path_buf();
     let lazy = LazyEmbedder::new(Box::new(move |files_to_embed| {
@@ -669,8 +686,9 @@ struct SemanticStatus {
     /// file's hash to match AND the table's fingerprint to be current.
     state: &'static str,
     /// How the table's recorded fingerprint relates to the configured setup:
-    /// `current`, `unrecorded`, `mismatch`, `unresolved` (the model files
-    /// could not be digested), or `absent` (no table).
+    /// `current`, `unrecorded`, `mismatch`, `unknown` (the model files are
+    /// not in the local cache; `status` never downloads them), `unresolved`
+    /// (the model files could not be digested), or `absent` (no table).
     fingerprint: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     indexed_files: Option<usize>,
@@ -726,17 +744,20 @@ fn semantic_status(root: &Path) -> Result<SemanticStatus> {
     };
     // The recorded dimension names the table; the fingerprint needs the
     // model files on disk. Either missing leaves freshness undecidable,
-    // which is never reported as fresh.
+    // which is never reported as fresh. A status line never downloads a
+    // model: files absent from the local cache are `unknown`.
     let Some(dim) = db.recorded_semantic_dim()? else {
         return Ok(unavailable(model, "unresolved"));
     };
-    let current = match SemanticFingerprint::compute(&emb_config, dim) {
-        Ok(fingerprint) => fingerprint,
-        Err(e) => {
-            eprintln!("warning: semantic fingerprint could not be derived: {e:#}");
-            return Ok(unavailable(model, "unresolved"));
-        }
-    };
+    let current =
+        match resolve_semantic_fingerprint(&db, &emb_config, dim, ArtifactLookup::CachedOnly) {
+            Ok(Some(fingerprint)) => fingerprint,
+            Ok(None) => return Ok(unavailable(model, "unknown")),
+            Err(e) => {
+                eprintln!("warning: semantic fingerprint could not be derived: {e:#}");
+                return Ok(unavailable(model, "unresolved"));
+            }
+        };
     let table = semantic_table_state(&db, &current)?;
     Ok(SemanticStatus {
         model,

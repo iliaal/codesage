@@ -721,8 +721,11 @@ pub(crate) fn load_query_stack(
     let db = open_db_for_model(root, &emb_config.model, dim)?;
     // A table whose vectors were produced under another setup — or under
     // none this version attested — answers a query with wrong neighbours.
-    // Refuse (`EXIT_STALE_INDEX`) rather than serve them.
-    let fingerprint = codesage_graph::SemanticFingerprint::compute(&emb_config, dim)?;
+    // Refuse (`EXIT_STALE_INDEX`) rather than serve them. Resolved through
+    // the recorded attestation: with a daemon answering, no model file is
+    // read; without one, the private session's pin check already digested
+    // each file once and the shared cache answers the fingerprint.
+    let fingerprint = commands::index::resolved_fingerprint(&db, &emb_config, dim)?;
     codesage_graph::require_current_semantic_table(&db, &fingerprint)?;
     let reranker = emb_config
         .reranker

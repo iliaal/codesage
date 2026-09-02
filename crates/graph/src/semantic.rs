@@ -3,8 +3,11 @@ use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 use codesage_embed::chunk::{ChunkConfig, chunk_text};
+use codesage_embed::config::EmbeddingConfig;
 pub use codesage_embed::fingerprint::SemanticFingerprint;
-use codesage_embed::model::Embedder;
+use codesage_embed::model::{
+    Embedder, ModelArtifacts, cached_model_artifacts, resolve_model_artifacts,
+};
 use codesage_protocol::{FileInfo, SemanticIndexStats, Symbol};
 
 /// Anything that turns chunk texts into vectors. [`Embedder`] is the
@@ -102,7 +105,7 @@ impl TextEmbedder for LazyEmbedder {
         self.ensure(announced)?.embed_batch(texts)
     }
 }
-use codesage_storage::Database;
+use codesage_storage::{Database, SemanticAttestation};
 use rayon::prelude::*;
 
 use codesage_parser::discover::discover_files_with_excludes;
@@ -421,6 +424,70 @@ pub fn semantic_table_state(
     })
 }
 
+/// Where [`resolve_semantic_fingerprint`] may look for the model files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactLookup {
+    /// The local hf-hub cache first, then the same resolution the session
+    /// loader performs — which downloads on a cache miss.
+    Resolve,
+    /// The local hf-hub cache only. Absent artifacts are `None`, never a
+    /// download: for `status` and any other path that must not block on the
+    /// network.
+    CachedOnly,
+}
+
+/// The fingerprint the table should be compared against, derived without
+/// reading a model file whenever the recorded attestation allows it.
+///
+/// A model file is hundreds of megabytes, and every semantic command used to
+/// digest it before deciding anything — a no-change `codesage index` from
+/// the git hook paid ~2.6 s to learn it had nothing to do. The completed pass
+/// that attested the table recorded the digest it used and the stat key
+/// (paths, sizes, mtimes) of the files it digested. When the current files
+/// stat to the same key and the fingerprint rebuilt over the recorded digest
+/// is the recorded text, that text is the answer and nothing is read. Any
+/// other case — no attestation, a stat key that moved, a fingerprint that
+/// differs on a non-artifact component — digests the files for real. The
+/// stat key's blind spot (a same-length, same-nanosecond rewrite) is the one
+/// the per-process cache already accepted.
+///
+/// `Ok(None)` only under [`ArtifactLookup::CachedOnly`] with the artifacts
+/// not in the cache.
+pub fn resolve_semantic_fingerprint(
+    db: &Database,
+    config: &EmbeddingConfig,
+    dim: usize,
+    lookup: ArtifactLookup,
+) -> Result<Option<SemanticFingerprint>> {
+    let artifacts = match (cached_model_artifacts(&config.model), lookup) {
+        (Some(artifacts), _) => artifacts,
+        (None, ArtifactLookup::CachedOnly) => return Ok(None),
+        (None, ArtifactLookup::Resolve) => resolve_model_artifacts(&config.model)
+            .with_context(|| format!("resolving model files for {:?}", config.model))?,
+    };
+    resolve_semantic_fingerprint_for_artifacts(db, config, dim, &artifacts).map(Some)
+}
+
+/// [`resolve_semantic_fingerprint`] over an explicit artifact set.
+pub fn resolve_semantic_fingerprint_for_artifacts(
+    db: &Database,
+    config: &EmbeddingConfig,
+    dim: usize,
+    artifacts: &ModelArtifacts,
+) -> Result<SemanticFingerprint> {
+    if let Some(stat_key) = artifacts.stat_key()
+        && let Some(attestation) = db.semantic_attestation()?
+        && attestation.artifact_stat_key.as_deref() == Some(stat_key.as_str())
+        && let Some(digest) = &attestation.artifact_digest
+    {
+        let candidate = SemanticFingerprint::with_attested_digest(config, dim, digest, &stat_key);
+        if candidate.as_str() == attestation.fingerprint {
+            return Ok(candidate);
+        }
+    }
+    SemanticFingerprint::for_artifacts(config, dim, artifacts)
+}
+
 /// The chunk table cannot serve a query: its vectors were produced under an
 /// unknown or different setup. Typed so a CLI can map it to its own exit
 /// status rather than the generic failure.
@@ -513,7 +580,11 @@ fn record_fingerprint_if_complete(
         );
         return Ok(());
     }
-    db.record_semantic_fingerprint(fingerprint.as_str())
+    db.record_semantic_attestation(&SemanticAttestation {
+        fingerprint: fingerprint.as_str().to_string(),
+        artifact_digest: Some(fingerprint.artifact_digest().to_string()),
+        artifact_stat_key: fingerprint.artifact_stat_key().map(str::to_string),
+    })
 }
 
 fn semantic_index(
@@ -736,6 +807,7 @@ pub fn semantic_remove_files(db: &Database, paths: &[String]) -> Result<usize> {
 mod tests {
     use super::*;
     use codesage_protocol::Language;
+    use std::time::Duration;
 
     fn file(path: &str, hash: &str) -> FileInfo {
         FileInfo {
@@ -1231,6 +1303,110 @@ mod tests {
             }
             Ok(texts.iter().map(|_| embedding(0.25)).collect())
         }
+    }
+
+    fn resolved_fp(
+        db: &Database,
+        artifacts: &codesage_embed::model::ModelArtifacts,
+    ) -> SemanticFingerprint {
+        resolve_semantic_fingerprint_for_artifacts(
+            db,
+            &codesage_embed::config::EmbeddingConfig::default(),
+            codesage_storage::db::DEFAULT_EMBEDDING_DIM,
+            artifacts,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn no_change_incremental_pass_over_a_current_table_reads_no_model_file() {
+        use codesage_embed::fingerprint::{artifact_read_count, forget_cached_digests};
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let model = tempfile::tempdir().unwrap();
+        let artifacts = scratch_model(model.path());
+        let db = Database::open_in_memory().unwrap();
+        let mut fake = FakeEmbedder {
+            prepared_with: Vec::new(),
+            batches: 0,
+        };
+
+        // First population: no attestation yet, so the files are digested.
+        let reads_before = artifact_read_count(&artifacts.onnx);
+        let first = resolved_fp(&db, &artifacts);
+        assert_eq!(artifact_read_count(&artifacts.onnx), reads_before + 1);
+        semantic_incremental_index(root.path(), &db, &mut fake, &[], &first, false).unwrap();
+        let attestation = db.semantic_attestation().unwrap().unwrap();
+        assert_eq!(attestation.fingerprint, first.as_str());
+        assert_eq!(
+            attestation.artifact_digest.as_deref(),
+            Some(first.artifact_digest())
+        );
+        assert_eq!(
+            attestation.artifact_stat_key.as_deref(),
+            artifacts.stat_key().as_deref()
+        );
+
+        // Start the way a new process would: with no digest in memory. Only
+        // the recorded attestation can now answer without a read.
+        forget_cached_digests();
+        let original = std::fs::metadata(&artifacts.onnx)
+            .unwrap()
+            .modified()
+            .unwrap();
+        let file = std::fs::File::open(&artifacts.onnx).unwrap();
+
+        // No-change pass over a current table: the stat key matches, the
+        // recorded digest is reused, and not one artifact byte is read.
+        let reads_before = artifact_read_count(&artifacts.onnx);
+        let second = resolved_fp(&db, &artifacts);
+        assert_eq!(second, first);
+        assert_eq!(second.artifact_stat_key(), first.artifact_stat_key());
+        let stats =
+            semantic_incremental_index(root.path(), &db, &mut fake, &[], &second, false).unwrap();
+        assert_eq!(stats.files_skipped, 1, "{stats:?}");
+        assert_eq!(
+            artifact_read_count(&artifacts.onnx),
+            reads_before,
+            "a no-change pass over a current table must not read the model"
+        );
+        assert_eq!(artifact_read_count(&artifacts.tokenizer), reads_before);
+
+        // A moved stat key (same bytes, new mtime on the graph) triggers
+        // exactly one digest per artifact (the cache is cold for both), and
+        // the table is still current.
+        let tokenizer_reads = artifact_read_count(&artifacts.tokenizer);
+        file.set_modified(original + Duration::from_secs(60))
+            .unwrap();
+        let third = resolved_fp(&db, &artifacts);
+        assert_eq!(third, first, "same bytes, same fingerprint");
+        assert_eq!(artifact_read_count(&artifacts.onnx), reads_before + 1);
+        assert_eq!(
+            artifact_read_count(&artifacts.tokenizer),
+            tokenizer_reads + 1
+        );
+        assert!(semantic_table_state(&db, &third).unwrap().is_current());
+
+        // A recorded stat key that matches but a fingerprint that differs
+        // on another component (pooling) is not taken on trust: the files
+        // are digested for real and the table reads as mismatched.
+        file.set_modified(original).unwrap();
+        let cls = codesage_embed::config::EmbeddingConfig {
+            pooling: Some(codesage_embed::config::PoolingStrategy::Cls),
+            ..Default::default()
+        };
+        let reads_before = artifact_read_count(&artifacts.onnx);
+        let fourth = resolve_semantic_fingerprint_for_artifacts(
+            &db,
+            &cls,
+            codesage_storage::db::DEFAULT_EMBEDDING_DIM,
+            &artifacts,
+        )
+        .unwrap();
+        assert_ne!(fourth, first);
+        assert!(!semantic_table_state(&db, &fourth).unwrap().is_current());
+        assert_eq!(artifact_read_count(&artifacts.onnx), reads_before + 1);
     }
 
     #[test]

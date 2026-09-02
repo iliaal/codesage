@@ -56,38 +56,77 @@ impl PipelineIdentity {
 
 /// Opaque, comparable identity of an embedding setup. Persisted beside the
 /// chunk table and compared byte-for-byte before any stored vector is reused.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SemanticFingerprint(String);
+///
+/// Equality is over the persisted text alone. The artifact digest and stat
+/// key ride along so a completed pass can persist them beside the text and
+/// the next process can skip re-reading the model files when their paths,
+/// sizes, and mtimes are unchanged.
+#[derive(Debug, Clone)]
+pub struct SemanticFingerprint {
+    text: String,
+    artifact_digest: String,
+    artifact_stat_key: Option<String>,
+}
+
+impl PartialEq for SemanticFingerprint {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+    }
+}
+
+impl Eq for SemanticFingerprint {}
 
 impl SemanticFingerprint {
     /// Derive the fingerprint from the configured model's files on disk and
     /// the dimension the table was opened for. Resolves the artifacts the
     /// way the loader does (a cache miss downloads) and digests their bytes,
     /// once per process per unchanged file; never builds a session.
+    ///
+    /// Always reads the model files when the process cache is cold. A caller
+    /// with a recorded attestation at hand should prefer
+    /// `codesage_graph::resolve_semantic_fingerprint`, which compares the
+    /// stat key first and reads nothing when it matches.
     pub fn compute(config: &EmbeddingConfig, dim: usize) -> Result<Self> {
         let artifacts = resolve_model_artifacts(&config.model)
             .with_context(|| format!("resolving model files for {:?}", config.model))?;
         Self::for_artifacts(config, dim, &artifacts)
     }
 
-    /// The fingerprint for `config` over an explicit artifact set.
+    /// The fingerprint for `config` over an explicit artifact set. Reads
+    /// every artifact the process cache does not already hold.
     pub fn for_artifacts(
         config: &EmbeddingConfig,
         dim: usize,
         artifacts: &ModelArtifacts,
     ) -> Result<Self> {
         let digest = model_artifact_digest(artifacts)?;
-        Ok(Self::with_artifact_digest(config, dim, &digest))
+        let mut fingerprint = Self::with_artifact_digest(config, dim, &digest);
+        fingerprint.artifact_stat_key = artifacts.stat_key();
+        Ok(fingerprint)
     }
 
     /// The fingerprint for `config` given an already-computed artifact
-    /// digest. Pure.
+    /// digest. Pure; carries no stat key.
     pub fn with_artifact_digest(
         config: &EmbeddingConfig,
         dim: usize,
         artifact_digest: &str,
     ) -> Self {
         Self::with_pipeline(config, dim, artifact_digest, &PipelineIdentity::CURRENT)
+    }
+
+    /// The fingerprint for `config` given an artifact digest a persisted
+    /// attestation vouches for, together with the stat key it was recorded
+    /// under. Pure; nothing is read.
+    pub fn with_attested_digest(
+        config: &EmbeddingConfig,
+        dim: usize,
+        artifact_digest: &str,
+        artifact_stat_key: &str,
+    ) -> Self {
+        let mut fingerprint = Self::with_artifact_digest(config, dim, artifact_digest);
+        fingerprint.artifact_stat_key = Some(artifact_stat_key.to_string());
+        fingerprint
     }
 
     /// The persisted form is built here and nowhere else.
@@ -103,28 +142,44 @@ impl SemanticFingerprint {
             crate::config::PoolingStrategy::Cls => "cls",
         };
         let normalized = if pipeline.normalized { "l2" } else { "none" };
-        Self(format!(
-            "v3;model={};artifacts={artifact_digest};dim={dim};pooling={pooling};\
-             pipeline={};maxseq={};norm={normalized};\
-             chunker={CHUNKER_VERSION};chunk={}/{}/{}",
-            config.model,
-            pipeline.version,
-            pipeline.max_seq_length,
-            chunk.chunk_size,
-            chunk.min_chunk_size,
-            chunk.overlap
-        ))
+        Self {
+            text: format!(
+                "v3;model={};artifacts={artifact_digest};dim={dim};pooling={pooling};\
+                 pipeline={};maxseq={};norm={normalized};\
+                 chunker={CHUNKER_VERSION};chunk={}/{}/{}",
+                config.model,
+                pipeline.version,
+                pipeline.max_seq_length,
+                chunk.chunk_size,
+                chunk.min_chunk_size,
+                chunk.overlap
+            ),
+            artifact_digest: artifact_digest.to_string(),
+            artifact_stat_key: None,
+        }
     }
 
     /// The persisted form.
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.text
+    }
+
+    /// The model-artifact digest this fingerprint was built over.
+    pub fn artifact_digest(&self) -> &str {
+        &self.artifact_digest
+    }
+
+    /// Path, size, and mtime of every artifact the digest covered, when the
+    /// fingerprint was derived from files on disk (or from an attestation
+    /// that recorded one).
+    pub fn artifact_stat_key(&self) -> Option<&str> {
+        self.artifact_stat_key.as_deref()
     }
 }
 
 impl fmt::Display for SemanticFingerprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.text)
     }
 }
 
@@ -155,12 +210,43 @@ fn digest_cache() -> &'static Mutex<HashMap<PathBuf, CachedDigest>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn read_counts() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    static COUNTS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Drop every cached digest, so the next lookup reads the file as a fresh
+/// process would. For tests that need a cold cache without a new process;
+/// nothing in a running command should call it.
+pub fn forget_cached_digests() {
+    digest_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+/// How many times this process has read `path` end to end to digest it.
+/// A model file is hundreds of megabytes, so a caller that only wanted to
+/// compare identities must be able to prove it read nothing; the count is
+/// per path so concurrent tests over different files do not disturb each
+/// other.
+pub fn artifact_read_count(path: &Path) -> u64 {
+    read_counts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(path)
+        .copied()
+        .unwrap_or(0)
+}
+
 /// SHA-256 of the file at `path`, hex. A model file is tens to hundreds of
 /// megabytes and every semantic command needs its digest, so the result is
 /// kept for the life of the process and reused while the file's size and
 /// mtime are unchanged; a rewrite that keeps both (same-second, same-length)
-/// is the accepted blind spot of that key.
-fn cached_file_digest(path: &Path) -> Result<String> {
+/// is the accepted blind spot of that key. The loader's pin verification
+/// shares this cache, so a `search` that built a private session and then
+/// derived the fingerprint reads each artifact once, not twice.
+pub fn cached_file_digest(path: &Path) -> Result<String> {
     let meta = std::fs::metadata(path)?;
     let len = meta.len();
     let modified = meta.modified()?;
@@ -188,6 +274,11 @@ fn cached_file_digest(path: &Path) -> Result<String> {
 
 fn sha256_file(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path)?;
+    *read_counts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(path.to_path_buf())
+        .or_insert(0) += 1;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -273,6 +364,32 @@ mod tests {
             current, raw,
             "dropping the L2 normalisation must be visible"
         );
+    }
+
+    #[test]
+    fn for_artifacts_carries_the_stat_key_and_counts_its_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifacts = scratch_artifacts(dir.path());
+        let config = EmbeddingConfig::default();
+        let before = artifact_read_count(&artifacts.onnx);
+        let fp = SemanticFingerprint::for_artifacts(&config, 384, &artifacts).unwrap();
+        assert_eq!(fp.artifact_stat_key(), artifacts.stat_key().as_deref());
+        assert_eq!(
+            fp.artifact_digest(),
+            model_artifact_digest(&artifacts).unwrap()
+        );
+        assert_eq!(artifact_read_count(&artifacts.onnx), before + 1);
+
+        // Attested digest: pure, equal text, nothing read.
+        let attested = SemanticFingerprint::with_attested_digest(
+            &config,
+            384,
+            fp.artifact_digest(),
+            fp.artifact_stat_key().unwrap(),
+        );
+        assert_eq!(attested, fp);
+        assert_eq!(attested.artifact_stat_key(), fp.artifact_stat_key());
+        assert_eq!(artifact_read_count(&artifacts.onnx), before + 1);
     }
 
     #[test]

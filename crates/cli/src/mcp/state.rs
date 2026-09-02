@@ -787,7 +787,7 @@ impl CodeSageServer {
         let embedder_arc = self.get_or_load_embedder(config)?;
         let dim = embedder_arc.lock().dim();
         let db = Database::open_for_model_existing(&state.db_path, &config.model, dim)?;
-        let fingerprint = codesage_graph::SemanticFingerprint::compute(config, dim)?;
+        let fingerprint = crate::commands::index::resolved_fingerprint(&db, config, dim)?;
         codesage_graph::require_current_semantic_table(&db, &fingerprint)?;
         Ok(db)
     }

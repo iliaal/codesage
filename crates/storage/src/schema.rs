@@ -118,7 +118,9 @@ CREATE TABLE IF NOT EXISTS semantic_models (
     model TEXT NOT NULL,
     dim INTEGER NOT NULL,
     indexed_at INTEGER NOT NULL DEFAULT (unixepoch()),
-    fingerprint TEXT
+    fingerprint TEXT,
+    artifact_digest TEXT,
+    artifact_stat_key TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_semantic_models_model ON semantic_models(model);
@@ -413,6 +415,10 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
         "0015_semantic_models_fingerprint",
         migrate_0015_semantic_models_fingerprint,
     ),
+    (
+        "0016_semantic_models_artifact_stat_key",
+        migrate_0016_semantic_models_artifact_stat_key,
+    ),
 ];
 
 /// `semantic_models.fingerprint`: the embedding setup (model, pinned files,
@@ -427,6 +433,27 @@ fn migrate_0015_semantic_models_fingerprint(conn: &Connection) -> rusqlite::Resu
     )?;
     if has_column == 0 {
         conn.execute_batch("ALTER TABLE semantic_models ADD COLUMN fingerprint TEXT;")?;
+    }
+    Ok(())
+}
+
+/// `semantic_models.artifact_digest` and `artifact_stat_key`: the model-file
+/// digest the recorded fingerprint was built over and the path/size/mtime key
+/// of those files at the time. A later process compares the stat key first
+/// and re-reads the model files only when it differs. NULL on a row attested
+/// before the columns existed, which forces one read.
+fn migrate_0016_semantic_models_artifact_stat_key(conn: &Connection) -> rusqlite::Result<()> {
+    for column in ["artifact_digest", "artifact_stat_key"] {
+        let has_column: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('semantic_models') WHERE name = ?1",
+            rusqlite::params![column],
+            |row| row.get(0),
+        )?;
+        if has_column == 0 {
+            conn.execute_batch(&format!(
+                "ALTER TABLE semantic_models ADD COLUMN {column} TEXT;"
+            ))?;
+        }
     }
     Ok(())
 }

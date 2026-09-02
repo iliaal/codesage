@@ -10,7 +10,6 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use hf_hub::{Repo, RepoType};
 use ort::session::Session;
-use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
 use wait_timeout::ChildExt;
 
@@ -678,20 +677,11 @@ fn verify_model_artifact_sha256(
     path: &Path,
     expected: &str,
 ) -> Result<()> {
-    let mut file = std::fs::File::open(path)
-        .with_context(|| format!("opening {artifact} for pinned model {model:?}"))?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = file
-            .read(&mut buf)
-            .with_context(|| format!("reading {artifact} for pinned model {model:?}"))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    let actual = hex::encode(hasher.finalize());
+    // Shares the fingerprint's per-process digest cache: the same bytes are
+    // digested for the pin gate and for the table fingerprint, and a model
+    // file is read once for both.
+    let actual = crate::fingerprint::cached_file_digest(path)
+        .with_context(|| format!("reading {artifact} for pinned model {model:?}"))?;
     if actual != expected {
         anyhow::bail!(
             "pinned model artifact hash mismatch for {model:?} {artifact}: \
