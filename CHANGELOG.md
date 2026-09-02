@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.23.0] - 2026-09-02
+
 ### Added
 
 - Hidden daemon tool `embed_texts`: `index` and `search` embed through the running daemon's resident session instead of opening a private CUDA context, falling back to a private session when no daemon answers.
@@ -780,5 +782,7 @@ Initial public release.
 
 [0.21.0]: https://github.com/iliaal/codesage/releases/tag/v0.21.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.22.0...HEAD
 [0.22.0]: https://github.com/iliaal/codesage/releases/tag/v0.22.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/iliaal/codesage/releases/tag/v0.23.0

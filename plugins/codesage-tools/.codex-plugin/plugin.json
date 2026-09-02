@@ -1,6 +1,6 @@
 {
   "name": "codesage-tools",
-  "version": "0.22.0",
+  "version": "0.23.0",
   "description": "CodeSage retrieval routing and code-intelligence workflows for Codex.",
   "author": {
     "name": "Ilia Alshanetsky",
