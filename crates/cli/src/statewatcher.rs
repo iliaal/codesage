@@ -817,7 +817,13 @@ fn semantic_reindex_batch(
             return WorkOutcome::Failed;
         }
     };
-    let fingerprint = SemanticFingerprint::compute(&config.embed_config, emb.dim());
+    let fingerprint = match SemanticFingerprint::compute(&config.embed_config, emb.dim()) {
+        Ok(fingerprint) => fingerprint,
+        Err(e) => {
+            tracing::warn!(error = %e, "deriving the semantic fingerprint for semantic reindex");
+            return WorkOutcome::Failed;
+        }
+    };
     match semantic_index_files(
         &config.project_root,
         &db,
@@ -1470,7 +1476,16 @@ fn run_bulk_incremental(config: &StateWatcherConfig, embedder: &mut EmbedderHand
                 return WorkOutcome::Failed;
             }
         };
-        let fingerprint = SemanticFingerprint::compute(&config.embed_config, emb.dim());
+        let fingerprint = match SemanticFingerprint::compute(&config.embed_config, emb.dim()) {
+            Ok(fingerprint) => fingerprint,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "deriving the semantic fingerprint for bulk semantic incremental"
+                );
+                return WorkOutcome::Failed;
+            }
+        };
         if let Err(e) = codesage_graph::semantic_incremental_index(
             &config.project_root,
             &db,

@@ -528,20 +528,126 @@ fn model_pin(model: &str) -> Option<&'static ModelPin> {
     MODEL_PINS.iter().find(|pin| pin.model == model)
 }
 
-/// The pinned revision and ONNX file digest a validated model loads at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PinnedModelIdentity {
-    pub revision: &'static str,
-    pub onnx_sha256: &'static str,
+/// The files a model load opens: the tokenizer, the ONNX graph, and the
+/// external-weights sidecar when the repository ships one. Resolved by
+/// [`resolve_model_artifacts`] through the same hf-hub lookups the session
+/// loader performs, so a digest over these paths is a digest over the bytes
+/// ONNX Runtime will execute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelArtifacts {
+    pub tokenizer: PathBuf,
+    pub onnx: PathBuf,
+    pub onnx_data: Option<PathBuf>,
 }
 
-/// Identity of the files `model` is pinned to, `None` for a model outside the
-/// pin table (loadable only under `CODESAGE_ALLOW_ANY_MODEL`). Static lookup;
-/// never touches the network or the model cache.
-pub fn pinned_model_identity(model: &str) -> Option<PinnedModelIdentity> {
-    model_pin(model).map(|pin| PinnedModelIdentity {
-        revision: pin.revision,
-        onnx_sha256: pin.onnx_sha256,
+impl ModelArtifacts {
+    /// Path, size, and mtime of every artifact: the same key the digest
+    /// cache is invalidated by, without reading a byte. For a per-call
+    /// change detector that must stay cheap; `None` when a file cannot be
+    /// stat'ed.
+    pub fn stat_key(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        for (label, path) in self.labelled_files() {
+            let meta = std::fs::metadata(path).ok()?;
+            let modified = meta
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?;
+            parts.push(format!(
+                "{label}={}:{}:{}.{:09}",
+                path.display(),
+                meta.len(),
+                modified.as_secs(),
+                modified.subsec_nanos()
+            ));
+        }
+        Some(parts.join(";"))
+    }
+
+    /// Every artifact with its label, in the fixed order a digest covers.
+    pub fn labelled_files(&self) -> Vec<(&'static str, &Path)> {
+        let mut files = vec![
+            ("tokenizer", self.tokenizer.as_path()),
+            ("onnx", self.onnx.as_path()),
+        ];
+        if let Some(data) = &self.onnx_data {
+            files.push(("onnx_data", data.as_path()));
+        }
+        files
+    }
+}
+
+/// The revision a load of `model` resolves against: the pinned commit for a
+/// validated model, the repository head once the user opted out of pinning
+/// with `CODESAGE_ALLOW_ANY_MODEL`. The fingerprint and the session loader
+/// must agree on this, or the fingerprint would digest files the session
+/// never opens.
+fn load_revision(model: &str, allow_any: bool) -> Option<&'static str> {
+    if allow_any {
+        None
+    } else {
+        model_pin(model).map(|pin| pin.revision)
+    }
+}
+
+/// Locate exactly the files [`load_onnx_session`] would open for `model`,
+/// downloading on a cache miss the way the loader does. The allowlist is
+/// checked first, as the loader checks it: the model name comes from the
+/// indexed repo's config, and an unvalidated name must not reach the network
+/// through this path any more than through a session build. Performs no pin
+/// verification: that is the loader's separate gate, and the semantic
+/// fingerprint must reflect the bytes on disk whether or not they match a
+/// pin.
+pub fn resolve_model_artifacts(model: &str) -> Result<ModelArtifacts> {
+    let allow_any = allow_any_model_from_env();
+    validate_model_allowed(model, allow_any)?;
+    resolve_model_artifacts_at(model, load_revision(model, allow_any))
+}
+
+/// The artifacts for `model` already present in the local hf-hub cache, at
+/// the revision a load would open. Never touches the network: `None` when
+/// the model is not allowlisted or the tokenizer or the graph is not cached
+/// yet. For a caller that must not block on a download (a per-call key, a
+/// status line), where a later load changing the answer is acceptable.
+pub fn cached_model_artifacts(model: &str) -> Option<ModelArtifacts> {
+    let allow_any = allow_any_model_from_env();
+    validate_model_allowed(model, allow_any).ok()?;
+    let revision = load_revision(model, allow_any);
+    let repo = match revision {
+        Some(revision) => {
+            Repo::with_revision(model.to_string(), RepoType::Model, revision.to_string())
+        }
+        None => Repo::model(model.to_string()),
+    };
+    let cache = hf_hub::Cache::from_env().repo(repo);
+    Some(ModelArtifacts {
+        tokenizer: cache.get("tokenizer.json")?,
+        onnx: cache.get("onnx/model.onnx")?,
+        onnx_data: cache.get("onnx/model.onnx_data"),
+    })
+}
+
+fn resolve_model_artifacts_at(model: &str, revision: Option<&str>) -> Result<ModelArtifacts> {
+    let tokenizer = hf_get_model_file(model, revision, "tokenizer.json")?;
+    let onnx = hf_get_model_file(model, revision, "onnx/model.onnx")?;
+    // External-weights sidecar (>2GB models like Jina v2 base, BGE-large).
+    // Most models don't have this file — a 404 is the expected outcome and
+    // not worth surfacing. A real failure (network, disk, permission) is
+    // worth a debug-level breadcrumb so users running with RUST_LOG=debug
+    // don't have to guess when commit_from_file later errors with an
+    // opaque ORT external-data load failure.
+    let onnx_data = match hf_get_model_file(model, revision, "onnx/model.onnx_data") {
+        Ok(path) => Some(path),
+        Err(e) => {
+            tracing::debug!(error = %e, "onnx/model.onnx_data not fetched (normal for small models)");
+            None
+        }
+    };
+    Ok(ModelArtifacts {
+        tokenizer,
+        onnx,
+        onnx_data,
     })
 }
 
@@ -773,6 +879,11 @@ pub(crate) fn load_onnx_session(model: &str, device: &str) -> Result<(Session, T
     let allow_any = allow_any_model_from_env();
     validate_model_allowed(model, allow_any)?;
     let pin = if allow_any { None } else { model_pin(model) };
+    debug_assert_eq!(
+        pin.map(|pin| pin.revision),
+        load_revision(model, allow_any),
+        "the fingerprint must resolve the revision the loader opens"
+    );
     if !allow_any && pin.is_none() {
         anyhow::bail!(
             "validated model {model:?} has no pinned revision/hash metadata; refusing unpinned load"
@@ -800,26 +911,17 @@ pub(crate) fn load_onnx_session(model: &str, device: &str) -> Result<(Session, T
         );
     }
 
-    let revision = pin.map(|pin| pin.revision);
-    let tokenizer_path = hf_get_model_file(model, revision, "tokenizer.json")?;
-    let model_path = hf_get_model_file(model, revision, "onnx/model.onnx")?;
-    // External-weights sidecar (>2GB models like Jina v2 base, BGE-large).
-    // Most models don't have this file — a 404 is the expected outcome and
-    // not worth surfacing. A real failure (network, disk, permission) is
-    // worth a debug-level breadcrumb so users running with RUST_LOG=debug
-    // don't have to guess when commit_from_file later errors with an
-    // opaque ORT external-data load failure.
-    let onnx_data_path = match hf_get_model_file(model, revision, "onnx/model.onnx_data") {
-        Ok(path) => Some(path),
-        Err(e) => {
-            tracing::debug!(error = %e, "onnx/model.onnx_data not fetched (normal for small models)");
-            None
-        }
-    };
+    let artifacts = resolve_model_artifacts_at(model, pin.map(|pin| pin.revision))?;
     let (tokenizer_path, model_path) = if let Some(pin) = pin {
-        verify_pinned_model_artifacts(model, pin, tokenizer_path, model_path, onnx_data_path)?
+        verify_pinned_model_artifacts(
+            model,
+            pin,
+            artifacts.tokenizer,
+            artifacts.onnx,
+            artifacts.onnx_data,
+        )?
     } else {
-        (tokenizer_path, model_path)
+        (artifacts.tokenizer, artifacts.onnx)
     };
 
     let mut tokenizer =
@@ -1388,6 +1490,75 @@ mod tests {
     #[test]
     fn allow_any_override_bypasses_allowlist() {
         assert!(validate_model_allowed("evil/backdoored-model", true).is_ok());
+    }
+
+    #[test]
+    fn artifact_resolution_is_gated_on_the_allowlist_before_any_lookup() {
+        // The fingerprint path resolves model files by the repo-supplied
+        // name; an unvalidated name must fail here, offline, before hf-hub
+        // is asked for anything (the environment leaves the override unset
+        // for this test binary).
+        if allow_any_model_from_env() {
+            return;
+        }
+        let err = resolve_model_artifacts("evil/backdoored-model")
+            .expect_err("unallowlisted model must not be resolved");
+        assert!(
+            err.to_string()
+                .contains("not on CodeSage's validated-model allowlist"),
+            "{err:#}"
+        );
+        assert_eq!(cached_model_artifacts("evil/backdoored-model"), None);
+    }
+
+    #[test]
+    fn artifact_stat_key_tracks_size_and_mtime_without_reading_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer = dir.path().join("tokenizer.json");
+        let onnx = dir.path().join("model.onnx");
+        std::fs::write(&tokenizer, b"{}").unwrap();
+        std::fs::write(&onnx, b"aaaa").unwrap();
+        let fixed = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let touch = |path: &Path, at: std::time::SystemTime| {
+            std::fs::File::open(path).unwrap().set_modified(at).unwrap();
+        };
+        touch(&tokenizer, fixed);
+        touch(&onnx, fixed);
+        let artifacts = ModelArtifacts {
+            tokenizer: tokenizer.clone(),
+            onnx: onnx.clone(),
+            onnx_data: None,
+        };
+        let base = artifacts.stat_key().unwrap();
+
+        // Same size, same mtime, different bytes: the stat key cannot see it
+        // (the content digest can); that is the trade the per-call key makes.
+        std::fs::write(&onnx, b"bbbb").unwrap();
+        touch(&onnx, fixed);
+        assert_eq!(artifacts.stat_key().unwrap(), base);
+
+        std::fs::write(&onnx, b"bbbbb").unwrap();
+        touch(&onnx, fixed);
+        assert_ne!(
+            artifacts.stat_key().unwrap(),
+            base,
+            "a size change is visible"
+        );
+
+        std::fs::write(&onnx, b"aaaa").unwrap();
+        touch(&onnx, fixed + Duration::from_secs(1));
+        assert_ne!(
+            artifacts.stat_key().unwrap(),
+            base,
+            "an mtime change is visible"
+        );
+
+        let missing = ModelArtifacts {
+            tokenizer,
+            onnx: dir.path().join("absent.onnx"),
+            onnx_data: None,
+        };
+        assert_eq!(missing.stat_key(), None);
     }
 
     #[test]

@@ -29,8 +29,9 @@ pub use overview::build_project_overview;
 pub use rehearsal::build_review_rehearsal;
 pub use search::{RerankFn, search};
 pub use semantic::{
-    EmbedderInit, LazyEmbedder, SemanticFingerprint, TextEmbedder, semantic_full_index,
-    semantic_incremental_index, semantic_index_files, semantic_remove_files,
+    EmbedderInit, LazyEmbedder, SemanticFingerprint, SemanticTableState, StaleSemanticTable,
+    TextEmbedder, require_current_semantic_table, semantic_full_index, semantic_incremental_index,
+    semantic_index_files, semantic_remove_files, semantic_table_state,
 };
 pub use session::{session_end, session_start, top_risk_files};
 pub use similar::find_similar;

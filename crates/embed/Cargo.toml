@@ -33,3 +33,6 @@ ort = { version = "2.0.0-rc.13", default-features = false, features = ["api-24",
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 ort = { version = "2.0.0-rc.13", default-features = false, features = ["api-24", "copy-dylibs", "coreml", "download-binaries", "ndarray", "std", "tls-native", "tracing"] }
+
+[dev-dependencies]
+tempfile = "3"

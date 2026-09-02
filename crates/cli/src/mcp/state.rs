@@ -744,11 +744,17 @@ impl CodeSageServer {
         Ok(&state.embedding_config)
     }
 
+    /// Open the chunk table a semantic query reads, refusing one whose
+    /// fingerprint is absent or differs from the configured setup: its
+    /// vectors are another setup's output and the error names the repair.
     fn open_db_for(&self, state: &ProjectState) -> Result<Database> {
         let config = self.semantic_embedding_config(state)?;
         let embedder_arc = self.get_or_load_embedder(config)?;
-        let embedder = embedder_arc.lock();
-        Database::open_for_model_existing(&state.db_path, &config.model, embedder.dim())
+        let dim = embedder_arc.lock().dim();
+        let db = Database::open_for_model_existing(&state.db_path, &config.model, dim)?;
+        let fingerprint = codesage_graph::SemanticFingerprint::compute(config, dim)?;
+        codesage_graph::require_current_semantic_table(&db, &fingerprint)?;
+        Ok(db)
     }
 
     pub(super) fn open_structural_db_for(&self, state: &ProjectState) -> Result<Database> {

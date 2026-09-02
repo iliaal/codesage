@@ -9,8 +9,8 @@ use anyhow::{Result, bail, ensure};
 use codesage_embed::config::EmbeddingConfig;
 use codesage_embed::model::Embedder;
 use codesage_graph::{
-    LazyEmbedder, SemanticFingerprint, TextEmbedder, full_index, incremental_index,
-    semantic_full_index, semantic_incremental_index,
+    LazyEmbedder, SemanticFingerprint, SemanticTableState, TextEmbedder, full_index,
+    incremental_index, semantic_full_index, semantic_incremental_index, semantic_table_state,
 };
 use codesage_parser::discover::build_exclude_set;
 use codesage_storage::Database;
@@ -331,12 +331,12 @@ fn open_index_db_and_embedder(
         } else {
             open_db_for_model(root, &emb_config.model, dim)?
         };
-        let fingerprint = SemanticFingerprint::compute(emb_config, dim);
+        let fingerprint = SemanticFingerprint::compute(emb_config, dim)?;
         return Ok((db, embedder, fingerprint));
     };
 
     let db = open_db_for_model(root, &emb_config.model, dim)?;
-    let fingerprint = SemanticFingerprint::compute(emb_config, dim);
+    let fingerprint = SemanticFingerprint::compute(emb_config, dim)?;
     let init_config = emb_config.clone();
     let root = root.to_path_buf();
     let lazy = LazyEmbedder::new(Box::new(move |files_to_embed| {
@@ -664,8 +664,14 @@ struct StatusReport {
 struct SemanticStatus {
     model: String,
     /// One of `fresh`, `stale`, `missing` (no chunk table for the configured
-    /// model), or `unavailable` (freshness query returned nothing).
+    /// model), or `unavailable` (freshness query returned nothing, or the
+    /// current fingerprint could not be derived). `fresh` requires every
+    /// file's hash to match AND the table's fingerprint to be current.
     state: &'static str,
+    /// How the table's recorded fingerprint relates to the configured setup:
+    /// `current`, `unrecorded`, `mismatch`, `unresolved` (the model files
+    /// could not be digested), or `absent` (no table).
+    fingerprint: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     indexed_files: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -674,35 +680,68 @@ struct SemanticStatus {
     missing_files: Option<usize>,
 }
 
+/// The `state` label: file hashes alone cannot make a table fresh when its
+/// vectors were produced under an unknown or different setup.
+fn semantic_state_label(files_fresh: bool, table: &SemanticTableState) -> &'static str {
+    if files_fresh && table.is_current() {
+        "fresh"
+    } else {
+        "stale"
+    }
+}
+
+fn fingerprint_label(table: &SemanticTableState) -> &'static str {
+    match table {
+        SemanticTableState::Current => "current",
+        SemanticTableState::Unrecorded => "unrecorded",
+        SemanticTableState::Mismatch { .. } => "mismatch",
+    }
+}
+
 fn semantic_status(root: &Path) -> Result<SemanticStatus> {
     let config = load_project_config(root)?;
-    let model = config.embedding.unwrap_or_default().model;
+    let emb_config = config.embedding.unwrap_or_default();
+    let model = emb_config.model.clone();
     let db = open_context_db_for_existing_model(root, &model)?;
     if db.chunk_table_name().is_empty() {
         return Ok(SemanticStatus {
             model,
             state: "missing",
+            fingerprint: "absent",
             indexed_files: None,
             stale_files: None,
             missing_files: None,
         });
     }
-    let Some(freshness) = db.semantic_freshness()? else {
-        return Ok(SemanticStatus {
-            model,
-            state: "unavailable",
-            indexed_files: None,
-            stale_files: None,
-            missing_files: None,
-        });
+    let unavailable = |model: String, fingerprint: &'static str| SemanticStatus {
+        model,
+        state: "unavailable",
+        fingerprint,
+        indexed_files: None,
+        stale_files: None,
+        missing_files: None,
     };
+    let Some(freshness) = db.semantic_freshness()? else {
+        return Ok(unavailable(model, "unresolved"));
+    };
+    // The recorded dimension names the table; the fingerprint needs the
+    // model files on disk. Either missing leaves freshness undecidable,
+    // which is never reported as fresh.
+    let Some(dim) = db.recorded_semantic_dim()? else {
+        return Ok(unavailable(model, "unresolved"));
+    };
+    let current = match SemanticFingerprint::compute(&emb_config, dim) {
+        Ok(fingerprint) => fingerprint,
+        Err(e) => {
+            eprintln!("warning: semantic fingerprint could not be derived: {e:#}");
+            return Ok(unavailable(model, "unresolved"));
+        }
+    };
+    let table = semantic_table_state(&db, &current)?;
     Ok(SemanticStatus {
         model,
-        state: if freshness.is_fresh() {
-            "fresh"
-        } else {
-            "stale"
-        },
+        state: semantic_state_label(freshness.is_fresh(), &table),
+        fingerprint: fingerprint_label(&table),
         indexed_files: Some(freshness.indexed_files),
         stale_files: Some(freshness.stale_files),
         missing_files: Some(freshness.missing_files),
@@ -715,11 +754,18 @@ fn print_semantic_status(s: &SemanticStatus) {
             "Semantic:   missing for model {} (run `codesage index`)",
             s.model
         ),
-        "unavailable" => println!("Semantic:   unavailable for model {}", s.model),
+        "unavailable" => println!(
+            "Semantic:   unavailable for model {} (fingerprint {})",
+            s.model, s.fingerprint
+        ),
         "fresh" => println!(
             "Semantic:   fresh for model {} ({} files)",
             s.model,
             s.indexed_files.unwrap_or(0)
+        ),
+        _ if s.fingerprint != "current" => println!(
+            "Semantic:   stale for model {} (fingerprint {}; run `codesage index --full`)",
+            s.model, s.fingerprint
         ),
         _ => println!(
             "Semantic:   stale for model {} ({} stale, {} missing; run `codesage index`)",
@@ -1040,6 +1086,40 @@ mod tests {
     }
 
     #[test]
+    fn status_never_reports_fresh_over_a_stale_or_unrecorded_fingerprint() {
+        assert_eq!(
+            semantic_state_label(true, &SemanticTableState::Current),
+            "fresh"
+        );
+        assert_eq!(
+            semantic_state_label(false, &SemanticTableState::Current),
+            "stale"
+        );
+        assert_eq!(
+            semantic_state_label(true, &SemanticTableState::Unrecorded),
+            "stale",
+            "matching file hashes over unattested vectors are not fresh"
+        );
+        assert_eq!(
+            semantic_state_label(
+                true,
+                &SemanticTableState::Mismatch {
+                    stored: "v2;other".into()
+                }
+            ),
+            "stale"
+        );
+        assert_eq!(
+            fingerprint_label(&SemanticTableState::Unrecorded),
+            "unrecorded"
+        );
+        assert_eq!(
+            fingerprint_label(&SemanticTableState::Mismatch { stored: "x".into() }),
+            "mismatch"
+        );
+    }
+
+    #[test]
     fn excluded_manifest_does_not_affect_fingerprint() {
         // The mapper honors [index].exclude_patterns; a vendored manifest the
         // mapper never reads must not defeat the skip either.
@@ -1133,6 +1213,7 @@ mod tests {
         let s = SemanticStatus {
             model: "m".to_string(),
             state: "stale",
+            fingerprint: "mismatch",
             indexed_files: Some(10),
             stale_files: Some(2),
             missing_files: Some(1),
@@ -1140,10 +1221,12 @@ mod tests {
         let v: serde_json::Value = serde_json::to_value(&s).unwrap();
         assert_eq!(v["state"], "stale");
         assert_eq!(v["stale_files"], 2);
+        assert_eq!(v["fingerprint"], "mismatch");
 
         let missing = SemanticStatus {
             model: "m".to_string(),
             state: "missing",
+            fingerprint: "absent",
             indexed_files: None,
             stale_files: None,
             missing_files: None,

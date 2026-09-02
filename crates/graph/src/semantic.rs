@@ -387,6 +387,86 @@ fn process_semantic_batch(
     Ok(())
 }
 
+/// How the chunk table's recorded fingerprint relates to the one this run
+/// would produce. Anything but [`SemanticTableState::Current`] means the
+/// table's vectors cannot be vouched for: a reader must not serve them as
+/// current and a writer must not reuse them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticTableState {
+    /// The table records exactly this run's fingerprint.
+    Current,
+    /// The table records no fingerprint: it predates the column, or no
+    /// completed population has attested it yet.
+    Unrecorded,
+    /// The table records a different fingerprint.
+    Mismatch { stored: String },
+}
+
+impl SemanticTableState {
+    pub fn is_current(&self) -> bool {
+        matches!(self, Self::Current)
+    }
+}
+
+/// Compare the table's recorded fingerprint with `fingerprint`. An absent
+/// record is [`SemanticTableState::Unrecorded`], never a match.
+pub fn semantic_table_state(
+    db: &Database,
+    fingerprint: &SemanticFingerprint,
+) -> Result<SemanticTableState> {
+    Ok(match db.semantic_fingerprint()? {
+        Some(stored) if stored == fingerprint.as_str() => SemanticTableState::Current,
+        Some(stored) => SemanticTableState::Mismatch { stored },
+        None => SemanticTableState::Unrecorded,
+    })
+}
+
+/// The chunk table cannot serve a query: its vectors were produced under an
+/// unknown or different setup. Typed so a CLI can map it to its own exit
+/// status rather than the generic failure.
+#[derive(Debug)]
+pub struct StaleSemanticTable {
+    pub state: SemanticTableState,
+    pub current: String,
+}
+
+impl std::fmt::Display for StaleSemanticTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.state {
+            SemanticTableState::Current => write!(f, "semantic index is current"),
+            SemanticTableState::Unrecorded => write!(
+                f,
+                "semantic index records no fingerprint (never fully embedded under this \
+                 CodeSage version, or a rebuild did not complete); run `codesage index --full`"
+            ),
+            SemanticTableState::Mismatch { stored } => write!(
+                f,
+                "semantic index was embedded under a different setup (stored {stored}, \
+                 current {}); run `codesage index --full`",
+                self.current
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StaleSemanticTable {}
+
+/// Refuse to read a chunk table whose fingerprint is absent or differs from
+/// `fingerprint`. Returns a [`StaleSemanticTable`] error naming the repair.
+pub fn require_current_semantic_table(
+    db: &Database,
+    fingerprint: &SemanticFingerprint,
+) -> Result<()> {
+    match semantic_table_state(db, fingerprint)? {
+        SemanticTableState::Current => Ok(()),
+        state => Err(StaleSemanticTable {
+            state,
+            current: fingerprint.as_str().to_string(),
+        }
+        .into()),
+    }
+}
+
 /// Whether a stored vector may stand in for a fresh one on this pass.
 ///
 /// A full rebuild never reuses: it is the command a user runs to repair
@@ -394,31 +474,25 @@ fn process_semantic_batch(
 /// and the table name cannot tell those apart. An incremental pass reuses
 /// only when the table records exactly the fingerprint this run would
 /// produce; a different or absent record is "unknown", never "matches".
-fn stored_vectors_reusable(
-    db: &Database,
-    strategy: IndexStrategy,
-    fingerprint: &SemanticFingerprint,
-) -> Result<bool> {
+fn stored_vectors_reusable(strategy: IndexStrategy, table_state: &SemanticTableState) -> bool {
     if strategy == IndexStrategy::Full {
-        return Ok(false);
+        return false;
     }
-    match db.semantic_fingerprint()? {
-        Some(stored) if stored == fingerprint.as_str() => Ok(true),
-        Some(stored) => {
+    match table_state {
+        SemanticTableState::Current => true,
+        SemanticTableState::Mismatch { stored } => {
             tracing::warn!(
                 stored,
-                current = %fingerprint,
                 "stored embeddings were produced under a different semantic fingerprint; \
-                 reusing none of them — run `codesage index --full` to rebuild the table"
+                 reusing none of them"
             );
-            Ok(false)
+            false
         }
-        None => {
+        SemanticTableState::Unrecorded => {
             tracing::debug!(
-                current = %fingerprint,
                 "chunk table records no semantic fingerprint; reusing no stored vectors"
             );
-            Ok(false)
+            false
         }
     }
 }
@@ -454,14 +528,37 @@ fn semantic_index(
     let files = discover_files_with_excludes(root, exclude_patterns)?;
     let config = ChunkConfig::default();
     let mut stats = SemanticIndexStats::default();
-    let reuse_stored = stored_vectors_reusable(db, strategy, fingerprint)?;
+    let table_state = semantic_table_state(db, fingerprint)?;
+    let reuse_stored = stored_vectors_reusable(strategy, &table_state);
+    if strategy == IndexStrategy::Full {
+        // Every row is about to be rewritten; until they all have been, the
+        // table holds vectors no fingerprint describes.
+        db.clear_semantic_fingerprint()?;
+    }
+    // A table whose fingerprint is absent or differs holds vectors this run
+    // cannot vouch for in ANY file, not only the ones whose content moved:
+    // an incremental pass over it re-embeds every file, as `--full` would.
+    let stale_table = !table_state.is_current();
+    let selection = if stale_table {
+        IndexStrategy::Full
+    } else {
+        strategy
+    };
+    if strategy == IndexStrategy::Incremental && stale_table {
+        tracing::warn!(
+            state = ?table_state,
+            current = %fingerprint,
+            "chunk table fingerprint is absent or differs; re-embedding every file"
+        );
+    }
 
     let discovered_paths: HashSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
     let existing_chunk_paths = db.all_chunk_file_paths()?;
     let existing_semantic_hashes = db.all_semantic_file_hashes()?;
-    // A full pass rewrites every row; a first population of an empty table
-    // does too. Either one may vouch for the table's vectors afterwards.
-    let records_fingerprint = strategy == IndexStrategy::Full
+    // A full pass rewrites every row; so does a pass over a stale table, and
+    // a first population of an empty table. Any of them may vouch for the
+    // table's vectors afterwards.
+    let records_fingerprint = selection == IndexStrategy::Full
         || (existing_chunk_paths.is_empty() && existing_semantic_hashes.is_empty());
     let orphan_chunks: Vec<&str> = existing_chunk_paths
         .iter()
@@ -487,9 +584,9 @@ fn semantic_index(
         stats.files_removed = removed_count;
     }
 
-    let to_index = select_semantic_files(&files, &existing_semantic_hashes, strategy);
+    let to_index = select_semantic_files(&files, &existing_semantic_hashes, selection);
 
-    if strategy == IndexStrategy::Incremental {
+    if selection == IndexStrategy::Incremental {
         stats.files_skipped = files.len() - to_index.len();
     }
 
@@ -586,7 +683,8 @@ pub fn semantic_index_files(
     if files.is_empty() {
         return Ok(stats);
     }
-    let reuse_stored = stored_vectors_reusable(db, IndexStrategy::Incremental, fingerprint)?;
+    let table_state = semantic_table_state(db, fingerprint)?;
+    let reuse_stored = stored_vectors_reusable(IndexStrategy::Incremental, &table_state);
 
     if verbose {
         tracing::info!(count = files.len(), "semantic indexing specific files");
@@ -643,9 +741,10 @@ mod tests {
     }
 
     fn test_fp() -> SemanticFingerprint {
-        SemanticFingerprint::compute(
+        SemanticFingerprint::with_artifact_digest(
             &codesage_embed::config::EmbeddingConfig::default(),
             codesage_storage::db::DEFAULT_EMBEDDING_DIM,
+            "artifact-digest-a",
         )
     }
 
@@ -654,7 +753,33 @@ mod tests {
     fn other_fp() -> SemanticFingerprint {
         let mut config = codesage_embed::config::EmbeddingConfig::default();
         config.pooling = Some(codesage_embed::config::PoolingStrategy::Cls);
-        SemanticFingerprint::compute(&config, codesage_storage::db::DEFAULT_EMBEDDING_DIM)
+        SemanticFingerprint::with_artifact_digest(
+            &config,
+            codesage_storage::db::DEFAULT_EMBEDDING_DIM,
+            "artifact-digest-a",
+        )
+    }
+
+    /// A scratch model on disk, so a test can rewrite a byte of it.
+    fn scratch_model(dir: &Path) -> codesage_embed::model::ModelArtifacts {
+        let tokenizer = dir.join("tokenizer.json");
+        let onnx = dir.join("model.onnx");
+        std::fs::write(&tokenizer, b"{}").unwrap();
+        std::fs::write(&onnx, b"graph bytes v1").unwrap();
+        codesage_embed::model::ModelArtifacts {
+            tokenizer,
+            onnx,
+            onnx_data: None,
+        }
+    }
+
+    fn fp_for(artifacts: &codesage_embed::model::ModelArtifacts) -> SemanticFingerprint {
+        SemanticFingerprint::for_artifacts(
+            &codesage_embed::config::EmbeddingConfig::default(),
+            codesage_storage::db::DEFAULT_EMBEDDING_DIM,
+            artifacts,
+        )
+        .unwrap()
     }
 
     struct FakeEmbedder {
@@ -712,6 +837,9 @@ mod tests {
         assert_eq!(files.len(), 1);
         db.upsert_semantic_file_hash(&files[0].path, &files[0].content_hash)
             .unwrap();
+        // The skip holds only for a table attested under this fingerprint;
+        // an unattested table is stale and re-embeds everything.
+        db.record_semantic_fingerprint(test_fp().as_str()).unwrap();
         let constructions = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut lazy = counting_lazy(constructions.clone());
 
@@ -871,9 +999,128 @@ mod tests {
         assert_eq!(fake.batches, 2, "the chunk must go back to the model");
         assert_eq!(
             db.semantic_fingerprint().unwrap().as_deref(),
-            Some(test_fp().as_str()),
-            "an incremental pass over a populated table never re-attests it"
+            Some(other_fp().as_str()),
+            "a pass that rewrote every row under the new setup attests it"
         );
+    }
+
+    #[test]
+    fn one_rewritten_model_byte_disables_stored_vector_reuse() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let model_dir = tempfile::tempdir().unwrap();
+        let artifacts = scratch_model(model_dir.path());
+        let db = Database::open_in_memory().unwrap();
+        let mut fake = FakeEmbedder {
+            prepared_with: Vec::new(),
+            batches: 0,
+        };
+        let before = fp_for(&artifacts);
+        semantic_incremental_index(root.path(), &db, &mut fake, &[], &before, false).unwrap();
+        assert_eq!(fake.batches, 1);
+        assert_eq!(
+            db.semantic_fingerprint().unwrap().as_deref(),
+            Some(before.as_str())
+        );
+
+        // Same model name, same length, one byte of the graph rewritten in
+        // place: the table's vectors are another model's output.
+        let mut bytes = std::fs::read(&artifacts.onnx).unwrap();
+        bytes[0] ^= 0x01;
+        std::fs::write(&artifacts.onnx, &bytes).unwrap();
+        let later = std::fs::metadata(&artifacts.onnx)
+            .unwrap()
+            .modified()
+            .unwrap()
+            + std::time::Duration::from_secs(2);
+        std::fs::File::open(&artifacts.onnx)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let after = fp_for(&artifacts);
+        assert_ne!(before, after);
+
+        // The file's content hash is unchanged, so a content-keyed pass would
+        // skip it; a stale table re-embeds it instead, reusing nothing.
+        let stats =
+            semantic_incremental_index(root.path(), &db, &mut fake, &[], &after, false).unwrap();
+        assert_eq!(stats.files_processed, 1, "{stats:?}");
+        assert_eq!(stats.files_skipped, 0, "{stats:?}");
+        assert_eq!(stats.chunks_reused, 0, "{stats:?}");
+        assert_eq!(fake.batches, 2, "the chunk must go back to the model");
+        assert_eq!(
+            db.semantic_fingerprint().unwrap().as_deref(),
+            Some(after.as_str())
+        );
+    }
+
+    #[test]
+    fn incremental_pass_over_a_stale_table_reembeds_unchanged_files() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.path().join("b.rs"), "fn b() {}\n").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut fake = FakeEmbedder {
+            prepared_with: Vec::new(),
+            batches: 0,
+        };
+        semantic_incremental_index(root.path(), &db, &mut fake, &[], &other_fp(), false).unwrap();
+        assert_eq!(fake.batches, 1);
+
+        // Nothing on disk changed. Under the recorded fingerprint every file
+        // would be skipped; under a different one none may be.
+        let stats = semantic_incremental_index(root.path(), &db, &mut fake, &[], &test_fp(), false)
+            .unwrap();
+        assert_eq!(stats.files_processed, 2, "{stats:?}");
+        assert_eq!(stats.files_skipped, 0, "{stats:?}");
+        assert_eq!(stats.chunks_reused, 0, "{stats:?}");
+        assert_eq!(fake.batches, 2);
+        assert_eq!(
+            db.semantic_fingerprint().unwrap().as_deref(),
+            Some(test_fp().as_str())
+        );
+
+        // A table that records no fingerprint at all is stale the same way.
+        db.clear_semantic_fingerprint().unwrap();
+        let stats = semantic_incremental_index(root.path(), &db, &mut fake, &[], &test_fp(), false)
+            .unwrap();
+        assert_eq!(stats.files_processed, 2, "{stats:?}");
+        assert_eq!(stats.files_skipped, 0, "{stats:?}");
+        assert_eq!(fake.batches, 3);
+
+        // Current again: the ordinary content-keyed skip applies.
+        let stats = semantic_incremental_index(root.path(), &db, &mut fake, &[], &test_fp(), false)
+            .unwrap();
+        assert_eq!(stats.files_skipped, 2, "{stats:?}");
+        assert_eq!(fake.batches, 3);
+    }
+
+    #[test]
+    fn require_current_semantic_table_refuses_unrecorded_and_mismatched() {
+        let db = Database::open_in_memory().unwrap();
+        let err = require_current_semantic_table(&db, &test_fp()).unwrap_err();
+        let stale = err
+            .downcast_ref::<StaleSemanticTable>()
+            .expect("typed refusal");
+        assert_eq!(stale.state, SemanticTableState::Unrecorded);
+        assert!(err.to_string().contains("codesage index --full"), "{err}");
+
+        db.record_semantic_fingerprint(other_fp().as_str()).unwrap();
+        let err = require_current_semantic_table(&db, &test_fp()).unwrap_err();
+        let stale = err
+            .downcast_ref::<StaleSemanticTable>()
+            .expect("typed refusal");
+        assert_eq!(
+            stale.state,
+            SemanticTableState::Mismatch {
+                stored: other_fp().as_str().to_string()
+            }
+        );
+        assert!(err.to_string().contains("codesage index --full"), "{err}");
+
+        db.record_semantic_fingerprint(test_fp().as_str()).unwrap();
+        require_current_semantic_table(&db, &test_fp()).unwrap();
+        assert!(semantic_table_state(&db, &test_fp()).unwrap().is_current());
     }
 
     #[test]
@@ -925,6 +1172,37 @@ mod tests {
             None,
             "rows this pass could not rewrite have unknown provenance"
         );
+    }
+
+    #[test]
+    fn partial_full_rebuild_clears_the_previous_attestation() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut fake = FakeEmbedder {
+            prepared_with: Vec::new(),
+            batches: 0,
+        };
+        semantic_full_index(root.path(), &db, &mut fake, &[], &test_fp(), false).unwrap();
+        assert_eq!(
+            db.semantic_fingerprint().unwrap().as_deref(),
+            Some(test_fp().as_str())
+        );
+
+        // A second file that cannot be read makes the next --full partial:
+        // a.rs holds new vectors, b.rs none, and the old attestation must not
+        // survive to describe that mix.
+        std::fs::write(root.path().join("b.rs"), b"fn b() {}\n\xff\xfe").unwrap();
+        let stats =
+            semantic_full_index(root.path(), &db, &mut fake, &[], &test_fp(), false).unwrap();
+        assert_eq!(stats.files_failed, 1, "{stats:?}");
+        assert_eq!(stats.files_processed, 1, "{stats:?}");
+        assert_eq!(
+            db.semantic_fingerprint().unwrap(),
+            None,
+            "a partial --full leaves the table unattested"
+        );
+        assert!(!semantic_table_state(&db, &test_fp()).unwrap().is_current());
     }
 
     #[test]

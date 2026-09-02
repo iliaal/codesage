@@ -597,6 +597,12 @@ pub(crate) fn open_context_db_for_existing_model(root: &Path, model: &str) -> Re
 /// sysexits terms.
 pub(crate) const EXIT_LOCK_HELD: i32 = 75;
 
+/// Exit status when the semantic index cannot serve a query because its
+/// recorded fingerprint is absent or differs from the configured setup. The
+/// data on disk is the problem, not the invocation: `EX_DATAERR` in sysexits
+/// terms. The message names `codesage index --full`.
+pub(crate) const EXIT_STALE_INDEX: i32 = 65;
+
 /// Another process held the project's indexing lock past the wait window.
 /// Nothing was indexed. Used to be reported as success, which let a hook
 /// record the tree as indexed and skip every later run on the same HEAD.
@@ -646,6 +652,13 @@ fn exit_code_for(result: &Result<()>) -> i32 {
         Err(e) if e.downcast_ref::<IndexLockHeld>().is_some() => {
             eprintln!("{e}");
             EXIT_LOCK_HELD
+        }
+        Err(e)
+            if e.downcast_ref::<codesage_graph::StaleSemanticTable>()
+                .is_some() =>
+        {
+            eprintln!("error: {e:#}");
+            EXIT_STALE_INDEX
         }
         Err(e) => {
             eprintln!("error: {e:#}");
@@ -706,6 +719,11 @@ pub(crate) fn load_query_stack(
     let emb_config = config.embedding.unwrap_or_default();
     let (embedder, dim) = query_embedder(root, &emb_config)?;
     let db = open_db_for_model(root, &emb_config.model, dim)?;
+    // A table whose vectors were produced under another setup — or under
+    // none this version attested — answers a query with wrong neighbours.
+    // Refuse (`EXIT_STALE_INDEX`) rather than serve them.
+    let fingerprint = codesage_graph::SemanticFingerprint::compute(&emb_config, dim)?;
+    codesage_graph::require_current_semantic_table(&db, &fingerprint)?;
     let reranker = emb_config
         .reranker
         .as_ref()
@@ -1161,6 +1179,34 @@ mod tests {
             1,
             "other errors keep the generic code"
         );
+    }
+
+    #[test]
+    fn a_stale_semantic_table_exits_65_naming_the_full_rebuild() {
+        let stale: Result<()> = Err(codesage_graph::StaleSemanticTable {
+            state: codesage_graph::SemanticTableState::Unrecorded,
+            current: "v2;model=m".to_string(),
+        }
+        .into());
+        assert_eq!(exit_code_for(&stale), EXIT_STALE_INDEX);
+        assert!(
+            stale
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("codesage index --full")
+        );
+        // Wrapped in context the way a caller propagates it, still 65.
+        let wrapped: Result<()> = Err(codesage_graph::StaleSemanticTable {
+            state: codesage_graph::SemanticTableState::Mismatch {
+                stored: "v2;old".to_string(),
+            },
+            current: "v2;new".to_string(),
+        })
+        .context("loading query stack");
+        assert_eq!(exit_code_for(&wrapped), EXIT_STALE_INDEX);
+        assert_ne!(EXIT_STALE_INDEX, EXIT_LOCK_HELD);
+        assert_ne!(EXIT_STALE_INDEX, 1);
     }
 
     #[test]

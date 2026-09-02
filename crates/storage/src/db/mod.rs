@@ -401,6 +401,14 @@ fn ensure_semantic_model_compatible(
     Ok(())
 }
 
+fn clear_semantic_fingerprint_for(conn: &Connection, chunk_table: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE semantic_models SET fingerprint = NULL WHERE chunk_table = ?1",
+        params![chunk_table],
+    )?;
+    Ok(())
+}
+
 fn record_semantic_model_table(
     conn: &Connection,
     chunk_table: &str,
@@ -556,6 +564,11 @@ impl Database {
         }
         ensure_chunk_table(&conn, &chunk_table, dim)?;
         record_semantic_model_table(&conn, &chunk_table, model, dim)?;
+        // A rebuild is about to rewrite every row. Until it has, the table
+        // holds a mix of old and new vectors that no fingerprint describes;
+        // a compatible reopen used to carry the previous attestation across
+        // a rebuild that then failed on some files.
+        clear_semantic_fingerprint_for(&conn, &chunk_table)?;
         harden_db_path_permissions(path)?;
         Ok(Database { conn, chunk_table })
     }
@@ -676,6 +689,19 @@ impl Database {
         Ok(())
     }
 
+    /// Forget the recorded fingerprint: the table's vectors are of unknown
+    /// provenance until a completed population records one again. Called at
+    /// the start of a full rebuild, so an interrupted or partial rebuild
+    /// leaves `None`, never the previous run's attestation over rows it did
+    /// not write.
+    pub fn clear_semantic_fingerprint(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.chunk_table.is_empty(),
+            "cannot clear a semantic fingerprint on a handle without a chunk table"
+        );
+        clear_semantic_fingerprint_for(&self.conn, &self.chunk_table)
+    }
+
     pub fn execute_batch(&self, f: impl FnOnce(&Self) -> Result<()>) -> Result<()> {
         self.conn.execute_batch("BEGIN")?;
         match f(self) {
@@ -731,6 +757,32 @@ mod tests {
         let structural = Database::open(&path).unwrap();
         assert_eq!(structural.semantic_fingerprint().unwrap(), None);
         assert!(structural.record_semantic_fingerprint("x").is_err());
+    }
+
+    #[test]
+    fn rebuild_open_and_clear_forget_the_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = Database::open_for_model(&path, "fp/model", DEFAULT_EMBEDDING_DIM).unwrap();
+        db.record_semantic_fingerprint("v2;model=fp/model;dim=384")
+            .unwrap();
+        db.clear_semantic_fingerprint().unwrap();
+        assert_eq!(db.semantic_fingerprint().unwrap(), None);
+        db.record_semantic_fingerprint("v2;model=fp/model;dim=384")
+            .unwrap();
+        drop(db);
+
+        // A compatible rebuild open keeps the table and its rows but never
+        // the attestation: the rebuild has not rewritten anything yet.
+        let db =
+            Database::open_for_model_rebuild(&path, "fp/model", DEFAULT_EMBEDDING_DIM).unwrap();
+        assert_eq!(
+            db.semantic_fingerprint().unwrap(),
+            None,
+            "a rebuild open must start from an unattested table"
+        );
+        let structural = Database::open(&path).unwrap();
+        assert!(structural.clear_semantic_fingerprint().is_err());
     }
 
     #[test]

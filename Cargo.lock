@@ -292,6 +292,7 @@ dependencies = [
  "ort",
  "serde",
  "sha2",
+ "tempfile",
  "tokenizers",
  "tracing",
  "wait-timeout",
