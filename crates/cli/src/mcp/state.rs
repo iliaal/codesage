@@ -501,6 +501,19 @@ fn resolved_embedder_pool_key(config: &EmbeddingConfig) -> Result<String> {
     embedder_pool_key(config, &digest)
 }
 
+/// The semantic fingerprint of the vectors a resident `embedder` loaded for
+/// `config` produces. The artifact digest is already cached from the pool
+/// key the load resolved, so this reads no model file.
+fn session_fingerprint(
+    config: &EmbeddingConfig,
+    embedder: &Embedder,
+) -> Result<codesage_graph::SemanticFingerprint> {
+    Ok(
+        codesage_graph::SemanticFingerprint::compute(config, embedder.dim())?
+            .with_execution_provider(embedder.execution_provider()),
+    )
+}
+
 /// The `embed_texts` fingerprint gate: a caller's `expected` fingerprint
 /// must equal the one this session `produces`; a non-empty request must
 /// carry one. A probe (empty texts) may omit it. Refusals carry
@@ -975,10 +988,7 @@ impl CodeSageServer {
         let embedder_arc = self.get_or_load_embedder(config)?;
         let mut embedder = embedder_arc.lock();
         let dim = embedder.dim();
-        // The artifact digest is already cached from the pool key the load
-        // above resolved, so this reads no model file.
-        let fingerprint = codesage_graph::SemanticFingerprint::compute(config, dim)?
-            .with_execution_provider(embedder.execution_provider());
+        let fingerprint = session_fingerprint(config, &embedder)?;
         check_expected_fingerprint(expected_fingerprint, fingerprint.as_str(), texts.is_empty())?;
         let embeddings = if texts.is_empty() {
             Vec::new()
@@ -1020,6 +1030,12 @@ impl CodeSageServer {
 
         let query_embedding = {
             let mut guard = embedder_arc.lock();
+            // The table is current for the configured setup; the query
+            // vector must come from a session producing that same identity,
+            // or its neighbours are another setup's. Refused as the stale
+            // table is, naming `codesage index --full`.
+            let produces = session_fingerprint(config, &guard)?;
+            codesage_graph::require_current_semantic_table(&db, &produces)?;
             guard.embed_one(query)?
         };
 
@@ -1462,6 +1478,34 @@ mod tests {
             "the surviving entry is the new one, not the stopped watcher's"
         );
         assert!(entry.thread.is_none(), "the reservation has no thread yet");
+    }
+
+    #[test]
+    fn a_session_producing_another_identity_than_the_table_is_refused_as_stale() {
+        // The table was attested under the configured CUDA setup; a resident
+        // session producing the CPU identity must not answer its queries.
+        let config = EmbeddingConfig {
+            device: "cuda".to_string(),
+            ..EmbeddingConfig::default()
+        };
+        let table = codesage_graph::SemanticFingerprint::with_artifact_digest(&config, 4, "d");
+        let db = Database::open_in_memory().unwrap();
+        db.record_semantic_fingerprint(table.as_str()).unwrap();
+        codesage_graph::require_current_semantic_table(&db, &table).unwrap();
+
+        let produces = table.with_execution_provider("cpu");
+        let err = codesage_graph::require_current_semantic_table(&db, &produces).unwrap_err();
+        assert!(
+            err.downcast_ref::<codesage_graph::StaleSemanticTable>()
+                .is_some(),
+            "typed as the stale-table refusal: {err}"
+        );
+        let err = err.to_string();
+        assert!(err.contains("codesage index --full"), "{err}");
+        assert!(
+            err.contains("device=cuda") && err.contains("device=cpu"),
+            "{err}"
+        );
     }
 
     #[test]

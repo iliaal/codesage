@@ -37,6 +37,7 @@
 - The model-artifact stat key records canonical paths (absolute, symlinks resolved); a relative `HF_HOME` keys the same as its absolute spelling and a relocated cache directory keys differently.
 - The daemon's last-client watcher stop re-reads the client count under the watcher registry lock immediately before signalling and aborts when a client has connected since the disconnect that scheduled it.
 - The daemon client's private fallback for texts the daemon refuses as over cap is bound to the pass fingerprint before it embeds; a session producing another identity is an error, never a silently embedded batch.
+- `codesage search` and query `export` bind the daemon-backed embedder to the table's fingerprint before embedding (an unbound request was refused with no private fallback), and the MCP semantic tools refuse a resident session whose fingerprint differs from the table's, naming `codesage index --full`.
 
 ## [0.22.0] - 2026-08-30
 

@@ -704,18 +704,48 @@ pub(crate) fn load_query_stack(
     Box<dyn codesage_graph::TextEmbedder>,
     Option<codesage_embed::reranker::Reranker>,
 )> {
+    load_query_stack_with(root, query_embedder, |db, emb_config, dim| {
+        // Resolved through the recorded attestation: with a daemon
+        // answering, no model file is read; without one, the private
+        // session's pin check already digested each file once and the
+        // shared cache answers the fingerprint.
+        commands::index::resolved_fingerprint(db, emb_config, dim)
+    })
+}
+
+/// [`load_query_stack`] over an injected embedder source and fingerprint
+/// resolver, so the assembly — table check, then the bind — is testable
+/// without a model on disk.
+fn load_query_stack_with(
+    root: &Path,
+    embedder_for: impl FnOnce(
+        &Path,
+        &EmbeddingConfig,
+    ) -> Result<(Box<dyn codesage_graph::TextEmbedder>, usize)>,
+    fingerprint_for: impl FnOnce(
+        &Database,
+        &EmbeddingConfig,
+        usize,
+    ) -> Result<codesage_graph::SemanticFingerprint>,
+) -> Result<(
+    Database,
+    Box<dyn codesage_graph::TextEmbedder>,
+    Option<codesage_embed::reranker::Reranker>,
+)> {
     let config = load_project_config(root)?;
     let emb_config = config.embedding.unwrap_or_default();
-    let (embedder, dim) = query_embedder(root, &emb_config)?;
+    let (mut embedder, dim) = embedder_for(root, &emb_config)?;
     let db = open_db_for_model(root, &emb_config.model, dim)?;
     // A table whose vectors were produced under another setup — or under
     // none this version attested — answers a query with wrong neighbours.
-    // Refuse (`EXIT_STALE_INDEX`) rather than serve them. Resolved through
-    // the recorded attestation: with a daemon answering, no model file is
-    // read; without one, the private session's pin check already digested
-    // each file once and the shared cache answers the fingerprint.
-    let fingerprint = commands::index::resolved_fingerprint(&db, &emb_config, dim)?;
+    // Refuse (`EXIT_STALE_INDEX`) rather than serve them.
+    let fingerprint = fingerprint_for(&db, &emb_config, dim)?;
     codesage_graph::require_current_semantic_table(&db, &fingerprint)?;
+    // The query vector must come from the setup the table's vectors did. A
+    // daemon session refuses here when it produces another identity (and
+    // will not embed unbound at all); a private session refuses a provider
+    // the fingerprint does not name.
+    embedder.bind_fingerprint(&fingerprint)?;
     let reranker = emb_config
         .reranker
         .as_ref()
@@ -1126,6 +1156,146 @@ fn run(cli: Cli) -> Result<()> {
 mod tests {
     use super::*;
     use codesage_embed::config::IndexConfig;
+
+    /// A project root whose chunk table for the default model is attested
+    /// under `fingerprint`, as a completed `index --full` leaves it.
+    fn attested_root(
+        fingerprint: &codesage_graph::SemanticFingerprint,
+        dim: usize,
+    ) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(PROJECT_DIR)).unwrap();
+        let model = EmbeddingConfig::default().model;
+        let db = open_db_for_model(dir.path(), &model, dim).unwrap();
+        db.record_semantic_fingerprint(fingerprint.as_str())
+            .unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_daemon_backed_query_stack_is_bound_to_the_table_fingerprint_and_embeds() {
+        use daemon_embed::tests::{FakeDaemon, fp_a, spawn_fake};
+        let daemon = FakeDaemon::new(4, &EmbeddingConfig::default().model);
+        let embedded = daemon.embedded.clone();
+        let (_dir, socket, handle) = spawn_fake(daemon);
+        let root = attested_root(&fp_a(), 4);
+        {
+            let (_db, mut embedder, reranker) = load_query_stack_with(
+                root.path(),
+                |_root, config| {
+                    let daemon =
+                        daemon_embed::DaemonEmbedder::connect_to(&socket, "/p", &config.model)?;
+                    let dim = daemon.dim();
+                    Ok((
+                        Box::new(daemon) as Box<dyn codesage_graph::TextEmbedder>,
+                        dim,
+                    ))
+                },
+                |_db, _config, _dim| Ok(fp_a()),
+            )
+            .unwrap();
+            assert!(reranker.is_none());
+            // An unbound daemon embedder refuses every non-empty request, so
+            // a query vector coming back is the bind having happened.
+            let query = embedder.embed_one("abc").unwrap();
+            assert_eq!(query[0], 3.0, "the daemon produced the query vector");
+            assert_eq!(embedded.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_daemon_producing_another_fingerprint_than_the_table_is_refused_before_embedding() {
+        use daemon_embed::tests::{FakeDaemon, fp_a, fp_b, spawn_fake};
+        // The table is current for the configured setup (A); the daemon's
+        // resident session pools the other way (B).
+        let daemon = FakeDaemon {
+            fingerprint: fp_b().as_str().to_string(),
+            ..FakeDaemon::new(4, &EmbeddingConfig::default().model)
+        };
+        let embedded = daemon.embedded.clone();
+        let (_dir, socket, handle) = spawn_fake(daemon);
+        let root = attested_root(&fp_a(), 4);
+        {
+            let err = load_query_stack_with(
+                root.path(),
+                |_root, config| {
+                    let daemon =
+                        daemon_embed::DaemonEmbedder::connect_to(&socket, "/p", &config.model)?;
+                    let dim = daemon.dim();
+                    Ok((
+                        Box::new(daemon) as Box<dyn codesage_graph::TextEmbedder>,
+                        dim,
+                    ))
+                },
+                |_db, _config, _dim| Ok(fp_a()),
+            )
+            .err()
+            .expect("a daemon on another fingerprint must not serve the query");
+            let err = format!("{err:#}");
+            assert!(err.contains(mcp::EMBED_TEXTS_FINGERPRINT_MISMATCH), "{err}");
+            assert!(
+                err.contains("pooling=cls") && err.contains("pooling=mean"),
+                "{err}"
+            );
+            assert_eq!(
+                embedded.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "nothing was embedded"
+            );
+        }
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_stale_table_is_refused_before_the_embedder_is_bound() {
+        use daemon_embed::tests::{fp_a, fp_b};
+        struct Recorder(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+        impl codesage_graph::TextEmbedder for Recorder {
+            fn bind_fingerprint(
+                &mut self,
+                expected: &codesage_graph::SemanticFingerprint,
+            ) -> Result<()> {
+                self.0.lock().unwrap().push(expected.as_str().to_string());
+                Ok(())
+            }
+            fn embed_batch(&mut self, _texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+                unreachable!("a stale table never reaches the embedder")
+            }
+        }
+        let bound = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let root = attested_root(&fp_a(), 4);
+        let result = load_query_stack_with(
+            root.path(),
+            |_root, _config| {
+                Ok((
+                    Box::new(Recorder(bound.clone())) as Box<dyn codesage_graph::TextEmbedder>,
+                    4,
+                ))
+            },
+            |_db, _config, _dim| Ok(fp_b()),
+        )
+        .map(|_| ());
+        assert_eq!(exit_code_for(&result), EXIT_STALE_INDEX);
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("codesage index --full"), "{err}");
+        assert!(bound.lock().unwrap().is_empty(), "no bind on a stale table");
+
+        // A current table binds the embedder to exactly its fingerprint.
+        let root = attested_root(&fp_a(), 4);
+        load_query_stack_with(
+            root.path(),
+            |_root, _config| {
+                Ok((
+                    Box::new(Recorder(bound.clone())) as Box<dyn codesage_graph::TextEmbedder>,
+                    4,
+                ))
+            },
+            |_db, _config, _dim| Ok(fp_a()),
+        )
+        .unwrap();
+        assert_eq!(*bound.lock().unwrap(), vec![fp_a().as_str().to_string()]);
+    }
 
     #[test]
     fn held_index_lock_is_a_distinct_nonzero_exit_not_a_success() {
