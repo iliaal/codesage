@@ -721,7 +721,7 @@ pub(crate) fn query_embedder(
     emb_config: &EmbeddingConfig,
 ) -> Result<(Box<dyn codesage_graph::TextEmbedder>, usize)> {
     #[cfg(unix)]
-    if let Some(daemon) = daemon_embed::DaemonEmbedder::connect(root, &emb_config.model) {
+    if let Some(daemon) = daemon_embed::DaemonEmbedder::connect(root, emb_config) {
         let dim = daemon.dim();
         return Ok((Box::new(daemon), dim));
     }

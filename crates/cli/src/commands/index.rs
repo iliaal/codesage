@@ -311,7 +311,7 @@ fn open_index_db_and_embedder(
     };
 
     let Some(dim) = recorded_dim else {
-        let (embedder, dim) = match daemon_embedder(root, &emb_config.model) {
+        let (embedder, dim) = match daemon_embedder(root, emb_config) {
             Some(pair) => pair,
             None => {
                 let mut cfg = emb_config.clone();
@@ -340,7 +340,7 @@ fn open_index_db_and_embedder(
     let init_config = emb_config.clone();
     let root = root.to_path_buf();
     let lazy = LazyEmbedder::new(Box::new(move |files_to_embed| {
-        let (embedder, produced) = match daemon_embedder(&root, &init_config.model) {
+        let (embedder, produced) = match daemon_embedder(&root, &init_config) {
             Some(pair) => pair,
             None => {
                 let mut cfg = init_config;
@@ -368,16 +368,19 @@ fn open_index_db_and_embedder(
 /// The running daemon's resident session for `model`, with its dimension,
 /// when a daemon spawned from this binary answers. `None` means embed
 /// privately; the refusal has already been logged.
-fn daemon_embedder(root: &Path, model: &str) -> Option<(Box<dyn TextEmbedder>, usize)> {
+fn daemon_embedder(
+    root: &Path,
+    emb_config: &EmbeddingConfig,
+) -> Option<(Box<dyn TextEmbedder>, usize)> {
     #[cfg(unix)]
     {
-        let daemon = crate::daemon_embed::DaemonEmbedder::connect(root, model)?;
+        let daemon = crate::daemon_embed::DaemonEmbedder::connect(root, emb_config)?;
         let dim = daemon.dim();
         Some((Box::new(daemon), dim))
     }
     #[cfg(not(unix))]
     {
-        let _ = (root, model);
+        let _ = (root, emb_config);
         None
     }
 }

@@ -43,6 +43,47 @@ const MAX_MCP_OFFSET: usize = 1_000;
 /// Per-call ceiling for the hidden `embed_texts` tool. The CLI sends one
 /// commit batch (50 files) per call, so this is headroom, not a target.
 pub(crate) const MAX_MCP_EMBED_TEXTS: usize = 4_096;
+/// Per-text byte ceiling for `embed_texts`. A chunk is at most
+/// `DEFAULT_CHUNK_SIZE` characters plus its overlap and symbol header; 32×
+/// the chunk size in bytes covers four-byte UTF-8 and a dense header many
+/// times over, while a whole file pasted as one text is refused.
+pub(crate) const MAX_MCP_EMBED_TEXT_BYTES: usize = 32 * codesage_embed::chunk::DEFAULT_CHUNK_SIZE;
+/// Aggregate byte ceiling per `embed_texts` call: every text at four bytes
+/// per chunk character, times the count cap (24 MiB at the defaults). The
+/// count cap alone let one call carry gigabytes.
+pub(crate) const MAX_MCP_EMBED_TOTAL_BYTES: usize =
+    MAX_MCP_EMBED_TEXTS * 4 * codesage_embed::chunk::DEFAULT_CHUNK_SIZE;
+/// Prefix of every `embed_texts` cap refusal. The CLI client keys its
+/// private-embedder fallback on it, so a daemon of another build still
+/// speaks the same refusal.
+pub(crate) const EMBED_TEXTS_OVER_CAP: &str = "embed_texts: over cap:";
+
+/// Refuse an `embed_texts` request whose count, any single text, or total
+/// bytes exceed the caps. The message names the cap that was hit.
+fn check_embed_texts_caps(texts: &[String]) -> Result<(), String> {
+    if texts.len() > MAX_MCP_EMBED_TEXTS {
+        return Err(format!(
+            "{EMBED_TEXTS_OVER_CAP} {} texts exceeds the per-call cap of {MAX_MCP_EMBED_TEXTS}",
+            texts.len()
+        ));
+    }
+    let mut total = 0usize;
+    for (i, text) in texts.iter().enumerate() {
+        if text.len() > MAX_MCP_EMBED_TEXT_BYTES {
+            return Err(format!(
+                "{EMBED_TEXTS_OVER_CAP} text {i} is {} bytes, over the per-text cap of {MAX_MCP_EMBED_TEXT_BYTES}",
+                text.len()
+            ));
+        }
+        total += text.len();
+    }
+    if total > MAX_MCP_EMBED_TOTAL_BYTES {
+        return Err(format!(
+            "{EMBED_TEXTS_OVER_CAP} {total} bytes in total, over the per-call cap of {MAX_MCP_EMBED_TOTAL_BYTES}"
+        ));
+    }
+    Ok(())
+}
 
 /// Tools the router dispatches but `tools/list` never advertises: the CLI
 /// calls them over the daemon socket so that one process holds the model
@@ -386,11 +427,8 @@ impl CodeSageServer {
         Parameters(params): Parameters<EmbedTextsParams>,
     ) -> CallToolResult {
         self.blocking(move |s| {
-            if params.texts.len() > MAX_MCP_EMBED_TEXTS {
-                return CallToolResult::error(vec![ContentBlock::text(format!(
-                    "embed_texts: {} texts exceeds the per-call cap of {MAX_MCP_EMBED_TEXTS}",
-                    params.texts.len()
-                ))]);
+            if let Err(refusal) = check_embed_texts_caps(&params.texts) {
+                return CallToolResult::error(vec![ContentBlock::text(refusal)]);
             }
             // Raw vectors, not a rendered digest: the budget cap and coverage
             // annotation the other tools go through would corrupt them.
@@ -915,6 +953,37 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+
+    #[test]
+    fn embed_texts_caps_bound_count_per_text_and_total_bytes() {
+        let ok: Vec<String> = vec!["a".repeat(MAX_MCP_EMBED_TEXT_BYTES); 3];
+        assert_eq!(check_embed_texts_caps(&ok), Ok(()));
+
+        let too_many: Vec<String> = vec![String::from("x"); MAX_MCP_EMBED_TEXTS + 1];
+        let err = check_embed_texts_caps(&too_many).unwrap_err();
+        assert!(err.starts_with(EMBED_TEXTS_OVER_CAP), "{err}");
+        assert!(err.contains("per-call cap"), "{err}");
+
+        // One text over the per-text cap is refused even though the count is
+        // tiny: the count cap alone let a single call carry a whole file.
+        let one_big = vec![String::from("ok"), "b".repeat(MAX_MCP_EMBED_TEXT_BYTES + 1)];
+        let err = check_embed_texts_caps(&one_big).unwrap_err();
+        assert!(err.starts_with(EMBED_TEXTS_OVER_CAP), "{err}");
+        assert!(err.contains("text 1 is"), "{err}");
+        assert!(err.contains("per-text cap"), "{err}");
+
+        // Every text under the per-text cap, but together over the aggregate.
+        let per_text = MAX_MCP_EMBED_TEXT_BYTES;
+        let count = MAX_MCP_EMBED_TOTAL_BYTES / per_text + 1;
+        assert!(
+            count <= MAX_MCP_EMBED_TEXTS,
+            "fixture must stay under the count cap"
+        );
+        let aggregate: Vec<String> = vec!["c".repeat(per_text); count];
+        let err = check_embed_texts_caps(&aggregate).unwrap_err();
+        assert!(err.starts_with(EMBED_TEXTS_OVER_CAP), "{err}");
+        assert!(err.contains("in total"), "{err}");
+    }
 
     #[test]
     fn typed_kind_params_advertise_enum_in_input_schema() {
