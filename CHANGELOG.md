@@ -1,5 +1,15 @@
 ## [Unreleased]
 
+### Added
+
+- Hidden daemon tool `embed_texts`: `index` and `search` embed through the running daemon's resident session instead of opening a private CUDA context, falling back to a private session when no daemon answers.
+
+### Changed
+
+- The live statewatcher re-embeds only chunks whose text changed, waits for 30 s of quiet, batches dirty paths into one pass, and defers while `.git/index.lock`, high load, or a cargo/rustc/pytest tree is present. It starts on the first semantic query, not on session start, and stops with the last client. An 8-save burst: 90 chunks → 1 embedded. (cs-r23)
+- `codesage index` constructs the embedder only when a pass has files to embed; a no-change incremental run never loads the model or maps CUDA (2.7–4.5 s and 1.16 GB → 0.08 s and 150 MB). `init_for_main` keeps only the env writes at startup; the CUDA/cuDNN preload moves to the first ONNX session. (cs-ox8)
+- Git hooks skip the binary when HEAD and the worktree status digest are unchanged (`.codesage/hook-state`, written only after both passes succeed) and embed on CPU when at most 32 files changed.
+
 ## [0.22.0] - 2026-08-30
 
 ### Security
