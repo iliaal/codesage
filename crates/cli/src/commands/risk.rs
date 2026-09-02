@@ -24,9 +24,7 @@ pub(crate) fn cmd_git_index(
     // at a time without the user seeing an error. `--lock-wait` bounds
     // a polling wait first — the watcher never refreshes git history, so
     // a hook-invoked skip would leave it stale until the next commit.
-    let Some(_lock) = acquire_index_lock(&root, "skipping", lock_wait)? else {
-        return Ok(());
-    };
+    let _lock = acquire_index_lock(&root, "skipping", lock_wait)?;
     let db = open_db(&root)?;
     let config = load_project_config(&root)?;
     let excludes = get_user_exclude_patterns(&config);

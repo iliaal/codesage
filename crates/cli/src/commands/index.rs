@@ -396,17 +396,12 @@ pub(crate) fn cmd_index(
         codesage_embed::config::validate_device(device)?;
     }
     // Acquire the project-level indexing lock before loading embedders or
-    // touching the DB. Skips work cleanly (exit 0) if another codesage
-    // indexer is already running on this project — the concurrency-audit
-    // finding from recommendations doc §2.4 said the previous behavior was
-    // "one process wins with rc=0, loser dies with SQLITE_BUSY", which
-    // looks like a failure in hook logs even though no data is at risk.
-    // `--lock-wait` bounds a polling wait first: the daemon's watcher
-    // debounce-indexes around commit time but never runs feature mapping,
-    // so a hook-invoked skip here would leave feature slices stale.
-    let Some(_lock) = acquire_index_lock(&root, "skipping", lock_wait)? else {
-        return Ok(());
-    };
+    // touching the DB. `--lock-wait` bounds a polling wait first: the
+    // daemon's watcher debounce-indexes around commit time but never runs
+    // feature mapping, so a skip here would leave feature slices stale.
+    // Contention past the window exits EXIT_LOCK_HELD: nothing was indexed,
+    // and the installed hook records its skip stamp only on exit 0.
+    let _lock = acquire_index_lock(&root, "skipping", lock_wait)?;
     let config = load_project_config(&root)?;
     let excludes = get_exclude_patterns(&config);
 
@@ -624,9 +619,7 @@ pub(crate) fn cmd_map(json: bool) -> Result<()> {
     // / cmd_cleanup hold so a manual `codesage map` doesn't race the background
     // hook-driven indexer (which maps features itself) into SQLITE_BUSY or a
     // partial multi-transaction state. Skip if an indexer already holds it.
-    let Some(_lock) = acquire_index_lock(&root, "skipping map", Duration::ZERO)? else {
-        return Ok(());
-    };
+    let _lock = acquire_index_lock(&root, "skipping map", Duration::ZERO)?;
     let db = open_db(&root)?;
     let config = load_project_config(&root)?;
     let excludes = get_exclude_patterns(&config);
@@ -772,9 +765,7 @@ pub(crate) fn cmd_cleanup(dry_run: bool) -> Result<()> {
     // Cleanup drops orphan vec tables (from prior model switches) — also
     // a writer-style operation that races with in-flight indexers. Same
     // lock coordination.
-    let Some(_lock) = acquire_index_lock(&root, "skipping cleanup", Duration::ZERO)? else {
-        return Ok(());
-    };
+    let _lock = acquire_index_lock(&root, "skipping cleanup", Duration::ZERO)?;
     let config = load_project_config(&root)?;
     let emb_config = config.embedding.unwrap_or_default();
 

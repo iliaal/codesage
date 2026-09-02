@@ -591,25 +591,65 @@ pub(crate) fn open_context_db_for_existing_model(root: &Path, model: &str) -> Re
         .context("failed to open index database")
 }
 
+/// Exit status when another indexer held the project lock for the whole
+/// wait window. Distinct from the generic `1` so a hook can tell "nothing
+/// was indexed, retry later" from "the run broke". `EX_TEMPFAIL` in
+/// sysexits terms.
+pub(crate) const EXIT_LOCK_HELD: i32 = 75;
+
+/// Another process held the project's indexing lock past the wait window.
+/// Nothing was indexed. Used to be reported as success, which let a hook
+/// record the tree as indexed and skip every later run on the same HEAD.
+#[derive(Debug)]
+pub(crate) struct IndexLockHeld {
+    root: PathBuf,
+    action: String,
+}
+
+impl std::fmt::Display for IndexLockHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "another codesage indexer is running on {} — {}",
+            self.root.display(),
+            self.action
+        )
+    }
+}
+
+impl std::error::Error for IndexLockHeld {}
+
 /// Try to acquire the project indexing lock, polling for up to `wait`
-/// (`Duration::ZERO` = single non-blocking attempt). On contention past
-/// the window, prints the standard "another indexer is running …
-/// {action}" line and returns `Ok(None)` so the caller can skip work
-/// cleanly:
-/// `let Some(_lock) = acquire_index_lock(&root, "skipping", wait)? else { return Ok(()) };`.
+/// (`Duration::ZERO` = single non-blocking attempt). Contention past the
+/// window is an [`IndexLockHeld`] error, which `main` maps to
+/// [`EXIT_LOCK_HELD`] rather than the generic failure code; the command did
+/// no work, and its caller must not record that it did.
 pub(crate) fn acquire_index_lock(
     root: &Path,
     action: &str,
     wait: Duration,
-) -> Result<Option<lockfile::IndexLock>> {
+) -> Result<lockfile::IndexLock> {
     match lockfile::acquire_with_wait(root, wait)? {
-        lockfile::LockOutcome::Acquired(lock) => Ok(Some(lock)),
-        lockfile::LockOutcome::AlreadyHeld => {
-            eprintln!(
-                "another codesage indexer is running on {} — {action}",
-                root.display()
-            );
-            Ok(None)
+        lockfile::LockOutcome::Acquired(lock) => Ok(lock),
+        lockfile::LockOutcome::AlreadyHeld => Err(IndexLockHeld {
+            root: root.to_path_buf(),
+            action: action.to_string(),
+        }
+        .into()),
+    }
+}
+
+/// Process exit status for a finished `run`.
+fn exit_code_for(result: &Result<()>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(e) if e.downcast_ref::<IndexLockHeld>().is_some() => {
+            eprintln!("{e}");
+            EXIT_LOCK_HELD
+        }
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            1
         }
     }
 }
@@ -778,13 +818,7 @@ fn main() {
 
     flush_stdio();
 
-    let code = match result {
-        Ok(()) => 0,
-        Err(e) => {
-            eprintln!("error: {e:#}");
-            1
-        }
-    };
+    let code = exit_code_for(&result);
 
     // Leave the process without running any teardown. ORT's session/arena
     // teardown interacts with sqlite-vec's extension destructors in a way that
@@ -1088,6 +1122,46 @@ fn run(cli: Cli) -> Result<()> {
 mod tests {
     use super::*;
     use codesage_embed::config::IndexConfig;
+
+    #[test]
+    fn held_index_lock_is_a_distinct_nonzero_exit_not_a_success() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".codesage")).unwrap();
+        let held = match lockfile::try_acquire(dir.path()).unwrap() {
+            lockfile::LockOutcome::Acquired(lock) => lock,
+            lockfile::LockOutcome::AlreadyHeld => panic!("fresh tmpdir must lock"),
+        };
+
+        let result = acquire_index_lock(dir.path(), "skipping", Duration::ZERO).map(|_| ());
+
+        let err = result
+            .as_ref()
+            .expect_err("a held lock must not read as acquired");
+        assert!(
+            err.downcast_ref::<IndexLockHeld>().is_some(),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            err.to_string()
+                .contains("another codesage indexer is running"),
+            "{err}"
+        );
+        assert_eq!(exit_code_for(&result), EXIT_LOCK_HELD);
+        assert_ne!(EXIT_LOCK_HELD, 0);
+        assert_ne!(
+            EXIT_LOCK_HELD, 1,
+            "must be distinguishable from a generic failure"
+        );
+        drop(held);
+
+        let acquired = acquire_index_lock(dir.path(), "skipping", Duration::ZERO).map(|_| ());
+        assert_eq!(exit_code_for(&acquired), 0);
+        assert_eq!(
+            exit_code_for(&Err(anyhow::anyhow!("boom"))),
+            1,
+            "other errors keep the generic code"
+        );
+    }
 
     #[test]
     fn exclude_patterns_no_user_config_returns_defaults() {
