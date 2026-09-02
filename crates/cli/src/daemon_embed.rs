@@ -44,8 +44,9 @@ pub(crate) struct DaemonEmbedder {
     /// identity of the vectors its session produces.
     daemon_fingerprint: String,
     /// The fingerprint the pass attests under, once bound. Sent with every
-    /// embed request so the daemon refuses the moment its own moves.
-    expected_fingerprint: Option<String>,
+    /// embed request so the daemon refuses the moment its own moves, and
+    /// bound to the private fallback before it embeds a text.
+    expected_fingerprint: Option<codesage_graph::SemanticFingerprint>,
     /// Private-embedder fallback for texts the daemon refuses as over cap
     /// — a single text past the per-text byte cap, or a refusal from a
     /// daemon of another build with tighter caps. Constructed on first use.
@@ -176,8 +177,21 @@ impl DaemonEmbedder {
             let init = self.private_init.take().with_context(|| {
                 format!("{why}, and no private embedder is configured to fall back to")
             })?;
+            // The private session must produce the same identity the pass
+            // attests; one that does not is an error here, never a batch
+            // embedded under a third identity.
+            let expected = self
+                .expected_fingerprint
+                .as_ref()
+                .context("no fingerprint bound before embedding privately")?;
             tracing::warn!(texts = texts.len(), "{why}; embedding these privately");
-            self.private = Some(init()?);
+            let mut private = init()?;
+            private.bind_fingerprint(expected).with_context(|| {
+                format!(
+                    "{why}; the private embedder does not produce the fingerprint this pass attests"
+                )
+            })?;
+            self.private = Some(private);
         }
         let out = self
             .private
@@ -206,7 +220,7 @@ impl DaemonEmbedder {
         arguments.insert("project".into(), self.project.clone().into());
         arguments.insert("model".into(), self.model.clone().into());
         if let Some(expected) = &self.expected_fingerprint {
-            arguments.insert("fingerprint".into(), expected.clone().into());
+            arguments.insert("fingerprint".into(), expected.as_str().into());
         }
         arguments.insert(
             "texts".into(),
@@ -301,7 +315,10 @@ impl TextEmbedder for DaemonEmbedder {
             self.daemon_fingerprint,
             expected.as_str()
         );
-        self.expected_fingerprint = Some(expected.as_str().to_string());
+        if let Some(private) = self.private.as_deref_mut() {
+            private.bind_fingerprint(expected)?;
+        }
+        self.expected_fingerprint = Some(expected.clone());
         Ok(())
     }
 
@@ -387,7 +404,7 @@ impl Drop for DaemonEmbedder {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::PathBuf;
 
     use rmcp::model::{
@@ -404,35 +421,38 @@ mod tests {
     /// first component is the text's length, records the model it was asked
     /// for, and refuses any other model.
     #[derive(Clone)]
-    struct FakeDaemon {
-        dim: usize,
-        model: String,
+    pub(crate) struct FakeDaemon {
+        pub(crate) dim: usize,
+        pub(crate) model: String,
         /// Refuse any text longer than this with the shared over-cap prefix,
         /// as a daemon of another build with tighter caps would.
-        text_cap: Option<usize>,
+        pub(crate) text_cap: Option<usize>,
         /// The fingerprint this daemon's session produces, reported at the
         /// probe and required on every non-empty request.
-        fingerprint: String,
+        pub(crate) fingerprint: String,
         /// When set, the fingerprint the session produces from the first
         /// non-empty request on: a same-model config change landing on the
         /// daemon between the probe and a later batch.
-        fingerprint_after_probe: Option<String>,
+        pub(crate) fingerprint_after_probe: Option<String>,
+        /// Texts embedded so far, across every accepted non-empty request.
+        pub(crate) embedded: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl FakeDaemon {
-        fn new(dim: usize, model: &str) -> Self {
+        pub(crate) fn new(dim: usize, model: &str) -> Self {
             Self {
                 dim,
                 model: model.to_string(),
                 text_cap: None,
                 fingerprint: fp_a().as_str().to_string(),
                 fingerprint_after_probe: None,
+                embedded: Default::default(),
             }
         }
     }
 
     /// The fingerprint every client in these tests attests under.
-    fn fp_a() -> codesage_graph::SemanticFingerprint {
+    pub(crate) fn fp_a() -> codesage_graph::SemanticFingerprint {
         codesage_graph::SemanticFingerprint::with_artifact_digest(
             &codesage_embed::config::EmbeddingConfig::default(),
             4,
@@ -441,7 +461,7 @@ mod tests {
     }
 
     /// The same model name and dimension, pooling the other way.
-    fn fp_b() -> codesage_graph::SemanticFingerprint {
+    pub(crate) fn fp_b() -> codesage_graph::SemanticFingerprint {
         let config = codesage_embed::config::EmbeddingConfig {
             pooling: Some(codesage_embed::config::PoolingStrategy::Cls),
             ..codesage_embed::config::EmbeddingConfig::default()
@@ -501,6 +521,8 @@ mod tests {
                     "client must never send a text over its own per-text cap"
                 );
             }
+            self.embedded
+                .fetch_add(texts.len(), std::sync::atomic::Ordering::SeqCst);
             let embeddings: Vec<Vec<f32>> = texts
                 .iter()
                 .map(|t| {
@@ -521,7 +543,9 @@ mod tests {
 
     /// Serve `daemon` on a fresh socket under a tempdir until the returned
     /// guard drops.
-    fn spawn_fake(daemon: FakeDaemon) -> (tempfile::TempDir, PathBuf, std::thread::JoinHandle<()>) {
+    pub(crate) fn spawn_fake(
+        daemon: FakeDaemon,
+    ) -> (tempfile::TempDir, PathBuf, std::thread::JoinHandle<()>) {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("mcp-test.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
@@ -573,13 +597,49 @@ mod tests {
     }
 
     /// Private stand-in: `dim`-wide vectors whose first component is -1 so a
-    /// test can tell which side produced each vector.
+    /// test can tell which side produced each vector. Records every
+    /// fingerprint bound to it and, when `produces` is set, refuses any
+    /// other one the way [`codesage_embed::model::Embedder`] refuses a
+    /// provider it does not run on.
     struct FakePrivate {
         dim: usize,
+        produces: Option<codesage_graph::SemanticFingerprint>,
+        bound_with: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        batches: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl FakePrivate {
+        fn new(dim: usize) -> Self {
+            Self {
+                dim,
+                produces: None,
+                bound_with: Default::default(),
+                batches: Default::default(),
+            }
+        }
     }
 
     impl TextEmbedder for FakePrivate {
+        fn bind_fingerprint(
+            &mut self,
+            expected: &codesage_graph::SemanticFingerprint,
+        ) -> Result<()> {
+            self.bound_with
+                .lock()
+                .unwrap()
+                .push(expected.as_str().to_string());
+            if let Some(produces) = &self.produces {
+                ensure!(
+                    produces == expected,
+                    "private session produces {produces}, this pass attests {expected}"
+                );
+            }
+            Ok(())
+        }
+
         fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+            self.batches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(texts
                 .iter()
                 .map(|_| {
@@ -619,7 +679,7 @@ mod tests {
             let mut client = DaemonEmbedder::connect_to(&socket, "/p", "m")
                 .unwrap()
                 .with_private_fallback(Box::new(|| {
-                    Ok(Box::new(FakePrivate { dim: 4 }) as Box<dyn TextEmbedder>)
+                    Ok(Box::new(FakePrivate::new(4)) as Box<dyn TextEmbedder>)
                 }));
             client.bind_fingerprint(&fp_a()).unwrap();
             let big = "x".repeat(MAX_MCP_EMBED_TEXT_BYTES + 1);
@@ -648,7 +708,7 @@ mod tests {
             let mut client = DaemonEmbedder::connect_to(&socket, "/p", "m")
                 .unwrap()
                 .with_private_fallback(Box::new(|| {
-                    Ok(Box::new(FakePrivate { dim: 4 }) as Box<dyn TextEmbedder>)
+                    Ok(Box::new(FakePrivate::new(4)) as Box<dyn TextEmbedder>)
                 }));
             client.bind_fingerprint(&fp_a()).unwrap();
             assert!(!client.private_loaded());
@@ -688,7 +748,7 @@ mod tests {
             let mut client = DaemonEmbedder::connect_to(&socket, "/p", "m")
                 .unwrap()
                 .with_private_fallback(Box::new(|| {
-                    Ok(Box::new(FakePrivate { dim: 4 }) as Box<dyn TextEmbedder>)
+                    Ok(Box::new(FakePrivate::new(4)) as Box<dyn TextEmbedder>)
                 }));
             let err = format!("{:#}", client.bind_fingerprint(&fp_a()).unwrap_err());
             assert!(err.contains(EMBED_TEXTS_FINGERPRINT_MISMATCH), "{err}");
@@ -719,13 +779,90 @@ mod tests {
             let mut client = DaemonEmbedder::connect_to(&socket, "/p", "m")
                 .unwrap()
                 .with_private_fallback(Box::new(|| {
-                    Ok(Box::new(FakePrivate { dim: 4 }) as Box<dyn TextEmbedder>)
+                    Ok(Box::new(FakePrivate::new(4)) as Box<dyn TextEmbedder>)
                 }));
             client.bind_fingerprint(&fp_a()).unwrap();
             let err = format!("{:#}", client.embed_batch(&["ab", "abcd"]).unwrap_err());
             assert!(err.contains(EMBED_TEXTS_FINGERPRINT_MISMATCH), "{err}");
             assert!(err.contains("moved during the pass"), "{err}");
             assert!(!client.private_loaded(), "no private embedder stands in");
+        }
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn the_private_fallback_is_bound_to_the_pass_fingerprint_before_it_embeds() {
+        let (_dir, socket, handle) = spawn_fake(FakeDaemon {
+            text_cap: Some(3),
+            ..FakeDaemon::new(4, "m")
+        });
+        {
+            let bound_with = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let batches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (bw, b) = (bound_with.clone(), batches.clone());
+            let mut client = DaemonEmbedder::connect_to(&socket, "/p", "m")
+                .unwrap()
+                .with_private_fallback(Box::new(move || {
+                    Ok(Box::new(FakePrivate {
+                        bound_with: bw,
+                        batches: b,
+                        ..FakePrivate::new(4)
+                    }) as Box<dyn TextEmbedder>)
+                }));
+            client.bind_fingerprint(&fp_a()).unwrap();
+            let out = client.embed_batch(&["abcd"]).unwrap();
+            assert_eq!(out[0][0], -1.0, "the refused batch is embedded privately");
+            assert_eq!(
+                *bound_with.lock().unwrap(),
+                vec![fp_a().as_str().to_string()],
+                "the private session is bound to the pass fingerprint exactly once, before use"
+            );
+            assert_eq!(batches.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_private_fallback_producing_another_fingerprint_is_an_error_not_a_silent_embed() {
+        // The daemon refuses the batch as over cap; the private session
+        // this process would build produces B while the pass attests A.
+        let (_dir, socket, handle) = spawn_fake(FakeDaemon {
+            text_cap: Some(3),
+            ..FakeDaemon::new(4, "m")
+        });
+        {
+            let batches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let b = batches.clone();
+            let mut client = DaemonEmbedder::connect_to(&socket, "/p", "m")
+                .unwrap()
+                .with_private_fallback(Box::new(move || {
+                    Ok(Box::new(FakePrivate {
+                        produces: Some(fp_b()),
+                        batches: b,
+                        ..FakePrivate::new(4)
+                    }) as Box<dyn TextEmbedder>)
+                }));
+            client.bind_fingerprint(&fp_a()).unwrap();
+            let err = format!("{:#}", client.embed_batch(&["ab", "abcd"]).unwrap_err());
+            assert!(err.contains("private session produces"), "{err}");
+            assert!(
+                err.contains("pooling=cls") && err.contains("pooling=mean"),
+                "{err}"
+            );
+            assert!(
+                err.contains("does not produce the fingerprint this pass attests"),
+                "{err}"
+            );
+            assert_eq!(
+                batches.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "no text reached the mismatched private session"
+            );
+            // The oversize route is refused the same way.
+            let big = "x".repeat(MAX_MCP_EMBED_TEXT_BYTES + 1);
+            let err = format!("{:#}", client.embed_batch(&[big.as_str()]).unwrap_err());
+            assert!(err.contains("no private embedder is configured"), "{err}");
+            assert_eq!(batches.load(std::sync::atomic::Ordering::SeqCst), 0);
         }
         handle.join().unwrap();
     }
