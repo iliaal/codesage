@@ -25,8 +25,34 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::chunk::{CHUNKER_VERSION, ChunkConfig};
-use crate::config::EmbeddingConfig;
+use crate::config::{EmbeddingConfig, MAX_SEQ_LENGTH};
 use crate::model::{ModelArtifacts, resolve_model_artifacts};
+
+/// Version of the embedding pipeline's fixed policy: the tokenizer
+/// truncation at [`MAX_SEQ_LENGTH`], `BatchLongest` padding, and the
+/// unconditional L2 normalisation of every pooled vector (`model.rs`,
+/// `embed_batch_inner`). None of these is visible in the model files or the
+/// config, yet each changes the bytes a chunk embeds to. Bump this whenever
+/// one of them changes; a stored table then reads as stale and is re-embedded.
+pub const EMBEDDING_PIPELINE_VERSION: u32 = 1;
+
+/// The pipeline inputs that go into a fingerprint, as one struct so a test
+/// can vary them without editing a constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PipelineIdentity {
+    pub version: u32,
+    pub max_seq_length: usize,
+    pub normalized: bool,
+}
+
+impl PipelineIdentity {
+    /// The pipeline this build runs.
+    pub const CURRENT: Self = Self {
+        version: EMBEDDING_PIPELINE_VERSION,
+        max_seq_length: MAX_SEQ_LENGTH,
+        normalized: true,
+    };
+}
 
 /// Opaque, comparable identity of an embedding setup. Persisted beside the
 /// chunk table and compared byte-for-byte before any stored vector is reused.
@@ -55,21 +81,38 @@ impl SemanticFingerprint {
     }
 
     /// The fingerprint for `config` given an already-computed artifact
-    /// digest. Pure; the persisted form is built here and nowhere else.
+    /// digest. Pure.
     pub fn with_artifact_digest(
         config: &EmbeddingConfig,
         dim: usize,
         artifact_digest: &str,
+    ) -> Self {
+        Self::with_pipeline(config, dim, artifact_digest, &PipelineIdentity::CURRENT)
+    }
+
+    /// The persisted form is built here and nowhere else.
+    pub fn with_pipeline(
+        config: &EmbeddingConfig,
+        dim: usize,
+        artifact_digest: &str,
+        pipeline: &PipelineIdentity,
     ) -> Self {
         let chunk = ChunkConfig::default();
         let pooling = match config.pooling_strategy() {
             crate::config::PoolingStrategy::Mean => "mean",
             crate::config::PoolingStrategy::Cls => "cls",
         };
+        let normalized = if pipeline.normalized { "l2" } else { "none" };
         Self(format!(
-            "v2;model={};artifacts={artifact_digest};dim={dim};pooling={pooling};\
+            "v3;model={};artifacts={artifact_digest};dim={dim};pooling={pooling};\
+             pipeline={};maxseq={};norm={normalized};\
              chunker={CHUNKER_VERSION};chunk={}/{}/{}",
-            config.model, chunk.chunk_size, chunk.min_chunk_size, chunk.overlap
+            config.model,
+            pipeline.version,
+            pipeline.max_seq_length,
+            chunk.chunk_size,
+            chunk.min_chunk_size,
+            chunk.overlap
         ))
     }
 
@@ -185,6 +228,51 @@ mod tests {
         let file = std::fs::File::open(path).unwrap();
         let later = std::fs::metadata(path).unwrap().modified().unwrap() + Duration::from_secs(2);
         file.set_modified(later).unwrap();
+    }
+
+    #[test]
+    fn pipeline_version_and_policy_are_part_of_the_identity() {
+        let config = EmbeddingConfig::default();
+        let current = SemanticFingerprint::with_artifact_digest(&config, 384, "d");
+        assert!(
+            current.as_str().contains(&format!(
+                "pipeline={EMBEDDING_PIPELINE_VERSION};maxseq={MAX_SEQ_LENGTH};norm=l2"
+            )),
+            "{current}"
+        );
+        let bumped = SemanticFingerprint::with_pipeline(
+            &config,
+            384,
+            "d",
+            &PipelineIdentity {
+                version: EMBEDDING_PIPELINE_VERSION + 1,
+                ..PipelineIdentity::CURRENT
+            },
+        );
+        assert_ne!(current, bumped, "a pipeline version bump must be visible");
+        let longer = SemanticFingerprint::with_pipeline(
+            &config,
+            384,
+            "d",
+            &PipelineIdentity {
+                max_seq_length: MAX_SEQ_LENGTH * 2,
+                ..PipelineIdentity::CURRENT
+            },
+        );
+        assert_ne!(current, longer, "a truncation change must be visible");
+        let raw = SemanticFingerprint::with_pipeline(
+            &config,
+            384,
+            "d",
+            &PipelineIdentity {
+                normalized: false,
+                ..PipelineIdentity::CURRENT
+            },
+        );
+        assert_ne!(
+            current, raw,
+            "dropping the L2 normalisation must be visible"
+        );
     }
 
     #[test]
