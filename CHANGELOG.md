@@ -24,6 +24,10 @@
 - The daemon's watcher restart key and embedder pool key include pooling, batch size, and the model-file digest; a pooling change or a same-name model edit replaces the watcher and the session.
 - The git hook's untracked-file digest is NUL-delimited end to end (`git ls-files -z` into `xargs -0`); a name with a newline is hashed by content instead of recorded as special. Files over 8 MB, or past a 256 MB read budget, contribute size and mtime.
 - `scripts/refresh-onboarded-repos.sh` reports an index exit 75 (lock held) as retry-later, still refreshes that repo's hooks and hint, and exits 75 itself when nothing else failed.
+- `codesage index`, `status`, `search`, the MCP semantic tools, and the daemon watcher derive the semantic fingerprint from the table's recorded attestation (digest plus model-file paths, sizes, mtimes) and read the model files only when that stat key differs; a no-change `index` reads none. `status` never downloads a model and reports fingerprint `unknown` when the files are not cached. (cs-ox8)
+- An incremental or per-file semantic pass over a table whose fingerprint is absent or differs clears the old record before its first write; a pass interrupted midway leaves the table unattested under every setup, and `search` refuses it until `codesage index --full` completes.
+- The semantic fingerprint covers `EMBEDDING_PIPELINE_VERSION`, the 512-token truncation, and the L2 normalisation of every vector; every existing chunk table re-embeds once on its next `index`.
+- The git hook's worktree digest lists tracked changes and untracked files NUL-delimited into one list, checksums each under a single 256 MB budget carried across `xargs` batches through a file, digests the name list (a deleted tracked file changes the stamp), and no longer runs `git diff --binary`; a `readlink` failure fails the digest, and the temp files are removed on `EXIT`, `INT`, and `TERM`.
 
 ## [0.22.0] - 2026-08-30
 
