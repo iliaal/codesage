@@ -101,10 +101,17 @@ pub(crate) fn cmd_install_hooks(with_leak_check: bool) -> Result<()> {
 /// previous hook run wrote after both passes exited 0. A match means
 /// nothing the hook indexes has changed (a release commit that touched
 /// only ignored files, a checkout back to the same tree, a rewrite that
-/// kept HEAD), and the binary is not invoked at all — a `git status` costs
-/// milliseconds where a process start plus lock handshake costs a second.
-/// The stamp is taken before the run and written after it, so a worktree
-/// that moves during the run never matches the next time.
+/// kept HEAD), and the binary is not invoked at all. The digest covers
+/// CONTENT — `git diff HEAD --binary` for every tracked change plus a
+/// checksum of every untracked file — not `git status`, whose output is
+/// status letters and paths: a second edit to an already-modified file left
+/// that unchanged and a same-HEAD hook skipped the reindex. Every stage's
+/// exit status is checked; any failure leaves the stamp empty, which never
+/// matches and is never written, so the binary runs. The stamp is taken
+/// before the run and written after it, so a worktree that moves during the
+/// run never matches the next time. A pass that exits nonzero — including
+/// `EXIT_LOCK_HELD` when another indexer held the lock for the whole wait —
+/// withholds the stamp, so the next hook retries.
 ///
 /// The index pass carries `--device cpu`: an incremental pass embeds a
 /// handful of changed files, and on that count a CUDA context bring-up costs
@@ -141,9 +148,27 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
          # permanent skip.\n\
          state=\"$root/.codesage/hook-state\"\n\
          if [ -L \"$state\" ] || {{ [ -e \"$state\" ] && [ ! -f \"$state\" ]; }}; then state=/dev/null; fi\n\
+         # Content digest of the worktree relative to HEAD: every tracked\n\
+         # change as a binary patch, plus name and checksum of every untracked\n\
+         # file. Each stage's status is checked; one failure fails the digest.\n\
+         worktree_digest() {{\n\
+           tracked=\"$(git diff HEAD --binary --no-ext-diff --no-color -- . ':(exclude).codesage')\" || return 1\n\
+           untracked=\"$(git ls-files -o --exclude-standard -- . ':(exclude).codesage')\" || return 1\n\
+           sums=\"$(printf '%s\\n' \"$untracked\" | while IFS= read -r f; do\n\
+             [ -n \"$f\" ] || continue\n\
+             if [ -L \"$f\" ]; then printf '%s -> %s\\n' \"$f\" \"$(readlink \"$f\")\" || exit 1\n\
+             elif [ -f \"$f\" ]; then cksum \"$f\" || exit 1\n\
+             else printf '%s (special)\\n' \"$f\"\n\
+             fi\n\
+           done)\" || return 1\n\
+           printf '%s\\n%s\\n' \"$tracked\" \"$sums\" | cksum\n\
+         }}\n\
          head=\"$(git rev-parse HEAD 2>/dev/null)\" || head=\"\"\n\
-         stamp=\"$head $(git status --porcelain -- . ':(exclude).codesage' 2>/dev/null | cksum)\"\n\
-         if [ -n \"$head\" ] && [ -f \"$state\" ] && [ \"$(cat \"$state\" 2>/dev/null)\" = \"$stamp\" ]; then\n\
+         stamp=\"\"\n\
+         if [ -n \"$head\" ]; then\n\
+           digest=\"$(worktree_digest 2>/dev/null)\" && stamp=\"$head $digest\"\n\
+         fi\n\
+         if [ -n \"$stamp\" ] && [ -f \"$state\" ] && [ \"$(cat \"$state\" 2>/dev/null)\" = \"$stamp\" ]; then\n\
            echo \"[$(date)] $(basename \"$0\") hook skip: HEAD and worktree unchanged since last index\" >>\"$log\"\n\
            exit 0\n\
          fi\n\
@@ -157,7 +182,9 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
          # polls it out instead of skipping. --device cpu keeps a few changed\n\
          # files off the GPU; the binary ignores it past --device-max-files.\n\
          # The stamp is recorded only after both passes exit 0, so a failed\n\
-         # run is retried by the next hook.\n\
+         # run — or one that exited 75 because another indexer held the lock\n\
+         # for the whole wait — is retried by the next hook. An empty stamp\n\
+         # (no HEAD, or a digest stage failed) is never recorded.\n\
          ( cd \"$root\" || exit 0\n\
            echo \"[$(date)] $(basename \"$0\") hook start\" >>\"$log\"\n\
            $IONICE $NICE {bin} index --lock-wait 60 --device cpu >>\"$log\" 2>&1; rc=$?\n\
@@ -165,7 +192,7 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
            index_rc=$rc\n\
            $IONICE $NICE {bin} git-index --incremental --lock-wait 60 >>\"$log\" 2>&1; rc=$?\n\
            echo \"[$(date)] git-index exit=$rc\" >>\"$log\"\n\
-           [ -n \"$head\" ] && [ \"$index_rc\" -eq 0 ] && [ \"$rc\" -eq 0 ] && printf '%s\\n' \"$stamp\" >\"$state\" ) >>\"$log\" 2>&1 &\n\
+           [ -n \"$stamp\" ] && [ \"$index_rc\" -eq 0 ] && [ \"$rc\" -eq 0 ] && printf '%s\\n' \"$stamp\" >\"$state\" ) >>\"$log\" 2>&1 &\n\
          exit 0\n",
     )
 }
@@ -456,21 +483,43 @@ mod tests {
     }
 
     #[test]
-    fn post_commit_hook_early_exit_keys_on_head_and_status_digest() {
+    fn post_commit_hook_early_exit_keys_on_head_and_content_digest() {
         let body = generate_post_commit_hook_body("/x");
         assert!(
             body.contains("state=\"$root/.codesage/hook-state\""),
             "expected the hook-state path, got:\n{body}"
         );
+        // Content, not status: the tracked side is a binary patch against
+        // HEAD and the untracked side checksums each file. `git status
+        // --porcelain` must be gone — its output is unchanged by a second
+        // edit to an already-modified file.
         assert!(
-            body.contains(
-                "stamp=\"$head $(git status --porcelain -- . ':(exclude).codesage' 2>/dev/null | cksum)\""
-            ),
-            "stamp must combine HEAD with a worktree-status digest, got:\n{body}"
+            !body.contains("git status"),
+            "the stamp must not be keyed on `git status` output:\n{body}"
         );
         assert!(
-            body.contains("if [ -n \"$head\" ] && [ -f \"$state\" ] && [ \"$(cat \"$state\" 2>/dev/null)\" = \"$stamp\" ]; then"),
-            "expected the skip comparison, got:\n{body}"
+            body.contains(
+                "tracked=\"$(git diff HEAD --binary --no-ext-diff --no-color -- . ':(exclude).codesage')\" || return 1"
+            ),
+            "tracked changes must be digested as content with the stage checked, got:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "untracked=\"$(git ls-files -o --exclude-standard -- . ':(exclude).codesage')\" || return 1"
+            ),
+            "untracked listing must be stage-checked, got:\n{body}"
+        );
+        assert!(
+            body.contains("elif [ -f \"$f\" ]; then cksum \"$f\" || exit 1"),
+            "untracked file content must be checksummed with the stage checked, got:\n{body}"
+        );
+        assert!(
+            body.contains("digest=\"$(worktree_digest 2>/dev/null)\" && stamp=\"$head $digest\""),
+            "a failed digest must leave the stamp empty, got:\n{body}"
+        );
+        assert!(
+            body.contains("if [ -n \"$stamp\" ] && [ -f \"$state\" ] && [ \"$(cat \"$state\" 2>/dev/null)\" = \"$stamp\" ]; then"),
+            "expected the skip comparison gated on a non-empty stamp, got:\n{body}"
         );
         // The skip must be decided before the binary is launched, and the
         // stamp written only after both passes exited 0.
@@ -479,8 +528,10 @@ mod tests {
         let record = body.find("printf '%s\\n' \"$stamp\" >\"$state\"").unwrap();
         assert!(skip < launch && launch < record, "{body}");
         assert!(
-            body.contains("[ \"$index_rc\" -eq 0 ] && [ \"$rc\" -eq 0 ] && printf"),
-            "stamp must require both passes to succeed, got:\n{body}"
+            body.contains(
+                "[ -n \"$stamp\" ] && [ \"$index_rc\" -eq 0 ] && [ \"$rc\" -eq 0 ] && printf"
+            ),
+            "stamp must require a computed digest and both passes exiting 0, got:\n{body}"
         );
         // Same symlink guard as the log, before the first use of $state.
         assert!(
@@ -598,18 +649,273 @@ mod tests {
         // A worktree change with the same HEAD defeats the skip.
         std::fs::write(root.join("a.txt"), "changed\n").unwrap();
         assert!(run_script(&hook, root).success());
+        let starts_after = |n: usize, why: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let content = std::fs::read_to_string(&log).unwrap_or_default();
+                if content.matches("hook start").count() == n
+                    && content.matches("] git-index exit=0").count() == n
+                {
+                    return;
+                }
+                assert!(std::time::Instant::now() < deadline, "{why}:\n{content}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        starts_after(2, "dirty worktree must re-run the passes");
+        let wait_stamp_change = |previous: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let now = std::fs::read_to_string(&state).unwrap_or_default();
+                if !now.is_empty() && now != previous {
+                    return now;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "stamp never moved past {previous:?}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        let stamp_modified = wait_stamp_change(&stamp);
+
+        // The file is still "modified" in `git status` terms, so a status
+        // digest would be identical here; the content digest must not be.
+        std::fs::write(root.join("a.txt"), "changed again\n").unwrap();
+        assert!(run_script(&hook, root).success());
+        starts_after(3, "a second edit to an already-modified file must re-run");
+        let stamp_modified_again = wait_stamp_change(&stamp_modified);
+
+        // Untracked content is part of the digest too: creating the file and
+        // then editing it are two changes, and both must run the passes.
+        std::fs::write(root.join("u.txt"), "u1\n").unwrap();
+        assert!(run_script(&hook, root).success());
+        starts_after(4, "a new untracked file must re-run");
+        let stamp_untracked = wait_stamp_change(&stamp_modified_again);
+        std::fs::write(root.join("u.txt"), "u2\n").unwrap();
+        assert!(run_script(&hook, root).success());
+        starts_after(5, "an edit to an untracked file must re-run");
+        wait_stamp_change(&stamp_untracked);
+
+        // Same tree once more: skipped.
+        assert!(run_script(&hook, root).success());
+        let content = wait_for("hook skip:");
+        assert_eq!(content.matches("hook skip:").count(), 2, "{content}");
+        assert_eq!(content.matches("hook start").count(), 5, "{content}");
+    }
+
+    #[cfg(unix)]
+    fn git_repo_with_one_commit(root: &std::path::Path) {
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "t"],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        }
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        for args in [vec!["add", "a.txt"], vec!["commit", "-q", "-m", "one"]] {
+            let status = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        }
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn install_hook_with_stub(root: &std::path::Path, stub_body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let stub = root.join("codesage-stub");
+        std::fs::write(&stub, stub_body).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let hook = root.join(".git/hooks/post-commit");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hook,
+            generate_post_commit_hook_body(stub.to_str().unwrap()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        hook
+    }
+
+    #[cfg(unix)]
+    fn wait_for_log(log: &std::path::Path, needle: &str) -> String {
+        use std::time::Duration;
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let content = std::fs::read_to_string(&log).unwrap_or_default();
-            if content.matches("hook start").count() == 2 {
-                break;
+            let content = std::fs::read_to_string(log).unwrap_or_default();
+            if content.contains(needle) {
+                return content;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "dirty worktree must re-run the passes:\n{content}"
+                "log never recorded {needle:?}:\n{content}"
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_commit_hook_runs_the_binary_and_writes_no_stamp_when_git_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_repo_with_one_commit(root);
+        let hook = install_hook_with_stub(
+            root,
+            "#!/bin/sh\necho \"stub ran: $1\" >> \"$(git rev-parse --show-toplevel)/.codesage/stub.mark\"\nexit 0\n",
+        );
+
+        // A `git` whose `diff` fails, ahead of the real one on PATH. The old
+        // stamp piped this failure into a successful `cksum`, so a broken
+        // digest still matched itself and the binary was skipped.
+        let real_git = String::from_utf8(
+            std::process::Command::new("sh")
+                .args(["-c", "command -v git"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let shim_dir = root.join("shim");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        let shim = shim_dir.join("git");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = diff ]; then echo 'simulated git failure' >&2; exit 128; fi\nexec '{}' \"$@\"\n",
+                real_git.trim()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            shim_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let run_with_shim = || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                match std::process::Command::new(&hook)
+                    .current_dir(root)
+                    .env("PATH", &path)
+                    .status()
+                {
+                    Ok(status) => return status,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("hook spawn failed: {e}"),
+                }
+            }
+        };
+
+        let log = root.join(".codesage/hooks.log");
+        let state = root.join(".codesage/hook-state");
+        for run in 1..=2 {
+            assert!(run_with_shim().success(), "hook must still exit 0");
+            let content = {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    let content = std::fs::read_to_string(&log).unwrap_or_default();
+                    if content.matches("] git-index exit=0").count() == run {
+                        break content;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "run {run}: passes never completed:\n{content}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            };
+            assert_eq!(
+                content.matches("hook start").count(),
+                run,
+                "run {run}: the binary must run when the digest cannot be computed:\n{content}"
+            );
+            assert!(
+                !content.contains("hook skip:"),
+                "run {run}: a failed digest must never match a stamp:\n{content}"
+            );
+            // Both passes exited 0, yet nothing may be recorded: an empty
+            // stamp would otherwise be written and match itself forever.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(
+                !state.exists(),
+                "run {run}: no stamp may be written when a digest stage failed"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join(".codesage/stub.mark")).unwrap(),
+            "stub ran: index\nstub ran: git-index\nstub ran: index\nstub ran: git-index\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_commit_hook_withholds_the_stamp_when_index_exits_lock_held() {
+        // `codesage index` exits EXIT_LOCK_HELD (75) when another indexer
+        // held the lock for the whole wait: nothing was indexed. The hook
+        // must not record the tree as indexed, or every later run on this
+        // HEAD would skip and the index would stay stale for good.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_repo_with_one_commit(root);
+        let hook = install_hook_with_stub(
+            root,
+            &format!(
+                "#!/bin/sh\necho \"stub ran: $1\" >> \"$(git rev-parse --show-toplevel)/.codesage/stub.mark\"\n[ \"$1\" = index ] && exit {}\nexit 0\n",
+                crate::EXIT_LOCK_HELD
+            ),
+        );
+        let log = root.join(".codesage/hooks.log");
+        let state = root.join(".codesage/hook-state");
+
+        assert!(run_script(&hook, root).success());
+        let content = wait_for_log(&log, "] git-index exit=0");
+        assert!(
+            content.contains(&format!("] index exit={}", crate::EXIT_LOCK_HELD)),
+            "{content}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !state.exists(),
+            "a lock-held index pass indexed nothing; the stamp must be withheld"
+        );
+
+        // The next hook on the same tree retries instead of skipping.
+        assert!(run_script(&hook, root).success());
+        let content = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let content = std::fs::read_to_string(&log).unwrap_or_default();
+                if content.matches("hook start").count() == 2 {
+                    break content;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "second run must retry the passes:\n{content}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        };
+        assert!(!content.contains("hook skip:"), "{content}");
     }
 
     #[cfg(unix)]
