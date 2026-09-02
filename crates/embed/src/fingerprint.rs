@@ -25,7 +25,7 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::chunk::{CHUNKER_VERSION, ChunkConfig};
-use crate::config::{EmbeddingConfig, MAX_SEQ_LENGTH};
+use crate::config::{EmbeddingConfig, MAX_SEQ_LENGTH, wants_coreml, wants_cuda};
 use crate::model::{ModelArtifacts, resolve_model_artifacts};
 
 /// Version of the embedding pipeline's fixed policy: the tokenizer
@@ -142,10 +142,15 @@ impl SemanticFingerprint {
             crate::config::PoolingStrategy::Cls => "cls",
         };
         let normalized = if pipeline.normalized { "l2" } else { "none" };
+        // The execution provider is part of the identity: CPU and CUDA
+        // kernels do not produce bit-identical vectors, so a table must hold
+        // one backend's output only. Spellings that select the same provider
+        // (`gpu`, `cuda`) fingerprint the same.
+        let device = execution_provider(&config.device);
         Self {
             text: format!(
                 "v3;model={};artifacts={artifact_digest};dim={dim};pooling={pooling};\
-                 pipeline={};maxseq={};norm={normalized};\
+                 device={device};pipeline={};maxseq={};norm={normalized};\
                  chunker={CHUNKER_VERSION};chunk={}/{}/{}",
                 config.model,
                 pipeline.version,
@@ -180,6 +185,17 @@ impl SemanticFingerprint {
 impl fmt::Display for SemanticFingerprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.text)
+    }
+}
+
+/// The execution provider a configured `device` string selects.
+fn execution_provider(device: &str) -> &'static str {
+    if wants_cuda(device) {
+        "cuda"
+    } else if wants_coreml(device) {
+        "coreml"
+    } else {
+        "cpu"
     }
 }
 
@@ -390,6 +406,31 @@ mod tests {
         assert_eq!(attested, fp);
         assert_eq!(attested.artifact_stat_key(), fp.artifact_stat_key());
         assert_eq!(artifact_read_count(&artifacts.onnx), before + 1);
+    }
+
+    #[test]
+    fn device_is_part_of_the_identity_by_execution_provider() {
+        let gpu = EmbeddingConfig {
+            device: "gpu".to_string(),
+            ..EmbeddingConfig::default()
+        };
+        let cuda = EmbeddingConfig {
+            device: "CUDA".to_string(),
+            ..EmbeddingConfig::default()
+        };
+        let cpu = EmbeddingConfig {
+            device: "cpu".to_string(),
+            ..EmbeddingConfig::default()
+        };
+        let fp = |c: &EmbeddingConfig| SemanticFingerprint::with_artifact_digest(c, 384, "d");
+        assert_eq!(fp(&gpu), fp(&cuda), "two spellings of one provider");
+        assert_ne!(
+            fp(&gpu),
+            fp(&cpu),
+            "CPU and CUDA vectors must never share a table"
+        );
+        assert!(fp(&gpu).as_str().contains("device=cuda"), "{}", fp(&gpu));
+        assert!(fp(&cpu).as_str().contains("device=cpu"), "{}", fp(&cpu));
     }
 
     #[test]
