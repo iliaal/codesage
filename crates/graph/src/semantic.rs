@@ -897,6 +897,7 @@ mod tests {
             tokenizer,
             onnx,
             onnx_data: None,
+            ort_runtime: None,
         }
     }
 

@@ -79,6 +79,26 @@ struct FingerprintInputs {
     pooling: &'static str,
     execution_provider: String,
     pipeline: PipelineIdentity,
+    ort_runtime: String,
+}
+
+/// The ONNX Runtime this build embeds through, as the fingerprint names it.
+/// On a dynamic-loading target the runtime's bytes are digested with the
+/// model files (the `ort_runtime` entry of [`ModelArtifacts::labelled_files`]),
+/// so this tag records the API level the crate was compiled against and
+/// that the library itself is in the artifact digest. On a static target the
+/// runtime is part of the binary: its build-info string (version, commit,
+/// compile flags) is digested here instead.
+pub fn ort_runtime_tag() -> String {
+    #[cfg(target_vendor = "apple")]
+    {
+        let build = hex::encode(Sha256::digest(ort::info().as_bytes()));
+        format!("api1.{}/static:{}", ort::MINOR_VERSION, &build[..16])
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        format!("api1.{}/dylib", ort::MINOR_VERSION)
+    }
 }
 
 impl PartialEq for SemanticFingerprint {
@@ -166,6 +186,7 @@ impl SemanticFingerprint {
             pooling,
             execution_provider: configured_execution_provider(&config.device).to_string(),
             pipeline: *pipeline,
+            ort_runtime: ort_runtime_tag(),
         };
         Self {
             text: render(&inputs, artifact_digest),
@@ -227,13 +248,14 @@ fn render(inputs: &FingerprintInputs, artifact_digest: &str) -> String {
         "none"
     };
     format!(
-        "v3;model={};artifacts={artifact_digest};dim={};pooling={};\
-         device={};pipeline={};maxseq={};norm={normalized};\
+        "v4;model={};artifacts={artifact_digest};dim={};pooling={};\
+         device={};ort={};pipeline={};maxseq={};norm={normalized};\
          chunker={CHUNKER_VERSION};chunk={}/{}/{}",
         inputs.model,
         inputs.dim,
         inputs.pooling,
         inputs.execution_provider,
+        inputs.ort_runtime,
         inputs.pipeline.version,
         inputs.pipeline.max_seq_length,
         chunk.chunk_size,
@@ -378,6 +400,7 @@ mod tests {
             tokenizer,
             onnx,
             onnx_data: None,
+            ort_runtime: None,
         }
     }
 
@@ -582,6 +605,7 @@ mod tests {
             tokenizer: artifacts.onnx.clone(),
             onnx: artifacts.tokenizer.clone(),
             onnx_data: None,
+            ort_runtime: None,
         };
         assert_ne!(plain, model_artifact_digest(&swapped).unwrap());
 
@@ -592,6 +616,59 @@ mod tests {
             ..artifacts
         };
         assert_ne!(plain, model_artifact_digest(&with_sidecar).unwrap());
+    }
+
+    #[test]
+    fn the_onnx_runtime_is_part_of_the_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = EmbeddingConfig::default();
+        let without = scratch_artifacts(dir.path());
+        let runtime = dir.path().join("libonnxruntime.so.1.24.1");
+        std::fs::write(&runtime, b"ELF onnxruntime 1.24.1 kernels").unwrap();
+        let with = ModelArtifacts {
+            ort_runtime: Some(runtime.clone()),
+            ..without.clone()
+        };
+
+        let fp_without = SemanticFingerprint::for_artifacts(&config, 384, &without).unwrap();
+        let fp_with = SemanticFingerprint::for_artifacts(&config, 384, &with).unwrap();
+        assert!(fp_with.as_str().starts_with("v4;"), "{fp_with}");
+        assert!(
+            fp_with
+                .as_str()
+                .contains(&format!(";ort={};", ort_runtime_tag())),
+            "{fp_with}"
+        );
+        assert_ne!(
+            fp_without, fp_with,
+            "a runtime joining the artifact set must be visible"
+        );
+        assert!(
+            fp_with
+                .artifact_stat_key()
+                .unwrap()
+                .contains("ort_runtime="),
+            "the stat key names the runtime: {:?}",
+            fp_with.artifact_stat_key()
+        );
+        assert!(
+            !fp_without
+                .artifact_stat_key()
+                .unwrap()
+                .contains("ort_runtime="),
+            "{:?}",
+            fp_without.artifact_stat_key()
+        );
+
+        // An ORT upgrade: same model files, other runtime bytes.
+        flip_one_byte(&runtime);
+        let upgraded = SemanticFingerprint::for_artifacts(&config, 384, &with).unwrap();
+        assert_ne!(
+            fp_with, upgraded,
+            "a changed runtime library must change the fingerprint"
+        );
+        assert_ne!(fp_with.artifact_digest(), upgraded.artifact_digest());
+        assert_ne!(fp_with.artifact_stat_key(), upgraded.artifact_stat_key());
     }
 
     #[test]

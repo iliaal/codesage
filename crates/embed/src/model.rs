@@ -537,6 +537,12 @@ pub struct ModelArtifacts {
     pub tokenizer: PathBuf,
     pub onnx: PathBuf,
     pub onnx_data: Option<PathBuf>,
+    /// The ONNX Runtime shared library a session would `dlopen`, on a
+    /// target that loads it dynamically; `None` where the runtime is linked
+    /// statically. Part of the artifact set because the runtime decides the
+    /// graph partitioning and the kernels, so an upgraded library produces
+    /// other vectors from unchanged model files.
+    pub ort_runtime: Option<PathBuf>,
 }
 
 impl ModelArtifacts {
@@ -578,7 +584,36 @@ impl ModelArtifacts {
         if let Some(data) = &self.onnx_data {
             files.push(("onnx_data", data.as_path()));
         }
+        if let Some(runtime) = &self.ort_runtime {
+            files.push(("ort_runtime", runtime.as_path()));
+        }
         files
+    }
+}
+
+/// The ONNX Runtime shared library a session built by this process would
+/// load: the `ORT_DYLIB_PATH` the loader honours after discovery. `Ok(None)`
+/// on a target that links the runtime statically. On a dynamic-loading
+/// target an unlocated library is an error, never an absent component: the
+/// loader would resolve a bare soname through the dynamic linker's search
+/// path, and a fingerprint that cannot name the runtime it attests must not
+/// vouch for the vectors.
+pub fn ort_runtime_dylib() -> Result<Option<PathBuf>> {
+    #[cfg(target_vendor = "apple")]
+    {
+        Ok(None)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        init_ort_dylib();
+        match std::env::var_os("ORT_DYLIB_PATH") {
+            Some(path) if !path.is_empty() => Ok(Some(PathBuf::from(path))),
+            _ => anyhow::bail!(
+                "ONNX Runtime shared library not located (no ORT_DYLIB_PATH, no pip \
+                 onnxruntime, nothing under /usr/lib or /usr/local/lib); set \
+                 ORT_DYLIB_PATH to the libonnxruntime.so the embedder should load"
+            ),
+        }
     }
 }
 
@@ -625,10 +660,12 @@ pub fn cached_model_artifacts(model: &str) -> Option<ModelArtifacts> {
         None => Repo::model(model.to_string()),
     };
     let cache = hf_hub::Cache::from_env().repo(repo);
+    let ort_runtime = ort_runtime_dylib().ok()?;
     Some(ModelArtifacts {
         tokenizer: cache.get("tokenizer.json")?,
         onnx: cache.get("onnx/model.onnx")?,
         onnx_data: cache.get("onnx/model.onnx_data"),
+        ort_runtime,
     })
 }
 
@@ -652,6 +689,7 @@ fn resolve_model_artifacts_at(model: &str, revision: Option<&str>) -> Result<Mod
         tokenizer,
         onnx,
         onnx_data,
+        ort_runtime: ort_runtime_dylib()?,
     })
 }
 
@@ -1601,6 +1639,7 @@ mod tests {
             tokenizer: tokenizer.clone(),
             onnx: onnx.clone(),
             onnx_data: None,
+            ort_runtime: None,
         };
         let base = artifacts.stat_key().unwrap();
 
@@ -1630,6 +1669,7 @@ mod tests {
             tokenizer,
             onnx: dir.path().join("absent.onnx"),
             onnx_data: None,
+            ort_runtime: None,
         };
         assert_eq!(missing.stat_key(), None);
     }
@@ -1645,6 +1685,7 @@ mod tests {
             tokenizer: real.join("tokenizer.json"),
             onnx: real.join("model.onnx"),
             onnx_data: None,
+            ort_runtime: None,
         };
         // The same files spelled through `.` and `..` segments and through
         // a symlinked directory, as a relative HF_HOME resolves them.
@@ -1652,6 +1693,7 @@ mod tests {
             tokenizer: real.join(".").join("tokenizer.json"),
             onnx: real.join("sub").join("..").join("model.onnx"),
             onnx_data: None,
+            ort_runtime: None,
         };
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
@@ -1659,6 +1701,7 @@ mod tests {
             tokenizer: link.join("tokenizer.json"),
             onnx: link.join("model.onnx"),
             onnx_data: None,
+            ort_runtime: None,
         };
         let base = absolute.stat_key().unwrap();
         assert_eq!(dotted.stat_key().unwrap(), base, "dotted spelling");
@@ -1676,6 +1719,7 @@ mod tests {
             tokenizer: moved.join("tokenizer.json"),
             onnx: moved.join("model.onnx"),
             onnx_data: None,
+            ort_runtime: None,
         };
         assert_ne!(
             relocated.stat_key().unwrap(),
