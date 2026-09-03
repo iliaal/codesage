@@ -2,11 +2,11 @@
 
 ### Changed
 
-- The external-weights sidecar (`onnx/model.onnx_data`) is resolved from the model pin instead of fetched on every resolution. A warm MCP semantic query makes no HuggingFace request. A `model.onnx_data` next to the graph that the pin does not declare is refused as unverified.
+- The external-weights sidecar (`onnx/model.onnx_data`) comes from the model pin instead of a fetch on every resolution. A warm MCP semantic query makes no HuggingFace request, and a `model.onnx_data` next to the graph that the pin does not declare is refused as unverified.
 
 ### Fixed
 
-- A model's HuggingFace artifact paths are resolved once per process instead of on every hf-hub lookup in every MCP semantic query. (cs-u0e)
+- A model's HuggingFace artifact paths resolve once per process instead of on every hf-hub lookup in every MCP semantic query. (cs-u0e)
 - `codesage status` and the daemon's per-tool-call cache probe no longer panic when neither `HF_HOME` nor `HOME` resolves a home directory.
 
 ## [0.23.0] - 2026-09-02
