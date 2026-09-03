@@ -20,3 +20,19 @@
 ; The captured text keeps the leading dots so the consumer can resolve it
 ; relative to the importing file.
 (import_from_statement module_name: (relative_import) @ref)
+
+; Patterns 7-10: decorators, mirroring Java's annotation patterns (which file
+; as Call so `find_references("Test", kind="call")` surfaces decoration
+; sites). Only the applied name is captured — `@app.route("/x")` records
+; `route`, the same way attribute calls record the method, not the receiver.
+; Pattern 7: bare decorator (@property)
+(decorator (identifier) @ref)
+
+; Pattern 8: decorator with arguments (@retry(tries=3))
+(decorator (call function: (identifier) @ref))
+
+; Pattern 9: dotted decorator (@app.route, no call)
+(decorator (attribute attribute: (identifier) @ref))
+
+; Pattern 10: dotted decorator with arguments (@app.route("/x"))
+(decorator (call function: (attribute attribute: (identifier) @ref)))

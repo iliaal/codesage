@@ -155,8 +155,14 @@ fn test_conventions_for(languages: &[LanguageStat]) -> Vec<String> {
             Language::JavaScript => "JavaScript: `foo.test.js` / `foo.spec.js`",
             Language::TypeScript => "TypeScript: `foo.test.ts(x)` / `foo.spec.ts(x)`",
             Language::Java => "Java: `src/test/java` mirror tree, `FooTest.java`",
-            Language::C => "C: project `tests/` dir; php-src `<dir>/tests/*.phpt`",
-            Language::Cpp => "C++: project `tests/` dir; CMake/ctest targets",
+            Language::C => {
+                "C: `foo_test.c` / `test_foo.c` (sibling or under `tests/`); php-src \
+                 `<dir>/tests/*.phpt`"
+            }
+            Language::Cpp => {
+                "C++: `foo_test.cpp` / `test_foo.cpp` (sibling or under `tests/`, \
+                 same extension)"
+            }
         })
         .map(str::to_string)
         .collect()

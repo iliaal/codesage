@@ -38,7 +38,7 @@ impl AgentTarget for CodexTarget {
             .parse::<DocumentMut>()
             .with_context(|| format!("parsing existing TOML at {}", path.display()))?;
 
-        let (command, args) = mcp_command_args(ctx.project_utf8);
+        let (command, args) = mcp_command_args(ctx.project_utf8)?;
         let mut arg_arr = Array::new();
         for a in &args {
             arg_arr.push(a.as_str());
@@ -129,8 +129,8 @@ mod tests {
     fn ctx<'a>(home: &'a Path, project: &'a Path) -> InstallCtx<'a> {
         InstallCtx {
             home,
-            project,
-            project_utf8: project.to_str().expect("test project path must be UTF-8"),
+            project: Some(project),
+            project_utf8: Some(project.to_str().expect("test project path must be UTF-8")),
             global: true,
         }
     }
@@ -186,6 +186,33 @@ mod tests {
         assert_eq!(t.install(&c).unwrap(), InstallOutcome::Unchanged);
         assert_eq!(t.uninstall(&c).unwrap(), UninstallOutcome::Removed);
         assert!(!fs::read_to_string(&cfg).unwrap().contains("codesage"));
+    }
+
+    #[test]
+    fn global_install_without_project_registers_current_exe_without_project_flag() {
+        // Codex is global-only; outside any onboarded project there is no
+        // root to bake in, so the entry carries no `--project` default.
+        let home = tempdir().unwrap();
+        let t = CodexTarget;
+        let c = InstallCtx {
+            home: home.path(),
+            project: None,
+            project_utf8: None,
+            global: true,
+        };
+        assert_eq!(t.install(&c).unwrap(), InstallOutcome::Wrote);
+        let cfg = home.path().join(".codex/config.toml");
+        let written = fs::read_to_string(&cfg).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        assert!(
+            written.contains(exe.to_str().unwrap()),
+            "must register this binary, got: {written}"
+        );
+        assert!(
+            !written.contains("--project"),
+            "no project, no flag, got: {written}"
+        );
+        assert_eq!(t.install(&c).unwrap(), InstallOutcome::Unchanged);
     }
 
     #[test]

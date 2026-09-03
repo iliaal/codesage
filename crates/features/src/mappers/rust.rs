@@ -3,7 +3,6 @@
 //! `tests/*.rs`. Translates clawpatch's Rust mapper (src/mappers/rust.ts)
 //! to native Rust with the same shape.
 
-use std::fs;
 use std::path::Path;
 
 use anyhow::Result;
@@ -11,7 +10,8 @@ use codesage_protocol::{FeatureConfidence, FeatureKind, Language};
 use regex::Regex;
 
 use crate::mappers::shared::{
-    is_safe_dir, is_safe_file, read_to_string_bounded, rel_path, strip_line_comments,
+    is_safe_dir, is_safe_file, read_to_string_bounded, rel_path, sorted_read_dir,
+    strip_line_comments,
 };
 use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile};
 
@@ -40,8 +40,7 @@ impl FeatureMapper for RustMapper {
         // Conventional `crates/*` even when not declared in workspace.
         let crates_dir = root.join("crates");
         if is_safe_dir(root, &crates_dir) {
-            for entry in fs::read_dir(&crates_dir)?.flatten() {
-                let p = entry.path();
+            for p in sorted_read_dir(&crates_dir) {
                 if !is_safe_dir(root, &p) {
                     continue;
                 }
@@ -126,8 +125,7 @@ fn seed_for_package(
     // Additional bins under src/bin/*.rs (one feature each).
     let bin_dir = pkg_dir.join("src/bin");
     if is_safe_dir(root, &bin_dir) {
-        for entry in fs::read_dir(&bin_dir)?.flatten() {
-            let p = entry.path();
+        for p in sorted_read_dir(&bin_dir) {
             if let Some(file_name) = p.file_name().and_then(|s| s.to_str())
                 && file_name.ends_with(".rs")
                 && is_safe_file(root, &p)
@@ -159,8 +157,7 @@ fn seed_for_package(
     // Integration tests under tests/*.rs.
     let tests_dir = pkg_dir.join("tests");
     if is_safe_dir(root, &tests_dir) {
-        for entry in fs::read_dir(&tests_dir)?.flatten() {
-            let p = entry.path();
+        for p in sorted_read_dir(&tests_dir) {
             if let Some(file_name) = p.file_name().and_then(|s| s.to_str())
                 && file_name.ends_with(".rs")
                 && is_safe_file(root, &p)
@@ -300,11 +297,8 @@ fn cargo_workspace_members(root: &Path, manifest: &Path) -> Result<Vec<String>> 
                     && !prefix.contains("..")
                 {
                     let base = root.join(prefix);
-                    if is_safe_dir(root, &base)
-                        && let Ok(rd) = fs::read_dir(&base)
-                    {
-                        for sub in rd.flatten() {
-                            let p = sub.path();
+                    if is_safe_dir(root, &base) {
+                        for p in sorted_read_dir(&base) {
                             if p.is_dir() && p.join("Cargo.toml").is_file() && is_safe_dir(root, &p)
                             {
                                 let rel = rel_path(root, &p);
@@ -474,5 +468,32 @@ mod tests {
             .expect("integration test seeded");
         assert_eq!(test.entry_path, "tests/integration.rs");
         assert_eq!(test.kind, FeatureKind::TestSuite);
+    }
+
+    #[test]
+    fn map_is_deterministic_across_runs() {
+        // Bin/test seed order follows sorted directory scans, never
+        // readdir order: mapping the same tree twice must agree exactly.
+        let dir = tempdir().unwrap();
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "[package]\nname = \"k\"\nversion = \"0.1.0\"\n",
+        );
+        write(dir.path(), "src/lib.rs", "");
+        write(dir.path(), "src/bin/zeta.rs", "fn main() {}");
+        write(dir.path(), "src/bin/alpha.rs", "fn main() {}");
+        write(dir.path(), "tests/zeta.rs", "#[test] fn z() {}");
+        write(dir.path(), "tests/alpha.rs", "#[test] fn a() {}");
+        let ctx = MapperContext::for_root(dir.path());
+        let first = RustMapper.map(&ctx).unwrap();
+        let second = RustMapper.map(&ctx).unwrap();
+        assert_eq!(format!("{first:?}"), format!("{second:?}"));
+        let bins: Vec<&str> = first
+            .iter()
+            .filter(|s| s.source == "cargo-bin")
+            .map(|s| s.entry_path.as_str())
+            .collect();
+        assert_eq!(bins, vec!["src/bin/alpha.rs", "src/bin/zeta.rs"]);
     }
 }

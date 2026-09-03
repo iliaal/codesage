@@ -96,30 +96,89 @@ fn check_embed_texts_caps(texts: &[String]) -> Result<(), String> {
 /// raw vectors.
 const HIDDEN_TOOLS: &[&str] = &["embed_texts"];
 
-fn capped_limit(value: Option<usize>, default: usize, max: usize) -> usize {
-    value.unwrap_or(default).min(max)
-}
-
-fn capped_optional_limit(value: Option<usize>, max: usize) -> Option<usize> {
-    value.map(|n| n.min(max))
-}
-
-fn validate_file_list_len(paths: &[String], tool: &str) -> Result<()> {
-    if paths.len() > MAX_MCP_FILE_PATHS {
-        anyhow::bail!(
-            "{tool} accepts at most {MAX_MCP_FILE_PATHS} file paths per call (got {})",
-            paths.len()
-        );
+/// Cap an optional numeric param at `max` (defaulting when omitted) and
+/// report the adjustment: over-max requests are capped and the
+/// requested-vs-applied pair is returned for the `_meta.clamps` annotation
+/// (see `render.rs`) instead of being silent.
+/// Returns `(applied, note)`; `note` is `None` in the common case.
+fn capped_limit_tracked(
+    value: Option<usize>,
+    default: usize,
+    max: usize,
+    param: &'static str,
+) -> (usize, Option<render::ClampNote>) {
+    let requested = value.unwrap_or(default);
+    if requested > max {
+        (
+            max,
+            Some(render::ClampNote {
+                param,
+                requested: serde_json::json!(requested),
+                applied: serde_json::json!(max),
+            }),
+        )
+    } else {
+        (requested, None)
     }
-    Ok(())
 }
 
-fn validate_non_empty_file_list(paths: &[String], tool: &str) -> Result<()> {
-    validate_file_list_len(paths, tool)?;
-    if paths.is_empty() {
-        anyhow::bail!("{tool} requires at least one file path");
+/// `list_features` limit: `None` → default, `Some(0)` → unbounded (the
+/// schema promise and the CLI's `0 = no limit`), else capped to the ceiling
+/// with a `_meta.clamps` note. Returns `(applied, note)`; `applied == 0`
+/// means "no limit" downstream.
+fn capped_limit_or_unbounded(
+    value: Option<usize>,
+    default: usize,
+    max: usize,
+    param: &'static str,
+) -> (usize, Option<render::ClampNote>) {
+    match value {
+        None => (default, None),
+        Some(0) => (0, None),
+        Some(n) => capped_limit_tracked(Some(n), default, max, param),
     }
-    Ok(())
+}
+
+/// Cap an optional result-set limit at `max` and report the adjustment for
+/// `_meta.clamps`. Returns `(applied, note)`.
+fn capped_optional_limit_tracked(
+    value: Option<usize>,
+    max: usize,
+    param: &'static str,
+) -> (Option<usize>, Option<render::ClampNote>) {
+    match value {
+        Some(n) if n > max => (
+            Some(max),
+            Some(render::ClampNote {
+                param,
+                requested: serde_json::json!(n),
+                applied: serde_json::json!(max),
+            }),
+        ),
+        other => (other, None),
+    }
+}
+
+/// Normalize the `find_similar` threshold at the param layer: finite
+/// out-of-range values clamp to `[0, 1]`, non-finite values (rejected at the
+/// serde layer, so unreachable here) fall back to the default. Returns
+/// `(applied, note)`; a present `note` lands under `_meta.clamps`.
+fn clamp_min_jaccard_tracked(requested: Option<f32>) -> (f32, Option<render::ClampNote>) {
+    const DEFAULT: f32 = 0.85;
+    let Some(v) = requested else {
+        return (DEFAULT, None);
+    };
+    let applied = if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        DEFAULT
+    };
+    let note = (applied != v || !v.is_finite()).then(|| render::ClampNote {
+        param: "min_jaccard",
+        requested: serde_json::json!(v),
+        applied: serde_json::json!(applied),
+    });
+    (applied, note)
 }
 
 fn session_start_report(
@@ -140,6 +199,29 @@ fn session_start_report(
         snapshot_path: snapshot_path.to_string_lossy().into_owned(),
         git_head: snapshot.git_head,
     }
+}
+
+fn validate_file_list_len(paths: &[String], tool: &str) -> Result<()> {
+    if paths.len() > MAX_MCP_FILE_PATHS {
+        anyhow::bail!(
+            "{tool} accepts at most {MAX_MCP_FILE_PATHS} file paths per call (got {})",
+            paths.len()
+        );
+    }
+    Ok(())
+}
+
+fn validate_non_empty_file_list(paths: &[String], tool: &str) -> Result<()> {
+    validate_file_list_len(paths, tool)?;
+    if paths.is_empty() {
+        // The CLI's "no file paths provided" sentence, extended with the
+        // "at least one file path" remediation the integration contract
+        // (`tools_call_file_list_tools_reject_empty_lists`) requires.
+        anyhow::bail!(
+            "{tool}: no file paths provided (pass at least one file path as args or pipe via stdin)"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -272,7 +354,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "review_rehearsal",
-        description = "Predict the objections a reviewer will likely raise against a patch, BEFORE committing. Input is the patch's file list (e.g. `git diff --name-only`). Returns severity-ranked objections — missing tests, high-risk files, wide blast radius, fix-prone files, churn hotspots, import cycles touched, trust-boundary expansion (≥3 boundaries), feature-test gaps (changed a feature's core files but none of its mapped tests), and scope-spread when a patch touches many unrelated feature areas — each with concrete evidence and the files it concerns, plus paste-ready `summary_notes` (objection counts + risk summary + the exact tests to run). Pure composition of `assess_risk_diff`, `recommend_tests`, index-drift, and feature mapping — read-only, no AI prose. Use as the last step before a commit: fix or consciously accept each objection.",
+        description = "Predict the objections a reviewer will likely raise against a patch, BEFORE committing. Input is the patch's file list (e.g. `git diff --name-only`). Returns severity-ranked objections — missing tests, high-risk files, wide blast radius, fix-prone files, churn hotspots, import cycles touched, trust-boundary expansion (≥3 boundaries), feature-test gaps (changed a feature's core files but none of its mapped tests), and scope-spread when a patch touches many unrelated feature areas — each with concrete evidence and the files it concerns, plus paste-ready `summary_notes` (objection counts + risk summary + the exact tests to run). Pure composition of `assess_risk_diff`, `recommend_tests`, index-drift, and feature mapping — read-only, no AI prose. Use as the last step before a commit: fix or consciously accept each objection. `file_paths` must be non-empty: an empty list is rejected (the CLI's stdin/working-tree fallback does not exist over MCP).",
         output_schema = schema_for_type::<ReviewRehearsal>()
     )]
     async fn review_rehearsal_tool(
@@ -281,9 +363,12 @@ impl CodeSageServer {
     ) -> CallToolResult {
         self.blocking(move |s| {
             let file_paths = params.file_paths.clone();
+            // Unlike the CLI (which falls back to piped stdin or the
+            // working-tree diff), MCP has no implicit file set: an empty
+            // list is a caller error, rejected with the CLI's message.
             s.render(
                 &params.project,
-                validate_file_list_len(&file_paths, "review_rehearsal").and_then(|()| {
+                validate_non_empty_file_list(&file_paths, "review_rehearsal").and_then(|()| {
                     s.with_project_root_db(&params.project, |root, db| {
                         codesage_graph::build_review_rehearsal(root, db, &file_paths)
                     })
@@ -342,7 +427,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "find_similar",
-        description = "Find functions/methods structurally similar to a named one (near-clone detection via MinHash over AST shape; identifiers and literals are ignored). Use before editing a function to find its copies so a fix lands everywhere, to spot divergent forks of a helper, or to locate copy-paste during review. Returns {name, file_path, line_start, line_end, kind, jaccard} ranked by similarity (1.0 = structurally identical body). Test files are excluded. Tune `min_jaccard` up for exact clones, down for looser matches.",
+        description = "Find functions/methods structurally similar to a named one (near-clone detection via MinHash over AST shape; identifiers and literals are ignored). Use before editing a function to find its copies so a fix lands everywhere, to spot divergent forks of a helper, or to locate copy-paste during review. Returns {name, file_path, line_start, line_end, kind, jaccard} ranked by similarity (1.0 = structurally identical body). Test files are excluded. Tune `min_jaccard` up for exact clones, down for looser matches. `min_jaccard` outside [0, 1] is clamped and `limit` over 100 is capped; either adjustment is reported under `_meta.clamps` as requested-vs-applied.",
         output_schema = schema_for_type::<FindSimilarResults>()
     )]
     async fn find_similar_tool(
@@ -350,15 +435,19 @@ impl CodeSageServer {
         Parameters(params): Parameters<FindSimilarParams>,
     ) -> CallToolResult {
         self.blocking(move |s| {
-            let min_jaccard = params.min_jaccard.unwrap_or(0.85);
-            let limit = capped_limit(params.limit, 20, MAX_MCP_LIMIT);
-            s.render(
+            let (min_jaccard, jaccard_clamp) = clamp_min_jaccard_tracked(params.min_jaccard);
+            let (limit, limit_clamp) =
+                capped_limit_tracked(params.limit, 20, MAX_MCP_LIMIT, "limit");
+            let clamps: Vec<render::ClampNote> =
+                [jaccard_clamp, limit_clamp].into_iter().flatten().collect();
+            let result = s.render(
                 &params.project,
                 s.with_project_db(&params.project, |db| {
                     find_similar(db, &params.name, min_jaccard, limit)
                 }),
                 "find_similar",
-            )
+            );
+            render::annotate_clamps(result, &clamps)
         })
         .await
     }
@@ -392,10 +481,16 @@ impl CodeSageServer {
     async fn search_tool(&self, Parameters(params): Parameters<SearchParams>) -> CallToolResult {
         self.blocking(move |s| {
             let languages = params.language.map(|l| vec![l]);
+            let (limit, limit_clamp) =
+                capped_limit_tracked(params.limit, 10, MAX_MCP_LIMIT, "limit");
+            let (offset, offset_clamp) =
+                capped_limit_tracked(params.offset, 0, MAX_MCP_OFFSET, "offset");
+            let clamps: Vec<render::ClampNote> =
+                [limit_clamp, offset_clamp].into_iter().flatten().collect();
             let req = SearchRequest {
                 query: params.query,
-                limit: Some(capped_limit(params.limit, 10, MAX_MCP_LIMIT)),
-                offset: Some(capped_limit(params.offset, 0, MAX_MCP_OFFSET)),
+                limit: Some(limit),
+                offset: Some(offset),
                 languages,
                 paths: params.paths,
             };
@@ -404,7 +499,7 @@ impl CodeSageServer {
             // request. Coverage would report that as "no matches", which is
             // false about the corpus.
             let paged = req.offset.unwrap_or(0) > 0 || req.limit == Some(0);
-            s.render_coverage_gated(
+            let result = s.render_coverage_gated(
                 &params.project,
                 req.paths
                     .as_ref()
@@ -417,7 +512,9 @@ impl CodeSageServer {
                     }),
                 "search",
                 !paged,
-            )
+            );
+            let result = render::annotate_test_override(result, Self::test_override_active());
+            render::annotate_clamps(result, &clamps)
         })
         .await
     }
@@ -457,7 +554,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "trace_call_path",
-        description = "Shortest call chain from one symbol to another: how does `from` end up calling `to`? Breadth-first over resolved callee edges, so `steps` is a shortest path, each entry naming the symbol, its file:line, and `call_line` — the line in the PREVIOUS step's body where it is invoked. Answers the question `find_references` needs N manual round-trips for, and that `impact_analysis` cannot answer at all because it returns an unordered set rather than a route. Use for `how does request input reach this exec/query/write?` during security review, and for orienting in an unfamiliar callstack. On `found: false` read `note` and `bounded`: `bounded: true` means the search stopped at its depth or breadth limit, so a longer chain may still exist and a bigger `max_depth` may find it — an empty result is NOT proof no path exists. `max_depth` is capped at 6 over MCP, so a `bounded` miss at that depth cannot be retried deeper here — the `codesage trace` CLI searches further. Direction matters: this walks callee edges forward from `from`, so swap the arguments to ask the reverse question.",
+        description = "Shortest call chain from one symbol to another: how does `from` end up calling `to`? Breadth-first over resolved callee edges, so `steps` is a shortest path, each entry naming the symbol, its file:line, and `call_line` — the line in the PREVIOUS step's body where it is invoked. Answers the question `find_references` needs N manual round-trips for, and that `impact_analysis` cannot answer at all because it returns an unordered set rather than a route. Use for `how does request input reach this exec/query/write?` during security review, and for orienting in an unfamiliar callstack. On `found: false` read `note` and `bounded`: `bounded: true` means the search stopped at its depth or breadth limit, so a longer chain may still exist and a bigger `max_depth` may find it — an empty result is NOT proof no path exists. `max_depth` over 6 is capped to 6 and reported under `_meta.clamps` as requested-vs-applied, so a `bounded` miss at that depth cannot be retried deeper here — the `codesage trace` CLI searches further. Direction matters: this walks callee edges forward from `from`, so swap the arguments to ask the reverse question.",
         output_schema = schema_for_type::<CallPathReport>()
     )]
     async fn trace_call_path_tool(
@@ -465,16 +562,19 @@ impl CodeSageServer {
         Parameters(params): Parameters<TracePathParams>,
     ) -> CallToolResult {
         self.blocking(move |s| {
+            let (max_depth, depth_clamp) =
+                capped_limit_tracked(params.max_depth, 6, MAX_MCP_IMPACT_DEPTH, "max_depth");
             let req = CallPathRequest {
                 from: params.from.clone(),
                 to: params.to.clone(),
-                max_depth: capped_limit(params.max_depth, 6, MAX_MCP_IMPACT_DEPTH),
+                max_depth,
             };
-            s.render(
+            let result = s.render(
                 &params.project,
                 s.with_project_db(&params.project, |db| trace_call_path(db, &req)),
                 "trace_call_path",
-            )
+            );
+            render::annotate_clamps(result, depth_clamp.as_slice())
         })
         .await
     }
@@ -489,24 +589,31 @@ impl CodeSageServer {
         Parameters(params): Parameters<ImpactParams>,
     ) -> CallToolResult {
         self.blocking(move |s| {
+            let (depth, depth_clamp) =
+                capped_limit_tracked(params.depth, 2, MAX_MCP_IMPACT_DEPTH, "depth");
+            let (limit, limit_clamp) =
+                capped_optional_limit_tracked(params.limit, MAX_MCP_IMPACT_LIMIT, "limit");
+            let clamps: Vec<render::ClampNote> =
+                [depth_clamp, limit_clamp].into_iter().flatten().collect();
             let req = ImpactRequest {
                 target: ImpactTarget::from_hint(params.target, params.is_file),
-                depth: capped_limit(params.depth, 2, MAX_MCP_IMPACT_DEPTH),
+                depth,
                 source_only: params.source_only.unwrap_or(false),
             };
             let opts = ImpactOptions {
                 include_forward: params.include_forward.unwrap_or(false),
                 include_siblings: params.include_siblings.unwrap_or(false),
-                limit: capped_optional_limit(params.limit, MAX_MCP_IMPACT_LIMIT),
+                limit,
                 summary_only: params.summary_only.unwrap_or(false),
             };
-            s.render(
+            let result = s.render(
                 &params.project,
                 s.with_project_db(&params.project, |db| {
                     impact_analysis_report(db, &req, &opts)
                 }),
                 "impact_analysis",
-            )
+            );
+            render::annotate_clamps(result, &clamps)
         })
         .await
     }
@@ -521,16 +628,19 @@ impl CodeSageServer {
         Parameters(params): Parameters<ExportContextParams>,
     ) -> CallToolResult {
         self.blocking(move |s| {
+            let (limit, limit_clamp) =
+                capped_limit_tracked(params.limit, 5, MAX_MCP_CONTEXT_LIMIT, "limit");
+            let clamps = limit_clamp.as_slice();
             let req = ExportRequest::from_target(
                 params.target,
                 params.is_symbol.unwrap_or(false),
-                capped_limit(params.limit, 5, MAX_MCP_CONTEXT_LIMIT),
+                limit,
                 params.include_callers.unwrap_or(false),
                 params.include_callees.unwrap_or(false),
             );
             let budget = s.bundle_budget_chars(&params.project);
             if let Some(sym_name) = req.symbol.clone() {
-                return s.render_budget(
+                let result = s.render_budget(
                     &params.project,
                     s.with_project_context_db(&params.project, |db| {
                         export_context_for_symbol(db, &sym_name, &req)
@@ -538,16 +648,19 @@ impl CodeSageServer {
                     "export_context",
                     budget,
                 );
+                return render::annotate_clamps(result, clamps);
             }
             let query_for_embed = req.query.clone().unwrap_or_default();
-            s.render_budget(
+            let result = s.render_budget(
                 &params.project,
                 s.with_project_query(&params.project, &query_for_embed, |db, emb, rr| {
                     export_context(db, emb, rr, &req)
                 }),
                 "export_context",
                 budget,
-            )
+            );
+            let result = render::annotate_test_override(result, Self::test_override_active());
+            render::annotate_clamps(result, clamps)
         })
         .await
     }
@@ -562,13 +675,15 @@ impl CodeSageServer {
         Parameters(params): Parameters<CouplingParams>,
     ) -> CallToolResult {
         self.blocking(move |s| {
-            let limit = capped_limit(params.limit, 10, MAX_MCP_LIMIT);
+            let (limit, limit_clamp) =
+                capped_limit_tracked(params.limit, 10, MAX_MCP_LIMIT, "limit");
             let file_path = params.file_path.clone();
-            s.render(
+            let result = s.render(
                 &params.project,
                 s.with_project_db(&params.project, |db| find_coupling(db, &file_path, limit)),
                 "find_coupling",
-            )
+            );
+            render::annotate_clamps(result, limit_clamp.as_slice())
         })
         .await
     }
@@ -701,7 +816,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "list_features",
-        description = "List feature slices in the project, optionally filtered by kind, language, or tag. A feature is a behavior-keyed bundle (entrypoint + owned files + context + tests + trust boundaries) — e.g. \"Laravel route POST /api/login\", \"Rust binary `codesage`\", \"php-src extension `iconv`\", \"CMake binary `myapp`\". Use this to discover the agent-facing surface area of the project before deep-diving into a specific slice. Pair with `find_feature` (file → features) and `assess_risk` (per-file scoring inside a feature).",
+        description = "List feature slices in the project, optionally filtered by kind, language, or tag. A feature is a behavior-keyed bundle (entrypoint + owned files + context + tests + trust boundaries) — e.g. \"Laravel route POST /api/login\", \"Rust binary `codesage`\", \"php-src extension `iconv`\", \"CMake binary `myapp`\". Use this to discover the agent-facing surface area of the project before deep-diving into a specific slice. Pair with `find_feature` (file → features) and `assess_risk` (per-file scoring inside a feature). `limit` 0 means no limit (same as the CLI); a `limit` over 500 is capped and reported under `_meta.clamps` as requested-vs-applied.",
         output_schema = schema_for_type::<FeatureListResults>()
     )]
     async fn list_features_tool(
@@ -713,19 +828,24 @@ impl CodeSageServer {
             let language = params.language;
             let tag = params.tag.clone();
             let since = params.since.clone();
-            let limit = match params.limit {
-                Some(0) | None => 100,
-                Some(n) => n.min(MAX_MCP_FEATURE_LIMIT),
-            };
+            // `Some(0)` is unbounded per the schema promise (and the CLI's
+            // `0 = no limit`); the storage layer treats limit 0 as "all".
+            // Unbounded is safe here: the feature table is small in practice
+            // and the budget cap still bounds the wire response.
+            let (limit, limit_clamp) =
+                capped_limit_or_unbounded(params.limit, 100, MAX_MCP_FEATURE_LIMIT, "limit");
+            let clamps = limit_clamp.as_slice();
             // With `since`, fetch unbounded then cap after the changed-file
             // intersection, mirroring the CLI: the SQL LIMIT runs before the
             // diff filter, so a pre-filter limit would truncate candidates.
-            let query_limit = if since.is_some() {
+            // The scan cap bounds that pre-filter fetch unless the caller
+            // explicitly asked for unbounded (limit 0).
+            let query_limit = if since.is_some() && limit != 0 {
                 MAX_MCP_FEATURE_SCAN_LIMIT
             } else {
                 limit
             };
-            s.render(
+            let result = s.render(
                 &params.project,
                 s.with_project_root_db(&params.project, |root, db| {
                     let mut features =
@@ -741,7 +861,8 @@ impl CodeSageServer {
                     Ok(features)
                 }),
                 "list_features",
-            )
+            );
+            render::annotate_clamps(result, clamps)
         })
         .await
     }
@@ -779,21 +900,23 @@ impl CodeSageServer {
             let feature_id = params.feature_id.clone();
             let include_callers = params.include_callers.unwrap_or(false);
             let include_callees = params.include_callees.unwrap_or(false);
-            let limit = capped_limit(params.limit, 5, MAX_MCP_CONTEXT_LIMIT);
+            let (limit, limit_clamp) =
+                capped_limit_tracked(params.limit, 5, MAX_MCP_CONTEXT_LIMIT, "limit");
             // Use the context DB (binds to the configured embedding model's
             // chunk table) so `primary`/`related` resolve real chunks. The
             // structural-only db variant points at the default chunk table
             // and returns empty content on projects using a non-default
             // model (php-src uses jina v2 768-dim, MiniLM is the default).
             let budget = s.bundle_budget_chars(&params.project);
-            s.render_budget(
+            let result = s.render_budget(
                 &params.project,
                 s.with_project_context_db(&params.project, |db| {
                     feature_bundle(db, &feature_id, include_callers, include_callees, limit)
                 }),
                 "feature_bundle",
                 budget,
-            )
+            );
+            render::annotate_clamps(result, limit_clamp.as_slice())
         })
         .await
     }
@@ -1179,5 +1302,109 @@ mod tests {
                 tool.name
             );
         }
+    }
+    #[test]
+    fn over_max_limits_cap_with_a_requested_vs_applied_note() {
+        // The STRICT contract: over-max values still cap (behavior
+        // compatible), but the adjustment must be visible under
+        // `_meta.clamps` instead of silent.
+        let (applied, note) = capped_limit_tracked(Some(10_000), 10, MAX_MCP_LIMIT, "limit");
+        assert_eq!(applied, MAX_MCP_LIMIT);
+        let note = note.expect("over-max must produce a clamp note");
+        assert_eq!(note.param, "limit");
+        assert_eq!(note.requested, serde_json::json!(10_000));
+        assert_eq!(note.applied, serde_json::json!(MAX_MCP_LIMIT));
+
+        assert_eq!(capped_limit_tracked(None, 10, MAX_MCP_LIMIT, "limit").0, 10);
+        assert!(
+            capped_limit_tracked(None, 10, MAX_MCP_LIMIT, "limit")
+                .1
+                .is_none()
+        );
+        assert!(
+            capped_limit_tracked(Some(50), 10, MAX_MCP_LIMIT, "limit")
+                .1
+                .is_none()
+        );
+        assert!(
+            capped_limit_tracked(Some(100), 10, MAX_MCP_LIMIT, "limit")
+                .1
+                .is_none()
+        );
+
+        let (opt, note) = capped_optional_limit_tracked(Some(9999), MAX_MCP_IMPACT_LIMIT, "limit");
+        assert_eq!(opt, Some(MAX_MCP_IMPACT_LIMIT));
+        assert!(note.is_some());
+        assert_eq!(
+            capped_optional_limit_tracked(None, MAX_MCP_IMPACT_LIMIT, "limit").0,
+            None
+        );
+    }
+
+    #[test]
+    fn list_features_limit_zero_is_unbounded() {
+        // Schema promise + CLI parity: `Some(0)` means no limit. Only `None`
+        // takes the default; over-max caps with a note.
+        assert_eq!(
+            capped_limit_or_unbounded(None, 100, MAX_MCP_FEATURE_LIMIT, "limit").0,
+            100
+        );
+        let (applied, note) =
+            capped_limit_or_unbounded(Some(0), 100, MAX_MCP_FEATURE_LIMIT, "limit");
+        assert_eq!(
+            applied, 0,
+            "limit 0 must stay unbounded, not reset to the default"
+        );
+        assert!(note.is_none());
+        let (applied, note) =
+            capped_limit_or_unbounded(Some(50), 100, MAX_MCP_FEATURE_LIMIT, "limit");
+        assert_eq!(applied, 50);
+        assert!(note.is_none());
+        let (applied, note) =
+            capped_limit_or_unbounded(Some(50_000), 100, MAX_MCP_FEATURE_LIMIT, "limit");
+        assert_eq!(applied, MAX_MCP_FEATURE_LIMIT);
+        assert!(note.is_some());
+    }
+
+    #[test]
+    fn min_jaccard_clamps_to_unit_range_at_the_param_layer() {
+        // Out-of-range is a clamp (reported), not an error: the graph layer
+        // historically clamped, so erroring would break callers.
+        let (applied, note) = clamp_min_jaccard_tracked(None);
+        assert_eq!(applied, 0.85);
+        assert!(note.is_none());
+        let (applied, note) = clamp_min_jaccard_tracked(Some(0.7));
+        assert_eq!(applied, 0.7);
+        assert!(note.is_none());
+        let (applied, note) = clamp_min_jaccard_tracked(Some(1.5));
+        assert_eq!(applied, 1.0);
+        let note = note.expect("1.5 must clamp with a note");
+        assert_eq!(note.param, "min_jaccard");
+        assert_eq!(note.requested, serde_json::json!(1.5));
+        assert_eq!(note.applied, serde_json::json!(1.0));
+        let (applied, note) = clamp_min_jaccard_tracked(Some(-0.2));
+        assert_eq!(applied, 0.0);
+        assert!(note.is_some());
+    }
+
+    #[test]
+    fn empty_file_lists_are_rejected_with_the_cli_sentence() {
+        // Parity with the CLI's risk-diff/batch/tests-for error; extended to
+        // review_rehearsal, which has no stdin/working-tree fallback over MCP.
+        for tool in [
+            "assess_risk_diff",
+            "assess_risk_batch",
+            "recommend_tests",
+            "review_rehearsal",
+        ] {
+            let err = validate_non_empty_file_list(&[], tool)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("no file paths provided") && err.contains("at least one file path"),
+                "{tool}: got: {err}"
+            );
+        }
+        assert!(validate_non_empty_file_list(&["a.rs".to_string()], "review_rehearsal").is_ok());
     }
 }

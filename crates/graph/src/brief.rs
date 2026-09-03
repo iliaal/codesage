@@ -125,12 +125,37 @@ fn test_names_source(test_path: &str, source_path: &str) -> bool {
     if src.chars().count() < 3 {
         return false;
     }
-    let name = test_path
-        .rsplit('/')
-        .next()
-        .unwrap_or(test_path)
-        .to_lowercase();
-    name.contains(&src)
+    let test_stem = stem(test_path);
+    if test_stem == src {
+        return true;
+    }
+    // Otherwise the stems must differ by exactly one known test affix —
+    // `test_`/`test-` prefix, `_test`/`-test`/`_spec`/`-spec` suffix, or the
+    // delimiter-less `Test`/`Tests`/`Spec` suffix (`RepositoryTest.php`). A
+    // bare substring check here lets `user` match `test_superuser_auth.py`;
+    // requiring a full-stem match after one affix strip keeps every real
+    // convention (`foo.test.ts`, `test_foo.py`, `foo_test.go`,
+    // `RepositoryTest.php`) while rejecting coincidental containment.
+    strip_one_test_affix(&test_stem).is_some_and(|stripped| stripped == src)
+}
+
+/// Remove a single leading or trailing test affix from a lowercased file
+/// stem (first dot-segment, so `foo.test.ts` arrives as `foo` and matches
+/// exactly). Multi-character affixes sort before their suffixes so
+/// `footests` loses `tests`, not `test`. Returns `None` when no affix
+/// applies.
+fn strip_one_test_affix(stem: &str) -> Option<&str> {
+    for prefix in ["test_", "test-"] {
+        if let Some(rest) = stem.strip_prefix(prefix) {
+            return Some(rest);
+        }
+    }
+    for suffix in ["_test", "-test", "_spec", "-spec", "tests", "test", "spec"] {
+        if let Some(rest) = stem.strip_suffix(suffix) {
+            return Some(rest);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -162,5 +187,14 @@ mod tests {
 
         // A stem too short to discriminate matches nothing.
         assert!(!test_names_source("tests/db_helper_test.rs", "src/db.rs"));
+
+        // Coincidental containment is not a sibling: `user` is inside
+        // `superuser`, but the stems differ by more than a test affix.
+        assert!(!test_names_source(
+            "tests/test_superuser_auth.py",
+            "app/user.py"
+        ));
+        // ...while a real affix relationship still matches.
+        assert!(test_names_source("tests/user_test.py", "app/user.py"));
     }
 }

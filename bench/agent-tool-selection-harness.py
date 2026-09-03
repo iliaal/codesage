@@ -78,6 +78,15 @@ def positive_int(value: str) -> int:
     return n
 
 
+def _coerce_cost(value: object) -> float:
+    # Model/CLI output is untrusted: a malformed total_cost_usd must score
+    # this run as $0, not kill the whole A/B aggregate.
+    try:
+        return float(value or 0.0)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def expected_tool_set(with_codesage: bool) -> set[str]:
     """The only tools the agent should be able to use under this condition."""
     s = set(BASE_TOOLS)
@@ -219,7 +228,7 @@ def run_task(
                     tool_uses.append(c.get("name") or "")
         elif obj.get("type") == "result":
             result_text = (obj.get("result") or "").strip()
-            cost_usd = float(obj.get("total_cost_usd") or 0.0)
+            cost_usd = _coerce_cost(obj.get("total_cost_usd"))
 
     first_tool = tool_uses[0] if tool_uses else None
     codesage_count = sum(1 for t in tool_uses if t.startswith("mcp__codesage__"))

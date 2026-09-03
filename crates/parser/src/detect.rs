@@ -37,7 +37,9 @@ pub fn detect_language_with_dialect(path: &Path, header_is_cpp: bool) -> Option<
         "java" => Some(Language::Java),
         "rs" => Some(Language::Rust),
         "js" | "mjs" | "cjs" | "jsx" => Some(Language::JavaScript),
-        "ts" | "tsx" => Some(Language::TypeScript),
+        // `.mts`/`.cts` are the explicit-ESM/CJS TypeScript flavors; without
+        // an arm they fell through to None and were silently excluded.
+        "ts" | "tsx" | "mts" | "cts" => Some(Language::TypeScript),
         "go" => Some(Language::Go),
         _ => None,
     }
@@ -189,6 +191,14 @@ mod tests {
         );
         assert_eq!(
             detect_language(Path::new("App.tsx")),
+            Some(Language::TypeScript)
+        );
+        assert_eq!(
+            detect_language(Path::new("mod.mts")),
+            Some(Language::TypeScript)
+        );
+        assert_eq!(
+            detect_language(Path::new("mod.cts")),
             Some(Language::TypeScript)
         );
     }

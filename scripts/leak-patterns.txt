@@ -11,9 +11,22 @@
 # AWS access key id
 \bAKIA[0-9A-Z]{16}\b
 
-# GitHub personal access tokens (classic + fine-grained)
+# AWS secret access key (40-char base64). Anchored to an AWS keyword on the
+# same line: a bare 40-char pattern false-positives on pinned action SHAs.
+[Aa][Ww][Ss].{0,30}[A-Za-z0-9/+=]{40}([^A-Za-z0-9/+=]|$)
+
+# GitHub personal access tokens (classic + fine-grained) and
+# OAuth / App tokens (user-to-server, server-to-server, refresh)
 \bghp_[A-Za-z0-9]{36}\b
+\bgh[ousr]_[A-Za-z0-9]{36}\b
 \bgithub_pat_[A-Za-z0-9_]{80,}\b
+
+# GitHub App installation token, new JWT/stateless format (~520 chars,
+# variable length, dot-separated ghs_<APPID>_<JWT>). Fixed-length {36}
+# misses it per GitHub advisory; the recommended ghs_-prefixed shape
+# below covers both legacy and new formats. Anchored on the ghs_ prefix
+# so bare SHAs / base64 elsewhere never match.
+\bghs_[A-Za-z0-9_.-]{36,}
 
 # Slack tokens
 \bxox[baprs]-[0-9A-Za-z-]{10,}
@@ -42,3 +55,9 @@
 
 # GitLab personal access token
 \bglpat-[A-Za-z0-9_-]{20,}
+
+# Azure storage account / Cosmos DB / Service Bus keys
+# (88-char base64 ending in ==) and connection strings embedding one.
+# No leading \b: a key may start with + or /, which are non-word chars.
+[A-Za-z0-9+/]{86}==
+AccountKey=[A-Za-z0-9+/=]{80,}

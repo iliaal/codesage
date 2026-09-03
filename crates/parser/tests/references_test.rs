@@ -217,15 +217,35 @@ fn javascript_barrel_destructure_and_local_reexport_name_their_symbols() {
 }
 
 #[test]
-fn javascript_destructuring_a_non_module_value_is_still_captured() {
-    // Deliberate scope note: the pattern cannot tell a module namespace from
-    // any other object, so this DOES bind `data`. Resolution downstream is what
-    // decides whether an edge survives; the risk is measured, not assumed.
+fn javascript_destructuring_a_non_module_value_is_ignored() {
+    // The old pattern bound ANY bare identifier on the right, so this
+    // recorded a bogus ImportBinding for `data`. Value-destructures now
+    // require the RHS to be a same-file import binding; `response` is not
+    // imported here, so no edge is recorded.
     let src = "const { data } = response;\n";
     let refs = refs_from_source(src, Language::JavaScript);
-    assert!(has_ref(&refs, "data", ReferenceKind::ImportBinding));
+    assert!(!has_ref(&refs, "data", ReferenceKind::ImportBinding));
 }
 
+#[test]
+fn javascript_destructuring_an_import_binding_is_captured() {
+    // The positive half of the filter: `response` IS imported, so unwrapping
+    // `data` off it names the module's export. Aliased keys record the
+    // source symbol, not the local alias.
+    let src = "import response from './r.js';\n\
+               const { data, meta: m } = response;\n";
+    let refs = refs_from_source(src, Language::JavaScript);
+    assert!(has_ref(&refs, "data", ReferenceKind::ImportBinding));
+    assert!(has_ref(&refs, "meta", ReferenceKind::ImportBinding));
+    assert!(!has_ref(&refs, "m", ReferenceKind::ImportBinding));
+}
+
+#[test]
+fn typescript_destructuring_a_non_module_value_is_ignored() {
+    let src = "const { data } = response;\n";
+    let refs = refs_from_source(src, Language::TypeScript);
+    assert!(!has_ref(&refs, "data", ReferenceKind::ImportBinding));
+}
 #[test]
 fn typescript_barrel_destructure_and_local_reexport_name_their_symbols() {
     let src = "import axios from './axios.js';\n\
@@ -237,4 +257,61 @@ fn typescript_barrel_destructure_and_local_reexport_name_their_symbols() {
         "{refs:?}"
     );
     assert!(has_ref(&refs, "CancelToken", ReferenceKind::ImportBinding));
+}
+
+#[test]
+fn javascript_require_then_destructure_is_captured_but_plain_unpack_is_not() {
+    // Regression: `const axios = require('axios')` bound a local the
+    // value-destructure filter did not know (patterns 7-9 are ESM-only and
+    // pattern 1 keeps only the module string), so `const { Foo } = axios`
+    // named no symbol. The require-bound LHS is now an ImportBinding, which
+    // admits it to the filter — while an unbound `resp` still drops.
+    let src = "const axios = require('axios');\n\
+               const { Foo, Bar: B } = axios;\n\
+               const { data } = resp;\n";
+    let refs = refs_from_source(src, Language::JavaScript);
+    assert!(has_ref(&refs, "axios", ReferenceKind::ImportBinding));
+    assert!(
+        has_ref(&refs, "Foo", ReferenceKind::ImportBinding),
+        "{refs:?}"
+    );
+    // Aliased keys record the source symbol, not the local alias.
+    assert!(has_ref(&refs, "Bar", ReferenceKind::ImportBinding));
+    assert!(!has_ref(&refs, "B", ReferenceKind::ImportBinding));
+    // `resp` binds nothing import-like, so its unpack stays dropped.
+    assert!(!has_ref(&refs, "data", ReferenceKind::ImportBinding));
+}
+
+#[test]
+fn typescript_require_then_destructure_is_captured_but_plain_unpack_is_not() {
+    // TS mirror of the JS regression above: same require-then-destructure
+    // shape under the TSX grammar, same discrimination against `resp`.
+    let src = "const axios = require('axios');\n\
+               const { Foo, Bar: B } = axios;\n\
+               const { data } = resp;\n";
+    let refs = refs_from_source(src, Language::TypeScript);
+    assert!(has_ref(&refs, "axios", ReferenceKind::ImportBinding));
+    assert!(
+        has_ref(&refs, "Foo", ReferenceKind::ImportBinding),
+        "{refs:?}"
+    );
+    assert!(has_ref(&refs, "Bar", ReferenceKind::ImportBinding));
+    assert!(!has_ref(&refs, "B", ReferenceKind::ImportBinding));
+    assert!(!has_ref(&refs, "data", ReferenceKind::ImportBinding));
+}
+
+#[test]
+fn python_decorators_name_the_applied_symbol() {
+    // Parity with Java's annotation patterns: decoration sites surface as
+    // Call rows naming the decorator, whether bare, called, dotted, or both.
+    let src = "@property\n\
+               def name(self):\n    return 1\n\
+               @retry(tries=3)\n\
+               def flaky():\n    pass\n\
+               @app.route(\"/x\")\n\
+               def view():\n    pass\n";
+    let refs = refs_from_source(src, Language::Python);
+    assert!(has_ref(&refs, "property", ReferenceKind::Call));
+    assert!(has_ref(&refs, "retry", ReferenceKind::Call));
+    assert!(has_ref(&refs, "route", ReferenceKind::Call));
 }

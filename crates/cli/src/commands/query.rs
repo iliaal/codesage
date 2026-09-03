@@ -87,6 +87,28 @@ pub(crate) fn cmd_find_references(name: &str, kind_str: Option<&str>, json: bool
     Ok(())
 }
 
+/// Parse the `--language` filter, rejecting unknown values instead of
+/// silently dropping the filter (which would return unfiltered results the
+/// caller believes are filtered). Mirrors `cmd_features_list`.
+fn parse_search_language(language: Option<&str>) -> Result<Option<Language>> {
+    language
+        .map(|l| Language::parse(l).ok_or_else(|| anyhow::anyhow!("unknown language: {l}")))
+        .transpose()
+}
+
+/// Normalize a `min_jaccard` threshold into the contract range `[0, 1]`:
+/// finite out-of-range values clamp, non-finite values (NaN/inf, which make
+/// every comparison false and silently zero the results) fall back to the
+/// default 0.85. Mirrors the graph layer's guard so the CLI prints the
+/// applied value instead of the requested one.
+fn normalize_min_jaccard(min_jaccard: f32) -> f32 {
+    if min_jaccard.is_finite() {
+        min_jaccard.clamp(0.0, 1.0)
+    } else {
+        0.85
+    }
+}
+
 pub(crate) fn cmd_search(
     query: &str,
     limit: usize,
@@ -98,7 +120,7 @@ pub(crate) fn cmd_search(
     let root = find_project_root()?;
     let (db, mut embedder, mut reranker) = load_query_stack(&root)?;
 
-    let languages = language.and_then(|l| Language::parse(l).map(|lang| vec![lang]));
+    let languages = parse_search_language(language)?.map(|lang| vec![lang]);
 
     let req = SearchRequest {
         query: query.to_string(),
@@ -173,6 +195,10 @@ pub(crate) fn cmd_dependencies(file: &str, json: bool) -> Result<()> {
 pub(crate) fn cmd_similar(symbol: &str, min_jaccard: f32, limit: usize, json: bool) -> Result<()> {
     let root = find_project_root()?;
     let db = open_db(&root)?;
+    // Report the applied threshold: out-of-range input is clamped (see
+    // `normalize_min_jaccard`), so echoing the request would lie about what
+    // was actually searched.
+    let min_jaccard = normalize_min_jaccard(min_jaccard);
     let hits = find_similar(&db, symbol, min_jaccard, limit)?;
     if json {
         println!(
@@ -723,6 +749,34 @@ mod tests {
         assert_eq!(export_format("md", true), export_format("json", false));
         assert_eq!(export_format("md", false), "md");
         assert_eq!(export_format("ingest", false), "ingest");
+    }
+
+    #[test]
+    fn search_rejects_unknown_language_instead_of_unfiltering() {
+        // Parity with `cmd_features_list` and the MCP `search` param: an
+        // unknown language must error, never silently drop the filter and
+        // return unfiltered results the caller believes are filtered.
+        let err = parse_search_language(Some("cobol"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown language"), "got: {err}");
+        assert!(parse_search_language(None).unwrap().is_none());
+        assert_eq!(
+            parse_search_language(Some("rust")).unwrap(),
+            Some(Language::Rust)
+        );
+    }
+
+    #[test]
+    fn similar_threshold_normalizes_to_contract_range() {
+        // Finite out-of-range values clamp to [0, 1] (reported as the
+        // applied value by both CLI and MCP); non-finite values fall back
+        // to the default instead of silently zeroing the results.
+        assert_eq!(normalize_min_jaccard(0.7), 0.7);
+        assert_eq!(normalize_min_jaccard(1.5), 1.0);
+        assert_eq!(normalize_min_jaccard(-0.2), 0.0);
+        assert_eq!(normalize_min_jaccard(f32::NAN), 0.85);
+        assert_eq!(normalize_min_jaccard(f32::INFINITY), 0.85);
     }
 
     #[test]

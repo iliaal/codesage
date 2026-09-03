@@ -771,13 +771,44 @@ fn apply_symbol_boost(results: &mut [SearchResult], known_symbols: &[String]) {
         let content_lower = result.content.to_lowercase();
         let mut boost = 0.0f32;
         for sym in known_symbols {
-            if content_lower.contains(sym) {
+            // Token-boundary match, not substring: a raw `contains` lets a
+            // short query token fire inside a longer identifier (`test`
+            // boosting "latest", `log` boosting "catalog"). Both sides are
+            // already lowercased (`extract_known_symbols` lowercases the
+            // symbols; `content_lower` here), so the comparison is
+            // case-insensitive by construction.
+            if contains_token(&content_lower, sym) {
                 boost += 0.1;
             }
         }
         result.score += boost;
     }
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+}
+
+/// Identifier character for token-boundary checks: letters, digits, `_`.
+/// A query token only matches when neither neighbor is one of these.
+fn is_token_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// True when `needle` occurs in `haystack` with a token boundary on both
+/// sides (string edges count as boundaries).
+fn contains_token(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    haystack.match_indices(needle).any(|(idx, _)| {
+        let left_ok = haystack[..idx]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_token_char(c));
+        let right_ok = haystack[idx + needle.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_token_char(c));
+        left_ok && right_ok
+    })
 }
 
 // Multiplicative ×2.0 boost when a query-derived identifier token matches the
@@ -1047,10 +1078,44 @@ fn extract_symbol_name(query: &str) -> String {
     q.to_string()
 }
 
+/// Upper bound on cached compiled definition patterns. One entry per distinct
+/// symbol name; without a cap a pathological query stream (random tokens that
+/// pass the symbol-existence probe) grows the cache without bound.
+const DEFINITION_PATTERN_CACHE_CAP: usize = 64;
+
+static DEFINITION_PATTERN_CACHE: LazyLock<Mutex<HashMap<String, Regex>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 fn build_definition_pattern(symbol_name: &str) -> Option<Regex> {
     if symbol_name.is_empty() {
         return None;
     }
+    // Hit: Regex clones cheaply (Arc-backed automaton), so handing out a
+    // clone keeps the cache entry while avoiding a recompile per symbol per
+    // query. Lock recovered rather than panicked: a poisoned mutex here
+    // must degrade to a recompile, not hang the search call.
+    if let Some(cached) = DEFINITION_PATTERN_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(symbol_name)
+    {
+        return Some(cached.clone());
+    }
+    let compiled = compile_definition_pattern(symbol_name)?;
+    let mut cache = DEFINITION_PATTERN_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // Simple eviction: drop the whole map at capacity. Definition-pattern
+    // demand is bursty per query, so clearing keeps the bound with no LRU
+    // bookkeeping; the next query recompiles what it still needs.
+    if cache.len() >= DEFINITION_PATTERN_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(symbol_name.to_string(), compiled.clone());
+    Some(compiled)
+}
+
+fn compile_definition_pattern(symbol_name: &str) -> Option<Regex> {
     let escaped = regex::escape(symbol_name);
     // The keyword alternation is constant; build it once. Only `escaped`
     // (the symbol) varies between calls, so the full regex still has to compile
@@ -1451,9 +1516,11 @@ fn stem_scan_enabled() -> bool {
 }
 
 // Path-penalty multipliers, ported from Semble's ranking/penalties.py. Applied
-// multiplicatively after symbol boost and before cross-encoder reranking, so
-// the reranker sees demoted scores and the post-rerank merge respects the
-// prior. Tests/benches/compat/examples are still indexed (see
+// multiplicatively AFTER cross-encoder reranking (see the call order in
+// `search`), so the final blended score carries the full demote: blending a
+// pre-rerank demote would dilute it to `1 - weight` strength through the
+// `(1 - w) * score + w * ce_norm` merge. Tests/benches/compat/examples are
+// still indexed (see
 // HARD_EXCLUDE_PATTERNS vs TEST_LIKE_EXCLUDE_PATTERNS in parser/discover.rs)
 // so find_references / find_symbol remain accurate; this only down-weights
 // them in semantic `search` results where they're rarely the right answer.
@@ -1922,9 +1989,12 @@ const RERANK_WEIGHT_NATLANG: f32 = 0.6;
 
 /// Pick the rerank/semantic blend weight based on query shape. Adopted
 /// from semble's adaptive-α signal — see `notes/20260516-semble-
-/// classification.md`. Codesage's pipeline has no BM25 stage, so the
-/// natural mapping is to vary the **rerank vs semantic** blend instead
-/// of the **BM25 vs dense** blend.
+/// classification.md`. This varies the **rerank vs semantic** blend for the
+/// dense leg of the pipeline; the gated BM25/RRF leg
+/// ([`query_has_rare_literal`]/[`rrf_merge`]) is fused *before* reranking,
+/// and fused queries bypass this derivation via `weight_override` (pinned to
+/// `RERANK_WEIGHT_SHORT_ID` so the rare-token prior stays dominant) rather
+/// than skipping the cross-encoder outright.
 ///
 /// - **Short identifier queries** (`FooBar`, `parse_config`,
 ///   `Middleware`): trust the cross-encoder less. Symbol-boost and
@@ -1975,20 +2045,32 @@ fn adaptive_rerank_weight_enabled() -> bool {
 /// `weight_override` forces a blend weight instead of deriving one from the
 /// query shape. Fused (BM25/RRF) queries use it to keep the rare-token prior
 /// dominant while still consulting the cross-encoder.
+///
+/// Returns whether the cross-encoder scores were blended in. A reranker
+/// failure keeps the pre-rerank order (with a warning) instead of silently
+/// degrading: callers and tests use the return to tell "reranked" apart from
+/// "semantic order survived".
 fn apply_reranking(
     rerank: &mut RerankFn<'_>,
     query: &str,
     results: &mut [SearchResult],
     weight_override: Option<f32>,
-) {
+) -> bool {
     if results.is_empty() {
-        return;
+        return false;
     }
 
     let docs: Vec<&str> = results.iter().map(|r| r.content.as_str()).collect();
     let ce_scores = match rerank(query, &docs) {
         Ok(s) => s,
-        Err(_) => return,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                candidates = results.len(),
+                "cross-encoder rerank failed; keeping pre-rerank order"
+            );
+            return false;
+        }
     };
 
     let ce_min = ce_scores.iter().cloned().fold(f32::INFINITY, f32::min);
@@ -2005,6 +2087,7 @@ fn apply_reranking(
         result.score = (1.0 - weight) * result.score + weight * ce_norm;
     }
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    true
 }
 
 pub(crate) fn annotate_with_symbols(db: &Database, results: &mut [SearchResult]) -> Result<()> {
@@ -2547,12 +2630,12 @@ mod hybrid_tests {
 
         let mut kept = vec![mk("src/reg.rs", 0.95), mk("src/lib.rs", 0.35)];
         let mut rerank: RerankFn = Box::new(ce);
-        apply_reranking(
+        assert!(apply_reranking(
             &mut rerank,
             "ColdFusion::register",
             &mut kept,
             Some(RERANK_WEIGHT_SHORT_ID),
-        );
+        ));
         assert_eq!(
             kept[0].file_path, "src/reg.rs",
             "fused winner should survive at the SHORT_ID weight"
@@ -2560,12 +2643,12 @@ mod hybrid_tests {
 
         let mut lost = vec![mk("src/reg.rs", 0.95), mk("src/lib.rs", 0.35)];
         let mut rerank: RerankFn = Box::new(ce);
-        apply_reranking(
+        assert!(apply_reranking(
             &mut rerank,
             "ColdFusion::register",
             &mut lost,
             Some(RERANK_WEIGHT_NATLANG),
-        );
+        ));
         assert_eq!(
             lost[0].file_path, "src/lib.rs",
             "same disagreement should flip the order at the natural-language weight"
@@ -3071,6 +3154,47 @@ mod file_saturation_tests {
 }
 
 #[cfg(test)]
+mod symbol_boost_tests {
+    use super::{SearchResult, apply_symbol_boost, contains_token};
+
+    fn mk(content: &str, score: f32) -> SearchResult {
+        SearchResult {
+            file_path: "a.rs".to_string(),
+            language: codesage_protocol::Language::Rust,
+            content: content.to_string(),
+            start_line: 1,
+            end_line: 10,
+            score,
+            symbols: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn token_match_requires_word_boundaries() {
+        assert!(contains_token("let test = 1;", "test"));
+        assert!(contains_token("test", "test"));
+        assert!(contains_token("(test)", "test"));
+        // Substring inside a longer identifier must not match.
+        assert!(!contains_token("latest news", "test"));
+        assert!(!contains_token("catalog of logs", "log"));
+        assert!(!contains_token("attested", "test"));
+        assert!(!contains_token("testing", "test"));
+    }
+
+    #[test]
+    fn symbol_boost_ignores_substring_inside_longer_identifier() {
+        let syms = vec!["test".to_string()];
+        let mut hit = vec![mk("fn test() {}", 0.5)];
+        apply_symbol_boost(&mut hit, &syms);
+        assert!((hit[0].score - 0.6).abs() < 1e-6);
+
+        let mut miss = vec![mk("latest updates", 0.5)];
+        apply_symbol_boost(&mut miss, &syms);
+        assert!((miss[0].score - 0.5).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
 mod definition_boost_tests {
     use super::{
         SearchResult, apply_definition_boost, build_definition_pattern, extract_symbol_name,
@@ -3532,7 +3656,7 @@ mod rerank_blend_tests {
                 .map(|d| if *d == "doc b" { 10.0 } else { 0.0 })
                 .collect())
         });
-        apply_reranking(&mut rerank, QUERY, &mut results, None);
+        assert!(apply_reranking(&mut rerank, QUERY, &mut results, None));
 
         let w = RERANK_WEIGHT_NATLANG;
         assert_eq!(results[0].file_path, "b.rs");
@@ -3559,7 +3683,7 @@ mod rerank_blend_tests {
             mk("c.rs", "doc c", 0.1),
         ];
         let mut rerank: RerankFn = Box::new(|_q, docs| Ok(vec![3.25; docs.len()]));
-        apply_reranking(&mut rerank, QUERY, &mut results, None);
+        assert!(apply_reranking(&mut rerank, QUERY, &mut results, None));
 
         let order: Vec<&str> = results.iter().map(|r| r.file_path.as_str()).collect();
         assert_eq!(order, ["a.rs", "b.rs", "c.rs"]);
@@ -3580,7 +3704,7 @@ mod rerank_blend_tests {
     fn rerank_error_leaves_results_untouched() {
         let mut results = vec![mk("a.rs", "doc a", 0.9), mk("b.rs", "doc b", 0.5)];
         let mut rerank: RerankFn = Box::new(|_q, _docs| anyhow::bail!("ORT unavailable"));
-        apply_reranking(&mut rerank, QUERY, &mut results, None);
+        assert!(!apply_reranking(&mut rerank, QUERY, &mut results, None));
         assert_eq!(results[0].file_path, "a.rs");
         assert!((results[0].score - 0.9).abs() < 1e-6);
         assert!((results[1].score - 0.5).abs() < 1e-6);

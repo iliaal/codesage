@@ -4,7 +4,7 @@
 //! and formatting survive a re-run. An existing `opencode.json` (no `c`) is
 //! preferred when present; otherwise `.jsonc` is created.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
 use jsonc_parser::ParseOptions;
@@ -18,12 +18,13 @@ pub struct OpencodeTarget;
 impl OpencodeTarget {
     fn dir(&self, ctx: &InstallCtx) -> PathBuf {
         if ctx.global {
-            let base = std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| ctx.home.join(".config"));
-            base.join("opencode")
+            global_config_dir(ctx.home)
         } else {
-            ctx.project.to_path_buf()
+            // `cmd_install`/`cmd_uninstall` resolve the project before any
+            // project-local target runs, so this is always `Some` here.
+            ctx.project
+                .expect("project-local opencode install requires a project root")
+                .to_path_buf()
         }
     }
 
@@ -38,6 +39,25 @@ impl OpencodeTarget {
             jsonc
         }
     }
+}
+
+/// Global opencode config dir, with the env read split out so the mapping
+/// itself is unit-testable without mutating process env.
+fn global_config_dir(home: &Path) -> PathBuf {
+    global_config_dir_for(home, std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from))
+}
+
+fn global_config_dir_for(home: &Path, xdg: Option<PathBuf>) -> PathBuf {
+    let base = xdg.unwrap_or_else(|| home.join(".config"));
+    base.join("opencode")
+}
+
+/// The `mcp.codesage` entry's command array: this binary plus `mcp`, with
+/// `--project <abs>` only when the registration is project-bound. Split
+/// out so both shapes are unit-testable without touching the filesystem.
+fn codesage_command(project_utf8: Option<&str>) -> Result<Vec<String>> {
+    let (command, args) = super::mcp_command_args(project_utf8)?;
+    Ok(std::iter::once(command).chain(args).collect())
 }
 
 impl AgentTarget for OpencodeTarget {
@@ -62,10 +82,10 @@ impl AgentTarget for OpencodeTarget {
         let root_obj = root.object_value_or_set();
         let mcp_obj = root_obj.object_value_or_set("mcp");
 
-        let project = ctx.project_utf8;
+        let full = codesage_command(ctx.project_utf8)?;
         let entry = json!({
             "type": "local",
-            "command": ["codesage", "mcp", "--project", project],
+            "command": full,
             "enabled": true,
         });
         if let Some(prop) = mcp_obj.get("codesage") {
@@ -123,10 +143,36 @@ mod tests {
     fn ctx<'a>(project: &'a Path) -> InstallCtx<'a> {
         InstallCtx {
             home: Path::new("/unused"),
-            project,
-            project_utf8: project.to_str().expect("test project path must be UTF-8"),
+            project: Some(project),
+            project_utf8: Some(project.to_str().expect("test project path must be UTF-8")),
             global: false,
         }
+    }
+
+    #[test]
+    fn global_config_dir_prefers_xdg_over_dot_config() {
+        let home = Path::new("/home/u");
+        assert_eq!(
+            global_config_dir_for(home, Some(PathBuf::from("/xdg"))),
+            PathBuf::from("/xdg/opencode")
+        );
+        assert_eq!(
+            global_config_dir_for(home, None),
+            PathBuf::from("/home/u/.config/opencode")
+        );
+    }
+
+    #[test]
+    fn codesage_command_bakes_project_only_when_bound() {
+        // A global registration made outside any onboarded project carries
+        // no `--project` default; the server resolves the project per call.
+        let exe = std::env::current_exe().unwrap();
+        let exe = exe.to_str().unwrap();
+        assert_eq!(
+            codesage_command(Some("/abs/proj")).unwrap(),
+            vec![exe, "mcp", "--project", "/abs/proj"]
+        );
+        assert_eq!(codesage_command(None).unwrap(), vec![exe, "mcp"]);
     }
 
     #[test]

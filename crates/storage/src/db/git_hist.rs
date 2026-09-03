@@ -45,8 +45,24 @@ impl Database {
         Ok(())
     }
 
-    /// UPSERT a co-change pair. Caller must ensure file_a < file_b lexicographically so
-    /// each pair is stored exactly once.
+    /// Order a co-change pair for storage. Pairs are stored once with
+    /// `file_a < file_b` lexicographically; the write path normalizes here
+    /// instead of trusting callers (a `debug_assert` was a no-op in release,
+    /// letting a reversed pair silently insert a mirrored duplicate row).
+    /// A self-pair (`file_a == file_b`) is meaningless — error, don't store.
+    fn order_co_change_pair<'a>(file_a: &'a str, file_b: &'a str) -> Result<(&'a str, &'a str)> {
+        if file_a == file_b {
+            anyhow::bail!("co-change pair must be two distinct files, got {file_a:?} twice");
+        }
+        if file_a < file_b {
+            Ok((file_a, file_b))
+        } else {
+            Ok((file_b, file_a))
+        }
+    }
+
+    /// UPSERT a co-change pair. Pair order is normalized (see
+    /// [`Database::order_co_change_pair`]); a self-pair errors.
     pub fn upsert_git_co_change(
         &self,
         file_a: &str,
@@ -55,18 +71,15 @@ impl Database {
         count: u32,
         last_observed_at: Option<i64>,
     ) -> Result<()> {
-        debug_assert!(
-            file_a < file_b,
-            "co-change pair must be sorted: {file_a} >= {file_b}"
-        );
+        let (lo, hi) = Self::order_co_change_pair(file_a, file_b)?;
         self.conn.execute(
             "INSERT INTO git_co_changes (file_a, file_b, weight, count, last_observed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(file_a, file_b) DO UPDATE SET
-                 weight = excluded.weight,
-                 count = excluded.count,
-                 last_observed_at = excluded.last_observed_at",
-            rusqlite::params![file_a, file_b, weight, count, last_observed_at],
+              VALUES (?1, ?2, ?3, ?4, ?5)
+              ON CONFLICT(file_a, file_b) DO UPDATE SET
+                  weight = excluded.weight,
+                  count = excluded.count,
+                  last_observed_at = excluded.last_observed_at",
+            rusqlite::params![lo, hi, weight, count, last_observed_at],
         )?;
         Ok(())
     }
@@ -83,20 +96,6 @@ impl Database {
     /// Return (last_sha, last_indexed_at_unix) if an incremental state exists.
     pub fn get_git_index_state(&self) -> Result<Option<(String, i64)>> {
         super::get_index_state(&self.conn, "git_index_state")
-    }
-
-    /// All file paths in `git_files` whose path begins with `prefix`. Used by
-    /// the test recommender to enumerate Rust integration tests under a crate's
-    /// `tests/` directory, where there's no per-file naming convention to lean on.
-    pub fn git_files_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT path FROM git_files WHERE path LIKE ?1 ORDER BY path")?;
-        let pattern = format!("{prefix}%");
-        let rows: Vec<String> = stmt
-            .query_map(rusqlite::params![pattern], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
     }
 
     /// Paths from `git_files` ordered by churn_score desc, capped at `limit`.
@@ -119,16 +118,37 @@ impl Database {
 
     /// Apply a global multiplicative decay factor to existing churn and co-change weights.
     /// Used in incremental mode to age rows to "now" before adding new-commit deltas.
+    ///
+    /// Atomic unit: both UPDATEs run inside one savepoint, so a crash or
+    /// error between them cannot leave `git_files` decayed while
+    /// `git_co_changes` still holds pre-decay weights (or vice versa) —
+    /// the two tables would then disagree about the age of the same pass.
+    /// A savepoint (not a bare BEGIN) composes with a caller's outer
+    /// transaction elsewhere in the indexer.
     pub fn scale_git_decay(&self, factor: f64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE git_files SET churn_score = churn_score * ?1",
-            rusqlite::params![factor],
-        )?;
-        self.conn.execute(
-            "UPDATE git_co_changes SET weight = weight * ?1",
-            rusqlite::params![factor],
-        )?;
-        Ok(())
+        self.conn.execute_batch("SAVEPOINT scale_git_decay")?;
+        let result = (|| -> Result<()> {
+            self.conn.execute(
+                "UPDATE git_files SET churn_score = churn_score * ?1",
+                rusqlite::params![factor],
+            )?;
+            self.conn.execute(
+                "UPDATE git_co_changes SET weight = weight * ?1",
+                rusqlite::params![factor],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("RELEASE scale_git_decay")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK TO scale_git_decay");
+                let _ = self.conn.execute_batch("RELEASE scale_git_decay");
+                Err(e)
+            }
+        }
     }
 
     /// Additive upsert: add the given counters to any existing row. Timestamp
@@ -160,6 +180,7 @@ impl Database {
     }
 
     /// Additive upsert for a co-change pair. See `incr_git_file` for semantics.
+    /// Pair order is normalized like [`Database::upsert_git_co_change`]; a self-pair errors.
     pub fn incr_git_co_change(
         &self,
         file_a: &str,
@@ -168,7 +189,7 @@ impl Database {
         count_delta: u32,
         last_observed_at: Option<i64>,
     ) -> Result<()> {
-        debug_assert!(file_a < file_b);
+        let (lo, hi) = Self::order_co_change_pair(file_a, file_b)?;
         self.conn.execute(
             "INSERT INTO git_co_changes (file_a, file_b, weight, count, last_observed_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -180,19 +201,20 @@ impl Database {
                      WHEN last_observed_at IS NULL THEN excluded.last_observed_at
                      ELSE MAX(last_observed_at, excluded.last_observed_at)
                  END",
-            rusqlite::params![file_a, file_b, weight_delta, count_delta, last_observed_at],
+            rusqlite::params![lo, hi, weight_delta, count_delta, last_observed_at],
         )?;
         Ok(())
     }
 
-    /// True if a co-change pair already exists in the DB. `file_a` must be the lexicographic
-    /// lower end. Used by incremental indexing to decide whether a sub-threshold pair should
+    /// True if a co-change pair already exists in the DB. Order-insensitive
+    /// (normalized like the upserts); a self-pair errors. Used by incremental
+    /// indexing to decide whether a sub-threshold pair should
     /// be upserted (existing pairs keep accumulating) or dropped (new noise below threshold).
     pub fn co_change_pair_exists(&self, file_a: &str, file_b: &str) -> Result<bool> {
-        debug_assert!(file_a < file_b);
+        let (lo, hi) = Self::order_co_change_pair(file_a, file_b)?;
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM git_co_changes WHERE file_a = ?1 AND file_b = ?2",
-            rusqlite::params![file_a, file_b],
+            rusqlite::params![lo, hi],
             |r| r.get(0),
         )?;
         Ok(n > 0)
@@ -285,6 +307,86 @@ impl Database {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Top-`limit` co-changing files for every path in `paths`, in one query.
+    /// Bulk counterpart of [`Database::co_changes_for`] for callers scoring
+    /// many files at once. One row-numbered pass over the union of both pair
+    /// sides reproduces the per-file `ORDER BY weight DESC, other LIMIT`
+    /// exactly, ties included. Every requested path is present in the map,
+    /// with an empty vec when it has no recorded pairs.
+    pub fn co_changes_for_many(
+        &self,
+        paths: &[&str],
+        limit: usize,
+    ) -> Result<std::collections::HashMap<String, Vec<CoChangeRow>>> {
+        use std::collections::{HashMap, HashSet};
+        let mut out: HashMap<String, Vec<CoChangeRow>> = HashMap::new();
+        for p in paths {
+            out.entry(p.to_string()).or_default();
+        }
+        // Duplicate inputs share one map entry: query each distinct path once
+        // so its rows are not pushed twice.
+        let mut seen = HashSet::new();
+        let mut unique = Vec::new();
+        for p in paths {
+            if seen.insert(*p) {
+                unique.push(*p);
+            }
+        }
+        if unique.is_empty() {
+            return Ok(out);
+        }
+        // One SELECT arm per path per pair side. The same positional parameter
+        // binds both sides of a path, so N distinct paths need N+1 parameters
+        // (the trailing one is the per-path limit). All structure is fixed;
+        // only values are bound.
+        let mut arms = Vec::with_capacity(unique.len() * 2);
+        for (i, _) in unique.iter().enumerate() {
+            let param = format!("?{}", i + 1);
+            arms.push(format!(
+                "SELECT {param} AS qpath, file_b AS other, weight, count AS cnt, last_observed_at \
+                 FROM git_co_changes WHERE file_a = {param}"
+            ));
+            arms.push(format!(
+                "SELECT {param} AS qpath, file_a AS other, weight, count AS cnt, last_observed_at \
+                 FROM git_co_changes WHERE file_b = {param}"
+            ));
+        }
+        let limit_param = format!("?{}", unique.len() + 1);
+        let sql = format!(
+            "SELECT qpath, other, weight, cnt, last_observed_at FROM (
+               SELECT qpath, other, weight, cnt, last_observed_at,
+                      ROW_NUMBER() OVER (PARTITION BY qpath ORDER BY weight DESC, other) AS rn
+               FROM ({})
+             ) WHERE rn <= {limit_param}",
+            arms.join(" UNION ALL ")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut bound: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(unique.len() + 1);
+        for p in &unique {
+            bound.push(p);
+        }
+        let limit_i64 = limit as i64;
+        bound.push(&limit_i64);
+        let rows = stmt.query_map(bound.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                CoChangeRow {
+                    file: row.get(1)?,
+                    weight: row.get(2)?,
+                    count: row.get::<_, i64>(3)? as u32,
+                    last_observed_at: row.get(4)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (qpath, co) = row?;
+            if let Some(peers) = out.get_mut(&qpath) {
+                peers.push(co);
+            }
+        }
+        Ok(out)
     }
 
     /// Compute churn percentile for a single path using all git_files churn scores.
@@ -458,5 +560,108 @@ mod tests {
     fn churn_percentiles_empty_table_returns_empty_map() {
         let db = Database::open_in_memory().unwrap();
         assert!(db.churn_percentiles().unwrap().is_empty());
+    }
+
+    #[test]
+    fn co_changes_for_many_matches_per_file_query_including_ties_and_gaps() {
+        let db = Database::open_in_memory().unwrap();
+        // target.rs: five peers tied at one weight (limit cuts the tie), plus
+        // a heavier peer that must sort first on both paths.
+        db.upsert_git_co_change("heavy.rs", "target.rs", 9.0, 10, Some(1_700_000_000))
+            .unwrap();
+        for other in ["e.rs", "c.rs", "a.rs", "d.rs", "b.rs"] {
+            db.upsert_git_co_change(other, "target.rs", 1.0, 3, Some(1_700_000_000))
+                .unwrap();
+        }
+        // A second queried path sharing one pair side with the first.
+        db.upsert_git_co_change("a.rs", "solo.rs", 4.0, 2, None)
+            .unwrap();
+
+        let paths = ["target.rs", "solo.rs", "unknown.rs", "target.rs"];
+        let bulk = db
+            .co_changes_for_many(&paths, 3)
+            .expect("batch co-change lookup");
+        // Every requested path is present, even the unknown and duplicated one.
+        assert_eq!(bulk.len(), 3);
+        assert!(bulk["unknown.rs"].is_empty());
+        for p in ["target.rs", "solo.rs"] {
+            let single = db.co_changes_for(p, 3).unwrap();
+            let batch = &bulk[p];
+            assert_eq!(
+                batch.len(),
+                single.len(),
+                "path {p}: batch cut a different number of rows than the per-file query"
+            );
+            for (got, want) in batch.iter().zip(single.iter()) {
+                assert_eq!(got.file, want.file);
+                assert_eq!(got.weight.to_bits(), want.weight.to_bits());
+                assert_eq!(got.count, want.count);
+                assert_eq!(got.last_observed_at, want.last_observed_at);
+            }
+        }
+        // The tie under the cap resolves the same total order both ways.
+        let files: Vec<&str> = bulk["target.rs"].iter().map(|r| r.file.as_str()).collect();
+        assert_eq!(files, vec!["heavy.rs", "a.rs", "b.rs"]);
+        assert!(db.co_changes_for_many(&[], 3).unwrap().is_empty());
+    }
+
+    /// Reversed pairs must land on the same stored row, not a mirrored
+    /// duplicate: the old `debug_assert!(file_a < file_b)` was compiled out
+    /// in release, so a reversed call silently inserted a second row and
+    /// double-counted the pair in every downstream weight query.
+    #[test]
+    fn reversed_co_change_pair_normalizes_to_one_row() {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_git_co_change("b.rs", "a.rs", 2.0, 1, None)
+            .unwrap();
+        db.upsert_git_co_change("a.rs", "b.rs", 3.0, 2, None)
+            .unwrap();
+        // Second upsert overwrote the first (UPSERT), it did not add a row.
+        let n: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM git_co_changes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "reversed pair must not create a mirrored row");
+        assert_eq!(db.co_change_weight("a.rs", "b.rs").unwrap(), 3.0);
+        assert_eq!(db.co_change_weight("b.rs", "a.rs").unwrap(), 3.0);
+        // Existence probes are order-insensitive too.
+        assert!(db.co_change_pair_exists("b.rs", "a.rs").unwrap());
+        // Additive path normalizes as well.
+        db.incr_git_co_change("b.rs", "a.rs", 1.0, 1, None).unwrap();
+        assert_eq!(db.co_change_weight("a.rs", "b.rs").unwrap(), 4.0);
+    }
+
+    /// A self-pair has no meaning (a file never co-changes with itself) and
+    /// previously passed the `debug_assert` only when `file_a < file_b`
+    /// happened to hold vacuously false — it must be a runtime error.
+    #[test]
+    fn self_pair_co_change_is_rejected() {
+        let db = Database::open_in_memory().unwrap();
+        assert!(
+            db.upsert_git_co_change("a.rs", "a.rs", 1.0, 1, None)
+                .is_err()
+        );
+        assert!(db.incr_git_co_change("a.rs", "a.rs", 1.0, 1, None).is_err());
+        assert!(db.co_change_pair_exists("a.rs", "a.rs").is_err());
+        let n: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM git_co_changes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "rejected self-pair must not leave a row");
+    }
+
+    /// Decay must move both tables together: a partial application (files
+    /// aged, co-changes not) would make the next incremental pass add fresh
+    /// deltas onto inconsistently-aged baselines.
+    #[test]
+    fn scale_git_decay_applies_to_both_tables() {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_git_file("a.rs", 10.0, 4, 4, None).unwrap();
+        db.upsert_git_co_change("a.rs", "b.rs", 8.0, 2, None)
+            .unwrap();
+        db.scale_git_decay(0.5).unwrap();
+        let churn = db.git_file("a.rs").unwrap().expect("git file row");
+        assert_eq!(churn.churn_score, 5.0);
+        assert_eq!(db.co_change_weight("a.rs", "b.rs").unwrap(), 4.0);
     }
 }

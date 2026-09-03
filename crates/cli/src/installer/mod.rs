@@ -26,9 +26,14 @@ pub struct InstallCtx<'a> {
     /// unit-testable without mutating process env.
     pub home: &'a Path,
     /// Absolute project root (for display and project-local config paths).
-    pub project: &'a Path,
+    /// `None` for a global registration made outside any onboarded project —
+    /// the entry is then registered without a `--project` default and the
+    /// server resolves the project per call instead.
+    pub project: Option<&'a Path>,
     /// Canonical UTF-8 project root baked into `codesage mcp --project`.
-    pub project_utf8: &'a str,
+    /// `None` exactly when `project` is; targets must omit `--project`
+    /// rather than guess.
+    pub project_utf8: Option<&'a str>,
     /// Global (user-level) vs project-local registration. Some targets
     /// (Codex) are global-only and ignore this.
     pub global: bool,
@@ -117,18 +122,28 @@ pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
-/// The argv CodeSage registers for every agent: the `codesage` binary plus
-/// `mcp --project <abs>`. Returned split so TOML (separate command/args) and
-/// JSON (single command array) targets can each shape it.
-pub(crate) fn mcp_command_args(project_utf8: &str) -> (String, Vec<String>) {
-    (
-        "codesage".to_string(),
-        vec![
-            "mcp".to_string(),
-            "--project".to_string(),
-            project_utf8.to_string(),
-        ],
-    )
+/// The argv CodeSage registers for every agent: this binary plus `mcp`, with
+/// `--project <abs>` when the registration is project-bound. Returned split
+/// so TOML (separate command/args) and JSON (single command array) targets
+/// can each shape it.
+///
+/// The binary is [`std::env::current_exe`], never the literal `codesage`:
+/// a PATH-installed name may resolve to another build (or nothing) where
+/// the agent runs. A failure to resolve it errors rather than registering
+/// a path that cannot work — the same rule as the git-hook installer.
+pub(crate) fn mcp_command_args(project_utf8: Option<&str>) -> Result<(String, Vec<String>)> {
+    let exe =
+        std::env::current_exe().context("resolving current_exe for agent MCP registration")?;
+    let command = exe
+        .to_str()
+        .with_context(|| format!("codesage binary path is not valid UTF-8: {}", exe.display()))?
+        .to_owned();
+    let mut args = vec!["mcp".to_string()];
+    if let Some(project) = project_utf8 {
+        args.push("--project".to_string());
+        args.push(project.to_string());
+    }
+    Ok((command, args))
 }
 
 #[cfg(test)]
@@ -151,9 +166,19 @@ mod tests {
 
     #[test]
     fn mcp_command_args_bakes_project() {
-        let (cmd, args) = mcp_command_args("/abs/proj");
-        assert_eq!(cmd, "codesage");
+        let exe = std::env::current_exe().unwrap();
+        let (cmd, args) = mcp_command_args(Some("/abs/proj")).unwrap();
+        assert_eq!(cmd, exe.to_str().unwrap());
         assert_eq!(args, vec!["mcp", "--project", "/abs/proj"]);
+    }
+
+    #[test]
+    fn mcp_command_args_without_project_omits_the_flag() {
+        // A global registration made outside any project carries no
+        // `--project` default; the server resolves the project per call.
+        let (cmd, args) = mcp_command_args(None).unwrap();
+        assert_eq!(cmd, std::env::current_exe().unwrap().to_str().unwrap());
+        assert_eq!(args, vec!["mcp"]);
     }
 
     #[test]

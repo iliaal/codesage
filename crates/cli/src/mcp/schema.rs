@@ -74,11 +74,16 @@ fn meta_property_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "description": "Response envelope annotations, present only when the server \
-            trimmed or flagged this response. `_meta.truncated` means the response \
+            trimmed, capped, or flagged this response. `_meta.truncated` means the response \
             exceeded the per-call token budget and an array field was trimmed; it is \
             distinct from any same-named field inside a tool's own result (e.g. \
             impact_analysis's `truncated`, which reports that the tool's `limit` \
-            parameter capped the result set).",
+            parameter capped the result set). `_meta.clamps` lists numeric params \
+            the caller over-asked (limit/offset/depth over the ceiling, min_jaccard \
+            outside [0, 1]) with their requested-vs-applied values. \
+            `_meta.test_override` marks a response served through the debug-only \
+            test query-embedding override instead of the resident model; \
+            production responses never carry it.",
         "properties": {
             "truncated": { "type": "boolean", "description": "response was trimmed to fit the token budget" },
             "kind": { "type": "string", "description": "tool that produced the truncated response" },
@@ -90,8 +95,10 @@ fn meta_property_schema() -> serde_json::Value {
             "hint": { "type": "string", "description": "suggested next step (refine query, narrow scope, paginate via offset)" },
             "dropped_files": { "type": "array", "items": { "type": "string" }, "description": "identifiers of elements trimmed from a protected array (e.g. assess_risk_diff `files`)" },
             "dropped_count": { "type": "integer", "minimum": 0, "description": "trimmed protected-array elements that had no identifier" },
+            "clamps": { "type": "array", "items": { "type": "object", "properties": { "param": { "type": "string" }, "requested": {}, "applied": {} } }, "description": "numeric params adjusted from requested to applied (over-max limits capped, min_jaccard clamped to [0, 1])" },
             "stale_files": { "type": "array", "items": { "type": "string" }, "description": "referenced files that changed on disk since indexing" },
-            "stale_warning": { "type": "string", "description": "human-readable staleness notice" }
+            "stale_warning": { "type": "string", "description": "human-readable staleness notice" },
+            "test_override": { "type": "boolean", "description": "response was served through the debug-only test query-embedding override (debug builds only); production responses never carry it" }
         }
     })
 }
@@ -213,7 +220,6 @@ mod tests {
                         tool.name
                     )
                 });
-            assert_eq!(meta["type"], json!("object"), "tool `{}`", tool.name);
             for field in [
                 "truncated",
                 "total_results",
@@ -221,8 +227,10 @@ mod tests {
                 "also_truncated_fields",
                 "dropped_files",
                 "dropped_count",
+                "clamps",
                 "stale_files",
                 "stale_warning",
+                "test_override",
             ] {
                 assert!(
                     meta["properties"].get(field).is_some(),

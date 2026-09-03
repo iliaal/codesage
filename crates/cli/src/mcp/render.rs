@@ -66,7 +66,8 @@ impl CodeSageServer {
     /// code was never indexed". `impact_analysis` is deliberately absent: `[]`
     /// there means a leaf nothing imports, which its own description already
     /// states, so a coverage note would be noise on a correct answer.
-    const COVERAGE_ANNOTATED_TOOLS: [&str; 2] = ["search", "find_symbol"];
+    const COVERAGE_ANNOTATED_TOOLS: [&str; 4] =
+        ["search", "find_symbol", "find_references", "find_similar"];
 
     /// On an empty result, record what the index actually holds under
     /// `_meta.coverage`. An agent that searches and gets nothing back cannot
@@ -525,6 +526,83 @@ fn merge_stale_meta(structured: &mut serde_json::Value, stale: &[String]) {
                 .to_string(),
         ),
     );
+}
+
+/// One silent numeric adjustment: the caller asked for `requested`, the tool
+/// ran with `applied`. Produced by the MCP cap helpers in `mod.rs` for every
+/// over-max `limit`/`offset`/`depth` and every out-of-range `min_jaccard`;
+/// surfaced under `_meta.clamps` so requested-vs-applied is visible instead
+/// of silently capped.
+#[derive(Debug, Clone)]
+pub(super) struct ClampNote {
+    pub(super) param: &'static str,
+    pub(super) requested: serde_json::Value,
+    pub(super) applied: serde_json::Value,
+}
+
+/// Record requested-vs-applied numeric adjustments under `_meta.clamps`,
+/// merging into any existing `_meta` (truncation, coverage, staleness)
+/// rather than overwriting it. No-op on error results, on responses without
+/// structured content, or when nothing was clamped — the common case stays
+/// byte-identical.
+pub(super) fn annotate_clamps(mut result: CallToolResult, notes: &[ClampNote]) -> CallToolResult {
+    if notes.is_empty() || result.is_error == Some(true) {
+        return result;
+    }
+    let Some(structured) = result.structured_content.as_mut() else {
+        return result;
+    };
+    let serde_json::Value::Object(map) = structured else {
+        return result;
+    };
+    let meta = map
+        .entry("_meta")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let serde_json::Value::Object(meta) = meta else {
+        return result;
+    };
+    meta.insert(
+        "clamps".to_string(),
+        serde_json::Value::Array(
+            notes
+                .iter()
+                .map(|n| {
+                    serde_json::json!({
+                        "param": n.param,
+                        "requested": n.requested,
+                        "applied": n.applied,
+                    })
+                })
+                .collect(),
+        ),
+    );
+    result
+}
+
+/// Stamp `_meta.test_override: true` when the debug-only query-embedding
+/// override served this response (see `test_override_active` in `state.rs`:
+/// debug build plus a parseable `CODESAGE_MCP_TEST_QUERY_EMBEDDING`). Skipped
+/// on error results and when the override is inert — the common case stays
+/// byte-identical. Merges into any existing `_meta` (truncation, coverage,
+/// staleness, clamps) rather than overwriting it.
+pub(super) fn annotate_test_override(mut result: CallToolResult, active: bool) -> CallToolResult {
+    if !active || result.is_error == Some(true) {
+        return result;
+    }
+    let Some(structured) = result.structured_content.as_mut() else {
+        return result;
+    };
+    let serde_json::Value::Object(map) = structured else {
+        return result;
+    };
+    let meta = map
+        .entry("_meta")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let serde_json::Value::Object(meta) = meta else {
+        return result;
+    };
+    meta.insert("test_override".to_string(), serde_json::Value::Bool(true));
+    result
 }
 
 /// Array fields that carry a documented per-element invariant and must not
@@ -1820,6 +1898,17 @@ mod tests {
             coverage_of("find_symbol", json!({ "results": [] })).is_some(),
             "find_symbol is in the annotated set"
         );
+        // `find_references` / `find_similar` returning [] is likewise
+        // ambiguous between "no such code" and "never indexed", so they
+        // carry the same annotation.
+        assert!(
+            coverage_of("find_references", json!({ "results": [] })).is_some(),
+            "find_references is in the annotated set"
+        );
+        assert!(
+            coverage_of("find_similar", json!({ "results": [] })).is_some(),
+            "find_similar is in the annotated set"
+        );
         // A non-empty result is not ambiguous, so it must stay untouched.
         assert!(
             coverage_of(
@@ -1881,6 +1970,54 @@ mod tests {
     }
 
     #[test]
+    fn clamps_annotate_requested_vs_applied_and_spare_the_common_case() {
+        // No adjustment: the response must stay byte-identical, with no
+        // `_meta` injected.
+        let plain = render_with_kind(Ok(json!({ "results": [] })), "search");
+        let untouched = annotate_clamps(plain, &[]);
+        assert!(
+            untouched
+                .structured_content
+                .as_ref()
+                .unwrap()
+                .get("_meta")
+                .is_none(),
+            "an unclamped response must not grow a `_meta` envelope"
+        );
+
+        // One adjustment: requested-vs-applied lands under `_meta.clamps`.
+        let capped = render_with_kind(Ok(json!({ "results": [] })), "search");
+        let annotated = annotate_clamps(
+            capped,
+            &[ClampNote {
+                param: "limit",
+                requested: json!(10_000),
+                applied: json!(100),
+            }],
+        );
+        let clamps = annotated.structured_content.as_ref().unwrap()["_meta"]["clamps"].clone();
+        assert_eq!(
+            clamps,
+            json!([{ "param": "limit", "requested": 10_000, "applied": 100 }])
+        );
+
+        // Error results stay errors: a clamp note must not decorate a
+        // failure or clear its error flag.
+        let failed: CallToolResult =
+            render_with_kind::<serde_json::Value>(Err(anyhow::anyhow!("boom")), "search");
+        assert_eq!(failed.is_error, Some(true));
+        let still_failed = annotate_clamps(
+            failed,
+            &[ClampNote {
+                param: "limit",
+                requested: json!(10_000),
+                applied: json!(100),
+            }],
+        );
+        assert_eq!(still_failed.is_error, Some(true));
+    }
+
+    #[test]
     fn staleness_refuses_absolute_indexed_paths() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("project");
@@ -1903,5 +2040,43 @@ mod tests {
             .unwrap();
 
         assert_eq!(stale, vec![outside_path]);
+    }
+
+    #[test]
+    fn test_override_marks_success_and_spares_the_common_case() {
+        // Marker present when active and merged with any existing `_meta`;
+        // absent when inert; error results never carry it.
+        let marked =
+            annotate_test_override(CallToolResult::structured(json!({"results": []})), true);
+        assert_eq!(
+            marked.structured_content.as_ref().unwrap()["_meta"]["test_override"],
+            json!(true)
+        );
+
+        let merged = annotate_test_override(
+            CallToolResult::structured(json!({"results": [], "_meta": {"truncated": true}})),
+            true,
+        );
+        let meta = &merged.structured_content.as_ref().unwrap()["_meta"];
+        assert_eq!(meta["test_override"], json!(true));
+        assert_eq!(meta["truncated"], json!(true));
+
+        let unmarked =
+            annotate_test_override(CallToolResult::structured(json!({"results": []})), false);
+        assert!(
+            unmarked
+                .structured_content
+                .as_ref()
+                .unwrap()
+                .get("_meta")
+                .is_none(),
+            "inert override must leave the response byte-identical"
+        );
+
+        let still_failed = annotate_test_override(
+            CallToolResult::error(vec![ContentBlock::text("boom")]),
+            true,
+        );
+        assert_eq!(still_failed.is_error, Some(true));
     }
 }

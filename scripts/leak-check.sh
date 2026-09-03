@@ -13,7 +13,7 @@
 # Exits non-zero on the first match (stops the commit / fails the CI job).
 # Bypass deliberately with: git commit --no-verify
 
-set -eu
+set -euo pipefail
 
 mode="staged"
 range=""

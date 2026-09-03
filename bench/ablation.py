@@ -82,7 +82,13 @@ def parse_metrics(stdout: str) -> dict[str, str]:
 def run_arm(runner: Path, corpus: Path, bin_: str, limit: int, env_over: dict[str, str]) -> dict[str, str]:
     env = {**os.environ, **env_over}
     cmd = [sys.executable, str(runner), str(corpus), "--codesage-bin", bin_, "--limit", str(limit)]
-    r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=3600)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=3600)
+    except subprocess.TimeoutExpired:
+        # One hung arm must not abort the whole sweep and discard the arms
+        # already collected — score it as empty and keep going.
+        print(f"  [warn] runner timed out after 3600s: {cmd[2]}", file=sys.stderr)
+        return {}
     if r.returncode != 0:
         print(f"  [warn] runner rc={r.returncode}: {r.stderr.strip()[:200]}", file=sys.stderr)
     metrics = parse_metrics(r.stdout)

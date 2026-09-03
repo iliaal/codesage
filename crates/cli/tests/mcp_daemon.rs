@@ -981,6 +981,11 @@ fn tools_call_search_returns_seeded_hits_without_model_download() {
                 .is_some_and(|c| c.contains("hello_symbol"))),
         "seeded search hit missing from results: {results:?}"
     );
+    assert_eq!(
+        resp["result"]["structuredContent"]["_meta"]["test_override"],
+        Value::Bool(true),
+        "debug-override search must be marked: {resp}"
+    );
 }
 
 #[test]

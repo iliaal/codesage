@@ -566,6 +566,8 @@ These address different layers than CodeSage and work well alongside it:
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). In short: file an issue first, add a test, update `CHANGELOG.md` under `[Unreleased]` for user-visible changes.
 
+Agent-facing planning docs: [TODO.md](TODO.md) (improvement backlog) and [docs/spikes/](docs/spikes/) (spike write-ups; each names its branch and what shipped vs stayed on-branch).
+
 ## License
 
 MIT

@@ -20,11 +20,14 @@ static JS_REF_QUERY: &str = include_str!("queries/javascript_refs.scm");
 static TS_REF_QUERY: &str = include_str!("queries/typescript_refs.scm");
 static GO_REF_QUERY: &str = include_str!("queries/go_refs.scm");
 
-/// Compiled reference query + cached @ref capture index, lazily initialized
-/// once per language.
+/// Compiled reference query + cached capture indices, lazily initialized once
+/// per language. `rhs_idx` is `Some` only for JS/TS, whose value-destructure
+/// patterns capture the right-hand side as `@rhs` for the import-binding
+/// filter in `extract_references`.
 struct RefQuerySpec {
     query: Query,
     ref_idx: u32,
+    rhs_idx: Option<u32>,
 }
 
 fn compile_ref_query(lang: tree_sitter::Language, src: &str) -> RefQuerySpec {
@@ -32,7 +35,12 @@ fn compile_ref_query(lang: tree_sitter::Language, src: &str) -> RefQuerySpec {
     let ref_idx = query
         .capture_index_for_name("ref")
         .expect("embedded .scm has @ref capture");
-    RefQuerySpec { query, ref_idx }
+    let rhs_idx = query.capture_index_for_name("rhs");
+    RefQuerySpec {
+        query,
+        ref_idx,
+        rhs_idx,
+    }
 }
 
 static PHP_REF: LazyLock<RefQuerySpec> =
@@ -172,6 +180,10 @@ fn python_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
         3 => Some(ReferenceKind::Import),   // from X import Y as Z (aliased)
         4 | 5 => Some(ReferenceKind::Call), // call expression
         6 => Some(ReferenceKind::Import),   // relative import module (from . import x)
+        // Decorators (@property, @retry(..), @app.route, @app.route(..)).
+        // Filed as Call to match Java's annotation handling, so decoration
+        // sites surface through the same kind query.
+        7..=10 => Some(ReferenceKind::Call),
         _ => None,
     }
 }
@@ -239,7 +251,7 @@ fn js_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
         4 => Some(ReferenceKind::Import),             // re-export (export ... from "src")
         5 => Some(ReferenceKind::Inheritance),        // class Foo extends Bar (JS heritage)
         6 => Some(ReferenceKind::Instantiation),      // new Foo()
-        7..=14 => Some(ReferenceKind::ImportBinding), // import / re-export bindings
+        7..=15 => Some(ReferenceKind::ImportBinding), // import / re-export / require bindings
         _ => None,
     }
 }
@@ -257,18 +269,16 @@ fn ts_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
         4 => Some(ReferenceKind::Import),             // re-export (export ... from "src")
         5 => Some(ReferenceKind::Instantiation),      // new Foo()
         6 => Some(ReferenceKind::Inheritance),        // class Foo extends Bar (TS extends_clause)
-        7..=14 => Some(ReferenceKind::ImportBinding), // import / re-export bindings
+        7..=15 => Some(ReferenceKind::ImportBinding), // import / re-export / require bindings
         _ => None,
     }
 }
 
-pub fn extract_references(
-    tree: &Tree,
-    source: &[u8],
-    language: Language,
-    file_path: &str,
-) -> Result<Vec<Reference>> {
-    let kind_map: fn(usize) -> Option<ReferenceKind> = match language {
+/// The pattern-index → `ReferenceKind` map for a language. Counterpart to
+/// `crate::extract::kind_map_for`; shared by `extract_references` and the
+/// validation gate so both agree on what each `@ref` pattern means.
+pub(crate) fn ref_kind_map_for(language: Language) -> fn(usize) -> Option<ReferenceKind> {
+    match language {
         Language::Php => php_ref_kind,
         Language::Python => python_ref_kind,
         Language::C => c_ref_kind,
@@ -278,8 +288,16 @@ pub fn extract_references(
         Language::JavaScript => js_ref_kind,
         Language::TypeScript => ts_ref_kind,
         Language::Go => go_ref_kind,
-    };
+    }
+}
 
+pub fn extract_references(
+    tree: &Tree,
+    source: &[u8],
+    language: Language,
+    file_path: &str,
+) -> Result<Vec<Reference>> {
+    let kind_map = ref_kind_map_for(language);
     let spec = ref_query_for(language);
     let query = &spec.query;
     let name_idx = spec.ref_idx;
@@ -287,21 +305,69 @@ pub fn extract_references(
     let root = tree.root_node();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, root, source);
+    let rhs_idx = spec.rhs_idx;
 
-    let mut refs = Vec::new();
-
+    // Collect first: the JS/TS value-destructure filter below needs the full
+    // set of same-file import bindings before it can judge any one match.
+    // Nodes borrow the tree, so holding them past the cursor is free.
+    struct Pending<'a> {
+        pattern: usize,
+        node: tree_sitter::Node<'a>,
+        rhs: Option<tree_sitter::Node<'a>>,
+    }
+    let mut pending = Vec::new();
     while let Some(m) = matches.next() {
-        let Some(kind) = kind_map(m.pattern_index) else {
-            continue;
-        };
-
         let Some(ref_cap) = m.captures.iter().find(|c| c.index == name_idx) else {
             continue;
         };
+        let rhs =
+            rhs_idx.and_then(|idx| m.captures.iter().find(|c| c.index == idx).map(|c| c.node));
+        pending.push(Pending {
+            pattern: m.pattern_index,
+            node: ref_cap.node,
+            rhs,
+        });
+    }
 
-        let ref_node = ref_cap.node;
-        let raw = ref_node.utf8_text(source).unwrap_or("");
-        let stripped = strip_surrounding_quotes(raw);
+    // Names bound by an `import` in this file (patterns 7-9 in both JS and
+    // TS ref queries) plus the CommonJS require-bound local (pattern 15:
+    // `const axios = require('axios')`). A value-destructure `const { X } =
+    // rhs` only names a module export when `rhs` is one of these; otherwise
+    // it is an arbitrary object unpack (`const { data } = response`) and its
+    // keys are not references to anything.
+    let imports_js_ts = matches!(language, Language::JavaScript | Language::TypeScript);
+    let import_bindings: std::collections::HashSet<String> = if imports_js_ts {
+        pending
+            .iter()
+            .filter(|p| matches!(p.pattern, 7..=9 | 15))
+            .map(|p| crate::parse::node_text_lossy(&p.node, source))
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    let mut refs = Vec::new();
+    for p in &pending {
+        let Some(kind) = kind_map(p.pattern) else {
+            continue;
+        };
+
+        // Patterns 13-14 (JS and TS): keep only destructures off a same-file
+        // import binding. `const { Axios } = axios` (imported) stays;
+        // `const { data } = response` (not imported) is dropped.
+        if imports_js_ts && matches!(p.pattern, 13 | 14) {
+            let rhs_bound = p
+                .rhs
+                .map(|rhs| import_bindings.contains(&crate::parse::node_text_lossy(&rhs, source)))
+                .unwrap_or(false);
+            if !rhs_bound {
+                continue;
+            }
+        }
+
+        let ref_node = p.node;
+        let raw = crate::parse::node_text_lossy(&ref_node, source);
+        let stripped = strip_surrounding_quotes(&raw);
         if stripped.is_empty() {
             continue;
         }

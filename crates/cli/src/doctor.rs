@@ -158,7 +158,9 @@ fn check_db(root: &Path) -> Check {
             message: format!("missing {} (run `codesage index`)", db_path.display()),
         };
     }
-    match Database::open(&db_path) {
+    // Read-only: doctor must never chmod, migrate, or WAL-touch an index it
+    // only inspects (read-only checkouts fail those writes outright).
+    match Database::open_read_only(&db_path) {
         Ok(db) => {
             let f = db.file_count().unwrap_or(0);
             let s = db.symbol_count().unwrap_or(0);
@@ -417,16 +419,24 @@ fn check_hooks(root: &Path) -> Check {
     let mut foreign = Vec::new();
     let mut missing = Vec::new();
     let mut dead_binaries: Vec<String> = Vec::new();
+    // Hooks that carry the marker but no recognizable invocation line: the
+    // binary check below cannot vouch for them, and silently passing them
+    // would bless a hook that may invoke a moved binary.
+    let mut unparseable: Vec<&str> = Vec::new();
     for name in REQUIRED_HOOKS {
         let p = hooks_dir.join(name);
         match std::fs::read_to_string(&p) {
             Ok(body) if body.contains("codesage install-hooks") => {
                 installed.push(*name);
-                if let Some(bin) = hook_embedded_binary(&body)
-                    && !dead_binaries.contains(&bin)
-                    && !is_executable_file(Path::new(&bin))
-                {
-                    dead_binaries.push(bin);
+                match hook_embedded_binary(&body) {
+                    Some(bin)
+                        if !dead_binaries.contains(&bin)
+                            && !is_executable_file(Path::new(&bin)) =>
+                    {
+                        dead_binaries.push(bin);
+                    }
+                    None => unparseable.push(*name),
+                    _ => {}
                 }
             }
             // The slot is occupied by someone else's hook. `install-hooks`
@@ -447,6 +457,22 @@ fn check_hooks(root: &Path) -> Check {
             message: format!(
                 "{kind}: installed hooks invoke {} which is missing or not executable (re-run `codesage install-hooks`)",
                 dead_binaries.join(", ")
+            ),
+        };
+    }
+
+    // A hook that carries the marker but no parseable invocation line cannot
+    // have its binary vouched for — hand-editing may have broken the command
+    // the hook runs. Warn rather than pass: the hook looks installed but
+    // doctor cannot confirm what it invokes.
+    if !unparseable.is_empty() {
+        return Check {
+            name: "hooks",
+            status: Status::Warn,
+            message: format!(
+                "{kind}: installed hook(s) [{}] carry the marker but no parseable binary path \
+                 (re-run `codesage install-hooks` to refresh them)",
+                unparseable.join(",")
             ),
         };
     }
@@ -567,7 +593,9 @@ fn check_index_drift(root: &Path) -> Check {
             message: "no index.db yet (run `codesage index`)".to_string(),
         };
     }
-    let db = match Database::open(&db_path) {
+    // No migrations: a pure read must keep working when the database was
+    // migrated by a newer binary (see `open_existing_read`).
+    let db = match Database::open_existing_read(&db_path) {
         Ok(db) => db,
         Err(e) => {
             return Check {
@@ -591,6 +619,21 @@ fn check_index_drift(root: &Path) -> Check {
     }
 }
 
+/// Map [`Database::require_semantic_fingerprint`] to a doctor [`Check`]:
+/// `Some(Fail)` naming `index --full` when the table's vectors were attested
+/// under another setup, `None` when they match `expected` (or the table holds
+/// no vectors yet, in which case there is nothing to vouch for).
+fn fingerprint_gate(db: &Database, expected: &str) -> Option<Check> {
+    match db.require_semantic_fingerprint(expected) {
+        Ok(()) => None,
+        Err(e) => Some(Check {
+            name: "semantic",
+            status: Status::Fail,
+            message: format!("{e:#}"),
+        }),
+    }
+}
+
 fn check_semantic_freshness(root: &Path) -> Check {
     let db_path = root.join(PROJECT_DIR).join(DB_FILE);
     if !db_path.exists() {
@@ -611,7 +654,8 @@ fn check_semantic_freshness(root: &Path) -> Check {
             };
         }
     };
-    let model = config.embedding.unwrap_or_default().model;
+    let emb_config = config.embedding.unwrap_or_default();
+    let model = emb_config.model.clone();
     let db = match Database::open_for_existing_model(&db_path, &model) {
         Ok(db) => db,
         Err(e) => {
@@ -628,6 +672,23 @@ fn check_semantic_freshness(root: &Path) -> Check {
             status: Status::Warn,
             message: format!("no semantic chunks for model {model}; run `codesage index`"),
         };
+    }
+    // Deny-by-default fingerprint gate: vectors attested under another setup
+    // (same model name and dimension, different pooling/device/model bytes)
+    // Fail naming the rebuild instead of reading as fresh-or-stale. The
+    // expected fingerprint resolves from the recorded dim, so doctor never
+    // loads a model; uncached artifacts skip the gate (`models` already
+    // warns those as MISSING).
+    if let Ok(Some(dim)) = db.recorded_semantic_dim()
+        && let Ok(Some(expected)) = codesage_graph::resolve_semantic_fingerprint(
+            &db,
+            &emb_config,
+            dim,
+            codesage_graph::ArtifactLookup::CachedOnly,
+        )
+        && let Some(check) = fingerprint_gate(&db, expected.as_str())
+    {
+        return check;
     }
 
     match db.semantic_freshness() {
@@ -731,13 +792,13 @@ mod tests {
     }
 
     fn write_codesage_hook(root: &Path, name: &str) {
+        // A real installer body (not marker-only): a marker with no
+        // parseable invocation now warns as unparseable, so tests that
+        // expect pass/missing must install the genuine template.
         let hooks = root.join(".git").join("hooks");
         std::fs::create_dir_all(&hooks).unwrap();
-        std::fs::write(
-            hooks.join(name),
-            "#!/bin/sh\n# installed by codesage install-hooks\n",
-        )
-        .unwrap();
+        let body = crate::commands::hooks::generate_post_commit_hook_body("/bin/sh");
+        std::fs::write(hooks.join(name), body).unwrap();
     }
 
     fn init_codesage_project() -> tempfile::TempDir {
@@ -890,6 +951,35 @@ mod tests {
     }
 
     #[test]
+    fn check_hooks_warns_when_installed_hook_has_no_parseable_binary() {
+        // Marker-only bodies look installed but doctor cannot vouch for the
+        // binary they invoke (a hand-edit may have broken the command), so
+        // they warn instead of passing.
+        let dir = init_git_repo();
+        for hook in REQUIRED_HOOKS {
+            write_hook_body(
+                dir.path(),
+                hook,
+                "#!/bin/sh\n# installed by codesage install-hooks\ntrue\n",
+            );
+        }
+
+        let check = check_hooks(dir.path());
+
+        assert_eq!(check.status, Status::Warn);
+        assert!(
+            check.message.contains("no parseable binary path"),
+            "message should name the unparseable hooks: {}",
+            check.message
+        );
+        assert!(
+            check.message.contains("install-hooks"),
+            "message should carry the remediation: {}",
+            check.message
+        );
+    }
+
+    #[test]
     fn hook_embedded_binary_unquotes_shell_escaped_paths() {
         let body = crate::commands::hooks::generate_post_commit_hook_body("/tmp/a'b/codesage");
         assert_eq!(
@@ -900,6 +990,32 @@ mod tests {
         assert_eq!(
             hook_embedded_binary("#!/bin/sh\n# installed by codesage install-hooks\n"),
             None
+        );
+    }
+
+    #[test]
+    fn semantic_fingerprint_gate_fails_naming_full_rebuild_on_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = Database::open_for_model(&path, "fp/model", 4).unwrap();
+        // An empty table holds no vectors, so there is nothing to vouch for.
+        assert!(fingerprint_gate(&db, "fp-b").is_none());
+        // Attest one vector row under fp-a, then require fp-b.
+        db.insert_chunks(
+            "a.rs",
+            "rust",
+            &[("fn a() {}", 1, 1, &[0.0, 0.0, 0.0, 1.0])],
+        )
+        .unwrap();
+        db.record_semantic_fingerprint("fp-a").unwrap();
+        assert!(fingerprint_gate(&db, "fp-a").is_none());
+        let check = fingerprint_gate(&db, "fp-b").expect("mismatch must fail");
+        assert_eq!(check.name, "semantic");
+        assert_eq!(check.status, Status::Fail);
+        assert!(
+            check.message.contains("index --full"),
+            "mismatch must name the rebuild: {}",
+            check.message
         );
     }
 

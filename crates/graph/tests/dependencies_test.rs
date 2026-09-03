@@ -1,4 +1,4 @@
-use codesage_graph::{full_index, list_dependencies};
+use codesage_graph::{full_index, list_dependencies, list_dependencies_batch};
 use codesage_storage::Database;
 
 fn indexed(files: &[(&str, &str)]) -> (tempfile::TempDir, Database) {
@@ -223,4 +223,28 @@ fn unindexed_file_reports_not_found() {
     let deps = list_dependencies(&db, "missing.py").unwrap();
     assert!(!deps.found);
     assert!(deps.imported_by.is_empty());
+}
+
+#[test]
+fn batch_matches_single_file_results_in_order() {
+    let (_dir, db) = indexed(&[
+        (
+            "src/lib.rs",
+            "pub mod util;\nuse crate::util::helper;\n\npub fn run() -> u32 {\n    helper()\n}\n",
+        ),
+        ("src/util.rs", "pub fn helper() -> u32 {\n    1\n}\n"),
+        ("main.py", "def run():\n    return 1\n"),
+    ]);
+
+    let paths = ["src/util.rs", "src/lib.rs", "main.py", "missing.py"];
+    let refs: Vec<&str> = paths.to_vec();
+    let batched = list_dependencies_batch(&db, &refs).unwrap();
+    assert_eq!(batched.len(), paths.len());
+    for (entry, path) in batched.iter().zip(paths.iter()) {
+        let single = list_dependencies(&db, path).unwrap();
+        assert_eq!(entry.file_path, single.file_path);
+        assert_eq!(entry.found, single.found);
+        assert_eq!(entry.imports, single.imports);
+        assert_eq!(entry.imported_by, single.imported_by);
+    }
 }

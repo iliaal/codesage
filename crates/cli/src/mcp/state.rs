@@ -16,6 +16,12 @@ use super::params::EmbedTextsResult;
 
 const MCP_TEST_QUERY_EMBEDDING_ENV: &str = "CODESAGE_MCP_TEST_QUERY_EMBEDDING";
 
+/// Ceiling for the attacker-controlled `CODESAGE_MCP_TEST_QUERY_EMBEDDING`
+/// dimension, enforced before the value reaches `open_for_model_existing`.
+/// Real text-embedding dims top out at 4096; the harness seeds use 4.
+/// Anything larger is junk that would otherwise mint absurd chunk tables.
+const MAX_TEST_QUERY_EMBEDDING_DIM: usize = 4096;
+
 #[derive(Debug, Clone)]
 pub(super) struct ProjectState {
     pub(super) db_path: PathBuf,
@@ -207,12 +213,24 @@ struct WatcherEntry {
     alive: Arc<AtomicBool>,
     config_key: String,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// When the entry was first observed STOPPING (shutdown signalled, thread
+    /// not yet exited). Bounds the reserve: a watcher wedged past
+    /// [`WATCHER_STUCK_FORCE_DETACH`] is detached so one wedged thread cannot
+    /// disable semantic reindex process-wide forever.
+    stopping_since: Option<Instant>,
 }
 
 /// How long a start request waits for a stopping watcher on the same root
 /// before giving up on spawning for this call. Bounded because it runs
 /// inside a tool call; the next call retries.
 const WATCHER_RESTART_WAIT: Duration = Duration::from_secs(5);
+
+/// How long a stopping watcher may hold its slot before a start request
+/// detaches it. Past this the thread is wedged (its drain normally takes
+/// seconds); keeping the slot would silently disable semantic reindex for
+/// the project forever. Detaching orphans the old thread — it still exits
+/// through its `AliveGuard` on its own handle — so a fresh watcher can spawn.
+const WATCHER_STUCK_FORCE_DETACH: Duration = Duration::from_secs(15 * 60);
 
 /// How long the last-client stop waits for each watcher to finish its drain
 /// before leaving its slot in place as still-stopping.
@@ -359,11 +377,40 @@ fn reserve_watcher_slot(
             drop(guard);
             if !wait_for_watcher_exit(&old_alive, deadline) {
                 let mut guard = watchers.lock();
-                if let Some(entry) = guard
+                // The slot still belongs to the stopping watcher: put its
+                // handle back and wait for the next call — unless it has been
+                // wedged past the bound, in which case detach the slot so a
+                // fresh watcher can spawn (the old thread keeps its own
+                // `alive` token and still exits through its `AliveGuard`).
+                let wedged = match guard
                     .get_mut(root)
                     .filter(|entry| Arc::ptr_eq(&entry.alive, &old_alive))
                 {
-                    entry.thread = thread;
+                    Some(entry) => {
+                        entry.thread = thread;
+                        // First sighting of the wedge starts the clock; a
+                        // later call past the bound detaches instead of
+                        // waiting out a thread that will never exit.
+                        let since = *entry.stopping_since.get_or_insert_with(Instant::now);
+                        if since.elapsed() >= WATCHER_STUCK_FORCE_DETACH {
+                            guard.remove(root);
+                            tracing::error!(
+                                root = %root.display(),
+                                stuck_secs = since.elapsed().as_secs(),
+                                "watcher wedged in shutdown; detaching its slot so a fresh watcher can spawn"
+                            );
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    // Another stop path already reaped the slot; nothing to
+                    // spawn into from this call.
+                    None => return WatcherSlot::StillStopping,
+                };
+                drop(guard);
+                if wedged {
+                    continue;
                 }
                 return WatcherSlot::StillStopping;
             }
@@ -383,6 +430,7 @@ fn reserve_watcher_slot(
                 alive: alive.clone(),
                 config_key: config_key.to_string(),
                 thread: None,
+                stopping_since: None,
             },
         );
         return WatcherSlot::Reserved;
@@ -640,16 +688,29 @@ impl CodeSageServer {
                 return Ok(state);
             }
         }
+        // Mirror the CLI's `find_project_root`: a `project` pointing at a
+        // subdirectory of an onboarded tree resolves to the enclosing root
+        // instead of failing as "not onboarded". The nearest ancestor wins,
+        // so a nested `.codesage` still resolves to its own project, never
+        // an outer one. `canonical` is the root from here on, so the state
+        // cache, drift log, and db path below all key on the root.
+        let mut enclosing = canonical.clone();
+        loop {
+            if enclosing.join(".codesage").join("index.db").exists() {
+                break;
+            }
+            if !enclosing.pop() {
+                bail!(
+                    "project `{}` is not onboarded (no .codesage/index.db). \
+                    Run `/codesage-onboard {}` to initialize.",
+                    canonical.display(),
+                    canonical.display()
+                );
+            }
+        }
+        let canonical = enclosing;
         let codesage_dir = canonical.join(".codesage");
         let db_path = codesage_dir.join("index.db");
-        if !db_path.exists() {
-            bail!(
-                "project `{}` is not onboarded (no .codesage/index.db). \
-                Run `/codesage-onboard {}` to initialize.",
-                canonical.display(),
-                canonical.display()
-            );
-        }
         let config_path = codesage_dir.join("config.toml");
         // Stamp the mtime BEFORE reading: if the file is replaced between the
         // stat and the read we hold an older stamp and reload on the next
@@ -870,9 +931,36 @@ impl CodeSageServer {
     // Daemon integration tests spawn the real binary, where ordinary
     // `#[cfg(test)]` fakes are unavailable. This test-named env var lets that
     // binary exercise MCP search with a seeded vector table and no model
-    // download; release/user paths ignore it unless explicitly set.
+    // download. Release binaries never honor it: `cfg!(debug_assertions)` is
+    // false there, so a leaked or attacker-set variable in production is
+    // inert. Only debug builds — the harness's `CARGO_BIN_EXE_codesage` —
+    // take the override branch in `with_project_query`, and even there the
+    // dimension is capped and the freshness gate in `open_test_override_db`
+    // still applies.
+    // In-tree consumers (debug harness only):
+    // - crates/cli/tests/mcp_daemon.rs
+    //   `tools_call_search_returns_seeded_hits_without_model_download`
+    // - crates/cli/tests/mcp_daemon.rs
+    //   `every_schema_bearing_tool_returns_populated_structured_content`
     fn test_query_embedding_override(&self) -> Result<Option<Vec<f32>>> {
-        let Ok(raw) = std::env::var(MCP_TEST_QUERY_EMBEDDING_ENV) else {
+        Self::parse_test_query_embedding_override(
+            std::env::var(MCP_TEST_QUERY_EMBEDDING_ENV).ok().as_deref(),
+            cfg!(debug_assertions),
+        )
+    }
+
+    /// Pure core of [`Self::test_query_embedding_override`]. `honored` is
+    /// `cfg!(debug_assertions)` in production; threading it as a parameter
+    /// keeps the release-path behavior (override ignored even when set)
+    /// unit-testable under a debug test build.
+    fn parse_test_query_embedding_override(
+        raw: Option<&str>,
+        honored: bool,
+    ) -> Result<Option<Vec<f32>>> {
+        if !honored {
+            return Ok(None);
+        }
+        let Some(raw) = raw else {
             return Ok(None);
         };
 
@@ -902,7 +990,135 @@ impl CodeSageServer {
         if embedding.is_empty() {
             bail!("{MCP_TEST_QUERY_EMBEDDING_ENV} must contain at least one f32");
         }
+        // Cap the attacker-controlled dimension before it reaches
+        // `open_for_model_existing`, where a huge dim would mint a junk chunk
+        // table. `open_test_override_db` refines this to equality with the
+        // model's recorded dim.
+        if embedding.len() > MAX_TEST_QUERY_EMBEDDING_DIM {
+            bail!(
+                "{MCP_TEST_QUERY_EMBEDDING_ENV} has {} components, over the {MAX_TEST_QUERY_EMBEDDING_DIM} cap",
+                embedding.len()
+            );
+        }
         Ok(Some(embedding))
+    }
+
+    /// Whether the debug-only query-embedding override would fire for this
+    /// process: debug build plus a parseable env value. Probe for the render
+    /// layer's `_meta.test_override` annotation — `with_project_query` is
+    /// generic over its result type and cannot stamp the envelope itself.
+    /// False in release builds (where the override is inert) and when the
+    /// variable is unset; a malformed value reads false here and surfaces as
+    /// a tool error on the query path itself; called by the `search` and
+    /// `export_context` tool handlers to stamp `_meta.test_override`.
+    pub(super) fn test_override_active() -> bool {
+        Self::parse_test_query_embedding_override(
+            std::env::var(MCP_TEST_QUERY_EMBEDDING_ENV).ok().as_deref(),
+            cfg!(debug_assertions),
+        )
+        .is_ok_and(|opt| opt.is_some())
+    }
+
+    /// Open the chunk table for the debug-only test override. Unlike the
+    /// normal path this loads no embedder (no model download — the reason
+    /// the escape exists), but it is not a freshness bypass:
+    ///
+    /// - `open_for_existing_model` runs no migrations and creates nothing,
+    ///   so an override for an unindexed model fails instead of minting
+    ///   tables; the recorded dimension must then equal the override's, so
+    ///   the vector queries exactly the table the configured model recorded
+    ///   — never another setup's, never a fresh empty one. The final open
+    ///   reuses that recorded dim, not the attacker-controlled length.
+    /// - The fingerprint gate still runs, cheapest-first: an unattested
+    ///   table (the harness's seeded tables, by construction) carries
+    ///   nothing to compare, so artifact resolution is skipped entirely —
+    ///   resolving would digest hundreds of megabytes of model files on the
+    ///   request path. An attested table resolves the expectation from the
+    ///   local cache only (`CachedOnly`, never a network download) and a
+    ///   recorded `Mismatch` is refused like the production path; absent
+    ///   local artifacts (the harness's offline case) leave nothing to
+    ///   compare, so the model-identity + dim-equality gate above is all
+    ///   that is enforced — see `enforce_test_override_freshness`.
+    fn open_test_override_db(
+        &self,
+        state: &ProjectState,
+        config: &EmbeddingConfig,
+        dim: usize,
+    ) -> Result<Database> {
+        let db = Database::open_for_existing_model(&state.db_path, &config.model)?;
+        let recorded = db.recorded_semantic_dim()?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "test query-embedding override is set but model {:?} has no recorded chunk table; run `codesage index`",
+                config.model
+            )
+        })?;
+        if recorded != dim {
+            bail!(
+                "test query-embedding override has dim {dim} but model {:?} recorded dim {recorded}",
+                config.model
+            );
+        }
+        // Fingerprint gate, cheapest-first: an unattested table carries
+        // nothing to compare, so skip artifact resolution entirely for it.
+        // Resolving would digest hundreds of megabytes of model files on the
+        // request path (the harness's seeded tables are unattested by
+        // construction, and the seeded-search daemon tests run under a
+        // 5-second response budget). Attested tables still resolve the
+        // expectation from the local cache only — never a download — and a
+        // recorded `Mismatch` is refused like the production path.
+        if db.semantic_fingerprint()?.is_some() {
+            let expected = codesage_graph::resolve_semantic_fingerprint(
+                &db,
+                config,
+                recorded,
+                codesage_graph::ArtifactLookup::CachedOnly,
+            )?;
+            Self::enforce_test_override_freshness(&db, expected.as_ref())?;
+        } else {
+            tracing::debug!(
+                "test query-embedding override proceeds without a fingerprint check: chunk table records no fingerprint"
+            );
+        }
+        Database::open_for_model_existing(&state.db_path, &config.model, recorded)
+    }
+
+    /// The override's share of the production freshness gate, as a pure
+    /// function of the resolved expectation so every case is unit-testable
+    /// without model artifacts on disk:
+    /// - `None` (artifacts absent from the local cache): nothing to compare
+    ///   against without a network download; the dim gate stands alone.
+    /// - `Current`: the attested table matches this setup; proceed.
+    /// - `Mismatch`: stale table; refused exactly like the production path.
+    /// - `Unrecorded`: the harness's seeded tables carry vectors but no
+    ///   attestation by construction; demanding one here would force the
+    ///   model download the escape exists to avoid, so the dim gate stands
+    ///   alone. Any real indexing pass attests its table and returns to the
+    ///   `Current`/`Mismatch` arms.
+    fn enforce_test_override_freshness(
+        db: &Database,
+        expected: Option<&codesage_graph::SemanticFingerprint>,
+    ) -> Result<()> {
+        let Some(expected) = expected else {
+            tracing::debug!(
+                "test query-embedding override proceeds without a fingerprint check: model artifacts not in the local cache"
+            );
+            return Ok(());
+        };
+        match codesage_graph::semantic_table_state(db, expected)? {
+            codesage_graph::SemanticTableState::Current => Ok(()),
+            codesage_graph::SemanticTableState::Unrecorded => {
+                tracing::debug!(
+                    "test query-embedding override proceeds without a fingerprint check: chunk table records no fingerprint"
+                );
+                Ok(())
+            }
+            codesage_graph::SemanticTableState::Mismatch { stored } => {
+                bail!(
+                    "test query-embedding override refused: semantic index was embedded under a different setup (stored {stored}, current {}); run `codesage index --full`",
+                    expected.as_str()
+                )
+            }
+        }
     }
 
     /// Resolve project, open its DB, run `f` with the DB. Error handling funnel:
@@ -1013,11 +1229,14 @@ impl CodeSageServer {
         self.maybe_start_watcher(&state, true);
         let config = self.semantic_embedding_config(&state)?;
         if let Some(query_embedding) = self.test_query_embedding_override()? {
-            let db = Database::open_for_model_existing(
-                &state.db_path,
-                &config.model,
-                query_embedding.len(),
-            )?;
+            // Debug-harness escape: no embedder load, no reranker. The open
+            // still validates the dim against the recorded table and runs
+            // the fingerprint gate whenever it is locally computable; the
+            // `_meta.test_override` marker is stamped by the render layer
+            // via `test_override_active` (this function is generic over `R`
+            // and cannot touch the response envelope itself).
+            let dim = query_embedding.len();
+            let db = self.open_test_override_db(&state, config, dim)?;
             return f(&db, &query_embedding, None);
         }
         let db = self.open_db_for(&state)?;
@@ -1358,6 +1577,7 @@ mod tests {
                 alive: Arc::new(AtomicBool::new(true)),
                 config_key: "k".to_string(),
                 thread: None,
+                stopping_since: None,
             };
             (shutdown, entry)
         };
@@ -1426,6 +1646,7 @@ mod tests {
                 alive: alive.clone(),
                 config_key: config_key.to_string(),
                 thread: Some(thread),
+                stopping_since: None,
             },
         );
         (shutdown, alive)
@@ -1478,6 +1699,56 @@ mod tests {
             "the surviving entry is the new one, not the stopped watcher's"
         );
         assert!(entry.thread.is_none(), "the reservation has no thread yet");
+    }
+
+    #[test]
+    fn a_watcher_wedged_in_shutdown_is_detached_past_the_bound() {
+        // A watcher whose thread never exits (shutdown signalled, `alive`
+        // stuck true) must not hold its slot — and disable semantic reindex
+        // for the project — forever. The first call waits it out; a call
+        // past the bound detaches the slot and reserves it afresh.
+        let watchers: Mutex<HashMap<PathBuf, WatcherEntry>> = Mutex::new(HashMap::new());
+        let root = PathBuf::from("/proj");
+        watchers.lock().insert(
+            root.clone(),
+            WatcherEntry {
+                shutdown: Arc::new(AtomicBool::new(true)),
+                alive: Arc::new(AtomicBool::new(true)),
+                config_key: "k".to_string(),
+                thread: None,
+                stopping_since: None,
+            },
+        );
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(true));
+        let slot = reserve_watcher_slot(&watchers, &root, "k", &shutdown, &alive, Duration::ZERO);
+        assert_eq!(slot, WatcherSlot::StillStopping);
+        assert!(
+            watchers.lock().get(&root).unwrap().stopping_since.is_some(),
+            "first sighting of the wedge must start the clock"
+        );
+        // Wind the clock past the bound: the next call detaches and reserves.
+        watchers.lock().get_mut(&root).unwrap().stopping_since =
+            Some(Instant::now() - WATCHER_STUCK_FORCE_DETACH - Duration::from_secs(1));
+        let fresh_shutdown = Arc::new(AtomicBool::new(false));
+        let fresh_alive = Arc::new(AtomicBool::new(true));
+        let slot = reserve_watcher_slot(
+            &watchers,
+            &root,
+            "k",
+            &fresh_shutdown,
+            &fresh_alive,
+            Duration::ZERO,
+        );
+        assert_eq!(slot, WatcherSlot::Reserved);
+        let guard = watchers.lock();
+        let entry = guard
+            .get(&root)
+            .expect("the fresh reservation owns the slot");
+        assert!(
+            Arc::ptr_eq(&entry.alive, &fresh_alive),
+            "the wedged entry must be gone, replaced by the fresh reservation"
+        );
     }
 
     #[test]
@@ -1739,6 +2010,36 @@ mod tests {
             err.contains("not onboarded") && err.contains("onboard"),
             "not-onboarded error must carry the onboarding remediation hint: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_project_walks_up_to_the_enclosing_onboarded_root() {
+        // Mirror the CLI's `find_project_root`: a `project` pointing inside
+        // an onboarded tree resolves to that project instead of failing as
+        // "not onboarded".
+        let (_dir, root) = onboarded_project(None);
+        let sub = root.join("src").join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+        let server = CodeSageServer::new();
+        let state = server.resolve_project_inner(sub.to_str().unwrap()).unwrap();
+        assert_eq!(state.db_path, root.join(".codesage").join("index.db"));
+    }
+
+    #[test]
+    fn resolve_project_prefers_the_nearest_enclosing_codesage() {
+        // A nested `.codesage` resolves to its own project, never the outer
+        // one — same nearest-ancestor rule as the CLI walk.
+        let (_outer_dir, outer) = onboarded_project(None);
+        let inner = outer.join("inner");
+        std::fs::create_dir_all(inner.join(".codesage")).unwrap();
+        Database::open(&inner.join(".codesage").join("index.db")).unwrap();
+        let deep = inner.join("src");
+        std::fs::create_dir_all(&deep).unwrap();
+        let server = CodeSageServer::new();
+        let state = server
+            .resolve_project_inner(deep.to_str().unwrap())
+            .unwrap();
+        assert_eq!(state.db_path, inner.join(".codesage").join("index.db"));
     }
 
     #[test]
@@ -2134,5 +2435,208 @@ mod tests {
             db.list_vec_tables().unwrap().is_empty(),
             "semantic query should fail before creating a default vec table"
         );
+    }
+
+    #[test]
+    fn test_override_ignored_when_not_honored_release_path() {
+        // Release binaries never honor the escape: even with the variable
+        // set, `honored = false` (what `cfg!(debug_assertions)` evaluates to
+        // in a release build) yields None. This runs under a debug test
+        // build, so it proves the release-path logic, not the build flag.
+        assert!(
+            CodeSageServer::parse_test_query_embedding_override(Some("0.1,0.2,0.3,0.4"), false)
+                .unwrap()
+                .is_none(),
+            "release path must ignore the override even when set"
+        );
+        assert!(
+            CodeSageServer::parse_test_query_embedding_override(None, false)
+                .unwrap()
+                .is_none()
+        );
+        // The render-layer probe upholds the same invariant (it feeds the
+        // pending `_meta.test_override` annotation): active implies a debug
+        // build, so release responses can never carry the marker.
+        assert!(
+            !CodeSageServer::test_override_active() || cfg!(debug_assertions),
+            "override must never report active in a release build"
+        );
+    }
+
+    #[test]
+    fn test_override_parses_comma_floats_when_honored() {
+        assert!(
+            CodeSageServer::parse_test_query_embedding_override(None, true)
+                .unwrap()
+                .is_none(),
+            "unset variable means no override"
+        );
+        let parsed =
+            CodeSageServer::parse_test_query_embedding_override(Some("0.1, 0.2,0.3, 0.4"), true)
+                .unwrap()
+                .expect("honored debug build must parse the override");
+        assert_eq!(parsed, vec![0.1_f32, 0.2, 0.3, 0.4]);
+    }
+
+    #[test]
+    fn test_override_rejects_malformed_components() {
+        // Every malformed shape errors rather than serving a partial vector.
+        for raw in [
+            "",
+            "   ",
+            "0.1,,0.3",
+            "0.1,abc,0.3",
+            "0.1,nan,0.3",
+            "0.1,inf,0.3",
+            "0.1,-inf,0.3",
+        ] {
+            assert!(
+                CodeSageServer::parse_test_query_embedding_override(Some(raw), true).is_err(),
+                "override {raw:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn test_override_caps_attacker_controlled_dim() {
+        let at_cap = (0..MAX_TEST_QUERY_EMBEDDING_DIM)
+            .map(|_| "0.5")
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(
+            CodeSageServer::parse_test_query_embedding_override(Some(&at_cap), true)
+                .unwrap()
+                .is_some(),
+            "exactly the cap must still parse"
+        );
+        let over_cap = format!("{at_cap},0.5");
+        let err = CodeSageServer::parse_test_query_embedding_override(Some(&over_cap), true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("over the"),
+            "over-cap override must name the cap: {err}"
+        );
+    }
+
+    /// Onboard a project on the uncached fake model and resolve its state.
+    fn override_project_with_recorded_dim() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        CodeSageServer,
+        ProjectState,
+    ) {
+        const MODEL: &str = "codesage-test/does-not-exist";
+        let (dir, root, server, state) = onboarded_project_and_state(
+            "[embedding]\nmodel = \"codesage-test/does-not-exist\"\ndevice = \"cpu\"\n",
+        );
+        assert_eq!(state.embedding_config.model, MODEL);
+        // Seed a dim-4 chunk table for the model. The fake model name keeps
+        // `CachedOnly` resolution at `None` on every machine, so these tests
+        // never depend on a local model cache.
+        let db_path = root.join(".codesage").join("index.db");
+        Database::open_for_model(&db_path, MODEL, 4).unwrap();
+        (dir, root, server, state)
+    }
+
+    /// Variant of `onboarded_project` that also resolves the project state.
+    fn onboarded_project_and_state(
+        config: &str,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        CodeSageServer,
+        ProjectState,
+    ) {
+        let (dir, root) = onboarded_project(Some(config));
+        let server = CodeSageServer::new();
+        let project = root.to_str().unwrap().to_string();
+        let state = server.resolve_project_inner(&project).unwrap();
+        (dir, root, server, state)
+    }
+
+    #[test]
+    fn test_override_open_accepts_recorded_dim() {
+        let (_dir, _root, server, state) = override_project_with_recorded_dim();
+        let db = server
+            .open_test_override_db(&state, &state.embedding_config, 4)
+            .expect("matching dim must open");
+        assert_eq!(db.recorded_semantic_dim().unwrap(), Some(4));
+    }
+
+    #[test]
+    fn test_override_open_refuses_dim_mismatch_without_creating_tables() {
+        let (_dir, root, server, state) = override_project_with_recorded_dim();
+        let err = server
+            .open_test_override_db(&state, &state.embedding_config, 8)
+            .err()
+            .expect("dim mismatch must be refused")
+            .to_string();
+        assert!(
+            err.contains("recorded dim 4"),
+            "dim mismatch must name the recorded dim: {err}"
+        );
+        let db = Database::open(&root.join(".codesage").join("index.db")).unwrap();
+        assert!(
+            !db.list_vec_tables()
+                .unwrap()
+                .iter()
+                .any(|t| t.contains("_8")),
+            "a refused dim must not mint a dim-8 chunk table"
+        );
+    }
+
+    #[test]
+    fn test_override_open_refuses_model_without_recorded_table() {
+        let (_dir, _root, server, state) = onboarded_project_and_state(
+            "[embedding]\nmodel = \"codesage-test/does-not-exist\"\ndevice = \"cpu\"\n",
+        );
+        // No `open_for_model` call: the model never indexed this project.
+        let err = server
+            .open_test_override_db(&state, &state.embedding_config, 4)
+            .err()
+            .expect("unindexed model must be refused")
+            .to_string();
+        assert!(
+            err.contains("no recorded chunk table"),
+            "unindexed model must fail instead of minting tables: {err}"
+        );
+    }
+
+    #[test]
+    fn test_override_freshness_refuses_mismatch_accepts_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        let config = EmbeddingConfig::default();
+        let db = Database::open_for_model(&db_path, &config.model, 4).unwrap();
+
+        // No expectation resolvable offline: the dim gate stands alone.
+        CodeSageServer::enforce_test_override_freshness(&db, None)
+            .expect("absent artifacts must not fail a debug-only override");
+
+        // Unattested table (the harness seeds): nothing recorded to compare.
+        let expected = codesage_graph::SemanticFingerprint::with_artifact_digest(
+            &config,
+            4,
+            "digest-for-override-test",
+        );
+        CodeSageServer::enforce_test_override_freshness(&db, Some(&expected))
+            .expect("unattested table must not fail the debug-only override");
+
+        // Attested but stale: refused like the production path.
+        db.record_semantic_fingerprint("stale-setup-fingerprint")
+            .unwrap();
+        let err = CodeSageServer::enforce_test_override_freshness(&db, Some(&expected))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("different setup") && err.contains("codesage index --full"),
+            "stale table must name the repair: {err}"
+        );
+
+        // Attested and current: proceeds.
+        db.record_semantic_fingerprint(expected.as_str()).unwrap();
+        CodeSageServer::enforce_test_override_freshness(&db, Some(&expected))
+            .expect("current table must pass the override gate");
     }
 }

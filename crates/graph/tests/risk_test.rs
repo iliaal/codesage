@@ -42,6 +42,14 @@ fn index_test_file(db: &Database, path: &str) {
         Language::Python
     } else if path.ends_with(".c") || path.ends_with(".h") {
         Language::C
+    } else if path.ends_with(".java") {
+        Language::Java
+    } else if path.ends_with(".cpp")
+        || path.ends_with(".hpp")
+        || path.ends_with(".cc")
+        || path.ends_with(".cxx")
+    {
+        Language::Cpp
     } else {
         Language::TypeScript
     };
@@ -1126,6 +1134,58 @@ fn oversized_phpt_dir_still_counts_as_sibling_test_for_risk() {
         !r.test_gap,
         "60 .phpt tests next to the file must close the test gap, notes: {:?}",
         r.notes
+    );
+}
+
+#[test]
+fn recommend_tests_finds_java_maven_mirror_test() {
+    let (_dir, db) = setup_project();
+    index_test_file(&db, "src/test/java/com/app/FooTest.java");
+    // Same-package unrelated test must not leak in.
+    index_test_file(&db, "src/test/java/com/app/BarTest.java");
+
+    let r = codesage_graph::recommend_tests(&db, &["src/main/java/com/app/Foo.java".to_string()])
+        .unwrap();
+    assert_eq!(
+        r.primary,
+        vec!["src/test/java/com/app/FooTest.java".to_string()]
+    );
+}
+
+#[test]
+fn recommend_tests_finds_c_and_cpp_affix_siblings() {
+    let (_dir, db) = setup_project();
+    index_test_file(&db, "src/foo_test.c");
+    index_test_file(&db, "tests/test_bar.cpp");
+    index_test_file(&db, "tests/unrelated_test.c");
+
+    let r =
+        codesage_graph::recommend_tests(&db, &["src/foo.c".to_string(), "src/bar.cpp".to_string()])
+            .unwrap();
+    assert!(r.primary.contains(&"src/foo_test.c".to_string()));
+    assert!(r.primary.contains(&"tests/test_bar.cpp".to_string()));
+    assert!(
+        !r.primary.contains(&"tests/unrelated_test.c".to_string()),
+        "unrelated C test must not leak in: {:?}",
+        r.primary
+    );
+}
+
+#[test]
+fn recommend_tests_first_dot_stem_matches_dotted_basename() {
+    let (_dir, db) = setup_project();
+    index_test_file(&db, "src/foo.test.ts");
+
+    // The source pairs with the dotted test file by first-dot stem.
+    let r = codesage_graph::recommend_tests(&db, &["src/foo.ts".to_string()]).unwrap();
+    assert_eq!(r.primary, vec!["src/foo.test.ts".to_string()]);
+
+    // ...but the test file itself is never its own test.
+    let r = codesage_graph::recommend_tests(&db, &["src/foo.test.ts".to_string()]).unwrap();
+    assert!(
+        !r.primary.contains(&"src/foo.test.ts".to_string()),
+        "edited test file must not recommend itself: {:?}",
+        r.primary
     );
 }
 

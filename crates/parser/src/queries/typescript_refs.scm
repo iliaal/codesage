@@ -60,12 +60,23 @@
 ; Patterns 13-14: destructuring a module's exports off a VALUE rather than a
 ; `require(...)` call. A barrel does `const { Foo } = axios;` after importing
 ; the default export, so the symbols it unwraps are named nowhere else in the
-; file. Restricted to a bare identifier on the right: broadening to arbitrary
-; expressions would bind every `const { data } = resp.body` to any symbol
-; named `data`.
+; file. The RHS is captured as `@rhs` so the extractor can keep only
+; destructures off a same-file import binding: without that check every
+; `const { data } = resp.body` binds a bogus edge to any symbol named `data`.
 (variable_declarator
   name: (object_pattern (shorthand_property_identifier_pattern) @ref)
-  value: (identifier))
+  value: (identifier) @rhs)
 (variable_declarator
   name: (object_pattern (pair_pattern key: (property_identifier) @ref))
-  value: (identifier))
+  value: (identifier) @rhs)
+
+; Pattern 15: the CommonJS require-bound LOCAL, `const axios = require('axios')`.
+; Mirrors the JS pattern of the same index: pattern 1 captures only the module
+; string, so without the LHS binding the value-destructure filter (patterns
+; 13-14) drops `const { Foo } = axios`. See javascript_refs.scm.
+(variable_declarator
+  name: (identifier) @ref
+  value: (call_expression
+    function: (identifier) @_req
+    arguments: (arguments (string)))
+  (#eq? @_req "require"))

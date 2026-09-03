@@ -44,11 +44,11 @@ Run `cargo test --workspace` before you send a pull request. Tests that need GPU
 
 ## Commit messages
 
-Imperative mood, under 70 characters in the subject. A body is optional but useful when the *why* isn't obvious from the diff. Conventional prefixes (`feat:`, `fix:`, `docs:`, `test:`, `chore:`) help with later parsing.
+Imperative mood, keep the subject under ~100 characters (~72 preferred for `git log --oneline` readability). The old 70-char hard limit was relaxed deliberately: measured history shows it systematically unobserved (~half of subjects exceed it), mostly because `type(scope):` prefixes don't fit in 70; 100 keeps one-line readability while fitting conventional prefixes. A body is optional but useful when the *why* isn't obvious from the diff. Conventional prefixes (`feat:`, `fix:`, `docs:`, `test:`, `chore:`) help with later parsing.
 
 ## CHANGELOG
 
-Every user-visible change updates `CHANGELOG.md` under `## [Unreleased]` in the same commit. User-visible means: new CLI flags or subcommands, new or changed MCP tools, behavior changes, breaking changes, schema migrations, hook template changes, config surface changes, or security fixes. Pure internal refactors, test-only changes, and doc-only changes don't need an entry.
+Every user-visible change updates `CHANGELOG.md` under `## [Unreleased]` in the same commit. User-visible means: new CLI flags or subcommands, new or changed MCP tools, behavior changes, breaking changes, schema migrations, hook template changes, config surface changes, or security fixes. Pure internal refactors, test-only changes, and doc-only changes don't need an entry. Enforced by the CI `check-changelog` job (which validates the `## [Unreleased]` block on PRs), not by a local hook — hooks are bypassable and slow down every commit, while CI is the source of truth at the PR boundary.
 
 One bullet per change. Describe what a user can now do, not how you implemented it.
 

@@ -52,6 +52,19 @@ jobs:
       - run: shfmt -d scripts/*.sh
       - run: bash scripts/regression-tests.sh
 
+  changelog:
+    name: changelog format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Validates the `## [Unreleased]` block (section order, terse bullets).
+      # Runs on every PR — the script itself is stdlib-only and passes when
+      # there is no Unreleased content to check, so scoping by paths is
+      # unnecessary overhead.
+      - run: python3 scripts/check-changelog.py CHANGELOG.md
+
   build:
     name: cargo build (CPU)
     runs-on: ubuntu-latest

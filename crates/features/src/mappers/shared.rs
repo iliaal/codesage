@@ -75,11 +75,13 @@ pub fn walk_files(
         .require_git(false)
         .build();
 
+    // Collect-then-sort-then-truncate: the walker yields entries in
+    // readdir order, so truncating mid-walk would make the survivors
+    // (and every downstream seed list) depend on filesystem order.
+    // Walking the full subtree costs a full traversal on over-cap repos,
+    // but keeps output identical across machines and runs.
     let mut out: Vec<String> = Vec::new();
     for entry in walker.flatten() {
-        if out.len() >= max_files {
-            break;
-        }
         let path = entry.path();
         let Some(ft) = entry.file_type() else {
             continue;
@@ -98,6 +100,7 @@ pub fn walk_files(
     }
     out.sort();
     out.dedup();
+    out.truncate(max_files);
     out
 }
 
@@ -183,7 +186,7 @@ pub const SOURCE_FILE_CAP: usize = 2_000;
 /// Shared source-enumeration pipeline: walk each scan dir under the
 /// project's exclusion contract (`walk_cap` bounds each raw walk), keep
 /// files matching `ext_pred`, drop files matching `exclude_pred` (tests,
-/// generated artifacts), dedup across dirs, stop at `cap`, sort.
+/// generated artifacts), dedup across dirs, sort, truncate at `cap`.
 pub fn collect_source_files(
     ctx: &MapperContext,
     scan_dirs: &[PathBuf],
@@ -192,24 +195,19 @@ pub fn collect_source_files(
     exclude_pred: impl Fn(&str) -> bool,
     cap: usize,
 ) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+    // Collect-then-sort-then-truncate, same rationale as `walk_files`:
+    // each per-dir walk is already sorted, but stopping at `cap`
+    // mid-iteration would bias survivors toward the dirs listed first.
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    'dirs: for dir in scan_dirs {
+    for dir in scan_dirs {
         for rel in walk_files(ctx.root, dir, walk_cap, ctx.excludes) {
             if !ext_pred(&rel) || exclude_pred(&rel) {
                 continue;
             }
-            if !seen.insert(rel.clone()) {
-                continue;
-            }
-            out.push(rel);
-            if out.len() >= cap {
-                break 'dirs;
-            }
+            seen.insert(rel);
         }
     }
-    out.sort();
-    out
+    seen.into_iter().take(cap).collect()
 }
 
 /// Depth-1 file listing of `dir` under the same skip contract as
@@ -230,6 +228,19 @@ pub fn list_dir_files(
 /// contract as [`list_dir_files`]. Sorted repo-relative paths.
 pub fn list_dir_subdirs(root: &Path, dir: &Path, excludes: Option<&GlobSet>) -> Vec<String> {
     list_dir_children(root, dir, excludes, true, &|_| true)
+}
+
+/// `fs::read_dir` in sorted (lexicographic path) order. `read_dir` yields
+/// entries in arbitrary filesystem order, so any mapper loop whose output
+/// or seed order depends on iteration order must go through this instead
+/// of the raw call. Returns an empty vec on I/O error.
+pub fn sorted_read_dir(dir: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    entries
 }
 
 /// Read a file's contents to a UTF-8 string, returning None on any error
@@ -538,6 +549,21 @@ mod tests {
             "exclude pattern not applied: {:?}",
             walked
         );
+    }
+
+    #[test]
+    fn walk_truncates_sorted_survivors() {
+        // Over-cap walks must keep the lexicographically-first paths, not
+        // whichever readdir yielded first: collect-then-sort-then-truncate.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        for name in ["z.rs", "a.rs", "m.rs", "b.rs"] {
+            fs::write(root.join(name), b"// src").unwrap();
+        }
+        let walked = walk_files(root, root, 2, None);
+        assert_eq!(walked, vec!["a.rs".to_string(), "b.rs".to_string()]);
+        // And repeated walks agree with each other.
+        assert_eq!(walked, walk_files(root, root, 2, None));
     }
 
     #[test]

@@ -28,6 +28,7 @@ jsonc-parser = { version = "0.33", features = ["cst"] }
 anyhow.workspace = true
 ignore.workspace = true
 parking_lot.workspace = true
+rusqlite.workspace = true
 rmcp.workspace = true
 tokio.workspace = true
 schemars.workspace = true

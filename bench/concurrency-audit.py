@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -73,7 +74,10 @@ def backup_db(codesage_dir: Path) -> Path | None:
             "Stop the codesage daemon (`codesage daemon stop`) and any "
             "running indexer, then re-run this audit."
         )
-    fd, bak_name = tempfile.mkstemp(prefix="index.db.audit-backup-", dir=codesage_dir)
+    # Backup lives outside .codesage/ (system temp dir): a crash between
+    # backup and the finally-unlink in main() must not leave a permanent
+    # full-size copy inside the project dir.
+    fd, bak_name = tempfile.mkstemp(prefix="index.db.audit-backup-")
     os.close(fd)
     bak = Path(bak_name)
     shutil.copy2(src, bak)
@@ -82,6 +86,35 @@ def backup_db(codesage_dir: Path) -> Path | None:
 
 def restore_db(codesage_dir: Path, bak: Path | None) -> None:
     src = codesage_dir / "index.db"
+    # Re-check for live writers before touching -wal/-shm: unlinking a live
+    # writer's WAL tears its uncheckpointed frames. A non-empty -wal means
+    # someone (usually the codesage daemon) wrote during the audit run —
+    # checkpoint first; on busy refuse instead of unlinking.
+    wal = codesage_dir / "index.db-wal"
+    try:
+        wal_nonempty = wal.exists() and wal.stat().st_size > 0
+    except OSError:
+        wal_nonempty = True
+    if wal_nonempty and src.exists():
+        # A torn or non-database file (e.g. a half-written audit artifact)
+        # has no live writer to protect — checkpoint errors mean "nothing
+        # to checkpoint", so fall through to the unlink path below.
+        try:
+            conn = sqlite3.connect(str(src))
+            try:
+                row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            row = None
+        if row is not None and row[0] != 0:
+            sys.exit(
+                "wal_checkpoint(TRUNCATE) returned busy=1 on "
+                f"{src} — another process holds the database. "
+                "Stop the codesage daemon (`codesage daemon stop`) and any "
+                "running indexer, then re-run this audit. "
+                "Refusing to unlink the live -wal."
+            )
     # Remove WAL/SHM siblings so the restored .db (which was checkpointed
     # to a self-contained state at backup time) isn't shadowed by stale
     # log frames written during the audit run.
@@ -161,6 +194,12 @@ def run_parallel(cmds: list[list[str]], cwd: Path, timeout_s: int = 300) -> list
 REQUIRED_TABLES = ("files", "symbols", "refs", "schema_migrations")
 
 
+def _is_safe_table(name: str) -> bool:
+    # sqlite_master names reach SQL text below; quote-wrap alone does not
+    # make an arbitrary identifier safe (embedded quotes break out).
+    return re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is not None
+
+
 def semantic_chunk_check(conn: sqlite3.Connection) -> dict:
     """Best-effort semantic/vector consistency without loading sqlite-vec."""
     out: dict = {
@@ -174,6 +213,9 @@ def semantic_chunk_check(conn: sqlite3.Connection) -> dict:
         "WHERE type='table' AND sql LIKE '%vec0%'"
     ).fetchall()
     for (table_name,) in vec_rows:
+        if not _is_safe_table(table_name):
+            out["issues"].append(f"skipping unexpected table name: {table_name!r}")
+            continue
         out["vec_tables"].append(table_name)
         fts_name = f"{table_name}_fts"
         fts_row = conn.execute(
@@ -182,12 +224,15 @@ def semantic_chunk_check(conn: sqlite3.Connection) -> dict:
         ).fetchone()
         fts_count = None
         if fts_row:
-            try:
-                fts_count = conn.execute(
-                    f'SELECT COUNT(*) FROM "{fts_name}"'
-                ).fetchone()[0]
-            except sqlite3.OperationalError as e:
-                out["issues"].append(f"fts query failed for {fts_name}: {e}")
+            if not _is_safe_table(fts_name):
+                out["issues"].append(f"skipping unexpected table name: {fts_name!r}")
+            else:
+                try:
+                    fts_count = conn.execute(
+                        f'SELECT COUNT(*) FROM "{fts_name}"'
+                    ).fetchone()[0]
+                except sqlite3.OperationalError as e:
+                    out["issues"].append(f"fts query failed for {fts_name}: {e}")
         try:
             vec_count = conn.execute(
                 f'SELECT COUNT(*) FROM "{table_name}"'

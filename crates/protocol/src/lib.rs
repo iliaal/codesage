@@ -619,8 +619,10 @@ fn looks_like_file_target(target: &str) -> bool {
             | "go"
             | "js"
             | "jsx"
+            | "mts"
             | "mjs"
             | "cjs"
+            | "cts"
             | "ts"
             | "tsx"
             | "php"
@@ -813,8 +815,10 @@ pub struct RiskAssessment {
     pub score: f64,
     /// Wire switch, not a measurement: when false the decomposition scalars
     /// and `top_coupled` are left out of the serialized form. Never
-    /// serialized itself.
-    #[serde(skip, default = "default_found")]
+    /// serialized itself, and defaults to false when parsed: a trimmed
+    /// payload that claimed `verbose=true` with zeroed scalars would
+    /// re-emit fabricated measurements on the next hop.
+    #[serde(skip, default)]
     pub verbose: bool,
     /// Present only when the caller asked for `verbose` output.
     #[serde(default)]
@@ -1993,6 +1997,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn impact_target_heuristic_detects_mts_cts_targets() {
+        for name in ["worker.mts", "legacy.cts", "worker.mjs", "legacy.cjs"] {
+            match ImpactTarget::from_hint(name.into(), None) {
+                ImpactTarget::File { path } => assert_eq!(path, name),
+                other => panic!("{name} must be a file target, got {other:?}"),
+            }
+        }
+    }
+
     /// Regression trap: the `legend` field on RiskDiffAssessment / RiskBatchAssessment
     /// is serialized as `_legend` (not `legend`). Agent prompts and downstream
     /// docs reference the underscore form. If the `serde(rename = "_legend")`
@@ -2191,17 +2205,25 @@ mod tests {
 
     /// Guards the hand-written `Serialize`: a field added to the struct but
     /// forgotten in the impl would come back at its default here and fail the
-    /// `Debug` comparison.
+    /// `Debug` comparison. `verbose` is the exception: it never reaches the
+    /// wire, so it parses back false and is re-armed before comparing.
     #[test]
     fn risk_assessment_verbose_round_trips_every_field() {
         let full = risk_fixture();
         let json = serde_json::to_string(&full).unwrap();
-        let back: RiskAssessment = serde_json::from_str(&json).unwrap();
+        let mut back: RiskAssessment = serde_json::from_str(&json).unwrap();
+        assert!(
+            !back.verbose,
+            "verbose is a wire switch, never serialized: parsing must not claim it"
+        );
+        back.set_verbose(true);
         assert_eq!(format!("{back:?}"), format!("{full:?}"));
     }
 
     /// A trimmed payload (what an agent gets by default) still deserializes:
-    /// the hidden scalars fall back to their defaults.
+    /// the hidden scalars fall back to their defaults, and crucially the
+    /// parsed value must not claim `verbose` — re-emitting it would
+    /// fabricate the zeroed scalars as measurements.
     #[test]
     fn risk_assessment_trimmed_payload_deserializes() {
         let mut trimmed = risk_fixture();
@@ -2209,6 +2231,10 @@ mod tests {
         let json = serde_json::to_string(&trimmed).unwrap();
         let back: RiskAssessment = serde_json::from_str(&json).unwrap();
         assert!(back.found);
+        assert!(
+            !back.verbose,
+            "a trimmed payload must parse as non-verbose, or re-serializing it fabricates scalars"
+        );
         assert_eq!(back.score, 0.61);
         assert_eq!(back.churn_score, 0.0);
         assert_eq!(back.cycle_size, 0);
@@ -2219,6 +2245,12 @@ mod tests {
         );
         assert!(back.top_coupled.is_empty());
         assert_eq!(back.notes.len(), 2);
+        let trimmed_again = serde_json::to_string(&back).unwrap();
+        assert_eq!(
+            json_keys(&trimmed_again),
+            json_keys(&json),
+            "re-emitting a parsed trimmed payload must not fabricate verbose fields"
+        );
     }
 
     /// Batch and diff containers propagate the switch into every entry,

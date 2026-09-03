@@ -33,15 +33,120 @@ pub fn validate_all_queries() -> Result<()> {
     for &(lang, src) in crate::references::REF_QUERY_SOURCES {
         validate_one(lang, "reference", src, &["ref"], &mut errors);
     }
+    validate_pattern_counts(&mut errors);
 
     if errors.is_empty() {
         Ok(())
     } else {
         bail!(
-            "{} tree-sitter query validation failure(s):\n  {}",
+            "{} query validation failure(s):\n{}",
             errors.len(),
-            errors.join("\n  ")
+            errors.join("\n")
+        )
+    }
+}
+
+/// Expected top-level pattern count per (language, query-kind) pair.
+/// Tree-sitter pattern indices are positional and the `*_kind_map`
+/// functions in `extract`/`references` map them by number, so appending,
+/// removing, or reordering a pattern in an `.scm` file silently re-kinds
+/// every pattern after it. `Query::new` already catches grammar bumps; this
+/// table catches same-schema drift. When you change an `.scm` file, update
+/// the count here AND the corresponding kind map.
+const EXPECTED_SYMBOL_PATTERN_COUNTS: &[(Language, usize)] = &[
+    (Language::Php, 8),
+    (Language::Python, 2),
+    (Language::C, 8),
+    (Language::Cpp, 23),
+    (Language::Java, 9),
+    (Language::Rust, 10),
+    (Language::JavaScript, 12),
+    (Language::TypeScript, 15),
+    (Language::Go, 6),
+];
+
+const EXPECTED_REF_PATTERN_COUNTS: &[(Language, usize)] = &[
+    (Language::Php, 15),
+    (Language::Python, 11),
+    (Language::C, 3),
+    (Language::Cpp, 14),
+    (Language::Java, 16),
+    (Language::Rust, 13),
+    (Language::JavaScript, 16),
+    (Language::TypeScript, 16),
+    (Language::Go, 3),
+];
+
+fn validate_pattern_counts(errors: &mut Vec<String>) {
+    for &(lang, src) in crate::extract::SYMBOL_QUERY_SOURCES {
+        let Some(&(_, expected)) = EXPECTED_SYMBOL_PATTERN_COUNTS
+            .iter()
+            .find(|(l, _)| *l == lang)
+        else {
+            errors.push(format!(
+                "{lang:?} symbol query missing from EXPECTED_SYMBOL_PATTERN_COUNTS"
+            ));
+            continue;
+        };
+        check_patterns(
+            lang,
+            "symbol",
+            src,
+            expected,
+            crate::extract::kind_map_for(lang),
+            errors,
         );
+    }
+    for &(lang, src) in crate::references::REF_QUERY_SOURCES {
+        let Some(&(_, expected)) = EXPECTED_REF_PATTERN_COUNTS.iter().find(|(l, _)| *l == lang)
+        else {
+            errors.push(format!(
+                "{lang:?} reference query missing from EXPECTED_REF_PATTERN_COUNTS"
+            ));
+            continue;
+        };
+        check_patterns(
+            lang,
+            "reference",
+            src,
+            expected,
+            crate::references::ref_kind_map_for(lang),
+            errors,
+        );
+    }
+}
+
+/// One query's share of the positional contract: the compiled pattern count
+/// must equal the table, and every index below it must map to a kind (a
+/// pattern no map arm covers is silently skipped at extraction time).
+fn check_patterns<K>(
+    lang: Language,
+    kind: &str,
+    src: &str,
+    expected: usize,
+    kind_map: fn(usize) -> Option<K>,
+    errors: &mut Vec<String>,
+) {
+    let ts = ts_language(lang);
+    let query = match Query::new(&ts, src) {
+        Ok(q) => q,
+        Err(_) => return, // compile failure already reported by validate_one
+    };
+    let actual = query.pattern_count();
+    if actual != expected {
+        errors.push(format!(
+            "{lang:?} {kind} query has {actual} patterns but the count table says {expected}: \
+             update the .scm file, the kind map, and the table together"
+        ));
+        return;
+    }
+    for i in 0..actual {
+        if kind_map(i).is_none() {
+            errors.push(format!(
+                "{lang:?} {kind} query pattern {i} maps to no kind (silently skipped): \
+                 add a kind-map arm"
+            ));
+        }
     }
 }
 
@@ -84,7 +189,7 @@ mod tests {
     fn source_tables_cover_every_language() {
         // The validation gate is only as good as its coverage: if a language is
         // added to extract/references but left out of the SOURCES tables, its
-        // queries would never be checked. Assert both tables list all 9.
+        // queries would never be checked. Assert all four tables list all 9.
         let langs = [
             Language::Php,
             Language::Python,
@@ -109,6 +214,27 @@ mod tests {
                     .any(|(l, _)| *l == lang),
                 "{lang:?} missing from REF_QUERY_SOURCES"
             );
+            assert!(
+                super::EXPECTED_SYMBOL_PATTERN_COUNTS
+                    .iter()
+                    .any(|(l, _)| *l == lang),
+                "{lang:?} missing from EXPECTED_SYMBOL_PATTERN_COUNTS"
+            );
+            assert!(
+                super::EXPECTED_REF_PATTERN_COUNTS
+                    .iter()
+                    .any(|(l, _)| *l == lang),
+                "{lang:?} missing from EXPECTED_REF_PATTERN_COUNTS"
+            );
+        }
+    }
+
+    #[test]
+    fn pattern_counts_match_the_kind_maps() {
+        // The positional contract itself: every compiled query has exactly
+        // the tabled number of patterns, and each one maps to a kind.
+        if let Err(e) = validate_all_queries() {
+            panic!("pattern-count gate failed:\n{e:#}");
         }
     }
 }

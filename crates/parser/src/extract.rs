@@ -119,8 +119,9 @@ fn php_kind_map(pattern_index: usize) -> Option<SymbolKind> {
         4 => Some(SymbolKind::Interface),
         5 => Some(SymbolKind::Enum),
         6 => Some(SymbolKind::Constant),
-        7 => Some(SymbolKind::Namespace),
-        8 => Some(SymbolKind::Constant), // enum case (PHP 8.1)
+        // No Namespace arm: php.scm carries no namespace pattern (it matched
+        // only to be discarded). Keep this map dense over 0..=7.
+        7 => Some(SymbolKind::Constant), // enum case (PHP 8.1)
         _ => None,
     }
 }
@@ -197,7 +198,6 @@ fn rust_kind_map(pattern_index: usize) -> Option<SymbolKind> {
         _ => None,
     }
 }
-
 fn js_kind_map(pattern_index: usize) -> Option<SymbolKind> {
     match pattern_index {
         0 => Some(SymbolKind::Function),
@@ -208,6 +208,7 @@ fn js_kind_map(pattern_index: usize) -> Option<SymbolKind> {
         6 => Some(SymbolKind::Constant),     // exports.X = ...
         7 => Some(SymbolKind::Function),     // generator function
         8 | 9 => Some(SymbolKind::Constant), // top-level / exported var
+        10 | 11 => Some(SymbolKind::Constant), // module.exports = / module.exports.X =
         _ => None,
     }
 }
@@ -296,13 +297,8 @@ pub fn extract_symbols(
         if !seen_defs.insert(def_id) {
             continue;
         }
-
-        let captured_name = name_node.utf8_text(source).unwrap_or("").to_string();
+        let captured_name = crate::parse::node_text_lossy(&name_node, source);
         if captured_name.is_empty() {
-            continue;
-        }
-
-        if kind == SymbolKind::Namespace {
             continue;
         }
 

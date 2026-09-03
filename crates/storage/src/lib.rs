@@ -2,5 +2,6 @@ pub mod db;
 pub mod schema;
 
 pub use db::{
-    Database, RawSearchRow, SemanticAttestation, SemanticValidityToken, embedding_to_bytes,
+    Database, RawSearchRow, SemanticAttestation, SemanticValidityToken, StaleSemanticFingerprint,
+    embedding_to_bytes,
 };

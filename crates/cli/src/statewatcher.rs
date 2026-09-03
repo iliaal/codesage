@@ -29,6 +29,10 @@ use crate::lockfile;
 /// file is indexed once the author pauses, and every path that fell quiet in
 /// the same poll is embedded in one batched call.
 const DEFAULT_DEBOUNCE_MS: u64 = 30_000;
+/// Smallest quiet window the watcher honors. Below this a save on every
+/// keystroke (or a zero `--reindex-debounce`) re-indexes hot instead of
+/// batching, pinning the model for nothing.
+pub const MIN_DEBOUNCE_MS: u64 = 1_000;
 /// Longest a ready batch stays deferred under backpressure before it runs
 /// anyway. Load that never drops (a machine that is simply busy) must not
 /// turn into an index that never updates.
@@ -136,6 +140,14 @@ enum EmbedderLookup {
 /// retries land at roughly 30 s, 60 s, 2 min, 4 min and 8 min.
 const MAX_SEMANTIC_RETRIES: u32 = 5;
 
+/// How long a path abandoned after [`MAX_SEMANTIC_RETRIES`] stays parked
+/// before the main loop gives it one fresh round of attempts. Thirty minutes
+/// is long enough to ride out a broken model download or a full disk without
+/// hot-spinning, and short enough that a never-touched-again file does not
+/// sit silently stale for the session. Parked paths are also surfaced in
+/// `watch.status` (`stale_parked`) so `codesage watch status` shows them.
+const PARKED_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
 /// Longest extra wait a semantic retry adds on top of the debounce window.
 const MAX_SEMANTIC_RETRY_EXTRA: Duration = Duration::from_secs(600);
 
@@ -205,7 +217,7 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
     let debounce = Duration::from_millis(config.debounce_ms);
     let disabled_marker = watch_disabled_path(&config.project_root);
 
-    write_status(&config.project_root, config.mode)?;
+    write_status(&config.project_root, config.mode, 0)?;
     let _status_guard = StatusGuard(watch_status_path(&config.project_root));
 
     let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
@@ -221,6 +233,11 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
     // Failed semantic passes per path, for the bounded retry in
     // `process_ready`. Cleared when the path's semantic rows land.
     let mut semantic_retries: HashMap<PathBuf, u32> = HashMap::new();
+    // Paths abandoned after MAX_SEMANTIC_RETRIES, with when they parked.
+    // Revived with a fresh retry budget after PARKED_RETRY_INTERVAL, and
+    // counted in watch.status so they are stale-but-visible, never silent.
+    let mut parked: HashMap<PathBuf, Instant> = HashMap::new();
+    let mut parked_written: usize = usize::MAX;
     let mut bulk_retry_at: Option<Instant> = None;
     let mut bulk_cooldown_until: Option<Instant> = None;
     let mut removal_retry_at: Option<Instant> = None;
@@ -443,6 +460,7 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
                 &mut currently_indexing,
                 &mut recheck_queue,
                 &mut semantic_retries,
+                &mut parked,
                 &filter,
                 &mut embedder,
                 header_is_cpp,
@@ -507,6 +525,7 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
             &mut currently_indexing,
             &mut recheck_queue,
             &mut semantic_retries,
+            &mut parked,
             &filter,
             &mut embedder,
             header_is_cpp,
@@ -516,14 +535,40 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
             header_is_cpp = header_dialect_is_cpp(&config.db_path);
         }
 
+        // Parked backoff: paths abandoned after MAX_SEMANTIC_RETRIES get one
+        // fresh round of attempts after PARKED_RETRY_INTERVAL, so a file that
+        // never changes again does not sit silently stale for the session.
+        let revived = revive_due_parked(
+            &mut parked,
+            &mut semantic_retries,
+            &mut pending,
+            Instant::now(),
+        );
+        if revived > 0 {
+            tracing::info!(
+                files = revived,
+                "retrying parked paths whose semantic rows are still stale"
+            );
+        }
+        // Surface the parked count in watch.status (rewritten only on
+        // change): stale-but-visible beats silently stale.
+        if parked.len() != parked_written {
+            parked_written = parked.len();
+            if let Err(e) = write_status(&config.project_root, config.mode, parked.len()) {
+                tracing::warn!(error = %e, "refreshing watch status with parked count");
+            }
+        }
+
         // Idle clock: only queued or in-flight work counts as activity, so
         // raw FS events that fail the source/ignore filters can't keep the
-        // watcher (and its pooled model) alive.
+        // watcher (and its pooled model) alive. Parked paths count: they are
+        // future work due back after PARKED_RETRY_INTERVAL.
         if !pending.is_empty()
             || !currently_indexing.is_empty()
             || !recheck_queue.is_empty()
             || !removed_paths.is_empty()
             || !removed_prefixes.is_empty()
+            || !parked.is_empty()
             || bulk_retry_at.is_some()
         {
             last_activity = Instant::now();
@@ -554,6 +599,7 @@ fn drain_pending(
     currently_indexing: &mut HashSet<PathBuf>,
     recheck_queue: &mut HashSet<PathBuf>,
     semantic_retries: &mut HashMap<PathBuf, u32>,
+    parked: &mut HashMap<PathBuf, Instant>,
     filter: &WatchFilter,
     embedder: &mut EmbedderHandle,
     header_is_cpp: bool,
@@ -583,6 +629,7 @@ fn drain_pending(
         currently_indexing,
         recheck_queue,
         semantic_retries,
+        parked,
         filter,
         embedder,
         header_is_cpp,
@@ -597,6 +644,7 @@ fn drain_pending_force(
     currently_indexing: &mut HashSet<PathBuf>,
     recheck_queue: &mut HashSet<PathBuf>,
     semantic_retries: &mut HashMap<PathBuf, u32>,
+    parked: &mut HashMap<PathBuf, Instant>,
     filter: &WatchFilter,
     embedder: &mut EmbedderHandle,
     header_is_cpp: bool,
@@ -608,6 +656,7 @@ fn drain_pending_force(
         currently_indexing,
         recheck_queue,
         semantic_retries,
+        parked,
         filter,
         embedder,
         header_is_cpp,
@@ -639,6 +688,7 @@ fn process_ready(
     currently_indexing: &mut HashSet<PathBuf>,
     recheck_queue: &mut HashSet<PathBuf>,
     semantic_retries: &mut HashMap<PathBuf, u32>,
+    parked: &mut HashMap<PathBuf, Instant>,
     filter: &WatchFilter,
     embedder: &mut EmbedderHandle,
     header_is_cpp: bool,
@@ -715,6 +765,7 @@ fn process_ready(
             WorkOutcome::Done => {
                 for (path, _) in &semantic_todo {
                     semantic_retries.remove(path);
+                    parked.remove(path);
                 }
             }
             WorkOutcome::Skipped => {
@@ -731,34 +782,38 @@ fn process_ready(
                 // Same stale state as Skipped — the structural rows landed
                 // and the semantic ones did not — but dropping the paths here
                 // left them stale until the next filesystem event. Re-queue
-                // with a growing delay, up to a bound, so a model that will
-                // not load is retried a few times rather than every tick or
-                // never.
-                requeue_failed_semantic(
+                // with a growing delay, up to a bound; past the bound the
+                // paths park with a long backoff (revived by the main loop)
+                // instead of going silently stale.
+                let now = Instant::now();
+                for path in requeue_failed_semantic(
                     pending,
                     semantic_retries,
                     semantic_todo.into_iter().map(|(path, _)| path),
                     Duration::from_millis(config.debounce_ms),
-                    Instant::now(),
-                );
+                    now,
+                ) {
+                    parked.insert(path, now);
+                }
             }
         }
     }
     rederive_header
 }
-
 /// Re-queue `paths` after a failed semantic pass, each one retry deeper.
-/// A path past [`MAX_SEMANTIC_RETRIES`] is dropped with its counter cleared:
-/// its semantic rows stay stale until its next save re-queues it afresh.
+/// Returns the paths past [`MAX_SEMANTIC_RETRIES`]: the caller parks them
+/// (see `PARKED_RETRY_INTERVAL`) instead of dropping them into silent
+/// staleness until their next save.
 fn requeue_failed_semantic(
     pending: &mut HashMap<PathBuf, Instant>,
     semantic_retries: &mut HashMap<PathBuf, u32>,
     paths: impl IntoIterator<Item = PathBuf>,
     debounce: Duration,
     now: Instant,
-) {
+) -> Vec<PathBuf> {
     let mut requeued = 0usize;
-    let mut abandoned: Vec<String> = Vec::new();
+    let mut abandoned: Vec<PathBuf> = Vec::new();
+    let mut abandoned_log: Vec<String> = Vec::new();
     let mut longest_extra = Duration::ZERO;
     let mut deepest_attempt = 0u32;
     for path in paths {
@@ -766,7 +821,8 @@ fn requeue_failed_semantic(
         *attempt += 1;
         if *attempt > MAX_SEMANTIC_RETRIES {
             semantic_retries.remove(&path);
-            abandoned.push(path.to_string_lossy().into_owned());
+            abandoned_log.push(path.to_string_lossy().into_owned());
+            abandoned.push(path);
             continue;
         }
         let extra = semantic_retry_extra_delay(*attempt, debounce);
@@ -789,11 +845,35 @@ fn requeue_failed_semantic(
     if !abandoned.is_empty() {
         tracing::warn!(
             files = abandoned.len(),
-            paths = ?abandoned,
+            paths = ?abandoned_log,
             max_attempts = MAX_SEMANTIC_RETRIES,
-            "semantic reindex failed repeatedly; giving up on these paths until they change again"
+            "semantic reindex failed repeatedly; parking these paths with a long backoff instead of abandoning them"
         );
     }
+    abandoned
+}
+/// Move parked paths due for another attempt back into `pending` with a fresh
+/// retry budget. Returns how many were revived.
+fn revive_due_parked(
+    parked: &mut HashMap<PathBuf, Instant>,
+    semantic_retries: &mut HashMap<PathBuf, u32>,
+    pending: &mut HashMap<PathBuf, Instant>,
+    now: Instant,
+) -> usize {
+    let mut due = Vec::new();
+    parked.retain(|path, since| {
+        if now.duration_since(*since) >= PARKED_RETRY_INTERVAL {
+            due.push(path.clone());
+            false
+        } else {
+            true
+        }
+    });
+    for path in &due {
+        semantic_retries.remove(path);
+        pending.insert(path.clone(), now);
+    }
+    due.len()
 }
 
 /// Embed every file in `files` in one pass under one lock. Chunks whose text
@@ -1230,14 +1310,33 @@ fn in_bulk_cooldown(cooldown_until: Option<Instant>, now: Instant) -> bool {
 /// SQLITE_BUSY / SQLITE_LOCKED are transient — a concurrent daemon reader or
 /// the index-lock holder had the DB write-locked. Retrying after a debounce
 /// clears them, so the caller must retain the work instead of dropping the
-/// queued paths. Classified by rendered
-/// message because `rusqlite` is not a direct dependency of this crate; SQLite
-/// renders the whole busy/locked family as "... is locked".
+/// queued paths. Classified by typed [`rusqlite::ErrorCode`] first: substring
+/// matching cannot tell SQLITE_FULL / SQLITE_CORRUPT / SQLITE_READONLY apart,
+/// and those must not all share the abandon path. A full disk (space may
+/// drain) and an interrupted query retry; corruption and read-only mounts
+/// fail fast into the bounded retry, then the parked set. Untyped errors
+/// (context wrappers from other layers) keep the old substring fallback —
+/// SQLite renders the whole busy/locked family as "... is locked".
 fn is_retryable_db_error(err: &anyhow::Error) -> bool {
+    if let Some(code) = sqlite_error_code(err) {
+        use rusqlite::ErrorCode::*;
+        return matches!(
+            code,
+            DatabaseBusy | DatabaseLocked | DiskFull | OperationInterrupted
+        );
+    }
     let msg = format!("{err:#}").to_ascii_lowercase();
     msg.contains("is locked") || msg.contains("busy")
 }
 
+/// The SQLite error code carried anywhere in `err`'s context chain, if any.
+fn sqlite_error_code(err: &anyhow::Error) -> Option<rusqlite::ErrorCode> {
+    err.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .and_then(|e| e.sqlite_error_code())
+    })
+}
 /// Apply a bulk-incremental outcome to the accumulated watch state,
 /// returning when (if at all) the bulk pass should be retried. `Done`
 /// clears the state the pass covered. `Skipped` keeps it, restamps
@@ -1695,12 +1794,37 @@ fn is_source_file(rel: &Path) -> bool {
 }
 
 pub fn resolve_debounce_ms() -> u64 {
-    std::env::var("REINDEX_DEBOUNCE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_DEBOUNCE_MS)
+    let raw = std::env::var("REINDEX_DEBOUNCE").ok();
+    match raw.as_deref().and_then(|s| s.parse::<u64>().ok()) {
+        Some(ms) => {
+            let floored = floor_debounce_ms(ms);
+            if floored != ms {
+                tracing::warn!(
+                    requested_ms = ms,
+                    applied_ms = floored,
+                    "REINDEX_DEBOUNCE below the floor; clamped",
+                );
+            }
+            floored
+        }
+        None => {
+            if raw.is_some() {
+                tracing::warn!(
+                    default_ms = DEFAULT_DEBOUNCE_MS,
+                    "unparseable REINDEX_DEBOUNCE; using the default",
+                );
+            }
+            DEFAULT_DEBOUNCE_MS
+        }
+    }
 }
 
+/// Clamp a debounce window up to [`MIN_DEBOUNCE_MS`]. Shared by the env
+/// resolution above and the explicit `watch run --reindex-debounce`, so both
+/// paths agree on the floor.
+pub fn floor_debounce_ms(ms: u64) -> u64 {
+    ms.max(MIN_DEBOUNCE_MS)
+}
 /// Idle window before a watcher self-exits, from `CODESAGE_WATCH_IDLE_SECS`.
 /// `0` disables self-exit. Defaults to 30 minutes.
 pub fn resolve_idle_timeout() -> Duration {
@@ -1718,6 +1842,11 @@ pub struct WatchStatus {
     pub mode: WatcherMode,
     pub pid: u32,
     pub started_at_unix: u64,
+    /// Paths parked after repeated semantic failures, awaiting their long
+    /// backoff retry. `#[serde(default)]` so statuses written before this
+    /// field existed still parse.
+    #[serde(default)]
+    pub stale_parked: usize,
 }
 
 pub fn watch_status_path(root: &Path) -> PathBuf {
@@ -1728,7 +1857,7 @@ pub fn watch_disabled_path(root: &Path) -> PathBuf {
     root.join(".codesage").join("watch.disabled")
 }
 
-fn write_status(root: &Path, mode: WatcherMode) -> Result<()> {
+fn write_status(root: &Path, mode: WatcherMode, stale_parked: usize) -> Result<()> {
     let started_at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1737,6 +1866,7 @@ fn write_status(root: &Path, mode: WatcherMode) -> Result<()> {
         mode,
         pid: std::process::id(),
         started_at_unix,
+        stale_parked,
     };
     let path = watch_status_path(root);
     let json = serde_json::to_string(&status)?;
@@ -1885,7 +2015,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".codesage")).unwrap();
         std::os::unix::fs::symlink(&victim, watch_status_path(root)).unwrap();
 
-        assert!(write_status(root, WatcherMode::Foreground).is_err());
+        assert!(write_status(root, WatcherMode::Foreground, 0).is_err());
         assert_eq!(std::fs::read(&victim).unwrap(), b"PRIVATE KEY");
     }
 
@@ -1896,7 +2026,7 @@ mod tests {
         let root = dir.path();
         std::fs::create_dir_all(root.join(".codesage")).unwrap();
 
-        write_status(root, WatcherMode::Foreground).unwrap();
+        write_status(root, WatcherMode::Foreground, 0).unwrap();
 
         let status = read_status(root).expect("status must round-trip");
         assert_eq!(status.pid, std::process::id());
@@ -2222,6 +2352,39 @@ mod tests {
             "no such table: files"
         )));
         assert!(!is_retryable_db_error(&anyhow::anyhow!("disk I/O error")));
+    }
+
+    #[test]
+    fn is_retryable_db_error_trusts_typed_codes_over_substrings() {
+        use rusqlite::ffi;
+        // A typed code classifies even when the message says nothing
+        // useful — and a scary message with a benign code must not send
+        // corruption down the retry path.
+        fn typed(code: std::os::raw::c_int) -> anyhow::Error {
+            rusqlite::Error::SqliteFailure(ffi::Error::new(code), Some("op failed".to_string()))
+                .into()
+        }
+        for code in [
+            ffi::SQLITE_BUSY,
+            ffi::SQLITE_LOCKED,
+            ffi::SQLITE_FULL,
+            ffi::SQLITE_INTERRUPT,
+        ] {
+            assert!(
+                is_retryable_db_error(&typed(code)),
+                "code {code} must retry"
+            );
+        }
+        for code in [ffi::SQLITE_CORRUPT, ffi::SQLITE_READONLY, ffi::SQLITE_ERROR] {
+            assert!(
+                !is_retryable_db_error(&typed(code)),
+                "code {code} must fail fast into the bounded retry"
+            );
+        }
+        // The classifier walks the anyhow chain: a typed code wrapped in
+        // context still classifies by code, not by the outer message.
+        let wrapped = typed(ffi::SQLITE_BUSY).context("removing files");
+        assert!(is_retryable_db_error(&wrapped));
     }
 
     #[test]
@@ -2565,6 +2728,7 @@ mod tests {
         let mut currently_indexing = HashSet::new();
         let mut recheck_queue = HashSet::new();
         let mut semantic_retries = HashMap::new();
+        let mut parked = HashMap::new();
         let mut deferred_since = None;
 
         let rederive = drain_pending(
@@ -2573,6 +2737,7 @@ mod tests {
             &mut currently_indexing,
             &mut recheck_queue,
             &mut semantic_retries,
+            &mut parked,
             &filter,
             &mut embedder,
             false,
@@ -2608,6 +2773,7 @@ mod tests {
             &mut currently_indexing,
             &mut recheck_queue,
             &mut semantic_retries,
+            &mut parked,
             &filter,
             &mut embedder,
             false,
@@ -2646,7 +2812,7 @@ mod tests {
     }
 
     #[test]
-    fn requeue_failed_semantic_bounds_the_retries_and_then_drops_the_path() {
+    fn requeue_failed_semantic_bounds_the_retries_and_then_parks_the_path() {
         let debounce = Duration::from_millis(100);
         let now = Instant::now();
         let mut pending = HashMap::new();
@@ -2672,14 +2838,84 @@ mod tests {
             pending.remove(&path);
         }
 
-        requeue_failed_semantic(&mut pending, &mut retries, [path.clone()], debounce, now);
+        // Past the bound the path leaves `pending`: it is parked for the
+        // long backoff (see `PARKED_RETRY_INTERVAL`), not dropped into
+        // silent staleness and not spun on.
+        let parked =
+            requeue_failed_semantic(&mut pending, &mut retries, [path.clone()], debounce, now);
+        assert_eq!(
+            parked,
+            vec![path.clone()],
+            "the caller parks what comes back"
+        );
         assert!(
             !pending.contains_key(&path),
-            "past the bound the path is dropped, not spun on"
+            "past the bound the path is parked, not spun on"
         );
         assert!(
             !retries.contains_key(&path),
             "the counter is cleared so the next save starts fresh"
+        );
+    }
+
+    #[test]
+    fn revive_due_parked_revives_only_entries_past_the_interval() {
+        let now = Instant::now();
+        let mut parked = HashMap::new();
+        let mut retries = HashMap::new();
+        let mut pending = HashMap::new();
+        let fresh = PathBuf::from("fresh.rs");
+        let due = PathBuf::from("due.rs");
+        parked.insert(fresh.clone(), now);
+        parked.insert(
+            due.clone(),
+            now - PARKED_RETRY_INTERVAL - Duration::from_secs(60),
+        );
+        retries.insert(due.clone(), MAX_SEMANTIC_RETRIES);
+
+        assert_eq!(
+            revive_due_parked(&mut parked, &mut retries, &mut pending, now),
+            1
+        );
+        assert!(parked.contains_key(&fresh), "fresh entries stay parked");
+        assert!(!parked.contains_key(&due), "due entries leave the set");
+        assert_eq!(
+            pending.get(&due),
+            Some(&now),
+            "revived paths are immediately drainable"
+        );
+        assert!(
+            !retries.contains_key(&due),
+            "revival grants a fresh retry budget"
+        );
+    }
+
+    #[test]
+    fn revive_due_parked_with_nothing_parked_revives_nothing() {
+        let now = Instant::now();
+        let mut parked = HashMap::new();
+        let mut retries = HashMap::new();
+        let mut pending = HashMap::new();
+        assert_eq!(
+            revive_due_parked(&mut parked, &mut retries, &mut pending, now),
+            0
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn debounce_floor_clamps_sub_floor_windows() {
+        assert_eq!(
+            floor_debounce_ms(0),
+            MIN_DEBOUNCE_MS,
+            "a zero flag must batch, not re-index hot"
+        );
+        assert_eq!(floor_debounce_ms(MIN_DEBOUNCE_MS - 1), MIN_DEBOUNCE_MS);
+        assert_eq!(floor_debounce_ms(MIN_DEBOUNCE_MS), MIN_DEBOUNCE_MS);
+        assert_eq!(
+            floor_debounce_ms(DEFAULT_DEBOUNCE_MS),
+            DEFAULT_DEBOUNCE_MS,
+            "above the floor passes through untouched"
         );
     }
 
@@ -2707,6 +2943,7 @@ mod tests {
         let mut recheck_queue = HashSet::new();
         let mut semantic_retries = HashMap::new();
 
+        let mut parked = HashMap::new();
         let before = Instant::now();
         process_ready(
             &config,
@@ -2714,6 +2951,7 @@ mod tests {
             &mut currently_indexing,
             &mut recheck_queue,
             &mut semantic_retries,
+            &mut parked,
             &filter,
             &mut embedder,
             false,
@@ -2745,6 +2983,7 @@ mod tests {
             &mut currently_indexing,
             &mut recheck_queue,
             &mut semantic_retries,
+            &mut parked,
             &filter,
             &mut embedder,
             false,
@@ -2856,6 +3095,7 @@ mod tests {
         let mut recheck_queue = HashSet::new();
         let mut semantic_retries = HashMap::new();
 
+        let mut parked = HashMap::new();
         let _held = hold_lock(root);
         process_ready(
             &config,
@@ -2863,6 +3103,7 @@ mod tests {
             &mut currently_indexing,
             &mut recheck_queue,
             &mut semantic_retries,
+            &mut parked,
             &filter,
             &mut embedder,
             false,
@@ -3159,6 +3400,7 @@ mod tests {
         let mut recheck_queue = HashSet::new();
         let mut semantic_retries = HashMap::new();
 
+        let mut parked = HashMap::new();
         // Still present and non-empty: a plain reindex must not request a
         // re-derivation.
         let rederive = process_ready(
@@ -3167,6 +3409,7 @@ mod tests {
             &mut currently_indexing,
             &mut recheck_queue,
             &mut semantic_retries,
+            &mut parked,
             &filter,
             &mut embedder,
             true,
@@ -3183,6 +3426,7 @@ mod tests {
             &mut currently_indexing,
             &mut recheck_queue,
             &mut semantic_retries,
+            &mut parked,
             &filter,
             &mut embedder,
             true,

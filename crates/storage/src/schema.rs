@@ -173,8 +173,13 @@ CREATE TABLE IF NOT EXISTS feature_trust_boundaries (
 "#;
 
 pub(crate) fn semantic_schema(table_name: &str, dim: usize) -> String {
+    // `table_name` can name a table recorded by an older binary (the open
+    // path re-ensures whatever `semantic_models` points at), so it is not
+    // trusted the way the sanitized `model_table_name` output is: escape
+    // through `quote_ident` or a `"` in the name breaks out of the DDL.
+    let table = quote_ident(table_name);
     format!(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS \"{table_name}\" USING vec0(\
+        "CREATE VIRTUAL TABLE IF NOT EXISTS \"{table}\" USING vec0(\
          id INTEGER PRIMARY KEY, \
          +file_path TEXT, \
          language TEXT partition key, \
@@ -198,8 +203,11 @@ pub fn fts_table_name(chunk_table: &str) -> String {
 /// them into half-useful tokens. No Porter stemmer — we match code
 /// identifiers verbatim, not English.
 pub(crate) fn fts_schema(table_name: &str) -> String {
+    // Same quoting contract as `semantic_schema`: sidecar names derive from
+    // the chunk table name, so they inherit whatever quoting it needs.
+    let table = quote_ident(table_name);
     format!(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS \"{table_name}\" USING fts5(\
+        "CREATE VIRTUAL TABLE IF NOT EXISTS \"{table}\" USING fts5(\
          content, \
          file_path UNINDEXED, \
          language UNINDEXED, \
@@ -236,11 +244,48 @@ fn table_max_id(conn: &Connection, table_name: &str, id_col: &str) -> rusqlite::
     conn.query_row(&sql, [], |row| row.get(0))
 }
 
-fn repair_fts_sidecar(
+/// Whether the FTS5 sidecar mirrors its chunk table. Returned by the
+/// read-path health probe ([`fts_sidecar_health`]) so diagnostics can report
+/// divergence without paying for a repair, and by the capped repair when the
+/// table is over the row cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FtsSidecarHealth {
+    /// Count + MAX(rowid) match: the sidecar mirrors the chunk table.
+    InSync,
+    /// The sidecar diverges; `chunk_rows` / `fts_rows` are the two counts so
+    /// a diagnostic can say how far apart they are.
+    Diverged { chunk_rows: i64, fts_rows: i64 },
+}
+
+/// What a bounded FTS repair did. [`FtsRepairOutcome::SkippedOverCap`] is the
+/// health signal for a diverged table too large to rebuild synchronously on
+/// open: the caller logs it and carries on with a degraded BM25 sidecar
+/// rather than stalling startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FtsRepairOutcome {
+    /// The sidecar already mirrored the chunk table; nothing was rewritten.
+    InSync,
+    /// The sidecar was rebuilt from the chunk table; `rows` is the chunk
+    /// count that was copied.
+    Repaired { rows: i64 },
+    /// The sidecar diverges but the chunk table holds more than `max_rows`
+    /// rows, so no rebuild ran. Repair explicitly off the open path (see
+    /// [`Database::repair_fts_sidecar`]).
+    SkippedOverCap { chunk_rows: i64 },
+}
+
+/// Largest chunk table a synchronous open-path repair will rebuild. The
+/// repair is a full DELETE + INSERT…SELECT rewrite, linear in row count with
+/// FTS5 index build on top; past ~100 k chunks it dominates process startup
+/// (seconds to minutes) on every query-shaped open. Over the cap the open
+/// proceeds with a stale BM25 sidecar and reports it instead of stalling.
+pub const FTS_REPAIR_ROW_CAP: i64 = 100_000;
+
+fn fts_sidecar_counts(
     conn: &Connection,
     chunk_table: &str,
     fts_table: &str,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<(i64, i64, bool)> {
     let chunk_count = table_row_count(conn, chunk_table)?;
     let fts_count = table_row_count(conn, fts_table)?;
     // Equal counts alone miss paired delete+insert divergence (one row
@@ -248,18 +293,41 @@ fn repair_fts_sidecar(
     // Count + MAX(rowid) together is a much stronger invariant for the
     // append/delete workload the indexer produces, and stays two cheap
     // queries — no checksums.
-    if chunk_count == fts_count
-        && table_max_id(conn, chunk_table, "id")? == table_max_id(conn, fts_table, "rowid")?
-    {
-        return Ok(());
-    }
+    let in_sync = chunk_count == fts_count
+        && table_max_id(conn, chunk_table, "id")? == table_max_id(conn, fts_table, "rowid")?;
+    Ok((chunk_count, fts_count, in_sync))
+}
 
+/// Read-path probe: does the FTS5 sidecar mirror `chunk_table`? Two cheap
+/// queries, never a rewrite — safe on every open, including read-only and
+/// migration-free handles.
+pub(crate) fn fts_sidecar_health(
+    conn: &Connection,
+    chunk_table: &str,
+    fts_table: &str,
+) -> rusqlite::Result<FtsSidecarHealth> {
+    let (chunk_count, fts_count, in_sync) = fts_sidecar_counts(conn, chunk_table, fts_table)?;
+    Ok(if in_sync {
+        FtsSidecarHealth::InSync
+    } else {
+        FtsSidecarHealth::Diverged {
+            chunk_rows: chunk_count,
+            fts_rows: fts_count,
+        }
+    })
+}
+
+pub(crate) fn repair_fts_sidecar(
+    conn: &Connection,
+    chunk_table: &str,
+    fts_table: &str,
+) -> rusqlite::Result<()> {
     let chunk_table = quote_ident(chunk_table);
     let fts_table = quote_ident(fts_table);
     // Wrap DELETE + INSERT…SELECT in one savepoint. Without it, a crash
     // between the two statements leaves the FTS sidecar empty while the
     // chunk table still has data; BM25 search returns zero results until
-    // the next process start re-runs the repair. A savepoint (not a raw
+    // the next write-path open re-runs the repair. A savepoint (not a raw
     // BEGIN/COMMIT) composes when this runs inside an outer transaction —
     // a bare BEGIN errors with "cannot start a transaction within a
     // transaction."
@@ -278,6 +346,33 @@ fn repair_fts_sidecar(
         return Err(e);
     }
     Ok(())
+}
+
+/// Bounded repair for open paths: rebuilds the sidecar when it diverges and
+/// the chunk table holds at most `max_rows` rows, otherwise reports
+/// [`FtsRepairOutcome::SkippedOverCap`] without rewriting anything. Open
+/// paths pass [`FTS_REPAIR_ROW_CAP`]; tests pass a small cap to exercise the
+/// skip without a 100 k-row fixture.
+pub(crate) fn repair_fts_sidecar_capped(
+    conn: &Connection,
+    chunk_table: &str,
+    fts_table: &str,
+    max_rows: i64,
+) -> rusqlite::Result<FtsRepairOutcome> {
+    let (chunk_count, fts_count, in_sync) = fts_sidecar_counts(conn, chunk_table, fts_table)?;
+    if in_sync {
+        return Ok(FtsRepairOutcome::InSync);
+    }
+    if chunk_count > max_rows {
+        return Ok(FtsRepairOutcome::SkippedOverCap {
+            chunk_rows: chunk_count,
+        });
+    }
+    repair_fts_sidecar(conn, chunk_table, fts_table)?;
+    // Re-read the sidecar count for the report rather than trusting the
+    // pre-repair chunk count: a concurrent writer could have moved it.
+    let _ = fts_count;
+    Ok(FtsRepairOutcome::Repaired { rows: chunk_count })
 }
 
 pub fn model_table_name(model: &str, dim: usize) -> String {
@@ -311,6 +406,16 @@ pub(crate) fn init_vec_extension() {
     });
 }
 
+/// How long a read-only connection waits on a locked database before failing
+/// with `SQLITE_BUSY` instead. A long write transaction (a full semantic
+/// re-index committing thousands of chunk rows) holds the lock well past the
+/// 5 s the write path tolerates, and a reader that fails instantly turns an
+/// ordinary concurrent index into a user-visible error. 30 s still bounds the
+/// wait — SQLite retries internally for the whole window, so this is the
+/// bounded retry-on-busy the read path gets — while covering any realistic
+/// single-transaction commit on a derived index.
+pub(crate) const READ_BUSY_TIMEOUT_MS: i64 = 30_000;
+
 /// Pragmas for a connection that will only ever read.
 ///
 /// [`init_db`] cannot be used on a read-only handle: `journal_mode=WAL` is
@@ -320,7 +425,7 @@ pub(crate) fn init_vec_extension() {
 /// the read outright, and the same mmap/cache sizing the read path benefits
 /// from.
 pub fn init_db_read_only(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+    conn.execute_batch(&format!("PRAGMA busy_timeout={READ_BUSY_TIMEOUT_MS};"))?;
     conn.execute_batch("PRAGMA mmap_size=268435456;")?;
     conn.execute_batch("PRAGMA cache_size=-65536;")?;
     Ok(())
@@ -478,6 +583,28 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
              applied_at INTEGER NOT NULL DEFAULT (unixepoch())
          );",
     )?;
+    // Each migration runs in its own transaction, opened with BEGIN
+    // IMMEDIATE rather than a deferred BEGIN. A deferred transaction takes
+    // no lock until its first write, so two processes opening the DB at
+    // once could both run the same migration body and only collide at
+    // COMMIT — the loser failing with SQLITE_BUSY after doing the work.
+    // BEGIN IMMEDIATE takes the RESERVED lock up front, serializing the
+    // second opener at transaction start instead.
+    //
+    // Caller-side serialization this relies on:
+    // - Writer commands (`index`, `git-index`, `cleanup`) hold the
+    //   project advisory lockfile (`.codesage/indexing.lock`, acquired via
+    //   `lockfile::acquire_with_wait` in the CLI; the daemon watcher
+    //   defers its pass on `AlreadyHeld`), so two writers never reach
+    //   here together — the normal case is single-flighted.
+    // - Lock-bypass opens (query/daemon read paths that call `init_db`
+    //   without holding the lockfile) fall back on the 5 s `busy_timeout`
+    //   pragma `init_db` sets before this runner: SQLite retries the
+    //   blocked BEGIN IMMEDIATE internally for the whole window, so the
+    //   second opener waits out the first migration and then sees the
+    //   `schema_migrations` row and skips — no new hard-error class, the
+    //   same SQLITE_BUSY only past the window that a deferred BEGIN
+    //   produced at COMMIT time.
     for (name, up) in MIGRATIONS {
         let already: i64 = conn.query_row(
             "SELECT COUNT(*) FROM schema_migrations WHERE name = ?1",
@@ -487,7 +614,7 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         if already > 0 {
             continue;
         }
-        conn.execute_batch("BEGIN")?;
+        conn.execute_batch("BEGIN IMMEDIATE")?;
         if let Err(e) = (|| -> rusqlite::Result<()> {
             up(conn)?;
             conn.execute(
@@ -567,6 +694,46 @@ pub fn name_tail(s: &str) -> &str {
     }
 }
 
+/// Rows per backfill page in [`backfill_refs_name_tail`]. Bounds the
+/// migration's heap to one page of `(id, to_name)` pairs instead of the
+/// whole `refs` table; 500 rows of short strings is tens of KiB.
+const NAME_TAIL_BACKFILL_CHUNK_ROWS: i64 = 500;
+
+/// Recompute `refs.to_name_tail` for every row, one id-ordered page at a
+/// time. `name_tail` splits past the last `\`, `/`, `.`, or two-char `::`,
+/// which has no faithful pure-SQL spelling in SQLite's string functions —
+/// hence a Rust-side cursor rather than a set-based UPDATE. Paginating by
+/// `id > last_seen` (not OFFSET) keeps each page a bounded indexed range
+/// scan and stays correct while the UPDATEs themselves change no ids.
+fn backfill_refs_name_tail(conn: &Connection) -> rusqlite::Result<()> {
+    let mut last_id: i64 = 0;
+    loop {
+        let rows: Vec<(i64, String)> = {
+            let mut stmt =
+                conn.prepare("SELECT id, to_name FROM refs WHERE id > ?1 ORDER BY id LIMIT ?2")?;
+            stmt.query_map(
+                rusqlite::params![last_id, NAME_TAIL_BACKFILL_CHUNK_ROWS],
+                |row| Ok((row.get(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if rows.is_empty() {
+            break;
+        }
+        {
+            let mut update = conn.prepare("UPDATE refs SET to_name_tail = ?1 WHERE id = ?2")?;
+            for (id, to_name) in &rows {
+                update.execute(rusqlite::params![name_tail(to_name), id])?;
+                last_id = last_id.max(*id);
+            }
+        }
+        if (rows.len() as i64) < NAME_TAIL_BACKFILL_CHUNK_ROWS {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// Adds `refs.to_name_tail` + backfill + supporting index. Safe against
 /// already-current schema: guarded by `pragma_table_info` check. Runner owns
 /// the transaction; this body can issue SQL directly.
@@ -578,15 +745,7 @@ fn migrate_0001_refs_name_tail(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     if has_column == 0 {
         conn.execute_batch("ALTER TABLE refs ADD COLUMN to_name_tail TEXT NOT NULL DEFAULT '';")?;
-        let rows: Vec<(i64, String)> = {
-            let mut stmt = conn.prepare("SELECT id, to_name FROM refs")?;
-            stmt.query_map([], |row| Ok((row.get(0)?, row.get::<_, String>(1)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        let mut update = conn.prepare("UPDATE refs SET to_name_tail = ?1 WHERE id = ?2")?;
-        for (id, to_name) in &rows {
-            update.execute(rusqlite::params![name_tail(to_name), id])?;
-        }
+        backfill_refs_name_tail(conn)?;
     }
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_refs_to_name_tail ON refs(to_name_tail);")?;
     Ok(())
@@ -792,6 +951,12 @@ fn migrate_0007_symbols_rationale(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Recompute `to_name_tail` under the dotted-tail rule (0001 only split on
+/// `\`, `/`, `::`; the dot matters for Go `fmt.Println`-style names).
+/// No-op when the column does not exist yet — 0001 runs first in the same
+/// `run_migrations` pass and backfills on column creation. Paged through
+/// [`backfill_refs_name_tail`] so a php-src-scale `refs` table is never
+/// materialized into one `Vec`.
 fn migrate_0006_refs_name_tail_dot(conn: &Connection) -> rusqlite::Result<()> {
     let has_column: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('refs') WHERE name = 'to_name_tail'",
@@ -801,17 +966,7 @@ fn migrate_0006_refs_name_tail_dot(conn: &Connection) -> rusqlite::Result<()> {
     if has_column == 0 {
         return Ok(());
     }
-
-    let rows: Vec<(i64, String)> = {
-        let mut stmt = conn.prepare("SELECT id, to_name FROM refs")?;
-        stmt.query_map([], |row| Ok((row.get(0)?, row.get::<_, String>(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    let mut update = conn.prepare("UPDATE refs SET to_name_tail = ?1 WHERE id = ?2")?;
-    for (id, to_name) in &rows {
-        update.execute(rusqlite::params![name_tail(to_name), id])?;
-    }
-    Ok(())
+    backfill_refs_name_tail(conn)
 }
 
 /// Adds `structural_index_state` for tracking the last HEAD SHA the structural
@@ -897,6 +1052,13 @@ fn migrate_0005_semantic_models(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Create the vec0 chunk table and its FTS5 sidecar + vocab table when they
+/// are missing. DDL only, deliberately no repair: the sidecar rebuild is a
+/// full DELETE + INSERT…SELECT rewrite that used to run on every
+/// `open_for_model`, stalling query-shaped opens on large indexes. Write-path
+/// opens run the bounded [`repair_fts_sidecar_capped`] instead (row-capped,
+/// with a health signal on skip); read paths probe with
+/// [`fts_sidecar_health`] and never rewrite.
 pub(crate) fn ensure_chunk_table(
     conn: &Connection,
     table_name: &str,
@@ -906,7 +1068,6 @@ pub(crate) fn ensure_chunk_table(
     let fts = fts_table_name(table_name);
     conn.execute_batch(&fts_schema(&fts))?;
     conn.execute_batch(&fts_vocab_schema(&fts))?;
-    repair_fts_sidecar(conn, table_name, &fts)?;
     Ok(())
 }
 
@@ -1055,5 +1216,187 @@ mod tests {
             timeout_ms >= 5000,
             "expected busy_timeout >= 5000ms, got {timeout_ms}",
         );
+    }
+
+    #[test]
+    fn capped_repair_skips_over_cap_and_repairs_under_it() {
+        let table = "chunks_repaircap_2";
+        let conn = open_with_chunk_table(table, 2);
+        insert_chunk_pair(&conn, table, 1, "fn one");
+        insert_chunk_pair(&conn, table, 2, "fn two");
+        let fts = fts_table_name(table);
+        conn.execute(&format!("DELETE FROM \"{fts}\""), []).unwrap();
+
+        // A cap below the table size reports the divergence without paying
+        // for the rewrite — the over-cap health signal open paths log.
+        assert_eq!(
+            repair_fts_sidecar_capped(&conn, table, &fts, 1).unwrap(),
+            FtsRepairOutcome::SkippedOverCap { chunk_rows: 2 }
+        );
+        assert_eq!(
+            fts_sidecar_health(&conn, table, &fts).unwrap(),
+            FtsSidecarHealth::Diverged {
+                chunk_rows: 2,
+                fts_rows: 0
+            }
+        );
+
+        assert_eq!(
+            repair_fts_sidecar_capped(&conn, table, &fts, FTS_REPAIR_ROW_CAP).unwrap(),
+            FtsRepairOutcome::Repaired { rows: 2 }
+        );
+        assert_eq!(
+            fts_sidecar_health(&conn, table, &fts).unwrap(),
+            FtsSidecarHealth::InSync
+        );
+        // In-sync is a no-op report, not a rewrite.
+        assert_eq!(
+            repair_fts_sidecar_capped(&conn, table, &fts, 0).unwrap(),
+            FtsRepairOutcome::InSync
+        );
+    }
+
+    #[test]
+    fn init_db_read_only_sets_raised_busy_timeout() {
+        // A long write transaction holds the lock well past the write path's
+        // 5 s; readers wait it out instead of failing SQLITE_BUSY outright.
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        init_db_read_only(&conn).expect("init_db_read_only");
+        let timeout_ms = pragma_int(&conn, "busy_timeout");
+        assert_eq!(
+            timeout_ms, READ_BUSY_TIMEOUT_MS,
+            "read-only opens must carry the raised busy timeout"
+        );
+        assert!(
+            timeout_ms > 5000,
+            "readers must wait longer than the 5 s write-path window"
+        );
+    }
+
+    /// Re-running `init_db` must not re-apply migrations: the registry row
+    /// count is stable and the schema still works. (The BEGIN IMMEDIATE
+    /// change keeps this true under concurrency — the second opener blocks
+    /// at transaction start, then sees the row and skips.)
+    #[test]
+    fn init_db_double_run_does_not_reapply_migrations() {
+        let conn = open_initialized();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert!(count > 0, "fresh init_db must record migrations");
+        init_db(&conn).expect("second init_db");
+        let again: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(again, count, "second init_db must be a registry no-op");
+    }
+
+    /// Two concurrent `init_db` opens on the same file must both succeed:
+    /// BEGIN IMMEDIATE serializes the second at transaction start (inside
+    /// the 5 s busy_timeout window) instead of failing at COMMIT after
+    /// doing migration work.
+    #[test]
+    fn concurrent_init_db_opens_both_succeed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("idx.db");
+        // Pre-create so both threads open an existing file.
+        {
+            let conn = Connection::open(&path).expect("open file db");
+            init_db(&conn).expect("seed init_db");
+        }
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let conn = Connection::open(&path).expect("open file db");
+                    init_db(&conn).expect("concurrent init_db must succeed");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("init_db thread panicked");
+        }
+    }
+
+    /// The chunked backfill must cover every row past the first page:
+    /// 1200 rows (> 2 pages of 500) across all four `name_tail`
+    /// delimiters, verified row-by-row against the Rust implementation.
+    #[test]
+    fn name_tail_backfill_pages_past_first_chunk() {
+        let conn = open_initialized();
+        conn.execute(
+            "INSERT INTO files (id, path, language, content_hash) VALUES (1, 'a.rs', 'rust', 'x')",
+            [],
+        )
+        .unwrap();
+        let cases = [
+            "App\\Http\\Controllers\\Foo",
+            "mod::sub::bar",
+            "fmt.Println",
+            "a/b/c",
+            "plain",
+        ];
+        {
+            // `line` carries the loop index: migration 0013's unique index
+            // on (from_file_id, to_name, kind, line, col) rejects 1200
+            // rows that differ only in `to_name` cycling over 5 values.
+            let mut ins = conn
+                .prepare(
+                    "INSERT INTO refs (from_file_id, to_name, kind, line, col)
+                     VALUES (1, ?1, 'call', ?2, 1)",
+                )
+                .unwrap();
+            for i in 0..1200 {
+                ins.execute(rusqlite::params![cases[i % cases.len()], i as i64])
+                    .unwrap();
+            }
+        }
+        backfill_refs_name_tail(&conn).expect("chunked backfill");
+        let tails: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT to_name_tail FROM refs ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(tails.len(), 1200);
+        for (i, tail) in tails.iter().enumerate() {
+            assert_eq!(
+                tail,
+                name_tail(cases[i % cases.len()]),
+                "row {i} tail mismatch"
+            );
+        }
+    }
+
+    /// A `"` in a chunk-table name must not break out of the vec0/FTS DDL:
+    /// the escaped identifier names one table instead of injecting SQL.
+    #[test]
+    fn chunk_ddl_escapes_quote_in_table_name() {
+        let ddl = semantic_schema("chunks_evil\"_2", 2);
+        assert!(
+            ddl.contains("\"chunks_evil\"\"_2\""),
+            "vec0 DDL must double the embedded quote, got: {ddl}"
+        );
+        let fts = fts_schema("chunks_evil\"_2_fts");
+        assert!(
+            fts.contains("\"chunks_evil\"\"_2_fts\""),
+            "FTS DDL must double the embedded quote, got: {fts}"
+        );
+        // End to end: the escaped DDL actually creates the weirdly-named table.
+        init_vec_extension();
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        init_db(&conn).expect("init_db");
+        ensure_chunk_table(&conn, "chunks_evil\"_2", 2).expect("ensure_chunk_table");
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'chunks_evil\"_2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "quoted table must exist under its literal name");
     }
 }

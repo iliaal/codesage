@@ -7,8 +7,8 @@ use anyhow::{Context, Result, bail};
 use codesage_embed::model::Embedder;
 
 use crate::{
-    PROJECT_DIR, daemon, db_path, find_project_root, get_exclude_patterns, installer,
-    load_project_config, mcp, statewatcher,
+    PROJECT_DIR, daemon, db_path, find_project_root, find_project_root_opt, get_exclude_patterns,
+    installer, load_project_config, mcp, statewatcher,
 };
 
 pub(crate) fn cmd_mcp(
@@ -90,14 +90,34 @@ fn canonical_project_utf8() -> Result<(PathBuf, String)> {
     Ok((canon, utf8))
 }
 
+/// Project root for install/uninstall. Project-local mode requires an
+/// onboarded project; global mode resolves opportunistically so `install
+/// --global` (and global `uninstall`) work outside onboarded projects —
+/// the registration then carries no `--project` default and the server
+/// resolves the project per call instead.
+fn resolve_install_project(global: bool) -> Result<(Option<PathBuf>, Option<String>)> {
+    if !global {
+        return canonical_project_utf8().map(|(p, s)| (Some(p), Some(s)));
+    }
+    let Some(root) = find_project_root_opt() else {
+        return Ok((None, None));
+    };
+    let canon = std::fs::canonicalize(&root).unwrap_or(root);
+    let utf8 = canon
+        .to_str()
+        .with_context(|| format!("project path is not valid UTF-8: {}", canon.display()))?
+        .to_owned();
+    Ok((Some(canon), Some(utf8)))
+}
+
 pub(crate) fn cmd_install(target: &str, global: bool) -> Result<()> {
-    let (project, project_utf8) = canonical_project_utf8()?;
+    let (project, project_utf8) = resolve_install_project(global)?;
     let home = home_dir()?;
     let targets = resolve_install_targets(target)?;
     let ctx = installer::InstallCtx {
         home: &home,
-        project: &project,
-        project_utf8: &project_utf8,
+        project: project.as_deref(),
+        project_utf8: project_utf8.as_deref(),
         global,
     };
     for t in &targets {
@@ -115,21 +135,27 @@ pub(crate) fn cmd_install(target: &str, global: bool) -> Result<()> {
             }
         }
     }
-    println!(
-        "\nCodeSage MCP server registered for project: {}",
-        project.display()
-    );
+    match &project {
+        Some(p) => println!(
+            "\nCodeSage MCP server registered for project: {}",
+            p.display()
+        ),
+        None => println!(
+            "\nCodeSage MCP server registered globally with no project default \
+             (outside any onboarded project); pass a project per call or run inside one"
+        ),
+    }
     Ok(())
 }
 
 pub(crate) fn cmd_uninstall(target: &str, global: bool) -> Result<()> {
-    let (project, project_utf8) = canonical_project_utf8()?;
+    let (project, project_utf8) = resolve_install_project(global)?;
     let home = home_dir()?;
     let targets = resolve_install_targets(target)?;
     let ctx = installer::InstallCtx {
         home: &home,
-        project: &project,
-        project_utf8: &project_utf8,
+        project: project.as_deref(),
+        project_utf8: project_utf8.as_deref(),
         global,
     };
     for t in &targets {
@@ -293,7 +319,23 @@ pub(crate) fn cmd_watch_run(project: Option<PathBuf>, debounce_ms: Option<u64>) 
     let config = load_project_config(&root)?;
     let excludes = get_exclude_patterns(&config);
     let emb_config = config.embedding.clone().unwrap_or_default();
-    let debounce = debounce_ms.unwrap_or_else(statewatcher::resolve_debounce_ms);
+    // The env path (`resolve_debounce_ms`) already warns through tracing when
+    // it clamps; an explicit flag previously skipped the floor entirely, so
+    // a zero `--reindex-debounce` re-indexed hot. Floor it here and say so
+    // on stderr, where the operator will actually see it.
+    let debounce = match debounce_ms {
+        Some(ms) => {
+            let floored = statewatcher::floor_debounce_ms(ms);
+            if floored != ms {
+                eprintln!(
+                    "warning: --reindex-debounce {ms}ms is below the {}ms floor; using {floored}ms",
+                    statewatcher::MIN_DEBOUNCE_MS,
+                );
+            }
+            floored
+        }
+        None => statewatcher::resolve_debounce_ms(),
+    };
 
     // An explicit foreground run overrides a prior `watch stop`. A clone can
     // ship `watch.disabled` as a directory, which no removal clears: surface
@@ -366,12 +408,23 @@ pub(crate) fn cmd_watch_status(project: Option<PathBuf>, json: bool) -> Result<(
         println!("{}", serde_json::to_string_pretty(&obj)?);
     } else {
         match status {
-            Some(s) => println!(
-                "watcher active for {} (mode: {:?}, pid: {})",
-                root.display(),
-                s.mode,
-                s.pid
-            ),
+            Some(s) => {
+                // `stale_parked` is already in the JSON object above; the
+                // human line must not hide it — parked paths are stale, and
+                // a status that reads "active" with no hint would lie about
+                // their visibility.
+                let parked_note = match s.stale_parked {
+                    0 => String::new(),
+                    1 => ", 1 path parked after repeated failures".to_string(),
+                    n => format!(", {n} paths parked after repeated failures"),
+                };
+                println!(
+                    "watcher active for {} (mode: {:?}, pid: {}{parked_note})",
+                    root.display(),
+                    s.mode,
+                    s.pid
+                );
+            }
             None => println!(
                 "watcher not active for {}{}",
                 root.display(),

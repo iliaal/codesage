@@ -46,12 +46,12 @@ EOF
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --corpus-dir)    shift; CORPUS_DIR="$1" ;;
-        --max-cases)     shift; MAX_CASES="$1" ;;
-        --min-files)     shift; MIN_FILES="$1" ;;
-        --runner)        shift; RUNNER="$1" ;;
-        --extractor)     shift; EXTRACTOR="$1" ;;
-        --codesage-bin)  shift; CODESAGE_BIN="$1" ;;
+        --corpus-dir)    shift; CORPUS_DIR="${1:?missing value for --corpus-dir}" ;;
+        --max-cases)     shift; MAX_CASES="${1:?missing value for --max-cases}" ;;
+        --min-files)     shift; MIN_FILES="${1:?missing value for --min-files}" ;;
+        --runner)        shift; RUNNER="${1:?missing value for --runner}" ;;
+        --extractor)     shift; EXTRACTOR="${1:?missing value for --extractor}" ;;
+        --codesage-bin)  shift; CODESAGE_BIN="${1:?missing value for --codesage-bin}" ;;
         --no-extract)    NO_EXTRACT=1 ;;
         --no-save)       SAVE_HISTORY=0 ;;
         -h|--help)       usage ;;

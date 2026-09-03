@@ -308,6 +308,20 @@ fn read_counts() -> &'static Mutex<HashMap<PathBuf, u64>> {
     COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Drop the cached digest for one path, if any. Call this when the file
+/// behind `path` is replaced out of band — the cache eviction in
+/// `model.rs` deletes the blob and re-downloads it, and a refetch that
+/// lands within the same mtime tick with the same length would otherwise
+/// serve the evicted bytes' hash and trip a false supply-chain alarm.
+/// Purging is safe when the replacement never happens: the next lookup
+/// just re-reads the file.
+pub(crate) fn forget_cached_digest(path: &Path) {
+    digest_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path);
+}
+
 /// Drop every cached digest, so the next lookup reads the file as a fresh
 /// process would. For tests that need a cold cache without a new process;
 /// nothing in a running command should call it.

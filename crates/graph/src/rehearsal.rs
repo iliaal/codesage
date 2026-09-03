@@ -4,14 +4,15 @@
 //! mapping — so there is no duplicated analysis logic here, only the glue that
 //! turns those signals into severity-ranked objections.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::git_history::{assess_risk_diff, recommend_tests};
+use crate::git_history::{assess_risk, assess_risk_diff, recommend_tests};
 use codesage_protocol::{
-    FeatureFileRole, ReviewObjection, ReviewRehearsal, ReviewSeverity, TrustBoundary,
+    FeatureFileRole, ReviewObjection, ReviewRehearsal, ReviewSeverity, RiskAssessment,
+    TrustBoundary,
 };
 use codesage_storage::Database;
 
@@ -71,6 +72,33 @@ pub fn build_review_rehearsal(
 
     // --- risk rollup for the patch ---
     let risk = assess_risk_diff(db, files)?;
+    // A clustered directory keeps full detail for only its top-3 files; the
+    // rest survive as bare names in `omitted_files` with no score, so a 4th+
+    // file that still clears a risk threshold would lose its objection line.
+    // Re-assess those names through the same single-file scorer the diff used
+    // pre-clustering, so the thresholds below see every changed file.
+    let mut omitted_detail: Vec<RiskAssessment> = Vec::new();
+    {
+        let mut seen: HashSet<&str> = HashSet::new();
+        for a in risk.files.iter().chain(
+            risk.clustered_directories
+                .iter()
+                .flat_map(|cluster| cluster.top_files.iter()),
+        ) {
+            seen.insert(a.file.as_str());
+        }
+        for cluster in &risk.clustered_directories {
+            for omitted in &cluster.omitted_files {
+                if !seen.insert(omitted.as_str()) {
+                    continue;
+                }
+                omitted_detail.push(
+                    assess_risk(db, omitted)
+                        .with_context(|| format!("scoring clustered-away file {omitted}"))?,
+                );
+            }
+        }
+    }
     let detailed_risk: Vec<&codesage_protocol::RiskAssessment> = risk
         .files
         .iter()
@@ -79,6 +107,7 @@ pub fn build_review_rehearsal(
                 .iter()
                 .flat_map(|cluster| cluster.top_files.iter()),
         )
+        .chain(omitted_detail.iter())
         .collect();
     let by_file: HashMap<&str, &codesage_protocol::RiskAssessment> = detailed_risk
         .iter()
@@ -525,6 +554,84 @@ mod tests {
             obj.files.contains(&"app/Risk/File0.php".to_string()),
             "high-risk objection must include clustered top_files, got {obj:?}"
         );
+    }
+
+    #[test]
+    fn high_risk_objection_includes_clustered_omitted_files() {
+        // Five hot files in one directory: clustering keeps full detail for
+        // the top 3 and demotes the 4th+ to bare `omitted_files` names. Every
+        // file here clears 0.60, so the high-risk objection must name all
+        // five — not just the three that survived clustering.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let clustered: Vec<String> = (0..5).map(|i| format!("app/Hot/File{i}.php")).collect();
+        // Identical hot signals, so CUME_DIST ties share percentile 1.0 and
+        // every file scores ~0.64 regardless of its rank in the cluster.
+        for path in &clustered {
+            let id = db
+                .upsert_file(&FileInfo {
+                    path: path.clone(),
+                    language: Language::Php,
+                    content_hash: format!("hot-{path}"),
+                })
+                .unwrap();
+            db.replace_file_trust_boundaries(
+                id,
+                &[
+                    TrustBoundary::Network,
+                    TrustBoundary::Filesystem,
+                    TrustBoundary::Database,
+                    TrustBoundary::Secrets,
+                    TrustBoundary::ProcessExec,
+                ],
+            )
+            .unwrap();
+            db.upsert_git_file(path, 100.0, 40, 80, Some(1_700_000_000))
+                .unwrap();
+        }
+        for path in ["cold_a.php", "cold_b.php", "cold_c.php"] {
+            db.upsert_git_file(path, 0.05, 0, 5, Some(1_700_000_000))
+                .unwrap();
+        }
+
+        let risk = crate::git_history::assess_risk_diff(&db, &clustered).unwrap();
+        let omitted: Vec<String> = risk
+            .clustered_directories
+            .iter()
+            .flat_map(|c| c.omitted_files.iter().cloned())
+            .collect();
+        assert_eq!(
+            omitted.len(),
+            2,
+            "5 files in one directory must demote 2 to omitted_files, got {risk:?}"
+        );
+        assert!(
+            risk.files.iter().all(|a| !omitted.contains(&a.file))
+                && risk
+                    .clustered_directories
+                    .iter()
+                    .flat_map(|c| c.top_files.iter())
+                    .all(|a| !omitted.contains(&a.file)),
+            "fixture must prove omitted files survive nowhere with detail, got {risk:?}"
+        );
+
+        let r = build_review_rehearsal(dir.path(), &db, &clustered).unwrap();
+        let obj = r
+            .objections
+            .iter()
+            .find(|o| o.category == "high-risk-file" && o.severity == ReviewSeverity::High)
+            .unwrap_or_else(|| panic!("expected high-risk-file objection, got {:?}", r.objections));
+
+        for path in &clustered {
+            assert!(
+                obj.files.contains(path),
+                "high-risk objection must include omitted {path}, got {obj:?}"
+            );
+            assert!(
+                obj.evidence.iter().any(|e| e.contains(path)),
+                "high-risk objection must carry an evidence line for omitted {path}, got {obj:?}"
+            );
+        }
     }
 
     #[test]

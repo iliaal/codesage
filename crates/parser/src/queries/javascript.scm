@@ -32,3 +32,26 @@
 
 ; Pattern 9: exported var → Constant
 (export_statement declaration: (variable_declaration (variable_declarator name: (identifier) @name) @def))
+
+; Pattern 10: module.exports = ... (whole-exports assignment) → Constant.
+; Named "exports": the module's entry point. Appended (not inserted after
+; pattern 6) so every pattern index above keeps its kind-map meaning.
+(expression_statement
+  (assignment_expression
+    left: (member_expression
+      object: (identifier) @_mod
+      property: (property_identifier) @name)
+    (#eq? @_mod "module")
+    (#eq? @name "exports")) @def)
+
+; Pattern 11: module.exports.X = ... (named CJS export) → Constant.
+; The `exports.X = ...` shorthand is pattern 6; this is its qualified form.
+(expression_statement
+  (assignment_expression
+    left: (member_expression
+      object: (member_expression
+        object: (identifier) @_mod
+        property: (property_identifier) @_exp)
+      property: (property_identifier) @name)
+    (#eq? @_mod "module")
+    (#eq? @_exp "exports")) @def)

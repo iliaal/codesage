@@ -51,8 +51,8 @@ hint_only=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --device)       shift; device="$1" ;;
-        --codesage-bin) shift; codesage_bin="$1" ;;
+        --device)       shift; device="${1:?missing value for --device}" ;;
+        --codesage-bin) shift; codesage_bin="${1:?missing value for --codesage-bin}" ;;
         --no-mcp)       skip_mcp=1 ;;
         --no-hooks)     skip_hooks=1 ;;
         --no-hint)      skip_hint=1 ;;

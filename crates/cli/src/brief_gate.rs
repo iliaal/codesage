@@ -156,12 +156,20 @@ fn now_secs() -> u64 {
 
 /// Session ids arrive from a hook payload, so they are untrusted input on a
 /// path that becomes a filename. Keep only characters that cannot traverse.
+///
+/// The charset and cap mirror the documented session contract (see the
+/// `session_id` help and the session validator): ASCII alphanumerics plus
+/// `-`, `_`, `.`, max 128 chars. `.` is significant, not stripped — `a.b`
+/// and `ab` are different sessions and must not share a state file.
+/// Leading dots are trimmed: the contract rejects them (hidden-file
+/// confusion), and the `brief-` prefix already guarantees a visible name.
 fn sanitize(session: &str) -> String {
     let cleaned: String = session
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .take(64)
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+        .take(128)
         .collect();
+    let cleaned = cleaned.trim_start_matches('.').to_owned();
     if cleaned.is_empty() {
         format!("{:x}", digest(session))
     } else {
@@ -411,6 +419,36 @@ mod tests {
         assert!(!escaped.to_string_lossy().contains(".."));
         // An id with nothing usable still yields a stable, distinct file.
         assert_ne!(state_path(dir, "///"), state_path(dir, "!!!"));
+    }
+    #[test]
+    fn dots_are_significant_not_stripped() {
+        // The old charset dropped `.`, so `a.b` and `ab` shared one state
+        // file: one session's budget and history leaked into the other's.
+        let dir = Path::new("/run/user/1000/codesage");
+        assert_ne!(state_path(dir, "a.b"), state_path(dir, "ab"));
+        assert!(state_path(dir, "a.b").to_string_lossy().contains("a.b"));
+    }
+
+    #[test]
+    fn sanitize_cap_matches_the_documented_128() {
+        let max = "x".repeat(128);
+        assert_eq!(sanitize(&max), max, "a max-length id passes through");
+        let over = "x".repeat(200);
+        assert_eq!(sanitize(&over), max, "over-long ids truncate to the cap");
+    }
+
+    #[test]
+    fn leading_dots_neither_hide_nor_escape_the_state_file() {
+        let dir = Path::new("/run/user/1000/codesage");
+        for id in ["...", "../sess", ".hidden"] {
+            let p = state_path(dir, id);
+            assert_eq!(p.parent().unwrap(), dir, "{id} must stay in the dir");
+            let name = p.file_name().unwrap().to_string_lossy();
+            assert!(
+                name.starts_with("brief-") && !name.starts_with("brief-."),
+                "{id} must not yield a hidden file: {name}"
+            );
+        }
     }
 
     #[test]

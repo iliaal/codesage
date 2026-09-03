@@ -285,6 +285,22 @@ def run_once(
     )
 
 
+def _coerce_cost(value: object) -> float:
+    # Model/CLI output is untrusted: a malformed total_cost_usd (e.g. "$1.2",
+    # None-as-string, dict) must score this run as $0, not kill the whole
+    # A/B aggregate with a ValueError/TypeError.
+    try:
+        return float(value or 0.0)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _coerce_int(value: object) -> int:
+    try:
+        return int(value or 0)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+
 def parse_run_output(
     stdout: str, stderr: str, returncode: int, duration_s: float, *, with_codesage: bool
 ) -> dict[str, Any]:
@@ -311,14 +327,14 @@ def parse_run_output(
                     tool_uses.append(c.get("name") or "")
             usage = msg.get("usage") or {}
             tokens += (
-                int(usage.get("input_tokens") or 0)
-                + int(usage.get("output_tokens") or 0)
-                + int(usage.get("cache_read_input_tokens") or 0)
-                + int(usage.get("cache_creation_input_tokens") or 0)
+                _coerce_int(usage.get("input_tokens"))
+                + _coerce_int(usage.get("output_tokens"))
+                + _coerce_int(usage.get("cache_read_input_tokens"))
+                + _coerce_int(usage.get("cache_creation_input_tokens"))
             )
         elif obj.get("type") == "result":
             result_text = (obj.get("result") or "").strip()
-            cost_usd = float(obj.get("total_cost_usd") or 0.0)
+            cost_usd = _coerce_cost(obj.get("total_cost_usd"))
             is_error = bool(obj.get("is_error")) or obj.get("subtype") not in (None, "success")
 
     blob = stdout + "\n" + stderr

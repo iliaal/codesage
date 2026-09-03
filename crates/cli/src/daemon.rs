@@ -54,6 +54,17 @@ mod unix {
     /// connection open for the whole drain.
     const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
+    /// Lock an activity-clock mutex, recovering from poisoning. The clock is
+    /// a plain timestamp: a writer that panicked mid-store leaves the old
+    /// value intact, so `into_inner` recovery (rather than an `.unwrap()`
+    /// that crash-loops the daemon across the accept loop and every tick) is
+    /// the correct call.
+    fn lock_clock(mutex: &Mutex<Instant>) -> std::sync::MutexGuard<'_, Instant> {
+        mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Await every task in `clients`, bounded by `timeout`. Returns how many
     /// tasks were still in flight when the bound expired (those are aborted);
     /// `0` means a clean drain.
@@ -456,8 +467,8 @@ mod unix {
 
                     let server = CodeSageServer::with_state(state.clone());
                     active.fetch_add(1, Ordering::SeqCst);
-                    *last_activity.lock().unwrap() = Instant::now();
-                    *daemon_last_byte.lock().unwrap() = Instant::now();
+                    *lock_clock(&last_activity) = Instant::now();
+                    *lock_clock(&daemon_last_byte) = Instant::now();
                     let active_for_conn = active.clone();
                     let active_for_stop = active.clone();
                     let last_activity_for_conn = last_activity.clone();
@@ -470,7 +481,7 @@ mod unix {
                         let remaining = active_for_conn.fetch_sub(1, Ordering::SeqCst) - 1;
                         // Reset the idle clock on disconnect so the timeout
                         // measures continuous idleness, not uptime.
-                        *last_activity_for_conn.lock().unwrap() = Instant::now();
+                        *lock_clock(&last_activity_for_conn) = Instant::now();
                         // With no client left there is nobody to keep an
                         // index fresh for: stop every live watcher now rather
                         // than letting it re-embed saved files for the rest of
@@ -504,7 +515,7 @@ mod unix {
                     if !idle_timeout.is_zero() {
                         let connected = active.load(Ordering::SeqCst);
                         if connected == 0 {
-                            if last_activity.lock().unwrap().elapsed() >= idle_timeout {
+                            if lock_clock(&last_activity).elapsed() >= idle_timeout {
                                 break "idle";
                             }
                         } else {
@@ -515,7 +526,7 @@ mod unix {
                             // nothing, and only the per-connection ceiling
                             // (CODESAGE_CLIENT_IDLE_MAX_SECS, 4h default) will
                             // eventually release them.
-                            let silent = daemon_last_byte.lock().unwrap().elapsed();
+                            let silent = lock_clock(&daemon_last_byte).elapsed();
                             // Latch so a parked session logs once per silent
                             // window rather than every tick for hours. The end
                             // of the window is already observable: the
@@ -665,8 +676,8 @@ mod unix {
             let r = Pin::new(&mut this.inner).poll_read(cx, buf);
             if matches!(r, Poll::Ready(Ok(()))) && buf.filled().len() > before {
                 let now = Instant::now();
-                *this.last_activity.lock().unwrap() = now;
-                *this.daemon_last_byte.lock().unwrap() = now;
+                *lock_clock(&this.last_activity) = now;
+                *lock_clock(&this.daemon_last_byte) = now;
             }
             r
         }
@@ -757,7 +768,7 @@ mod unix {
                     };
                 }
                 _ = idle_tick.tick() => {
-                    let idle = last_activity.lock().unwrap().elapsed();
+                    let idle = lock_clock(&last_activity).elapsed();
                     if idle >= idle_max {
                         tracing::warn!(
                             "MCP client idle for {:?} (>= {:?}); dropping",
@@ -1352,6 +1363,16 @@ mod unix {
         })
     }
 
+    /// Exit status for a finished stdio-proxy direction: a copy error means
+    /// the far side died mid-stream, so exiting 0 would let a dead daemon
+    /// look like a clean EOF to the client.
+    fn proxy_exit_code<E>(res: &Result<(), E>) -> i32 {
+        match res {
+            Ok(()) => 0,
+            Err(_) => 1,
+        }
+    }
+
     async fn proxy_stdio(stream: UnixStream, default_project: Option<String>) -> Result<()> {
         let (mut socket_read, mut socket_write) = tokio::io::split(stream);
         let mut stdin = tokio::io::stdin();
@@ -1394,18 +1415,19 @@ mod unix {
         // Both directions therefore terminate the process directly.
         tokio::select! {
             res = &mut socket_to_stdout => {
-                if let Err(e) = res {
+                if let Err(e) = &res {
                     tracing::warn!(error = %e, "MCP daemon connection closed with error");
                 }
-                std::process::exit(0);
+                std::process::exit(proxy_exit_code(&res));
             }
             res = &mut stdin_to_socket => {
-                if let Err(e) = res {
+                if let Err(e) = &res {
                     tracing::warn!(error = %e, "MCP client stdin closed with error");
                 }
+                let code = proxy_exit_code(&res);
                 // Stdin EOF: drain in-flight server response, then exit.
                 let _ = socket_to_stdout.await;
-                std::process::exit(0);
+                std::process::exit(code);
             }
         }
     }
@@ -2317,6 +2339,16 @@ mod unix {
             assert_eq!(
                 sibling_reap_action(true, Some(50), Some(100)),
                 SiblingReapAction::Leave
+            );
+        }
+
+        #[test]
+        fn proxy_copy_error_exits_nonzero_not_clean_eof() {
+            assert_eq!(proxy_exit_code::<anyhow::Error>(&Ok(())), 0);
+            assert_eq!(
+                proxy_exit_code(&Err(anyhow::anyhow!("connection reset"))),
+                1,
+                "a dead daemon must not look like a clean EOF"
             );
         }
     }

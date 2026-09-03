@@ -533,7 +533,10 @@ const TOP_SYMBOLS_CAP: usize = 5;
 /// file-level signal: every symbol in a file participating in an import cycle
 /// gets the same +1.0 bump, which is the intended behaviour — the cycle term
 /// promotes hot files into the top-symbols breakdown without distorting the
-/// intra-file ordering.
+/// intra-file ordering. Ref counts are likewise keyed by SHORT name (same
+/// shape as `find_references`), so same-named symbols in one file share one
+/// count: the score keeps using it (calibration), but the `why` line says
+/// "shared" instead of presenting it as a per-symbol measurement.
 ///
 /// Empty when the file has no indexed symbols. Not an error.
 fn compute_top_symbols(
@@ -556,6 +559,12 @@ fn compute_top_symbols(
     let counts = db
         .reference_counts_for_names(&names)
         .with_context(|| format!("counting refs for top-symbols breakdown of {file_path}"))?;
+    // Short-name frequencies in THIS file: a count is "shared" when more
+    // than one symbol here answers to the same short name.
+    let mut name_freq: HashMap<&str, usize> = HashMap::new();
+    for s in &symbols {
+        *name_freq.entry(s.name.as_str()).or_default() += 1;
+    }
 
     let cycle_bonus = if in_cycle { 1.0_f64 } else { 0.0 };
 
@@ -591,7 +600,12 @@ fn compute_top_symbols(
             } else {
                 String::new()
             };
-            let why = format!("hot: {line_count} lines, {ref_count} refs{cycle_clause}");
+            let refs_clause = if name_freq.get(sym.name.as_str()).copied().unwrap_or(1) > 1 {
+                format!("{ref_count} refs (shared across same-named symbols in this file)")
+            } else {
+                format!("{ref_count} refs")
+            };
+            let why = format!("hot: {line_count} lines, {refs_clause}{cycle_clause}");
             TopSymbol {
                 name: sym.name.clone(),
                 line: sym.line_start,
@@ -924,61 +938,35 @@ fn find_cycles_touching(db: &Database, patch_files: &[String]) -> Result<Vec<Cyc
     Ok(out)
 }
 
-const SINGLE_FILE_CYCLE_WALK_LIMIT: usize = 2_000;
-
-#[derive(Clone, Copy)]
-enum ImportWalkDirection {
-    Forward,
-    Reverse,
-}
-
+/// Single-file cycle membership, routed through the SAME Tarjan SCCs the
+/// batch path ([`find_cycles_touching`]) reads, so one file scores identically
+/// whether assessed alone or as part of a patch. The forward/reverse
+/// reachability intersection this replaces computes the same set — files
+/// mutually reachable with the start *are* its SCC — but on uncached
+/// per-file SQL walks with a traversal cap that bailed on large graphs,
+/// which is exactly how the same file scored differently per entry point.
 fn find_cycle_containing_file(db: &Database, file_path: &str) -> Result<Option<CycleEntry>> {
-    let forward = reachable_import_files(db, file_path, ImportWalkDirection::Forward)?;
-    if forward.len() < 2 {
-        return Ok(None);
-    }
-    let reverse = reachable_import_files(db, file_path, ImportWalkDirection::Reverse)?;
-    let mut members: Vec<String> = forward.intersection(&reverse).cloned().collect();
-    if members.len() < 2 {
-        return Ok(None);
-    }
-    members.sort();
-    let size = members.len() as u32;
-    let max_churn_file = pick_max_churn(db, &members)?;
-    Ok(Some(CycleEntry {
-        members,
-        size,
-        max_churn_file,
-    }))
-}
-
-fn reachable_import_files(
-    db: &Database,
-    start: &str,
-    direction: ImportWalkDirection,
-) -> Result<HashSet<String>> {
-    let mut seen = HashSet::new();
-    let mut stack = vec![start.to_string()];
-    seen.insert(start.to_string());
-
-    while let Some(file) = stack.pop() {
-        let next = match direction {
-            ImportWalkDirection::Forward => db.import_targets_for_file(&file)?,
-            ImportWalkDirection::Reverse => db.import_sources_for_file(&file)?,
-        };
-        for neighbor in next {
-            if seen.insert(neighbor.clone()) {
-                if seen.len() > SINGLE_FILE_CYCLE_WALK_LIMIT {
-                    anyhow::bail!(
-                        "single-file import cycle walk exceeded {SINGLE_FILE_CYCLE_WALK_LIMIT} files"
-                    );
-                }
-                stack.push(neighbor);
-            }
+    let components = import_cycle_components(db)?;
+    for component in components.iter() {
+        // Trivial SCCs (single-node, no self-edge) aren't cycles — same rule
+        // as `find_cycles_touching`.
+        if component.len() < 2 {
+            continue;
         }
+        if !component.iter().any(|f| f == file_path) {
+            continue;
+        }
+        let mut members = component.clone();
+        members.sort();
+        let size = members.len() as u32;
+        let max_churn_file = pick_max_churn(db, &members)?;
+        return Ok(Some(CycleEntry {
+            members,
+            size,
+            max_churn_file,
+        }));
     }
-
-    Ok(seen)
+    Ok(None)
 }
 
 fn import_cycle_components(db: &Database) -> Result<Arc<Vec<Vec<String>>>> {
@@ -1236,5 +1224,82 @@ mod tests {
             assert_eq!(single.in_cycle, batched.in_cycle, "{path}: cycle flag");
             assert_eq!(single.cycle_size, batched.cycle_size, "{path}: cycle size");
         }
+    }
+
+    /// The single-file cycle path must agree with the batch SCC path: both
+    /// now read the same Tarjan components, so one file in a 2-cycle reports
+    /// the same members alone and inside a patch, and a file outside any
+    /// cycle reports none on both.
+    #[test]
+    fn single_file_cycle_matches_batch_scc_members() {
+        use codesage_protocol::{FileInfo, Language, Reference, ReferenceKind, Symbol, SymbolKind};
+
+        let db = Database::open_in_memory().unwrap();
+        for path in ["cyc_a.php", "cyc_b.php", "lone.php"] {
+            db.upsert_file(&FileInfo {
+                path: path.to_string(),
+                language: Language::Php,
+                content_hash: "hash".to_string(),
+            })
+            .unwrap();
+        }
+        let sym = |name: &str, qualified: &str, file: &str| Symbol {
+            name: name.to_string(),
+            qualified_name: qualified.to_string(),
+            kind: SymbolKind::Class,
+            file_path: file.to_string(),
+            line_start: 1,
+            line_end: 5,
+            col_start: 0,
+            col_end: 0,
+            rationale: Vec::new(),
+        };
+        let ids = |path: &str| db.file_id_for_path(path).unwrap().unwrap();
+        db.insert_symbols(
+            ids("cyc_a.php"),
+            &[sym("CycleA", "App\\CycleA", "cyc_a.php")],
+        )
+        .unwrap();
+        db.insert_symbols(
+            ids("cyc_b.php"),
+            &[sym("CycleB", "App\\CycleB", "cyc_b.php")],
+        )
+        .unwrap();
+        db.insert_symbols(ids("lone.php"), &[sym("Lone", "App\\Lone", "lone.php")])
+            .unwrap();
+        let imp = |from: &str, to: &str| Reference {
+            from_file: from.to_string(),
+            from_symbol: None,
+            to_name: to.to_string(),
+            kind: ReferenceKind::Import,
+            line: 1,
+            col: 0,
+        };
+        db.insert_references(ids("cyc_a.php"), &[imp("cyc_a.php", "App\\CycleB")])
+            .unwrap();
+        db.insert_references(ids("cyc_b.php"), &[imp("cyc_b.php", "App\\CycleA")])
+            .unwrap();
+
+        let single = find_cycle_containing_file(&db, "cyc_a.php")
+            .unwrap()
+            .expect("cyc_a.php is in a 2-cycle");
+        assert_eq!(
+            single.members,
+            vec!["cyc_a.php".to_string(), "cyc_b.php".to_string()]
+        );
+        assert_eq!(single.size, 2);
+
+        let batch =
+            find_cycles_touching(&db, &["cyc_a.php".to_string(), "lone.php".to_string()]).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].members, single.members);
+        assert_eq!(batch[0].size, single.size);
+
+        assert!(
+            find_cycle_containing_file(&db, "lone.php")
+                .unwrap()
+                .is_none(),
+            "a file outside any cycle reports none"
+        );
     }
 }

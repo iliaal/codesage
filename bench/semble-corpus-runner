@@ -170,7 +170,17 @@ def main() -> int:
     if not (project_root / ".codesage" / "index.db").is_file():
         sys.exit(f"no codesage index at {project_root}/.codesage/index.db")
 
-    annotations = json.load(open(args.annotations))
+    annotations_path = Path(args.annotations)
+    try:
+        if annotations_path.stat().st_size > 20 * 1024 * 1024:
+            sys.exit(f"annotations file too large (>20MiB): {annotations_path}")
+        raw = annotations_path.read_text(encoding="utf-8")
+    except OSError as e:
+        sys.exit(f"cannot read annotations {annotations_path}: {e}")
+    try:
+        annotations = json.loads(raw)
+    except json.JSONDecodeError as e:
+        sys.exit(f"invalid annotations JSON in {annotations_path}: {e}")
 
     baseline = score_corpus(
         args.codesage_bin, project_root, annotations, args.limit, env_extra={}

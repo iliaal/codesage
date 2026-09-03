@@ -32,21 +32,30 @@
   declarator: (function_declarator
     declarator: (operator_name) @name)) @def
 
-; Pattern 6: Class -> Class (matches both top-level and template-wrapped)
+; Pattern 6: Class -> Class (matches both top-level and template-wrapped).
+; The `body:` requirement excludes forward declarations (`class Foo;`),
+; which parse as a bodiless class_specifier and would otherwise emit phantom
+; Class symbols for types defined in another header.
 (class_specifier
-  name: (type_identifier) @name) @def
+  name: (type_identifier) @name
+  body: (field_declaration_list)) @def
 
-; Pattern 7: Struct -> Struct
+; Pattern 7: Struct -> Struct (forward declarations excluded, as above)
 (struct_specifier
-  name: (type_identifier) @name) @def
+  name: (type_identifier) @name
+  body: (field_declaration_list)) @def
 
-; Pattern 8: Union -> Struct (closest available kind)
+; Pattern 8: Union -> Struct (closest available kind; fwd decls excluded)
 (union_specifier
-  name: (type_identifier) @name) @def
+  name: (type_identifier) @name
+  body: (field_declaration_list)) @def
 
-; Pattern 9: Enum / enum class -> Enum
+; Pattern 9: Enum / enum class -> Enum. Opaque declarations
+; (`enum E : int;`, `enum class EC;`) carry no enumerator_list and are
+; excluded the same way.
 (enum_specifier
-  name: (type_identifier) @name) @def
+  name: (type_identifier) @name
+  body: (enumerator_list)) @def
 
 ; Pattern 10: typedef -> Constant (parity with C)
 (type_definition

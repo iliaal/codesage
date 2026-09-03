@@ -1,5 +1,45 @@
 ## [Unreleased]
 
+### Added
+
+- MCP responses report silently adjusted limits under `_meta.clamps` as requested-vs-applied (search, export, find_similar, list_features, review_rehearsal, trace).
+- The empty-result coverage annotation now covers `find_references` and `find_similar`, not just search and `find_symbol`.
+- `co_changes_for_many` batch query backs `recommend_tests`, replacing the per-file N+1 lookup.
+- `list_dependencies_batch` answers multi-file dependency sweeps with one pass over the import table.
+
+### Changed
+
+- CLI `search --language` errors on unknown values instead of searching unfiltered; `cmd_similar` normalizes `min_jaccard` into `[0, 1]` and prints the applied value.
+- `list_features` limit 0 is now truly unbounded (was silently reset to 100); other tools keep prior zero semantics, documented in descriptions.
+- `review_rehearsal` over MCP rejects empty file lists with the CLI's "no file paths provided" sentence.
+- Daemon embed batch timeout is 120s per sub-batch with private fallback on generic failure; hook index runs single-flight under a lock.
+- `watch` and `daemon` metadata subcommands (status/stop/start) skip the ORT/CUDA preload.
+- `install`/`uninstall --global` work outside onboarded projects and register the running binary instead of PATH lookup.
+- MCP project resolution walks ancestors like the CLI; subdirectories resolve instead of forking nested indexes.
+- Reranker failures warn instead of degrading silently; symbol boost matches token boundaries; definition patterns compile once.
+- `recommend_tests` covers Java Maven mirrors and C/C++ affix siblings; sibling stems split at the first dot.
+- Chunking budgets are character-based (`CHUNKER_VERSION` 1 → 2 triggers one automatic re-embed); pooling detection is case-insensitive.
+- Semantic compatibility is deny-by-default on fingerprint mismatch in storage and `doctor` (which names `index --full`).
+- Migration runner uses `BEGIN IMMEDIATE`; `scale_git_decay` is atomic; co-change pairs normalize at runtime.
+- `CODESAGE_ALLOW_ANY_MODEL` is now env-eligibility plus a per-project allowlist (`~/.config/codesage/allowed-models`), with a loud warning naming unpinned model and revision.
+- `release.sh` commits by pathspec instead of `git commit -am`; release prompts are EOF-safe; `leak-check.sh` runs under `pipefail`.
+
+### Fixed
+
+- HuggingFace resolution in HOME-less environments returns an error naming `HOME`/`HF_HOME` instead of panicking; downloads honor `HF_HOME` so custom cache dirs get `CachedOnly` hits.
+- Malformed files fail the parse with a degraded-file mark instead of indexing partial symbols; non-UTF8 sources extract lossily instead of vanishing.
+- `.mts`/`.cts` files are indexed; Python decorators, `module.exports` forms, and C++ forward declarations are captured; JS destructuring off non-imports no longer records bogus bindings.
+- `project_overview` test conventions match what `recommend_tests` enforces (Java/C/C++ claims scoped).
+- `doctor` diagnostics open the index read-only; unparseable hook bodies warn instead of passing silently.
+- `brief_gate` accepts `.` with the documented 128-char cap; daemon proxy exits nonzero on copy errors; wedged watcher slots detach after 15 minutes; debounce floors at 1s with a warning; SQLite errors classify by code; abandoned paths park with revival instead of vanishing.
+- Bench harness survives hung arms, live-DB restores, malformed costs, and unreadable transcripts; backup copies live in the system temp dir.
+- Plugin scripts validate flag values instead of dying on `unbound variable`; the brief hook falls back to session-less brief instead of silent no-op.
+
+### Security
+
+- The test-only query-embedding override fires only in debug builds, is marked `_meta.test_override`, and still enforces fingerprint and dimension checks.
+- The leak gate covers GitHub OAuth/App/refresh tokens (including JWT-format `ghs_`), AWS secret keys, and Azure keys.
+
 ## [0.24.0] - 2026-09-03
 
 ### Changed

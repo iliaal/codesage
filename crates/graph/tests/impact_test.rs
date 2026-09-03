@@ -986,3 +986,50 @@ fn call_path_does_not_credit_an_outer_symbol_with_a_nested_symbols_calls() {
         real.note
     );
 }
+
+#[test]
+fn call_path_repeated_callee_names_resolve_consistently() {
+    use codesage_protocol::CallPathRequest;
+
+    // A hub body calling one name dozens of times resolves the same
+    // (file, name) pair per call site; the per-pair cache must return the
+    // same import-filtered definitions as a fresh lookup each time. The
+    // second `sink` definition (never imported) proves filtering still
+    // applies on the cached path: the chain must land in sink.rs, not other.rs.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("sink.rs"), b"pub fn sink() {}\n").unwrap();
+    std::fs::write(root.join("other.rs"), b"pub fn sink() {}\n").unwrap();
+    let mut hub = String::from("use crate::sink::sink;\npub fn hub() {\n");
+    for _ in 0..40 {
+        hub.push_str("    sink();\n");
+    }
+    hub.push_str("}\n");
+    std::fs::write(root.join("hub.rs"), hub.as_bytes()).unwrap();
+
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+
+    let report = codesage_graph::trace_call_path(
+        &db,
+        &CallPathRequest {
+            from: "hub".to_string(),
+            to: "sink".to_string(),
+            max_depth: 3,
+        },
+    )
+    .unwrap();
+    assert!(report.found, "hub -> sink must resolve: {:?}", report.note);
+    let names: Vec<&str> = report.steps.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["hub", "sink"]);
+    assert_eq!(
+        report.steps.last().unwrap().file_path,
+        "sink.rs",
+        "cached resolution must keep the import filter, got {:?}",
+        report.steps
+    );
+    assert!(
+        report.steps.last().unwrap().call_line.is_some(),
+        "repeated call sites must still carry an invocation line"
+    );
+}

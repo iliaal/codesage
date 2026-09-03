@@ -21,8 +21,9 @@ use codesage_protocol::{ReferenceKind, SymbolKind};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::schema::{
-    ensure_chunk_table, fts_table_name, init_db, init_vec_extension, model_table_name,
-    model_table_prefix,
+    FTS_REPAIR_ROW_CAP, FtsRepairOutcome, FtsSidecarHealth, READ_BUSY_TIMEOUT_MS,
+    ensure_chunk_table, fts_sidecar_health, fts_table_name, init_db, init_vec_extension,
+    model_table_name, model_table_prefix, repair_fts_sidecar_capped,
 };
 
 pub use codesage_protocol::DEFAULT_EMBEDDING_DIM;
@@ -256,6 +257,63 @@ fn open_connection(path: &Path, create: bool) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Open a read/write connection that runs no migrations and no schema batch:
+/// only connection-local pragmas. Read and diagnostic paths (which must keep
+/// working on a database a newer binary migrated, or one whose later schema
+/// objects are damaged) use this instead of [`open_connection`]. The tradeoff
+/// is the one [`Database::open_read_only`] already documents: callers must
+/// tolerate whatever schema is on disk rather than assume the current one.
+/// `journal_mode` is deliberately left alone — changing it is a write, and a
+/// persisted WAL mode from an earlier indexed open applies as-is.
+fn open_connection_no_migrations(path: &Path) -> Result<Connection> {
+    init_vec_extension();
+    reject_symlinked_db_path(path)?;
+    if !path.exists() {
+        anyhow::bail!(
+            "index database {} does not exist (project not onboarded, or its index was deleted)",
+            path.display()
+        );
+    }
+    harden_db_path_permissions(path)?;
+    use rusqlite::OpenFlags;
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| match e {
+        rusqlite::Error::SqliteFailure(ffi_err, _)
+            if ffi_err.code == rusqlite::ErrorCode::CannotOpen =>
+        {
+            anyhow::anyhow!(
+                "index database {} does not exist (project not onboarded, or its index was deleted)",
+                path.display()
+            )
+        }
+        other => other.into(),
+    })?;
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    conn.execute_batch(&format!("PRAGMA busy_timeout={READ_BUSY_TIMEOUT_MS};"))?;
+    conn.execute_batch("PRAGMA mmap_size=268435456;")?;
+    conn.execute_batch("PRAGMA cache_size=-65536;")?;
+    Ok(conn)
+}
+
+/// Whether `semantic_models` exists on this connection. A migration-free read
+/// open meets whatever schema is on disk, including one from before the
+/// semantic-models registry existed — metadata lookups must degrade to
+/// "unknown" instead of failing with `no such table`.
+fn semantic_models_table_exists(conn: &Connection) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'semantic_models'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)?)
+}
+
 #[cfg(unix)]
 fn db_sidecar_paths(path: &Path) -> [PathBuf; 3] {
     [
@@ -304,18 +362,33 @@ fn semantic_model_metadata(conn: &Connection, chunk_table: &str) -> Result<Optio
 
 fn legacy_chunk_table_candidates(conn: &Connection, model: &str) -> Result<Vec<String>> {
     let prefix = model_table_prefix(model);
-    let mut stmt = conn.prepare(
-        "SELECT m.name FROM sqlite_master m
-         LEFT JOIN semantic_models sm ON lower(sm.chunk_table) = lower(m.name)
-         WHERE m.type = 'table'
-           AND lower(m.name) GLOB lower(?1)
-           AND sm.chunk_table IS NULL
-           AND EXISTS (
-               SELECT 1 FROM sqlite_master aux
-               WHERE aux.type = 'table' AND aux.name = m.name || '_info'
-           )
-         ORDER BY m.name",
-    )?;
+    // Without the registry every vec table lacks metadata by definition;
+    // list them directly instead of failing on the missing join target.
+    let mut stmt = if semantic_models_table_exists(conn)? {
+        conn.prepare(
+            "SELECT m.name FROM sqlite_master m
+             LEFT JOIN semantic_models sm ON lower(sm.chunk_table) = lower(m.name)
+             WHERE m.type = 'table'
+               AND lower(m.name) GLOB lower(?1)
+               AND sm.chunk_table IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM sqlite_master aux
+                   WHERE aux.type = 'table' AND aux.name = m.name || '_info'
+               )
+             ORDER BY m.name",
+        )?
+    } else {
+        conn.prepare(
+            "SELECT m.name FROM sqlite_master m
+             WHERE m.type = 'table'
+               AND lower(m.name) GLOB lower(?1)
+               AND EXISTS (
+                   SELECT 1 FROM sqlite_master aux
+                   WHERE aux.type = 'table' AND aux.name = m.name || '_info'
+               )
+             ORDER BY m.name",
+        )?
+    };
     let rows = stmt
         .query_map(params![format!("{prefix}*")], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -373,11 +446,99 @@ pub(super) fn drop_chunk_table_group(conn: &Connection, table_name: &str) -> Res
     }
 }
 
+/// Refusal to serve or reuse vectors whose provenance is unknown or foreign:
+/// the chunk table holds rows no recorded fingerprint vouches for, or a
+/// fingerprint other than the one the caller runs under. Typed so CLI layers
+/// can map it to `EXIT_STALE_INDEX` instead of a generic failure.
+#[derive(Debug)]
+pub struct StaleSemanticFingerprint {
+    /// Chunk table whose vectors cannot be vouched for.
+    pub chunk_table: String,
+    /// Fingerprint the table records, if any. `None` means unrecorded: a row
+    /// that predates the column, a table no completed pass attested, or a
+    /// registry the migration-free read never saw.
+    pub stored: Option<String>,
+    /// Fingerprint the caller runs under.
+    pub expected: String,
+}
+
+impl std::fmt::Display for StaleSemanticFingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.stored {
+            Some(stored) => write!(
+                f,
+                "chunk table {:?} holds vectors embedded under a different setup (stored {stored}, current {}); run `codesage index --full` to rebuild it",
+                self.chunk_table, self.expected
+            ),
+            None => write!(
+                f,
+                "chunk table {:?} records no semantic fingerprint (never fully embedded under this CodeSage version, or a rebuild did not complete); run `codesage index --full` to rebuild it",
+                self.chunk_table
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StaleSemanticFingerprint {}
+
+/// Stored fingerprint for `chunk_table`: `None` when no registry row exists
+/// or its fingerprint column is NULL. A missing `semantic_models` table (a
+/// migration-free read on a pre-registry schema) also reads as `None`:
+/// unknown is never a match.
+fn stored_semantic_fingerprint(conn: &Connection, chunk_table: &str) -> Result<Option<String>> {
+    if !semantic_models_table_exists(conn)? {
+        return Ok(None);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT fingerprint FROM semantic_models WHERE chunk_table = ?1",
+            params![chunk_table],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// Deny-by-default fingerprint gate behind the `open_for_model_*_with_fingerprint`
+/// constructors and [`Database::require_semantic_fingerprint`]. A stored
+/// fingerprint equal to `expected` passes; anything else refuses when the
+/// table actually holds vectors. An empty (or not-yet-created) table passes:
+/// the indexing pass opening it is what will populate and attest it, and
+/// refusing there would make the first index impossible.
+fn ensure_semantic_fingerprint_compatible(
+    conn: &Connection,
+    chunk_table: &str,
+    expected: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        !expected.is_empty(),
+        "cannot check a semantic fingerprint against an empty expected value"
+    );
+    if !chunk_table_exists(conn, chunk_table)? {
+        return Ok(());
+    }
+    match stored_semantic_fingerprint(conn, chunk_table)? {
+        Some(stored) if stored == expected => Ok(()),
+        stored => {
+            if chunk_table_count(conn, chunk_table)? == 0 {
+                return Ok(());
+            }
+            Err(StaleSemanticFingerprint {
+                chunk_table: chunk_table.to_string(),
+                stored,
+                expected: expected.to_string(),
+            }
+            .into())
+        }
+    }
+}
+
 fn ensure_semantic_model_compatible(
     conn: &Connection,
     chunk_table: &str,
     model: &str,
     dim: usize,
+    expected_fingerprint: Option<&str>,
 ) -> Result<()> {
     let existing = semantic_model_metadata(conn, chunk_table)?;
 
@@ -396,6 +557,10 @@ fn ensure_semantic_model_compatible(
                 "chunk table {chunk_table:?} exists with {rows} chunks but has no exact semantic model metadata; run `codesage index --full` with this CodeSage version to rebuild it before using model {model:?} dim {dim}"
             );
         }
+    }
+
+    if let Some(expected) = expected_fingerprint {
+        ensure_semantic_fingerprint_compatible(conn, chunk_table, expected)?;
     }
 
     Ok(())
@@ -472,6 +637,27 @@ impl Database {
         })
     }
 
+    /// Open an existing index for structural reads without running the schema
+    /// batch or the migration runner. Read and diagnostic paths (status,
+    /// drift checks, doctor) use this so a pure read keeps working when the
+    /// database was migrated by a newer binary or its later schema objects
+    /// are damaged: [`Database::open_existing`] would fail those opens in
+    /// `run_migrations` before the first query runs.
+    ///
+    /// Unlike [`Database::open_read_only`] the handle is read-write (WAL
+    /// sidecars work normally), but nothing in the open writes: callers must
+    /// tolerate whatever schema is on disk. Writers must keep using
+    /// [`Database::open_existing`] / [`Database::open_for_model_existing`],
+    /// which migrate first.
+    pub fn open_existing_read(path: &Path) -> Result<Self> {
+        let conn = open_connection_no_migrations(path)?;
+        harden_db_path_permissions(path)?;
+        Ok(Database {
+            conn,
+            chunk_table: String::new(),
+        })
+    }
+
     /// Open an existing index for reading only.
     ///
     /// Differs from [`Database::open`] in three ways that matter to a caller
@@ -538,7 +724,7 @@ impl Database {
 
     pub fn open_for_model(path: &Path, model: &str, dim: usize) -> Result<Self> {
         let conn = open_connection(path, true)?;
-        Self::finish_open_for_model(conn, path, model, dim)
+        Self::finish_open_for_model(conn, path, model, dim, None, true)
     }
 
     /// Like [`Database::open_for_model`], but refuses to create a missing
@@ -546,20 +732,76 @@ impl Database {
     /// existing database). See [`Database::open_existing`] for why.
     pub fn open_for_model_existing(path: &Path, model: &str, dim: usize) -> Result<Self> {
         let conn = open_connection(path, false)?;
-        Self::finish_open_for_model(conn, path, model, dim)
+        Self::finish_open_for_model(conn, path, model, dim, None, false)
     }
 
+    /// Like [`Database::open_for_model`], but refuses to open a populated
+    /// chunk table whose recorded fingerprint is absent or differs from
+    /// `expected_fingerprint`: its vectors are another setup's output and
+    /// must not be silently reused. An empty (or not-yet-created) table
+    /// opens fine — the pass that populates it attests it on completion.
+    /// Query paths that know the configured setup should prefer this over
+    /// [`Database::open_for_model`]; the model/dim gate alone cannot tell a
+    /// pooling, device, or model-file change apart.
+    pub fn open_for_model_with_fingerprint(
+        path: &Path,
+        model: &str,
+        dim: usize,
+        expected_fingerprint: &str,
+    ) -> Result<Self> {
+        let conn = open_connection(path, true)?;
+        Self::finish_open_for_model(conn, path, model, dim, Some(expected_fingerprint), true)
+    }
+
+    /// Like [`Database::open_for_model_with_fingerprint`], but refuses to
+    /// create a missing database file.
+    pub fn open_for_model_existing_with_fingerprint(
+        path: &Path,
+        model: &str,
+        dim: usize,
+        expected_fingerprint: &str,
+    ) -> Result<Self> {
+        let conn = open_connection(path, false)?;
+        Self::finish_open_for_model(conn, path, model, dim, Some(expected_fingerprint), false)
+    }
+
+    /// Shared funnel behind the `open_for_model*` constructors.
+    /// `expected_fingerprint` (when `Some`) turns on the deny-by-default
+    /// stored-vector gate; `repair_fts` selects the write-path FTS posture
+    /// (bounded repair with a health signal on skip) versus the read-path one
+    /// (DDL only — a query must never pay for a sidecar rebuild).
     fn finish_open_for_model(
         conn: Connection,
         path: &Path,
         model: &str,
         dim: usize,
+        expected_fingerprint: Option<&str>,
+        repair_fts: bool,
     ) -> Result<Self> {
         let requested_table = model_table_name(model, dim);
         let chunk_table =
             existing_chunk_table_name(&conn, &requested_table)?.unwrap_or(requested_table);
-        ensure_semantic_model_compatible(&conn, &chunk_table, model, dim)?;
+        ensure_semantic_model_compatible(&conn, &chunk_table, model, dim, expected_fingerprint)?;
         ensure_chunk_table(&conn, &chunk_table, dim)?;
+        if repair_fts {
+            match repair_fts_sidecar_capped(
+                &conn,
+                &chunk_table,
+                &fts_table_name(&chunk_table),
+                FTS_REPAIR_ROW_CAP,
+            )? {
+                FtsRepairOutcome::InSync | FtsRepairOutcome::Repaired { .. } => {}
+                FtsRepairOutcome::SkippedOverCap { chunk_rows } => {
+                    tracing::warn!(
+                        chunk_table = chunk_table.as_str(),
+                        chunk_rows,
+                        cap = FTS_REPAIR_ROW_CAP,
+                        "FTS sidecar diverges on a table over the synchronous repair cap; \
+                         BM25 search stays degraded until an explicit repair runs"
+                    );
+                }
+            }
+        }
         record_semantic_model_table(&conn, &chunk_table, model, dim)?;
         harden_db_path_permissions(path)?;
         Ok(Database { conn, chunk_table })
@@ -578,6 +820,20 @@ impl Database {
             }
         }
         ensure_chunk_table(&conn, &chunk_table, dim)?;
+        if let FtsRepairOutcome::SkippedOverCap { chunk_rows } = repair_fts_sidecar_capped(
+            &conn,
+            &chunk_table,
+            &fts_table_name(&chunk_table),
+            FTS_REPAIR_ROW_CAP,
+        )? {
+            tracing::warn!(
+                chunk_table = chunk_table.as_str(),
+                chunk_rows,
+                cap = FTS_REPAIR_ROW_CAP,
+                "FTS sidecar diverges on a table over the synchronous repair cap; \
+                 the rebuild repopulates both sides row by row, healing it without a rewrite"
+            );
+        }
         record_semantic_model_table(&conn, &chunk_table, model, dim)?;
         // A rebuild is about to rewrite every row. Until it has, the table
         // holds a mix of old and new vectors that no fingerprint describes;
@@ -595,9 +851,14 @@ impl Database {
     /// results; if multiple tables match, the caller must resolve the ambiguity.
     /// A missing database file is an error, never created here — every caller
     /// is a read path on a project expected to already be indexed.
+    ///
+    /// Migration-free: runs no schema batch and no migrations, so a pure read
+    /// keeps working on a database whose later schema objects are damaged or
+    /// were written by a newer binary. A missing `semantic_models` registry
+    /// degrades to the legacy-candidate path instead of `no such table`.
     pub fn open_for_existing_model(path: &Path, model: &str) -> Result<Self> {
-        let conn = open_connection(path, false)?;
-        let matches = {
+        let conn = open_connection_no_migrations(path)?;
+        let matches = if semantic_models_table_exists(&conn)? {
             let mut stmt = conn.prepare(
                 "SELECT sm.chunk_table FROM semantic_models sm
                  JOIN sqlite_master m
@@ -612,6 +873,8 @@ impl Database {
             )?;
             stmt.query_map(params![model], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            Vec::new()
         };
         let chunk_table = match matches.as_slice() {
             [] => {
@@ -641,7 +904,13 @@ impl Database {
         let conn = Connection::open_in_memory()?;
         init_db(&conn)?;
         let chunk_table = model_table_name("default", DEFAULT_EMBEDDING_DIM);
-        ensure_semantic_model_compatible(&conn, &chunk_table, "default", DEFAULT_EMBEDDING_DIM)?;
+        ensure_semantic_model_compatible(
+            &conn,
+            &chunk_table,
+            "default",
+            DEFAULT_EMBEDDING_DIM,
+            None,
+        )?;
         ensure_chunk_table(&conn, &chunk_table, DEFAULT_EMBEDDING_DIM)?;
         record_semantic_model_table(&conn, &chunk_table, "default", DEFAULT_EMBEDDING_DIM)?;
         Ok(Database { conn, chunk_table })
@@ -708,6 +977,57 @@ impl Database {
             )
             .optional()?
             .flatten())
+    }
+
+    /// Refuse to serve this handle's chunk table unless its recorded
+    /// fingerprint equals `expected`: deny-by-default against silent
+    /// stale-vector reuse after a setup change (pooling, device, model-file
+    /// revision) that keeps the model name and dimension identical. An empty
+    /// table passes — there are no vectors to vouch for yet. Fails on a
+    /// handle without a chunk table: there is nothing to check against.
+    pub fn require_semantic_fingerprint(&self, expected: &str) -> Result<()> {
+        anyhow::ensure!(
+            !self.chunk_table.is_empty(),
+            "cannot check a semantic fingerprint on a handle without a chunk table"
+        );
+        ensure_semantic_fingerprint_compatible(&self.conn, &self.chunk_table, expected)
+    }
+
+    /// Whether this handle's FTS5 sidecar mirrors its chunk table. Two cheap
+    /// queries, never a rewrite — the read-path health signal for a sidecar
+    /// the open deliberately did not repair. Fails on a handle without a
+    /// chunk table.
+    pub fn fts_health(&self) -> Result<FtsSidecarHealth> {
+        anyhow::ensure!(
+            !self.chunk_table.is_empty(),
+            "cannot check FTS health on a handle without a chunk table"
+        );
+        Ok(fts_sidecar_health(
+            &self.conn,
+            &self.chunk_table,
+            &fts_table_name(&self.chunk_table),
+        )?)
+    }
+
+    /// Rebuild this handle's FTS5 sidecar from its chunk table, unconditionally
+    /// and without a row cap. Explicit write-path repair for a sidecar that
+    /// [`Database::fts_health`] reports as diverged on a table over
+    /// [`FTS_REPAIR_ROW_CAP`]: the caller opts into the cost instead of paying
+    /// it on every open. Fails on a handle without a chunk table.
+    pub fn repair_fts_sidecar(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.chunk_table.is_empty(),
+            "cannot repair the FTS sidecar on a handle without a chunk table"
+        );
+        let fts = fts_table_name(&self.chunk_table);
+        if fts_sidecar_health(&self.conn, &self.chunk_table, &fts)? == FtsSidecarHealth::InSync {
+            return Ok(());
+        }
+        Ok(crate::schema::repair_fts_sidecar(
+            &self.conn,
+            &self.chunk_table,
+            &fts,
+        )?)
     }
 
     /// Record the fingerprint whose vectors this handle's chunk table now
@@ -2504,5 +2824,163 @@ mod tests {
             )
             .unwrap();
         assert!(db.get_structural_index_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn open_with_fingerprint_refuses_stale_vectors_deny_by_default() {
+        use crate::schema::FtsSidecarHealth;
+
+        const MODEL: &str = "fp/compat-model";
+        const DIM: usize = 2;
+        const CURRENT: &str = "v9;model=fp/compat-model;dim=2;pool=mean";
+        const OTHER: &str = "v9;model=fp/compat-model;dim=2;pool=cls";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let chunk = |db: &Database| {
+            db.insert_chunks("a.rs", "rust", &[("fn one() {}", 1, 3, &[0.0, 0.0])])
+                .unwrap();
+        };
+
+        // Attested table: the recorded fingerprint opens, any other refuses.
+        {
+            let db = Database::open_for_model(&path, MODEL, DIM).unwrap();
+            chunk(&db);
+            db.record_semantic_fingerprint(CURRENT).unwrap();
+        }
+        Database::open_for_model_with_fingerprint(&path, MODEL, DIM, CURRENT).unwrap();
+        let err = match Database::open_for_model_with_fingerprint(&path, MODEL, DIM, OTHER) {
+            Ok(_) => panic!("another setup's vectors must not open as current"),
+            Err(err) => err,
+        };
+        let stale = err
+            .downcast_ref::<StaleSemanticFingerprint>()
+            .expect("typed refusal for exit-status mapping");
+        assert_eq!(stale.stored.as_deref(), Some(CURRENT));
+        assert_eq!(stale.expected, OTHER);
+        assert!(err.to_string().contains("codesage index --full"), "{err}");
+
+        // Same gate on an existing handle: readers that opened before they
+        // knew the configured setup check before serving.
+        let db = Database::open_for_model_existing(&path, MODEL, DIM).unwrap();
+        db.require_semantic_fingerprint(CURRENT).unwrap();
+        let err = db.require_semantic_fingerprint(OTHER).unwrap_err();
+        assert!(err.to_string().contains("different setup"), "{err}");
+        assert!(db.require_semantic_fingerprint("").is_err());
+        assert_eq!(db.fts_health().unwrap(), FtsSidecarHealth::InSync);
+    }
+
+    #[test]
+    fn open_with_fingerprint_refuses_unrecorded_populated_table_but_allows_empty() {
+        const MODEL: &str = "fp/unrecorded-model";
+        const DIM: usize = 2;
+        let dir = tempfile::tempdir().unwrap();
+        let populated = dir.path().join("populated.db");
+        let empty = dir.path().join("empty.db");
+
+        // Rows with no attestation are unknown, never a match — denying them
+        // is what closes the silent stale-vector reuse on setup change.
+        {
+            let db = Database::open_for_model(&populated, MODEL, DIM).unwrap();
+            db.insert_chunks("a.rs", "rust", &[("fn one() {}", 1, 3, &[0.0, 0.0])])
+                .unwrap();
+            assert_eq!(db.semantic_fingerprint().unwrap(), None);
+        }
+        let err = match Database::open_for_model_with_fingerprint(
+            &populated,
+            MODEL,
+            DIM,
+            "v1;anything",
+        ) {
+            Ok(_) => panic!("unrecorded vectors must not open as current"),
+            Err(err) => err,
+        };
+        assert!(
+            err.downcast_ref::<StaleSemanticFingerprint>()
+                .is_some_and(|stale| stale.stored.is_none()),
+            "{err}"
+        );
+
+        // An empty table has no vectors to vouch for: the indexing pass that
+        // opens it is what will populate and attest it.
+        drop(Database::open_for_model(&empty, MODEL, DIM).unwrap());
+        Database::open_for_model_with_fingerprint(&empty, MODEL, DIM, "v1;anything").unwrap();
+    }
+
+    #[test]
+    fn migration_free_read_opens_survive_a_breaking_registry_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            let db =
+                Database::open_for_model(&path, "fp/read-model", DEFAULT_EMBEDDING_DIM).unwrap();
+            db.upsert_file(&make_file("app/Svc.php")).unwrap();
+            // Populated but never attested: the fingerprint check must refuse
+            // it even though the migration-free open itself succeeds.
+            db.insert_chunks(
+                "app/Svc.php",
+                "php",
+                &[("svc", 1, 3, &vec![0.0; DEFAULT_EMBEDDING_DIM])],
+            )
+            .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO schema_migrations (name) VALUES ('breaking_9999_future')",
+                    [],
+                )
+                .unwrap();
+        }
+        let err = match Database::open_existing(&path) {
+            Ok(_) => panic!("a breaking registry row must refuse the migrating open"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("too old to open"), "{err}");
+
+        let ro = Database::open_existing_read(&path).unwrap();
+        assert!(ro.file_id_for_path("app/Svc.php").unwrap().is_some());
+        let model_db = Database::open_for_existing_model(&path, "fp/read-model").unwrap();
+        assert!(!model_db.chunk_table_name().is_empty());
+        model_db
+            .require_semantic_fingerprint("v1;whatever")
+            .expect_err("unattested table still refuses a fingerprint check");
+    }
+
+    #[test]
+    fn read_open_skips_fts_repair_but_reports_health_until_explicit_repair() {
+        use crate::schema::{FtsSidecarHealth, fts_table_name};
+
+        const MODEL: &str = "fp/fts-model";
+        const DIM: usize = 2;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let diverge = |db: &Database| {
+            let fts = fts_table_name(db.chunk_table_name());
+            db.conn
+                .execute(&format!("DELETE FROM \"{}\"", fts.replace('"', "\"\"")), [])
+                .unwrap();
+        };
+
+        let db = Database::open_for_model(&path, MODEL, DIM).unwrap();
+        db.insert_chunks("a.rs", "rust", &[("fn one() {}", 1, 3, &[0.0, 0.0])])
+            .unwrap();
+        diverge(&db);
+        drop(db);
+
+        // A query-shaped open never pays for the sidecar rebuild — but it says
+        // so instead of silently serving degraded BM25.
+        let db = Database::open_for_model_existing(&path, MODEL, DIM).unwrap();
+        assert!(
+            matches!(db.fts_health().unwrap(), FtsSidecarHealth::Diverged { .. }),
+            "read open must report divergence, not repair it"
+        );
+        assert_eq!(db.chunk_count().unwrap(), 1);
+        db.repair_fts_sidecar().unwrap();
+        assert_eq!(db.fts_health().unwrap(), FtsSidecarHealth::InSync);
+        assert!(db.repair_fts_sidecar().is_ok(), "repair is idempotent");
+
+        // A write-shaped open heals a small divergence itself.
+        diverge(&db);
+        drop(db);
+        let db = Database::open_for_model(&path, MODEL, DIM).unwrap();
+        assert_eq!(db.fts_health().unwrap(), FtsSidecarHealth::InSync);
     }
 }

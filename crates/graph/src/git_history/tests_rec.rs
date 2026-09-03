@@ -13,11 +13,13 @@ use codesage_storage::Database;
 /// "too many tests to list" and "no tests" are opposite claims.
 fn test_sibling_paths(db: &Database, file_path: &str) -> Result<(Vec<String>, bool)> {
     let mut suppressed = false;
+    // First-dot stem: `foo.test.ts` stems to `foo`, so dotted basenames
+    // still key the convention candidates. (Last-dot split left `foo.test`,
+    // which no candidate pattern ever matched.)
     let stem = file_path
         .rsplit('/')
         .next()
-        .and_then(|name| name.rsplit_once('.'))
-        .map(|(s, _)| s.to_string())
+        .map(|name| name.split('.').next().unwrap_or(name).to_string())
         .unwrap_or_default();
     if stem.is_empty() {
         return Ok((Vec::new(), false));
@@ -42,6 +44,8 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<(Vec<String>, bo
         format!("{dir}/{stem}.spec.ts"),
         format!("{dir}/{stem}.spec.tsx"),
         format!("{dir}/{stem}.spec.js"),
+        // Java: FooTest.java sibling (Maven mirror-tree handled below).
+        format!("{dir}/{stem}Test.java"),
         // Rust: foo.rs uses inline #[cfg(test)] mod tests so often no separate
         // file. Skip the explicit rust check; absence here just means the rust
         // file relies on inline tests.
@@ -50,6 +54,12 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<(Vec<String>, bo
     let mut found = Vec::new();
     for c in &candidates {
         let normalized = c.trim_start_matches('/').to_string();
+        // First-dot stemming means a test file passed as input names itself
+        // (`foo.test.ts` stems to `foo`, regenerating `foo.test.ts`); the
+        // edited file is never its own test.
+        if normalized == file_path {
+            continue;
+        }
         if db.file_id_for_path(&normalized)?.is_some() {
             found.push(normalized);
         }
@@ -136,6 +146,39 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<(Vec<String>, bo
             found.push(candidate);
         }
     }
+    // Java Maven mirror-tree: source at `src/main/java/<rest>/Foo.java`
+    // pairs with `src/test/java/<rest>/FooTest.java`.
+    if file_path.ends_with(".java")
+        && let Some(rest) = file_path.strip_prefix("src/main/java/")
+        && let Some((rest_dir, _)) = rest.rsplit_once('/')
+    {
+        let candidate = format!("src/test/java/{rest_dir}/{stem}Test.java");
+        if !found.contains(&candidate) && db.file_id_for_path(&candidate)?.is_some() {
+            found.push(candidate);
+        }
+    }
+
+    // C/C++: `foo_test.<ext>` / `test_foo.<ext>` next to the source or under
+    // `tests/`, keeping the source extension (covers .c/.h/.cc/.cpp/.cxx/.hpp).
+    if let Some(ext) = ["c", "h", "cc", "cpp", "cxx", "hpp"]
+        .into_iter()
+        .find(|ext| file_path.ends_with(&format!(".{ext}")))
+    {
+        for candidate in [
+            format!("{dir}/{stem}_test.{ext}"),
+            format!("{dir}/test_{stem}.{ext}"),
+            format!("tests/{stem}_test.{ext}"),
+            format!("tests/test_{stem}.{ext}"),
+        ] {
+            let candidate = candidate.trim_start_matches('/').to_string();
+            if candidate != file_path
+                && !found.contains(&candidate)
+                && db.file_id_for_path(&candidate)?.is_some()
+            {
+                found.push(candidate);
+            }
+        }
+    }
 
     Ok((found, suppressed))
 }
@@ -165,6 +208,12 @@ pub fn recommend_tests(db: &Database, file_paths: &[String]) -> Result<TestRecom
     let mut coupled: Vec<CoupledTestEntry> = Vec::new();
     let mut suppressed_sources: Vec<String> = Vec::new();
 
+    // One batched co-change query for the whole file list instead of one
+    // `co_changes_for` per file. Same per-file top-20 (weight DESC, name
+    // tiebreak) — `co_changes_for_many` reproduces the per-file LIMIT
+    // exactly — with a single round-trip.
+    let path_refs: Vec<&str> = file_paths.iter().map(String::as_str).collect();
+    let co_batched = db.co_changes_for_many(&path_refs, 20)?;
     for path in file_paths {
         let (siblings, suppressed) = test_sibling_paths(db, path)?;
         if suppressed {
@@ -173,15 +222,16 @@ pub fn recommend_tests(db: &Database, file_paths: &[String]) -> Result<TestRecom
         for sibling in siblings {
             primary.insert(sibling);
         }
-        let co = db.co_changes_for(path, 20)?;
-        for entry in co {
-            if matches!(FileCategory::classify(&entry.file), FileCategory::Test) {
-                coupled.push(CoupledTestEntry {
-                    file: entry.file,
-                    weight: entry.weight,
-                    count: entry.count,
-                    source: path.clone(),
-                });
+        if let Some(rows) = co_batched.get(path.as_str()) {
+            for entry in rows {
+                if matches!(FileCategory::classify(&entry.file), FileCategory::Test) {
+                    coupled.push(CoupledTestEntry {
+                        file: entry.file.clone(),
+                        weight: entry.weight,
+                        count: entry.count,
+                        source: path.clone(),
+                    });
+                }
             }
         }
     }

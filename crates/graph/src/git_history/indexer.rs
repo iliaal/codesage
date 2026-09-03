@@ -612,6 +612,8 @@ fn normalize_rename_path(raw: &str) -> String {
     //   src/{foo.rs => bar.rs}
     //   src/{old => new}/inner/file.rs
     //   {old/dir => new/dir}/file.rs
+    //   src/old.rs => src/new.rs          (braceless: whole-path move)
+    //   src/FOO.rs => src/foo.rs          (braceless: case-only rename)
     if let (Some(open), Some(close)) = (raw.find('{'), raw.find('}'))
         && open < close
         && let Some(arrow) = raw[open..close].find(" => ")
@@ -620,6 +622,18 @@ fn normalize_rename_path(raw: &str) -> String {
         let after_arrow_in_braces = &raw[open + arrow + 4..close];
         let suffix = &raw[close + 1..];
         return format!("{prefix}{after_arrow_in_braces}{suffix}");
+    }
+    // Braceless form carries full paths on both sides with no shared
+    // prefix/suffix elision, so the destination is everything right of the
+    // arrow. Case-only renames arrive in this form (no common substring to
+    // brace), and resolving to the right side keeps the on-disk spelling.
+    // Both sides must be non-empty: a literal `=>` in a filename is
+    // vanishingly rare, but an empty side means this is not a rename line.
+    if let Some((src, dest)) = raw.rsplit_once(" => ")
+        && !src.is_empty()
+        && !dest.is_empty()
+    {
+        return dest.to_string();
     }
     raw.to_string()
 }
@@ -757,6 +771,17 @@ mod tests {
             "new/dir/file.rs"
         );
         assert_eq!(normalize_rename_path("plain/path.rs"), "plain/path.rs");
+        assert_eq!(
+            normalize_rename_path("src/old.rs => src/new.rs"),
+            "src/new.rs"
+        );
+        assert_eq!(
+            normalize_rename_path("src/FOO.rs => src/foo.rs"),
+            "src/foo.rs"
+        );
+        // Degenerate arrows are not renames; leave them untouched.
+        assert_eq!(normalize_rename_path(" => src/new.rs"), " => src/new.rs");
+        assert_eq!(normalize_rename_path("src/old.rs => "), "src/old.rs => ");
     }
 
     #[test]

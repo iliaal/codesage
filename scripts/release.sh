@@ -208,11 +208,32 @@ PYEOF
 		echo "Proceed? [y/N] y  (--yes)"
 		ans=y
 	else
-		read -r -p "Proceed? [y/N] " ans
+		# EOF (piped stdin / closed TTY) under `set -e` would abort here
+		# mid-ceremony after the tag step; treat it as an empty answer so
+		# the explicit abort below fires instead of an unexplained exit.
+		read -r -p "Proceed? [y/N] " ans || ans=""
 	fi
 	[[ "$ans" == "y" || "$ans" == "Y" ]] || die "aborted before commit"
 
-	git commit -am "release: v$VERSION"
+	# Commit by pathspec, not `git commit -am`: -a would sweep stray edits
+	# and the Cargo.lock refresh into the release. These are exactly the
+	# files this script mutates above (CHANGELOG + version bumps) plus the
+	# Cargo.lock the --features cuda build refreshes (absent in checkouts
+	# without a lockfile — only existing paths are committed).
+	RELEASE_FILES=(
+		CHANGELOG.md
+		Cargo.toml
+		Cargo.lock
+		plugins/codesage-tools/.codex-plugin/plugin.json
+		plugins/codesage-tools/.claude-plugin/plugin.json
+		.claude-plugin/marketplace.json
+	)
+	EXISTING_FILES=()
+	for f in "${RELEASE_FILES[@]}"; do
+		[[ -e "$f" ]] && EXISTING_FILES+=("$f")
+	done
+	git add -- "${EXISTING_FILES[@]}"
+	git commit -m "release: v$VERSION" -- "${EXISTING_FILES[@]}"
 	git tag -a "v$VERSION" -m "codesage $VERSION"
 
 	echo
@@ -226,7 +247,8 @@ if [[ "$ASSUME_YES" -eq 1 ]]; then
 	echo "Push master + v$VERSION to origin? [y/N] y  (--yes)"
 	ans=y
 else
-	read -r -p "Push master + v$VERSION to origin? [y/N] " ans
+	# Same EOF guard as the commit prompt above.
+	read -r -p "Push master + v$VERSION to origin? [y/N] " ans || ans=""
 fi
 if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
 	echo

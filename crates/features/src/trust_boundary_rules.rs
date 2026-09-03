@@ -557,7 +557,12 @@ const PYTHON_RULES: &[TrustBoundaryRule] = &[
     rule("starlette", MatchMode::PrefixDot, NETWORK),
     rule("django", MatchMode::PrefixDot, NETWORK),
     rule("tornado", MatchMode::PrefixDot, NETWORK),
-    // filesystem
+    // filesystem. Bare `os` fires Filesystem for a plain `import os`:
+    // call rows for `os.open(...)`/`os.read(...)` record only the bare
+    // attribute name, so without this those files derive no boundary at
+    // all. The engine unions matches, so `os.environ`/`os.system` keep
+    // their Secrets/ProcessExec tags alongside this one.
+    rule("os", MatchMode::PrefixDot, FS),
     rule("os.path", MatchMode::PrefixDot, FS),
     rule("pathlib", MatchMode::PrefixDot, FS),
     rule("shutil", MatchMode::PrefixDot, FS),
@@ -597,7 +602,10 @@ const PYTHON_RULES: &[TrustBoundaryRule] = &[
     rule("sqlalchemy", MatchMode::PrefixDot, DB),
     rule("redis", MatchMode::PrefixDot, DB),
     rule("pymongo", MatchMode::PrefixDot, DB),
-    // user-input
+    // user-input. Deliberately no bare `sys` rule: `sys.exit`/`sys.path`
+    // manipulation signal no boundary, and tagging every `import sys`
+    // as user input would drown the signal. Only `sys.argv` (genuine
+    // untrusted-input surface) fires.
     rule("argparse", MatchMode::PrefixDot, USER_INPUT),
     rule("click", MatchMode::PrefixDot, USER_INPUT),
     rule("typer", MatchMode::PrefixDot, USER_INPUT),
@@ -628,7 +636,11 @@ const GO_RULES: &[TrustBoundaryRule] = &[
     rule("github.com/gin-gonic/gin", MatchMode::PrefixSlash, NETWORK),
     rule("github.com/gofiber/fiber", MatchMode::PrefixSlash, NETWORK),
     rule("github.com/labstack/echo", MatchMode::PrefixSlash, NETWORK),
-    // filesystem
+    // filesystem (`os` is Exact: subpaths like `os/exec` and `os/user`
+    // carry their own rules below, and a PrefixSlash here would shadow
+    // their intent. Bare `os` covers file I/O; env/process entry points
+    // surface as `os.Getenv`-style call rows.)
+    rule("os", MatchMode::Exact, FS),
     rule("io/ioutil", MatchMode::PrefixSlash, FS),
     rule("io/fs", MatchMode::PrefixSlash, FS),
     rule("path/filepath", MatchMode::PrefixSlash, FS),
@@ -654,6 +666,7 @@ const GO_RULES: &[TrustBoundaryRule] = &[
     rule("github.com/spf13/cobra", MatchMode::PrefixSlash, USER_INPUT),
     rule("github.com/urfave/cli", MatchMode::PrefixSlash, USER_INPUT),
     // serialization
+    rule("encoding/json", MatchMode::PrefixSlash, SERIALIZATION),
     rule("encoding/xml", MatchMode::PrefixSlash, SERIALIZATION),
     rule("encoding/gob", MatchMode::PrefixSlash, SERIALIZATION),
     rule("gopkg.in/yaml.v2", MatchMode::PrefixSlash, SERIALIZATION),
@@ -698,7 +711,10 @@ const JS_RULES: &[TrustBoundaryRule] = &[
     rule("node:child_process", MatchMode::Exact, EXEC),
     rule("child_process", MatchMode::Exact, EXEC),
     rule("execa", MatchMode::PrefixSlash, EXEC),
-    // secrets / env
+    // secrets / env. `process.env` matches by Contains: recorded names
+    // vary (`process.env`, `process.env.DB_URL`), and no narrower mode
+    // covers both the bare and suffixed forms.
+    rule("process.env", MatchMode::Contains, SECRETS),
     rule("node:crypto", MatchMode::Exact, SECRETS),
     rule("crypto", MatchMode::Exact, SECRETS),
     rule("bcrypt", MatchMode::PrefixSlash, SECRETS),
@@ -1009,5 +1025,122 @@ mod tests {
         assert!(rule_matches(cp, "node:child_process"));
         assert!(!rule_matches(cp, "node:child_processx"));
         assert!(!rule_matches(cp, "child_processx"));
+    }
+
+    fn go_fires(name: &str, expected: TrustBoundary) -> bool {
+        rules_for(Language::Go)[0]
+            .iter()
+            .any(|r| rule_matches(r, name) && r.boundaries.contains(&expected))
+    }
+
+    fn js_fires(name: &str, expected: TrustBoundary) -> bool {
+        rules_for(Language::JavaScript)[0]
+            .iter()
+            .any(|r| rule_matches(r, name) && r.boundaries.contains(&expected))
+    }
+
+    fn c_fires(name: &str, expected: TrustBoundary) -> bool {
+        rules_for(Language::C)[0]
+            .iter()
+            .any(|r| rule_matches(r, name) && r.boundaries.contains(&expected))
+    }
+
+    #[test]
+    fn go_bare_os_yields_filesystem() {
+        // `import "os"` is the most common Go file-surface import; without
+        // a bare rule those files derived no boundary at all.
+        let table = rules_for(Language::Go)[0];
+        let os = table
+            .iter()
+            .find(|r| r.pattern == "os")
+            .expect("bare os rule present");
+        assert!(rule_matches(os, "os"));
+        // Exact: subpaths keep their own rules (`os/exec` is process-exec).
+        assert!(!rule_matches(os, "os/exec"));
+        assert!(!rule_matches(os, "osextra"));
+        assert!(go_fires("os", TrustBoundary::Filesystem));
+        assert!(!go_fires("os", TrustBoundary::ProcessExec));
+        assert!(go_fires("os/exec", TrustBoundary::ProcessExec));
+    }
+
+    #[test]
+    fn go_encoding_json_yields_serialization() {
+        let table = rules_for(Language::Go)[0];
+        let js = table
+            .iter()
+            .find(|r| r.pattern == "encoding/json")
+            .expect("encoding/json rule present");
+        assert!(rule_matches(js, "encoding/json"));
+        assert!(!rule_matches(js, "encoding/jsonx"));
+        assert!(go_fires("encoding/json", TrustBoundary::Serialization));
+    }
+
+    #[test]
+    fn python_bare_os_yields_filesystem() {
+        // Plain `import os` plus `os.open(...)`-style calls (recorded under
+        // the bare attribute name) previously derived nothing.
+        assert!(python_fires("os", TrustBoundary::Filesystem));
+        assert!(python_fires("os.open", TrustBoundary::Filesystem));
+        // Union semantics: specific rules still fire alongside the bare one.
+        assert!(python_fires("os.environ", TrustBoundary::Secrets));
+        assert!(python_fires("os.system", TrustBoundary::ProcessExec));
+    }
+
+    #[test]
+    fn python_bare_sys_yields_no_boundary() {
+        // Documented intent: only `sys.argv` is a user-input surface.
+        // `sys.exit` / `sys.path` / a bare `import sys` tag nothing.
+        for name in ["sys", "sys.exit", "sys.path", "sys.stdin"] {
+            assert!(
+                !python_fires(name, TrustBoundary::UserInput),
+                "bare `{name}` must not imply user input"
+            );
+            assert!(
+                !python_fires(name, TrustBoundary::Filesystem),
+                "bare `{name}` must not imply filesystem"
+            );
+            assert!(
+                !python_fires(name, TrustBoundary::ProcessExec),
+                "bare `{name}` must not imply process-exec"
+            );
+        }
+        assert!(python_fires("sys.argv", TrustBoundary::UserInput));
+    }
+
+    #[test]
+    fn js_process_env_yields_secrets() {
+        // The table docstring claims process.env coverage; this locks it.
+        // Contains covers both the bare form and `process.env.DB_URL`.
+        let table = rules_for(Language::JavaScript)[0];
+        let env = table
+            .iter()
+            .find(|r| r.pattern == "process.env")
+            .expect("process.env rule present");
+        assert!(rule_matches(env, "process.env"));
+        assert!(rule_matches(env, "process.env.DB_URL"));
+        assert!(!rule_matches(env, "process"));
+        assert!(!rule_matches(env, "env"));
+        assert!(js_fires("process.env.DB_URL", TrustBoundary::Secrets));
+    }
+
+    #[test]
+    fn c_mbedtls_include_yields_secrets_network() {
+        // Regression lock: the mbedtls rule must name the real header
+        // (`mbedtls/ssl.h` with no space). A spaced variant would never
+        // match a recorded include and silently disable the rule.
+        let table = rules_for(Language::C)[0];
+        let mbedtls: Vec<_> = table
+            .iter()
+            .filter(|r| r.pattern.ends_with("tls/ssl.h"))
+            .collect();
+        assert_eq!(
+            mbedtls.len(),
+            1,
+            "expected exactly one mbedtls rule, got {:?}",
+            mbedtls.iter().map(|r| r.pattern).collect::<Vec<_>>()
+        );
+        assert_eq!(mbedtls[0].pattern, "mbedtls/ssl.h");
+        assert!(c_fires("mbedtls/ssl.h", TrustBoundary::Secrets));
+        assert!(c_fires("mbedtls/ssl.h", TrustBoundary::Network));
     }
 }

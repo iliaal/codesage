@@ -32,11 +32,16 @@ pub const LSH_ROWS: usize = MINHASH_K / LSH_BANDS;
 
 pub type Fingerprint = [u64; MINHASH_K];
 
-/// One fingerprinted function/method.
+/// One fingerprinted function/method. `language` is load-bearing, not
+/// decoration: `kind_id`s are grammar-local integers, so identical trigrams
+/// from two grammars mean nothing and their Jaccard is meaningless.
+/// `file_fingerprints` stamps the parsing language; compare with
+/// `jaccard_checked`, which refuses cross-language pairs.
 #[derive(Debug, Clone)]
 pub struct FunctionFingerprint {
     pub name: String,
     pub kind: SymbolKind,
+    pub language: Language,
     pub line_start: u32,
     pub line_end: u32,
     pub leaf_count: usize,
@@ -150,19 +155,16 @@ pub fn file_fingerprints(
         let Some((fp, leaves)) = fingerprint_def(&def) else {
             continue;
         };
-        // Normalize the captured name the same way `extract_symbols` does, so a
-        // fingerprint's name matches what `find_symbol` stores (C++ out-of-line
-        // `Foo::bar` captures as bare `bar`). Otherwise `find_similar bar` would
-        // miss C++ methods.
-        let captured = name_cap.node.utf8_text(source).unwrap_or("");
+        let captured = crate::parse::node_text_lossy(&name_cap.node, source);
         let name = if language == Language::Cpp {
-            crate::extract::cpp_bare_name(captured)
+            crate::extract::cpp_bare_name(&captured)
         } else {
-            captured.to_string()
+            captured
         };
         out.push(FunctionFingerprint {
             name,
             kind,
+            language,
             line_start: def.start_position().row as u32 + 1,
             line_end: def.end_position().row as u32 + 1,
             leaf_count: leaves,
@@ -171,12 +173,26 @@ pub fn file_fingerprints(
     }
     out
 }
-
 /// Estimated Jaccard similarity: fraction of MinHash positions that agree.
+/// Same-language precondition — callers must only compare fingerprints the
+/// index grouped by language (see `find_similar`). The raw form cannot check
+/// this (grammar-local ids carry no provenance); use [`jaccard_checked`]
+/// when the pair's provenance is uncertain.
 #[inline]
 pub fn jaccard(a: &Fingerprint, b: &Fingerprint) -> f32 {
-    let eq = a.iter().zip(b.iter()).filter(|(x, y)| x == y).count();
-    eq as f32 / MINHASH_K as f32
+    let agree = a.iter().zip(b.iter()).filter(|(x, y)| x == y).count();
+    agree as f32 / MINHASH_K as f32
+}
+
+/// Jaccard over two fingerprinted functions, `None` when their languages
+/// differ. Prefer this over [`jaccard`] whenever the pair did not come from
+/// the same per-language bucket.
+#[inline]
+pub fn jaccard_checked(a: &FunctionFingerprint, b: &FunctionFingerprint) -> Option<f32> {
+    if a.language != b.language {
+        return None;
+    }
+    Some(jaccard(&a.fp, &b.fp))
 }
 
 /// LSH band signatures for candidate bucketing. Two functions that share any
@@ -309,5 +325,52 @@ fn two(x: i32) -> i32 { let mut s = 0; for i in 0..x { s += i; if s > 100 { brea
         // A trivial getter is below the leaf floor and should not fingerprint.
         let src = "fn id(x: i32) -> i32 { x }\n";
         assert!(fps(src, Language::Rust).is_empty());
+    }
+
+    #[test]
+    fn fingerprints_carry_their_language() {
+        let src = r#"
+fn alpha(items: &[i32]) -> i32 {
+    let mut total = 0;
+    for it in items {
+        if *it > 0 {
+            total += *it * 2;
+        } else {
+            total -= 1;
+        }
+    }
+    total
+}
+"#;
+        let f = fps(src, Language::Rust);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].language, Language::Rust);
+    }
+
+    #[test]
+    fn jaccard_checked_refuses_cross_language_pairs() {
+        let rust_src = r#"
+fn alpha(items: &[i32]) -> i32 {
+    let mut total = 0;
+    for it in items {
+        if *it > 0 {
+            total += *it * 2;
+        } else {
+            total -= 1;
+        }
+    }
+    total
+}
+"#;
+        // Same shape, different grammar: the raw kind-id trigrams are
+        // numerically comparable but semantically meaningless across
+        // languages, so the checked form must decline.
+        let py_src = "def alpha(items):\n    total = 0\n    for it in items:\n        if it > 0:\n            total += it * 2\n        else:\n            total -= 1\n    extra = len(items)\n    total += extra\n    return total\n";
+        let r = fps(rust_src, Language::Rust);
+        let p = fps(py_src, Language::Python);
+        assert_eq!(r.len(), 1);
+        assert_eq!(p.len(), 1);
+        assert!(jaccard_checked(&r[0], &r[0]).is_some());
+        assert_eq!(jaccard_checked(&r[0], &p[0]), None);
     }
 }

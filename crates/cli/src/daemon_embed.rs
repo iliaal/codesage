@@ -31,8 +31,11 @@ type PrivateEmbedderInit = Box<dyn FnOnce() -> Result<Box<dyn TextEmbedder>> + S
 /// resident loads it inside this window, so it is sized for a cold load from
 /// disk, not for a round trip.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
-/// One commit batch of chunks, embedded on whatever device the daemon runs.
-const EMBED_TIMEOUT: Duration = Duration::from_secs(600);
+/// One daemon-side batch of chunks, embedded on whatever device the daemon
+/// runs. Sized for a single batch — not the whole pass — so one wedged batch
+/// fails over to the private fallback below (per batch) instead of pinning
+/// the pass under the index lock for ten minutes.
+const EMBED_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(crate) struct DaemonEmbedder {
     rt: tokio::runtime::Runtime,
@@ -367,7 +370,19 @@ impl TextEmbedder for DaemonEmbedder {
                     &chunk,
                     &format!("daemon refused a batch as over cap ({e:#})"),
                 )?,
-                Err(e) => return Err(e),
+                // Any other daemon failure (timeout, dropped connection) is
+                // scoped to this batch: embed it privately under the same
+                // attested fingerprint and try the daemon again on the next
+                // batch, so one slow batch cannot abort the whole pass while
+                // the index lock is held. Without a fallback configured this
+                // is still an error, naming the batch it failed on.
+                Err(e) => self.private_embed(
+                    &chunk,
+                    &format!(
+                        "daemon embed_texts failed for a batch of {} text(s) ({e:#})",
+                        chunk.len()
+                    ),
+                )?,
             };
             for (i, embedding) in batch.into_iter().zip(embeddings) {
                 out[i] = Some(embedding);
@@ -424,6 +439,10 @@ pub(crate) mod tests {
     pub(crate) struct FakeDaemon {
         pub(crate) dim: usize,
         pub(crate) model: String,
+        /// When set, fail the next non-empty request with a generic (non-cap,
+        /// non-fingerprint) error before serving normally again. Exercises the
+        /// batch-scoped fallback: one bad batch must not abort the pass.
+        pub(crate) fail_next: std::sync::Arc<std::sync::atomic::AtomicBool>,
         /// Refuse any text longer than this with the shared over-cap prefix,
         /// as a daemon of another build with tighter caps would.
         pub(crate) text_cap: Option<usize>,
@@ -446,6 +465,7 @@ pub(crate) mod tests {
                 text_cap: None,
                 fingerprint: fp_a().as_str().to_string(),
                 fingerprint_after_probe: None,
+                fail_next: Default::default(),
                 embedded: Default::default(),
             }
         }
@@ -490,6 +510,19 @@ pub(crate) mod tests {
                 .into());
             }
             let texts: Vec<String> = serde_json::from_value(args["texts"].clone()).unwrap();
+            if !texts.is_empty()
+                && self
+                    .fail_next
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                // A generic failure: deliberately free of both the over-cap
+                // and fingerprint markers, so the client must take the
+                // batch-scoped fallback path.
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    "boom: simulated transient daemon failure".to_string(),
+                )])
+                .into());
+            }
             let produces = if texts.is_empty() {
                 self.fingerprint.as_str()
             } else {
@@ -875,5 +908,56 @@ pub(crate) mod tests {
             .expect("no listener must fail")
             .to_string();
         assert!(err.contains("connecting to"), "{err}");
+    }
+
+    #[test]
+    fn a_transient_daemon_failure_falls_back_for_that_batch_then_retries_the_daemon() {
+        let daemon = FakeDaemon {
+            fail_next: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            ..FakeDaemon::new(4, "m")
+        };
+        let (_dir, socket, handle) = spawn_fake(daemon);
+        {
+            let mut client = DaemonEmbedder::connect_to(&socket, "/p", "m")
+                .unwrap()
+                .with_private_fallback(Box::new(|| {
+                    Ok(Box::new(FakePrivate::new(4)) as Box<dyn TextEmbedder>)
+                }));
+            client.bind_fingerprint(&fp_a()).unwrap();
+            // First batch hits the transient failure: embedded privately in
+            // place (-1.0 marker) instead of aborting the pass.
+            let out = client.embed_batch(&["ab"]).unwrap();
+            assert_eq!(out[0][0], -1.0, "failed batch falls back privately");
+            assert!(client.private_loaded());
+            // The next batch retries the daemon first and succeeds there.
+            let out = client.embed_batch(&["abcd"]).unwrap();
+            assert_eq!(out[0][0], 4.0, "daemon is re-probed on the next batch");
+        }
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_transient_daemon_failure_without_a_fallback_names_the_batch() {
+        let daemon = FakeDaemon {
+            fail_next: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            ..FakeDaemon::new(4, "m")
+        };
+        let (_dir, socket, handle) = spawn_fake(daemon);
+        {
+            let mut client = DaemonEmbedder::connect_to(&socket, "/p", "m").unwrap();
+            client.bind_fingerprint(&fp_a()).unwrap();
+            let err = format!("{:#}", client.embed_batch(&["ab"]).unwrap_err());
+            assert!(err.contains("no private embedder is configured"), "{err}");
+            assert!(err.contains("batch of 1"), "{err}");
+        }
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn batch_timeout_is_bounded_to_one_batch_not_the_whole_pass() {
+        assert!(
+            EMBED_TIMEOUT.as_secs() <= 120,
+            "one wedged batch must fail over in ~minutes, not pin the pass under the lock: {EMBED_TIMEOUT:?}"
+        );
     }
 }

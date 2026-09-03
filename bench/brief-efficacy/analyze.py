@@ -326,11 +326,18 @@ def main() -> int:
     def load_transcript(p: Path) -> list[dict]:
         if p not in transcripts:
             evs = []
-            for line in p.read_text(errors="replace").splitlines():
-                try:
-                    evs.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+            try:
+                # Stream line-by-line: transcripts can be tens of MB and
+                # only JSON lines are needed; a whole-file read would
+                # hold two copies (text + split list) at once.
+                with p.open(encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        try:
+                            evs.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+            except OSError as e:
+                print(f"[warn] cannot read transcript {p}: {e}", file=sys.stderr)
             transcripts[p] = evs
         return transcripts[p]
 

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::io::Read;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -180,8 +181,36 @@ fn hf_with_deadline<T: Send + 'static>(
     }
 }
 
+/// The HuggingFace client every download and file-list probe shares, built
+/// from the same [`hf_cache_from_env`] root the cached-only probe
+/// ([`cached_model_artifacts`]) consults — never `Api::new`, whose
+/// `Cache::default` panics HOME-less (`dirs::home_dir().expect(..)`) and
+/// ignores `HF_HOME`, so a custom cache root would download into one
+/// directory while the probe reads another. Unresolvable environments
+/// (neither `HF_HOME` nor `HOME` set) are an error naming both variables,
+/// raised here rather than as a worker-thread panic surfacing as a
+/// misleading `RecvTimeoutError::Disconnected`.
+fn hf_api() -> Result<hf_hub::api::sync::Api> {
+    let Some(cache) = hf_cache_from_env() else {
+        anyhow::bail!(
+            "cannot resolve the HuggingFace cache directory: HF_HOME is unset and HOME is \
+             unset or empty, so neither an explicit cache root nor the ~/.cache/huggingface \
+             fallback resolves; set HF_HOME (or HOME) to a writable directory"
+        );
+    };
+    // Mirror `ApiBuilder::from_env`'s endpoint override without its
+    // `Cache::from_env` fallback, which panics HOME-less via `Cache::default`.
+    let mut builder = hf_hub::api::sync::ApiBuilder::from_cache(cache);
+    if let Ok(endpoint) = std::env::var("HF_ENDPOINT") {
+        builder = builder.with_endpoint(endpoint);
+    }
+    builder
+        .build()
+        .context("failed to create HuggingFace API client")
+}
+
 fn hf_api_repo(model: String, revision: Option<String>) -> Result<hf_hub::api::sync::ApiRepo> {
-    let api = hf_hub::api::sync::Api::new().context("failed to create HuggingFace API client")?;
+    let api = hf_api()?;
     Ok(if let Some(revision) = revision {
         api.repo(Repo::with_revision(model, RepoType::Model, revision))
     } else {
@@ -476,12 +505,24 @@ fn discover_ort_dylib() -> Option<PathBuf> {
     None
 }
 
+/// `ORT_DYLIB_PATH` as the loader honours it: an empty value is the same as
+/// unset (an empty path would otherwise count as "caller took control" in
+/// `init_ort_dylib` and then hard-fail inside ORT, where unsetting it would
+/// have discovered the library). One helper so discovery and the
+/// fingerprint's runtime probe agree on what counts as set.
+#[cfg(not(target_vendor = "apple"))]
+fn ort_dylib_path_from_env() -> Option<PathBuf> {
+    std::env::var_os("ORT_DYLIB_PATH")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
 /// Runtime ONNX Runtime dylib discovery (`ORT_DYLIB_PATH`, pip site-packages).
 /// No-op on Apple targets: macOS builds statically link ORT with the CoreML EP.
 #[cfg(not(target_vendor = "apple"))]
 pub fn init_ort_dylib() {
     ORT_INIT.call_once(|| {
-        if std::env::var("ORT_DYLIB_PATH").is_ok() {
+        if ort_dylib_path_from_env().is_some() {
             // Caller took control. Still prepend discovered NVIDIA dirs so CUDA loads.
             let nvidia = discover_nvidia_lib_dirs();
             if !nvidia.is_empty() {
@@ -509,8 +550,10 @@ pub fn init_ort_dylib() {
 /// it is attacker-controlled when indexing a cloned repo; passing it straight
 /// to hf-hub would let that repo pick an arbitrary ONNX graph to download and
 /// load into the native ONNX Runtime. Gate every load on this allowlist plus
-/// pinned artifact hashes unless the user (not the repo) opts out via
-/// `CODESAGE_ALLOW_ANY_MODEL=1`.
+/// pinned artifact hashes unless the user (not the repo) activates the
+/// per-project bypass: `CODESAGE_ALLOW_ANY_MODEL=1` for eligibility plus the
+/// project's canonical root listed in the user-owned allowlist file (see
+/// [`allow_any_model_from_env`]). The env var alone never suffices.
 const ALLOWED_MODELS: &[&str] = &[
     "sentence-transformers/all-MiniLM-L6-v2",
     "cross-encoder/ms-marco-MiniLM-L6-v2",
@@ -649,8 +692,8 @@ pub fn ort_runtime_dylib() -> Result<Option<PathBuf>> {
     #[cfg(not(target_vendor = "apple"))]
     {
         init_ort_dylib();
-        match std::env::var_os("ORT_DYLIB_PATH") {
-            Some(path) if !path.is_empty() => Ok(Some(PathBuf::from(path))),
+        match ort_dylib_path_from_env() {
+            Some(path) => Ok(Some(path)),
             _ => anyhow::bail!(
                 "ONNX Runtime shared library not located (no ORT_DYLIB_PATH, no pip \
                  onnxruntime, nothing under /usr/lib or /usr/local/lib); set \
@@ -661,26 +704,26 @@ pub fn ort_runtime_dylib() -> Result<Option<PathBuf>> {
 }
 
 /// The revision a load of `model` resolves against: the pinned commit for a
-/// validated model, the repository head once the user opted out of pinning
-/// with `CODESAGE_ALLOW_ANY_MODEL`. The fingerprint and the session loader
-/// must agree on this, or the fingerprint would digest files the session
-/// never opens.
+/// validated model, the repository head under the per-project unpinned
+/// bypass (see [`allow_any_model_from_env`]). The fingerprint and the
+/// session loader must agree on this, or the fingerprint would digest files
+/// the session never opens.
 fn load_revision(model: &str, allow_any: bool) -> Option<&'static str> {
     load_pin(model, allow_any).map(|pin| pin.revision)
 }
 
 /// The pin a load verifies against: the entry for a validated model, none
-/// once the user opted out of pinning with `CODESAGE_ALLOW_ANY_MODEL`. The
-/// fingerprint's revision and sidecar expectation and the loader's derive
-/// from this one lookup, so they agree by construction.
+/// under the per-project unpinned bypass (see [`allow_any_model_from_env`]).
+/// The fingerprint's revision and sidecar expectation and the loader's
+/// derive from this one lookup, so they agree by construction.
 fn load_pin(model: &str, allow_any: bool) -> Option<&'static ModelPin> {
     if allow_any { None } else { model_pin(model) }
 }
 
 /// What the pin a load verifies against says about the external-weights
 /// sidecar. The one derivation the loader, the resolver, and the cache probe
-/// share, so a pinned verdict can never be applied to an unpinned
-/// (`CODESAGE_ALLOW_ANY_MODEL=1`) resolution by one of them alone.
+/// share, so a pinned verdict can never be applied to an unpinned-bypass
+/// resolution by one of them alone.
 fn sidecar_expectation(model: &str, allow_any: bool) -> SidecarExpectation {
     SidecarExpectation::from_pin(load_pin(model, allow_any))
 }
@@ -778,7 +821,7 @@ enum SidecarExpectation {
     /// Runtime would load a sidecar from, and a refusal if a file is there
     /// (`refuse_undeclared_sidecar`).
     Absent,
-    /// No pin (`CODESAGE_ALLOW_ANY_MODEL=1`, or an allowlisted model without
+    /// No pin (per-project unpinned bypass, or an allowlisted model without
     /// a pin entry): fetch, and fall back to the hub's file list when that
     /// fetch fails.
     Unknown,
@@ -805,12 +848,11 @@ type ArtifactPaths = (PathBuf, PathBuf, Option<PathBuf>);
 
 /// `HF_HOME` as set in the environment (`None` when unset), model, revision:
 /// everything that decides which snapshot files a resolution lands on. The
-/// root is only a label for the key, read with `var_os` rather than through
-/// `hf_hub::Cache::from_env`, whose unset-`HF_HOME` fallback panics when no
-/// home directory resolves. Today `Api::new` downloads into `Cache::default`
-/// regardless, so the component is inert; it stays in the key so a future
-/// hf-hub that honours `HF_HOME` for downloads can only cost an extra fetch,
-/// never serve another root's paths.
+/// root is read with `var_os` rather than through `hf_hub::Cache::from_env`,
+/// whose unset-`HF_HOME` fallback panics when no home directory resolves;
+/// every download and probe goes through [`hf_api`], built from the same
+/// [`hf_cache_from_env`] root this key names, so a custom `HF_HOME` can only
+/// cost an extra fetch under another root, never serve another root's paths.
 type ArtifactKey = (Option<PathBuf>, String, Option<String>);
 
 /// One memo entry. `sidecar` is `None` while the sidecar outcome is
@@ -836,7 +878,7 @@ struct ArtifactMemo {
 // `fingerprint::cached_file_digest` keys on size and mtime. Three
 // resolutions run per MCP semantic query — the embedder pool key, the
 // session fingerprint, and the table fingerprint — so an unmemoized
-// resolution cost nine `Api::new` constructions per query before this
+// resolution cost nine hub-client constructions per query before this
 // (measured on a live daemon: 60 over a six-query probe, six of them the
 // cold session load). A memo hit replaces a resolution's two lookups for a
 // pinned model, three when a sidecar is fetched, with two or three
@@ -1057,10 +1099,149 @@ fn resolve_model_artifacts_at(
     })
 }
 
+/// Migration note (cs-72x): `CODESAGE_ALLOW_ANY_MODEL=1` used to be a
+/// process-global bypass — export it once in a shell profile and every cloned
+/// repo indexed from that shell could point `.codesage/config.toml` at an
+/// arbitrary ONNX graph and have it downloaded and executed. It now grants
+/// only *eligibility*; the bypass *activates* only for a project the user
+/// opted in by listing its canonical root, one per line, in the user-owned
+/// allowlist file from [`user_allowlist_path`] (default
+/// `~/.config/codesage/allowed-models`; blank lines and `#` comments
+/// ignored). To migrate a workflow that relied on the old global bypass for
+/// a project you trust, keep the env var and append that project's root:
+/// `mkdir -p ~/.config/codesage && pwd >> ~/.config/codesage/allowed-models`.
+///
+/// There is deliberately no repo-local opt-in (no `.codesage/allow-any-model`
+/// marker): the model name comes from the project's own config, so anything
+/// inside the project directory is attacker-controlled for a cloned repo — a
+/// repo-local marker would let a malicious repo self-authorize under a
+/// globally-exported env var, the exact bypass this closes. Activation state
+/// lives outside every repo, under the user's config home.
+///
+/// The current project is the nearest ancestor of the process working
+/// directory holding a `.codesage/` directory; outside any project the answer
+/// is `false` (fail closed). Name kept for the `doctor` check and the
+/// existing callers; semantics are now "env-eligible AND project opted in".
 pub fn allow_any_model_from_env() -> bool {
+    if !allow_any_eligible_from_env() {
+        return false;
+    }
+    let Some(root) = current_project_root() else {
+        return false;
+    };
+    project_allow_any_opted_in(&root)
+}
+
+/// Raw eligibility signal behind [`allow_any_model_from_env`]: the env var
+/// alone. Process-global — never consult it directly on a load path; loads
+/// require the per-project opt-in on top.
+fn allow_any_eligible_from_env() -> bool {
     matches!(
         std::env::var("CODESAGE_ALLOW_ANY_MODEL").as_deref(),
         Ok("1") | Ok("true")
+    )
+}
+
+/// Nearest ancestor of the process working directory holding a `.codesage/`
+/// directory, if any. `None` outside a project or when the cwd is unknown:
+/// callers fail closed.
+fn current_project_root() -> Option<PathBuf> {
+    find_project_root_from(&std::env::current_dir().ok()?)
+}
+
+/// Pure core over an explicit start directory (the env/cwd wrappers above
+/// cannot be touched by unit tests without racing process-global state):
+/// walk up until a directory holding a `.codesage/` entry is found.
+fn find_project_root_from(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|dir| dir.join(".codesage").is_dir())
+        .map(Path::to_path_buf)
+}
+
+/// Whether `root` is opted in: its canonical path is listed in the
+/// user-owned allowlist file. A missing or unreadable file, or an
+/// unresolvable config home (notably HOME-less daemon environments — see
+/// [`hf_cache_from_env`]), is "not listed": fail closed, never panic.
+fn project_allow_any_opted_in(root: &Path) -> bool {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let Some(path) = user_allowlist_path() else {
+        return false;
+    };
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    // Eligibility was established by the caller (`allow_any_model_from_env`);
+    // this is the activation half, through the same pure core the tests pin.
+    allow_any_for_project_root(Some(&canonical), true, &contents)
+}
+
+/// The user-owned allowlist file consulted at load time, or `None` when no
+/// config home resolves. `$XDG_CONFIG_HOME/codesage/allowed-models` wins
+/// when set and non-empty, else `$HOME/.config/codesage/allowed-models`.
+/// Read with `var_os` exactly like [`hf_cache_from_env`], so a non-UTF-8
+/// value falls back the same way instead of erroring.
+fn user_allowlist_path() -> Option<PathBuf> {
+    user_allowlist_path_from(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// Pure core of [`user_allowlist_path`] so tests can prove the precedence
+/// without touching process env.
+fn user_allowlist_path_from(
+    xdg_config_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Option<PathBuf> {
+    if let Some(xdg) = xdg_config_home.filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(xdg).join("codesage").join("allowed-models"));
+    }
+    let home = home.filter(|v| !v.is_empty())?;
+    Some(
+        PathBuf::from(home)
+            .join(".config")
+            .join("codesage")
+            .join("allowed-models"),
+    )
+}
+
+/// Pure core: does `contents` (the allowlist file) name `canonical_root`?
+/// Blank lines and `#` comments are ignored; entries compare as paths, so a
+/// trailing slash on either side still matches.
+fn project_listed_in_allowlist(canonical_root: &Path, contents: &str) -> bool {
+    contents.lines().any(|line| {
+        let line = line.trim();
+        !line.is_empty() && !line.starts_with('#') && Path::new(line) == canonical_root
+    })
+}
+
+/// Effective bypass for an explicit project root: env eligibility AND that
+/// project listed in `allowlist_contents`. Pure core so unit tests can prove
+/// the matrix without touching process env or cwd: an env flag set for a
+/// non-allowlisted project still refuses.
+fn allow_any_for_project_root(
+    project_root: Option<&Path>,
+    eligible: bool,
+    allowlist_contents: &str,
+) -> bool {
+    eligible
+        && project_root.is_some_and(|root| project_listed_in_allowlist(root, allowlist_contents))
+}
+
+/// Message for the loud warning emitted when a load proceeds unpinned: names
+/// the model and the resolved revision (`None` is the floating repository
+/// head — the bypass never pins).
+fn unpinned_load_message(model: &str, revision: Option<&str>) -> String {
+    format!(
+        "loading model {model:?} outside the validated-model pin set at {} — no hash \
+         verification will run; the bytes ONNX Runtime executes are whatever the hub serves. \
+         Bypass is active for this project (CODESAGE_ALLOW_ANY_MODEL plus project opt-in): \
+         only use models you trust.",
+        revision.map_or_else(
+            || "the floating repository head (unpinned)".to_string(),
+            |rev| format!("pinned revision {rev:?}")
+        )
     )
 }
 
@@ -1074,7 +1255,19 @@ pub fn validate_model_allowed(model: &str, allow_any: bool) -> Result<()> {
          is untrusted when the repo isn't yours — an arbitrary name would \
          download and execute an attacker-chosen ONNX graph inside ONNX \
          Runtime. Validated models: {ALLOWED_MODELS:?}. To experiment with \
-         another model you trust, set CODESAGE_ALLOW_ANY_MODEL=1."
+         another model you trust, set CODESAGE_ALLOW_ANY_MODEL=1 AND list \
+         this project's canonical root in {}.",
+        user_allowlist_display()
+    )
+}
+
+/// Where [`validate_model_allowed`] tells the user to opt their project in:
+/// the resolved allowlist path, or the `~` shorthand when no config home
+/// resolves (e.g. HOME-less environments) so the error still names the file.
+fn user_allowlist_display() -> String {
+    user_allowlist_path().map_or_else(
+        || "~/.config/codesage/allowed-models".to_string(),
+        |path| path.display().to_string(),
     )
 }
 
@@ -1131,12 +1324,18 @@ fn verify_with_refetch<P>(
 /// must not get an arbitrary external file deleted on the eviction path.
 /// On containment failure only the symlink itself is removed.
 fn evict_cached_artifact(path: &Path) -> Result<()> {
+    // The pin verifier shares `fingerprint::cached_file_digest`, keyed on
+    // (size, mtime): a refetch that lands within the same mtime tick with
+    // the same length would otherwise verify against the evicted bytes'
+    // hash. Purge first; a purge with no refetch just costs a re-read.
+    crate::fingerprint::forget_cached_digest(path);
     if let Ok(target) = std::fs::read_link(path) {
         let blob = if target.is_absolute() {
             target
         } else {
             path.parent().unwrap_or(Path::new("")).join(target)
         };
+        crate::fingerprint::forget_cached_digest(&blob);
         match blob_within_cache_boundary(path, &blob) {
             Some(true) => {
                 if let Err(e) = std::fs::remove_file(&blob)
@@ -1337,6 +1536,15 @@ pub(crate) fn load_onnx_session_with_provider(model: &str, device: &str) -> Resu
             "validated model {model:?} has no pinned revision/hash metadata; refusing unpinned load"
         );
     }
+    if allow_any {
+        // Unpinned by construction (`load_pin` returns `None` under the
+        // bypass): the hub head executes with no hash check. Loud on purpose —
+        // the line names the model plus the resolved revision so the log alone
+        // answers "what ran unpinned". Session builds are cached, so this
+        // fires once per session, not per query.
+        let unpinned = unpinned_load_message(model, load_revision(model, allow_any));
+        tracing::warn!("{unpinned}");
+    }
 
     #[cfg(not(target_vendor = "apple"))]
     init_ort_dylib();
@@ -1447,6 +1655,14 @@ pub(crate) fn load_onnx_session_with_provider(model: &str, device: &str) -> Resu
         configured
     };
     #[cfg(not(all(feature = "cuda", target_os = "linux")))]
+    // No functional check here for CoreML, deliberately: unlike CUDA — whose
+    // loader can report "Successfully registered" while binding nothing,
+    // which is what the /proc/self/maps guard above catches — the CoreML
+    // provider is registered with `error_on_failure`, so a registration
+    // failure is already loud, and ORT exposes no query for the provider a
+    // committed session actually runs on nor any userspace-visible mapping
+    // to assert. The attested provider is the configured one (pinned by
+    // `coreml_provider_is_attested_from_configuration`).
     let execution_provider = configured;
 
     let has_token_type_ids = wants_token_type_ids(session.inputs().iter().map(|i| i.name()));
@@ -1549,8 +1765,9 @@ impl Embedder {
         }
 
         let ids_tensor = ort::value::Tensor::from_array(([batch_size, seq_len], input_ids))?;
-        let mask_tensor =
-            ort::value::Tensor::from_array(([batch_size, seq_len], attention_mask.clone()))?;
+        // Moved, not cloned: mean pooling reads the same values back from
+        // `encodings` below instead of a second copy of this vector.
+        let mask_tensor = ort::value::Tensor::from_array(([batch_size, seq_len], attention_mask))?;
 
         let outputs = if self.has_token_type_ids {
             let token_type_ids = vec![0i64; batch_size * seq_len];
@@ -1598,13 +1815,14 @@ impl Embedder {
 
         let mut embeddings = Vec::with_capacity(batch_size);
 
-        for i in 0..batch_size {
+        for (i, enc) in encodings.iter().enumerate() {
             let pooled = match self.pooling {
                 PoolingStrategy::Mean => {
+                    let mask = enc.get_attention_mask();
                     let mut vec = vec![0.0f32; self.dim];
                     let mut mask_sum = 0.0f32;
-                    for j in 0..seq_len {
-                        let m = attention_mask[i * seq_len + j] as f32;
+                    for (j, &m) in mask.iter().enumerate() {
+                        let m = m as f32;
                         mask_sum += m;
                         let offset = (i * seq_len + j) * self.dim;
                         for k in 0..self.dim {
@@ -1977,6 +2195,127 @@ mod tests {
     #[test]
     fn allow_any_override_bypasses_allowlist() {
         assert!(validate_model_allowed("evil/backdoored-model", true).is_ok());
+    }
+
+    #[test]
+    fn allow_any_needs_env_eligibility_and_project_opt_in() {
+        let root = Path::new("/home/user/proj");
+        let listed = "/home/user/proj\n";
+        assert!(allow_any_for_project_root(Some(root), true, listed));
+        // Env flag set, but a project that was never opted in: still refused.
+        assert!(!allow_any_for_project_root(
+            Some(root),
+            true,
+            "/home/user/other\n"
+        ));
+        // Opted-in project, but the env flag not set: still refused.
+        assert!(!allow_any_for_project_root(Some(root), false, listed));
+        assert!(!allow_any_for_project_root(None, true, listed));
+        assert!(!allow_any_for_project_root(None, false, ""));
+    }
+
+    #[test]
+    fn effective_bypass_allows_opted_in_project_and_refuses_other_projects() {
+        let listed = "/home/user/trusted\n";
+        let trusted = Path::new("/home/user/trusted");
+        let cloned = Path::new("/home/user/cloned-evil");
+        // The env flag is "set" (eligible) in both cases; only the opted-in
+        // project activates the bypass, so a cloned repo cannot ride a
+        // globally-exported flag.
+        assert!(
+            validate_model_allowed(
+                "evil/backdoored-model",
+                allow_any_for_project_root(Some(trusted), true, listed)
+            )
+            .is_ok(),
+            "opted-in project loads unpinned"
+        );
+        let err = validate_model_allowed(
+            "evil/backdoored-model",
+            allow_any_for_project_root(Some(cloned), true, listed),
+        )
+        .expect_err("flag set without project opt-in must still refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("allowed-models"),
+            "refusal should point at the opt-in file: {msg}"
+        );
+        assert!(
+            msg.contains("CODESAGE_ALLOW_ANY_MODEL"),
+            "refusal should still name the env half of the opt-in: {msg}"
+        );
+    }
+
+    #[test]
+    fn project_opt_in_ignores_comments_blanks_and_matches_trailing_slash() {
+        let root = Path::new("/home/user/proj");
+        let contents = "# trusted projects\n\n  /home/user/proj/  \n/home/user/other\n";
+        assert!(project_listed_in_allowlist(root, contents));
+        assert!(!project_listed_in_allowlist(
+            Path::new("/home/user/eve"),
+            contents
+        ));
+        assert!(
+            !project_listed_in_allowlist(root, "# /home/user/proj\n"),
+            "a commented-out entry must not opt a project in"
+        );
+    }
+
+    #[test]
+    fn project_root_discovery_walks_up_to_the_codesage_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".codesage")).unwrap();
+        let nested = dir.path().join("a").join("b");
+        fs::create_dir_all(&nested).unwrap();
+        assert_eq!(
+            find_project_root_from(&nested),
+            Some(dir.path().to_path_buf())
+        );
+        assert_eq!(
+            find_project_root_from(dir.path()),
+            Some(dir.path().to_path_buf())
+        );
+
+        let bare = tempfile::tempdir().unwrap();
+        assert_eq!(find_project_root_from(bare.path()), None);
+    }
+
+    #[test]
+    fn allowlist_path_prefers_xdg_over_home_and_fails_closed() {
+        assert_eq!(
+            user_allowlist_path_from(Some(OsStr::new("/xdg")), Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/xdg/codesage/allowed-models"))
+        );
+        assert_eq!(
+            user_allowlist_path_from(None, Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/home/u/.config/codesage/allowed-models"))
+        );
+        // Empty values are the same as unset (mirrors the HF_HOME/HOME
+        // handling): XDG falls back to HOME, and no home fails closed.
+        assert_eq!(
+            user_allowlist_path_from(Some(OsStr::new("")), Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/home/u/.config/codesage/allowed-models"))
+        );
+        assert_eq!(user_allowlist_path_from(None, None), None);
+        assert_eq!(user_allowlist_path_from(None, Some(OsStr::new(""))), None);
+    }
+
+    #[test]
+    fn unpinned_warning_names_model_and_resolved_revision() {
+        let msg = unpinned_load_message("evil/backdoored-model", None);
+        assert!(
+            msg.contains("evil/backdoored-model"),
+            "warning must name the model: {msg}"
+        );
+        assert!(
+            msg.contains("unpinned"),
+            "warning must say the load is unpinned: {msg}"
+        );
+        let msg = unpinned_load_message("evil/backdoored-model", Some("abc123"));
+        assert!(
+            msg.contains("evil/backdoored-model") && msg.contains("abc123"),
+            "warning must name model and revision: {msg}"
+        );
     }
 
     #[test]
@@ -2762,6 +3101,176 @@ mod tests {
         assert!(
             msg.contains("libcudnn") && msg.contains("libcublas"),
             "error should name the missing math libraries: {msg}"
+        );
+    }
+
+    /// Serializes the env-seam tests below: `HF_HOME`, `HOME`, and
+    /// `ORT_DYLIB_PATH` are process-global and the harness runs tests on
+    /// threads. Every test below restores what it touches via [`SavedEnv`].
+    fn env_lock() -> std::sync::LockResult<std::sync::MutexGuard<'static, ()>> {
+        static LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
+        LOCK.lock()
+    }
+
+    /// Saves one env var and restores it on drop, so a serial env-seam test
+    /// cannot leak into another test if it panics mid-mutation.
+    struct SavedEnv {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl SavedEnv {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, old }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let old = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, old }
+        }
+    }
+
+    impl Drop for SavedEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.old {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hf_cache_prefers_hf_home_over_home() {
+        let _lock = env_lock().unwrap_or_else(PoisonError::into_inner);
+        let hf_home = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _hf = SavedEnv::set("HF_HOME", hf_home.path().to_str().unwrap());
+        let _home = SavedEnv::set("HOME", home.path().to_str().unwrap());
+
+        let cache = hf_cache_from_env().expect("a set HF_HOME must resolve");
+        assert_eq!(
+            cache.path(),
+            &hf_home.path().join("hub"),
+            "HF_HOME wins over HOME, exactly as hf-hub reads it"
+        );
+        // The download client builds from that same root without touching
+        // the network: construction is the seam under test, not the hub.
+        hf_api().expect("client construction from the resolved cache must succeed");
+    }
+
+    #[test]
+    fn hf_cache_falls_back_to_home_when_hf_home_unset() {
+        let _lock = env_lock().unwrap_or_else(PoisonError::into_inner);
+        let home = tempfile::tempdir().unwrap();
+        let _hf = SavedEnv::remove("HF_HOME");
+        let _home = SavedEnv::set("HOME", home.path().to_str().unwrap());
+
+        let cache = hf_cache_from_env().expect("a set HOME must resolve");
+        assert_eq!(
+            cache.path(),
+            &home.path().join(".cache").join("huggingface").join("hub")
+        );
+    }
+
+    #[test]
+    fn hf_cache_is_unresolvable_without_hf_home_or_home() {
+        let _lock = env_lock().unwrap_or_else(PoisonError::into_inner);
+        let _hf = SavedEnv::remove("HF_HOME");
+        let _home = SavedEnv::remove("HOME");
+
+        assert!(
+            hf_cache_from_env().is_none(),
+            "with neither variable set there is no cache root (and no HOME-less panic)"
+        );
+        let err = hf_api().expect_err("an unresolvable cache root must be an error, not a panic");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("HF_HOME") && msg.contains("HOME"),
+            "the error must name both variables so the fix is actionable: {msg}"
+        );
+
+        let _empty_home = SavedEnv::set("HOME", "");
+        assert!(
+            hf_cache_from_env().is_none(),
+            "an empty HOME resolves nothing either"
+        );
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    #[test]
+    fn empty_ort_dylib_path_counts_as_unset() {
+        let _lock = env_lock().unwrap_or_else(PoisonError::into_inner);
+        let _empty = SavedEnv::set("ORT_DYLIB_PATH", "");
+        assert_eq!(
+            ort_dylib_path_from_env(),
+            None,
+            "an empty ORT_DYLIB_PATH must fall through to discovery instead of \
+             counting as caller-takes-control and hard-failing inside ORT"
+        );
+        {
+            let _set = SavedEnv::set("ORT_DYLIB_PATH", "/tmp/libonnxruntime.so");
+            assert_eq!(
+                ort_dylib_path_from_env(),
+                Some(PathBuf::from("/tmp/libonnxruntime.so"))
+            );
+        }
+        let _unset = SavedEnv::remove("ORT_DYLIB_PATH");
+        assert_eq!(ort_dylib_path_from_env(), None);
+    }
+
+    #[test]
+    fn evicting_a_cached_artifact_purges_its_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        std::fs::write(&path, b"aaaaaaaaaaaaaaaaaaaa").unwrap();
+        let before = crate::fingerprint::artifact_read_count(&path);
+        let first = crate::fingerprint::cached_file_digest(&path).unwrap();
+        assert_eq!(crate::fingerprint::artifact_read_count(&path), before + 1);
+        // Same length, same mtime after the refetch: without a purge the
+        // (size, mtime) key would serve the evicted bytes' hash and trip a
+        // false supply-chain alarm in `verify_model_artifact_sha256`.
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        evict_cached_artifact(&path).unwrap();
+        assert!(!path.exists(), "eviction still removes the file");
+        std::fs::write(&path, b"bbbbbbbbbbbbbbbbbbbb").unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let second = crate::fingerprint::cached_file_digest(&path).unwrap();
+        assert_ne!(
+            second, first,
+            "the post-evict digest must reflect the refetched bytes, not the evicted ones"
+        );
+        assert_eq!(
+            crate::fingerprint::artifact_read_count(&path),
+            before + 2,
+            "the refetch must be re-read from disk, not served from memory"
+        );
+    }
+
+    #[test]
+    fn coreml_provider_is_attested_from_configuration() {
+        // There is no functional CoreML check (see the why-not at the
+        // provider selection in `load_onnx_session_with_provider`): ORT
+        // exposes no post-commit provider query, so the attested provider
+        // is the configured one. Pin that mapping here.
+        assert_eq!(
+            crate::fingerprint::configured_execution_provider("coreml"),
+            "coreml"
+        );
+        assert_eq!(
+            crate::fingerprint::configured_execution_provider("CoreML"),
+            "coreml"
+        );
+        assert_eq!(
+            crate::fingerprint::configured_execution_provider("cpu"),
+            "cpu"
         );
     }
 }

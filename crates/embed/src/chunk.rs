@@ -6,6 +6,11 @@ use codesage_protocol::Chunk;
 // 1000-char value paired with a 256-token cap caused silent truncation
 // on dense chunks; the cap-and-chunk pair was raised together. See
 // `bench/history/cap512-1500-2026-05-04.md` for the validating bench.
+//
+// The budgets below are character counts, not bytes: byte accounting
+// over-chunks multibyte text ~2-3x (a 1500-byte CJK slice is only ~500
+// chars). Byte offsets are still used for slicing and line numbers —
+// only the size comparisons count characters.
 pub const DEFAULT_CHUNK_SIZE: usize = 1500;
 pub const DEFAULT_MIN_CHUNK_SIZE: usize = 350;
 pub const DEFAULT_CHUNK_OVERLAP: usize = 200;
@@ -13,7 +18,11 @@ pub const DEFAULT_CHUNK_OVERLAP: usize = 200;
 /// Version of the splitting algorithm below. Bump it when a change to
 /// `chunk_text` can produce different chunk texts for the same input; it is
 /// part of the semantic fingerprint that gates stored-vector reuse.
-pub const CHUNKER_VERSION: u32 = 1;
+///
+/// Version 2 switched the budgets from bytes to characters: ASCII chunking
+/// is unchanged (one byte per char), multibyte text now chunks at the
+/// designed granularity instead of ~2-3x finer.
+pub const CHUNKER_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct ChunkConfig {
@@ -47,7 +56,7 @@ pub fn chunk_text(content: &str, config: &ChunkConfig) -> Vec<Chunk> {
 
     let raw = split_recursive(content, chunk_size, 0);
 
-    let mut merged = merge_small_chunks(raw, config.min_chunk_size, chunk_size);
+    let mut merged = merge_small_chunks(raw, content, config.min_chunk_size, chunk_size);
 
     apply_overlap(&mut merged, content, config.overlap, chunk_size);
 
@@ -98,7 +107,10 @@ struct Segment {
 }
 
 fn split_recursive(text: &str, max_size: usize, sep_idx: usize) -> Vec<Segment> {
-    if text.len() <= max_size {
+    // Character budget, byte offsets: `text.len() <= max_size` in bytes
+    // implies the same in chars, so the cheap check runs first and the
+    // O(n) count only pays for inputs that might actually split.
+    if text.len() <= max_size || text.chars().count() <= max_size {
         return vec![Segment {
             start: 0,
             end: text.len(),
@@ -109,8 +121,9 @@ fn split_recursive(text: &str, max_size: usize, sep_idx: usize) -> Vec<Segment> 
         let mut segments = Vec::new();
         let mut pos = 0;
         while pos < text.len() {
-            let end = (pos + max_size).min(text.len());
-            let end = find_char_boundary(text, end);
+            // `max_size >= 1` (clamped at the entry) advances at least one
+            // char, so this loop always terminates.
+            let end = advance_by_chars(text, pos, max_size);
             segments.push(Segment { start: pos, end });
             pos = end;
         }
@@ -123,16 +136,23 @@ fn split_recursive(text: &str, max_size: usize, sep_idx: usize) -> Vec<Segment> 
     let mut segments = Vec::new();
     let mut current_start = 0;
     let mut current_end = 0;
+    // Characters in `text[current_start..current_end]`, tracked
+    // incrementally: recounting the whole candidate per part would be
+    // quadratic in the part count. Parts tile the input contiguously, so
+    // each part's chars are counted exactly once.
+    let mut current_len = 0;
 
     for (part_start, part_end) in parts {
+        let part_len = text[part_start..part_end].chars().count();
         let candidate_len = if current_start == current_end {
-            part_end - part_start
+            part_len
         } else {
-            part_end - current_start
+            current_len + part_len
         };
 
         if candidate_len <= max_size {
             current_end = part_end;
+            current_len = candidate_len;
         } else {
             if current_start < current_end {
                 segments.push(Segment {
@@ -142,7 +162,7 @@ fn split_recursive(text: &str, max_size: usize, sep_idx: usize) -> Vec<Segment> 
             }
 
             let part_text = &text[part_start..part_end];
-            if part_text.len() > max_size {
+            if part_len > max_size {
                 let sub = split_recursive(part_text, max_size, sep_idx + 1);
                 for s in sub {
                     segments.push(Segment {
@@ -152,9 +172,11 @@ fn split_recursive(text: &str, max_size: usize, sep_idx: usize) -> Vec<Segment> 
                 }
                 current_start = part_end;
                 current_end = part_end;
+                current_len = 0;
             } else {
                 current_start = part_start;
                 current_end = part_end;
+                current_len = part_len;
             }
         }
     }
@@ -188,11 +210,16 @@ fn split_keeping_offsets(text: &str, sep: &str) -> Vec<(usize, usize)> {
     parts
 }
 
-fn segment_len(seg: &Segment) -> usize {
-    seg.end - seg.start
+fn segment_chars(text: &str, seg: &Segment) -> usize {
+    text[seg.start..seg.end].chars().count()
 }
 
-fn merge_small_chunks(segments: Vec<Segment>, min_size: usize, max_size: usize) -> Vec<Segment> {
+fn merge_small_chunks(
+    segments: Vec<Segment>,
+    text: &str,
+    min_size: usize,
+    max_size: usize,
+) -> Vec<Segment> {
     if segments.is_empty() {
         return segments;
     }
@@ -203,8 +230,8 @@ fn merge_small_chunks(segments: Vec<Segment>, min_size: usize, max_size: usize) 
         // fits `max_size` — so a small segment following a large one is also
         // absorbed, not just a small predecessor.
         if let Some(last) = merged.last_mut()
-            && (segment_len(last) < min_size || segment_len(&seg) < min_size)
-            && segment_len(last) + segment_len(&seg) <= max_size
+            && (segment_chars(text, last) < min_size || segment_chars(text, &seg) < min_size)
+            && segment_chars(text, last) + segment_chars(text, &seg) <= max_size
         {
             last.end = seg.end;
             continue;
@@ -214,8 +241,9 @@ fn merge_small_chunks(segments: Vec<Segment>, min_size: usize, max_size: usize) 
 
     if merged.len() > 1 {
         let last_idx = merged.len() - 1;
-        if segment_len(&merged[last_idx]) < min_size {
-            let combined = segment_len(&merged[last_idx - 1]) + segment_len(&merged[last_idx]);
+        if segment_chars(text, &merged[last_idx]) < min_size {
+            let combined =
+                segment_chars(text, &merged[last_idx - 1]) + segment_chars(text, &merged[last_idx]);
             if combined <= max_size {
                 let last_end = merged[last_idx].end;
                 merged[last_idx - 1].end = last_end;
@@ -234,14 +262,41 @@ fn apply_overlap(segments: &mut [Segment], text: &str, overlap: usize, chunk_siz
 
     for i in 1..segments.len() {
         let prev_end = segments[i - 1].end;
-        let target_start = prev_end.saturating_sub(overlap);
+        let target_start = retreat_by_chars(text, prev_end, overlap);
         let new_start = find_line_boundary_after(text, target_start);
-        let min_start = segments[i].end.saturating_sub(chunk_size);
+        // The overlap must not push the chunk over budget: the earliest
+        // start that still fits `chunk_size` characters in `[start, end]`.
+        let min_start = retreat_by_chars(text, segments[i].end, chunk_size);
         let new_start = new_start.max(min_start);
         if new_start < segments[i].start {
             segments[i].start = new_start;
         }
     }
+}
+
+/// Byte offset `n` characters after `pos`, clamped to `text.len()`. Always a
+/// char boundary; advances at least one character while `pos` is inside the
+/// text and `n >= 1`.
+fn advance_by_chars(text: &str, pos: usize, n: usize) -> usize {
+    text[pos..]
+        .char_indices()
+        .nth(n)
+        .map_or(text.len(), |(off, _)| pos + off)
+}
+
+/// Byte offset `n` characters before `pos`, clamped to 0. Walks back over
+/// UTF-8 continuation bytes, so the result is always a char boundary.
+fn retreat_by_chars(text: &str, pos: usize, n: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut p = pos.min(text.len());
+    let mut remaining = n;
+    while remaining > 0 && p > 0 {
+        p -= 1;
+        if (bytes[p] & 0xC0) != 0x80 {
+            remaining -= 1;
+        }
+    }
+    p
 }
 
 fn find_line_boundary_after(text: &str, pos: usize) -> usize {
@@ -568,5 +623,46 @@ mod tests {
         assert!(!chunks.is_empty());
         let total_coverage: usize = chunks.iter().map(|c| c.text.len()).sum();
         assert!(total_coverage >= text.len());
+    }
+
+    #[test]
+    fn budgets_count_characters_not_bytes() {
+        // 600 CJK chars are 1800 bytes: over a 1500-byte budget but under
+        // a 1500-char one. Byte accounting hard-split this input in two.
+        let text = "中".repeat(600);
+        let config = ChunkConfig {
+            chunk_size: 1500,
+            min_chunk_size: 100,
+            overlap: 0,
+        };
+        let chunks = chunk_text(&text, &config);
+        assert_eq!(
+            chunks.len(),
+            1,
+            "600 chars must fit one 1500-char chunk despite being 1800 bytes"
+        );
+        assert_eq!(chunks[0].text.chars().count(), 600);
+
+        // Overlapped multibyte chunks stay within the char budget on
+        // char boundaries (slicing would panic otherwise).
+        let text = "あ".repeat(1000);
+        let config = ChunkConfig {
+            chunk_size: 400,
+            min_chunk_size: 50,
+            overlap: 100,
+        };
+        let chunks = chunk_text(&text, &config);
+        assert!(chunks.len() >= 2, "1000 chars need several 400-char chunks");
+        for chunk in &chunks {
+            assert!(
+                chunk.text.chars().count() <= 400,
+                "chunk exceeds char budget: {} chars",
+                chunk.text.chars().count()
+            );
+            assert!(
+                text.is_char_boundary(chunk.start_byte) && text.is_char_boundary(chunk.end_byte),
+                "chunk boundary splits a character"
+            );
+        }
     }
 }

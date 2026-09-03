@@ -98,11 +98,11 @@ pub struct EmbeddingConfig {
     #[serde(default)]
     pub reranker: Option<String>,
     /// Override the pooling strategy. When omitted, falls back to a
-    /// model-name heuristic (`bge-*` → CLS, everything else → Mean). The
-    /// heuristic is silent and wrong for any non-`bge-` model that uses CLS
-    /// pooling (intfloat/e5-*, etc.) or any `bge-` model that uses Mean —
-    /// both produce semantically wrong vectors with no error. Set this
-    /// explicitly when picking a non-default model.
+    /// case-insensitive model-name heuristic (`bge-*` → CLS, everything
+    /// else → Mean). The heuristic is silent and wrong for any non-`bge-`
+    /// model that uses CLS pooling (intfloat/e5-*, etc.) or any `bge-`
+    /// model that uses Mean — both produce semantically wrong vectors with
+    /// no error. Set this explicitly when picking a non-default model.
     #[serde(default)]
     pub pooling: Option<PoolingStrategy>,
     /// Embedding batch size. When omitted, falls back to
@@ -161,13 +161,18 @@ impl EmbeddingConfig {
         if let Some(p) = self.pooling {
             return p;
         }
-        if self.model.contains("bge-") {
+        // Lowercase once: the `bge-` match used to be case-sensitive while
+        // the `minilm` gate below was not, so an uppercase `BGE-...` id (or
+        // any custom CLS model) fell through to mean pooling and embedded
+        // wrong vectors behind only a log line.
+        let model = self.model.to_lowercase();
+        if model.contains("bge-") {
             PoolingStrategy::Cls
         } else {
             // Mean is correct for MiniLM/E5-style models but wrong for any
             // CLS model not named `bge-*`. Warn once so a silent pooling
             // mismatch on a custom model surfaces.
-            if !self.model.to_lowercase().contains("minilm") {
+            if !model.contains("minilm") {
                 static WARNED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
                 if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -317,6 +322,47 @@ mod batch_size_tests {
             err.to_string().contains("exceeds max supported batch size"),
             "unexpected error: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod pooling_tests {
+    use super::*;
+
+    fn config_for(model: &str) -> EmbeddingConfig {
+        EmbeddingConfig {
+            model: model.to_string(),
+            ..EmbeddingConfig::default()
+        }
+    }
+
+    #[test]
+    fn pooling_heuristic_is_case_insensitive() {
+        assert_eq!(
+            config_for("BAAI/bge-m3").pooling_strategy(),
+            PoolingStrategy::Cls,
+            "an uppercase BGE id must take the CLS path like its lowercase spelling"
+        );
+        assert_eq!(
+            config_for("baai/BGE-M3").pooling_strategy(),
+            PoolingStrategy::Cls
+        );
+        assert_eq!(
+            config_for("sentence-transformers/all-MiniLM-L6-v2").pooling_strategy(),
+            PoolingStrategy::Mean
+        );
+        assert_eq!(
+            config_for("sentence-transformers/ALL-MINILM-L6-V2").pooling_strategy(),
+            PoolingStrategy::Mean,
+            "an uppercase MiniLM id must stay on the mean path"
+        );
+    }
+
+    #[test]
+    fn explicit_pooling_overrides_the_heuristic() {
+        let mut cfg = config_for("BAAI/bge-m3");
+        cfg.pooling = Some(PoolingStrategy::Mean);
+        assert_eq!(cfg.pooling_strategy(), PoolingStrategy::Mean);
     }
 }
 

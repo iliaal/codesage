@@ -173,7 +173,7 @@ impl Database {
         // Each chunk inserts a vec0 row and a matching FTS5 row, keyed by the
         // same rowid. A failure between the two leaves vec0 with an orphaned
         // row that has no FTS sidecar entry — `repair_fts_sidecar` heals this
-        // on the next open, but until then BM25 search misses the row. All
+        // on the next write-path open, but until then BM25 search misses the row. All
         // current callers wrap in `execute_batch`, but pulling the BEGIN /
         // COMMIT in here keeps the function safe against future direct use.
         // The savepoint is a no-op when the caller already opened a tx.

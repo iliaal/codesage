@@ -270,6 +270,7 @@ dependencies = [
  "notify",
  "parking_lot",
  "rmcp",
+ "rusqlite",
  "schemars",
  "serde",
  "serde_json",

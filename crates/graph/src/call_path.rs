@@ -42,9 +42,13 @@ fn is_call_edge(kind: ReferenceKind) -> bool {
 /// "stopped looking", not "no path".
 const MAX_VISITED: usize = 4000;
 
-/// Call sites resolved per expanded symbol. Resolution runs a query per
-/// reference, so without this a hub symbol turns one expansion into thousands
-/// of queries and `MAX_VISITED` never gets a chance to stop it.
+/// Call sites resolved per expanded symbol. Resolution runs one query per
+/// distinct callee name (cached per `(file, name)` like
+/// `impact.rs::references_for_symbol`); without the cache a hub body repeating
+/// one callee name re-runs the same import-filtered lookup per call site.
+/// The cap still counts examined call-site references, not distinct names, so
+/// a hub symbol with hundreds of call sites stops at the same point — with
+/// far fewer queries spent getting there.
 const MAX_REFS_PER_SYMBOL: usize = 200;
 
 /// A definition's identity. `Symbol` carries no id, so key on the triple that
@@ -148,6 +152,10 @@ fn callees_of(db: &Database, sym: &Symbol) -> Result<Vec<(Symbol, u32)>> {
     let refs = db.references_in_file_range(&sym.file_path, sym.line_start, sym.line_end)?;
     let mut out = Vec::new();
     let mut seen: HashSet<SymbolKey> = HashSet::new();
+    // Same key shape as `impact.rs::references_for_symbol`: every reference
+    // here shares one caller file, so this dedupes repeat call sites of one
+    // name (`sink(); sink(); …`) to a single resolution.
+    let mut cache: HashMap<(String, String), Vec<Symbol>> = HashMap::new();
     let mut examined = 0usize;
     for r in refs {
         if !is_call_edge(r.kind) {
@@ -178,7 +186,12 @@ fn callees_of(db: &Database, sym: &Symbol) -> Result<Vec<(Symbol, u32)>> {
             );
             break;
         }
-        for def in resolve_callee_definitions(db, &sym.file_path, &r.to_name)? {
+        let cache_key = (sym.file_path.clone(), r.to_name.clone());
+        if !cache.contains_key(&cache_key) {
+            let resolved = resolve_callee_definitions(db, &sym.file_path, &r.to_name)?;
+            cache.insert(cache_key.clone(), resolved);
+        }
+        for def in &cache[&cache_key] {
             // A symbol whose body spans the call site is its own container,
             // not its callee; without this a recursive or self-referencing
             // definition re-enters itself.
@@ -188,9 +201,9 @@ fn callees_of(db: &Database, sym: &Symbol) -> Result<Vec<(Symbol, u32)>> {
             {
                 continue;
             }
-            let k = key_of(&def);
+            let k = key_of(def);
             if seen.insert(k) {
-                out.push((def, r.line));
+                out.push((def.clone(), r.line));
             }
         }
     }

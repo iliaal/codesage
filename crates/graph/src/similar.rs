@@ -139,6 +139,22 @@ fn build_language_index(rows: Arc<Vec<StoredFingerprint>>) -> LanguageFingerprin
     LanguageFingerprintIndex { rows, buckets }
 }
 
+/// Upper bound on cached per-language fingerprint snapshots. Cache keys embed
+/// the index-state token, so every reindex mints fresh keys and stale entries
+/// would otherwise accumulate for the daemon's lifetime.
+const FINGERPRINT_CACHE_CAP: usize = 32;
+
+/// Recover from a poisoned fingerprint-cache lock instead of panicking. A
+/// panic in a tool handler is silently swallowed by rmcp (no `catch_unwind`),
+/// hanging the client; the guarded map is still inspected, so at worst a
+/// torn write yields a stale-snapshot miss and a fresh DB read.
+fn lock_fingerprint_cache() -> std::sync::MutexGuard<'static, FingerprintCache> {
+    FINGERPRINT_CACHE.lock().unwrap_or_else(|e| {
+        tracing::warn!("fingerprint cache lock poisoned; recovering with guarded state");
+        e.into_inner()
+    })
+}
+
 fn fingerprints_for_language_cached(
     db: &Database,
     language: &str,
@@ -148,9 +164,7 @@ fn fingerprints_for_language_cached(
     };
     let key = format!("{key}::{language}");
     let token = db.fingerprint_validity_token()?;
-    if let Some((_, cached)) = FINGERPRINT_CACHE
-        .lock()
-        .expect("fingerprint cache lock poisoned")
+    if let Some((_, cached)) = lock_fingerprint_cache()
         .get(&key)
         .filter(|(cached_token, _)| *cached_token == token)
     {
@@ -158,9 +172,13 @@ fn fingerprints_for_language_cached(
     }
 
     let all = Arc::new(db.fingerprints_for_language(language)?);
-    FINGERPRINT_CACHE
-        .lock()
-        .expect("fingerprint cache lock poisoned")
-        .insert(key, (token, Arc::clone(&all)));
+    let mut cache = lock_fingerprint_cache();
+    // Simple eviction: drop the whole map at capacity. Demand is a handful
+    // of languages per query, so clearing keeps the bound with no LRU
+    // bookkeeping; the next query reloads what it still needs.
+    if cache.len() >= FINGERPRINT_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(key, (token, Arc::clone(&all)));
     Ok(all)
 }

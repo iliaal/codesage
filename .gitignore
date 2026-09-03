@@ -45,3 +45,8 @@ id_ed25519*
 credentials.json
 service-account*.json
 __pycache__/
+
+# Local-only planning notes (backlog, spike write-ups). Untracked by
+# intent; listed here so `git add -A` can't sweep them into a commit.
+/TODO.md
+/docs/spikes/cbm-ideas.md

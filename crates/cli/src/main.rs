@@ -263,7 +263,7 @@ enum Commands {
     Install {
         /// Agent to register with: `codex`, `opencode`, or `all`
         target: String,
-        /// Register globally (user-level) instead of project-local
+        /// Register globally (user-level) instead of project-local. Works outside onboarded projects; with no project resolved no `--project` default is baked in and the server resolves the project per call
         #[arg(long)]
         global: bool,
     },
@@ -271,7 +271,7 @@ enum Commands {
     Uninstall {
         /// Agent to remove from: `codex`, `opencode`, or `all`
         target: String,
-        /// Target the global (user-level) registration instead of project-local
+        /// Target the global (user-level) registration instead of project-local (works outside onboarded projects)
         #[arg(long)]
         global: bool,
     },
@@ -957,7 +957,14 @@ where
 /// and must not pay the preload, whose CUDA dlopen can abort under a restricted
 /// sandbox. `mcp` is listed for the `--direct` server; the bare `mcp` shim is
 /// already excluded earlier via `is_shim_invocation`.
-const EMBEDDER_COMMANDS: &[&str] = &["search", "index", "export", "watch", "daemon", "mcp"];
+const EMBEDDER_COMMANDS: &[&str] = &["search", "index", "export", "mcp"];
+
+/// `watch`/`daemon` actions that never touch a model: status reads a JSON
+/// file, stop/start touch a marker file. `watch run` and a bare/`run` daemon
+/// build an embedder and need the preload; anything unrecognized preloads,
+/// the safe direction (see `is_shim_argv`).
+const WATCH_PURE_ACTIONS: &[&str] = &["status", "stop", "start"];
+const DAEMON_PURE_ACTIONS: &[&str] = &["status", "stop"];
 
 fn uses_embedder() -> bool {
     argv_uses_embedder(std::env::args_os().skip(1))
@@ -968,22 +975,60 @@ where
     I: IntoIterator,
     I::Item: AsRef<std::ffi::OsStr>,
 {
+    // First two positionals: the subcommand and, for `watch`/`daemon`, its
+    // action. Clap-style flags are skipped; so is the value of the global
+    // `--runtime-dir`, which otherwise `daemon --runtime-dir <dir> status`
+    // would misread as the action.
+    let mut positionals: Vec<String> = Vec::new();
+    let mut skip_value = false;
     for a in args {
         let a = a.as_ref();
         if a == "--" {
             break;
         }
-        // Skip clap-style global flags that may precede the subcommand.
-        if a.to_str().is_some_and(|s| s.starts_with('-')) {
+        if skip_value {
+            skip_value = false;
             continue;
         }
-        // First positional token is the subcommand. A non-UTF-8 token is never a
-        // known embedder command, so it falls through to the safe direction
-        // (skip preload) — structural commands never embed, and the Embedder::new
-        // fallback covers anything that does.
-        return a.to_str().is_some_and(|s| EMBEDDER_COMMANDS.contains(&s));
+        let Some(s) = a.to_str() else {
+            // A non-UTF-8 token is never a known subcommand or action, so it
+            // ends the parse the safe way: skip the preload (structural
+            // commands never embed, and the Embedder::new fallback covers
+            // anything that does).
+            if positionals.is_empty() {
+                return false;
+            }
+            positionals.push(String::new());
+            continue;
+        };
+        if s.starts_with('-') {
+            if s == "--runtime-dir" {
+                skip_value = true;
+            }
+            continue;
+        }
+        positionals.push(s.to_string());
+        if positionals.len() == 2 {
+            break;
+        }
     }
-    false
+    let (sub, action): (&str, Option<&str>) = match positionals.as_slice() {
+        [] => return false,
+        [sub] => (sub.as_str(), None),
+        [sub, action, ..] => (sub.as_str(), Some(action.as_str())),
+    };
+    uses_embedder_subcommand(sub, action)
+}
+
+fn uses_embedder_subcommand(sub: &str, action: Option<&str>) -> bool {
+    match sub {
+        // `watch status`/`stop`/`start` only read a status file or flip a
+        // marker; only `run` builds an embedder. `daemon status`/`stop` are
+        // likewise metadata-only, while a bare `daemon` runs the server.
+        "watch" => !matches!(action, Some(a) if WATCH_PURE_ACTIONS.contains(&a)),
+        "daemon" => !matches!(action, Some(a) if DAEMON_PURE_ACTIONS.contains(&a)),
+        sub => EMBEDDER_COMMANDS.contains(&sub),
+    }
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -1570,6 +1615,41 @@ mod tests {
             assert!(
                 argv_uses_embedder(argv(&[cmd])),
                 "expected preload for {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn embedder_gate_is_subcommand_aware_for_watch_and_daemon() {
+        // Metadata-only actions never build an embedder; preloading the CUDA
+        // stack for them aborts under a restricted sandbox.
+        for args in [
+            vec!["watch", "status"],
+            vec!["watch", "stop"],
+            vec!["watch", "start"],
+            vec!["daemon", "status"],
+            vec!["daemon", "stop"],
+            vec!["daemon", "--runtime-dir", "/tmp/x", "status"],
+            vec!["daemon", "--runtime-dir", "/tmp/x", "stop"],
+        ] {
+            assert!(
+                !argv_uses_embedder(argv(&args)),
+                "expected skip for {args:?}"
+            );
+        }
+        // `run` (and a bare `daemon`, which runs) builds an embedder.
+        for args in [
+            vec!["watch"],
+            vec!["watch", "run"],
+            vec!["watch", "run", "/tmp/proj"],
+            vec!["daemon"],
+            vec!["daemon", "run"],
+            vec!["daemon", "--runtime-dir", "/tmp/x", "run"],
+            vec!["watch", "bogus-action"],
+        ] {
+            assert!(
+                argv_uses_embedder(argv(&args)),
+                "expected preload for {args:?}"
             );
         }
     }

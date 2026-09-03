@@ -532,3 +532,38 @@ fn nested_function_in_rust_method_is_not_a_method() {
     assert_eq!(method.kind, SymbolKind::Method);
     assert_eq!(method.qualified_name, "Foo::method");
 }
+#[test]
+fn cpp_forward_declarations_emit_no_symbols() {
+    // `class Foo;` parses as a bodiless class_specifier; without the `body:`
+    // requirement it emitted a phantom Class for a type defined elsewhere.
+    // Defined types (including template-wrapped) still surface.
+    let src = "class Fwd;\n\
+               struct Pod;\n\
+               union U;\n\
+               enum E : int;\n\
+               enum class EC;\n\
+               class Real { void bar(); };\n\
+               template<class T> class Box { T v; };\n\
+               enum Color { Red, Green };\n";
+    let syms = symbols_from_source(src, Language::Cpp);
+    for phantom in ["Fwd", "Pod", "U", "E", "EC"] {
+        assert!(
+            !syms.iter().any(|s| s.name == phantom),
+            "forward declaration {phantom} must not emit a symbol, got {syms:?}"
+        );
+    }
+    assert!(has_symbol(&syms, "Real", SymbolKind::Class));
+    assert!(has_symbol(&syms, "Box", SymbolKind::Class));
+    assert!(has_symbol(&syms, "Color", SymbolKind::Enum));
+}
+
+#[test]
+fn javascript_module_exports_forms_are_captured() {
+    // CJS entry points: `module.exports = ...` names the entry "exports",
+    // `module.exports.X = ...` names X — parity with the `exports.X` arm.
+    let src = "module.exports = { start };\n\
+               module.exports.stop = function () {};\n";
+    let syms = symbols_from_source(src, Language::JavaScript);
+    assert!(has_symbol(&syms, "exports", SymbolKind::Constant));
+    assert!(has_symbol(&syms, "stop", SymbolKind::Constant));
+}

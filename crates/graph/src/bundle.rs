@@ -200,11 +200,16 @@ pub fn export_context_for_symbol(
         });
     }
 
-    let defs: Vec<Symbol> = defs.into_iter().take(req.limit).collect();
+    // A zero limit would otherwise return `found: true` with empty
+    // everything — the symbol resolved, but every `take(0)`/cap below drops
+    // it again. `feature_bundle` normalizes 0 to 5; do the same here so both
+    // entry points agree on what "no limit given" means.
+    let limit = if req.limit == 0 { 5 } else { req.limit };
+    let defs: Vec<Symbol> = defs.into_iter().take(limit).collect();
     let mut primary: Vec<SearchResult> = Vec::new();
     let mut primary_keys: HashSet<(String, u32)> = HashSet::new();
     for def in &defs {
-        if primary.len() >= req.limit {
+        if primary.len() >= limit {
             break;
         }
         add_related_from_file(
@@ -225,7 +230,7 @@ pub fn export_context_for_symbol(
             &defs,
             req.include_callers,
             req.include_callees,
-            req.limit,
+            limit,
             &mut related,
             &mut related_keys,
         )?;
@@ -559,6 +564,14 @@ fn add_callees_for_symbol(
     Ok(())
 }
 
+/// Case-insensitive qualified-name equality for the second tier of
+/// [`resolve_callee_definitions`]. ASCII-only by design: symbol spellings
+/// that differ beyond ASCII case are different symbols, not spelling
+/// variants, and must fall through to the import-evidence filter instead.
+fn qualified_name_matches_normalized(sym: &Symbol, to_name: &str) -> bool {
+    sym.qualified_name.eq_ignore_ascii_case(to_name) || sym.name.eq_ignore_ascii_case(to_name)
+}
+
 pub(crate) fn resolve_callee_definitions(
     db: &Database,
     caller_file: &str,
@@ -566,10 +579,30 @@ pub(crate) fn resolve_callee_definitions(
 ) -> Result<Vec<Symbol>> {
     let candidates = db.find_symbols(to_name, None)?;
     if is_qualified_symbol_name(to_name) {
-        return Ok(candidates
-            .into_iter()
+        // Exact spelling first, preserving current behavior wherever the
+        // callsite spells the name exactly as indexed.
+        let exact: Vec<Symbol> = candidates
+            .iter()
             .filter(|s| s.qualified_name == to_name || s.name == to_name)
-            .collect());
+            .cloned()
+            .collect();
+        if !exact.is_empty() {
+            return Ok(exact);
+        }
+        // Normalized pass for case-only mismatches (PHP class names are
+        // case-insensitive; barrels re-export under a different case). When
+        // even that finds nothing, fall through to the import-evidence
+        // filter below instead of returning empty: a qualified callsite
+        // whose spelling matches neither form previously dropped every
+        // reverse edge for the symbol.
+        let folded: Vec<Symbol> = candidates
+            .iter()
+            .filter(|s| qualified_name_matches_normalized(s, to_name))
+            .cloned()
+            .collect();
+        if !folded.is_empty() {
+            return Ok(folded);
+        }
     }
     if candidates.len() <= 1 {
         return Ok(candidates);
@@ -749,9 +782,11 @@ fn is_path_specifier(s: &str) -> bool {
 
 /// Extensions a path specifier may omit or misname. TypeScript ESM is the
 /// reason `.js` maps to `.ts`: the spec requires the *emitted* extension in the
-/// specifier, so `./foo.js` routinely refers to `foo.ts` on disk.
-const IMPORT_EXTENSIONS: [&str; 10] = [
-    "js", "mjs", "cjs", "jsx", "ts", "tsx", "d.ts", "h", "hpp", "py",
+/// specifier, so `./foo.js` routinely refers to `foo.ts` on disk. The same
+/// swap covers the explicit module flavors: `./foo.mjs` for `foo.mts` and
+/// `./foo.cjs` for `foo.cts` on disk.
+const IMPORT_EXTENSIONS: [&str; 12] = [
+    "js", "mjs", "cjs", "jsx", "ts", "tsx", "mts", "cts", "d.ts", "h", "hpp", "py",
 ];
 
 fn import_path_targets_file(spec: &str, caller_file: &str, sym_file: &str) -> bool {
@@ -906,6 +941,38 @@ mod import_path_tests {
             "./utils",
             "src/client.js",
             "src/utils/index.js"
+        ));
+    }
+
+    #[test]
+    fn mts_cts_extensions_resolve_like_their_emit_targets() {
+        // `.mts`/`.cts` are indexed as TypeScript; the extension swap must
+        // admit them both bare and under their emitted `.mjs`/`.cjs` names.
+        assert!(import_path_targets_file(
+            "./foo",
+            "src/client.ts",
+            "src/foo.mts"
+        ));
+        assert!(import_path_targets_file(
+            "./foo",
+            "src/client.ts",
+            "src/foo.cts"
+        ));
+        assert!(import_path_targets_file(
+            "./foo.mjs",
+            "src/client.ts",
+            "src/foo.mts"
+        ));
+        assert!(import_path_targets_file(
+            "./foo.cjs",
+            "src/client.ts",
+            "src/foo.cts"
+        ));
+        // The directory-index form applies to them as well.
+        assert!(import_path_targets_file(
+            "./utils",
+            "src/client.ts",
+            "src/utils/index.mts"
         ));
     }
 

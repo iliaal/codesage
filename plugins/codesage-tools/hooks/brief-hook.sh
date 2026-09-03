@@ -34,9 +34,14 @@ FILE=${BASH_REMATCH[1]}
 # is fine — that is every Write of a new file.
 [[ -e $FILE && ! -f $FILE ]] && exit 0
 
-[[ $INPUT =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]] || exit 0
-SESSION=${BASH_REMATCH[1]}
-[[ -n $SESSION ]] && [[ $SESSION != *\\* ]] || exit 0
+# session_id is optional: a hook payload without one (or with an escaped,
+# non-decodable value) falls back to a session-less `codesage brief` call
+# below — ungated render, no repeat/cooldown/budget suppression — rather
+# than going fully silent. jq stays a hard prereq: without it the JSON
+# envelope cannot be built, so the hook stays silent per the never-block
+# contract above.
+[[ $INPUT =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]] && SESSION=${BASH_REMATCH[1]} || SESSION=""
+[[ $SESSION == *\\* ]] && SESSION=""
 
 # Onboarded-project check: walk up from the file's directory for
 # .codesage/index.db. Stat-only; exits before any process is spawned when the
@@ -54,11 +59,18 @@ done
 [[ -n $ROOT ]] || exit 0
 
 command -v codesage >/dev/null 2>&1 || exit 0
+# jq builds the JSON envelope below, so it is a hard prerequisite — without
+# it the hook stays silent (install jq to enable brief context).
 command -v jq >/dev/null 2>&1 || exit 0
 
 # `codesage brief` resolves the project by walking up from cwd, and expects a
-# root-relative path. Suppressed or empty briefs print nothing.
-PAYLOAD=$(cd "$ROOT" && codesage brief --session "$SESSION" -- "${FILE#"$ROOT"/}") || exit 0
+# root-relative path. Suppressed or empty briefs print nothing. Without a
+# session id the --session flag is omitted (session-less render).
+if [[ -n ${SESSION:-} ]]; then
+	PAYLOAD=$(cd "$ROOT" && codesage brief --session "$SESSION" -- "${FILE#"$ROOT"/}") || exit 0
+else
+	PAYLOAD=$(cd "$ROOT" && codesage brief -- "${FILE#"$ROOT"/}") || exit 0
+fi
 [[ -n $PAYLOAD ]] || exit 0
 
 jq -cn --arg ctx "$PAYLOAD" \

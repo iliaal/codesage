@@ -28,7 +28,7 @@ use codesage_protocol::{FeatureKind, Language};
 use regex::Regex;
 
 use crate::mappers::shared::{
-    is_safe_dir, is_safe_file, read_to_string_bounded, should_skip, walk_files,
+    is_safe_dir, is_safe_file, read_to_string_bounded, should_skip, sorted_read_dir, walk_files,
 };
 use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile, SeedTest};
 
@@ -167,9 +167,11 @@ fn read_go_package_name(root: &Path, dir_rel: &str) -> Option<String> {
         return None;
     }
     let pkg_re = Regex::new(r"(?m)^\s*package\s+([A-Za-z_][A-Za-z0-9_]*)").ok()?;
-    let entries = fs::read_dir(&dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
+    // Sorted lexicographic scan: in a mixed-package directory (two `package`
+    // clauses, invalid Go but common mid-refactor) the winner must not
+    // depend on readdir order, or the seed flips between cli-command and
+    // library across runs.
+    for path in sorted_read_dir(&dir) {
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
@@ -288,17 +290,16 @@ fn is_generated_go_file(abs: &Path, file_name: &str) -> bool {
 const IMPORT_CONTEXT_CAP_DEFAULT: usize = 24;
 
 // Env-overridable for per-project tuning (`CODESAGE_GO_IMPORT_CONTEXT_CAP`).
-// Cached on first read; values < 1 fall back to the default.
+// Read on every call: caching it in a `OnceLock` made mapper output depend
+// on which value the process happened to read first (env/process history),
+// so identical inputs mapped differently across runs and tests.
+// Values < 1 fall back to the default.
 fn import_context_cap() -> usize {
-    use std::sync::OnceLock;
-    static CACHE: OnceLock<usize> = OnceLock::new();
-    *CACHE.get_or_init(|| {
-        std::env::var("CODESAGE_GO_IMPORT_CONTEXT_CAP")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(IMPORT_CONTEXT_CAP_DEFAULT)
-    })
+    std::env::var("CODESAGE_GO_IMPORT_CONTEXT_CAP")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(IMPORT_CONTEXT_CAP_DEFAULT)
 }
 
 fn collect_import_context(
@@ -865,5 +866,57 @@ mod tests {
             !entry_paths.contains(&"pkg/util/a_excluded.go"),
             "excluded file leaked into seed: {entry_paths:?}"
         );
+    }
+
+    #[test]
+    fn map_is_deterministic_across_runs() {
+        // Same tree mapped twice must agree exactly: package discovery
+        // walks a sorted file list and entry selection reads sorted
+        // per-package files, never readdir order.
+        let dir = tempdir().unwrap();
+        write(dir.path(), "go.mod", "module example.com/acme\n");
+        write(
+            dir.path(),
+            "cmd/server/main.go",
+            "package main\nfunc main() {}\n",
+        );
+        write(
+            dir.path(),
+            "pkg/util/zebra.go",
+            "package util\nfunc Zebra() {}\n",
+        );
+        write(
+            dir.path(),
+            "pkg/util/alpha.go",
+            "package util\nfunc Alpha() {}\n",
+        );
+        let ctx = MapperContext::for_root(dir.path());
+        let first = GoMapper.map(&ctx).unwrap();
+        let second = GoMapper.map(&ctx).unwrap();
+        assert_eq!(format!("{first:?}"), format!("{second:?}"));
+    }
+
+    #[test]
+    fn mixed_package_dir_has_lexicographic_winner() {
+        // Two `package` clauses in one dir is invalid Go but common
+        // mid-refactor. The winner is the lexicographically-first file's
+        // clause (`a_lib.go` → `lib`), so the seed kind can't flip with
+        // readdir order. (The stray `func main` in a non-main package is
+        // likewise invalid Go; the filesystem-only mapper doesn't care.)
+        let dir = tempdir().unwrap();
+        write(dir.path(), "go.mod", "module example.com/acme\n");
+        write(dir.path(), "pkg/m/a_lib.go", "package lib\nfunc Lib() {}\n");
+        write(
+            dir.path(),
+            "pkg/m/z_main.go",
+            "package main\nfunc main() {}\n",
+        );
+        let ctx = MapperContext::for_root(dir.path());
+        let first = GoMapper.map(&ctx).unwrap();
+        let second = GoMapper.map(&ctx).unwrap();
+        assert_eq!(format!("{first:?}"), format!("{second:?}"));
+        assert_eq!(first.len(), 1, "one package, one seed: {first:?}");
+        assert_eq!(first[0].kind, FeatureKind::Library);
+        assert_eq!(first[0].entry_path, "pkg/m/a_lib.go");
     }
 }

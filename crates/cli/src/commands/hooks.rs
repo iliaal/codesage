@@ -213,7 +213,22 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
          # run — or one that exited 75 because another indexer held the lock\n\
          # for the whole wait — is retried by the next hook. An empty stamp\n\
          # (no HEAD, or a digest stage failed) is never recorded.\n\
-         ( cd \"$root\" || exit 0\n\
+         lockdir=\"$root/.codesage/hook-index.lock\"\n\
+         # Single-flight: rapid commits must not queue serial full passes.\n\
+         # `mkdir` is atomic; the loser logs and exits 0 — the winner's stamp\n\
+         # covers the same tree. A lockdir older than 30 minutes is a SIGKILL\n\
+         # orphan (no trap runs on SIGKILL): reap it and take over. The\n\
+         # subshell's EXIT trap releases the lock on every other path.\n\
+         if mkdir \"$lockdir\" 2>/dev/null; then\n\
+           :\n\
+         elif [ -n \"$(find \"$lockdir\" -mmin +30 2>/dev/null)\" ] && rmdir \"$lockdir\" 2>/dev/null && mkdir \"$lockdir\" 2>/dev/null; then\n\
+           echo \"[$(date)] $(basename \"$0\") hook start (reaped stale lock)\" >>\"$log\"\n\
+         else\n\
+           echo \"[$(date)] $(basename \"$0\") hook skip: another index already running\" >>\"$log\"\n\
+           exit 0\n\
+         fi\n\
+         ( trap 'rmdir \"$lockdir\" 2>/dev/null' EXIT INT TERM\n\
+           cd \"$root\" || exit 0\n\
            echo \"[$(date)] $(basename \"$0\") hook start\" >>\"$log\"\n\
            # shellcheck disable=SC2086 # IONICE and NICE are command words, split on purpose\n\
            $IONICE $NICE {bin} index --lock-wait 60 >>\"$log\" 2>&1; rc=$?\n\
@@ -1026,6 +1041,42 @@ mod tests {
             "shellcheck -s sh rejected the generated hook:\n{}{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn post_commit_hook_body_is_single_flight() {
+        let body = generate_post_commit_hook_body("/usr/local/bin/codesage");
+        assert!(
+            body.contains("hook-index.lock"),
+            "hook must take a single-flight lock:\n{body}"
+        );
+        assert!(
+            body.contains("another index already running"),
+            "lock loser must log the skip:\n{body}"
+        );
+        assert!(
+            body.contains("trap 'rmdir"),
+            "the background subshell must release the lock on exit:\n{body}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_commit_hook_skips_when_another_index_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_repo_with_one_commit(root);
+        let hook = install_hook_with_stub(root, "#!/bin/sh\nexit 0\n");
+        let log = root.join(".codesage/hooks.log");
+        // A live lock: the hook must skip without invoking the binary.
+        std::fs::create_dir_all(root.join(".codesage/hook-index.lock")).unwrap();
+        assert!(run_script(&hook, root).success());
+        let content = wait_for_log(&log, "another index already running");
+        assert_eq!(
+            content.matches("hook start").count(),
+            0,
+            "a second concurrent hook must not start a pass:\n{content}"
         );
     }
 

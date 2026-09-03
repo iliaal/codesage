@@ -113,10 +113,14 @@ pub struct FindSimilarParams {
     pub project: String,
     #[schemars(description = "Function/method name to find near-clones of")]
     pub name: String,
-    #[schemars(description = "Minimum Jaccard similarity in [0, 1] (default 0.85)")]
+    #[schemars(
+        description = "Minimum Jaccard similarity in [0, 1] (default 0.85). Out-of-range values are clamped, and the applied value is reported under `_meta.clamps`."
+    )]
     #[serde(default, deserialize_with = "deser_optional_f32")]
     pub min_jaccard: Option<f32>,
-    #[schemars(description = "Max results (default 20)")]
+    #[schemars(
+        description = "Max results (default 20, max 100). Over-max requests are capped and reported under `_meta.clamps`."
+    )]
     #[serde(default, deserialize_with = "deser_optional_usize")]
     pub limit: Option<usize>,
 }
@@ -135,7 +139,9 @@ pub struct CouplingParams {
     pub project: String,
     #[schemars(description = "Repo-relative file path to look up co-change history for")]
     pub file_path: String,
-    #[schemars(description = "Max results (default 10)")]
+    #[schemars(
+        description = "Max results (default 10, max 100). Over-max requests are capped and reported under `_meta.clamps`."
+    )]
     #[serde(default, deserialize_with = "deser_optional_usize")]
     pub limit: Option<usize>,
 }
@@ -157,7 +163,7 @@ pub struct RiskDiffParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
     #[schemars(
-        description = "Repo-relative file paths in the patch (typically the output of `git diff --name-only`)"
+        description = "Repo-relative file paths in the patch (typically the output of `git diff --name-only`). Must provide at least one path: an empty list is rejected."
     )]
     pub file_paths: Vec<String>,
     #[schemars(description = RISK_VERBOSE_DESC)]
@@ -169,7 +175,7 @@ pub struct RiskBatchParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
     #[schemars(
-        description = "Repo-relative file paths to score individually. Returns one RiskAssessment per path, in input order. Use when you have a list of files (e.g. from impact analysis or coupling) and want each one's individual score — saves the per-file MCP round-trip overhead vs N separate `assess_risk` calls. For patch-level aggregation (max/mean, summary_notes, cycles), use `assess_risk_diff` instead."
+        description = "Repo-relative file paths to score individually. Must provide at least one path: an empty list is rejected. Returns one RiskAssessment per path, in input order. Use when you have a list of files (e.g. from impact analysis or coupling) and want each one's individual score — saves the per-file MCP round-trip overhead vs N separate `assess_risk` calls. For patch-level aggregation (max/mean, summary_notes, cycles), use `assess_risk_diff` instead."
     )]
     pub file_paths: Vec<String>,
     #[schemars(description = RISK_VERBOSE_DESC)]
@@ -180,7 +186,9 @@ pub struct RiskBatchParams {
 pub struct TestsForParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
-    #[schemars(description = "Repo-relative file paths whose tests should be recommended")]
+    #[schemars(
+        description = "Repo-relative file paths whose tests should be recommended. Must provide at least one path: an empty list is rejected."
+    )]
     pub file_paths: Vec<String>,
 }
 
@@ -203,7 +211,7 @@ pub struct TracePathParams {
     #[schemars(description = "Target symbol the chain should reach")]
     pub to: String,
     #[schemars(
-        description = "Maximum hops to search before giving up (default 6, and 6 is also the ceiling over MCP — a larger value is silently capped, so `bounded: true` at 6 cannot be retried deeper from here; use the `codesage trace` CLI for a longer search)"
+        description = "Maximum hops to search before giving up (default 6, and 6 is also the ceiling over MCP — a larger value is capped and reported under `_meta.clamps`, so `bounded: true` at 6 cannot be retried deeper from here; use the `codesage trace` CLI for a longer search)"
     )]
     #[serde(default, deserialize_with = "deser_optional_usize")]
     pub max_depth: Option<usize>,
@@ -219,7 +227,9 @@ pub struct ImpactParams {
         description = "Treat target as file path (auto-detected if path-like); pass false to force symbol interpretation"
     )]
     pub is_file: Option<bool>,
-    #[schemars(description = "Recursion depth for transitive impact (default 2)")]
+    #[schemars(
+        description = "Recursion depth for transitive impact (default 2, max 6). Over-max requests are capped and reported under `_meta.clamps`."
+    )]
     #[serde(default, deserialize_with = "deser_optional_usize")]
     pub depth: Option<usize>,
     #[schemars(description = "Exclude test and config files from results")]
@@ -232,7 +242,9 @@ pub struct ImpactParams {
         description = "Also return the symbols defined alongside the target in its own file, in `sibling_symbols`"
     )]
     pub include_siblings: Option<bool>,
-    #[schemars(description = "Cap the reverse-impact `results` list to this many entries")]
+    #[schemars(
+        description = "Cap the reverse-impact `results` list to this many entries (max 500). Over-max requests are capped and reported under `_meta.clamps`."
+    )]
     #[serde(default, deserialize_with = "deser_optional_usize")]
     pub limit: Option<usize>,
     #[schemars(
@@ -249,7 +261,9 @@ pub struct ExportContextParams {
     pub target: String,
     #[schemars(description = "Treat target as a symbol name instead of a semantic query")]
     pub is_symbol: Option<bool>,
-    #[schemars(description = "Max primary results to include (default 5)")]
+    #[schemars(
+        description = "Max primary results to include (default 5, max 20). Over-max requests are capped and reported under `_meta.clamps`."
+    )]
     #[serde(default, deserialize_with = "deser_optional_usize")]
     pub limit: Option<usize>,
     #[schemars(description = "Include caller code in the bundle")]
@@ -266,10 +280,14 @@ pub struct SearchParams {
         description = "Natural language query or code snippet to search for semantically similar code"
     )]
     pub query: String,
-    #[schemars(description = "Maximum results to return (default 10)")]
+    #[schemars(
+        description = "Maximum results to return (default 10, max 100). Over-max requests are capped and reported under `_meta.clamps`."
+    )]
     #[serde(default, deserialize_with = "deser_optional_usize")]
     pub limit: Option<usize>,
-    #[schemars(description = "Results offset for pagination")]
+    #[schemars(
+        description = "Results offset for pagination (max 1000). Over-max requests are capped and reported under `_meta.clamps`."
+    )]
     #[serde(default, deserialize_with = "deser_optional_usize")]
     pub offset: Option<usize>,
     #[schemars(
@@ -298,7 +316,9 @@ pub struct ListFeaturesParams {
         description = "Keep only features whose entry/owned/context files changed since this git ref (e.g. \"main\", \"HEAD~5\"). Uses `git diff <ref>...HEAD`; errors if the ref is unknown."
     )]
     pub since: Option<String>,
-    #[schemars(description = "Max results (default 100, 0 = no limit)")]
+    #[schemars(
+        description = "Max results (default 100, 0 = no limit, max 500). Over-max requests are capped and reported under `_meta.clamps`."
+    )]
     #[serde(default, deserialize_with = "deser_optional_usize")]
     pub limit: Option<usize>,
 }
@@ -327,7 +347,9 @@ pub struct FeatureBundleParams {
         description = "Include callee chunks reached from the feature's entry symbol (default false)"
     )]
     pub include_callees: Option<bool>,
-    #[schemars(description = "Max chunks per section (primary, related). Default 5.")]
+    #[schemars(
+        description = "Max chunks per section (primary, related). Default 5, max 20. Over-max requests are capped and reported under `_meta.clamps`."
+    )]
     #[serde(default, deserialize_with = "deser_optional_usize")]
     pub limit: Option<usize>,
 }
@@ -374,7 +396,7 @@ pub struct ReviewRehearsalParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
     #[schemars(
-        description = "Repo-relative file paths in the patch / working-tree change set (typically `git diff --name-only`)"
+        description = "Repo-relative file paths in the patch / working-tree change set (typically `git diff --name-only`). Must provide at least one path: an empty list is rejected (the CLI's stdin/working-tree fallback does not exist over MCP)."
     )]
     pub file_paths: Vec<String>,
 }
@@ -498,6 +520,23 @@ mod tests {
                 r.is_err(),
                 "non-finite threshold {bad:?} must error (NaN/inf silently zeroes results)"
             );
+        }
+    }
+
+    #[test]
+    fn find_similar_params_accept_out_of_range_min_jaccard_for_param_layer_clamp() {
+        // Out-of-range is a clamp, not a deser error: the tool layer clamps
+        // to [0, 1] and reports the applied value under `_meta.clamps`.
+        // (Non-finite values ARE still rejected here — NaN/inf silently
+        // zero the results instead of erroring.)
+        for v in [1.5, -0.2, 0.0, 1.0] {
+            let p: FindSimilarParams = serde_json::from_value(json!({
+                "project": "/p",
+                "name": "clone_me",
+                "min_jaccard": v,
+            }))
+            .unwrap();
+            assert_eq!(p.min_jaccard, Some(v as f32));
         }
     }
 

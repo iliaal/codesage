@@ -33,10 +33,10 @@ EOF
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --corpus-dir)   shift; CORPUS_DIR="$1" ;;
+        --corpus-dir)   shift; CORPUS_DIR="${1:?missing value for --corpus-dir}" ;;
         --no-save)      SAVE_HISTORY=0 ;;
-        --runner)       shift; RUNNER="$1" ;;
-        --codesage-bin) shift; CODESAGE_BIN="$1" ;;
+        --runner)       shift; RUNNER="${1:?missing value for --runner}" ;;
+        --codesage-bin) shift; CODESAGE_BIN="${1:?missing value for --codesage-bin}" ;;
         -h|--help)      usage ;;
         *)              echo "unknown arg: $1" >&2; usage ;;
     esac
