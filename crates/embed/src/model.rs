@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::io::Read;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 #[cfg(any(feature = "cuda", not(target_vendor = "apple")))]
 use std::sync::Once;
-use std::sync::{OnceLock, mpsc};
+use std::sync::{Mutex, OnceLock, PoisonError, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -147,44 +148,77 @@ fn hf_download_timeout() -> Duration {
     }
 }
 
-fn hf_get_model_file(
-    model: &str,
-    revision: Option<&str>,
-    artifact: &'static str,
-) -> Result<PathBuf> {
+/// Runs `work` on a worker thread and waits at most [`hf_download_timeout`]
+/// for its result. hf-hub's client has no overall deadline, so a hub that
+/// accepts the connection and then stalls would otherwise pin the calling
+/// thread (a daemon request thread) indefinitely; the worker is abandoned on
+/// timeout and exits on its own when the request does. `action` names the
+/// operation in the timeout message ("downloading onnx/model.onnx").
+fn hf_with_deadline<T: Send + 'static>(
+    action: &str,
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
     let timeout = hf_download_timeout();
-    let model = model.to_string();
-    let revision = revision.map(str::to_string);
     let (tx, rx) = mpsc::sync_channel(1);
 
     thread::spawn(move || {
-        let result = (|| -> Result<PathBuf> {
-            let api =
-                hf_hub::api::sync::Api::new().context("failed to create HuggingFace API client")?;
-            let repo = if let Some(revision) = revision {
-                api.repo(Repo::with_revision(model, RepoType::Model, revision))
-            } else {
-                api.model(model)
-            };
-            repo.get(artifact)
-                .with_context(|| format!("failed to download {artifact}"))
-        })();
-        let _ = tx.send(result);
+        let _ = tx.send(work());
     });
 
     match rx.recv_timeout(timeout) {
         Ok(result) => result,
         Err(mpsc::RecvTimeoutError::Timeout) => {
             anyhow::bail!(
-                "timed out after {}s downloading {artifact} from HuggingFace; \
+                "timed out after {}s {action} from HuggingFace; \
                  set {HF_DOWNLOAD_TIMEOUT_ENV} to adjust the limit",
                 timeout.as_secs()
             )
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            anyhow::bail!("HuggingFace download worker exited before fetching {artifact}")
+            anyhow::bail!("HuggingFace worker exited before {action}")
         }
     }
+}
+
+fn hf_api_repo(model: String, revision: Option<String>) -> Result<hf_hub::api::sync::ApiRepo> {
+    let api = hf_hub::api::sync::Api::new().context("failed to create HuggingFace API client")?;
+    Ok(if let Some(revision) = revision {
+        api.repo(Repo::with_revision(model, RepoType::Model, revision))
+    } else {
+        api.model(model)
+    })
+}
+
+fn hf_get_model_file(
+    model: &str,
+    revision: Option<&str>,
+    artifact: &'static str,
+) -> Result<PathBuf> {
+    let model = model.to_string();
+    let revision = revision.map(str::to_string);
+    hf_with_deadline(&format!("downloading {artifact}"), move || {
+        hf_api_repo(model, revision)?
+            .get(artifact)
+            .with_context(|| format!("failed to download {artifact}"))
+    })
+}
+
+/// Whether the repository ships `onnx/model.onnx_data` at `revision`,
+/// according to the hub's file list for that revision (`Repo::api_url`
+/// embeds `revision/<rev>`, so the answer is for the pinned snapshot, not
+/// `main`). One metadata request; does not download anything.
+fn hf_sidecar_listed(model: &str, revision: Option<&str>) -> Result<bool> {
+    let model = model.to_string();
+    let revision = revision.map(str::to_string);
+    hf_with_deadline(&format!("listing the files of {model}"), move || {
+        let info = hf_api_repo(model.clone(), revision)?
+            .info()
+            .with_context(|| format!("failed to list the files of {model}"))?;
+        Ok(info
+            .siblings
+            .iter()
+            .any(|sibling| sibling.rfilename == ONNX_DATA_ARTIFACT))
+    })
 }
 
 /// Best-effort probe of Python `site-packages` directories. Does not fail on
@@ -489,6 +523,15 @@ struct ModelPin {
     revision: &'static str,
     tokenizer_sha256: &'static str,
     onnx_sha256: &'static str,
+    /// Pin-authoring contract: when the ONNX graph at `revision` uses external
+    /// weights (`onnx/model.onnx_data`), this must be `Some`. `None` is read as
+    /// "this revision ships no sidecar": the loader never fetches one, and
+    /// resolution refuses to proceed when a `model.onnx_data` is already on
+    /// disk next to the graph (`refuse_undeclared_sidecar`). That refusal is
+    /// what keeps a mis-authored `None` from loading unverified weights: ONNX
+    /// Runtime resolves external data relative to the graph file's directory
+    /// on its own, so a sidecar left there by an earlier run or an external
+    /// download would be loaded whether or not CodeSage fetched it.
     onnx_data_sha256: Option<&'static str>,
 }
 
@@ -623,11 +666,23 @@ pub fn ort_runtime_dylib() -> Result<Option<PathBuf>> {
 /// must agree on this, or the fingerprint would digest files the session
 /// never opens.
 fn load_revision(model: &str, allow_any: bool) -> Option<&'static str> {
-    if allow_any {
-        None
-    } else {
-        model_pin(model).map(|pin| pin.revision)
-    }
+    load_pin(model, allow_any).map(|pin| pin.revision)
+}
+
+/// The pin a load verifies against: the entry for a validated model, none
+/// once the user opted out of pinning with `CODESAGE_ALLOW_ANY_MODEL`. The
+/// fingerprint's revision and sidecar expectation and the loader's derive
+/// from this one lookup, so they agree by construction.
+fn load_pin(model: &str, allow_any: bool) -> Option<&'static ModelPin> {
+    if allow_any { None } else { model_pin(model) }
+}
+
+/// What the pin a load verifies against says about the external-weights
+/// sidecar. The one derivation the loader, the resolver, and the cache probe
+/// share, so a pinned verdict can never be applied to an unpinned
+/// (`CODESAGE_ALLOW_ANY_MODEL=1`) resolution by one of them alone.
+fn sidecar_expectation(model: &str, allow_any: bool) -> SidecarExpectation {
+    SidecarExpectation::from_pin(load_pin(model, allow_any))
 }
 
 /// Locate exactly the files [`load_onnx_session`] would open for `model`,
@@ -641,7 +696,11 @@ fn load_revision(model: &str, allow_any: bool) -> Option<&'static str> {
 pub fn resolve_model_artifacts(model: &str) -> Result<ModelArtifacts> {
     let allow_any = allow_any_model_from_env();
     validate_model_allowed(model, allow_any)?;
-    resolve_model_artifacts_at(model, load_revision(model, allow_any))
+    resolve_model_artifacts_at(
+        model,
+        load_revision(model, allow_any),
+        sidecar_expectation(model, allow_any),
+    )
 }
 
 /// The artifacts for `model` already present in the local hf-hub cache, at
@@ -659,32 +718,337 @@ pub fn cached_model_artifacts(model: &str) -> Option<ModelArtifacts> {
         }
         None => Repo::model(model.to_string()),
     };
-    let cache = hf_hub::Cache::from_env().repo(repo);
+    let cache = hf_cache_from_env()?.repo(repo);
     let ort_runtime = ort_runtime_dylib().ok()?;
+    // The same artifact set `resolve_model_artifacts` describes, or the two
+    // digests never converge and every pass re-embeds: a pin that declares
+    // no sidecar yields `onnx_data: None` here as there, even when a
+    // `model.onnx_data` is sitting in the snapshot. That anomaly is not this
+    // probe's to report (it returns `Option`, never an error); resolution
+    // refuses it in `refuse_undeclared_sidecar` before any session is served.
+    let onnx_data = match sidecar_expectation(model, allow_any) {
+        SidecarExpectation::Absent => None,
+        SidecarExpectation::Required | SidecarExpectation::Unknown => cache.get(ONNX_DATA_ARTIFACT),
+    };
     Some(ModelArtifacts {
         tokenizer: cache.get("tokenizer.json")?,
         onnx: cache.get("onnx/model.onnx")?,
-        onnx_data: cache.get("onnx/model.onnx_data"),
+        onnx_data,
         ort_runtime,
     })
 }
 
-fn resolve_model_artifacts_at(model: &str, revision: Option<&str>) -> Result<ModelArtifacts> {
-    let tokenizer = hf_get_model_file(model, revision, "tokenizer.json")?;
-    let onnx = hf_get_model_file(model, revision, "onnx/model.onnx")?;
-    // External-weights sidecar (>2GB models like Jina v2 base, BGE-large).
-    // Most models don't have this file — a 404 is the expected outcome and
-    // not worth surfacing. A real failure (network, disk, permission) is
-    // worth a debug-level breadcrumb so users running with RUST_LOG=debug
-    // don't have to guess when commit_from_file later errors with an
-    // opaque ORT external-data load failure.
-    let onnx_data = match hf_get_model_file(model, revision, "onnx/model.onnx_data") {
-        Ok(path) => Some(path),
-        Err(e) => {
-            tracing::debug!(error = %e, "onnx/model.onnx_data not fetched (normal for small models)");
-            None
+/// The directory `hf_hub::Cache::from_env` would consult, built without its
+/// unset-`HF_HOME` fallback: `Cache::default` is
+/// `dirs::home_dir().expect(..)`, and `dirs::home_dir` is `None` when `HOME`
+/// is unset or empty and the UID has no passwd entry (`env -i`, a systemd
+/// unit without `Environment=HOME`, a container UID absent from
+/// `/etc/passwd`). That panic sits on the per-tool-call path in the daemon,
+/// where it is a request with no response. `HF_HOME` is read with
+/// `std::env::var` exactly as hf-hub reads it, so a non-UTF-8 value falls
+/// back the same way. The `HOME`-only fallback drops `dirs`' passwd lookup
+/// (`dirs` is not a dependency of this crate): with `HOME` unset the answer
+/// is `None` rather than a passwd-derived directory.
+fn hf_cache_from_env() -> Option<hf_hub::Cache> {
+    let root = match std::env::var("HF_HOME") {
+        Ok(hf_home) => PathBuf::from(hf_home).join("hub"),
+        Err(_) => {
+            let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
+            PathBuf::from(home)
+                .join(".cache")
+                .join("huggingface")
+                .join("hub")
         }
     };
+    Some(hf_hub::Cache::new(root))
+}
+
+const ONNX_DATA_ARTIFACT: &str = "onnx/model.onnx_data";
+
+/// What the pin says about `onnx/model.onnx_data` at the revision being
+/// resolved. Every allowlisted model is pinned, so on a real deployment the
+/// answer to "is there a sidecar?" costs no network request at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidecarExpectation {
+    /// The pin declares the sidecar and its hash: fetch it.
+    Required,
+    /// The pin declares this revision ships none. A HuggingFace revision is
+    /// an immutable commit, so the declaration cannot go stale: no fetch, no
+    /// file-list probe, no network. One `fs::metadata` on the path ONNX
+    /// Runtime would load a sidecar from, and a refusal if a file is there
+    /// (`refuse_undeclared_sidecar`).
+    Absent,
+    /// No pin (`CODESAGE_ALLOW_ANY_MODEL=1`, or an allowlisted model without
+    /// a pin entry): fetch, and fall back to the hub's file list when that
+    /// fetch fails.
+    Unknown,
+}
+
+impl SidecarExpectation {
+    fn from_pin(pin: Option<&ModelPin>) -> Self {
+        match pin {
+            Some(ModelPin {
+                onnx_data_sha256: Some(_),
+                ..
+            }) => Self::Required,
+            Some(ModelPin {
+                onnx_data_sha256: None,
+                ..
+            }) => Self::Absent,
+            None => Self::Unknown,
+        }
+    }
+}
+
+/// Tokenizer, graph, and optional external-weights sidecar, in that order.
+type ArtifactPaths = (PathBuf, PathBuf, Option<PathBuf>);
+
+/// `HF_HOME` as set in the environment (`None` when unset), model, revision:
+/// everything that decides which snapshot files a resolution lands on. The
+/// root is only a label for the key, read with `var_os` rather than through
+/// `hf_hub::Cache::from_env`, whose unset-`HF_HOME` fallback panics when no
+/// home directory resolves. Today `Api::new` downloads into `Cache::default`
+/// regardless, so the component is inert; it stays in the key so a future
+/// hf-hub that honours `HF_HOME` for downloads can only cost an extra fetch,
+/// never serve another root's paths.
+type ArtifactKey = (Option<PathBuf>, String, Option<String>);
+
+/// One memo entry. `sidecar` is `None` while the sidecar outcome is
+/// unresolved (a pinned sidecar's fetch failed, or an unpinned one's fetch
+/// failed and the hub's file list either names the file or could not be
+/// retrieved), `Some(None)` once the pin or the file list established that
+/// the revision does not ship it, and `Some(Some(path))` once it was
+/// fetched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ArtifactMemo {
+    tokenizer: PathBuf,
+    onnx: PathBuf,
+    sidecar: Option<Option<PathBuf>>,
+}
+
+// Resolved snapshot paths are revision-pinned and stable for the life of
+// the process, while each hf-hub lookup builds a fresh API client (two TLS
+// agents, a token-file read) and then reads `refs/<revision>` and stats the
+// snapshot path — and the fingerprint asks for
+// them on every query. An eviction plus refetch of a corrupted artifact
+// recreates the symlink at the same snapshot path, so a memoized path stays
+// valid across it; the bytes behind it are re-digested because
+// `fingerprint::cached_file_digest` keys on size and mtime. Three
+// resolutions run per MCP semantic query — the embedder pool key, the
+// session fingerprint, and the table fingerprint — so an unmemoized
+// resolution cost nine `Api::new` constructions per query before this
+// (measured on a live daemon: 60 over a six-query probe, six of them the
+// cold session load). A memo hit replaces a resolution's two lookups for a
+// pinned model, three when a sidecar is fetched, with two or three
+// `fs::metadata` calls: a path whose file is gone — the cache
+// was cleared by hand, an `hf cache delete` ran, or an eviction's refetch
+// failed — is dropped so the next resolution re-downloads instead of every
+// later query failing with ENOENT until the daemon restarts. `fs::metadata`
+// rather than `symlink_metadata`, so a snapshot symlink over a deleted blob
+// counts as gone too and the entry is dropped; that case does not recover
+// by itself, though. hf-hub's `symlink_or_rename` skips when `dst.exists()`
+// (false for a dangling link) and then `symlink`s onto the occupied name,
+// so the refetch fails with `EEXIST` on every resolution until the dangling
+// link is removed by hand. A deleted file re-downloads; a dangling snapshot
+// symlink surfaces an error.
+static ARTIFACT_PATHS: OnceLock<Mutex<HashMap<ArtifactKey, ArtifactMemo>>> = OnceLock::new();
+
+fn artifact_paths_memo() -> &'static Mutex<HashMap<ArtifactKey, ArtifactMemo>> {
+    ARTIFACT_PATHS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn memoized_artifacts(key: &ArtifactKey) -> Option<ArtifactMemo> {
+    let mut memo = artifact_paths_memo()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let entry = memo.get(key)?;
+    let unreadable = [&entry.tokenizer, &entry.onnx]
+        .into_iter()
+        .chain(entry.sidecar.iter().flatten())
+        .find_map(|path| std::fs::metadata(path).err().map(|e| (path.clone(), e)));
+    match unreadable {
+        None => Some(entry.clone()),
+        Some((path, error)) => {
+            // Any stat failure invalidates, not only ENOENT: EACCES, EIO, and
+            // ELOOP also mean the path cannot be opened, and re-resolving is
+            // the safe direction. The line is what distinguishes "the cache
+            // was cleared" from a directory that lost read permission and now
+            // costs a full resolution per pass.
+            tracing::debug!(
+                path = %path.display(),
+                error = %error,
+                "memoized model artifact path no longer stats; dropping the entry so the next resolution re-fetches"
+            );
+            memo.remove(key);
+            None
+        }
+    }
+}
+
+/// The three artifact paths for `model` at `revision` under `hf_home`,
+/// fetched through `fetch` on the first call for that key and served from
+/// the memo afterwards while the files still exist. A failed tokenizer or
+/// graph fetch memoizes nothing.
+///
+/// The sidecar is settled by `expectation` first. A pin answers outright:
+/// `Absent` is memoized without a fetch or a probe, after one stat of the
+/// path ONNX Runtime would load a sidecar from (`refuse_undeclared_sidecar`,
+/// repeated on every memo hit so a sidecar that appears later is caught
+/// too); `Required` is fetched and a failed fetch is left unresolved for the
+/// loader's pin check to report (the next call re-attempts only that
+/// fetch). Only `Unknown` reaches the network to find out.
+///
+/// For `Unknown`, a failed sidecar fetch is not an answer by itself: hf-hub
+/// reports a 404, a 503, a refused connection, a DNS miss, and a TLS failure
+/// through the one `ApiError::RequestError` variant (ureq's
+/// `http_status_as_error` is on and hf-hub sets `max_retries: 0`), so
+/// inferring absence from the error would let one blip during warm-up
+/// memoize "no external weights" for the process lifetime and every later
+/// session build fail on the missing sidecar. Absence is established
+/// positively instead, through `sidecar_listed`, the hub's file list for the
+/// revision: listed and fetch failed, or list unavailable, leaves the
+/// sidecar unresolved so the next call re-attempts only that fetch; not
+/// listed memoizes absence. For an unpinned model without a sidecar that is
+/// one extra metadata request per key per process, after the 404, not per
+/// query. The lock is never held across `fetch` or `sidecar_listed`, which
+/// may block on the network: two first-callers racing on one key both fetch
+/// and both insert the same paths.
+fn resolve_hf_artifact_paths(
+    hf_home: Option<&Path>,
+    model: &str,
+    revision: Option<&str>,
+    expectation: SidecarExpectation,
+    mut fetch: impl FnMut(&'static str) -> Result<PathBuf>,
+    sidecar_listed: impl FnOnce() -> Result<bool>,
+) -> Result<ArtifactPaths> {
+    let key = (
+        hf_home.map(Path::to_path_buf),
+        model.to_string(),
+        revision.map(str::to_string),
+    );
+    let (tokenizer, onnx) = match memoized_artifacts(&key) {
+        Some(ArtifactMemo {
+            tokenizer,
+            onnx,
+            sidecar: Some(sidecar),
+        }) => {
+            if expectation == SidecarExpectation::Absent {
+                refuse_undeclared_sidecar(&onnx)?;
+            }
+            return Ok((tokenizer, onnx, sidecar));
+        }
+        Some(ArtifactMemo {
+            tokenizer,
+            onnx,
+            sidecar: None,
+        }) => (tokenizer, onnx),
+        None => (fetch("tokenizer.json")?, fetch("onnx/model.onnx")?),
+    };
+    // External-weights sidecar (>2GB models like Jina v2 base, BGE-large).
+    // Most models don't have this file — a 404 is the expected outcome and
+    // not worth surfacing. Every failure gets a debug-level breadcrumb so
+    // users running with RUST_LOG=debug don't have to guess when
+    // commit_from_file later errors with an opaque ORT external-data load
+    // failure.
+    let sidecar = match expectation {
+        SidecarExpectation::Absent => {
+            refuse_undeclared_sidecar(&onnx)?;
+            Some(None)
+        }
+        SidecarExpectation::Required => match fetch(ONNX_DATA_ARTIFACT) {
+            Ok(path) => Some(Some(path)),
+            Err(fetch_error) => {
+                tracing::debug!(
+                    error = %fetch_error,
+                    "onnx/model.onnx_data is pinned but its fetch failed; will retry on the next resolution"
+                );
+                None
+            }
+        },
+        SidecarExpectation::Unknown => match fetch(ONNX_DATA_ARTIFACT) {
+            Ok(path) => Some(Some(path)),
+            Err(fetch_error) => match sidecar_listed() {
+                Ok(false) => {
+                    tracing::debug!(
+                        error = %fetch_error,
+                        "onnx/model.onnx_data is not in the repository's file list (normal for small models); memoized as absent"
+                    );
+                    Some(None)
+                }
+                Ok(true) => {
+                    tracing::debug!(
+                        error = %fetch_error,
+                        "onnx/model.onnx_data is listed in the repository but its fetch failed; will retry on the next resolution"
+                    );
+                    None
+                }
+                Err(list_error) => {
+                    tracing::debug!(
+                        fetch_error = %fetch_error,
+                        list_error = %list_error,
+                        "onnx/model.onnx_data fetch failed and the repository's file list is unavailable; will retry on the next resolution"
+                    );
+                    None
+                }
+            },
+        },
+    };
+    let entry = ArtifactMemo {
+        tokenizer,
+        onnx,
+        sidecar,
+    };
+    artifact_paths_memo()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(key, entry.clone());
+    Ok((entry.tokenizer, entry.onnx, entry.sidecar.flatten()))
+}
+
+/// Refuse a `model.onnx_data` next to the graph when the pin declares this
+/// revision ships none. ONNX Runtime resolves external tensor data relative
+/// to the graph file's directory, and the session is built from the graph
+/// path alone (`commit_from_file`), so a sidecar already at that path — left
+/// by an earlier run or an external `huggingface-cli download` — would be
+/// loaded whether or not this process fetched it, with no pin to verify it
+/// against. One stat, no network. A stat failure other than `NotFound` is
+/// refused too: the check cannot vouch for a path it cannot inspect.
+fn refuse_undeclared_sidecar(onnx: &Path) -> Result<()> {
+    let sidecar = onnx
+        .parent()
+        .unwrap_or(Path::new(""))
+        .join("model.onnx_data");
+    match std::fs::metadata(&sidecar) {
+        Ok(_) => anyhow::bail!(
+            "found {} next to the ONNX graph, but CodeSage's model pin declares no \
+             external-weights sidecar for this revision; the file is unverified and \
+             refused. Remove it, or update the model pin deliberately.",
+            sidecar.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "checking for an undeclared external-weights sidecar at {}",
+                sidecar.display()
+            )
+        }),
+    }
+}
+
+fn resolve_model_artifacts_at(
+    model: &str,
+    revision: Option<&str>,
+    expectation: SidecarExpectation,
+) -> Result<ModelArtifacts> {
+    let hf_home = std::env::var_os("HF_HOME").map(PathBuf::from);
+    let (tokenizer, onnx, onnx_data) = resolve_hf_artifact_paths(
+        hf_home.as_deref(),
+        model,
+        revision,
+        expectation,
+        |artifact| hf_get_model_file(model, revision, artifact),
+        || hf_sidecar_listed(model, revision),
+    )?;
     Ok(ModelArtifacts {
         tokenizer,
         onnx,
@@ -886,6 +1250,13 @@ fn verify_pinned_model_artifacts(
             );
         }
         (None, Some(path)) => {
+            // Unreachable on the pinned path: `SidecarExpectation::Absent`
+            // never fetches the sidecar, so resolution cannot hand one back.
+            // The live guard for a pin that declares none is
+            // `refuse_undeclared_sidecar`, which runs during resolution
+            // against the on-disk path ONNX Runtime would load. Retained as
+            // the fail-closed arm should resolution ever grow another way to
+            // produce a path for such a pin.
             anyhow::bail!(
                 "pinned model {model:?} unexpectedly resolved onnx/model.onnx_data at {}; refusing unpinned sidecar",
                 path.display()
@@ -955,7 +1326,7 @@ fn cpu_fallback_allowed_from_env() -> bool {
 pub(crate) fn load_onnx_session_with_provider(model: &str, device: &str) -> Result<LoadedSession> {
     let allow_any = allow_any_model_from_env();
     validate_model_allowed(model, allow_any)?;
-    let pin = if allow_any { None } else { model_pin(model) };
+    let pin = load_pin(model, allow_any);
     debug_assert_eq!(
         pin.map(|pin| pin.revision),
         load_revision(model, allow_any),
@@ -988,7 +1359,11 @@ pub(crate) fn load_onnx_session_with_provider(model: &str, device: &str) -> Resu
         );
     }
 
-    let artifacts = resolve_model_artifacts_at(model, pin.map(|pin| pin.revision))?;
+    let artifacts = resolve_model_artifacts_at(
+        model,
+        pin.map(|pin| pin.revision),
+        sidecar_expectation(model, allow_any),
+    )?;
     let (tokenizer_path, model_path) = if let Some(pin) = pin {
         verify_pinned_model_artifacts(
             model,
@@ -1288,6 +1663,7 @@ fn detect_dim(session: &Session) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1620,6 +1996,587 @@ mod tests {
             "{err:#}"
         );
         assert_eq!(cached_model_artifacts("evil/backdoored-model"), None);
+    }
+
+    /// Creates `root/<artifact>` so a memo hit's existence check passes,
+    /// returning the path the way a real fetch would.
+    fn fake_fetch(root: &Path, artifact: &str) -> PathBuf {
+        let path = root.join(artifact);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, artifact).unwrap();
+        path
+    }
+
+    /// The sidecar probe for a call whose sidecar fetch succeeds: the file
+    /// list is only consulted after a failed fetch.
+    fn no_probe() -> Result<bool> {
+        panic!("the file list must not be consulted when the sidecar fetch succeeds")
+    }
+
+    /// The error hf-hub's `get` returns when the snapshot path is a dangling
+    /// symlink: `symlink_or_rename` sees `!dst.exists()`, then `symlink`
+    /// fails with `EEXIST` on the occupied name.
+    fn hf_dangling_symlink_error(artifact: &str) -> anyhow::Error {
+        anyhow::Error::from(hf_hub::api::sync::ApiError::IoError(std::io::Error::from(
+            std::io::ErrorKind::AlreadyExists,
+        )))
+        .context(format!("failed to download {artifact}"))
+    }
+
+    #[test]
+    fn artifact_paths_are_fetched_once_per_hf_home() {
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        let fetches = Cell::new(0u32);
+        let resolve = |root: &Path| {
+            resolve_hf_artifact_paths(
+                Some(root),
+                "test/memoized-model",
+                Some("rev"),
+                SidecarExpectation::Unknown,
+                |artifact| {
+                    fetches.set(fetches.get() + 1);
+                    Ok(fake_fetch(root, artifact))
+                },
+                no_probe,
+            )
+            .unwrap()
+        };
+
+        let first = resolve(root_a.path());
+        assert_eq!(
+            fetches.get(),
+            3,
+            "tokenizer, graph, and sidecar fetched once"
+        );
+        assert_eq!(first.0, root_a.path().join("tokenizer.json"));
+        assert_eq!(first.2, Some(root_a.path().join("onnx/model.onnx_data")));
+
+        let again = resolve(root_a.path());
+        assert_eq!(again, first, "the memo serves the same paths");
+        assert_eq!(fetches.get(), 3, "a repeat resolution fetches nothing");
+
+        let other = resolve(root_b.path());
+        assert_eq!(fetches.get(), 6, "another HF_HOME resolves independently");
+        assert_ne!(other, first);
+        assert!(other.0.starts_with(root_b.path()), "{}", other.0.display());
+    }
+
+    #[test]
+    fn artifact_paths_are_keyed_by_model() {
+        let root = tempfile::tempdir().unwrap();
+        let fetches = Cell::new(0u32);
+        let resolve = |model: &str| {
+            resolve_hf_artifact_paths(
+                Some(root.path()),
+                model,
+                Some("rev"),
+                SidecarExpectation::Unknown,
+                |artifact| {
+                    fetches.set(fetches.get() + 1);
+                    Ok(fake_fetch(&root.path().join(model), artifact))
+                },
+                no_probe,
+            )
+            .unwrap()
+        };
+
+        let minilm = resolve("test/keyed-minilm");
+        assert_eq!(fetches.get(), 3);
+        let jina = resolve("test/keyed-jina");
+        assert_eq!(
+            fetches.get(),
+            6,
+            "a second model under the same root is its own key"
+        );
+        assert_ne!(jina, minilm);
+        assert!(jina.0.starts_with(root.path().join("test/keyed-jina")));
+        assert!(minilm.0.starts_with(root.path().join("test/keyed-minilm")));
+
+        assert_eq!(resolve("test/keyed-minilm"), minilm);
+        assert_eq!(resolve("test/keyed-jina"), jina);
+        assert_eq!(fetches.get(), 6, "both keys are served from the memo");
+    }
+
+    #[test]
+    fn artifact_paths_are_keyed_by_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let fetches = Cell::new(0u32);
+        let resolve = |revision: Option<&str>| {
+            resolve_hf_artifact_paths(
+                Some(root.path()),
+                "test/keyed-revision",
+                revision,
+                SidecarExpectation::Unknown,
+                |artifact| {
+                    fetches.set(fetches.get() + 1);
+                    Ok(fake_fetch(
+                        &root.path().join(revision.unwrap_or("main")),
+                        artifact,
+                    ))
+                },
+                no_probe,
+            )
+            .unwrap()
+        };
+
+        let pinned = resolve(Some("rev"));
+        assert_eq!(fetches.get(), 3);
+        let unpinned = resolve(None);
+        assert_eq!(
+            fetches.get(),
+            6,
+            "the unpinned revision is a distinct key from the pinned one"
+        );
+        assert_ne!(unpinned, pinned);
+        assert!(pinned.0.starts_with(root.path().join("rev")));
+        assert!(unpinned.0.starts_with(root.path().join("main")));
+
+        assert_eq!(resolve(Some("rev")), pinned);
+        assert_eq!(resolve(None), unpinned);
+        assert_eq!(fetches.get(), 6, "both keys are served from the memo");
+    }
+
+    #[test]
+    fn artifact_paths_memo_is_dropped_when_a_file_disappears() {
+        let root = tempfile::tempdir().unwrap();
+        let fetches = Cell::new(0u32);
+        let graph_symlink_dangling = Cell::new(false);
+        let resolve = || {
+            resolve_hf_artifact_paths(
+                Some(root.path()),
+                "test/evicted-model",
+                Some("rev"),
+                SidecarExpectation::Unknown,
+                |artifact| {
+                    fetches.set(fetches.get() + 1);
+                    if artifact == "onnx/model.onnx" && graph_symlink_dangling.get() {
+                        return Err(hf_dangling_symlink_error(artifact));
+                    }
+                    Ok(fake_fetch(root.path(), artifact))
+                },
+                no_probe,
+            )
+        };
+
+        let first = resolve().unwrap();
+        assert_eq!(fetches.get(), 3);
+        assert_eq!(resolve().unwrap(), first);
+        assert_eq!(fetches.get(), 3, "all files present: served from the memo");
+
+        fs::remove_file(&first.1).unwrap();
+        assert_eq!(
+            resolve().unwrap(),
+            first,
+            "the refetch lands on the same paths"
+        );
+        assert_eq!(
+            fetches.get(),
+            6,
+            "a missing graph invalidates the entry and all three are refetched"
+        );
+
+        fs::remove_file(first.2.as_ref().unwrap()).unwrap();
+        assert_eq!(resolve().unwrap(), first);
+        assert_eq!(
+            fetches.get(),
+            9,
+            "a missing sidecar invalidates the entry too"
+        );
+
+        // A snapshot symlink over a deleted blob is a miss too: the entry
+        // must be dropped. Recovery is not asserted because production has
+        // none here: hf-hub's `symlink_or_rename` fails with EEXIST on the
+        // dangling name, so the refetch surfaces that error and nothing is
+        // memoized until the link is removed by hand.
+        fs::remove_file(&first.1).unwrap();
+        std::os::unix::fs::symlink(root.path().join("gone-blob"), &first.1).unwrap();
+        graph_symlink_dangling.set(true);
+        let err = resolve().expect_err("a dangling graph symlink surfaces the refetch failure");
+        assert_eq!(
+            fetches.get(),
+            5 + 6,
+            "the dangling symlink invalidated the entry: tokenizer and graph were re-attempted"
+        );
+        assert!(
+            err.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists)
+            }),
+            "{err:?}"
+        );
+        let key = (
+            Some(root.path().to_path_buf()),
+            "test/evicted-model".to_string(),
+            Some("rev".to_string()),
+        );
+        assert!(
+            !artifact_paths_memo()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&key),
+            "a failed graph fetch memoizes nothing"
+        );
+    }
+
+    #[test]
+    fn artifact_paths_memoize_a_sidecar_the_file_list_proves_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let fetches = Cell::new(0u32);
+        let probes = Cell::new(0u32);
+        let err = resolve_hf_artifact_paths(
+            Some(root.path()),
+            "test/small-model",
+            None,
+            SidecarExpectation::Unknown,
+            |_| {
+                fetches.set(fetches.get() + 1);
+                Err(anyhow::anyhow!("network down"))
+            },
+            no_probe,
+        )
+        .expect_err("a failed tokenizer fetch must surface");
+        assert!(err.to_string().contains("network down"));
+        assert_eq!(fetches.get(), 1);
+
+        let resolve = || {
+            resolve_hf_artifact_paths(
+                Some(root.path()),
+                "test/small-model",
+                None,
+                SidecarExpectation::Unknown,
+                |artifact| {
+                    fetches.set(fetches.get() + 1);
+                    if artifact == ONNX_DATA_ARTIFACT {
+                        return Err(anyhow::anyhow!("request error: status 404"));
+                    }
+                    Ok(fake_fetch(root.path(), artifact))
+                },
+                || {
+                    probes.set(probes.get() + 1);
+                    Ok(false)
+                },
+            )
+            .unwrap()
+        };
+
+        let first = resolve();
+        assert_eq!(
+            fetches.get(),
+            4,
+            "the tokenizer failure was not memoized; all three fetched"
+        );
+        assert_eq!(
+            probes.get(),
+            1,
+            "the file list is consulted once after the 404"
+        );
+        assert_eq!(first.2, None);
+
+        assert_eq!(resolve(), first);
+        assert_eq!(
+            fetches.get(),
+            4,
+            "a proven-absent sidecar is not re-attempted"
+        );
+        assert_eq!(probes.get(), 1, "and the file list is not re-read");
+    }
+
+    #[test]
+    fn artifact_paths_retry_a_sidecar_that_is_listed_or_unverifiable() {
+        let root = tempfile::tempdir().unwrap();
+        let fetches = Cell::new(0u32);
+        let sidecar_err = Cell::new(Some("request error: status 503"));
+        let resolve = |probe: &dyn Fn() -> Result<bool>| {
+            resolve_hf_artifact_paths(
+                Some(root.path()),
+                "test/large-model",
+                Some("rev"),
+                SidecarExpectation::Unknown,
+                |artifact| {
+                    fetches.set(fetches.get() + 1);
+                    if artifact == ONNX_DATA_ARTIFACT
+                        && let Some(message) = sidecar_err.get()
+                    {
+                        return Err(anyhow::anyhow!(message));
+                    }
+                    Ok(fake_fetch(root.path(), artifact))
+                },
+                probe,
+            )
+            .unwrap()
+        };
+
+        // Listed upstream, fetch failed: a transient failure on a model that
+        // does ship external weights. Memoizing absence here would break
+        // every later session build until the daemon restarts.
+        let first = resolve(&|| Ok(true));
+        assert_eq!(fetches.get(), 3);
+        assert_eq!(
+            first.2, None,
+            "an unresolved sidecar is reported as absent for this call"
+        );
+
+        // The file list itself unavailable: no answer either way.
+        assert_eq!(
+            resolve(&|| Err(anyhow::anyhow!("request error: timeout"))),
+            first
+        );
+        assert_eq!(
+            fetches.get(),
+            4,
+            "only the sidecar is re-attempted; tokenizer and graph come from the memo"
+        );
+
+        // The hub recovers: the sidecar lands and the memo is complete.
+        sidecar_err.set(None);
+        let resolved = resolve(&no_probe);
+        assert_eq!(fetches.get(), 5);
+        assert_eq!(
+            resolved.2,
+            Some(root.path().join(ONNX_DATA_ARTIFACT)),
+            "the sidecar is picked up once its fetch succeeds"
+        );
+        assert_eq!((&resolved.0, &resolved.1), (&first.0, &first.1));
+
+        assert_eq!(resolve(&no_probe), resolved);
+        assert_eq!(
+            fetches.get(),
+            5,
+            "a fetched sidecar is served from the memo"
+        );
+    }
+
+    /// The sidecar probe for a pinned load: the pin already answered, so the
+    /// file list must never be consulted.
+    fn no_pinned_probe() -> Result<bool> {
+        panic!("the file list must not be consulted when the pin declares the sidecar outcome")
+    }
+
+    #[test]
+    fn artifact_paths_skip_a_sidecar_the_pin_declares_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let fetches = Cell::new(0u32);
+        let resolve = || {
+            resolve_hf_artifact_paths(
+                Some(root.path()),
+                "test/pinned-small-model",
+                Some("rev"),
+                SidecarExpectation::Absent,
+                |artifact| {
+                    assert_ne!(
+                        artifact, ONNX_DATA_ARTIFACT,
+                        "a pin that declares no sidecar must not fetch one"
+                    );
+                    fetches.set(fetches.get() + 1);
+                    Ok(fake_fetch(root.path(), artifact))
+                },
+                no_pinned_probe,
+            )
+            .unwrap()
+        };
+
+        let first = resolve();
+        assert_eq!(fetches.get(), 2, "tokenizer and graph only; no sidecar GET");
+        assert_eq!(first.2, None);
+
+        // `fetches` cannot tell a memoized absence (`Some(None)`) from an
+        // unresolved sidecar (`None`): neither fetches under `Absent`. The
+        // memo entry itself is the discriminator.
+        let key = (
+            Some(root.path().to_path_buf()),
+            "test/pinned-small-model".to_string(),
+            Some("rev".to_string()),
+        );
+        let entry = artifact_paths_memo()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .cloned()
+            .expect("a pinned resolution memoizes its paths");
+        assert_eq!(
+            entry.sidecar,
+            Some(None),
+            "the declared absence is memoized as settled, not left unresolved"
+        );
+
+        assert_eq!(resolve(), first);
+        assert_eq!(fetches.get(), 2, "a repeat resolution fetches nothing");
+    }
+
+    #[test]
+    fn sidecar_expectation_derives_from_the_pin_the_loader_verifies() {
+        let minilm = "sentence-transformers/all-MiniLM-L6-v2";
+        assert_eq!(
+            model_pin(minilm).unwrap().onnx_data_sha256,
+            None,
+            "this test assumes the MiniLM pin declares no sidecar"
+        );
+        assert_eq!(
+            sidecar_expectation(minilm, false),
+            SidecarExpectation::Absent,
+            "an allowlisted pin with onnx_data_sha256: None declares the sidecar absent"
+        );
+        assert_eq!(
+            sidecar_expectation(minilm, true),
+            SidecarExpectation::Unknown,
+            "CODESAGE_ALLOW_ANY_MODEL resolves the repository head, where the pin says nothing"
+        );
+        assert_eq!(
+            sidecar_expectation("test/model-without-a-pin-entry", false),
+            SidecarExpectation::Unknown,
+            "no pin entry: the network has to answer"
+        );
+
+        let pinned_with_sidecar = ModelPin {
+            model: "test/pinned-large-model",
+            revision: "rev",
+            tokenizer_sha256: "",
+            onnx_sha256: "",
+            onnx_data_sha256: Some(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+        };
+        assert_eq!(
+            SidecarExpectation::from_pin(Some(&pinned_with_sidecar)),
+            SidecarExpectation::Required
+        );
+        assert_eq!(
+            SidecarExpectation::from_pin(None),
+            SidecarExpectation::Unknown
+        );
+    }
+
+    #[test]
+    fn artifact_paths_refuse_an_on_disk_sidecar_the_pin_declares_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let fetches = Cell::new(0u32);
+        let resolve = |model: &str| {
+            resolve_hf_artifact_paths(
+                Some(root.path()),
+                model,
+                Some("rev"),
+                SidecarExpectation::Absent,
+                |artifact| {
+                    fetches.set(fetches.get() + 1);
+                    Ok(fake_fetch(&root.path().join(model), artifact))
+                },
+                no_pinned_probe,
+            )
+        };
+
+        // Nothing on disk: resolution succeeds and is memoized.
+        let first = resolve("test/stray-sidecar-later").unwrap();
+        assert_eq!(fetches.get(), 2);
+        assert_eq!(first.2, None);
+
+        // A sidecar appears next to the graph after memoization (an external
+        // `huggingface-cli download`): the memo hit refuses it, with the path
+        // ONNX Runtime would have loaded it from.
+        let stray = first.1.parent().unwrap().join("model.onnx_data");
+        fs::write(&stray, b"unverified weights").unwrap();
+        let err = resolve("test/stray-sidecar-later")
+            .expect_err("a sidecar on disk under a pin that declares none must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&stray.display().to_string()),
+            "error should name the refused path: {msg}"
+        );
+        assert!(
+            msg.contains("declares no external-weights sidecar"),
+            "error should say why the file is refused: {msg}"
+        );
+        assert_eq!(fetches.get(), 2, "the refusal costs no fetch");
+
+        // Already on disk before the first resolution: refused before
+        // anything is memoized.
+        let early = root.path().join("test/stray-sidecar-first/onnx");
+        fs::create_dir_all(&early).unwrap();
+        fs::write(early.join("model.onnx_data"), b"unverified weights").unwrap();
+        let err = resolve("test/stray-sidecar-first")
+            .expect_err("a pre-existing sidecar is refused on the first resolution too");
+        assert!(
+            err.to_string()
+                .contains(&early.join("model.onnx_data").display().to_string()),
+            "{err}"
+        );
+        let key = (
+            Some(root.path().to_path_buf()),
+            "test/stray-sidecar-first".to_string(),
+            Some("rev".to_string()),
+        );
+        assert!(
+            !artifact_paths_memo()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains_key(&key),
+            "a refused resolution memoizes nothing"
+        );
+    }
+
+    #[test]
+    fn artifact_paths_fetch_a_pinned_sidecar_without_the_file_list() {
+        let root = tempfile::tempdir().unwrap();
+        let fetches = Cell::new(0u32);
+        let sidecar_err = Cell::new(Some("request error: status 503"));
+        let resolve = || {
+            resolve_hf_artifact_paths(
+                Some(root.path()),
+                "test/pinned-large-model",
+                Some("rev"),
+                SidecarExpectation::Required,
+                |artifact| {
+                    fetches.set(fetches.get() + 1);
+                    if artifact == ONNX_DATA_ARTIFACT
+                        && let Some(message) = sidecar_err.get()
+                    {
+                        return Err(anyhow::anyhow!(message));
+                    }
+                    Ok(fake_fetch(root.path(), artifact))
+                },
+                no_pinned_probe,
+            )
+            .unwrap()
+        };
+
+        // The pin requires the sidecar and its fetch failed: unresolved, not
+        // an error here. `verify_pinned_model_artifacts` reports the missing
+        // pinned sidecar with its own message.
+        let first = resolve();
+        assert_eq!(
+            fetches.get(),
+            3,
+            "tokenizer, graph, and the sidecar attempted"
+        );
+        assert_eq!(
+            first.2, None,
+            "an unresolved pinned sidecar is reported as absent for this call"
+        );
+
+        assert_eq!(resolve(), first);
+        assert_eq!(
+            fetches.get(),
+            4,
+            "only the sidecar is re-attempted; tokenizer and graph come from the memo"
+        );
+
+        sidecar_err.set(None);
+        let resolved = resolve();
+        assert_eq!(fetches.get(), 5);
+        assert_eq!(
+            resolved.2,
+            Some(root.path().join(ONNX_DATA_ARTIFACT)),
+            "the pinned sidecar is picked up once its fetch succeeds"
+        );
+        assert_eq!((&resolved.0, &resolved.1), (&first.0, &first.1));
+
+        assert_eq!(resolve(), resolved);
+        assert_eq!(
+            fetches.get(),
+            5,
+            "a fetched sidecar is served from the memo"
+        );
     }
 
     #[test]
