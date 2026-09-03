@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.24.0] - 2026-09-03
+
 ### Changed
 
 - The external-weights sidecar (`onnx/model.onnx_data`) comes from the model pin instead of a fetch on every resolution. A warm MCP semantic query makes no HuggingFace request, and a `model.onnx_data` next to the graph that the pin does not declare is refused as unverified.
@@ -793,5 +795,7 @@ Initial public release.
 
 [0.22.0]: https://github.com/iliaal/codesage/releases/tag/v0.22.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.23.0...HEAD
 [0.23.0]: https://github.com/iliaal/codesage/releases/tag/v0.23.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/iliaal/codesage/releases/tag/v0.24.0
