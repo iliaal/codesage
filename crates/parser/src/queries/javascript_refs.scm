@@ -84,3 +84,31 @@
     function: (identifier) @_req
     arguments: (arguments (string)))
   (#eq? @_req "require"))
+
+; Pattern 16: non-call member access off a same-file import binding,
+; `axios.CancelToken.source()` / `typeof axios.CancelToken` / `new
+; axios.CancelToken(...)`. Pattern 3 sees a member expression only as a
+; callee and records its property (`source`), so a file that reaches an
+; export through the module object rather than a named import named the
+; export nowhere. The receiver is captured as `@rhs` so the extractor can
+; apply the same import-binding gate as patterns 13-14: `response.data`
+; binds nothing because `response` is not imported. A member expression that
+; is itself the callee is skipped in references.rs to avoid duplicating
+; pattern 3's row.
+(member_expression
+  object: (identifier) @rhs
+  property: (property_identifier) @ref)
+
+; Pattern 17: the CommonJS default-unwrapped LOCAL,
+; `const axios = require('axios').default`. Pattern 15 requires the
+; `require(...)` call to be the whole initializer, so this form left `axios`
+; out of the import-binding allowlist and every later `const { X } = axios`
+; and `axios.X` was dropped as an arbitrary object unpack.
+(variable_declarator
+  name: (identifier) @ref
+  value: (member_expression
+    object: (call_expression
+      function: (identifier) @_req
+      arguments: (arguments (string)))
+    property: (property_identifier))
+  (#eq? @_req "require"))

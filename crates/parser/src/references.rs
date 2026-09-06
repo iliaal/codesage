@@ -252,6 +252,8 @@ fn js_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
         5 => Some(ReferenceKind::Inheritance),        // class Foo extends Bar (JS heritage)
         6 => Some(ReferenceKind::Instantiation),      // new Foo()
         7..=15 => Some(ReferenceKind::ImportBinding), // import / re-export / require bindings
+        16 => Some(ReferenceKind::ImportBinding),     // member access off an import binding
+        17 => Some(ReferenceKind::ImportBinding),     // const x = require("m").default
         _ => None,
     }
 }
@@ -270,8 +272,56 @@ fn ts_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
         5 => Some(ReferenceKind::Instantiation),      // new Foo()
         6 => Some(ReferenceKind::Inheritance),        // class Foo extends Bar (TS extends_clause)
         7..=15 => Some(ReferenceKind::ImportBinding), // import / re-export / require bindings
+        16 => Some(ReferenceKind::ImportBinding),     // member access off an import binding
+        17 => Some(ReferenceKind::ImportBinding),     // const x = require("m").default
+        18 => Some(ReferenceKind::ImportBinding),     // import x = require("m") (binding)
+        19 => Some(ReferenceKind::Import),            // import x = require("m") (module)
+        20 => Some(ReferenceKind::ImportBinding),     // type via module namespace (ns.Type)
         _ => None,
     }
+}
+
+/// JS/TS patterns whose `@ref` is a LOCAL name bound to an imported module:
+/// `import` clauses (7-9), `const m = require(...)` (15), `const m =
+/// require(...).default` (17), and the TS `import m = require(...)` (18).
+/// These form the allowlist the receiver-gated patterns consult.
+fn js_ts_binding_pattern(language: Language, pattern: usize) -> bool {
+    match language {
+        Language::JavaScript => matches!(pattern, 7..=9 | 15 | 17),
+        Language::TypeScript => matches!(pattern, 7..=9 | 15 | 17 | 18),
+        _ => false,
+    }
+}
+
+/// JS/TS patterns that capture a receiver as `@rhs` and only name a module
+/// export when that receiver is a same-file import binding: value
+/// destructuring (13-14), non-call member access (16), and the TS
+/// namespace-qualified type (20).
+fn js_ts_receiver_gated_pattern(language: Language, pattern: usize) -> bool {
+    match language {
+        Language::JavaScript => matches!(pattern, 13 | 14 | 16),
+        Language::TypeScript => matches!(pattern, 13 | 14 | 16 | 20),
+        _ => false,
+    }
+}
+
+/// True when `property` (the `@ref` of a member-access pattern) sits in a
+/// member expression that is the callee of a call: `axios.get(...)`. Pattern 3
+/// already records that property as a `Call`, so the member-access pattern
+/// must not emit a second row for it. The inner receiver of a chained call
+/// (`axios.CancelToken` in `axios.CancelToken.source()`) is not a callee and
+/// stays.
+fn member_is_callee(property: &Node) -> bool {
+    let Some(member) = property.parent() else {
+        return false;
+    };
+    let Some(call) = member.parent() else {
+        return false;
+    };
+    call.kind() == "call_expression"
+        && call
+            .child_by_field_name("function")
+            .is_some_and(|f| f.id() == member.id())
 }
 
 /// The pattern-index → `ReferenceKind` map for a language. Counterpart to
@@ -329,17 +379,16 @@ pub fn extract_references(
         });
     }
 
-    // Names bound by an `import` in this file (patterns 7-9 in both JS and
-    // TS ref queries) plus the CommonJS require-bound local (pattern 15:
-    // `const axios = require('axios')`). A value-destructure `const { X } =
-    // rhs` only names a module export when `rhs` is one of these; otherwise
-    // it is an arbitrary object unpack (`const { data } = response`) and its
-    // keys are not references to anything.
+    // Names bound to an imported module in this file (see
+    // `js_ts_binding_pattern`). A value-destructure `const { X } = rhs` or a
+    // member access `rhs.X` only names a module export when `rhs` is one of
+    // these; otherwise it is an arbitrary object (`const { data } =
+    // response`, `response.data`) and its keys are not references to anything.
     let imports_js_ts = matches!(language, Language::JavaScript | Language::TypeScript);
     let import_bindings: std::collections::HashSet<String> = if imports_js_ts {
         pending
             .iter()
-            .filter(|p| matches!(p.pattern, 7..=9 | 15))
+            .filter(|p| js_ts_binding_pattern(language, p.pattern))
             .map(|p| crate::parse::node_text_lossy(&p.node, source))
             .collect()
     } else {
@@ -352,10 +401,11 @@ pub fn extract_references(
             continue;
         };
 
-        // Patterns 13-14 (JS and TS): keep only destructures off a same-file
-        // import binding. `const { Axios } = axios` (imported) stays;
-        // `const { data } = response` (not imported) is dropped.
-        if imports_js_ts && matches!(p.pattern, 13 | 14) {
+        // Receiver-gated patterns (JS and TS): keep only shapes whose receiver
+        // is a same-file import binding. `const { Axios } = axios` and
+        // `axios.CancelToken` (imported) stay; `const { data } = response` and
+        // `response.data` (not imported) are dropped.
+        if imports_js_ts && js_ts_receiver_gated_pattern(language, p.pattern) {
             let rhs_bound = p
                 .rhs
                 .map(|rhs| import_bindings.contains(&crate::parse::node_text_lossy(&rhs, source)))
@@ -363,6 +413,12 @@ pub fn extract_references(
             if !rhs_bound {
                 continue;
             }
+        }
+
+        // Pattern 16 (JS and TS): a member expression in callee position is
+        // already pattern 3's `Call` row.
+        if imports_js_ts && p.pattern == 16 && member_is_callee(&p.node) {
+            continue;
         }
 
         let ref_node = p.node;
@@ -457,5 +513,114 @@ mod tests {
     fn leaves_mismatched_quotes_unchanged() {
         assert_eq!(strip_surrounding_quotes("\"foo'"), "\"foo'");
         assert_eq!(strip_surrounding_quotes("'foo\""), "'foo\"");
+    }
+
+    use codesage_protocol::{Language, Reference, ReferenceKind};
+
+    fn refs_from_source(source: &str, language: Language) -> Vec<Reference> {
+        let bytes = source.as_bytes();
+        let tree = crate::parse::parse_file(bytes, language).unwrap();
+        super::extract_references(&tree, bytes, language, "inline").unwrap()
+    }
+
+    fn rows(refs: &[Reference], name: &str, kind: ReferenceKind) -> usize {
+        refs.iter()
+            .filter(|r| r.to_name == name && r.kind == kind)
+            .count()
+    }
+
+    #[test]
+    fn javascript_member_access_off_an_import_binding_names_the_property() {
+        // `axios.CancelToken.source()`: pattern 3 records the callee `source`;
+        // the receiver `CancelToken` used to be recorded nowhere.
+        let src = "import axios from './lib/axios.js';\n\
+                   const source = axios.CancelToken.source();\n\
+                   assert.strictEqual(typeof axios.CancelToken, 'function');\n\
+                   const t = new axios.CancelToken(fn);\n";
+        let refs = refs_from_source(src, Language::JavaScript);
+        assert_eq!(rows(&refs, "CancelToken", ReferenceKind::ImportBinding), 3);
+        assert_eq!(rows(&refs, "source", ReferenceKind::Call), 1);
+        // Callee members stay pattern 3's row only: no second row for `source`
+        // or `strictEqual`.
+        assert_eq!(rows(&refs, "source", ReferenceKind::ImportBinding), 0);
+        assert_eq!(rows(&refs, "strictEqual", ReferenceKind::ImportBinding), 0);
+    }
+
+    #[test]
+    fn javascript_member_access_off_a_require_binding_names_the_property() {
+        let src = "const exports = require('axios');\n\
+                   expect(typeof exports.CancelToken).toBe('function');\n";
+        let refs = refs_from_source(src, Language::JavaScript);
+        assert_eq!(rows(&refs, "CancelToken", ReferenceKind::ImportBinding), 1);
+    }
+
+    #[test]
+    fn javascript_member_access_off_an_unbound_receiver_is_ignored() {
+        // Nothing binds `response` or `exports` to a module here, so neither
+        // `data` nor `CancelToken` may become a reference: `response.data`
+        // would otherwise make every HTTP test a dependent of any symbol
+        // named `data`. This is the deliberate gap: a receiver bound by
+        // `await import(...)` is also unbound and its members are dropped.
+        let src = "import axios from './lib/axios.js';\n\
+                   const response = await axios.get('/x');\n\
+                   const body = response.data;\n\
+                   const exports = (await import('axios'));\n\
+                   expect(typeof exports.CancelToken).toBe('function');\n";
+        let refs = refs_from_source(src, Language::JavaScript);
+        assert_eq!(rows(&refs, "data", ReferenceKind::ImportBinding), 0);
+        assert_eq!(rows(&refs, "CancelToken", ReferenceKind::ImportBinding), 0);
+        assert_eq!(rows(&refs, "get", ReferenceKind::Call), 1);
+        // The callee member is pattern 3's row alone: `member_is_callee`
+        // keeps pattern 16 from adding a duplicate ImportBinding for `get`.
+        assert_eq!(rows(&refs, "get", ReferenceKind::ImportBinding), 0);
+    }
+
+    #[test]
+    fn javascript_require_default_binds_the_local_for_later_unpacks() {
+        let src = "const axios = require('axios').default;\n\
+                   const { CanceledError } = axios;\n\
+                   const e = axios.AxiosError;\n";
+        let refs = refs_from_source(src, Language::JavaScript);
+        assert_eq!(rows(&refs, "axios", ReferenceKind::Import), 1);
+        assert_eq!(rows(&refs, "axios", ReferenceKind::ImportBinding), 1);
+        assert_eq!(
+            rows(&refs, "CanceledError", ReferenceKind::ImportBinding),
+            1
+        );
+        assert_eq!(rows(&refs, "AxiosError", ReferenceKind::ImportBinding), 1);
+    }
+
+    #[test]
+    fn typescript_member_access_and_namespaced_types_off_an_import_binding() {
+        let src = "import axios from 'axios';\n\
+                   const source = axios.CancelToken.source();\n\
+                   const h: axios.AxiosHeaders = new axios.AxiosHeaders();\n\
+                   const r = await axios.get('/x');\n";
+        let refs = refs_from_source(src, Language::TypeScript);
+        assert_eq!(rows(&refs, "CancelToken", ReferenceKind::ImportBinding), 1);
+        assert_eq!(rows(&refs, "AxiosHeaders", ReferenceKind::ImportBinding), 2);
+        assert_eq!(rows(&refs, "source", ReferenceKind::ImportBinding), 0);
+        assert_eq!(rows(&refs, "get", ReferenceKind::Call), 1);
+        assert_eq!(rows(&refs, "get", ReferenceKind::ImportBinding), 0);
+    }
+
+    #[test]
+    fn typescript_import_equals_require_binds_the_module_and_the_local() {
+        let src = "import axios = require('axios');\n\
+                   const t = new axios.CancelToken((c: axios.Canceler) => {});\n";
+        let refs = refs_from_source(src, Language::TypeScript);
+        assert_eq!(rows(&refs, "axios", ReferenceKind::Import), 1);
+        assert_eq!(rows(&refs, "axios", ReferenceKind::ImportBinding), 1);
+        assert_eq!(rows(&refs, "CancelToken", ReferenceKind::ImportBinding), 1);
+        assert_eq!(rows(&refs, "Canceler", ReferenceKind::ImportBinding), 1);
+    }
+
+    #[test]
+    fn typescript_member_access_and_types_off_an_unbound_receiver_are_ignored() {
+        let src = "const body = response.data;\n\
+                   const h: ns.Header = make();\n";
+        let refs = refs_from_source(src, Language::TypeScript);
+        assert_eq!(rows(&refs, "data", ReferenceKind::ImportBinding), 0);
+        assert_eq!(rows(&refs, "Header", ReferenceKind::ImportBinding), 0);
     }
 }

@@ -80,3 +80,36 @@
     function: (identifier) @_req
     arguments: (arguments (string)))
   (#eq? @_req "require"))
+
+; Pattern 16: non-call member access off a same-file import binding. Mirrors
+; the JS pattern of the same index; see javascript_refs.scm.
+(member_expression
+  object: (identifier) @rhs
+  property: (property_identifier) @ref)
+
+; Pattern 17: `const axios = require('axios').default`. Mirrors the JS
+; pattern of the same index; see javascript_refs.scm.
+(variable_declarator
+  name: (identifier) @ref
+  value: (member_expression
+    object: (call_expression
+      function: (identifier) @_req
+      arguments: (arguments (string)))
+    property: (property_identifier))
+  (#eq? @_req "require"))
+
+; Patterns 18-19: TS import-equals, `import axios = require('axios')`. The
+; grammar puts `source` on the `import_require_clause`, not on the
+; `import_statement`, so pattern 0 never matched it and pattern 7's
+; `import_clause` never saw the binding: a file using this form recorded
+; neither the module nor the local name. 18 is the binding, 19 the module.
+(import_statement (import_require_clause (identifier) @ref))
+(import_statement (import_require_clause source: (string) @ref))
+
+; Pattern 20: a type written through the module namespace,
+; `const h: axios.AxiosHeaders = ...`. Type positions parse as
+; `nested_type_identifier`, not `member_expression`, so pattern 16 does not
+; reach them. Same `@rhs` import-binding gate as pattern 16.
+(nested_type_identifier
+  module: (identifier) @rhs
+  name: (type_identifier) @ref)
