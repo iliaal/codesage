@@ -5,15 +5,23 @@ Measures whether the `codesage brief` PreToolUse hook
 spends context. Stdlib-only Python:
 
 ```bash
-python3 bench/brief-efficacy/analyze.py [--runtime-dir DIR] [--projects-dir DIR] [--min-served 50] [--json]
+python3 bench/brief-efficacy/analyze.py [--ledger-dir DIR] [--projects-dir DIR] [--min-served 50] [--json]
 ```
 
 ## Data sources
 
 1. **Fire ledger** — `brief-fires.jsonl` (and rotation sibling
-   `brief-fires.jsonl.1`) in the CodeSage runtime dir
-   (`$CODESAGE_DAEMON_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/codesage`, else
-   `/tmp/codesage-$UID`). Written by `codesage brief --session`, one line per
+   `brief-fires.jsonl.1`) in the CodeSage state dir (`$XDG_STATE_HOME/codesage`,
+   else `~/.local/state/codesage`; relative or empty values are ignored, and
+   if neither resolves the ledger falls back to the runtime dir). Not the
+   runtime dir by default: that is tmpfs on
+   systemd hosts and WSL2 and is wiped at boot, which is where every fire
+   before 2026-09-06 went. Unless `--ledger-dir` is given, the analyzer also
+   reads every runtime-dir candidate (`$CODESAGE_DAEMON_RUNTIME_DIR`,
+   `$XDG_RUNTIME_DIR/codesage`, `/tmp/codesage-$UID`, `$TMPDIR/codesage-$UID`)
+   and merges them, so rows
+   written before the move still count until those dirs are wiped.
+   Written by `codesage brief --session`, one line per
    fire, silent fires included: `t` (epoch secs), `s` (session id), `p`
    (project root), `f` (repo-relative file), `d` (decision:
    served/empty/repeat/cooldown/budget/unavailable/error), and on non-empty

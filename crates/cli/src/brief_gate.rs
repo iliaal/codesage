@@ -19,7 +19,9 @@
 //!
 //! State is per session, lives in the runtime dir, and never touches the
 //! project — the same rule that made [`codesage_storage::Database::open_read_only`]
-//! necessary.
+//! necessary. The fire ledger is the exception: it is the denominator of every
+//! later efficacy measurement and must outlive a reboot, so it lives in the
+//! state dir ([`ledger_dir`]), not the tmpfs-backed runtime dir.
 //!
 //! **A gate that cannot read its own state fails closed.** Silence is always
 //! safe; noise is what makes an unrequested channel get ignored permanently, and
@@ -56,6 +58,45 @@ const CHARS_PER_TOKEN: usize = 4;
 
 /// Append-only record of every fire, silent ones included.
 const FIRE_LOG: &str = "brief-fires.jsonl";
+
+/// Where the fire ledger lives: `$XDG_STATE_HOME/codesage`, else
+/// `$HOME/.local/state/codesage`.
+///
+/// Not the runtime dir. `$XDG_RUNTIME_DIR` is tmpfs on systemd hosts and WSL2,
+/// cleared at every boot — a ledger kept there loses its history on the same
+/// schedule the machine restarts, and the ≥50-served-fire decision rule the
+/// analyzer enforces was never reached because of it. Session gate state stays
+/// in the runtime dir, where a boot wiping it is correct.
+///
+/// Falls back to `fallback` (the runtime dir) when neither variable resolves,
+/// so a HOME-less environment still logs the fire somewhere rather than
+/// dropping it.
+pub(crate) fn ledger_dir(fallback: &Path) -> PathBuf {
+    ledger_dir_from(
+        std::env::var_os("XDG_STATE_HOME"),
+        std::env::var_os("HOME"),
+        fallback,
+    )
+}
+
+/// Env-free core of [`ledger_dir`]. Set-but-empty variables count as unset,
+/// matching the runtime-dir resolution, and so do relative ones: the XDG spec
+/// says a relative base dir is invalid, and the hook runs `brief` from the
+/// project root, so a relative value would put the ledger inside the checkout.
+fn ledger_dir_from(
+    xdg_state_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    fallback: &Path,
+) -> PathBuf {
+    let absolute = |v: Option<std::ffi::OsString>| v.map(PathBuf::from).filter(|p| p.is_absolute());
+    if let Some(dir) = absolute(xdg_state_home) {
+        return dir.join("codesage");
+    }
+    if let Some(home) = absolute(home) {
+        return home.join(".local").join("state").join("codesage");
+    }
+    fallback.to_path_buf()
+}
 
 /// Rotate past this, keeping one previous generation. At the ~120 bytes a line
 /// costs, this holds on the order of 35k fires — more than the 11331 the whole
@@ -257,7 +298,9 @@ pub(crate) fn evaluate(dir: &Path, session: &str, path: &str, payload: &str) -> 
     Decision::Served
 }
 
-/// One line per fire, appended to `brief-fires.jsonl` in the runtime dir.
+/// One line per fire, appended to `brief-fires.jsonl` in `dir` — the state dir
+/// from [`ledger_dir`] in production (the runtime dir only as its HOME-less
+/// fallback).
 ///
 /// This exists because a silent fire leaves no trace anywhere else. About 90% of
 /// real fires emit nothing, and a transcript only ever records what an agent was
@@ -283,7 +326,7 @@ pub(crate) fn log_fire(
     // returns Empty before it creates anything, and `create(true)` does not make
     // parents — so without this the log drops every fire before the session's
     // first non-silent one, which is exactly the population it exists to count.
-    if std::fs::create_dir_all(dir).is_err() {
+    if create_private_dir(dir).is_err() {
         return;
     }
     let log = dir.join(FIRE_LOG);
@@ -307,12 +350,67 @@ pub(crate) fn log_fire(
     line.push_str("}\n");
 
     use std::io::Write;
-    if let Ok(mut fh) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if let Ok(mut fh) = opts.open(&log) {
         let _ = fh.write_all(line.as_bytes());
+    }
+}
+
+/// The ledger names session ids, project roots and edited paths. The runtime
+/// dir it used to live in is held at 0o700 on every daemon start
+/// (`prepare_runtime_dir`); the leaf state dir gets the same treatment, created
+/// or tightened. Intermediates (`~/.local`, `~/.local/state`) are shared with
+/// every other XDG consumer and get the umask default.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut b = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    match b.create(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // mkdir reports EEXIST for any inode. Only a real directory is
+            // acceptable: a symlink would have set_permissions and the
+            // append follow it wherever it points (the runtime-dir fallback
+            // sits under a world-writable /tmp), and a regular file would be
+            // chmodded and then fail the append with ENOTDIR. Fail closed,
+            // as validate_runtime_dir does for the daemon.
+            let meta = std::fs::symlink_metadata(dir)?;
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(std::io::Error::other(format!(
+                    "{} exists but is not a directory",
+                    dir.display()
+                )));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                // Another user's directory under /tmp can hold a planted
+                // `brief-fires.jsonl` symlink the append would follow.
+                if meta.uid() != unsafe { libc::getuid() } {
+                    return Err(std::io::Error::other(format!(
+                        "{} is owned by another user",
+                        dir.display()
+                    )));
+                }
+                // Best-effort like the rest of the fire log: an operator-made
+                // 0o755 dir is tightened; a failure to do so is not a reason
+                // to drop the row.
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            }
+            Ok(())
+        }
+        r => r,
     }
 }
 
@@ -515,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn a_silent_fire_is_logged_even_as_the_first_fire_in_a_fresh_runtime_dir() {
+    fn a_silent_fire_is_logged_even_as_the_first_fire_in_a_fresh_ledger_dir() {
         let dir = tempfile::tempdir().unwrap();
         // Nothing has created this yet, which is the state a hook's very first
         // fire meets. The first fires of a session are overwhelmingly silent, so
@@ -530,6 +628,97 @@ mod tests {
 
         let raw = std::fs::read_to_string(p.join(FIRE_LOG)).expect("log must exist");
         assert!(raw.contains(r#""d":"empty""#), "{raw}");
+    }
+
+    #[test]
+    fn ledger_dir_prefers_xdg_state_home_then_home_then_fallback() {
+        let fb = Path::new("/run/user/1000/codesage");
+        assert_eq!(
+            ledger_dir_from(Some("/xdg".into()), Some("/home/u".into()), fb),
+            PathBuf::from("/xdg/codesage")
+        );
+        assert_eq!(
+            ledger_dir_from(None, Some("/home/u".into()), fb),
+            PathBuf::from("/home/u/.local/state/codesage")
+        );
+        // Set-but-empty counts as unset, like the runtime-dir resolution.
+        assert_eq!(
+            ledger_dir_from(Some("".into()), Some("".into()), fb),
+            fb.to_path_buf()
+        );
+        // A relative value is invalid per the XDG spec and would land inside
+        // the project the hook runs from; it falls through to the next candidate.
+        assert_eq!(
+            ledger_dir_from(Some("state".into()), Some("/home/u".into()), fb),
+            PathBuf::from("/home/u/.local/state/codesage")
+        );
+        assert_eq!(
+            ledger_dir_from(Some("state".into()), Some("home".into()), fb),
+            fb.to_path_buf()
+        );
+        assert_eq!(ledger_dir_from(None, None, fb), fb.to_path_buf());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_ledger_dir_and_file_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("state").join("codesage");
+        log_fire(&p, "s", Path::new("/p"), "a.rs", Decision::Empty, "");
+        let dir_mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        // Only the leaf is private; the shared intermediate keeps the umask
+        // default so other XDG consumers under it stay traversable. Compared
+        // against a plain create_dir sibling rather than a literal, since the
+        // default depends on the test process's umask.
+        std::fs::create_dir(dir.path().join("ref")).unwrap();
+        let mode_of =
+            |p: std::path::PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode_of(dir.path().join("state")),
+            mode_of(dir.path().join("ref"))
+        );
+        let file_mode = std::fs::metadata(p.join(FIRE_LOG))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+
+        // A leaf that already exists too loose is tightened, matching the
+        // runtime dir's every-start contract.
+        let loose = dir.path().join("loose");
+        std::fs::create_dir(&loose).unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
+        log_fire(&loose, "s", Path::new("/p"), "a.rs", Decision::Empty, "");
+        assert_eq!(mode_of(loose), 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_or_non_directory_leaf_gets_no_ledger_and_no_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        log_fire(&link, "s", Path::new("/p"), "a.rs", Decision::Empty, "");
+        assert!(
+            !target.join(FIRE_LOG).exists(),
+            "ledger must not follow the link"
+        );
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "target mode must be untouched");
+
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        log_fire(&file, "s", Path::new("/p"), "a.rs", Decision::Empty, "");
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "file mode must be untouched");
     }
 
     #[test]

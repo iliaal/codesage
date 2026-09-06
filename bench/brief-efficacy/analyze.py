@@ -2,7 +2,7 @@
 """Efficacy analysis for `codesage brief` hook fires.
 
 Reads the fire ledger (`brief-fires.jsonl` plus its rotation sibling
-`brief-fires.jsonl.1`) from the CodeSage runtime dir, summarizes the
+`brief-fires.jsonl.1`) from the CodeSage state dir, summarizes the
 decision mix, pairs `served` fires with Claude Code session transcripts,
 and scores each serve as acted / ambiguous / no-op. Also computes an
 unconditioned base rate of "runs file-named tests after editing a file"
@@ -11,7 +11,7 @@ scoring rules, and the decision rule.
 
 Stdlib only. Usage:
 
-    python3 analyze.py [--runtime-dir DIR] [--projects-dir DIR]
+    python3 analyze.py [--ledger-dir DIR] [--projects-dir DIR]
                        [--min-served 50] [--json]
 """
 
@@ -23,6 +23,7 @@ import math
 import os
 import re
 import sys
+import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -49,14 +50,39 @@ def fnv1a64(s: str) -> str:
     return format(h, "x")
 
 
-def default_runtime_dir() -> Path:
+def candidate_runtime_dirs() -> list[Path]:
+    """Mirrors candidate_runtime_dirs_from() in crates/cli/src/daemon.rs. A
+    hook fired from a process without XDG_RUNTIME_DIR wrote its rows to the
+    /tmp candidate, so a legacy read has to cover every one."""
+    dirs: list[Path] = []
     env = os.environ.get("CODESAGE_DAEMON_RUNTIME_DIR")
     if env:
-        return Path(env)
+        dirs.append(Path(env))
     xdg = os.environ.get("XDG_RUNTIME_DIR")
     if xdg:
+        dirs.append(Path(xdg) / "codesage")
+    uid = os.getuid()
+    for tmp in (Path("/tmp"), Path(tempfile.gettempdir())):
+        d = tmp / f"codesage-{uid}"
+        if d not in dirs:
+            dirs.append(d)
+    return dirs
+
+
+def default_runtime_dir() -> Path:
+    return candidate_runtime_dirs()[0]
+
+
+def default_ledger_dir() -> Path:
+    """Mirrors ledger_dir() in crates/cli/src/brief_gate.rs: the state dir,
+    not the tmpfs runtime dir, so the ledger survives a reboot."""
+    xdg = os.environ.get("XDG_STATE_HOME")
+    if xdg and Path(xdg).is_absolute():
         return Path(xdg) / "codesage"
-    return Path(f"/tmp/codesage-{os.getuid()}")
+    home = os.environ.get("HOME")
+    if home and Path(home).is_absolute():
+        return Path(home) / ".local" / "state" / "codesage"
+    return default_runtime_dir()
 
 
 def valid_fire(rec) -> bool:
@@ -81,6 +107,12 @@ def read_generation(p: Path) -> list[dict]:
         raw = p.read_text(errors="replace")
     except FileNotFoundError:
         return []
+    except OSError as e:
+        # A legacy candidate under world-writable /tmp can be another user's
+        # dir or a plain file; one unreadable candidate must not take the
+        # state-dir rows down with it.
+        print(f"skipping unreadable ledger {p}: {e}", file=sys.stderr)
+        return []
     fires = []
     for line in raw.splitlines():
         line = line.strip()
@@ -95,19 +127,25 @@ def read_generation(p: Path) -> list[dict]:
     return fires
 
 
-def load_fires(runtime_dir: Path) -> list[dict]:
-    def snapshot() -> list[dict]:
-        # Older generation first. Each read tolerates the file not existing.
-        return read_generation(runtime_dir / (FIRE_LOG + ".1")) + read_generation(
-            runtime_dir / FIRE_LOG
-        )
+def load_fires(*dirs: Path) -> list[dict]:
+    """Union of the ledgers in `dirs`, deduped and time-ordered. More than one
+    dir is the normal case after the move to the state dir: rows written before
+    it sit in the runtime dir until the next reboot, and the ledger is a
+    denominator, so both halves count."""
 
-    fires = snapshot()
-    # A rotation between the two reads can surface the same rows in both
-    # generations; one retry re-reads a settled pair of files, and the dedupe
-    # below drops whatever overlap remains.
-    if not fires:
-        fires = snapshot()
+    def snapshot(d: Path) -> list[dict]:
+        # Older generation first. Each read tolerates the file not existing.
+        return read_generation(d / (FIRE_LOG + ".1")) + read_generation(d / FIRE_LOG)
+
+    fires: list[dict] = []
+    for d in dirs:
+        rows = snapshot(d)
+        # A rotation between the two reads can surface the same rows in both
+        # generations; one retry re-reads a settled pair of files, and the
+        # dedupe below drops whatever overlap remains.
+        if not rows:
+            rows = snapshot(d)
+        fires.extend(rows)
     seen: set[tuple] = set()
     unique = []
     for rec in fires:
@@ -298,16 +336,33 @@ def two_proportion_z(x1: int, n1: int, x2: int, n2: int) -> float | None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--runtime-dir", type=Path, default=default_runtime_dir())
+    ap.add_argument("--ledger-dir", "--runtime-dir", dest="ledger_dir", type=Path,
+                    default=None,
+                    help="directory holding brief-fires.jsonl (default: "
+                         "$XDG_STATE_HOME/codesage or ~/.local/state/codesage; "
+                         "--runtime-dir is the legacy alias from when the ledger "
+                         "lived in the runtime dir)")
     ap.add_argument("--projects-dir", type=Path, default=Path.home() / ".claude" / "projects")
     ap.add_argument("--min-served", type=int, default=50,
                     help="served-fire count the decision rule requires (default 50)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     args = ap.parse_args()
 
-    fires = load_fires(args.runtime_dir)
+    explicit = args.ledger_dir is not None
+    if explicit:
+        ledger_dirs = [args.ledger_dir]
+    else:
+        # Rows written before the ledger moved to the state dir sit in the
+        # runtime dir until the next reboot; read both so the denominator
+        # keeps them. An explicit --ledger-dir is honoured as given.
+        ledger_dirs = [default_ledger_dir()]
+        for legacy in candidate_runtime_dirs():
+            if legacy not in ledger_dirs:
+                ledger_dirs.append(legacy)
+    ledger_label = " + ".join(str(d) for d in ledger_dirs)
+    fires = load_fires(*ledger_dirs)
     if not fires:
-        print(f"no fire ledger found under {args.runtime_dir}", file=sys.stderr)
+        print(f"no fire ledger found under {ledger_label}", file=sys.stderr)
         return 1
 
     # (a) decision mix
@@ -393,7 +448,7 @@ def main() -> int:
     z = two_proportion_z(verdicts["acted"], scored_n, base_followed, base_edits)
 
     report = {
-        "runtime_dir": str(args.runtime_dir),
+        "ledger_dirs": [str(d) for d in ledger_dirs],
         "fires_total": sum(total.values()),
         "decision_mix": dict(total),
         "by_project": {p: dict(c) for p, c in by_project.items()},
@@ -416,7 +471,7 @@ def main() -> int:
         print(json.dumps(report, indent=2))
         return 0
 
-    print(f"ledger: {args.runtime_dir}/{FIRE_LOG} (+ .1 if rotated)")
+    print(f"ledger: {FIRE_LOG} (+ .1 if rotated) under {ledger_label}")
     print(f"fires: {sum(total.values())} across {len(by_session)} sessions, "
           f"{len(by_project)} projects")
     print("decision mix: " + ", ".join(f"{d}={total[d]}" for d in DECISIONS if total[d]))

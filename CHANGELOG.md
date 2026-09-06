@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Fixed
+
+- `codesage brief --session` writes `brief-fires.jsonl` to `$XDG_STATE_HOME/codesage` (else `~/.local/state/codesage`, mode 0700) instead of the tmpfs runtime dir; the fire ledger no longer disappears at reboot. Session gate state stays in the runtime dir.
+
 ## [0.25.0] - 2026-09-03
 
 ### Added

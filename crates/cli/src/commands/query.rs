@@ -650,9 +650,9 @@ pub(crate) fn cmd_brief(file: &str, json: bool, session: Option<&str>) -> Result
             // fire; leaving it out makes a broken payload path read as a quiet
             // one.
             if let Some(session) = session {
-                let dir = crate::daemon::default_runtime_dir();
+                let ledger = crate::brief_gate::ledger_dir(&crate::daemon::default_runtime_dir());
                 crate::brief_gate::log_fire(
-                    &dir,
+                    &ledger,
                     session,
                     &root,
                     rel,
@@ -676,8 +676,11 @@ pub(crate) fn cmd_brief(file: &str, json: bool, session: Option<&str>) -> Result
         let decision = crate::brief_gate::evaluate(&dir, session, rel, &rendered);
         // Logged before the early return, silent fires included: they are ~90%
         // of all fires and leave no trace anywhere else, so a denominator not
-        // written here is unrecoverable afterwards.
-        crate::brief_gate::log_fire(&dir, session, &root, rel, decision, &rendered);
+        // written here is unrecoverable afterwards. The ledger goes to the
+        // state dir rather than `dir` (which is only its HOME-less fallback):
+        // the runtime dir is tmpfs and a reboot must not erase the denominator.
+        let ledger = crate::brief_gate::ledger_dir(&dir);
+        crate::brief_gate::log_fire(&ledger, session, &root, rel, decision, &rendered);
         if decision != crate::brief_gate::Decision::Served {
             return Ok(());
         }
