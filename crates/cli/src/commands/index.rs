@@ -552,6 +552,7 @@ pub(crate) fn cmd_index(
                 files_processed = sem_stats.files_processed,
                 files_skipped = sem_stats.files_skipped,
                 files_failed = sem_stats.files_failed,
+                failed_paths = %codesage_graph::summarize_paths(&sem_stats.failed_paths, 10),
                 files_removed = sem_stats.files_removed,
                 chunks = sem_stats.chunks_created,
                 "semantic index complete"
@@ -565,6 +566,12 @@ pub(crate) fn cmd_index(
                 sem_stats.files_removed,
                 sem_stats.chunks_created
             );
+            if !sem_stats.failed_paths.is_empty() {
+                println!(
+                    "  failed to read (retried next pass): {}",
+                    codesage_graph::summarize_paths(&sem_stats.failed_paths, 10)
+                );
+            }
         }
     }
 

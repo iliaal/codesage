@@ -2,6 +2,8 @@
 
 ### Fixed
 
+- Semantic indexing reads non-UTF-8 sources lossily, as the structural parser does, instead of failing the file (php-src's Latin-1 `ext/gd/libgd/gdtestft.c` now gets vectors).
+- A file that fails to read during a whole-table semantic pass (`codesage index --full`, or `codesage index` over an unrecorded or stale table) no longer blocks the semantic fingerprint; the summary names the failed paths.
 - `codesage brief --session` writes `brief-fires.jsonl` to `$XDG_STATE_HOME/codesage` (else `~/.local/state/codesage`, mode 0700) instead of the tmpfs runtime dir; the fire ledger no longer disappears at reboot. Session gate state stays in the runtime dir.
 
 ## [0.25.0] - 2026-09-03

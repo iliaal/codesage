@@ -32,7 +32,7 @@ pub use semantic::{
     ArtifactLookup, EmbedderInit, LazyEmbedder, SemanticFingerprint, SemanticTableState,
     StaleSemanticTable, TextEmbedder, require_current_semantic_table, resolve_semantic_fingerprint,
     resolve_semantic_fingerprint_for_artifacts, semantic_full_index, semantic_incremental_index,
-    semantic_index_files, semantic_remove_files, semantic_table_state,
+    semantic_index_files, semantic_remove_files, semantic_table_state, summarize_paths,
 };
 pub use session::{session_end, session_start, top_risk_files};
 pub use similar::find_similar;

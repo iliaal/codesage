@@ -1072,9 +1072,10 @@ impl Database {
 
     /// Forget the recorded fingerprint: the table's vectors are of unknown
     /// provenance until a completed population records one again. Called at
-    /// the start of a full rebuild, so an interrupted or partial rebuild
-    /// leaves `None`, never the previous run's attestation over rows it did
-    /// not write.
+    /// the start of a full rebuild, so an interrupted rebuild leaves `None`,
+    /// never the previous run's attestation over rows it did not write. A
+    /// rebuild that completes with unreadable files does attest: those files'
+    /// rows are purged first, so the record covers every row that remains.
     pub fn clear_semantic_fingerprint(&self) -> Result<()> {
         anyhow::ensure!(
             !self.chunk_table.is_empty(),

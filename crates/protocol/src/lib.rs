@@ -500,6 +500,10 @@ pub struct SemanticIndexStats {
     pub files_skipped: usize,
     #[serde(default)]
     pub files_failed: usize,
+    /// Repo-relative paths behind `files_failed`, so a persistent failure
+    /// can be found without a debug log.
+    #[serde(default)]
+    pub failed_paths: Vec<String>,
     pub files_removed: usize,
     /// Chunks written for the processed files, embedded or reused.
     pub chunks_created: usize,

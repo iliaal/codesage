@@ -161,8 +161,11 @@ struct ChunkedFile {
 
 fn chunk_one(root: &Path, f: &FileInfo, config: &ChunkConfig) -> Result<Option<ChunkedFile>> {
     let abs = root.join(&f.path);
-    let content = std::fs::read_to_string(&abs)
-        .with_context(|| format!("reading {} for semantic chunks", f.path))?;
+    let bytes =
+        std::fs::read(&abs).with_context(|| format!("reading {} for semantic chunks", f.path))?;
+    // Lossy, like the structural parser: a Latin-1 comment in an otherwise
+    // fine C file is a U+FFFD in one chunk, not a file with no vectors.
+    let content = String::from_utf8_lossy(&bytes);
     if content.is_empty() {
         return Ok(None);
     }
@@ -326,21 +329,37 @@ fn write_semantic_updates_with_batch(
     Ok(())
 }
 
+/// How a pass treats what it finds in the table.
+#[derive(Clone, Copy)]
+struct BatchPolicy {
+    /// Stored vectors of text-identical chunks may be kept (see
+    /// `stored_vectors_reusable`).
+    reuse_stored: bool,
+    /// A file this pass cannot read loses its rows and hash. True only for a
+    /// pass that rewrites the whole table and will attest it afterwards.
+    purge_failed: bool,
+}
+
 fn process_semantic_batch(
     root: &Path,
     db: &Database,
     embedder: &mut dyn TextEmbedder,
     config: &ChunkConfig,
     batch: &[&FileInfo],
-    reuse_stored: bool,
+    policy: BatchPolicy,
     stats: &mut SemanticIndexStats,
 ) -> Result<()> {
+    let BatchPolicy {
+        reuse_stored,
+        purge_failed,
+    } = policy;
     let chunk_results: Vec<(&FileInfo, Result<Option<ChunkedFile>>)> = batch
         .par_iter()
         .map(|f| (*f, chunk_one(root, f, config)))
         .collect();
     let mut selected = Vec::with_capacity(batch.len());
     let mut chunked = Vec::new();
+    let mut failed = Vec::new();
     for (file, result) in chunk_results {
         match result {
             Ok(Some(cf)) => {
@@ -350,6 +369,8 @@ fn process_semantic_batch(
             Ok(None) => selected.push(file),
             Err(e) => {
                 stats.files_failed += 1;
+                stats.failed_paths.push(file.path.clone());
+                failed.push(file);
                 tracing::warn!(
                     file = %file.path,
                     error = %e,
@@ -357,6 +378,22 @@ fn process_semantic_batch(
                 );
             }
         }
+    }
+
+    // On a pass that rewrites the whole table, a file this run could not
+    // read must not keep rows from a previous setup: the fingerprint about
+    // to be recorded describes every vector in the table, so those rows go
+    // and the file simply has none until a later pass reads it. Its hash
+    // goes too, so the next incremental pass retries it instead of taking
+    // the absence for "unchanged".
+    if purge_failed && !failed.is_empty() {
+        db.execute_batch(|db| {
+            for f in &failed {
+                db.delete_chunks_for_file(&f.path)?;
+                db.delete_semantic_file_hash(&f.path)?;
+            }
+            Ok(())
+        })?;
     }
 
     if selected.is_empty() {
@@ -606,11 +643,14 @@ fn stored_vectors_reusable(strategy: IndexStrategy, table_state: &SemanticTableS
     }
 }
 
-/// Record `fingerprint` as the identity of every vector in the table, but
-/// only when the pass really did rewrite every row it was responsible for: a
-/// file that failed to read keeps its previous rows, whose provenance this
-/// run cannot vouch for.
-fn record_fingerprint_if_complete(
+/// Record `fingerprint` as the identity of every vector in the table. A
+/// file the pass could not read has had its rows purged (see
+/// `process_semantic_batch`), so the table holds only this run's vectors and
+/// the attestation is honest; the file is named so the operator knows what
+/// has no vectors. Refusing to attest here would leave the table permanently
+/// unrecorded on a repository with one persistently unreadable file, forcing
+/// a full re-embed on every subsequent pass.
+fn record_fingerprint(
     db: &Database,
     fingerprint: &SemanticFingerprint,
     stats: &SemanticIndexStats,
@@ -618,15 +658,26 @@ fn record_fingerprint_if_complete(
     if stats.files_failed > 0 {
         tracing::warn!(
             files_failed = stats.files_failed,
-            "semantic fingerprint not recorded: some files kept rows this pass could not rewrite"
+            files = %summarize_paths(&stats.failed_paths, 10),
+            "semantic fingerprint recorded; the named files could not be read and have no vectors"
         );
-        return Ok(());
     }
     db.record_semantic_attestation(&SemanticAttestation {
         fingerprint: fingerprint.as_str().to_string(),
         artifact_digest: Some(fingerprint.artifact_digest().to_string()),
         artifact_stat_key: fingerprint.artifact_stat_key().map(str::to_string),
     })
+}
+
+/// The first `limit` paths, comma-separated, with a count for the rest. A
+/// 600-file failure must not become a 30 KB log line.
+pub fn summarize_paths(paths: &[String], limit: usize) -> String {
+    let shown: Vec<&str> = paths.iter().take(limit).map(String::as_str).collect();
+    let mut out = shown.join(", ");
+    if paths.len() > limit {
+        out.push_str(&format!(" (+{} more)", paths.len() - limit));
+    }
+    out
 }
 
 fn semantic_index(
@@ -639,6 +690,21 @@ fn semantic_index(
     verbose: bool,
 ) -> Result<SemanticIndexStats> {
     let files = discover_files_with_excludes(root, exclude_patterns)?;
+    semantic_index_discovered(root, db, embedder, &files, strategy, fingerprint, verbose)
+}
+
+/// [`semantic_index`] over an already-discovered file list. Split out so the
+/// pass can be driven with a `FileInfo` whose file is unreadable, which
+/// discovery would otherwise drop before the pass ever saw it.
+fn semantic_index_discovered(
+    root: &Path,
+    db: &Database,
+    embedder: &mut dyn TextEmbedder,
+    files: &[FileInfo],
+    strategy: IndexStrategy,
+    fingerprint: &SemanticFingerprint,
+    verbose: bool,
+) -> Result<SemanticIndexStats> {
     let config = ChunkConfig::default();
     let mut stats = SemanticIndexStats::default();
     let table_state = semantic_table_state(db, fingerprint)?;
@@ -701,7 +767,7 @@ fn semantic_index(
         stats.files_removed = removed_count;
     }
 
-    let to_index = select_semantic_files(&files, &existing_semantic_hashes, selection);
+    let to_index = select_semantic_files(files, &existing_semantic_hashes, selection);
 
     if selection == IndexStrategy::Incremental {
         stats.files_skipped = files.len() - to_index.len();
@@ -709,7 +775,7 @@ fn semantic_index(
 
     if to_index.is_empty() {
         if records_fingerprint {
-            record_fingerprint_if_complete(db, fingerprint, &stats)?;
+            record_fingerprint(db, fingerprint, &stats)?;
         }
         return Ok(stats);
     }
@@ -719,6 +785,10 @@ fn semantic_index(
     }
     embedder.prepare(to_index.len())?;
     embedder.bind_fingerprint(fingerprint)?;
+    let policy = BatchPolicy {
+        reuse_stored,
+        purge_failed: selection == IndexStrategy::Full,
+    };
 
     let n_batches = to_index.len().div_ceil(COMMIT_BATCH_SIZE);
     for (i, batch) in to_index.chunks(COMMIT_BATCH_SIZE).enumerate() {
@@ -734,10 +804,10 @@ fn semantic_index(
                 "embedding batch"
             );
         }
-        process_semantic_batch(root, db, embedder, &config, batch, reuse_stored, &mut stats)?;
+        process_semantic_batch(root, db, embedder, &config, batch, policy, &mut stats)?;
     }
     if records_fingerprint {
-        record_fingerprint_if_complete(db, fingerprint, &stats)?;
+        record_fingerprint(db, fingerprint, &stats)?;
     }
     Ok(stats)
 }
@@ -816,6 +886,11 @@ pub fn semantic_index_files(
     }
     embedder.prepare(files.len())?;
     embedder.bind_fingerprint(fingerprint)?;
+    // Never purges: this pass does not see the whole table.
+    let policy = BatchPolicy {
+        reuse_stored,
+        purge_failed: false,
+    };
 
     let file_refs: Vec<&FileInfo> = files.iter().collect();
     let n_batches = file_refs.len().div_ceil(COMMIT_BATCH_SIZE);
@@ -829,7 +904,7 @@ pub fn semantic_index_files(
                 "semantic per-file batch"
             );
         }
-        process_semantic_batch(root, db, embedder, &config, batch, reuse_stored, &mut stats)?;
+        process_semantic_batch(root, db, embedder, &config, batch, policy, &mut stats)?;
     }
     Ok(stats)
 }
@@ -1377,11 +1452,10 @@ mod tests {
     }
 
     #[test]
-    fn full_rebuild_with_a_failed_file_does_not_attest_the_table() {
+    fn non_utf8_source_is_chunked_lossily_not_failed() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("a.rs"), "fn a() {}\n").unwrap();
-        // Non-UTF-8 bytes make `read_to_string` fail for this file only.
-        std::fs::write(root.path().join("b.rs"), b"fn b() {}\n\xff\xfe").unwrap();
+        // A Latin-1 byte in a comment (php-src's ext/gd/libgd/gdtestft.c).
+        std::fs::write(root.path().join("a.rs"), b"// caf\xe9\nfn a() {}\n").unwrap();
         let db = Database::open_in_memory().unwrap();
         let mut fake = FakeEmbedder {
             prepared_with: Vec::new(),
@@ -1391,43 +1465,248 @@ mod tests {
         let stats =
             semantic_full_index(root.path(), &db, &mut fake, &[], &test_fp(), false).unwrap();
 
-        assert_eq!(stats.files_failed, 1, "{stats:?}");
+        assert_eq!(stats.files_failed, 0, "{stats:?}");
+        assert_eq!(stats.files_processed, 1, "{stats:?}");
+        assert!(stats.chunks_created > 0, "{stats:?}");
         assert_eq!(
-            db.semantic_fingerprint().unwrap(),
-            None,
-            "rows this pass could not rewrite have unknown provenance"
+            db.semantic_fingerprint().unwrap().as_deref(),
+            Some(test_fp().as_str())
         );
     }
 
+    /// A file discovery listed but the pass cannot read (deleted or made
+    /// unreadable between the two, or any other per-file read error).
+    fn unreadable(path: &str) -> FileInfo {
+        file(path, "gone")
+    }
+
     #[test]
-    fn partial_full_rebuild_clears_the_previous_attestation() {
+    fn full_rebuild_with_a_failed_file_purges_its_rows_and_attests_the_table() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        // b.rs holds rows from a previous setup that this pass cannot rewrite.
+        db.insert_chunks(
+            "b.rs",
+            "rust",
+            &[("old b", 1, 1, embedding(0.1).as_slice())],
+        )
+        .unwrap();
+        db.upsert_semantic_file_hash("b.rs", "stale").unwrap();
+        let mut fake = FakeEmbedder {
+            prepared_with: Vec::new(),
+            batches: 0,
+        };
+        let files = vec![file("a.rs", "h"), unreadable("b.rs")];
+
+        let stats = semantic_index_discovered(
+            root.path(),
+            &db,
+            &mut fake,
+            &files,
+            IndexStrategy::Full,
+            &test_fp(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(stats.files_failed, 1, "{stats:?}");
+        assert_eq!(stats.failed_paths, vec!["b.rs".to_string()], "{stats:?}");
+        assert_eq!(stats.files_processed, 1, "{stats:?}");
+        assert!(
+            db.chunk_embeddings_for_file("b.rs").unwrap().is_empty(),
+            "rows this pass could not rewrite must not survive under the new attestation"
+        );
+        assert!(
+            !db.all_semantic_file_hashes().unwrap().contains_key("b.rs"),
+            "the failed file must be retried by the next incremental pass"
+        );
+        assert_eq!(
+            db.semantic_fingerprint().unwrap().as_deref(),
+            Some(test_fp().as_str()),
+            "the table holds only this run's vectors, so the pass attests it"
+        );
+        assert!(semantic_table_state(&db, &test_fp()).unwrap().is_current());
+    }
+
+    #[test]
+    fn incremental_over_an_unrecorded_table_with_a_failed_file_purges_and_attests() {
+        // The bead's loop ran on plain `codesage index`: an incremental pass
+        // over an Unrecorded table is promoted to a whole-table pass, and it
+        // too must purge the failed file and attest, or the loop is back.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        db.insert_chunks(
+            "b.rs",
+            "rust",
+            &[("old b", 1, 1, embedding(0.1).as_slice())],
+        )
+        .unwrap();
+        db.upsert_semantic_file_hash("b.rs", "stale").unwrap();
+        assert_eq!(db.semantic_fingerprint().unwrap(), None);
+        let mut fake = FakeEmbedder {
+            prepared_with: Vec::new(),
+            batches: 0,
+        };
+        let files = vec![file("a.rs", "h"), unreadable("b.rs")];
+
+        let stats = semantic_index_discovered(
+            root.path(),
+            &db,
+            &mut fake,
+            &files,
+            IndexStrategy::Incremental,
+            &test_fp(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(stats.files_failed, 1, "{stats:?}");
+        assert!(db.chunk_embeddings_for_file("b.rs").unwrap().is_empty());
+        assert!(!db.all_semantic_file_hashes().unwrap().contains_key("b.rs"));
+        assert!(semantic_table_state(&db, &test_fp()).unwrap().is_current());
+    }
+
+    #[test]
+    fn a_persistently_failing_file_does_not_force_a_full_reembed_every_pass() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut fake = FakeEmbedder {
+            prepared_with: Vec::new(),
+            batches: 0,
+        };
+        let files = vec![file("a.rs", "h"), unreadable("b.rs")];
+        let full = |db: &Database, fake: &mut FakeEmbedder| {
+            semantic_index_discovered(
+                root.path(),
+                db,
+                fake,
+                &files,
+                IndexStrategy::Full,
+                &test_fp(),
+                false,
+            )
+            .unwrap()
+        };
+        full(&db, &mut fake);
+        assert_eq!(fake.batches, 1);
+
+        // The failing file fails again; the table is still attested, so the
+        // incremental pass retries only that file and reuses everything else.
+        let stats = semantic_index_discovered(
+            root.path(),
+            &db,
+            &mut fake,
+            &files,
+            IndexStrategy::Incremental,
+            &test_fp(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(stats.files_failed, 1, "{stats:?}");
+        assert_eq!(
+            stats.files_skipped, 1,
+            "a.rs is unchanged and skipped: {stats:?}"
+        );
+        assert_eq!(stats.files_processed, 0, "{stats:?}");
+        assert_eq!(fake.batches, 1, "nothing was re-embedded");
+        assert!(semantic_table_state(&db, &test_fp()).unwrap().is_current());
+    }
+
+    #[test]
+    fn incremental_pass_keeps_an_attested_files_rows_when_it_fails_to_read() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.path().join("b.rs"), "fn b() {}\n").unwrap();
         let db = Database::open_in_memory().unwrap();
         let mut fake = FakeEmbedder {
             prepared_with: Vec::new(),
             batches: 0,
         };
         semantic_full_index(root.path(), &db, &mut fake, &[], &test_fp(), false).unwrap();
-        assert_eq!(
-            db.semantic_fingerprint().unwrap().as_deref(),
-            Some(test_fp().as_str())
-        );
+        let before = db.chunk_embeddings_for_file("b.rs").unwrap();
+        assert!(!before.is_empty());
 
-        // A second file that cannot be read makes the next --full partial:
-        // a.rs holds new vectors, b.rs none, and the old attestation must not
-        // survive to describe that mix.
-        std::fs::write(root.path().join("b.rs"), b"fn b() {}\n\xff\xfe").unwrap();
-        let stats =
-            semantic_full_index(root.path(), &db, &mut fake, &[], &test_fp(), false).unwrap();
+        // b.rs changed (new hash) and then vanished before this pass could
+        // read it. Its rows were attested under the current fingerprint, so
+        // they stay rather than leaving the file with nothing; the hash is
+        // not advanced, so the next pass retries.
+        std::fs::remove_file(root.path().join("b.rs")).unwrap();
+        let files = vec![file("a.rs", "h"), unreadable("b.rs")];
+        let stats = semantic_index_discovered(
+            root.path(),
+            &db,
+            &mut fake,
+            &files,
+            IndexStrategy::Incremental,
+            &test_fp(),
+            false,
+        )
+        .unwrap();
         assert_eq!(stats.files_failed, 1, "{stats:?}");
-        assert_eq!(stats.files_processed, 1, "{stats:?}");
         assert_eq!(
-            db.semantic_fingerprint().unwrap(),
-            None,
-            "a partial --full leaves the table unattested"
+            db.chunk_embeddings_for_file("b.rs").unwrap().len(),
+            before.len()
         );
-        assert!(!semantic_table_state(&db, &test_fp()).unwrap().is_current());
+        assert!(semantic_table_state(&db, &test_fp()).unwrap().is_current());
+        let hashes = db.all_semantic_file_hashes().unwrap();
+        assert_ne!(
+            hashes.get("b.rs").map(String::as_str),
+            Some("gone"),
+            "a failed file's hash must not advance, or the next pass would skip it"
+        );
+        assert!(
+            hashes.contains_key("b.rs"),
+            "the attested rows keep their hash"
+        );
+    }
+
+    #[test]
+    fn watcher_pass_never_purges_a_file_it_fails_to_read() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.path().join("b.rs"), "fn b() {}\n").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut fake = FakeEmbedder {
+            prepared_with: Vec::new(),
+            batches: 0,
+        };
+        semantic_full_index(root.path(), &db, &mut fake, &[], &test_fp(), false).unwrap();
+        let before = db.chunk_embeddings_for_file("b.rs").unwrap();
+        assert!(!before.is_empty());
+
+        std::fs::remove_file(root.path().join("b.rs")).unwrap();
+        let stats = semantic_index_files(
+            root.path(),
+            &db,
+            &mut fake,
+            &[unreadable("b.rs")],
+            &test_fp(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(stats.failed_paths, vec!["b.rs".to_string()], "{stats:?}");
+        assert_eq!(
+            db.chunk_embeddings_for_file("b.rs").unwrap().len(),
+            before.len(),
+            "the watcher never sees the whole table, so it never purges"
+        );
+        let hashes = db.all_semantic_file_hashes().unwrap();
+        assert!(hashes.contains_key("b.rs"));
+        assert_ne!(hashes.get("b.rs").map(String::as_str), Some("gone"));
+        assert!(semantic_table_state(&db, &test_fp()).unwrap().is_current());
+    }
+
+    #[test]
+    fn summarize_paths_caps_the_list_and_counts_the_rest() {
+        let paths: Vec<String> = (0..12).map(|i| format!("f{i}.rs")).collect();
+        let s = summarize_paths(&paths, 10);
+        assert!(s.starts_with("f0.rs, f1.rs"));
+        assert!(s.ends_with("f9.rs (+2 more)"), "{s}");
+        assert_eq!(summarize_paths(&paths[..2], 10), "f0.rs, f1.rs");
     }
 
     /// Fails every `embed_batch` call from `fail_on_call` onwards: a process
