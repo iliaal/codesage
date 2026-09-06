@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.26.1] - 2026-09-06
+
 ### Fixed
 
 - `codesage install-hooks` and `doctor` recognize husky 9's `core.hooksPath = .husky/_` before the generated dir exists and install into `.husky/<hook>`; previously the layout was rejected as unrecognized while hooks sat unused in `.git/hooks`. `doctor` warns when hooks are installed but husky's runtime dir has not been generated, since git runs no hooks until then.
@@ -862,5 +864,7 @@ Initial public release.
 
 [0.25.0]: https://github.com/iliaal/codesage/releases/tag/v0.25.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.26.0...HEAD
 [0.26.0]: https://github.com/iliaal/codesage/releases/tag/v0.26.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.26.1...HEAD
+[0.26.1]: https://github.com/iliaal/codesage/releases/tag/v0.26.1
