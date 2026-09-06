@@ -84,6 +84,7 @@ where
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FindSymbolParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
@@ -96,6 +97,7 @@ pub struct FindSymbolParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FindReferencesParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
@@ -108,6 +110,7 @@ pub struct FindReferencesParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FindSimilarParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
@@ -126,6 +129,7 @@ pub struct FindSimilarParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListDependenciesParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
@@ -134,6 +138,7 @@ pub struct ListDependenciesParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CouplingParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
@@ -149,6 +154,7 @@ pub struct CouplingParams {
 const RISK_VERBOSE_DESC: &str = "Include per-signal decomposition (churn_score, churn_percentile, fix_ratio, total_commits, fix_count, dependent_files, coupled_files, test_gap, in_cycle, cycle_size) and coupled files (`top_coupled`) on each RiskAssessment; default false.";
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RiskParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
@@ -159,6 +165,7 @@ pub struct RiskParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RiskDiffParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
@@ -171,6 +178,7 @@ pub struct RiskDiffParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RiskBatchParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
@@ -183,6 +191,7 @@ pub struct RiskBatchParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TestsForParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
@@ -193,6 +202,7 @@ pub struct TestsForParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SessionParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
@@ -203,6 +213,7 @@ pub struct SessionParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TracePathParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
@@ -218,6 +229,7 @@ pub struct TracePathParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ImpactParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
@@ -254,6 +266,7 @@ pub struct ImpactParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ExportContextParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
@@ -273,6 +286,7 @@ pub struct ExportContextParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SearchParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
@@ -299,6 +313,7 @@ pub struct SearchParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListFeaturesParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
@@ -324,6 +339,7 @@ pub struct ListFeaturesParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FindFeatureParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
@@ -332,6 +348,7 @@ pub struct FindFeatureParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FeatureBundleParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
@@ -357,6 +374,7 @@ pub struct FeatureBundleParams {
 /// Input of the hidden `embed_texts` tool: the CLI's request to embed with
 /// the daemon's resident session instead of a private one.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EmbedTextsParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
@@ -386,12 +404,14 @@ pub struct EmbedTextsResult {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectOverviewParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewRehearsalParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
@@ -669,5 +689,134 @@ mod tests {
             "language": "cobol",
         }));
         assert!(r.is_err(), "unknown language must error, not unfilter");
+    }
+
+    /// Pre-`deny_unknown_fields`, a misspelled or invented argument
+    /// (`max_results` for `limit`, `token_budget` for nothing) was silently
+    /// dropped and the tool answered with defaults. Every params struct must
+    /// now refuse it, and the error must name the offending field, say
+    /// `expected`, and list at least one field the caller could have meant.
+    #[test]
+    fn every_params_struct_rejects_an_unknown_field_and_names_the_valid_set() {
+        fn check<T: serde::de::DeserializeOwned>(struct_name: &str, mut valid: serde_json::Value) {
+            let obj = valid.as_object_mut().unwrap();
+            assert!(
+                serde_json::from_value::<T>(serde_json::Value::Object(obj.clone())).is_ok(),
+                "{struct_name}: the fixture must be valid before the unknown field is added"
+            );
+            obj.insert("max_results".to_string(), json!(5));
+            let err = match serde_json::from_value::<T>(serde_json::Value::Object(obj.clone())) {
+                Ok(_) => panic!("{struct_name} silently accepted unknown field `max_results`"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains("max_results"),
+                "{struct_name}: error must name the unknown field, got: {err}"
+            );
+            assert!(
+                err.contains("expected"),
+                "{struct_name}: error must say what was expected, got: {err}"
+            );
+            assert!(
+                err.contains("`project`"),
+                "{struct_name}: error must list the valid field set, got: {err}"
+            );
+        }
+
+        check::<FindSymbolParams>("FindSymbolParams", json!({"project": "/p", "name": "x"}));
+        check::<FindReferencesParams>(
+            "FindReferencesParams",
+            json!({"project": "/p", "name": "x"}),
+        );
+        check::<FindSimilarParams>("FindSimilarParams", json!({"project": "/p", "name": "x"}));
+        check::<ListDependenciesParams>(
+            "ListDependenciesParams",
+            json!({"project": "/p", "file_path": "a.rs"}),
+        );
+        check::<CouplingParams>(
+            "CouplingParams",
+            json!({"project": "/p", "file_path": "a.rs"}),
+        );
+        check::<RiskParams>("RiskParams", json!({"project": "/p", "file_path": "a.rs"}));
+        check::<RiskDiffParams>(
+            "RiskDiffParams",
+            json!({"project": "/p", "file_paths": ["a.rs"]}),
+        );
+        check::<RiskBatchParams>(
+            "RiskBatchParams",
+            json!({"project": "/p", "file_paths": ["a.rs"]}),
+        );
+        check::<TestsForParams>(
+            "TestsForParams",
+            json!({"project": "/p", "file_paths": ["a.rs"]}),
+        );
+        check::<SessionParams>("SessionParams", json!({"project": "/p"}));
+        check::<TracePathParams>(
+            "TracePathParams",
+            json!({"project": "/p", "from": "a", "to": "b"}),
+        );
+        check::<ImpactParams>("ImpactParams", json!({"project": "/p", "target": "Foo"}));
+        check::<ExportContextParams>(
+            "ExportContextParams",
+            json!({"project": "/p", "target": "Foo"}),
+        );
+        check::<SearchParams>("SearchParams", json!({"project": "/p", "query": "auth"}));
+        check::<ListFeaturesParams>("ListFeaturesParams", json!({"project": "/p"}));
+        check::<FindFeatureParams>(
+            "FindFeatureParams",
+            json!({"project": "/p", "file_path": "a.rs"}),
+        );
+        check::<FeatureBundleParams>(
+            "FeatureBundleParams",
+            json!({"project": "/p", "feature_id": "feat_1"}),
+        );
+        check::<EmbedTextsParams>(
+            "EmbedTextsParams",
+            json!({"project": "/p", "model": "m", "texts": []}),
+        );
+        check::<ProjectOverviewParams>("ProjectOverviewParams", json!({"project": "/p"}));
+        check::<ReviewRehearsalParams>(
+            "ReviewRehearsalParams",
+            json!({"project": "/p", "file_paths": ["a.rs"]}),
+        );
+    }
+
+    #[test]
+    fn search_unknown_field_error_offers_limit_as_the_alternative() {
+        // The agent that sent `max_results` needs to see `limit` in the
+        // refusal to self-correct on the next call.
+        let err = serde_json::from_value::<SearchParams>(json!({
+            "project": "/p",
+            "query": "auth",
+            "max_results": 5,
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("`limit`"),
+            "refusal must list `limit` as a valid field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn impact_params_accept_every_declared_field_with_stringy_numerics() {
+        // Guards against the closed field set accidentally excluding a
+        // declared field: every ImpactParams field, string-encoded numerics
+        // included, must still deserialize.
+        let p: ImpactParams = serde_json::from_value(json!({
+            "project": "/p",
+            "target": "Foo",
+            "is_file": false,
+            "depth": "3",
+            "source_only": true,
+            "include_forward": true,
+            "include_siblings": false,
+            "limit": "50",
+            "summary_only": true,
+        }))
+        .unwrap();
+        assert_eq!(p.depth, Some(3));
+        assert_eq!(p.limit, Some(50));
+        assert_eq!(p.summary_only, Some(true));
     }
 }

@@ -255,6 +255,29 @@ mod tests {
         }
     }
 
+    /// Every params struct is `deny_unknown_fields`, and schemars renders
+    /// that as `additionalProperties: false`, so the advertised inputSchema
+    /// and the server's validation agree by construction. Runs through
+    /// `finalize_tools_for_listing` to prove the format strip leaves the
+    /// key in place.
+    #[test]
+    fn every_tool_input_schema_closes_additional_properties() {
+        let server = CodeSageServer::new();
+        let mut tools = server.tool_router.list_all();
+        finalize_tools_for_listing(&mut tools);
+        assert!(!tools.is_empty());
+        let open: Vec<String> = tools
+            .iter()
+            .filter(|t| t.input_schema.get("additionalProperties") != Some(&json!(false)))
+            .map(|t| t.name.to_string())
+            .collect();
+        assert_eq!(
+            open,
+            Vec::<String>::new(),
+            "these tools advertise an open inputSchema while the server refuses unknown fields"
+        );
+    }
+
     /// The payload trim must show in the advertised schemas: the risk fields
     /// gated behind `verbose` stay described but optional, the switch itself
     /// is not a wire field, and the dropped column fields are not advertised

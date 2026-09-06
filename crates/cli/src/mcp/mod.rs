@@ -1135,6 +1135,58 @@ mod tests {
         );
     }
 
+    /// Drives a real `tools/call` through the rmcp server (in-process duplex
+    /// transport) so the assertion covers the `Parameters<T>` extractor, not
+    /// just `serde_json::from_value`. rmcp maps the deserialization failure
+    /// to a tool result with `isError: true` whose text is the serde
+    /// message, so the caller sees the unknown field and the valid set.
+    #[tokio::test]
+    async fn tools_call_with_unknown_argument_is_refused_naming_the_field() {
+        use rmcp::ServiceExt;
+        use rmcp::model::CallToolRequestParams;
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            let service = CodeSageServer::new().serve(server_io).await.unwrap();
+            let _ = service.waiting().await;
+        });
+        let client = ().serve(client_io).await.unwrap();
+
+        let mut args = serde_json::Map::new();
+        args.insert("project".into(), json!("/nonexistent"));
+        args.insert("query".into(), json!("auth"));
+        args.insert("max_results".into(), json!(5));
+        let result = client
+            .call_tool(CallToolRequestParams::new("search").with_arguments(args))
+            .await
+            .expect("argument refusal is a tool result, not a protocol error");
+
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "unknown argument must fail the call instead of running with defaults: {result:?}"
+        );
+        let text = result
+            .content
+            .iter()
+            .filter_map(|block| block.as_text().map(|t| t.text.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.starts_with("failed to deserialize parameters"),
+            "refusal must come from parameter validation, not the tool body: {text:?}"
+        );
+        for needle in ["max_results", "expected", "`limit`"] {
+            assert!(
+                text.contains(needle),
+                "refusal must contain {needle:?}, got: {text:?}"
+            );
+        }
+
+        client.cancel().await.unwrap();
+        server_task.await.unwrap();
+    }
+
     #[test]
     fn inject_default_project_fills_missing() {
         let line = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"status","arguments":{}}}"#;
