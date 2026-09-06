@@ -60,12 +60,14 @@ If the mismatch path ran, the semantic portion will rebuild from scratch for eve
 
 Parse the `codesage index` output. It prints these lines:
 
-- `Structural: N files (X skipped, Y failed, Z removed), S symbols, R references`
+- `Structural: N files (X skipped, Y failed, Z removed), S symbols, R references` — with an optional suffix `, D parsed with syntax errors` when tree-sitter recovered from ERROR nodes in D files (those files are indexed, not failed)
+- `  failed (retried next pass): <path>, <path>, … (+N more)` (only when Y > 0; names the files that could not be read or stored, capped at 10)
 - `Trust boundaries: backfilled N/M pending files` (only when a boundary backfill runs)
 - `Features:   created=… updated=… removed=… total=…`
 - `Semantic: N files (X skipped, Y failed, Z removed), C chunks`
+- `  failed to read (retried next pass): <path>, …` (only when the semantic Y > 0)
 
-Report the structural and semantic file counts, the semantic chunk count and its delta vs. the pre-count, whether cleanup ran (and which model → which model), and any errors.
+Report the structural and semantic file counts, the degraded (syntax-error) count if present, the named failed paths if any, the semantic chunk count and its delta vs. the pre-count, whether cleanup ran (and which model → which model), and any errors.
 
 End with one line: `<project>: <N> chunks, <M> files indexed, took <time>s`. If cleanup ran, prefix with `[model switched: old → new]`.
 

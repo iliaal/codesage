@@ -410,13 +410,15 @@ pub(crate) fn cmd_index(
             files_indexed = stats.files_indexed,
             files_skipped = stats.files_skipped,
             files_failed = stats.files_failed,
+            failed_paths = %codesage_graph::summarize_paths(&stats.failed_paths, 10),
+            files_degraded = stats.files_degraded,
             files_removed = stats.files_removed,
             symbols = stats.symbols_found,
             refs = stats.references_found,
             "structural index complete"
         );
     } else {
-        println!(
+        let mut line = format!(
             "Structural: {} files ({} skipped, {} failed, {} removed), {} symbols, {} references",
             stats.files_indexed,
             stats.files_skipped,
@@ -425,6 +427,19 @@ pub(crate) fn cmd_index(
             stats.symbols_found,
             stats.references_found
         );
+        if stats.files_degraded > 0 {
+            line.push_str(&format!(
+                ", {} parsed with syntax errors",
+                stats.files_degraded
+            ));
+        }
+        println!("{line}");
+        if !stats.failed_paths.is_empty() {
+            println!(
+                "  failed (retried next pass): {}",
+                codesage_graph::summarize_paths(&stats.failed_paths, 10)
+            );
+        }
     }
 
     // Targeted trust-boundary backfill. `files_pending_boundary_derivation`

@@ -23,20 +23,38 @@ pub(crate) fn ts_language(language: Language) -> tree_sitter::Language {
 
 /// Parse one source file. Tree-sitter is error-tolerant: it returns `Some`
 /// even for malformed input, surfacing the damage as `ERROR` / `MISSING`
-/// nodes. Callers store whatever symbols/references come out, so a partial
-/// parse stored silently would read as a complete file downstream. Fail
-/// instead — the indexer's per-file `files_failed` accounting already skips
-/// and warns on `Err`, which is the degraded-file marking available today.
+/// nodes while still producing well-formed subtrees around them. The tree
+/// is returned as-is so those subtrees are extracted; unknown function-like
+/// macros at file scope (php-src's `ZEND_*` / `PHP_FUNCTION` family, custom
+/// attribute macros) would otherwise drop every symbol in the file. Callers
+/// that want to account for partial parses check [`ParsedTree::degraded`]
+/// via [`parse_file_tolerant`].
 pub fn parse_file(source: &[u8], language: Language) -> Result<Tree> {
+    Ok(parse_file_tolerant(source, language)?.tree)
+}
+
+/// A parsed tree plus whether tree-sitter had to recover from syntax it
+/// could not fully parse.
+#[derive(Debug)]
+pub struct ParsedTree {
+    pub tree: Tree,
+    /// True when the tree contains `ERROR` or `MISSING` nodes. Symbols and
+    /// references outside the damaged regions are still extractable; the flag
+    /// lets the indexer count such files separately from outright failures.
+    pub degraded: bool,
+}
+
+/// Parse one source file and report whether the parse was degraded. Only a
+/// parser that returns no tree at all (cancelled, or the language failed to
+/// load) is an error.
+pub fn parse_file_tolerant(source: &[u8], language: Language) -> Result<ParsedTree> {
     let mut parser = Parser::new();
     parser.set_language(&ts_language(language))?;
     let tree = parser
         .parse(source, None)
         .ok_or_else(|| anyhow::anyhow!("tree-sitter parsing failed"))?;
-    if tree.root_node().has_error() {
-        anyhow::bail!("tree-sitter parse produced error nodes (malformed input)");
-    }
-    Ok(tree)
+    let degraded = tree.root_node().has_error();
+    Ok(ParsedTree { tree, degraded })
 }
 
 /// Lossy text of the byte range a node spans. `Node::utf8_text` fails on

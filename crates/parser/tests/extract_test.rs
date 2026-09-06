@@ -567,3 +567,95 @@ fn javascript_module_exports_forms_are_captured() {
     assert!(has_symbol(&syms, "exports", SymbolKind::Constant));
     assert!(has_symbol(&syms, "stop", SymbolKind::Constant));
 }
+
+// Error recovery in the C grammar. Tree-sitter keeps producing a tree around
+// syntax it cannot parse; the extractor must neither drop the file nor emit
+// one stored row twice.
+
+const NTAPI_TYPEDEF_C: &[u8] = b"typedef NTSTATUS (NTAPI *nt_create_file_fn)(\n\
+    \tPHANDLE, ACCESS_MASK, ULONG, ULONG, ULONG, ULONG, PVOID, ULONG);\n\
+    int after(void) { return 0; }\n";
+
+const UNKNOWN_TOPLEVEL_MACROS_C: &[u8] = b"ZEND_BEGIN_ARG_INFO_EX(arginfo_add, 0, 0, 2)\n\
+    \tZEND_ARG_INFO(0, a)\n\
+    ZEND_END_ARG_INFO()\n\
+    \n\
+    int add(int a, int b) {\n\
+    \treturn a + b;\n\
+    }\n\
+    \n\
+    PHP_FUNCTION(fastchart_add)\n\
+    {\n\
+    \tRETURN_LONG(add(1, 2));\n\
+    }\n";
+
+#[test]
+fn parse_file_tolerant_flags_a_tree_with_error_nodes_as_degraded() {
+    let parsed =
+        codesage_parser::parse::parse_file_tolerant(UNKNOWN_TOPLEVEL_MACROS_C, Language::C)
+            .unwrap();
+    assert!(parsed.degraded);
+    assert!(parsed.tree.root_node().has_error());
+}
+
+#[test]
+fn parse_file_tolerant_leaves_clean_source_undegraded() {
+    let parsed = codesage_parser::parse::parse_file_tolerant(
+        b"int add(int a, int b) { return a + b; }\n",
+        Language::C,
+    )
+    .unwrap();
+    assert!(!parsed.degraded);
+}
+
+#[test]
+fn c_unknown_toplevel_macros_do_not_hide_the_functions_around_them() {
+    let tree = parse_file(UNKNOWN_TOPLEVEL_MACROS_C, Language::C)
+        .expect("a tree with error nodes is still a tree");
+    let syms = extract_symbols(&tree, UNKNOWN_TOPLEVEL_MACROS_C, Language::C, "ext.c").unwrap();
+    assert!(has_symbol(&syms, "add", SymbolKind::Function), "{syms:?}");
+    assert!(
+        has_symbol(&syms, "fastchart_add", SymbolKind::Function),
+        "{syms:?}"
+    );
+}
+
+#[test]
+fn c_recovered_typedef_emits_each_symbol_row_once() {
+    // With `NTAPI` unknown, the recovered `type_definition` carries one
+    // `declarator: (type_identifier)` per parameter type, so the typedef
+    // pattern matches `ULONG` five times on one def node. Storage keys a
+    // symbol on (name, qualified_name, kind, span): five equal rows would
+    // trip the UNIQUE index and abort the write batch.
+    let tree = parse_file(NTAPI_TYPEDEF_C, Language::C).unwrap();
+    assert!(
+        tree.root_node().has_error(),
+        "fixture must exercise recovery"
+    );
+    let syms = extract_symbols(&tree, NTAPI_TYPEDEF_C, Language::C, "nt.c").unwrap();
+
+    let mut rows: Vec<(&str, &str, &str, u32, u32, u32, u32)> = syms
+        .iter()
+        .map(|s| {
+            (
+                s.name.as_str(),
+                s.qualified_name.as_str(),
+                s.kind.as_str(),
+                s.line_start,
+                s.line_end,
+                s.col_start,
+                s.col_end,
+            )
+        })
+        .collect();
+    let emitted = rows.len();
+    rows.sort();
+    rows.dedup();
+    assert_eq!(emitted, rows.len(), "duplicate symbol rows: {syms:?}");
+    assert_eq!(
+        syms.iter().filter(|s| s.name == "ULONG").count(),
+        1,
+        "{syms:?}"
+    );
+    assert!(has_symbol(&syms, "after", SymbolKind::Function), "{syms:?}");
+}

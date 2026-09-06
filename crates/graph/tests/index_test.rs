@@ -146,3 +146,31 @@ fn incremental_removes_deleted_files() {
     .unwrap();
     assert!(results.is_empty());
 }
+
+#[test]
+fn full_index_keeps_a_file_whose_parse_recovered_from_unknown_macros() {
+    let (dir, db) = setup_project();
+    // php-src style: function-like macros at file scope that the C grammar
+    // cannot parse without the preprocessor. Tree-sitter recovers around them.
+    std::fs::write(
+        dir.path().join("ext.c"),
+        b"ZEND_BEGIN_ARG_INFO_EX(arginfo_mul, 0, 0, 2)\nZEND_END_ARG_INFO()\n\nint mul(int a, int b) {\n    return a * b;\n}\n",
+    )
+    .unwrap();
+
+    let stats = full_index(dir.path(), &db, &[], false).unwrap();
+
+    assert_eq!(stats.files_failed, 0, "{stats:?}");
+    assert_eq!(stats.files_indexed, 4, "{stats:?}");
+    assert_eq!(stats.files_degraded, 1, "{stats:?}");
+    let results = find_symbol(
+        &db,
+        &FindSymbolRequest {
+            name: "mul".to_string(),
+            kind: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(results[0].file_path, "ext.c");
+}

@@ -812,6 +812,22 @@ impl Database {
         Ok(n > 0)
     }
 
+    /// Drop one file's structural rows: the `files` row and, by cascade,
+    /// its `symbols`, `refs`, `symbol_fingerprints`, and
+    /// `file_trust_boundaries`. Unlike [`Database::remove_file`] this leaves
+    /// semantic chunks, git history, and feature rows alone: the file still
+    /// exists on disk, only a structural pass could not process it, and those
+    /// layers derive their state independently. With no `files` row the next
+    /// incremental pass sees no stored hash and retries the file. Returns
+    /// whether a row existed.
+    pub fn remove_structural_file(&self, path: &str) -> Result<bool> {
+        let n = self
+            .conn
+            .prepare_cached("DELETE FROM files WHERE path = ?1")?
+            .execute(params![path])?;
+        Ok(n > 0)
+    }
+
     /// Remove one file from every per-path store: `files` (FK cascades cover
     /// symbols / refs / fingerprints / trust boundaries), semantic freshness,
     /// git history, feature membership, and EVERY model's chunk table plus

@@ -452,6 +452,16 @@ pub struct IndexStats {
     pub files_skipped: usize,
     #[serde(default)]
     pub files_failed: usize,
+    /// Repo-relative paths behind `files_failed`, so a persistent failure
+    /// can be named in the summary instead of leaving the operator to
+    /// grep the log.
+    #[serde(default)]
+    pub failed_paths: Vec<String>,
+    /// Files indexed from a tree containing `ERROR` / `MISSING` nodes.
+    /// Counted inside `files_indexed`, never in `files_failed`: symbols
+    /// outside the damaged regions were extracted and stored.
+    #[serde(default)]
+    pub files_degraded: usize,
     pub files_removed: usize,
     pub symbols_found: usize,
     pub references_found: usize,

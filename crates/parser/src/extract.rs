@@ -266,8 +266,15 @@ pub fn extract_symbols(
         _ => None,
     };
 
-    let mut symbols = Vec::new();
+    let mut symbols: Vec<Symbol> = Vec::new();
     let mut seen_defs = std::collections::HashSet::new();
+    // Storage keys a symbol on (name, qualified_name, kind, span). Error
+    // recovery can hang several same-text declarators off one def node (a
+    // `typedef R (CALLCONV *fn)(T, T, T)` whose calling-convention macro is
+    // unknown parses each parameter type as a declarator of the typedef), and
+    // `seen_defs` keeps those because the name nodes differ. Collapse them
+    // here so the stored row set equals the emitted one.
+    let mut seen_rows = std::collections::HashSet::new();
 
     while let Some(m) = matches.next() {
         let Some(kind) = kind_map(m.pattern_index) else {
@@ -350,7 +357,7 @@ pub fn extract_symbols(
             _ => Vec::new(),
         };
 
-        symbols.push(Symbol {
+        let symbol = Symbol {
             name,
             qualified_name,
             kind,
@@ -360,10 +367,27 @@ pub fn extract_symbols(
             col_start,
             col_end,
             rationale,
-        });
+        };
+        if seen_rows.insert(symbol_row_key(&symbol)) {
+            symbols.push(symbol);
+        }
     }
 
     Ok(symbols)
+}
+
+/// The columns of the `symbols` UNIQUE index, minus `file_id` (one file per
+/// call). Two emitted symbols with equal keys would be one stored row.
+fn symbol_row_key(s: &Symbol) -> (String, String, SymbolKind, u32, u32, u32, u32) {
+    (
+        s.name.clone(),
+        s.qualified_name.clone(),
+        s.kind,
+        s.line_start,
+        s.line_end,
+        s.col_start,
+        s.col_end,
+    )
 }
 
 fn find_php_namespace(root: &Node, source: &[u8]) -> Option<String> {

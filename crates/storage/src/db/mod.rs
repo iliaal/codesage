@@ -55,6 +55,26 @@ pub(super) fn row_enum<T>(
     })
 }
 
+/// Whether `e` is, or wraps anywhere in its chain, a SQLite UNIQUE or
+/// PRIMARY KEY violation: the only constraint failures that mean "this
+/// file's rows collide with each other". Callers writing many files use this
+/// to separate that recoverable case (skip the file) from everything that
+/// must abort the whole pass: `SQLITE_FULL`, `SQLITE_IOERR`,
+/// `SQLITE_READONLY`, `SQLITE_BUSY`, a missing table, and the other
+/// constraint kinds (CHECK, NOT NULL, FOREIGN KEY, `RAISE(ABORT)`), which
+/// share the `SQLITE_CONSTRAINT` primary code but indicate a schema/binary
+/// mismatch that would fail every file the same way.
+pub fn is_unique_violation(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(ffi_err, _))
+                if ffi_err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                    || ffi_err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+        )
+    })
+}
+
 pub(super) fn row_symbol_kind(s: &str) -> rusqlite::Result<SymbolKind> {
     row_enum(s, SymbolKind::parse, "SymbolKind")
 }
@@ -1084,6 +1104,15 @@ impl Database {
         clear_semantic_fingerprint_for(&self.conn, &self.chunk_table)
     }
 
+    /// Run arbitrary SQL on the underlying connection. Exists only so tests in
+    /// dependent crates can inject schema faults (rename a table, drop an
+    /// index) that the public API cannot express; not a supported surface.
+    #[doc(hidden)]
+    pub fn execute_raw_for_tests(&self, sql: &str) -> Result<()> {
+        self.conn.execute_batch(sql)?;
+        Ok(())
+    }
+
     pub fn execute_batch(&self, f: impl FnOnce(&Self) -> Result<()>) -> Result<()> {
         self.conn.execute_batch("BEGIN")?;
         match f(self) {
@@ -1114,6 +1143,74 @@ mod tests {
         FeatureConfidence, FeatureKind, FeatureRecord, FileInfo, Language, Reference, Symbol,
         TrustBoundary,
     };
+
+    #[test]
+    fn is_unique_violation_matches_only_unique_failures_through_the_chain() {
+        let db = Database::open_in_memory().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO files (path, language, content_hash) VALUES ('dup.c', 'c', 'x')",
+                [],
+            )
+            .unwrap();
+        let duplicate: anyhow::Error = db
+            .conn
+            .execute(
+                "INSERT INTO files (path, language, content_hash) VALUES ('dup.c', 'c', 'y')",
+                [],
+            )
+            .map(|_| ())
+            .unwrap_err()
+            .into();
+        let wrapped = anyhow::Error::from(
+            db.conn
+                .execute(
+                    "INSERT INTO files (path, language, content_hash) VALUES ('dup.c', 'c', 'z')",
+                    [],
+                )
+                .map(|_| ())
+                .unwrap_err(),
+        )
+        .context("writing dup.c")
+        .context("batch 3");
+        let missing_table: anyhow::Error = db
+            .conn
+            .execute("INSERT INTO no_such_table (x) VALUES (1)", [])
+            .map(|_| ())
+            .unwrap_err()
+            .into();
+        // `symbol_fingerprints.fp` carries `CHECK (length(fp) = 512)`; a
+        // 511-byte blob fails with SQLITE_CONSTRAINT_CHECK, same primary code
+        // as UNIQUE but a systemic fault, not a per-file collision.
+        let check_failed: anyhow::Error = db
+            .conn
+            .execute(
+                "INSERT INTO symbol_fingerprints
+                     (file_id, name, kind, line_start, line_end, leaf_count, fp)
+                 VALUES (1, 'f', 'function', 1, 1, 1, ?1)",
+                params![vec![0u8; 511]],
+            )
+            .map(|_| ())
+            .unwrap_err()
+            .into();
+        let check_code = check_failed
+            .downcast_ref::<rusqlite::Error>()
+            .and_then(|e| match e {
+                rusqlite::Error::SqliteFailure(ffi_err, _) => Some(ffi_err.extended_code),
+                _ => None,
+            });
+        assert_eq!(
+            check_code,
+            Some(rusqlite::ffi::SQLITE_CONSTRAINT_CHECK),
+            "{check_failed:#}"
+        );
+
+        assert!(is_unique_violation(&duplicate));
+        assert!(is_unique_violation(&wrapped));
+        assert!(!is_unique_violation(&missing_table));
+        assert!(!is_unique_violation(&check_failed));
+        assert!(!is_unique_violation(&anyhow::anyhow!("disk full")));
+    }
 
     #[test]
     fn semantic_fingerprint_is_unknown_until_recorded_and_survives_reopen() {

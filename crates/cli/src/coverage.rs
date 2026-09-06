@@ -1,10 +1,12 @@
 //! `codesage coverage` — what this project contains that indexing cannot see.
 //!
 //! Answers a question no existing surface does. `IndexStats::files_skipped`
-//! counts files unchanged since the last pass (freshness), and `files_failed`
-//! counts parse errors on files that were at least recognized. A file whose
-//! extension maps to no supported language is dropped at discovery and reaches
-//! neither counter, so the largest coverage gap is the one nothing reports.
+//! counts files unchanged since the last pass (freshness), `files_degraded`
+//! counts recognized files whose parse recovered from syntax errors, and
+//! `files_failed` counts recognized files the pass could not read or store. A
+//! file whose extension maps to no supported language is dropped at discovery
+//! and reaches none of these counters, so the largest coverage gap is the one
+//! nothing reports.
 
 use anyhow::Result;
 use codesage_parser::discover::survey_coverage;

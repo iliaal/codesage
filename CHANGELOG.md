@@ -1,7 +1,14 @@
 ## [Unreleased]
 
+### Changed
+
+- `impact_analysis` / `find_references` on JS/TS follow member access off an imported module (`axios.CancelToken`, `typeof mod.X`, TS `ns.Type`) and the `import x = require()` / `require().default` binding forms; unbound receivers (`response.data`) are still ignored.
+
 ### Fixed
 
+- `codesage index` no longer drops a file whose parse contains error nodes (unknown function-like macros such as php-src's `ZEND_*` / `PHP_FUNCTION`); symbols outside the damaged regions are indexed and the summary reports the count as `parsed with syntax errors`.
+- A duplicate symbol row within one file (tree-sitter error recovery on a typedef with an unknown calling-convention macro) no longer aborts `codesage index` with `UNIQUE constraint failed: symbols…`; per-file failures are logged with path and cause, named in the summary, and a `--full` pass purges their stale structural rows.
+- Two same-named functions on one line (minified bundles, macro-generated C) no longer abort `codesage index` with `UNIQUE constraint failed: symbol_fingerprints…`; a file whose rows the schema rejects is failed and named on its own while the rest of the batch is written.
 - Semantic indexing reads non-UTF-8 sources lossily, as the structural parser does, instead of failing the file (php-src's Latin-1 `ext/gd/libgd/gdtestft.c` now gets vectors).
 - A file that fails to read during a whole-table semantic pass (`codesage index --full`, or `codesage index` over an unrecorded or stale table) no longer blocks the semantic fingerprint; the summary names the failed paths.
 - `codesage brief --session` writes `brief-fires.jsonl` to `$XDG_STATE_HOME/codesage` (else `~/.local/state/codesage`, mode 0700) instead of the tmpfs runtime dir; the fire ledger no longer disappears at reboot. Session gate state stays in the runtime dir.

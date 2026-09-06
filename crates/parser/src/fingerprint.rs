@@ -149,24 +149,33 @@ pub fn file_fingerprints(
             continue;
         };
         let def = def_cap.node;
-        if !seen.insert((def.start_byte(), def.end_byte())) {
-            continue;
-        }
-        let Some((fp, leaves)) = fingerprint_def(&def) else {
-            continue;
-        };
         let captured = crate::parse::node_text_lossy(&name_cap.node, source);
         let name = if language == Language::Cpp {
             crate::extract::cpp_bare_name(&captured)
         } else {
             captured
         };
+        let line_start = def.start_position().row as u32 + 1;
+        let line_end = def.end_position().row as u32 + 1;
+        // Dedupe on the `symbol_fingerprints` UNIQUE key, not the node's byte
+        // span: two same-named definitions on one line (minified bundles,
+        // macro-generated C) are distinct nodes with one storage identity,
+        // and a second row aborts the whole write batch. Only a stored row
+        // claims the key, so a sub-floor twin never shadows a real one.
+        let key = (name.clone(), kind, line_start, line_end);
+        if seen.contains(&key) {
+            continue;
+        }
+        let Some((fp, leaves)) = fingerprint_def(&def) else {
+            continue;
+        };
+        seen.insert(key);
         out.push(FunctionFingerprint {
             name,
             kind,
             language,
-            line_start: def.start_position().row as u32 + 1,
-            line_end: def.end_position().row as u32 + 1,
+            line_start,
+            line_end,
             leaf_count: leaves,
             fp,
         });
@@ -318,6 +327,35 @@ fn two(x: i32) -> i32 { let mut s = 0; for i in 0..x { s += i; if s > 100 { brea
         let f = fps(src, Language::Rust);
         assert_eq!(f.len(), 2);
         assert!((jaccard(&f[0].fp, &f[1].fp) - 1.0).abs() < f32::EPSILON);
+    }
+
+    const ONE_LINE_DUP_JS: &str = "function n(a,b){var s=0;for(var i=0;i<a;i++){if(i%2){s+=i*b}else{s-=1}}return s} function n(a,b){var s=0;for(var i=0;i<a;i++){if(i%2){s+=i*b}else{s-=1}}return s}\n";
+    const ONE_LINE_DUP_C: &str = "int dup(int a,int b){int s=0;for(int i=0;i<a;i++){if(i%2){s+=i*b;}else{s-=1;}}return s;} int dup(int a,int b){int s=0;for(int i=0;i<a;i++){if(i%2){s+=i*b;}else{s-=1;}}return s;}\n";
+
+    #[test]
+    fn same_named_definitions_on_one_line_yield_one_fingerprint_row() {
+        // Storage identity is `(file, name, kind, line_start, line_end)`;
+        // distinct byte spans do not make distinct rows.
+        for (src, lang) in [
+            (ONE_LINE_DUP_JS, Language::JavaScript),
+            (ONE_LINE_DUP_C, Language::C),
+        ] {
+            let f = fps(src, lang);
+            assert_eq!(f.len(), 1, "{lang:?}: {f:?}");
+            assert_eq!((f[0].line_start, f[0].line_end), (1, 1), "{lang:?}");
+            assert!(
+                f[0].leaf_count >= MIN_LEAF_NODES,
+                "{lang:?}: fixture must clear the leaf floor"
+            );
+        }
+    }
+
+    #[test]
+    fn same_named_definitions_on_different_lines_keep_both_rows() {
+        let src = ONE_LINE_DUP_C.replacen("} int dup", "}\nint dup", 1);
+        let f = fps(&src, Language::C);
+        assert_eq!(f.len(), 2, "{f:?}");
+        assert_ne!(f[0].line_start, f[1].line_start);
     }
 
     #[test]
