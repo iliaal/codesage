@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.26.0] - 2026-09-06
+
 ### Changed
 
 - `impact_analysis` / `find_references` on JS/TS follow member access off an imported module (`axios.CancelToken`, `typeof mod.X`, TS `ns.Type`) and the `import x = require()` / `require().default` binding forms; unbound receivers (`response.data`) are still ignored.
@@ -854,5 +856,7 @@ Initial public release.
 
 [0.24.0]: https://github.com/iliaal/codesage/releases/tag/v0.24.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.25.0...HEAD
 [0.25.0]: https://github.com/iliaal/codesage/releases/tag/v0.25.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.26.0...HEAD
+[0.26.0]: https://github.com/iliaal/codesage/releases/tag/v0.26.0
