@@ -323,6 +323,37 @@ mod tests {
         assert!(!refs.contains("\"col\""), "{refs}");
     }
 
+    /// The graph tools disclose that their counts are floors over name-based
+    /// edges; the schema must advertise those fields so an agent consulting
+    /// `outputSchema` knows to read them.
+    #[test]
+    fn graph_tools_declare_resolution_honesty_fields() {
+        let server = CodeSageServer::new();
+        let mut tools = server.tool_router.list_all();
+        finalize_tools_for_listing(&mut tools);
+        let props = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name.as_ref() == name)
+                .and_then(|t| t.output_schema.clone())
+                .and_then(|s| s.get("properties").cloned())
+                .unwrap_or_else(|| panic!("tool `{name}` must advertise outputSchema properties"))
+        };
+        for tool in ["find_references", "impact_analysis", "trace_call_path"] {
+            assert!(
+                props(tool).get("counts_floor").is_some(),
+                "`{tool}` outputSchema must declare `counts_floor`"
+            );
+        }
+        let refs = props("find_references");
+        for key in ["definition_count", "ambiguous", "note"] {
+            assert!(
+                refs.get(key).is_some(),
+                "find_references outputSchema must declare `{key}`"
+            );
+        }
+    }
+
     /// Every tool must advertise annotations through the `tools/list`
     /// finalization path: `readOnlyHint: true` + `openWorldHint: false` for
     /// the query surface, `readOnlyHint: false` for the session tools (they

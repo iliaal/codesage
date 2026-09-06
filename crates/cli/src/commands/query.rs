@@ -60,7 +60,7 @@ pub(crate) fn cmd_find_references(name: &str, kind_str: Option<&str>, json: bool
                 .ok_or_else(|| anyhow::anyhow!("unknown reference kind: {kind}"))
         })
         .transpose()?;
-    let results = find_references(
+    let report = find_references(
         &db,
         &FindReferencesRequest {
             symbol_name: name.to_string(),
@@ -69,20 +69,22 @@ pub(crate) fn cmd_find_references(name: &str, kind_str: Option<&str>, json: bool
     )?;
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&codesage_protocol::FindReferencesResults { results })?
-        );
-    } else if results.is_empty() {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    if report.results.is_empty() {
         println!("No references found for '{name}'");
     } else {
-        for r in &results {
+        for r in &report.results {
             let ctx = r.from_symbol.as_deref().unwrap_or("top-level");
             println!(
                 "{} {} -- {}:{} (in {})",
                 r.kind, r.to_name, r.from_file, r.line, ctx
             );
         }
+    }
+    if let Some(note) = &report.note {
+        println!("Note: {note}");
     }
     Ok(())
 }

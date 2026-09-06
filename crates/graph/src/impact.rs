@@ -289,6 +289,7 @@ pub fn impact_analysis_report(
         sibling_symbols,
         truncated,
         summary,
+        counts_floor: true,
     })
 }
 
@@ -505,6 +506,16 @@ mod tests {
         let (entries, capped) = impact_analysis_walk(&db, &file_request(), MAX_FRONTIER).unwrap();
         assert!(!capped, "two callers must not trip the default cap");
         assert_eq!(entries.len(), 2, "entries: {entries:?}");
+    }
+
+    #[test]
+    fn report_discloses_that_counts_are_a_floor() {
+        let (_dir, db) = setup_project();
+        let report =
+            impact_analysis_report(&db, &file_request(), &ImpactOptions::default()).unwrap();
+        assert!(report.counts_floor, "report: {report:?}");
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["counts_floor"], serde_json::Value::Bool(true));
     }
 
     #[test]

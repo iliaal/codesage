@@ -90,6 +90,7 @@ pub fn trace_call_path(db: &Database, req: &CallPathRequest) -> Result<CallPathR
                 length: 0,
                 note: Some("origin and target are the same symbol".to_string()),
                 bounded: false,
+                counts_floor: true,
             });
         }
         if visited.insert(k) {
@@ -120,6 +121,7 @@ pub fn trace_call_path(db: &Database, req: &CallPathRequest) -> Result<CallPathR
                     length,
                     note: None,
                     bounded: false,
+                    counts_floor: true,
                 });
             }
             if visited.insert(k.clone()) {
@@ -131,13 +133,16 @@ pub fn trace_call_path(db: &Database, req: &CallPathRequest) -> Result<CallPathR
 
     let note = if hit_bound {
         format!(
-            "no call chain within {} hop{} (search stopped at a bound, so a longer path may exist)",
+            "no call chain within {} hop{} via resolved name-based edges (search stopped at a \
+             bound, so a longer path may exist)",
             req.max_depth,
             if req.max_depth == 1 { "" } else { "s" }
         )
     } else {
         format!(
-            "'{}' does not reach '{}' through any call chain in the index",
+            "'{}' does not reach '{}' through any resolved name-based call edge in the index; \
+             dynamic dispatch, reflection, and callbacks leave no edge, so this is not proof no \
+             path exists",
             req.from, req.to
         )
     };
@@ -257,5 +262,58 @@ fn unfound(note: String, bounded: bool) -> CallPathReport {
         length: 0,
         note: Some(note),
         bounded,
+        counts_floor: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codesage_protocol::{FileInfo, Language, SymbolKind};
+
+    fn define(db: &Database, name: &str, path: &str) {
+        let id = db
+            .upsert_file(&FileInfo {
+                path: path.to_string(),
+                language: Language::Rust,
+                content_hash: path.to_string(),
+            })
+            .unwrap();
+        db.insert_symbols(
+            id,
+            &[Symbol {
+                name: name.to_string(),
+                qualified_name: name.to_string(),
+                kind: SymbolKind::Function,
+                file_path: path.to_string(),
+                line_start: 1,
+                line_end: 1,
+                col_start: 0,
+                col_end: 0,
+                rationale: vec![],
+            }],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn not_found_reads_as_floor_over_name_based_edges() {
+        let db = Database::open_in_memory().unwrap();
+        define(&db, "entry", "entry.rs");
+        define(&db, "sink", "sink.rs");
+        let req = CallPathRequest {
+            from: "entry".to_string(),
+            to: "sink".to_string(),
+            max_depth: 6,
+        };
+
+        let report = trace_call_path(&db, &req).unwrap();
+        assert!(!report.found);
+        assert!(!report.bounded);
+        assert!(report.counts_floor);
+        let note = report.note.as_deref().expect("unfound path carries a note");
+        assert!(note.contains("name-based"), "{note}");
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["counts_floor"], serde_json::Value::Bool(true));
     }
 }

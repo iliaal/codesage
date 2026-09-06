@@ -1474,9 +1474,34 @@ pub struct FindSymbolResults {
 }
 
 /// `{"results": [...]}` envelope around `Vec<Reference>`. See [`FindSymbolResults`].
+///
+/// The extra fields disclose what the row list cannot: reference edges come
+/// from name-based extraction, so the count is a floor, and a bare name may
+/// match several definitions, in which case the rows are their union.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FindReferencesResults {
     pub results: Vec<Reference>,
+    /// Always `true`: edges come from name-based tree-sitter extraction, so
+    /// dynamic dispatch, reflection, callback tables, and macro-generated call
+    /// sites leave no row. A zero means none found, never none exists.
+    #[serde(default = "default_true")]
+    pub counts_floor: bool,
+    /// Indexed definitions sharing the queried name (kind-unfiltered, same
+    /// lookup as `find_symbol`). Zero means the references target an
+    /// external or unindexed symbol.
+    #[serde(default)]
+    pub definition_count: usize,
+    /// `definition_count > 1`: the rows are the union across every same-named
+    /// definition, not the callers of any one of them.
+    #[serde(default)]
+    pub ambiguous: bool,
+    /// How to read an ambiguous or definition-less result; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub note: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// `{"results": [...]}` envelope around `Vec<SearchResult>`. See [`FindSymbolResults`].
@@ -1618,6 +1643,11 @@ pub struct CallPathReport {
     /// that no path exists.
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub bounded: bool,
+    /// Always `true`: the walk follows resolved name-based callee edges only,
+    /// so a `found: false` means no path via those edges, not that no path
+    /// exists (dynamic dispatch, reflection, and callbacks leave no edge).
+    #[serde(default = "default_true")]
+    pub counts_floor: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1635,7 +1665,7 @@ fn default_call_path_depth() -> usize {
 /// Adaptive `impact_analysis` output. `results` is the existing reverse-impact
 /// list (so callers reading `.results` keep working); the other fields populate
 /// only when the matching [`ImpactOptions`] flag is set.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ImpactReport {
     /// Reverse impact: files affected by changing the target, by distance.
     pub results: Vec<ImpactEntry>,
@@ -1652,6 +1682,24 @@ pub struct ImpactReport {
     /// Rollup counts; present with `summary_only`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub summary: Option<ImpactSummary>,
+    /// Always `true`: reverse edges come from name-based extraction, so every
+    /// count here is a floor. An empty `results` means no dependents found,
+    /// never none exist.
+    #[serde(default = "default_true")]
+    pub counts_floor: bool,
+}
+
+impl Default for ImpactReport {
+    fn default() -> Self {
+        Self {
+            results: Vec::new(),
+            forward_dependencies: Vec::new(),
+            sibling_symbols: Vec::new(),
+            truncated: false,
+            summary: None,
+            counts_floor: true,
+        }
+    }
 }
 
 /// One-call orientation snapshot for an agent starting work on a project.
