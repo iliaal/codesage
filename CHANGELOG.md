@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Fixed
+
+- `codesage install-hooks` and `doctor` recognize husky 9's `core.hooksPath = .husky/_` before the generated dir exists and install into `.husky/<hook>`; previously the layout was rejected as unrecognized while hooks sat unused in `.git/hooks`. `doctor` warns when hooks are installed but husky's runtime dir has not been generated, since git runs no hooks until then.
+
 ## [0.26.0] - 2026-09-06
 
 ### Changed

@@ -355,65 +355,31 @@ fn check_models(project: Option<&Path>) -> Check {
 }
 
 fn check_hooks(root: &Path) -> Check {
-    let configured = std::process::Command::new("git")
-        .arg("config")
-        .arg("--get")
-        .arg("core.hooksPath")
-        .current_dir(root)
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if s.is_empty() { None } else { Some(s) }
-            } else {
-                None
-            }
-        });
-
-    let (hooks_dir, kind) = match configured {
-        None => match git_common_dir(root) {
-            Some(c) => (c.join("hooks"), "git"),
-            None => {
-                return Check {
-                    name: "hooks",
-                    status: Status::Skip,
-                    message: "not a git repository".to_string(),
-                };
-            }
-        },
-        Some(p) => {
-            let path = if std::path::Path::new(&p).is_absolute() {
-                PathBuf::from(p)
-            } else {
-                root.join(&p)
-            };
-            // Redundant `core.hooksPath` pointing at the default git hooks dir
-            // — treat as unset to match resolve_hooks_dir's behavior.
-            let common = git_common_dir(root);
-            let default_hooks = common.as_ref().map(|c| c.join("hooks"));
-            if let Some(default) = default_hooks.as_ref()
-                && crate::util::paths_resolve_same(&path, default)
-            {
-                (default.clone(), "git")
-            } else if path.join("h").is_file() || path.join("husky.sh").is_file() {
-                let user = path
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or(path.clone());
-                (user, "husky")
-            } else {
+    use crate::commands::hooks::{HooksLayout, classify_hooks_path, read_hooks_path};
+    if git_common_dir(root).is_none() {
+        return Check {
+            name: "hooks",
+            status: Status::Skip,
+            message: "not a git repository".to_string(),
+        };
+    }
+    let configured = read_hooks_path(root);
+    let (hooks_dir, kind, husky_runtime_missing) =
+        match classify_hooks_path(root, configured.as_deref()) {
+            Ok(HooksLayout::Git(dir)) => (dir, "git", None),
+            Ok(HooksLayout::Husky {
+                user_dir,
+                runtime_dir,
+                runtime_present,
+            }) => (user_dir, "husky", (!runtime_present).then_some(runtime_dir)),
+            Err(e) => {
                 return Check {
                     name: "hooks",
                     status: Status::Warn,
-                    message: format!(
-                        "core.hooksPath = {} unrecognized; cannot install hooks here",
-                        path.display()
-                    ),
+                    message: format!("{e:#}"),
                 };
             }
-        }
-    };
+        };
 
     let mut installed = Vec::new();
     let mut foreign = Vec::new();
@@ -445,6 +411,25 @@ fn check_hooks(root: &Path) -> Check {
             Ok(_) => foreign.push(*name),
             Err(_) => missing.push(*name),
         }
+    }
+
+    // Husky 9 generates `.husky/_` on package-manager install; until then git
+    // has a `core.hooksPath` pointing at nothing and runs no hooks, ours
+    // included. Installed-but-inert is worth its own warning.
+    if let Some(runtime_dir) = husky_runtime_missing
+        && !installed.is_empty()
+    {
+        return Check {
+            name: "hooks",
+            status: Status::Warn,
+            message: format!(
+                "husky: {} hook(s) installed in {} but husky's runtime dir {} does not exist; \
+                 git runs no hooks until a package-manager install regenerates it",
+                installed.len(),
+                hooks_dir.display(),
+                runtime_dir.display()
+            ),
+        };
     }
 
     // A hook whose baked-in binary path no longer resolves runs and fails
@@ -789,6 +774,36 @@ mod tests {
             .unwrap();
         assert!(status.success(), "git init failed");
         dir
+    }
+
+    #[test]
+    fn check_hooks_warns_when_husky_runtime_dir_is_missing_then_passes_once_generated() {
+        // husky 9 writes the RELATIVE `.husky/_` and generates the dir only on
+        // a package-manager install; the classification must see the layout
+        // through the relative path before the dir exists.
+        let dir = init_git_repo();
+        let status = std::process::Command::new("git")
+            .args(["config", "core.hooksPath", ".husky/_"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let husky = dir.path().join(".husky");
+        std::fs::create_dir(&husky).unwrap();
+        let body = crate::commands::hooks::generate_post_commit_hook_body("/bin/sh");
+        for hook in REQUIRED_HOOKS {
+            std::fs::write(husky.join(hook), &body).unwrap();
+        }
+
+        let check = check_hooks(dir.path());
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(check.message.contains("runtime dir"), "{}", check.message);
+        assert!(check.message.contains(".husky"), "{}", check.message);
+
+        std::fs::create_dir_all(husky.join("_")).unwrap();
+        std::fs::write(husky.join("_").join("h"), "#!/bin/sh\n").unwrap();
+        let check = check_hooks(dir.path());
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
     }
 
     fn write_codesage_hook(root: &Path, name: &str) {

@@ -316,9 +316,31 @@ fn install_leak_check_hook(
     Ok(())
 }
 
-fn resolve_hooks_dir(root: &std::path::Path) -> Result<(PathBuf, bool)> {
-    let configured = std::process::Command::new("git")
+/// Where git looks for hooks in this repo, and what that location is.
+#[derive(Debug)]
+pub(crate) enum HooksLayout {
+    /// Plain git: `<git_common>/hooks`, or a `core.hooksPath` that resolves
+    /// to it.
+    Git(PathBuf),
+    /// Husky: `core.hooksPath` names husky's generated runtime dir
+    /// (`.husky/_` in husky 9, whose `h` shim runs the sibling `.husky/<hook>`
+    /// files). Hooks belong in `user_dir`; `runtime_present` says whether the
+    /// generated dir exists yet. Husky regenerates it on every package-manager
+    /// install, so nothing may be written there, and until it exists git runs
+    /// no hooks at all for this repo.
+    Husky {
+        user_dir: PathBuf,
+        runtime_dir: PathBuf,
+        runtime_present: bool,
+    },
+}
+
+pub(crate) fn read_hooks_path(root: &std::path::Path) -> Option<String> {
+    // `--type=path` expands a leading `~`, as git itself does when it
+    // resolves the hooks dir; the raw value would land under `<root>/~/…`.
+    std::process::Command::new("git")
         .arg("config")
+        .arg("--type=path")
         .arg("--get")
         .arg("core.hooksPath")
         .current_dir(root)
@@ -331,44 +353,80 @@ fn resolve_hooks_dir(root: &std::path::Path) -> Result<(PathBuf, bool)> {
             } else {
                 None
             }
-        });
+        })
+}
 
-    match configured {
-        None => {
-            let common = git_common_dir(root)
-                .ok_or_else(|| anyhow::anyhow!("unable to resolve git common dir"))?;
-            Ok((common.join("hooks"), false))
+/// Classify `core.hooksPath` (`configured`, as `git config --get` prints it)
+/// against the repo at `root`. Env-free so tests can drive every branch.
+pub(crate) fn classify_hooks_path(
+    root: &std::path::Path,
+    configured: Option<&str>,
+) -> Result<HooksLayout> {
+    let Some(raw) = configured else {
+        let common = git_common_dir(root)
+            .ok_or_else(|| anyhow::anyhow!("unable to resolve git common dir"))?;
+        return Ok(HooksLayout::Git(common.join("hooks")));
+    };
+    let path = std::path::Path::new(raw);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    // A `core.hooksPath` that resolves to the default `<git_common>/hooks`
+    // is a no-op redundancy; treat it like an unset value rather than
+    // refusing. Seen in the wild on PHP-extension repos that share a
+    // config template.
+    if let Some(common) = git_common_dir(root) {
+        let default_hooks = common.join("hooks");
+        if util::paths_resolve_same(&resolved, &default_hooks) {
+            return Ok(HooksLayout::Git(default_hooks));
         }
-        Some(raw) => {
-            let path = std::path::Path::new(&raw);
-            let resolved = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                root.join(path)
-            };
-            // A `core.hooksPath` that resolves to the default `<git_common>/hooks`
-            // is a no-op redundancy; treat it like an unset value rather than
-            // refusing. Seen in the wild on PHP-extension repos that share a
-            // config template.
-            if let Some(common) = git_common_dir(root) {
-                let default_hooks = common.join("hooks");
-                if util::paths_resolve_same(&resolved, &default_hooks) {
-                    return Ok((default_hooks, false));
-                }
-            }
-            if resolved.join("h").is_file() || resolved.join("husky.sh").is_file() {
-                let user_dir = resolved
-                    .parent()
-                    .ok_or_else(|| anyhow::anyhow!("husky hooks dir has no parent"))?
-                    .to_path_buf();
-                Ok((user_dir, true))
-            } else {
-                bail!(
-                    "core.hooksPath is set to {} but it does not look like a Husky setup; \
-                     refusing to install hooks. Install manually or clear core.hooksPath.",
-                    resolved.display()
+    }
+    let runtime_present = resolved.join("h").is_file() || resolved.join("husky.sh").is_file();
+    // Husky 9 writes `.husky/_` only when its `prepare` script runs (a
+    // package-manager install), so a fresh clone has `core.hooksPath`
+    // pointing at a directory that does not exist yet. The layout is still
+    // unmistakable: the final component is `_` and the user's hook dir is
+    // its parent. Refusing here left hooks in `.git/hooks`, which git never
+    // consults once `core.hooksPath` is set.
+    let looks_like_husky_runtime = resolved.file_name().is_some_and(|n| n == "_")
+        && resolved.parent().is_some_and(|p| p.is_dir());
+    if runtime_present || looks_like_husky_runtime {
+        let user_dir = resolved
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("husky hooks dir has no parent"))?
+            .to_path_buf();
+        return Ok(HooksLayout::Husky {
+            user_dir,
+            runtime_dir: resolved,
+            runtime_present,
+        });
+    }
+    bail!(
+        "core.hooksPath is set to {} but it does not look like a Husky setup; \
+         refusing to install hooks. Install manually or clear core.hooksPath.",
+        resolved.display()
+    );
+}
+
+fn resolve_hooks_dir(root: &std::path::Path) -> Result<(PathBuf, bool)> {
+    let configured = read_hooks_path(root);
+    match classify_hooks_path(root, configured.as_deref())? {
+        HooksLayout::Git(dir) => Ok((dir, false)),
+        HooksLayout::Husky {
+            user_dir,
+            runtime_dir,
+            runtime_present,
+        } => {
+            if !runtime_present {
+                println!(
+                    "notice: husky runtime dir {} does not exist yet; git runs no hooks in this \
+                     repo until your package-manager install regenerates it",
+                    runtime_dir.display()
                 );
             }
+            Ok((user_dir, true))
         }
     }
 }
@@ -434,6 +492,60 @@ mod tests {
                 Err(e) => panic!("hook spawn failed: {e}"),
             }
         }
+    }
+
+    // ---------- core.hooksPath classification ----------
+
+    #[test]
+    fn husky9_runtime_dir_is_recognized_even_before_it_is_generated() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".husky")).unwrap();
+        let configured = root.path().join(".husky/_");
+        match classify_hooks_path(root.path(), Some(configured.to_str().unwrap())).unwrap() {
+            HooksLayout::Husky {
+                user_dir,
+                runtime_dir,
+                runtime_present,
+            } => {
+                assert_eq!(user_dir, root.path().join(".husky"));
+                assert_eq!(runtime_dir, configured);
+                assert!(!runtime_present, "no `_/h` on disk yet");
+            }
+            HooksLayout::Git(_) => panic!("husky layout read as plain git"),
+        }
+    }
+
+    #[test]
+    fn husky_runtime_dir_with_the_h_shim_is_recognized_as_present() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".husky/_")).unwrap();
+        std::fs::write(root.path().join(".husky/_/h"), "#!/bin/sh\n").unwrap();
+        let configured = root.path().join(".husky/_");
+        match classify_hooks_path(root.path(), Some(configured.to_str().unwrap())).unwrap() {
+            HooksLayout::Husky {
+                user_dir,
+                runtime_present,
+                ..
+            } => {
+                assert_eq!(user_dir, root.path().join(".husky"));
+                assert!(runtime_present);
+            }
+            HooksLayout::Git(_) => panic!("husky layout read as plain git"),
+        }
+    }
+
+    #[test]
+    fn an_unrelated_hooks_path_is_still_refused() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("custom-hooks")).unwrap();
+        let configured = root.path().join("custom-hooks");
+        let err = classify_hooks_path(root.path(), Some(configured.to_str().unwrap()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not look like a Husky setup"), "{err}");
+        // A bare `_` whose parent is missing is not a husky layout either.
+        let orphan = root.path().join("nope/_");
+        assert!(classify_hooks_path(root.path(), Some(orphan.to_str().unwrap())).is_err());
     }
 
     // ---------- post-commit hook body contract ----------
