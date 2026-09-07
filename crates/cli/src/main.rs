@@ -162,6 +162,17 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Map a pasted stack trace or sanitizer report onto indexed symbols, innermost-first
+    FromTrace {
+        /// File holding the trace; `-` or omitted reads stdin
+        file: Option<PathBuf>,
+        /// Maximum frames to report (innermost-first); all when omitted or 0
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Analyze change impact for a symbol or file
     Impact {
         /// Symbol name or file path (auto-detected)
@@ -1090,6 +1101,9 @@ fn run(cli: Cli) -> Result<()> {
             max_depth,
             json,
         } => query::cmd_trace(&from, &to, max_depth, json),
+        Commands::FromTrace { file, limit, json } => {
+            query::cmd_from_trace(file.as_deref(), limit, json)
+        }
         Commands::Impact {
             target,
             file,
@@ -1682,6 +1696,7 @@ mod tests {
             "find-references",
             "dependencies",
             "impact",
+            "from-trace",
             "trust-boundaries",
             "map",
             "features-list",

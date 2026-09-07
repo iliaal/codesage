@@ -8,6 +8,7 @@
 - `recommend_tests` (CLI `codesage tests-for`, `review_rehearsal`) adds a `reachable` bucket: test files with a resolved call/import path into the changed set within two hops, with `reachable_total`, `unmodelled`, and lower-bound disclosure (`reach_walk_capped`, `unwalked_files`, `partial_files`, `unindexed_files`, `no_symbol_files`, `unsupported_files`).
 - `recommend_tests` walks changed tests too: a base test class or helper under `tests/` lists the tests that extend or call it in `reachable`; a `.phpt` input lands in `primary` without capping the walk.
 - The reachability walk spends one pool of resolution steps in request order under a wall-clock deadline; `CODESAGE_REACH_BUDGET` / `CODESAGE_REACH_DEADLINE_MS` override the defaults (1,500,000 steps, 5 s; `review_rehearsal` uses 1.5 s).
+- `from_trace` MCP tool and `codesage from-trace` CLI command map a pasted stack trace or sanitizer report (Python, PHP incl. Xdebug, Rust, Java, Go, Node/JS, gdb/ASan/UBSan; chained stacks split, deepest cause first) onto indexed symbols and `file:line`, innermost-first; frames outside the index or matching several definitions are `unresolved` / `ambiguous` with candidates, never guessed.
 
 ### Changed
 

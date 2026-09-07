@@ -1796,6 +1796,159 @@ fn default_call_path_depth() -> usize {
     6
 }
 
+/// Input to `from_trace`: a pasted stack trace or sanitizer report.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FromTraceRequest {
+    /// Raw trace text. Format is detected per line (python, php, rust, java,
+    /// go, node, gdb/asan); unrecognized lines are skipped.
+    pub trace: String,
+    /// Maximum frames returned, innermost-first. `None` or `0` returns every
+    /// parsed frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+/// How a trace frame mapped onto the index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum TraceFrameStatus {
+    /// The frame's file is in the index, or the frame's qualified name agrees
+    /// with exactly one indexed definition; `symbol`, when present, is that
+    /// definition. A resolved frame may still carry `symbol: null` when the
+    /// line falls between definitions (module-level code).
+    Resolved,
+    /// The file suffix matched several indexed files, the qualified name
+    /// agreed with several definitions, or only a bare function name matched
+    /// (even a single same-named definition is a lead, not a location);
+    /// `candidates` lists them and `symbol` is left empty rather than guessed.
+    Ambiguous,
+    /// The file is not indexed (vendor, stdlib, runtime internals) or the frame
+    /// carried nothing the index could match.
+    Unresolved,
+}
+
+str_enum!(TraceFrameStatus {
+    Resolved => "resolved",
+    Ambiguous => "ambiguous",
+    Unresolved => "unresolved",
+});
+
+/// The indexed definition a trace frame landed on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TraceSymbol {
+    /// Bare definition name (`save`, `cmd_search`).
+    pub name: String,
+    /// Fully qualified name as the index stores it (`Type::method`,
+    /// `Ns\Class\method`, `pkg.Class.method`); equal to `name` for an
+    /// unqualified definition.
+    pub qualified_name: String,
+    /// Definition kind (function, method, class, struct, …).
+    pub kind: SymbolKind,
+    /// Project-relative path of the definition.
+    pub path: String,
+    /// First line of the definition, 1-based.
+    pub line_start: u32,
+    /// Last line of the definition, 1-based, inclusive.
+    pub line_end: u32,
+}
+
+/// One frame of a parsed trace, mapped onto the index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TraceFrame {
+    /// Position in `frames`, 0 = innermost frame of stack 0 (see
+    /// `FromTraceReport.root_cause_first` for what stack 0 means).
+    pub index: usize,
+    /// Which stack of a multi-stack report the frame belongs to. Java: the
+    /// deepest `Caused by:` is stack 0, the primary exception last among the
+    /// causes, and `Suppressed:` blocks (siblings, not causes) after all of
+    /// them. Python: the first traceback printed (the one `During handling …`
+    /// / `The above exception was the direct cause …` refers back to). ASan:
+    /// the access stack, then `freed by`, then `previously allocated by`. Go:
+    /// the `[running]` goroutine, then the rest as printed. Rust: one stack
+    /// per `thread '…' panicked at` header. PHP `Next` chains: as printed.
+    /// `FromTraceReport.root_cause_first` says whether stack 0 is a cause or
+    /// merely first.
+    pub stack: u32,
+    /// The trace line(s) this frame was parsed from, verbatim.
+    pub raw: String,
+    /// Function or method named by the frame, as printed (path-qualified for
+    /// Rust/Java/Go/PHP), or `None` when the frame names none (`<module>`,
+    /// `{main}`, `??`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub function: Option<String>,
+    /// File named by the frame. Project-relative when it resolved to an indexed
+    /// file; otherwise as printed.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub file: Option<String>,
+    /// Line named by the frame. For PHP `#N file(line): func()` frames this is
+    /// the call site of `func`, not a line inside it; for every other format it
+    /// is a line inside `function`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub line: Option<u32>,
+    /// How the frame mapped onto the index: `resolved`, `ambiguous`, or
+    /// `unresolved` (see [`TraceFrameStatus`]).
+    pub status: TraceFrameStatus,
+    /// The definition the frame landed on. Empty when `status` is not
+    /// `resolved`, and also when the file resolved but no indexed symbol spans
+    /// the line (module-level code). It may not span `line`: when the printed
+    /// name disagrees with the spanning symbol (a closure, lambda, or trait
+    /// impl the parser did not record), a same-file definition of the printed
+    /// name wins; for PHP call-site frames it is the callee's definition,
+    /// possibly in another file.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub symbol: Option<TraceSymbol>,
+    /// On `ambiguous`: the indexed file paths that share the frame's path
+    /// suffix, or the `path:line` of each candidate definition when the
+    /// function name matched several (or only a bare name matched one).
+    /// At most 10 entries (5 when the frame names no file); `candidates_total`
+    /// carries the full count. Empty otherwise.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub candidates: Vec<String>,
+    /// How many candidates matched before `candidates` was capped; 0 when
+    /// the frame is not `ambiguous`. Always present.
+    pub candidates_total: usize,
+}
+
+/// `from_trace` result: every recognized frame, innermost-first.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct FromTraceReport {
+    /// Frames in `order`, capped at the request's `limit`.
+    pub frames: Vec<TraceFrame>,
+    /// Detected trace format: `python`, `php`, `php-xdebug`, `rust`, `java`,
+    /// `go`, `node`, `gdb-asan`, or `unknown` when no line parsed.
+    pub format: String,
+    /// Always `innermost-first`: `frames[0]` is the innermost frame of stack
+    /// 0 (see `TraceFrame.stack` and `root_cause_first`). Python and Xdebug
+    /// print outermost-first and are reversed to match.
+    pub order: String,
+    /// Stacks found in the input (1 for a plain trace; more for Java
+    /// `Caused by`, Python chained tracebacks, ASan freed/allocated stacks,
+    /// Go goroutine dumps, Rust multi-thread panics, PHP `Next` chains).
+    pub stacks: usize,
+    /// True when the format's semantics make stack 0 the root cause (a Java
+    /// cause chain; a Go dump whose `[running]` goroutine was found). False
+    /// when stack 0 is simply the first printed. Set by format even for a
+    /// single-stack report (true for any Java trace), where it carries no
+    /// ordering information. Always present.
+    pub root_cause_first: bool,
+    /// Frames recognized in the input before `limit` was applied.
+    pub parsed: usize,
+    /// Count of `resolved` frames among the frames kept by `limit` (not the
+    /// whole input; only `parsed` counts that).
+    pub resolved: usize,
+    /// Frames among those kept by `limit` that carry a `symbol`;
+    /// `resolved - with_symbol` frames landed in an indexed file between
+    /// definitions.
+    pub with_symbol: usize,
+    /// Count of `ambiguous` frames among the frames kept by `limit`.
+    pub ambiguous: usize,
+    /// Count of `unresolved` frames among the frames kept by `limit`.
+    pub unresolved: usize,
+    /// Set when nothing parsed or when `limit` dropped frames.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub note: Option<String>,
+}
+
 /// Adaptive `impact_analysis` output. `results` is the existing reverse-impact
 /// list (so callers reading `.results` keep working); the other fields populate
 /// only when the matching [`ImpactOptions`] flag is set.

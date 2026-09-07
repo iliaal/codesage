@@ -298,6 +298,99 @@ pub(crate) fn cmd_trace(from: &str, to: &str, max_depth: usize, json: bool) -> R
     Ok(())
 }
 
+pub(crate) fn cmd_from_trace(
+    file: Option<&std::path::Path>,
+    limit: Option<usize>,
+    json: bool,
+) -> Result<()> {
+    use anyhow::{Context, bail};
+    use std::io::{IsTerminal, Read};
+
+    let trace = match file {
+        Some(p) if p.as_os_str() != "-" => std::fs::read_to_string(p)
+            .with_context(|| format!("failed to read trace from {}", p.display()))?,
+        _ => {
+            if std::io::stdin().is_terminal() {
+                bail!("no trace provided (pass a file path or pipe the trace via stdin)");
+            }
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            buf
+        }
+    };
+    if trace.trim().is_empty() {
+        bail!("the trace is empty");
+    }
+
+    let root = find_project_root()?;
+    let db = open_db(&root)?;
+    let report = codesage_graph::from_trace(
+        &db,
+        &root,
+        &codesage_protocol::FromTraceRequest { trace, limit },
+    )?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    println!(
+        "format: {} ({} parsed, {} resolved ({} with symbol), {} ambiguous, {} unresolved; {} stack{}; {})",
+        report.format,
+        report.parsed,
+        report.resolved,
+        report.with_symbol,
+        report.ambiguous,
+        report.unresolved,
+        report.stacks,
+        if report.stacks == 1 { "" } else { "s" },
+        report.order
+    );
+    if let Some(note) = &report.note {
+        println!("  {note}");
+    }
+    let mut current_stack: Option<u32> = None;
+    for f in &report.frames {
+        if report.stacks > 1 && current_stack != Some(f.stack) {
+            current_stack = Some(f.stack);
+            println!(
+                "-- stack {}{}",
+                f.stack,
+                if f.stack == 0 && report.root_cause_first {
+                    " (root cause)"
+                } else {
+                    ""
+                }
+            );
+        }
+        let location = match (&f.file, f.line) {
+            (Some(p), Some(l)) => format!("{p}:{l}"),
+            (Some(p), None) => p.clone(),
+            (None, _) => "(no file)".to_string(),
+        };
+        let symbol = match &f.symbol {
+            Some(s) => format!(
+                "{} ({}, {}:{}-{})",
+                s.qualified_name, s.kind, s.path, s.line_start, s.line_end
+            ),
+            None => f.function.clone().unwrap_or_default(),
+        };
+        println!("#{:<3} {:<10} {location}  {symbol}", f.index, f.status);
+        for c in &f.candidates {
+            println!("        candidate: {c}");
+        }
+        if f.candidates_total > f.candidates.len() {
+            println!(
+                "        … {} more candidates ({} total)",
+                f.candidates_total - f.candidates.len(),
+                f.candidates_total
+            );
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_impact(
     target: &str,

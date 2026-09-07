@@ -1152,6 +1152,15 @@ fn every_schema_bearing_tool_returns_populated_structured_content() {
             &["found", "steps", "length"],
         ),
         (
+            "from_trace",
+            serde_json::json!({
+                "trace": format!(
+                    "thread 'main' panicked at src/helper.rs:4:5:\nboom\nstack backtrace:\n   0: fixture::helper::inner_step\n             at {root}/src/helper.rs:4:5\n   1: fixture::outer_step\n             at {root}/src/lib.rs:7:5\n   2: std::rt::lang_start\n             at /rustc/abc/library/std/src/rt.rs:100:5\n"
+                )
+            }),
+            &["frames", "format", "parsed", "resolved"],
+        ),
+        (
             "impact_analysis",
             serde_json::json!({"target": "inner_step"}),
             &["results"],
@@ -1559,6 +1568,46 @@ fn trace_call_path_mcp_and_cli_json_agree_on_step_fields() {
         .filter(|k| *k != "_meta")
         .collect();
     assert_eq!(ckeys, mkeys, "top-level field sets diverge");
+}
+
+#[test]
+fn from_trace_subdirectory_project_still_reads_the_workspace_manifest() {
+    // A name-only Rust frame (no `at` line) can only resolve through the
+    // Cargo manifest: `fixture::helper::inner_step` ↔ package `fixture`,
+    // `src/helper.rs`. Passing a subdirectory as `project` resolves the same
+    // index; the handler must hand the graph layer the canonical root, not
+    // the subdirectory, or the manifest is never found.
+    let project = tempfile::tempdir().unwrap();
+    onboard_rich_fixture(project.path());
+
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut session = McpSession::start(runtime.path());
+    session.initialize();
+    let resp = session.request(
+        2,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"from_trace","arguments":{{"project":"{}","trace":"   0: fixture::helper::inner_step\n   1: fixture::outer_step\n"}}}}}}"#,
+            project.path().join("src").display()
+        ),
+    );
+    assert_ne!(
+        resp["result"]["isError"],
+        Value::Bool(true),
+        "from_trace failed: {resp}"
+    );
+    let report = &resp["result"]["structuredContent"];
+    assert_eq!(report["format"], "rust", "{report}");
+    assert_eq!(report["parsed"], 2, "{report}");
+    let frames = report["frames"].as_array().expect("frames");
+    assert_eq!(frames[0]["status"], "resolved", "{report}");
+    assert_eq!(frames[0]["file"], "src/helper.rs", "{report}");
+    assert_eq!(frames[0]["symbol"]["name"], "inner_step", "{report}");
+    assert_eq!(frames[1]["status"], "resolved", "{report}");
+    assert_eq!(frames[1]["file"], "src/lib.rs", "{report}");
+    assert_eq!(report["resolved"], 2, "{report}");
 }
 
 /// A fixture with real data for every MCP tool, so an assertion that a tool

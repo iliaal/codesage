@@ -230,6 +230,22 @@ pub struct TracePathParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct FromTraceParams {
+    #[schemars(description = PROJECT_ARG_DESC)]
+    pub project: String,
+    #[schemars(
+        description = "The stack trace or sanitizer report, pasted verbatim (Python traceback, PHP fatal + `#N` frames or Xdebug `Call Stack`, Rust backtrace, Java/Kotlin `at` lines, Go goroutine dump, Node/JS `at` lines, gdb/ASan/UBSan `#N` frames). Chained reports (`Caused by:`, `During handling …`, `freed by thread`, several goroutines) are split into stacks. Unrecognized lines are skipped."
+    )]
+    pub trace: String,
+    #[schemars(
+        description = "Maximum frames returned, innermost-first (default 50, which is also the ceiling over MCP; a larger value is capped and reported under `_meta.clamps`; 0 means the default)"
+    )]
+    #[serde(default, deserialize_with = "deser_optional_usize")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ImpactParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
@@ -704,6 +720,29 @@ mod tests {
     }
 
     #[test]
+    fn from_trace_requires_trace_and_accepts_string_limit() {
+        let r: Result<FromTraceParams, _> = serde_json::from_value(json!({
+            "project": "/p",
+        }));
+        assert!(r.is_err(), "a missing `trace` must be a param error");
+
+        let p: FromTraceParams = serde_json::from_value(json!({
+            "project": "/p",
+            "trace": "   0: main\n",
+            "limit": "5",
+        }))
+        .expect("numeric-string limit parses like every other integer param");
+        assert_eq!(p.limit, Some(5));
+
+        let r: Result<FromTraceParams, _> = serde_json::from_value(json!({
+            "project": "/p",
+            "trace": "x",
+            "limit": "many",
+        }));
+        assert!(r.is_err(), "a non-numeric limit must error, not be dropped");
+    }
+
+    #[test]
     fn search_rejects_unknown_language() {
         let r: Result<SearchParams, _> = serde_json::from_value(json!({
             "project": "/p",
@@ -776,6 +815,10 @@ mod tests {
         check::<TracePathParams>(
             "TracePathParams",
             json!({"project": "/p", "from": "a", "to": "b"}),
+        );
+        check::<FromTraceParams>(
+            "FromTraceParams",
+            json!({"project": "/p", "trace": "   0: main\n"}),
         );
         check::<ImpactParams>("ImpactParams", json!({"project": "/p", "target": "Foo"}));
         check::<ExportContextParams>(

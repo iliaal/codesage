@@ -11,16 +11,17 @@ use std::sync::Arc;
 use anyhow::Result;
 use codesage_graph::{
     assess_risk, assess_risk_batch, assess_risk_diff, export_context, export_context_for_symbol,
-    feature_bundle, find_coupling, find_references, find_similar, find_symbol,
+    feature_bundle, find_coupling, find_references, find_similar, find_symbol, from_trace,
     impact_analysis_report, list_dependencies, recommend_tests_with_reachability, search_page,
     session_end, session_start, trace_call_path,
 };
 use codesage_protocol::{
     CallPathReport, CallPathRequest, ContextBundle, CouplingReport, DependencyEntry, ExportRequest,
     FeatureListResults, FindReferencesRequest, FindReferencesResults, FindSimilarResults,
-    FindSymbolRequest, FindSymbolResults, ImpactOptions, ImpactReport, ImpactRequest, ImpactTarget,
-    ProjectOverview, ReviewRehearsal, RiskAssessment, RiskBatchAssessment, RiskDiffAssessment,
-    SearchRequest, SearchResults, SessionDiff, SessionStartReport, TestRecommendations,
+    FindSymbolRequest, FindSymbolResults, FromTraceReport, FromTraceRequest, ImpactOptions,
+    ImpactReport, ImpactRequest, ImpactTarget, ProjectOverview, ReviewRehearsal, RiskAssessment,
+    RiskBatchAssessment, RiskDiffAssessment, SearchRequest, SearchResults, SessionDiff,
+    SessionStartReport, TestRecommendations,
 };
 use rmcp::{
     ServerHandler, ServiceExt,
@@ -40,6 +41,7 @@ const MAX_MCP_CONTEXT_LIMIT: usize = 20;
 const MAX_MCP_FEATURE_LIMIT: usize = 500;
 const MAX_MCP_FEATURE_SCAN_LIMIT: usize = 5_000;
 const MAX_MCP_OFFSET: usize = 1_000;
+const MAX_MCP_TRACE_FRAMES: usize = 50;
 /// Per-call ceiling for the hidden `embed_texts` tool. The CLI sends one
 /// commit batch (50 files) per call, so this is headroom, not a target.
 pub(crate) const MAX_MCP_EMBED_TEXTS: usize = 4_096;
@@ -576,6 +578,40 @@ impl CodeSageServer {
                 "trace_call_path",
             );
             render::annotate_clamps(result, depth_clamp.as_slice())
+        })
+        .await
+    }
+
+    #[tool(
+        name = "from_trace",
+        description = "Map a pasted stack trace or sanitizer report onto indexed symbols. Paste it verbatim; Python, PHP (incl. Xdebug), Rust, Java, Go, Node/JS, and gdb/ASan/UBSan are detected per line (Kotlin parses as Java, but a frame naming a `.kt` file is always `unresolved`: Kotlin is not indexed). `frames` are innermost-first: `frames[0]` is the innermost frame of stack 0, each with the indexed `file`:`line` and the `symbol` whose definition spans it. Chained reports split into stacks (`stack`, `stacks`, `root_cause_first`): Java's deepest `Caused by:` is stack 0 with `Suppressed:` blocks last; Python's first traceback, ASan's access stack, Go's `[running]` goroutine, and each Rust panicking thread are stack 0 in printed order. Frames are marked, not guessed: `unresolved` = file outside the index or nothing matched; `ambiguous` = path suffix or qualified name matched several entries, or only a bare name matched (a lead, not a location), listed in `candidates` (max 10, or 5 for a frame with no file; `candidates_total` has the count) with `symbol` empty. `resolved` may carry `symbol: null` between definitions (`with_symbol` counts the rest). PHP `#N file(line): func()` frames give the CALL SITE of `func`, so `symbol` is `func`'s definition, not the function spanning `line`. `format: \"unknown\"`, `parsed: 0` means nothing was recognized. Long traces are cut twice: `limit` (default and ceiling 50) sets `frames` and the resolved/ambiguous/unresolved counts — see `note`; the response budget may cut `frames` further — see `_meta.truncated`. Only `parsed` counts the whole input. Follow up with `find_references` or `trace_call_path` on the resolved symbols.",
+        output_schema = schema_for_type::<FromTraceReport>()
+    )]
+    async fn from_trace_tool(
+        &self,
+        Parameters(params): Parameters<FromTraceParams>,
+    ) -> CallToolResult {
+        self.blocking(move |s| {
+            // `limit: 0` means "the default", as it does for `list_features`.
+            let (limit, clamp) = capped_limit_tracked(
+                params.limit.filter(|&l| l > 0),
+                MAX_MCP_TRACE_FRAMES,
+                MAX_MCP_TRACE_FRAMES,
+                "limit",
+            );
+            let req = FromTraceRequest {
+                trace: params.trace.clone(),
+                limit: Some(limit),
+            };
+            let result = s.render(
+                &params.project,
+                // The canonical root, not `params.project`: a subdirectory
+                // resolves the same index but holds no `Cargo.toml`, which
+                // would silently disable Rust module-path agreement.
+                s.with_project_root_db(&params.project, |root, db| from_trace(db, root, &req)),
+                "from_trace",
+            );
+            render::annotate_clamps(result, clamp.as_slice())
         })
         .await
     }

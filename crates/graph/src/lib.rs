@@ -13,6 +13,7 @@ mod search;
 mod semantic;
 mod session;
 mod similar;
+mod trace_locate;
 
 pub use brief::build_edit_brief;
 pub use bundle::{export_context, export_context_for_symbol, feature_bundle};
@@ -36,3 +37,4 @@ pub use semantic::{
 };
 pub use session::{session_end, session_start, top_risk_files};
 pub use similar::find_similar;
+pub use trace_locate::from_trace;
