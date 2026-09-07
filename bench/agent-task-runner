@@ -71,6 +71,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+sys.path.append(str(Path(__file__).resolve().parent))
+from _codesage_version import parse_version_banner, run_version_banner  # noqa: E402
+
 try:
     import yaml
 except ImportError:
@@ -571,13 +574,9 @@ def render_scorecard(
 
 
 def codesage_version(codesage_bin: str) -> str:
-    try:
-        r = subprocess.run(
-            [codesage_bin, "--version"], capture_output=True, text=True, timeout=10
-        )
-        return (r.stdout or r.stderr or "").strip() or "unknown"
-    except Exception:
-        return "unknown"
+    # First banner line only; the multi-line 0.26+ banner would otherwise
+    # break the single-line `- **CodeSage**:` report field.
+    return parse_version_banner(run_version_banner(codesage_bin, timeout=10))["version"]
 
 
 def main() -> int:

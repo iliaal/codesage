@@ -36,6 +36,23 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
+sys.path.append(str(Path(__file__).resolve().parent))
+from _codesage_version import codesage_version_info  # noqa: E402
+
+
+def codesage_provenance(codesage_bin: str) -> dict:
+    """Binary provenance from the first `--version` line plus build fields.
+
+    The banner's `device configured` line depends on the cwd's project config
+    and this runner searches many repos, so it is deliberately not recorded.
+    """
+    info = codesage_version_info(codesage_bin)
+    return {
+        "codesage_version": None if info["version"] == "unknown" else info["version"],
+        "codesage_build_target": info.get("build_target"),
+        "codesage_features": info.get("features"),
+    }
+
 SUPPORTED = {
     "python", "php", "c", "cpp", "java",
     "rust", "javascript", "typescript", "go",
@@ -272,14 +289,8 @@ def main():
         except Exception:  # noqa: BLE001 - provenance is best-effort, never fatal
             return None
 
-    try:
-        bin_version = subprocess.run([args.codesage_bin, "--version"],
-                                     capture_output=True, text=True, timeout=30).stdout.strip()
-    except Exception:  # noqa: BLE001
-        bin_version = None
-
     provenance = {
-        "codesage_version": bin_version,
+        **codesage_provenance(args.codesage_bin),
         "codesage_commit": _rev(Path(__file__).resolve().parent.parent),
         "semble_commit": _rev(args.repos.parent.parent),
         "corpus_root": str(args.corpus),

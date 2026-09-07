@@ -9,15 +9,55 @@ claim derived from this runner should be quotable verbatim from the output.
 
 Usage:
   codesage-bench-runner <corpus.yaml> [--limit 10] [--verbose] [--codesage-bin PATH]
+      [--results-json out.json] [--split train|heldout --salt STR]
+      [--allow-search-failures]
+
+`--results-json` writes `{"meta": {...}, "complete": bool, "records": [...]}`
+for `bench/compare-runs.py`. Each record is `{id, query, expected_files,
+hits (ranked file list), first_hit_rank | null, source, repo}` plus
+`error: "timeout" | "rc=N" | "error"` when that case's `codesage search` did
+not run cleanly. `meta` carries `corpus` (basename), `corpus_sha256`, `split`,
+`salt`, `limit`, `head` (project HEAD), `model`, `reranker`, `codesage`
+(first banner line), `build_target`, `features`, `device`, `run_at`,
+`project_root`, and `search_failures` (count of records with `error`). The
+path is probed before any search runs and the file is rewritten after every
+case with `complete: false` until the run finishes, so an interrupted run
+keeps its partial records.
+
+Search failures are double-penalised on purpose: a failed search is scored as
+a miss in every aggregate (miss rate, recall, MRR, tokens) and excluded from
+none of them, the count is appended to METRICS as `search_failures=N`, the
+one-liner is prefixed `[INVALID: N search failures]`, and the process exits 3
+unless `--allow-search-failures`. A broken index must never read as "0% hit
+rate" in a saved scorecard.
+
+`--split` keeps only the cases whose salted sha256 lands in that half (same
+`split_of` as compare-runs.py); tune on `train`, run `heldout` once, and
+record the salt next to the result.
+
+Exit codes: 0 clean run; 1 unwritable `--results-json` or missing
+`project_root`; 2 usage error, malformed corpus, or no cases to run (empty
+`cases:` or a `--split` that selects none); 3 search failures without
+`--allow-search-failures`.
+
+The METRICS comment names the binary as two whitespace-free tokens,
+`codesage=<version> build=<release|debug>` (`build=` omitted when the banner
+has no suffix), so single-line `key=value` consumers keep working.
 """
 
 import argparse
 import datetime as _dt
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+
+sys.path.append(str(Path(__file__).resolve().parent))
+from _codesage_version import codesage_version_info  # noqa: E402
 
 try:
     import yaml
@@ -57,15 +97,6 @@ def _run(cmd: list[str], cwd: Path | None = None) -> str:
     except (subprocess.SubprocessError, FileNotFoundError):
         pass
     return ""
-
-
-def codesage_version(codesage_bin: str) -> str:
-    out = _run([codesage_bin, "--version"])
-    # Typical output is `codesage X.Y.Z`. Strip the bin name so headers that
-    # prefix with "CodeSage:" don't double up ("CodeSage: codesage 0.4.0").
-    if out.lower().startswith("codesage "):
-        out = out[len("codesage "):].strip()
-    return out or "unknown"
 
 
 def project_head_sha(project_root: Path) -> str:
@@ -146,7 +177,13 @@ def now_iso_utc() -> str:
 # Retrieval runner (unchanged core logic)
 # ---------------------------------------------------------------------------
 
-def run_codesage_search(codesage_bin: str, project_root: Path, query: str, limit: int) -> str:
+def run_codesage_search(
+    codesage_bin: str, project_root: Path, query: str, limit: int
+) -> tuple[str, str | None]:
+    """Return (stdout, error). `error` is None on a clean run, else
+    `"timeout"`, `"rc=N"`, or `"error"`; the case is still scored (as a miss
+    when stdout is empty) so one bad search does not discard the run, but the
+    failure is recorded so compare-runs can refuse to read lift into it."""
     cmd = [codesage_bin, "search", "--json", "--limit", str(limit), query]
     try:
         result = subprocess.run(
@@ -157,32 +194,22 @@ def run_codesage_search(codesage_bin: str, project_root: Path, query: str, limit
             timeout=120,
         )
     except subprocess.TimeoutExpired:
-        # Score this case as a miss (empty output) instead of crashing the
-        # whole run and discarding every prior result.
         print(f"[warn] codesage search timed out after 120s: {query!r}", file=sys.stderr)
-        return ""
+        return "", "timeout"
     except subprocess.SubprocessError as e:
         print(f"[warn] codesage search errored: {e}", file=sys.stderr)
-        return ""
+        return "", "error"
     if result.returncode != 0:
         print(f"[warn] codesage search failed rc={result.returncode}: {result.stderr}", file=sys.stderr)
-    return result.stdout
-
-
-def parse_result_paths(output: str) -> list[str]:
-    """Extract ordered file paths from codesage search --json output.
-
-    Wraps `parse_results` for callers that only need paths.
-    """
-    return [p for p, _content in parse_results(output)]
+        return result.stdout, f"rc={result.returncode}"
+    return result.stdout, None
 
 
 def parse_results(output: str) -> list[tuple[str, str]]:
-    """Extract ordered (file_path, chunk_content) pairs.
+    """Extract ordered (file_path, chunk_content) pairs, first chunk per file.
 
-    The path-only `parse_result_paths` deduplicates by file_path; this version
-    keeps every chunk row in order so token-budget calculations see the chunks
-    an agent would actually consume rank-by-rank. Same JSON-extraction logic.
+    Deduplicates by file_path in rank order so token-budget calculations see
+    the chunks an agent would actually consume rank-by-rank.
     """
     lines: list[str] = []
     for line in output.splitlines():
@@ -212,6 +239,56 @@ def parse_results(output: str) -> list[tuple[str, str]]:
         seen.add(path)
         ordered.append((path, r.get("content", "")))
     return ordered
+
+
+def split_of(case_id: str, salt: str) -> str:
+    """Salted held-out assignment; must stay identical to compare-runs.py."""
+    digest = hashlib.sha256((salt + "\0" + case_id).encode("utf-8")).digest()
+    return "train" if digest[0] < 128 else "heldout"
+
+
+_SALT_RE = re.compile(r"[A-Za-z0-9_.-]+\Z")
+
+
+def salt_arg(value: str) -> str:
+    # The salt is echoed into the `<!-- METRICS: ... -->` comment; whitespace
+    # or `-->` in it would break every consumer that greps that line.
+    if not _SALT_RE.match(value):
+        raise argparse.ArgumentTypeError(
+            f"--salt must match [A-Za-z0-9_.-]+ (got {value!r})"
+        )
+    return value
+
+
+def write_results_json(path: Path, meta: dict, results: list[dict], project_root: Path,
+                       complete: bool) -> None:
+    records = []
+    for r in results:
+        rec = {
+            "id": r["id"],
+            "query": r["query"],
+            "expected_files": list(r["expected"]),
+            "hits": list(r["returned"]),
+            "first_hit_rank": r["first_hit_rank"],
+            "source": r["source"],
+            "repo": str(project_root),
+        }
+        if r.get("error"):
+            rec["error"] = r["error"]
+        records.append(rec)
+    meta = {**meta, "search_failures": sum(1 for r in results if r.get("error"))}
+    envelope = {"meta": meta, "complete": complete, "records": records}
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(envelope, indent=2, sort_keys=True) + "\n")
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def score_case(
@@ -277,6 +354,7 @@ def format_header(
     reranker: str,
     baseline: str,
     run_ts: str,
+    split_str: str = "",
 ) -> list[str]:
     """Build the "named everything" header.
 
@@ -289,7 +367,8 @@ def format_header(
     lines.append("")
     lines.append(f"- **Project**: `{project_root}` (HEAD `{head_sha}`, {size_str})")
     case_word = "case" if case_count == 1 else "cases"
-    lines.append(f"- **Corpus**: `{corpus_name}` — {case_count} {case_word}, top-{limit}, k={k_values}")
+    lines.append(f"- **Corpus**: `{corpus_name}` — {case_count} {case_word}{split_str}, "
+                 f"top-{limit}, k={k_values}")
     lines.append(f"- **CodeSage**: {cs_version}")
     model_line = f"- **Embedding model**: {embedding_model}"
     if embedding_dim:
@@ -331,18 +410,96 @@ def main() -> int:
              "fill in what the numbers are being compared against when "
              "quoting the scorecard externally.",
     )
+    ap.add_argument(
+        "--results-json",
+        type=Path,
+        default=None,
+        help="Write per-case results as JSON (input shape for bench/compare-runs.py).",
+    )
+    ap.add_argument(
+        "--split",
+        choices=["train", "heldout"],
+        default=None,
+        help="Run only the cases in this salted half of the corpus; requires --salt.",
+    )
+    ap.add_argument("--salt", type=salt_arg, default=None,
+                    help="Salt for --split ([A-Za-z0-9_.-]+); record it with the result.")
+    ap.add_argument(
+        "--allow-search-failures", action="store_true",
+        help="Exit 0 even when some `codesage search` calls failed (they still score as misses).",
+    )
     args = ap.parse_args()
 
-    corpus = yaml.safe_load(args.corpus.read_text())
+    if (args.split is None) != (args.salt is None):
+        ap.error("--split and --salt must be given together")
+
+    try:
+        corpus_bytes = args.corpus.read_bytes()
+    except OSError as e:
+        sys.exit(f"cannot read corpus {args.corpus}: {e}")
+    corpus_sha256 = hashlib.sha256(corpus_bytes).hexdigest()
+    try:
+        corpus = yaml.safe_load(corpus_bytes)
+    except yaml.YAMLError as e:
+        print(f"corpus {args.corpus}: malformed YAML: {e}", file=sys.stderr)
+        return 2
+    if not isinstance(corpus, dict) or not isinstance(corpus.get("project_root"), str):
+        print(f"corpus {args.corpus}: expected a mapping with a string `project_root`",
+              file=sys.stderr)
+        return 2
+    if not isinstance(corpus.get("cases"), list):
+        print(f"corpus {args.corpus}: expected a `cases` list", file=sys.stderr)
+        return 2
+    for i, case in enumerate(corpus["cases"]):
+        problem = None
+        if not isinstance(case, dict):
+            problem = "is not a mapping"
+        elif not isinstance(case.get("id"), str):
+            problem = "needs a string `id`"
+        elif not isinstance(case.get("query"), str):
+            problem = "needs a string `query`"
+        elif not isinstance(case.get("expected_files"), list) or not case["expected_files"] or not all(
+            isinstance(p, str) for p in case["expected_files"]
+        ):
+            problem = "needs `expected_files` as a non-empty list of strings"
+        if problem:
+            print(f"corpus {args.corpus}: case #{i} {problem}", file=sys.stderr)
+            return 2
     project_root = Path(corpus["project_root"]).expanduser()
     k_values = corpus.get("scoring", {}).get("k_values", [5, 10])
     cases = corpus["cases"]
+    if args.split is not None:
+        total = len(cases)
+        cases = [c for c in cases if split_of(str(c["id"]), args.salt) == args.split]
+        print(f"[split] {args.split}: {len(cases)} of {total} cases (salt={args.salt!r})",
+              file=sys.stderr)
+    if not cases:
+        # "hits 100% of 0 cases" is not a result; an empty corpus or an empty
+        # split must fail loudly rather than feed a scorecard or an ablation.
+        why = f" (--split {args.split}, salt {args.salt!r})" if args.split is not None else ""
+        print(f"corpus {args.corpus}: no cases to run{why}", file=sys.stderr)
+        return 2
 
     if not project_root.exists():
         sys.exit(f"project_root does not exist: {project_root}")
 
+    if args.results_json is not None:
+        # Fail on an unwritable path now, not after an hour of searches. Runs
+        # only after the corpus validated, so a rejected corpus leaves no
+        # directories behind; probe a sibling so a finished result file that
+        # happens to live at --results-json is never clobbered.
+        try:
+            args.results_json.parent.mkdir(parents=True, exist_ok=True)
+            fd, probe = tempfile.mkstemp(dir=args.results_json.parent,
+                                         prefix=args.results_json.name + ".", suffix=".probe")
+            os.close(fd)
+            os.unlink(probe)
+        except OSError as e:
+            sys.exit(f"--results-json {args.results_json} is not writable: {e}")
+
     # --- Metadata collection ---
-    cs_version = codesage_version(args.codesage_bin)
+    cs_info = codesage_version_info(args.codesage_bin, cwd=project_root)
+    cs_version = cs_info["version"]
     head_sha = project_head_sha(project_root)
     file_count, line_count = project_size(project_root)
     size_str = format_size(file_count, line_count)
@@ -354,6 +511,25 @@ def main() -> int:
     # Dim isn't in config; leave blank and let the header format gracefully.
     embedding_dim = emb_section.get("dimensions", "")
     run_ts = now_iso_utc()
+    results_meta = {
+        "corpus": args.corpus.name,
+        "corpus_sha256": corpus_sha256,
+        "split": args.split,
+        "salt": args.salt,
+        "head": head_sha,
+        "model": embedding_model,
+        "reranker": reranker,
+        "codesage": cs_version,
+        "build_target": cs_info.get("build_target"),
+        "features": cs_info.get("features"),
+        "device": cs_info.get("device"),
+        "run_at": run_ts,
+        "project_root": str(project_root),
+        "limit": args.limit,
+    }
+    if args.results_json is not None:
+        # First real write: corpus and project_root are validated by now.
+        write_results_json(args.results_json, results_meta, [], project_root, complete=False)
 
     # --- Run cases ---
     results = []
@@ -361,14 +537,21 @@ def main() -> int:
         cid = case["id"]
         query = case["query"]
         expected = case["expected_files"]
-        raw = run_codesage_search(args.codesage_bin, project_root, query, args.limit)
+        raw, error = run_codesage_search(args.codesage_bin, project_root, query, args.limit)
         returned = parse_results(raw)
         scored = score_case(expected, returned, k_values)
         scored["id"] = cid
+        scored["query"] = query
+        scored["error"] = error
         scored["source"] = case.get("source", "?")
         scored["returned"] = [p for p, _ in returned]
         scored["expected"] = expected
         results.append(scored)
+        if args.results_json is not None:
+            # Full rewrite per case is O(n^2) in bytes by design: crash safety
+            # over a few hundred cases costs less than one lost search.
+            write_results_json(args.results_json, results_meta, results, project_root,
+                               complete=False)
         if args.verbose:
             print(f"[{cid}] first_hit={scored['first_hit_rank']} "
                   f"noise={scored['noise_before_first_hit']} "
@@ -378,7 +561,9 @@ def main() -> int:
             print(f"  returned[:5]: {returned[:5]}", file=sys.stderr)
 
     # --- Emit scorecard ---
+    split_str = f" (split {args.split}, salt {args.salt})" if args.split is not None else ""
     header = format_header(
+        split_str=split_str,
         project_root=project_root,
         head_sha=head_sha,
         size_str=size_str,
@@ -418,6 +603,7 @@ def main() -> int:
             line += f"| {ttf_str} "
         print(line + "|")
 
+    search_failures = sum(1 for r in results if r.get("error"))
     hits = [r for r in results if r["first_hit_rank"] is not None]
     miss_rate = 1.0 - len(hits) / len(results) if results else 0.0
     avg_r5 = sum(r["recall@5"] for r in results) / len(results) if results else 0.0
@@ -433,6 +619,8 @@ def main() -> int:
 
     print()
     print("## Aggregate")
+    if search_failures:
+        print(f"- **Search failures:** {search_failures} (scored as misses)")
     print(f"- **Miss rate (no ground-truth file in top-{args.limit}):** {miss_rate:.0%}")
     print(f"- **Median first-hit rank (hits only):** {median_first}")
     print(f"- **Mean recall@5:** {avg_r5:.2f}")
@@ -448,8 +636,9 @@ def main() -> int:
     pct = f"{int(round((1 - miss_rate) * 100))}%"
     median_str = f"median first-hit rank {median_first}" if median_first is not None else "no hits"
     case_word_q = "case" if len(results) == 1 else "cases"
-    print(f"> CodeSage {cs_version} hits {pct} of {len(results)} ground-truth {case_word_q} on "
-          f"`{project_root.name}` (HEAD `{head_sha}`, {size_str}) with "
+    invalid = f"[INVALID: {search_failures} search failures] " if search_failures else ""
+    print(f"> {invalid}CodeSage {cs_version} hits {pct} of {len(results)} ground-truth {case_word_q}"
+          f"{split_str} on `{project_root.name}` (HEAD `{head_sha}`, {size_str}) with "
           f"{embedding_model}"
           + (f" + {reranker}" if reranker and reranker != "none" else "")
           + f", {median_str}, mean recall@10 {avg_r10:.2f}. "
@@ -462,12 +651,28 @@ def main() -> int:
         f"r5={avg_r5:.4f} r10={avg_r10:.4f} cases={len(results)} "
         f"project={project_root.name} head={head_sha} "
         f"model={embedding_model} reranker={reranker} baseline={args.baseline} "
-        f"run_at={run_ts} codesage={cs_version}"
+        f"run_at={run_ts} codesage={cs_info['version_token']}"
     )
+    if cs_info.get("build"):
+        metrics += f" build={cs_info['build']}"
     if avg_tokens is not None:
         metrics += f" mean_tokens_to_hit={int(round(avg_tokens))}"
+    if args.split is not None:
+        metrics += f" split={args.split} salt={args.salt}"
+    metrics += f" search_failures={search_failures}"
     print(f"<!-- METRICS: {metrics} -->")
 
+    if args.results_json is not None:
+        write_results_json(args.results_json, results_meta, results, project_root,
+                           complete=True)
+        print(f"[results-json] wrote {len(results)} records to {args.results_json}",
+              file=sys.stderr)
+
+    if search_failures and not args.allow_search_failures:
+        print(f"[error] {search_failures} of {len(results)} searches failed; the scorecard "
+              "is not a retrieval result. Fix the index/daemon and rerun, or pass "
+              "--allow-search-failures.", file=sys.stderr)
+        return 3
     return 0
 
 
