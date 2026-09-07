@@ -42,6 +42,7 @@ Query flows through these stages in order:
 5. **Symbol annotation** -- attach overlapping symbol names to each result
 6. **Cross-encoder rerank** -- ms-marco-MiniLM-L6-v2, adaptive blend weight (0.35 identifier-shaped / 0.6 natural-language / 0.5 default); skipped when BM25 fusion already ran
 7. **Truncate** to requested limit
+8. **Relevance-cliff disclosure** -- the page reports `confidence` (`high` when the largest adjacent relative score drop is ≥20%, else `low`), `margin_pct`, and `cliff_at`. Opt-in `adaptive_limit: true` (CLI `--adaptive-limit`) cuts the page at that drop when `confidence` is `high`; a flat page is returned in full. The cut is page-local, so it composes poorly with `offset` paging.
 
 The reranker is optional (configured per-project in config.toml). Without it, the remaining stages still run.
 
@@ -140,9 +141,9 @@ PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go.
 ## MCP tools
 
 - `project_overview` -- one bounded first-call orientation: languages, structural + semantic freshness, feature summary by kind, top-risk files, trust-boundary clusters, per-language test conventions, sample entrypoints, and suggested next calls. Pure aggregation over the index; call once at session start.
-- `search` -- semantic search with embedding + reranking
+- `search` -- semantic search with embedding + reranking; each page carries `confidence` / `margin_pct` / `cliff_at` (relevance-cliff disclosure) and honors opt-in `adaptive_limit`
 - `find_symbol` -- symbol definitions by name
-- `find_references` -- references to a symbol; each row's `from_symbol` names the enclosing caller (null at file scope)
+- `find_references` -- references to a symbol; each row's `from_symbol` names the enclosing caller (null at file scope). The envelope carries `counts_floor: true` (name-based edges; an empty result means none found, not none exist), `definition_count`, and `ambiguous` with a `note` when several same-named definitions make the rows a union
 - `find_similar` -- near-clone detection: functions/methods structurally similar to a named one (MinHash over AST shape, identifiers/literals ignored), ranked by Jaccard. Test files excluded. Needs fingerprints from a reindex.
 - `list_dependencies` -- file-level imports/imported-by
 - `trace_call_path` -- shortest call chain from one symbol to another, breadth-first over resolved callee edges. Each step names the symbol, its file:line, and `call_line` (the line in the previous step's body where it is invoked). `found: false` carries `note` and `bounded`; `bounded: true` means the search stopped at a limit, so an empty answer is not proof no path exists.
@@ -189,7 +190,7 @@ The daemon writes tracing to `mcp-<version>-<key>.log` in the runtime dir; check
 
 ## CLI commands
 
-`init`, `index`, `overview`, `search`, `find-symbol`, `find-references`, `dependencies`, `impact`, `trace`, `export`, `status`, `mcp`, `daemon`, `watch`, `install-hooks`, `install`, `uninstall`, `cleanup`, `git-index`, `coupling`, `risk`, `risk-batch`, `risk-diff`, `similar`, `tests-for`, `rehearse`, `session-start`, `session-end`, `doctor`, `map`, `features-list`, `feature-show`, `feature-for`, `feature-bundle`, `trust-boundaries`.
+`init`, `index`, `overview`, `search`, `brief`, `find-symbol`, `find-references`, `dependencies`, `impact`, `trace`, `export`, `status`, `mcp`, `daemon`, `watch`, `install-hooks`, `install`, `uninstall`, `cleanup`, `coverage`, `git-index`, `coupling`, `risk`, `risk-batch`, `risk-diff`, `similar`, `tests-for`, `rehearse`, `session-start`, `session-end`, `doctor`, `map`, `features-list`, `feature-show`, `feature-for`, `feature-bundle`, `trust-boundaries`. (Mirrors the `Commands` enum in `crates/cli/src/main.rs` — audit this list when adding a subcommand.)
 
 `watch run|status|stop|start [project]` controls the live filesystem watcher. The daemon auto-starts a per-project watcher on the first MCP tool call for that project (reusing the daemon's pooled embedder), debounces edits, and reindexes structural + semantic on change; it self-exits after idle (`CODESAGE_WATCH_IDLE_SECS`) and is reaped on daemon shutdown. Disable per project with `[index] watch = false` or globally with `CODESAGE_WATCH=0`. `watch run` is a foreground instance with its own embedder for debugging; `watch stop` writes a `.codesage/watch.disabled` marker the running watcher honors; `watch start` clears it. The watcher complements the git hooks, it does not replace them: it refreshes structural + semantic content live during a session, but git history intelligence (`git-index`, feeding `assess_risk` / `find_coupling`) and feature mapping still refresh only via the hooks or a full `codesage index`, and the watcher only runs while a daemon is alive.
 
@@ -201,7 +202,7 @@ The daemon writes tracing to `mcp-<version>-<key>.log` in the runtime dir; check
 
 ## Benchmarks
 
-Benchmark harness under `bench/`:
+Benchmark harness under `bench/` (curated examples — see `bench/` for the full inventory, including ablation, semble-corpus, concurrency-audit, agent-task, and quality-analysis runners):
 
 - `bench/codesage-bench-runner` — Python runner that executes a YAML corpus of ground-truth cases against `codesage search` and reports miss rate, median first-hit, recall@5, recall@10.
 - `bench/extract-eval-cases.py` — mines eval cases from Claude Code session transcripts and git commit history.
