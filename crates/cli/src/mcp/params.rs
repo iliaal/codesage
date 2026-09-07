@@ -311,7 +311,7 @@ pub struct SearchParams {
     #[schemars(description = "Filter by file path glob patterns")]
     pub paths: Option<Vec<String>>,
     #[schemars(
-        description = "When true, truncate results at the relevance cliff (largest ≥20% relative score drop) instead of returning exactly `limit` rows; only truncates when `confidence` is `high`, a flat page comes back in full. The cut is page-local (computed over this page's rows only), so combining it with `offset` paging can skip rows between pages. `cliff_at`/`margin_pct` still disclose the cliff either way."
+        description = "When true, truncate results at the relevance cliff (largest relative score drop that rounds to 20% or more) instead of returning exactly `limit` rows; only truncates when `confidence` is `high`, a flat page comes back in full. The cut is page-local (computed over this page's rows only), so combining it with `offset` paging can skip rows between pages. `cliff_at`/`margin_pct` still disclose the cliff either way."
     )]
     #[serde(default)]
     pub adaptive_limit: Option<bool>,

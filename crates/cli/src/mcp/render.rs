@@ -321,7 +321,8 @@ fn render_with_budget<T: serde::Serialize>(
             let capped = cap_to_budget_with(value, kind, budget_chars);
             // MCP requires structuredContent to be a JSON object. Tools that
             // return bare arrays (find_symbol, find_similar) get wrapped in
-            // {"results": [...]} so Claude's validator accepts the response. cap_to_budget already wraps over-budget arrays into
+            // {"results": [...]} so Claude's validator accepts the response.
+            // cap_to_budget already wraps over-budget arrays into
             // {"results": ..., "_meta": {...}}; this covers the under-budget
             // path so the shape is consistent regardless of size.
             let structured = match capped {
@@ -768,7 +769,7 @@ fn cap_to_budget_with(
 
 /// Tools whose params carry an `offset` argument; only their truncation hint
 /// may advise paging, since the advice is unsatisfiable anywhere else.
-const OFFSET_PAGED_KINDS: &[&str] = &["search"];
+pub(super) const OFFSET_PAGED_KINDS: &[&str] = &["search"];
 
 /// Truncation hint keyed on the tool, independent of whether its payload is a
 /// bare array or an object envelope.

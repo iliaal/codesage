@@ -17,6 +17,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -381,6 +382,43 @@ with tempfile.TemporaryDirectory() as td:
         tagged == [("a.rs", True), ("b.rs", True), ("c.rs", False), ("d.rs", False), ("e.rs", False)],
         f"extract: --include-codesage-sessions keeps and tags contaminated cases (got {tagged!r})",
     )
+
+# CODESAGE_SUBCOMMANDS is a hand-copied mirror of the clap `Commands` enum; a
+# subcommand added there and not here is silently undetected. Parse the enum
+# and diff the two sets.
+_VARIANT_RE = re.compile(r"^\s*([A-Z][A-Za-z0-9]*)\s*(?:\{|\(|,)")
+
+
+def _kebab(name: str) -> str:
+    return re.sub(r"(?<!^)(?=[A-Z])", "-", name).lower()
+
+
+def commands_enum_variants(main_rs: Path) -> set[str]:
+    lines = main_rs.read_text(encoding="utf-8").splitlines()
+    start = next(i for i, line in enumerate(lines) if line.strip() == "enum Commands {")
+    variants: set[str] = set()
+    depth = 0
+    for offset, line in enumerate(lines[start:]):
+        code = line.split("//", 1)[0]
+        if offset and depth == 1:
+            m = _VARIANT_RE.match(code)
+            if m:
+                variants.add(_kebab(m.group(1)))
+        depth += code.count("{") - code.count("}")
+        if offset and depth == 0:
+            break
+    return variants
+
+
+_main_rs = HERE.parent / "crates/cli/src/main.rs"
+_variants = commands_enum_variants(_main_rs)
+check(len(_variants) >= 30, f"extract: Commands enum parse found only {len(_variants)} variants")
+check(
+    _variants == set(extract.CODESAGE_SUBCOMMANDS),
+    "extract: CODESAGE_SUBCOMMANDS drifted from the Commands enum "
+    f"(missing from set: {sorted(_variants - extract.CODESAGE_SUBCOMMANDS)}, "
+    f"stale in set: {sorted(extract.CODESAGE_SUBCOMMANDS - _variants)})",
+)
 
 # CODESAGE_BASH_RE: the token after `codesage` (or after `-- `) must be a real
 # subcommand, on the same line.

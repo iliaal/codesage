@@ -484,7 +484,8 @@ pub struct SearchRequest {
     pub languages: Option<Vec<Language>>,
     pub paths: Option<Vec<String>>,
     /// When true, truncate the page at the relevance cliff (largest relative
-    /// score drop of at least 20%) instead of returning exactly `limit` rows.
+    /// score drop that rounds to 20% or more) instead of returning exactly
+    /// `limit` rows.
     /// Only applies when the cliff is sharp enough to rate `confidence: high`;
     /// a flat ranking still returns the full page.
     #[serde(default)]
@@ -492,9 +493,10 @@ pub struct SearchRequest {
 }
 
 /// Ranking-flatness signal on a `search` page. `High` means the returned
-/// scores have a sharp relative drop (≥20%) somewhere on the page, so the
-/// rows above it stand out from the rest; `Low` means the scores are flat and
-/// the page is a starting point rather than a ranked answer.
+/// scores have a sharp relative drop (one that rounds to 20% or more)
+/// somewhere on the page, so the rows above it stand out from the rest;
+/// `Low` means the scores are flat and the page is a starting point rather
+/// than a ranked answer.
 ///
 /// This is a property of the score distribution only. It is not evidence that
 /// the answer exists in the corpus: ripwire measured a similar signal at
@@ -1534,9 +1536,9 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SearchResults {
     pub results: Vec<SearchResult>,
-    /// `high` when the page has a relative score drop of at least 20% between
-    /// adjacent rows, `low` when the ranking is flat. A flatness signal, not
-    /// evidence the answer exists.
+    /// `high` when the page has a relative score drop that rounds to 20% or
+    /// more between adjacent rows, `low` when the ranking is flat. A flatness
+    /// signal, not evidence the answer exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<SearchConfidence>,
     /// Largest adjacent relative score drop on the page, in whole percent

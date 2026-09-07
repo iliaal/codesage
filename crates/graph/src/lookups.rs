@@ -7,6 +7,7 @@ use codesage_protocol::{
 use codesage_storage::Database;
 
 use crate::bundle::import_ref_targets_file;
+use crate::impact::is_qualified_symbol_name;
 
 pub fn find_symbol(db: &Database, req: &FindSymbolRequest) -> Result<Vec<Symbol>> {
     db.find_symbols(&req.name, req.kind)
@@ -24,11 +25,18 @@ pub fn find_references(
     let definition_count = definitions.len();
     let ambiguous = definition_count > 1;
     let note = if ambiguous {
-        // `impact_analysis` disambiguates by qualified name only (see
-        // `impact::impact_analysis_walk`). Languages without namespaces give every
-        // definition the bare name, so when the qualified names collapse to
-        // one the only handle left is the file.
-        let qualified = distinct_sorted(definitions.iter().map(|s| s.qualified_name.as_str()));
+        // `impact_analysis` disambiguates by qualified name only, and a name
+        // counts as qualified only per `is_qualified_symbol_name` (see
+        // `impact::impact_analysis_walk`): a bare candidate offered here would
+        // route back through its ambiguity check and hard-fail. Languages
+        // without namespaces give every definition the bare name, so when
+        // fewer than two qualified candidates remain the only handle left is
+        // the file.
+        let qualified: Vec<&str> =
+            distinct_sorted(definitions.iter().map(|s| s.qualified_name.as_str()))
+                .into_iter()
+                .filter(|q| is_qualified_symbol_name(q))
+                .collect();
         if qualified.len() > 1 {
             Some(format!(
                 "{definition_count} definitions share the name '{}'; rows are the union across \
@@ -269,6 +277,28 @@ mod tests {
         assert!(note.contains("impact_analysis"), "{note}");
         assert!(note.contains("alpha::helper, beta::helper"), "{note}");
         assert!(!note.contains("indistinguishable"), "{note}");
+    }
+
+    #[test]
+    fn envelope_with_one_bare_and_one_qualified_name_scopes_by_file() {
+        let db = Database::open_in_memory().unwrap();
+        let a = file(&db, "a.rs");
+        let b = file(&db, "b.rs");
+        db.insert_symbols(a, &[symbol("helper", "a.rs")]).unwrap();
+        db.insert_symbols(b, &[qualified_symbol("helper", "beta::helper", "b.rs")])
+            .unwrap();
+
+        let out = lookup(&db, "helper");
+        assert_eq!(out.definition_count, 2);
+        assert!(out.ambiguous);
+        let note = out.note.expect("ambiguous lookup must carry a note");
+        // Bare `helper` is not a qualified name to impact_analysis, so offering
+        // it would hard-fail there; with one qualified candidate left, only the
+        // files can scope both definitions.
+        assert!(note.contains("indistinguishable"), "{note}");
+        assert!(note.contains("a.rs, b.rs"), "{note}");
+        assert!(!note.contains("qualified name ("), "{note}");
+        assert!(!note.contains("beta::helper"), "{note}");
     }
 
     #[test]

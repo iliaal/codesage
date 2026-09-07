@@ -278,6 +278,37 @@ mod tests {
         );
     }
 
+    /// The truncation hint's paging advice is satisfiable only on tools whose
+    /// params declare `offset`; bind the const to the advertised schemas so a
+    /// new paged tool or a dropped `offset` cannot leave the two apart.
+    #[test]
+    fn offset_paged_kinds_match_tools_declaring_offset() {
+        let server = CodeSageServer::new();
+        let mut tools = server.tool_router.list_all();
+        finalize_tools_for_listing(&mut tools);
+        assert!(!tools.is_empty());
+        let mut declared: Vec<String> = tools
+            .iter()
+            .filter(|t| {
+                t.input_schema
+                    .get("properties")
+                    .and_then(|p| p.get("offset"))
+                    .is_some()
+            })
+            .map(|t| t.name.to_string())
+            .collect();
+        declared.sort_unstable();
+        let mut expected: Vec<String> = crate::mcp::render::OFFSET_PAGED_KINDS
+            .iter()
+            .map(|k| (*k).to_string())
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(
+            declared, expected,
+            "OFFSET_PAGED_KINDS must equal the tools whose inputSchema declares `offset`"
+        );
+    }
+
     /// The payload trim must show in the advertised schemas: the risk fields
     /// gated behind `verbose` stay described but optional, the switch itself
     /// is not a wire field, and the dropped column fields are not advertised

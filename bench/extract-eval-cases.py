@@ -121,6 +121,8 @@ def tool_use_blocks(msg: dict):
             yield block
 
 
+# CodeSage calls made inside a Task/subagent live in a sidechain transcript, so
+# they are invisible here; the subagent's file reads are equally absent.
 def uses_codesage(msg: dict) -> bool:
     for block in tool_use_blocks(msg):
         name = str(block.get("name", ""))
