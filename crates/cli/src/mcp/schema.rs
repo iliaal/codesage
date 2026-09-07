@@ -339,6 +339,29 @@ mod tests {
             );
         }
 
+        // The relevance-cliff disclosure rides on the `search` envelope as
+        // optional fields, and the opt-in cut is an optional boolean input.
+        let search = schema("search");
+        for key in ["confidence", "margin_pct", "cliff_at"] {
+            assert!(
+                search["properties"].get(key).is_some(),
+                "search schema must describe `{key}`"
+            );
+        }
+        let search_required = search["required"].as_array().expect("required array");
+        assert!(search_required.iter().any(|r| r == "results"));
+        for key in ["confidence", "margin_pct", "cliff_at"] {
+            assert!(
+                !search_required.iter().any(|r| r == key),
+                "`{key}` is optional on the wire"
+            );
+        }
+        assert_eq!(
+            input_schema("search")["properties"]["adaptive_limit"]["type"],
+            json!(["boolean", "null"]),
+            "search must accept an optional boolean `adaptive_limit`"
+        );
+
         let symbols = serde_json::to_string(&*schema("find_symbol")).unwrap();
         assert!(!symbols.contains("col_start"), "{symbols}");
         assert!(!symbols.contains("col_end"), "{symbols}");

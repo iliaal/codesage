@@ -27,7 +27,7 @@ pub use index::{full_index, incremental_index, index_files, remove_files};
 pub use lookups::{find_references, find_symbol, list_dependencies, list_dependencies_batch};
 pub use overview::build_project_overview;
 pub use rehearsal::build_review_rehearsal;
-pub use search::{RerankFn, search};
+pub use search::{CliffCut, MIN_CLIFF_DROP, RerankFn, relevance_cliff, search, search_page};
 pub use semantic::{
     ArtifactLookup, EmbedderInit, LazyEmbedder, SemanticFingerprint, SemanticTableState,
     StaleSemanticTable, TextEmbedder, require_current_semantic_table, resolve_semantic_fingerprint,

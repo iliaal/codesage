@@ -483,6 +483,27 @@ pub struct SearchRequest {
     pub offset: Option<usize>,
     pub languages: Option<Vec<Language>>,
     pub paths: Option<Vec<String>>,
+    /// When true, truncate the page at the relevance cliff (largest relative
+    /// score drop of at least 20%) instead of returning exactly `limit` rows.
+    /// Only applies when the cliff is sharp enough to rate `confidence: high`;
+    /// a flat ranking still returns the full page.
+    #[serde(default)]
+    pub adaptive_limit: bool,
+}
+
+/// Ranking-flatness signal on a `search` page. `High` means the returned
+/// scores have a sharp relative drop (≥20%) somewhere on the page, so the
+/// rows above it stand out from the rest; `Low` means the scores are flat and
+/// the page is a starting point rather than a ranked answer.
+///
+/// This is a property of the score distribution only. It is not evidence that
+/// the answer exists in the corpus: ripwire measured a similar signal at
+/// AUROC ~0.5 for answerability, i.e. no better than chance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchConfidence {
+    High,
+    Low,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1505,9 +1526,27 @@ fn default_true() -> bool {
 }
 
 /// `{"results": [...]}` envelope around `Vec<SearchResult>`. See [`FindSymbolResults`].
+///
+/// The three optional fields disclose the relevance cliff of the returned
+/// page. They describe ranking flatness only — not whether the answer exists
+/// (see [`SearchConfidence`]). All default to absent so pre-cliff JSON still
+/// deserializes.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SearchResults {
     pub results: Vec<SearchResult>,
+    /// `high` when the page has a relative score drop of at least 20% between
+    /// adjacent rows, `low` when the ranking is flat. A flatness signal, not
+    /// evidence the answer exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<SearchConfidence>,
+    /// Largest adjacent relative score drop on the page, in whole percent
+    /// (`round((s_i - s_{i+1}) / s_i * 100)`). 0 for zero or one rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub margin_pct: Option<u8>,
+    /// Number of rows above the cliff. Equals `results.len()` when
+    /// `confidence` is `low` or when `adaptive_limit` already cut the page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cliff_at: Option<usize>,
 }
 
 /// `{"results": [...]}` envelope around `Vec<SimilarSymbol>`. See [`FindSymbolResults`].

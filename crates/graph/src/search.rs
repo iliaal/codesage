@@ -4,7 +4,9 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use codesage_parser::discover::{TEST_LIKE_EXCLUDE_PATTERNS, build_exclude_set};
-use codesage_protocol::{Language, SearchRequest, SearchResult, Symbol, SymbolSummary};
+use codesage_protocol::{
+    Language, SearchConfidence, SearchRequest, SearchResult, SearchResults, Symbol, SymbolSummary,
+};
 use codesage_storage::{Database, RawSearchRow, SemanticValidityToken, embedding_to_bytes};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use regex::Regex;
@@ -419,6 +421,61 @@ fn rrf_merge(
         .collect()
 }
 
+/// Smallest adjacent relative score drop that counts as a relevance cliff.
+pub const MIN_CLIFF_DROP: f32 = 0.20;
+
+/// Where a ranked page's scores fall off, and how sharply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CliffCut {
+    /// Rows to keep: the index just past the largest drop when `confidence`
+    /// is `High`, the full length otherwise.
+    pub cut: usize,
+    /// Largest adjacent relative drop, rounded to whole percent (0 when the
+    /// page has fewer than two comparable rows).
+    pub drop_pct: u8,
+    pub confidence: SearchConfidence,
+}
+
+/// Locate the largest relative score drop between adjacent rows of a page
+/// sorted best-first. `scores` is read as produced by the pipeline: every
+/// stage keeps scores finite and non-negative (`l2_to_score` clamps at 0, the
+/// reranker blend is a convex combination of [0,1] terms, penalties and
+/// saturation are multiplicative on non-negative values, boosts are additive
+/// and positive), so `(s_i - s_{i+1}) / s_i` is meaningful without shifting.
+/// Pairs whose leading score is 0 or non-finite are skipped rather than
+/// divided through; a drop onto an exact 0 counts as 100%. Ties produce a 0%
+/// drop and can never be selected, so a cut never splits equal scores.
+pub fn relevance_cliff(scores: &[f32]) -> CliffCut {
+    let mut best_drop = 0.0f32;
+    let mut best_cut = scores.len();
+    for (i, pair) in scores.windows(2).enumerate() {
+        let (hi, lo) = (pair[0], pair[1]);
+        if !hi.is_finite() || !lo.is_finite() || hi <= 0.0 {
+            continue;
+        }
+        let drop = ((hi - lo) / hi).min(1.0);
+        if drop > best_drop {
+            best_drop = drop;
+            best_cut = i + 1;
+        }
+    }
+    // best_drop is within [0, 1], so the rounded percentage fits in a u8.
+    let drop_pct = (best_drop * 100.0).round() as u8;
+    if best_drop >= MIN_CLIFF_DROP {
+        CliffCut {
+            cut: best_cut,
+            drop_pct,
+            confidence: SearchConfidence::High,
+        }
+    } else {
+        CliffCut {
+            cut: scores.len(),
+            drop_pct,
+            confidence: SearchConfidence::Low,
+        }
+    }
+}
+
 fn apply_offset_and_limit<T>(rows: &mut Vec<T>, offset: usize, limit: usize) {
     if offset >= rows.len() {
         rows.clear();
@@ -517,12 +574,28 @@ fn path_filtered_knn_candidates(
     Ok(rows)
 }
 
+/// [`search_page`] without the envelope: the ranked rows only. Honors
+/// `req.adaptive_limit` the same way; callers that need the cliff disclosure
+/// use [`search_page`].
 pub fn search(
     db: &Database,
     query_embedding: &[f32],
     rerank: Option<RerankFn<'_>>,
     req: &SearchRequest,
 ) -> Result<Vec<SearchResult>> {
+    search_page(db, query_embedding, rerank, req).map(|page| page.results)
+}
+
+/// Run the search pipeline and return the page together with its
+/// relevance-cliff disclosure (`confidence`, `margin_pct`, `cliff_at`). When
+/// `req.adaptive_limit` is set and the cliff rates `High`, the page is cut at
+/// the cliff instead of filling `limit` rows.
+pub fn search_page(
+    db: &Database,
+    query_embedding: &[f32],
+    rerank: Option<RerankFn<'_>>,
+    req: &SearchRequest,
+) -> Result<SearchResults> {
     let limit = req.limit.unwrap_or(10);
     let offset = req.offset.unwrap_or(0);
 
@@ -712,7 +785,18 @@ pub fn search(
     }
 
     apply_offset_and_limit(&mut results, offset, limit);
-    Ok(results)
+
+    let scores: Vec<f32> = results.iter().map(|r| r.score).collect();
+    let cliff = relevance_cliff(&scores);
+    if req.adaptive_limit && cliff.confidence == SearchConfidence::High {
+        results.truncate(cliff.cut);
+    }
+    Ok(SearchResults {
+        results,
+        confidence: Some(cliff.confidence),
+        margin_pct: Some(cliff.drop_pct),
+        cliff_at: Some(cliff.cut),
+    })
 }
 
 fn extract_known_symbols(db: &Database, query: &str) -> Result<Vec<String>> {
@@ -2340,6 +2424,146 @@ mod hybrid_tests {
     }
 
     #[test]
+    fn relevance_cliff_cuts_at_largest_relative_drop() {
+        let cut = relevance_cliff(&[1.0, 0.95, 0.5, 0.48]);
+        assert_eq!(cut.confidence, SearchConfidence::High);
+        assert_eq!(cut.cut, 2);
+        assert_eq!(cut.drop_pct, 47);
+    }
+
+    #[test]
+    fn relevance_cliff_flat_page_is_low_and_keeps_everything() {
+        let cut = relevance_cliff(&[1.0, 0.97, 0.95]);
+        assert_eq!(cut.confidence, SearchConfidence::Low);
+        assert_eq!(cut.cut, 3);
+        assert_eq!(cut.drop_pct, 3);
+    }
+
+    #[test]
+    fn relevance_cliff_never_splits_ties() {
+        let all_tied = relevance_cliff(&[0.7, 0.7, 0.7]);
+        assert_eq!(all_tied.confidence, SearchConfidence::Low);
+        assert_eq!(all_tied.cut, 3);
+        assert_eq!(all_tied.drop_pct, 0);
+
+        // Tied pairs on both sides of the drop stay whole: the cut lands
+        // between the two distinct values, never inside a run.
+        let two_bands = relevance_cliff(&[1.0, 1.0, 0.5, 0.5]);
+        assert_eq!(two_bands.confidence, SearchConfidence::High);
+        assert_eq!(two_bands.cut, 2);
+        assert_eq!(two_bands.drop_pct, 50);
+
+        // A tail clamped to exactly 0 is a 100% drop, not a division error.
+        let zero_tail = relevance_cliff(&[0.5, 0.5, 0.0, 0.0]);
+        assert_eq!(zero_tail.confidence, SearchConfidence::High);
+        assert_eq!(zero_tail.cut, 2);
+        assert_eq!(zero_tail.drop_pct, 100);
+    }
+
+    #[test]
+    fn relevance_cliff_handles_empty_single_and_non_finite() {
+        let empty = relevance_cliff(&[]);
+        assert_eq!(
+            (empty.confidence, empty.cut, empty.drop_pct),
+            (SearchConfidence::Low, 0, 0)
+        );
+        let single = relevance_cliff(&[0.9]);
+        assert_eq!(
+            (single.confidence, single.cut, single.drop_pct),
+            (SearchConfidence::Low, 1, 0)
+        );
+        // NaN / infinities are skipped pairwise, never propagated into the
+        // percentage or the cut.
+        let nan_mid = relevance_cliff(&[1.0, f32::NAN, 0.9]);
+        assert_eq!(nan_mid.confidence, SearchConfidence::Low);
+        assert_eq!(nan_mid.cut, 3);
+        assert_eq!(nan_mid.drop_pct, 0);
+        let inf_lead = relevance_cliff(&[f32::INFINITY, 0.1, 0.05]);
+        assert_eq!(inf_lead.confidence, SearchConfidence::High);
+        assert_eq!(inf_lead.cut, 2);
+        assert_eq!(inf_lead.drop_pct, 50);
+    }
+
+    #[test]
+    fn search_page_discloses_cliff_and_keeps_full_page_by_default() {
+        // The cross-encoder singles out the authentication chunk, so the page
+        // has a sharp drop after it. Without `adaptive_limit` every requested
+        // row still comes back; the cliff is disclosed alongside.
+        let db = Database::open_in_memory().unwrap();
+        seed_chunks(&db);
+        let emb = mk_embedding(0.1);
+        let rerank: RerankFn = Box::new(|_q, docs| {
+            Ok(docs
+                .iter()
+                .map(|d| {
+                    if d.contains("authentication") {
+                        10.0
+                    } else {
+                        0.0
+                    }
+                })
+                .collect())
+        });
+        let mut req = search_req("authentication logic");
+        req.limit = Some(4);
+
+        let page = search_page(&db, &emb, Some(rerank), &req).unwrap();
+        assert_eq!(page.results.len(), 4, "default path fills `limit` rows");
+        assert_eq!(page.confidence, Some(SearchConfidence::High));
+        let cliff_at = page.cliff_at.expect("cliff_at disclosed");
+        assert!(
+            (1..4).contains(&cliff_at),
+            "cliff must sit strictly inside the page, got {cliff_at}"
+        );
+        assert!(page.margin_pct.unwrap() >= 20);
+
+        // Opt in: the page is cut exactly where the disclosure said.
+        let rerank: RerankFn = Box::new(|_q, docs| {
+            Ok(docs
+                .iter()
+                .map(|d| {
+                    if d.contains("authentication") {
+                        10.0
+                    } else {
+                        0.0
+                    }
+                })
+                .collect())
+        });
+        req.adaptive_limit = true;
+        let cut_page = search_page(&db, &emb, Some(rerank), &req).unwrap();
+        assert_eq!(cut_page.results.len(), cliff_at);
+        assert_eq!(cut_page.cliff_at, Some(cliff_at));
+        assert_eq!(cut_page.confidence, Some(SearchConfidence::High));
+        assert_eq!(cut_page.results[0].file_path, "src/lib.rs");
+    }
+
+    #[test]
+    fn adaptive_limit_does_not_cut_a_flat_page() {
+        // Four identical chunks in four different directories: no saturation,
+        // no boosts, every score equal. Low confidence means `adaptive_limit`
+        // is inert and the full page comes back.
+        let db = Database::open_in_memory().unwrap();
+        for path in ["a.rs", "b/x.rs", "c/y.rs", "d/z.rs"] {
+            db.insert_chunks(
+                path,
+                "rust",
+                &[("fn handler() { }", 1, 5, mk_embedding(0.1).as_slice())],
+            )
+            .unwrap();
+        }
+        let mut req = search_req("handler");
+        req.limit = Some(4);
+        req.adaptive_limit = true;
+
+        let page = search_page(&db, &mk_embedding(0.1), None, &req).unwrap();
+        assert_eq!(page.confidence, Some(SearchConfidence::Low));
+        assert_eq!(page.results.len(), 4);
+        assert_eq!(page.cliff_at, Some(4));
+        assert_eq!(page.margin_pct, Some(0));
+    }
+
+    #[test]
     fn search_bm25_returns_chunks_containing_rare_literal() {
         // Integration: seed chunks, run BM25 for a rare literal, assert the
         // correct chunk is in the result. Proves the FTS5 insert path is
@@ -2554,6 +2778,7 @@ mod hybrid_tests {
             offset: Some(0),
             languages: None,
             paths: None,
+            adaptive_limit: false,
         }
     }
 

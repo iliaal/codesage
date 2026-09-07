@@ -126,6 +126,10 @@ enum Commands {
         /// Filter by file path glob
         #[arg(long)]
         path: Option<Vec<String>>,
+        /// Stop at the relevance cliff (largest >=20% relative score drop)
+        /// instead of returning exactly --limit rows
+        #[arg(long)]
+        adaptive_limit: bool,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -1064,8 +1068,17 @@ fn run(cli: Cli) -> Result<()> {
             offset,
             language,
             path,
+            adaptive_limit,
             json,
-        } => commands::query::cmd_search(&query, limit, offset, language.as_deref(), path, json),
+        } => commands::query::cmd_search(
+            &query,
+            limit,
+            offset,
+            language.as_deref(),
+            path,
+            adaptive_limit,
+            json,
+        ),
         Commands::Brief {
             file,
             json,

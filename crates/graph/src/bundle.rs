@@ -122,6 +122,7 @@ pub fn export_context(
         offset: Some(0),
         languages: None,
         paths: None,
+        adaptive_limit: false,
     };
     let primary = search(db, query_embedding, rerank, &search_req)?;
 

@@ -310,6 +310,11 @@ pub struct SearchParams {
     pub language: Option<Language>,
     #[schemars(description = "Filter by file path glob patterns")]
     pub paths: Option<Vec<String>>,
+    #[schemars(
+        description = "When true, truncate results at the relevance cliff (largest ≥20% relative score drop) instead of returning exactly `limit` rows; `cliff_at`/`margin_pct` still disclose the cliff either way."
+    )]
+    #[serde(default)]
+    pub adaptive_limit: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -500,6 +505,23 @@ mod tests {
         .unwrap();
         assert_eq!(p.limit, Some(10));
         assert_eq!(p.offset, Some(20));
+    }
+
+    #[test]
+    fn search_params_adaptive_limit_defaults_off_and_accepts_bool() {
+        let p: SearchParams = serde_json::from_value(json!({
+            "project": "/p",
+            "query": "auth",
+        }))
+        .unwrap();
+        assert_eq!(p.adaptive_limit, None);
+        let p: SearchParams = serde_json::from_value(json!({
+            "project": "/p",
+            "query": "auth",
+            "adaptive_limit": true,
+        }))
+        .unwrap();
+        assert_eq!(p.adaptive_limit, Some(true));
     }
 
     #[test]

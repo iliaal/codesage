@@ -4,7 +4,7 @@
 use anyhow::Result;
 use codesage_graph::{
     export_context, export_context_for_symbol, find_references, find_similar, find_symbol,
-    impact_analysis_report, list_dependencies, search,
+    impact_analysis_report, list_dependencies, search_page,
 };
 use codesage_protocol::{
     ContextBundle, ExportRequest, FileCategory, FindReferencesRequest, FindSymbolRequest,
@@ -117,6 +117,7 @@ pub(crate) fn cmd_search(
     offset: usize,
     language: Option<&str>,
     paths: Option<Vec<String>>,
+    adaptive_limit: bool,
     json: bool,
 ) -> Result<()> {
     let root = find_project_root()?;
@@ -130,6 +131,7 @@ pub(crate) fn cmd_search(
         offset: Some(offset),
         languages,
         paths,
+        adaptive_limit,
     };
 
     let query_embedding = embedder.embed_one(&req.query)?;
@@ -137,17 +139,15 @@ pub(crate) fn cmd_search(
         Box::new(move |q: &str, docs: &[&str]| r.score_pairs(q, docs))
             as Box<dyn FnMut(&str, &[&str]) -> Result<Vec<f32>>>
     });
-    let results = search(&db, &query_embedding, rerank_fn, &req)?;
+    let page = search_page(&db, &query_embedding, rerank_fn, &req)?;
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&codesage_protocol::SearchResults { results })?
-        );
-    } else if results.is_empty() {
+        println!("{}", serde_json::to_string_pretty(&page)?);
+    } else if page.results.is_empty() {
         println!("No results found for '{query}'");
     } else {
-        for r in &results {
+        let results = &page.results;
+        for r in results {
             let preview: String = r.content.chars().take(120).collect();
             let preview = preview.replace('\n', " ");
             println!(
@@ -159,6 +159,15 @@ pub(crate) fn cmd_search(
                 r.language,
                 preview
             );
+        }
+        if let (Some(confidence), Some(margin), Some(cliff_at)) =
+            (page.confidence, page.margin_pct, page.cliff_at)
+        {
+            let label = match confidence {
+                codesage_protocol::SearchConfidence::High => "high",
+                codesage_protocol::SearchConfidence::Low => "low",
+            };
+            println!("confidence: {label} (largest drop {margin}%, cliff after row {cliff_at})");
         }
     }
     Ok(())

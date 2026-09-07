@@ -12,8 +12,8 @@ use anyhow::Result;
 use codesage_graph::{
     assess_risk, assess_risk_batch, assess_risk_diff, export_context, export_context_for_symbol,
     feature_bundle, find_coupling, find_references, find_similar, find_symbol,
-    impact_analysis_report, list_dependencies, recommend_tests, search, session_end, session_start,
-    trace_call_path,
+    impact_analysis_report, list_dependencies, recommend_tests, search_page, session_end,
+    session_start, trace_call_path,
 };
 use codesage_protocol::{
     CallPathReport, CallPathRequest, ContextBundle, CouplingReport, DependencyEntry, ExportRequest,
@@ -493,6 +493,7 @@ impl CodeSageServer {
                 offset: Some(offset),
                 languages,
                 paths: params.paths,
+                adaptive_limit: params.adaptive_limit.unwrap_or(false),
             };
             let query_for_embed = req.query.clone();
             // A page past the end, or a zero limit, empties the result by
@@ -507,7 +508,7 @@ impl CodeSageServer {
                     .unwrap_or(Ok(()))
                     .and_then(|()| {
                         s.with_project_query(&params.project, &query_for_embed, |db, emb, rr| {
-                            search(db, emb, rr, &req)
+                            search_page(db, emb, rr, &req)
                         })
                     }),
                 "search",
