@@ -291,6 +291,22 @@ def write_results_json(path: Path, meta: dict, results: list[dict], project_root
         raise
 
 
+def returned_for_case(returned: list[tuple[str, str]], case: dict) -> list[tuple[str, str]]:
+    """Drop the case's `defining_file` (self-eval references mode) before ranking.
+
+    The defining file ranks first for a bare-name query and is excluded from
+    gold, which would otherwise impose a first-hit floor of 2 on every such
+    case. Every case searches at the same `--limit`: over-fetching by one
+    changes membership, order and scores of the top rows, so the excluded
+    row costs one slot instead and the per-case `returned` column reports
+    the resulting length.
+    """
+    defining = case.get("defining_file")
+    if defining:
+        returned = [(p, c) for p, c in returned if p != defining]
+    return returned
+
+
 def score_case(
     expected: list[str],
     returned: list[tuple[str, str]],
@@ -355,6 +371,7 @@ def format_header(
     baseline: str,
     run_ts: str,
     split_str: str = "",
+    refs_mode_cases: int = 0,
 ) -> list[str]:
     """Build the "named everything" header.
 
@@ -381,6 +398,14 @@ def format_header(
     lines.append(model_line)
     lines.append(f"- **Reranker**: {reranker}")
     lines.append(f"- **Baseline for comparison**: {baseline}")
+    if refs_mode_cases:
+        lines.append(
+            f"- **Refs-mode adjustment**: each case's `defining_file` is excluded from the returned "
+            f"list after the search; the excluded row costs one slot and file de-duplication may cost "
+            f"more — the per-case `returned` column is the actual ranked-list length "
+            f"({refs_mode_cases}/{case_count} cases affected). Refs-mode scorecards are comparable "
+            f"only with other refs-mode runs at the same --limit ({limit})."
+        )
     lines.append(f"- **Run at**: {run_ts}")
     lines.append("")
     lines.append("**Measured quantities**: miss rate (no ground-truth file in top-N), "
@@ -388,7 +413,8 @@ def format_header(
                  "to first relevant hit (cl100k_base, when tiktoken is installed; "
                  "misses are charged a 32k penalty so the average isn't dominated "
                  "by a single un-bounded outlier). Per-case rows show `first_hit_rank`, "
-                 "`noise_before_first_hit`, recall@5, recall@10, and tokens-to-hit.")
+                 "`noise_before_first_hit`, recall@5, recall@10, tokens-to-hit, and the "
+                 "ranked list length after any refs-mode exclusion.")
     lines.append("")
     lines.append("**Not measured** (flagged so nothing reads in that we didn't test): "
                  "agent tool-call counts, end-to-end task-completion rate, "
@@ -538,7 +564,7 @@ def main() -> int:
         query = case["query"]
         expected = case["expected_files"]
         raw, error = run_codesage_search(args.codesage_bin, project_root, query, args.limit)
-        returned = parse_results(raw)
+        returned = returned_for_case(parse_results(raw), case)
         scored = score_case(expected, returned, k_values)
         scored["id"] = cid
         scored["query"] = query
@@ -578,6 +604,7 @@ def main() -> int:
         reranker=reranker,
         baseline=args.baseline,
         run_ts=run_ts,
+        refs_mode_cases=sum(1 for c in cases if c.get("defining_file")),
     )
     for line in header:
         print(line)
@@ -586,11 +613,11 @@ def main() -> int:
     print("## Per-case results")
     print()
     if _ENCODING is not None:
-        print("| id | src | first hit | noise | r@5 | r@10 | tokens→hit |")
-        print("|---|---|---:|---:|---:|---:|---:|")
+        print("| id | src | first hit | noise | r@5 | r@10 | tokens→hit | returned |")
+        print("|---|---|---:|---:|---:|---:|---:|---:|")
     else:
-        print("| id | src | first hit | noise | r@5 | r@10 |")
-        print("|---|---|---:|---:|---:|---:|")
+        print("| id | src | first hit | noise | r@5 | r@10 | returned |")
+        print("|---|---|---:|---:|---:|---:|---:|")
     for r in results:
         fh = r["first_hit_rank"] if r["first_hit_rank"] else "MISS"
         line = (
@@ -601,7 +628,7 @@ def main() -> int:
             ttf = r["tokens_to_first_hit"]
             ttf_str = f"{ttf:,}" if r["first_hit_rank"] else f"MISS ({_MISS_TOKEN_PENALTY:,})"
             line += f"| {ttf_str} "
-        print(line + "|")
+        print(line + f"| {r['returned_count']} |")
 
     search_failures = sum(1 for r in results if r.get("error"))
     hits = [r for r in results if r["first_hit_rank"] is not None]
