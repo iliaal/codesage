@@ -41,8 +41,9 @@ Query flows through these stages in order:
 4. **Symbol boost** -- +0.1 per query token that matches a known symbol in the chunk, plus definition/qualified-name boosts, path penalties, and directory/file saturation (each env-toggleable)
 5. **Symbol annotation** -- attach overlapping symbol names to each result
 6. **Cross-encoder rerank** -- ms-marco-MiniLM-L6-v2, adaptive blend weight (0.35 identifier-shaped / 0.6 natural-language / 0.5 default); skipped when BM25 fusion already ran
-7. **Truncate** to requested limit
-8. **Relevance-cliff disclosure** -- the page reports `confidence` (`high` when the largest adjacent relative score drop rounds to ≥20%, else `low`), `margin_pct`, and `cliff_at`. Opt-in `adaptive_limit: true` (CLI `--adaptive-limit`) cuts the page at that drop when `confidence` is `high`; a flat page is returned in full. The cut is page-local, so it composes poorly with `offset` paging.
+7. **Query-mention anchoring** -- a path, dotted module, or `Type::method` named outright in the query lifts its matching rows onto a slot ladder directly under the top score (each anchored row ends at or above `top * 0.95^(slot+1)`; at most 5 rows, 4 files x 3 chunks, first page only). A path suffix that matches several indexed files anchors nothing. Inert when the query names nothing; disable with `CODESAGE_MENTION_ANCHOR=0`.
+8. **Truncate** to requested limit
+9. **Relevance-cliff disclosure** -- the page reports `confidence` (`high` when the largest adjacent relative score drop rounds to ≥20%, else `low`), `margin_pct`, and `cliff_at`. Opt-in `adaptive_limit: true` (CLI `--adaptive-limit`) cuts the page at that drop when `confidence` is `high`; a flat page is returned in full. The cut is page-local, so it composes poorly with `offset` paging.
 
 The reranker is optional (configured per-project in config.toml). Without it, the remaining stages still run.
 
@@ -269,4 +270,3 @@ V2b shipped (0.7.0): feature-slice mapping + trust-boundary derivation + `output
 V2b slice 2 (next): `bus_factor`, `change_pattern`, `find_hotspots` MCP tools. Conditional on slice 1 validating on large real codebases.
 
 V2c (deferred): docs/decision layer (process traces, architecture summaries). Revisited after V2b slice 2 lands.
-

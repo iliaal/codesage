@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
+use codesage_parser::detect::detect_language;
 use codesage_parser::discover::{TEST_LIKE_EXCLUDE_PATTERNS, build_exclude_set};
 use codesage_protocol::{
     Language, SearchConfidence, SearchRequest, SearchResult, SearchResults, Symbol, SymbolSummary,
@@ -787,6 +788,19 @@ pub fn search_page(
         apply_directory_saturation(&mut results);
     }
 
+    // Last, on the final blended scores: a candidate the query names outright
+    // (a pasted path, a `Type::method`) is lifted onto a ladder directly under
+    // the current top result. After saturation on purpose, so a per-file
+    // decay cannot undo the lift; inert when the query names nothing and on
+    // every page but the first.
+    apply_mention_anchor(
+        &mut results,
+        &req.query,
+        limit.saturating_mul(overfetch),
+        offset,
+        mention_anchor_enabled(),
+    );
+
     apply_offset_and_limit(&mut results, offset, limit);
 
     let scores: Vec<f32> = results.iter().map(|r| r.score).collect();
@@ -1303,6 +1317,8 @@ fn apply_definition_boost(results: &mut [SearchResult], query: &str) {
 /// - `FILE_SATURATION`: per-file chunk-count decay
 /// - `DIR_SATURATION`: per-directory chunk-count decay
 /// - `ADAPTIVE_RERANK`: query-shape-adaptive rerank blend weight
+/// - `MENTION_ANCHOR`: lift candidates the query literally names (paths,
+///   `Type::method`) onto a slot ladder under the top result
 ///
 /// Boolean gate, default-off — enable with `=1` / `=true` / `=yes`:
 ///
@@ -1328,6 +1344,7 @@ mod tuning {
     pub(super) const FUSED_RERANK: &str = "CODESAGE_FUSED_RERANK";
     pub(super) const STEM_MATCH_BOOST: &str = "CODESAGE_STEM_MATCH_BOOST";
     pub(super) const HYBRID: &str = "CODESAGE_HYBRID";
+    pub(super) const MENTION_ANCHOR: &str = "CODESAGE_MENTION_ANCHOR";
 }
 
 // The `is_symbol_query` gate makes the definition boost provably inert on NL
@@ -2068,6 +2085,357 @@ static FILE_SATURATION_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn file_saturation_enabled() -> bool {
     *FILE_SATURATION_ENABLED.get_or_init(|| env_default_on(tuning::FILE_SATURATION))
+}
+
+// Query-mention anchoring. An agent paste ("thread 'main' panicked at
+// crates/graph/src/search.rs:123", "why does Database::symbol_exists probe
+// with LIMIT 1") names its target outright, but to the embedding a path or a
+// qualified name is a handful of tokens, and the named file can rank under
+// prose-similar neighbours. This stage lifts candidates the query literally
+// names onto a slot ladder directly under the current top score: the first
+// anchored candidate lands at `top * (1 - MENTION_TOP_GAP_FRAC)`, the second
+// at `top * (1 - MENTION_TOP_GAP_FRAC)^2`, and so on, in original-rank order.
+// The rungs are relative, not absolute: each anchored row ends at or above
+// `top * (1 - MENTION_TOP_GAP_FRAC)^(slot + 1)`, and a row already above its
+// rung keeps its score, whatever the score scale. It never demotes and never
+// fetches: a named file that KNN did not retrieve stays absent (logged at
+// debug), so the stage reorders the candidate set and cannot widen it. Bare
+// identifiers are not mentions; the symbol boost already covers those.
+//
+// The stage runs only for the first page (`offset == 0`) and only over the
+// first `scan_limit` rows. It is the sole stage that promotes upward, and a
+// deeper page's pool is a different candidate set (KNN fetch, RRF pool, and
+// the reranker's min-max all scale with the pool), so a lift computed on
+// page 2 could land a row in ranks no page ever shows. Page 1 is the only
+// page the lift can help, and confining it there keeps every later page a
+// plain slice of the organic ranking.
+//
+// Measured 2026-09-07 (corpora under the gitignored `bench/corpora/`; not
+// reproducible from a clone) with the debug CUDA build of this branch (jina
+// v2 base-code + ms-marco reranker), `CODESAGE_MENTION_ANCHOR=0` against
+// default: `ripgrep-eval` (5 cases) and `ripgrep-llm-eval` (5 cases) are
+// per-case byte-identical, so the stage is inert on queries that name
+// nothing; a 16-case mention corpus against this repo (stack traces, absolute
+// pastes, `Type::method`, issue prose) moves miss rate 0.375 → 0.3125 and
+// recall@10 0.625 → 0.6875. The remaining misses are files KNN never
+// retrieved, which is the no-fetch contract above, not a matching gap.
+const MENTION_TOP_GAP_FRAC: f32 = 0.05;
+const MENTION_MAX_FILES: usize = 4;
+const MENTION_MAX_CHUNKS_PER_FILE: usize = 3;
+// Total cap across all mentions, so anchored rows cannot fill a whole page
+// and evict every organic result. It binds before the per-file caps could
+// admit their 4 × 3 = 12 rows.
+const MENTION_MAX_ANCHORED: usize = 5;
+// `name.ext` tokens with one of these are files, never `Type.method`.
+const MENTION_NON_CODE_EXTENSIONS: &[&str] = &[
+    "toml", "md", "json", "yaml", "yml", "lock", "txt", "graphql", "proto", "sql", "csv", "xml",
+    "html", "css",
+];
+// An all-lowercase `.member` this short is indistinguishable from a file
+// extension (`parser.cc`, `Foo.kt`), so the dotted form needs a longer or
+// otherwise qualified member (uppercase, digit, underscore).
+const MENTION_DOTTED_MEMBER_AMBIGUOUS_LEN: usize = 4;
+const MENTION_TRIM_LEADING: &[char] = &['`', '\'', '"', '(', '[', '{', '<', '*'];
+// `(` is trailing-trimmed too, so `Database::open()` reduces to the identifier.
+const MENTION_TRIM_TRAILING: &[char] = &[
+    '`', '\'', '"', '(', ')', ']', '}', '>', ',', ';', ':', '.', '!', '?', '*',
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QueryMention {
+    /// A path-like token, line/column suffix already stripped.
+    Path(String),
+    /// A two-segment identifier: `owner::member`, `owner\member`, or
+    /// `owner.member`. `stem_fallback` is set for the first two: they are
+    /// unambiguously scoped, so a file stem equal to `owner` may stand in
+    /// for a missing qualified name. The dotted form is also prose
+    /// (`request.body`), so it must match a qualified name.
+    Symbol {
+        owner: String,
+        member: String,
+        stem_fallback: bool,
+    },
+}
+
+/// Strip up to two trailing `:digits` groups (`foo.rs:120`, `foo.rs:120:7`).
+/// `Type::method` is untouched: its tail after the last `:` is not numeric.
+fn strip_line_suffix(token: &str) -> &str {
+    let mut out = token;
+    for _ in 0..2 {
+        match out.rsplit_once(':') {
+            Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => {
+                out = head;
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
+/// Path-like: at least one `/` and a final component whose extension the
+/// parser maps to a language (the parser's table is the single source of
+/// truth, so a new language reaches this stage without a mirror list). Both
+/// halves are load-bearing: `/` alone admits `read/write`, `TCP/IP`, `24/7`;
+/// an extension alone admits bare basenames (`mod.rs`, `index.js`) whose
+/// specificity cannot be judged without the whole corpus. Backslash paths
+/// are rejected outright: indexed paths are `/`-separated, so a Windows
+/// paste could only produce an unmatchable mention.
+fn path_mention(token: &str) -> Option<String> {
+    let t = strip_line_suffix(token);
+    let t = t.strip_prefix("./").unwrap_or(t);
+    if t.is_empty() || t.ends_with('/') || t.contains('\\') || t.contains("://") || t.contains("::")
+    {
+        return None;
+    }
+    let has_slash = t.contains('/');
+    let has_source_ext = detect_language(std::path::Path::new(t)).is_some();
+    (has_slash && has_source_ext).then(|| t.to_string())
+}
+
+fn is_mention_segment(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    s.chars().count() >= 2
+        && (first.is_alphabetic() || first == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
+fn symbol_mention(token: &str) -> Option<QueryMention> {
+    let (owner, member, stem_fallback) = if let Some((o, m)) = token.rsplit_once("::") {
+        (o, m, true)
+    } else if let Some((o, m)) = token.rsplit_once('\\') {
+        (o, m, true)
+    } else {
+        let (o, m) = token.rsplit_once('.')?;
+        // `Cargo.toml`, `README.md`: a file, not a member access.
+        if MENTION_NON_CODE_EXTENSIONS.contains(&m) {
+            return None;
+        }
+        let ambiguous_with_extension = m.chars().count() <= MENTION_DOTTED_MEMBER_AMBIGUOUS_LEN
+            && m.chars().all(|c| c.is_ascii_lowercase());
+        if ambiguous_with_extension {
+            return None;
+        }
+        (o, m, false)
+    };
+    // A deeper scope (`a::b::Type::method`) keeps only the innermost owner.
+    let owner = owner.rsplit(['.', ':', '\\']).next().unwrap_or(owner);
+    (is_mention_segment(owner) && is_mention_segment(member)).then(|| QueryMention::Symbol {
+        owner: owner.to_string(),
+        member: member.to_string(),
+        stem_fallback,
+    })
+}
+
+/// Mentions in query order, deduplicated. Path shape wins over symbol shape,
+/// so `search.rs` is a path and not `search::rs`.
+fn extract_query_mentions(query: &str) -> Vec<QueryMention> {
+    let mut out = Vec::new();
+    for raw in query.split_whitespace() {
+        let token = raw
+            .trim_start_matches(MENTION_TRIM_LEADING)
+            .trim_end_matches(MENTION_TRIM_TRAILING);
+        if token.is_empty() {
+            continue;
+        }
+        let mention = if let Some(path) = path_mention(token) {
+            QueryMention::Path(path)
+        } else if let Some(symbol) = symbol_mention(token) {
+            symbol
+        } else {
+            continue;
+        };
+        if !out.contains(&mention) {
+            out.push(mention);
+        }
+    }
+    out
+}
+
+/// Whole-component suffix match, case-sensitive, in either direction, with
+/// at least two components on both sides. A repo-relative mention is a
+/// suffix of the indexed path (`src/search.rs` against
+/// `crates/graph/src/search.rs`); an absolute paste is longer than the
+/// indexed path, so then the indexed path must be a suffix of the mention.
+/// Fewer than two mention components (`/mod.rs`, `./lib.rs`) or a
+/// one-component indexed path (`lib.rs` against `/x/lib.rs`) match nothing,
+/// and neither does `earch.rs`. What this does NOT guarantee is uniqueness:
+/// `src/lib.rs` matches every crate's `src/lib.rs`, so the caller must still
+/// check that the matched rows belong to one file.
+fn path_matches_mention(file_path: &str, mention: &str) -> bool {
+    let candidate: Vec<&str> = file_path.rsplit('/').collect();
+    let wanted: Vec<&str> = mention
+        .rsplit('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    if wanted.len() < 2 || candidate.len() < 2 {
+        return false;
+    }
+    if wanted.len() <= candidate.len() {
+        wanted.iter().zip(&candidate).all(|(w, c)| w == c)
+    } else {
+        candidate.iter().zip(&wanted).all(|(c, w)| c == w)
+    }
+}
+
+/// The chunk carries `member` with a qualified name ending in `owner::member`
+/// (any separator), or, when `stem_fallback` is set, a file stem equal to
+/// `owner`. The stem rule is what reaches Rust free functions, whose
+/// qualified name is bare (`search::apply_symbol_boost` has qualified name
+/// `apply_symbol_boost`).
+fn symbols_match_mention(
+    result: &SearchResult,
+    owner: &str,
+    member: &str,
+    stem_fallback: bool,
+) -> bool {
+    let members: Vec<&SymbolSummary> = result.symbols.iter().filter(|s| s.name == member).collect();
+    if members.is_empty() {
+        return false;
+    }
+    let qualified = members.iter().any(|s| {
+        let segments = qualified_name_segments(&s.qualified_name);
+        segments.len() >= 2
+            && segments[segments.len() - 1] == member
+            && segments[segments.len() - 2] == owner
+    });
+    qualified
+        || (stem_fallback
+            && std::path::Path::new(&result.file_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                == Some(owner))
+}
+
+/// Per-file and per-mention bookkeeping for the anchored set. One map serves
+/// path and symbol hits alike, so a symbol mention cannot lift more chunks of
+/// one file than a path mention could.
+struct AnchorLedger<'a> {
+    anchored: Vec<usize>,
+    per_file: HashMap<&'a str, usize>,
+}
+
+impl<'a> AnchorLedger<'a> {
+    fn try_anchor(&mut self, idx: usize, file_path: &'a str) {
+        if self.anchored.len() >= MENTION_MAX_ANCHORED || self.anchored.contains(&idx) {
+            return;
+        }
+        let count = self.per_file.get(file_path).copied().unwrap_or(0);
+        if count == 0 && self.per_file.len() >= MENTION_MAX_FILES {
+            return;
+        }
+        if count >= MENTION_MAX_CHUNKS_PER_FILE {
+            return;
+        }
+        self.per_file.insert(file_path, count + 1);
+        self.anchored.push(idx);
+    }
+}
+
+fn apply_mention_anchor(
+    results: &mut [SearchResult],
+    query: &str,
+    scan_limit: usize,
+    offset: usize,
+    enabled: bool,
+) {
+    if !enabled || offset != 0 || results.is_empty() {
+        return;
+    }
+    let mentions = extract_query_mentions(query);
+    if mentions.is_empty() {
+        return;
+    }
+    let window = &results[..scan_limit.min(results.len())];
+    if window.is_empty() {
+        return;
+    }
+
+    let mut ledger = AnchorLedger {
+        anchored: Vec::new(),
+        per_file: HashMap::new(),
+    };
+    for mention in &mentions {
+        match mention {
+            QueryMention::Path(path) => {
+                let hits: Vec<usize> = window
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| path_matches_mention(&r.file_path, path))
+                    .map(|(idx, _)| idx)
+                    .collect();
+                if hits.is_empty() {
+                    tracing::debug!(
+                        mention = %path,
+                        "query names a file absent from the candidate set; not fetched"
+                    );
+                    continue;
+                }
+                // A suffix shared by several files (`src/lib.rs` in a
+                // workspace) names none of them; several chunks of one
+                // file are fine. Ambiguity outside the retrieved window is
+                // invisible: if KNN returned only one of the workspace's
+                // `src/lib.rs` files, that one anchors.
+                let distinct: HashSet<&str> =
+                    hits.iter().map(|&i| window[i].file_path.as_str()).collect();
+                if distinct.len() > 1 {
+                    tracing::debug!(
+                        mention = %path,
+                        files = distinct.len(),
+                        "path mention matches several files; skipped as non-specific"
+                    );
+                    continue;
+                }
+                for idx in hits {
+                    ledger.try_anchor(idx, window[idx].file_path.as_str());
+                }
+            }
+            QueryMention::Symbol {
+                owner,
+                member,
+                stem_fallback,
+            } => {
+                for (idx, result) in window.iter().enumerate() {
+                    if ledger.anchored.len() >= MENTION_MAX_ANCHORED {
+                        break;
+                    }
+                    if symbols_match_mention(result, owner, member, *stem_fallback) {
+                        ledger.try_anchor(idx, result.file_path.as_str());
+                    }
+                }
+            }
+        }
+    }
+    let mut anchored = ledger.anchored;
+    if anchored.is_empty() {
+        return;
+    }
+
+    // Results arrive score-descending, so ascending index order is "by
+    // original score, ties by original rank". `top` is still taken as the
+    // window maximum rather than `window[0]` so an unsorted caller cannot
+    // produce a ladder above the real top.
+    anchored.sort_unstable();
+    let top = window.iter().map(|r| r.score).fold(f32::MIN, f32::max);
+    let mut lifted = false;
+    for (slot, &idx) in anchored.iter().enumerate() {
+        let target = top * (1.0 - MENTION_TOP_GAP_FRAC).powi(slot as i32 + 1);
+        if results[idx].score < target {
+            results[idx].score = target;
+            lifted = true;
+        }
+    }
+    if lifted {
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    }
+}
+
+static MENTION_ANCHOR_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn mention_anchor_enabled() -> bool {
+    *MENTION_ANCHOR_ENABLED.get_or_init(|| env_default_on(tuning::MENTION_ANCHOR))
 }
 
 const RERANK_WEIGHT_DEFAULT: f32 = 0.5;
@@ -4551,5 +4919,673 @@ mod scoped_fts_evidence_tests {
             q.contains("\"create\""),
             "dotted route admits lowercase: {q:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod mention_anchor_tests {
+    use super::{
+        MENTION_MAX_CHUNKS_PER_FILE, MENTION_MAX_FILES, MENTION_TOP_GAP_FRAC, QueryMention,
+        apply_mention_anchor, apply_offset_and_limit, extract_query_mentions, path_matches_mention,
+    };
+    use codesage_protocol::{Language, SearchResult, SymbolKind, SymbolSummary};
+
+    const ALL: usize = usize::MAX;
+    const PAGE1: usize = 0;
+
+    fn mk(file: &str, score: f32) -> SearchResult {
+        SearchResult {
+            file_path: file.to_string(),
+            language: Language::Rust,
+            content: String::new(),
+            start_line: 1,
+            end_line: 10,
+            score,
+            symbols: Vec::new(),
+        }
+    }
+
+    fn mk_with_symbols(file: &str, score: f32, symbols: &[(&str, &str)]) -> SearchResult {
+        let mut r = mk(file, score);
+        r.symbols = symbols
+            .iter()
+            .map(|(name, qn)| SymbolSummary {
+                name: name.to_string(),
+                qualified_name: qn.to_string(),
+                kind: SymbolKind::Function,
+            })
+            .collect();
+        r
+    }
+
+    fn rung(top: f32, slot: usize) -> f32 {
+        top * (1.0 - MENTION_TOP_GAP_FRAC).powi(slot as i32 + 1)
+    }
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-6
+    }
+
+    fn sym(owner: &str, member: &str, stem_fallback: bool) -> QueryMention {
+        QueryMention::Symbol {
+            owner: owner.to_string(),
+            member: member.to_string(),
+            stem_fallback,
+        }
+    }
+
+    fn path(p: &str) -> QueryMention {
+        QueryMention::Path(p.to_string())
+    }
+
+    /// Seven distinct files, scores 0.90 down to 0.30 in 0.10 steps; the
+    /// mentioned file sits at rank 7.
+    fn ladder_fixture() -> Vec<SearchResult> {
+        vec![
+            mk("crates/graph/src/index.rs", 0.90),
+            mk("crates/graph/src/lookups.rs", 0.80),
+            mk("crates/graph/src/impact.rs", 0.70),
+            mk("crates/graph/src/drift.rs", 0.60),
+            mk("crates/graph/src/scc.rs", 0.50),
+            mk("crates/graph/src/brief.rs", 0.40),
+            mk("crates/graph/src/search.rs", 0.30),
+        ]
+    }
+
+    fn snapshot(results: &[SearchResult]) -> String {
+        serde_json::to_string(results).unwrap()
+    }
+
+    /// Rows at ranks 1..=n (after the untouched top) must sit exactly on
+    /// rungs 0..n, in that order.
+    fn assert_on_rungs(results: &[SearchResult], top: f32, files: &[&str]) {
+        assert!(close(results[0].score, top), "top is untouched");
+        for (slot, file) in files.iter().enumerate() {
+            let r = &results[slot + 1];
+            assert_eq!(r.file_path, *file, "rank {}", slot + 2);
+            assert!(
+                close(r.score, rung(top, slot)),
+                "{file}: {} vs rung {}",
+                r.score,
+                rung(top, slot)
+            );
+        }
+    }
+
+    #[test]
+    fn path_mention_lifts_rank_seven_to_rank_two_on_the_first_rung() {
+        let mut r = ladder_fixture();
+        apply_mention_anchor(
+            &mut r,
+            "thread 'main' panicked at crates/graph/src/search.rs",
+            ALL,
+            PAGE1,
+            true,
+        );
+        assert_on_rungs(&r, 0.90, &["crates/graph/src/search.rs"]);
+        assert!(close(r[1].score, 0.855));
+    }
+
+    #[test]
+    fn rungs_are_relative_so_a_low_top_never_opens_a_cliff() {
+        // With an absolute 0.05 step, top 0.24 would put the rung at 0.19, a
+        // 20.8% drop that a downstream relevance cliff reads as a boundary.
+        let mut r = vec![mk("x/a.rs", 0.24), mk("x/b.rs", 0.10), mk("x/c.rs", 0.09)];
+        apply_mention_anchor(&mut r, "see x/c.rs", ALL, PAGE1, true);
+        assert_on_rungs(&r, 0.24, &["x/c.rs"]);
+        assert!(close(r[1].score, 0.228));
+        assert!((r[0].score - r[1].score) / r[0].score < 0.20);
+    }
+
+    #[test]
+    fn line_and_column_suffixes_are_stripped_from_path_mentions() {
+        assert_eq!(
+            extract_query_mentions("panicked at src/foo.rs:120"),
+            vec![path("src/foo.rs")]
+        );
+        assert_eq!(
+            extract_query_mentions("--> src/foo.rs:120:7"),
+            vec![path("src/foo.rs")]
+        );
+        assert_eq!(
+            extract_query_mentions("at ./src/foo.rs:120:7:"),
+            vec![path("src/foo.rs")]
+        );
+        let mut r = vec![
+            mk("a/lib.rs", 0.90),
+            mk("b/other.rs", 0.80),
+            mk("src/foo.rs", 0.20),
+        ];
+        apply_mention_anchor(&mut r, "error at src/foo.rs:120:7", ALL, PAGE1, true);
+        assert_on_rungs(&r, 0.90, &["src/foo.rs"]);
+    }
+
+    #[test]
+    fn absolute_paths_match_the_repo_relative_index_path() {
+        let mut r = ladder_fixture();
+        apply_mention_anchor(
+            &mut r,
+            "thread 'main' panicked at /home/x/repo/crates/graph/src/search.rs:123",
+            ALL,
+            PAGE1,
+            true,
+        );
+        assert_on_rungs(&r, 0.90, &["crates/graph/src/search.rs"]);
+
+        // Python traceback and Node frame shapes survive the trim.
+        assert_eq!(
+            extract_query_mentions("File \"/home/x/repo/bench/ablation.py\", line 40, in main"),
+            vec![path("/home/x/repo/bench/ablation.py")]
+        );
+        assert_eq!(
+            extract_query_mentions("at foo (/home/x/repo/src/app.js:12:5)"),
+            vec![path("/home/x/repo/src/app.js")]
+        );
+    }
+
+    #[test]
+    fn type_method_mention_lifts_the_chunk_carrying_that_qualified_name() {
+        let mut r = vec![
+            mk("crates/graph/src/search.rs", 0.90),
+            mk("crates/graph/src/lookups.rs", 0.80),
+            mk_with_symbols(
+                "crates/storage/src/db/structural.rs",
+                0.20,
+                &[("symbol_exists", "Database::symbol_exists")],
+            ),
+            mk_with_symbols(
+                "crates/storage/src/db/mod.rs",
+                0.10,
+                &[("symbol_exists", "Other::symbol_exists")],
+            ),
+        ];
+        apply_mention_anchor(
+            &mut r,
+            "why does Database::symbol_exists probe LIMIT 1",
+            ALL,
+            PAGE1,
+            true,
+        );
+        assert_on_rungs(&r, 0.90, &["crates/storage/src/db/structural.rs"]);
+        // `Other::symbol_exists` shares the member but not the owner.
+        assert_eq!(r[3].file_path, "crates/storage/src/db/mod.rs");
+        assert!(close(r[3].score, 0.10));
+    }
+
+    #[test]
+    fn file_stem_stands_in_for_the_owner_of_a_scoped_free_function() {
+        // Rust free functions have a bare qualified name; `search::foo`
+        // resolves through the file stem instead.
+        let mut r = vec![
+            mk("crates/graph/src/index.rs", 0.90),
+            mk("crates/graph/src/lookups.rs", 0.80),
+            mk_with_symbols(
+                "crates/graph/src/search.rs",
+                0.10,
+                &[("apply_symbol_boost", "apply_symbol_boost")],
+            ),
+        ];
+        apply_mention_anchor(
+            &mut r,
+            "search::apply_symbol_boost double counts",
+            ALL,
+            PAGE1,
+            true,
+        );
+        assert_on_rungs(&r, 0.90, &["crates/graph/src/search.rs"]);
+    }
+
+    #[test]
+    fn dotted_form_requires_a_qualified_name_and_never_uses_the_stem() {
+        // `request.headers` is as likely prose as a member access, so a
+        // `request.js` that merely defines `headers` is not evidence.
+        let mut r = vec![
+            mk("src/app.js", 0.90),
+            mk("src/router.js", 0.80),
+            mk_with_symbols("src/request.js", 0.10, &[("headers", "headers")]),
+        ];
+        let before = snapshot(&r);
+        apply_mention_anchor(&mut r, "request.headers is empty", ALL, PAGE1, true);
+        assert_eq!(snapshot(&r), before);
+        // The reviewer's literal case: `body` is also too short for the
+        // dotted form, so it never becomes a mention at all.
+        assert!(extract_query_mentions("request.body is undefined").is_empty());
+        apply_mention_anchor(&mut r, "request.body is undefined", ALL, PAGE1, true);
+        assert_eq!(snapshot(&r), before);
+        // With the qualified name present, the dotted form does lift.
+        r[2].symbols[0].qualified_name = "request.headers".to_string();
+        apply_mention_anchor(&mut r, "request.headers is empty", ALL, PAGE1, true);
+        assert_on_rungs(&r, 0.90, &["src/request.js"]);
+    }
+
+    #[test]
+    fn at_most_four_mentioned_files_are_lifted() {
+        let mut r = vec![
+            mk("x/top.rs", 1.00),
+            mk("x/a.rs", 0.10),
+            mk("x/b.rs", 0.09),
+            mk("x/c.rs", 0.08),
+            mk("x/d.rs", 0.07),
+            mk("x/e.rs", 0.06),
+        ];
+        apply_mention_anchor(
+            &mut r,
+            "see x/a.rs x/b.rs x/c.rs x/d.rs x/e.rs",
+            ALL,
+            PAGE1,
+            true,
+        );
+        let lifted = ["x/a.rs", "x/b.rs", "x/c.rs", "x/d.rs"];
+        assert_eq!(lifted.len(), MENTION_MAX_FILES);
+        assert_on_rungs(&r, 1.00, &lifted);
+        assert_eq!(r[5].file_path, "x/e.rs");
+        assert!(close(r[5].score, 0.06), "fifth file is left where it was");
+    }
+
+    #[test]
+    fn at_most_three_chunks_of_one_mentioned_file_are_lifted() {
+        let mut r = vec![mk("x/top.rs", 1.00)];
+        for i in 0..5 {
+            let mut c = mk("x/many.rs", 0.10 - i as f32 * 0.01);
+            c.start_line = 100 * (i as u32 + 1);
+            r.push(c);
+        }
+        apply_mention_anchor(&mut r, "x/many.rs is huge", ALL, PAGE1, true);
+        // Original-score order is kept on the ladder: chunk at line 100 first.
+        assert_on_rungs(&r, 1.00, &["x/many.rs"; MENTION_MAX_CHUNKS_PER_FILE]);
+        assert_eq!(r[1].start_line, 100);
+        assert_eq!(r[2].start_line, 200);
+        assert_eq!(r[3].start_line, 300);
+        assert!(close(r[3].score, 0.857375));
+        assert!(close(r[4].score, 0.07), "fourth chunk is left where it was");
+        assert!(close(r[5].score, 0.06));
+    }
+
+    #[test]
+    fn total_anchored_rows_are_capped_so_a_page_keeps_organic_results() {
+        // Four mentioned files x three chunks = twelve eligible under the
+        // per-file caps; the total cap stops at five, in mention order then
+        // original rank.
+        let mut r = vec![mk("x/top.rs", 1.00)];
+        for f in ["x/a.rs", "x/b.rs", "x/c.rs", "x/d.rs"] {
+            for c in 0..3 {
+                let mut row = mk(f, 0.30 - (r.len() as f32) * 0.01);
+                row.start_line = 100 * (c + 1);
+                r.push(row);
+            }
+        }
+        apply_mention_anchor(
+            &mut r,
+            "compare x/a.rs x/b.rs x/c.rs x/d.rs",
+            ALL,
+            PAGE1,
+            true,
+        );
+        assert_on_rungs(
+            &r,
+            1.00,
+            &["x/a.rs", "x/a.rs", "x/a.rs", "x/b.rs", "x/b.rs"],
+        );
+        assert!(r[6].score < rung(1.00, 5), "sixth row is organic");
+    }
+
+    #[test]
+    fn symbol_hits_share_the_per_file_chunk_cap() {
+        let mut r = vec![mk("x/top.rs", 1.00)];
+        for i in 0..8 {
+            let mut c = mk_with_symbols(
+                "src/db.rs",
+                0.10 - i as f32 * 0.01,
+                &[("open", "Database::open")],
+            );
+            c.start_line = 100 * (i as u32 + 1);
+            r.push(c);
+        }
+        apply_mention_anchor(&mut r, "Database::open hangs", ALL, PAGE1, true);
+        assert_on_rungs(&r, 1.00, &["src/db.rs"; MENTION_MAX_CHUNKS_PER_FILE]);
+        assert!(close(r[4].score, 0.07), "fourth chunk is left where it was");
+    }
+
+    #[test]
+    fn symbol_hits_are_bounded_by_the_total_cap_across_files() {
+        // Three files x three matching chunks = nine eligible under the
+        // per-file caps; the total cap (5) binds, so five rows sit on rungs
+        // in original-rank order and the sixth eligible row stays organic.
+        let mut r = vec![mk("x/top.rs", 1.00)];
+        for f in 0..3 {
+            for c in 0..3 {
+                let mut row = mk_with_symbols(
+                    &format!("src/f{f}.rs"),
+                    0.30 - (f * 3 + c) as f32 * 0.01,
+                    &[("open", "Database::open")],
+                );
+                row.start_line = 100 * (c as u32 + 1);
+                r.push(row);
+            }
+        }
+        apply_mention_anchor(&mut r, "Database::open hangs", ALL, PAGE1, true);
+        assert_on_rungs(
+            &r,
+            1.00,
+            &[
+                "src/f0.rs",
+                "src/f0.rs",
+                "src/f0.rs",
+                "src/f1.rs",
+                "src/f1.rs",
+            ],
+        );
+        assert!(r[6].score < rung(1.00, 5));
+    }
+
+    #[test]
+    fn a_bare_basename_is_never_a_mention() {
+        assert!(extract_query_mentions("mod.rs is huge").is_empty());
+        assert!(extract_query_mentions("index.js and __init__.py and main.go").is_empty());
+        let mut r = vec![
+            mk("crates/graph/src/lib.rs", 0.90),
+            mk("crates/storage/src/db/mod.rs", 0.30),
+            mk("crates/cli/src/mcp/mod.rs", 0.20),
+        ];
+        let before = snapshot(&r);
+        apply_mention_anchor(&mut r, "mod.rs is huge", ALL, PAGE1, true);
+        assert_eq!(snapshot(&r), before);
+        // A leading slash does not smuggle a bare basename back in.
+        apply_mention_anchor(&mut r, "/mod.rs is huge", ALL, PAGE1, true);
+        assert_eq!(snapshot(&r), before);
+        // One directory component makes it specific.
+        apply_mention_anchor(&mut r, "mcp/mod.rs is huge", ALL, PAGE1, true);
+        assert_on_rungs(&r, 0.90, &["crates/cli/src/mcp/mod.rs"]);
+    }
+
+    #[test]
+    fn a_suffix_shared_by_several_files_is_non_specific() {
+        let mut r = vec![
+            mk("crates/graph/src/index.rs", 0.90),
+            mk("crates/storage/src/lib.rs", 0.30),
+            mk("crates/graph/src/lib.rs", 0.20),
+            mk("crates/graph/src/lib.rs", 0.10),
+        ];
+        let before = snapshot(&r);
+        apply_mention_anchor(&mut r, "src/lib.rs re-exports", ALL, PAGE1, true);
+        assert_eq!(snapshot(&r), before);
+        // Naming the crate disambiguates, and both chunks of that file lift.
+        apply_mention_anchor(
+            &mut r,
+            "crates/graph/src/lib.rs re-exports",
+            ALL,
+            PAGE1,
+            true,
+        );
+        assert_on_rungs(&r, 0.90, &["crates/graph/src/lib.rs"; 2]);
+        assert_eq!(r[3].file_path, "crates/storage/src/lib.rs");
+        assert!(close(r[3].score, 0.30));
+    }
+
+    #[test]
+    fn slash_prose_and_directories_are_not_mentions() {
+        assert!(extract_query_mentions("read/write lock").is_empty());
+        assert!(extract_query_mentions("TCP/IP stack").is_empty());
+        assert!(extract_query_mentions("24/7 uptime").is_empty());
+        assert!(extract_query_mentions("under crates/graph/src").is_empty());
+        assert!(extract_query_mentions("under crates/graph/src/").is_empty());
+    }
+
+    #[test]
+    fn scan_window_bounds_matching_and_the_ladder() {
+        // Geometric spacing keeps every neighbour more than one 5% rung
+        // apart, so a lifted row lands exactly one place under the top.
+        let pool: Vec<SearchResult> = (0..25)
+            .map(|i| {
+                let score = 0.9_f32.powi(i);
+                if i == 19 {
+                    mk("x/target.rs", score)
+                } else {
+                    mk(&format!("x/f{i}.rs"), score)
+                }
+            })
+            .collect();
+
+        let mut narrow = pool.clone();
+        apply_mention_anchor(&mut narrow, "x/target.rs panics", 10, PAGE1, true);
+        assert_eq!(
+            snapshot(&narrow),
+            snapshot(&pool),
+            "rank 20 is outside a window of 10"
+        );
+
+        let mut wide = pool.clone();
+        apply_mention_anchor(&mut wide, "x/target.rs panics", 25, PAGE1, true);
+        assert_on_rungs(&wide, 1.0, &["x/target.rs"]);
+    }
+
+    #[test]
+    fn stage_is_inert_on_every_page_but_the_first() {
+        let pool: Vec<SearchResult> = (0..25)
+            .map(|i| {
+                let score = 0.9_f32.powi(i);
+                if i == 19 {
+                    mk("x/target.rs", score)
+                } else {
+                    mk(&format!("x/f{i}.rs"), score)
+                }
+            })
+            .collect();
+        let mut page2 = pool.clone();
+        apply_mention_anchor(&mut page2, "x/target.rs panics", ALL, 10, true);
+        assert_eq!(snapshot(&page2), snapshot(&pool));
+        apply_offset_and_limit(&mut page2, 10, 10);
+        let organic: Vec<String> = (10..20).map(|i| format!("x/f{i}.rs")).collect();
+        let mut expected = organic.clone();
+        expected[9] = "x/target.rs".to_string();
+        let got: Vec<String> = page2.iter().map(|r| r.file_path.clone()).collect();
+        assert_eq!(
+            got, expected,
+            "page 2 is a plain slice of the organic ranking"
+        );
+
+        let mut page1 = pool.clone();
+        apply_mention_anchor(&mut page1, "x/target.rs panics", ALL, PAGE1, true);
+        assert_on_rungs(&page1, 1.0, &["x/target.rs"]);
+    }
+
+    #[test]
+    fn top_is_the_window_maximum_even_for_unsorted_input() {
+        let mut r = vec![mk("x/a.rs", 0.50), mk("x/b.rs", 0.90), mk("c/t.rs", 0.10)];
+        apply_mention_anchor(&mut r, "c/t.rs", ALL, PAGE1, true);
+        let t = r.iter().find(|x| x.file_path == "c/t.rs").unwrap();
+        assert!(close(t.score, rung(0.90, 0)));
+    }
+
+    #[test]
+    fn a_mentioned_chunk_already_on_top_is_never_demoted() {
+        let mut r = vec![
+            mk("crates/graph/src/search.rs", 0.90),
+            mk("crates/graph/src/index.rs", 0.89),
+            mk("crates/graph/src/lookups.rs", 0.10),
+        ];
+        let before = snapshot(&r);
+        apply_mention_anchor(
+            &mut r,
+            "crates/graph/src/search.rs is slow",
+            ALL,
+            PAGE1,
+            true,
+        );
+        assert_eq!(snapshot(&r), before);
+    }
+
+    #[test]
+    fn mention_free_query_is_byte_identical() {
+        let mut r = ladder_fixture();
+        let before = snapshot(&r);
+        apply_mention_anchor(
+            &mut r,
+            "how does the search pipeline blend reranker scores with symbol boosts",
+            ALL,
+            PAGE1,
+            true,
+        );
+        assert_eq!(snapshot(&r), before);
+    }
+
+    #[test]
+    fn disabled_gate_is_inert_even_with_a_mention() {
+        let mut r = ladder_fixture();
+        let before = snapshot(&r);
+        apply_mention_anchor(
+            &mut r,
+            "panicked at crates/graph/src/search.rs:123",
+            ALL,
+            PAGE1,
+            false,
+        );
+        assert_eq!(snapshot(&r), before);
+    }
+
+    #[test]
+    fn bare_identifiers_and_prose_are_not_mentions() {
+        assert!(extract_query_mentions("apply_symbol_boost SearchResult reranker").is_empty());
+        assert!(extract_query_mentions("e.g. the daemon, i.e. v0.26.1, costs 1.5 GB").is_empty());
+        assert_eq!(
+            extract_query_mentions("`Database::open()` and ns\\Repo then Foo.barBaz,"),
+            vec![
+                sym("Database", "open", true),
+                sym("ns", "Repo", true),
+                sym("Foo", "barBaz", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn file_like_tokens_never_become_symbol_mentions() {
+        // Known non-code extensions, short lowercase "members", and bare
+        // basenames with a code extension are all files, and a bare file
+        // name is not specific enough to anchor.
+        assert!(extract_query_mentions("bump Cargo.toml").is_empty());
+        assert!(extract_query_mentions("update README.md").is_empty());
+        assert!(extract_query_mentions("port Foo.kt").is_empty());
+        assert!(extract_query_mentions("crash in parser.cc").is_empty());
+    }
+
+    #[test]
+    fn parser_language_table_drives_the_path_extension_set() {
+        // No mirror list to drift: whatever `detect_language` maps is a path.
+        for tok in [
+            "x/a.mts", "x/b.pyi", "x/c.cu", "x/d.cxx", "x/e.go", "x/f.java", "x/g.php", "x/h.cc",
+        ] {
+            assert_eq!(extract_query_mentions(tok), vec![path(tok)], "{tok}");
+        }
+        assert!(extract_query_mentions("x/h.rb").is_empty());
+        assert!(extract_query_mentions("x/notes.txt").is_empty());
+    }
+
+    #[test]
+    fn windows_paths_are_rejected_rather_than_emitted() {
+        assert!(extract_query_mentions(r"C:\proj\src\foo.rs:12").is_empty());
+        assert!(extract_query_mentions(r"src\foo.rs").is_empty());
+        assert!(extract_query_mentions(r"..\lib\bar.py").is_empty());
+        // PHP namespaces keep working: both segments are identifiers.
+        assert_eq!(
+            extract_query_mentions(r"App\Http\Kernel"),
+            vec![sym("Http", "Kernel", true)]
+        );
+    }
+
+    #[test]
+    fn path_suffix_match_respects_component_boundaries_and_case() {
+        let indexed = "crates/graph/src/search.rs";
+        assert!(path_matches_mention(indexed, "src/search.rs"));
+        assert!(path_matches_mention(indexed, "crates/graph/src/search.rs"));
+        assert!(path_matches_mention(
+            indexed,
+            "./crates/graph/src/search.rs"
+        ));
+        assert!(path_matches_mention(
+            indexed,
+            "/home/x/repo/crates/graph/src/search.rs"
+        ));
+        assert!(!path_matches_mention(indexed, "earch.rs"));
+        assert!(!path_matches_mention(indexed, "Search.rs"));
+        assert!(!path_matches_mention(indexed, "graph/search.rs"));
+        // One component after filtering never matches, whatever the prefix.
+        assert!(!path_matches_mention(indexed, "search.rs"));
+        assert!(!path_matches_mention(indexed, "/search.rs"));
+        assert!(!path_matches_mention(indexed, "./search.rs"));
+        assert!(!path_matches_mention(
+            indexed,
+            "/home/x/other/src/search.rs"
+        ));
+        // An absolute mention longer than the indexed path needs two
+        // matching components, so `/x/lib.rs` cannot claim every `lib.rs`.
+        assert!(!path_matches_mention("lib.rs", "/x/lib.rs"));
+        assert!(path_matches_mention("src/lib.rs", "/x/src/lib.rs"));
+    }
+}
+
+#[cfg(test)]
+mod mention_anchor_pipeline_tests {
+    use super::{MENTION_TOP_GAP_FRAC, search};
+    use codesage_protocol::SearchRequest;
+    use codesage_storage::Database;
+
+    fn mk_embedding(v: f32) -> Vec<f32> {
+        let mut e = vec![0.0; codesage_storage::db::DEFAULT_EMBEDDING_DIM];
+        for slot in e.iter_mut().take(10) {
+            *slot = v;
+        }
+        e
+    }
+
+    fn seed(db: &Database) {
+        for (path, text, v) in [
+            ("src/lib.rs", "fn auth() { }", 0.1),
+            // Spaced so the runner-up scores under the first 5% rung
+            // (l2 0.1→0.3 over ten dims is score 0.80 against top 1.00).
+            ("src/db.rs", "fn connect() { }", 0.3),
+            ("src/reg.rs", "fn register() { }", 0.5),
+            ("src/misc.rs", "fn handler() { }", 0.7),
+        ] {
+            db.insert_chunks(path, "rust", &[(text, 1, 5, mk_embedding(v).as_slice())])
+                .unwrap();
+        }
+    }
+
+    fn req(query: &str, limit: usize, offset: usize) -> SearchRequest {
+        SearchRequest {
+            query: query.to_string(),
+            limit: Some(limit),
+            offset: Some(offset),
+            languages: None,
+            paths: None,
+            adaptive_limit: false,
+        }
+    }
+
+    #[test]
+    fn search_lifts_the_named_file_under_the_semantic_top_on_page_one_only() {
+        let db = Database::open_in_memory().unwrap();
+        seed(&db);
+        let emb = mk_embedding(0.1);
+
+        let baseline = search(&db, &emb, None, &req("handler panics", 10, 0)).unwrap();
+        assert_eq!(baseline[0].file_path, "src/lib.rs");
+        assert_eq!(
+            baseline[3].file_path, "src/misc.rs",
+            "farthest by embedding"
+        );
+
+        let query = "thread 'main' panicked at /home/x/repo/src/misc.rs:5";
+        let page1 = search(&db, &emb, None, &req(query, 10, 0)).unwrap();
+        assert_eq!(page1[0].file_path, "src/lib.rs");
+        assert_eq!(page1[1].file_path, "src/misc.rs");
+        let expected = page1[0].score * (1.0 - MENTION_TOP_GAP_FRAC);
+        assert!((page1[1].score - expected).abs() < 1e-6);
+
+        // A later page is the organic slice: no lift, and misc.rs is
+        // reachable where the ranking puts it.
+        let page2 = search(&db, &emb, None, &req(query, 2, 2)).unwrap();
+        let files: Vec<&str> = page2.iter().map(|r| r.file_path.as_str()).collect();
+        assert_eq!(files, vec!["src/reg.rs", "src/misc.rs"]);
     }
 }

@@ -4,6 +4,7 @@
 
 - `find_references` reports `counts_floor: true`, `definition_count`, `ambiguous`, and a `note` when the name matches several or no indexed definitions; `impact_analysis` and `trace_call_path` carry `counts_floor: true`, and a not-found trace says it searched resolved name-based edges only.
 - `search` reports `confidence` (`high` / `low`), `margin_pct`, and `cliff_at` from the largest relative score drop in the returned page; `adaptive_limit: true` (CLI `codesage search --adaptive-limit`) truncates at that cliff instead of returning exactly `limit` rows when the drop rates `confidence: high` (rounds to ≥20%); a flat page is returned in full.
+- `search` anchors query mentions: a path, dotted module, or `Type::method` named in the query lifts its matching rows directly under the top result on the first page; a suffix shared by several indexed files anchors nothing. `CODESAGE_MENTION_ANCHOR=0` disables it.
 
 ### Changed
 
