@@ -15,12 +15,16 @@ those calls actually helped the agent. Questions answered:
   for Grep on a symbol it had just asked codesage about? That is a
   "codesage didn't satisfy me" signal — distinct from a genuine follow-up
   on a different token.
+- Per tool, how often was a codesage call *terminal*: no native retrieval
+  (Grep / Glob / unexplained Read / grep-shaped Bash) within the next N
+  tool calls. Definition adapted from ripwire `docs/METHODOLOGY.md` §9.
 
 No forward instrumentation; all signal is extracted from transcripts at
-`~/.claude/projects/*/*.jsonl`.
+`~/.claude/projects/*/*.jsonl` (main sessions) and
+`~/.claude/projects/*/*/subagents/*.jsonl` (subagent transcripts).
 
 Usage:
-  bench/analyze-codesage-quality.py [--window-days 7] [--projects-root PATH] [--output PATH]
+  bench/analyze-codesage-quality.py [--window-days 7] [--terminality-window 3] [--projects-root PATH] [--output PATH]
 
 Stdlib only.
 """
@@ -32,6 +36,7 @@ import datetime as _dt
 import json
 import os
 import re
+import shlex
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -53,10 +58,6 @@ RETRIEVAL_CODESAGE_TOOLS = {
     "list_dependencies",
 }
 
-# Tool names we care about for utility pairing. These are the Claude Code
-# built-ins the agent reaches for when it bypasses MCP retrieval.
-FALLBACK_TOOLS = {"Grep", "Read", "Glob"}
-
 # Identifier shape — matches ASCII code tokens: function names, type names,
 # constants. Permissive on length so short tokens like `fd` and `pt` count.
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -73,14 +74,22 @@ REGEX_META_RE = re.compile(r"[.\\\[\](){}^$*+?]")
 # -----------------------------------------------------------------------------
 
 
+def is_subagent_transcript(path: Path) -> bool:
+    return path.parent.name == "subagents"
+
+
 def iter_transcripts(root: Path, min_mtime: float) -> list[Path]:
+    """Top-level session transcripts plus subagent transcripts under
+    `<project>/<session>/subagents/*.jsonl`, both filtered by mtime.
+    """
     out: list[Path] = []
     if not root.is_dir():
         return out
     for project in root.iterdir():
         if not project.is_dir():
             continue
-        for f in project.glob("*.jsonl"):
+        candidates = list(project.glob("*.jsonl")) + list(project.glob("*/subagents/*.jsonl"))
+        for f in candidates:
             try:
                 if f.stat().st_mtime >= min_mtime:
                     out.append(f)
@@ -134,13 +143,15 @@ def extract_events(transcript: Path) -> list[dict[str, Any]]:
 
             # User text turn: role=user with string content, or role=user
             # with a list whose entries are plain text (not tool_result).
+            # tool_result blocks also ride on role=user envelopes, so a
+            # message carrying one falls through to the block loop below.
             if role == "user":
                 user_text = ""
+                has_tool_result = False
                 if isinstance(content, str):
                     user_text = content
                 elif isinstance(content, list):
                     parts = []
-                    has_tool_result = False
                     for c in content:
                         if not isinstance(c, dict):
                             continue
@@ -154,7 +165,8 @@ def extract_events(transcript: Path) -> list[dict[str, Any]]:
                         user_text = "\n".join(parts).strip()
                 if user_text:
                     events.append({"kind": "user", "text": user_text, "ts": ts})
-                continue
+                if not has_tool_result:
+                    continue
 
             if not isinstance(content, list):
                 continue
@@ -404,16 +416,911 @@ def extract_codesage_subject(event: dict[str, Any]) -> set[str]:
 
 
 # -----------------------------------------------------------------------------
+# Terminality (ripwire METHODOLOGY.md §9, adapted)
+# -----------------------------------------------------------------------------
+
+DEFAULT_TERMINALITY_WINDOW = 3
+
+# Regex fallback for non-JSON result text. The extension must start with a
+# letter so version strings (`0.26.1`) and decimals don't register, and a
+# candidate must contain `/` so prose mentions of bare basenames don't.
+RESULT_PATH_RE = re.compile(r"[\w./-]+/[\w.-]+\.[A-Za-z]\w*")
+LEADING_DOT_SEGMENTS_RE = re.compile(r"^(\.\.?/)+")
+# JSON keys whose string values (or list-of-string values) are file paths in
+# the MCP result shapes (`crates/protocol/src/lib.rs`): `file_path`, `file`,
+# `path`, `files: Vec<String>`, `stale_files`, `dropped_files`, `max_risk_file`.
+RESULT_PATH_KEYS = {"file_path", "file", "path"}
+RESULT_PATH_KEY_SUFFIXES = ("_file", "_path", "files", "paths")
+
+# Bash command words that are native retrieval in their own right.
+NATIVE_GREP_WORDS = {"grep", "egrep", "fgrep", "rg"}
+# Sentinel working directory after pushd/popd or a subshell: relative
+# arguments can no longer be resolved and fail the path guard.
+CWD_UNKNOWN = "<unknown-cwd>"
+# Revision syntax that is never a pathspec.
+GIT_REF_RE = re.compile(r"^(origin|upstream|refs)/|\.\.|[\^~]|@\{")
+# Launchers / wrappers that precede the real command word. `rtk proxy grep`
+# is how this workstation's transcripts spell a raw grep.
+BASH_WRAPPER_WORDS = {
+    "rtk", "proxy", "sudo", "command", "nice", "time", "timeout", "nohup", "env", "stdbuf", "xvfb-run",
+}
+# Wrapper flags that take a separate argument (`sudo -u nobody`, `timeout -s KILL`).
+WRAPPER_FLAG_ARGS: dict[str, set[str]] = {
+    "sudo": {"-u", "--user", "-g", "--group", "-C", "-D", "-h", "-p", "-r", "-t", "-T", "-U"},
+    "timeout": {"-s", "-k", "--signal", "--kill-after"},
+    "env": {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"},
+    "stdbuf": {"-i", "-o", "-e"},
+    "nice": {"-n"},
+    "xvfb-run": {"-s", "-n", "-f", "-p", "-w", "-l", "-e"},
+}
+TIMEOUT_DURATION_RE = re.compile(r"^\d+(\.\d+)?[smhd]?$")
+ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# grep / rg flags whose argument is a separate token; the argument is never
+# a path (`-e PATTERN`, `-f FILE`, `-A 25`, `-m 1`). Combined short flags
+# ending in one of these letters consume the next token too (`-rne foo`).
+GREP_ARG_FLAG_RES = {
+    "grep": re.compile(r"^-[A-Za-z]*[ABCDdefm]$"),
+    "rg": re.compile(r"^-[A-Za-z]*[ABCEefgjmMtT]$"),
+}
+GREP_PATTERN_FLAG_RES = {
+    "grep": re.compile(r"^-[A-Za-z]*[ef]$"),
+    "rg": re.compile(r"^-[A-Za-z]*[ef]$"),
+}
+GREP_PATTERN_ATTACHED_RE = re.compile(r"^-[ef](\S+)$")
+GREP_PATTERN_LONG_PREFIXES = ("--regexp=", "--file=")
+GREP_PATTERN_LONG_FLAGS = {"--regexp", "--file"}
+# A `git log` positional is a pathspec (not a ref like `v0.26.1` or
+# `main..HEAD`) only when it has a directory component or a source extension.
+SOURCE_EXT_RE = re.compile(
+    r"\.(rs|py|php|phpt|c|h|cc|cpp|cxx|hpp|hh|java|js|jsx|mjs|ts|tsx|go|toml|yaml|yml|json|md|txt|sh|"
+    r"scm|sql|m4|w32|lock|cfg|ini|xml|html|css|scss|proto|rb|pl|swift|kt|zig)$",
+    re.IGNORECASE,
+)
+# Tools that are not actions in the retrieval sense and must not consume a
+# window slot: asking the user, spawning or messaging agents, bookkeeping.
+NON_SLOT_TOOLS = {
+    "AskUserQuestion", "Agent", "Task", "Skill", "TodoWrite", "Monitor", "ListAgents", "SendMessage",
+    "ToolSearch", "TaskOutput", "TaskStop", "TaskUpdate",
+}
+# Statement separators only. A single `|` is NOT a boundary: only the first
+# command of a pipeline can be retrieval; `... | grep -E error:` filters
+# output and is not a search of the code base.
+# `\;` is find's -exec terminator, not a statement separator. Accepted trade:
+# an escaped backslash right before `;` (`echo a\\; grep ...`) is also read
+# as an escape, so that statement boundary is swallowed.
+BASH_STATEMENT_SPLIT_RE = re.compile(r"\|\||&&|(?<!\\);|\n")
+HEREDOC_START_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+GREP_RECURSIVE_FLAG_RE = re.compile(r"^-[A-Za-z]*[rR][A-Za-z]*$")
+# Shell redirections are not path arguments: `2>/dev/null`, `>out.txt`,
+# `2>&1`, `&>log`, and the two-token form `2> /dev/null`.
+REDIRECT_BARE_RE = re.compile(r"^(\d*>{1,2}|\d*<{1,3}|&>{1,2})$")
+REDIRECT_ATTACHED_RE = re.compile(r"^(\d*>{1,2}|\d*<{1,3}|&>{1,2})\S")
+FIND_NAME_PREDICATES = {"-name", "-iname", "-path", "-ipath", "-wholename", "-regex"}
+# Actions that make a `find` housekeeping rather than retrieval. The `-exec`
+# family is judged by the utility it runs: read-only utilities keep the find
+# as retrieval (`-exec grep -n foo {} \;`), anything else (`rm`, `sed`, `awk`,
+# `mv`, ...) rejects it.
+FIND_MUTATING_ACTIONS = {"-delete", "-fls", "-fprint", "-fprint0", "-fprintf"}
+FIND_EXEC_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir"}
+FIND_READONLY_EXEC_UTILS = {
+    "cat", "grep", "rg", "egrep", "fgrep", "head", "tail", "wc", "ls", "stat", "file", "echo", "nl", "od", "jq",
+}
+FIND_EXEC_TERMINATORS = {";", "+", "{}"}
+# Paths that are scratch / diagnostic output, never code retrieval.
+NON_CODE_PATH_PREFIXES = ("/tmp/", "/proc/", "/dev/", "/var/log/", "/var/tmp/", "/run/")
+NON_CODE_PATH_SUFFIXES = (".log", ".output", ".out", ".err")
+
+EDIT_TOOLS = {"Edit", "Write", "MultiEdit"}
+
+
+def _norm_path(p: str) -> str:
+    p = p.strip().strip("'\"`")
+    p = LEADING_DOT_SEGMENTS_RE.sub("", p)
+    return p.rstrip("/")
+
+
+def _abs_norm(p: str, project_root: str | None) -> str:
+    """Absolute, normalized form of a path; relative paths resolve against
+    the codesage call's `project` root.
+    """
+    p = os.path.expanduser(p.strip().strip("'\"`"))
+    if not os.path.isabs(p) and project_root:
+        p = os.path.join(project_root, p)
+    return os.path.normpath(p)
+
+
+def _walk_json_paths(node: Any, key: str | None, out: set[str]) -> None:
+    if isinstance(node, dict):
+        for k, v in node.items():
+            _walk_json_paths(v, k, out)
+        return
+    if isinstance(node, list):
+        for item in node:
+            _walk_json_paths(item, key, out)
+        return
+    if not isinstance(node, str) or key is None:
+        return
+    if key in RESULT_PATH_KEYS or key.endswith(RESULT_PATH_KEY_SUFFIXES):
+        p = _norm_path(node)
+        if p:
+            out.add(p)
+
+
+FENCE_RE = re.compile(r"^```[A-Za-z0-9_-]*[ \t]*\n|\n```[ \t]*$")
+
+
+def _parse_result_json(t: str) -> Any:
+    """json.loads with recovery for fenced or prose-prefixed payloads: strip
+    a leading/trailing ``` fence, then retry from the first `{`/`[` to the
+    last `}`/`]`.
+    """
+    try:
+        return json.loads(t)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    stripped = FENCE_RE.sub("", t).strip()
+    starts = [i for i in (stripped.find("{"), stripped.find("[")) if i >= 0]
+    if not starts:
+        return None
+    start = min(starts)
+    end = max(stripped.rfind("}"), stripped.rfind("]"))
+    if end < start:
+        return None
+    try:
+        return json.loads(stripped[start:end + 1])
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def extract_result_paths(text: str) -> set[str]:
+    """File paths a codesage result named. JSON results yield only the values
+    of structured path fields; the regex fallback runs on non-JSON text and
+    requires a `/` in the candidate so prose and code snippets that mention
+    a bare basename (`Cargo.toml`) don't excuse an unrelated Read.
+    """
+    t = (text or "").strip()
+    if not t:
+        return set()
+    out: set[str] = set()
+    data = _parse_result_json(t)
+    if isinstance(data, (dict, list)):
+        _walk_json_paths(data, None, out)
+        return out
+    if "{" in t or "[" in t:
+        # Bracketed but unparseable: a truncated or malformed structured
+        # payload. Do not fall back to regex over what may be code text.
+        return out
+    for m in RESULT_PATH_RE.finditer(t):
+        p = _norm_path(m.group(0))
+        if p:
+            out.add(p)
+    return out
+
+
+def read_hits_result(read_path: str, result_paths: set[str], project_root: str | None = None) -> bool:
+    """True when the Read's path is one the result named. With a project
+    root, result paths resolve against it and must match exactly; without
+    one, a component-boundary suffix match is used and the result path must
+    carry a directory component.
+    """
+    rp = _norm_path(read_path)
+    if not rp:
+        return False
+    read_abs = _abs_norm(rp, project_root)
+    for p in result_paths:
+        if project_root:
+            if _abs_norm(p, project_root) == read_abs:
+                return True
+            continue
+        if "/" in p and (rp == p or rp.endswith("/" + p)):
+            return True
+    return False
+
+
+def _strip_heredocs(command: str) -> str:
+    out: list[str] = []
+    pos = 0
+    while True:
+        m = HEREDOC_START_RE.search(command, pos)
+        if not m:
+            out.append(command[pos:])
+            break
+        line_end = command.find("\n", m.end())
+        if line_end == -1:
+            out.append(command[pos:m.start()])
+            break
+        out.append(command[pos:line_end])
+        terminator = m.group(2)
+        body_pos = line_end + 1
+        pos = len(command)
+        for line_m in re.finditer(r"^[ \t]*(.*?)[ \t]*$", command[body_pos:], re.MULTILINE):
+            if line_m.group(1) == terminator:
+                pos = body_pos + line_m.end()
+                break
+    return "".join(out)
+
+
+def _tokenize(statement: str) -> list[str]:
+    try:
+        return shlex.split(statement, posix=True)
+    except ValueError:
+        return statement.split()
+
+
+def _is_scratch_abs(norm: str) -> bool:
+    return any(norm == p.rstrip("/") or norm.startswith(p) for p in NON_CODE_PATH_PREFIXES)
+
+
+def _code_path_arg(arg: str, project_root: str | None, cwd: str | None = None) -> bool:
+    """Path guard: the argument names something under the project (or, when
+    the working directory is unknown, a relative path / `.`) and is not a
+    scratch file, log, or task output. Relative arguments resolve against
+    `cwd` (tracked across `cd` statements; defaults to the project root).
+    Absolute paths outside the declared root, and any absolute path when no
+    root is known, fail the guard — terminal-favouring by design.
+    """
+    a = arg.strip().rstrip(")")
+    if not a or a.startswith("-"):
+        return False
+    if a.lower().endswith(NON_CODE_PATH_SUFFIXES):
+        return False
+    expanded = os.path.expanduser(a)
+    if not os.path.isabs(expanded):
+        if cwd == CWD_UNKNOWN:
+            # After pushd/popd or inside a subshell the working directory
+            # cannot be followed; a relative path is not provably code.
+            return False
+        if cwd:
+            expanded = os.path.join(cwd, expanded)
+    if os.path.isabs(expanded):
+        norm = os.path.normpath(expanded)
+        if _is_scratch_abs(norm):
+            return False
+        if not project_root:
+            return False
+        root = os.path.normpath(project_root)
+        return norm == root or norm.startswith(root + os.sep)
+    return "/tmp/" not in expanded and not expanded.startswith("/proc")
+
+
+def _parse_grep(word: str, args: list[str]) -> tuple[str | None, list[str], bool]:
+    """(pattern, paths, recursive) for a `grep`/`rg`/`git grep` argument
+    list. Flag arguments (`-e PAT`, `-f FILE`, `-A 25`) are consumed and
+    never treated as paths. `pattern` is None when no pattern is present
+    and "" when patterns come from a file (`-f`, `--file`) and are unknown.
+    The recursive flag is also read off combined tokens (`-rne foo`).
+    """
+    family = "rg" if word == "rg" else "grep"
+    arg_flag_re = GREP_ARG_FLAG_RES[family]
+    pattern_flag_re = GREP_PATTERN_FLAG_RES[family]
+    positional: list[str] = []
+    explicit_pattern: str | None = None
+    recursive = word in ("rg", "git grep")
+    skip = False
+    capture_pattern = False
+
+    def note_recursive(tok: str) -> None:
+        nonlocal recursive
+        if GREP_RECURSIVE_FLAG_RE.match(tok) or tok.startswith(("--recursive", "--dereference-recursive")):
+            recursive = True
+
+    for a in args:
+        if skip:
+            skip = False
+            if capture_pattern:
+                capture_pattern = False
+                explicit_pattern = explicit_pattern or a
+            continue
+        if a in GREP_PATTERN_LONG_FLAGS:
+            # `--file FILE` supplies patterns from a file: pattern unknown.
+            explicit_pattern = explicit_pattern or ""
+            skip = True
+            capture_pattern = a == "--regexp"
+            continue
+        if a.startswith(GREP_PATTERN_LONG_PREFIXES):
+            value = a.split("=", 1)[1]
+            explicit_pattern = explicit_pattern or (value if a.startswith("--regexp=") else "")
+            continue
+        m = GREP_PATTERN_ATTACHED_RE.match(a)
+        if m:
+            explicit_pattern = explicit_pattern or (m.group(1) if a.startswith("-e") else "")
+            continue
+        if pattern_flag_re.match(a):
+            note_recursive(a)
+            explicit_pattern = explicit_pattern or ""
+            skip = True
+            capture_pattern = a.endswith("e")
+            continue
+        if arg_flag_re.match(a):
+            note_recursive(a)
+            skip = True
+            continue
+        if a.startswith("-") and a != "-":
+            note_recursive(a)
+            continue
+        positional.append(a)
+    if explicit_pattern is None:
+        if not positional:
+            return None, [], recursive
+        return positional[0], positional[1:], recursive
+    return explicit_pattern, positional, recursive
+
+
+def _classify_grep(word: str, args: list[str], project_root: str | None, cwd: str | None) -> str | None:
+    """The search pattern when a `grep`/`rg` invocation searches code under
+    the project, else None ("" when the pattern comes from a file).
+    """
+    pattern, paths, recursive = _parse_grep(word, args)
+    if pattern is None:
+        return None
+    if paths:
+        hit = any(_code_path_arg(p, project_root, cwd) for p in paths)
+    else:
+        hit = recursive and _code_path_arg(".", project_root, cwd)
+    return pattern if hit else None
+
+
+def _classify_find(args: list[str], project_root: str | None, cwd: str | None) -> tuple[bool, str | None]:
+    """(is_retrieval, pattern) for a `find` invocation. Retrieval needs a
+    name/path predicate, a root under the project, no mutating action
+    (`-delete`, `-fprint`, ...), and any `-exec`/`-execdir`/`-ok`/`-okdir`
+    utility drawn from `FIND_READONLY_EXEC_UTILS`; a find that acts on its
+    matches is housekeeping, not retrieval. When the exec utility is a
+    grep, its pattern is returned so the find is accounted like a grep.
+    """
+    if not any(a in FIND_NAME_PREDICATES for a in args):
+        return False, None
+    if any(a in FIND_MUTATING_ACTIONS for a in args):
+        return False, None
+    pattern: str | None = None
+    for i, a in enumerate(args):
+        if a not in FIND_EXEC_ACTIONS:
+            continue
+        util = os.path.basename(args[i + 1]) if i + 1 < len(args) else ""
+        if util not in FIND_READONLY_EXEC_UTILS:
+            return False, None
+        if util in NATIVE_GREP_WORDS and pattern is None:
+            exec_args: list[str] = []
+            for tok in args[i + 2:]:
+                if tok in FIND_EXEC_TERMINATORS:
+                    break
+                exec_args.append(tok)
+            pattern = _parse_grep(util, exec_args)[0]
+    roots: list[str] = []
+    for a in args:
+        if a.startswith("-") or a in ("(", "!"):
+            break
+        roots.append(a)
+    if not roots:
+        roots = ["."]
+    if not any(_code_path_arg(r, project_root, cwd) for r in roots):
+        return False, None
+    return True, pattern
+
+
+def _is_pathspec(arg: str) -> bool:
+    """A `git log` positional that names files rather than a revision.
+    Refs are rejected first: `origin/master`, `refs/...`, `a..b`, `HEAD~2`,
+    `HEAD^`, `@{u}`.
+    """
+    if GIT_REF_RE.search(arg):
+        return False
+    return "/" in arg or bool(SOURCE_EXT_RE.search(arg))
+
+
+def _classify_git(args: list[str], project_root: str | None, cwd: str | None) -> tuple[str | None, str | None]:
+    """(label, pattern) for a `git` invocation: `git grep` (always, with its
+    pattern parsed like grep), `git blame` (always), `git log` with a
+    pathspec / `--` / `-p` / `-S` / `-G`; (None, None) otherwise.
+    """
+    j = 0
+    while j < len(args) and args[j].startswith("-"):
+        j += 2 if args[j] in ("-C", "-c") else 1
+    if j >= len(args):
+        return None, None
+    sub = args[j]
+    rest = args[j + 1:]
+    if sub == "grep":
+        pattern, _paths, _recursive = _parse_grep("git grep", rest)
+        return "git grep", pattern
+    if sub == "blame":
+        return "git blame", None
+    if sub != "log":
+        return None, None
+    if "--" in rest:
+        return "git log", None
+    for a in rest:
+        if a == "-p" or a.startswith("-S") or a.startswith("-G") or a in ("--patch", "--pickaxe-regex"):
+            return "git log", None
+        if not a.startswith("-") and _is_pathspec(a) and _code_path_arg(a, project_root, cwd):
+            return "git log", None
+    return None, None
+
+
+def _resolve_cd(target: str, cwd: str | None) -> str | None:
+    expanded = os.path.expanduser(target)
+    if os.path.isabs(expanded):
+        return os.path.normpath(expanded)
+    if cwd and cwd != CWD_UNKNOWN:
+        return os.path.normpath(os.path.join(cwd, expanded))
+    return cwd
+
+
+def _env_chdir(prefix: list[str], cwd: str | None) -> tuple[str | None, bool]:
+    """(working directory, target_was_absolute) for one statement after an
+    `env -C DIR` / `--chdir DIR` / `--chdir=DIR` in its wrapper prefix. Only
+    an absolute target may re-root the statement, the same rule as `cd`.
+    """
+    for idx, tok in enumerate(prefix):
+        target: str | None = None
+        if tok in ("-C", "--chdir") and idx + 1 < len(prefix) and idx > 0 and "env" in prefix[:idx]:
+            target = prefix[idx + 1]
+        elif tok.startswith("--chdir=") and "env" in prefix[:idx]:
+            target = tok.split("=", 1)[1]
+        if target is not None:
+            return _resolve_cd(target, cwd), os.path.isabs(os.path.expanduser(target))
+    return cwd, False
+
+
+def _skip_wrappers(tokens: list[str], j: int) -> int:
+    """Index of the real command word after launcher / wrapper words, their
+    flags and flag arguments, and leading env assignments.
+    """
+    while j < len(tokens):
+        tok = tokens[j]
+        if ENV_ASSIGNMENT_RE.match(tok):
+            j += 1
+            continue
+        if tok not in BASH_WRAPPER_WORDS:
+            return j
+        wrapper = tok
+        j += 1
+        flag_args = WRAPPER_FLAG_ARGS.get(wrapper, set())
+        while j < len(tokens) and tokens[j].startswith("-") and tokens[j] != "-":
+            j += 2 if tokens[j] in flag_args else 1
+        if wrapper == "timeout" and j < len(tokens) and TIMEOUT_DURATION_RE.match(tokens[j]):
+            j += 1
+    return j
+
+
+def _command_args(tokens: list[str], start: int) -> list[str]:
+    """Arguments of the command at `start`, up to the next pipe or the
+    closing `)` of a `$(...)` substitution (the token carrying `)` is kept
+    with the paren stripped).
+    """
+    out: list[str] = []
+    skip_next = False
+    for tok in tokens[start:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in ("|", "&"):
+            break
+        if REDIRECT_BARE_RE.match(tok):
+            skip_next = True
+            continue
+        if REDIRECT_ATTACHED_RE.match(tok):
+            continue
+        if tok.endswith(")") and not tok.startswith("("):
+            stripped = tok.rstrip(")")
+            if stripped:
+                out.append(stripped)
+            break
+        out.append(tok)
+    return out
+
+
+def shell_retrieval(command: Any, project_root: str | None = None) -> tuple[str | None, str | None]:
+    """(label, pattern) when a Bash command searches the code base under
+    `project_root`, else (None, None). See `shell_retrieval_detail`.
+    """
+    label, pattern, _root = shell_retrieval_detail(command, project_root)
+    return label, pattern
+
+
+def shell_retrieval_detail(
+    command: Any, project_root: str | None = None, *, root_follows_cd: bool = False
+) -> tuple[str | None, str | None, str | None]:
+    """(label, pattern, root) when a Bash command searches the code base,
+    else (None, None, None). The label is `grep`, `rg`, `find`, `git log`,
+    `git blame`, or `git grep`; the pattern is the grep/rg search pattern
+    when known; `root` is the root the winning statement was judged
+    against. With `root_follows_cd` (the §2.3 session-scoped rule) an
+    absolute `cd` inside the command re-roots the statements after it,
+    statement by statement; without it the root is fixed for the command.
+
+    Only the first command of each pipeline is a candidate (a `grep` that
+    consumes another command's output is a filter, not a search), plus a
+    `grep|rg|find` that follows `xargs` or opens a `$(...)` substitution.
+    Heredoc bodies are skipped. `cd` is tracked across statements so
+    relative arguments resolve against the running working directory
+    (initially the project root). `grep`/`rg` count when a path argument
+    passes the project-root guard (or, with no path, when they recurse the
+    working directory and it is under the project); `find` needs a
+    name/path predicate and no mutating action (`-delete`, `-fprint*`,
+    `-fls`, or an `-exec`/`-ok` family action whose utility is not one of
+    the read-only `FIND_READONLY_EXEC_UTILS`); `git log` needs a pathspec
+    or `-p`/`-S`/`-G`;
+    `git blame`/`git grep` always count. Calls with no project root and
+    absolute paths outside it are scored conservatively (not retrieval).
+    """
+    if not isinstance(command, str) or not command.strip():
+        return None, None, None
+    root: str | None = os.path.normpath(os.path.expanduser(project_root)) if project_root else None
+    cwd: str | None = root
+    cwd_lost = False
+    for statement in BASH_STATEMENT_SPLIT_RE.split(_strip_heredocs(command)):
+        tokens = _tokenize(statement)
+        if not tokens:
+            continue
+        if tokens[0].startswith("("):
+            # Subshell: its cd's do not leak out and we do not model the
+            # nesting, so the working directory is unknown from here on.
+            cwd_lost = True
+            tokens[0] = tokens[0][1:]
+            if not tokens[0]:
+                tokens.pop(0)
+                if not tokens:
+                    continue
+        if cwd_lost:
+            cwd = CWD_UNKNOWN
+        head = _skip_wrappers(tokens, 0)
+        stmt_cwd, env_chdir_absolute = _env_chdir(tokens[:head], cwd)
+        if head < len(tokens) and tokens[head] in ("pushd", "popd"):
+            cwd_lost = True
+            cwd = CWD_UNKNOWN
+            continue
+        if head < len(tokens) and tokens[head] == "cd":
+            if cwd_lost:
+                continue
+            target = tokens[head + 1] if head + 1 < len(tokens) and tokens[head + 1] != "|" else "~"
+            if target == "-":
+                continue
+            cwd = _resolve_cd(target, cwd)
+            if root_follows_cd and cwd and cwd != CWD_UNKNOWN and os.path.isabs(os.path.expanduser(target)):
+                root = cwd
+            continue
+        cwd_for_statement = stmt_cwd
+        stmt_root = root
+        if root_follows_cd and env_chdir_absolute and stmt_cwd and stmt_cwd != CWD_UNKNOWN:
+            stmt_root = stmt_cwd
+        for i, raw in enumerate(tokens):
+            substitution = raw.startswith("$(")
+            tok = raw[2:] if substitution else raw
+            if not tok:
+                continue
+            after_xargs = False
+            k = i - 1
+            while k >= 0 and tokens[k].startswith("-"):
+                k -= 1
+            if k >= 0 and os.path.basename(tokens[k]) == "xargs":
+                after_xargs = True
+            if not (i == 0 or substitution or after_xargs):
+                continue
+            j = i if substitution else _skip_wrappers(tokens, i)
+            if j >= len(tokens):
+                break
+            if j != i:
+                tok = tokens[j]
+                if tok == "|":
+                    continue
+            word = os.path.basename(tok)
+            args = _command_args(tokens, j + 1)
+            if after_xargs and word in NATIVE_GREP_WORDS | {"find"}:
+                # Paths arrive on stdin: judge the producer stage's arguments
+                # (`ls crates | xargs grep foo` searches crates/; a list read
+                # from /tmp does not).
+                pipes = [idx for idx in range(i) if tokens[idx] == "|"]
+                if not pipes:
+                    continue
+                stage = tokens[(pipes[-2] + 1 if len(pipes) > 1 else 0):pipes[-1]]
+                stage = stage[_skip_wrappers(stage, 0):]
+                producer_args = [a for a in stage[1:] if not a.startswith("-")]
+                if any(_code_path_arg(a, stmt_root, cwd_for_statement) for a in producer_args):
+                    # Paths come from stdin, so the pattern is parsed
+                    # without the path guard.
+                    pattern = _parse_grep(word, args)[0] if word in NATIVE_GREP_WORDS else None
+                    return word, pattern, stmt_root
+                continue
+            if word in NATIVE_GREP_WORDS:
+                pattern = _classify_grep(word, args, stmt_root, cwd_for_statement)
+                if pattern is not None:
+                    return word, pattern, stmt_root
+            elif word == "find":
+                is_find, find_pattern = _classify_find(args, stmt_root, cwd_for_statement)
+                if is_find:
+                    return "find", find_pattern, stmt_root
+            elif word == "git":
+                label, pattern = _classify_git(args, stmt_root, cwd_for_statement)
+                if label:
+                    return label, pattern, stmt_root
+    return None, None, None
+
+
+def last_absolute_cd(command: Any) -> str | None:
+    """The working directory a Bash command leaves behind for the next
+    call, when it can be followed: the last absolute `cd`/`pushd` target
+    (relative targets and `popd` cannot be followed and yield None).
+    Claude Code's Bash tool persists the working directory across calls in
+    a main session (not in subagent transcripts, where each call starts
+    fresh). A `cd` that failed at runtime (missing directory) is still
+    adopted: the transcript does not carry the exit status.
+    """
+    if not isinstance(command, str) or not command.strip():
+        return None
+    result: str | None = None
+    for statement in BASH_STATEMENT_SPLIT_RE.split(_strip_heredocs(command)):
+        tokens = _tokenize(statement)
+        if not tokens or tokens[0].startswith("("):
+            continue
+        head = _skip_wrappers(tokens, 0)
+        if head >= len(tokens) or tokens[head] not in ("cd", "pushd", "popd"):
+            continue
+        if tokens[head] == "popd" or head + 1 >= len(tokens) or tokens[head + 1] in ("|", "-"):
+            result = None
+            continue
+        expanded = os.path.expanduser(tokens[head + 1])
+        result = os.path.normpath(expanded) if os.path.isabs(expanded) else None
+    return result
+
+
+def is_onboarded_root(root: str | None, session_roots: set[str], cache: dict[str, bool]) -> bool:
+    """True when `root` is inside an onboarded project: one of the
+    absolute `session_roots` (the `project` values of the session's
+    CodeSage calls) or a directory holding `.codesage/index.db`, checking
+    the path and every parent, so a grep from `<proj>/crates/graph` or a
+    worktree under `<proj>/.claude/worktrees/*` still counts. `cache` is
+    keyed on the queried path and lasts one run.
+    """
+    if not root or root == CWD_UNKNOWN:
+        return False
+    # A relative root cannot be located (abspath would resolve it against
+    # the analyzer's own cwd, which is meaningless here).
+    expanded = os.path.expanduser(root)
+    if not os.path.isabs(expanded):
+        return False
+    probe = Path(os.path.normpath(expanded))
+    candidates = [probe, *probe.parents]
+    if any(str(c) in session_roots for c in candidates):
+        return True
+    key = str(probe)
+    if key not in cache:
+        cache[key] = any((c / ".codesage" / "index.db").is_file() for c in candidates)
+    return cache[key]
+
+
+def bash_native_retrieval(command: Any, project_root: str | None = None) -> str | None:
+    """Label when a Bash command searches the code base, else None. See
+    `shell_retrieval`. Known gap, left as is: a wrapper inside a command
+    substitution (`$(rtk proxy grep ...)`) is not recognised; `$(grep ...)` is.
+    """
+    return shell_retrieval(command, project_root)[0]
+
+
+TERMINALITY_COUNT_KEYS = (
+    "calls",
+    "terminal",
+    "non_terminal",
+    "chained",
+    "policy_read",
+    "follow_through_read",
+    "unscoped",
+)
+
+
+def _new_terminality_bucket() -> dict[str, Any]:
+    bucket: dict[str, Any] = {key: 0 for key in TERMINALITY_COUNT_KEYS}
+    bucket["first_followups"] = {}
+    bucket["top_followups"] = []
+    bucket["terminal_rate"] = None
+    bucket["terminal_rate_strict"] = None
+    return bucket
+
+
+def _score_window(
+    calls: list[dict[str, Any]],
+    result_paths: set[str],
+    project_root: str | None = None,
+) -> tuple[str, str | None, int, int, str | None]:
+    """Walk the tool calls after one codesage call. Returns
+    (outcome, first_non_terminal_followup, policy_reads, follow_through_reads, evidence)
+    where outcome is `terminal`, `non_terminal`, or `chained` (another
+    codesage call arrived before any native retrieval) and evidence is the
+    Bash command / Read path / Grep pattern that decided a non-terminal call.
+
+    A Read is excused when the result named its path (follow-through) or
+    when an Edit/Write of the same path follows inside the window (harness
+    read-before-edit policy); either way it consumes a window slot but is
+    not native retrieval. The policy-read exclusion is deliberately broader
+    than ripwire §9, which excuses only the Read of an EDIT verb's own
+    target file: here any Read followed by an Edit/Write of the same path
+    is excused, because CodeSage has no edit verbs and every edit the agent
+    makes after a query goes through the harness's read-before-edit rule.
+    """
+    policy = 0
+    follow = 0
+    for k, call in enumerate(calls):
+        name = call.get("tool") or ""
+        inp = call.get("input") or {}
+        if not isinstance(inp, dict):
+            inp = {}
+        if name.startswith(TOOL_PREFIX):
+            return "chained", None, policy, follow, None
+        if name in ("Grep", "Glob"):
+            return "non_terminal", name, policy, follow, str(inp.get("pattern") or "")
+        if name == "Bash":
+            command = inp.get("command")
+            label = bash_native_retrieval(command, project_root)
+            if label:
+                return "non_terminal", f"Bash({label})", policy, follow, str(command)
+            continue
+        if name == "Read":
+            path = inp.get("file_path")
+            if not isinstance(path, str):
+                continue
+            if result_paths and read_hits_result(path, result_paths, project_root):
+                follow += 1
+                continue
+            norm = _norm_path(path)
+            edited_later = False
+            for later in calls[k + 1:]:
+                if (later.get("tool") or "") not in EDIT_TOOLS:
+                    continue
+                later_inp = later.get("input") or {}
+                later_path = later_inp.get("file_path") if isinstance(later_inp, dict) else None
+                if isinstance(later_path, str) and _norm_path(later_path) == norm:
+                    edited_later = True
+                    break
+            if edited_later:
+                policy += 1
+                continue
+            return "non_terminal", "Read", policy, follow, path
+    return "terminal", None, policy, follow, None
+
+
+def _finalize_terminality_bucket(bucket: dict[str, Any]) -> None:
+    ranked = sorted(bucket["first_followups"].items(), key=lambda kv: (-kv[1], kv[0]))
+    bucket["top_followups"] = ranked[:5]
+    calls = bucket["calls"]
+    strict = bucket["terminal"] + bucket["non_terminal"]
+    bucket["terminal_rate"] = (bucket["terminal"] / calls) if calls else None
+    bucket["terminal_rate_strict"] = (bucket["terminal"] / strict) if strict else None
+
+
+def _window_calls(events: list[dict[str, Any]], start: int, window: int) -> list[dict[str, Any]]:
+    """Tool calls after `start`, capped at `window`, cut at the next user
+    turn (a new question re-baselines the agent) and at the next codesage
+    call (which is appended so the scorer can report `chained`).
+    """
+    calls: list[dict[str, Any]] = []
+    for e in events[start + 1:]:
+        kind = e.get("kind")
+        if kind == "user":
+            # Only a real user question re-baselines the agent. Harness
+            # injections (task notifications, system reminders, pasted
+            # command bodies) also arrive as role=user and must not cut.
+            if is_real_user_question(e.get("text") or ""):
+                break
+            continue
+        if kind != "tool_use":
+            continue
+        if (e.get("tool") or "") in NON_SLOT_TOOLS:
+            continue
+        calls.append(e)
+        if (e.get("tool") or "").startswith(TOOL_PREFIX) or len(calls) >= window:
+            break
+    return calls
+
+
+def terminality(
+    events: list[dict[str, Any]], window: int = DEFAULT_TERMINALITY_WINDOW
+) -> dict[str, Any]:
+    """Per-codesage-tool terminality for one transcript's events.
+
+    A codesage call is terminal when none of the next `window` tool calls
+    (before the next user turn) is native retrieval: Grep, Glob, a Read of
+    a path the result did not name (and that is not edited within the
+    window), or a Bash command that searches the code base (see
+    `bash_native_retrieval`). Non-terminal calls are also listed under
+    `evidence` with the follow-up that decided them.
+    """
+    results_by_id: dict[Any, dict[str, Any]] = {}
+    for e in events:
+        if e.get("kind") == "tool_result" and e.get("id") is not None:
+            results_by_id.setdefault(e["id"], e)
+
+    tools: dict[str, dict[str, Any]] = {}
+    overall = _new_terminality_bucket()
+    evidence: list[dict[str, Any]] = []
+    for i, ev in enumerate(events):
+        if ev.get("kind") != "tool_use":
+            continue
+        tool = ev.get("tool") or ""
+        if not tool.startswith(TOOL_PREFIX):
+            continue
+        suffix = tool[len(TOOL_PREFIX):]
+        inp = ev.get("input") or {}
+        project_root = inp.get("project") if isinstance(inp, dict) else None
+        if not isinstance(project_root, str) or not project_root:
+            project_root = None
+        res = results_by_id.get(ev.get("id")) if ev.get("id") is not None else None
+        result_paths = extract_result_paths((res or {}).get("text") or "")
+        outcome, first, policy, follow, decided_by = _score_window(
+            _window_calls(events, i, window), result_paths, project_root
+        )
+        for bucket in (tools.setdefault(suffix, _new_terminality_bucket()), overall):
+            bucket["calls"] += 1
+            bucket["policy_read"] += policy
+            bucket["follow_through_read"] += follow
+            bucket["unscoped"] += 0 if project_root else 1
+            bucket[outcome] += 1
+            if outcome == "non_terminal":
+                bucket["first_followups"][first] = bucket["first_followups"].get(first, 0) + 1
+        if outcome == "non_terminal":
+            evidence.append({"tool": suffix, "followup": first, "evidence": decided_by})
+    for bucket in tools.values():
+        _finalize_terminality_bucket(bucket)
+    _finalize_terminality_bucket(overall)
+    return {"window": window, "tools": tools, "all": overall, "evidence": evidence}
+
+
+def merge_terminality(parts: list[dict[str, Any]], window: int) -> dict[str, Any]:
+    tools: dict[str, dict[str, Any]] = {}
+    overall = _new_terminality_bucket()
+    evidence: list[dict[str, Any]] = []
+
+    def fold(dst: dict[str, Any], src: dict[str, Any]) -> None:
+        for key in TERMINALITY_COUNT_KEYS:
+            dst[key] += src.get(key, 0)
+        for name, cnt in (src.get("first_followups") or {}).items():
+            dst["first_followups"][name] = dst["first_followups"].get(name, 0) + cnt
+
+    for part in parts:
+        for suffix, bucket in (part.get("tools") or {}).items():
+            fold(tools.setdefault(suffix, _new_terminality_bucket()), bucket)
+        fold(overall, part.get("all") or {})
+        evidence.extend(part.get("evidence") or [])
+    for bucket in tools.values():
+        _finalize_terminality_bucket(bucket)
+    _finalize_terminality_bucket(overall)
+    return {"window": window, "tools": tools, "all": overall, "evidence": evidence}
+
+
+# -----------------------------------------------------------------------------
 # Aggregation
 # -----------------------------------------------------------------------------
 
 
-def aggregate(events_per_transcript: list[list[dict[str, Any]]]) -> dict[str, Any]:
+def aggregate(
+    events_per_transcript: list[list[dict[str, Any]]],
+    *,
+    terminality_window: int = DEFAULT_TERMINALITY_WINDOW,
+    subagent_flags: list[bool] | None = None,
+) -> dict[str, Any]:
+    """`subagent_flags[i]` marks `events_per_transcript[i]` as a subagent
+    transcript; the Bash working directory is carried across calls only in
+    main sessions.
+    """
     # Per-tool result categorization
     quality: dict[str, dict[str, int]] = defaultdict(lambda: {"ok": 0, "empty": 0, "error": 0})
 
-    # Utility signals
-    grep_calls = 0
+    # Utility signals. "Grep" here means the Grep tool plus shell greps
+    # (`grep`/`rg`/`git grep` at a pipeline head, or a `find -exec grep`
+    # whose pattern was recovered; see `shell_retrieval`).
+    grep_tool_calls = 0
+    grep_tool_calls_all = 0
+    # Shell greps under an onboarded root: one of the `project` values seen
+    # in any CodeSage call of the session, or a directory holding
+    # `.codesage/index.db`, either directly or in an ancestor. Only these
+    # are decisions where CodeSage was actually available;
+    # `shell_grep_calls_all` also counts the rest.
+    shell_grep_calls = 0
+    shell_grep_calls_all = 0
+    identifier_grep_in_codesage_sessions_all = 0
+    # Shell greps whose pattern could not be recovered (`-f FILE`, `--file`):
+    # reported, but kept out of the identifier-shaped denominator.
+    shell_grep_unparsed = 0
+    followup_grep_events = 0
     grep_identifier_shaped = 0
     grep_multi_ident = 0  # pipe-joined or whitespace-split → multiple codesage calls would be needed
     followup_grep_after_codesage = 0
@@ -457,29 +1364,99 @@ def aggregate(events_per_transcript: list[list[dict[str, Any]]]) -> dict[str, An
         }
     )
 
+    # Per-run filesystem cache for `is_onboarded_root`, keyed on the queried path.
+    onboarded_cache: dict[str, bool] = {}
+
     # Retrieval-class first tools: these are the ones we count as a
     # "retrieval decision". Read counts because the agent may have
     # decided to read a specific file rather than search — that's still
     # a retrieval choice, just one CodeSage doesn't compete with directly
     # (Read needs a known path).
-    def first_retrieval_tool(events: list[dict[str, Any]], start: int) -> tuple[str | None, int]:
-        """From `start`, scan forward until the first tool_use OR the
-        next user message, whichever comes first. Return (tool_name, idx)
-        or (None, end-of-window-idx). Tool name returned verbatim; the
-        caller decides whether it counts as retrieval-shape.
+    def first_retrieval_tool(
+        events: list[dict[str, Any]], start: int, project_root: str | None
+    ) -> str | None:
+        """From `start`, scan forward until the first *decision* tool_use
+        OR the next user message, whichever comes first. Bookkeeping tools
+        (`NON_SLOT_TOOLS`) are skipped; a `Bash` call counts only when it
+        is a shell grep (grep family, `git grep` → `Grep`) or `find`
+        (→ `Glob`; → `Grep` when it runs `-exec grep` and the pattern was
+        recovered), the same label set the §2.3 counters use (the root
+        gate and the `-f` exclusion are not applied here); other shell
+        retrieval (`git log`, `git blame`) is not a decision and is skipped.
+        Returns the tool name or None.
         """
         n = len(events)
         j = start
         while j < n:
             e = events[j]
             if e.get("kind") == "user":
-                return None, j
+                return None
             if e.get("kind") == "tool_use":
-                return (e.get("tool") or ""), j
+                tool = e.get("tool") or ""
+                if tool in NON_SLOT_TOOLS:
+                    j += 1
+                    continue
+                if tool == "Bash":
+                    label, pattern = shell_retrieval((e.get("input") or {}).get("command"), project_root)
+                    if label in NATIVE_GREP_WORDS or label == "git grep" or (label == "find" and pattern is not None):
+                        return "Grep"
+                    if label == "find":
+                        return "Glob"
+                    j += 1
+                    continue
+                return tool
             j += 1
-        return None, n
+        return None
 
-    def shape_walk(events: list[dict[str, Any]], session_had_codesage: bool) -> None:
+    def account_grep_pattern(
+        pattern: str, session_had_codesage: bool, recent_subjects: list[dict[str, Any]]
+    ) -> None:
+        """Identifier-shape and follow-up accounting shared by the Grep tool
+        and shell greps. A codesage result is counted as "followed by a
+        grep" at most once; every (grep, matched result) pair is counted in
+        `followup_grep_events`, so the per-result mean is at least 1.
+        """
+        nonlocal grep_identifier_shaped, grep_multi_ident
+        nonlocal identifier_grep_in_codesage_sessions, followup_grep_after_codesage, followup_grep_events
+        if identifier_shaped_grep(pattern):
+            grep_identifier_shaped += 1
+            if session_had_codesage:
+                identifier_grep_in_codesage_sessions += 1
+            # Multi-identifier patterns are strictly stronger: the agent
+            # would have needed N find_symbol calls, not one.
+            if "|" in pattern or len(pattern.split()) > 1:
+                grep_multi_ident += 1
+        # Follow-up grep on a recent codesage subject?
+        grep_idents = extract_grep_identifiers(pattern)
+        if not grep_idents:
+            return
+        for entry in recent_subjects:
+            if grep_idents & entry["subjects"]:
+                followup_grep_events += 1
+                if not entry["hit"]:
+                    entry["hit"] = True
+                    followup_grep_after_codesage += 1
+
+    def session_project_roots(events: list[dict[str, Any]]) -> list[str]:
+        """Absolute `project` arguments of the session's codesage calls, in
+        order of first appearance (tilde expanded; a relative value such as
+        `codesage` cannot be located and is skipped). The first is the
+        default root shell paths are judged against; all of them are
+        onboarded by construction.
+        """
+        roots: list[str] = []
+        for ev in events:
+            if ev.get("kind") == "tool_use" and (ev.get("tool") or "").startswith(TOOL_PREFIX):
+                inp = ev.get("input") or {}
+                root = inp.get("project") if isinstance(inp, dict) else None
+                if not isinstance(root, str) or not root:
+                    continue
+                expanded = os.path.normpath(os.path.expanduser(root))
+                if os.path.isabs(expanded) and expanded not in roots:
+                    roots.append(expanded)
+        return roots
+
+    def shape_walk(events: list[dict[str, Any]], session_had_codesage: bool, project_root: str | None) -> None:
         """For each *real* user question (excluding pasted command bodies
         and system notifications), classify by shape and record the
         first tool the agent reached for in response. Only sessions
@@ -488,8 +1465,9 @@ def aggregate(events_per_transcript: list[list[dict[str, Any]]]) -> dict[str, An
         The denominator the rendered output cares about is
         `retrieval_decisions` per shape — questions that resulted in a
         retrieval-class first action. That excludes turns where the
-        agent immediately wrote code, ran a Bash command, or reasoned
-        without a tool — none of which are retrieval choices.
+        agent immediately wrote code, ran a non-search Bash command, or
+        reasoned without a tool — none of which are retrieval choices. A
+        Bash command that is a shell grep counts as `first=Grep`.
         """
         if not session_had_codesage:
             return
@@ -506,7 +1484,7 @@ def aggregate(events_per_transcript: list[list[dict[str, Any]]]) -> dict[str, An
                 continue
             shape = classify_user_question(text)
             shape_counts[shape]["questions"] += 1
-            first_tool, _next = first_retrieval_tool(events, i + 1)
+            first_tool = first_retrieval_tool(events, i + 1, project_root)
             bucket = shape_counts[shape]
             if first_tool is None:
                 bucket["first_other_or_none"] += 1
@@ -528,8 +1506,9 @@ def aggregate(events_per_transcript: list[list[dict[str, Any]]]) -> dict[str, An
                 bucket["first_other_or_none"] += 1
             i += 1
 
-    for events in events_per_transcript:
+    for idx_transcript, events in enumerate(events_per_transcript):
         sessions_total += 1
+        is_subagent = bool(subagent_flags[idx_transcript]) if subagent_flags else False
         # Detect whether codesage was registered in this session at all.
         # Any `tool_use` naming a codesage tool is proof the tool was
         # available; without at least one call we can't tell from the
@@ -540,18 +1519,25 @@ def aggregate(events_per_transcript: list[list[dict[str, Any]]]) -> dict[str, An
         )
         if had_codesage:
             sessions_with_codesage_available += 1
+        session_roots_list = session_project_roots(events)
+        session_roots = set(session_roots_list)
+        session_project = session_roots_list[0] if session_roots_list else None
 
         # Question-shape pass (does not depend on the streaming detail walk
         # below — keeps the new code self-contained and easier to remove if
         # the metric is rotated out later).
-        shape_walk(events, had_codesage)
+        shape_walk(events, had_codesage, session_project)
 
         # Track recent codesage subject-sets with a tiny buffer. A follow-up
         # Grep within 5 subsequent tool_uses on any tracked subject counts
         # as "codesage didn't satisfy" — 5 is a heuristic, short enough to
         # stay topical, long enough to survive incidental intermediate
         # actions like Read.
-        recent_codesage_subjects: list[set[str]] = []
+        recent_codesage_subjects: list[dict[str, Any]] = []
+        # Working directory the Bash tool carries between calls, when the
+        # last cd/pushd target was absolute; shell greps are judged against
+        # it, else against the session's codesage project root (§2.3 rule).
+        bash_cwd: str | None = None
         # Stream events in order.
         i = 0
         n = len(events)
@@ -565,7 +1551,7 @@ def aggregate(events_per_transcript: list[list[dict[str, Any]]]) -> dict[str, An
                         codesage_retrieval_in_codesage_sessions += 1
                 subj = extract_codesage_subject(e)
                 if subj:
-                    recent_codesage_subjects.append(subj)
+                    recent_codesage_subjects.append({"subjects": subj, "hit": False})
                     if len(recent_codesage_subjects) > 5:
                         recent_codesage_subjects.pop(0)
             elif e["kind"] == "tool_result" and (e.get("pair_tool") or "").startswith(TOOL_PREFIX):
@@ -577,9 +1563,9 @@ def aggregate(events_per_transcript: list[list[dict[str, Any]]]) -> dict[str, An
                 subj = extract_codesage_subject(e)
                 if subj:
                     if recent_codesage_subjects:
-                        recent_codesage_subjects[-1] = recent_codesage_subjects[-1] | subj
+                        recent_codesage_subjects[-1]["subjects"] |= subj
                     else:
-                        recent_codesage_subjects.append(subj)
+                        recent_codesage_subjects.append({"subjects": subj, "hit": False})
                 # Count Reads until next non-(Read|Grep) tool_use.
                 reads = 0
                 j = i + 1
@@ -600,29 +1586,69 @@ def aggregate(events_per_transcript: list[list[dict[str, Any]]]) -> dict[str, An
                     j += 1
                 reads_after_codesage.append(reads)
             elif e["kind"] == "tool_use" and e.get("tool") == "Grep":
-                grep_calls += 1
-                pattern = (e.get("input") or {}).get("pattern", "")
+                # Same onboarded-root gate as shell greps: an absolute
+                # `path` is judged on its own; a relative or absent path
+                # means the tool searched from the session's working tree.
+                grep_input = e.get("input") or {}
+                grep_path = grep_input.get("path") if isinstance(grep_input, dict) else None
+                if isinstance(grep_path, str) and os.path.isabs(os.path.expanduser(grep_path)):
+                    grep_root: str | None = os.path.expanduser(grep_path)
+                else:
+                    grep_root = bash_cwd or session_project
+                grep_tool_calls_all += 1
+                pattern = grep_input.get("pattern", "") if isinstance(grep_input, dict) else ""
                 if isinstance(pattern, str):
-                    if identifier_shaped_grep(pattern):
-                        grep_identifier_shaped += 1
-                        if had_codesage:
-                            identifier_grep_in_codesage_sessions += 1
-                        # Multi-identifier patterns are strictly stronger: the
-                        # agent would have needed N find_symbol calls, not one.
-                        if "|" in pattern or len(pattern.split()) > 1:
-                            grep_multi_ident += 1
-                    # Follow-up Grep on a recent codesage subject?
-                    grep_idents = extract_grep_identifiers(pattern)
-                    if grep_idents and any(grep_idents & s for s in recent_codesage_subjects):
-                        followup_grep_after_codesage += 1
+                    if had_codesage and identifier_shaped_grep(pattern):
+                        identifier_grep_in_codesage_sessions_all += 1
+                    if is_onboarded_root(grep_root, session_roots, onboarded_cache):
+                        grep_tool_calls += 1
+                        account_grep_pattern(pattern, had_codesage, recent_codesage_subjects)
+                elif is_onboarded_root(grep_root, session_roots, onboarded_cache):
+                    grep_tool_calls += 1
+            elif e["kind"] == "tool_use" and e.get("tool") == "Bash":
+                # Shell greps are the same retrieval decision as the Grep
+                # tool; this corpus reaches for `rtk proxy grep` far more
+                # often than for Grep, so counting only the tool would make
+                # the tool-selection rate a denominator artifact.
+                command = (e.get("input") or {}).get("command")
+                # The command starts in the cwd the previous call left
+                # behind (main sessions only); an absolute cd inside it
+                # re-roots the statements that follow, not the ones before.
+                label, pattern, stmt_root = shell_retrieval_detail(
+                    command, bash_cwd or session_project, root_follows_cd=True
+                )
+                # A `find -exec grep PATTERN` is a grep of the tree and is
+                # accounted as one (its pattern was recovered).
+                if label in NATIVE_GREP_WORDS or label == "git grep" or (label == "find" and pattern is not None):
+                    if not pattern:
+                        shell_grep_unparsed += 1
+                    else:
+                        shell_grep_calls_all += 1
+                        identifier_shaped = identifier_shaped_grep(pattern)
+                        if had_codesage and identifier_shaped:
+                            identifier_grep_in_codesage_sessions_all += 1
+                        if is_onboarded_root(stmt_root, session_roots, onboarded_cache):
+                            shell_grep_calls += 1
+                            account_grep_pattern(pattern, had_codesage, recent_codesage_subjects)
+                        # else: non-onboarded root — CodeSage was not an
+                        # option there, so not a tool-selection decision.
+                if not is_subagent:
+                    bash_cwd = last_absolute_cd(command) or bash_cwd
             i += 1
 
     return {
         "quality": quality,
-        "grep_calls": grep_calls,
+        "grep_calls": grep_tool_calls + shell_grep_calls,
+        "grep_tool_calls": grep_tool_calls,
+        "grep_tool_calls_all": grep_tool_calls_all,
+        "shell_grep_calls": shell_grep_calls,
+        "shell_grep_calls_all": shell_grep_calls_all,
+        "shell_grep_unparsed": shell_grep_unparsed,
+        "identifier_grep_in_codesage_sessions_all": identifier_grep_in_codesage_sessions_all,
         "grep_identifier_shaped": grep_identifier_shaped,
         "grep_multi_ident": grep_multi_ident,
         "followup_grep_after_codesage": followup_grep_after_codesage,
+        "followup_grep_events": followup_grep_events,
         "codesage_results_total": codesage_results_total,
         "reads_after_codesage": reads_after_codesage,
         "codesage_retrieval_calls": dict(codesage_retrieval_calls),
@@ -631,6 +1657,10 @@ def aggregate(events_per_transcript: list[list[dict[str, Any]]]) -> dict[str, An
         "identifier_grep_in_codesage_sessions": identifier_grep_in_codesage_sessions,
         "codesage_retrieval_in_codesage_sessions": codesage_retrieval_in_codesage_sessions,
         "question_shape_counts": {k: dict(v) for k, v in shape_counts.items()},
+        "terminality": merge_terminality(
+            [terminality(events, terminality_window) for events in events_per_transcript],
+            terminality_window,
+        ),
     }
 
 
@@ -663,6 +1693,7 @@ def render(
     window_days: int,
     transcripts: int,
     now: str,
+    subagent_transcripts: int = 0,
 ) -> str:
     out: list[str] = []
     q: dict[str, dict[str, int]] = agg["quality"]
@@ -670,10 +1701,20 @@ def render(
     out.append("# CodeSage MCP quality + utility analysis")
     out.append("")
     out.append(f"**Window**: last {window_days} days  ")
-    out.append(f"**Transcripts scanned**: {transcripts}  ")
+    out.append(
+        f"**Transcripts scanned**: {transcripts} "
+        f"({transcripts - subagent_transcripts} session, {subagent_transcripts} subagent)  "
+    )
     out.append(f"**Run at**: {now}  ")
     out.append(f"**CodeSage tool_results analyzed**: {agg['codesage_results_total']}  ")
-    out.append(f"**Grep calls observed (any context)**: {agg['grep_calls']}")
+    shell_all = agg.get("shell_grep_calls_all", agg.get("shell_grep_calls", 0))
+    tool_all = agg.get("grep_tool_calls_all", agg.get("grep_tool_calls", 0))
+    out.append(
+        f"**Grep tool + shell grep calls observed (onboarded roots)**: {agg['grep_calls']} "
+        f"(Grep tool {agg.get('grep_tool_calls', agg['grep_calls'])}, "
+        f"shell greps {agg.get('shell_grep_calls', 0)}); "
+        f"all roots: {tool_all + shell_all} (Grep tool {tool_all}, shell greps {shell_all})"
+    )
     out.append("")
 
     # ------------------------------------------------------------------ quality
@@ -704,12 +1745,24 @@ def render(
     out.append("")
 
     # ----------------------------------------------------------------- utility
-    out.append("## Utility: Grep that CodeSage would have answered")
+    out.append("## Utility: Grep tool + shell greps that CodeSage would have answered")
     out.append("")
     gc = agg["grep_calls"]
     gi = agg["grep_identifier_shaped"]
     gm = agg["grep_multi_ident"]
-    out.append(f"- **Grep calls in window**: {gc}")
+    shell_gated = agg.get("shell_grep_calls", 0)
+    shell_all = agg.get("shell_grep_calls_all", shell_gated)
+    tool_gated = agg.get("grep_tool_calls", gc)
+    tool_all = agg.get("grep_tool_calls_all", tool_gated)
+    out.append(
+        f"- **Grep calls in window**: {gc} (Grep tool {tool_gated}, "
+        f"shell `grep`/`rg`/`git grep` at a pipeline head or `find -exec grep` {shell_gated}; "
+        f"both under an onboarded root). "
+        f"Excluded from the denominator below: {tool_all - tool_gated} Grep tool calls and "
+        f"{shell_all - shell_gated} shell greps under non-onboarded roots, "
+        f"{agg.get('shell_grep_unparsed', 0)} shell greps with no recoverable pattern "
+        f"(`-f FILE` / `--file`)"
+    )
     out.append(
         f"- **Identifier-shaped** (CodeSage `find_symbol` / `find_references` territory): "
         f"{gi} ({pct(gi, gc)})"
@@ -748,23 +1801,37 @@ def render(
     else:
         out.append("  - breakdown: none (zero retrieval-class codesage calls in window)")
     out.append(
-        f"- **Identifier-shaped Grep calls in same sessions**: {id_grep_in_avail}"
+        f"- **Identifier-shaped Grep tool + shell grep calls in same sessions**: {id_grep_in_avail}"
     )
     if avail_decisions > 0:
         rate = 100.0 * retr_in_avail / avail_decisions
         out.append(
             f"- **Tool-selection rate** (retrieval-class picks that went to CodeSage "
-            f"over Grep, sessions where codesage was available): "
+            f"over Grep, sessions where codesage was available, shell greps under "
+            f"onboarded roots only): "
             f"**{rate:.1f}%** ({retr_in_avail} CodeSage / {avail_decisions} total "
             f"retrieval-shape decisions)"
         )
     else:
         out.append("- **Tool-selection rate**: n/a (no retrieval-shape decisions in window)")
+    id_grep_all = agg.get("identifier_grep_in_codesage_sessions_all", id_grep_in_avail)
+    all_decisions = retr_in_avail + id_grep_all
+    out.append(
+        f"  - including non-onboarded roots: rate {pct(retr_in_avail, all_decisions)} "
+        f"({id_grep_all} identifier-shaped greps in CodeSage sessions)"
+    )
     out.append("")
     out.append(
         "Interpretation: in sessions where the agent *could have* used CodeSage, "
         "retrieval-class picks went to either a CodeSage MCP tool or to an "
-        "identifier-shaped Grep pattern that CodeSage would have answered. High "
+        "identifier-shaped Grep pattern that CodeSage would have answered. Shell "
+        "greps are session-scoped: each is judged against the working directory the "
+        "Bash tool carried into it (the last absolute `cd`/`pushd` in the session) or, "
+        "failing that, the `project` of the session's first CodeSage call; greps whose "
+        "pattern could not be recovered are excluded. A shell grep counts only when "
+        "that root is onboarded — a `project` seen in any CodeSage call of the session, "
+        "or a directory holding `.codesage/index.db` — because elsewhere CodeSage was "
+        "not an option; the secondary line keeps the ungated figure. High "
         "rate (>70%) means the agent reaches for CodeSage on merit. Near-zero "
         "rate means the tool affordances (descriptions, CLAUDE.md directives) "
         "are not winning — escalation path is either stronger prompts or "
@@ -775,10 +1842,15 @@ def render(
     out.append("## Utility: follow-up Grep after a CodeSage result")
     out.append("")
     fg = agg["followup_grep_after_codesage"]
+    fge = agg.get("followup_grep_events", fg)
     cr = agg["codesage_results_total"]
     out.append(
-        f"- **Codesage results followed by a Grep on a mentioned identifier within 5 "
-        f"tool_uses**: {fg} ({pct(fg, cr)})"
+        f"- **Codesage results followed by at least one Grep on a mentioned identifier "
+        f"within 5 tool_uses**: {fg} ({pct(fg, cr)})"
+    )
+    out.append(
+        f"- **Follow-up greps per followed result** (mean): "
+        f"{(fge / fg):.2f} ({fge} greps)" if fg else "- **Follow-up greps per followed result**: n/a"
     )
     out.append("")
     out.append(
@@ -814,6 +1886,83 @@ def render(
     )
     out.append("")
 
+    # ------------------------------------------------------------ terminality
+    term = agg.get("terminality") or {}
+    term_window = term.get("window", DEFAULT_TERMINALITY_WINDOW)
+    out.append(
+        f"## Terminality per CodeSage tool (native retrieval within {term_window} calls)"
+    )
+    out.append("")
+    out.append(
+        f"A CodeSage call is **terminal** when none of the next {term_window} tool calls "
+        "(same transcript, before the next user turn) is native retrieval: `Grep`, "
+        "`Glob`, a `Read` of a file the result did not name, or a `Bash` command that "
+        "searches the code base — the first command of a pipeline (or one after "
+        "`xargs` / inside `$(...)`) being `grep`/`rg` with a project path, `find` with "
+        "a name/path predicate and no mutating action (`-delete`, `-fprint*`, `-fls`, or "
+        "`-exec`/`-ok` running anything but a read-only utility such as `cat`, `grep`, "
+        "`head`, `wc`, `ls`, `stat`, `jq`), `git log` with a pathspec or `-p`/`-S`/`-G`, or "
+        "`git blame`/`git grep`. A `grep` that filters another command's output is not "
+        "retrieval. `chained` means another CodeSage call arrived before any native "
+        "retrieval; `rate` counts chained calls in the denominator, `strict rate` "
+        "excludes them. Exclusions, counted separately: `policy-read` is a `Read` "
+        "followed within the window by an `Edit`/`Write` of the same path (harness "
+        "read-before-edit rule, not a search); `follow-through` is a `Read` of a path "
+        "the result itself named. Shell paths are judged against the call's `project` "
+        "argument: absolute paths outside that root, and every absolute path on a call "
+        "that carried no `project` (`unscoped`), are scored conservatively — they never "
+        "count as retrieval, so those calls lean terminal. Delegation is likewise "
+        "one-directional: `Agent`/`Task` and other bookkeeping tools consume no window "
+        "slot and whatever a subagent greps is never charged to the parent's call, "
+        "another terminal-favouring bias. Definition adapted from "
+        "ripwire `docs/METHODOLOGY.md` §9; the policy-read exclusion is broader than "
+        "ripwire's (any Read followed by an Edit of the same path, not only an edit "
+        "verb's own target)."
+    )
+    out.append("")
+    term_tools: dict[str, dict[str, Any]] = term.get("tools") or {}
+    if not term_tools:
+        out.append("_No codesage tool calls in the window._")
+    else:
+        out.append(
+            "| tool | calls | terminal | non-terminal | chained | rate | strict rate | "
+            "policy-read | follow-through | top first follow-ups |"
+        )
+        out.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+
+        def rate(value: float | None) -> str:
+            return "n/a" if value is None else f"{100.0 * value:.1f}%"
+
+        def term_row(label: str, b: dict[str, Any]) -> str:
+            tops = ", ".join(f"`{name}`×{cnt}" for name, cnt in b.get("top_followups") or [])
+            return (
+                f"| {label} | {b['calls']} | {b['terminal']} | {b['non_terminal']} | "
+                f"{b['chained']} | {rate(b.get('terminal_rate'))} | "
+                f"{rate(b.get('terminal_rate_strict'))} | "
+                f"{b['policy_read']} | {b['follow_through_read']} | {tops or '—'} |"
+            )
+
+        overall_bucket = term.get("all") or _new_terminality_bucket()
+        for t in sorted(term_tools, key=lambda t: (-term_tools[t]["calls"], t)):
+            out.append(term_row(f"`{t}`", term_tools[t]))
+        out.append(term_row("**all**", overall_bucket))
+        out.append("")
+        out.append(
+            f"Unscoped calls (no `project` argument; shell paths scored conservatively): "
+            f"{overall_bucket.get('unscoped', 0)} of {overall_bucket['calls']}."
+        )
+        evidence = term.get("evidence") or []
+        if evidence:
+            out.append("")
+            out.append(f"Non-terminal calls and the follow-up that decided them (first {min(len(evidence), 20)} of {len(evidence)}):")
+            out.append("")
+            for row in evidence[:20]:
+                snippet = " ".join(str(row.get("evidence") or "").split())
+                if len(snippet) > 160:
+                    snippet = snippet[:157] + "..."
+                out.append(f"- `{row.get('tool')}` → `{row.get('followup')}`: `{snippet}`")
+    out.append("")
+
     # --------------------------------------------------------- verdict section
     out.append("## Verdict")
     out.append("")
@@ -836,7 +1985,7 @@ def render(
         ident_pct = 100.0 * gi / gc
         if ident_pct >= 30:
             notes.append(
-                f"**Grep-vs-codesage gap is large**: {ident_pct:.0f}% of Grep calls were "
+                f"**Grep-vs-codesage gap is large**: {ident_pct:.0f}% of Grep tool + shell grep calls were "
                 "identifier-shaped — codesage would have answered them in one call. The "
                 "tool-selection affordances (CLAUDE.md directives, MCP tool descriptions) "
                 "are not winning yet. Consider the next escalation: stronger directives or "
@@ -844,13 +1993,13 @@ def render(
             )
         elif ident_pct >= 10:
             notes.append(
-                f"**Grep-vs-codesage gap is moderate**: {ident_pct:.0f}% of Grep calls were "
+                f"**Grep-vs-codesage gap is moderate**: {ident_pct:.0f}% of Grep tool + shell grep calls were "
                 "identifier-shaped. Watch the trend; if it doesn't fall in the next sweep, "
                 "the current affordances aren't enough."
             )
         else:
             notes.append(
-                f"**Grep-vs-codesage gap is small**: {ident_pct:.0f}% of Grep calls were "
+                f"**Grep-vs-codesage gap is small**: {ident_pct:.0f}% of Grep tool + shell grep calls were "
                 "identifier-shaped. Current affordances appear to be doing their job."
             )
     for n in notes:
@@ -865,7 +2014,10 @@ def render(
         out.append(
             "Each user message in a session that had codesage available is bucketed by "
             "question shape (`semantic`, `identifier`, `literal`, `other`). "
-            "The first tool the agent reached for in response is recorded. "
+            "The first tool the agent reached for in response is recorded; a `Bash` "
+            "shell grep (`grep`/`rg`/`git grep`, or `find -exec grep` with a recovered "
+            "pattern) is filed under `first=Grep` and any other retrieval `find` under "
+            "`first=Glob`; other Bash calls and bookkeeping tools are skipped. "
             "Classifier rules in `classify_user_question`."
         )
         out.append("")
@@ -892,7 +2044,7 @@ def render(
         order = ["semantic", "identifier", "literal", "other"]
         for shape in order:
             row = shape_counts.get(shape) or {}
-            q = row.get("questions", 0)
+            questions = row.get("questions", 0)
             cs = row.get("first_codesage_retrieval", 0)
             cs_search = row.get("first_codesage_search", 0)
             gp = row.get("first_grep", 0)
@@ -902,7 +2054,7 @@ def render(
             decisions = cs + gp + rd + gl  # retrieval-class subset
             rate = pct(cs, decisions)
             out.append(
-                f"| {shape} | {q} | {decisions} | {cs} | {cs_search} | {gp} | {rd} | {gl} | {other} | {rate} |"
+                f"| {shape} | {questions} | {decisions} | {cs} | {cs_search} | {gp} | {rd} | {gl} | {other} | {rate} |"
             )
         out.append("")
 
@@ -969,17 +2121,38 @@ def main() -> int:
         default=Path.home() / ".claude" / "projects",
     )
     ap.add_argument("--output", type=Path, default=None)
+    ap.add_argument(
+        "--terminality-window",
+        dest="terminality_window",
+        type=int,
+        default=DEFAULT_TERMINALITY_WINDOW,
+        help="tool calls after a codesage call that the terminality metric inspects (default 3)",
+    )
+    ap.add_argument(
+        "--window",
+        dest="terminality_window",
+        type=int,
+        default=DEFAULT_TERMINALITY_WINDOW,
+        help=argparse.SUPPRESS,
+    )
     args = ap.parse_args()
+    if args.terminality_window < 1:
+        ap.error("--terminality-window must be >= 1")
 
     min_mtime = (_dt.datetime.now() - _dt.timedelta(days=args.window_days)).timestamp()
     transcripts = iter_transcripts(args.projects_root, min_mtime)
     events_per_transcript = [extract_events(t) for t in transcripts]
-    agg = aggregate(events_per_transcript)
+    agg = aggregate(
+        events_per_transcript,
+        terminality_window=args.terminality_window,
+        subagent_flags=[is_subagent_transcript(t) for t in transcripts],
+    )
     now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     report = render(
         agg,
         window_days=args.window_days,
         transcripts=len(transcripts),
+        subagent_transcripts=sum(1 for t in transcripts if is_subagent_transcript(t)),
         now=now,
     )
     if args.output:

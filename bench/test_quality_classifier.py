@@ -44,9 +44,7 @@ def expect(actual, expected, label: str) -> None:
 # --------------------------------------------------------------------
 expect(is_real(""), False, "empty string is rejected")
 expect(is_real("   "), False, "whitespace-only is rejected (no real content)")
-# ^ note: current implementation returns True for whitespace because the
-# length check is permissive. If this assertion fails, decide whether to
-# tighten `is_real_user_question` or relax this expectation.
+# `is_real_user_question` strips before testing, so whitespace-only is rejected.
 expect(
     is_real("<task-notification>foo</task-notification>"),
     False,
