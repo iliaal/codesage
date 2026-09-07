@@ -320,9 +320,8 @@ fn render_with_budget<T: serde::Serialize>(
             let value = serde_json::to_value(&v).unwrap_or(serde_json::Value::Null);
             let capped = cap_to_budget_with(value, kind, budget_chars);
             // MCP requires structuredContent to be a JSON object. Tools that
-            // return bare arrays (find_symbol, find_references, search) get
-            // wrapped in {"results": [...]} so Claude's validator accepts the
-            // response. cap_to_budget already wraps over-budget arrays into
+            // return bare arrays (find_symbol, find_similar) get wrapped in
+            // {"results": [...]} so Claude's validator accepts the response. cap_to_budget already wraps over-budget arrays into
             // {"results": ..., "_meta": {...}}; this covers the under-budget
             // path so the shape is consistent regardless of size.
             let structured = match capped {
@@ -636,6 +635,7 @@ fn cap_to_budget_with(
     budget_chars: usize,
 ) -> serde_json::Value {
     let approx_tokens_budget = budget_chars / MCP_CHARS_PER_TOKEN;
+    let hint = budget_hint(kind);
     let initial_len = serde_json::to_string(&value).map(|s| s.len()).unwrap_or(0);
     if initial_len <= budget_chars {
         return value;
@@ -654,7 +654,7 @@ fn cap_to_budget_with(
                     "total_results": total,
                     "returned": returned,
                     "approx_tokens_budget": approx_tokens_budget,
-                    "hint": "output exceeded budget; refine query, narrow scope (paths/language), or call with offset to paginate",
+                    "hint": hint,
                 }
             });
             if let Some(nested) = nested {
@@ -732,7 +732,7 @@ fn cap_to_budget_with(
                     "total_results": total,
                     "returned": returned,
                     "approx_tokens_budget": approx_tokens_budget,
-                    "hint": "output exceeded budget; refine query or narrow scope",
+                    "hint": hint,
                 });
                 if protected {
                     let dropped = &identifiers[returned..];
@@ -763,6 +763,20 @@ fn cap_to_budget_with(
             serde_json::Value::Object(map)
         }
         other => other,
+    }
+}
+
+/// Tools whose params carry an `offset` argument; only their truncation hint
+/// may advise paging, since the advice is unsatisfiable anywhere else.
+const OFFSET_PAGED_KINDS: &[&str] = &["search"];
+
+/// Truncation hint keyed on the tool, independent of whether its payload is a
+/// bare array or an object envelope.
+fn budget_hint(kind: &str) -> &'static str {
+    if OFFSET_PAGED_KINDS.contains(&kind) {
+        "output exceeded budget; refine query, narrow scope (paths/language), or call with offset to paginate"
+    } else {
+        "output exceeded budget; refine query or narrow scope"
     }
 }
 
@@ -1110,15 +1124,43 @@ mod tests {
         let items: Vec<Value> = (0..50)
             .map(|i| json!({"i": i, "blob": fat_string(1000)}))
             .collect();
-        let out = cap_to_budget_with(Value::Array(items), "search", MCP_BUDGET_CHARS);
+        let out = cap_to_budget_with(Value::Array(items), "find_symbol", MCP_BUDGET_CHARS);
         let obj = out.as_object().expect("wrapped as object");
         let meta = &obj["_meta"];
         assert_eq!(meta["truncated"], json!(true));
-        assert_eq!(meta["kind"], json!("search"));
+        assert_eq!(meta["kind"], json!("find_symbol"));
         assert_eq!(meta["total_results"], json!(50));
         let returned = meta["returned"].as_u64().unwrap() as usize;
         assert!(returned > 0 && returned < 50, "got {returned}");
         assert_eq!(obj["results"].as_array().unwrap().len(), returned);
+        // find_symbol has no `offset` param, so the hint must not advise paging.
+        let hint = meta["hint"].as_str().unwrap();
+        assert!(!hint.contains("offset"), "{hint}");
+    }
+
+    #[test]
+    fn cap_search_envelope_hint_keeps_pagination_advice() {
+        // `search` ships the `SearchResults` object envelope, not a bare
+        // array; the object branch must still tell the agent it can page.
+        let results: Vec<Value> = (0..50)
+            .map(|i| json!({"i": i, "blob": fat_string(1000)}))
+            .collect();
+        let v = json!({
+            "results": results,
+            "confidence": "low",
+            "margin_pct": 3,
+            "cliff_at": 50,
+        });
+        let out = cap_to_budget_with(v, "search", MCP_BUDGET_CHARS);
+        let obj = out.as_object().expect("still an object");
+        let meta = &obj["_meta"];
+        assert_eq!(meta["truncated"], json!(true));
+        assert_eq!(meta["kind"], json!("search"));
+        assert_eq!(meta["field"], json!("results"));
+        assert_eq!(meta["total_results"], json!(50));
+        let hint = meta["hint"].as_str().unwrap();
+        assert!(hint.contains("offset"), "{hint}");
+        assert_eq!(obj["confidence"], json!("low"), "scalar fields survive");
     }
 
     #[test]
@@ -1628,7 +1670,7 @@ mod tests {
             .map(|i| json!({"i": i, "blob": fat_string(1000)}))
             .collect();
         let r: Result<Vec<Value>> = Ok(items);
-        let result = render_with_kind(r, "search");
+        let result = render_with_kind(r, "find_similar");
         let value = result.structured_content.expect("structured content");
         let obj = value
             .as_object()
@@ -1636,7 +1678,7 @@ mod tests {
         assert!(obj.contains_key("results"));
         let meta = &obj["_meta"];
         assert_eq!(meta["truncated"], json!(true));
-        assert_eq!(meta["kind"], json!("search"));
+        assert_eq!(meta["kind"], json!("find_similar"));
         assert_eq!(meta["total_results"], json!(50));
         // No double-wrapping: results sits directly under the top object.
         assert!(obj["results"].is_array());

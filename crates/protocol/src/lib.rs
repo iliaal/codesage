@@ -1543,8 +1543,11 @@ pub struct SearchResults {
     /// (`round((s_i - s_{i+1}) / s_i * 100)`). 0 for zero or one rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub margin_pct: Option<u8>,
-    /// Number of rows above the cliff. Equals `results.len()` when
-    /// `confidence` is `low` or when `adaptive_limit` already cut the page.
+    /// Rows above the cliff, counted over the ranked page: the full page when
+    /// `confidence` is `low`, the kept prefix when `adaptive_limit` cut it.
+    /// Render-layer budget truncation can shrink `results` afterwards, so
+    /// after truncation `_meta.returned`, not this field, says how many rows
+    /// are present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cliff_at: Option<usize>,
 }

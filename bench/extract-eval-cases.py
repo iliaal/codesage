@@ -84,11 +84,31 @@ def extract_file_paths_from_value(value) -> set[str]:
     return paths
 
 
-# `codesage` as a command word (bare or the last path component) followed by a
-# subcommand. A plain substring test is useless on this repo's own transcripts:
-# `cd <repo-root>; ...` prefixes nearly every Bash call when the repo dir is named codesage.
+# Top-level subcommands of the `codesage` binary: the `Commands` enum in
+# crates/cli/src/main.rs (clap kebab-case), mirrored by the "CLI commands"
+# line in the root CLAUDE.md.
+CODESAGE_SUBCOMMANDS = frozenset(
+    {
+        "init", "index", "overview", "search", "brief", "find-symbol",
+        "find-references", "dependencies", "impact", "trace", "export",
+        "status", "mcp", "daemon", "watch", "install-hooks", "install",
+        "uninstall", "cleanup", "coverage", "git-index", "coupling", "risk",
+        "risk-batch", "risk-diff", "similar", "tests-for", "rehearse",
+        "session-start", "session-end", "doctor", "map", "features-list",
+        "feature-show", "feature-for", "feature-bundle", "trust-boundaries",
+    }
+)
+
+# `codesage` as a command word (bare or the last path component) followed on
+# the same line by a real subcommand, optionally across a `--` separator
+# (`cargo run -p codesage -- search`). A plain substring test is useless on
+# this repo's own transcripts: `cd <repo-root>; ...` prefixes nearly every
+# Bash call when the repo dir is named codesage, and `git -C <repo-root> log`
+# or `cd <repo-root>\ncargo build` put an unrelated word right after it.
 CODESAGE_BASH_RE = re.compile(
-    r"(?:^|[\s;|&(`'\"=])(?:\S*/)?codesage(?=\s+(?:--\s+)?[A-Za-z])"
+    r"(?:^|[\s;|&(`'\"=])(?:\S*/)?codesage(?=[ \t]+(?:--[ \t]+)?(?:"
+    + "|".join(sorted(CODESAGE_SUBCOMMANDS, key=len, reverse=True))
+    + r")\b)"
 )
 
 

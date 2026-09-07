@@ -325,14 +325,16 @@ with tempfile.TemporaryDirectory() as td:
 
 # Contamination guard: a window in which CodeSage itself was called must not
 # become an eval case by default, or the benchmark grades its own retrieval.
+# The fixture root is named `codesage` so the clean turns carry the
+# `cd <repo-root>` / `git -C <repo-root>` prefixes that a substring test, or a
+# lookahead that accepts any word, would misclassify.
 with tempfile.TemporaryDirectory() as td:
-    root = Path(td) / "project"
+    root = Path(td) / "codesage"
     sessions = Path(td) / "sessions"
     root.mkdir()
     sessions.mkdir()
-    (root / "a.rs").write_text("fn a() {}\n")
-    (root / "b.rs").write_text("fn b() {}\n")
-    (root / "c.rs").write_text("fn c() {}\n")
+    for name in ("a", "b", "c", "d", "e"):
+        (root / f"{name}.rs").write_text(f"fn {name}() {{}}\n")
 
     def _turn(query: str, tool_name: str, tool_input: dict, path: Path) -> list[str]:
         return [
@@ -353,13 +355,18 @@ with tempfile.TemporaryDirectory() as td:
                 {"command": "codesage risk b.rs"}, root / "b.rs")
         + _turn("where is the c handler wired up in this crate", "Bash",
                 {"command": f"cd {root}; grep -rn c ."}, root / "c.rs")
+        + _turn("where is the d handler wired up in this crate", "Bash",
+                {"command": f"cd {root}\ncargo build"}, root / "d.rs")
+        + _turn("where is the e handler wired up in this crate", "Bash",
+                {"command": f"git -C {root} log --oneline"}, root / "e.rs")
     )
     (sessions / "mixed.jsonl").write_text("\n".join(lines) + "\n")
 
     stats: dict = {}
     cases = extract.extract_cases(sessions, str(root), min_files=1, max_cases=10, stats=stats)
+    kept_files = sorted(f for c in cases for f in c["files"])
     check(
-        [c["files"] for c in cases] == [["c.rs"]],
+        kept_files == ["c.rs", "d.rs", "e.rs"],
         f"extract: codesage-used windows are excluded by default (got {cases!r})",
     )
     check(
@@ -371,9 +378,29 @@ with tempfile.TemporaryDirectory() as td:
     )
     tagged = sorted((c["files"][0], bool(c.get("codesage_used"))) for c in kept)
     check(
-        tagged == [("a.rs", True), ("b.rs", True), ("c.rs", False)],
+        tagged == [("a.rs", True), ("b.rs", True), ("c.rs", False), ("d.rs", False), ("e.rs", False)],
         f"extract: --include-codesage-sessions keeps and tags contaminated cases (got {tagged!r})",
     )
+
+# CODESAGE_BASH_RE: the token after `codesage` (or after `-- `) must be a real
+# subcommand, on the same line.
+for cmd in (
+    "codesage search auth",
+    "./target/debug/codesage search auth",
+    "cargo run -p codesage -- search auth",
+    "git diff --name-only | codesage risk-diff",
+):
+    check(extract.CODESAGE_BASH_RE.search(cmd), f"extract: bash regex matches {cmd!r}")
+for cmd in (
+    "codesage-bench-runner --corpus x.yaml",
+    "codesage --version",
+    "cd /path/codesage; cargo build",
+    "cd /path/codesage && cargo test",
+    "cd /path/to/codesage\ncargo build",
+    "git -C /path/to/codesage log --oneline",
+    "ls /path/to/codesage crates",
+):
+    check(not extract.CODESAGE_BASH_RE.search(cmd), f"extract: bash regex rejects {cmd!r}")
 
 with tempfile.TemporaryDirectory() as td:
     root = Path(td) / "project"

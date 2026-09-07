@@ -20,15 +20,34 @@ pub fn find_references(
     req: &FindReferencesRequest,
 ) -> Result<FindReferencesResults> {
     let results = db.find_references(&req.symbol_name, req.kind)?;
-    let definition_count = db.find_symbols(&req.symbol_name, None)?.len();
+    let definitions = db.find_symbols(&req.symbol_name, None)?;
+    let definition_count = definitions.len();
     let ambiguous = definition_count > 1;
     let note = if ambiguous {
-        Some(format!(
-            "{definition_count} definitions share the name '{}'; rows are the union across all \
-             of them. Use find_symbol to list them and impact_analysis with a qualified name \
-             to scope to one.",
-            req.symbol_name
-        ))
+        // `impact_analysis` disambiguates by qualified name only (see
+        // `impact::impact_analysis_walk`). Languages without namespaces give every
+        // definition the bare name, so when the qualified names collapse to
+        // one the only handle left is the file.
+        let qualified = distinct_sorted(definitions.iter().map(|s| s.qualified_name.as_str()));
+        if qualified.len() > 1 {
+            Some(format!(
+                "{definition_count} definitions share the name '{}'; rows are the union across \
+                 all of them. Use find_symbol to list them and impact_analysis with one \
+                 qualified name ({}) to scope to one.",
+                req.symbol_name,
+                sample_list(&qualified, 5)
+            ))
+        } else {
+            let files = distinct_sorted(definitions.iter().map(|s| s.file_path.as_str()));
+            Some(format!(
+                "{definition_count} definitions share the name '{}' and are indistinguishable \
+                 by qualified name; rows are the union across all of them. Use find_symbol to \
+                 list them and scope by file instead (impact_analysis on the file, or filter \
+                 rows by from_file): {}.",
+                req.symbol_name,
+                sample_list(&files, 5)
+            ))
+        }
     } else if definition_count == 0 {
         Some(format!(
             "no indexed definition named '{}'; references may target an external or unindexed \
@@ -45,6 +64,23 @@ pub fn find_references(
         ambiguous,
         note,
     })
+}
+
+fn distinct_sorted<'a>(items: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut out: Vec<&str> = items.collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Comma-joined prefix of `items`, with the overflow counted rather than listed.
+fn sample_list(items: &[&str], max: usize) -> String {
+    let shown = items[..items.len().min(max)].join(", ");
+    if items.len() > max {
+        format!("{shown}, +{} more", items.len() - max)
+    } else {
+        shown
+    }
 }
 
 pub fn list_dependencies(db: &Database, file_path: &str) -> Result<DependencyEntry> {
@@ -109,9 +145,13 @@ mod tests {
     }
 
     fn symbol(name: &str, file_path: &str) -> Symbol {
+        qualified_symbol(name, name, file_path)
+    }
+
+    fn qualified_symbol(name: &str, qualified_name: &str, file_path: &str) -> Symbol {
         Symbol {
             name: name.to_string(),
-            qualified_name: name.to_string(),
+            qualified_name: qualified_name.to_string(),
             kind: SymbolKind::Function,
             file_path: file_path.to_string(),
             line_start: 1,
@@ -178,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn envelope_with_two_definitions_marks_rows_as_union() {
+    fn envelope_with_same_qualified_name_in_two_files_scopes_by_file() {
         let db = Database::open_in_memory().unwrap();
         let a = file(&db, "a.rs");
         let b = file(&db, "b.rs");
@@ -205,5 +245,36 @@ mod tests {
         );
         assert!(note.contains("find_symbol"), "{note}");
         assert!(note.contains("impact_analysis"), "{note}");
+        // Both carry the bare name as qualified name (JS `.d.ts` beside `.js`
+        // shape): "qualify it" is unsatisfiable, so the note must name files.
+        assert!(note.contains("indistinguishable"), "{note}");
+        assert!(note.contains("a.rs, b.rs"), "{note}");
+        assert!(!note.contains("qualified name ("), "{note}");
+    }
+
+    #[test]
+    fn envelope_with_two_distinct_qualified_names_lists_them() {
+        let db = Database::open_in_memory().unwrap();
+        let a = file(&db, "a.rs");
+        let b = file(&db, "b.rs");
+        db.insert_symbols(a, &[qualified_symbol("helper", "alpha::helper", "a.rs")])
+            .unwrap();
+        db.insert_symbols(b, &[qualified_symbol("helper", "beta::helper", "b.rs")])
+            .unwrap();
+
+        let out = lookup(&db, "helper");
+        assert_eq!(out.definition_count, 2);
+        assert!(out.ambiguous);
+        let note = out.note.expect("ambiguous lookup must carry a note");
+        assert!(note.contains("impact_analysis"), "{note}");
+        assert!(note.contains("alpha::helper, beta::helper"), "{note}");
+        assert!(!note.contains("indistinguishable"), "{note}");
+    }
+
+    #[test]
+    fn sample_list_counts_the_overflow() {
+        let items = ["a", "b", "c", "d", "e", "f", "g"];
+        assert_eq!(sample_list(&items, 5), "a, b, c, d, e, +2 more");
+        assert_eq!(sample_list(&items[..2], 5), "a, b");
     }
 }

@@ -461,7 +461,10 @@ pub fn relevance_cliff(scores: &[f32]) -> CliffCut {
     }
     // best_drop is within [0, 1], so the rounded percentage fits in a u8.
     let drop_pct = (best_drop * 100.0).round() as u8;
-    if best_drop >= MIN_CLIFF_DROP {
+    // Gate on the rounded figure the caller sees, so a disclosed
+    // `margin_pct` of 20 is never paired with `confidence: low`.
+    let min_drop_pct = (MIN_CLIFF_DROP * 100.0).round() as u8;
+    if drop_pct >= min_drop_pct {
         CliffCut {
             cut: best_cut,
             drop_pct,
@@ -2437,6 +2440,20 @@ mod hybrid_tests {
         assert_eq!(cut.confidence, SearchConfidence::Low);
         assert_eq!(cut.cut, 3);
         assert_eq!(cut.drop_pct, 3);
+    }
+
+    #[test]
+    fn relevance_cliff_gates_on_the_rounded_percentage() {
+        // 19.54% rounds to the disclosed 20; the verdict must agree with it.
+        let rounds_up = relevance_cliff(&[1.0, 0.8046]);
+        assert_eq!(rounds_up.confidence, SearchConfidence::High);
+        assert_eq!(rounds_up.cut, 1);
+        assert_eq!(rounds_up.drop_pct, 20);
+
+        let just_under = relevance_cliff(&[1.0, 0.81]);
+        assert_eq!(just_under.confidence, SearchConfidence::Low);
+        assert_eq!(just_under.cut, 2);
+        assert_eq!(just_under.drop_pct, 19);
     }
 
     #[test]
