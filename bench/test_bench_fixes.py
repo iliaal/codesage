@@ -323,6 +323,58 @@ with tempfile.TemporaryDirectory() as td:
         f"extract: root-level allowed files are retained in cases (got {cases!r})",
     )
 
+# Contamination guard: a window in which CodeSage itself was called must not
+# become an eval case by default, or the benchmark grades its own retrieval.
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td) / "project"
+    sessions = Path(td) / "sessions"
+    root.mkdir()
+    sessions.mkdir()
+    (root / "a.rs").write_text("fn a() {}\n")
+    (root / "b.rs").write_text("fn b() {}\n")
+    (root / "c.rs").write_text("fn c() {}\n")
+
+    def _turn(query: str, tool_name: str, tool_input: dict, path: Path) -> list[str]:
+        return [
+            json.dumps({"type": "user", "message": {"content": query}, "padding": "x" * 3500}),
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "tool_use", "name": tool_name, "input": tool_input}]},
+                }
+            ),
+            _tool_result(path),
+        ]
+
+    lines = (
+        _turn("where is the a handler wired up in this crate", "mcp__codesage__search",
+              {"project": str(root), "query": "a handler"}, root / "a.rs")
+        + _turn("where is the b handler wired up in this crate", "Bash",
+                {"command": "codesage risk b.rs"}, root / "b.rs")
+        + _turn("where is the c handler wired up in this crate", "Bash",
+                {"command": f"cd {root}; grep -rn c ."}, root / "c.rs")
+    )
+    (sessions / "mixed.jsonl").write_text("\n".join(lines) + "\n")
+
+    stats: dict = {}
+    cases = extract.extract_cases(sessions, str(root), min_files=1, max_cases=10, stats=stats)
+    check(
+        [c["files"] for c in cases] == [["c.rs"]],
+        f"extract: codesage-used windows are excluded by default (got {cases!r})",
+    )
+    check(
+        stats.get("excluded_cases") == 2 and stats.get("codesage_sessions") == 1,
+        f"extract: contamination stats count excluded windows and sessions (got {stats!r})",
+    )
+    kept = extract.extract_cases(
+        sessions, str(root), min_files=1, max_cases=10, include_codesage=True
+    )
+    tagged = sorted((c["files"][0], bool(c.get("codesage_used"))) for c in kept)
+    check(
+        tagged == [("a.rs", True), ("b.rs", True), ("c.rs", False)],
+        f"extract: --include-codesage-sessions keeps and tags contaminated cases (got {tagged!r})",
+    )
+
 with tempfile.TemporaryDirectory() as td:
     root = Path(td) / "project"
     sessions = Path(td) / "sessions"

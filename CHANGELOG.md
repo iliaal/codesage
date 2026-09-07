@@ -1,5 +1,14 @@
 ## [Unreleased]
 
+### Added
+
+- `find_references` reports `counts_floor: true`, `definition_count`, `ambiguous`, and a `note` when the name matches several or no indexed definitions; `impact_analysis` and `trace_call_path` carry `counts_floor: true`, and a not-found trace says it searched resolved name-based edges only.
+- `search` reports `confidence` (`high` / `low`), `margin_pct`, and `cliff_at` from the largest relative score drop in the returned page; `adaptive_limit: true` (CLI `codesage search --adaptive-limit`) truncates at that cliff instead of returning exactly `limit` rows.
+
+### Changed
+
+- MCP tools refuse a call carrying an undeclared argument, naming the field and the valid set, instead of silently ignoring it; every tool's `inputSchema` advertises `additionalProperties: false`.
+
 ## [0.26.1] - 2026-09-06
 
 ### Fixed

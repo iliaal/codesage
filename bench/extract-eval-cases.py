@@ -6,9 +6,17 @@ Finds user queries and the files that were subsequently accessed.
 Usage:
   python3 extract-eval-cases.py <session-dir> <project-root> [--min-files 1] [--max-cases 50]
   python3 extract-eval-cases.py <session-dir> <project-root> --yaml <out.yaml> [--project-name NAME]
+  python3 extract-eval-cases.py <session-dir> <project-root> --include-codesage-sessions
 
 Without --yaml, prints human-readable candidates to stdout for manual review.
 With --yaml, writes a corpus YAML directly (project_root + scoring + cases).
+
+A case window (user query up to the next user query) in which CodeSage itself
+was called -- any `mcp__*codesage*` tool_use, or a Bash tool_use that invokes
+the `codesage` binary -- is excluded by default: its file set is whatever
+CodeSage surfaced, so grading it would grade CodeSage's own homework. A summary
+line goes to stderr. --include-codesage-sessions keeps those cases and tags
+each one `codesage_used: true` in both the human-readable and YAML output.
 """
 
 import argparse
@@ -62,15 +70,48 @@ def extract_tool_result_file_paths(msg: dict) -> set[str]:
 def extract_file_paths_from_value(value) -> set[str]:
     paths = set()
     if isinstance(value, dict):
-        fp = value.get("file_path")
-        if isinstance(fp, str) and fp:
-            paths.add(fp)
+        # Tool inputs spell it `file_path`; Claude Code's toolUseResult records
+        # spell it `filePath` (e.g. Read -> toolUseResult.file.filePath).
+        for key in ("file_path", "filePath"):
+            fp = value.get(key)
+            if isinstance(fp, str) and fp:
+                paths.add(fp)
         for child in value.values():
             paths.update(extract_file_paths_from_value(child))
     elif isinstance(value, list):
         for child in value:
             paths.update(extract_file_paths_from_value(child))
     return paths
+
+
+# `codesage` as a command word (bare or the last path component) followed by a
+# subcommand. A plain substring test is useless on this repo's own transcripts:
+# `cd <repo-root>; ...` prefixes nearly every Bash call when the repo dir is named codesage.
+CODESAGE_BASH_RE = re.compile(
+    r"(?:^|[\s;|&(`'\"=])(?:\S*/)?codesage(?=\s+(?:--\s+)?[A-Za-z])"
+)
+
+
+def tool_use_blocks(msg: dict):
+    content = msg.get("message", {}).get("content", [])
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            yield block
+
+
+def uses_codesage(msg: dict) -> bool:
+    for block in tool_use_blocks(msg):
+        name = str(block.get("name", ""))
+        if "codesage" in name.lower():
+            return True
+        if name == "Bash":
+            tool_input = block.get("input")
+            command = tool_input.get("command", "") if isinstance(tool_input, dict) else ""
+            if isinstance(command, str) and CODESAGE_BASH_RE.search(command):
+                return True
+    return False
 
 
 def get_user_text(msg: dict) -> str:
@@ -166,9 +207,13 @@ def extract_cases(
     min_files: int,
     max_cases: int,
     max_sessions: int = 40,
+    include_codesage: bool = False,
+    stats: dict | None = None,
 ) -> list[dict]:
     candidates = []
     seen_keys = set()
+    excluded_cases = 0
+    codesage_sessions = 0
     jsonl_files: list[tuple[Path, int, float]] = []
     for path in session_dir.rglob("*.jsonl"):
         if path.is_symlink():
@@ -194,6 +239,9 @@ def extract_cases(
         if not messages:
             continue
 
+        if any(m.get("type") == "assistant" and uses_codesage(m) for m in messages):
+            codesage_sessions += 1
+
         i = 0
         while i < len(messages):
             msg = messages[i]
@@ -206,12 +254,15 @@ def extract_cases(
 
                 if is_search_query(text):
                     files = set()
+                    codesage_used = False
                     for j in range(i + 1, len(messages)):
                         next_msg = messages[j]
                         if next_msg.get("type") == "user" and not is_tool_result(next_msg):
                             break
                         if next_msg.get("type") == "assistant":
                             files.update(extract_tool_file_paths(next_msg))
+                            if not codesage_used and uses_codesage(next_msg):
+                                codesage_used = True
                         elif is_tool_result(next_msg):
                             files.update(extract_tool_result_file_paths(next_msg))
 
@@ -226,6 +277,10 @@ def extract_cases(
                                 rel_files.add(rel)
 
                     if len(rel_files) >= min_files:
+                        if codesage_used and not include_codesage:
+                            excluded_cases += 1
+                            i += 1
+                            continue
                         query = text[:300].strip()
                         query = re.sub(r'\s+', ' ', query)
                         case = {
@@ -233,6 +288,7 @@ def extract_cases(
                             "files": sorted(rel_files),
                             "session": jsonl_path.name,
                             "file_count": len(rel_files),
+                            "codesage_used": codesage_used,
                         }
                         key = dedup_key(case)
                         if key not in seen_keys:
@@ -243,6 +299,10 @@ def extract_cases(
 
         if len(candidates) >= max_cases * 3:
             break
+
+    if stats is not None:
+        stats["excluded_cases"] = excluded_cases
+        stats["codesage_sessions"] = codesage_sessions
 
     candidates.sort(key=lambda c: c["file_count"], reverse=True)
     return candidates[:max_cases]
@@ -294,6 +354,8 @@ def write_yaml(cases: list[dict], project_root: str, project_name: str, out_path
         query = c["query"].replace("\n", " ").strip()
         lines.append(f"  - id: {candidate}")
         lines.append("    source: session")
+        if c.get("codesage_used"):
+            lines.append("    codesage_used: true")
         # Quote the query and every path defensively (double-quoted scalar with
         # backslash/quote escaping) so user-derived text and mined paths can't
         # inject YAML structure. normalize_path already drops control chars;
@@ -323,18 +385,29 @@ def main():
                     help="Write a corpus YAML to this path instead of printing candidates")
     ap.add_argument("--project-name", type=str, default=None,
                     help="Name used in YAML description (default: basename of project_root)")
+    ap.add_argument("--include-codesage-sessions", action="store_true",
+                    help="Keep cases whose window used CodeSage tools (tagged codesage_used: true) "
+                         "instead of excluding them")
     args = ap.parse_args()
 
     if not args.session_dir.is_dir():
         print(f"not a directory: {args.session_dir}", file=sys.stderr)
         return 1
 
+    stats: dict = {}
     cases = extract_cases(
         args.session_dir,
         args.project_root,
         args.min_files,
         args.max_cases,
         args.max_sessions,
+        include_codesage=args.include_codesage_sessions,
+        stats=stats,
+    )
+    print(
+        f"contaminated: {stats['excluded_cases']} cases excluded (codesage used in window); "
+        f"{stats['codesage_sessions']} sessions used codesage",
+        file=sys.stderr,
     )
 
     if args.yaml is not None:
@@ -348,7 +421,8 @@ def main():
 
     print(f"# Found {len(cases)} candidate cases\n")
     for i, c in enumerate(cases):
-        print(f"## Case {i+1} ({c['file_count']} files, session: {c['session'][:12]}...)")
+        tag = " [codesage_used]" if c.get("codesage_used") else ""
+        print(f"## Case {i+1} ({c['file_count']} files, session: {c['session'][:12]}...){tag}")
         print(f"Query: {c['query'][:200]}")
         print(f"Files:")
         for f in c["files"][:10]:
