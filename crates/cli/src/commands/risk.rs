@@ -216,7 +216,11 @@ pub(crate) fn cmd_tests_for(files: Vec<String>, json: bool) -> Result<()> {
     if files.is_empty() {
         bail!("no file paths provided (pass as args or pipe via stdin)");
     }
-    let recs = codesage_graph::recommend_tests(&db, &files)?;
+    let opts = codesage_graph::ReachabilityOptions {
+        project_root: Some(root.clone()),
+        ..codesage_graph::ReachabilityOptions::default()
+    };
+    let recs = codesage_graph::recommend_tests_with_reachability(&db, &files, &opts)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&recs)?);
     } else {
@@ -235,8 +239,65 @@ pub(crate) fn cmd_tests_for(files: Vec<String>, json: bool) -> Result<()> {
                 );
             }
         }
-        if recs.primary.is_empty() && recs.coupled.is_empty() {
-            println!("No test files found for the given paths.");
+        if !recs.reachable.is_empty() {
+            println!("Reachable tests (call/import edges, distance <= 2):");
+            for e in &recs.reachable {
+                println!(
+                    "  d={}  {:>2} edge(s)  {}  (reaches {})",
+                    e.distance, e.edge_count, e.path, e.via
+                );
+            }
+            if recs.reachable_capped {
+                println!(
+                    "  ... {} of {} shown",
+                    recs.reachable.len(),
+                    recs.reachable_total
+                );
+            }
+        }
+        if recs.reach_walk_capped {
+            if !recs.unwalked_files.is_empty() {
+                println!(
+                    "Not walked (no budget or deadline passed): {}",
+                    codesage_graph::abbreviate_paths(&recs.unwalked_files)
+                );
+            }
+            if !recs.partial_files.is_empty() {
+                println!(
+                    "Walk cut short (budget, deadline, or frontier): {}",
+                    codesage_graph::abbreviate_paths(&recs.partial_files)
+                );
+            }
+            if !recs.unindexed_files.is_empty() {
+                println!(
+                    "Not indexed (new file, path not repo-relative, or excluded by \
+                     [index] exclude_patterns): {}",
+                    codesage_graph::abbreviate_paths(&recs.unindexed_files)
+                );
+            }
+            if !recs.no_symbol_files.is_empty() {
+                println!(
+                    "No symbols indexed (nothing for a test to reach): {}",
+                    codesage_graph::abbreviate_paths(&recs.no_symbol_files)
+                );
+            }
+            println!("Reachable is a lower bound.");
+        }
+        if !recs.unsupported_files.is_empty() {
+            println!(
+                "Skipped (no parser for this file type): {}",
+                codesage_graph::abbreviate_paths(&recs.unsupported_files)
+            );
+        }
+        // With no indexed test files there was nothing to search (the index
+        // holds no tests, or every input was ignored); the notes say which,
+        // and an absence verdict would claim a search that never ran.
+        if recs.primary.is_empty() && recs.coupled.is_empty() && recs.reachable.is_empty() {
+            if recs.reach_walk_capped {
+                println!("No test files resolved within the walked portion.");
+            } else if recs.indexed_test_files > 0 {
+                println!("No test files found for the given paths.");
+            }
         }
         if !recs.notes.is_empty() {
             for n in &recs.notes {

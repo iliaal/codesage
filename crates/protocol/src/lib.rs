@@ -1154,18 +1154,108 @@ pub struct CoupledTestEntry {
     pub source: String,
 }
 
+/// A test file that transitively references one of the changed files through
+/// resolved call/import edges.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ReachableTestEntry {
+    /// Repo-relative path of the test file, as the index stores it.
+    pub path: String,
+    /// Reverse-dependency hops from `via` to this test (1 = the test
+    /// references the changed file directly; 2 = through one intermediate).
+    pub distance: u32,
+    /// Distinct resolved edges from this test into `via`'s reverse-dependency
+    /// walk (uncapped). Higher means more of the test's code touches that
+    /// changed file; edges toward other changed files are not added in.
+    pub edge_count: u32,
+    /// The changed file this test reaches: the earliest input in the request
+    /// order that reaches it at the shortest distance. Index spelling
+    /// (`src/x.php`), which may differ from the spelling passed
+    /// (`./src/x.php`, an absolute path).
+    pub via: String,
+}
+
 /// Tests an agent should run after editing a set of files. Splits into
-/// sibling-convention matches (high confidence) and historical co-change
-/// (medium confidence; surfaces tests that other test heuristics miss).
+/// sibling-convention matches (high confidence), historical co-change
+/// (medium confidence; surfaces tests that other test heuristics miss), and
+/// graph reachability (tests whose code resolves to the changed files).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TestRecommendations {
     /// Sibling tests resolved by language conventions (FooTest.php,
-    /// foo.test.ts, test_foo.py, foo_test.go). Always run these.
+    /// foo.test.ts, test_foo.py, foo_test.go), plus — from the reachability
+    /// variant — any input file that is itself a test. Always run these.
     pub primary: Vec<String>,
     /// Tests that historically change with one of the input files. Worth
     /// running when sibling tests don't exist or when behavior crosses
     /// component boundaries.
     pub coupled: Vec<CoupledTestEntry>,
+    /// Tests that reach one of the input files through resolved call/import
+    /// edges within two hops, excluding anything already in `primary` or
+    /// `coupled`. Sorted by distance, then edge count descending, then path;
+    /// at most 50 entries. Empty from the cheap `recommend_tests` variant
+    /// that skips the graph walk.
+    #[serde(default)]
+    pub reachable: Vec<ReachableTestEntry>,
+    /// Reachable tests found before the 50-entry list cap.
+    #[serde(default)]
+    pub reachable_total: usize,
+    /// `true` when `reachable_total` exceeds the entries in `reachable`.
+    #[serde(default)]
+    pub reachable_capped: bool,
+    /// `true` when the answer is incomplete for at least one input: the walk
+    /// stopped early (frontier cap, the shared step pool ran out, or the
+    /// wall-clock deadline), or the input is unindexed or defines no symbols.
+    /// The pool is drawn in request order, so put the files you care about
+    /// first; later inputs are the ones that end up unwalked. `reachable` is
+    /// then a lower bound and `unmodelled` carries no information: a truncated
+    /// walk cannot assert "no edge" about anything it never visited. One
+    /// incomplete case is not covered: when `indexed_test_files` is 0 the
+    /// walk never ran and `reachable` is a lower bound, but the skipped walk
+    /// alone does not set this flag; the note names it.
+    #[serde(default)]
+    pub reach_walk_capped: bool,
+    /// Input files that received no walk at all: their budget share was zero
+    /// or the deadline had already passed when their turn came.
+    #[serde(default)]
+    pub unwalked_files: Vec<String>,
+    /// Input files whose walk started and was cut short by budget, deadline,
+    /// or the frontier cap.
+    #[serde(default)]
+    pub partial_files: Vec<String>,
+    /// Input files with a supported language that the index does not hold:
+    /// a file created since the last index pass, a path that is not
+    /// repo-relative, or one excluded by `[index] exclude_patterns`; a
+    /// changed test the index has not seen counts too. The graph
+    /// holds no edges for them, so nothing can be said about which tests
+    /// reach them. `reach_walk_capped` is `true` iff any of `unwalked_files`,
+    /// `partial_files`, this, or `no_symbol_files` is non-empty.
+    #[serde(default)]
+    pub unindexed_files: Vec<String>,
+    /// Input files that are indexed but define no symbols (empty or
+    /// declaration-free files): nothing exists for a test to reach, so an
+    /// empty result for them is not a finding.
+    #[serde(default)]
+    pub no_symbol_files: Vec<String>,
+    /// Input files with no parser for their extension (CHANGELOG.md,
+    /// lockfiles, config): skipped. Never indexed, so their absence says
+    /// nothing about the walk; they do not set `reach_walk_capped`.
+    #[serde(default)]
+    pub unsupported_files: Vec<String>,
+    /// Indexed test files with no resolved edge into the changed set that are
+    /// also absent from `primary` and `coupled`: the graph cannot vouch for
+    /// them either way. Changed files that are themselves tests are excluded.
+    /// Meaningful only when `reach_walk_capped` is `false`; always 0 from the
+    /// cheap `recommend_tests` variant, which does not scan the index, and 0
+    /// with `indexed_test_files` when no input was usable (every input blank,
+    /// the project root, or without a parser): the pair then describes the
+    /// request, not the index.
+    #[serde(default)]
+    pub unmodelled: usize,
+    /// Test files in the index (test-category paths plus convention-resolved
+    /// siblings the category rule misses); the denominator for `unmodelled`.
+    /// Always 0 from the cheap `recommend_tests` variant, and 0 when no input
+    /// was usable even though the index may hold tests.
+    #[serde(default)]
+    pub indexed_test_files: usize,
     /// Human-readable rationale.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub notes: Vec<String>,

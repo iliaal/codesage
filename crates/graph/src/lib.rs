@@ -18,9 +18,9 @@ pub use brief::build_edit_brief;
 pub use bundle::{export_context, export_context_for_symbol, feature_bundle};
 pub use call_path::trace_call_path;
 pub use git_history::{
-    IndexMode, assess_risk, assess_risk_batch, assess_risk_diff, changed_files_since,
-    feature_touched_since, find_coupling, git_history_index, git_history_index_with_options,
-    recommend_tests,
+    IndexMode, ReachabilityOptions, abbreviate_paths, assess_risk, assess_risk_batch,
+    assess_risk_diff, changed_files_since, feature_touched_since, find_coupling, git_history_index,
+    git_history_index_with_options, recommend_tests, recommend_tests_with_reachability,
 };
 pub use impact::{impact_analysis, impact_analysis_report};
 pub use index::{full_index, incremental_index, index_files, remove_files};

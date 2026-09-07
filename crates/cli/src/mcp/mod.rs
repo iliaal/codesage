@@ -12,8 +12,8 @@ use anyhow::Result;
 use codesage_graph::{
     assess_risk, assess_risk_batch, assess_risk_diff, export_context, export_context_for_symbol,
     feature_bundle, find_coupling, find_references, find_similar, find_symbol,
-    impact_analysis_report, list_dependencies, recommend_tests, search_page, session_end,
-    session_start, trace_call_path,
+    impact_analysis_report, list_dependencies, recommend_tests_with_reachability, search_page,
+    session_end, session_start, trace_call_path,
 };
 use codesage_protocol::{
     CallPathReport, CallPathRequest, ContextBundle, CouplingReport, DependencyEntry, ExportRequest,
@@ -769,7 +769,7 @@ impl CodeSageServer {
 
     #[tool(
         name = "recommend_tests",
-        description = "Tests an agent should run after editing the given files. Returns `primary` (sibling tests resolved by language convention — FooTest.php, foo.test.ts, test_foo.py, foo_test.go — high confidence, always run these) and `coupled` (tests that historically change with the input files via git co-change history — medium confidence, catches integration tests that don't follow naming conventions). Empty result means no test files in the index for these paths. Use AFTER making a change to know which subset of tests to actually run. Pair with `assess_risk_diff` on the same file list for the patch-level risk rollup (test-gap files, hotspot list, paste-ready summary notes).",
+        description = "Tests an agent should run after editing the given files. Returns `primary` (sibling tests resolved by language convention — FooTest.php, foo.test.ts, test_foo.py, foo_test.go — high confidence, always run these), `coupled` (tests that historically change with the input files via git co-change history — medium confidence, catches integration tests that don't follow naming conventions), and `reachable` (test files that reach one of the input files through resolved call/import edges within 2 hops; each entry carries `path`, `distance`, `edge_count`, and `via` = the changed file it reaches, in the index's spelling, which may differ from the spelling passed; sorted by distance, then edge_count desc, then path; `reachable_total` is the pre-cap count and the list is capped at 50 with `reachable_capped: true` when more exist; never repeats a `primary` or `coupled` entry). Changed files that are themselves tests are listed in `primary` and walked for tests that extend or call them (a base test class or helper under `tests/` reaches its subclasses); a `.phpt` has no grammar, so it is listed but not walked and does not cap. The walk spends one pool of resolution steps (default 1,500,000) under one wall-clock deadline (default 5 s), overridable with `CODESAGE_REACH_BUDGET` / `CODESAGE_REACH_DEADLINE_MS` in the daemon's environment. The pool is drawn in request order: each input may spend everything left except a floor (100,000 steps) reserved for every input still queued behind it, so put the files you care about first: later inputs are the ones that land in `unwalked_files` when it runs out. `reach_walk_capped: true` means the answer is incomplete — `unwalked_files` (no walk at all), `partial_files` (walk cut short), `unindexed_files` (a supported-language path the index does not hold: a new file, a path that is not repo-relative, or one excluded by `[index] exclude_patterns`), `no_symbol_files` (indexed but defines nothing) — and `reachable` is then a lower bound while `unmodelled` carries no information. `unsupported_files` (no parser for the extension: CHANGELOG.md, lockfiles, config) are skipped without capping the answer; a request of only such files returns the co-change bucket plus that note, with `indexed_test_files` and `unmodelled` at 0. When `indexed_test_files` is 0 the walk never ran and `reachable` is a lower bound; the skipped walk alone does not set `reach_walk_capped`. Two spellings of one path (`./src/x.php`, `src/x.php`) are one input, reported as first spelled. Otherwise `unmodelled` / `indexed_test_files` = the indexed test files in none of the three buckets over the total — the graph cannot vouch for them either way, so a large ratio means the buckets are a lower bound, not the full suite. Empty result means no test files in the index for these paths. Use AFTER making a change to know which subset of tests to actually run. Pair with `assess_risk_diff` on the same file list for the patch-level risk rollup (test-gap files, hotspot list, paste-ready summary notes).",
         output_schema = schema_for_type::<TestRecommendations>()
     )]
     async fn recommend_tests_tool(
@@ -781,7 +781,16 @@ impl CodeSageServer {
             s.render(
                 &params.project,
                 validate_non_empty_file_list(&file_paths, "recommend_tests").and_then(|()| {
-                    s.with_project_db(&params.project, |db| recommend_tests(db, &file_paths))
+                    // The resolved index root, not the raw argument: a caller
+                    // may pass a subdirectory, and absolute inputs must be
+                    // relativized against the root the index was built from.
+                    s.with_project_root_db(&params.project, |root, db| {
+                        let opts = codesage_graph::ReachabilityOptions {
+                            project_root: Some(root.to_path_buf()),
+                            ..codesage_graph::ReachabilityOptions::default()
+                        };
+                        recommend_tests_with_reachability(db, &file_paths, &opts)
+                    })
                 }),
                 "recommend_tests",
             )

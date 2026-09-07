@@ -9,7 +9,20 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::git_history::{assess_risk, assess_risk_diff, recommend_tests};
+use crate::git_history::{
+    ReachabilityOptions, assess_risk, assess_risk_diff, reach_cap_clause,
+    recommend_tests_with_reachability,
+};
+
+/// Reachable test paths named verbatim in the rehearsal summary; the rest
+/// are folded into a "+N more" count (`reachable_total` carries the number).
+const REHEARSAL_REACHABLE_NOTE_CAP: usize = 5;
+
+/// Wall-clock cap on the rehearsal's reachability walk. `assess_risk_diff`
+/// already ran a depth-2 reverse traversal over the same files for its
+/// blast-radius signal; until the two share one `WalkOutcome`, this second
+/// traversal is bounded tighter than the standalone tool's 5 s.
+const REHEARSAL_REACH_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1_500);
 use codesage_protocol::{
     FeatureFileRole, ReviewObjection, ReviewRehearsal, ReviewSeverity, RiskAssessment,
     TrustBoundary,
@@ -384,7 +397,7 @@ pub fn build_review_rehearsal(
             .then_with(|| a.category.cmp(&b.category))
     });
 
-    let summary_notes = build_summary(db, files, &risk, &objections)?;
+    let summary_notes = build_summary(root, db, files, &risk, &objections)?;
 
     Ok(ReviewRehearsal {
         files: files.to_vec(),
@@ -406,6 +419,7 @@ fn entry_area(entry_path: &str) -> String {
 }
 
 fn build_summary(
+    root: &Path,
     db: &Database,
     files: &[String],
     risk: &codesage_protocol::RiskDiffAssessment,
@@ -434,15 +448,57 @@ fn build_summary(
 
     // Propagate, don't swallow: an error read as "no tests to recommend"
     // would print a clean summary off a failed engine call.
-    let tests = recommend_tests(db, files).context("recommending tests for rehearsal summary")?;
+    // The pre-commit step can afford the bounded graph walk the per-edit
+    // hook cannot, so the reachability variant runs here.
+    let opts = ReachabilityOptions {
+        deadline: REHEARSAL_REACH_DEADLINE,
+        project_root: Some(root.to_path_buf()),
+        ..ReachabilityOptions::default()
+    };
+    let tests = recommend_tests_with_reachability(db, files, &opts)
+        .context("recommending tests for rehearsal summary")?;
+    notes.extend(test_notes(&tests));
+
+    Ok(notes)
+}
+
+/// The summary's test lines for one `TestRecommendations`. Pure so the
+/// wording can be pinned without a graph fixture.
+fn test_notes(tests: &codesage_protocol::TestRecommendations) -> Vec<String> {
+    let mut notes = Vec::new();
     if !tests.primary.is_empty() {
         notes.push(format!("Run tests: {}", tests.primary.join(", ")));
     } else if !tests.coupled.is_empty() {
         let coupled: Vec<String> = tests.coupled.iter().map(|c| c.file.clone()).collect();
         notes.push(format!("Coupled tests to consider: {}", coupled.join(", ")));
     }
-
-    Ok(notes)
+    // Reachability is its own signal, not a fallback: a patch with sibling
+    // tests can still have integration tests that only the graph knows about.
+    // A truncated walk must say so here too, or the summary reads as complete.
+    let cap_clause = reach_cap_clause(tests)
+        .map(|c| format!("; lower bound: {c}"))
+        .unwrap_or_default();
+    if !tests.reachable.is_empty() {
+        let shown: Vec<String> = tests
+            .reachable
+            .iter()
+            .take(REHEARSAL_REACHABLE_NOTE_CAP)
+            .map(|e| e.path.clone())
+            .collect();
+        let more = tests.reachable_total.saturating_sub(shown.len());
+        let suffix = if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        };
+        notes.push(format!(
+            "Reachable tests (call/import edges): {}{suffix}{cap_clause}",
+            shown.join(", ")
+        ));
+    } else if !cap_clause.is_empty() {
+        notes.push(format!("Reachable tests: none resolved{cap_clause}"));
+    }
+    notes
 }
 
 #[cfg(test)]
@@ -451,6 +507,55 @@ mod tests {
     use codesage_protocol::{
         FeatureConfidence, FeatureFileRef, FeatureKind, FeatureRecord, FileInfo, Language,
     };
+
+    #[test]
+    fn reachable_note_caps_at_five_and_carries_the_lower_bound_clause() {
+        use codesage_protocol::{ReachableTestEntry, TestRecommendations};
+        let entry = |i: usize| ReachableTestEntry {
+            path: format!("tests/T{i}.php"),
+            distance: 1,
+            edge_count: 1,
+            via: "src/A.php".to_string(),
+        };
+        let recs = TestRecommendations {
+            reachable: (0..7).map(entry).collect(),
+            reachable_total: 40,
+            reach_walk_capped: true,
+            partial_files: vec!["src/A.php".to_string()],
+            unindexed_files: vec!["src/New.php".to_string()],
+            ..Default::default()
+        };
+        let notes = test_notes(&recs);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(
+            notes[0],
+            "Reachable tests (call/import edges): tests/T0.php, tests/T1.php, tests/T2.php, \
+             tests/T3.php, tests/T4.php (+35 more); lower bound: cut short: src/A.php; \
+             not indexed: src/New.php"
+        );
+
+        // Complete walk: no clause at all.
+        let complete = TestRecommendations {
+            reachable: vec![entry(0)],
+            reachable_total: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            test_notes(&complete),
+            vec!["Reachable tests (call/import edges): tests/T0.php".to_string()]
+        );
+
+        // Nothing reachable but the walk was cut: the summary still says so.
+        let empty_capped = TestRecommendations {
+            reach_walk_capped: true,
+            unwalked_files: vec!["src/B.php".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            test_notes(&empty_capped),
+            vec!["Reachable tests: none resolved; lower bound: not walked: src/B.php".to_string()]
+        );
+    }
 
     fn file_ref(path: &str, role: FeatureFileRole) -> FeatureFileRef {
         FeatureFileRef {

@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use anyhow::Result;
 use codesage_protocol::{
     CategoryCount, DistanceCount, FileCategory, ImpactEntry, ImpactOptions, ImpactReason,
-    ImpactReport, ImpactRequest, ImpactSummary, ImpactTarget, Reference, SiblingSymbol, Symbol,
+    ImpactReport, ImpactRequest, ImpactSummary, ImpactTarget, Reference, ReferenceKind,
+    SiblingSymbol, Symbol,
 };
 use codesage_storage::Database;
 
@@ -35,6 +37,137 @@ pub(crate) fn impact_analysis_walk(
     req: &ImpactRequest,
     max_frontier: usize,
 ) -> Result<(Vec<ImpactEntry>, bool)> {
+    let outcome = impact_analysis_walk_budgeted(db, req, max_frontier, None)?;
+    Ok((outcome.entries, outcome.capped))
+}
+
+/// Result of [`impact_analysis_walk_budgeted`].
+#[derive(Debug)]
+pub(crate) struct WalkOutcome {
+    pub entries: Vec<ImpactEntry>,
+    /// Frontier cap, work budget, or deadline stopped the walk early; every
+    /// derived count is a lower bound.
+    pub capped: bool,
+    /// Distinct resolved edges per dependent file, uncapped (an
+    /// `ImpactEntry` keeps at most 10 `reasons`, so its length saturates on
+    /// hub files and cannot rank them).
+    pub edge_counts: HashMap<String, u32>,
+    /// Symbols the walk started from. Zero with `capped: false` means the
+    /// target is indexed but defines nothing, so an empty result is not a
+    /// finding about its dependents.
+    pub seed_count: usize,
+}
+
+/// Hard work budget for a walk, counted in resolution steps (see
+/// [`WalkBudget::cost`]), plus an optional wall-clock deadline. One instance
+/// serves several walks: [`WalkBudget::reset`] refills the steps between
+/// inputs while the deadline and the per-name cost memo carry over.
+#[derive(Debug)]
+pub(crate) struct WalkBudget {
+    pub remaining: usize,
+    /// Steps spent or deadline passed; the current walk stops and later
+    /// walks return immediately until `reset`.
+    pub exhausted: bool,
+    pub deadline: Option<Instant>,
+    /// Sticky: once the deadline has passed, `reset` cannot revive a budget.
+    pub deadline_hit: bool,
+    candidate_counts: HashMap<String, usize>,
+    caller_file_counts: HashMap<String, usize>,
+}
+
+impl WalkBudget {
+    pub(crate) fn new(steps: usize, deadline: Option<Instant>) -> Self {
+        Self {
+            remaining: steps,
+            exhausted: steps == 0,
+            deadline,
+            deadline_hit: false,
+            candidate_counts: HashMap::new(),
+            caller_file_counts: HashMap::new(),
+        }
+    }
+
+    /// Refill the step budget for the next input. The deadline and the cost
+    /// memo persist; a passed deadline stays exhausted.
+    pub(crate) fn reset(&mut self, steps: usize) {
+        self.remaining = steps;
+        self.exhausted = steps == 0 || self.deadline_hit;
+    }
+
+    /// Charge `steps` for an admitted symbol. Spending the budget to exactly
+    /// zero is not exhaustion: `exhausted` means something was skipped, and
+    /// only the admission loop (or the deadline) can know that.
+    fn charge(&mut self, steps: usize) {
+        self.remaining = self.remaining.saturating_sub(steps);
+    }
+
+    /// `true` (and exhausted) once the wall-clock deadline has passed.
+    pub(crate) fn over_deadline(&mut self) -> bool {
+        if self.deadline_hit {
+            return true;
+        }
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
+            self.deadline_hit = true;
+            self.exhausted = true;
+            return true;
+        }
+        false
+    }
+
+    /// Predicted cost of resolving the references to `sym`: distinct caller
+    /// files × candidate definitions sharing the short name.
+    /// `resolve_callee_definitions` runs once per caller file and filters
+    /// every candidate against that file's imports, so that product is the
+    /// work, not the row count — on home-assistant, `__init__` is 4215 rows
+    /// but 2970 files × 5927 candidates, and took 27 s where every other
+    /// symbol in the file took under 40 ms. A unique name costs its
+    /// caller-file count. Both counts are COUNT queries memoized per name, so
+    /// pricing a symbol never hydrates a row.
+    fn cost(&mut self, db: &Database, sym: &Symbol) -> Result<usize> {
+        let files = match self.caller_file_counts.get(&sym.name) {
+            Some(n) => *n,
+            None => {
+                let n = db.count_referencing_files(&sym.name)?;
+                self.caller_file_counts.insert(sym.name.clone(), n);
+                n
+            }
+        };
+        let candidates = match self.candidate_counts.get(&sym.name) {
+            Some(n) => *n,
+            None => {
+                let n = db.count_symbols_named(&sym.name)?.max(1);
+                self.candidate_counts.insert(sym.name.clone(), n);
+                n
+            }
+        };
+        Ok(files.saturating_mul(candidates))
+    }
+}
+
+/// [`impact_analysis_walk`] with an optional [`WalkBudget`]. Per level, every
+/// unvisited frontier symbol is priced, the cheapest are admitted until the
+/// budget runs out, and the admitted ones are then resolved in their original
+/// frontier order — so a walk that skips nothing is identical to the
+/// unbudgeted walk, and a hub name spends the budget instead of starving the
+/// precise neighbours that came after it in file order. A symbol in a hot
+/// file can have tens of thousands of reference rows, and a caller that only
+/// needs "which tests reach this" must not pay for all of them.
+pub(crate) fn impact_analysis_walk_budgeted(
+    db: &Database,
+    req: &ImpactRequest,
+    max_frontier: usize,
+    mut budget: Option<&mut WalkBudget>,
+) -> Result<WalkOutcome> {
+    if let Some(b) = budget.as_deref_mut()
+        && (b.exhausted || b.over_deadline())
+    {
+        return Ok(WalkOutcome {
+            entries: Vec::new(),
+            capped: true,
+            edge_counts: HashMap::new(),
+            seed_count: 0,
+        });
+    }
     let seed_symbols: Vec<Symbol> = match &req.target {
         ImpactTarget::Symbol { name } => {
             let syms = db.find_symbols(name, None)?;
@@ -66,7 +199,12 @@ pub(crate) fn impact_analysis_walk(
     };
 
     if seed_symbols.is_empty() {
-        return Ok((Vec::new(), false));
+        return Ok(WalkOutcome {
+            entries: Vec::new(),
+            capped: false,
+            edge_counts: HashMap::new(),
+            seed_count: 0,
+        });
     }
 
     let origin_files: HashSet<String> = match &req.target {
@@ -78,7 +216,14 @@ pub(crate) fn impact_analysis_walk(
         ImpactTarget::Symbol { .. } => seed_symbols.iter().map(|s| s.file_path.clone()).collect(),
     };
 
-    let mut file_reasons: HashMap<String, (u32, Vec<ImpactReason>)> = HashMap::new();
+    // Per dependent file: shortest distance, the first 10 distinct reasons
+    // (the wire projection), and the full set of distinct reasons keyed on
+    // (via_symbol, kind, line) so the edge count neither caps at 10 nor
+    // double-counts a reason that repeats after the tenth.
+    type ReasonKey = (String, ReferenceKind, u32);
+    let mut file_reasons: HashMap<String, (u32, Vec<ImpactReason>, HashSet<ReasonKey>)> =
+        HashMap::new();
+    let seed_count = seed_symbols.len();
     let mut frontier: Vec<Symbol> = seed_symbols;
     let mut visited_symbols: HashSet<(String, String, u32)> = HashSet::new();
     let mut frontier_capped = false;
@@ -87,18 +232,62 @@ pub(crate) fn impact_analysis_walk(
         // First pass: collect refs, update file_reasons, record (from_file, line) pairs
         // that need caller-symbol lookups for the next frontier.
         let mut pending_callers: Vec<(String, Option<String>, u32)> = Vec::new();
-        for sym in &frontier {
-            if !visited_symbols.insert(symbol_identity_key(sym)) {
-                continue;
+        let mut budget_spent = false;
+        let mut level: Vec<(&Symbol, Vec<Reference>)> = Vec::new();
+        if let Some(b) = budget.as_deref_mut() {
+            // Admission is greedy cheapest-first over the priced level;
+            // resolution then runs in frontier order over the admitted set
+            // only, so the reason ordering (and therefore the output) matches
+            // the unbudgeted walk whenever nothing is skipped.
+            let mut priced: Vec<(usize, usize)> = Vec::new();
+            for (idx, sym) in frontier.iter().enumerate() {
+                // Pricing is two COUNT queries per symbol; on a wide level
+                // that alone can outlast the deadline, so it is checked here
+                // too: once at the start of every level and every 256 symbols.
+                if idx % 256 == 0 && b.over_deadline() {
+                    break;
+                }
+                if !visited_symbols.insert(symbol_identity_key(sym)) {
+                    continue;
+                }
+                priced.push((b.cost(db, sym)?, idx));
             }
-            let refs = references_for_symbol(db, sym)?;
+            priced.sort_unstable();
+            let mut admitted = vec![false; frontier.len()];
+            for (cost, idx) in priced {
+                if cost > b.remaining {
+                    b.exhausted = true;
+                    break;
+                }
+                b.charge(cost);
+                admitted[idx] = true;
+            }
+            for (idx, sym) in frontier.iter().enumerate() {
+                if !admitted[idx] {
+                    continue;
+                }
+                if b.over_deadline() {
+                    break;
+                }
+                level.push((sym, references_for_symbol(db, sym)?));
+            }
+            budget_spent = b.exhausted;
+        } else {
+            for sym in &frontier {
+                if !visited_symbols.insert(symbol_identity_key(sym)) {
+                    continue;
+                }
+                level.push((sym, references_for_symbol(db, sym)?));
+            }
+        }
+        for (sym, refs) in level {
             for r in refs {
                 if origin_files.contains(&r.from_file) {
                     continue;
                 }
                 let entry = file_reasons
                     .entry(r.from_file.clone())
-                    .or_insert_with(|| (depth, Vec::new()));
+                    .or_insert_with(|| (depth, Vec::new(), HashSet::new()));
                 if entry.0 > depth {
                     entry.0 = depth;
                 }
@@ -112,12 +301,11 @@ pub(crate) fn impact_analysis_walk(
                     kind: r.kind,
                     line: r.line,
                 };
-                let already = entry.1.iter().any(|e| {
-                    e.via_symbol == reason.via_symbol
-                        && e.kind == reason.kind
-                        && e.line == reason.line
-                });
-                if !already && entry.1.len() < 10 {
+                let distinct =
+                    entry
+                        .2
+                        .insert((reason.via_symbol.clone(), reason.kind, reason.line));
+                if distinct && entry.1.len() < 10 {
                     entry.1.push(reason);
                 }
                 if depth < req.depth as u32 {
@@ -126,6 +314,12 @@ pub(crate) fn impact_analysis_walk(
             }
         }
 
+        if budget_spent {
+            // Rows fetched so far are recorded; the next level would need more
+            // fetches, so everything deeper is unknown.
+            frontier_capped = true;
+            break;
+        }
         if pending_callers.is_empty() {
             break;
         }
@@ -139,6 +333,14 @@ pub(crate) fn impact_analysis_walk(
             });
             set.into_iter().collect()
         };
+        // The caller lookup for a level is unpriced: it hydrates every symbol
+        // of every file the level reached. Check the clock once before it.
+        if let Some(b) = budget.as_deref_mut()
+            && b.over_deadline()
+        {
+            frontier_capped = true;
+            break;
+        }
         let syms_by_file = db.symbols_for_files(&distinct_files)?;
 
         let mut next_frontier: Vec<Symbol> = Vec::new();
@@ -194,9 +396,13 @@ pub(crate) fn impact_analysis_walk(
         frontier = next_frontier;
     }
 
+    let edge_counts: HashMap<String, u32> = file_reasons
+        .iter()
+        .map(|(path, (_, _, edges))| (path.clone(), edges.len() as u32))
+        .collect();
     let mut entries: Vec<ImpactEntry> = file_reasons
         .into_iter()
-        .map(|(path, (distance, reasons))| {
+        .map(|(path, (distance, reasons, _))| {
             let category = FileCategory::classify(&path);
             ImpactEntry {
                 file_path: path,
@@ -219,7 +425,12 @@ pub(crate) fn impact_analysis_walk(
             .then_with(|| b.reasons.len().cmp(&a.reasons.len()))
             .then_with(|| a.file_path.cmp(&b.file_path))
     });
-    Ok((entries, frontier_capped))
+    Ok(WalkOutcome {
+        entries,
+        capped: frontier_capped,
+        edge_counts,
+        seed_count,
+    })
 }
 
 /// Cap on `sibling_symbols` to keep dense files from blowing up the response.
@@ -402,7 +613,16 @@ pub(crate) fn references_for_symbol(db: &Database, sym: &Symbol) -> Result<Vec<R
     // already had to handle this for symbols whose qualified name equals their
     // short name.
     let raw = db.find_references(&sym.name, None)?;
+    resolve_references_to_symbol(db, sym, raw)
+}
 
+/// Second half of [`references_for_symbol`]: keep only the raw rows whose
+/// callsite actually resolves to `sym`.
+fn resolve_references_to_symbol(
+    db: &Database,
+    sym: &Symbol,
+    raw: Vec<Reference>,
+) -> Result<Vec<Reference>> {
     // Import-aware reverse resolution. `find_references` matches by
     // `to_name_tail`, so an unqualified name fans out to *every* same-named
     // definition — a call to one class's `getAttributes` was counted toward
@@ -531,5 +751,183 @@ mod tests {
         let (entries, capped) = impact_analysis_walk(&db, &req, MAX_FRONTIER).unwrap();
         assert!(entries.is_empty());
         assert!(!capped);
+    }
+
+    #[test]
+    fn budgeted_walk_that_skips_nothing_matches_the_unbudgeted_walk() {
+        let (_dir, db) = setup_project();
+        let (plain, plain_capped) =
+            impact_analysis_walk(&db, &file_request(), MAX_FRONTIER).unwrap();
+        let mut budget = WalkBudget::new(usize::MAX, None);
+        let out =
+            impact_analysis_walk_budgeted(&db, &file_request(), MAX_FRONTIER, Some(&mut budget))
+                .unwrap();
+        assert!(!plain_capped);
+        assert!(!out.capped, "unlimited budget must not cap");
+        assert_eq!(format!("{plain:?}"), format!("{:?}", out.entries));
+        assert_eq!(out.edge_counts.len(), plain.len());
+        for entry in &plain {
+            assert_eq!(
+                out.edge_counts[&entry.file_path] as usize,
+                entry.reasons.len(),
+                "under the reason cap the uncapped edge count equals reasons.len()"
+            );
+        }
+    }
+
+    #[test]
+    fn budgeted_walk_reports_deadline_and_zero_budget_as_capped() {
+        let (_dir, db) = setup_project();
+        let mut spent = WalkBudget::new(0, None);
+        let out =
+            impact_analysis_walk_budgeted(&db, &file_request(), MAX_FRONTIER, Some(&mut spent))
+                .unwrap();
+        assert!(out.capped);
+        assert!(out.entries.is_empty());
+
+        let mut late = WalkBudget::new(usize::MAX, Some(Instant::now()));
+        let out =
+            impact_analysis_walk_budgeted(&db, &file_request(), MAX_FRONTIER, Some(&mut late))
+                .unwrap();
+        assert!(out.capped);
+        assert!(late.deadline_hit);
+        late.reset(usize::MAX);
+        assert!(late.exhausted, "a passed deadline survives reset");
+    }
+
+    /// Repository.php defines `find` (three callers) and `save` (one caller):
+    /// the seed symbols price differently, so cheapest-first admission visits
+    /// `save` before `find` while frontier order is `find`, `save`.
+    fn setup_project_with_uneven_costs() -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Repository.php"),
+            b"<?php\nnamespace App;\nclass Repository {\n  public function find($id) { return null; }\n  public function save($e) { return true; }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Controller.php"),
+            b"<?php\nnamespace App;\nuse App\\Repository;\nclass Controller {\n  public function show(Repository $r, $id) { return $r->find($id); }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Service.php"),
+            b"<?php\nnamespace App;\nuse App\\Repository;\nclass Service {\n  public function run(Repository $r) { return $r->find(1); }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Job.php"),
+            b"<?php\nnamespace App;\nuse App\\Repository;\nclass Job {\n  public function go(Repository $r) { $r->save(1); return $r->find(2); }\n}\n",
+        )
+        .unwrap();
+        let db = Database::open_in_memory().unwrap();
+        crate::full_index(root, &db, &[], false).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn budgeted_walk_with_uneven_costs_still_matches_the_unbudgeted_walk() {
+        let (_dir, db) = setup_project_with_uneven_costs();
+        let mut probe = WalkBudget::new(usize::MAX, None);
+        let find = db
+            .find_symbols("find", None)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let save = db
+            .find_symbols("save", None)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(
+            probe.cost(&db, &save).unwrap() < probe.cost(&db, &find).unwrap(),
+            "fixture must price the symbols unevenly for this test to mean anything"
+        );
+
+        let (plain, plain_capped) =
+            impact_analysis_walk(&db, &file_request(), MAX_FRONTIER).unwrap();
+        let mut budget = WalkBudget::new(usize::MAX, None);
+        let out =
+            impact_analysis_walk_budgeted(&db, &file_request(), MAX_FRONTIER, Some(&mut budget))
+                .unwrap();
+        assert!(!plain_capped && !out.capped);
+        assert_eq!(plain.len(), 3, "entries: {plain:?}");
+        assert_eq!(format!("{plain:?}"), format!("{:?}", out.entries));
+    }
+
+    #[test]
+    fn edge_count_dedupes_reasons_beyond_the_ten_kept() {
+        use codesage_protocol::{FileInfo, Language, ReferenceKind, SymbolKind};
+
+        let db = Database::open_in_memory().unwrap();
+        let repo = db
+            .upsert_file(&FileInfo {
+                path: "Repository.php".to_string(),
+                language: Language::Php,
+                content_hash: "r".to_string(),
+            })
+            .unwrap();
+        let names: Vec<String> = (1..=15).map(|i| format!("op{i:02}")).collect();
+        let syms: Vec<Symbol> = names
+            .iter()
+            .map(|n| Symbol {
+                name: n.clone(),
+                qualified_name: n.clone(),
+                kind: SymbolKind::Function,
+                file_path: "Repository.php".to_string(),
+                line_start: 1,
+                line_end: 10,
+                col_start: 0,
+                col_end: 0,
+                rationale: vec![],
+            })
+            .collect();
+        db.insert_symbols(repo, &syms).unwrap();
+
+        let caller = db
+            .upsert_file(&FileInfo {
+                path: "Caller.php".to_string(),
+                language: Language::Php,
+                content_hash: "c".to_string(),
+            })
+            .unwrap();
+        let mut refs: Vec<Reference> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| Reference {
+                from_file: "Caller.php".to_string(),
+                from_symbol: None,
+                to_name: n.clone(),
+                kind: ReferenceKind::Call,
+                line: 10 + i as u32,
+                col: 0,
+            })
+            .collect();
+        // Five repeats of already-recorded (symbol, kind, line) reasons at a
+        // different column: distinct rows, the same edge.
+        for (i, n) in names.iter().enumerate().take(5) {
+            refs.push(Reference {
+                from_file: "Caller.php".to_string(),
+                from_symbol: None,
+                to_name: n.clone(),
+                kind: ReferenceKind::Call,
+                line: 10 + i as u32,
+                col: 8,
+            });
+        }
+        db.insert_references(caller, &refs).unwrap();
+
+        let out = impact_analysis_walk_budgeted(&db, &file_request(), MAX_FRONTIER, None).unwrap();
+        assert_eq!(out.entries.len(), 1);
+        assert_eq!(out.entries[0].file_path, "Caller.php");
+        assert_eq!(
+            out.entries[0].reasons.len(),
+            10,
+            "wire projection stays capped"
+        );
+        assert_eq!(out.edge_counts["Caller.php"], 15, "15 distinct, 5 repeats");
     }
 }

@@ -18,4 +18,7 @@ pub use indexer::{
     git_history_index_with_options,
 };
 pub use risk::{assess_risk, assess_risk_batch, assess_risk_diff, find_coupling};
-pub use tests_rec::recommend_tests;
+pub(crate) use tests_rec::reach_cap_clause;
+pub use tests_rec::{
+    ReachabilityOptions, abbreviate_paths, recommend_tests, recommend_tests_with_reachability,
+};

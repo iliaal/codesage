@@ -398,6 +398,28 @@ impl Database {
         Ok(symbols)
     }
 
+    /// Definitions sharing the short `name`, counted without hydrating rows.
+    /// Sizes the ambiguity of a name before a caller decides to resolve it.
+    pub fn count_symbols_named(&self, name: &str) -> Result<usize> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT COUNT(*) FROM symbols WHERE name = ?1")?;
+        let n: i64 = stmt.query_row(params![name], |row| row.get(0))?;
+        Ok(n as usize)
+    }
+
+    /// Distinct files holding at least one reference whose name tail matches
+    /// `name` — the same rows `find_references` returns for a short name,
+    /// counted per file without hydrating them.
+    pub fn count_referencing_files(&self, name: &str) -> Result<usize> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT COUNT(DISTINCT from_file_id) FROM refs
+             WHERE to_name_tail = ?1 OR to_name = ?1",
+        )?;
+        let n: i64 = stmt.query_row(params![name], |row| row.get(0))?;
+        Ok(n as usize)
+    }
+
     pub fn find_references(
         &self,
         to_name: &str,
