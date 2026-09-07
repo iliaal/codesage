@@ -400,6 +400,8 @@ def commands_enum_variants(main_rs: Path) -> set[str]:
     depth = 0
     for offset, line in enumerate(lines[start:]):
         code = line.split("//", 1)[0]
+        # Braces inside help strings must not move the depth counter.
+        code = re.sub(r'"(?:\\.|[^"\\])*"', '""', code)
         if offset and depth == 1:
             m = _VARIANT_RE.match(code)
             if m:

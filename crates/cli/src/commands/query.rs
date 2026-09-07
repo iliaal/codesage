@@ -160,9 +160,11 @@ pub(crate) fn cmd_search(
                 preview
             );
         }
-        // A one-row page has no adjacent pair, so its "cliff" is a 0% drop
-        // after row 1: true, but noise to a reader. JSON keeps the fields.
-        if results.len() < 2 {
+        // A naturally one-row page has no adjacent pair, so its "cliff" is a
+        // 0% drop after row 1: true, but noise to a reader. A page cut to one
+        // row by --adaptive-limit carries the real drop and must still say
+        // why the rest vanished. JSON keeps the fields either way.
+        if results.len() < 2 && page.margin_pct == Some(0) {
             return Ok(());
         }
         if let (Some(confidence), Some(margin), Some(cliff_at)) =

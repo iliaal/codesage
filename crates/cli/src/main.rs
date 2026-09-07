@@ -126,7 +126,7 @@ enum Commands {
         /// Filter by file path glob
         #[arg(long)]
         path: Option<Vec<String>>,
-        /// Stop at the relevance cliff (largest >=20% relative score drop)
+        /// Stop at the relevance cliff (largest relative score drop that rounds to >=20%)
         /// instead of returning exactly --limit rows
         #[arg(long)]
         adaptive_limit: bool,

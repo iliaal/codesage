@@ -37,21 +37,36 @@ pub fn find_references(
                 .into_iter()
                 .filter(|q| is_qualified_symbol_name(q))
                 .collect();
+        let bare_only = definitions
+            .iter()
+            .filter(|s| !is_qualified_symbol_name(&s.qualified_name))
+            .count();
         if qualified.len() > 1 {
+            let bare_note = if bare_only > 0 {
+                format!(
+                    " {bare_only} of them carry only the bare name and are reachable by file alone."
+                )
+            } else {
+                String::new()
+            };
             Some(format!(
                 "{definition_count} definitions share the name '{}'; rows are the union across \
                  all of them. Use find_symbol to list them and impact_analysis with one \
-                 qualified name ({}) to scope to one.",
+                 qualified name ({}) to scope to one.{bare_note}",
                 req.symbol_name,
                 sample_list(&qualified, 5)
             ))
         } else {
             let files = distinct_sorted(definitions.iter().map(|s| s.file_path.as_str()));
+            let why = if bare_only == definitions.len() {
+                "are indistinguishable by qualified name"
+            } else {
+                "cannot all be addressed by a qualified name, since at most one carries one"
+            };
             Some(format!(
-                "{definition_count} definitions share the name '{}' and are indistinguishable \
-                 by qualified name; rows are the union across all of them. Use find_symbol to \
-                 list them and scope by file instead (impact_analysis on the file, or filter \
-                 rows by from_file): {}.",
+                "{definition_count} definitions share the name '{}' and {why}; rows are the \
+                 union across all of them. Use find_symbol to list them and scope by file \
+                 instead (impact_analysis on the file, or filter rows by from_file): {}.",
                 req.symbol_name,
                 sample_list(&files, 5)
             ))
@@ -295,10 +310,33 @@ mod tests {
         // Bare `helper` is not a qualified name to impact_analysis, so offering
         // it would hard-fail there; with one qualified candidate left, only the
         // files can scope both definitions.
-        assert!(note.contains("indistinguishable"), "{note}");
+        assert!(note.contains("at most one carries one"), "{note}");
+        assert!(!note.contains("indistinguishable"), "{note}");
         assert!(note.contains("a.rs, b.rs"), "{note}");
         assert!(!note.contains("qualified name ("), "{note}");
         assert!(!note.contains("beta::helper"), "{note}");
+    }
+
+    #[test]
+    fn envelope_with_two_qualified_and_one_bare_counts_the_bare_one() {
+        let db = Database::open_in_memory().unwrap();
+        let a = file(&db, "a.rs");
+        let b = file(&db, "b.rs");
+        let c = file(&db, "c.rs");
+        db.insert_symbols(a, &[qualified_symbol("build", "Foo::build", "a.rs")])
+            .unwrap();
+        db.insert_symbols(b, &[qualified_symbol("build", "Bar::build", "b.rs")])
+            .unwrap();
+        db.insert_symbols(c, &[symbol("build", "c.rs")]).unwrap();
+
+        let out = lookup(&db, "build");
+        assert_eq!(out.definition_count, 3);
+        let note = out.note.expect("ambiguous lookup must carry a note");
+        assert!(note.contains("Bar::build, Foo::build"), "{note}");
+        assert!(
+            note.contains("1 of them carry only the bare name"),
+            "{note}"
+        );
     }
 
     #[test]

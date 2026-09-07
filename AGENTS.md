@@ -42,7 +42,7 @@ Query flows through these stages in order:
 5. **Symbol annotation** -- attach overlapping symbol names to each result
 6. **Cross-encoder rerank** -- ms-marco-MiniLM-L6-v2, adaptive blend weight (0.35 identifier-shaped / 0.6 natural-language / 0.5 default); skipped when BM25 fusion already ran
 7. **Truncate** to requested limit
-8. **Relevance-cliff disclosure** -- the page reports `confidence` (`high` when the largest adjacent relative score drop is ≥20%, else `low`), `margin_pct`, and `cliff_at`. Opt-in `adaptive_limit: true` (CLI `--adaptive-limit`) cuts the page at that drop when `confidence` is `high`; a flat page is returned in full. The cut is page-local, so it composes poorly with `offset` paging.
+8. **Relevance-cliff disclosure** -- the page reports `confidence` (`high` when the largest adjacent relative score drop rounds to ≥20%, else `low`), `margin_pct`, and `cliff_at`. Opt-in `adaptive_limit: true` (CLI `--adaptive-limit`) cuts the page at that drop when `confidence` is `high`; a flat page is returned in full. The cut is page-local, so it composes poorly with `offset` paging.
 
 The reranker is optional (configured per-project in config.toml). Without it, the remaining stages still run.
 
