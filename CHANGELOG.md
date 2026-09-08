@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.28.0] - 2026-09-08
+
 ### Added
 
 - `brief` and `review_rehearsal` report other branches editing the same files, with scan limits disclosed; branch evidence works without a structural index.
@@ -926,5 +928,7 @@ Initial public release.
 
 [0.26.1]: https://github.com/iliaal/codesage/releases/tag/v0.26.1
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.27.0...HEAD
 [0.27.0]: https://github.com/iliaal/codesage/releases/tag/v0.27.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.28.0...HEAD
+[0.28.0]: https://github.com/iliaal/codesage/releases/tag/v0.28.0
