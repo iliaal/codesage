@@ -382,11 +382,11 @@ fn base_recommendations(db: &Database, file_paths: &[String]) -> Result<BaseReco
     let mut withheld: Vec<String> = Vec::new();
     let mut coupled_cut_sources: Vec<String> = Vec::new();
 
-    // One batched co-change query for the whole file list instead of one
+    // Batched co-change queries for the whole file list instead of one
     // `co_changes_for` per file. Same per-file order as `find_coupling`
     // (weight halved for non-recurring pairs, name tiebreak) —
-    // `co_changes_for_many` reproduces the per-file LIMIT exactly — with a
-    // single round-trip. One row past the cap tells us the cap cut.
+    // `co_changes_for_many` reproduces the per-file LIMIT exactly.
+    // One row past the cap tells us the cap cut.
     let multiplier = super::risk::one_off_multiplier_from_env();
     let path_refs: Vec<&str> = file_paths.iter().map(String::as_str).collect();
     let co_batched = db.co_changes_for_many(&path_refs, COUPLED_FETCH_CAP + 1, multiplier)?;

@@ -21,6 +21,7 @@
 
 ### Fixed
 
+- `codesage tests-for` and `recommend_tests` handle more than 250 distinct input files without exceeding SQLite's compound-query limit.
 - Opening the index while another process applies the same schema migration no longer fails with a duplicate-migration error.
 
 ## [0.26.1] - 2026-09-06

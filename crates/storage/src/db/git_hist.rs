@@ -522,12 +522,12 @@ impl Database {
         })
     }
 
-    /// Top-`limit` co-changing files for every path in `paths`, in one query.
+    /// Top-`limit` co-changing files for every path in `paths`, in bounded queries.
     /// Bulk counterpart of [`Database::co_changes_for_ranked`] for callers
     /// scoring many files at once (`recommend_tests`' coupled bucket):
     /// `one_off_multiplier` demotes pairs whose span is under
-    /// [`RECURRING_SPAN_SECS`] or unknown, `1.0` for raw order. One
-    /// row-numbered pass over the union of both pair sides reproduces the
+    /// [`RECURRING_SPAN_SECS`] or unknown, `1.0` for raw order. Batched
+    /// row-numbered passes over the union of both pair sides reproduce the
     /// per-file `ORDER BY ... LIMIT` exactly, ties included, so it agrees
     /// with `find_coupling`. Every requested path is present in the map, with
     /// an empty vec when it has no recorded pairs.
@@ -554,28 +554,26 @@ impl Database {
         if unique.is_empty() {
             return Ok(out);
         }
-        // One SELECT arm per path per pair side. The same positional parameter
-        // binds both sides of a path, so N distinct paths need N+1 parameters
-        // (the trailing one is the per-path limit). All structure is fixed;
-        // only values are bound.
-        let mut arms = Vec::with_capacity(unique.len() * 2);
-        for (i, _) in unique.iter().enumerate() {
-            let param = format!("?{}", i + 1);
-            arms.push(format!(
-                "SELECT {param} AS qpath, file_b AS other, weight, count AS cnt, \
+        // Each path needs two SELECT arms; SQLite permits 500 per compound query.
+        for batch in unique.chunks(250) {
+            let mut arms = Vec::with_capacity(batch.len() * 2);
+            for (i, _) in batch.iter().enumerate() {
+                let param = format!("?{}", i + 1);
+                arms.push(format!(
+                    "SELECT {param} AS qpath, file_b AS other, weight, count AS cnt, \
                  last_observed_at, windows, first_observed_at, window_mask \
                  FROM git_co_changes WHERE file_a = {param}"
-            ));
-            arms.push(format!(
-                "SELECT {param} AS qpath, file_a AS other, weight, count AS cnt, \
+                ));
+                arms.push(format!(
+                    "SELECT {param} AS qpath, file_a AS other, weight, count AS cnt, \
                  last_observed_at, windows, first_observed_at, window_mask \
                  FROM git_co_changes WHERE file_b = {param}"
-            ));
-        }
-        let limit_param = format!("?{}", unique.len() + 1);
-        let multiplier_param = format!("?{}", unique.len() + 2);
-        let sql = format!(
-            "SELECT r.qpath, r.other, r.weight, r.cnt, r.last_observed_at, r.windows,
+                ));
+            }
+            let limit_param = format!("?{}", batch.len() + 1);
+            let multiplier_param = format!("?{}", batch.len() + 2);
+            let sql = format!(
+                "SELECT r.qpath, r.other, r.weight, r.cnt, r.last_observed_at, r.windows,
                     COALESCE(g.total_commits, 0), r.first_observed_at, r.window_mask
              FROM (
                SELECT qpath, other, weight, cnt, last_observed_at, windows,
@@ -592,23 +590,24 @@ impl Database {
              ) AS r
              LEFT JOIN git_files AS g ON g.path = r.other
              WHERE r.rn <= {limit_param}",
-            arms.join(" UNION ALL ")
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut bound: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(unique.len() + 2);
-        for p in &unique {
-            bound.push(p);
-        }
-        let limit_i64 = limit as i64;
-        bound.push(&limit_i64);
-        bound.push(&one_off_multiplier);
-        let rows = stmt.query_map(bound.as_slice(), |row| {
-            Ok((row.get::<_, String>(0)?, Self::co_change_row_from(row, 1)?))
-        })?;
-        for row in rows {
-            let (qpath, co) = row?;
-            if let Some(peers) = out.get_mut(&qpath) {
-                peers.push(co);
+                arms.join(" UNION ALL ")
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut bound: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(batch.len() + 2);
+            for p in batch {
+                bound.push(p);
+            }
+            let limit_i64 = limit as i64;
+            bound.push(&limit_i64);
+            bound.push(&one_off_multiplier);
+            let rows = stmt.query_map(bound.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, Self::co_change_row_from(row, 1)?))
+            })?;
+            for row in rows {
+                let (qpath, co) = row?;
+                if let Some(peers) = out.get_mut(&qpath) {
+                    peers.push(co);
+                }
             }
         }
         Ok(out)
@@ -917,6 +916,30 @@ mod tests {
     fn churn_percentiles_empty_table_returns_empty_map() {
         let db = Database::open_in_memory().unwrap();
         assert!(db.churn_percentiles().unwrap().is_empty());
+    }
+
+    #[test]
+    fn co_changes_for_many_handles_large_input_sets() {
+        let db = Database::open_in_memory().unwrap();
+        let paths: Vec<String> = (0..1001).map(|i| format!("src/{i:04}.rs")).collect();
+        for path in &paths {
+            db.upsert_git_co_change("a.rs", path, 3.0, 3, None).unwrap();
+            db.upsert_git_co_change(path, "z.rs", 5.0, 5, None).unwrap();
+        }
+        for count in [250, 251, 500, 501, 1001] {
+            let mut inputs: Vec<&str> = paths[..count].iter().map(String::as_str).collect();
+            inputs.extend([paths[0].as_str(), "unknown.rs"]);
+            let result = db.co_changes_for_many(&inputs, 1, 0.5).unwrap();
+            assert_eq!(result.len(), count + 1);
+            assert!(result["unknown.rs"].is_empty());
+            for path in &paths[..count] {
+                let rows = &result[path];
+                assert_eq!(rows.len(), 1, "{path}");
+                assert_eq!(rows[0].file, "z.rs", "{path}");
+                assert_eq!(rows[0].weight, 5.0);
+                assert_eq!(rows[0].count, 5);
+            }
+        }
     }
 
     #[test]
