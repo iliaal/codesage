@@ -26,10 +26,6 @@ fn make_feature(id: &str, tags: &[&str]) -> FeatureRecord {
 
 #[test]
 fn list_features_tag_filter_matches_substring_within_compound_tags() {
-    // Regression for the validated finding "list_features tag LIKE
-    // pattern mismatch": doc says "tag substring" but the SQL used to
-    // bind `%"{tag}"%` (literal quote anchors), so a filter of
-    // `tag="framework"` would miss tags like `framework:react-router`.
     let db = Database::open_in_memory().expect("open in-memory db");
 
     db.upsert_feature(&make_feature(
@@ -42,7 +38,6 @@ fn list_features_tag_filter_matches_substring_within_compound_tags() {
     db.upsert_feature(&make_feature("feat_c", &["library", "rust"]))
         .unwrap();
 
-    // Substring inside a compound tag — historically missed.
     let framework_hits = db.list_features(None, None, Some("framework"), 0).unwrap();
     let ids: Vec<&str> = framework_hits
         .iter()
@@ -61,14 +56,12 @@ fn list_features_tag_filter_matches_substring_within_compound_tags() {
         "substring 'framework' must not match unrelated tags, got {ids:?}"
     );
 
-    // Full-tag exact match still works.
     let exact = db
         .list_features(None, None, Some("framework:react-router"), 0)
         .unwrap();
     let exact_ids: Vec<&str> = exact.iter().map(|f| f.feature_id.as_str()).collect();
     assert_eq!(exact_ids, vec!["feat_a"]);
 
-    // Non-substring filter returns nothing.
     let none = db
         .list_features(None, None, Some("nonexistent"), 0)
         .unwrap();
@@ -85,7 +78,6 @@ fn feature_exists_reports_presence_without_hydration() {
     assert!(db.feature_exists("feat_a").unwrap());
     assert!(!db.feature_exists("feat_missing").unwrap());
 
-    // Must agree with load_feature on both sides.
     assert!(db.load_feature("feat_a").unwrap().is_some());
     assert!(db.load_feature("feat_missing").unwrap().is_none());
 }

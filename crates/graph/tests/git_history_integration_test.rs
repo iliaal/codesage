@@ -1,13 +1,5 @@
-//! End-to-end smoke test for git_history_index. Points at the CodeSage repo itself
-//! (parent of CARGO_MANIFEST_DIR) rather than building a synthetic fixture. This trades
-//! tight behavioral assertions (specific weights, specific top hotspots) for a cheaper
-//! integration probe that catches:
-//!   - subprocess pipeline breakage (git not in PATH, format string wrong)
-//!   - parse-shape regressions (numstat / rename / binary handling)
-//!   - storage/accessor wiring (populated rows come back through co_changes_for etc.)
-//!
-//! Values drift on every commit, so assertions stay loose. For exact-value coverage,
-//! see the unit tests in git_history::tests and the seeded-DB tests in risk_test.
+//! Git-history integration tests using this repository and controlled temporary histories.
+//! Repository smoke assertions permit changing history; fixtures check exact semantics.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -19,7 +11,6 @@ use codesage_graph::{
 use codesage_storage::Database;
 
 fn codesage_repo_root() -> PathBuf {
-    // crates/graph/Cargo.toml -> crates/graph -> crates -> repo root
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -32,8 +23,7 @@ fn init_hermetic_repo(root: &std::path::Path) {
     run_git(root, &["init", "-q"]);
     run_git(root, &["config", "user.email", "review@example.invalid"]);
     run_git(root, &["config", "user.name", "Review"]);
-    // Ignore ambient signing/hooks config so temp-repo tests don't fail on
-    // machines with global commit.gpgsign or custom core.hooksPath.
+    // Isolate temporary repositories from global signing and hook configuration.
     run_git(root, &["config", "commit.gpgsign", "false"]);
     std::fs::create_dir_all(root.join(".git/disabled-hooks")).unwrap();
     run_git(root, &["config", "core.hooksPath", ".git/disabled-hooks"]);
@@ -82,7 +72,6 @@ fn indexer_runs_against_codesage_repo_and_populates_tables() {
     let db = Database::open_in_memory().unwrap();
     let stats = git_history_index(&db, &root).expect("git-index on codesage repo must succeed");
 
-    // Loose structural assertions. Exact numbers drift; these just prove the pipe is alive.
     assert!(
         stats.commits_scanned > 0,
         "expected > 0 commits, got {}",
@@ -93,10 +82,7 @@ fn indexer_runs_against_codesage_repo_and_populates_tables() {
         "expected > 0 files tracked, got {}",
         stats.files_tracked
     );
-    // Even tiny histories should produce some qualifying pairs (min_count=3), but a brand-new
-    // repo could have zero. Allow either.
 
-    // Every git_files row should have plausible bounds.
     let cargo_toml = db.git_file("Cargo.toml").unwrap();
     if let Some(row) = cargo_toml {
         assert!(row.total_commits >= 1);
@@ -104,8 +90,6 @@ fn indexer_runs_against_codesage_repo_and_populates_tables() {
         assert!(row.fix_count <= row.total_commits);
     }
 
-    // Pick a file that's known to exist in this repo and confirm coupling lookups work
-    // without panicking. Result can be empty if the file is too new or isolated.
     let _ = find_coupling(&db, "crates/storage/src/schema.rs", 5)
         .expect("find_coupling must return Ok even when empty");
 }
@@ -120,9 +104,6 @@ fn own_repo_indexer_is_idempotent() {
     let db = Database::open_in_memory().unwrap();
     let first = git_history_index(&db, &root).unwrap();
     let second = git_history_index(&db, &root).unwrap();
-    // Same input -> same output (commits_scanned is driven by decay-time, which uses
-    // unix_now; it can shift by a microsecond on re-run but the counts are commit-level
-    // and unchanged).
     assert_eq!(first.commits_scanned, second.commits_scanned);
     assert_eq!(first.files_tracked, second.files_tracked);
     assert_eq!(first.co_change_pairs, second.co_change_pairs);
@@ -135,17 +116,14 @@ fn incremental_after_full_is_noop_when_head_unchanged() {
         return;
     }
     let db = Database::open_in_memory().unwrap();
-    // Full pass: stamps state with HEAD.
     let full = git_history_index_with_options(&db, &root, &[], IndexMode::Full).unwrap();
     assert!(full.files_tracked > 0);
 
-    // Incremental with HEAD unchanged: short-circuits and reports zeros.
     let incr = git_history_index_with_options(&db, &root, &[], IndexMode::Incremental).unwrap();
     assert_eq!(incr.commits_scanned, 0);
     assert_eq!(incr.files_tracked, 0);
     assert_eq!(incr.co_change_pairs, 0);
 
-    // State must still point at the HEAD SHA.
     let state = db.get_git_index_state().unwrap();
     assert!(
         state.is_some(),
@@ -159,13 +137,10 @@ fn incremental_without_state_falls_back_to_full() {
     if !root.join(".git").exists() {
         return;
     }
-    // Fresh DB, no state recorded. Asking for Incremental directly should still produce
-    // a populated index (we fall back to Full instead of failing).
     let db = Database::open_in_memory().unwrap();
     let stats = git_history_index_with_options(&db, &root, &[], IndexMode::Incremental).unwrap();
     assert!(stats.commits_scanned > 0);
     assert!(stats.files_tracked > 0);
-    // State must now be populated so subsequent calls are truly incremental.
     assert!(db.get_git_index_state().unwrap().is_some());
 }
 
@@ -220,7 +195,6 @@ fn auto_mode_matches_full_on_fresh_db() {
     let db_auto = Database::open_in_memory().unwrap();
     let auto = git_history_index_with_options(&db_auto, &root, &[], IndexMode::Auto).unwrap();
 
-    // Auto with no state should behave like Full.
     assert_eq!(full.commits_scanned, auto.commits_scanned);
     assert_eq!(full.files_tracked, auto.files_tracked);
     assert_eq!(full.co_change_pairs, auto.co_change_pairs);
@@ -254,13 +228,11 @@ fn changed_files_since_returns_only_files_touched_after_ref() {
     let root = dir.path();
     init_hermetic_repo(root);
 
-    // Commit 1: two files, both untouched after this point except `changed.rs`.
     std::fs::write(root.join("stable.rs"), "fn stable() {}\n").unwrap();
     std::fs::write(root.join("changed.rs"), "fn before() {}\n").unwrap();
     run_git(root, &["add", "."]);
     run_git(root, &["commit", "-qm", "first"]);
 
-    // Commit 2: modify one existing file, add a new one. `stable.rs` is left alone.
     std::fs::write(root.join("changed.rs"), "fn after() {}\n").unwrap();
     std::fs::write(root.join("added.rs"), "fn added() {}\n").unwrap();
     run_git(root, &["add", "."]);
@@ -284,10 +256,7 @@ fn changed_files_since_returns_only_files_touched_after_ref() {
 
 #[test]
 fn incremental_falls_back_to_full_when_history_rewritten() {
-    // Documented contract: when the stored SHA is no longer an ancestor of
-    // HEAD (rebase, reset+recommit, force-update), incremental must detect
-    // non-ancestry and fall back to a full rescan instead of additively
-    // updating counters against an abandoned line of history.
+    // Rewritten ancestry requires replacement, not additive history updates.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     init_hermetic_repo(root);
@@ -305,9 +274,7 @@ fn incremental_falls_back_to_full_when_history_rewritten() {
     assert!(db.git_file("b.rs").unwrap().is_some());
     let (stale_sha, _) = db.get_git_index_state().unwrap().expect("state after full");
 
-    // Rewrite history: drop the second commit and commit different content,
-    // so the stored SHA still exists as an object but is not an ancestor of
-    // the new HEAD.
+    // Keep the abandoned SHA available as an object while removing it from HEAD's ancestry.
     run_git(root, &["reset", "--hard", "HEAD~1"]);
     std::fs::write(root.join("a.rs"), "fn a() { let _ = 1; }\n").unwrap();
     std::fs::write(root.join("c.rs"), "fn c() {}\n").unwrap();
@@ -316,9 +283,6 @@ fn incremental_falls_back_to_full_when_history_rewritten() {
 
     let incr = git_history_index_with_options(&db, root, &[], IndexMode::Incremental).unwrap();
 
-    // (a) Non-ancestry detected → full rescan. The whole rewritten history is
-    // scanned (2 commits), not just the delta reachable from HEAD but not the
-    // stale SHA (which would be 1). State must move off the stale SHA.
     assert_eq!(
         incr.commits_scanned, 2,
         "fallback must rescan the entire rewritten history"
@@ -332,14 +296,11 @@ fn incremental_falls_back_to_full_when_history_rewritten() {
         "state must be restamped to the new HEAD"
     );
 
-    // The full rescan drops rows from the abandoned line; a buggy additive
-    // incremental would have kept b.rs.
     assert!(
         db.git_file("b.rs").unwrap().is_none(),
         "b.rs only exists on the abandoned history line"
     );
 
-    // (b) Counters equal a pristine full scan of the rewritten history.
     let db_fresh = Database::open_in_memory().unwrap();
     let fresh = git_history_index_with_options(&db_fresh, root, &[], IndexMode::Full).unwrap();
     assert_eq!(incr.commits_scanned, fresh.commits_scanned);
@@ -356,8 +317,7 @@ fn incremental_falls_back_to_full_when_history_rewritten() {
             .unwrap_or_else(|| panic!("{path} missing from pristine full scan"));
         assert_eq!(got.total_commits, want.total_commits, "{path}");
         assert_eq!(got.fix_count, want.fix_count, "{path}");
-        // Churn decays against wall-clock "now" at scan time; the two scans run
-        // moments apart so the scores agree to well under a permille.
+        // Scans run against slightly different wall-clock times.
         assert!(
             (got.churn_score - want.churn_score).abs() < 1e-3,
             "{path}: churn {} vs pristine {}",
@@ -367,27 +327,13 @@ fn incremental_falls_back_to_full_when_history_rewritten() {
     }
 }
 
-/// Mirrors `DECAY_HALFLIFE_DAYS * SECONDS_PER_DAY` in `git_history::indexer`.
-/// The decay-materiality bounds below are tight enough that a drift in the
-/// production constant fails this test — deliberate: the composition being
-/// asserted is exp(-Δt/τ) with exactly this τ.
+/// Keep the decay-materiality check aligned with the production time constant.
 const DECAY_TAU_SECS: f64 = 180.0 * 86_400.0;
 
 #[test]
 fn full_then_incremental_matches_pristine_full_scan() {
-    // Equivalence contract of the incremental decay math: Full over the first
-    // commits followed by Incremental over the rest must produce the same
-    // per-file stats and co-change weights as one Full pass over everything.
-    // The incremental path scales stored weights by exp(-Δt/τ) before adding
-    // new-commit deltas, which composes exactly with the full pass's
-    // exp(-age/τ) — any drift here is a real decay bug, not test noise.
-    //
-    // Equivalence alone cannot prove decay ran: the phases execute moments
-    // apart, so a regression nulling `decay_git_history_to_now` also passes
-    // it (factor ≈ 1 either way). The decay-materiality block below closes
-    // that hole: a forced ≥3s stamped gap between the phases plus a file
-    // untouched by phase 2 pins the applied factor between two bounds a
-    // no-op decay violates.
+    // Near-simultaneous passes can hide a no-op decay. A forced timestamp gap
+    // and a file untouched by phase two make the decay factor independently measurable.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     init_hermetic_repo(root);
@@ -399,8 +345,6 @@ fn full_then_incremental_matches_pristine_full_scan() {
         run_git(root, &["commit", "-qm", subject]);
     };
 
-    // Three co-change commits: the (a.rs, b.rs) pair clears the min-count
-    // filter (3) within the full part alone.
     commit_pair("feat: one", "fn a() {}\n", "fn b() {}\n");
     commit_pair(
         "feat: two",
@@ -412,8 +356,7 @@ fn full_then_incremental_matches_pristine_full_scan() {
         "fn a() { let _ = 2; }\n",
         "fn b() { let _ = 2; }\n",
     );
-    // Phase-1-only file: untouched by phase 2, so after the incremental its
-    // churn row differs from the full-pass value by exactly the decay factor.
+    // No later deltas: this file isolates the decay factor.
     std::fs::write(root.join("c.rs"), "fn c() {}\n").unwrap();
     run_git(root, &["add", "."]);
     run_git(root, &["commit", "-qm", "feat: c only"]);
@@ -433,14 +376,10 @@ fn full_then_incremental_matches_pristine_full_scan() {
         .expect("c.rs after full")
         .churn_score;
 
-    // Force a stamped gap of at least 3 seconds between the phases so the
-    // incremental's decay factor is bounded away from 1 by more than the
-    // ±2s timestamp-truncation skew between unix_now() and unixepoch().
+    // A three-second gap exceeds the two-second timestamp-truncation uncertainty.
     std::thread::sleep(std::time::Duration::from_millis(3200));
 
-    // One more co-change commit — its delta count (1) is below the min-count
-    // filter, so only the pair-exists accumulate branch can surface it — plus
-    // a fix commit touching a single file to vary fix_count/total_commits.
+    // One co-change falls below the threshold alone but must update an existing pair.
     commit_pair(
         "fix: four",
         "fn a() { let _ = 3; }\n",
@@ -456,12 +395,7 @@ fn full_then_incremental_matches_pristine_full_scan() {
         "incremental must scan only the two commits after the recorded SHA"
     );
 
-    // Decay materiality: c.rs took no phase-2 deltas, so its stored churn
-    // moved only by the decay scale. The applied factor is exp(-Δ'/τ) where
-    // Δ' is the real seconds between the two passes' unix_now() calls; the
-    // observed stamped gap Δ agrees with Δ' to within ±2s (each endpoint is
-    // an independent second-truncation). A nulled decay leaves the row
-    // bit-identical (w1 == w0), which the upper bound rejects.
+    // Independent timestamp truncation permits a ±2s gap error; the bounds reject no decay.
     let (_, incr_stamp) = db_incr
         .get_git_index_state()
         .unwrap()
@@ -478,10 +412,7 @@ fn full_then_incremental_matches_pristine_full_scan() {
     );
     let upper = c_churn_full * (-(stamped_gap - 2.0) / DECAY_TAU_SECS).exp();
     let lower = c_churn_full * (-(stamped_gap + 2.0) / DECAY_TAU_SECS).exp();
-    // Discriminating margin: the no-op outcome (w1 == w0) sits at least
-    // w0·(1 - exp(-1s/τ)) ≈ 6.4e-8·w0 above `upper` — eight orders of
-    // magnitude beyond f64 rounding on the single multiply decay performs,
-    // so the comparison below is numerically meaningful.
+    // The no-decay result exceeds `upper` by about 6.4e-8 * w0, well above f64 rounding.
     assert!(
         c_churn_full - upper > c_churn_full * 1e-8,
         "bound must be distinguishable from the undecayed value: w0={c_churn_full} upper={upper}"
@@ -513,8 +444,7 @@ fn full_then_incremental_matches_pristine_full_scan() {
             "{path}: total_commits"
         );
         assert_eq!(got.fix_count, want.fix_count, "{path}: fix_count");
-        // Both scans decay against wall-clock "now" moments apart; agreement
-        // to 1e-3 proves the scale-then-add composition is exact.
+        // Allow small wall-clock differences between scans.
         assert!(
             (got.churn_score - want.churn_score).abs() < 1e-3,
             "{path}: churn {} vs pristine {}",
@@ -532,8 +462,6 @@ fn full_then_incremental_matches_pristine_full_scan() {
     );
     assert_eq!(want_pairs.len(), 1);
     assert_eq!(got_pairs[0].file, "b.rs");
-    // Count 4 proves the sub-threshold incremental delta accumulated onto the
-    // existing pair rather than being dropped by the min-count filter.
     assert_eq!(
         got_pairs[0].count, 4,
         "pair-exists accumulate branch must fire"
@@ -573,7 +501,6 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
-/// Write a fresh body to a.rs and b.rs and commit both at `ts`.
 fn commit_pair_at(root: &std::path::Path, tag: u32, ts: i64) {
     std::fs::write(root.join("a.rs"), format!("fn a() {{ let _ = {tag}; }}\n")).unwrap();
     std::fs::write(root.join("b.rs"), format!("fn b() {{ let _ = {tag}; }}\n")).unwrap();
@@ -597,12 +524,7 @@ fn pair_state(db: &Database) -> (u32, u32, u64, Option<i64>, Option<i64>) {
 
 #[test]
 fn incremental_recurrence_matches_full_at_every_step_over_300_days() {
-    // The reviewer's repro: three co-changes ~300 days back, then ten more
-    // 30 days apart, each followed by an incremental pass. After every step
-    // the incremental row must equal a fresh full scan bit for bit: count,
-    // windows, window_mask, first/last observation. The old newest-commit
-    // anchoring failed this at step 1 (windows never grew under
-    // --incremental); fixed-epoch numbering composes exactly.
+    // Incremental recurrence columns must match a full scan after each new commit.
     let now = unix_now();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -640,7 +562,6 @@ fn incremental_recurrence_matches_full_at_every_step_over_300_days() {
         assert_eq!(got.0, 3 + step, "step {step}: count");
         assert_eq!(got.4, Some(ts), "step {step}: last_observed_at");
         assert_eq!(got.3, Some(start), "step {step}: first_observed_at");
-        // Ten 30-day steps cover 300 days: at least four 90-day windows.
         let expected_min_windows = 1 + (step * 30) / 90;
         assert!(
             got.1 >= expected_min_windows,
@@ -667,17 +588,12 @@ fn incremental_recurrence_matches_full_at_every_step_over_300_days() {
 
 #[test]
 fn hundred_day_spacing_is_one_window_per_commit_under_both_modes() {
-    // 100 > 90, so consecutive commits can never share a fixed window; four
-    // commits are four windows whether they arrive in one full scan or one
-    // at a time. Guards the off-by-one at a boundary: a commit at exactly
-    // window start belongs to the new window, not the old one.
+    // Spacing of 100 days forces distinct 90-day windows, including boundary timestamps.
     let now = unix_now();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     init_hermetic_repo(root);
 
-    // Align the first commit on a window boundary so the boundary itself is
-    // exercised.
     let start = ((now - 400 * DAY) / WINDOW) * WINDOW;
     commit_pair_at(root, 1, start);
     commit_pair_at(root, 2, start + 100 * DAY);
@@ -694,8 +610,6 @@ fn hundred_day_spacing_is_one_window_per_commit_under_both_modes() {
     assert_eq!(pair_state(&incr_db), pair_state(&fresh));
     assert_eq!(pair_state(&incr_db).1, 4);
 
-    // One second before the boundary stays in the previous window; the
-    // boundary second opens the next one.
     let edge_dir = tempfile::tempdir().unwrap();
     let edge = edge_dir.path();
     init_hermetic_repo(edge);
@@ -714,8 +628,6 @@ fn hundred_day_spacing_is_one_window_per_commit_under_both_modes() {
 
 #[test]
 fn incremental_inside_one_window_does_not_grow_windows() {
-    // Delta commits landing in a window the row already has set leave
-    // `windows` unchanged and match a fresh full scan.
     let now = unix_now();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -747,7 +659,5 @@ fn changed_files_since_errors_on_unknown_ref() {
     run_git(root, &["add", "."]);
     run_git(root, &["commit", "-qm", "only"]);
 
-    // An unresolvable ref must surface as an error, not a silent empty set —
-    // otherwise `--since typo` would look like "nothing changed".
     assert!(changed_files_since(root, "no-such-ref").is_err());
 }

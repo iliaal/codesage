@@ -13,11 +13,6 @@
 //! reason so an agent skips editing them; same-repo imports up to 24 refs
 //! attach as context with reason `"imported package <import_path>"`.
 //!
-//! Ported from clawpatch's `go.ts`. Three anti-patterns explicitly skipped:
-//! `go list` toolchain dependency (we stay hermetic — filesystem only),
-//! hardcoded `["user-input","filesystem","process-exec","network"]` boundaries
-//! on every binary (would override codesage's per-file derivation), and the
-//! unscoped `"go test ./..."` literal (we scope per package).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -95,9 +90,6 @@ fn read_module_path(go_mod: &Path) -> Option<String> {
 
 fn discover_packages(ctx: &MapperContext, module_path: Option<&str>) -> Result<Vec<GoPackage>> {
     let root = ctx.root;
-    // Walk every .go file in the repo, gated by gitignore + project excludes,
-    // and bucket by parent directory. 20k file cap is enough for very large
-    // Go repos (e.g. kubernetes is ~15k); cuts off worst-case walks.
     let mut by_dir: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for rel in walk_files(root, root, 20_000, ctx.excludes) {
         if !rel.ends_with(".go") {
@@ -145,8 +137,7 @@ fn is_skipped_go_dir(root: &Path, dir_rel: &str) -> bool {
             return true;
         }
     }
-    // Nested `go.mod` walks up from `dir_rel` toward (but not including) the
-    // root. Any ancestor with a `go.mod` is a sub-module.
+    // A nested go.mod excludes its entire subtree from the parent module.
     let parts: Vec<&str> = dir_rel.split('/').filter(|p| !p.is_empty()).collect();
     for i in 1..=parts.len() {
         let candidate: String = parts[..i].join("/");
@@ -167,10 +158,7 @@ fn read_go_package_name(root: &Path, dir_rel: &str) -> Option<String> {
         return None;
     }
     let pkg_re = Regex::new(r"(?m)^\s*package\s+([A-Za-z_][A-Za-z0-9_]*)").ok()?;
-    // Sorted lexicographic scan: in a mixed-package directory (two `package`
-    // clauses, invalid Go but common mid-refactor) the winner must not
-    // depend on readdir order, or the seed flips between cli-command and
-    // library across runs.
+    // Mixed-package directories use the first file's clause to keep seed kinds stable.
     for path in sorted_read_dir(&dir) {
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
@@ -218,10 +206,7 @@ fn collect_package_files(ctx: &MapperContext, dir_rel: &str) -> Result<GoPackage
         } else {
             format!("{dir_rel}/{name}")
         };
-        // Honor project excludes inside the per-package classifier too. If
-        // an excluded file happened to sort first, it would have ended up
-        // as entry_path and the post-map `seeds.retain(...excluded)` would
-        // drop the whole package — losing every non-excluded sibling.
+        // An excluded entry would cause post-map filtering to drop the whole package.
         if !ctx.allowed(&rel) {
             continue;
         }
@@ -242,21 +227,13 @@ fn collect_package_files(ctx: &MapperContext, dir_rel: &str) -> Result<GoPackage
 }
 
 fn is_generated_go_file(abs: &Path, file_name: &str) -> bool {
-    // Filename suffix patterns. The clawpatch list plus codesage-specific
-    // ones (sqlc, gen). Ordered most-common-first so the regex short-
-    // circuits earlier on the typical case.
     let suffix_re = Regex::new(r"\.pb\.go$|_gen\.go$|_generated\.go$|\.sql\.go$|_sqlc\.go$")
         .expect("static regex");
     if suffix_re.is_match(file_name) {
         return true;
     }
-    // Bounded header sniff: take the first ~2 KB of the file rather than
-    // reading it whole. go-bindata can emit MB-scale generated files
-    // without a recognized suffix; reading the entire thing just to check
-    // the comment header allocates the full buffer. Drop bytes past the
-    // last valid UTF-8 char boundary so a multibyte sequence split at the
-    // cap doesn't reject a real marker. ASCII files (the common case) are
-    // unaffected.
+    // Generated files can be huge; read only the header and discard an incomplete
+    // UTF-8 suffix so a split character cannot hide an earlier marker.
     let mut head_bytes = Vec::with_capacity(2_000);
     {
         use std::io::Read;
@@ -289,11 +266,7 @@ fn is_generated_go_file(abs: &Path, file_name: &str) -> bool {
 
 const IMPORT_CONTEXT_CAP_DEFAULT: usize = 24;
 
-// Env-overridable for per-project tuning (`CODESAGE_GO_IMPORT_CONTEXT_CAP`).
-// Read on every call: caching it in a `OnceLock` made mapper output depend
-// on which value the process happened to read first (env/process history),
-// so identical inputs mapped differently across runs and tests.
-// Values < 1 fall back to the default.
+// Read each call so an earlier mapping cannot freeze another project's setting.
 fn import_context_cap() -> usize {
     std::env::var("CODESAGE_GO_IMPORT_CONTEXT_CAP")
         .ok()
@@ -486,11 +459,7 @@ fn make_seed(
             None
         },
         entry_command: command_name,
-        // Scoped `go test ./<dir>/...` is the runnable test invocation for
-        // every Go package feature. Lives on test_command so feature IDs
-        // stay stable when test config evolves; lives separately from any
-        // per-test SeedTest.command since the FeatureFileRef table doesn't
-        // carry per-file command columns.
+        // Test commands do not affect feature IDs; file refs cannot store commands.
         test_command: if files.tests.is_empty() {
             None
         } else {
@@ -509,10 +478,7 @@ fn make_seed(
     }
 }
 
-/// Scoped test command for a package: `go test ./<dir>/...` (or `./...` for
-/// the repo root). The unscoped clawpatch literal (`go test ./...` for every
-/// feature) was rejected during validation — it tells the agent nothing the
-/// default doesn't already convey.
+/// Run tests within the package subtree (the whole module for its root).
 fn scoped_test_command(dir_rel: &str) -> String {
     if dir_rel.is_empty() {
         "go test ./...".to_string()
@@ -583,9 +549,6 @@ mod tests {
     fn root_main_go_skipped_when_not_package_main() {
         let dir = tempdir().unwrap();
         write(dir.path(), "go.mod", "module example.com/lib\n");
-        // A non-main package at the repo root is still a package — it just
-        // shouldn't be a cli-command. The mapper should produce a library
-        // seed, not a cli-command seed.
         write(dir.path(), "foo.go", "package lib\n");
         let seeds = GoMapper.map(&MapperContext::for_root(dir.path())).unwrap();
         assert!(!seeds.iter().any(|s| s.kind == FeatureKind::CliCommand));
@@ -595,7 +558,6 @@ mod tests {
     #[test]
     fn no_seeds_without_go_mod() {
         let dir = tempdir().unwrap();
-        // No go.mod — not a Go module, skip entirely.
         write(dir.path(), "stray.go", "package stray\n");
         let seeds = GoMapper.map(&MapperContext::for_root(dir.path())).unwrap();
         assert!(seeds.is_empty());
@@ -684,8 +646,6 @@ mod tests {
             .iter()
             .find(|s| s.entry_path == "pkg/api/api.go")
             .expect("api package seed");
-        // The .pb.go suffix-matched file and the DO-NOT-EDIT-header file are
-        // both in context, not owned. Owned only has the hand-written file.
         let context_paths: Vec<&str> = s.context_files.iter().map(|f| f.path.as_str()).collect();
         assert!(
             context_paths.contains(&"pkg/api/messages.pb.go"),
@@ -737,9 +697,6 @@ mod tests {
 
     #[test]
     fn nested_go_mod_subtree_skipped() {
-        // A sub-directory with its own go.mod is its own module; don't index
-        // it as part of the parent. This is the common case for repos that
-        // vendor a tools/ sub-module.
         let dir = tempdir().unwrap();
         write(dir.path(), "go.mod", "module example.com/acme\n");
         write(
@@ -801,7 +758,6 @@ mod tests {
     fn import_context_bounded_at_24() {
         let dir = tempdir().unwrap();
         write(dir.path(), "go.mod", "module example.com/acme\n");
-        // Create 30 internal packages, each with 1 file, all imported by main.
         let mut imports = String::new();
         for i in 0..30 {
             write(
@@ -831,11 +787,6 @@ mod tests {
 
     #[test]
     fn excluded_file_does_not_drop_whole_package() {
-        // Regression: prior to the fix, `collect_package_files` ignored
-        // ctx.excludes. If the alphabetically-first .go file in a dir was
-        // excluded, it became entry_path; then the post-map
-        // `seeds.retain(|s| !ctx.excluded(&s.entry_path))` dropped the
-        // entire package, losing every non-excluded sibling.
         use globset::{Glob, GlobSetBuilder};
         let dir = tempdir().unwrap();
         write(dir.path(), "go.mod", "module example.com/acme\n");
@@ -870,9 +821,6 @@ mod tests {
 
     #[test]
     fn map_is_deterministic_across_runs() {
-        // Same tree mapped twice must agree exactly: package discovery
-        // walks a sorted file list and entry selection reads sorted
-        // per-package files, never readdir order.
         let dir = tempdir().unwrap();
         write(dir.path(), "go.mod", "module example.com/acme\n");
         write(
@@ -898,11 +846,7 @@ mod tests {
 
     #[test]
     fn mixed_package_dir_has_lexicographic_winner() {
-        // Two `package` clauses in one dir is invalid Go but common
-        // mid-refactor. The winner is the lexicographically-first file's
-        // clause (`a_lib.go` → `lib`), so the seed kind can't flip with
-        // readdir order. (The stray `func main` in a non-main package is
-        // likewise invalid Go; the filesystem-only mapper doesn't care.)
+        // Invalid Go can occur during edits; mapping must still be deterministic.
         let dir = tempdir().unwrap();
         write(dir.path(), "go.mod", "module example.com/acme\n");
         write(dir.path(), "pkg/m/a_lib.go", "package lib\nfunc Lib() {}\n");

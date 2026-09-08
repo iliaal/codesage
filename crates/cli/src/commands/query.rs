@@ -89,20 +89,13 @@ pub(crate) fn cmd_find_references(name: &str, kind_str: Option<&str>, json: bool
     Ok(())
 }
 
-/// Parse the `--language` filter, rejecting unknown values instead of
-/// silently dropping the filter (which would return unfiltered results the
-/// caller believes are filtered). Mirrors `cmd_features_list`.
 fn parse_search_language(language: Option<&str>) -> Result<Option<Language>> {
     language
         .map(|l| Language::parse(l).ok_or_else(|| anyhow::anyhow!("unknown language: {l}")))
         .transpose()
 }
 
-/// Normalize a `min_jaccard` threshold into the contract range `[0, 1]`:
-/// finite out-of-range values clamp, non-finite values (NaN/inf, which make
-/// every comparison false and silently zero the results) fall back to the
-/// default 0.85. Mirrors the graph layer's guard so the CLI prints the
-/// applied value instead of the requested one.
+/// Match the graph's normalization so CLI output reports the applied threshold.
 fn normalize_min_jaccard(min_jaccard: f32) -> f32 {
     if min_jaccard.is_finite() {
         min_jaccard.clamp(0.0, 1.0)
@@ -160,10 +153,7 @@ pub(crate) fn cmd_search(
                 preview
             );
         }
-        // A naturally one-row page has no adjacent pair, so its "cliff" is a
-        // 0% drop after row 1: true, but noise to a reader. A page cut to one
-        // row by --adaptive-limit carries the real drop and must still say
-        // why the rest vanished. JSON keeps the fields either way.
+        // Suppress a natural single-row cliff, but explain rows removed by --adaptive-limit.
         if results.len() < 2 && page.margin_pct == Some(0) {
             return Ok(());
         }
@@ -213,9 +203,6 @@ pub(crate) fn cmd_dependencies(file: &str, json: bool) -> Result<()> {
 pub(crate) fn cmd_similar(symbol: &str, min_jaccard: f32, limit: usize, json: bool) -> Result<()> {
     let root = find_project_root()?;
     let db = open_db(&root)?;
-    // Report the applied threshold: out-of-range input is clamped (see
-    // `normalize_min_jaccard`), so echoing the request would lie about what
-    // was actually searched.
     let min_jaccard = normalize_min_jaccard(min_jaccard);
     let hits = find_similar(&db, symbol, min_jaccard, limit)?;
     if json {
@@ -407,8 +394,7 @@ pub(crate) fn cmd_impact(
     let root = find_project_root()?;
     let db = open_db(&root)?;
 
-    // Pass Some(true) only when the user explicitly set --file; an unset false
-    // would force Symbol classification and break the heuristic fallback.
+    // Neither flag must remain None to preserve heuristic target classification.
     let hint = if is_file {
         Some(true)
     } else if is_symbol {
@@ -537,8 +523,7 @@ pub(crate) fn cmd_export(
     Ok(())
 }
 
-/// Flat-text envelope inspired by gitingest: one self-contained artifact agents can paste
-/// into another LLM session without re-templating. Token count is a chars/4 approximation.
+/// Portable context bundle; token counts are approximate.
 fn print_bundle_ingest(bundle: &ContextBundle, target: &str, is_symbol: bool) {
     let target_label = if is_symbol {
         format!("symbol={target}")
@@ -624,7 +609,6 @@ fn print_bundle_ingest(bundle: &ContextBundle, target: &str, is_symbol: bool) {
     }
 }
 
-/// Render a list of file paths as an ASCII tree. Files appear in sorted order under each dir.
 fn render_file_tree(paths: &[&String]) -> Vec<String> {
     use std::collections::BTreeMap;
 
@@ -724,42 +708,35 @@ fn print_result_block(r: &codesage_protocol::SearchResult) {
     println!();
 }
 
-/// `codesage brief <file>` — what a serve-side caller can say about a file
-/// someone is about to edit.
-///
-/// The contract that matters here is the one this exists to satisfy: **failure
-/// is silence.** A hook wired to every edit must never surface an error, a
-/// stack trace or a nonzero exit, because all three land in the agent's context
-/// as noise it cannot act on. Every failure path below returns Ok(()) having
-/// printed nothing. That is deliberate, not sloppy error handling.
-///
-/// Silence toward the agent is not silence toward the operator. A failure a
-/// session recorded is still counted in the fire log, and `CODESAGE_BRIEF_DEBUG=1`
-/// puts the cause on stderr — without one of those, a payload path that quietly
-/// stopped working looks exactly like a file with nothing to say.
+/// Hook failures return success without a payload to avoid agent-context noise.
+/// Record failures in the fire log; CODESAGE_BRIEF_DEBUG exposes causes on stderr.
 pub(crate) fn cmd_brief(file: &str, json: bool, session: Option<&str>) -> Result<()> {
-    let Ok(root) = find_project_root() else {
+    let Ok(root) = std::env::current_dir()
+        .map_err(anyhow::Error::from)
+        .and_then(|cwd| crate::evidence_root(&cwd))
+    else {
         debug_brief("no project root found from cwd");
         return Ok(());
     };
-    let Ok(db) = open_db_read_only(&root) else {
-        debug_brief("index could not be opened read-only");
-        return Ok(());
-    };
-
     let rel = file.trim_start_matches("./");
-    let on_disk = std::fs::read(root.join(rel))
-        .ok()
-        .map(|b| codesage_parser::discover::content_hash(&b));
-
-    let brief = match codesage_graph::build_edit_brief(&db, rel, on_disk.as_deref()) {
+    let indexed_brief = if crate::db_path(&root).try_exists().unwrap_or(true) {
+        let on_disk = std::fs::read(root.join(rel))
+            .ok()
+            .map(|b| codesage_parser::discover::content_hash(&b));
+        open_db_read_only(&root)
+            .and_then(|db| codesage_graph::build_edit_brief(&db, rel, on_disk.as_deref()))
+    } else {
+        Ok(codesage_protocol::EditBrief {
+            file_path: rel.to_string(),
+            empty: true,
+            ..Default::default()
+        })
+    };
+    let mut brief = match indexed_brief {
         Ok(brief) => brief,
         Err(e) => {
             debug_brief(&format!("building the brief for {rel} failed: {e:#}"));
-            // Counted, not dropped. The fire log is the denominator of every
-            // later efficacy measurement, and a fire that failed is still a
-            // fire; leaving it out makes a broken payload path read as a quiet
-            // one.
+            // Failed fires belong in the denominator of efficacy measurements.
             if let Some(session) = session {
                 let ledger = crate::brief_gate::ledger_dir(&crate::daemon::default_runtime_dir());
                 crate::brief_gate::log_fire(
@@ -775,21 +752,22 @@ pub(crate) fn cmd_brief(file: &str, json: bool, session: Option<&str>) -> Result
         }
     };
 
+    let overlap = codesage_graph::branch_overlap::branch_overlap(
+        &root,
+        &[rel.to_string()],
+        std::time::Duration::from_millis(100),
+    );
+    brief.empty &= overlap.branches.is_empty();
+    brief.branch_overlap = Some(overlap);
+
     let rendered = render_brief(&brief);
 
     if let Some(session) = session {
-        // `--session` declares this a served fire rather than an operator query,
-        // so the repeat gate applies to BOTH output formats and a suppressed
-        // fire prints nothing at all — including under --json, which otherwise
-        // always prints. The gate hashes the rendered text in either mode, so
-        // switching format does not re-arm a payload already served.
+        // Session gating applies to both formats; hash rendered text so format changes
+        // cannot re-arm an already served payload.
         let dir = crate::daemon::default_runtime_dir();
         let decision = crate::brief_gate::evaluate(&dir, session, rel, &rendered);
-        // Logged before the early return, silent fires included: they are ~90%
-        // of all fires and leave no trace anywhere else, so a denominator not
-        // written here is unrecoverable afterwards. The ledger goes to the
-        // state dir rather than `dir` (which is only its HOME-less fallback):
-        // the runtime dir is tmpfs and a reboot must not erase the denominator.
+        // Log suppressed fires before returning; keep the ledger outside volatile runtime storage.
         let ledger = crate::brief_gate::ledger_dir(&dir);
         crate::brief_gate::log_fire(&ledger, session, &root, rel, decision, &rendered);
         if decision != crate::brief_gate::Decision::Served {
@@ -798,36 +776,30 @@ pub(crate) fn cmd_brief(file: &str, json: bool, session: Option<&str>) -> Result
     }
 
     if json {
-        // The JSON form always prints, empty or not: a machine caller asked for
-        // it explicitly and can branch on `empty` itself.
+        // Explicit JSON queries include empty results unless session gating suppresses them.
         if let Ok(s) = serde_json::to_string(&brief) {
             println!("{s}");
         }
         return Ok(());
     }
 
-    // Nothing worth an agent's context. Say nothing at all rather than "no
-    // findings", which costs the same tokens and reads as a result.
     print!("{rendered}");
     Ok(())
 }
 
-/// Why `brief` said nothing, for an operator running it by hand. Never on the
-/// agent-facing path: stdout stays the payload and nothing else.
+/// Optional diagnostics stay on stderr, separate from the agent payload.
 fn debug_brief(msg: &str) {
     if std::env::var_os("CODESAGE_BRIEF_DEBUG").is_some_and(|v| !v.is_empty()) {
         eprintln!("brief: {msg}");
     }
 }
 
-/// The served text form. Empty exactly when `brief.empty`, which the gate relies
-/// on: an empty payload is never a fire and must never charge the budget.
+/// Empty briefs must render empty: the gate charges only nonempty payloads.
 fn render_brief(brief: &codesage_protocol::EditBrief) -> String {
     let mut out = String::new();
     if let Some(p) = brief.churn_percentile.filter(|_| brief.hotspot) {
         out.push_str(&format!("hotspot: churn percentile {:.0}%", p * 100.0));
-        // A zero fix count is not evidence of anything, so it is left off
-        // rather than rendered as "0 of N commits were fixes".
+        // Zero recorded fixes do not establish safety.
         if let (Some(f), Some(c)) = (brief.fix_count, brief.commits)
             && f > 0
         {
@@ -840,6 +812,22 @@ fn render_brief(brief: &codesage_protocol::EditBrief) -> String {
     }
     if !brief.coupled.is_empty() {
         out.push_str(&format!("changes with: {}\n", brief.coupled.join(", ")));
+    }
+    if let Some(overlap) = &brief.branch_overlap
+        && !overlap.branches.is_empty()
+    {
+        for branch in &overlap.branches {
+            out.push_str(&format!(
+                "branch overlap: {:?} edits {} (same-file, HEAD...branch; merge base {})\n",
+                branch.branch,
+                codesage_graph::branch_overlap::quoted_paths(&branch.files),
+                branch.merge_base
+            ));
+        }
+        out.push_str(&format!(
+            "{}\n",
+            codesage_graph::branch_overlap::branch_overlap_summary(overlap)
+        ));
     }
     out
 }
@@ -858,8 +846,6 @@ mod tests {
 
     #[test]
     fn export_json_flag_is_exact_alias_for_format_json() {
-        // `--json` must behave identically to `--format json`: same resolved
-        // format string, so the same match arm runs in cmd_export.
         assert_eq!(export_format("md", true), export_format("json", false));
         assert_eq!(export_format("md", false), "md");
         assert_eq!(export_format("ingest", false), "ingest");
@@ -867,9 +853,6 @@ mod tests {
 
     #[test]
     fn search_rejects_unknown_language_instead_of_unfiltering() {
-        // Parity with `cmd_features_list` and the MCP `search` param: an
-        // unknown language must error, never silently drop the filter and
-        // return unfiltered results the caller believes are filtered.
         let err = parse_search_language(Some("cobol"))
             .unwrap_err()
             .to_string();
@@ -883,9 +866,6 @@ mod tests {
 
     #[test]
     fn similar_threshold_normalizes_to_contract_range() {
-        // Finite out-of-range values clamp to [0, 1] (reported as the
-        // applied value by both CLI and MCP); non-finite values fall back
-        // to the default instead of silently zeroing the results.
         assert_eq!(normalize_min_jaccard(0.7), 0.7);
         assert_eq!(normalize_min_jaccard(1.5), 1.0);
         assert_eq!(normalize_min_jaccard(-0.2), 0.0);

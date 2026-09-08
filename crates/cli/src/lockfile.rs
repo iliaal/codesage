@@ -1,22 +1,5 @@
-//! Advisory lockfile coordination for CodeSage indexing commands.
-//!
-//! Two `codesage index` / `git-index` / `cleanup` processes running against
-//! the same `.codesage/index.db` used to collide at the SQLite layer —
-//! WAL mode + `ON DELETE CASCADE` prevents corruption (verified by
-//! `bench/concurrency-audit.py`, recommendations doc §2.4), but the
-//! losing process exits with a scary-looking `Error: database is locked`.
-//! That matters most for `install-hooks`-registered background hooks
-//! that fire on every commit / merge / checkout and often overlap a
-//! manual indexing run.
-//!
-//! Fix: a per-project advisory lockfile at `.codesage/indexing.lock`,
-//! acquired non-blocking on entry to any writer-style command. If
-//! another process already holds it, the second instance exits 0
-//! quietly rather than waiting or erroring. The lock is released when
-//! the `IndexLock` value is dropped (file-handle close).
-//!
-//! Uses the stdlib `File::try_lock` API (stable since Rust 1.89) so no
-//! new crate is pulled in.
+//! Coordinate index writers with a non-blocking advisory lock at `.codesage/indexing.lock`.
+//! Contending commands exit 75 (EX_TEMPFAIL); hook callers may wait to avoid missing history updates.
 
 use std::fs::{File, OpenOptions};
 use std::path::Path;
@@ -24,8 +7,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-/// How often [`acquire_with_wait`] re-polls a held lock. Watcher passes
-/// release within seconds, so sub-second polling just burns wakeups.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Outcome of a non-blocking lock acquisition attempt.
@@ -37,51 +18,28 @@ pub enum LockOutcome {
     AlreadyHeld,
 }
 
-/// Handle to an acquired indexing lock. Releases on drop (file close).
-/// Holding an `IndexLock` gives the caller exclusive rights to mutate
-/// `.codesage/index.db` for the lifetime of the handle; other writers
-/// will see `AlreadyHeld`.
+/// Hold through the write; file close releases the advisory lock.
 #[must_use = "dropping an IndexLock releases the project write lock; keep \
               it alive until the write completes"]
 pub struct IndexLock {
     _file: File,
 }
 
-/// Attempt to acquire the indexing lock on `<project_root>/.codesage/indexing.lock`
-/// without blocking. Creates the file if it doesn't exist; the file's
-/// contents are irrelevant — the lock is the OS-level advisory flock on
-/// the open handle.
-///
-/// Returns:
-/// - `Ok(LockOutcome::Acquired(lock))` — exclusive lock held; caller
-///   owns the write window and must keep `lock` alive while writing.
-/// - `Ok(LockOutcome::AlreadyHeld)` — another process holds it; caller
-///   should exit 0 with a skip message.
-/// - `Err(...)` — unexpected IO error (permissions, disk full, etc.);
-///   not the "contention" case.
+/// Try the per-project advisory lock without waiting. File contents are irrelevant.
+/// `AlreadyHeld` distinguishes contention from I/O errors.
 pub fn try_acquire(project_root: &Path) -> Result<LockOutcome> {
     let codesage_dir = project_root.join(".codesage");
     if !codesage_dir.is_dir() {
-        // No `.codesage/` — caller is running in a non-onboarded
-        // project; let the command below produce its own clearer
-        // error rather than manufacturing a generic one here.
+        // Let the command report a missing index instead of an unrelated lockfile error.
         return Ok(LockOutcome::Acquired(IndexLock {
             _file: empty_file_handle()?,
         }));
     }
     let path = codesage_dir.join("indexing.lock");
-    // A cloned repo ships its own `.codesage/`, so `indexing.lock` can be a
-    // planted symlink; without O_NOFOLLOW this create would materialize a file
-    // at the link's target, before any project config is even loaded.
+    // Repository-controlled lock paths may be planted symlinks.
     let file = crate::fsguard::open_lockfile(&path)
         .with_context(|| format!("opening lockfile {}", path.display()))?;
-    // `File::try_lock` returns `Ok(())` on success and
-    // `Err(TryLockError::WouldBlock)` on contention. Any other error
-    // is a real IO failure we want to surface.
-    //
-    // On Android (Rust ≤1.95), the stdlib `try_lock` returns
-    // `Unsupported` due to a missing `cfg` — bypass with direct
-    // `libc::flock` FFI. Remove when the toolchain catches up.
+    // Android stdlib try_lock lacks the required cfg through Rust 1.95; use flock directly.
     #[cfg(target_os = "android")]
     {
         match crate::flock_override::try_flock_exclusive(&file) {
@@ -102,14 +60,8 @@ pub fn try_acquire(project_root: &Path) -> Result<LockOutcome> {
     }
 }
 
-/// Like [`try_acquire`], but polls a held lock for up to `wait` before
-/// reporting `AlreadyHeld`. `Duration::ZERO` degenerates to a single
-/// non-blocking attempt (identical to `try_acquire`). Exists for
-/// hook-invoked indexing: the daemon's filesystem watcher debounce-indexes
-/// right around commit time, and a silent skip there would leave
-/// hook-only passes (feature mapping, git history) stale until the next
-/// commit. Watcher passes release within seconds, so a bounded wait
-/// converts the silent skip into eventual success.
+/// Wait for watcher contention so commit hooks can refresh history and feature maps.
+/// Zero wait is a single non-blocking attempt.
 pub fn acquire_with_wait(project_root: &Path, wait: Duration) -> Result<LockOutcome> {
     let deadline = Instant::now() + wait;
     loop {
@@ -126,14 +78,8 @@ pub fn acquire_with_wait(project_root: &Path, wait: Duration) -> Result<LockOutc
     }
 }
 
-/// Returns an open file handle on `/dev/null`-equivalent that holds a
-/// permissive lock for the non-onboarded-dir branch. Kept tiny so the
-/// `Acquired` variant remains a value we can construct even when
-/// lockfile bookkeeping is skipped.
+/// Inert handle for non-onboarded projects; no lock is acquired.
 fn empty_file_handle() -> Result<File> {
-    // std tempfile::NamedTempFile would work but we don't want the
-    // extra crate; a bare anonymous pipe / dev-null file handle is
-    // enough because we don't call try_lock on it again.
     OpenOptions::new()
         .read(true)
         .open(if cfg!(unix) { "/dev/null" } else { "NUL" })
@@ -148,9 +94,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn acquire_refuses_a_symlinked_lockfile() {
-        // A cloned repo can ship `.codesage/indexing.lock` as a dangling
-        // symlink; following it would create a file at an arbitrary path
-        // before any project config is loaded.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join(".codesage")).unwrap();
@@ -178,10 +121,7 @@ mod tests {
                  stdlib flock semantics were supposed to prevent this"
             ),
         }
-        // Releasing the first lock lets the next attempt succeed. Poll with
-        // a bound instead of asserting immediately: a concurrent test's fork
-        // duplicates the lock fd until exec, briefly extending the flock
-        // past our drop.
+        // Concurrent test forks may retain the lock fd until exec, briefly outliving our drop.
         drop(first);
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -197,10 +137,6 @@ mod tests {
 
     #[test]
     fn try_acquire_on_non_onboarded_project_succeeds_noop() {
-        // No `.codesage/` in the tmpdir. The command path would then
-        // fail with a clearer error about the missing index DB; this
-        // test just confirms we don't manufacture a spurious lock
-        // error when the project isn't onboarded.
         let tmp = tempfile::tempdir().unwrap();
         match try_acquire(tmp.path()).unwrap() {
             LockOutcome::Acquired(_) => { /* expected */ }
@@ -210,8 +146,6 @@ mod tests {
 
     #[test]
     fn acquire_with_wait_zero_matches_try_acquire() {
-        // `Duration::ZERO` must be exactly the non-blocking behavior:
-        // one attempt, immediate AlreadyHeld, no polling delay.
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".codesage")).unwrap();
         let _first = match try_acquire(tmp.path()).unwrap() {
@@ -277,9 +211,6 @@ mod tests {
 
     #[test]
     fn sleep_to_ensure_lock_ordering_is_deterministic() {
-        // Regression guard: try_lock must be non-blocking. If the stdlib
-        // API ever shifts semantics, this sleep would expose the drift by
-        // making the second call wait.
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".codesage")).unwrap();
         let first = match try_acquire(tmp.path()).unwrap() {

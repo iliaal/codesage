@@ -4,10 +4,7 @@ use std::path::Path;
 
 use tracing_subscriber::EnvFilter;
 
-/// Initialize the global `tracing` subscriber for the CLI. Writes to **stderr**
-/// (stdout is reserved for MCP stdio transport and the CLI's structured JSON
-/// output). Honors `RUST_LOG`; falls back to `info`. Uses `try_init` so repeated
-/// initialization (tests, nested binaries) is a no-op rather than a panic.
+/// Keep tracing on stderr; stdout carries MCP and JSON. Repeated initialization is harmless.
 pub(crate) fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
@@ -17,14 +14,9 @@ pub(crate) fn init_tracing() {
         .try_init();
 }
 
-/// Canonical git-common-dir resolution lives in the graph crate beside the
-/// drift instrumentation; re-exported here so CLI modules keep one import path.
 pub(crate) use codesage_graph::drift::git_common_dir;
 
-/// True when `a` and `b` resolve to the same filesystem location. Tries
-/// `canonicalize` first (which follows symlinks and normalizes `..`); if
-/// either path can't be canonicalized — typically because it doesn't exist
-/// yet — falls back to lexical equality.
+/// Compare canonical paths, falling back to lexical equality if either cannot resolve.
 pub(crate) fn paths_resolve_same(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(x), Ok(y)) => x == y,
@@ -32,8 +24,6 @@ pub(crate) fn paths_resolve_same(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Format a byte count using binary (GiB/MiB/KiB) units. Consistent on both
-/// the CLI reports and doctor output.
 pub(crate) fn format_bytes(n: u64) -> String {
     if n >= 1 << 30 {
         format!("{:.2} GiB", n as f64 / (1u64 << 30) as f64)

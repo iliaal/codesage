@@ -100,10 +100,7 @@ fn check_binary() -> Check {
     }
 }
 
-/// Force-compile every embedded tree-sitter query against its grammar. A
-/// grammar version bump that renames a node type or field otherwise surfaces as
-/// a panic on the first file of the affected language indexed; surfacing it here
-/// makes a mismatched build visible before any indexing runs.
+/// Detect grammar/query mismatches before indexing would panic.
 fn check_queries() -> Check {
     match codesage_parser::validate::validate_all_queries() {
         Ok(()) => Check {
@@ -160,8 +157,7 @@ fn check_db(root: &Path) -> Check {
             message: format!("missing {} (run `codesage index`)", db_path.display()),
         };
     }
-    // Read-only: doctor must never chmod, migrate, or WAL-touch an index it
-    // only inspects (read-only checkouts fail those writes outright).
+    // Inspection must also work on read-only checkouts without chmod or migrations.
     match Database::open_read_only(&db_path) {
         Ok(db) => {
             let f = db.file_count().unwrap_or(0);
@@ -183,10 +179,7 @@ fn check_db(root: &Path) -> Check {
 
 fn check_disk(root: &Path) -> Check {
     let db_path = root.join(PROJECT_DIR).join(DB_FILE);
-    // lstat the leaf AND the `.codesage` parent: lstat on the full path still
-    // resolves every earlier component, so a symlinked project dir would
-    // otherwise report an outside file's size and pass a disk check that the
-    // database check rejects.
+    // lstat protects only the leaf; reject a symlinked .codesage parent separately.
     let size = crate::fsguard::reject_symlinked_project_dir(&db_path)
         .ok()
         .and_then(|()| std::fs::symlink_metadata(&db_path).ok())
@@ -293,9 +286,7 @@ fn check_models(project: Option<&Path>) -> Check {
             )
         });
 
-    // A model name that isn't on the load-path allowlist errors at first load
-    // instead of downloading (see crates/embed/src/model.rs), so the cache
-    // "will download on first use" advice below would be wrong for it.
+    // Disallowed models fail before download, so cache-miss advice would be misleading.
     let allow_any = codesage_embed::model::allow_any_model_from_env();
     let mut disallowed = Vec::new();
     if codesage_embed::model::validate_model_allowed(&embed_model, allow_any).is_err() {
@@ -387,9 +378,7 @@ fn check_hooks(root: &Path) -> Check {
     let mut foreign = Vec::new();
     let mut missing = Vec::new();
     let mut dead_binaries: Vec<String> = Vec::new();
-    // Hooks that carry the marker but no recognizable invocation line: the
-    // binary check below cannot vouch for them, and silently passing them
-    // would bless a hook that may invoke a moved binary.
+    // A marker alone cannot identify the binary the hook invokes.
     let mut unparseable: Vec<&str> = Vec::new();
     for name in REQUIRED_HOOKS {
         let p = hooks_dir.join(name);
@@ -407,17 +396,13 @@ fn check_hooks(root: &Path) -> Check {
                     _ => {}
                 }
             }
-            // The slot is occupied by someone else's hook. `install-hooks`
-            // refuses to clobber it, so this is not "missing" — the fix is
-            // chaining, not re-running the installer.
+            // Foreign hooks require chaining; reinstalling will not overwrite them.
             Ok(_) => foreign.push(*name),
             Err(_) => missing.push(*name),
         }
     }
 
-    // Husky 9 generates `.husky/_` on package-manager install; until then git
-    // has a `core.hooksPath` pointing at nothing and runs no hooks, ours
-    // included. Installed-but-inert is worth its own warning.
+    // Git runs no Husky hooks until package installation generates .husky/_.
     if let Some(runtime_dir) = husky_runtime_missing
         && !installed.is_empty()
     {
@@ -434,9 +419,6 @@ fn check_hooks(root: &Path) -> Check {
         };
     }
 
-    // A hook whose baked-in binary path no longer resolves runs and fails
-    // silently on every commit — worse than a missing hook, which at least
-    // shows up as "missing" above. Surface it as its own warning.
     if !dead_binaries.is_empty() {
         return Check {
             name: "hooks",
@@ -448,10 +430,6 @@ fn check_hooks(root: &Path) -> Check {
         };
     }
 
-    // A hook that carries the marker but no parseable invocation line cannot
-    // have its binary vouched for — hand-editing may have broken the command
-    // the hook runs. Warn rather than pass: the hook looks installed but
-    // doctor cannot confirm what it invokes.
     if !unparseable.is_empty() {
         return Check {
             name: "hooks",
@@ -475,9 +453,6 @@ fn check_hooks(root: &Path) -> Check {
             ),
         }
     } else if !foreign.is_empty() {
-        // Distinct from "missing": the slot exists but belongs to another
-        // tool, so `codesage install-hooks` will (correctly) refuse to
-        // overwrite it and re-running the installer changes nothing.
         let mut parts = Vec::new();
         if !installed.is_empty() {
             parts.push(format!("installed=[{}]", installed.join(",")));
@@ -521,11 +496,7 @@ fn check_hooks(root: &Path) -> Check {
     }
 }
 
-/// Extract the codesage binary path baked into an installed hook body: the
-/// shell-single-quoted token preceding ` index --lock-wait` on the invocation
-/// line (see `generate_post_commit_hook_body`). Returns `None` for bodies
-/// that carry the marker but no recognizable invocation, in which case the
-/// binary check is skipped rather than guessed.
+/// Parse the installer's quoted binary token; unrecognized hook bodies yield None.
 fn hook_embedded_binary(body: &str) -> Option<String> {
     for line in body.lines() {
         let Some(idx) = line.find(" index --lock-wait") else {
@@ -540,8 +511,7 @@ fn hook_embedded_binary(body: &str) -> Option<String> {
         if !(token.len() >= 2 && token.starts_with('\'') && token.ends_with('\'')) {
             return None;
         }
-        // Reverse of `shell_single_quote`: strip the outer quotes, then
-        // collapse the '"'"' escape back to a literal single quote.
+        // Reverse shell_single_quote's embedded-quote escape.
         let inner = &token[1..token.len() - 1];
         return Some(inner.replace("'\"'\"'", "'"));
     }
@@ -566,11 +536,6 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-/// Drift telemetry: compares the HEAD SHA stamped at the last successful
-/// `codesage index` against the current `git rev-parse HEAD`. Warning
-/// classification (Pass/Warn/Skip) matches what the drift module classifies —
-/// we surface it here so `codesage doctor` is a single stop for "is my index
-/// trustworthy right now?".
 fn check_index_drift(root: &Path) -> Check {
     let db_path = root.join(PROJECT_DIR).join(DB_FILE);
     if !db_path.exists() {
@@ -580,8 +545,7 @@ fn check_index_drift(root: &Path) -> Check {
             message: "no index.db yet (run `codesage index`)".to_string(),
         };
     }
-    // No migrations: a pure read must keep working when the database was
-    // migrated by a newer binary (see `open_existing_read`).
+    // A newer binary may have migrated the DB; inspection must not attempt migrations.
     let db = match Database::open_existing_read(&db_path) {
         Ok(db) => db,
         Err(e) => {
@@ -606,10 +570,7 @@ fn check_index_drift(root: &Path) -> Check {
     }
 }
 
-/// Map [`Database::require_semantic_fingerprint`] to a doctor [`Check`]:
-/// `Some(Fail)` naming `index --full` when the table's vectors were attested
-/// under another setup, `None` when they match `expected` (or the table holds
-/// no vectors yet, in which case there is nothing to vouch for).
+/// Report fingerprint mismatch; empty tables have no vectors to attest.
 fn fingerprint_gate(db: &Database, expected: &str) -> Option<Check> {
     match db.require_semantic_fingerprint(expected) {
         Ok(()) => None,
@@ -660,12 +621,8 @@ fn check_semantic_freshness(root: &Path) -> Check {
             message: format!("no semantic chunks for model {model}; run `codesage index`"),
         };
     }
-    // Deny-by-default fingerprint gate: vectors attested under another setup
-    // (same model name and dimension, different pooling/device/model bytes)
-    // Fail naming the rebuild instead of reading as fresh-or-stale. The
-    // expected fingerprint resolves from the recorded dim, so doctor never
-    // loads a model; uncached artifacts skip the gate (`models` already
-    // warns those as MISSING).
+    // Check cached model identity without loading/downloading a model.
+    // Unavailable artifacts skip this gate; the models check reports cache misses.
     if let Ok(Some(dim)) = db.recorded_semantic_dim()
         && let Ok(Some(expected)) = codesage_graph::resolve_semantic_fingerprint(
             &db,
@@ -742,10 +699,8 @@ fn check_mcp() -> Check {
 
 use crate::util::git_common_dir;
 
-/// Mirror hf-hub's `Cache::from_env` resolution (the path the embedder actually
-/// reads from): `$HF_HOME/hub`, else `~/.cache/huggingface/hub`. Deliberately
-/// does not honor `HUGGINGFACE_HUB_CACHE` — hf-hub 0.5.0 ignores it, so keying
-/// cache verdicts off it would test a directory the download never touches.
+/// Match hf-hub 0.5.0 Cache::from_env: HF_HOME/hub or ~/.cache/huggingface/hub.
+/// HUGGINGFACE_HUB_CACHE is ignored by the loader and must not affect this verdict.
 fn hf_cache_dir() -> PathBuf {
     if let Ok(p) = std::env::var("HF_HOME") {
         return PathBuf::from(p).join("hub");
@@ -780,9 +735,6 @@ mod tests {
 
     #[test]
     fn check_hooks_warns_when_husky_runtime_dir_is_missing_then_passes_once_generated() {
-        // husky 9 writes the RELATIVE `.husky/_` and generates the dir only on
-        // a package-manager install; the classification must see the layout
-        // through the relative path before the dir exists.
         let dir = init_git_repo();
         let status = std::process::Command::new("git")
             .args(["config", "core.hooksPath", ".husky/_"])
@@ -809,9 +761,7 @@ mod tests {
     }
 
     fn write_codesage_hook(root: &Path, name: &str) {
-        // A real installer body (not marker-only): a marker with no
-        // parseable invocation now warns as unparseable, so tests that
-        // expect pass/missing must install the genuine template.
+        // Marker-only fixtures trigger the unparseable-binary warning.
         let hooks = root.join(".git").join("hooks");
         std::fs::create_dir_all(&hooks).unwrap();
         let body = crate::commands::hooks::generate_post_commit_hook_body("/bin/sh");
@@ -867,9 +817,6 @@ mod tests {
 
     #[test]
     fn check_hooks_distinguishes_foreign_hook_from_missing() {
-        // A slot held by someone else's hook is not "missing": install-hooks
-        // refuses to clobber it, so re-running the installer fixes nothing.
-        // Doctor must name it as foreign with the chaining remediation.
         let dir = init_git_repo();
         write_hook_body(
             dir.path(),
@@ -954,8 +901,6 @@ mod tests {
 
     #[test]
     fn check_hooks_passes_when_embedded_binary_is_executable() {
-        // Uses the real hook template so this doubles as a contract test
-        // between generate_post_commit_hook_body and hook_embedded_binary.
         let dir = init_git_repo();
         let body = crate::commands::hooks::generate_post_commit_hook_body("/bin/sh");
         for hook in REQUIRED_HOOKS {
@@ -969,9 +914,6 @@ mod tests {
 
     #[test]
     fn check_hooks_warns_when_installed_hook_has_no_parseable_binary() {
-        // Marker-only bodies look installed but doctor cannot vouch for the
-        // binary they invoke (a hand-edit may have broken the command), so
-        // they warn instead of passing.
         let dir = init_git_repo();
         for hook in REQUIRED_HOOKS {
             write_hook_body(
@@ -1003,7 +945,6 @@ mod tests {
             hook_embedded_binary(&body).as_deref(),
             Some("/tmp/a'b/codesage")
         );
-        // Marker-only bodies (e.g. hand-written hooks) yield no path.
         assert_eq!(
             hook_embedded_binary("#!/bin/sh\n# installed by codesage install-hooks\n"),
             None
@@ -1015,9 +956,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.db");
         let db = Database::open_for_model(&path, "fp/model", 4).unwrap();
-        // An empty table holds no vectors, so there is nothing to vouch for.
         assert!(fingerprint_gate(&db, "fp-b").is_none());
-        // Attest one vector row under fp-a, then require fp-b.
         db.insert_chunks(
             "a.rs",
             "rust",
@@ -1038,9 +977,7 @@ mod tests {
 
     #[test]
     fn check_models_fails_on_non_allowlisted_model() {
-        // The load path errors on a non-allowlisted model rather than
-        // downloading it, so doctor must surface that instead of "will
-        // download". Skip when the env override that neuters the gate is set.
+        // Skip when the operator has disabled model allowlist enforcement.
         if codesage_embed::model::allow_any_model_from_env() {
             return;
         }

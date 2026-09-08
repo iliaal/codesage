@@ -1,8 +1,4 @@
-//! Feature record CRUD: `features` + `feature_files` + `feature_trust_boundaries`.
-//!
-//! Methods are kept thin and direct — the mapper crate composes them into a
-//! single `replace_all_features` transaction. No domain logic here; this
-//! module is just SQL plus enum<->string conversions.
+//! Feature records, file membership, and trust boundaries.
 
 use std::collections::HashMap;
 
@@ -57,9 +53,6 @@ impl Database {
     /// mapping pass.
     pub fn upsert_feature(&self, feature: &FeatureRecord) -> Result<()> {
         self.conn.execute_batch("SAVEPOINT upsert_feature")?;
-        // prepare_cached throughout: five constant statements, run once per
-        // feature in a mapping pass (thousands of features on seed-dense
-        // repos). Same rationale as the structural index-loop inserts.
         let result = (|| -> Result<()> {
             let tags_json =
                 serde_json::to_string(&feature.tags).unwrap_or_else(|_| "[]".to_string());
@@ -152,7 +145,6 @@ impl Database {
             let n = self.conn.execute("DELETE FROM features", [])?;
             return Ok(n);
         }
-        // SQLite doesn't support direct `IN (rust slice)`; build a temp table.
         self.conn.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS _keep_features (feature_id TEXT PRIMARY KEY);",
         )?;
@@ -173,7 +165,6 @@ impl Database {
         Ok(n)
     }
 
-    /// Count features in the DB. Cheap, single query.
     pub fn feature_count(&self) -> Result<usize> {
         let n: i64 = self
             .conn
@@ -181,9 +172,6 @@ impl Database {
         Ok(n as usize)
     }
 
-    /// Cheap existence probe for a feature id. `load_feature` hydrates the
-    /// head row plus files and boundaries; the mapping pass only needs the
-    /// bool, once per feature, so the statement is cached.
     pub fn feature_exists(&self, feature_id: &str) -> Result<bool> {
         let mut stmt = self
             .conn
@@ -242,11 +230,7 @@ impl Database {
             binds.push(Box::new(l.as_str().to_string()));
         }
         if let Some(t) = tag {
-            // True substring match against the JSON-encoded tags column.
-            // Previously bound `%"{tag}"%`, which only matched the whole
-            // tag string (with quote anchors) — `tag="framework"` would
-            // miss `framework:react-router` even though the doc above
-            // promises "tag substring" semantics.
+            // Match tag substrings, not quote-delimited whole tags.
             sql.push_str(" AND tags LIKE ? ESCAPE '\\'");
             binds.push(Box::new(format!("%{}%", escape_like_pattern(t))));
         }

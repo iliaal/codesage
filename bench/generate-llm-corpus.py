@@ -30,8 +30,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Skip these — already excluded from the structural index, also useless as
-# query targets (the model has no signal in them).
 SKIP_DIR_PATTERNS = re.compile(
     r"(^|/)("
     r"node_modules|vendor|target|build|dist|out|"
@@ -119,9 +117,7 @@ def candidate_files(project_root: Path) -> list[Path]:
             if line_count < MIN_LINES or line_count > MAX_LINES:
                 continue
             out.append(path)
-    # Sort for determinism: os.walk() yields entries in filesystem order, which
-    # varies across machines/filesystems/checkouts. The seeded shuffle below
-    # only reproduces the same sample if its input order is stable.
+    # A seeded shuffle is reproducible only with stable input ordering.
     out.sort()
     return out
 
@@ -171,12 +167,7 @@ def validate_query_text(query: str | None, rel_path: str, content: str) -> str |
 
 
 def positive_int(value: str) -> int:
-    """argparse type: require a positive integer.
-
-    A negative `--num-cases` would be used as a slice bound (`candidates[:n]`),
-    silently selecting all-but-the-last-|n| candidates and firing hundreds of
-    paid `codex` calls.
-    """
+    """Reject negative slice bounds that could trigger an unexpectedly large paid run."""
     n = int(value)
     if n < 1:
         raise argparse.ArgumentTypeError("must be a positive integer")
@@ -207,13 +198,7 @@ File: {rel_path}
 
 
 def yaml_sq(s: str) -> str:
-    """Single-quoted YAML scalar: strip C0 control chars, then wrap in `'...'`
-    doubling embedded quotes. A single-quoted YAML scalar treats every character
-    literally except `'`, so this is safe for arbitrary one-line text (colons,
-    `#`, leading specials). Control chars (a newline in a POSIX filename, an ANSI
-    escape) are stripped because YAML rejects raw control characters even inside
-    quotes.
-    """
+    """Quote one-line YAML text; raw control characters remain illegal inside quotes."""
     cleaned = CONTROL_CHARS.sub("", str(s))
     return "'" + cleaned.replace("'", "''") + "'"
 
@@ -292,7 +277,7 @@ def generate_query(file_path: Path, project_root: Path) -> str | None:
     except OSError:
         return None
 
-    # Truncate giant files defensively even though we already line-filter.
+    # The line-count filter does not bound bytes.
     if len(content) > 20_000:
         content = content[:20_000] + "\n... (truncated)\n"
 
@@ -338,10 +323,7 @@ def generate_query(file_path: Path, project_root: Path) -> str | None:
             )
             query_text = parse_codex_query_output(proc.stdout, last_message)
     except subprocess.TimeoutExpired:
-        # A single hung codex call used to bubble out of the per-file
-        # loop and discard every case produced so far (real-money API
-        # calls). Match the rc!=0 path: log, skip, let the loop keep
-        # writing the YAML at the end. fnd_fe9e8a5a.
+        # Preserve already-paid results when one query times out.
         print("  ! codex exec timed out, skipping", file=sys.stderr)
         return None
     except FileNotFoundError:
@@ -355,12 +337,7 @@ def generate_query(file_path: Path, project_root: Path) -> str | None:
 
 
 def format_corpus_yaml(project_root: str, cases: list[dict]) -> str:
-    """Hand-roll the corpus YAML (avoids a pyyaml dependency for generation; the
-    bench runner needs it but lighter environments shouldn't). Every
-    interpolated value — project_root, id, query, and each expected_files path —
-    is quoted via `yaml_sq` so a `: `, `#`, leading special, or control char in
-    any of them can't corrupt or inject structure into the document.
-    """
+    """Emit quoted scalars without requiring PyYAML in generation environments."""
     out_lines: list[str] = [f"project_root: {yaml_path(project_root)}", "cases:"]
     for case in cases:
         out_lines.append(f"  - id: {yaml_sq(case['id'])}")

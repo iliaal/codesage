@@ -89,9 +89,6 @@ if [ "$regex_status" -gt 1 ]; then
 	exit 2
 fi
 
-# Resolve the content ref per mode and validate the range. `content_ref` is
-# empty in staged mode (blob lives at ":FILE"), the range endpoint in range
-# mode, and HEAD in all mode.
 case "$mode" in
 staged)
 	content_ref="" # ":FILE" syntax for staged content
@@ -109,10 +106,7 @@ all)
 	;;
 esac
 
-# Emit the NUL-delimited file list for the active mode. core.quotepath=false +
-# -z keeps non-ASCII paths verbatim; the default C-quoting would rename them
-# (e.g. "p\303\242th.txt") so the later `git show ":$file"` would miss and the
-# file would be scanned as empty — a silent secret-scan bypass.
+# Preserve raw filenames so `git show` reads the intended blobs.
 list_files() {
 	case "$mode" in
 	staged)
@@ -127,10 +121,6 @@ list_files() {
 	esac
 }
 
-# Materialize one file's blob into $content_file. In `staged` mode the blob is
-# at `:FILE`; otherwise it's at `$content_ref:FILE`. Returns git show's exit
-# status so the caller can fail loudly rather than treat an unreadable blob as
-# empty.
 read_content() {
 	local file="$1"
 	if [ "$mode" = "staged" ]; then
@@ -171,8 +161,7 @@ while IFS= read -r -d '' file; do
 		continue
 	fi
 
-	# Fail loudly if the blob can't be read: silently skipping a listed file
-	# would let a secret through unscanned.
+	# Unreadable blobs must not bypass the scan.
 	set +e
 	read_content "$file"
 	show_status=$?

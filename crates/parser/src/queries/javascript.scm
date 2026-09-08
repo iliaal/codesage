@@ -33,9 +33,7 @@
 ; Pattern 9: exported var → Constant
 (export_statement declaration: (variable_declaration (variable_declarator name: (identifier) @name) @def))
 
-; Pattern 10: module.exports = ... (whole-exports assignment) → Constant.
-; Named "exports": the module's entry point. Appended (not inserted after
-; pattern 6) so every pattern index above keeps its kind-map meaning.
+; Pattern 10: module.exports = ... → Constant named "exports".
 (expression_statement
   (assignment_expression
     left: (member_expression

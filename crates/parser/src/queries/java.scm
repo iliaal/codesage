@@ -22,23 +22,15 @@
 (constructor_declaration
   name: (identifier) @name) @def
 
-; Pattern 6: class / interface field -> Constant (no Field kind in protocol).
-; Multi-declarator fields (`String x, y, z;`) match this pattern once per
-; variable_declarator child — extract.rs's dedup key includes the @name node
-; so all three declarators emit as separate symbols rather than collapsing
-; to the first.
+; Pattern 6: field → Constant (no Field kind); each declarator has a distinct @name.
 (field_declaration
   declarator: (variable_declarator
     name: (identifier) @name)) @def
 
-; Pattern 7: @interface MyAnnotation -> Interface (annotation type definition).
-;   The body's `String value() default "x"` elements are method-shape and
-;   match pattern 4 (method_declaration) under the annotation_type_body, so
-;   they surface as Method symbols.
+; Pattern 7: @interface → Interface; annotation elements have no capture pattern.
 (annotation_type_declaration
   name: (identifier) @name) @def
 
-; Pattern 8: enum constant (enum E { A, B }) -> Constant.
-; Parity with PHP enum_case, which already surfaces as Constant.
+; Pattern 8: enum constant → Constant.
 (enum_constant
   name: (identifier) @name) @def

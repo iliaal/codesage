@@ -18,12 +18,7 @@ pub(crate) fn cmd_git_index(
     lock_wait: Duration,
 ) -> Result<()> {
     let root = find_project_root()?;
-    // Same lock as `codesage index`: if a structural index is in flight,
-    // the git-history pass would race it and hit SQLITE_BUSY. Skipping
-    // here lets the hook-driven scheduler converge on a single indexer
-    // at a time without the user seeing an error. `--lock-wait` bounds
-    // a polling wait first — the watcher never refreshes git history, so
-    // a hook-invoked skip would leave it stale until the next commit.
+    // Serialize with structural writers; wait because the watcher never refreshes git history.
     let _lock = acquire_index_lock(&root, "skipping", lock_wait)?;
     let db = open_db(&root)?;
     let config = load_project_config(&root)?;
@@ -47,8 +42,7 @@ pub(crate) fn cmd_git_index(
     Ok(())
 }
 
-/// Row suffix for the `coupling` and `risk` tables: an unbaselined row is not
-/// a measured one-off, so it gets its own marker.
+/// Unknown spans are not measured one-offs.
 fn span_marker(span_known: bool, recurring: bool) -> &'static str {
     if !span_known {
         "  (span unknown)"
@@ -166,9 +160,7 @@ pub(crate) fn cmd_risk(file: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Resolve a file-list argument: positional args if non-empty, else newline-separated
-/// from stdin. Used by `risk-diff` and `tests-for` so they compose with `git diff
-/// --name-only` and similar pipelines.
+/// Use positional paths, falling back to newline-separated stdin.
 fn resolve_file_list(files: Vec<String>) -> Result<Vec<String>> {
     if !files.is_empty() {
         return Ok(files);
@@ -332,9 +324,7 @@ pub(crate) fn cmd_tests_for(files: Vec<String>, json: bool) -> Result<()> {
                 codesage_graph::abbreviate_paths(&recs.unsupported_files)
             );
         }
-        // With no indexed test files there was nothing to search (the index
-        // holds no tests, or every input was ignored); the notes say which,
-        // and an absence verdict would claim a search that never ran.
+        // Without indexed tests, an absence verdict would imply a search that never ran.
         if recs.primary.is_empty() && recs.coupled.is_empty() && recs.reachable.is_empty() {
             if recs.reach_walk_capped {
                 println!("No test files resolved within the walked portion.");
@@ -351,10 +341,7 @@ pub(crate) fn cmd_tests_for(files: Vec<String>, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the patch file list for `rehearse`: explicit args, else piped stdin,
-/// else the working-tree changes vs HEAD. Lets the command run both in a
-/// pipeline (`git diff --name-only | codesage rehearse`) and bare in a dirty
-/// working tree.
+/// Prefer explicit paths, then piped stdin, then tracked changes against HEAD.
 fn resolve_patch_files(root: &Path, files: Vec<String>) -> Result<Vec<String>> {
     if !files.is_empty() {
         return Ok(files);
@@ -366,8 +353,7 @@ fn resolve_patch_files(root: &Path, files: Vec<String>) -> Result<Vec<String>> {
     working_tree_changes(root)
 }
 
-/// Files changed in the working tree relative to HEAD (tracked modifications,
-/// staged or not). Empty on a clean tree or when git is unavailable.
+/// Tracked changes against HEAD; empty when git exits unsuccessfully.
 fn working_tree_changes(root: &Path) -> Result<Vec<String>> {
     let out = std::process::Command::new("git")
         .args(["diff", "--name-only", "HEAD"])
@@ -385,15 +371,19 @@ fn working_tree_changes(root: &Path) -> Result<Vec<String>> {
 }
 
 pub(crate) fn cmd_rehearse(files: Vec<String>, json: bool) -> Result<()> {
-    let root = find_project_root()?;
-    let db = open_db(&root)?;
+    let root = crate::evidence_root(&std::env::current_dir()?)?;
     let files = resolve_patch_files(&root, files)?;
     if files.is_empty() {
         bail!(
             "no changed files (pass paths as args, pipe via stdin, or make working-tree changes)"
         );
     }
-    let rehearsal = codesage_graph::build_review_rehearsal(&root, &db, &files)?;
+    let rehearsal = if crate::db_path(&root).try_exists()? {
+        let db = crate::open_db_read_only(&root)?;
+        codesage_graph::build_review_rehearsal(&root, &db, &files)?
+    } else {
+        codesage_graph::build_branch_only_rehearsal(&root, &files)
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&rehearsal)?);
         return Ok(());

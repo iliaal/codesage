@@ -13,9 +13,7 @@ pub fn find_symbol(db: &Database, req: &FindSymbolRequest) -> Result<Vec<Symbol>
     db.find_symbols(&req.name, req.kind)
 }
 
-/// References to a name plus what the row list alone cannot say: how many
-/// indexed definitions share the name (so an agent knows whether the rows are
-/// the union across homonyms) and that the count is a floor.
+/// Name-based references, with homonym counts and incomplete-count disclosure.
 pub fn find_references(
     db: &Database,
     req: &FindReferencesRequest,
@@ -25,13 +23,7 @@ pub fn find_references(
     let definition_count = definitions.len();
     let ambiguous = definition_count > 1;
     let note = if ambiguous {
-        // `impact_analysis` disambiguates by qualified name only, and a name
-        // counts as qualified only per `is_qualified_symbol_name` (see
-        // `impact::impact_analysis_walk`): a bare candidate offered here would
-        // route back through its ambiguity check and hard-fail. Languages
-        // without namespaces give every definition the bare name, so when
-        // fewer than two qualified candidates remain the only handle left is
-        // the file.
+        // Bare candidates cannot disambiguate impact_analysis; offer files instead.
         let qualified: Vec<&str> =
             distinct_sorted(definitions.iter().map(|s| s.qualified_name.as_str()))
                 .into_iter()
@@ -96,7 +88,6 @@ fn distinct_sorted<'a>(items: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
     out
 }
 
-/// Comma-joined prefix of `items`, with the overflow counted rather than listed.
 fn sample_list(items: &[&str], max: usize) -> String {
     let shown = items[..items.len().min(max)].join(", ");
     if items.len() > max {
@@ -108,17 +99,11 @@ fn sample_list(items: &[&str], max: usize) -> String {
 
 pub fn list_dependencies(db: &Database, file_path: &str) -> Result<DependencyEntry> {
     let mut out = list_dependencies_batch(db, &[file_path])?;
-    // Batch preserves input order, so the single requested file is the only row.
     Ok(out.pop().expect("batch returns one entry per input path"))
 }
 
-/// Batched [`list_dependencies`] over many files with a single project-wide
-/// import-ref sweep. The single-file wrapper delegates here, so there is one
-/// resolution code path; multi-file callers should prefer this directly —
-/// one sweep total instead of one per file.
+/// Resolve dependencies in input order, sharing one project-wide import query.
 pub fn list_dependencies_batch(db: &Database, file_paths: &[&str]) -> Result<Vec<DependencyEntry>> {
-    // One set-based query fetches every import ref project-wide, so the
-    // per-file sweep below is O(import refs), not a per-file N+1.
     let all_refs = db.import_include_refs_all()?;
     let mut out = Vec::with_capacity(file_paths.len());
     for file_path in file_paths {
@@ -131,14 +116,8 @@ pub fn list_dependencies_batch(db: &Database, file_paths: &[&str]) -> Result<Vec
     Ok(out)
 }
 
-/// Extend `entry.imported_by` with path/module-specifier importers the SQL
-/// half cannot join (see the call-site comment in [`list_dependencies`]).
+/// Resolve path imports that cannot join against symbol names in SQL.
 fn resolve_path_imported_by(entry: &mut DependencyEntry, all_refs: &[(String, String)]) {
-    // The SQL `imported_by` half joins refs to the symbols they name, so it
-    // only sees imports recorded as a symbol name. JS/TS/C imports recorded
-    // as a path (`./util.js`, `dir/foo.h`) and Rust `use crate::…` module
-    // paths never join; resolve those against the target with the same rules
-    // `impact_analysis` uses.
     let mut known: HashSet<String> = entry.imported_by.iter().cloned().collect();
     known.insert(entry.file_path.clone());
     for (from_path, to_name) in all_refs {
@@ -268,8 +247,6 @@ mod tests {
         );
         assert!(note.contains("find_symbol"), "{note}");
         assert!(note.contains("impact_analysis"), "{note}");
-        // Both carry the bare name as qualified name (JS `.d.ts` beside `.js`
-        // shape): "qualify it" is unsatisfiable, so the note must name files.
         assert!(note.contains("indistinguishable"), "{note}");
         assert!(note.contains("a.rs, b.rs"), "{note}");
         assert!(!note.contains("qualified name ("), "{note}");
@@ -307,9 +284,6 @@ mod tests {
         assert_eq!(out.definition_count, 2);
         assert!(out.ambiguous);
         let note = out.note.expect("ambiguous lookup must carry a note");
-        // Bare `helper` is not a qualified name to impact_analysis, so offering
-        // it would hard-fail there; with one qualified candidate left, only the
-        // files can scope both definitions.
         assert!(note.contains("at most one carries one"), "{note}");
         assert!(!note.contains("indistinguishable"), "{note}");
         assert!(note.contains("a.rs, b.rs"), "{note}");

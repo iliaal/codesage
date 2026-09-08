@@ -1,8 +1,4 @@
-//! `feature_bundle` end-to-end: map features against a tiny fixture repo,
-//! seed chunks for the relevant files (semantic indexer requires a real
-//! embedder; we shortcut by inserting chunks directly), call
-//! `feature_bundle` on the resulting feature_id, and verify the bundle
-//! tracks the curated file list rather than semantic search results.
+//! Feature bundles use mapped ownership and seeded chunks, without an embedder.
 
 use codesage_features::map_features;
 use codesage_graph::{feature_bundle, full_index};
@@ -57,7 +53,6 @@ fn returns_bundle_with_curated_files_after_map() {
     full_index(root, &db, &[], false).unwrap();
     map_features(root, &db, &[]).unwrap();
 
-    // Seed chunks directly (avoids spinning up a real embedder in tests).
     seed_chunk(&db, "src/main.rs", "rust", main_src);
     seed_chunk(&db, "tests/integration.rs", "rust", test_src);
 
@@ -89,15 +84,11 @@ fn returns_bundle_with_curated_files_after_map() {
         .iter()
         .map(|c| c.file_path.as_str())
         .collect();
-    // The nearby-test discovery attaches tests/integration.rs to Rust
-    // binaries by convention; the bundle's related[] should carry it.
     assert!(
         related_paths.contains(&"tests/integration.rs"),
         "related should include the nearby test, got {:?}",
         related_paths
     );
-    // The bundle must include the entry symbol's definition (Rust `main`)
-    // because the feature has entry_symbol = "main".
     assert!(
         bundle
             .symbol_definitions
@@ -114,10 +105,7 @@ fn returns_bundle_with_curated_files_after_map() {
 
 #[test]
 fn entry_chunk_overlaps_entry_symbol_not_first_chunk() {
-    // Regression: real codesage binary main.rs has 447 lines of `use`
-    // statements before `fn main()`. The bundle's entry chunk must
-    // overlap the symbol, not just be the file's first chunk — otherwise
-    // an agent reviewing the feature gets imports instead of the body.
+    // Leading imports must not displace the entry symbol's body from the bundle.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(
@@ -125,7 +113,6 @@ fn entry_chunk_overlaps_entry_symbol_not_first_chunk() {
         "Cargo.toml",
         "[package]\nname = \"acme\"\nversion = \"0.1.0\"\n",
     );
-    // Synthesize a large entry file: 100 import lines, then main() at L101.
     let mut content = String::new();
     for _ in 0..100 {
         content.push_str("use std::path::Path;\n");
@@ -135,9 +122,7 @@ fn entry_chunk_overlaps_entry_symbol_not_first_chunk() {
     let db = Database::open_in_memory().unwrap();
     full_index(root, &db, &[], false).unwrap();
     map_features(root, &db, &[]).unwrap();
-    // Seed two chunks: imports L1-50, body L51-101. Without the fix, the
-    // bundle would pick L1-50; with the fix it picks the L51-101 chunk
-    // because that's where `fn main` sits.
+    // Only the second chunk overlaps `main`.
     let imports = content.lines().take(50).collect::<Vec<_>>().join("\n");
     let body = content.lines().skip(50).collect::<Vec<_>>().join("\n");
     db.insert_chunks(
@@ -480,10 +465,7 @@ fn entry_chunk_present_when_owned_lib_sorts_before_entry() {
 
 #[test]
 fn missing_chunks_yield_empty_primary_but_keep_metadata() {
-    // Feature mapped but never semantically indexed: the bundle returns
-    // metadata + the entry symbol definition (loaded from the symbol
-    // table, which structural index populated), but `primary` / `related`
-    // come up empty because no chunks exist.
+    // Structural metadata remains available without semantic chunks.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(
@@ -500,7 +482,6 @@ fn missing_chunks_yield_empty_primary_but_keep_metadata() {
     let bundle = feature_bundle(&db, &main_feature.feature_id, false, false, 5).unwrap();
     assert!(bundle.primary.is_empty());
     assert!(bundle.related.is_empty());
-    // Entry symbol still resolvable from symbols table.
     assert!(
         bundle.symbol_definitions.iter().any(|s| s.name == "main"),
         "entry symbol should still come back even without chunks"

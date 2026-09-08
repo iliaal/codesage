@@ -1,18 +1,7 @@
-//! Identity of the vectors a chunk table holds.
-//!
-//! A stored embedding is reusable only by a run that would have produced the
-//! same bytes: same model files, same dimension, same pooling, same chunker.
-//! The table name (`chunks_<model>_<dim>`) carries two of those, so a pooling
-//! change or a same-name model revision used to reuse every text-identical
-//! vector — including under `--full`, which is the one command a user runs to
-//! repair exactly that.
-//!
-//! The model component is a digest of the artifact bytes on disk — the files
-//! the session loader opens — not of the pin table. The pin table is the
-//! loader's separate supply-chain gate: a model outside it (loaded under
-//! `CODESAGE_ALLOW_ANY_MODEL`) has no pin, and a pinned name loaded with that
-//! opt-out is never verified, so under either the pin values said nothing
-//! about the vectors a table held.
+//! Stored vectors are reusable only with matching artifacts, dimensions,
+//! pooling, chunking, pipeline policy, and execution provider. Table names
+//! encode only model and dimension. Digest loaded artifact bytes, not pins:
+//! pins govern supply-chain verification and may be bypassed.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -28,16 +17,10 @@ use crate::chunk::{CHUNKER_VERSION, ChunkConfig};
 use crate::config::{EmbeddingConfig, MAX_SEQ_LENGTH, wants_coreml, wants_cuda};
 use crate::model::{ModelArtifacts, resolve_model_artifacts};
 
-/// Version of the embedding pipeline's fixed policy: the tokenizer
-/// truncation at [`MAX_SEQ_LENGTH`], `BatchLongest` padding, and the
-/// unconditional L2 normalisation of every pooled vector (`model.rs`,
-/// `embed_batch_inner`). None of these is visible in the model files or the
-/// config, yet each changes the bytes a chunk embeds to. Bump this whenever
-/// one of them changes; a stored table then reads as stale and is re-embedded.
+/// Bump when tokenizer truncation, BatchLongest padding, or unconditional L2
+/// normalization changes; these policies affect vectors without changing artifacts.
 pub const EMBEDDING_PIPELINE_VERSION: u32 = 1;
 
-/// The pipeline inputs that go into a fingerprint, as one struct so a test
-/// can vary them without editing a constant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PipelineIdentity {
     pub version: u32,
@@ -46,7 +29,6 @@ pub struct PipelineIdentity {
 }
 
 impl PipelineIdentity {
-    /// The pipeline this build runs.
     pub const CURRENT: Self = Self {
         version: EMBEDDING_PIPELINE_VERSION,
         max_seq_length: MAX_SEQ_LENGTH,
@@ -54,21 +36,14 @@ impl PipelineIdentity {
     };
 }
 
-/// Opaque, comparable identity of an embedding setup. Persisted beside the
-/// chunk table and compared byte-for-byte before any stored vector is reused.
-///
-/// Equality is over the persisted text alone. The artifact digest and stat
-/// key ride along so a completed pass can persist them beside the text and
-/// the next process can skip re-reading the model files when their paths,
-/// sizes, and mtimes are unchanged.
+/// Persisted identity compared before vector reuse. Equality uses text alone;
+/// digest/stat metadata allows later processes to reuse an artifact attestation.
 #[derive(Debug, Clone)]
 pub struct SemanticFingerprint {
     text: String,
     artifact_digest: String,
     artifact_stat_key: Option<String>,
-    /// The inputs `text` was rendered from, kept so one component can be
-    /// rebound (the execution provider, once a session reports the one it
-    /// actually runs on) without re-deriving the rest.
+    /// Retained to rebind the actual execution provider without rehashing.
     inputs: FingerprintInputs,
 }
 
@@ -82,13 +57,8 @@ struct FingerprintInputs {
     ort_runtime: String,
 }
 
-/// The ONNX Runtime this build embeds through, as the fingerprint names it.
-/// On a dynamic-loading target the runtime's bytes are digested with the
-/// model files (the `ort_runtime` entry of [`ModelArtifacts::labelled_files`]),
-/// so this tag records the API level the crate was compiled against and
-/// that the library itself is in the artifact digest. On a static target the
-/// runtime is part of the binary: its build-info string (version, commit,
-/// compile flags) is digested here instead.
+/// Dynamic builds record the compiled API level and digest the runtime library
+/// with model artifacts. Static builds digest ORT's version/commit/build flags.
 pub fn ort_runtime_tag() -> String {
     #[cfg(target_vendor = "apple")]
     {
@@ -174,12 +144,8 @@ impl SemanticFingerprint {
             crate::config::PoolingStrategy::Mean => "mean",
             crate::config::PoolingStrategy::Cls => "cls",
         };
-        // The execution provider is part of the identity: CPU and CUDA
-        // kernels do not produce bit-identical vectors, so a table must hold
-        // one backend's output only. Spellings that select the same provider
-        // (`gpu`, `cuda`) fingerprint the same. This is the provider the
-        // config ASKS for; a session that ended up elsewhere rebinds it with
-        // [`Self::with_execution_provider`].
+        // CPU and CUDA vectors differ. Equivalent device spellings share an
+        // identity; the loaded session can rebind the actual provider.
         let inputs = FingerprintInputs {
             model: config.model.clone(),
             dim,
@@ -239,7 +205,6 @@ impl fmt::Display for SemanticFingerprint {
     }
 }
 
-/// The persisted form is built here and nowhere else.
 fn render(inputs: &FingerprintInputs, artifact_digest: &str) -> String {
     let chunk = ChunkConfig::default();
     let normalized = if inputs.pipeline.normalized {
@@ -308,13 +273,8 @@ fn read_counts() -> &'static Mutex<HashMap<PathBuf, u64>> {
     COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Drop the cached digest for one path, if any. Call this when the file
-/// behind `path` is replaced out of band — the cache eviction in
-/// `model.rs` deletes the blob and re-downloads it, and a refetch that
-/// lands within the same mtime tick with the same length would otherwise
-/// serve the evicted bytes' hash and trip a false supply-chain alarm.
-/// Purging is safe when the replacement never happens: the next lookup
-/// just re-reads the file.
+/// Invalidate before replacing an artifact: same-size, same-mtime refetches
+/// otherwise retain the evicted bytes' digest. Harmless if no replacement occurs.
 pub(crate) fn forget_cached_digest(path: &Path) {
     digest_cache()
         .lock()
@@ -332,11 +292,7 @@ pub fn forget_cached_digests() {
         .clear();
 }
 
-/// How many times this process has read `path` end to end to digest it.
-/// A model file is hundreds of megabytes, so a caller that only wanted to
-/// compare identities must be able to prove it read nothing; the count is
-/// per path so concurrent tests over different files do not disturb each
-/// other.
+/// Full-file digest reads for this path, isolated from concurrent tests' files.
 pub fn artifact_read_count(path: &Path) -> u64 {
     read_counts()
         .lock()
@@ -346,13 +302,9 @@ pub fn artifact_read_count(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// SHA-256 of the file at `path`, hex. A model file is tens to hundreds of
-/// megabytes and every semantic command needs its digest, so the result is
-/// kept for the life of the process and reused while the file's size and
-/// mtime are unchanged; a rewrite that keeps both (same-second, same-length)
-/// is the accepted blind spot of that key. The loader's pin verification
-/// shares this cache, so a `search` that built a private session and then
-/// derived the fingerprint reads each artifact once, not twice.
+/// Hex SHA-256 cached by path, size, and mtime for the process lifetime.
+/// Same-size, same-mtime rewrites are an accepted blind spot. Pin verification
+/// shares this cache so fingerprinting does not reread large model artifacts.
 pub fn cached_file_digest(path: &Path) -> Result<String> {
     let meta = std::fs::metadata(path)?;
     let len = meta.len();
@@ -488,7 +440,6 @@ mod tests {
         );
         assert_eq!(artifact_read_count(&artifacts.onnx), before + 1);
 
-        // Attested digest: pure, equal text, nothing read.
         let attested = SemanticFingerprint::with_attested_digest(
             &config,
             384,
@@ -538,8 +489,6 @@ mod tests {
         let as_cuda = SemanticFingerprint::with_attested_digest(&cuda, 384, "d", "stat");
         assert_eq!(as_cuda.execution_provider(), "cuda");
 
-        // A session under device=cuda that actually ran on the CPU
-        // fingerprints as the CPU setup would, never as the configured one.
         let fell_back = as_cuda.with_execution_provider("cpu");
         assert_ne!(fell_back, as_cuda, "the fallback is another identity");
         assert_eq!(
@@ -588,7 +537,6 @@ mod tests {
         let artifacts = scratch_artifacts(dir.path());
         let config = EmbeddingConfig::default();
         let before = SemanticFingerprint::for_artifacts(&config, 384, &artifacts).unwrap();
-        // Same call twice: the second answer comes from the cache and agrees.
         assert_eq!(
             before,
             SemanticFingerprint::for_artifacts(&config, 384, &artifacts).unwrap()
@@ -674,7 +622,6 @@ mod tests {
             fp_without.artifact_stat_key()
         );
 
-        // An ORT upgrade: same model files, other runtime bytes.
         flip_one_byte(&runtime);
         let upgraded = SemanticFingerprint::for_artifacts(&config, 384, &with).unwrap();
         assert_ne!(

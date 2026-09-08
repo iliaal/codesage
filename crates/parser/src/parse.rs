@@ -2,11 +2,7 @@ use anyhow::Result;
 use codesage_protocol::Language;
 use tree_sitter::{Parser, Tree};
 
-/// Map a CodeSage `Language` to its tree-sitter grammar. Single source of truth
-/// for the grammar choice — notably TypeScript → TSX (the TSX grammar is a
-/// superset that also parses plain `.ts`). `parse_file` and the lazily-compiled
-/// symbol/reference query tables in `extract`/`references` all route through
-/// here so the mapping can't drift between them.
+/// Shared grammar selection for parsing and queries. TSX also parses plain `.ts`.
 pub(crate) fn ts_language(language: Language) -> tree_sitter::Language {
     match language {
         Language::Php => tree_sitter_php::LANGUAGE_PHP.into(),
@@ -21,14 +17,8 @@ pub(crate) fn ts_language(language: Language) -> tree_sitter::Language {
     }
 }
 
-/// Parse one source file. Tree-sitter is error-tolerant: it returns `Some`
-/// even for malformed input, surfacing the damage as `ERROR` / `MISSING`
-/// nodes while still producing well-formed subtrees around them. The tree
-/// is returned as-is so those subtrees are extracted; unknown function-like
-/// macros at file scope (php-src's `ZEND_*` / `PHP_FUNCTION` family, custom
-/// attribute macros) would otherwise drop every symbol in the file. Callers
-/// that want to account for partial parses check [`ParsedTree::degraded`]
-/// via [`parse_file_tolerant`].
+/// Preserve recoverable subtrees around malformed syntax or unknown macros.
+/// Use [`parse_file_tolerant`] to also inspect [`ParsedTree::degraded`].
 pub fn parse_file(source: &[u8], language: Language) -> Result<Tree> {
     Ok(parse_file_tolerant(source, language)?.tree)
 }
@@ -38,9 +28,7 @@ pub fn parse_file(source: &[u8], language: Language) -> Result<Tree> {
 #[derive(Debug)]
 pub struct ParsedTree {
     pub tree: Tree,
-    /// True when the tree contains `ERROR` or `MISSING` nodes. Symbols and
-    /// references outside the damaged regions are still extractable; the flag
-    /// lets the indexer count such files separately from outright failures.
+    /// Contains `ERROR` or `MISSING` nodes; undamaged regions remain extractable.
     pub degraded: bool,
 }
 
@@ -57,11 +45,8 @@ pub fn parse_file_tolerant(source: &[u8], language: Language) -> Result<ParsedTr
     Ok(ParsedTree { tree, degraded })
 }
 
-/// Lossy text of the byte range a node spans. `Node::utf8_text` fails on
-/// non-UTF8 input, and every extractor treated that as "empty name, skip" —
-/// half-vanishing non-UTF8 files. Slicing by byte range keeps offsets valid
-/// (unlike converting the whole buffer up front, which shifts them) and
-/// `from_utf8_lossy` degrades to U+FFFD instead of dropping the symbol.
+/// Decode only the node's byte range so invalid UTF-8 cannot shift offsets
+/// or discard the entire symbol.
 pub(crate) fn node_text_lossy(node: &tree_sitter::Node, source: &[u8]) -> String {
     source
         .get(node.start_byte()..node.end_byte())

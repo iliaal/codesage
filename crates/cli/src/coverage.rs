@@ -1,12 +1,4 @@
-//! `codesage coverage` — what this project contains that indexing cannot see.
-//!
-//! Answers a question no existing surface does. `IndexStats::files_skipped`
-//! counts files unchanged since the last pass (freshness), `files_degraded`
-//! counts recognized files whose parse recovered from syntax errors, and
-//! `files_failed` counts recognized files the pass could not read or store. A
-//! file whose extension maps to no supported language is dropped at discovery
-//! and reaches none of these counters, so the largest coverage gap is the one
-//! nothing reports.
+//! Report unsupported files omitted by discovery and absent from indexing statistics.
 
 use anyhow::Result;
 use codesage_parser::discover::survey_coverage;
@@ -15,16 +7,12 @@ use crate::{find_project_root, get_exclude_patterns, load_project_config};
 
 pub fn run(json: bool, top: usize) -> Result<()> {
     let root = find_project_root()?;
-    // Same exclude set the indexer uses, so the denominator matches what
-    // indexing would actually consider rather than a parallel definition.
     let config = load_project_config(&root)?;
     let excludes = get_exclude_patterns(&config);
 
     let survey = survey_coverage(&root, &excludes)?;
 
     if json {
-        // --top caps the extension list in JSON too; it silently applied only
-        // to the human output before, so `--json --top 1` returned everything.
         let mut out = survey.clone();
         if top > 0 && out.uncovered_by_extension.len() > top {
             let mut kept: Vec<(String, usize)> = out
@@ -85,7 +73,6 @@ pub fn run(json: bool, top: usize) -> Result<()> {
     }
 
     let mut exts: Vec<_> = survey.uncovered_by_extension.iter().collect();
-    // Descending by count, then by extension so equal counts are stable.
     exts.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
     let shown = if top == 0 {
         exts.len()

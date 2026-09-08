@@ -1,31 +1,8 @@
-//! Whether a `brief` payload is worth serving *again* in a session.
+//! Bound cumulative brief output with a session budget, payload deduplication,
+//! and a per-path cooldown. Unreadable state suppresses output.
 //!
-//! Replaying 383 real Claude Code transcripts against `codesage brief` measured
-//! the problem this exists to solve: on files an agent actually edits the
-//! payload is not rare (40-70% of source edits produce one), and 58-80% of what
-//! it produces within a session is a repeat. One session emitted 117 payloads,
-//! about 4567 tokens, for 44 distinct facts. Per-fire cost was never the issue;
-//! cumulative context is.
-//!
-//! Three gates, checked in order, each answering a different repeat:
-//!
-//! - **budget** — a hard per-session ceiling. Once spent, the session is silent.
-//! - **dedup** by (path, payload) — the same fact about the same file, which is
-//!   the common case since the payload derives from committed history and does
-//!   not move while the agent edits.
-//! - **cooldown** per path — a payload for a path that changed slightly, e.g.
-//!   because the agent committed mid-session and the hooks reindexed. Dedup
-//!   cannot catch that one; without a cooldown a commit re-arms every path.
-//!
-//! State is per session, lives in the runtime dir, and never touches the
-//! project — the same rule that made [`codesage_storage::Database::open_read_only`]
-//! necessary. The fire ledger is the exception: it is the denominator of every
-//! later efficacy measurement and must outlive a reboot, so it lives in the
-//! state dir ([`ledger_dir`]), not the tmpfs-backed runtime dir.
-//!
-//! **A gate that cannot read its own state fails closed.** Silence is always
-//! safe; noise is what makes an unrequested channel get ignored permanently, and
-//! that failure is not recoverable by fixing the bug later.
+//! Session state lives outside the project in the runtime dir. The fire ledger
+//! uses persistent storage so efficacy measurements survive reboots.
 
 use std::{
     collections::HashMap,
@@ -36,20 +13,12 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 /// Tokens a single session may spend on served briefs.
-///
-/// Replaying the corpus through the gate below: the heaviest single session
-/// spent ~1072 tokens, the median ~166. This leaves about 40% headroom over the
-/// heaviest observed, and no session in the corpus reached it — the budget is a
-/// backstop against a session unlike any measured, not the working mechanism.
-/// Dedup is the working mechanism. For scale, the same corpus ungated put 4567
-/// tokens into one session.
 const SESSION_TOKEN_BUDGET: usize = 1500;
 
 /// Seconds before the same path may be served again, whatever the payload says.
 const PATH_COOLDOWN_SECS: u64 = 900;
 
-/// Characters per token. The replay measurements that set the budget above used
-/// the same divisor, so the two are consistent even though both are estimates.
+/// Token-cost estimate, shared with the replay measurements that set the budget.
 const CHARS_PER_TOKEN: usize = 4;
 
 /// Append-only record of every fire, silent ones included.
@@ -58,15 +27,8 @@ const FIRE_LOG: &str = "brief-fires.jsonl";
 /// Where the fire ledger lives: `$XDG_STATE_HOME/codesage`, else
 /// `$HOME/.local/state/codesage`.
 ///
-/// Not the runtime dir. `$XDG_RUNTIME_DIR` is tmpfs on systemd hosts and WSL2,
-/// cleared at every boot — a ledger kept there loses its history on the same
-/// schedule the machine restarts, and the ≥50-served-fire decision rule the
-/// analyzer enforces was never reached because of it. Session gate state stays
-/// in the runtime dir, where a boot wiping it is correct.
-///
-/// Falls back to `fallback` (the runtime dir) when neither variable resolves,
-/// so a HOME-less environment still logs the fire somewhere rather than
-/// dropping it.
+/// Unlike session state, the ledger must survive reboots. Uses `fallback`
+/// only when neither environment variable resolves to an absolute path.
 pub(crate) fn ledger_dir(fallback: &Path) -> PathBuf {
     ledger_dir_from(
         std::env::var_os("XDG_STATE_HOME"),
@@ -75,10 +37,7 @@ pub(crate) fn ledger_dir(fallback: &Path) -> PathBuf {
     )
 }
 
-/// Env-free core of [`ledger_dir`]. Set-but-empty variables count as unset,
-/// matching the runtime-dir resolution, and so do relative ones: the XDG spec
-/// says a relative base dir is invalid, and the hook runs `brief` from the
-/// project root, so a relative value would put the ledger inside the checkout.
+/// Reject relative XDG paths so a hook cannot write its ledger into the checkout.
 fn ledger_dir_from(
     xdg_state_home: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
@@ -94,9 +53,7 @@ fn ledger_dir_from(
     fallback.to_path_buf()
 }
 
-/// Rotate past this, keeping one previous generation. At the ~120 bytes a line
-/// costs, this holds on the order of 35k fires — more than the 11331 the whole
-/// replay corpus contains.
+/// Rotation threshold; keep one previous generation.
 const FIRE_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Default, Serialize, Deserialize)]
@@ -109,10 +66,6 @@ struct GateState {
 }
 
 /// Why a fire did or did not reach the agent.
-///
-/// The reason matters as much as the outcome. ~90% of fires are silent, and a
-/// scorer that cannot tell "there was nothing to say" from "we suppressed a
-/// repeat" cannot tell a well-targeted surface from an over-firing one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Decision {
     /// Reached the agent.
@@ -127,9 +80,7 @@ pub(crate) enum Decision {
     Budget,
     /// Gate state could not be read or written, so nothing was served.
     Unavailable,
-    /// The payload could not be built at all. Distinct from `Empty`: one is a
-    /// file with nothing to say, the other is a broken path, and a denominator
-    /// that conflates them hides a regression as a quiet surface.
+    /// Payload construction failed; distinct from a successful empty result.
     Error,
 }
 
@@ -147,8 +98,6 @@ impl Decision {
     }
 }
 
-/// Decide and record in one step. Pure, so the ordering of the three gates is
-/// testable without a filesystem.
 fn decide(state: &mut GateState, path: &str, payload: &str, now: u64) -> Decision {
     let cost = payload.len().div_ceil(CHARS_PER_TOKEN);
     if state.tokens + cost > SESSION_TOKEN_BUDGET {
@@ -172,9 +121,7 @@ fn decide(state: &mut GateState, path: &str, payload: &str, now: u64) -> Decisio
     Decision::Served
 }
 
-/// FNV-1a. The digest only has to separate payloads within one session's state
-/// file, so a 64-bit non-cryptographic hash with no dependency is the right
-/// size of tool.
+/// FNV-1a for session-local deduplication, not authentication.
 fn digest(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.as_bytes() {
@@ -191,15 +138,8 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Session ids arrive from a hook payload, so they are untrusted input on a
-/// path that becomes a filename. Keep only characters that cannot traverse.
-///
-/// The charset and cap mirror the documented session contract (see the
-/// `session_id` help and the session validator): ASCII alphanumerics plus
-/// `-`, `_`, `.`, max 128 chars. `.` is significant, not stripped — `a.b`
-/// and `ab` are different sessions and must not share a state file.
-/// Leading dots are trimmed: the contract rejects them (hidden-file
-/// confusion), and the `brief-` prefix already guarantees a visible name.
+/// Hook session IDs become filenames. Preserve internal dots to keep `a.b`
+/// distinct from `ab`; strip leading dots to match the session contract.
 fn sanitize(session: &str) -> String {
     let cleaned: String = session
         .chars()
@@ -242,7 +182,7 @@ pub(crate) fn evaluate(dir: &Path, session: &str, path: &str, payload: &str) -> 
     if !locked {
         return Decision::Unavailable;
     }
-    let existing = match std::fs::read_to_string(&file) {
+    let existing = match crate::fsguard::read_state_to_string(&file) {
         Ok(raw) => Some(raw),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => return Decision::Unavailable,
@@ -266,34 +206,14 @@ pub(crate) fn evaluate(dir: &Path, session: &str, path: &str, payload: &str) -> 
     let Ok(encoded) = serde_json::to_string(&state) else {
         return Decision::Unavailable;
     };
-    let tmp = file.with_extension(format!("tmp{}", std::process::id()));
-    if std::fs::write(&tmp, encoded).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return Decision::Unavailable;
-    }
-    if std::fs::rename(&tmp, &file).is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    if codesage_graph::state_file::replace(&file, encoded.as_bytes()).is_err() {
         return Decision::Unavailable;
     }
     Decision::Served
 }
 
-/// One line per fire, appended to `brief-fires.jsonl` in `dir` — the state dir
-/// from [`ledger_dir`] in production (the runtime dir only as its HOME-less
-/// fallback).
-///
-/// This exists because a silent fire leaves no trace anywhere else. About 90% of
-/// real fires emit nothing, and a transcript only ever records what an agent was
-/// shown — so without this the denominator of any efficacy measurement is
-/// unrecoverable after the fact, and an un-measured surface is indistinguishable
-/// from one that does nothing.
-///
-/// The digest is over the rendered payload, which is the only part that survives
-/// verbatim into a transcript. That is what lets a replayed firing settle the
-/// row it belongs to instead of creating a second one.
-///
-/// Best-effort throughout: a fire is not worth failing over, and the log must
-/// never turn into a reason the payload path errors.
+/// Best-effort ledger of all fires, including those absent from transcripts.
+/// Hash the rendered payload to join served fires to transcript exposures.
 pub(crate) fn log_fire(
     dir: &Path,
     session: &str,
@@ -302,14 +222,14 @@ pub(crate) fn log_fire(
     decision: Decision,
     payload: &str,
 ) {
-    // Own the directory rather than assuming a prior call made it. `evaluate`
-    // returns Empty before it creates anything, and `create(true)` does not make
-    // parents — so without this the log drops every fire before the session's
-    // first non-silent one, which is exactly the population it exists to count.
+    // Empty fires return from `evaluate` before it creates the directory.
     if create_private_dir(dir).is_err() {
         return;
     }
     let log = dir.join(FIRE_LOG);
+    let Ok(_lock) = codesage_graph::state_file::lock(&dir.join("brief-fires.lock")) else {
+        return;
+    };
     rotate_if_large(&log);
 
     let mut line = format!(
@@ -329,24 +249,10 @@ pub(crate) fn log_fire(
     }
     line.push_str("}\n");
 
-    use std::io::Write;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    if let Ok(mut fh) = opts.open(&log) {
-        let _ = fh.write_all(line.as_bytes());
-    }
+    let _ = codesage_graph::state_file::append_line(&log, line.as_bytes());
 }
 
-/// The ledger names session ids, project roots and edited paths. The runtime
-/// dir it used to live in is held at 0o700 on every daemon start
-/// (`prepare_runtime_dir`); the leaf state dir gets the same treatment, created
-/// or tightened. Intermediates (`~/.local`, `~/.local/state`) are shared with
-/// every other XDG consumer and get the umask default.
+/// Keep ledger paths private; leave shared XDG parent directories at their umask.
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent)?;
@@ -359,12 +265,7 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     }
     match b.create(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // mkdir reports EEXIST for any inode. Only a real directory is
-            // acceptable: a symlink would have set_permissions and the
-            // append follow it wherever it points (the runtime-dir fallback
-            // sits under a world-writable /tmp), and a regular file would be
-            // chmodded and then fail the append with ENOTDIR. Fail closed,
-            // as validate_runtime_dir does for the daemon.
+            // EEXIST also covers symlinks and files; reject them before chmod or append.
             let meta = std::fs::symlink_metadata(dir)?;
             if meta.file_type().is_symlink() || !meta.is_dir() {
                 return Err(std::io::Error::other(format!(
@@ -383,9 +284,7 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
                         dir.display()
                     )));
                 }
-                // Best-effort like the rest of the fire log: an operator-made
-                // 0o755 dir is tightened; a failure to do so is not a reason
-                // to drop the row.
+                // Tightening an existing directory is best-effort, like logging itself.
                 let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
             }
             Ok(())
@@ -396,8 +295,8 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 
 /// Keep one previous generation, matching the daemon log's convention.
 fn rotate_if_large(log: &Path) {
-    let too_big = std::fs::metadata(log)
-        .map(|m| m.len() > FIRE_LOG_MAX_BYTES)
+    let too_big = std::fs::symlink_metadata(log)
+        .map(|m| m.is_file() && m.len() > FIRE_LOG_MAX_BYTES)
         .unwrap_or(false);
     if too_big {
         let _ = std::fs::rename(log, log.with_extension("jsonl.1"));
@@ -411,6 +310,95 @@ fn escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fire_append_preserves_valid_records_around_an_interrupted_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FIRE_LOG);
+        std::fs::write(&path, b"{\"saved\":true}\n{\"partial\":").unwrap();
+        log_fire(
+            dir.path(),
+            "new",
+            Path::new("/project"),
+            "x.rs",
+            Decision::Empty,
+            "",
+        );
+        let raw = std::fs::read_to_string(path).unwrap();
+        let records: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["saved"], true);
+        assert_eq!(records[1]["s"], "new");
+    }
+
+    #[test]
+    fn concurrent_fire_rotation_keeps_every_new_fire() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FIRE_LOG);
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"old\":\"{}\"}}\n",
+                "x".repeat(FIRE_LOG_MAX_BYTES as usize)
+            ),
+        )
+        .unwrap();
+        std::thread::scope(|scope| {
+            for n in 0..16 {
+                let root = dir.path();
+                scope.spawn(move || {
+                    log_fire(
+                        root,
+                        &format!("new-{n}"),
+                        Path::new("/project"),
+                        "x.rs",
+                        Decision::Empty,
+                        "",
+                    )
+                });
+            }
+        });
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let records: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 16);
+        for n in 0..16 {
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|row| row["s"] == format!("new-{n}"))
+                    .count(),
+                1
+            );
+        }
+        let archived: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.with_extension("jsonl.1")).unwrap())
+                .unwrap();
+        assert_eq!(
+            archived["old"].as_str().unwrap().len(),
+            FIRE_LOG_MAX_BYTES as usize
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gate_rejects_symlinked_state_without_charging_or_touching_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        let original = serde_json::to_vec(&GateState::default()).unwrap();
+        std::fs::write(&victim, &original).unwrap();
+        std::os::unix::fs::symlink(&victim, state_path(dir.path(), "new")).unwrap();
+        assert_eq!(
+            evaluate(dir.path(), "new", "x.rs", "payload"),
+            Decision::Unavailable
+        );
+        assert_eq!(std::fs::read(victim).unwrap(), original);
+    }
 
     fn evaluate_after_release(dir: &Path, session: &str, path: &str, payload: &str) -> Decision {
         // Concurrent forks can retain a lock descriptor briefly after its guard drops.
@@ -473,8 +461,6 @@ mod tests {
             decide(&mut s, "a.rs", "hotspot: 90%", 1000),
             Decision::Repeat
         );
-        // Still suppressed long after the cooldown: the fact has not changed,
-        // so re-serving it is pure repetition.
         assert_eq!(
             decide(
                 &mut s,
@@ -493,8 +479,6 @@ mod tests {
             decide(&mut s, "a.rs", "hotspot: 90%", 1000),
             Decision::Served
         );
-        // A mid-session commit plus reindex can shift the payload. Within the
-        // cooldown that is still noise.
         assert_eq!(
             decide(
                 &mut s,
@@ -523,7 +507,6 @@ mod tests {
         let big = "x".repeat(SESSION_TOKEN_BUDGET * CHARS_PER_TOKEN);
         assert_eq!(decide(&mut s, "a.rs", &big, 1000), Decision::Served);
         assert_eq!(s.tokens, SESSION_TOKEN_BUDGET);
-        // Nothing more this session, however cheap or novel.
         assert_eq!(decide(&mut s, "b.rs", "y", 9999), Decision::Budget);
     }
 
@@ -541,13 +524,10 @@ mod tests {
         let escaped = state_path(dir, "../../../etc/passwd");
         assert_eq!(escaped.parent().unwrap(), dir);
         assert!(!escaped.to_string_lossy().contains(".."));
-        // An id with nothing usable still yields a stable, distinct file.
         assert_ne!(state_path(dir, "///"), state_path(dir, "!!!"));
     }
     #[test]
     fn dots_are_significant_not_stripped() {
-        // The old charset dropped `.`, so `a.b` and `ab` shared one state
-        // file: one session's budget and history leaked into the other's.
         let dir = Path::new("/run/user/1000/codesage");
         assert_ne!(state_path(dir, "a.b"), state_path(dir, "ab"));
         assert!(state_path(dir, "a.b").to_string_lossy().contains("a.b"));
@@ -587,12 +567,10 @@ mod tests {
             evaluate_after_release(p, "sess-1", "a.rs", "hotspot: 90%"),
             Decision::Repeat
         );
-        // A different session starts with its own budget and its own history.
         assert_eq!(
             evaluate(p, "sess-2", "a.rs", "hotspot: 90%"),
             Decision::Served
         );
-        // An empty payload is never a fire.
         assert_eq!(evaluate(p, "sess-3", "a.rs", ""), Decision::Empty);
     }
 
@@ -672,8 +650,6 @@ mod tests {
             let d = evaluate(p, "sess", path, payload);
             log_fire(p, "sess", proj, path, d, payload);
         }
-        // The repeat is the whole reason this log exists: it never reaches a
-        // transcript, so nothing else can count it.
         let d = evaluate_after_release(p, "sess", "a.rs", "hotspot: 90%");
         log_fire(p, "sess", proj, "a.rs", d, "hotspot: 90%");
 
@@ -684,8 +660,6 @@ mod tests {
         assert!(lines[1].contains(r#""d":"empty""#), "{}", lines[1]);
         assert!(lines[2].contains(r#""d":"repeat""#), "{}", lines[2]);
 
-        // A served line carries the payload digest, which is the join key back
-        // to a transcript; a silent one has no payload to hash.
         assert!(lines[0].contains(r#""h":"#));
         assert!(!lines[1].contains(r#""h":"#));
 
@@ -698,10 +672,6 @@ mod tests {
     #[test]
     fn a_silent_fire_is_logged_even_as_the_first_fire_in_a_fresh_ledger_dir() {
         let dir = tempfile::tempdir().unwrap();
-        // Nothing has created this yet, which is the state a hook's very first
-        // fire meets. The first fires of a session are overwhelmingly silent, so
-        // a log that needs someone else to make its directory loses exactly the
-        // records it exists for.
         let p = dir.path().join("codesage");
         assert!(!p.exists());
 
@@ -724,13 +694,10 @@ mod tests {
             ledger_dir_from(None, Some("/home/u".into()), fb),
             PathBuf::from("/home/u/.local/state/codesage")
         );
-        // Set-but-empty counts as unset, like the runtime-dir resolution.
         assert_eq!(
             ledger_dir_from(Some("".into()), Some("".into()), fb),
             fb.to_path_buf()
         );
-        // A relative value is invalid per the XDG spec and would land inside
-        // the project the hook runs from; it falls through to the next candidate.
         assert_eq!(
             ledger_dir_from(Some("state".into()), Some("/home/u".into()), fb),
             PathBuf::from("/home/u/.local/state/codesage")
@@ -750,10 +717,7 @@ mod tests {
         let p = dir.path().join("state").join("codesage");
         log_fire(&p, "s", Path::new("/p"), "a.rs", Decision::Empty, "");
         let dir_mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
-        // Only the leaf is private; the shared intermediate keeps the umask
-        // default so other XDG consumers under it stay traversable. Compared
-        // against a plain create_dir sibling rather than a literal, since the
-        // default depends on the test process's umask.
+        // Compare with a sibling because the parent mode depends on the process umask.
         std::fs::create_dir(dir.path().join("ref")).unwrap();
         let mode_of =
             |p: std::path::PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
@@ -769,8 +733,6 @@ mod tests {
         assert_eq!(dir_mode, 0o700);
         assert_eq!(file_mode, 0o600);
 
-        // A leaf that already exists too loose is tightened, matching the
-        // runtime dir's every-start contract.
         let loose = dir.path().join("loose");
         std::fs::create_dir(&loose).unwrap();
         std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();

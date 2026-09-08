@@ -175,6 +175,8 @@ Responses also include `next`, an evidence-derived `{tool, arguments}` call usin
 
 `codesage mcp` is the stable client entrypoint. It runs as a stdio shim, starts or connects to the per-user Unix-socket daemon, and forwards MCP JSON-RPC unchanged. The daemon hosts the real MCP server and owns shared project/model/reranker pools across main sessions and subagents.
 
+CLI `search` and `export` reuse the daemon's reranker through internal `rerank_pairs`, omitted from `tools/list`. Requests are capped at 32 documents, 65,536 bytes per text, and 1,048,576 bytes total; the CLI splits batches and uses private inference for oversized individual texts. Without a daemon, private initialization remains eager. Remote inference failures retain warning/pre-rerank-order behavior without loading a second model; already-running native inference cannot be forcibly cancelled.
+
 `codesage mcp --project <abs root>` makes the server default the per-call `project` argument to that root when a `tools/call` omits it. Set automatically by `codesage install` for agents without a CodeSage plugin (Codex, opencode), which otherwise have no way to inject the project path. With no `--project` (the Claude-plugin path) the shim raw-copies stdio with zero overhead.
 
 The daemon co-trusts every process under the same Unix UID. Runtime dirs, socket mode `0o600`, and `SO_PEERCRED` keep other users out, but a compromised same-UID agent can ask the daemon to read any onboarded project index. Use a separate Unix user for untrusted agents that need project isolation. MCP tools are capped for agent safety; CLI commands are the operator surface and intentionally keep broader limits unless a command documents its own cap.
@@ -198,6 +200,8 @@ The daemon inherits the **first** spawning shim's environment, including `RUST_L
 The daemon writes tracing to `mcp-<version>-<key>.log` in the runtime dir; check that file first when a tool call hangs or an MCP session won't initialize. SIGTERM/SIGINT trigger graceful shutdown (socket + pid file removed before exit).
 
 ## CLI commands
+
+`brief FILE --json` includes `branch_overlap`; CLI `rehearse` and MCP `review_rehearsal` add branch-overlap objections. Git-only scans exclude stacked branches, duplicate tips, and noise paths. They consider at most the newest 50 local/remote-tracking refs, with 100 ms for brief and 250 ms for rehearsal, and disclose scanned/total counts and incomplete evidence. At most three matching branches and five files per branch are shown with totals. Without an index, branch evidence remains available and rehearsal names skipped indexed checks. An existing unreadable index does not enable branch-only fallback.
 
 `init`, `index`, `overview`, `search`, `brief`, `find-symbol`, `find-references`, `dependencies`, `impact`, `trace`, `from-trace`, `export`, `status`, `mcp`, `daemon`, `watch`, `install-hooks`, `install`, `uninstall`, `cleanup`, `coverage`, `git-index`, `coupling`, `risk`, `risk-batch`, `risk-diff`, `similar`, `tests-for`, `rehearse`, `session-start`, `session-end`, `doctor` (with `--docs`), `map`, `features-list`, `feature-show`, `feature-for`, `feature-bundle`, `trust-boundaries`. (Mirrors the `Commands` enum in `crates/cli/src/main.rs` — audit this list when adding a subcommand.)
 

@@ -1,12 +1,6 @@
-//! Spike (CBM port): MinHash fingerprints over AST node-kind trigrams for
-//! near-clone detection. Mirrors codebase-memory-mcp's `simhash/minhash.h`:
-//! K=64 permutations, a leaf-token floor, and LSH banding for O(n) candidate
-//! generation instead of O(n²) all-pairs.
-//!
-//! Fingerprints are only comparable *within a language* — tree-sitter
-//! `kind_id`s are grammar-local integers, so a `block` in C and a `block` in
-//! PHP need not share an id. Cross-language clone detection is out of scope
-//! for this spike (and rarely what an agent wants anyway).
+//! MinHash near-clone detection over AST node-kind trigrams, adapted from
+//! codebase-memory-mcp's `simhash/minhash.h`, with LSH candidate bucketing.
+//! Compare only within a language: tree-sitter kind IDs are grammar-local.
 
 use std::collections::HashSet;
 
@@ -32,11 +26,7 @@ pub const LSH_ROWS: usize = MINHASH_K / LSH_BANDS;
 
 pub type Fingerprint = [u64; MINHASH_K];
 
-/// One fingerprinted function/method. `language` is load-bearing, not
-/// decoration: `kind_id`s are grammar-local integers, so identical trigrams
-/// from two grammars mean nothing and their Jaccard is meaningless.
-/// `file_fingerprints` stamps the parsing language; compare with
-/// `jaccard_checked`, which refuses cross-language pairs.
+/// A function fingerprint with language provenance for [`jaccard_checked`].
 #[derive(Debug, Clone)]
 pub struct FunctionFingerprint {
     pub name: String,
@@ -67,16 +57,9 @@ const SEEDS: [u64; MINHASH_K] = {
     s
 };
 
-/// Pre-order walk of `node`, pushing each node's `kind_id` and counting leaves
-/// (childless nodes — the actual source tokens). Order is preserved so the
-/// trigram sequence reflects structure, not just a node-kind bag.
 fn collect_preorder(root: &Node, kinds: &mut Vec<u16>, leaves: &mut usize) {
-    // Explicit-stack pre-order walk rather than recursion: this runs inside the
-    // indexer's rayon workers (fixed, non-growable stacks), and a deeply nested
-    // AST (machine-generated code, long expression chains) would otherwise
-    // overflow the stack — an uncatchable SIGABRT that aborts the whole index
-    // run. Children are pushed in reverse so the leftmost is visited first,
-    // preserving pre-order (the trigram sequence depends on it).
+    // Heap traversal avoids overflowing rayon worker stacks on deep ASTs.
+    // Reverse child insertion preserves the pre-order trigram sequence.
     let mut stack: Vec<Node> = vec![*root];
     while let Some(node) = stack.pop() {
         kinds.push(node.kind_id());
@@ -157,11 +140,8 @@ pub fn file_fingerprints(
         };
         let line_start = def.start_position().row as u32 + 1;
         let line_end = def.end_position().row as u32 + 1;
-        // Dedupe on the `symbol_fingerprints` UNIQUE key, not the node's byte
-        // span: two same-named definitions on one line (minified bundles,
-        // macro-generated C) are distinct nodes with one storage identity,
-        // and a second row aborts the whole write batch. Only a stored row
-        // claims the key, so a sub-floor twin never shadows a real one.
+        // Same-line definitions can share a storage key despite distinct spans.
+        // Claim the key only after fingerprinting so tiny twins cannot shadow it.
         let key = (name.clone(), kind, line_start, line_end);
         if seen.contains(&key) {
             continue;
@@ -234,11 +214,7 @@ mod tests {
 
     #[test]
     fn deeply_nested_ast_does_not_overflow_the_stack() {
-        // A function body nested thousands of levels deep. The previous
-        // recursive `collect_preorder` used one native stack frame per level;
-        // on a small (rayon-worker-sized) stack that SIGABRTs and aborts the
-        // whole indexer. The iterative walk uses the heap, so it completes.
-        // Run on a deliberately small stack to make the regression observable.
+        // Match a small rayon worker stack to expose recursive traversal.
         let depth = 4000;
         let mut body = String::from("1");
         for _ in 0..depth {
@@ -308,8 +284,6 @@ fn gamma(name: &str) -> String {
             "clone ({clone}) should clearly beat unrelated ({unrelated})"
         );
 
-        // LSH must bucket the clones together and (very likely) not the
-        // unrelated one.
         let ka = band_keys(&alpha.fp);
         let kb = band_keys(&beta.fp);
         assert!(
@@ -360,7 +334,6 @@ fn two(x: i32) -> i32 { let mut s = 0; for i in 0..x { s += i; if s > 100 { brea
 
     #[test]
     fn tiny_functions_are_skipped() {
-        // A trivial getter is below the leaf floor and should not fingerprint.
         let src = "fn id(x: i32) -> i32 { x }\n";
         assert!(fps(src, Language::Rust).is_empty());
     }
@@ -400,9 +373,6 @@ fn alpha(items: &[i32]) -> i32 {
     total
 }
 "#;
-        // Same shape, different grammar: the raw kind-id trigrams are
-        // numerically comparable but semantically meaningless across
-        // languages, so the checked form must decline.
         let py_src = "def alpha(items):\n    total = 0\n    for it in items:\n        if it > 0:\n            total += it * 2\n        else:\n            total -= 1\n    extra = len(items)\n    total += extra\n    return total\n";
         let r = fps(rust_src, Language::Rust);
         let p = fps(py_src, Language::Python);

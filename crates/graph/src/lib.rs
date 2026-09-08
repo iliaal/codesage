@@ -1,3 +1,4 @@
+pub mod branch_overlap;
 mod brief;
 mod bundle;
 mod call_path;
@@ -14,6 +15,8 @@ mod search;
 mod semantic;
 mod session;
 mod similar;
+#[doc(hidden)]
+pub mod state_file;
 mod trace_locate;
 
 pub use brief::build_edit_brief;
@@ -29,7 +32,7 @@ pub use impact::{impact_analysis, impact_analysis_report};
 pub use index::{full_index, incremental_index, index_files, remove_files};
 pub use lookups::{find_references, find_symbol, list_dependencies, list_dependencies_batch};
 pub use overview::build_project_overview;
-pub use rehearsal::build_review_rehearsal;
+pub use rehearsal::{build_branch_only_rehearsal, build_review_rehearsal};
 pub use search::{RerankFn, search, search_page};
 pub use semantic::{
     ArtifactLookup, EmbedderInit, LazyEmbedder, SemanticFingerprint, SemanticTableState,

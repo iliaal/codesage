@@ -1,14 +1,5 @@
-//! Multi-agent MCP installer. Registers CodeSage as an MCP server in
-//! agents that have no CodeSage plugin (Codex CLI, opencode) by writing
-//! their native MCP config. Each agent is one [`AgentTarget`] impl; the
-//! registry is a flat list, so adding an agent is one file plus one line.
-//!
-//! Claude Code is intentionally *not* a target here — it keeps its existing
-//! `claude mcp add` / plugin-marketplace registration.
-//!
-//! All targets register the command `codesage mcp --project <abs root>`, so
-//! the spawned server defaults the per-call `project` argument to that root
-//! (see `crate::mcp::inject_default_project_line`).
+//! Register MCP in Codex and opencode configs; Claude retains plugin registration.
+//! Project-bound entries supply `mcp --project` as the default for tool calls.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -21,18 +12,11 @@ mod opencode;
 
 /// Resolved environment for one install/uninstall operation.
 pub struct InstallCtx<'a> {
-    /// The user's home directory (`$HOME`). Global config paths derive from
-    /// it; passed in rather than read from the environment so targets are
-    /// unit-testable without mutating process env.
+    /// Resolve global paths without process-global environment reads.
     pub home: &'a Path,
-    /// Absolute project root (for display and project-local config paths).
-    /// `None` for a global registration made outside any onboarded project —
-    /// the entry is then registered without a `--project` default and the
-    /// server resolves the project per call instead.
+    /// None for global registration outside an onboarded project; omit the project default.
     pub project: Option<&'a Path>,
-    /// Canonical UTF-8 project root baked into `codesage mcp --project`.
-    /// `None` exactly when `project` is; targets must omit `--project`
-    /// rather than guess.
+    /// Canonical spelling for `--project`; absent exactly when `project` is absent.
     pub project_utf8: Option<&'a str>,
     /// Global (user-level) vs project-local registration. Some targets
     /// (Codex) are global-only and ignore this.
@@ -68,7 +52,6 @@ pub trait AgentTarget {
     fn uninstall(&self, ctx: &InstallCtx) -> Result<UninstallOutcome>;
 }
 
-/// Every registered target.
 pub fn all_targets() -> Vec<Box<dyn AgentTarget>> {
     vec![
         Box::new(codex::CodexTarget),
@@ -76,16 +59,11 @@ pub fn all_targets() -> Vec<Box<dyn AgentTarget>> {
     ]
 }
 
-/// Resolve a target by id, or `None` if unknown.
 pub fn target_by_id(id: &str) -> Option<Box<dyn AgentTarget>> {
     all_targets().into_iter().find(|t| t.id() == id)
 }
 
-/// Read a config file, treating "not found" as `default_when_absent` but
-/// surfacing any other read error (permission denied, invalid UTF-8) rather
-/// than collapsing it to empty. The collapse is dangerous: the caller then
-/// writes a fresh file and clobbers the user's real config (comments, other
-/// servers) it couldn't read.
+/// Only NotFound selects the default; masking other read errors could overwrite user config.
 pub(crate) fn read_config(path: &Path, default_when_absent: &str) -> Result<String> {
     match std::fs::read_to_string(path) {
         Ok(s) => Ok(s),
@@ -94,15 +72,7 @@ pub(crate) fn read_config(path: &Path, default_when_absent: &str) -> Result<Stri
     }
 }
 
-/// Replace `path`'s contents atomically: write to a temp file in the *same*
-/// directory, flush it to disk, then rename over the target. A crash, ENOSPC,
-/// or interrupt mid-write leaves the original config intact instead of a
-/// truncated one. Truncate-then-write would let a failed write destroy the
-/// user's other MCP servers, settings, and comments — the very content the
-/// read side works so hard not to clobber. The temp file shares the target's
-/// directory so the rename stays on one filesystem (a cross-device rename is
-/// not atomic and would fail); on any error the `NamedTempFile` is cleaned up
-/// on drop, so no stray temp file lingers.
+/// Sync a same-directory temporary file, then rename so failed writes preserve user config.
 pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<()> {
     let parent = path
         .parent()
@@ -122,15 +92,8 @@ pub(crate) fn atomic_write(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
-/// The argv CodeSage registers for every agent: this binary plus `mcp`, with
-/// `--project <abs>` when the registration is project-bound. Returned split
-/// so TOML (separate command/args) and JSON (single command array) targets
-/// can each shape it.
-///
-/// The binary is [`std::env::current_exe`], never the literal `codesage`:
-/// a PATH-installed name may resolve to another build (or nothing) where
-/// the agent runs. A failure to resolve it errors rather than registering
-/// a path that cannot work — the same rule as the git-hook installer.
+/// Register the current executable, not a PATH lookup that may select another build.
+/// Return command and arguments separately for TOML and JSON targets.
 pub(crate) fn mcp_command_args(project_utf8: Option<&str>) -> Result<(String, Vec<String>)> {
     let exe =
         std::env::current_exe().context("resolving current_exe for agent MCP registration")?;
@@ -174,8 +137,6 @@ mod tests {
 
     #[test]
     fn mcp_command_args_without_project_omits_the_flag() {
-        // A global registration made outside any project carries no
-        // `--project` default; the server resolves the project per call.
         let (cmd, args) = mcp_command_args(None).unwrap();
         assert_eq!(cmd, std::env::current_exe().unwrap().to_str().unwrap());
         assert_eq!(args, vec!["mcp"]);
@@ -190,7 +151,6 @@ mod tests {
         atomic_write(&path, "replaced\n").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "replaced\n");
 
-        // The same-dir temp file must be renamed away, not left behind.
         let entries: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name())

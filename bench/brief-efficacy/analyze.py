@@ -33,7 +33,17 @@ DECISIONS = ("served", "empty", "repeat", "cooldown", "budget", "unavailable", "
 
 # One rendered-payload line, mirroring render_brief() in
 # crates/cli/src/commands/query.rs.
-PAYLOAD_LINE = re.compile(r"^(hotspot: churn percentile |tests: |changes with: )")
+PAYLOAD_LINE = re.compile(r"^(hotspot: churn percentile |tests: |changes with: |branch overlap: |Branch overlap: )")
+QUOTED = r'"(?:[^"\\\n]|\\.)*"'
+BRANCH_LINE = re.compile(
+    rf"branch overlap: {QUOTED} edits {QUOTED}(?:, {QUOTED})* "
+    r"\(same-file, HEAD\.\.\.branch; merge base (?:[0-9a-f]{40}|[0-9a-f]{64})\)"
+)
+BRANCH_SUMMARY = re.compile(
+    r"Branch overlap: [1-9][0-9]* matching branch\(es\); scanned [0-9]+/(?:[0-9]+|unknown) refs "
+    r"\(local and remote-tracking refs; same-tip matches counted once; not a liveness check\)\."
+    r"(?: .*)?"
+)
 
 TEST_RUN_HINT = re.compile(
     r"\b(cargo (nextest|test)|pytest|phpunit|go test|npm (run )?test|pnpm test|"
@@ -87,9 +97,7 @@ def default_ledger_dir() -> Path:
 
 
 def valid_fire(rec) -> bool:
-    """Ledger rows are best-effort writes; validate before trusting a field.
-    `t` numeric (bool is an int in Python — exclude it), the string fields
-    strings, `h`/`tok` optional but typed when present."""
+    """Validate best-effort ledger rows; bool must not count as a timestamp."""
     if not isinstance(rec, dict):
         return False
     t = rec.get("t")
@@ -116,9 +124,7 @@ def read_generation(p: Path, seen_files: set[tuple[int, int]] | None = None) -> 
     except FileNotFoundError:
         return []
     except OSError as e:
-        # A legacy candidate under world-writable /tmp can be another user's
-        # dir or a plain file; one unreadable candidate must not take the
-        # state-dir rows down with it.
+        # Legacy /tmp candidates may be inaccessible; retain readable ledgers.
         print(f"skipping unreadable ledger {p}: {e}", file=sys.stderr)
         return []
     fires = []
@@ -174,6 +180,14 @@ def payload_candidates(text: str):
         if PAYLOAD_LINE.match(line):
             run.append(line)
         elif run:
+            branch_start = next((i for i, row in enumerate(run)
+                                 if row.startswith(("branch overlap: ", "Branch overlap: "))), None)
+            if branch_start is not None:
+                branches = run[branch_start:]
+                if (len(branches) < 2 or not BRANCH_SUMMARY.fullmatch(branches[-1])
+                        or any(not BRANCH_LINE.fullmatch(row) for row in branches[:-1])):
+                    run = []
+                    continue
             block = "\n".join(run)
             yield block + "\n"  # render_brief terminates every line
             yield block
@@ -183,13 +197,9 @@ def payload_candidates(text: str):
 def payload_occurrences(events: list[dict]) -> dict[str, list[tuple[int, str]]]:
     """digest -> [(event index, payload text), ...] in transcript order.
 
-    Only successful hook attachments count as exposure. Two
-    files can be served byte-identical payloads (same digest, distinct ledger
-    rows), so a serve must consume occurrences in order rather than always
-    taking the first match — the caller pairs the nth ledger row carrying a
-    digest with the nth transcript occurrence of it. One event contributes at
-    most one occurrence per digest (a payload echoed twice inside a single
-    event is one injection, not two)."""
+    Only successful hook attachments count. Pair identical payloads with ledger
+    rows in order; duplicate payloads within an event count once.
+    """
     occ: dict[str, list[tuple[int, str]]] = defaultdict(list)
     injections: set[tuple[str, str]] = set()
     for i, ev in enumerate(events):
@@ -220,11 +230,7 @@ def payload_occurrences(events: list[dict]) -> dict[str, list[tuple[int, str]]]:
                 strings.extend(s for s in value if isinstance(s, str))
         seen_here: set[str] = set()
         for s in strings:
-            if (
-                "hotspot: churn percentile" not in s
-                and "changes with: " not in s
-                and "tests: " not in s
-            ):
+            if not any(PAYLOAD_LINE.match(line) for line in s.split("\n")):
                 continue
             for cand in payload_candidates(s):
                 d = fnv1a64(cand)
@@ -380,8 +386,6 @@ def score_serve(events: list[dict], start: int, tests: list[str], coupled: list[
     return verdict
 
 
-# --- base rate ---------------------------------------------------------------
-
 TEST_NAME_TEMPLATES = (
     "{stem}Test",       # PHP
     "test_{stem}",      # Python
@@ -438,9 +442,6 @@ def two_proportion_z(x1: int, n1: int, x2: int, n2: int) -> float | None:
     return (p1 - p2) / se
 
 
-# --- main --------------------------------------------------------------------
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--ledger-dir", "--runtime-dir", dest="ledger_dir", type=Path,
@@ -459,9 +460,7 @@ def main() -> int:
     if explicit:
         ledger_dirs = [args.ledger_dir]
     else:
-        # Rows written before the ledger moved to the state dir sit in the
-        # runtime dir until the next reboot; read both so the denominator
-        # keeps them. An explicit --ledger-dir is honoured as given.
+        # Include legacy runtime rows in the denominator until reboot removes them.
         ledger_dirs = [default_ledger_dir()]
         for legacy in candidate_runtime_dirs():
             if legacy not in ledger_dirs:
@@ -472,7 +471,6 @@ def main() -> int:
         print(f"no fire ledger found under {ledger_label}", file=sys.stderr)
         return 1
 
-    # (a) decision mix
     by_session: dict[str, Counter] = defaultdict(Counter)
     by_project: dict[str, Counter] = defaultdict(Counter)
     total = Counter()
@@ -482,16 +480,14 @@ def main() -> int:
         by_session[f.get("s", "?")][d] += 1
         by_project[f.get("p", "?")][d] += 1
 
-    # (b) pair served fires with transcripts and score
     transcripts: dict[Path, list[dict]] = {}
+    failed_transcripts: set[Path] = set()
 
     def load_transcript(p: Path) -> list[dict]:
         if p not in transcripts:
             evs = []
             try:
-                # Stream line-by-line: transcripts can be tens of MB and
-                # only JSON lines are needed; a whole-file read would
-                # hold two copies (text + split list) at once.
+                # Avoid a second whole-file copy of large transcripts.
                 with p.open(encoding="utf-8", errors="replace") as f:
                     for line in f:
                         try:
@@ -499,6 +495,8 @@ def main() -> int:
                         except json.JSONDecodeError:
                             continue
             except OSError as e:
+                failed_transcripts.add(p)
+                evs = []
                 print(f"[warn] cannot read transcript {p}: {e}", file=sys.stderr)
             transcripts[p] = evs
         return transcripts[p]
@@ -513,35 +511,36 @@ def main() -> int:
         row = {
             "t": f.get("t"), "session": f.get("s"), "project": f.get("p"),
             "file": f.get("f"), "digest": f.get("h"), "verdict": "unmatched",
+            "unmatched_reason": "transcript-not-resolved",
         }
         tp = transcript_path(args.projects_dir, f.get("p", ""), f.get("s", ""))
         if tp is not None:
+            row["unmatched_reason"] = "exposure-not-found"
             events = load_transcript(tp)
+            if tp in failed_transcripts:
+                row["unmatched_reason"] = "transcript-read-failed"
+                serves.append(row)
+                continue
             if tp not in occurrences:
                 occurrences[tp] = payload_occurrences(events)
-            # Fires are time-sorted, so the nth ledger row with this digest in
-            # this transcript takes the nth occurrence. A row with no
-            # occurrence left stays unmatched — it never inherits another
-            # serve's position.
+            # Consume each exposure once, in ledger order.
             slot = consumed[(tp, f["h"])]
             hits = occurrences[tp].get(f["h"], [])
             if slot < len(hits):
+                del row["unmatched_reason"]
                 consumed[(tp, f["h"])] += 1
                 idx, payload = hits[slot]
                 tests, coupled = parse_payload(payload)
                 if tests or coupled:
                     row["verdict"] = score_serve(events, idx, tests, coupled)
                 else:
-                    # hotspot-only payload: nothing actionable was named, so
-                    # there is no action to detect. Not part of the acted/no-op
-                    # denominator.
-                    row["verdict"] = "hotspot-only"
+                    # No named action to score; exclude from the denominator.
+                    row["verdict"] = "branch-only" if "branch overlap: " in payload else "hotspot-only"
         serves.append(row)
 
     verdicts = Counter(r["verdict"] for r in serves)
     scored_n = sum(verdicts[v] for v in ("acted", "ambiguous", "no-op"))
 
-    # (c) base rate across every transcript of every project in the ledger
     base_edits = base_followed = 0
     for proj in by_project:
         d = args.projects_dir / munge_project(proj)
@@ -562,6 +561,7 @@ def main() -> int:
         "sessions": len(by_session),
         "served_scored": {
             "n": len(serves),
+            "scoreable_n": scored_n,
             "verdicts": dict(verdicts),
             "acted_rate": round(verdicts["acted"] / scored_n, 3) if scored_n else None,
         },
@@ -571,6 +571,8 @@ def main() -> int:
             "rate": round(base_followed / base_edits, 3) if base_edits else None,
         },
         "z_score": round(z, 2) if z is not None else None,
+        "required_scoreable_serves": args.min_served,
+        "observational_sample_ready": scored_n >= args.min_served,
         "default_on_ready": False,
         "decision": "Controlled A/B or randomized exposure is required; observational rates do not establish efficacy.",
         "serves": serves,
@@ -589,7 +591,7 @@ def main() -> int:
         print(f"  {p}: " + ", ".join(f"{d}={c[d]}" for d in DECISIONS if c[d]))
     print()
     print(f"served fires: {len(serves)}")
-    for v in ("acted", "ambiguous", "no-op", "hotspot-only", "unmatched"):
+    for v in ("acted", "ambiguous", "no-op", "hotspot-only", "branch-only", "unmatched"):
         if verdicts[v]:
             print(f"  {v}: {verdicts[v]}")
     if scored_n:

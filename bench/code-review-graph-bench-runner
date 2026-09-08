@@ -39,16 +39,8 @@ except ImportError:
     sys.exit("pyyaml required: pip install pyyaml")
 
 
-# ---------------------------------------------------------------------------
-# MCP driver
-# ---------------------------------------------------------------------------
-
-
 class CrgMcpSession:
-    """One MCP stdio session with the code-review-graph server. Keeps the
-    process alive so repeated queries reuse the loaded graph + embeddings
-    — spinning up a fresh `serve` per query would add 10+ seconds of
-    startup cost to each bench case."""
+    """Reuse loaded graph and embeddings to avoid per-query startup costs."""
 
     def __init__(self, cwd: Path) -> None:
         self._proc = subprocess.Popen(
@@ -136,11 +128,7 @@ class CrgMcpSession:
                 pass
 
 
-# ---------------------------------------------------------------------------
-# Scoring (mirrors codesage-bench-runner)
-# ---------------------------------------------------------------------------
-
-
+# Scoring mirrors codesage-bench-runner.
 def score_case(expected: list[str], returned: list[str], k_values: list[int]) -> dict:
     expected_set = set(expected)
     first_rank = None
@@ -172,11 +160,6 @@ def percentiles(xs: list[int]) -> tuple[int, int, int, int]:
         s[int(len(s) * 0.99)] if len(s) >= 100 else s[-1],
         s[-1],
     )
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def crg_version() -> str:
@@ -235,11 +218,6 @@ def normalize_path(fp: str, project_root: Path) -> str:
     return fp
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("corpus", type=Path)
@@ -259,7 +237,6 @@ def main() -> int:
     file_count, line_count = project_size(project_root)
     run_ts = now_iso_utc()
 
-    # One session, many queries — avoid per-query startup cost.
     session = CrgMcpSession(project_root)
     results = []
     wall_total = 0.0
@@ -284,7 +261,6 @@ def main() -> int:
                   file=sys.stderr)
     session.close()
 
-    # Header — same shape as codesage-bench-runner so diffs line up.
     size_str = f"{file_count:,} files, {line_count:,} LoC" if file_count else "size unknown"
     case_word = "case" if len(cases) == 1 else "cases"
     print("# code-review-graph retrieval scorecard")

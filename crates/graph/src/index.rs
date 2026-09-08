@@ -46,16 +46,12 @@ fn parse_one(root: &Path, file_info: &FileInfo) -> Result<ParsedFile> {
     })
 }
 
-/// Collapse references sharing the `refs` UNIQUE key `(to_name, kind, line,
-/// col)` within one file. Two query patterns matching one node would
-/// otherwise abort the whole write batch on the index; `references_found`
-/// then counts stored rows.
+/// Collapse overlapping query matches on the per-file `refs` UNIQUE key.
 fn dedupe_refs(refs: &mut Vec<Reference>) {
     let mut seen = HashSet::new();
     refs.retain(|r| seen.insert((r.to_name.clone(), r.kind, r.line, r.col)));
 }
 
-/// Map parsed fingerprints to borrowed insert rows.
 fn fingerprint_inputs(p: &ParsedFile) -> Vec<FingerprintInput<'_>> {
     p.fingerprints
         .iter()
@@ -70,13 +66,7 @@ fn fingerprint_inputs(p: &ParsedFile) -> Vec<FingerprintInput<'_>> {
         .collect()
 }
 
-/// Set each reference's `from_symbol` to the qualified name of the innermost
-/// symbol whose source range encloses the reference. This is what lets
-/// `find_references` report the calling symbol and `impact_analysis` walk the
-/// call graph at symbol precision instead of re-deriving the caller from
-/// `(file, line)`. References with no enclosing symbol (a top-level import, a
-/// reference in a file with no extracted symbols) keep `from_symbol = None`,
-/// so downstream consumers degrade cleanly.
+/// Assign the innermost enclosing symbol; unowned references retain `None`.
 fn populate_from_symbol(symbols: &[Symbol], refs: &mut [Reference]) {
     if symbols.is_empty() {
         return;
@@ -111,11 +101,7 @@ pub enum IndexStrategy {
 
 const STRUCTURAL_INDEX_BATCH_SIZE: usize = 50;
 
-/// Parse one batch in parallel. A file that fails (unreadable, or the parser
-/// returned no tree) is logged with its path and full cause chain, recorded
-/// in `stats.files_failed` / `stats.failed_paths`, and dropped from the
-/// returned set; the rest of the batch proceeds. A degraded parse is not a
-/// failure: it is logged at debug and counted when the batch is written.
+/// Skip and record unreadable or unparseable files; retain degraded parses.
 fn parse_batch(root: &Path, batch: &[&FileInfo], stats: &mut IndexStats) -> Vec<ParsedFile> {
     let results: Vec<(&FileInfo, Result<ParsedFile>)> =
         batch.par_iter().map(|f| (*f, parse_one(root, f))).collect();
@@ -165,19 +151,9 @@ fn count_written(stats: &mut IndexStats, p: &ParsedFile) {
     }
 }
 
-/// One transaction per batch: a failing statement rolls the whole batch
-/// back, so the tables never hold a half-written file, while earlier batches
-/// stay committed. Extraction collapses rows on the `symbols` / `refs` /
-/// `symbol_fingerprints` UNIQUE keys, so the batch path is the normal one.
-/// When it does fail, the batch is retried one file per transaction. Only a
-/// UNIQUE / PRIMARY KEY violation is the file's fault: that file is logged
-/// with path and cause, counted in `stats.files_failed` /
-/// `stats.failed_paths`, and isolated while the rest commit. Every other
-/// database error (full or read-only database, I/O error, lock held past
-/// `busy_timeout`, damaged schema, a CHECK / NOT NULL / FOREIGN KEY failure
-/// that would reject every file alike) aborts the pass with `Err`, leaving
-/// existing rows in place: a full pass purges the rows of every failed path,
-/// so treating such a fault as N file failures would delete committed data.
+/// Commit whole files in batches, retrying failed batches per file.
+/// Only UNIQUE/PRIMARY KEY violations count as file failures. Other database
+/// errors abort before full-pass cleanup can delete previously committed data.
 fn write_parsed_batch(db: &Database, parsed: &[ParsedFile], stats: &mut IndexStats) -> Result<()> {
     if parsed.is_empty() {
         return Ok(());
@@ -344,13 +320,8 @@ fn index_discovery_report(
         write_parsed_batch(db, &parsed, &mut stats)?;
     }
 
-    // A full pass rewrites the whole table, so a file it could not process
-    // must not keep rows from an earlier pass: they would describe a version
-    // of the file nobody can see. Dropping the `files` row also drops the
-    // stored hash, so the next incremental pass retries the file instead of
-    // reading the absence as "unchanged". An incremental pass keeps the old
-    // rows: it never saw the whole table and a transient read failure (an
-    // editor mid-write) should not blank a file's symbols.
+    // Full passes discard failed files' stale rows and hashes so later passes retry.
+    // Incremental passes retain old rows across transient read failures.
     if strategy == IndexStrategy::Full && !stats.failed_paths.is_empty() {
         db.execute_batch(|db| {
             for path in &stats.failed_paths {
@@ -445,8 +416,7 @@ mod tests {
         }
     }
 
-    /// A file discovery listed but the pass cannot read (deleted or made
-    /// unreadable between the two, or any other per-file read error).
+    /// Simulate a file disappearing after discovery.
     fn unreadable(path: &str, language: Language) -> FileInfo {
         FileInfo {
             path: path.to_string(),
@@ -599,9 +569,6 @@ mod tests {
         assert_eq!(db.all_fingerprints().unwrap().len(), 0);
     }
 
-    /// A file-backed index opened twice: `writer` seeds and later inspects
-    /// rows, `read_only` makes every write fail with `SQLITE_READONLY`, a
-    /// database-level fault that is nobody file's fault.
     fn read_only_pair(dir: &Path) -> (Database, Database) {
         let path = dir.join("index.db");
         let writer = Database::open(&path).unwrap();
@@ -640,12 +607,8 @@ mod tests {
         assert_eq!(stats.files_indexed, 0, "{stats:?}");
     }
 
-    /// The fault is a renamed `file_trust_boundaries` table on a writable
-    /// handle: `upsert_file`'s `DELETE FROM file_trust_boundaries` fails
-    /// with SQLITE_ERROR ("no such table"), a non-constraint fault, while
-    /// the purge's `DELETE FROM files` still works. A read-only handle would
-    /// not do: there the purge fails too, so the test would pass even if the
-    /// fault were misread as N per-file failures.
+    /// The renamed table breaks writes but permits purges. A read-only database
+    /// would also block purges, masking accidental deletion after write failure.
     #[test]
     fn full_pass_aborts_on_database_fault_and_keeps_existing_rows() {
         let root = tempfile::tempdir().unwrap();

@@ -19,8 +19,5 @@
 ; Pattern 6: Constant → Constant
 (const_declaration (const_element (name) @name)) @def
 
-; Pattern 7: Enum case → Constant (PHP 8.1 `case Hearts;`)
-; (Namespace declarations intentionally have no pattern: `extract_symbols`
-; used to match them only to discard them via the Namespace kind. Leaving
-; them out keeps pattern indices dense and the kind map total.)
+; Pattern 7: Enum case → Constant (PHP 8.1 `case Hearts;`).
 (enum_case name: (name) @name) @def

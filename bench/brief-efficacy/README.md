@@ -23,6 +23,63 @@ resets the gate. Corrupt state and concurrent lock contention suppress output.
 Run `python3 bench/brief-efficacy/test_canary.py` for hook and scorer regressions.
 These use controlled fixtures; they are not efficacy evidence.
 
+### Verify collection before accumulating a sample
+
+Start a new Claude Code session with the canary enabled and the CodeSage plugin
+loaded. From this checkout, you can load the local plugin for that session:
+
+```bash
+CODESAGE_BRIEF_CANARY=1 claude --plugin-dir "$PWD/plugins/codesage-tools"
+```
+
+Work on an actual editing task in an onboarded project. Keep the session
+transcript and the persistent fire ledger. Do not use `--bare` or
+`--no-session-persistence`: the former skips hooks, and the latter discards the
+transcript required to score exposure. A linked worktree needs its own index;
+the hook resolves the project from the edited file's ancestors.
+
+After a session finishes, run the analyzer and inspect the first served row
+before collecting more sessions. `served_scored.n` counts all served ledger
+rows; `served_scored.scoreable_n` counts only acted, ambiguous, and no-op rows.
+`required_scoreable_serves` reports the requested threshold, and
+`observational_sample_ready` reports whether that threshold was reached. None
+of these fields establishes causal efficacy.
+
+For an unmatched row, `unmatched_reason` distinguishes a transcript that could
+not be resolved (`transcript-not-resolved`, including ambiguous session paths)
+from a transcript without a matching successful exposure (`exposure-not-found`).
+`transcript-read-failed` means the transcript could not be read completely;
+partial contents are excluded from scoring and the base rate.
+For the latter, check for the brief hook's successful attachment and decoded
+`additionalContext`. Running `codesage brief --session` manually writes a served
+ledger row, but a command result is not proof that the PreToolUse hook injected
+context. Keep these rows unmatched; do not reconstruct attachment records.
+
+Native Codex subagents do not exercise this Claude PreToolUse hook. Their edits
+cannot supply its sample unless a separately verified integration records real
+exposure and follow-up actions.
+
+### Collect a controlled comparison
+
+Use real, independently useful tasks with acceptance checks defined before the
+runs. Give each task independent clean checkouts at the same source revision,
+with equivalent fresh indexes and history, the same model and effort, the same
+tool permissions, and the same task instructions. Randomize the order of the
+canary-enabled and disabled runs. Keep session budgets and deduplication intact;
+do not split a task into sessions merely to inflate the number of serves.
+
+Keep a private mapping of task, arm, order, source and binary revisions, session
+ID, and outcome. Evaluate both arms with the same acceptance checks without
+showing the evaluator the arm. Report task success, tool calls, tokens, latency,
+and cost alongside matched exposure counts. A served-file action can be
+correlated with the hook while task quality stays unchanged or worsens.
+
+The existing `bench/agent-task-runner` compares MCP availability on read-only
+retrieval tasks and disables Edit/Write. It cannot run this hook comparison
+unchanged. Select and bound the editing workload before starting billed model
+runs. Fifty scoreable serves make the observational sample reviewable; they do
+not establish fifty independent tasks or replace the controlled comparison.
+
 ## Data sources
 
 1. **Fire ledger** — `brief-fires.jsonl` (and rotation sibling
@@ -79,6 +136,8 @@ strictly:
 - **no-op** — none of the served content was exercised afterwards.
 - **hotspot-only** — the payload named no tests and no co-change files, so
   there is no detectable action; excluded from the acted/no-op denominator.
+- **branch-only** — the payload reports branch overlap without tests or
+  co-change files; excluded because branch-related actions are not scored.
 - **unmatched** — transcript missing or the digest never found (e.g. the
   session ran on another machine, or the transcript was pruned).
 
@@ -120,7 +179,7 @@ file-named-test pattern (`{stem}Test`, `test_{stem}`, `{stem}_test`,
 ## Decision rule
 
 After **≥ 50 scoreable served fires** (acted + ambiguous + no-op; not
-hotspot-only, not unmatched), the observational sample is available for review.
+hotspot-only, branch-only, or unmatched), the observational sample is available for review.
 Ambiguous counts against the hook. The descriptive z-score compares biased,
 non-equivalent populations; it cannot decide whether to keep the hook or enable
 it by default. Default-on requires randomized exposure or controlled A/B task

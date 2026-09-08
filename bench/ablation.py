@@ -51,11 +51,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-# The runner's METRICS comment is a single line since the banner fix (only the
-# first `codesage --version` line reaches it). DOTALL is kept so scorecards
-# captured before that fix, where the multi-line banner leaked into the
-# payload, still parse; splitting the captured group on any whitespace
-# recovers the key=value tokens either way.
+# DOTALL accepts older scorecards whose version banner spanned multiple lines.
 METRICS_RE = re.compile(r"<!--\s*METRICS:\s*(.*?)\s*-->", re.DOTALL)
 
 # (arm name, env overrides, needs_patch)
@@ -72,11 +68,9 @@ ARMS: dict[str, tuple[dict[str, str], bool]] = {
     "qualified_name_boost": ({"CODESAGE_QUALIFIED_NAME_BOOST": "1"}, False),
 }
 
-# Metrics we pull from the runner's machine-readable METRICS comment.
 METRIC_KEYS = ["miss_rate", "median_first", "r5", "r10", "mean_tokens_to_hit", "search_failures"]
 
-# Runner exit code for "some `codesage search` calls failed": the scorecard
-# is not a retrieval result and must not be compared against anything.
+# Search failures invalidate retrieval comparisons.
 RUNNER_RC_SEARCH_FAILURES = 3
 INVALID_KEY = "_invalid"
 
@@ -116,8 +110,6 @@ def run_arm(runner: Path, corpus: Path, bin_: str, limit: int, env_over: dict[st
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=3600)
     except subprocess.TimeoutExpired:
-        # One hung arm must not abort the whole sweep and discard the arms
-        # already collected — mark it invalid and keep going.
         print(f"  [warn] runner timed out after 3600s: {cmd[2]}", file=sys.stderr)
         return {INVALID_KEY: "INVALID (runner timed out)"}
     if r.returncode != 0:
@@ -162,8 +154,6 @@ def run_sweep(
             results[arm] = run_arm(runner, corpus, bin_, limit, env_over)
             if INVALID_KEY in results[arm]:
                 invalid_runs.append(f"{corpus.name}/{arm}")
-        # An invalid arm has an empty signature, so it is never compared; an
-        # invalid baseline means nothing on this corpus is compared.
         base_sig = metrics_signature(results.get("baseline", {}))
         for arm in selected:
             if arm == "baseline":
@@ -209,8 +199,7 @@ def main() -> int:
             sys.exit(f"unknown arms: {bad}; valid: {list(ARMS)}")
     if "baseline" not in selected:
         selected = ["baseline", *selected]  # always need baseline for deltas
-    # A repeated arm would be compared twice per corpus and could never reach
-    # the "compared on every corpus" bar for the inert warning.
+    # Duplicate arms would inflate the per-corpus comparison count.
     selected = list(dict.fromkeys(selected))
 
     lines: list[str] = ["# CodeSage ranker ablation", ""]
@@ -227,26 +216,18 @@ def main() -> int:
     )
     lines.append("")
 
-    # Pass 1: run every arm on every corpus, collect results. Track which arms
-    # moved off baseline on AT LEAST ONE corpus — that proves the knob is wired.
     all_results, ever_differed, compared, invalid_runs = run_sweep(
         args.corpora, selected, args.runner, args.codesage_bin, args.limit
     )
 
-    # Arms that never moved off baseline on ANY corpus. This is NOT proof the
-    # knob is unwired — it may legitimately have no effect on these corpora (a
-    # larger RRF_K often doesn't reorder anything). It only flags "no measurable
-    # effect anywhere tested", which is worth surfacing but must be disambiguated
-    # from a missing patch by a raw-output probe (see the rendered note).
-    # "Everywhere" requires a valid comparison on every corpus: an arm whose
-    # baseline crashed on one corpus was never shown inert there.
+    # An unchanged metric does not prove an unwired knob. Require valid
+    # comparisons on every corpus before reporting no measured effect.
     inert_everywhere = {
         a for a in selected
         if a != "baseline" and ARMS[a][1] and a not in ever_differed
         and compared.get(a, 0) == len(args.corpora)
     }
 
-    # Pass 2: render.
     for corpus_name, results in all_results:
         base_sig = metrics_signature(results.get("baseline", {}))
         lines.append(f"## {corpus_name}")

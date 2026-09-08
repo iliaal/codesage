@@ -14,20 +14,11 @@ use codesage_storage::db::CoChangeRow;
 use super::tests_rec::test_sibling_exists;
 use crate::impact::{MAX_FRONTIER, WalkCache, impact_analysis_walk_shared};
 
-/// Reverse-dependency traversal depth shared by the blast-radius count and the
-/// structural test-coverage check. Both read the same walk, and both notes
-/// quote this number, so it lives in one place rather than as a literal in
-/// three.
+/// Shared depth for blast radius, test reachability, and their disclosures.
 const DEPENDENT_DEPTH: usize = 2;
 
-/// Claim only what was measured: three checks ran, and this names all three
-/// rather than asserting the file is untested. A test can still exercise the
-/// file from beyond the traversal depth or through a dynamic call the
-/// structural graph does not model.
-///
-/// Spelled with a literal depth so it stays a `const` usable in
-/// [`ALIASABLE_NOTES`], which matches notes by exact string; the assertion
-/// below fails the build if `DEPENDENT_DEPTH` drifts away from the text.
+/// Describes completed checks, not proof of missing tests. The literal depth
+/// permits exact-string aliasing; the assertion keeps it aligned with the walk.
 const TEST_GAP_NOTE: &str =
     "test gap: no test found by sibling convention, co-change history, or within 2 dependency hops";
 const _: () = assert!(
@@ -35,10 +26,7 @@ const _: () = assert!(
     "TEST_GAP_NOTE spells the traversal depth literally; update the note text"
 );
 
-/// Fired when the reverse-dependency walk had nothing to seed on: the file has
-/// no indexed symbols (unsupported language, excluded from the structural
-/// index, or tracked only in git history). Without this, `dependent_files: 0`
-/// reads as "leaf, safe to change" when the honest answer is "unmeasured".
+/// A walk without indexed symbols cannot distinguish a leaf from missing evidence.
 const NO_STRUCTURAL_SIGNALS_NOTE: &str = "structural signals unavailable: file has no indexed \
      symbols, so the reverse-dependency walk and the dependency-hop test check could not run \
      (0 dependents means unknown, not zero)";
@@ -55,10 +43,7 @@ const CYCLE_SIGNAL_FAILED_NOTE: &str =
 const TEST_GAP_UNMEASURED_NOTE: &str = "test gap: no test found by sibling convention or \
      co-change history; the dependency-hop check could not run (file has no indexed symbols)";
 
-/// Test-gap note honesty: [`TEST_GAP_NOTE`] claims three checks ran, so it is
-/// only used when all three actually did. When the dependency-hop check could
-/// not run (no symbols) or was truncated (frontier cap), the note says so
-/// instead of presenting the partial check as a completed one.
+/// Reserve the three-check claim for a completed dependency walk.
 fn test_gap_note(no_symbols: bool, walk_capped: bool) -> String {
     if no_symbols {
         TEST_GAP_UNMEASURED_NOTE.to_string()
@@ -129,9 +114,7 @@ pub(crate) fn one_off_multiplier(recurrence_rank: bool) -> f64 {
     }
 }
 
-/// `"within N days"`, or `"within a day"` when the span rounds to zero (a
-/// pair needs three shared commits to be stored, so a zero span is a burst
-/// inside one day, not one commit).
+/// Human-readable observation span. Only pairs meeting the display threshold reach this path.
 fn span_phrase(max_span: u32) -> String {
     if max_span == 0 {
         "within a day".to_string()
@@ -232,10 +215,6 @@ fn one_off_page_note(db: &Database, coupled: &[CoChangeEntry]) -> Result<String>
 /// co-changing over a month or more outranks a one-off mass commit of equal
 /// raw weight. `CODESAGE_COUPLING_RECURRENCE=0` restores raw-weight order.
 /// The reported `weight` is the raw value in both modes.
-///
-/// Schema change from the pre-0.4.1 `Vec<CoChangeEntry>` return type: callers
-/// that read the MCP `find_coupling` response should now index into
-/// `result.coupled` instead of treating the result as a bare array.
 pub fn find_coupling(db: &Database, file_path: &str, limit: usize) -> Result<CouplingReport> {
     find_coupling_ranked(
         db,
@@ -264,11 +243,7 @@ pub fn find_coupling_ranked(
         .map(|r| to_co_change_entry(r, file_commits))
         .collect();
 
-    // Note distinguishes the three dominant empty-result causes so an agent
-    // can decide whether to retry, try a different tool, or warn the user
-    // that the index needs a refresh. A non-empty page gets a note when any
-    // row's span is unknown (its `recurring: false` is not evidence) or when
-    // no pair on it is recurring.
+    // Unknown spans cannot support a non-recurrence claim, even on non-empty pages.
     let note = if !coupled.is_empty() {
         if span_unknown > 0 {
             Some(span_unknown_note(
@@ -318,14 +293,11 @@ pub fn find_coupling_ranked(
 /// - cycle membership ((cycle_size - 1) / 4, capped at size 5) — weight 0.09
 /// - trust boundary count (capped at 5 distinct boundaries) — weight 0.10
 ///
-/// Output includes the decomposition so the agent can quote specific signals
-/// in PR descriptions or risk callouts. Empty git history → score=0 with a note.
+/// Includes the signal decomposition; structural signals remain usable without git history.
 /// Every field is populated and `verbose` starts true; a caller that wants
 /// the trimmed wire shape flips it with [`RiskAssessment::set_verbose`].
 ///
-/// The seven weights sum to 1.0 so the maximum score is bounded; relative
-/// shape is preserved when tuning so the structural signals (churn, fix
-/// ratio) keep dominating over the security-shaped trust-boundary term.
+/// The seven weights sum to 1.0, bounding the score.
 pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
     Ok(assess_risk_with_context(
         db,
@@ -406,11 +378,8 @@ fn assess_risk_with_context(
         0.0
     };
 
-    // Coupling pressure reads the raw top-10 set; the reported `top_coupled`
-    // list is the recurrence-ranked page so it agrees with `find_coupling`.
-    // The two differ only when a one-off or unknown-span pair is demoted out
-    // of or into the ten, so the coupled-test check looks at both pages and
-    // the note names a test that only the raw page holds.
+    // Pressure counts raw-ranked pairs; display uses recurrence ranking.
+    // Check both pages for tests and disclose any test omitted from display.
     let coupled = db.co_changes_for(file_path, 10)?;
     let coupled_files = coupled.len() as u32;
     let ranked = db.co_changes_for_ranked(file_path, 10, one_off_multiplier_from_env())?;
@@ -429,10 +398,7 @@ fn assess_risk_with_context(
         .map(|r| to_co_change_entry(r, total_commits))
         .collect();
 
-    // Reverse-dependency pressure and structural test coverage share one
-    // traversal: `impact_analysis` applies `source_only` as a final filter, so
-    // an unfiltered walk yields both the source-file count and any test file
-    // that reaches this one. Two calls would double the cost for the same rows.
+    // An unfiltered walk supplies both source-file pressure and reachable tests.
     let outcome = impact_analysis_walk_shared(
         db,
         &ImpactRequest {
@@ -450,9 +416,7 @@ fn assess_risk_with_context(
     let dependents = outcome.entries;
     let walk_capped = outcome.capped;
 
-    // Zero dependents is only evidence of a leaf when the walk actually had
-    // seeds. A file with no indexed symbols never entered the traversal, so
-    // its zero is "could not measure", not "nothing imports this".
+    // Without seeds, zero dependents means unmeasured.
     let no_symbols = dependents.is_empty()
         && db
             .symbols_for_file(file_path)
@@ -464,13 +428,7 @@ fn assess_risk_with_context(
         .filter(|e| e.category == FileCategory::Source)
         .count() as u32;
 
-    // Test gap: a sibling test by language convention, a test among the top
-    // co-changers, or a test that reaches this file through the dependency
-    // graph. The third term matters because the first two are convention and
-    // history: a newly added helper called by a well-tested caller has neither
-    // a sibling nor a co-change record, and without this would be reported as
-    // untested. Keep the nearest test dependent so the note can name a test the
-    // agent can actually run.
+    // Reachability can find tests for new helpers with no sibling or co-change history.
     let has_sibling_test = test_sibling_exists(db, file_path)
         .with_context(|| format!("checking sibling test for risk({file_path})"))?;
     let dependent_test = dependents
@@ -483,10 +441,7 @@ fn assess_risk_with_context(
     let coup_pressure = (coupled_files as f64 / 10.0).min(1.0);
     let test_gap_term = if test_gap { 1.0 } else { 0.0 };
 
-    // Cycle membership: best-effort. If SCC computation fails (DB-level
-    // edge enumeration error), we log and continue with no cycle data
-    // rather than failing the whole risk call. The structural sensor is
-    // additive to the existing git/coupling signals, not load-bearing.
+    // Cycle lookup failure must not discard the other risk signals.
     let mut cycle_signal_failed = false;
     let (in_cycle, cycle_size, cycle_files) = if let Some(cycles) = precomputed_cycles {
         cycle_membership(cycles, file_path)
@@ -501,19 +456,13 @@ fn assess_risk_with_context(
             }
         }
     };
-    // (cycle_size - 1) / 4 clamped: 2-file cycle → 0.25, 5+ → 1.0.
     let cycle_term = if in_cycle {
         (cycle_size.saturating_sub(1) as f64 / 4.0).min(1.0)
     } else {
         0.0
     };
 
-    // Trust boundaries are a security-shaped signal: a file that talks to the
-    // network AND reads secrets AND exec()s subprocesses is meaningfully more
-    // risky than one that does none of those, even if its churn and tests are
-    // identical. We cap at 5 distinct boundaries so a few extreme files
-    // (legitimately broad infra glue) don't get pinned at the top of the
-    // ranking solely on this term.
+    // Cap boundary pressure so infrastructure glue cannot dominate on this signal alone.
     let trust_boundaries = db
         .trust_boundaries_for_file_path(file_path)
         .with_context(|| format!("loading trust boundaries for risk({file_path})"))?;
@@ -577,9 +526,7 @@ fn assess_risk_with_context(
     if test_gap {
         notes.push(test_gap_note(no_symbols, walk_capped));
     } else if !hidden_coupled_tests.is_empty() && !top_coupled.iter().any(|e| is_test(&e.file)) {
-        // `test_gap` is false on the strength of tests the displayed list
-        // does not show: they sit in the raw top ten but were demoted below
-        // the recurrence-ranked ten. Say so, or the two fields contradict.
+        // Explain tests supporting `test_gap: false` that ranking omitted from display.
         for (unknown, label) in [(false, "one-off"), (true, "span unknown")] {
             let tests: Vec<&str> = hidden_coupled_tests
                 .iter()
@@ -610,10 +557,7 @@ fn assess_risk_with_context(
         && !has_coupled_test
         && let Some(t) = dependent_test
     {
-        // Coverage found only through the dependency graph. Claim reachability,
-        // not execution: this is a static reference chain, so the test may
-        // import the file without exercising the changed symbol. Naming the
-        // file and hop count lets the agent confirm in one read.
+        // A static dependency chain shows reachability, not execution of the changed symbol.
         notes.push(format!(
             "no direct test; test {} reaches this file in {} dependency hop(s)",
             t.file_path, t.distance
@@ -640,14 +584,8 @@ fn assess_risk_with_context(
             sample.join(", ")
         ));
 
-        // Cycle-breaking guidance, shaped by the cycle's structure. A single
-        // edge removal only meaningfully breaks an SCC close to a simple ring
-        // (each file imported by ~one other cycle member, edges ≈ nodes); there
-        // the lowest-co-change edge is the most arbitrary coupling and the
-        // safest dependency to invert. When the SCC has a hub many cycle files
-        // import, or far more edges than a ring, one cut won't untangle it — so
-        // surface the most-depended-on files (the decoupling targets) instead.
-        // `cycle_files` excludes the current file, so add it back for the SCC.
+        // A ring can be broken at one edge; dense or hub-heavy SCCs need broader decoupling.
+        // Restore the current file because `cycle_files` contains only its peers.
         let mut scc: Vec<&str> = cycle_files.iter().map(String::as_str).collect();
         scc.push(file_path);
         match db.import_edges_within(&scc) {
@@ -708,8 +646,7 @@ fn assess_risk_with_context(
     let top_symbols = match compute_top_symbols(db, file_path, in_cycle, cycle_size) {
         Ok(v) => v,
         Err(e) => {
-            // Failing to fetch symbols shouldn't fail the whole risk call; the
-            // top-symbol breakdown is additive context, not load-bearing.
+            // Missing symbol detail must not discard the file assessment.
             tracing::warn!(error = %e, file = %file_path, "top-symbols computation failed; omitting from risk");
             Vec::new()
         }
@@ -763,21 +700,16 @@ fn cycle_membership(cycles: &[CycleEntry], file_path: &str) -> (bool, u32, Vec<S
         .unwrap_or((false, 0, Vec::new()))
 }
 
-/// Maximum symbols returned per file. Burn-budget protection: a file with 200
-/// methods still returns 5 entries — agents asking "what drives this file's
-/// score" don't need the long tail.
+/// Bound the per-file symbol breakdown.
 const TOP_SYMBOLS_CAP: usize = 5;
 
 /// Rank symbols inside `file_path` by the heuristic
 /// `ln(1 + line_count) + ref_count + (in_cycle ? 1.0 : 0.0)` and return the
 /// top [`TOP_SYMBOLS_CAP`] with a one-line `why`. Cycle membership is a
 /// file-level signal: every symbol in a file participating in an import cycle
-/// gets the same +1.0 bump, which is the intended behaviour — the cycle term
-/// promotes hot files into the top-symbols breakdown without distorting the
-/// intra-file ordering. Ref counts are likewise keyed by SHORT name (same
-/// shape as `find_references`), so same-named symbols in one file share one
-/// count: the score keeps using it (calibration), but the `why` line says
-/// "shared" instead of presenting it as a per-symbol measurement.
+/// gets the same +1.0 bump without changing intra-file ordering.
+/// Ref counts use short names, like `find_references`. Same-named symbols share
+/// a count, disclosed as "shared" in `why` rather than as a per-symbol measurement.
 ///
 /// Empty when the file has no indexed symbols. Not an error.
 fn compute_top_symbols(
@@ -800,7 +732,7 @@ fn compute_top_symbols(
     let counts = db
         .reference_counts_for_names(&names)
         .with_context(|| format!("counting refs for top-symbols breakdown of {file_path}"))?;
-    // Short-name frequencies in THIS file: a count is "shared" when more
+    // Short-name frequencies in this file: a count is "shared" when more
     // than one symbol here answers to the same short name.
     let mut name_freq: HashMap<&str, usize> = HashMap::new();
     for s in &symbols {
@@ -819,9 +751,7 @@ fn compute_top_symbols(
         })
         .collect();
 
-    // Descending by score. Stable sort keeps insertion order (=source order)
-    // as a deterministic tiebreaker so two equal-scored symbols always come
-    // out in the same order.
+    // Stable sorting preserves source order for equal scores.
     scored.sort_by(|a, b| {
         b.0.partial_cmp(&a.0)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -857,10 +787,7 @@ fn compute_top_symbols(
         .collect())
 }
 
-/// Aggregate `assess_risk` across the file list of a patch. Lets an agent
-/// ask one question instead of N round-trips. Output exposes both the
-/// per-file decomposition and patch-level rollups (max/mean, files in each
-/// risk category, paste-ready summary notes).
+/// Per-file risk assessments and patch-level rollups for a list of changed files.
 pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiffAssessment> {
     assess_risk_diff_with_walk_cache(db, file_paths, None)
 }
@@ -972,10 +899,7 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
             fix_heavy_files.len()
         ));
     }
-    // The hop-check claim mirrors the per-file honesty rule: only files whose
-    // dependency-hop check actually completed get the "within N hops" wording.
-    // For symbol-less or cap-truncated files the aggregate says so, instead of
-    // re-asserting the certainty the per-file notes just disclaimed.
+    // The aggregate must distinguish completed, capped, and unavailable hop checks.
     if !test_gap_files.is_empty() {
         let total = test_gap_files.len();
         if partial_gap_count == 0 {
@@ -1004,9 +928,6 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
             wide_blast_files.len()
         ));
     }
-    // A hotspot+fix-heavy+test-gap file with no trust boundaries hits the
-    // weight ceiling at ~0.54, so 0.50 catches "worth flagging" without
-    // firing on every mid-tier file.
     if max_score >= 0.50 {
         summary_notes.push(format!(
             "max risk score {max_score:.2}; consider smaller patch and broader test sweep"
@@ -1035,10 +956,7 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
 
     let (mut files, clustered_directories) = cluster_by_directory(files, DIR_CLUSTER_THRESHOLD);
 
-    // Alias categorical notes that repeat across files into short codes.
-    // The clustered files have already been demoted to `omitted_files` (no
-    // notes there), so we only alias the kept `files[]` entries plus the
-    // detail kept inside each cluster's `top_files`.
+    // Omitted cluster members have no notes; alias only the retained detail.
     let mut all_for_alias: Vec<&mut RiskAssessment> = files.iter_mut().collect();
     let mut clustered_directories = clustered_directories;
     for cd in clustered_directories.iter_mut() {
@@ -1068,12 +986,6 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
 /// `assess_risk` over a list of files, returning per-file decomposition
 /// without patch-level aggregation. See [`RiskBatchAssessment`] for the
 /// design distinction vs [`assess_risk_diff`].
-///
-/// Retrospective session analysis (recommendations doc §1.7, 30-day
-/// window) found 230 individual `assess_risk` MCP calls vs 13
-/// `assess_risk_diff` — the agent's dominant pattern is per-file scoring,
-/// not patch aggregation. This batch variant cuts the per-call MCP
-/// protocol overhead for that pattern: one round-trip for N files.
 pub fn assess_risk_batch(db: &Database, file_paths: &[String]) -> Result<RiskBatchAssessment> {
     if file_paths.is_empty() {
         return Ok(RiskBatchAssessment::default());
@@ -1194,18 +1106,12 @@ fn find_cycles_touching(db: &Database, patch_files: &[String]) -> Result<Vec<Cyc
             max_churn_file,
         });
     }
-    // Largest cycles first — most useful for an agent scanning the output.
     out.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.members.cmp(&b.members)));
     Ok(out)
 }
 
-/// Single-file cycle membership, routed through the SAME Tarjan SCCs the
-/// batch path ([`find_cycles_touching`]) reads, so one file scores identically
-/// whether assessed alone or as part of a patch. The forward/reverse
-/// reachability intersection this replaces computes the same set — files
-/// mutually reachable with the start *are* its SCC — but on uncached
-/// per-file SQL walks with a traversal cap that bailed on large graphs,
-/// which is exactly how the same file scored differently per entry point.
+/// Use the same Tarjan SCCs as [`find_cycles_touching`] so single-file and
+/// batch assessments agree, including on large graphs.
 fn find_cycle_containing_file(db: &Database, file_path: &str) -> Result<Option<CycleEntry>> {
     let components = import_cycle_components(db)?;
     for component in components.iter() {
@@ -1258,10 +1164,7 @@ fn import_cycle_components(db: &Database) -> Result<Arc<Vec<Vec<String>>>> {
     Ok(components)
 }
 
-/// Return the member with the highest `churn_score` in `git_files`, or
-/// `None` if none of the members have a git history row. Best-effort
-/// heuristic: the most-modified member tends to be the most-crosscut
-/// and is usually the right refactor site to break the cycle.
+/// Highest-churn member as a heuristic refactor candidate, or `None` without history.
 fn pick_max_churn(db: &Database, members: &[String]) -> Result<Option<String>> {
     let mut best: Option<(f64, String)> = None;
     for m in members {
@@ -1277,9 +1180,7 @@ fn pick_max_churn(db: &Database, members: &[String]) -> Result<Option<String>> {
 
 /// When a patch touches at least this many files in a single directory, the
 /// per-file detail for that directory is condensed into a `ClusteredDirectory`
-/// entry. Measured on real 30-day session logs: `assess_risk_diff` responses
-/// at p95 were 24 KB and saved ~13% with this rule; smaller patches are
-/// untouched so agent prompts built against the flat shape keep working.
+/// entry. Smaller groups retain the flat response shape.
 const DIR_CLUSTER_THRESHOLD: usize = 5;
 
 /// Group `files` by their parent directory. Any directory with
@@ -1293,7 +1194,6 @@ fn cluster_by_directory(
 ) -> (Vec<RiskAssessment>, Vec<ClusteredDirectory>) {
     use std::collections::BTreeMap;
 
-    // Bucket by parent directory, preserving insertion order inside each bucket.
     let mut buckets: BTreeMap<String, Vec<RiskAssessment>> = BTreeMap::new();
     for f in files {
         let dir = std::path::Path::new(&f.file)
@@ -1311,7 +1211,6 @@ fn cluster_by_directory(
             kept.extend(items);
             continue;
         }
-        // Sort by risk score descending so top-3 are the highest.
         items.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -1334,8 +1233,6 @@ fn cluster_by_directory(
 mod tests {
     use super::*;
 
-    /// Small indexed project so impact_analysis has a graph to walk; mirrors
-    /// the setup in `tests/risk_test.rs`.
     fn setup_project() -> (tempfile::TempDir, Database) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1359,8 +1256,6 @@ mod tests {
         (dir, db)
     }
 
-    /// The full three-check note is reserved for a completed walk. The capped
-    /// and no-symbols variants must not claim the hop check as an absolute.
     #[test]
     fn test_gap_note_variants_claim_only_what_ran() {
         let full = test_gap_note(false, false);
@@ -1382,11 +1277,7 @@ mod tests {
         );
     }
 
-    /// End-to-end capped walk through the production path: the fixture's two
-    /// depth-1 callers overflow a frontier cap of 1, so the assessment must
-    /// carry the lower-bound note and the truncated test-gap variant instead
-    /// of the completed-three-check claim. Only the cap is injected; the walk,
-    /// gap logic, and note plumbing are all real.
+    /// Two callers exceed an injected frontier cap of one; the walk and disclosure remain real.
     #[test]
     fn capped_walk_emits_lower_bound_and_truncated_gap_notes() {
         let (_dir, db) = setup_project();
@@ -1429,8 +1320,6 @@ mod tests {
             r.notes
         );
 
-        // Same fixture under the production cap: the walk completes, the full
-        // three-check note returns, and the honesty notes disappear.
         let (r_full, partial_full) = assess_risk_with_context(
             &db,
             "Repository.php",
@@ -1586,9 +1475,7 @@ mod tests {
     #[test]
     fn batch_scores_bit_identical_to_single_file_path() {
         let (_dir, db) = setup_project();
-        // Tied churn scores exercise the CUME_DIST tie handling end-to-end;
-        // Service.php has no git row so its percentile takes the 0.0 fallback
-        // on both paths.
+        // Ties exercise CUME_DIST; the missing Service.php row exercises the zero fallback.
         db.upsert_git_file("Repository.php", 10.0, 4, 8, Some(1_700_000_000))
             .unwrap();
         db.upsert_git_file("Controller.php", 10.0, 1, 8, Some(1_700_000_000))
@@ -1633,10 +1520,6 @@ mod tests {
         }
     }
 
-    /// The single-file cycle path must agree with the batch SCC path: both
-    /// now read the same Tarjan components, so one file in a 2-cycle reports
-    /// the same members alone and inside a patch, and a file outside any
-    /// cycle reports none on both.
     #[test]
     fn single_file_cycle_matches_batch_scc_members() {
         use codesage_protocol::{FileInfo, Language, Reference, ReferenceKind, Symbol, SymbolKind};

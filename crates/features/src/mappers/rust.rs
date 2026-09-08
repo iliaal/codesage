@@ -1,7 +1,6 @@
 //! Rust mapper: `src/main.rs`, `src/bin/*.rs`, `src/lib.rs`, Cargo workspace
 //! members from `[workspace] members = [...]`, and integration tests in
-//! `tests/*.rs`. Translates clawpatch's Rust mapper (src/mappers/rust.ts)
-//! to native Rust with the same shape.
+//! `tests/*.rs`.
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
@@ -30,7 +29,6 @@ impl FeatureMapper for RustMapper {
         }
         let mut seeds = Vec::new();
         seed_for_package(ctx, root, &mut seeds, "cargo-root")?;
-        // Workspace members.
         for member_dir in cargo_workspace_members(root, &manifest)? {
             let full = root.join(&member_dir);
             if !is_safe_dir(root, &full) {
@@ -77,7 +75,6 @@ fn seed_for_package(
             .unwrap_or_else(|| "crate".to_string())
     });
     let test_command = format!("cargo test --package {pkg_name}");
-    // Binary entrypoint: src/main.rs.
     let main_rs = pkg_dir.join("src/main.rs");
     if is_safe_file(root, &main_rs) {
         let entry = rel_path(root, &main_rs);
@@ -101,7 +98,7 @@ fn seed_for_package(
             });
         }
     }
-    // Library entrypoint: src/lib.rs (separate feature even if main.rs exists).
+    // Libraries remain separate features when main.rs also exists.
     let lib_rs = pkg_dir.join("src/lib.rs");
     if is_safe_file(root, &lib_rs) {
         let entry = rel_path(root, &lib_rs);
@@ -123,7 +120,6 @@ fn seed_for_package(
             });
         }
     }
-    // Additional bins under src/bin/*.rs (one feature each).
     let bin_dir = pkg_dir.join("src/bin");
     if is_safe_dir(root, &bin_dir) {
         for p in sorted_read_dir(&bin_dir) {
@@ -156,7 +152,6 @@ fn seed_for_package(
             }
         }
     }
-    // Integration tests under tests/*.rs.
     let tests_dir = pkg_dir.join("tests");
     if is_safe_dir(root, &tests_dir) {
         for p in sorted_read_dir(&tests_dir) {
@@ -193,9 +188,7 @@ fn library_owned_files(ctx: &MapperContext, pkg_dir: &Path, entry_path: &str) ->
     if !is_safe_dir(ctx.root, &src_dir) {
         return Vec::new();
     }
-    // walk_files yields ROOT-relative paths, so the bin-exclusion prefix
-    // must be root-relative too. For a workspace member at crates/foo the
-    // bin dir is crates/foo/src/bin — a bare "src/bin/" would never match.
+    // walk_files yields root-relative paths; include the workspace member prefix.
     let bin_prefix = format!("{}/", rel_path(ctx.root, &src_dir.join("bin")));
     walk_files(ctx.root, &src_dir, 10_000, ctx.excludes)
         .into_iter()
@@ -400,7 +393,6 @@ fn cargo_toml_context(ctx: &MapperContext, pkg_dir: &Path) -> Vec<SeedFile> {
 fn read_package_name(manifest_path: &Path) -> Option<String> {
     let raw = read_to_string_bounded(manifest_path).ok().flatten()?;
     let stripped = strip_line_comments(&raw, '#');
-    // Find `[package]` section then `name = "..."` within it.
     let pkg_start = Regex::new(r"(?m)^\s*\[package\]\s*$")
         .ok()?
         .find(&stripped)?;
@@ -443,11 +435,7 @@ fn cargo_workspace_members(root: &Path, manifest: &Path) -> Result<Vec<String>> 
         if let Some(v) = cap.get(1) {
             let s = v.as_str().trim_end_matches('/').to_string();
             if s.contains('*') || s.contains('?') {
-                // Expand a simple `prefix/*` glob against the filesystem.
-                // `crates/*` is already covered by the dedicated crates_dir
-                // walk in `map`, so skip it here to avoid double-seeding;
-                // other prefixes (`libs/*`, `packages/*`) were previously
-                // dropped silently.
+                // The dedicated crates_dir walk already covers `crates/*`.
                 if let Some(prefix) = s.strip_suffix("/*")
                     && prefix != "crates"
                     && !prefix.is_empty()
@@ -473,11 +461,9 @@ fn cargo_workspace_members(root: &Path, manifest: &Path) -> Result<Vec<String>> 
             if s.is_empty() || s.contains("..") {
                 continue;
             }
-            // Skip the root self-reference (`"."`).
             if s == "." {
                 continue;
             }
-            // Discard outside-of-root entries.
             let full = root.join(&s);
             if !is_safe_dir(root, &full) {
                 continue;
@@ -596,9 +582,6 @@ mod tests {
 
     #[test]
     fn workspace_member_bin_excluded_from_library_owned_files() {
-        // A workspace member's src/bin/*.rs must not leak into the
-        // library seed's owned_files. The bin-exclusion prefix is
-        // root-relative, so it has to account for the member subdir.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -654,8 +637,6 @@ mod tests {
 
     #[test]
     fn map_is_deterministic_across_runs() {
-        // Bin/test seed order follows sorted directory scans, never
-        // readdir order: mapping the same tree twice must agree exactly.
         let dir = tempdir().unwrap();
         write(
             dir.path(),

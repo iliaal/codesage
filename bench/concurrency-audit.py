@@ -49,19 +49,8 @@ def backup_db(codesage_dir: Path) -> Path | None:
     src = codesage_dir / "index.db"
     if not src.exists():
         return None
-    # Force WAL → main file before snapshotting. Previously we copied -wal
-    # and -shm siblings under separate audit-backup-* names and the
-    # restore path never read them back — any committed-but-not-yet-
-    # checkpointed transactions (common after a fresh `codesage index`
-    # because checkpoints are lazy) were silently dropped on restore.
-    # TRUNCATE returns the WAL to zero length so the `.db` snapshot is
-    # the entire database state. fnd_9c80fa62.
-    #
-    # Another reader/writer (the per-user codesage daemon, which keeps a
-    # long-lived handle on every routed project's index.db) will cause
-    # the checkpoint to return busy=1 and leave WAL frames behind. Refuse
-    # to proceed in that case — restoring a torn snapshot would re-drop
-    # whatever was supposed to be in those frames. fnd_96b7b163.
+    # A main-file copy omits uncheckpointed transactions. Require a complete
+    # checkpoint; a busy connection can leave committed WAL frames behind.
     conn = sqlite3.connect(str(src))
     try:
         row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
@@ -74,9 +63,7 @@ def backup_db(codesage_dir: Path) -> Path | None:
             "Stop the codesage daemon (`codesage daemon stop`) and any "
             "running indexer, then re-run this audit."
         )
-    # Backup lives outside .codesage/ (system temp dir): a crash between
-    # backup and the finally-unlink in main() must not leave a permanent
-    # full-size copy inside the project dir.
+    # Keep crash-leftover backups outside the project.
     fd, bak_name = tempfile.mkstemp(prefix="index.db.audit-backup-")
     os.close(fd)
     bak = Path(bak_name)
@@ -86,19 +73,14 @@ def backup_db(codesage_dir: Path) -> Path | None:
 
 def restore_db(codesage_dir: Path, bak: Path | None) -> None:
     src = codesage_dir / "index.db"
-    # Re-check for live writers before touching -wal/-shm: unlinking a live
-    # writer's WAL tears its uncheckpointed frames. A non-empty -wal means
-    # someone (usually the codesage daemon) wrote during the audit run —
-    # checkpoint first; on busy refuse instead of unlinking.
+    # Recheck before unlinking WAL: another writer may have committed meanwhile.
     wal = codesage_dir / "index.db-wal"
     try:
         wal_nonempty = wal.exists() and wal.stat().st_size > 0
     except OSError:
         wal_nonempty = True
     if wal_nonempty and src.exists():
-        # A torn or non-database file (e.g. a half-written audit artifact)
-        # has no live writer to protect — checkpoint errors mean "nothing
-        # to checkpoint", so fall through to the unlink path below.
+        # Permit restoration over a damaged database that cannot checkpoint.
         try:
             conn = sqlite3.connect(str(src))
             try:
@@ -115,9 +97,7 @@ def restore_db(codesage_dir: Path, bak: Path | None) -> None:
                 "running indexer, then re-run this audit. "
                 "Refusing to unlink the live -wal."
             )
-    # Remove WAL/SHM siblings so the restored .db (which was checkpointed
-    # to a self-contained state at backup time) isn't shadowed by stale
-    # log frames written during the audit run.
+    # Old WAL frames must not shadow the restored snapshot.
     for ext in ("-wal", "-shm"):
         side = codesage_dir / f"index.db{ext}"
         if side.exists():
@@ -140,17 +120,10 @@ def _read_tail(f, limit: int = 400) -> str:
 
 
 def run_parallel(cmds: list[list[str]], cwd: Path, timeout_s: int = 300) -> list[dict]:
-    """Launch N commands simultaneously, wait for all, return structured
-    summaries. Intentionally does not stagger — the whole point is the hard
-    concurrency case.
+    """Launch without staggering, bounded by one shared deadline.
 
-    Each child's stdout/stderr is redirected to its own temp file rather than a
-    PIPE. Draining PIPEs sequentially (communicate() per child) let a child that
-    wrote more than the ~64 KiB OS pipe buffer block in write() while the harness
-    was busy on the other child — and if that blocked write happened while the
-    child held the SQLite write lock, the harness manufactured the very livelock
-    it exists to detect. Files have no such back-pressure. A single shared
-    deadline also bounds total wall time to one timeout window instead of N.
+    Temp-file output avoids pipe backpressure while a child holds a SQLite
+    lock, which would manufacture a concurrency failure in the harness.
     """
     procs = []
     files = []
@@ -186,10 +159,6 @@ def run_parallel(cmds: list[list[str]], cwd: Path, timeout_s: int = 300) -> list
         })
     return results
 
-
-# ---------------------------------------------------------------------------
-# Post-run DB integrity checks
-# ---------------------------------------------------------------------------
 
 REQUIRED_TABLES = ("files", "symbols", "refs", "schema_migrations")
 
@@ -302,15 +271,10 @@ def integrity_check(db_path: Path) -> dict:
             out["semantic"] = semantic_chunk_check(conn)
             return out
 
-        # FK enforcement is ON per init_db but cheap to re-verify: list
-        # foreign key violations (should be empty).
         fk_rows = conn.execute("PRAGMA foreign_key_check").fetchall()
         out["foreign_key_violations"] = [
             {"table": r[0], "rowid": r[1], "parent": r[2], "fkid": r[3]} for r in fk_rows
         ]
-        # Symbols / refs without a parent file row (FK is ON DELETE CASCADE
-        # so this should be impossible, but if WAL committed a half-state
-        # we'd see it).
         out["orphans"]["symbols_without_file"] = count_query(
             "symbols_without_file",
             "SELECT COUNT(*) FROM symbols s "
@@ -321,16 +285,12 @@ def integrity_check(db_path: Path) -> dict:
             "SELECT COUNT(*) FROM refs r "
             "LEFT JOIN files f ON r.from_file_id = f.id WHERE f.id IS NULL"
         )
-        # Duplicate files by path (files.path is UNIQUE so this must be 0).
         out["dupes"]["files_same_path"] = count_query(
             "files_same_path",
             "SELECT COUNT(*) FROM ("
             "  SELECT path, COUNT(*) c FROM files GROUP BY path HAVING c > 1"
             ")"
         )
-        # Schema-migration registry state — two concurrent writers could
-        # each INSERT into schema_migrations. UNIQUE constraint on name
-        # should prevent dupes, but worth verifying on the live DB.
         try:
             mig_rows = conn.execute(
                 "SELECT name, COUNT(*) FROM schema_migrations GROUP BY name"
@@ -339,18 +299,12 @@ def integrity_check(db_path: Path) -> dict:
             out["query_errors"].append({"check": "schema_migrations", "error": str(e)})
             mig_rows = []
         out["schema_migrations"] = [{"name": n, "count": c} for n, c in mig_rows]
-        # Summary row counts for sanity.
         for t in ("files", "symbols", "refs"):
             out[f"count_{t}"] = count_query(f"count_{t}", f"SELECT COUNT(*) FROM {t}")
         out["semantic"] = semantic_chunk_check(conn)
         return out
     finally:
         conn.close()
-
-
-# ---------------------------------------------------------------------------
-# Scenarios
-# ---------------------------------------------------------------------------
 
 
 def scenario_T1_two_index(project: Path) -> tuple[list[dict], dict]:
@@ -378,11 +332,6 @@ def scenario_T2_index_plus_git_index(project: Path) -> tuple[list[dict], dict]:
 SCENARIOS = {"T1": scenario_T1_two_index, "T2": scenario_T2_index_plus_git_index}
 
 
-# ---------------------------------------------------------------------------
-# Report
-# ---------------------------------------------------------------------------
-
-
 def summarize_proc(r: dict) -> str:
     if r["returncode"] == 0:
         verdict = "ok"
@@ -399,11 +348,7 @@ def summarize_proc(r: dict) -> str:
 def classify_verdict(results: list[dict], state: dict) -> str:
     """Map the per-process results + post-run DB state to a verdict string.
 
-    A timed-out process has `returncode is None` (SIGKILLed mid-run). It must
-    NOT be folded into the "one succeeded, other errored cleanly" branch — a
-    hung/livelocked writer is a distinct concurrency failure, exactly the class
-    this audit exists to surface, and it was previously reported with a green
-    checkmark.
+    A timeout (`returncode is None`) is a failure, not clean serialization.
     """
     semantic = state.get("semantic") or {}
     corrupt = (

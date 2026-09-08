@@ -56,9 +56,6 @@ def patched_search(fn):
     return patched("run_codesage_search", fn)
 
 
-# --------------------------------------------------------------------
-# Synthetic result builders
-# --------------------------------------------------------------------
 
 def record(cid: str, cluster: str, expected: list[str], hits: list[str]) -> dict:
     rank = next((i for i, h in enumerate(hits, start=1) if h in set(expected)), None)
@@ -122,9 +119,6 @@ def rejected_clauses(out: str) -> list[str]:
     return [l[2:] for l in lines[lines.index("REJECT") + 1:] if l.startswith("- ")]
 
 
-# --------------------------------------------------------------------
-# 1. identical arms -> zero deltas, REJECT (no lift); default key is `case`
-# --------------------------------------------------------------------
 
 same = [
     record(cid, cl, ["src/a.rs"], hit_hits("src/a.rs", at=(i % 5) + 1))
@@ -153,9 +147,6 @@ rc, out, _ = run(["--baseline", str(a), "--candidate", str(b), "--bootstrap", "2
 check("Cluster key: source-prefix; clusters: 6" in out, "identical: source-prefix key groups into 6")
 
 
-# --------------------------------------------------------------------
-# 2. lift on 40 of 60 cases spread over 6 clusters -> ACCEPT, LB > 0
-# --------------------------------------------------------------------
 
 base_recs, cand_recs = [], []
 for i, (cid, cl) in enumerate(sixty_cases()):
@@ -176,9 +167,6 @@ for key in ("case", "source-prefix"):
     check("| median first-hit | MISS | 1 | |" in out, f"spread/{key}: median first-hit row")
 
 
-# --------------------------------------------------------------------
-# 3. lift concentrated in one cluster, another regresses by -0.05 -> REJECT
-# --------------------------------------------------------------------
 
 base_recs, cand_recs = [], []
 for i, (cid, cl) in enumerate(sixty_cases()):
@@ -213,9 +201,6 @@ check(not any(c.startswith("mean recall@10 delta") for c in clauses),
       "concentrated: lift clause is not listed as failing")
 
 
-# --------------------------------------------------------------------
-# 4. paired n below --min-n -> exit 2 (reason on stderr, no verdict)
-# --------------------------------------------------------------------
 
 small = [record(f"s{i}", "c0", ["src/a.rs"], hit_hits("src/a.rs")) for i in range(20)]
 a = write("small-a.json", small)
@@ -228,9 +213,6 @@ rc, out, _ = run(["--baseline", str(a), "--candidate", str(b), "--min-n", "20", 
 check(rc == 0, f"min-n: --min-n 20 admits n=20 (got {rc})")
 
 
-# --------------------------------------------------------------------
-# 5. salted split: deterministic, balanced, shared with the runner
-# --------------------------------------------------------------------
 
 ids = [f"case-{i:04d}" for i in range(1000)]
 first = [cmp.split_of(i, "salt-1") for i in ids]
@@ -257,7 +239,6 @@ n_train = first[:200].count("train")
 check(f"- train: {n_train} of 200" in out, "split-report: train count matches split_of")
 check(f"- heldout: {200 - n_train} of 200" in out, "split-report: heldout count matches split_of")
 
-# malformed inputs refuse with a message, not a traceback
 bad_yaml = tmp / "bad.yaml"
 bad_yaml.write_text("cases: [unclosed\n")
 rc, out, err = run(["--split-report", str(bad_yaml), "--salt", "s"])
@@ -272,9 +253,6 @@ rc, _, _ = run(["--baseline", str(a), "--candidate", str(b), "--salt", "s"])
 check(rc == 2, f"usage: --salt without --split-report is a usage error (rc={rc})")
 
 
-# --------------------------------------------------------------------
-# 6. seeded bootstrap reproduces identical output; different seed differs
-# --------------------------------------------------------------------
 
 a = write("seed-a.json", [record(cid, cl, ["src/t.rs"], miss_hits()) for cid, cl in sixty_cases()])
 b = write(
@@ -311,9 +289,6 @@ boot7b = cmp.clustered_bootstrap({"a": [0.0, 1.0], "b": [1.0], "c": [0.0], "d": 
 check(boot7 == boot7b, "bootstrap: same seed gives identical mean/lb/ub")
 
 
-# --------------------------------------------------------------------
-# 7. nearest-rank percentile
-# --------------------------------------------------------------------
 
 check(cmp.percentile(list(range(10000)), 0.025) == 249, "percentile: 2.5% of 0..9999 is 249")
 check(cmp.percentile(list(range(10000)), 0.975) == 9749, "percentile: 97.5% of 0..9999 is 9749")
@@ -321,9 +296,6 @@ check(cmp.percentile([5.0], 0.025) == 5.0 and cmp.percentile([5.0], 0.975) == 5.
 check(cmp.percentile([], 0.5) == 0.0, "percentile: empty")
 
 
-# --------------------------------------------------------------------
-# 8. too few clusters refuses; undersized clusters cannot veto
-# --------------------------------------------------------------------
 
 two = [record(f"t{i}", "c0" if i < 20 else "c1", ["src/t.rs"], miss_hits()) for i in range(40)]
 two_c = [record(f"t{i}", "c0" if i < 20 else "c1", ["src/t.rs"], hit_hits("src/t.rs")) for i in range(40)]
@@ -343,7 +315,6 @@ rc, out, err = run(["--baseline", str(write("four-a.json", two[:4])), "--candida
 check(rc == 2 and "--cluster-key case yields 4 cluster(s)" in err and "Use --cluster-key case" not in err
       and "--min-n" in err, f"clusters: case-key refusal names --min-n, not --cluster-key case (rc={rc}, err={err.strip()[-120:]})")
 
-# the point estimate is the same statistic the bootstrap resamples
 uneq = {"big": [1.0] * 20, "s1": [0.0], "s2": [0.0], "s3": [0.0], "s4": [0.0]}
 check(cmp.pooled(uneq) == 20 / 24, "pooled: ratio of sums on unequal clusters is 20/24, not the mean of means")
 uneq_a, uneq_b = [], []
@@ -364,7 +335,6 @@ check(rc == 0 and bool(row) and row[0] == round(20 / 30, 4),
 rc, out, _ = run(["--baseline", str(a), "--candidate", str(b), "--bootstrap", "200", "--gate"])
 check(rc == 0 and "\nACCEPT\n" in out, f"clusters: same data under case key gives a verdict (rc={rc})")
 
-# a 2-of-60 fluke must not ACCEPT under the default key
 fluke_a = [record(cid, "session", ["src/t.rs"], miss_hits()) for cid, _ in sixty_cases()]
 fluke_b = [record(cid, "session", ["src/t.rs"], hit_hits("src/t.rs") if i < 2 else miss_hits())
            for i, (cid, _) in enumerate(sixty_cases())]
@@ -375,7 +345,6 @@ check(rc == 1 and "\nREJECT\n" in out, f"fluke: 2-of-60 lift on a single-source 
 check(any(c.startswith("bootstrap lower bound") for c in rejected_clauses(out)),
       "fluke: rejected on the lower-bound clause")
 
-# singleton `manual` regression is informational, not a veto
 veto_a, veto_b = [], []
 for c in range(5):
     for i in range(11):
@@ -391,9 +360,6 @@ check(rc == 0 and "\nACCEPT\n" in out, f"veto: singleton regressing cluster cann
 check("| manual | 1 | -1.0000 | no (n < 5, informational) |" in out, "veto: singleton listed as informational")
 
 
-# --------------------------------------------------------------------
-# 9. MRR clause and miss-rate clause in their failing directions
-# --------------------------------------------------------------------
 
 mrr_a, mrr_b = [], []
 for i, (cid, cl) in enumerate(sixty_cases()):
@@ -428,9 +394,6 @@ check("miss-rate delta +0.0833 > +0.0050" in clauses, f"miss: miss-rate clause n
 check(len(clauses) == 1, f"miss: miss-rate is the only failing clause (got {clauses})")
 
 
-# --------------------------------------------------------------------
-# 10. envelope, partial runs, provenance mismatch
-# --------------------------------------------------------------------
 
 meta_base = {"corpus": "c.yaml", "corpus_sha256": "deadbeef", "split": "heldout", "salt": "s1",
              "limit": 10, "head": "abc", "search_failures": 0}
@@ -442,7 +405,6 @@ rc, out, _ = run(["--baseline", str(a), "--candidate", str(b), "--bootstrap", "2
 check(rc == 0 and "\nACCEPT\n" in out, f"envelope: complete envelope compares (rc={rc})")
 check("- Baseline: corpus='c.yaml', corpus_sha256='deadbeef', split='heldout', salt='s1', limit=10, "
       "head='abc', search_failures=0" in out, "envelope: provenance incl. limit/sha/failures printed per arm")
-# limit and corpus hash are provenance
 other_limit = write("env-limit.json", recs_b, meta={**meta_base, "limit": 50})
 rc, out, err = run(["--baseline", str(a), "--candidate", str(other_limit), "--bootstrap", "200"])
 check(rc == 2 and "limit: baseline 10 vs candidate 50" in err, f"mismatch: --limit differs refuses (rc={rc})")
@@ -450,18 +412,15 @@ other_sha = write("env-sha.json", recs_b, meta={**meta_base, "corpus_sha256": "c
 rc, out, err = run(["--baseline", str(a), "--candidate", str(other_sha), "--bootstrap", "200"])
 check(rc == 2 and "corpus_sha256: baseline 'deadbeef' vs candidate 'cafe'" in err,
       f"mismatch: same basename, different corpus bytes refuses (rc={rc})")
-# recorded search failures refuse unless --allow-failures
 failed = write("env-failed.json", recs_b, meta={**meta_base, "search_failures": 3})
 rc, out, err = run(["--baseline", str(a), "--candidate", str(failed), "--bootstrap", "200"])
 check(rc == 2 and "search failures recorded (baseline 0, candidate 3)" in err,
       f"failures: refused with counts (rc={rc})")
 rc, out, _ = run(["--baseline", str(a), "--candidate", str(failed), "--bootstrap", "200", "--allow-failures"])
 check(rc == 0 and "search_failures=3" in out, f"failures: --allow-failures compares and shows the count (rc={rc})")
-# a record without id is a refusal, not a traceback
 no_id = write("env-noid.json", recs_b[:5] + [{"query": "q", "hits": []}] + recs_b[6:], meta=meta_base)
 rc, out, err = run(["--baseline", str(a), "--candidate", str(no_id), "--bootstrap", "200"])
 check(rc == 2 and "env-noid.json: record #5 has no `id`" in err, f"no-id: exit 2 naming file and index (rc={rc})")
-# multi-file meta merge is order-independent and keeps original values
 m1 = write("m1.json", recs_b[:20], meta={**meta_base, "head": "h1"})
 m2 = write("m2.json", recs_b[20:40], meta={**meta_base, "head": "h2"})
 m3 = write("m3.json", recs_b[40:], meta={**meta_base, "head": {"sha": "h3"}})
@@ -473,7 +432,6 @@ check(isinstance(meta_fwd["head"], cmp.MultiValue) and list(meta_fwd["head"]) ==
 check(meta_fwd["head"] != ["h1", "h2", {"sha": "h3"}], "merge: MultiValue is never equal to a plain list")
 check(repr(meta_fwd["head"]) == "multi['h1', 'h2', {'sha': 'h3'}]", "merge: MultiValue renders as multi[...]")
 check(meta_fwd["search_failures"] == 0 and meta_fwd["limit"] == 10, "merge: equal keys stay scalar")
-# head is provenance, so the mixed-head candidate is refused without --allow-mismatch
 rc, out, err = run(["--baseline", str(a), "--candidate", str(m1), str(m2), str(m3), "--bootstrap", "200"])
 check(rc == 2 and "head: baseline 'abc' vs candidate multi['h1', 'h2', {'sha': 'h3'}]" in err,
       f"head: differing HEAD refuses (rc={rc}, err={err.strip()[-160:]})")
@@ -485,7 +443,6 @@ check(rc == 0 and "\nACCEPT\n" in out, f"merge: concatenated candidate compares 
 check("head=multi['h1', 'h2', {'sha': 'h3'}]" in out, "merge: multi-valued meta rendered as multi[...]")
 rc, out, _ = run(["--baseline", str(a), "--candidate", str(m3), str(m2), str(m1), "--bootstrap", "200", "--allow-mismatch"])
 check(rc == 0 and "\nACCEPT\n" in out, f"merge: reversed order compares with --allow-mismatch (rc={rc})")
-# a genuinely list-valued meta key is not mistaken for an accumulation
 l1 = write("l1.json", recs_b[:30], meta={**meta_base, "features": ["cpu", "cuda"]})
 l2 = write("l2.json", recs_b[30:], meta={**meta_base, "features": ["cpu"]})
 lf, _ = cmp.load_records([l1, l2], allow_partial=False)
@@ -497,11 +454,9 @@ l4 = write("l4.json", recs_b[30:], meta={**meta_base, "features": ["cpu", "cuda"
 lsame, _ = cmp.load_records([l3, l4], allow_partial=False)
 check(lsame["features"] == ["cpu", "cuda"] and not isinstance(lsame["features"], cmp.MultiValue),
       f"merge: equal list values stay a plain list ({lsame['features']!r})")
-# a non-integer meta.search_failures is a refusal, not a traceback
 bad_count = write("env-badcount.json", recs_b, meta={**meta_base, "search_failures": "many"})
 rc, out, err = run(["--baseline", str(a), "--candidate", str(bad_count), "--bootstrap", "200"])
 check(rc == 2 and "meta.search_failures is not an integer ('many')" in err, f"failures: non-integer count exits 2 (rc={rc})")
-# failures recorded in meta with no record to attribute them to survive --exclude-failed
 ghost = write("env-ghost.json", recs_b, meta={**meta_base, "search_failures": 3})
 rc, out, err = run(["--baseline", str(a), "--candidate", str(ghost), "--bootstrap", "200", "--exclude-failed"])
 check(rc == 2 and "search failures recorded (baseline 0, candidate 3)" in err and "cannot locate them" in err,
@@ -510,12 +465,10 @@ rc, out, _ = run(["--baseline", str(a), "--candidate", str(ghost), "--bootstrap"
 check(rc == 0 and "- Excluded failed ids (both arms): none" in out, f"ghost: --allow-failures compares, excluded line says none (rc={rc})")
 rc, out, _ = run(["--baseline", str(a), "--candidate", str(b), "--bootstrap", "200"])
 check("- Excluded failed ids (both arms): none" in out, "excluded line printed unconditionally")
-# an explicit `error: null` is not a failure
 nulls = write("env-null.json", [{**r, "error": None} for r in recs_b], meta=meta_base)
 rc, out, _ = run(["--baseline", str(a), "--candidate", str(nulls), "--bootstrap", "200"])
 check(rc == 0 and "| search failures | 0 | 0 | |" in out, f"errors: error: null is not counted (rc={rc})")
 
-# per-record errors are counted per arm, listed, and excludable symmetrically
 err_a = [dict(r) for r in recs_a]
 err_b = [dict(r) for r in recs_b]
 err_a[3] = {**err_a[3], "error": "timeout", "hits": [], "first_hit_rank": None}
@@ -534,7 +487,6 @@ rc, out, _ = run(["--baseline", str(ea), "--candidate", str(eb), "--bootstrap", 
 check(rc == 0 and "Paired cases: 57" in out, f"errors: --exclude-failed pairs 60 minus the 3 failed ids (rc={rc})")
 check("- Excluded failed ids (both arms): 3 (case-0-3, case-0-7, case-0-8)" in out, "errors: excluded ids named")
 check("| search failures | 0 | 0 | |" in out, "errors: no failures remain after exclusion")
-# meta counts above the attributable records still refuse after exclusion
 eb_over = write("err-b-over.json", err_b, meta={**meta_base, "search_failures": 5})  # 2 attributable, 3 ghosts
 rc, out, err = run(["--baseline", str(ea), "--candidate", str(eb_over), "--bootstrap", "200", "--exclude-failed"])
 check(rc == 2 and "search failures recorded (baseline 0, candidate 3)" in err,
@@ -542,7 +494,6 @@ check(rc == 2 and "search failures recorded (baseline 0, candidate 3)" in err,
 rc, out, _ = run(["--baseline", str(ea), "--candidate", str(eb), "--bootstrap", "200", "--exclude-failed"])
 check(rc == 0 and "Paired cases: 57" in out, f"errors: --exclude-failed alone is sufficient (rc={rc})")
 
-# bootstrap floor and warning
 rc, _, err = run(["--baseline", str(a), "--candidate", str(b), "--bootstrap", "199"])
 check(rc == 2 and "--bootstrap must be >= 200" in err, f"bootstrap: 199 is a usage error (rc={rc})")
 rc, _, err = run(["--baseline", str(a), "--candidate", str(b), "--bootstrap", "500"])
@@ -566,7 +517,6 @@ check(rc == 2 and "corpus: baseline 'c.yaml' vs candidate None" in err,
 dup = write("dup.json", recs_a + recs_a[:1])
 rc, _, err = run(["--baseline", str(dup), "--candidate", str(b)])
 check(rc == 2 and "duplicate case id 'case-0-0'" in err, f"duplicate ids: exits 2 and names the id (rc={rc})")
-# a legacy bare list with a non-numeric first_hit_rank is refused, not a traceback
 bad_rank = write("bad-rank.json", [{**recs_b[0], "first_hit_rank": "one"}] + recs_b[1:])
 rc, _, err = run(["--baseline", str(write("bad-rank-base.json", recs_a)), "--candidate", str(bad_rank), "--bootstrap", "200"])
 check(rc == 2 and "record 'case-0-0': first_hit_rank must be a positive integer ('one')" in err,
@@ -581,9 +531,6 @@ rc, out, _ = run(["--baseline", str(write("bad-rank-base.json", recs_a)), "--can
 check(rc == 0 and "\nACCEPT\n" in out, f"bad rank: integral 1.0 and '1' are accepted (rc={rc})")
 
 
-# --------------------------------------------------------------------
-# 11. drive the runner's main() with canned search output
-# --------------------------------------------------------------------
 
 proj = tmp / "proj"
 proj.mkdir()
@@ -610,8 +557,7 @@ def run_runner(argv: list[str]) -> tuple[int, str, str]:
             try:
                 rc = runner.main()
             except SystemExit as e:
-                # sys.exit(str) prints the message at interpreter exit, which
-                # never happens here; mirror it onto the captured stderr.
+                # Mirror sys.exit(str) onto stderr because this harness catches SystemExit.
                 if isinstance(e.code, int):
                     rc = e.code
                 else:
@@ -641,7 +587,6 @@ check(meta.get("limit") == 10 and meta.get("search_failures") == 0, f"runner: me
 check("head" in meta and "model" in meta and "reranker" in meta, "runner: meta carries head/model/reranker")
 check("split=train salt=s" in out and "<!-- METRICS:" in out, "runner: METRICS gains split= and salt=")
 check(f"cases={len(train_ids)}" in out, "runner: METRICS case count is the split's")
-# header and one-liner name the split
 check(f"- **Corpus**: `run-corpus.yaml` — {len(train_ids)} cases (split train, salt s), top-10" in out,
       "runner: scorecard header names the split and salt")
 check("ground-truth cases (split train, salt s) on `proj`" in out, "runner: quotable one-liner names the split and salt")
@@ -656,7 +601,6 @@ check(rc == 0 and len(env["records"]) == 20 and env["meta"]["split"] is None,
       "runner: unsplit run writes all 20 records with split null")
 check("split=" not in out and "(split" not in out, "runner: no split text when no split ran")
 
-# failed searches are scored as misses but counted and tagged
 def flaky_search(_bin, _root, query, _limit):
     if query == "q r3":
         return "", "timeout"
@@ -678,8 +622,6 @@ rc, out, err = run(["--baseline", str(tmp / "full.json"), "--candidate", str(tmp
 check(rc == 2 and "search failures recorded (baseline 0, candidate 2)" in err,
       f"runner->compare: flaky arm is refused end to end (rc={rc})")
 
-# multi-line `codesage --version` banner: only the first line reaches the
-# one-liner and METRICS; the rest becomes meta provenance
 BANNER = (
     "codesage 0.26.1 (release)\n"
     "  target: x86_64-unknown-linux\n"
@@ -719,7 +661,6 @@ check(bmeta["codesage"] == "0.26.1 (release)" and bmeta["build_target"] == "x86_
       and bmeta["features"] == "cpu, cuda" and bmeta["device"] == "gpu",
       f"banner: meta carries build_target/features/device (got {bmeta})")
 
-# agent-task-runner shares the first-line banner parsing
 atr = _load("agent-task-runner", "agent_task_runner_under_test")
 _orig_atr_banner = atr.run_version_banner
 atr.run_version_banner = lambda _bin, timeout=10: BANNER
@@ -729,7 +670,6 @@ finally:
     atr.run_version_banner = _orig_atr_banner
 check(not hasattr(runner, "parse_result_paths"), "runner: dead parse_result_paths removed")
 
-# search failures are visible in the scorecard, METRICS, and the exit code
 five_corpus = tmp / "five.yaml"
 five_corpus.write_text(
     f"project_root: {proj}\ncases:\n"
@@ -753,7 +693,6 @@ with patched_search(canned_search):
 check(rc == 0 and " search_failures=0 -->" in out and "INVALID" not in out and "Search failures" not in out,
       "failures: clean run reports search_failures=0 and no flags")
 
-# malformed corpus exits 2 with a message and writes no envelope
 bad_corpus = tmp / "bad-corpus.yaml"
 bad_corpus.write_text("cases: [unclosed\n")
 with patched_search(canned_search):
@@ -785,7 +724,6 @@ check(rc == 0 and cwd_meta["codesage"] == "9.9.9 (stub)", f"version cwd: stub ba
 check(Path(cwd_meta["device"]).resolve() == proj.resolve(),
       f"version cwd: device line reflects the project root, not the runner cwd (got {cwd_meta.get('device')})")
 
-# per-case validation before any envelope write
 def bad_case_corpus(name: str, case_yaml: str) -> Path:
     p = tmp / name
     p.write_text(f"project_root: {proj}\ncases:\n  - id: ok\n    query: q\n    expected_files: [a.rs]\n{case_yaml}")
@@ -806,7 +744,6 @@ for label, case_yaml, expect in (
     check(rc == 2 and expect in err, f"corpus: {label} exits 2 naming the case (rc={rc}, err={err.strip()[-80:]})")
 check(not (tmp / "never2.json").exists(), "corpus: no envelope written for an invalid case")
 
-# ablation marks an arm invalid on runner rc 3 / search_failures > 0
 abl = _load("ablation.py", "ablation_under_test")
 stub_runner = tmp / "stub-runner.py"
 stub_runner.write_text(
@@ -855,7 +792,6 @@ def run_ablation(argv: list[str]) -> tuple[int, str]:
     return rc, out.getvalue()
 
 
-# a crashed arm (rc 1, no METRICS) is invalid, listed, fails the run, and is never "wired"
 crash_runner = tmp / "crash-runner.py"
 crash_runner.write_text(
     "import os, sys\n"
@@ -876,7 +812,6 @@ check("rrf_k_30" not in differed and compared_counts["rrf_k_30"] == 0 and invali
       f"ablation: crashed arm is neither differed nor compared ({differed}, {compared_counts}, {invalid_list})")
 check("## No measurable effect" not in text, "ablation: crashed needs-patch arm is not reported inert")
 
-# inert-everywhere needs a valid comparison on every corpus
 split_runner = tmp / "split-runner.py"
 split_runner.write_text(
     "import os, sys\n"
@@ -901,12 +836,10 @@ identical_runner.write_text(
 rc, text = run_ablation([str(c1), str(c2), "--runner", str(identical_runner), "--arms", "rrf_k_30"])
 check(rc == 0 and "## No measurable effect" in text and "- `rrf_k_30`" in text and "rrf_k_30  =base" in text,
       f"ablation: validly compared and identical on every corpus IS reported inert (rc={rc})")
-# a repeated --arms entry is deduplicated, so it cannot suppress the inert warning
 rc, text = run_ablation([str(c1), str(c2), "--runner", str(identical_runner), "--arms", "rrf_k_30,rrf_k_30,baseline"])
 check(rc == 0 and "## No measurable effect" in text and "- `rrf_k_30`" in text,
       f"ablation: duplicated arm still reported inert (rc={rc})")
 check(text.count("| rrf_k_30") == 2, f"ablation: one rrf_k_30 row per corpus after dedupe (got {text.count('| rrf_k_30')})")
-# --arms with no names is a usage error, not a silent baseline-only sweep
 try:
     run_ablation([str(c1), "--runner", str(identical_runner), "--arms", ","])
     arms_rc = 0
@@ -914,7 +847,6 @@ except SystemExit as e:
     arms_rc = e.code
 check(arms_rc == 2, f"ablation: --arms ',' is an argparse error (rc={arms_rc})")
 
-# an empty corpus is not a result: the real runner exits 2, and ablation marks the arm INVALID
 empty_corpus = tmp / "empty.yaml"
 empty_corpus.write_text(f"project_root: {proj}\ncases: []\n")
 with patched_search(canned_search):
@@ -933,7 +865,6 @@ check(rc == 1 and "| baseline | INVALID (runner rc=2, no METRICS) |" in text
       and "| no_definition_boost | INVALID (runner rc=2, no METRICS) |" in text,
       f"ablation: empty-corpus arms are INVALID via the real runner (rc={rc})")
 
-# semble-ndcg-runner shares the banner helper and records no cwd-dependent device
 ndcg = _load("semble-ndcg-runner", "semble_ndcg_under_test")
 _orig_ndcg_info = ndcg.codesage_version_info
 ndcg.codesage_version_info = lambda _bin, cwd=None: ver.parse_version_banner(BANNER)
@@ -951,11 +882,9 @@ finally:
 check(prov_unknown["codesage_version"] is None and "codesage_device" not in prov_unknown,
       "semble-ndcg: unknown binary keeps the null version and never records device")
 
-# no probe or temp files linger next to the results file
 leftovers = sorted(p.name for p in (tmp / "nested" / "dir").iterdir())
 check(leftovers == ["results.json"], f"runner: only results.json remains in its directory (got {leftovers})")
 
-# the path is probed before any search; an unwritable path fails fast
 calls: list[str] = []
 
 
@@ -971,7 +900,6 @@ with patched_search(counting_search):
 check(rc != 0 and "not writable" in err, f"runner: unwritable --results-json fails (rc={rc})")
 check(calls == [], "runner: no search ran before the path probe failed")
 
-# a finished result file survives a typo'd corpus path byte-for-byte
 finished = tmp / "finished.json"
 finished_bytes = (tmp / "full.json").read_bytes()
 finished.write_bytes(finished_bytes)
@@ -982,7 +910,6 @@ check(finished.read_bytes() == finished_bytes, "runner: existing --results-json 
 check(not finished.with_name("finished.json.probe").exists(), "runner: probe file removed")
 check(calls == [], "runner: no search ran for the missing corpus")
 
-# partial file exists with complete:false after the first case
 seen: list[dict] = []
 
 

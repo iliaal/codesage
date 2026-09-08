@@ -1,22 +1,8 @@
 #!/usr/bin/env python3
-"""Validate the `## [Unreleased]` block of CHANGELOG.md against the shared
-iliaal/* Keep-a-Changelog convention.
+"""Validate Unreleased section order and terse bullets; leave released history alone.
 
-Checks (on the `## [Unreleased]` section only — released blocks are history):
-  - every `### ` subsection is one of the canonical sections;
-  - no content sits between `## [Unreleased]` and the first `### ` heading
-    (a stray bullet outside any section would otherwise escape validation);
-  - subsections appear in the canonical order, with no duplicates;
-  - no subsection is empty (each has at least one `- ` bullet);
-  - each bullet is terse: no bold lead-in, no justification/explanation
-    phrase, and under the length backstop (consolidated semicolon lists are
-    fine; multi-sentence paragraphs are not).
-
-Canonical order: Added, Changed, Deprecated, Removed, Fixed, Security.
-
-Exit 0 when clean, 1 with a list of problems otherwise. An absent or empty
-`[Unreleased]` block is not an error here — that is a release-time concern
-handled by scripts/release.sh, which refuses to cut an empty release.
+Exit 0 when clean, 1 on errors. An empty block is valid here; release.sh rejects
+empty releases. A missing Unreleased heading is an error.
 
 Usage: python3 scripts/check-changelog.py [path/to/CHANGELOG.md]
 """
@@ -30,13 +16,9 @@ import sys
 CANONICAL = ["Added", "Changed", "Deprecated", "Removed", "Fixed", "Security"]
 RANK = {name: i for i, name in enumerate(CANONICAL)}
 
-# Substrings that mark a bullet as explaining or justifying the change rather
-# than stating it. The terse convention is: name the command/tool/behavior,
-# state the observable effect, stop. These are the tells of a paragraph
-# creeping in. Matched case-insensitively. Kept deliberately narrow so a
-# consolidated bullet (several sibling fixes joined by `;`) does not trip it.
+# Keep matches narrow enough to allow terse semicolon-separated changes.
 PROSE_TELLS = (
-    ", so ",          # causal tail: "...refs, so a reindex leaves no stale hits"
+    ", so ",
     "so that ",
     "in order to ",
     "which means ",
@@ -45,9 +27,7 @@ PROSE_TELLS = (
     "previously, ",
 )
 
-# Backstop against paragraph bullets. Consolidated semicolon lists run ~300
-# chars; genuine multi-sentence explanations run longer. Not a style ceiling —
-# a single terse change should land well under this.
+# Backstop for paragraphs, with room for consolidated semicolon lists.
 BULLET_MAX_LEN = 400
 
 
@@ -69,7 +49,6 @@ def extract_unreleased(text: str) -> str | None:
 def lint(body: str) -> list[str]:
     """Return a list of problem strings; empty means the block is valid."""
     problems: list[str] = []
-    # Split the body into (section-name, lines) pairs.
     sections: list[tuple[str, list[str]]] = []
     current: tuple[str, list[str]] | None = None
     for line in body.splitlines():

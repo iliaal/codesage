@@ -1,10 +1,4 @@
-//! Regression test for the to_name_tail migration ordering bug fixed in 6498ec2.
-//!
-//! Before that commit, init_db ran the SCHEMA batch (including
-//! `CREATE INDEX ... ON refs(to_name_tail)`) before the migration that adds the column.
-//! On a database that predated the column, init_db errored before the migration
-//! could run. This test creates such a stale database, runs init_db, and asserts
-//! that the column, index, and backfill all land correctly.
+//! Legacy databases need to_name_tail added before its index, with existing refs backfilled.
 
 use codesage_storage::schema::{BREAKING_MIGRATION_PREFIX, init_db, name_tail};
 use rusqlite::Connection;
@@ -52,7 +46,6 @@ fn migrates_legacy_schema_to_current() {
     let conn = Connection::open_in_memory().unwrap();
     create_old_schema(&conn);
 
-    // Seed some refs so we can verify the backfill happens.
     conn.execute(
         "INSERT INTO files (id, path, language, content_hash) VALUES (1, 'a.rs', 'rust', 'h')",
         [],
@@ -73,7 +66,6 @@ fn migrates_legacy_schema_to_current() {
         .unwrap();
     }
 
-    // Pre-condition: column does not exist yet.
     let has_col_before: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('refs') WHERE name = 'to_name_tail'",
@@ -83,10 +75,8 @@ fn migrates_legacy_schema_to_current() {
         .unwrap();
     assert_eq!(has_col_before, 0, "test setup must use legacy schema");
 
-    // Run init_db (should ALTER + backfill + create index).
     init_db(&conn).expect("init_db must succeed on legacy schema");
 
-    // Column added.
     let has_col_after: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('refs') WHERE name = 'to_name_tail'",
@@ -99,7 +89,6 @@ fn migrates_legacy_schema_to_current() {
         "to_name_tail column must exist after init_db"
     );
 
-    // Index created.
     let has_idx: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_refs_to_name_tail'",
@@ -109,7 +98,6 @@ fn migrates_legacy_schema_to_current() {
         .unwrap();
     assert_eq!(has_idx, 1, "idx_refs_to_name_tail must exist after init_db");
 
-    // Backfill: each row's to_name_tail must equal name_tail(to_name).
     for (id, to_name) in &cases {
         let tail: String = conn
             .query_row(
@@ -179,7 +167,6 @@ fn fresh_db_records_migrations_exactly_once() {
     let conn = Connection::open_in_memory().unwrap();
     init_db(&conn).expect("init_db on fresh DB");
 
-    // schema_migrations table must exist.
     let has_table: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'",
@@ -189,7 +176,6 @@ fn fresh_db_records_migrations_exactly_once() {
         .unwrap();
     assert_eq!(has_table, 1);
 
-    // Each migration name must be present exactly once after first init.
     let expected_migrations = [
         "0001_refs_name_tail",
         "0002_structural_index_state",
@@ -222,7 +208,6 @@ fn fresh_db_records_migrations_exactly_once() {
         assert_eq!(count, 1, "{migration} recorded on fresh DB");
     }
 
-    // Running init_db again must be a no-op: the count stays where it was.
     init_db(&conn).expect("second init_db");
     let count_after: i64 = conn
         .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
@@ -238,7 +223,6 @@ fn fresh_db_records_migrations_exactly_once() {
 fn legacy_db_records_migration_after_upgrade() {
     let conn = Connection::open_in_memory().unwrap();
     create_old_schema(&conn);
-    // Pre-condition: no schema_migrations yet.
     let has_table_before: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'",
@@ -519,7 +503,6 @@ fn superseded_0017_name_is_forgotten_and_the_renamed_migration_completes_it() {
             "{column} must exist after the renamed 0017 runs"
         );
     }
-    // Third open is a no-op.
     init_db(&conn).expect("third init_db");
 }
 
@@ -704,10 +687,7 @@ fn route_handler_refs_stay_exempt_from_unique_backstop() {
     use codesage_protocol::ReferenceKind;
     use codesage_storage::Database;
 
-    // Synthetic route_handler edges are rewritten wholesale per kind by the
-    // feature mapper (not per file by upsert_file) and always carry col = 0,
-    // so two same-line registrations of one handler are legitimate. The
-    // partial index must leave them ungoverned.
+    // Mapper-owned route edges use col = 0; same-line registrations may share a handler.
     let db = Database::open_in_memory().unwrap();
     let file_id = db.upsert_file(&sample_file_info()).unwrap();
     let refs = vec![sample_reference(ReferenceKind::RouteHandler)];
@@ -725,9 +705,6 @@ fn reindex_delete_then_insert_still_works_with_backstop() {
     let db = Database::open_in_memory().unwrap();
     let fp: Vec<u64> = vec![0; 64];
     for _pass in 0..2 {
-        // The normal indexer cycle: upsert_file deletes the file's prior
-        // rows, then the inserts repopulate them. Must stay clean under the
-        // new unique indexes.
         let file_id = db.upsert_file(&sample_file_info()).unwrap();
         db.insert_symbols(file_id, &[sample_symbol()]).unwrap();
         db.insert_references(file_id, &[sample_reference(ReferenceKind::Call)])

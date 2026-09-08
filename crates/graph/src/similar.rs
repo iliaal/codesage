@@ -1,11 +1,5 @@
-//! Near-clone detection over stored MinHash fingerprints.
-//!
-//! `find_similar` resolves the target function fingerprint by name, loads
-//! same-language fingerprints, builds an LSH band index (so we score
-//! O(candidates) instead of O(n²) all-pairs), and returns the functions
-//! structurally closest to the target, ranked by Jaccard.
-//! Identifiers and literals are ignored — this matches code *shape*, which is
-//! what surfaces copy-paste and divergent forks.
+//! Near-clone detection using same-language MinHash fingerprints and LSH candidates.
+//! Fingerprints compare code structure, ignoring identifiers and literals.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -27,18 +21,14 @@ fn as_sig(fp: &[u64]) -> Option<&Fingerprint> {
 }
 
 /// Functions structurally similar to `symbol_name`, Jaccard ≥ `min_jaccard`,
-/// capped at `limit`. Test files are excluded from the candidate set (clone
-/// scaffolding there is noise, not actionable). The target's own occurrence is
-/// never returned as its own clone.
+/// capped at `limit`. Excludes test files and the target's own occurrence.
 pub fn find_similar(
     db: &Database,
     symbol_name: &str,
     min_jaccard: f32,
     limit: usize,
 ) -> Result<Vec<SimilarSymbol>> {
-    // Guard against NaN / out-of-range thresholds: NaN would bypass the `<`
-    // filter (admitting everything) and a negative bound admits every LSH
-    // candidate.
+    // NaN would bypass the score threshold comparison.
     let min_jaccard = if min_jaccard.is_finite() {
         min_jaccard.clamp(0.0, 1.0)
     } else {
@@ -50,12 +40,9 @@ pub fn find_similar(
         return Ok(Vec::new());
     }
 
-    // LSH band indexes over non-test fingerprints, keyed by language then band.
-    // Tree-sitter `kind_id`s are grammar-local, so fingerprints only compare
-    // within a language.
+    // Tree-sitter kind IDs are grammar-local; compare only within one language.
     let mut language_indexes: HashMap<String, LanguageFingerprintIndex> = HashMap::new();
 
-    // Best score per distinct (file, line) clone location.
     let mut best: HashMap<(String, u32), SimilarSymbol> = HashMap::new();
     for target in &targets {
         let Some(tsig) = as_sig(&target.fp) else {
@@ -76,7 +63,6 @@ pub fn find_similar(
         }
         for ci in candidates {
             let c = &index.rows[ci];
-            // Skip the target's own occurrence(s).
             if c.file_path == target.file_path && c.line_start == target.line_start {
                 continue;
             }
@@ -104,11 +90,8 @@ pub fn find_similar(
     }
 
     let mut out: Vec<SimilarSymbol> = best.into_values().collect();
-    // Ties are the norm, not the exception — exact clones all score 1.0 — and
-    // `best` is a HashMap, so without a total order the truncation below keeps
-    // an arbitrary subset that changes between identical calls. `total_cmp`
-    // rather than `partial_cmp().unwrap_or(Equal)`: the latter is intransitive
-    // if a NaN ever reaches it, which can panic the sort and hang the client.
+    // Break ties before truncation so HashMap iteration cannot change the result set.
+    // `total_cmp` remains transitive even for NaN.
     out.sort_by(|a, b| {
         b.jaccard
             .total_cmp(&a.jaccard)
@@ -139,15 +122,10 @@ fn build_language_index(rows: Arc<Vec<StoredFingerprint>>) -> LanguageFingerprin
     LanguageFingerprintIndex { rows, buckets }
 }
 
-/// Upper bound on cached per-language fingerprint snapshots. Cache keys embed
-/// the index-state token, so every reindex mints fresh keys and stale entries
-/// would otherwise accumulate for the daemon's lifetime.
+/// Bound per-language snapshots retained for the daemon's lifetime.
 const FINGERPRINT_CACHE_CAP: usize = 32;
 
-/// Recover from a poisoned fingerprint-cache lock instead of panicking. A
-/// panic in a tool handler is silently swallowed by rmcp (no `catch_unwind`),
-/// hanging the client; the guarded map is still inspected, so at worst a
-/// torn write yields a stale-snapshot miss and a fresh DB read.
+/// Recover poisoned cache state; validity tokens still reject stale snapshots.
 fn lock_fingerprint_cache() -> std::sync::MutexGuard<'static, FingerprintCache> {
     FINGERPRINT_CACHE.lock().unwrap_or_else(|e| {
         tracing::warn!("fingerprint cache lock poisoned; recovering with guarded state");
@@ -173,9 +151,6 @@ fn fingerprints_for_language_cached(
 
     let all = Arc::new(db.fingerprints_for_language(language)?);
     let mut cache = lock_fingerprint_cache();
-    // Simple eviction: drop the whole map at capacity. Demand is a handful
-    // of languages per query, so clearing keeps the bound with no LRU
-    // bookkeeping; the next query reloads what it still needs.
     if cache.len() >= FINGERPRINT_CACHE_CAP {
         cache.clear();
     }

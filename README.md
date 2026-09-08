@@ -9,7 +9,7 @@
 
 ![CodeSage: structural and semantic code intelligence for AI agents](images/codesage-hero.jpg)
 
-CodeSage is a code intelligence engine for AI coding agents. It combines structural graph queries (symbols, references, dependencies) and semantic search (embedding retrieval with cross-encoder reranking) in a single Rust binary, usable as a CLI or over MCP. Nine languages today (PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go). On the [semble](https://github.com/MinishLab/semble) retrieval corpus, codesage `search` scores **NDCG@10 between 0.68 and 0.93 depending on language**, measured per language across 663 queries (see [External-corpus benchmark](#external-corpus-benchmark-semble) below).
+CodeSage is a code intelligence engine for AI coding agents. It combines structural graph queries (symbols, references, dependencies) and semantic search (embedding retrieval with cross-encoder reranking) in a single Rust binary, usable as a CLI or over MCP. Nine languages today (PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go). On the [semble](https://github.com/MinishLab/semble) retrieval corpus, codesage `search` scores **per-language NDCG@10 of 0.7455–0.9434 across 663 queries** (see [External-corpus benchmark](#external-corpus-benchmark-semble) below).
 
 ## 🔍 What you can do with it
 
@@ -62,6 +62,8 @@ PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go.
 
 CodeSage ships as one application binary plus a local SQLite database under `.codesage/` per project. Linux inference loads an ONNX Runtime shared library; Apple builds link ONNX Runtime at build time. No Docker container, no external vector DB server, no embedding service, and no service manager. CLI commands run directly. MCP clients use `codesage mcp`, a stdio shim that starts or reuses a user-local Unix-socket daemon so concurrent agent sessions share one project cache, embedding model pool, reranker pool, and CUDA context. CodeSage provides no HTTP listener or remote MCP transport.
 
+CLI `search` and `export` also reuse the running daemon's reranker. Without a daemon, they load a private session; inputs exceeding the daemon's per-text byte cap explicitly use private inference.
+
 The daemon is a same-UID co-trust boundary, not a same-UID isolation boundary. Its socket is private to the Unix user and checks peer credentials, but any process running as that user can ask the daemon to open any onboarded project index. Run untrusted agents under a separate Unix user when project isolation matters. MCP calls are agent-safety capped; CLI commands remain operator tools and can request larger limits or file lists.
 
 For Linux CPU inference, install the runtime described in [CPU setup](#cpu-setup-linux). CUDA also needs the `nvidia-*-cu12` pip packages on the host (see [CUDA setup](#cuda-setup)); on Apple Silicon, set `device = "coreml"` instead (see [CoreML setup](#coreml-setup-macos)). Each host needs its matching build and runtime dependencies. If you want `cargo install`, `codesage init`, and an on-demand local daemon hidden behind stdio MCP, use CodeSage.
@@ -76,29 +78,27 @@ One design difference is worth stating as a **hypothesis**, not a result: CodeSa
 
 ### External-corpus benchmark (semble)
 
-[semble](https://github.com/MinishLab/semble) ships a published retrieval-evaluation corpus (1,251 queries × 63 repos × 19 languages) with file-level ground truth in `benchmarks/annotations/`. Cleaner than the git-mined "files-changed-in-same-commit" proxy, and an externally-defined target codesage's authors did not write.
+[semble](https://github.com/MinishLab/semble) publishes 1,251 queries over 63 repositories and 19 languages. This 2026-09-08 run uses its corrected annotations at [a772a37](https://github.com/MinishLab/semble/commit/a772a37d558c11bffbd99b18141705df3f2982be) and each repository's pinned revision and `benchmark_root`.
 
-Running codesage `search` (`jina-embeddings-v2-base-code` + `ms-marco-MiniLM-L6-v2` reranker, GPU) on the corpus at its pinned SHAs:
+CodeSage uses Jina v2 base-code embeddings and the MiniLM cross-encoder reranker on CUDA. Results are deduplicated by file; each language's NDCG@10 is the mean over its queries.
 
-Per language, over the 33 repos in the 9 languages codesage parses. CodeSage's column is measured here; semble's and CodeRankEmbed's are their published figures.
+| Language | CodeSage NDCG@10 | Repositories | Queries |
+|---|--:|--:|--:|
+| JavaScript | 0.9434 | 3 | 60 |
+| C++ | 0.9007 | 3 | 60 |
+| Go | 0.8805 | 3 | 58 |
+| Python | 0.8686 | 9 | 184 |
+| PHP | 0.8539 | 3 | 60 |
+| Java | 0.8441 | 3 | 61 |
+| Rust | 0.7653 | 3 | 60 |
+| TypeScript | 0.7493 | 3 | 60 |
+| C | 0.7455 | 3 | 60 |
 
-| language | **CodeSage** | semble | CodeRankEmbed | repos | queries |
-|---|--:|--:|--:|--:|--:|
-| javascript | **0.928** | 0.917 | 0.925 | 3 | 60 |
-| go | **0.881** | 0.895 | 0.713 | 3 | 58 |
-| cpp | **0.876** | 0.915 | 0.897 | 3 | 60 |
-| python | **0.865** | 0.867 | 0.878 | 9 | 184 |
-| java | **0.850** | 0.849 | 0.790 | 3 | 61 |
-| php | **0.839** | 0.858 | 0.847 | 3 | 60 |
-| rust | **0.785** | 0.856 | 0.754 | 3 | 60 |
-| c | **0.743** | 0.741 | 0.771 | 3 | 60 |
-| typescript | **0.682** | 0.706 | 0.671 | 3 | 60 |
+[Run artifact](bench/public-corpus-results/semble-per-language-2026-09-08-corrected.json): 33 repositories, 663 queries, nine languages, zero skipped repositories, and zero degraded queries. It records per-query stderr and fallback classification, annotation and source hashes, the CUDA binary hash, and fresh fingerprint attestations for all indexes. The binary reports 0.27.0 and includes the recorded uncommitted changes; it is not the stock 0.27.0 release. Parser syntax-error diagnostics remain in the artifact, separately from read failures and query degradation.
 
-Artifact: `bench/public-corpus-results/semble-per-language-2026-08-04-clean.json`. The run reported no skipped repos and no degraded queries; a run with either is not publishable (see below).
+The [historical upstream comparison at d899d610](https://github.com/MinishLab/semble/blob/d899d610039d6e84de0bb2f236c5e8d75c5c5049/README.md) retains its published competitor figures. Those tools were not rerun against the corrected annotations. Upstream also scores chunk positions and weights repositories equally, so those figures are not a direct comparison with this file-level, query-weighted table.
 
-**No pooled number is quoted, deliberately.** semble's overall figure covers 63 repos across 19 languages; this covers the 33 repos in the 9 languages codesage parses. Different repo sets are not comparable, so the per-language rows are the only comparable unit. 47% of the corpus targets a language codesage does not parse (588 of 1,251 queries). That is a coverage gap, not a retrieval-quality measurement, and averaging it in would state the wrong thing.
-
-**Weakest rows are TypeScript (0.682) and C (0.743).** Both improved in 0.19.0 and both still trail. TypeScript's residual is `zod`, which ships v3 and v4 side by side and where the remaining confusion is between sibling v4 implementations rather than between versions.
+No pooled score is reported: 588 of the corpus's 1,251 queries (47%) target the ten languages CodeSage does not parse. That coverage gap is separate from retrieval quality. C and TypeScript are the lowest-scoring supported languages in this run.
 
 ### Why the previously published numbers were withdrawn
 
@@ -107,11 +107,11 @@ This section used to claim `recall@10 = 0.932 / NDCG@10 = 0.788` over 602 querie
 - They were measured across **whole repositories**. semble's `repos.json` carries a `benchmark_root` per repo (29 of the 33 supported repos point at a subdirectory: `monolog` to `src/Monolog`, `curl` to `lib`), and that subdirectory is what their harness indexes. Scoring the whole repo makes the ranker compete against tests, docs and sibling packages the other arms never see.
 - The harness scored a **crashed query as 0.000**. `codesage search` could write a complete result set and then abort at teardown; those queries were silently counted as total misses. That alone moved `monolog` from a true 0.8888 to a published 0.8388, and propagated into the PHP row.
 
-Both causes are fixed. The abort is gone from the CLI, and the harness now keeps results from a nonzero exit and reports a `degraded` count per repo and per language, so a crashed run cannot be read as a clean one.
+The harness retains usable results from nonzero exits and reports degradation per repository and language. It also records stderr and flags inference fallbacks even when a query exits successfully. Runs with skipped repositories or classified degradation are withheld from the published table.
 
 This is **not** a "codesage > semble" claim. A head-to-head would require running semble end-to-end on the same 63 repos under matched conditions, which is out of scope here. The number is codesage measured against semble's published ground truth.
 
-Reproduce the table above with:
+Use the annotation and repository revisions and embedding configurations recorded in the artifact. Clear experimental `CODESAGE_*` overrides and fully rebuild the indexes with the matching CUDA binary before scoring:
 
 ```sh
 python3 bench/semble-ndcg-runner \
@@ -202,6 +202,8 @@ git diff origin/main...HEAD --name-only | codesage risk-diff
 ```
 
 Same as the pre-commit check, but scoped to everything on the branch instead of just the staged diff. Useful as the last step before `gh pr create`.
+
+Use `codesage brief FILE --json` or `codesage rehearse FILE --json` to check whether other local or remote-tracking branches edit the same file. The scan uses merge-base diffs, excludes stacked branches and dependency manifests, and considers at most the newest 50 refs under a time budget. Read the scanned/total counts before interpreting an empty result. Branch evidence works without an index; rehearsal names the indexed checks it could not run.
 
 ### Inspect review objections in CI
 

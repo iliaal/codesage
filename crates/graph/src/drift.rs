@@ -1,21 +1,5 @@
-//! Structural-index drift instrumentation.
-//!
-//! Answers: "does the structural/semantic index's last-indexed HEAD SHA match
-//! the current git HEAD?" If yes, hooks are firing as intended and the index
-//! is fresh. If no, either a git hook missed (husky override, worktree gitlink,
-//! missing `codesage install-hooks`) or the user made commits without a
-//! triggering event — all cases we need to measure before deciding whether to
-//! build the full content-hash backstop (recommendations doc §1.3).
-//!
-//! This module is **measurement only**. It never auto-reindexes, never raises
-//! errors beyond `tracing::debug!` on malformed state, and never blocks a user
-//! command. Output surfaces:
-//!
-//! - `codesage doctor` — a human-readable line under the `index-drift` check.
-//! - `codesage status` — one-line indicator when a project is indexed.
-//! - MCP server startup — silent append of one JSON line to
-//!   `<project>/.codesage/drift.log`. Appended lines are greppable with `jq`
-//!   and suitable for computing a drift-rate over a user's session history.
+//! Compare the structural index's recorded commit with HEAD without reindexing.
+//! Matching commits do not attest to working-tree or semantic-index freshness.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -50,7 +34,7 @@ pub enum DriftKind {
     NotGit,
     /// Git repo but no structural index has ever been stamped.
     NeverIndexed,
-    /// Stored SHA == HEAD. Hooks are working.
+    /// Stored SHA matches HEAD.
     Fresh,
     /// HEAD is N commits past the stored SHA on the same history line.
     BehindHead,
@@ -63,8 +47,6 @@ pub enum DriftKind {
 }
 
 impl DriftReport {
-    /// Used by tests and reserved for future callers (e.g. a future `codesage
-    /// drift-report` summary). Keeps the semantic meaning close to the enum.
     #[cfg(test)]
     pub(crate) fn is_drift(&self) -> bool {
         matches!(
@@ -122,9 +104,6 @@ fn short(sha: &str) -> String {
     }
 }
 
-/// Format a unix timestamp as a short relative-time string ("3 hours ago",
-/// "just now", "5 days ago"). Avoids pulling in chrono for one line of
-/// user-facing output.
 fn fmt_ts(unix: i64) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
@@ -150,9 +129,7 @@ fn fmt_ts(unix: i64) -> String {
     format!("{d} day{} ago", if d == 1 { "" } else { "s" })
 }
 
-/// Compute the drift report for `project_root`. Reads `structural_index_state`
-/// from `db` and queries git for the current HEAD. Never panics; returns
-/// `DriftKind::Unknown` when git/rusqlite surface a structured error.
+/// Compare the recorded structural-index commit with the current HEAD.
 pub fn check_drift(project_root: &Path, db: &Database) -> DriftReport {
     let (stored_sha, stored_at) = match db.get_structural_index_state() {
         Ok(Some((sha, at))) => (Some(sha), Some(at)),
@@ -165,12 +142,8 @@ pub fn check_drift(project_root: &Path, db: &Database) -> DriftReport {
 
     let head_sha = git_head_sha(project_root);
 
-    // Single `commits_between` spawn: derive both the classification and the
-    // count from one result instead of running the git pair twice.
     let (kind, commits_between) = match (&stored_sha, &head_sha) {
-        // No HEAD SHA: distinguish a repo with an unborn HEAD (fresh `git
-        // init`, `checkout --orphan` — no commits yet) from a non-repo. Both
-        // yield `head_sha == None`, but only the latter is `NotGit`.
+        // An unborn HEAD is still a Git repository.
         (_, None) => {
             if git_common_dir(project_root).is_some() {
                 (DriftKind::NeverIndexed, None)
@@ -279,18 +252,15 @@ fn commits_between(cwd: &Path, a: &str, b: &str) -> CommitsBetween {
         .unwrap_or(CommitsBetween::Unknown)
 }
 
-/// Append one JSON-line drift record to `<project>/.codesage/drift.log`.
-/// Truncates the log to the last 10,000 lines on entry to keep growth
-/// bounded — roughly a year of once-per-session records.
+/// Append a drift record under `project_dir_name`, rotating logs over 1 MiB.
+/// Rotation retains at most 10,000 valid records from an 8 MiB tail.
 pub fn append_drift_log(
     project_root: &Path,
     project_dir_name: &str,
     report: &DriftReport,
 ) -> anyhow::Result<()> {
     let dir = project_root.join(project_dir_name);
-    // lstat, not `exists()`: a repo-planted `.codesage` *directory* symlink
-    // would otherwise redirect the whole log path out of the project tree, and
-    // the per-file guard below only inspects the final component.
+    // Reject directory symlinks before checking the log's final component.
     if !std::fs::symlink_metadata(&dir)
         .map(|m| m.is_dir())
         .unwrap_or(false)
@@ -299,22 +269,15 @@ pub fn append_drift_log(
     }
     let path = dir.join("drift.log");
 
-    // Refuse a symlinked or otherwise non-regular target, for the log itself
-    // and for the sibling the rotation renames over it. `.codesage/` is part of
-    // the repository work tree, so a hostile repo can ship either name as a
-    // git symlink (mode 120000): the append would put a repo-controlled JSON
-    // line at an arbitrary file's EOF, and the rotation's write-then-rename
-    // would replace an arbitrary file wholesale. Same posture as the hooks.log
-    // guard in the post-commit hook template and the session snapshot writer:
-    // skip the telemetry write, never follow the link.
+    // A cloned repository can plant the log as a symlink; telemetry must not
+    // follow it. The opened handle is checked again under the writer lock.
     if !drift_log_target_is_writable(&path) {
         return Ok(());
     }
+    let _lock = crate::state_file::lock(&dir.join("drift.lock"))?;
 
-    // Bounded rotation: if the log has grown past 10k lines, keep the tail.
     if let Ok(meta) = std::fs::metadata(&path) {
-        // Cheap guard: only do the rewrite when file is larger than ~1 MiB.
-        // Below that, line count won't exceed 10k for any plausible record size.
+        // Avoid scanning small logs solely to count records.
         if meta.len() > 1 << 20 {
             rotate_log(&path)?;
         }
@@ -328,55 +291,56 @@ pub fn append_drift_log(
         kind: report.kind,
     })?;
 
-    use std::io::Write as _;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-    writeln!(f, "{line}")?;
+    crate::state_file::append_line(&path, format!("{line}\n").as_bytes())?;
     Ok(())
 }
 
-/// True when both `drift.log` and the `drift.log.tmp` the rotation writes are
-/// safe to touch: each is either absent or an existing regular file. A symlink,
-/// fifo, or directory at either name means the write would land somewhere the
-/// project does not own, so the caller skips the record entirely.
 fn drift_log_target_is_writable(path: &Path) -> bool {
-    let regular_or_absent = |p: &Path| match std::fs::symlink_metadata(p) {
+    match std::fs::symlink_metadata(path) {
         Ok(meta) => meta.is_file(),
         Err(err) => err.kind() == std::io::ErrorKind::NotFound,
-    };
-    regular_or_absent(path) && regular_or_absent(&rotation_tmp_path(path))
+    }
 }
 
-fn rotation_tmp_path(path: &Path) -> PathBuf {
-    path.with_extension("log.tmp")
-}
-
-/// Largest drift log the rotation will read back into memory.
-///
-/// Rotation only ever keeps the last 10k records, so anything past this is
-/// discarded wholesale rather than loaded: the log is repository-supplied
-/// content, and a cloned repo can commit an arbitrarily large regular file at
-/// this path. Well above the 1 MiB rotation trigger, so ordinary logs still
-/// rotate by keeping their tail.
+/// Bound memory use for repository-supplied logs.
 const MAX_ROTATE_BYTES: u64 = 8 << 20;
 
 fn rotate_log(path: &Path) -> anyhow::Result<()> {
-    if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > MAX_ROTATE_BYTES {
-        // Too large to tail cheaply: start the log over instead of reading it.
-        std::fs::write(path, b"")?;
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut file = crate::state_file::open(path, false)?;
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub(MAX_ROTATE_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_ROTATE_BYTES).read_to_end(&mut bytes)?;
+    let contents = if start > 0 {
+        bytes
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(&[][..], |i| &bytes[i + 1..])
+    } else {
+        &bytes
+    };
+    let lines: Vec<&[u8]> = contents
+        .split(|b| *b == b'\n')
+        .filter(|line| serde_json::from_slice::<serde_json::Value>(line).is_ok())
+        .collect();
+    if start == 0
+        && lines.len() <= 10_000
+        && lines.len()
+            == contents
+                .split(|b| *b == b'\n')
+                .filter(|line| !line.is_empty())
+                .count()
+    {
         return Ok(());
     }
-    let contents = std::fs::read_to_string(path)?;
-    let lines: Vec<&str> = contents.lines().collect();
-    if lines.len() <= 10_000 {
-        return Ok(());
+    let mut tail = Vec::new();
+    for line in &lines[lines.len().saturating_sub(10_000)..] {
+        tail.extend_from_slice(line);
+        tail.push(b'\n');
     }
-    let tail = lines[lines.len() - 10_000..].join("\n");
-    let tmp = rotation_tmp_path(path);
-    std::fs::write(&tmp, format!("{tail}\n"))?;
-    std::fs::rename(&tmp, path)?;
+    crate::state_file::replace(path, &tail)?;
     Ok(())
 }
 
@@ -397,8 +361,6 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// Helper for tests and log tooling: path to the drift log. Public so callers
-/// outside this crate can inspect the file `append_drift_log` writes.
 pub fn drift_log_path(project_root: &Path, project_dir_name: &str) -> PathBuf {
     project_root.join(project_dir_name).join("drift.log")
 }
@@ -406,6 +368,79 @@ pub fn drift_log_path(project_root: &Path, project_dir_name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drift_append_preserves_valid_records_around_an_interrupted_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let cs = dir.path().join(".codesage");
+        std::fs::create_dir(&cs).unwrap();
+        let path = cs.join("drift.log");
+        std::fs::write(&path, b"{\"saved\":true}\n{\"partial\":").unwrap();
+        append_drift_log(dir.path(), ".codesage", &drift_report()).unwrap();
+        let bytes = std::fs::read_to_string(path).unwrap();
+        let records: Vec<serde_json::Value> = bytes
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["saved"], true);
+        assert!(records[1].get("ts").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drift_rotation_retains_valid_tail_of_oversized_invalid_utf8_log() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drift.log");
+        let mut bytes = vec![0xff; MAX_ROTATE_BYTES as usize + 1];
+        bytes.extend_from_slice(b"\n{\"saved\":true}\n{\"partial\":");
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        rotate_log(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"saved\":true}\n");
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn concurrent_drift_rotation_and_appends_keep_every_new_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let cs = dir.path().join(".codesage");
+        std::fs::create_dir(&cs).unwrap();
+        let path = cs.join("drift.log");
+        std::fs::write(
+            &path,
+            format!("{{\"old\":\"{}\"}}\n", "x".repeat(110)).repeat(10_001),
+        )
+        .unwrap();
+        std::thread::scope(|scope| {
+            for n in 0..16 {
+                let root = dir.path();
+                scope.spawn(move || {
+                    let mut report = drift_report();
+                    report.head_sha = Some(format!("new-{n}"));
+                    append_drift_log(root, ".codesage", &report).unwrap();
+                });
+            }
+        });
+        let raw = std::fs::read_to_string(path).unwrap();
+        let records: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for n in 0..16 {
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|row| row["head"] == format!("new-{n}"))
+                    .count(),
+                1
+            );
+        }
+    }
 
     #[test]
     fn short_truncates_hex() {
@@ -480,9 +515,6 @@ mod tests {
 
     #[test]
     fn unborn_head_repo_is_not_classified_notgit() {
-        // Fresh `git init` with no commits: HEAD is unborn so `git rev-parse
-        // HEAD` fails, but it is still a real repo. Must not be reported as
-        // "not a git repository".
         let dir = tempfile::tempdir().unwrap();
         git_init(dir.path());
         let db = Database::open_in_memory().unwrap();
@@ -531,8 +563,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn append_drift_log_refuses_a_symlinked_log() {
-        // A hostile repo ships `.codesage/drift.log` as a symlink; the append
-        // would put one repo-controlled JSON line at the target's EOF.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let victim = root.join("victim.rc");
@@ -548,8 +578,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn append_drift_log_refuses_a_dangling_symlinked_log() {
-        // A dangling link would otherwise have the append *create* the file at
-        // an attacker-chosen path.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let target = root.join("created-by-attacker");
@@ -563,9 +591,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn append_drift_log_refuses_a_symlinked_rotation_tmp() {
-        // The >1 MiB rotation writes `drift.log.tmp` and renames it over the
-        // log; a symlink there turns the write into a full-file replacement.
+    fn append_drift_log_does_not_use_a_planted_legacy_rotation_tmp() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let victim = root.join("victim.rc");
@@ -579,16 +605,17 @@ mod tests {
 
         assert_eq!(std::fs::read(&victim).unwrap(), b"# victim\n");
         assert_eq!(
-            std::fs::read_to_string(cs.join("drift.log")).unwrap(),
-            "{}\n",
-            "the record must be skipped, not appended, while the tmp name is unsafe"
+            std::fs::read_to_string(cs.join("drift.log"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
         );
     }
 
     #[cfg(unix)]
     #[test]
     fn append_drift_log_refuses_a_symlinked_project_dir() {
-        // `.codesage` itself can be a planted directory symlink.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("project");
         std::fs::create_dir(&root).unwrap();
@@ -607,7 +634,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn rotation_discards_an_oversized_log_without_reading_it() {
-        // The log is repo-supplied; a huge regular file must not be slurped.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let cs = root.join(".codesage");

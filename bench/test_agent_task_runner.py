@@ -50,19 +50,16 @@ def approx(a: float, b: float, tol: float = 1e-9) -> bool:
 m = _load("agent-task-runner", "agent_task_runner")
 
 
-# --- saved% math ------------------------------------------------------------
 check(approx(m.saved_pct(80, 100), 20.0), "saved_pct: 20% cheaper -> +20")
 check(approx(m.saved_pct(120, 100), -20.0), "saved_pct: 20% dearer -> -20 (honest)")
 check(m.saved_pct(5, 0) is None, "saved_pct: zero baseline -> None (no divide-by-zero)")
 check(m.saved_pct(0, 0) is None, "saved_pct: 0/0 -> None")
 
-# --- median-of-N ------------------------------------------------------------
 check(m.median_of([{"x": 1.0}, {"x": 3.0}, {"x": 2.0}], "x") == 2.0, "median_of: odd")
 check(m.median_of([{"x": 1.0}, {"x": 3.0}], "x") == 2.0, "median_of: even -> mean of mid")
 check(m.median_of([], "x") == 0.0, "median_of: empty -> 0.0")
 
 
-# --- stream-json parsing ----------------------------------------------------
 def _stream(*events: dict) -> str:
     return "\n".join(json.dumps(e) for e in events)
 
@@ -90,19 +87,14 @@ check(p["read_calls"] == 1, "parse: Read bucket")
 check(p["result_text"] == "src/foo.rs", "parse: final answer text")
 check(p["raced"] is False, "parse: no race markers -> not raced")
 
-# Cold-start race: WITH arm, server not ready -> excluded-class signal.
 raced = m.parse_run_output(
     _stream({"type": "result", "subtype": "success", "total_cost_usd": 0.01, "result": ""}),
     "Error: No such tool available: mcp__codesage__search", 0, 0.5, with_codesage=True,
 )
 check(raced["raced"] is True, "parse: race marker in stderr flags WITH run as raced")
-# The same marker in the WITHOUT arm is NOT a race (no codesage server expected).
 not_raced = m.parse_run_output("", "No such tool available", 0, 0.5, with_codesage=False)
 check(not_raced["raced"] is False, "parse: WITHOUT arm never flagged raced")
-# A generic (non-codesage) tool denial in the WITH arm — e.g. the agent tries
-# the DISALLOWED Bash to run shell grep on a grep-hostile task — is NOT a
-# codesage cold-start race; the agent falls back to Grep/Read and the run is
-# valid. Over-matching here silently discarded good data on the first opus run.
+# A denied non-CodeSage tool does not mean the CodeSage server failed to start.
 bash_denied = m.parse_run_output("", "No such tool available: Bash", 0, 0.5, with_codesage=True)
 check(bash_denied["raced"] is False,
       "parse: generic non-codesage tool denial in WITH arm is NOT raced")
@@ -110,20 +102,17 @@ check("Bash" in bash_denied["diag"],
       "parse: diag captures the failing line so raced/errored runs are diagnosable")
 check(raced["diag"] != "", "parse: a real codesage race carries a diag line")
 
-# Non-zero rc and result-level error both surface as errors.
 check(m.parse_run_output("", "boom", 1, 0.1, with_codesage=False)["error"] == "rc=1",
       "parse: non-zero returncode -> error")
 err_result = _stream({"type": "result", "subtype": "error_max_turns",
                       "total_cost_usd": 0.2, "result": "", "is_error": True})
 check(m.parse_run_output(err_result, "", 0, 0.1, with_codesage=True)["error"] == "result_error",
       "parse: result is_error/subtype -> error")
-# Garbage lines between events don't crash the parser.
 noisy = "debug: starting\n" + good + "\nnot json\n{bad"
 check(m.parse_run_output(noisy, "", 0, 1.0, with_codesage=True)["tool_calls"] == 3,
       "parse: tolerates non-JSON noise lines")
 
 
-# --- scorecard rendering ----------------------------------------------------
 def _arm(cost, tok, tools, dur, used=3, cs=2, cs_used=None):
     return dict(arm="with", runs_total=3, runs_used=used,
                 cs_used_runs=used if cs_used is None else cs_used,
@@ -143,15 +132,12 @@ sc = m.render_scorecard(project_root="/repo", corpus_name="x.yaml", rows=rows,
 for needle in ("Cost saved", "Tokens saved", "Tool-calls saved", "Wall-clock saved",
                "task-a", "NESTED RUN", "model-relative", "$0.180→$0.240 (+25%)"):
     check(needle in sc, f"render: contains {needle!r}")
-# Overall is the MEDIAN of per-task saved%, so task-b's regression isn't hidden.
+# Aggregate per-task savings so one task's cost cannot hide another's regression.
 check("**Cost saved**: +9%" in sc, "render: overall cost = median(+25,-7)=+9 (honest)")
-# A normal (CodeSage-used) run must NOT be stamped invalid, and reports usage.
 check("INVALID" not in sc, "render: cs-used run is not stamped invalid")
 check("CodeSage used in WITH arm" in sc, "render: overall reports cs-usage line")
 
-# --- cs-usage validity gate -------------------------------------------------
-# A WITH arm that never called CodeSage is an A/A comparison; the report MUST
-# stamp INVALID rather than present the variance as savings.
+# Unused CodeSage makes the WITH arm an A/A comparison.
 unused_rows = [
     {"id": "t", "with": _arm(0.18, 120000, 4, 8, cs=0, cs_used=0),
      "without": _arm(0.24, 150000, 6, 11)},
@@ -163,7 +149,6 @@ sc_unused = m.render_scorecard(project_root="/repo", corpus_name="x.yaml", rows=
 check("INVALID" in sc_unused, "render: cs-usage 0 stamps INVALID banner (A/A detected)")
 check("0/3 WITH runs" in sc_unused, "render: banner reports the cs-usage count")
 
-# --- steering ---------------------------------------------------------------
 check("mcp__codesage" not in m.build_prompt("q"),
       "prompt: neutral by default (no codesage nudge)")
 check("mcp__codesage" in m.build_prompt("q", steer_codesage=True),

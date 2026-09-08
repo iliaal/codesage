@@ -1,35 +1,14 @@
-//! Test-file discovery from the file list, by language convention.
-//!
-//! Adopted from clawpatch's `nearbyTests` (src/mappers/shared.ts) but
-//! works against an already-walked path list rather than re-walking the
-//! tree per seed. Caller passes the full file inventory once and we filter.
-//!
-//! Conventions covered:
-//!
-//! - Rust: sibling `tests/*.rs` to the entry's package dir.
-//! - PHP: `*Test.php` / `*_test.php` siblings, plus the file matching the
-//!   class name suffix in standard `tests/` directories. Also `.phpt`
-//!   under any `tests/` directory tied to the entry's dir.
-//! - Python: `tests/test_<stem>.py`, `tests/<stem>_test.py`, sibling
-//!   `test_<stem>.py`.
-//! - JS / TS: sibling `*.{test,spec}.{ts,tsx,js,jsx}` and `__tests__/*`.
-//! - Go: `*_test.go` in the same directory.
-//! - C / C++: `tests/<stem>.c` or `tests/<stem>_test.c` (best-effort).
-//! - Java: `*Test.java` / `*Tests.java` siblings and standard `src/test/` paths.
+//! Discover nearby tests by language convention from a shared file inventory.
 
 use crate::mappers::types::FeatureSeed;
 use codesage_protocol::Language;
 
 const MAX_TESTS_PER_SEED: usize = 5;
 
-/// Test-shaped subset of the repo file inventory, classified once per map
-/// run. Per-seed discovery then scans only this (much smaller) list instead
-/// of re-running the any-language shape check over every repo file for every
-/// seed — the hot path on seed-dense repos (php-src maps one seed per
-/// function against a ~20k-file inventory).
+/// Test-shaped inventory classified once per map run to avoid scanning
+/// every repository file for each seed.
 pub struct TestFileIndex<'a> {
-    /// Sorted. In production the walk output is already sorted, so sorting
-    /// here is a no-op that makes the prefix range-scan valid for any caller.
+    /// Sorted for prefix range scans, even when callers supply unsorted input.
     test_shaped: Vec<&'a str>,
 }
 
@@ -68,17 +47,9 @@ pub fn nearby_tests_indexed(seed: &FeatureSeed, index: &TestFileIndex) -> Vec<St
 
     let mut out: Vec<String> = Vec::new();
 
-    // Authoritative first: tests the mapper explicitly declared via
-    // `test_prefixes` (e.g. an autotools `<dir>/tests` prefix). These run BEFORE
-    // the heuristic convention/stem scan so loose matches can't starve them —
-    // pre-reorder, five stem matches could fill the cap and drop every declared
-    // test. The declared dir is matched by test SHAPE in any language, not only
-    // the seed's: a C-language PHP-extension seed declares a dir of .phpt tests
-    // that a seed-language filter would reject wholesale. Within the declared
-    // dirs, the seed's OWN-language tests take the cap slots first — otherwise
-    // alphabetically-earlier files of another language (five test_*.py before
-    // the crate's *.rs integration tests) exhaust the cap and starve the tests
-    // the seed actually runs.
+    // Declared prefixes precede heuristics so loose matches cannot exhaust the cap.
+    // Accept cross-language tests (e.g. .phpt for a C extension), but reserve
+    // slots for the seed's own language first.
     let mut lang_hits: Vec<&str> = Vec::new();
     let mut other_hits: Vec<&str> = Vec::new();
     for prefix in &seed.test_prefixes {
@@ -142,26 +113,19 @@ pub fn nearby_tests_indexed(seed: &FeatureSeed, index: &TestFileIndex) -> Vec<St
 }
 
 fn file_relates_to(seed: &FeatureSeed, stem: &str, dir: &str, candidate: &str) -> bool {
-    // 1. Sibling directory: same parent dir.
     let cand_dir = parent_dir(candidate);
     if !dir.is_empty() && cand_dir == dir {
         return true;
     }
-    // 2. Test file whose stem matches the entry's stem at a word boundary,
-    // but only within the same monorepo package/crate root so identical
-    // stems in different packages (e.g. packages/api vs packages/ui) don't
-    // cross-attach.
+    // Identical stems must not cross monorepo package/crate boundaries.
     let cand_stem = file_stem(candidate);
     if stem_at_word_boundary(cand_stem, stem)
         && same_stem_scope(seed.entry_path.as_str(), candidate)
     {
         return true;
     }
-    // 3. Convention dirs at the repo root that are typically the test home.
-    // Rust integration tests in `tests/` always attach (no stem match needed
-    // — any test in that dir exercises the crate as a whole). For other
-    // languages we require a stem match to avoid attaching every test in the
-    // suite to every entrypoint.
+    // Rust integration tests exercise the crate as a whole; other languages
+    // need a stem match to avoid attaching an entire suite to every entrypoint.
     let convention_dirs: &[&str] = match seed.language {
         Language::Rust => &["tests"],
         Language::Php => &["tests", "test"],
@@ -190,12 +154,8 @@ fn stem_match(candidate: &str, stem: &str) -> bool {
     stem_at_word_boundary(file_stem(candidate), stem)
 }
 
-/// True if `stem` occurs in `cand_stem` as a prefix or suffix at a word
-/// boundary — the adjacent character is a separator (`_` / `.` / `-`), an
-/// uppercase letter (a CamelCase word start), or the string edge. A bare
-/// substring/prefix match attaches unrelated files: entry stem `main` otherwise
-/// matches `maintenance_test`. The boundary keeps the real conventions
-/// (`main_test`, `test_main`, `MainTest`) while rejecting `maintenance`.
+/// Match a prefix or suffix at a separator, uppercase letter, or string edge.
+/// This accepts `main_test` while rejecting `maintenance_test` for `main`.
 fn stem_at_word_boundary(cand_stem: &str, stem: &str) -> bool {
     if stem.is_empty() || cand_stem.len() < stem.len() {
         return false;
@@ -203,7 +163,6 @@ fn stem_at_word_boundary(cand_stem: &str, stem: &str) -> bool {
     // A lowercase letter or digit continues a word; anything else (separator,
     // uppercase, edge) is a boundary.
     let is_word = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
-    // Prefix: stem at the start, followed by a boundary.
     if let Some(rest) = cand_stem.strip_prefix(stem) {
         match rest.chars().next() {
             None => return true,
@@ -268,9 +227,7 @@ fn matches_language(path: &str, language: Language) -> bool {
     }
 }
 
-/// Canonical per-language test-shape predicate. Mappers must route their
-/// own "is this a test file?" checks through this (or the broader
-/// [`is_test_file_any_language`]) instead of re-encoding the conventions.
+/// Shared per-language test-shape predicate for mappers and test association.
 pub(crate) fn is_test_file(path: &str, language: Language) -> bool {
     match language {
         Language::Rust => {
@@ -317,9 +274,7 @@ pub(crate) fn is_test_file(path: &str, language: Language) -> bool {
     }
 }
 
-/// The `test_*.py` / `*_test.py` basename convention, single-sourced so the
-/// Python mapper's pytest-file classifier and this module's Python arm can't
-/// drift apart. Callers guard the `.py` extension themselves.
+/// `test_*.py` / `*_test.py` basename convention; callers check the `.py` extension.
 pub(crate) fn is_python_test_basename(path: &str) -> bool {
     let base = path.rsplit('/').next().unwrap_or(path);
     base.starts_with("test_") || base.ends_with("_test.py")
@@ -329,9 +284,7 @@ pub(crate) fn is_python_test_basename(path: &str) -> bool {
 /// directory under `tests/` / `test/` / `__tests__/` (any depth,
 /// case-insensitive); basename prefixed with `test_` or `test-`; basename
 /// suffixed `_tests.cpp` / `-test.c`; `FooTest.cpp` / `BarTests.cc`.
-/// Mirrors clawpatch's `isCOrCppTestPath`. The same shape drives CMake
-/// test-target classification, `main()`-suppression in the c-main walker,
-/// and this module's C/C++ test association.
+/// Shared by CMake target classification, C main suppression, and test association.
 pub(crate) fn is_c_or_cpp_test_path(rel: &str) -> bool {
     let base = rel.rsplit('/').next().unwrap_or(rel);
     let lower = rel.to_ascii_lowercase();
@@ -348,7 +301,6 @@ pub(crate) fn is_c_or_cpp_test_path(rel: &str) -> bool {
     if base_lower.starts_with("test_") || base_lower.starts_with("test-") {
         return true;
     }
-    // foo_test.c / foo-tests.cpp
     let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base);
     let stem_lower = stem.to_ascii_lowercase();
     if stem_lower.ends_with("_test")
@@ -367,7 +319,7 @@ pub(crate) fn is_c_or_cpp_test_path(rel: &str) -> bool {
 }
 
 /// When both paths live under `packages/<name>/` or `crates/<name>/`, require
-/// the same `<name>`. Non-monorepo layouts keep the historical cross-dir
+/// the same `<name>`. Non-monorepo layouts allow cross-directory
 /// stem-match behavior (e.g. `acme/widget.py` + `other/widget_test.py`).
 fn same_stem_scope(entry: &str, candidate: &str) -> bool {
     match (monorepo_member_root(entry), monorepo_member_root(candidate)) {
@@ -379,9 +331,6 @@ fn same_stem_scope(entry: &str, candidate: &str) -> bool {
 
 fn monorepo_member_root(rel: &str) -> Option<String> {
     for prefix in ["packages/", "crates/"] {
-        // `continue` on a non-matching prefix — a bare `?` here returned None
-        // from the whole function on the first miss, leaving the `crates/`
-        // branch dead so `crates/*` sources never resolved a member root.
         let Some(rest) = rel.strip_prefix(prefix) else {
             continue;
         };
@@ -426,8 +375,6 @@ mod tests {
 
     #[test]
     fn is_c_or_cpp_test_path_covers_documented_patterns() {
-        // Patterns mirror clawpatch's `isCOrCppTestPath`. Listed here so
-        // a future change that loosens the helper trips the test.
         for path in [
             "tests/main.c",
             "test/main.cpp",
@@ -573,10 +520,6 @@ mod tests {
 
     #[test]
     fn crates_member_does_not_cross_attach_sibling_crate_test() {
-        // Regression: the `crates/` branch of monorepo_member_root was dead, so
-        // a crates-workspace source resolved no member root and a same-stem test
-        // in a *sibling* crate cross-attached. `crates/foo` must not pull in
-        // `crates/bar`'s test.
         let s = seed("crates/foo/src/lib.rs", Language::Rust);
         let all = vec![
             "crates/foo/src/lib.rs".to_string(),
@@ -591,8 +534,6 @@ mod tests {
 
     #[test]
     fn crates_member_attaches_own_crate_test() {
-        // The flip side: with the branch live, a crate's own in-tree test still
-        // attaches (proves the crates/ branch is no longer dead).
         let s = seed("crates/foo/src/lib.rs", Language::Rust);
         let all = vec![
             "crates/foo/src/lib.rs".to_string(),
@@ -607,9 +548,6 @@ mod tests {
 
     #[test]
     fn candidate_partition_preserves_output_on_mixed_fixture() {
-        // Locks the optimized (partition + hoisted-format!) path against a
-        // fixture that exercises declared prefixes, stem matches, sibling-dir
-        // matches, and non-test noise together.
         let mut s = seed("src/app/widget.py", Language::Python);
         s.test_prefixes = vec!["integration".to_string()];
         let all = vec![
@@ -659,8 +597,6 @@ mod tests {
 
     #[test]
     fn declared_prefix_is_path_anchored() {
-        // Prefix "tests" anchors at the repo-relative path start; a nested
-        // "other/tests/" dir must not match it.
         let mut s = seed("src/main.rs", Language::Rust);
         s.test_prefixes = vec!["tests".to_string()];
         let all = vec![
@@ -676,8 +612,6 @@ mod tests {
 
     #[test]
     fn declared_prefix_skips_non_test_shaped_files() {
-        // Files under the declared prefix still need to look like a test in
-        // SOME language — docs and fixtures data must not attach.
         let mut s = seed("ext/foo/config.m4", Language::C);
         s.test_prefixes = vec!["ext/foo/tests".to_string()];
         let all = vec![
@@ -697,12 +631,7 @@ mod tests {
 
     #[test]
     fn declared_prefix_prioritizes_seed_language_tests() {
-        // Starvation regression: the declared tests/ dir holds five
-        // alphabetically-earlier Python test files plus the Rust seed's own
-        // integration test. Pre-fix, the prefix loop filled the 5-slot cap
-        // in inventory order, so the .py files exhausted it and the one
-        // test the seed actually runs never attached. Own-language tests
-        // now take the cap slots first.
+        // Earlier Python files must not exhaust the cap before the Rust test.
         let mut s = seed("src/main.rs", Language::Rust);
         s.test_prefixes = vec!["tests".to_string()];
         // Sorted, matching walk_files' production output: the .py files

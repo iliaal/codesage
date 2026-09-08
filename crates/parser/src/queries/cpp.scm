@@ -16,8 +16,7 @@
     (function_declarator
       declarator: (identifier) @name))) @def
 
-; Pattern 3: Out-of-line method definition (void Foo::bar() {}) -> Method
-; @name captures the whole `Foo::bar`; build_qualified_name splits on `::`.
+; Pattern 3: Out-of-line method definition → Method; captures the full `Foo::bar`.
 (function_definition
   declarator: (function_declarator
     declarator: (qualified_identifier) @name)) @def
@@ -32,10 +31,7 @@
   declarator: (function_declarator
     declarator: (operator_name) @name)) @def
 
-; Pattern 6: Class -> Class (matches both top-level and template-wrapped).
-; The `body:` requirement excludes forward declarations (`class Foo;`),
-; which parse as a bodiless class_specifier and would otherwise emit phantom
-; Class symbols for types defined in another header.
+; Pattern 6: Class → Class; require a body to exclude forward declarations.
 (class_specifier
   name: (type_identifier) @name
   body: (field_declaration_list)) @def
@@ -50,9 +46,7 @@
   name: (type_identifier) @name
   body: (field_declaration_list)) @def
 
-; Pattern 9: Enum / enum class -> Enum. Opaque declarations
-; (`enum E : int;`, `enum class EC;`) carry no enumerator_list and are
-; excluded the same way.
+; Pattern 9: Enum / enum class → Enum; require a body to exclude opaque declarations.
 (enum_specifier
   name: (type_identifier) @name
   body: (enumerator_list)) @def
@@ -105,10 +99,8 @@
     (function_declarator
       declarator: (field_identifier) @name))) @def
 
-; Pattern 19: in-class method definition (with body) -> Function (refined to Method)
-;   class Foo { void bar() { ... } };
-; In-class member names parse as field_identifier (not identifier), so this is
-; the method-definition counterpart of pattern 0.
+; Pattern 19: in-class method definition → Function, refined to Method.
+; Member names use field_identifier rather than pattern 0's identifier.
 (function_definition
   declarator: (function_declarator
     declarator: (field_identifier) @name)) @def

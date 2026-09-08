@@ -205,7 +205,6 @@ fn unreadable_file_is_skipped_not_fatal() {
         return;
     }
 
-    // Pre-fix: an unreadable file aborted the whole walk (returned Err).
     let files = discover_files_with_excludes(root, &[])
         .expect("an unreadable file must be skipped, not abort the whole index");
     let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();

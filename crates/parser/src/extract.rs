@@ -15,10 +15,7 @@ static JS_QUERY: &str = include_str!("queries/javascript.scm");
 static TS_QUERY: &str = include_str!("queries/typescript.scm");
 static GO_QUERY: &str = include_str!("queries/go.scm");
 
-/// A compiled tree-sitter symbol query plus its capture indices. Compiled once
-/// per language on first use, then reused across every file. `capture_index_for_name`
-/// is O(n) over captures, so caching it beside the Query matters when the indexer
-/// runs through tens of thousands of files.
+/// Cache compiled queries and linear capture-name lookups across files.
 pub(crate) struct SymbolQuerySpec {
     pub(crate) query: Query,
     pub(crate) name_idx: u32,
@@ -76,9 +73,7 @@ pub(crate) fn symbol_query_for(lang: Language) -> &'static SymbolQuerySpec {
     }
 }
 
-/// The pattern-index → `SymbolKind` map for a language, shared by
-/// `extract_symbols` and the fingerprint pass so both agree on which `@def`
-/// matches are functions/methods.
+/// Shared pattern-kind mapping for symbol extraction and fingerprinting.
 pub(crate) fn kind_map_for(language: Language) -> fn(usize) -> Option<SymbolKind> {
     match language {
         Language::Php => php_kind_map,
@@ -93,11 +88,7 @@ pub(crate) fn kind_map_for(language: Language) -> fn(usize) -> Option<SymbolKind
     }
 }
 
-/// Every (language, symbol-query-source) pair. Single source of truth for the
-/// validation gate (`crate::validate`) that compiles each query against its
-/// grammar in CI, so a tree-sitter grammar bump that renames a node type or
-/// field is caught pre-merge instead of panicking on the first file of that
-/// language indexed.
+/// Query sources compiled by [`crate::validate`] to catch grammar incompatibility.
 pub(crate) const SYMBOL_QUERY_SOURCES: &[(Language, &str)] = &[
     (Language::Php, PHP_QUERY),
     (Language::Python, PYTHON_QUERY),
@@ -119,8 +110,6 @@ fn php_kind_map(pattern_index: usize) -> Option<SymbolKind> {
         4 => Some(SymbolKind::Interface),
         5 => Some(SymbolKind::Enum),
         6 => Some(SymbolKind::Constant),
-        // No Namespace arm: php.scm carries no namespace pattern (it matched
-        // only to be discarded). Keep this map dense over 0..=7.
         7 => Some(SymbolKind::Constant), // enum case (PHP 8.1)
         _ => None,
     }
@@ -268,12 +257,8 @@ pub fn extract_symbols(
 
     let mut symbols: Vec<Symbol> = Vec::new();
     let mut seen_defs = std::collections::HashSet::new();
-    // Storage keys a symbol on (name, qualified_name, kind, span). Error
-    // recovery can hang several same-text declarators off one def node (a
-    // `typedef R (CALLCONV *fn)(T, T, T)` whose calling-convention macro is
-    // unknown parses each parameter type as a declarator of the typedef), and
-    // `seen_defs` keeps those because the name nodes differ. Collapse them
-    // here so the stored row set equals the emitted one.
+    // Error recovery can emit distinct name nodes with the same storage key,
+    // e.g. parameter types in `typedef R (CALLCONV *fn)(T, T, T)`.
     let mut seen_rows = std::collections::HashSet::new();
 
     while let Some(m) = matches.next() {
@@ -291,11 +276,7 @@ pub fn extract_symbols(
         let name_node = name_cap.node;
         let def_node = def_cap.node;
 
-        // Dedup key includes the name node so multi-declarator field
-        // declarations (`String x, y, z;` in Java; the same shape exists in
-        // C/C++) emit one symbol per name. Without the name in the key, the
-        // first declarator wins and the rest are silently dropped because
-        // tree-sitter produces N matches all sharing the same def_node.
+        // Multi-declarator fields share a def node; keep each distinct name.
         let def_id = (
             def_node.start_byte(),
             def_node.end_byte(),
@@ -455,13 +436,7 @@ fn is_inside_impl_or_class(node: &Node, language: Language) -> bool {
     let mut current = node.parent();
     while let Some(parent) = current {
         match parent.kind() {
-            // An ENCLOSING function scope means this is a local/nested function
-            // (`def helper()` inside a method, `fn local()` inside an impl fn),
-            // not a method of the outer class. Stop before reaching the class so
-            // it stays a Function — otherwise it gets kind=Method and a
-            // fabricated `Class.helper` qualified name. `node` is the symbol's
-            // own function node, so its own kind is never matched here (we start
-            // from `node.parent()`).
+            // An intervening function makes this a local function, not a method.
             "function_definition" if language == Language::Python || language == Language::Cpp => {
                 return false;
             }
@@ -481,15 +456,7 @@ fn is_inside_impl_or_class(node: &Node, language: Language) -> bool {
     false
 }
 
-/// Extract the bare identifier from a captured C++ name.
-///
-/// Most captures already are the bare identifier (e.g. `bar` for an in-class
-/// method, `Foo` for a class). Patterns that capture `qualified_identifier`
-/// (out-of-line `void Foo::bar() {}`) yield `Foo::bar`; this helper returns
-/// `bar` in that case so symbol-name search hits the same way it does for
-/// in-class definitions. Destructors (`~Foo`) and operators (`operator+`) are
-/// returned as-is because the leading marker is part of the conventional
-/// search term.
+/// Remove C++ scope prefixes, preserving destructor and operator names.
 pub(crate) fn cpp_bare_name(captured: &str) -> String {
     captured.rsplit("::").next().unwrap_or(captured).to_string()
 }
@@ -521,8 +488,7 @@ fn find_cpp_namespace(node: &Node, source: &[u8]) -> Option<String> {
                             nested_parts.push(text.to_string());
                         }
                     }
-                    // nested specifier is left-to-right; we'll reverse the whole
-                    // chain at the end so push as-is.
+                    // Reverse each nested specifier before reversing the full chain.
                     for part in nested_parts.into_iter().rev() {
                         parts.push(part);
                     }
@@ -555,9 +521,7 @@ fn cpp_qualified_name(
         parts.push(ns);
     }
     if captured_name.contains("::") {
-        // Out-of-line definition: the captured text already contains the class
-        // scope (e.g. `Foo::bar`). Use it verbatim instead of walking parents,
-        // since these defs live at namespace scope, not inside the class body.
+        // Out-of-line definitions carry class scope in the name, not the AST ancestry.
         parts.push(captured_name.to_string());
     } else {
         if (kind == SymbolKind::Method || kind == SymbolKind::Constant)
@@ -640,10 +604,6 @@ fn find_parent_class_name<'a>(node: &Node, source: &'a [u8]) -> Option<&'a str> 
     None
 }
 
-/// Build a `namespace<sep>Class<sep>name` qualified name. Shared by the PHP
-/// (`\`) and Java (`.`) arms of `build_qualified_name`, which differ only in the
-/// separator: namespace/package prefix, optional enclosing class for methods and
-/// constants, then the bare name.
 fn join_qualified(
     name: &str,
     kind: SymbolKind,
@@ -684,9 +644,7 @@ fn build_qualified_name(
             name.to_string()
         }
         Language::C => name.to_string(),
-        // Cpp goes through `cpp_qualified_name` in extract_symbols. This arm
-        // exists only to keep the match exhaustive; the dispatcher never
-        // reaches here for Cpp.
+        // C++ qualification is handled by `cpp_qualified_name` before dispatch.
         Language::Cpp => name.to_string(),
         Language::Java => java_qualified_name(name, kind, def_node, source, namespace),
         Language::Rust => {

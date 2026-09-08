@@ -11,6 +11,7 @@ mod fsguard;
 mod installer;
 mod lockfile;
 mod mcp;
+mod query_reranker;
 mod statewatcher;
 mod util;
 
@@ -584,12 +585,23 @@ pub(crate) fn db_path(root: &Path) -> PathBuf {
     root.join(PROJECT_DIR).join(DB_FILE)
 }
 
+pub(crate) fn evidence_root(path: &Path) -> Result<PathBuf> {
+    anyhow::ensure!(path.is_absolute(), "project must be an absolute path");
+    let canonical = path.canonicalize().context("resolving project path")?;
+    anyhow::ensure!(canonical.is_dir(), "project must be a directory");
+    for ancestor in canonical.ancestors() {
+        if ancestor.join(PROJECT_DIR).is_dir() || ancestor.join(".git").exists() {
+            return Ok(ancestor.to_path_buf());
+        }
+    }
+    anyhow::bail!("no CodeSage project or Git repository found")
+}
+
 pub(crate) fn open_db(root: &Path) -> Result<Database> {
     Database::open(&db_path(root)).context("failed to open index database")
 }
 
-/// Read-only handle for paths that must not mutate the project. See
-/// [`Database::open_read_only`]: no chmod, no migrations.
+/// No chmod or migrations; suitable for read-only evidence paths.
 pub(crate) fn open_db_read_only(root: &Path) -> Result<Database> {
     Database::open_read_only(&db_path(root)).context("failed to open index database read-only")
 }
@@ -608,21 +620,13 @@ pub(crate) fn open_context_db_for_existing_model(root: &Path, model: &str) -> Re
         .context("failed to open index database")
 }
 
-/// Exit status when another indexer held the project lock for the whole
-/// wait window. Distinct from the generic `1` so a hook can tell "nothing
-/// was indexed, retry later" from "the run broke". `EX_TEMPFAIL` in
-/// sysexits terms.
+/// EX_TEMPFAIL distinguishes lock contention from failure so hooks retry without stamping success.
 pub(crate) const EXIT_LOCK_HELD: i32 = 75;
 
-/// Exit status when the semantic index cannot serve a query because its
-/// recorded fingerprint is absent or differs from the configured setup. The
-/// data on disk is the problem, not the invocation: `EX_DATAERR` in sysexits
-/// terms. The message names `codesage index --full`.
+/// EX_DATAERR identifies absent or mismatched semantic fingerprints; requires a full rebuild.
 pub(crate) const EXIT_STALE_INDEX: i32 = 65;
 
-/// Another process held the project's indexing lock past the wait window.
-/// Nothing was indexed. Used to be reported as success, which let a hook
-/// record the tree as indexed and skip every later run on the same HEAD.
+/// Lock contention must not count as successful indexing in hook skip markers.
 #[derive(Debug)]
 pub(crate) struct IndexLockHeld {
     root: PathBuf,
@@ -642,11 +646,7 @@ impl std::fmt::Display for IndexLockHeld {
 
 impl std::error::Error for IndexLockHeld {}
 
-/// Try to acquire the project indexing lock, polling for up to `wait`
-/// (`Duration::ZERO` = single non-blocking attempt). Contention past the
-/// window is an [`IndexLockHeld`] error, which `main` maps to
-/// [`EXIT_LOCK_HELD`] rather than the generic failure code; the command did
-/// no work, and its caller must not record that it did.
+/// Poll for up to `wait`; zero makes one attempt. Contention maps to EXIT_LOCK_HELD.
 pub(crate) fn acquire_index_lock(
     root: &Path,
     action: &str,
@@ -662,7 +662,6 @@ pub(crate) fn acquire_index_lock(
     }
 }
 
-/// Process exit status for a finished `run`.
 fn exit_code_for(result: &Result<()>) -> i32 {
     match result {
         Ok(()) => 0,
@@ -719,31 +718,20 @@ pub(crate) fn get_user_exclude_patterns(config: &ProjectConfig) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Load config, obtain an embedder, open DB for its model, and optionally load a reranker.
-/// Shared by `cmd_search` and `cmd_export`.
-///
-/// The embedder is the running daemon's resident session when one answers
-/// (see `daemon_embed`), otherwise a private `Embedder`. The reranker is
-/// always private: the daemon exposes no rerank entry point yet.
+/// Use daemon-pooled embedding and reranking sessions when available, otherwise private ones.
 pub(crate) fn load_query_stack(
     root: &Path,
 ) -> Result<(
     Database,
     Box<dyn codesage_graph::TextEmbedder>,
-    Option<codesage_embed::reranker::Reranker>,
+    Option<query_reranker::QueryReranker>,
 )> {
     load_query_stack_with(root, query_embedder, |db, emb_config, dim| {
-        // Resolved through the recorded attestation: with a daemon
-        // answering, no model file is read; without one, the private
-        // session's pin check already digested each file once and the
-        // shared cache answers the fingerprint.
+        // Reuse artifact attestations to avoid rereading model files.
         commands::index::resolved_fingerprint(db, emb_config, dim)
     })
 }
 
-/// [`load_query_stack`] over an injected embedder source and fingerprint
-/// resolver, so the assembly — table check, then the bind — is testable
-/// without a model on disk.
 fn load_query_stack_with(
     root: &Path,
     embedder_for: impl FnOnce(
@@ -758,32 +746,25 @@ fn load_query_stack_with(
 ) -> Result<(
     Database,
     Box<dyn codesage_graph::TextEmbedder>,
-    Option<codesage_embed::reranker::Reranker>,
+    Option<query_reranker::QueryReranker>,
 )> {
     let config = load_project_config(root)?;
     let emb_config = config.embedding.unwrap_or_default();
     let (mut embedder, dim) = embedder_for(root, &emb_config)?;
     let db = open_db_for_model(root, &emb_config.model, dim)?;
-    // A table whose vectors were produced under another setup — or under
-    // none this version attested — answers a query with wrong neighbours.
-    // Refuse (`EXIT_STALE_INDEX`) rather than serve them.
+    // Mismatched or unattested vectors cannot produce trustworthy neighbours.
     let fingerprint = fingerprint_for(&db, &emb_config, dim)?;
     codesage_graph::require_current_semantic_table(&db, &fingerprint)?;
-    // The query vector must come from the setup the table's vectors did. A
-    // daemon session refuses here when it produces another identity (and
-    // will not embed unbound at all); a private session refuses a provider
-    // the fingerprint does not name.
+    // Query and stored vectors must share the same model and provider identity.
     embedder.bind_fingerprint(&fingerprint)?;
     let reranker = emb_config
         .reranker
         .as_ref()
-        .map(|model| codesage_embed::reranker::Reranker::new(model, &emb_config.device))
+        .map(|model| query_reranker::QueryReranker::new(root, model, &emb_config.device))
         .transpose()?;
     Ok((db, embedder, reranker))
 }
 
-/// The daemon's session for `emb_config.model` when a daemon answers, else a
-/// private embedder; with the dimension either one produces.
 pub(crate) fn query_embedder(
     root: &Path,
     emb_config: &EmbeddingConfig,
@@ -848,9 +829,7 @@ fn print_version_info() {
 fn main() {
     init_tracing();
 
-    // Handle -V / --version before clap so it works without a subcommand and
-    // can include project-local device config from .codesage/config.toml.
-    // Use args_os — std::env::args() panics on non-UTF-8 argv (see cli_args test).
+    // Custom version output includes project-local config; args_os tolerates non-UTF-8 paths.
     let wants_version = std::env::args_os()
         .nth(1)
         .is_some_and(|a| a == "-V" || a == "--version");
@@ -859,24 +838,9 @@ fn main() {
         std::process::exit(0);
     }
 
-    // Resolve ONNX Runtime + NVIDIA library locations now, while we are still
-    // single-threaded. The discovery code calls `std::env::set_var` for
-    // `LD_LIBRARY_PATH` / `ORT_DYLIB_PATH`, which is `unsafe` under Rust 2024
-    // because concurrent `getenv` from another thread is UB. Doing it here
-    // (before clap, before any tokio runtime, before any thread spawn)
-    // keeps the writes race-free even though the calls themselves remain
-    // marked unsafe. This is the environment-only half of startup and costs
-    // microseconds; the CUDA/cuDNN dlopen (`preload_native_libs`, ~200 MB
-    // RSS, ~1.9 GB virtual) runs lazily from the session loader, so a
-    // command that never builds an ONNX session — including a no-change
-    // incremental `index` — never maps those libraries or touches the GPU.
-    //
-    // Skipped for the `codesage mcp` stdio shim (no `--direct` flag): the
-    // shim only proxies bytes between stdin and the daemon's Unix socket and
-    // never constructs an Embedder or Reranker. Structural/metadata commands
-    // (status, risk, find-symbol, …) skip it too; the `Once::call_once`
-    // fallback inside `load_onnx_session` covers any embedder codepath that
-    // reaches inference without a main-thread init.
+    // Set ORT/CUDA environment paths while single-threaded: set_var races with getenv.
+    // Native libraries load lazily, so no-op indexing avoids CUDA initialization.
+    // Shims and structural commands need no model environment setup.
     if !is_shim_invocation() && uses_embedder() {
         codesage_embed::model::init_for_main();
     }
@@ -888,28 +852,9 @@ fn main() {
 
     let code = exit_code_for(&result);
 
-    // Leave the process without running any teardown. ORT's session/arena
-    // teardown interacts with sqlite-vec's extension destructors in a way that
-    // intermittently aborts with "corrupted double-linked list" (a glibc
-    // heap-corruption diagnostic). Results are always correct and already
-    // flushed; only the teardown faults.
-    //
-    // `std::process::exit` is NOT enough, which is why this used to still
-    // abort. It skips Rust `Drop` glue, but it is a normal `exit(3)`: it still
-    // runs libc `atexit` handlers and the C++ static destructors ORT registers
-    // through `__cxa_atexit`, and those destructors are where the fault lives.
-    // `_exit(2)` bypasses that table and goes straight to the kernel.
-    //
-    // Safe here because nothing is left to do: stdout and stderr were flushed
-    // explicitly above, `run()` has already returned so its `Database` and
-    // `Session` values were dropped normally, SQLite commits durably per
-    // transaction rather than at exit, and no production path registers an
-    // atexit hook or relies on a tempfile destructor. The OS reclaims memory
-    // and file descriptors regardless.
-    //
-    // The MCP server path (`codesage mcp`) loops indefinitely and never
-    // reaches this exit; when it terminates via signal, no teardown runs
-    // either.
+    // ORT C++ atexit destructors can abort with heap-corruption diagnostics after
+    // normal Rust teardown. _exit bypasses them; process::exit still runs them.
+    // run() has dropped its values, SQLite commits per transaction, and stdio is flushed.
     flush_stdio();
     // SAFETY: `_exit` is async-signal-safe and always succeeds. Every buffer
     // this process owns has been flushed on the two lines above and in the
@@ -918,28 +863,15 @@ fn main() {
 }
 
 pub(crate) fn flush_stdio() {
-    // Flush stdio explicitly so explicit `process::exit` calls don't drop
-    // buffered output.
+    // Explicit exits bypass buffered-output destructors.
     use std::io::Write;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
 }
 
-/// Cheap pre-clap detector for the `codesage mcp` stdio-shim case.
-///
-/// Returns true iff argv (ignoring the program name and any leading global
-/// flags consumed by clap) names the `mcp` subcommand without `--direct`.
-/// Matches clap's resolution loosely on purpose — false negatives here just
-/// mean a non-shim invocation pays the unnecessary ORT/CUDA preload cost,
-/// which is the pre-fix status quo. False positives would skip the preload
-/// for a real model-loading codepath; the only way to hit one is to pass
-/// `--direct` as part of a sub-subcommand, and `mcp` has no sub-subcommands.
+/// Detect the stdio shim before model environment setup; false negatives only add startup cost.
 fn is_shim_invocation() -> bool {
-    // args_os(), not args(): the latter panics mid-iteration on a non-UTF-8
-    // argument, and this runs before clap on EVERY invocation. Non-UTF-8 paths
-    // are legal on Linux and `codesage install` writes `--project <root>`
-    // verbatim into agent configs, so a non-UTF-8 root would abort startup with
-    // a raw panic for every subcommand.
+    // Non-UTF-8 project paths are valid and must not panic before clap.
     is_shim_argv(std::env::args_os().skip(1))
 }
 
@@ -956,12 +888,7 @@ where
             break;
         }
         if !saw_mcp {
-            // Skip clap-style global flags that may precede the subcommand.
-            // Today there are none, but a future `-v` / `--verbose` should
-            // not flip this off accidentally. A non-UTF-8 arg (`to_str()` None)
-            // is not a flag and not `mcp`, so it falls through to the non-shim
-            // return below — the documented safe direction (only costs an
-            // unnecessary ORT preload).
+            // Unknown/non-UTF-8 positionals conservatively select the non-shim path.
             if a.to_str().is_some_and(|s| s.starts_with('-')) {
                 continue;
             }
@@ -969,7 +896,6 @@ where
                 saw_mcp = true;
                 continue;
             }
-            // First positional that isn't `mcp`: definitely not the shim.
             return false;
         }
         if a == "--direct" {
@@ -979,18 +905,10 @@ where
     saw_mcp && !saw_direct
 }
 
-/// Subcommands that construct an `Embedder`/`Reranker` (directly or via the
-/// in-process server) and therefore need the single-threaded ORT + CUDA preload
-/// in `main`. Every other command is structural/metadata-only (graph, git, SQL)
-/// and must not pay the preload, whose CUDA dlopen can abort under a restricted
-/// sandbox. `mcp` is listed for the `--direct` server; the bare `mcp` shim is
-/// already excluded earlier via `is_shim_invocation`.
+/// Commands requiring single-threaded model environment setup; bare MCP is excluded separately.
 const EMBEDDER_COMMANDS: &[&str] = &["search", "index", "export", "mcp"];
 
-/// `watch`/`daemon` actions that never touch a model: status reads a JSON
-/// file, stop/start touch a marker file. `watch run` and a bare/`run` daemon
-/// build an embedder and need the preload; anything unrecognized preloads,
-/// the safe direction (see `is_shim_argv`).
+/// Model-free actions; unknown actions conservatively retain model setup.
 const WATCH_PURE_ACTIONS: &[&str] = &["status", "stop", "start"];
 const DAEMON_PURE_ACTIONS: &[&str] = &["status", "stop"];
 
@@ -1003,10 +921,7 @@ where
     I: IntoIterator,
     I::Item: AsRef<std::ffi::OsStr>,
 {
-    // First two positionals: the subcommand and, for `watch`/`daemon`, its
-    // action. Clap-style flags are skipped; so is the value of the global
-    // `--runtime-dir`, which otherwise `daemon --runtime-dir <dir> status`
-    // would misread as the action.
+    // Skip --runtime-dir's value so it is not mistaken for the daemon action.
     let mut positionals: Vec<String> = Vec::new();
     let mut skip_value = false;
     for a in args {
@@ -1019,10 +934,7 @@ where
             continue;
         }
         let Some(s) = a.to_str() else {
-            // A non-UTF-8 token is never a known subcommand or action, so it
-            // ends the parse the safe way: skip the preload (structural
-            // commands never embed, and the Embedder::new fallback covers
-            // anything that does).
+            // Unknown command tokens cannot name a model-loading command.
             if positionals.is_empty() {
                 return false;
             }
@@ -1050,9 +962,6 @@ where
 
 fn uses_embedder_subcommand(sub: &str, action: Option<&str>) -> bool {
     match sub {
-        // `watch status`/`stop`/`start` only read a status file or flip a
-        // marker; only `run` builds an embedder. `daemon status`/`stop` are
-        // likewise metadata-only, while a bare `daemon` runs the server.
         "watch" => !matches!(action, Some(a) if WATCH_PURE_ACTIONS.contains(&a)),
         "daemon" => !matches!(action, Some(a) if DAEMON_PURE_ACTIONS.contains(&a)),
         sub => EMBEDDER_COMMANDS.contains(&sub),
@@ -1248,8 +1157,6 @@ mod tests {
     use super::*;
     use codesage_embed::config::IndexConfig;
 
-    /// A project root whose chunk table for the default model is attested
-    /// under `fingerprint`, as a completed `index --full` leaves it.
     fn attested_root(
         fingerprint: &codesage_graph::SemanticFingerprint,
         dim: usize,
@@ -1286,8 +1193,7 @@ mod tests {
             )
             .unwrap();
             assert!(reranker.is_none());
-            // An unbound daemon embedder refuses every non-empty request, so
-            // a query vector coming back is the bind having happened.
+            // A returned vector proves binding: unbound daemon sessions reject nonempty requests.
             let query = embedder.embed_one("abc").unwrap();
             assert_eq!(query[0], 3.0, "the daemon produced the query vector");
             assert_eq!(embedded.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -1298,8 +1204,6 @@ mod tests {
     #[test]
     fn a_daemon_producing_another_fingerprint_than_the_table_is_refused_before_embedding() {
         use daemon_embed::tests::{FakeDaemon, fp_a, fp_b, spawn_fake};
-        // The table is current for the configured setup (A); the daemon's
-        // resident session pools the other way (B).
         let daemon = FakeDaemon {
             fingerprint: fp_b().as_str().to_string(),
             ..FakeDaemon::new(4, &EmbeddingConfig::default().model)
@@ -1372,7 +1276,6 @@ mod tests {
         assert!(err.to_string().contains("codesage index --full"), "{err}");
         assert!(bound.lock().unwrap().is_empty(), "no bind on a stale table");
 
-        // A current table binds the embedder to exactly its fingerprint.
         let root = attested_root(&fp_a(), 4);
         load_query_stack_with(
             root.path(),
@@ -1443,7 +1346,6 @@ mod tests {
                 .to_string()
                 .contains("codesage index --full")
         );
-        // Wrapped in context the way a caller propagates it, still 65.
         let wrapped: Result<()> = Err(codesage_graph::StaleSemanticTable {
             state: codesage_graph::SemanticTableState::Mismatch {
                 stored: "v2;old".to_string(),
@@ -1520,10 +1422,7 @@ mod tests {
     #[cfg(not(feature = "cuda"))]
     #[test]
     fn query_embedder_errors_when_gpu_requested_without_cuda() {
-        // Must be an allowlisted model name: the validated-model gate runs
-        // before the cuda-feature guard, and this test targets the latter.
-        // No download happens — the guard bails before any hf-hub call. The
-        // test binary has no daemon of its own, so the private path is taken.
+        // Pass allowlist validation to reach the CUDA guard, which runs before downloads.
         let cfg = EmbeddingConfig {
             model: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
             device: "gpu".to_string(),
@@ -1587,8 +1486,6 @@ mod tests {
         );
     }
 
-    // ---------- shim invocation detection (ORT preload skip gate) ----------
-
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
     }
@@ -1600,14 +1497,11 @@ mod tests {
 
     #[test]
     fn shim_detector_recognizes_mcp_with_runtime_dir_override() {
-        // The shim still accepts `--runtime-dir <path>` after the subcommand.
         assert!(is_shim_argv(argv(&["mcp", "--runtime-dir", "/tmp/foo"])));
     }
 
     #[test]
     fn shim_detector_rejects_mcp_direct() {
-        // `--direct` switches to the in-process MCP server which DOES load
-        // models — preload must still happen.
         assert!(!is_shim_argv(argv(&["mcp", "--direct"])));
         assert!(!is_shim_argv(argv(&[
             "mcp",
@@ -1634,7 +1528,6 @@ mod tests {
 
     #[test]
     fn shim_detector_rejects_empty_argv() {
-        // No subcommand at all → not the shim (clap will error after).
         assert!(!is_shim_argv(argv(&[])));
     }
 
@@ -1643,8 +1536,6 @@ mod tests {
     fn shim_detector_handles_non_utf8_argv() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
-        // A non-UTF-8 project path (legal on Linux) must not panic. `codesage
-        // mcp --project <non-utf8>` is still the shim.
         let bad = OsString::from_vec(vec![b'/', 0xff, 0xfe, b'p']);
         let args: Vec<OsString> = vec![
             OsString::from("mcp"),
@@ -1652,11 +1543,8 @@ mod tests {
             bad.clone(),
         ];
         assert!(is_shim_argv(args));
-        // A non-UTF-8 first positional is treated as non-shim (no panic).
         assert!(!is_shim_argv(vec![bad]));
     }
-
-    // ---------- embedder-preload gate (CUDA dlopen skip) ----------
 
     #[test]
     fn embedder_gate_preloads_for_embedding_commands() {
@@ -1670,8 +1558,6 @@ mod tests {
 
     #[test]
     fn embedder_gate_is_subcommand_aware_for_watch_and_daemon() {
-        // Metadata-only actions never build an embedder; preloading the CUDA
-        // stack for them aborts under a restricted sandbox.
         for args in [
             vec!["watch", "status"],
             vec!["watch", "stop"],
@@ -1686,7 +1572,6 @@ mod tests {
                 "expected skip for {args:?}"
             );
         }
-        // `run` (and a bare `daemon`, which runs) builds an embedder.
         for args in [
             vec!["watch"],
             vec!["watch", "run"],
@@ -1705,8 +1590,6 @@ mod tests {
 
     #[test]
     fn embedder_gate_skips_structural_commands() {
-        // These never construct an Embedder; preloading the CUDA stack for them
-        // is pure waste and aborts under a restricted sandbox (the `status` case).
         for cmd in [
             "status",
             "risk",
@@ -1735,7 +1618,6 @@ mod tests {
 
     #[test]
     fn embedder_gate_skips_leading_global_flags() {
-        // A future global flag before the subcommand must not flip the gate.
         assert!(argv_uses_embedder(argv(&["--verbose", "search"])));
         assert!(!argv_uses_embedder(argv(&["--verbose", "status"])));
     }
@@ -1745,8 +1627,6 @@ mod tests {
         assert!(!argv_uses_embedder(argv(&[])));
         assert!(!argv_uses_embedder(argv(&["definitely-not-a-command"])));
     }
-
-    // ---------- clap arg contracts ----------
 
     #[test]
     fn export_rejects_unknown_format() {
@@ -1783,8 +1663,6 @@ mod tests {
 
     #[test]
     fn export_json_flag_conflicts_with_explicit_format() {
-        // `--json` is a shorthand, not a third channel: combining it with an
-        // explicit --format is ambiguous and must be rejected at parse time.
         let err =
             match Cli::try_parse_from(["codesage", "export", "foo", "--json", "--format", "md"]) {
                 Err(e) => e,
@@ -1803,8 +1681,6 @@ mod tests {
 
     #[test]
     fn watch_run_defaults_project_to_none() {
-        // No default_value on `project`, so a bare `watch run` yields None and
-        // falls through to find_project_root() — matching watch status/stop/start.
         let cli = Cli::try_parse_from(["codesage", "watch", "run"]).unwrap();
         let project = match cli.command {
             Commands::Watch {

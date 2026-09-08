@@ -21,48 +21,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::lockfile;
 
-/// Per-path quiet window before a saved file is re-indexed. Thirty seconds,
-/// not one: an editor saves the same file every few seconds during active
-/// work, and each save used to cost a full structural parse plus a GPU
-/// embedding pass — 714 re-embeds of whole files (154,900 chunks) in one
-/// day of editing one project. The window restarts on every event, so a
-/// file is indexed once the author pauses, and every path that fell quiet in
-/// the same poll is embedded in one batched call.
+/// Wait for a pause in saves, then embed quiet files together instead of re-embedding each save.
 const DEFAULT_DEBOUNCE_MS: u64 = 30_000;
-/// Smallest quiet window the watcher honors. Below this a save on every
-/// keystroke (or a zero `--reindex-debounce`) re-indexes hot instead of
-/// batching, pinning the model for nothing.
+/// Prevent per-keystroke indexing, including when the requested debounce is zero.
 pub const MIN_DEBOUNCE_MS: u64 = 1_000;
-/// Longest a ready batch stays deferred under backpressure before it runs
-/// anyway. Load that never drops (a machine that is simply busy) must not
-/// turn into an index that never updates.
+/// Persistent host load must not defer indexing indefinitely.
 const BACKPRESSURE_MAX_DEFER: Duration = Duration::from_secs(15 * 60);
 const BATCH_THRESHOLD: usize = 10;
 const BATCH_WINDOW: Duration = Duration::from_secs(3);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
-/// After a completed bulk pass, suppress threshold-triggered bulk passes for
-/// this window. The burst's events keep arriving from the channel while the
-/// pass runs and would re-cross the threshold every `BATCH_THRESHOLD` replayed
-/// events — one checkout would otherwise trigger ~N/10 full-repo passes.
+/// Coalesce backlog replay: events queued during a bulk pass must not trigger another pass per batch.
 const BULK_COOLDOWN: Duration = Duration::from_secs(3);
 const DEFAULT_IDLE_SECS: u64 = 1800;
-/// Give up on a set of removals after this many consecutive hard failures.
-/// A persistent failure (disk full, EACCES, corrupt table) will never clear,
-/// and retaining the paths keeps the loop reporting activity — which would
-/// pin the pooled embedder and its VRAM against the idle timeout forever.
-/// Transient lock contention (`Skipped`) does not count toward this ceiling.
+/// Bound hard removal failures so queued paths cannot prevent idle exit forever.
+/// Lock contention does not count toward this limit.
 const MAX_REMOVAL_FAILURES: u32 = 10;
 
-/// Lazily yields the embedder the watcher should use for semantic reindex.
-/// In the daemon this hands back the pooled `Arc<Mutex<Embedder>>` shared with
-/// live searches (no extra model load); the standalone `watch run` path builds
-/// a private one. `None` means semantic indexing is disabled (no model
-/// configured) and the watcher does structural-only updates.
+/// Lazy model lookup: daemon watchers share the pool; standalone watchers load privately.
 pub type EmbedderProvider = Arc<dyn Fn() -> Result<Arc<Mutex<Embedder>>> + Send + Sync>;
 
-/// Where the watcher is hosted. Recorded in the status file so `codesage watch
-/// stop` knows whether the `pid` is safe to signal (a foreground process) or
-/// must be asked to exit via the disabled marker (a daemon-owned thread).
+/// Foreground PIDs may be signalled; daemon threads must stop through the disabled marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WatcherMode {
@@ -80,19 +58,11 @@ pub struct StateWatcherConfig {
     pub mode: WatcherMode,
     pub embedder: Option<EmbedderProvider>,
     pub shutdown: Arc<AtomicBool>,
-    /// Defer indexing while the host is busy (see [`backpressure_reason`]).
-    /// Tests turn it off so a loaded CI runner cannot make a drain look like
-    /// a lock skip.
+    /// Disable in tests so host load cannot masquerade as lock contention.
     pub backpressure: bool,
 }
 
-/// Resolves the embedder through the provider on every use, holding no ref
-/// between uses. The provider is a pool lookup (map-lock + slot-lock) that
-/// restamps the pooled entry's `last_used`, so a reindex keeps the model
-/// marked in-use and the daemon's idle eviction won't drop a model the
-/// watcher touched seconds ago. Holding no strong ref across idle periods
-/// also means an idle watcher never pins the model's VRAM/host RSS against
-/// eviction; an idle watcher never calls `get`, so it never forces a load.
+/// Look up the model on each use to refresh pool activity without pinning it while idle.
 struct EmbedderHandle {
     provider: Option<EmbedderProvider>,
 }
@@ -106,10 +76,7 @@ impl EmbedderHandle {
         self.provider.is_some()
     }
 
-    /// Resolve the embedder for one use. The three outcomes are distinct on
-    /// purpose: a watcher with no provider has no semantic rows to write, a
-    /// provider that fails to load leaves the rows stale, and only the last
-    /// one may be reported as work done.
+    /// Disabled indexing is complete; a failed model load leaves semantic rows stale.
     fn get(&mut self) -> EmbedderLookup {
         let Some(provider) = self.provider.as_ref() else {
             return EmbedderLookup::Disabled;
@@ -124,7 +91,6 @@ impl EmbedderHandle {
     }
 }
 
-/// Outcome of one [`EmbedderHandle::get`].
 enum EmbedderLookup {
     /// Semantic indexing is off for this watcher: nothing to embed.
     Disabled,
@@ -134,28 +100,16 @@ enum EmbedderLookup {
     LoadFailed,
 }
 
-/// Failed semantic passes a path is retried after before the watcher gives
-/// up on it until its next save. Each retry waits longer (see
-/// [`semantic_retry_extra_delay`]); with the 30 s default debounce the five
-/// retries land at roughly 30 s, 60 s, 2 min, 4 min and 8 min.
+/// Retries before parking; delays grow through [`semantic_retry_extra_delay`].
 const MAX_SEMANTIC_RETRIES: u32 = 5;
 
-/// How long a path abandoned after [`MAX_SEMANTIC_RETRIES`] stays parked
-/// before the main loop gives it one fresh round of attempts. Thirty minutes
-/// is long enough to ride out a broken model download or a full disk without
-/// hot-spinning, and short enough that a never-touched-again file does not
-/// sit silently stale for the session. Parked paths are also surfaced in
-/// `watch.status` (`stale_parked`) so `codesage watch status` shows them.
+/// Retry parked paths even without another save; expose them through `watch.status`.
 const PARKED_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 /// Longest extra wait a semantic retry adds on top of the debounce window.
 const MAX_SEMANTIC_RETRY_EXTRA: Duration = Duration::from_secs(600);
 
-/// Extra wait beyond the debounce window before retry number `attempt` (1
-/// for the first retry) of a failed semantic pass: `debounce × (2^(attempt-1)
-/// − 1)`, capped. The first retry is one plain debounce out; each later one
-/// doubles, so a model that will not load or a database that stays broken
-/// costs a handful of attempts rather than one per tick.
+/// Extra delay beyond debounce: `debounce × (2^(attempt-1) − 1)`, capped.
 fn semantic_retry_extra_delay(attempt: u32, debounce: Duration) -> Duration {
     let factor = 2u32
         .saturating_pow(attempt.saturating_sub(1))
@@ -165,10 +119,7 @@ fn semantic_retry_extra_delay(attempt: u32, debounce: Duration) -> Duration {
         .min(MAX_SEMANTIC_RETRY_EXTRA)
 }
 
-/// Outcome of a lock-guarded indexing pass. Callers must only discard
-/// accumulated work (`pending` / `removed_paths`) on `Done`: a `Skipped`
-/// pass did nothing, and dropping the state would silently lose the
-/// changes it represented.
+/// Only `Done` permits clearing covered work; `Skipped` must retain it for retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkOutcome {
     /// The pass ran; accumulated state it covered can be cleared.
@@ -181,8 +132,6 @@ enum WorkOutcome {
     Failed,
 }
 
-/// Removes the status file when the watcher loop exits by any path
-/// (shutdown, idle, disabled marker, channel disconnect, or error).
 struct StatusGuard(PathBuf);
 
 impl Drop for StatusGuard {
@@ -191,53 +140,89 @@ impl Drop for StatusGuard {
     }
 }
 
-pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
-    // macOS FSEvents reports canonical paths (symlinks resolved, /var =>
-    // /private/var); a symlink-spelled root would fail every strip_prefix
-    // below and silently drop all events. Resolve once so registration,
-    // filtering, and event mapping agree on one spelling.
+#[derive(Default)]
+struct FilterRefresh {
+    reload: bool,
+    reconciling: bool,
+    failures: u32,
+    retry_at: Option<Instant>,
+}
+
+impl FilterRefresh {
+    fn request(&mut self, now: Instant) {
+        self.reload = true;
+        if self.failures == 0 {
+            self.retry_at = Some(now);
+        }
+    }
+
+    fn pending(&self) -> bool {
+        self.reload || self.reconciling
+    }
+
+    fn parked(&self) -> bool {
+        self.failures > MAX_SEMANTIC_RETRIES
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.pending() && self.retry_at.is_none_or(|at| now >= at)
+    }
+
+    fn failed(&mut self, now: Instant, debounce: Duration) {
+        self.failures = self.failures.saturating_add(1);
+        let delay = if self.parked() {
+            PARKED_RETRY_INTERVAL
+        } else {
+            let base = debounce.max(Duration::from_secs(1));
+            base + semantic_retry_extra_delay(self.failures, base)
+        };
+        self.retry_at = Some(now + delay);
+        tracing::warn!(
+            failures = self.failures,
+            retry_after_secs = delay.as_secs(),
+            "watch filter reconciliation incomplete; retaining work for retry"
+        );
+    }
+}
+
+pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
+    run_statewatcher_with_registration(config, watch_tree)
+}
+
+fn run_statewatcher_with_registration(
+    mut config: StateWatcherConfig,
+    mut register: impl FnMut(&mut RecommendedWatcher, &Path, &WatchFilter) -> Result<()>,
+) -> Result<()> {
+    // FSEvents resolves symlinks (including /var); registration and strip_prefix must agree.
     config.project_root = canonical_root(&config.project_root);
 
     let (tx, rx) = mpsc::channel();
     let project_root = config.project_root.clone();
 
-    // Errors are forwarded, not dropped: an Err from the backend (inotify
-    // queue overflow, rescan-needed) means events were lost, and the loop
-    // must schedule a reconciliation pass or those edits stay unindexed.
-    let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-        let _ = tx.send(res);
-    })
-    .context("creating filesystem watcher")?;
+    // Backend errors can mean lost events and require reconciliation.
+    let mut watcher = event_watcher(tx.clone())?;
 
-    let filter = WatchFilter::new(&config.project_root, &config.exclude_patterns)?;
-    watch_tree(&mut watcher, &project_root, &filter);
+    let mut filter = WatchFilter::new(&config.project_root, &config.exclude_patterns)?;
+    register(&mut watcher, &project_root, &filter)?;
 
     let mut embedder = EmbedderHandle::new(config.embedder.clone());
 
     let debounce = Duration::from_millis(config.debounce_ms);
     let disabled_marker = watch_disabled_path(&config.project_root);
 
-    write_status(&config.project_root, config.mode, 0)?;
+    write_status(&config.project_root, config.mode, 0, false, false)?;
     let _status_guard = StatusGuard(watch_status_path(&config.project_root));
 
     let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
     let mut removed_paths: Vec<String> = Vec::new();
-    // Root-relative prefixes of vanished non-source paths (directory moves
-    // and deletes). A directory moved out of the tree emits one event for
-    // the directory itself and none for the files under it; the affected
-    // rows are resolved from the index at removal time.
+    // Directory removals emit no child events; resolve affected rows from the index.
     let mut removed_prefixes: Vec<String> = Vec::new();
     let mut batch_event_times: Vec<Instant> = Vec::new();
     let mut currently_indexing: HashSet<PathBuf> = HashSet::new();
     let mut recheck_queue: HashSet<PathBuf> = HashSet::new();
-    // Failed semantic passes per path, for the bounded retry in
-    // `process_ready`. Cleared when the path's semantic rows land.
     let mut semantic_retries: HashMap<PathBuf, u32> = HashMap::new();
-    // Paths abandoned after MAX_SEMANTIC_RETRIES, with when they parked.
-    // Revived with a fresh retry budget after PARKED_RETRY_INTERVAL, and
-    // counted in watch.status so they are stale-but-visible, never silent.
     let mut parked: HashMap<PathBuf, Instant> = HashMap::new();
-    let mut parked_written: usize = usize::MAX;
+    let mut status_written = None;
     // Register watches first: events racing the scan stay queued for replay.
     let mut bulk_retry_at = Some(Instant::now());
     let mut startup_failures = Some(0);
@@ -247,6 +232,7 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
     let mut last_activity = Instant::now();
     let mut header_is_cpp = header_dialect_is_cpp(&config.db_path);
     let mut deferred_since: Option<Instant> = None;
+    let mut refresh = FilterRefresh::default();
 
     tracing::info!(
         root = %config.project_root.display(),
@@ -258,13 +244,9 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
     let exit_reason = loop {
         match rx.recv_timeout(POLL_INTERVAL) {
             Ok(Ok(event)) => {
-                // Dropped-event signals arrive as an Ok event flagged Rescan
-                // (kind Other; inotify attaches no path, FSEvents does),
-                // never through the Err arm: inotify surfaces queue overflow
-                // this way, FSEvents its must-scan-subdirs flag. Same
-                // disposition as a backend error — reconcile, or the dropped
-                // edits stay unindexed.
+                // inotify overflow and FSEvents rescan requests arrive as Ok events, not backend errors.
                 if event.need_rescan() {
+                    refresh.request(Instant::now());
                     tracing::warn!(
                         "watch backend requested rescan (events dropped); \
                          scheduling bulk reconciliation pass"
@@ -280,13 +262,25 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
                 }
 
                 for path in &event.paths {
-                    // A directory that appeared needs adoption: the root is
-                    // watched non-recursively, so new top-level trees aren't
-                    // covered until we recurse into them. A rename-in arrives
-                    // as Modify(Name), not Create, and no backend replays
-                    // files that landed before the watch registered — scan
-                    // the tree and queue what's already there.
+                    if path.starts_with(&config.project_root)
+                        && path.file_name().is_some_and(|name| name == ".gitignore")
+                        && matches!(
+                            event.kind,
+                            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                        )
+                    {
+                        refresh.request(Instant::now());
+                        bulk_retry_at = Some(Instant::now());
+                        continue;
+                    }
+                    // The root watch is non-recursive. Adopt new trees, including renames,
+                    // and scan files that arrived before registration because backends do not replay them.
                     if path.is_dir() && is_dir_adoption_kind(&event.kind) {
+                        if path.starts_with(&config.project_root) && !filter.is_ignored(path, true)
+                        {
+                            refresh.request(Instant::now());
+                            bulk_retry_at = Some(Instant::now());
+                        }
                         maybe_watch_new_dir(&mut watcher, &config.project_root, path, &filter);
                         match scan_dir_source_files(
                             &config.project_root,
@@ -307,8 +301,6 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
                                     }
                                 }
                             }
-                            // Too large to enqueue file by file — one bulk
-                            // reconciliation pass covers the whole tree.
                             DirScan::OverThreshold => {
                                 bulk_retry_at = schedule_watch_error_catchup(
                                     &mut pending,
@@ -327,13 +319,8 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
                         Err(_) => continue,
                     };
 
-                    // Any vanished path may have been a directory holding
-                    // indexed files: a rename-out is one Modify(Name(From))
-                    // for the directory, nothing for its contents, and a
-                    // directory can be named like a source file. Queue it as
-                    // a prefix; the removal pass resolves affected rows from
-                    // the index, and a plain file prefix expands to nothing
-                    // extra.
+                    // Rename-out emits only the directory event. Treat vanished paths as prefixes,
+                    // even when a directory name has a source extension.
                     if matches!(
                         event.kind,
                         EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
@@ -358,9 +345,6 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
                     let rel_str = rel.to_string_lossy().to_string();
                     match event.kind {
                         EventKind::Create(_) | EventKind::Modify(_) => {
-                            // First C++ file of the session: from here on,
-                            // edited `.h` headers parse as C++, matching what
-                            // the discovery layer would derive for this tree.
                             if !header_is_cpp
                                 && rel
                                     .extension()
@@ -369,10 +353,7 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
                             {
                                 header_is_cpp = true;
                             }
-                            // A re-creation cancels a still-queued removal for
-                            // the same path; otherwise a removal deferred on
-                            // lock contention would fire later and delete the
-                            // live file's symbols/chunks.
+                            // A delayed removal must not delete a re-created file's rows.
                             removed_paths.retain(|p| *p != rel_str);
                             pending.insert(rel, Instant::now());
                             batch_event_times.push(Instant::now());
@@ -387,17 +368,11 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
                 let now = Instant::now();
                 batch_event_times.retain(|t| now - *t < BATCH_WINDOW);
 
-                if batch_event_times.len() >= BATCH_THRESHOLD {
+                if !refresh.pending() && batch_event_times.len() >= BATCH_THRESHOLD {
                     let burst = batch_event_times.len();
                     batch_event_times.clear();
                     if in_bulk_cooldown(bulk_cooldown_until, now) {
-                        // Backlog replay: these events queued while the
-                        // just-finished bulk pass ran, and that pass already
-                        // observed the post-burst tree. Defer to one catch-up
-                        // pass at cooldown expiry instead of re-running a full
-                        // pass per BATCH_THRESHOLD replayed events. The Skipped
-                        // disposition keeps every event queued, so an edit
-                        // the pass raced past is never lost.
+                        // Retain events that raced the scan, but defer their catch-up until cooldown expiry.
                         bulk_retry_at = apply_bulk_outcome(
                             WorkOutcome::Skipped,
                             &mut pending,
@@ -418,12 +393,8 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
                     );
                     bulk_cooldown_until = bulk_cooldown_after(outcome, Instant::now());
                     if outcome == WorkOutcome::Done {
-                        // Unconditional: a bulk pass can also delete the last
-                        // C++ file, which must un-flip header parsing without
-                        // a watcher restart.
+                        // A bulk pass may remove the last C++ file and revert header parsing.
                         header_is_cpp = header_dialect_is_cpp(&config.db_path);
-                        // The bulk pass purged every orphaned row, which
-                        // covers any queued directory prefixes.
                         removed_prefixes.clear();
                     }
                     bulk_retry_at = apply_bulk_outcome(
@@ -438,6 +409,7 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
                 }
             }
             Ok(Err(e)) => {
+                refresh.request(Instant::now());
                 tracing::warn!(
                     error = %e,
                     "filesystem watcher reported an error; scheduling bulk reconciliation pass"
@@ -477,20 +449,55 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
             break "disabled marker present";
         }
 
-        // A lock-skipped bulk pass retries here, ahead of the per-file
-        // drain, so a success clears `pending` wholesale instead of
-        // re-walking it file by file.
-        if let Some(at) = bulk_retry_at
-            && Instant::now() >= at
+        if refresh.reload && refresh.due(Instant::now()) {
+            let replacement = (|| {
+                let next_filter = WatchFilter::new(&config.project_root, &config.exclude_patterns)?;
+                let mut next_watcher = event_watcher(tx.clone())?;
+                // Register before scanning: edits in newly admitted trees must
+                // queue while reconciliation runs, including during lock retries.
+                register(&mut next_watcher, &project_root, &next_filter)?;
+                Ok::<_, anyhow::Error>((next_watcher, next_filter))
+            })();
+            match replacement {
+                Ok((next_watcher, next_filter)) => {
+                    watcher = next_watcher;
+                    filter = next_filter;
+                    refresh.reload = false;
+                    refresh.reconciling = true;
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "replacing watch registrations failed; keeping existing watcher");
+                    refresh.failed(Instant::now(), debounce);
+                }
+            }
+        }
+
+        // Retry bulk work before per-file draining so success can clear the entire queue.
+        if !refresh.reload
+            && if refresh.reconciling {
+                refresh.due(Instant::now())
+            } else {
+                bulk_retry_at.is_some_and(|at| Instant::now() >= at)
+            }
         {
-            let outcome = startup_outcome(
-                run_bulk_guarded(&config, &mut embedder, &mut deferred_since),
-                &mut startup_failures,
-            );
+            let raw_outcome = run_bulk_guarded(&config, &mut embedder, &mut deferred_since);
+            let outcome = if refresh.reconciling {
+                match raw_outcome {
+                    WorkOutcome::Done => refresh = FilterRefresh::default(),
+                    WorkOutcome::Skipped => refresh.retry_at = Some(Instant::now() + debounce),
+                    WorkOutcome::Failed => refresh.failed(Instant::now(), debounce),
+                }
+                raw_outcome
+            } else {
+                startup_outcome(raw_outcome, &mut startup_failures)
+            };
             bulk_cooldown_until = bulk_cooldown_after(outcome, Instant::now());
             if outcome == WorkOutcome::Done {
                 header_is_cpp = header_dialect_is_cpp(&config.db_path);
                 removed_prefixes.clear();
+                semantic_retries
+                    .retain(|path, _| !filter.is_ignored(&project_root.join(path), false));
+                parked.retain(|path, _| !filter.is_ignored(&project_root.join(path), false));
             }
             bulk_retry_at = apply_bulk_outcome(
                 outcome,
@@ -502,9 +509,27 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
             );
         }
 
-        // Deletions have no natural retrigger: a removal dropped on lock
-        // contention would leave ghost symbols/chunks for the whole
-        // session, so keep the paths queued and retry a debounce later.
+        let next_status = (parked.len(), refresh.pending(), refresh.parked());
+        if status_written != Some(next_status) {
+            if let Err(error) = write_status(
+                &config.project_root,
+                config.mode,
+                next_status.0,
+                next_status.1,
+                next_status.2,
+            ) {
+                tracing::warn!(error = %error, "refreshing watch status");
+            } else {
+                status_written = Some(next_status);
+            }
+        }
+
+        if refresh.reconciling {
+            last_activity = Instant::now();
+            continue;
+        }
+
+        // Deletions have no later save event to recover a lock-skipped purge.
         if removed_paths.is_empty() && removed_prefixes.is_empty() {
             removal_retry_at = None;
             removal_fail_count = 0;
@@ -543,9 +568,6 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
             header_is_cpp = header_dialect_is_cpp(&config.db_path);
         }
 
-        // Parked backoff: paths abandoned after MAX_SEMANTIC_RETRIES get one
-        // fresh round of attempts after PARKED_RETRY_INTERVAL, so a file that
-        // never changes again does not sit silently stale for the session.
         let revived = revive_due_parked(
             &mut parked,
             &mut semantic_retries,
@@ -558,19 +580,8 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
                 "retrying parked paths whose semantic rows are still stale"
             );
         }
-        // Surface the parked count in watch.status (rewritten only on
-        // change): stale-but-visible beats silently stale.
-        if parked.len() != parked_written {
-            parked_written = parked.len();
-            if let Err(e) = write_status(&config.project_root, config.mode, parked.len()) {
-                tracing::warn!(error = %e, "refreshing watch status with parked count");
-            }
-        }
 
-        // Idle clock: only queued or in-flight work counts as activity, so
-        // raw FS events that fail the source/ignore filters can't keep the
-        // watcher (and its pooled model) alive. Parked paths count: they are
-        // future work due back after PARKED_RETRY_INTERVAL.
+        // Filtered-out filesystem events must not prevent idle exit; parked work must.
         if !pending.is_empty()
             || !currently_indexing.is_empty()
             || !recheck_queue.is_empty()
@@ -578,6 +589,7 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
             || !removed_prefixes.is_empty()
             || !parked.is_empty()
             || bulk_retry_at.is_some()
+            || refresh.pending()
         {
             last_activity = Instant::now();
         } else if is_idle(last_activity, config.idle_timeout) {
@@ -585,9 +597,7 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
         }
     };
 
-    // Drop the filesystem watcher first so its background thread joins
-    // before we return. This avoids a FORTIFY warning from the notify
-    // crate's internal mutex being destroyed while still in use.
+    // Join notify's background thread before return to avoid destroying its mutex in use.
     drop(watcher);
 
     tracing::info!(reason = exit_reason, "statewatcher stopped");
@@ -618,9 +628,6 @@ fn drain_pending(
     if ready.is_empty() {
         return false;
     }
-    // Backpressure: a ready batch waits while the host is busy, re-armed for
-    // one more debounce window, until the pressure lifts or the deferral cap
-    // says a stale index is now the worse outcome.
     if config.backpressure {
         let reason = backpressure_reason(&config.project_root);
         if should_defer(reason.as_deref(), deferred_since, Instant::now()) {
@@ -685,10 +692,8 @@ fn compute_ready(
         .collect()
 }
 
-/// Returns `true` when a completed reindex purged an unambiguous C++ file
-/// (vanished or emptied on disk) while headers were parsing as C++ — the
-/// caller must re-derive the header dialect, since that purge may have
-/// removed the last C++ file in the index.
+/// Return true after purging a C++ source that may have been the last one.
+/// The caller must then re-derive header parsing.
 #[allow(clippy::too_many_arguments)]
 fn process_ready(
     config: &StateWatcherConfig,
@@ -703,9 +708,7 @@ fn process_ready(
     ready: Vec<PathBuf>,
 ) -> bool {
     let mut rederive_header = false;
-    // Files whose structural pass landed and whose semantic rows are stale.
-    // They are embedded together below: one lock, one DB handle, and one
-    // model call per commit batch instead of one per file.
+    // Batch stale semantic files so they share a lock, database, and model call.
     let mut semantic_todo: Vec<(PathBuf, FileInfo)> = Vec::new();
     for path in ready {
         pending.remove(&path);
@@ -729,8 +732,7 @@ fn process_ready(
             semantic_todo.push((path.clone(), info));
         }
 
-        // Lock contention: re-queue with a fresh stamp so the retry waits
-        // out a full debounce window instead of spinning on the held lock.
+        // Restamp lock-skipped work to avoid retrying on every poll.
         if outcome == WorkOutcome::Skipped {
             pending.insert(path, Instant::now());
             continue;
@@ -777,22 +779,14 @@ fn process_ready(
                 }
             }
             WorkOutcome::Skipped => {
-                // Lock contention or a busy database: the structural rows
-                // landed, the semantic rows did not. Re-queue the paths; the
-                // next drain finds the structural hash fresh and only the
-                // semantic one stale.
+                // Structural rows are current; the next drain retries only stale semantic rows.
                 let now = Instant::now();
                 for (path, _) in semantic_todo {
                     pending.insert(path, now);
                 }
             }
             WorkOutcome::Failed => {
-                // Same stale state as Skipped — the structural rows landed
-                // and the semantic ones did not — but dropping the paths here
-                // left them stale until the next filesystem event. Re-queue
-                // with a growing delay, up to a bound; past the bound the
-                // paths park with a long backoff (revived by the main loop)
-                // instead of going silently stale.
+                // Back off and eventually park failures; dropping them requires another save to recover.
                 let now = Instant::now();
                 for path in requeue_failed_semantic(
                     pending,
@@ -808,10 +802,7 @@ fn process_ready(
     }
     rederive_header
 }
-/// Re-queue `paths` after a failed semantic pass, each one retry deeper.
-/// Returns the paths past [`MAX_SEMANTIC_RETRIES`]: the caller parks them
-/// (see `PARKED_RETRY_INTERVAL`) instead of dropping them into silent
-/// staleness until their next save.
+/// Requeue failed semantic work; return exhausted paths for long-backoff parking.
 fn requeue_failed_semantic(
     pending: &mut HashMap<PathBuf, Instant>,
     semantic_retries: &mut HashMap<PathBuf, u32>,
@@ -836,8 +827,7 @@ fn requeue_failed_semantic(
         let extra = semantic_retry_extra_delay(*attempt, debounce);
         deepest_attempt = deepest_attempt.max(*attempt);
         longest_extra = longest_extra.max(extra);
-        // A stamp in the future is not drain-ready until `debounce` has
-        // elapsed past it; `compute_ready` saturates, never panics, on it.
+        // Future stamps add backoff before debounce; Instant::duration_since saturates.
         pending.insert(path, now + extra);
         requeued += 1;
     }
@@ -884,10 +874,7 @@ fn revive_due_parked(
     due.len()
 }
 
-/// Embed every file in `files` in one pass under one lock. Chunks whose text
-/// is unchanged keep their stored vectors (see `codesage_graph::semantic`),
-/// so a batch of saved files costs one model call per fifty files for the
-/// chunks that actually changed.
+/// Batch semantic work under one lock; unchanged chunk text reuses stored vectors.
 fn semantic_reindex_batch(
     config: &StateWatcherConfig,
     embedder: &mut EmbedderHandle,
@@ -895,10 +882,7 @@ fn semantic_reindex_batch(
 ) -> WorkOutcome {
     let emb_arc = match embedder.get() {
         EmbedderLookup::Loaded(emb) => emb,
-        // Disabled cannot reach here (`reindex_one` reports no stale semantic
-        // file without an embedder); treating it as a failure keeps the
-        // paths queued rather than marking rows current that were never
-        // written.
+        // A missing model must not attest unwritten semantic rows as current.
         EmbedderLookup::Disabled | EmbedderLookup::LoadFailed => return WorkOutcome::Failed,
     };
     let _lock = match lockfile::try_acquire(&config.project_root) {
@@ -966,9 +950,7 @@ fn semantic_reindex_batch(
     }
 }
 
-/// Present on disk with at least one byte. A vanished or emptied path had
-/// its index rows purged by `reindex_one`, which is what the header-dialect
-/// re-derivation gate cares about.
+/// Vanished or empty files are purged and may require header-dialect re-derivation.
 fn file_has_content(abs: &Path) -> bool {
     std::fs::metadata(abs).is_ok_and(|m| m.len() > 0)
 }
@@ -988,10 +970,7 @@ fn reindex_one(
 
     let bytes = match std::fs::read(&abs) {
         Ok(b) => b,
-        // A vanished path is a removal, not a failure: notify's inotify
-        // backend reports a rename's old path as a Modify (MOVED_FROM), and
-        // editor swap patterns delete between event and read. Purge the rows
-        // or ghost symbols/chunks persist for the session.
+        // Rename-old paths arrive as Modify, and editor swaps can disappear before this read.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return purge_one_locked(config, &rel_str);
         }
@@ -1131,10 +1110,7 @@ fn handle_removals(
         }
     };
 
-    // Resolve queued directory prefixes into concrete indexed paths under
-    // the lock: a concurrent indexer can commit new rows under a prefix
-    // right up until the lock is ours, and a pre-lock snapshot would miss
-    // them while the caller clears the prefix.
+    // Expand prefixes under the lock or rows committed during acquisition could escape removal.
     let mut candidates: Vec<String> = paths.to_vec();
     if !prefixes.is_empty() {
         let Some(expanded) = expand_removed_prefixes(&config.db_path, prefixes) else {
@@ -1147,10 +1123,7 @@ fn handle_removals(
         }
     }
 
-    // A path that exists on disk was re-created after its removal was queued
-    // (git checkout back-and-forth, atomic-save editors). Deleting its rows
-    // would silently drop a live file's symbols/chunks for the session, so
-    // only purge paths that are genuinely gone.
+    // A queued removal may race re-creation; preserve live files.
     let to_remove: Vec<String> = candidates
         .into_iter()
         .filter(|p| !config.project_root.join(p).exists())
@@ -1163,9 +1136,7 @@ fn handle_removals(
 }
 
 fn purge_index_rows(config: &StateWatcherConfig, paths: &[String]) -> WorkOutcome {
-    // A reset deleted index.db: there are no rows to purge, and the open
-    // must not recreate the database (warm-state existence checks would
-    // pass again).
+    // Do not resurrect a reset database and satisfy warm-state checks with an empty index.
     if !config.db_path.exists() {
         return WorkOutcome::Done;
     }
@@ -1183,9 +1154,6 @@ fn purge_index_rows(config: &StateWatcherConfig, paths: &[String]) -> WorkOutcom
                 tracing::info!(removed = n, paths = ?paths, "files removed from index");
             }
         }
-        // A busy/locked DB is transient (a concurrent daemon reader or the
-        // lock holder). Retain the paths and retry rather than clear them,
-        // which would leave ghost symbols/chunks for the session.
         Err(e) if is_retryable_db_error(&e) => {
             tracing::debug!(error = %e, "removal deferred: database busy, will retry");
             return WorkOutcome::Skipped;
@@ -1216,9 +1184,7 @@ fn purge_index_rows(config: &StateWatcherConfig, paths: &[String]) -> WorkOutcom
     WorkOutcome::Done
 }
 
-/// Acquire the index lock and purge one path's structural + semantic rows.
-/// For paths whose on-disk state no longer warrants index rows: emptied
-/// files, and paths that vanished between the event and the read.
+/// Purge vanished or emptied files under the index lock.
 fn purge_one_locked(config: &StateWatcherConfig, rel_str: &str) -> WorkOutcome {
     let _lock = match lockfile::try_acquire(&config.project_root) {
         Ok(lockfile::LockOutcome::Acquired(lock)) => Some(lock),
@@ -1237,19 +1203,8 @@ fn purge_one_locked(config: &StateWatcherConfig, rel_str: &str) -> WorkOutcome {
     purge_index_rows(config, &[rel_str.to_string()])
 }
 
-/// Whether this project's bare `.h` headers should be parsed as C++. Mirrors
-/// the discovery layer's rule — an unambiguous C++ extension anywhere in the
-/// file set flips headers — against the indexed `files` table, so a watcher
-/// reindex of an edited header stores the same language a full index would.
-/// Keyed on path extension rather than the stored language column because
-/// `.cu`/`.cuh` files are stored as C++ without implying the header flip.
-///
-/// Cost shape: one scan of the `files` path column (no hashes, no HashMap).
-/// It runs at watcher startup, after every completed bulk pass, and after a
-/// deletion that could have removed the last C++ file — the deletion sites
-/// are gated so pure-C repos never pay it on the event path. The open must
-/// not create a missing database: a reset deletes `index.db`, and a probe
-/// that recreates it empty would make warm-state existence checks pass again.
+/// Match discovery's header rule using indexed paths, not stored language:
+/// CUDA files have C++ language but do not flip `.h` parsing. Never create a reset index.
 fn header_dialect_is_cpp(db_path: &Path) -> bool {
     let Ok(db) = Database::open_existing(db_path) else {
         return false;
@@ -1265,10 +1220,7 @@ fn header_dialect_is_cpp(db_path: &Path) -> bool {
     })
 }
 
-/// A completed removal pass can only lower the header dialect when the flag
-/// is currently set and one of the removed paths was itself an unambiguous
-/// C++ file — anything else leaves the indexed C++ set intact, so the
-/// re-derivation scan is skipped.
+/// Avoid a dialect scan unless removal could have deleted the last C++ source.
 fn removed_paths_may_unflip_header(header_is_cpp: bool, paths: &[String]) -> bool {
     header_is_cpp
         && paths.iter().any(|p| {
@@ -1279,14 +1231,7 @@ fn removed_paths_may_unflip_header(header_is_cpp: bool, paths: &[String]) -> boo
         })
 }
 
-/// A notify backend error (inotify queue overflow, rescan-needed) means
-/// events were lost: the accumulated queues no longer describe everything
-/// that changed on disk. Schedule a full reconciliation through the bulk
-/// catch-up path — the `Skipped` disposition retains all queued state and
-/// arms `bulk_retry_at` one debounce out, deferred to the end of any active
-/// bulk cooldown. The rescan is never lost, only delayed: the pass that
-/// armed the cooldown already observed the tree, and the catch-up at
-/// cooldown expiry reconciles anything the overflow dropped after that.
+/// Reconcile lost events without clearing queues or bypassing the bulk cooldown.
 fn schedule_watch_error_catchup(
     pending: &mut HashMap<PathBuf, Instant>,
     removed_paths: &mut Vec<String>,
@@ -1304,9 +1249,7 @@ fn schedule_watch_error_catchup(
     )
 }
 
-/// Cooldown window armed by a completed bulk pass. `Skipped`/`Failed` arm
-/// nothing: their state survives for the retry / per-file fallback, so a
-/// follow-up burst should still be allowed to trigger a fresh pass.
+/// Only completed bulk passes may suppress another burst-triggered pass.
 fn bulk_cooldown_after(outcome: WorkOutcome, now: Instant) -> Option<Instant> {
     (outcome == WorkOutcome::Done).then(|| now + BULK_COOLDOWN)
 }
@@ -1315,16 +1258,8 @@ fn in_bulk_cooldown(cooldown_until: Option<Instant>, now: Instant) -> bool {
     cooldown_until.is_some_and(|until| now < until)
 }
 
-/// SQLITE_BUSY / SQLITE_LOCKED are transient — a concurrent daemon reader or
-/// the index-lock holder had the DB write-locked. Retrying after a debounce
-/// clears them, so the caller must retain the work instead of dropping the
-/// queued paths. Classified by typed [`rusqlite::ErrorCode`] first: substring
-/// matching cannot tell SQLITE_FULL / SQLITE_CORRUPT / SQLITE_READONLY apart,
-/// and those must not all share the abandon path. A full disk (space may
-/// drain) and an interrupted query retry; corruption and read-only mounts
-/// fail fast into the bounded retry, then the parked set. Untyped errors
-/// (context wrappers from other layers) keep the old substring fallback —
-/// SQLite renders the whole busy/locked family as "... is locked".
+/// Typed SQLite codes take precedence over message substrings. Busy, locked,
+/// full-disk, and interrupted work can retry; other failures use bounded recovery.
 fn is_retryable_db_error(err: &anyhow::Error) -> bool {
     if let Some(code) = sqlite_error_code(err) {
         use rusqlite::ErrorCode::*;
@@ -1345,16 +1280,8 @@ fn sqlite_error_code(err: &anyhow::Error) -> Option<rusqlite::ErrorCode> {
             .and_then(|e| e.sqlite_error_code())
     })
 }
-/// Apply a bulk-incremental outcome to the accumulated watch state,
-/// returning when (if at all) the bulk pass should be retried. `Done`
-/// clears the state the pass covered. `Skipped` keeps it, restamps
-/// `pending` so the per-file drain doesn't race the bulk retry, and
-/// schedules that retry one debounce out — never sooner, so lock
-/// contention can't turn into a tight respin, and never inside an active
-/// bulk cooldown: a threshold crossing during the cooldown would otherwise
-/// re-arm a catch-up one debounce later and defeat the cooldown one retry
-/// at a time. `Failed` keeps the state with its original stamps: the
-/// per-file drain becomes the fallback, with per-file error logging.
+/// `Skipped` retains work until both debounce and cooldown expire; `Failed`
+/// preserves original stamps for per-file fallback. Only `Done` clears queues.
 fn apply_bulk_outcome(
     outcome: WorkOutcome,
     pending: &mut HashMap<PathBuf, Instant>,
@@ -1371,8 +1298,7 @@ fn apply_bulk_outcome(
         }
         WorkOutcome::Skipped => {
             let retry_at = cooldown_until.map_or(now + debounce, |cd| (now + debounce).max(cd));
-            // Stamp so nothing becomes drain-ready before the retry fires;
-            // retry_at >= now + debounce keeps this stamp at or after `now`.
+            // Keep per-file work unready until the bulk retry; retry_at includes debounce.
             let stamp = retry_at - debounce;
             for s in pending.values_mut() {
                 *s = stamp;
@@ -1404,14 +1330,8 @@ fn startup_outcome(outcome: WorkOutcome, failures: &mut Option<u32>) -> WorkOutc
     outcome
 }
 
-/// Apply a removal pass outcome to the accumulated removal state, returning
-/// when (if at all) the removal should be retried. `Done` clears the paths
-/// and prefixes and resets the failure counter. `Skipped` (transient lock
-/// contention) keeps the state and reschedules without counting toward the
-/// give-up ceiling. `Failed` counts toward the ceiling; after
-/// `MAX_REMOVAL_FAILURES` consecutive hard failures it gives up — clearing
-/// the state so the loop stops reporting activity and the watcher can idle
-/// out instead of pinning the pooled model.
+/// Retain lock-skipped work without consuming the hard-failure budget.
+/// Exhausted hard failures clear queues so the watcher can idle out.
 fn apply_removal_outcome(
     outcome: WorkOutcome,
     removed_paths: &mut Vec<String>,
@@ -1449,8 +1369,6 @@ fn apply_removal_outcome(
     }
 }
 
-/// [`run_bulk_incremental`] behind the same backpressure gate as the per-file
-/// drain: a deferred pass reports `Skipped`, which re-arms the retry.
 fn run_bulk_guarded(
     config: &StateWatcherConfig,
     embedder: &mut EmbedderHandle,
@@ -1465,10 +1383,7 @@ fn run_bulk_guarded(
     run_bulk_incremental(config, embedder)
 }
 
-/// Decide whether a ready batch waits. `reason` is `Some` while the host is
-/// under pressure; `deferred_since` tracks the first deferral of the current
-/// streak so the wait is bounded by [`BACKPRESSURE_MAX_DEFER`]. Returns
-/// `true` to defer.
+/// Bound a continuous deferral streak with [`BACKPRESSURE_MAX_DEFER`].
 fn should_defer(reason: Option<&str>, deferred_since: &mut Option<Instant>, now: Instant) -> bool {
     let Some(reason) = reason else {
         *deferred_since = None;
@@ -1488,13 +1403,7 @@ fn should_defer(reason: Option<&str>, deferred_since: &mut Option<Instant>, now:
     true
 }
 
-/// Why indexing should wait right now, or `None`. Three signals, each cheap:
-/// a git operation in flight (`index.lock` in the repository's git dir — a
-/// checkout or rebase is about to rewrite the files we would index), a
-/// one-minute load average above the CPU count, or a `cargo`/`rustc`/`pytest`
-/// process running with its working directory under the project root. A
-/// stale embedding for a few minutes costs less than contending with any of
-/// them.
+/// Defer during Git writes, excessive load, or builds under the project root.
 fn backpressure_reason(root: &Path) -> Option<String> {
     if git_index_lock_present(root) {
         return Some("git index.lock present".to_string());
@@ -1542,11 +1451,7 @@ fn load_average_1m() -> Option<f64> {
     raw.split_whitespace().next()?.parse().ok()
 }
 
-/// Names a build or test process whose working directory is `root` or below
-/// it, when one exists. Scans `/proc` by `comm`, so it costs one directory
-/// walk per ready batch and nothing between batches. Only the process names
-/// that saturate a machine for minutes are recognised; an `ls` under the
-/// root is not pressure.
+/// Scan /proc only for ready batches; unrelated short-lived commands are not backpressure.
 fn build_process_under(root: &Path) -> Option<String> {
     let entries = std::fs::read_dir("/proc").ok()?;
     let root = canonical_root(root);
@@ -1618,9 +1523,7 @@ fn run_bulk_incremental(config: &StateWatcherConfig, embedder: &mut EmbedderHand
         EmbedderLookup::Disabled => return WorkOutcome::Done,
         EmbedderLookup::Loaded(emb) => emb,
         EmbedderLookup::LoadFailed => {
-            // The structural rows landed; the semantic rows did not. `Done`
-            // here cleared the pending paths and left them stale until the
-            // next filesystem event, bypassing the per-file requeue.
+            // Reporting Done here would discard stale semantic work before per-file recovery.
             tracing::warn!("bulk incremental semantic reindex skipped: embedder did not load");
             return WorkOutcome::Failed;
         }
@@ -1668,39 +1571,32 @@ fn run_bulk_incremental(config: &StateWatcherConfig, embedder: &mut EmbedderHand
     WorkOutcome::Done
 }
 
-/// Set up the inotify watch set: the root non-recursively (top-level files +
-/// detecting new top-level directories), plus a recursive watch on each
-/// non-ignored top-level directory. This keeps `target/`, `.git/`,
-/// `node_modules/`, and gitignored top-level trees out of the watch set, so the
-/// watcher doesn't burn inotify descriptors or wake on build/VCS churn.
-fn watch_tree(watcher: &mut RecommendedWatcher, root: &Path, filter: &WatchFilter) {
-    if let Err(e) = watcher.watch(root, RecursiveMode::NonRecursive) {
-        tracing::warn!(error = %e, "watching project root");
-        return;
-    }
-    let entries = match std::fs::read_dir(root) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!(error = %e, "reading project root for watch set");
-            return;
-        }
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        if is_dir
-            && !filter.is_ignored(&path, true)
-            && let Err(e) = watcher.watch(&path, RecursiveMode::Recursive)
-        {
-            tracing::warn!(path = %path.display(), error = %e, "watching subtree");
-        }
-    }
+fn event_watcher(tx: mpsc::Sender<Result<Event, notify::Error>>) -> Result<RecommendedWatcher> {
+    notify::recommended_watcher(move |res| {
+        let _ = tx.send(res);
+    })
+    .context("creating filesystem watcher")
 }
 
-/// Event kinds that can introduce a directory needing adoption. A rename
-/// into the tree arrives as `Modify(Name(To))` (inotify MOVED_TO), never
-/// as `Create` — matching `Create` alone would leave a `mv dir project/`
-/// tree unwatched forever.
+// Avoid watching ignored top-level trees and their build/VCS churn.
+fn watch_tree(watcher: &mut RecommendedWatcher, root: &Path, filter: &WatchFilter) -> Result<()> {
+    watcher
+        .watch(root, RecursiveMode::NonRecursive)
+        .context("watching project root")?;
+    let entries = std::fs::read_dir(root).context("reading project root for watch set")?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() && !filter.is_ignored(&path, true) {
+            watcher
+                .watch(&path, RecursiveMode::Recursive)
+                .with_context(|| format!("watching subtree {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Rename-in arrives as Modify(Name), so Create alone misses populated trees.
 fn is_dir_adoption_kind(kind: &EventKind) -> bool {
     matches!(
         kind,
@@ -1708,26 +1604,18 @@ fn is_dir_adoption_kind(kind: &EventKind) -> bool {
     )
 }
 
-/// Cap on directory entries examined during an adoption scan. The scan runs
-/// synchronously on the event loop and a renamed-in tree can be arbitrarily
-/// large; past this, one bulk reconciliation pass is cheaper than walking.
+/// Bound synchronous event-loop scanning; large adopted trees use bulk reconciliation.
 const ADOPTION_SCAN_ENTRY_CAP: usize = 2048;
 
-/// Outcome of an adoption scan over a newly appeared directory.
 #[derive(Debug, PartialEq, Eq)]
 enum DirScan {
     /// Every non-ignored source file under the directory, root-relative.
     Files(Vec<PathBuf>),
-    /// The tree holds at least `file_threshold` source files (or blew the
-    /// entry cap): enqueueing per file would cross the bulk threshold
-    /// anyway, so the caller should schedule one bulk pass instead.
+    /// Source threshold or entry cap exceeded; schedule a bulk pass.
     OverThreshold,
 }
 
-/// Non-ignored source files under a newly appeared directory, as
-/// root-relative paths. Watch registration races population: no backend
-/// replays files that landed before the watch existed, and a directory
-/// renamed in arrives fully populated with no per-file events at all.
+/// Capture files populated before watch registration, which backends do not replay.
 fn scan_dir_source_files(
     root: &Path,
     dir: &Path,
@@ -1770,10 +1658,8 @@ fn scan_dir_source_files(
     DirScan::Files(found)
 }
 
-/// Indexed paths at or under any of the given root-relative prefixes.
-/// `None` when the index exists but can't be read — the caller retains the
-/// prefixes and retries. A missing database has nothing to purge, and the
-/// probe must not recreate it (a reset deletes `index.db`).
+/// Resolve indexed descendants. None retains prefixes for retry; a missing DB is
+/// empty and must not be recreated.
 fn expand_removed_prefixes(db_path: &Path, prefixes: &[String]) -> Option<Vec<String>> {
     if !db_path.exists() {
         return Some(Vec::new());
@@ -1791,16 +1677,12 @@ fn expand_removed_prefixes(db_path: &Path, prefixes: &[String]) -> Option<Vec<St
     )
 }
 
-/// The root's canonical spelling, or the given one when resolution fails
-/// (the caller's spelling still works for a root that exists but can't be
-/// canonicalized, e.g. permission-restricted ancestors).
+/// Preserve the supplied spelling if canonicalization fails, including inaccessible ancestors.
 fn canonical_root(root: &Path) -> PathBuf {
     std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
 }
 
-/// Extend the watch set when a new top-level directory appears. Deeper new
-/// directories are already covered by the recursive watch on their top-level
-/// ancestor, so only immediate children of the root need an explicit watch.
+/// Deeper directories inherit recursive watches; only new root children need registration.
 fn maybe_watch_new_dir(
     watcher: &mut RecommendedWatcher,
     root: &Path,
@@ -1815,9 +1697,6 @@ fn maybe_watch_new_dir(
     }
 }
 
-/// A watch candidate: a known source extension we have a tree-sitter grammar
-/// for. `detect_language` is the source of truth downstream; this is the cheap
-/// pre-filter so we don't even queue files we can't parse.
 fn is_source_file(rel: &Path) -> bool {
     detect_language(rel).is_some()
 }
@@ -1848,9 +1727,7 @@ pub fn resolve_debounce_ms() -> u64 {
     }
 }
 
-/// Clamp a debounce window up to [`MIN_DEBOUNCE_MS`]. Shared by the env
-/// resolution above and the explicit `watch run --reindex-debounce`, so both
-/// paths agree on the floor.
+/// Share the debounce floor between environment and CLI settings.
 pub fn floor_debounce_ms(ms: u64) -> u64 {
     ms.max(MIN_DEBOUNCE_MS)
 }
@@ -1864,18 +1741,18 @@ pub fn resolve_idle_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
-// ---- status + control files -------------------------------------------------
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchStatus {
     pub mode: WatcherMode,
     pub pid: u32,
     pub started_at_unix: u64,
-    /// Paths parked after repeated semantic failures, awaiting their long
-    /// backoff retry. `#[serde(default)]` so statuses written before this
-    /// field existed still parse.
+    /// Semantic failures awaiting long-backoff retry; absent in older status files.
     #[serde(default)]
     pub stale_parked: usize,
+    #[serde(default)]
+    pub reconciliation_pending: bool,
+    #[serde(default)]
+    pub reconciliation_parked: bool,
 }
 
 pub fn watch_status_path(root: &Path) -> PathBuf {
@@ -1886,7 +1763,13 @@ pub fn watch_disabled_path(root: &Path) -> PathBuf {
     root.join(".codesage").join("watch.disabled")
 }
 
-fn write_status(root: &Path, mode: WatcherMode, stale_parked: usize) -> Result<()> {
+fn write_status(
+    root: &Path,
+    mode: WatcherMode,
+    stale_parked: usize,
+    reconciliation_pending: bool,
+    reconciliation_parked: bool,
+) -> Result<()> {
     let started_at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1896,17 +1779,13 @@ fn write_status(root: &Path, mode: WatcherMode, stale_parked: usize) -> Result<(
         pid: std::process::id(),
         started_at_unix,
         stale_parked,
+        reconciliation_pending,
+        reconciliation_parked,
     };
     let path = watch_status_path(root);
     let json = serde_json::to_string(&status)?;
-    // `.codesage/` is repository-supplied content in a freshly cloned tree, so
-    // `watch.status` may be a planted symlink pointing anywhere on the host.
-    // Open with O_NOFOLLOW instead of `fs::write`: it fails with ELOOP rather
-    // than truncating the link's target, and unlike an lstat-then-write check
-    // it leaves no TOCTOU window.
-    let mut file = crate::fsguard::create_no_follow(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    std::io::Write::write_all(&mut file, json.as_bytes())
+    crate::fsguard::reject_symlinked_project_dir(&path)?;
+    codesage_graph::state_file::replace(&path, json.as_bytes())
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
@@ -1915,9 +1794,7 @@ pub fn read_status(root: &Path) -> Option<WatchStatus> {
     let path = watch_status_path(root);
     let raw = crate::fsguard::read_state_to_string(&path).ok()?;
     let status: WatchStatus = serde_json::from_str(&raw).ok()?;
-    // An abrupt daemon/process death leaves the status file behind without the
-    // owning thread running its cleanup. Treat a status whose recorded pid is
-    // gone as inactive, and prune the stale file.
+    // Abrupt process death bypasses StatusGuard cleanup.
     if !process_alive(status.pid) {
         let _ = crate::fsguard::remove_state_file(&path);
         return None;
@@ -1952,16 +1829,9 @@ pub fn watch_enabled(root: &Path, config_watch: Option<bool>) -> bool {
     !watch_disabled_marker_present(root)
 }
 
-/// Is a `watch.disabled` marker present at all?
-///
-/// lstat, not `exists()`: a dangling marker symlink reads as absent to
-/// `exists()`, so the marker would look cleared to some callers while every
-/// attempt to rewrite it fails. One helper keeps `watch_enabled` and
-/// `watch status` reporting the same thing.
+/// Treat dangling symlinks as present so status and write-side marker handling agree.
 pub fn watch_disabled_marker_present(root: &Path) -> bool {
-    // lstat the `.codesage` parent too: lstat on the full path still resolves
-    // every component *before* the last, so a symlinked project dir would have
-    // this report on an entry outside the tree.
+    // lstat still follows intermediate components; reject a symlinked parent separately.
     let dir = root.join(".codesage");
     if !std::fs::symlink_metadata(&dir)
         .map(|m| m.is_dir())
@@ -1972,12 +1842,7 @@ pub fn watch_disabled_marker_present(root: &Path) -> bool {
     std::fs::symlink_metadata(watch_disabled_path(root)).is_ok()
 }
 
-// ---- standalone signal handling ---------------------------------------------
-
-/// Holds a leaked pointer to the standalone watcher's shutdown flag so the
-/// async-signal-safe handler can flip it. Using `AtomicPtr` + a leaked `Arc`
-/// (rather than `static mut`) keeps the access sound: the flag lives for the
-/// whole process and the load/store are atomic.
+/// A leaked Arc keeps the atomic shutdown flag valid for every signal handler invocation.
 static STANDALONE_SHUTDOWN_PTR: AtomicPtr<AtomicBool> = AtomicPtr::new(std::ptr::null_mut());
 
 extern "C" fn shutdown_signal_handler(_: libc::c_int) {
@@ -2016,8 +1881,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn marker_presence_ignores_a_symlinked_project_dir() {
-        // lstat on the full path still resolves every component before the
-        // last, so the `.codesage` parent needs its own check.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("project");
         std::fs::create_dir(&root).unwrap();
@@ -2035,8 +1898,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn write_status_refuses_a_symlinked_status_file() {
-        // `.codesage/watch.status` ships with a cloned repo; `fs::write`
-        // through a planted symlink truncates the target.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let victim = root.join("victim.key");
@@ -2044,7 +1905,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".codesage")).unwrap();
         std::os::unix::fs::symlink(&victim, watch_status_path(root)).unwrap();
 
-        assert!(write_status(root, WatcherMode::Foreground, 0).is_err());
+        assert!(write_status(root, WatcherMode::Foreground, 0, false, false).is_err());
         assert_eq!(std::fs::read(&victim).unwrap(), b"PRIVATE KEY");
     }
 
@@ -2055,7 +1916,7 @@ mod tests {
         let root = dir.path();
         std::fs::create_dir_all(root.join(".codesage")).unwrap();
 
-        write_status(root, WatcherMode::Foreground, 0).unwrap();
+        write_status(root, WatcherMode::Foreground, 0, false, false).unwrap();
 
         let status = read_status(root).expect("status must round-trip");
         assert_eq!(status.pid, std::process::id());
@@ -2082,7 +1943,6 @@ mod tests {
         let debounce = Duration::from_millis(500);
         let now = Instant::now();
         let mut pending = HashMap::new();
-        // One stale (ready), one fresh (not yet).
         pending.insert(PathBuf::from("ready.rs"), now - Duration::from_millis(600));
         pending.insert(PathBuf::from("fresh.rs"), now - Duration::from_millis(100));
 
@@ -2155,6 +2015,20 @@ mod tests {
             Self {
                 shutdown: config.shutdown.clone(),
                 thread: Some(std::thread::spawn(move || run_statewatcher(config))),
+            }
+        }
+
+        fn start_with_registration(
+            config: StateWatcherConfig,
+            register: impl FnMut(&mut RecommendedWatcher, &Path, &WatchFilter) -> Result<()>
+            + Send
+            + 'static,
+        ) -> Self {
+            Self {
+                shutdown: config.shutdown.clone(),
+                thread: Some(std::thread::spawn(move || {
+                    run_statewatcher_with_registration(config, register)
+                })),
             }
         }
     }
@@ -2240,6 +2114,192 @@ mod tests {
     }
 
     #[test]
+    fn filter_refresh_backs_off_and_reports_parked_work_until_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join(".codesage")).unwrap();
+        let mut now = Instant::now();
+        let mut refresh = FilterRefresh::default();
+        refresh.request(now);
+        for seconds in [1, 2, 4, 8, 16, 1800, 1800] {
+            refresh.failed(now, Duration::from_millis(100));
+            refresh.request(now + Duration::from_millis(1));
+            let next = now + Duration::from_secs(seconds);
+            assert!(!refresh.due(next - Duration::from_millis(1)));
+            assert!(refresh.due(next));
+            assert_eq!(refresh.parked(), seconds == 1800);
+            assert!(refresh.pending());
+            now = next;
+        }
+        write_status(
+            root,
+            WatcherMode::Foreground,
+            2,
+            refresh.pending(),
+            refresh.parked(),
+        )
+        .unwrap();
+        let status = read_status(root).unwrap();
+        assert_eq!(status.stale_parked, 2);
+        assert!(status.reconciliation_pending);
+        assert!(status.reconciliation_parked);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_replacement_registration_keeps_live_coverage_and_recovers() {
+        for error_code in [libc::ENOENT, libc::ENOSPC] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            std::fs::create_dir(root.join(".codesage")).unwrap();
+            std::fs::create_dir(root.join(".git")).unwrap();
+            std::fs::create_dir(root.join("generated")).unwrap();
+            std::fs::write(root.join(".gitignore"), "generated/\n").unwrap();
+            std::fs::write(root.join("main.rs"), "fn before_failure() {}\n").unwrap();
+            std::fs::write(root.join("generated/api.rs"), "fn newly_admitted() {}\n").unwrap();
+            let config = test_config(root);
+            let db = Database::open(&config.db_path).unwrap();
+            let failing = Arc::new(AtomicBool::new(true));
+            let registration_failing = failing.clone();
+            let mut initial = true;
+            let watcher =
+                RunningWatcher::start_with_registration(config, move |watcher, root, filter| {
+                    if !initial && registration_failing.load(Ordering::Relaxed) {
+                        return Err(std::io::Error::from_raw_os_error(error_code).into());
+                    }
+                    initial = false;
+                    watch_tree(watcher, root, filter)
+                });
+            await_watcher_condition(|| db.symbol_exists("before_failure").unwrap());
+            std::fs::write(root.join(".gitignore"), "").unwrap();
+            await_watcher_condition(|| read_status(root).is_some_and(|s| s.reconciliation_pending));
+            assert!(!watcher.thread.as_ref().unwrap().is_finished());
+            std::fs::write(root.join("main.rs"), "fn existing_watch_still_live() {}\n").unwrap();
+            await_watcher_condition(|| db.symbol_exists("existing_watch_still_live").unwrap());
+            assert!(!db.symbol_exists("newly_admitted").unwrap());
+            failing.store(false, Ordering::Relaxed);
+            await_watcher_condition(|| {
+                db.symbol_exists("newly_admitted").unwrap()
+                    && read_status(root).is_some_and(|s| !s.reconciliation_pending)
+            });
+            std::fs::write(
+                root.join("generated/api.rs"),
+                "fn new_watch_now_live() {}\n",
+            )
+            .unwrap();
+            await_watcher_condition(|| db.symbol_exists("new_watch_now_live").unwrap());
+        }
+    }
+
+    #[test]
+    fn live_filter_semantic_failure_is_visible_and_does_not_retry_each_poll() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join(".codesage")).unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join("main.rs"), "fn existing() {}\n").unwrap();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider_attempts = attempts.clone();
+        let mut config = test_config(root);
+        config.embedder = Some(Arc::new(move || {
+            provider_attempts.fetch_add(1, Ordering::Relaxed);
+            anyhow::bail!("test provider unavailable")
+        }));
+        let _watcher = RunningWatcher::start(config);
+        await_watcher_condition(|| attempts.load(Ordering::Relaxed) >= 3);
+        std::fs::write(root.join(".gitignore"), "excluded.rs\n").unwrap();
+        await_watcher_condition(|| read_status(root).is_some_and(|s| s.reconciliation_pending));
+        let before = attempts.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(550));
+        assert_eq!(attempts.load(Ordering::Relaxed), before);
+        assert!(read_status(root).unwrap().reconciliation_pending);
+    }
+
+    #[test]
+    fn live_gitignore_reconciles_immediate_edits_and_new_watch_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir(root.join("generated")).unwrap();
+        std::fs::write(root.join("main.rs"), "fn initial() {}\n").unwrap();
+        std::fs::write(root.join("generated/api.rs"), "fn initially_ignored() {}\n").unwrap();
+        std::fs::write(root.join("excluded.rs"), "fn config_excluded() {}\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "generated/\n").unwrap();
+        let mut config = test_config(root);
+        config.exclude_patterns = vec!["**/excluded.rs".into()];
+        let db = Database::open(&config.db_path).unwrap();
+        let _watcher = RunningWatcher::start(config);
+        await_watcher_condition(|| db.symbol_exists("initial").unwrap());
+        std::fs::write(root.join("main.rs"), "fn positive_control() {}\n").unwrap();
+        await_watcher_condition(|| db.symbol_exists("positive_control").unwrap());
+        assert!(!db.symbol_exists("initially_ignored").unwrap());
+
+        std::fs::write(root.join(".gitignore"), "main.rs\n").unwrap();
+        std::fs::write(root.join("main.rs"), "fn now_ignored() {}\n").unwrap();
+        std::fs::write(
+            root.join("generated/api.rs"),
+            "fn immediately_unignored() {}\n",
+        )
+        .unwrap();
+        await_watcher_condition(|| {
+            db.symbol_exists("immediately_unignored").unwrap()
+                && db.get_file_hash("main.rs").unwrap().is_none()
+        });
+        assert!(!db.symbol_exists("now_ignored").unwrap());
+        assert!(!db.symbol_exists("config_excluded").unwrap());
+
+        std::fs::write(root.join("generated/api.rs"), "fn subsequent_edit() {}\n").unwrap();
+        await_watcher_condition(|| db.symbol_exists("subsequent_edit").unwrap());
+        std::fs::remove_file(root.join(".gitignore")).unwrap();
+        std::fs::write(root.join("main.rs"), "fn unignored_after_delete() {}\n").unwrap();
+        await_watcher_condition(|| db.symbol_exists("unignored_after_delete").unwrap());
+    }
+
+    #[test]
+    fn live_nested_gitignore_replacement_waits_for_reconciliation_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/.gitignore"), "api.rs\n").unwrap();
+        std::fs::write(root.join("src/api.rs"), "fn ignored_before() {}\n").unwrap();
+        std::fs::write(root.join("main.rs"), "fn initial() {}\n").unwrap();
+        let config = test_config(root);
+        let db = Database::open(&config.db_path).unwrap();
+        let _watcher = RunningWatcher::start(config);
+        await_watcher_condition(|| db.symbol_exists("initial").unwrap());
+        let mut lock = None;
+        await_watcher_condition(|| {
+            if let lockfile::LockOutcome::Acquired(acquired) = lockfile::try_acquire(root).unwrap()
+            {
+                lock = Some(acquired);
+            }
+            lock.is_some()
+        });
+        std::fs::write(root.join("src/replacement"), "").unwrap();
+        std::fs::rename(root.join("src/replacement"), root.join("src/.gitignore")).unwrap();
+        std::fs::write(
+            root.join("src/api.rs"),
+            "fn changed_during_reconciliation() {}\n",
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(!db.symbol_exists("changed_during_reconciliation").unwrap());
+        std::fs::write(root.join("src/api.rs"), "fn latest_while_locked() {}\n").unwrap();
+        drop(lock);
+        await_watcher_condition(|| db.symbol_exists("latest_while_locked").unwrap());
+        std::fs::write(
+            root.join("src/api.rs"),
+            "fn edited_after_reconciliation() {}\n",
+        )
+        .unwrap();
+        await_watcher_condition(|| db.symbol_exists("edited_after_reconciliation").unwrap());
+        assert!(!db.symbol_exists("latest_while_locked").unwrap());
+    }
+
+    #[test]
     fn startup_reconciliation_retries_hard_failures_with_a_bound() {
         let mut failures = Some(0);
         for expected in [
@@ -2309,12 +2369,9 @@ mod tests {
             None,
         );
 
-        // Everything retained, bulk retry scheduled a full debounce out.
         assert_eq!(retry, Some(now + debounce));
         assert_eq!(pending.len(), 2);
         assert_eq!(removed, vec!["gone.rs".to_string()]);
-        // Stamps were refreshed: nothing is drain-ready before the retry
-        // fires, so the skipped batch can't respin through the per-file path.
         assert!(compute_ready(&pending, now, debounce).is_empty());
         assert_eq!(compute_ready(&pending, now + debounce, debounce).len(), 2);
     }
@@ -2337,8 +2394,6 @@ mod tests {
             None,
         );
 
-        // No bulk retry, but the state survives with its original stamps so
-        // the per-file drain picks it up immediately.
         assert_eq!(retry, None);
         assert_eq!(compute_ready(&pending, now, debounce).len(), 1);
         assert_eq!(removed.len(), 1);
@@ -2364,7 +2419,6 @@ mod tests {
         assert_eq!(retry, Some(now + debounce));
         assert_eq!(removed, vec!["gone.rs".to_string()]);
         assert_eq!(prefixes, vec!["gonedir".to_string()]);
-        // Lock contention is not a hard failure — the give-up ceiling stays put.
         assert_eq!(fails, 0);
     }
 
@@ -2376,7 +2430,6 @@ mod tests {
         let mut prefixes = vec!["gonedir".to_string()];
         let mut fails = 0;
 
-        // Every hard failure short of the ceiling retains the state and reschedules.
         for _ in 0..(MAX_REMOVAL_FAILURES - 1) {
             let retry = apply_removal_outcome(
                 WorkOutcome::Failed,
@@ -2391,8 +2444,6 @@ mod tests {
             assert_eq!(prefixes.len(), 1);
         }
 
-        // The ceiling hit: give up, drop the state so the loop stops reporting
-        // activity and the watcher can idle out instead of pinning the model.
         let retry = apply_removal_outcome(
             WorkOutcome::Failed,
             &mut removed,
@@ -2449,15 +2500,12 @@ mod tests {
         std::fs::create_dir_all(root.join(".codesage")).unwrap();
         let config = test_config(root);
 
-        // No index.db on a fresh path: nothing to purge, no-op success.
         let paths = vec!["gone.rs".to_string()];
         assert_eq!(handle_removals(&config, &paths, &[]), WorkOutcome::Done);
     }
 
     #[test]
     fn handle_removals_skips_recreated_file() {
-        // A removal queued while the path still exists on disk (a re-creation
-        // raced ahead of the retry) must not delete the live file's rows.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join(".codesage")).unwrap();
@@ -2475,8 +2523,6 @@ mod tests {
         assert!(db.get_file_hash("foo.rs").unwrap().is_some());
         drop(db);
 
-        // foo.rs is present on disk, so the removal is a no-op and the rows
-        // survive.
         assert_eq!(
             handle_removals(&config, &["foo.rs".to_string()], &[]),
             WorkOutcome::Done
@@ -2496,7 +2542,6 @@ mod tests {
         assert!(is_retryable_db_error(&anyhow::anyhow!(
             "database table is locked"
         )));
-        // The classifier walks the anyhow context chain, not just the top.
         assert!(is_retryable_db_error(
             &anyhow::anyhow!("database is locked").context("removing files")
         ));
@@ -2509,9 +2554,6 @@ mod tests {
     #[test]
     fn is_retryable_db_error_trusts_typed_codes_over_substrings() {
         use rusqlite::ffi;
-        // A typed code classifies even when the message says nothing
-        // useful — and a scary message with a benign code must not send
-        // corruption down the retry path.
         fn typed(code: std::os::raw::c_int) -> anyhow::Error {
             rusqlite::Error::SqliteFailure(ffi::Error::new(code), Some("op failed".to_string()))
                 .into()
@@ -2533,8 +2575,6 @@ mod tests {
                 "code {code} must fail fast into the bounded retry"
             );
         }
-        // The classifier walks the anyhow chain: a typed code wrapped in
-        // context still classifies by code, not by the outer message.
         let wrapped = typed(ffi::SQLITE_BUSY).context("removing files");
         assert!(is_retryable_db_error(&wrapped));
     }
@@ -2691,7 +2731,6 @@ mod tests {
         let config = test_config(root);
         let hash = content_hash(src.as_bytes());
 
-        // Semantic disabled: structural lands, nothing is reported.
         let mut stale = None;
         assert_eq!(
             reindex_one(&config, Path::new("foo.rs"), false, false, &mut stale),
@@ -2700,9 +2739,7 @@ mod tests {
         assert!(stale.is_none());
         assert!(structural_hash_is_fresh(&config, "foo.rs", &hash));
 
-        // Semantic enabled, structural already fresh: no lock is taken (the
-        // held lock would otherwise force Skipped) and the file is handed to
-        // the batch because its semantic rows are stale.
+        // A held lock proves the fresh structural path avoids reacquiring it.
         let _held = hold_lock(root);
         let mut stale = None;
         assert_eq!(
@@ -2714,7 +2751,6 @@ mod tests {
         assert_eq!(info.content_hash, hash);
         drop(_held);
 
-        // Once the semantic hash is recorded, nothing is reported.
         let semantic_db = Database::open_for_model(
             &config.db_path,
             &config.embed_config.model,
@@ -2767,7 +2803,6 @@ mod tests {
         ));
         assert_eq!(since, Some(t0), "the streak keeps its first stamp");
 
-        // Cap reached: run anyway and start a fresh streak next time.
         assert!(!should_defer(
             Some("busy"),
             &mut since,
@@ -2775,7 +2810,6 @@ mod tests {
         ));
         assert!(since.is_none());
 
-        // Pressure lifting clears the streak too.
         assert!(should_defer(Some("busy"), &mut since, t0));
         assert!(!should_defer(None, &mut since, t0 + Duration::from_secs(1)));
         assert!(since.is_none());
@@ -2792,7 +2826,6 @@ mod tests {
         std::fs::write(root.join(".git/index.lock"), "").unwrap();
         assert!(git_index_lock_present(root));
 
-        // Linked worktree: `.git` is a pointer file to the real git dir.
         let wt = tmp.path().join("wt");
         std::fs::create_dir_all(&wt).unwrap();
         let gitdir = tmp.path().join("real-gitdir");
@@ -2802,7 +2835,6 @@ mod tests {
         std::fs::write(gitdir.join("index.lock"), "").unwrap();
         assert!(git_index_lock_present(&wt));
 
-        // Relative pointer resolves against the worktree root.
         let wt2 = tmp.path().join("wt2");
         std::fs::create_dir_all(&wt2).unwrap();
         std::fs::write(wt2.join(".git"), "gitdir: ../real-gitdir").unwrap();
@@ -2911,13 +2943,10 @@ mod tests {
         );
         drop(db);
 
-        // Pressure lifts: the next drain (after the debounce) indexes it.
         std::fs::remove_file(root.join(".git/index.lock")).unwrap();
         pending.insert(PathBuf::from("foo.rs"), stale);
         let mut config = config;
-        // The load-average and process probes read the real host; disable
-        // the gate once the deterministic signal is gone so this assertion
-        // cannot depend on the runner's load.
+        // Disable live-host probes after removing the deterministic pressure signal.
         config.backpressure = false;
         drain_pending(
             &config,
@@ -2980,7 +3009,6 @@ mod tests {
                 now + semantic_retry_extra_delay(attempt, debounce),
                 "attempt {attempt} waits its backoff"
             );
-            // Not drain-ready before the (delayed) debounce elapses.
             assert!(compute_ready(&pending, now, debounce).is_empty());
             assert_eq!(
                 compute_ready(&pending, stamp + debounce, debounce),
@@ -2990,9 +3018,6 @@ mod tests {
             pending.remove(&path);
         }
 
-        // Past the bound the path leaves `pending`: it is parked for the
-        // long backoff (see `PARKED_RETRY_INTERVAL`), not dropped into
-        // silent staleness and not spun on.
         let parked =
             requeue_failed_semantic(&mut pending, &mut retries, [path.clone()], debounce, now);
         assert_eq!(
@@ -3077,9 +3102,6 @@ mod tests {
         let root = tmp.path();
         std::fs::create_dir_all(root.join(".codesage")).unwrap();
         std::fs::write(root.join("foo.rs"), "fn main() {}\n").unwrap();
-        // Semantic enabled, but the embedder cannot be produced (a model
-        // that fails to load): the structural pass lands and the semantic
-        // pass is `Failed`. Before the fix that dropped the path.
         let mut config = test_config(root);
         let provider: EmbedderProvider =
             Arc::new(|| anyhow::bail!("simulated embedder load failure"));
@@ -3127,8 +3149,6 @@ mod tests {
             "retried on the next tick after one debounce"
         );
 
-        // The retry fails again: still pending, one attempt deeper, and the
-        // wait grows.
         process_ready(
             &config,
             &mut pending,
@@ -3179,8 +3199,6 @@ mod tests {
         );
         drop(db);
 
-        // The paths the burst queued survive the outcome and are drain-ready
-        // on the next tick, where the per-file path applies its backoff.
         let debounce = Duration::from_millis(config.debounce_ms);
         let now = Instant::now();
         let stale = now - Duration::from_secs(10);
@@ -3262,8 +3280,6 @@ mod tests {
             vec![PathBuf::from("foo.rs")],
         );
 
-        // Re-queued with a fresh stamp: still pending, but not drain-ready
-        // until another debounce window elapses.
         let stamp = pending
             .get(Path::new("foo.rs"))
             .copied()
@@ -3276,9 +3292,6 @@ mod tests {
 
     #[test]
     fn reindex_one_missing_file_purges_index_rows() {
-        // notify's inotify backend reports a rename's old path as a Modify
-        // event, so a vanished path reaches reindex_one; it must purge the
-        // stale rows rather than fail and strand them for the session.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join(".codesage")).unwrap();
@@ -3428,8 +3441,6 @@ mod tests {
 
     #[test]
     fn header_dialect_false_for_c_and_cuda_only_sets() {
-        // kernel.cu is stored with language cpp but must not flip headers —
-        // mirrors the discovery layer keeping .cu out of the unambiguous set.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join(".codesage")).unwrap();
@@ -3482,8 +3493,6 @@ mod tests {
         drop(db);
         assert!(header_dialect_is_cpp(&config.db_path));
 
-        // main.cpp is not on disk, so the removal pass purges its row; the
-        // remaining set (one bare header) no longer proves C++.
         assert_eq!(
             handle_removals(&config, &["src/main.cpp".to_string()], &[]),
             WorkOutcome::Done
@@ -3502,7 +3511,6 @@ mod tests {
 
         assert!(removed_paths_may_unflip_header(true, &cpp));
         assert!(removed_paths_may_unflip_header(true, &mixed));
-        // .cu never flipped the dialect, so removing it can't un-flip it.
         assert!(!removed_paths_may_unflip_header(true, &c_and_cuda));
         assert!(!removed_paths_may_unflip_header(false, &cpp));
         assert!(!removed_paths_may_unflip_header(true, &[]));
@@ -3553,8 +3561,6 @@ mod tests {
         let mut semantic_retries = HashMap::new();
 
         let mut parked = HashMap::new();
-        // Still present and non-empty: a plain reindex must not request a
-        // re-derivation.
         let rederive = process_ready(
             &config,
             &mut pending,
@@ -3569,8 +3575,6 @@ mod tests {
         );
         assert!(!rederive);
 
-        // Vanished (rename reported as Modify): the Done pass purged the
-        // rows, so the caller must re-derive the header dialect.
         std::fs::remove_file(root.join("main.cpp")).unwrap();
         let rederive = process_ready(
             &config,
@@ -3614,11 +3618,6 @@ mod tests {
 
     #[test]
     fn backlog_replay_during_cooldown_defers_bulk_and_keeps_events() {
-        // Sequence: a Done bulk pass arms the cooldown; the burst's queued
-        // events replay and re-cross the threshold during it. The Skipped
-        // disposition must keep every replayed event pending (nothing lost)
-        // and schedule exactly one catch-up pass at cooldown expiry — not a
-        // debounce out, which would land inside the cooldown and defeat it.
         let debounce = Duration::from_millis(500);
         let done_at = Instant::now();
         let cd = bulk_cooldown_after(WorkOutcome::Done, done_at);
@@ -3646,10 +3645,6 @@ mod tests {
 
     #[test]
     fn threshold_crossing_during_cooldown_never_arms_a_bulk_before_expiry() {
-        // A Done bulk pass at t=0 arms the 3s cooldown; a threshold crossing
-        // at t=0.1 must not produce a bulk pass before t=3 — the catch-up is
-        // clamped to cooldown expiry, and the restamped pending set stays
-        // drain-unready until then so the per-file path can't race it either.
         let debounce = Duration::from_millis(1000);
         let done_at = Instant::now();
         let cd = bulk_cooldown_after(WorkOutcome::Done, done_at);
@@ -3685,8 +3680,6 @@ mod tests {
 
     #[test]
     fn watch_error_schedules_bulk_catchup_and_retains_state() {
-        // A forwarded notify error must arm bulk_retry_at (the loop's
-        // catch-up path) while losing none of the queued work.
         let debounce = Duration::from_millis(500);
         let now = Instant::now();
         let stale = now - Duration::from_secs(10);
@@ -3699,7 +3692,6 @@ mod tests {
         assert_eq!(retry, Some(now + debounce));
         assert!(pending.contains_key(Path::new("a.rs")));
         assert_eq!(removed, vec!["gone.rs".to_string()]);
-        // Stamps refreshed: the per-file drain won't race the catch-up pass.
         assert!(compute_ready(&pending, now, debounce).is_empty());
     }
 
@@ -3719,11 +3711,6 @@ mod tests {
 
     #[test]
     fn watch_error_catchup_during_cooldown_defers_to_expiry() {
-        // Sequence: a Done bulk pass arms the cooldown; a notify error
-        // (queue overflow) arrives during it. The correctness rescan is
-        // never dropped — it's armed on bulk_retry_at — but it's clamped to
-        // cooldown expiry like any other catch-up, so an overflow can't be
-        // used to defeat the cooldown either.
         let debounce = Duration::from_millis(500);
         let done_at = Instant::now();
         let cd = bulk_cooldown_after(WorkOutcome::Done, done_at);
@@ -3768,12 +3755,7 @@ mod tests {
 
     #[test]
     fn overflow_arrives_as_ok_event_with_rescan_flag() {
-        // notify's inotify backend surfaces Q_OVERFLOW (and FSEvents its
-        // must-scan-subdirs flag) as Ok(Event{kind: Other, flag: Rescan}),
-        // never through the Err arm — the loop's catch-up must key on
-        // need_rescan(), not only on forwarded errors.
-        // Path attachment differs by backend (inotify none, FSEvents the
-        // affected path); only the flag is the contract.
+        // Only the Rescan flag is portable; inotify and FSEvents attach different paths.
         let overflow = Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
         assert!(overflow.need_rescan());
         assert!(!Event::new(EventKind::Other).need_rescan());
@@ -3785,14 +3767,12 @@ mod tests {
 
         assert!(is_dir_adoption_kind(&EventKind::Create(CreateKind::Folder)));
         assert!(is_dir_adoption_kind(&EventKind::Create(CreateKind::File)));
-        // inotify MOVED_TO: a directory renamed into the tree.
         assert!(is_dir_adoption_kind(&EventKind::Modify(ModifyKind::Name(
             RenameMode::To
         ))));
         assert!(is_dir_adoption_kind(&EventKind::Modify(ModifyKind::Name(
             RenameMode::Both
         ))));
-        // Content edits and removals never introduce a directory.
         assert!(!is_dir_adoption_kind(&EventKind::Modify(ModifyKind::Data(
             DataChange::Content
         ))));
@@ -3843,7 +3823,6 @@ mod tests {
             scan_dir_source_files(root, &root.join("newdir"), &filter, 3),
             DirScan::OverThreshold
         );
-        // One under the threshold still enumerates.
         assert!(matches!(
             scan_dir_source_files(root, &root.join("newdir"), &filter, 4),
             DirScan::Files(f) if f.len() == 3
@@ -3908,7 +3887,6 @@ mod tests {
 
         let mut expanded = expand_removed_prefixes(&config.db_path, &["foo".to_string()]).unwrap();
         expanded.sort();
-        // "foobar/c.rs" shares the byte prefix but not the path boundary.
         assert_eq!(
             expanded,
             vec!["foo/a.rs".to_string(), "foo/bar/b.rs".to_string()]
@@ -3938,9 +3916,6 @@ mod tests {
 
     #[test]
     fn handle_removals_expands_prefix_and_purges_descendants() {
-        // A directory moved out of the tree queues one prefix; the removal
-        // pass must resolve and purge every indexed row under it while
-        // sparing files that exist on disk (re-created after the move).
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join(".codesage")).unwrap();
@@ -3980,8 +3955,6 @@ mod tests {
         std::fs::create_dir_all(root.join(".codesage")).unwrap();
         let config = test_config(root);
 
-        // The lock is checked before any expansion, so a held lock defers
-        // the whole pass and the caller keeps the prefixes queued.
         let _held = hold_lock(root);
         assert_eq!(
             handle_removals(&config, &[], &["gone".to_string()]),
@@ -3996,9 +3969,6 @@ mod tests {
         std::fs::create_dir_all(root.join(".codesage")).unwrap();
         let config = test_config(root);
 
-        // "gone.rs" is absent on disk, so the purge path runs — against a
-        // reset (missing) index.db it must succeed as a no-op without
-        // resurrecting the database.
         assert_eq!(
             handle_removals(&config, &["gone.rs".to_string()], &[]),
             WorkOutcome::Done
@@ -4019,7 +3989,6 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
         assert_eq!(canonical_root(&link), std::fs::canonicalize(&real).unwrap());
-        // A vanished root falls back to the given spelling.
         let gone = tmp.path().join("gone");
         assert_eq!(canonical_root(&gone), gone);
     }

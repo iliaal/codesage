@@ -1,21 +1,6 @@
-//! The payload a serve-side caller can afford to assemble on every edit.
-//!
-//! Built for `cs-sweep-serve-dont-recommend-2l0`: two independent measurements
-//! found agents ignore retrieval *recommendations* (0.2% action rate across 502
-//! firings in one production replay), so the useful move is to serve a small
-//! answer rather than ask for a tool call. That only works if assembling it is
-//! nearly free and if saying nothing is the common case.
-//!
-//! What that rules out is most of the interesting data. `assess_risk` measured
-//! 464-675ms on real indexes because it walks import cycles and per-symbol
-//! reference counts, so nothing here calls it. `test_gap` is excluded on
-//! precision: its false-positive rate measured 15-25%.
-//!
-//! What survives is history- and convention-derived, which has a second
-//! property worth more than its cost: an unsaved edit cannot invalidate it.
-//! Churn, fix counts and co-change come from committed history; sibling tests
-//! come from naming conventions. That is why a stale index only annotates this
-//! payload instead of suppressing it.
+//! Per-edit context from committed history and test naming conventions.
+//! Avoid full risk analysis on this latency-sensitive path and test-gap claims
+//! with poor precision. Staleness annotates rather than suppresses history.
 
 use anyhow::Result;
 use codesage_protocol::EditBrief;
@@ -23,33 +8,16 @@ use codesage_storage::Database;
 
 use crate::git_history::{find_coupling, recommend_tests};
 
-/// Co-changed files carried into the brief. Past a handful this stops being a
-/// hint and starts being a list the reader skims, and it competes for context
-/// with whatever the agent was actually doing.
 const MAX_COUPLED: usize = 5;
 
-/// Tests named in the brief, for the same reason.
 const MAX_TESTS: usize = 5;
 
-/// Churn percentile below which a file is not worth mentioning on its own.
-/// A file nothing else recommends and that is not a hotspot produces silence.
 const CHURN_NOTABLE: f64 = 0.75;
 
-/// Commits a file needs before its churn rank is allowed to mean anything.
-///
-/// Churn percentile ranks a file against the rest of the repo, so the top
-/// quartile is occupied no matter how little has happened: on two real repos
-/// files with one and two commits ranked at the 90th percentile and above. The
-/// line this feeds reports a fix *ratio*, which carries no information over a
-/// handful of samples, and a false hotspot is exactly the noise that teaches an
-/// agent to stop reading an unrequested channel.
+// Percentiles can rank a one-commit file highly in a repository with little history.
 const MIN_COMMITS_FOR_CHURN: u32 = 5;
 
-/// Assemble the brief for `file_path` in one pass.
-///
-/// Returns a brief with `empty` set when there is nothing worth saying, which
-/// is the expected outcome for most files. Callers serving this unasked must
-/// emit nothing at all in that case rather than a "no findings" line.
+/// Callers serving unrequested context must emit nothing when `empty` is set.
 pub fn build_edit_brief(
     db: &Database,
     file_path: &str,
@@ -70,21 +38,8 @@ pub fn build_edit_brief(
     brief.coupled = coupling.coupled.into_iter().map(|c| c.file).collect();
 
     let recs = recommend_tests(db, std::slice::from_ref(&file_path.to_string()))?;
-    // Only sibling-convention matches, and only when the test is NAMED AFTER
-    // this file. Two separate reasons, both measured on real payloads:
-    //
-    // Rust's convention resolves to every integration test under
-    // `<crate>/tests/*.rs`, so it returns the same seven files for every source
-    // file in the crate. Serving that per edit would make `empty` unreachable in
-    // a Rust crate.
-    //
-    // `recs.coupled` is excluded outright. A co-changed test is a correlation,
-    // not a test OF this file, and the word "tests" claims the second thing.
-    // Reading the 67 distinct payloads this produces across three repos turned
-    // up `README.md -> tests: test_review_state.py`, `Cargo.toml ->
-    // tests: risk_test.rs`, `regression-tests.sh -> tests: impact_test.rs`.
-    // Nothing is lost by dropping them: a test that genuinely co-changes is
-    // already eligible for `coupled` below, which is the honest label for it.
+    // Crate-wide tests do not identify this source's tests. Co-change alone
+    // belongs under `coupled`, since it does not establish test coverage.
     brief.tests = recs
         .primary
         .into_iter()
@@ -104,13 +59,6 @@ pub fn build_edit_brief(
     Ok(brief)
 }
 
-/// True when `test_path`'s file name is derived from `source_path`'s, the
-/// relationship every sibling convention encodes: `Repository.php` ->
-/// `RepositoryTest.php`, `foo.ts` -> `foo.test.ts`, `foo.py` -> `test_foo.py`,
-/// `foo.go` -> `foo_test.go`.
-///
-/// A three-character floor keeps a short stem like `db` from matching most of
-/// the tree.
 fn test_names_source(test_path: &str, source_path: &str) -> bool {
     let stem = |p: &str| {
         p.rsplit('/')
@@ -122,6 +70,7 @@ fn test_names_source(test_path: &str, source_path: &str) -> bool {
             .to_lowercase()
     };
     let src = stem(source_path);
+    // Short stems such as `db` are too common to identify a source reliably.
     if src.chars().count() < 3 {
         return false;
     }
@@ -129,21 +78,10 @@ fn test_names_source(test_path: &str, source_path: &str) -> bool {
     if test_stem == src {
         return true;
     }
-    // Otherwise the stems must differ by exactly one known test affix —
-    // `test_`/`test-` prefix, `_test`/`-test`/`_spec`/`-spec` suffix, or the
-    // delimiter-less `Test`/`Tests`/`Spec` suffix (`RepositoryTest.php`). A
-    // bare substring check here lets `user` match `test_superuser_auth.py`;
-    // requiring a full-stem match after one affix strip keeps every real
-    // convention (`foo.test.ts`, `test_foo.py`, `foo_test.go`,
-    // `RepositoryTest.php`) while rejecting coincidental containment.
+    // Substring matching would let `user` claim `test_superuser_auth.py`.
     strip_one_test_affix(&test_stem).is_some_and(|stripped| stripped == src)
 }
 
-/// Remove a single leading or trailing test affix from a lowercased file
-/// stem (first dot-segment, so `foo.test.ts` arrives as `foo` and matches
-/// exactly). Multi-character affixes sort before their suffixes so
-/// `footests` loses `tests`, not `test`. Returns `None` when no affix
-/// applies.
 fn strip_one_test_affix(stem: &str) -> Option<&str> {
     for prefix in ["test_", "test-"] {
         if let Some(rest) = stem.strip_prefix(prefix) {
@@ -173,8 +111,6 @@ mod tests {
             assert!(test_names_source(test, src), "{test} should match {src}");
         }
 
-        // Rust integration tests are crate-level: the same list comes back for
-        // every source file in the crate, so none of them name their source.
         for test in [
             "crates/graph/tests/impact_test.rs",
             "crates/graph/tests/risk_test.rs",
@@ -185,16 +121,12 @@ mod tests {
             );
         }
 
-        // A stem too short to discriminate matches nothing.
         assert!(!test_names_source("tests/db_helper_test.rs", "src/db.rs"));
 
-        // Coincidental containment is not a sibling: `user` is inside
-        // `superuser`, but the stems differ by more than a test affix.
         assert!(!test_names_source(
             "tests/test_superuser_auth.py",
             "app/user.py"
         ));
-        // ...while a real affix relationship still matches.
         assert!(test_names_source("tests/user_test.py", "app/user.py"));
     }
 }

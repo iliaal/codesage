@@ -1,16 +1,5 @@
-//! Trust-boundary derivation engine.
-//!
-//! Given a file's already-extracted [`Reference`] list (or, equivalently, the
-//! same rows read back from the `refs` table) plus the file's language, return
-//! a sorted-deduped [`Vec<TrustBoundary>`] by matching every reference against
-//! the per-language rule table.
-//!
-//! The engine is **purely in-memory** for the derivation step — it takes
-//! `&[Reference]` directly so the indexer can derive boundaries from
-//! freshly-parsed refs without paying a round-trip to the DB. The
-//! [`store_for_file`] helper persists the result; [`derive_for_index`] runs
-//! the whole pipeline against an indexed DB and is the path used after
-//! incremental refresh hooks.
+//! Derive trust boundaries from parsed references without database access.
+//! Separate helpers persist results or re-derive them from indexed references.
 
 use std::collections::BTreeSet;
 
@@ -23,11 +12,9 @@ use crate::trust_boundary_rules::{TrustBoundaryRule, rule_matches, rules_for};
 /// Derive the set of trust boundaries crossed by a file from its parsed
 /// references. Sorted, deduped, language-aware (C++ inherits C rules).
 ///
-/// Only references with kinds that *can* signal a boundary contribute:
-/// `Import`, `Include`, `Call`, and `TypeHint`. `Inheritance`, `TraitUse`, and
-/// `Instantiation` produce no boundary signal in practice (Rust trait derives
-/// surface as `TraitUse` on totally innocuous traits like `Debug` and would
-/// pollute boundaries with no benefit).
+/// Uses `Import`, `Include`, `Call`, `TypeHint`, and Python `ImportBinding`
+/// references. Excludes inheritance and trait uses to avoid treating ordinary
+/// traits such as Rust's `Debug` as boundary signals.
 pub fn derive_from_refs(refs: &[Reference], language: Language) -> Vec<TrustBoundary> {
     let tables = rules_for(language);
     if tables.is_empty() {
@@ -48,11 +35,7 @@ pub fn derive_from_refs(refs: &[Reference], language: Language) -> Vec<TrustBoun
     acc.into_iter().collect()
 }
 
-/// Strip the angle-bracket / quote framing that the C parser preserves
-/// around `#include` directives. The parser records `<sys/socket.h>` and
-/// `"local.h"` verbatim; the rule patterns are written against the bare
-/// path, so without this normalization every C include-shaped rule
-/// silently misses on real source.
+/// C includes retain angle brackets or quotes; rules match the bare path.
 fn normalize_ref_name(name: &str, kind: ReferenceKind) -> String {
     if kind != ReferenceKind::Include {
         return name.to_string();
@@ -185,9 +168,6 @@ mod tests {
 
     #[test]
     fn c_include_strips_angle_brackets_and_quotes() {
-        // Regression: the C parser preserves `<...>` / `"..."` framing around
-        // includes; rules are written against the bare path. Without the
-        // strip, every C include rule misses silently.
         let refs = vec![
             inc("<sys/socket.h>"),
             inc("<curl/curl.h>"),
@@ -333,9 +313,6 @@ mod tests {
 
     #[test]
     fn inheritance_ref_kind_does_not_signal_boundary() {
-        // A Rust file `impl Default for Foo` would record a TraitUse on
-        // `Default`. That mustn't count toward boundaries; only Import /
-        // Include / Call / TypeHint do.
         let r = Reference {
             from_file: String::new(),
             from_symbol: None,

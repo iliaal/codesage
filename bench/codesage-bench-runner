@@ -64,11 +64,7 @@ try:
 except ImportError:
     sys.exit("pyyaml required: pip install pyyaml")
 
-# Optional. When present we report token-efficiency metrics (Semble-style:
-# expected tokens consumed before reaching the first relevant hit). When
-# absent we omit those columns and continue — cl100k_base is just one of
-# several reasonable token-counters and we don't want to hard-fail bench
-# runs over a missing dev dep.
+# Missing tiktoken disables token metrics, not retrieval scoring.
 try:
     import tiktoken
     _ENCODING = tiktoken.get_encoding("cl100k_base")
@@ -84,10 +80,6 @@ except ImportError:
 # pathological miss rate doesn't make the average meaningless.
 _MISS_TOKEN_PENALTY = 32_000
 
-
-# ---------------------------------------------------------------------------
-# Scorecard metadata collection
-# ---------------------------------------------------------------------------
 
 def _run(cmd: list[str], cwd: Path | None = None) -> str:
     try:
@@ -105,13 +97,7 @@ def project_head_sha(project_root: Path) -> str:
 
 
 def project_size(project_root: Path) -> tuple[int, int]:
-    """Return (file_count, total_lines) across tracked source extensions.
-
-    Intentionally conservative — we're shaping a public claim, not computing
-    a precise LoC. Matches what `cloc` or `wc` would produce on a tracked
-    subset, minus binary and generated noise. If git is unavailable, returns
-    (0, 0) and the header simply omits the size.
-    """
+    """Count tracked source files and lines; return (0, 0) without Git output."""
     files = _run(["git", "ls-files"], cwd=project_root)
     if not files:
         return 0, 0
@@ -133,8 +119,6 @@ def project_size(project_root: Path) -> tuple[int, int]:
             if not p.is_file():
                 continue
             with p.open("rb") as f:
-                # Count newline bytes — faster than decoding and close enough
-                # for a scorecard header.
                 line_count += sum(1 for _ in f)
             file_count += 1
         except OSError:
@@ -147,9 +131,7 @@ def codesage_config(project_root: Path) -> dict:
     cfg = project_root / ".codesage" / "config.toml"
     if not cfg.is_file():
         return {}
-    # Minimal TOML subset parser for the keys we need — avoid adding a
-    # dependency to the bench script. Handles `key = "value"` under section
-    # headers, ignores comments.
+    # Only simple section/key values are supported, avoiding another dependency.
     out: dict[str, dict[str, str]] = {}
     section = ""
     try:
@@ -172,10 +154,6 @@ def codesage_config(project_root: Path) -> dict:
 def now_iso_utc() -> str:
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-
-# ---------------------------------------------------------------------------
-# Retrieval runner (unchanged core logic)
-# ---------------------------------------------------------------------------
 
 def run_codesage_search(
     codesage_bin: str, project_root: Path, query: str, limit: int
@@ -330,8 +308,6 @@ def score_case(
         hits = len(topk & expected_set)
         recalls[k] = hits / len(expected_set) if expected_set else 0.0
 
-    # Misses are charged a fixed budget so the average isn't dominated by a
-    # single un-bounded outlier (matches Semble's methodology).
     if first_rank is None:
         tokens_to_first_hit = _MISS_TOKEN_PENALTY
 
@@ -343,10 +319,6 @@ def score_case(
         "returned_count": len(returned),
     }
 
-
-# ---------------------------------------------------------------------------
-# Scorecard formatter
-# ---------------------------------------------------------------------------
 
 def format_size(file_count: int, line_count: int) -> str:
     if file_count == 0:
@@ -373,12 +345,7 @@ def format_header(
     split_str: str = "",
     refs_mode_cases: int = 0,
 ) -> list[str]:
-    """Build the "named everything" header.
-
-    If a line here is missing (`unknown`, `not configured`), that is itself
-    information — the template shows exactly which fact is absent instead
-    of hiding it behind a vague claim.
-    """
+    """Show unavailable provenance explicitly rather than omitting it."""
     lines: list[str] = []
     lines.append("# CodeSage retrieval scorecard")
     lines.append("")
@@ -500,8 +467,6 @@ def main() -> int:
         print(f"[split] {args.split}: {len(cases)} of {total} cases (salt={args.salt!r})",
               file=sys.stderr)
     if not cases:
-        # "hits 100% of 0 cases" is not a result; an empty corpus or an empty
-        # split must fail loudly rather than feed a scorecard or an ablation.
         why = f" (--split {args.split}, salt {args.salt!r})" if args.split is not None else ""
         print(f"corpus {args.corpus}: no cases to run{why}", file=sys.stderr)
         return 2
@@ -510,10 +475,7 @@ def main() -> int:
         sys.exit(f"project_root does not exist: {project_root}")
 
     if args.results_json is not None:
-        # Fail on an unwritable path now, not after an hour of searches. Runs
-        # only after the corpus validated, so a rejected corpus leaves no
-        # directories behind; probe a sibling so a finished result file that
-        # happens to live at --results-json is never clobbered.
+        # Probe before expensive searches without clobbering an existing result.
         try:
             args.results_json.parent.mkdir(parents=True, exist_ok=True)
             fd, probe = tempfile.mkstemp(dir=args.results_json.parent,
@@ -523,7 +485,6 @@ def main() -> int:
         except OSError as e:
             sys.exit(f"--results-json {args.results_json} is not writable: {e}")
 
-    # --- Metadata collection ---
     cs_info = codesage_version_info(args.codesage_bin, cwd=project_root)
     cs_version = cs_info["version"]
     head_sha = project_head_sha(project_root)
@@ -534,7 +495,6 @@ def main() -> int:
     embedding_model = emb_section.get("model", "unknown")
     embedding_device = emb_section.get("device", "")
     reranker = emb_section.get("reranker", "none")
-    # Dim isn't in config; leave blank and let the header format gracefully.
     embedding_dim = emb_section.get("dimensions", "")
     run_ts = now_iso_utc()
     results_meta = {
@@ -554,10 +514,8 @@ def main() -> int:
         "limit": args.limit,
     }
     if args.results_json is not None:
-        # First real write: corpus and project_root are validated by now.
         write_results_json(args.results_json, results_meta, [], project_root, complete=False)
 
-    # --- Run cases ---
     results = []
     for case in cases:
         cid = case["id"]
@@ -586,7 +544,6 @@ def main() -> int:
             print(f"  expected: {expected}", file=sys.stderr)
             print(f"  returned[:5]: {returned[:5]}", file=sys.stderr)
 
-    # --- Emit scorecard ---
     split_str = f" (split {args.split}, salt {args.salt})" if args.split is not None else ""
     header = format_header(
         split_str=split_str,

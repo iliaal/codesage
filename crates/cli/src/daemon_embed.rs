@@ -1,12 +1,5 @@
-//! CLI-side client for the daemon's hidden `embed_texts` tool.
-//!
-//! Every process that constructs an [`codesage_embed::model::Embedder`] on a
-//! GPU device creates its own CUDA context and loads the model onto the card
-//! (~2.3 GB VRAM, ~950 MB host RSS per process, freed only when the session
-//! drops). When a daemon spawned from this same binary is already running, it
-//! holds that session, so `index` and `search` ask it to embed instead of
-//! bringing up a second one. The daemon is never started from here: a CLI run
-//! that finds none embeds privately.
+//! Reuse the running daemon's embedding session to avoid duplicate model memory.
+//! If no matching daemon is running, the CLI embeds privately without starting one.
 
 use std::path::Path;
 use std::time::Duration;
@@ -23,18 +16,11 @@ use crate::mcp::{
     MAX_MCP_EMBED_TEXTS, MAX_MCP_EMBED_TOTAL_BYTES,
 };
 
-/// Constructor for the private embedder a [`DaemonEmbedder`] falls back to
-/// when the daemon refuses a request over its caps.
 type PrivateEmbedderInit = Box<dyn FnOnce() -> Result<Box<dyn TextEmbedder>> + Send>;
 
-/// Handshake plus the model/dimension probe. A daemon whose model is not yet
-/// resident loads it inside this window, so it is sized for a cold load from
-/// disk, not for a round trip.
+/// Allow a cold model load during the handshake and dimension probe.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
-/// One daemon-side batch of chunks, embedded on whatever device the daemon
-/// runs. Sized for a single batch — not the whole pass — so one wedged batch
-/// fails over to the private fallback below (per batch) instead of pinning
-/// the pass under the index lock for ten minutes.
+/// Bound each batch so a wedged daemon cannot indefinitely hold the index lock.
 const EMBED_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(crate) struct DaemonEmbedder {
@@ -43,28 +29,18 @@ pub(crate) struct DaemonEmbedder {
     project: String,
     model: String,
     dim: usize,
-    /// The semantic fingerprint the daemon reported at the probe: the
-    /// identity of the vectors its session produces.
+    /// Vector identity reported by the daemon's probe.
     daemon_fingerprint: String,
-    /// The fingerprint the pass attests under, once bound. Sent with every
-    /// embed request so the daemon refuses the moment its own moves, and
-    /// bound to the private fallback before it embeds a text.
+    /// Bind every daemon request and private fallback to the pass's attested identity.
     expected_fingerprint: Option<codesage_graph::SemanticFingerprint>,
-    /// Private-embedder fallback for texts the daemon refuses as over cap
-    /// — a single text past the per-text byte cap, or a refusal from a
-    /// daemon of another build with tighter caps. Constructed on first use.
+    /// Lazily constructed fallback for oversized texts and daemon failures.
     private_init: Option<PrivateEmbedderInit>,
     private: Option<Box<dyn TextEmbedder>>,
 }
 
 impl DaemonEmbedder {
-    /// Borrow the running daemon's session for `model`, or `None` when no
-    /// daemon spawned from this binary answers, the project root is not
-    /// UTF-8 (the tool takes a string path), or the daemon cannot serve this
-    /// model. Every refusal is logged and falls back to a private embedder.
-    ///
-    /// `config` also seeds the private fallback used for texts the daemon
-    /// refuses as over its byte caps.
+    /// Borrow an existing daemon session; failed connections select private embedding.
+    /// `config` also seeds the fallback for oversized texts and failed batches.
     pub(crate) fn connect(
         root: &Path,
         config: &codesage_embed::config::EmbeddingConfig,
@@ -156,20 +132,16 @@ impl DaemonEmbedder {
         &self.daemon_fingerprint
     }
 
-    /// Dimension the daemon's session produces for this model.
     pub(crate) fn dim(&self) -> usize {
         self.dim
     }
 
-    /// Install the constructor for the private embedder used when the
-    /// daemon refuses a request as over cap. Without one, such a refusal is
-    /// an error.
+    /// Configure lazy fallback; without it, refused or failed batches are errors.
     pub(crate) fn with_private_fallback(mut self, init: PrivateEmbedderInit) -> Self {
         self.private_init = Some(init);
         self
     }
 
-    /// Whether the private fallback has been constructed.
     #[cfg(test)]
     fn private_loaded(&self) -> bool {
         self.private.is_some()
@@ -180,9 +152,7 @@ impl DaemonEmbedder {
             let init = self.private_init.take().with_context(|| {
                 format!("{why}, and no private embedder is configured to fall back to")
             })?;
-            // The private session must produce the same identity the pass
-            // attests; one that does not is an error here, never a batch
-            // embedded under a third identity.
+            // Fallback must preserve the pass's attested identity.
             let expected = self
                 .expected_fingerprint
                 .as_ref()
@@ -260,15 +230,11 @@ impl DaemonEmbedder {
     }
 }
 
-/// Whether a daemon error is a cap refusal rather than a failure: the
-/// request was well-formed but too large for that daemon.
 fn is_over_cap_refusal(err: &anyhow::Error) -> bool {
     format!("{err:#}").contains(EMBED_TEXTS_OVER_CAP)
 }
 
-/// Whether a daemon error says the daemon's fingerprint is not the one this
-/// pass attests under. Never a fallback case: a private session would embed
-/// under yet another identity.
+/// Fingerprint mismatches cannot fall back to a different vector identity.
 fn is_fingerprint_refusal(err: &anyhow::Error) -> bool {
     format!("{err:#}").contains(EMBED_TEXTS_FINGERPRINT_MISMATCH)
 }
@@ -305,10 +271,8 @@ fn plan_embed_batches(
 }
 
 impl TextEmbedder for DaemonEmbedder {
-    /// Refuse a daemon whose session does not produce `expected`: same model
-    /// name and dimension, but a pooling, device, or model-file change on
-    /// the daemon's side. Nothing is embedded privately in its place — the
-    /// pass aborts unattested, and the user re-runs once the two agree.
+    /// Model name and dimension alone cannot establish vector compatibility.
+    /// Refuse mismatched fingerprints without constructing a fallback.
     fn bind_fingerprint(&mut self, expected: &codesage_graph::SemanticFingerprint) -> Result<()> {
         ensure!(
             self.daemon_fingerprint == expected.as_str(),
@@ -359,23 +323,15 @@ impl TextEmbedder for DaemonEmbedder {
                     }
                     result.embeddings
                 }
-                // The daemon's fingerprint moved mid-pass: abort, and never
-                // embed the batch privately under a third identity.
                 Err(e) if is_fingerprint_refusal(&e) => {
                     return Err(e.context("daemon semantic fingerprint moved during the pass"));
                 }
-                // A daemon of another build may hold tighter caps than this
-                // binary planned for; its refusal is not a failure of the run.
+                // A different daemon build may enforce tighter caps than the client.
                 Err(e) if is_over_cap_refusal(&e) => self.private_embed(
                     &chunk,
                     &format!("daemon refused a batch as over cap ({e:#})"),
                 )?,
-                // Any other daemon failure (timeout, dropped connection) is
-                // scoped to this batch: embed it privately under the same
-                // attested fingerprint and try the daemon again on the next
-                // batch, so one slow batch cannot abort the whole pass while
-                // the index lock is held. Without a fallback configured this
-                // is still an error, naming the batch it failed on.
+                // Fall back for this batch only, preserving its fingerprint; retry the daemon next batch.
                 Err(e) => self.private_embed(
                     &chunk,
                     &format!(
@@ -410,10 +366,7 @@ impl TextEmbedder for DaemonEmbedder {
 
 impl Drop for DaemonEmbedder {
     fn drop(&mut self) {
-        // Best effort: tell the daemon this client is gone so its per-client
-        // task ends now rather than at the idle ceiling. `main` leaves via
-        // `_exit`, so on the normal path this runs only when the embedder is
-        // dropped before then.
+        // Cancel while still alive; normal `_exit` bypasses this destructor.
         self.client.cancellation_token().cancel();
     }
 }
@@ -432,26 +385,18 @@ pub(crate) mod tests {
 
     use super::*;
 
-    /// A stand-in daemon: answers `embed_texts` with `dim`-wide vectors whose
-    /// first component is the text's length, records the model it was asked
-    /// for, and refuses any other model.
+    /// Socket fixture: returns text length as the first vector component.
     #[derive(Clone)]
     pub(crate) struct FakeDaemon {
         pub(crate) dim: usize,
         pub(crate) model: String,
-        /// When set, fail the next non-empty request with a generic (non-cap,
-        /// non-fingerprint) error before serving normally again. Exercises the
-        /// batch-scoped fallback: one bad batch must not abort the pass.
+        /// One generic failure before normal service resumes.
         pub(crate) fail_next: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        /// Refuse any text longer than this with the shared over-cap prefix,
-        /// as a daemon of another build with tighter caps would.
+        /// Simulate a daemon build with tighter caps than the client.
         pub(crate) text_cap: Option<usize>,
-        /// The fingerprint this daemon's session produces, reported at the
-        /// probe and required on every non-empty request.
+        /// Probe identity, required on every non-empty request.
         pub(crate) fingerprint: String,
-        /// When set, the fingerprint the session produces from the first
-        /// non-empty request on: a same-model config change landing on the
-        /// daemon between the probe and a later batch.
+        /// Simulate a config change between the probe and first batch.
         pub(crate) fingerprint_after_probe: Option<String>,
         /// Texts embedded so far, across every accepted non-empty request.
         pub(crate) embedded: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -515,9 +460,7 @@ pub(crate) mod tests {
                     .fail_next
                     .swap(false, std::sync::atomic::Ordering::SeqCst)
             {
-                // A generic failure: deliberately free of both the over-cap
-                // and fingerprint markers, so the client must take the
-                // batch-scoped fallback path.
+                // Omit cap/fingerprint markers to exercise generic fallback.
                 return Ok(CallToolResult::error(vec![ContentBlock::text(
                     "boom: simulated transient daemon failure".to_string(),
                 )])
@@ -574,8 +517,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Serve `daemon` on a fresh socket under a tempdir until the returned
-    /// guard drops.
     pub(crate) fn spawn_fake(
         daemon: FakeDaemon,
     ) -> (tempfile::TempDir, PathBuf, std::thread::JoinHandle<()>) {
@@ -590,7 +531,6 @@ pub(crate) mod tests {
             rt.block_on(async move {
                 listener.set_nonblocking(true).unwrap();
                 let listener = tokio::net::UnixListener::from_std(listener).unwrap();
-                // One client per test; exit once it hangs up.
                 let (stream, _) = listener.accept().await.unwrap();
                 let service = daemon.serve(stream).await.unwrap();
                 let _ = service.waiting().await;
@@ -629,11 +569,7 @@ pub(crate) mod tests {
         handle.join().unwrap();
     }
 
-    /// Private stand-in: `dim`-wide vectors whose first component is -1 so a
-    /// test can tell which side produced each vector. Records every
-    /// fingerprint bound to it and, when `produces` is set, refuses any
-    /// other one the way [`codesage_embed::model::Embedder`] refuses a
-    /// provider it does not run on.
+    /// Private fixture: -1 distinguishes fallback vectors from daemon results.
     struct FakePrivate {
         dim: usize,
         produces: Option<codesage_graph::SemanticFingerprint>,
@@ -686,7 +622,6 @@ pub(crate) mod tests {
 
     #[test]
     fn plan_embed_batches_splits_on_count_and_bytes_and_sets_oversize_aside() {
-        // per-text 10, total 24, count 3.
         let (batches, oversize) = plan_embed_batches(&[5, 5, 5, 5, 11, 10, 10, 10, 1], 10, 24, 3);
         assert_eq!(
             oversize,
@@ -700,7 +635,6 @@ pub(crate) mod tests {
         );
         let (batches, oversize) = plan_embed_batches(&[], 10, 25, 3);
         assert!(batches.is_empty() && oversize.is_empty());
-        // A single text exactly at the cap is sent, one byte over is not.
         let (batches, oversize) = plan_embed_batches(&[10, 11], 10, 25, 3);
         assert_eq!((batches, oversize), (vec![vec![0]], vec![1]));
     }
@@ -731,8 +665,6 @@ pub(crate) mod tests {
 
     #[test]
     fn a_daemon_cap_refusal_falls_back_to_the_private_embedder() {
-        // The daemon (another build) refuses texts over 3 bytes; this
-        // client's own caps are wider, so the refusal arrives at call time.
         let (_dir, socket, handle) = spawn_fake(FakeDaemon {
             text_cap: Some(3),
             ..FakeDaemon::new(4, "m")
@@ -771,8 +703,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_daemon_producing_another_fingerprint_is_refused_at_bind_without_a_private_fallback() {
-        // Same model name, same dimension, pooling the other way: the probe
-        // passes the model check and the bind must still refuse.
+        // Only pooling differs; model and dimension checks must not suffice.
         let (_dir, socket, handle) = spawn_fake(FakeDaemon {
             fingerprint: fp_b().as_str().to_string(),
             ..FakeDaemon::new(4, "m")
@@ -790,8 +721,6 @@ pub(crate) mod tests {
                 "{err}"
             );
             assert!(!client.private_loaded(), "no private embedder stands in");
-            // Embedding without a successful bind never reaches the daemon
-            // or the fallback either.
             let err = format!("{:#}", client.embed_batch(&["ab"]).unwrap_err());
             assert!(err.contains(EMBED_TEXTS_FINGERPRINT_MISMATCH), "{err}");
             assert!(!client.private_loaded());
@@ -801,9 +730,6 @@ pub(crate) mod tests {
 
     #[test]
     fn a_fingerprint_that_moves_mid_pass_aborts_the_batch_without_a_private_fallback() {
-        // The probe and the bind agree on A; the daemon's config changes
-        // under the same model name before the next batch and its session
-        // now produces B. The batch must fail, not be embedded elsewhere.
         let (_dir, socket, handle) = spawn_fake(FakeDaemon {
             fingerprint_after_probe: Some(fp_b().as_str().to_string()),
             ..FakeDaemon::new(4, "m")
@@ -857,8 +783,6 @@ pub(crate) mod tests {
 
     #[test]
     fn a_private_fallback_producing_another_fingerprint_is_an_error_not_a_silent_embed() {
-        // The daemon refuses the batch as over cap; the private session
-        // this process would build produces B while the pass attests A.
         let (_dir, socket, handle) = spawn_fake(FakeDaemon {
             text_cap: Some(3),
             ..FakeDaemon::new(4, "m")
@@ -891,7 +815,6 @@ pub(crate) mod tests {
                 0,
                 "no text reached the mismatched private session"
             );
-            // The oversize route is refused the same way.
             let big = "x".repeat(MAX_MCP_EMBED_TEXT_BYTES + 1);
             let err = format!("{:#}", client.embed_batch(&[big.as_str()]).unwrap_err());
             assert!(err.contains("no private embedder is configured"), "{err}");
@@ -924,12 +847,9 @@ pub(crate) mod tests {
                     Ok(Box::new(FakePrivate::new(4)) as Box<dyn TextEmbedder>)
                 }));
             client.bind_fingerprint(&fp_a()).unwrap();
-            // First batch hits the transient failure: embedded privately in
-            // place (-1.0 marker) instead of aborting the pass.
             let out = client.embed_batch(&["ab"]).unwrap();
             assert_eq!(out[0][0], -1.0, "failed batch falls back privately");
             assert!(client.private_loaded());
-            // The next batch retries the daemon first and succeeds there.
             let out = client.embed_batch(&["abcd"]).unwrap();
             assert_eq!(out[0][0], 4.0, "daemon is re-probed on the next batch");
         }

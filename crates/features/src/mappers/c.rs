@@ -1,8 +1,6 @@
 //! C / C++ mapper: detects `main()` functions via tree-sitter, plus
 //! `bin_PROGRAMS` + `lib_LTLIBRARIES` from autotools `Makefile.am` and
-//! `add_executable` + `add_library` from CMake. Headers in `include/` and
-//! sibling `*.h` files get pulled into the corresponding library feature
-//! as context.
+//! `add_executable` + `add_library` from CMake.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -28,7 +26,6 @@ impl FeatureMapper for CCppMapper {
     }
     fn map(&self, ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
         let root = ctx.root;
-        // Skip work if the repo has no C/C++ files at all.
         let files: Vec<String> = walk_files(root, root, 50_000, ctx.excludes)
             .into_iter()
             .filter(|p| is_c_or_cpp_source(p) || is_makefile(p) || is_cmake(p))
@@ -39,10 +36,7 @@ impl FeatureMapper for CCppMapper {
         let mut seeds: Vec<FeatureSeed> = Vec::new();
         seeds.extend(autotools_targets(ctx, &files)?);
         seeds.extend(cmake_targets(ctx, &files)?);
-        // Build-target seeds win over generic main() detection: skip
-        // main()-anchored seeds for paths a CMake/autotools target
-        // already claims, otherwise the same binary shows up twice with
-        // different `source` tags.
+        // Build-target seeds take precedence over generic main() detection.
         let already_seeded_paths: BTreeSet<String> = seeds
             .iter()
             .filter(|s| s.kind == FeatureKind::CliCommand)
@@ -89,7 +83,7 @@ fn is_cuda_source(rel: &str) -> bool {
 /// neutral target name) only flips the classification when *all*
 /// compilable sources are test-shaped: a single helper file named
 /// `test_mode.c` inside a regular binary's source list should not turn
-/// `app` into a test suite. Mirrors clawpatch commit de82d0a.
+/// `app` into a test suite.
 fn is_cmake_test_executable(name: &str, sources: &[String]) -> bool {
     let lower = name.to_ascii_lowercase();
     let ends_in_tests = lower == "test"
@@ -111,14 +105,8 @@ fn is_cmake_test_executable(name: &str, sources: &[String]) -> bool {
     compilable.iter().all(|s| is_c_or_cpp_test_path(s))
 }
 
-/// Find the most recent `project(<name> ...)` declaration in a CMake body.
-/// Returns the project name when found. CMake semantics: `${PROJECT_NAME}`
-/// references the most recent `project()` call in scope; we model "in
-/// scope" coarsely as "anywhere earlier in the same CMakeLists.txt." If
-/// no `project()` call appears or the captured name isn't a valid
-/// identifier, returns `None` and the caller leaves `${PROJECT_NAME}`
-/// unresolved (the target will be skipped by `is_valid_target_name`,
-/// preserving the prior behavior). Mirrors clawpatch commit 8550604.
+/// Return the last valid project name in the file. This approximation ignores
+/// CMake scopes and declaration order relative to each target.
 fn cmake_project_name(body: &str) -> Option<String> {
     let mut name = None;
     for args in cmake_command_args(body, "project") {
@@ -148,17 +136,9 @@ fn resolve_cmake_target_name(raw: &str, project_name: Option<&str>) -> String {
 
 /// Expand Automake source-directory variables in a path.
 ///
-/// Returns a path *relative to the makefile's own directory*, because the
-/// downstream `filter_target_sources` applies `prefix_dir(makefile_dir,
-/// ...)` to every source. `$(srcdir)` and `${srcdir}` reference the
-/// makefile's own directory and are therefore stripped to the empty
-/// prefix; `$(top_srcdir)` / `${top_srcdir}` / `$(top_builddir)` /
-/// `${top_builddir}` reference the project root and are left verbatim
-/// (handling them correctly would require subtracting the makefile-dir
-/// prefix that gets re-added downstream — a normalization pass that's
-/// not worth building until a real user case surfaces). Other variables
-/// (`$(SOMETHING_USER_DEFINED)`) are left verbatim. Mirrors clawpatch
-/// commit 39a2545.
+/// Paths remain relative to the makefile directory, which filter_target_sources
+/// prefixes later. Root-relative top_srcdir/top_builddir and unknown variables
+/// remain unresolved; stripping them would resolve against the wrong directory.
 fn expand_automake_vars(source: &str, _makefile_dir: &str) -> String {
     let mut result = source.to_string();
     for var in ["$(srcdir)/", "${srcdir}/"] {
@@ -229,7 +209,6 @@ fn autotools_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<Featur
             .ok()
             .flatten()
             .unwrap_or_default();
-        // Join continuation lines (autoconf uses trailing backslashes).
         let body = collapse_backslash_continuations(&body);
         let dir = parent_dir(mf);
         for cap in bin_re.captures_iter(&body) {
@@ -353,18 +332,7 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
     if cmake_files.is_empty() {
         return Ok(out);
     }
-    // CMake parsing uses an explicit walker (`cmake_command_args` + friends)
-    // rather than regexes. Two reasons: (a) the previous `[^)]*` source-list
-    // capture truncated targets whose quoted args contained `)` (common with
-    // generator expressions like `$<$<CONFIG:Debug>:debug.c>`); (b) the
-    // walker skips `command(...)` text inside quoted strings and bracket
-    // arguments, so `message("add_executable(fake)")` no longer leaks a
-    // spurious feature. Ported from clawpatch commit 162a6fe.
-    //
-    // Target name shape (`[A-Za-z0-9_.\-]+` with no leading `$` / `\\` / `(`
-    // / `=` / `#`) and the case-insensitivity of CMake command names are
-    // enforced by `is_valid_target_name` and `cmake_command_args` rather
-    // than by a regex.
+    // String-aware walking ignores quoted command text and parentheses in paths.
     for cm in cmake_files {
         let path = root.join(cm);
         let raw = read_to_string_bounded(&path)
@@ -373,13 +341,6 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
             .unwrap_or_default();
         let body = strip_cmake_comments(&raw);
         let dir = parent_dir(cm);
-        // Resolve `${PROJECT_NAME}` references in target declarations against
-        // the most recent `project()` call. CMake's variable model is much
-        // richer than this, but `${PROJECT_NAME}` is the one form common
-        // enough in handwritten CMake that not handling it produces phantom
-        // gaps (`add_executable(${PROJECT_NAME} ...)` was being skipped
-        // because the literal `${PROJECT_NAME}` failed `is_valid_target_name`).
-        // Clawpatch commit 8550604.
         let project_name = cmake_project_name(&body);
 
         // Collect late-bound `target_sources(name [PRIVATE|PUBLIC|INTERFACE] …)`
@@ -457,12 +418,6 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
                 continue;
             }
             let context_files = filter_target_context(ctx, cm, "CMake target declaration");
-            // Test-target classification: name ending in `tests?` (with
-            // optional separator) or any source under a test path means
-            // this `add_executable` is a test harness, not a shippable
-            // CLI. Emit one `cmake-test` test-suite seed in that case so
-            // `recommend_tests` and PR-level risk views pick it up
-            // correctly; otherwise emit the regular `cmake-bin` cli seed.
             if is_cmake_test_executable(&name, &all_sources) {
                 let test_paths: Vec<&SeedFile> = owned_files
                     .iter()
@@ -608,22 +563,13 @@ fn main_function_targets(
         if !ctx.allowed(rel) {
             continue;
         }
-        // Test files routinely define their own `main()` (custom harnesses,
-        // googletest with --gtest_main, etc.). Without this guard the c-main
-        // walker emits `C++ binary foo_test` slices that swamp legitimate
-        // CLIs whenever the project's exclude_patterns don't already cover
-        // tests/. Uses the broad canonical shape: for an exclusion scan a
-        // rare false positive (a real CLI named `test_tool.c`) is cheaper
-        // than test harnesses flooding the feature list.
+        // Test harnesses define main() too. Prefer suppressing a test-shaped CLI
+        // over flooding feature lists with harness binaries.
         if is_c_or_cpp_test_path(rel) {
             continue;
         }
         let abs = root.join(rel);
-        // Size-gate BEFORE reading (the old shape read the whole file and
-        // then discarded it, allocating multi-MB buffers for generated
-        // sources). Bytes, not read_to_string_bounded: C sources are
-        // routinely non-UTF-8 (Latin-1 comments) and tree-sitter parses
-        // raw bytes fine.
+        // Gate allocations before reading; raw bytes allow non-UTF-8 C comments.
         if !fs::metadata(&abs).is_ok_and(|m| m.len() <= 2_000_000) {
             continue; // skip huge generated sources
         }
@@ -671,7 +617,7 @@ fn main_function_targets(
 }
 
 fn file_defines_main(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
-    // Walk one level deep — `main` is always a top-level function_definition.
+    // Only direct top-level definitions qualify.
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() != "function_definition" {
@@ -723,8 +669,7 @@ fn read_target_sources(body: &str, name: &str, template: &str) -> Vec<String> {
 }
 
 fn pick_entry(root: &Path, dir: &str, candidates: &[String], target_name: &str) -> Option<String> {
-    // Prefer a candidate that defines main(). Fall back to first candidate
-    // matching the target name or a "main.c" / "main.cpp".
+    // Rank by filename, without parsing candidate bodies.
     if candidates.is_empty() {
         return None;
     }
@@ -805,34 +750,14 @@ fn is_valid_target_name(s: &str) -> bool {
         && !s.contains('#')
 }
 
-/// Sources that the regex layer can extract but the rest of the mapper
-/// can't safely use: variable substitutions (`${APP_SOURCES}`) and
-/// absolute paths (`/src/main.cpp`). Targets containing either get
-/// skipped entirely — emitting them with the unsubstituted string would
-/// produce phantom `owned_files` entries.
+/// Unresolved variables and absolute paths cannot produce reliable owned-file refs.
 fn is_pathological_source(s: &str) -> bool {
     s.contains('$') || s.starts_with('/')
 }
 
-/// Remove CMake bracket comments (`#[[ ... ]]`, `#[=[ ... ]=]` with any
-/// equals count) and `# ...` line comments. Order matters: bracket
-/// comments must be detected first so the `#` opener isn't consumed by
-/// the line-comment branch. Newlines inside bracket comments are
-/// preserved so the line layout isn't compressed.
-///
-/// Quoted strings (`"..."`) and bracket arguments (`[[...]]`) are copied
-/// through verbatim so a `#` inside a string literal — `set(H "sha#abc")`,
-/// `project(x DESCRIPTION "C# bindings")` — is not mistaken for a line
-/// comment. Without this the cut left a dangling `"` that made the
-/// downstream command walker swallow to the next quote, dropping later
-/// `add_executable` / `add_library` targets.
-///
-/// The walk is driven by byte indices because the bracket-close marker
-/// (`]=*]`, `\n`, `#`, `[`) is pure ASCII and so can never match inside
-/// a UTF-8 continuation byte (continuation bytes are 0x80..=0xBF). Non-
-/// comment runs are copied through as whole `char`s so multibyte
-/// scalars round-trip — copying byte-by-byte via `b as char` produced
-/// mojibake on any non-ASCII identifier or path in `CMakeLists.txt`.
+/// Remove bracket and line comments while preserving newlines and string contents.
+/// Bracket comments must be checked before line comments consume their `#` opener.
+/// ASCII delimiters cannot match UTF-8 continuation bytes; copy other text as scalars.
 fn strip_cmake_comments(body: &str) -> String {
     let bytes = body.as_bytes();
     let mut out = String::with_capacity(bytes.len());
@@ -864,9 +789,7 @@ fn strip_cmake_comments(body: &str) -> String {
                 }
             }
         }
-        // Copy string-like spans (quoted strings and bracket arguments)
-        // through untouched. Both `cmake_skip_string_like` and `i` sit on
-        // char boundaries, so slicing `body[i..j]` never splits a scalar.
+        // Both indices are character boundaries, including for bracket arguments.
         if let Some(j) = cmake_skip_string_like(bytes, i) {
             out.push_str(&body[i..j]);
             i = j;
@@ -878,9 +801,6 @@ fn strip_cmake_comments(body: &str) -> String {
             }
             continue;
         }
-        // Copy one Unicode scalar verbatim. For ASCII this is one byte;
-        // for multibyte sequences we slice on the char boundary and
-        // append the full scalar, never `byte as char`.
         let ch = body[i..].chars().next().expect("byte index inside body");
         let width = ch.len_utf8();
         out.push(ch);
@@ -919,9 +839,7 @@ fn cmake_command_args(body: &str, command: &str) -> Vec<String> {
                 && bytes[open] == b'('
                 && let Some(close) = cmake_find_close_paren(bytes, open)
             {
-                // open+1 and close are both ASCII byte positions so
-                // slicing the str at those indices stays on char
-                // boundaries.
+                // ASCII delimiters guarantee character boundaries.
                 out.push(body[open + 1..close].to_string());
                 i = close + 1;
                 continue;
@@ -1057,9 +975,7 @@ fn cmake_split_args(args: &str) -> Vec<String> {
             continue;
         }
         if let Some(end) = cmake_bracket_end(bytes, i) {
-            // Recompute the opener length (`[`, `=*`, `[`) to know where
-            // the content starts and the closer length to know where it
-            // ends. Bracket-arg content is raw — no escape processing.
+            // Bracket arguments have equal-length delimiters and no escape processing.
             let mut k = i + 1;
             while bytes.get(k) == Some(&b'=') {
                 k += 1;
@@ -1090,11 +1006,7 @@ fn cmake_split_args(args: &str) -> Vec<String> {
     out
 }
 
-/// `\X` → `X` for any single character. CMake's quoted-string rules
-/// allow `\\`, `\"`, `\n`, etc. — we don't expand the special letter
-/// escapes (we keep `\n` as a literal `n`) because the only thing this
-/// mapper does with the result is path resolution, where preserving the
-/// literal beats interpreting it.
+/// Simplified path unescaping: `\X` becomes `X`, including `\n` becoming `n`.
 fn unescape_cmake_quoted(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
@@ -1129,14 +1041,7 @@ fn strip_target_sources_scope(words: &mut Vec<String>) {
     });
 }
 
-/// Drop the `add_executable` / `add_library` option keywords that sit between
-/// the target name (and library type) and the source list: `WIN32` and
-/// `MACOSX_BUNDLE` (executables) and `EXCLUDE_FROM_ALL` (both). Without this
-/// they leak into `owned_files` as phantom paths like `<dir>/WIN32`. Sibling of
-/// [`strip_target_sources_scope`] on the executable/library axis. `WIN32` /
-/// `MACOSX_BUNDLE` never legally appear in `add_library`, so stripping them
-/// there is a harmless no-op on real input (a source named exactly `WIN32` with
-/// no extension isn't a compilable file).
+/// Prevent executable/library option keywords from becoming owned-file paths.
 fn strip_cmake_target_options(words: &mut Vec<String>) {
     words.retain(|word| {
         let kw = word.to_ascii_uppercase();
@@ -1272,9 +1177,6 @@ mod tests {
 
     #[test]
     fn cmake_bin_with_main_function_emits_single_feature() {
-        // A binary declared in CMakeLists.txt that also contains `int main()`
-        // must produce exactly one cli-command seed — the build-target
-        // one — not duplicates under both `cmake-bin` and `c-main`.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -1303,7 +1205,6 @@ mod tests {
 
     #[test]
     fn autotools_bin_with_main_function_emits_single_feature() {
-        // Same dedup contract as the CMake test, anchored on Makefile.am.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -1327,12 +1228,8 @@ mod tests {
         assert_eq!(cli_seeds[0].source, "autotools-bin");
     }
 
-    // ---------- regressions ported from clawpatch PR #26 ----------
-
     #[test]
     fn c_main_skips_files_under_tests_directory() {
-        // googletest / catch2 / custom harness test files routinely define
-        // their own `main()`; they must not surface as CLI features.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -1438,10 +1335,6 @@ mod tests {
 
     #[test]
     fn cmake_bracket_comments_strip_commented_targets() {
-        // Commented-out CMake targets must not surface as cmake-bin
-        // features. The underlying source file is still on disk so
-        // c-main may surface it separately — that's expected and not
-        // what this regression covers.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -1529,8 +1422,6 @@ mod tests {
 
     #[test]
     fn cmake_interface_library_with_headers_emits() {
-        // INTERFACE libraries can legitimately have only header sources;
-        // they should still surface so reviewers can see the API surface.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -1550,9 +1441,6 @@ mod tests {
 
     #[test]
     fn cmake_skips_vendored_interface_when_excluded() {
-        // A vendored INTERFACE library whose only file lives under
-        // vendor/ should drop because the structural indexer won't
-        // index that file — emitting it would leak a phantom owned_file.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -1576,10 +1464,6 @@ mod tests {
 
     #[test]
     fn cmake_test_target_emits_test_suite_not_cli() {
-        // `add_executable(foo_tests test_a.cpp test_b.cpp)` is a unit-test
-        // harness, not a shippable CLI; emit as `cmake-test` /
-        // FeatureKind::TestSuite so it lands in `recommend_tests` and
-        // doesn't pollute `list_features --kind cli-command`.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -1609,9 +1493,6 @@ mod tests {
 
     #[test]
     fn cmake_test_target_by_source_paths_only() {
-        // Even with a neutral target name, sources under `tests/` flip
-        // the classification — `add_executable(runner tests/main.c)` is
-        // a test harness, not a CLI command.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -1633,8 +1514,6 @@ mod tests {
 
     #[test]
     fn cmake_non_test_target_remains_cli_command() {
-        // Negative regression: ordinary names with ordinary sources keep
-        // their pre-fix `cmake-bin` classification.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -1659,14 +1538,6 @@ mod tests {
 
     #[test]
     fn c_main_in_test_prefixed_file_is_suppressed() {
-        // Regression for the is_test_like_path → is_c_or_cpp_test_path
-        // unification. The two forks disagreed on `test_*.c` basenames
-        // (and `*-test.c` / `*_tests.c` / `FooTests.cpp`): the old narrow
-        // main-suppression predicate let a `test_foo.c` harness with its
-        // own `main()` surface as a `c-main` CLI seed. The broad shape
-        // won: exclusion scans prefer suppressing a rare
-        // legitimately-named CLI over flooding the feature list with test
-        // harness binaries.
         let dir = tempdir().unwrap();
         write(dir.path(), "src/tool.c", "int main(void) { return 0; }\n");
         write(
@@ -1691,11 +1562,6 @@ mod tests {
 
     #[test]
     fn strip_cmake_comments_preserves_non_ascii_paths() {
-        // Regression: byte-by-byte `b as char` mangled
-        // multibyte UTF-8 source paths into Latin-1 codepoints, so any
-        // CMakeLists.txt with a non-ASCII source path produced mojibake
-        // and the resulting cmake-bin features couldn't be matched back
-        // to the real file.
         let stripped = super::strip_cmake_comments("add_executable(app src/café.c)\n");
         assert!(
             stripped.contains("café"),
@@ -1705,11 +1571,6 @@ mod tests {
 
     #[test]
     fn cmake_ignores_command_text_inside_strings() {
-        // Ported from clawpatch 162a6fe: `message("add_executable(...)")`
-        // and `message([[add_library(...)]])` must not surface as
-        // features. The walker skips command-like text inside quoted
-        // strings and bracket arguments; the old `[^)]*` regex had no
-        // notion of string scope and matched right through them.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -1744,10 +1605,6 @@ mod tests {
 
     #[test]
     fn cmake_quoted_source_paths_with_spaces() {
-        // Ported from clawpatch 162a6fe: a quoted source path with an
-        // embedded space stays one word, not two. The old regex relied
-        // on `split_whitespace`, which would split "src/main file.cpp"
-        // into "src/main" and "file.cpp" and emit phantom sources.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -1776,12 +1633,6 @@ mod tests {
 
     #[test]
     fn cmake_quoted_source_paths_with_paren() {
-        // The headline regression: the old `[^)]*` capture truncated
-        // the source list at the first `)`, so a quoted path containing
-        // `)` (e.g., a vendored legacy file named `foo(v1).cpp`) made
-        // the regex eat only the prefix and the rest of the line stayed
-        // unparsed. The walker treats the `)` as ordinary content
-        // because it sits inside `"..."`.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -1810,10 +1661,6 @@ mod tests {
 
     #[test]
     fn cmake_add_library_strips_type_keyword() {
-        // `add_library(name SHARED src/a.c)` must not record "SHARED" as
-        // a phantom owned file. The old regex consumed the type keyword
-        // via a non-capturing group; the new walker has to strip it
-        // explicitly after splitting words.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -1842,10 +1689,6 @@ mod tests {
 
     #[test]
     fn cmake_strips_executable_and_library_option_keywords() {
-        // Sibling of the target_sources PRIVATE/PUBLIC/INTERFACE fix:
-        // `add_executable(app WIN32 MACOSX_BUNDLE main.c)` and
-        // `add_library(foo STATIC EXCLUDE_FROM_ALL a.c)` must not record the
-        // option keywords as phantom owned files.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -1892,7 +1735,6 @@ mod tests {
 
     #[test]
     fn cmake_cuda_add_executable_tagged_cuda() {
-        // `cuda_add_executable` (legacy FindCUDA) is always a CUDA target.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -1912,7 +1754,6 @@ mod tests {
 
     #[test]
     fn cmake_add_executable_with_cu_source_tagged_cuda() {
-        // Plain `add_executable` becomes a CUDA target when any source is .cu.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -1929,14 +1770,12 @@ mod tests {
             .find(|s| s.source == "cmake-bin" && s.entry_command.as_deref() == Some("app"))
             .expect("add_executable seed missing");
         assert!(s.tags.iter().any(|t| t == "cuda"), "tags: {:?}", s.tags);
-        // .cu owned source must be recorded, not filtered out.
         let owned: Vec<&str> = s.owned_files.iter().map(|f| f.path.as_str()).collect();
         assert!(owned.contains(&"src/kernel.cu"), "owned: {owned:?}");
     }
 
     #[test]
     fn standalone_cu_main_tagged_cuda() {
-        // A `.cu` file with main() and no build system → c-main seed, cuda tag.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -1974,9 +1813,6 @@ mod tests {
 
     #[test]
     fn cmake_command_args_walker_returns_inner_text() {
-        // Direct unit test for the walker so regressions in the parser
-        // primitive can be diagnosed without round-tripping through the
-        // full mapper.
         let body = "add_executable(a x.c)\nmessage(\"add_executable(fake y.c)\")\n\
                     add_executable(b \"with )paren.c\")\n";
         let args = super::cmake_command_args(body, "add_executable");
@@ -1987,20 +1823,12 @@ mod tests {
 
     #[test]
     fn cmake_split_args_preserves_quoted_tokens() {
-        // Quoted words survive whitespace and `;`; unquoted words split
-        // on `;` per CMake list semantics.
         let words = super::cmake_split_args("a \"b c\" d;e [[bracket;arg]]");
         assert_eq!(words, vec!["a", "b c", "d", "e", "bracket;arg"]);
     }
 
-    // ---- §2.13 audit gap fixes (clawpatch de82d0a / 39a2545 / 8550604) ----
-
     #[test]
     fn cmake_binary_with_test_like_helper_stays_binary() {
-        // Clawpatch de82d0a fixture: target name "app" (non-test), one
-        // helper source named test_mode.c (matches the test-path
-        // heuristic). Target-name match should win; the binary stays a
-        // binary, not a test suite.
         assert!(!super::is_cmake_test_executable(
             "app",
             &["src/main.c".to_string(), "src/test_mode.c".to_string()],
@@ -2009,9 +1837,6 @@ mod tests {
 
     #[test]
     fn cmake_target_named_tests_is_test_suite_regardless_of_sources() {
-        // Target name takes precedence over source heuristic: an
-        // `add_executable(my_tests main.c)` is still a test target even
-        // when none of its sources look test-shaped.
         assert!(super::is_cmake_test_executable(
             "my_tests",
             &["main.c".to_string()],
@@ -2020,16 +1845,12 @@ mod tests {
             "tests",
             &["fixture.c".to_string(), "main.c".to_string()],
         ));
-        // Single-word "test" / "tests" still flip.
         assert!(super::is_cmake_test_executable("test", &[]));
         assert!(super::is_cmake_test_executable("tests", &[]));
     }
 
     #[test]
     fn cmake_binary_with_all_test_sources_is_test_suite() {
-        // Neutral target name but every compilable source is test-shaped:
-        // classify as test. Headers don't count toward the all-test-sources
-        // check (they aren't compilable).
         assert!(super::is_cmake_test_executable(
             "my_runner",
             &["test_a.c".to_string(), "test_b.c".to_string()],
@@ -2046,9 +1867,6 @@ mod tests {
 
     #[test]
     fn cmake_binary_with_no_compilable_sources_is_not_test() {
-        // Header-only target list: don't false-flip to test. Upstream
-        // CMake walker would have dropped this target anyway (no compilable
-        // source) but the helper should be defensive on its own.
         assert!(!super::is_cmake_test_executable(
             "headerlib",
             &["foo.h".to_string(), "bar.hpp".to_string()],
@@ -2057,33 +1875,19 @@ mod tests {
 
     #[test]
     fn automake_srcdir_strips_to_makefile_relative() {
-        // `expand_automake_vars` returns a path relative to the makefile's
-        // own directory, because the downstream `filter_target_sources`
-        // re-applies `prefix_dir(makefile_dir, ...)`. So `$(srcdir)/foo.c`
-        // strips to `foo.c`, and the eventual project-root path lands at
-        // `<makefile_dir>/foo.c` via the existing pipeline.
         assert_eq!(
             super::expand_automake_vars("$(srcdir)/foo.c", "subdir/"),
             "foo.c"
         );
-        // Braced form also expands.
         assert_eq!(
             super::expand_automake_vars("${srcdir}/bar.cpp", "subdir/nested/"),
             "bar.cpp"
         );
-        // At the repo root the result is identical — there's no makefile
-        // dir to prefix, so $(srcdir)/foo.c also lands at `foo.c`.
         assert_eq!(super::expand_automake_vars("$(srcdir)/foo.c", ""), "foo.c");
     }
 
     #[test]
     fn automake_top_srcdir_left_verbatim() {
-        // `$(top_srcdir)` references the project root, which would need
-        // a "subtract the makefile-dir prefix" normalization to play
-        // nicely with the downstream prefix_dir. We leave such paths
-        // verbatim until a user case demands the work — downstream code
-        // already produces a broken seed for these and that's not worse
-        // than the pre-fix state for the more common $(srcdir) case.
         assert_eq!(
             super::expand_automake_vars("$(top_srcdir)/include/foo.h", "subdir/"),
             "$(top_srcdir)/include/foo.h"
@@ -2092,7 +1896,6 @@ mod tests {
 
     #[test]
     fn automake_unknown_vars_pass_through() {
-        // User-defined macros stay verbatim.
         assert_eq!(
             super::expand_automake_vars("$(SOURCES)/foo.c", "subdir/"),
             "$(SOURCES)/foo.c"
@@ -2101,7 +1904,6 @@ mod tests {
 
     #[test]
     fn automake_plain_path_passes_through() {
-        // Sources without Automake variables are unchanged.
         assert_eq!(
             super::expand_automake_vars("src/main.c", "subdir/"),
             "src/main.c"
@@ -2110,8 +1912,6 @@ mod tests {
 
     #[test]
     fn cmake_project_name_last_call_wins() {
-        // `${PROJECT_NAME}` refers to the most recent `project()`; later
-        // declarations override earlier ones inside the same file.
         let body =
             "project(first)\nadd_executable(a a.c)\nproject(second)\nadd_executable(b b.c)\n";
         assert_eq!(super::cmake_project_name(body).as_deref(), Some("second"));
@@ -2119,16 +1919,12 @@ mod tests {
 
     #[test]
     fn cmake_project_name_absent_returns_none() {
-        // No `project()` call → no resolution; `${PROJECT_NAME}` stays
-        // unresolved and the existing skip-on-invalid-name path drops
-        // the target.
         let body = "add_executable(${PROJECT_NAME} main.c)\n";
         assert!(super::cmake_project_name(body).is_none());
     }
 
     #[test]
     fn cmake_project_name_resolves_target_reference() {
-        // Resolve the canonical and CMake-namespaced spellings.
         assert_eq!(
             super::resolve_cmake_target_name("${PROJECT_NAME}", Some("myapp")),
             "myapp"
@@ -2137,12 +1933,10 @@ mod tests {
             super::resolve_cmake_target_name("${CMAKE_PROJECT_NAME}", Some("myapp")),
             "myapp"
         );
-        // Unrelated variable forms pass through unchanged.
         assert_eq!(
             super::resolve_cmake_target_name("${OTHER}", Some("myapp")),
             "${OTHER}"
         );
-        // No project name → input unchanged.
         assert_eq!(
             super::resolve_cmake_target_name("${PROJECT_NAME}", None),
             "${PROJECT_NAME}"
@@ -2151,10 +1945,6 @@ mod tests {
 
     #[test]
     fn cmake_add_executable_with_project_name_target() {
-        // End-to-end: `add_executable(${PROJECT_NAME} src/main.c)` after a
-        // `project(myapp)` declaration emits a `cmake-bin` seed with the
-        // resolved name. Pre-fix, the target was skipped because
-        // `${PROJECT_NAME}` failed `is_valid_target_name`.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -2175,10 +1965,6 @@ mod tests {
 
     #[test]
     fn autotools_bin_programs_expands_srcdir_var() {
-        // End-to-end: $(srcdir)/foo.c in a Makefile.am at subdir/ should
-        // resolve to subdir/foo.c so the source file is actually found.
-        // Pre-fix, the literal `$(srcdir)/foo.c` didn't match any file
-        // and the autotools-bin seed pointed at a non-existent path.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -2199,10 +1985,6 @@ mod tests {
 
     #[test]
     fn strip_cmake_comments_ignores_hash_inside_string() {
-        // A `#` inside a quoted string must not be treated as a line
-        // comment. The old stripper had no quote state, so it cut at the
-        // `#` and left a dangling `"`, which made the command walker
-        // swallow to the next quote and drop later targets.
         let stripped = super::strip_cmake_comments(
             "project(x DESCRIPTION \"C# bindings\")\nadd_executable(real src/real.c)\n",
         );
@@ -2218,8 +2000,6 @@ mod tests {
 
     #[test]
     fn cmake_hash_in_string_does_not_drop_following_target() {
-        // End-to-end: a `#` inside a string literal earlier in the file
-        // must not corrupt parsing of a later add_executable.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -2240,9 +2020,6 @@ mod tests {
 
     #[test]
     fn autotools_root_bin_without_sources_has_no_phantom_path() {
-        // A root-level Makefile.am `bin_PROGRAMS` target with no explicit
-        // `_SOURCES` (automake defaults `thing_SOURCES = thing.c`) must not
-        // fall back to a phantom leading-slash entry path `/Makefile.am`.
         let dir = tempdir().unwrap();
         write(dir.path(), "Makefile.am", "bin_PROGRAMS = thing\n");
         let seeds = CCppMapper

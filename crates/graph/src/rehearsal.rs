@@ -1,8 +1,4 @@
-//! `review_rehearsal`: predict the objections a reviewer would likely raise
-//! against a patch, before it is committed. Pure composition over shipped
-//! primitives — `assess_risk_diff`, `recommend_tests`, drift, and feature
-//! mapping — so there is no duplicated analysis logic here, only the glue that
-//! turns those signals into severity-ranked objections.
+//! Compose risk, test, drift, feature, and branch evidence into review objections.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -39,10 +35,7 @@ const TRUST_BOUNDARY_THRESHOLD: usize = 3;
 /// Hottest symbols to surface per high-risk file.
 const HOTSPOT_EVIDENCE_CAP: usize = 3;
 
-/// A patch touching at least this many distinct feature *areas* (entry
-/// directories) reads as scattered — worth confirming the change set is
-/// intentional. Tuned against real history on php-src + a Laravel backend so a
-/// focused deep change (which concentrates in 1–2 areas) does not fire.
+/// Count entry directories rather than densely mapped functions as distinct areas.
 const SCOPE_SPREAD_THRESHOLD: usize = 4;
 
 /// Cap on per-area evidence lines in the scope-spread objection.
@@ -66,7 +59,6 @@ pub fn build_review_rehearsal(
 
     let mut objections: Vec<ReviewObjection> = Vec::new();
 
-    // --- stale index (a caveat, not a code defect) ---
     let report = drift::check_drift(root, db);
     if matches!(
         report.kind,
@@ -84,14 +76,10 @@ pub fn build_review_rehearsal(
         });
     }
 
-    // --- risk rollup for the patch ---
     let mut walk_cache = WalkCache::default();
     let risk = assess_risk_diff_with_walk_cache(db, files, Some(&mut walk_cache))?;
-    // A clustered directory keeps full detail for only its top-3 files; the
-    // rest survive as bare names in `omitted_files` with no score, so a 4th+
-    // file that still clears a risk threshold would lose its objection line.
-    // Re-assess those names through the same single-file scorer the diff used
-    // pre-clustering, so the thresholds below see every changed file.
+    // Clustering retains scores for only three files per directory. Reassess
+    // omitted files so clustering cannot hide threshold-crossing objections.
     let mut omitted_detail: Vec<RiskAssessment> = Vec::new();
     {
         let mut seen: HashSet<&str> = HashSet::new();
@@ -154,7 +142,6 @@ pub fn build_review_rehearsal(
         });
     }
 
-    // High / elevated risk files, from every detailed risk entry.
     let mut high: Vec<&codesage_protocol::RiskAssessment> = Vec::new();
     let mut elevated: Vec<&codesage_protocol::RiskAssessment> = Vec::new();
     for &a in &detailed_risk {
@@ -165,10 +152,6 @@ pub fn build_review_rehearsal(
         }
     }
     if !high.is_empty() {
-        // For each high-risk file, the score line followed by its hottest
-        // symbols (already computed by `assess_risk`) so the reviewer knows
-        // which function to read first. `why` reflects structural load
-        // (size × references × cycle), not edit frequency.
         let mut evidence = Vec::new();
         evidence.push(
             "Current-file risk is a review priority, not a judgment of this patch's correctness or test adequacy."
@@ -284,12 +267,8 @@ pub fn build_review_rehearsal(
         });
     }
 
-    // --- trust-boundary expansion, queried directly per input file so the
-    // signal is complete even when risk detail was clustered away ---
+    // Query every input directly so clustering cannot omit boundary evidence.
     for f in files {
-        // Propagate, don't default: a DB error silently read as "no
-        // boundaries" would drop the security objection exactly when the
-        // engine is broken.
         let tb = db
             .trust_boundaries_for_file_path(f)
             .with_context(|| format!("loading trust boundaries for rehearsal({f})"))?;
@@ -308,21 +287,11 @@ pub fn build_review_rehearsal(
         }
     }
 
-    // --- feature mapping: one `features_for_file` pass per input file feeds
-    // both the feature-test-gap check and the scope-cohesion check ---
     let input_set: BTreeSet<&str> = files.iter().map(String::as_str).collect();
     let mut seen_features: BTreeSet<String> = BTreeSet::new();
-    // Scope accumulation keyed by the feature's entry *directory*, not
-    // feature_id. php-src maps every PHP function/method as its own feature
-    // sharing one source file, so a single-file change can touch 60+ features
-    // in one directory — counting feature ids would scream "scattered" on a
-    // focused patch. Entry directory is the area-level locus that actually
-    // signals scatter.
     let mut area_files: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut orphan_files: Vec<String> = Vec::new();
     for f in files {
-        // Propagate, don't default: an error here would silently disable the
-        // feature-test-gap and scope-spread checks for this file.
         let feats = db
             .features_for_file(f)
             .with_context(|| format!("loading features for rehearsal({f})"))?;
@@ -370,10 +339,6 @@ pub fn build_review_rehearsal(
         }
     }
 
-    // --- scope cohesion: a patch spread thin across many unrelated slices reads
-    // as scope creep. Deterministic proxy for "intent mismatch" — we can't read
-    // the PR's stated intent, so we flag the spread and ask for confirmation.
-    // Low severity: an attention prompt, never a defect. ---
     if area_files.len() >= SCOPE_SPREAD_THRESHOLD {
         let mut evidence: Vec<String> = area_files
             .iter()
@@ -408,14 +373,20 @@ pub fn build_review_rehearsal(
         });
     }
 
-    // High first, then by category for stable output.
+    let overlap =
+        crate::branch_overlap::branch_overlap(root, files, std::time::Duration::from_millis(250));
+    if let Some(objection) = crate::branch_overlap::branch_overlap_objection(&overlap) {
+        objections.push(objection);
+    }
+
     objections.sort_by(|a, b| {
         a.severity
             .cmp(&b.severity)
             .then_with(|| a.category.cmp(&b.category))
     });
 
-    let summary_notes = build_summary(root, db, files, &risk, &objections, &mut walk_cache)?;
+    let mut summary_notes = build_summary(root, db, files, &risk, &objections, &mut walk_cache)?;
+    summary_notes.push(crate::branch_overlap::branch_overlap_summary(&overlap));
 
     Ok(ReviewRehearsal {
         files: files.to_vec(),
@@ -424,10 +395,19 @@ pub fn build_review_rehearsal(
     })
 }
 
-/// The "area" of a feature for scope-spread accounting: the directory of its
-/// entry file. Collapses many fine-grained features that share one source file
-/// (php-src maps each PHP function as its own feature) into a single locus, so
-/// the signal measures scatter across the tree rather than function density.
+pub fn build_branch_only_rehearsal(root: &Path, files: &[String]) -> ReviewRehearsal {
+    let overlap =
+        crate::branch_overlap::branch_overlap(root, files, std::time::Duration::from_millis(250));
+    ReviewRehearsal {
+        files: files.to_vec(),
+        objections: crate::branch_overlap::branch_overlap_objection(&overlap).into_iter().collect(),
+        summary_notes: vec![
+            "No structural index: risk, test discovery, drift, and feature checks did not run. Run `codesage index` to enable them.".to_string(),
+            crate::branch_overlap::branch_overlap_summary(&overlap),
+        ],
+    }
+}
+
 fn entry_area(entry_path: &str) -> String {
     std::path::Path::new(entry_path)
         .parent()
@@ -465,10 +445,6 @@ fn build_summary(
 
     notes.extend(risk.summary_notes.iter().cloned());
 
-    // Propagate, don't swallow: an error read as "no tests to recommend"
-    // would print a clean summary off a failed engine call.
-    // The pre-commit step can afford the bounded graph walk the per-edit
-    // hook cannot, so the reachability variant runs here.
     let opts = ReachabilityOptions {
         deadline: REHEARSAL_REACH_DEADLINE,
         project_root: Some(root.to_path_buf()),
@@ -481,8 +457,6 @@ fn build_summary(
     Ok(notes)
 }
 
-/// The summary's test lines for one `TestRecommendations`. Pure so the
-/// wording can be pinned without a graph fixture.
 fn test_notes(tests: &codesage_protocol::TestRecommendations) -> Vec<String> {
     let mut notes = Vec::new();
     if !tests.primary.is_empty() {
@@ -491,9 +465,7 @@ fn test_notes(tests: &codesage_protocol::TestRecommendations) -> Vec<String> {
         let coupled: Vec<String> = tests.coupled.iter().map(|c| c.file.clone()).collect();
         notes.push(format!("Coupled tests to consider: {}", coupled.join(", ")));
     }
-    // Reachability is its own signal, not a fallback: a patch with sibling
-    // tests can still have integration tests that only the graph knows about.
-    // A truncated walk must say so here too, or the summary reads as complete.
+    // Reachability can add tests beyond sibling conventions; disclose incomplete walks.
     let cap_clause = reach_cap_clause(tests)
         .map(|c| format!("; lower bound: {c}"))
         .unwrap_or_default();
@@ -553,7 +525,6 @@ mod tests {
              not indexed: src/New.php"
         );
 
-        // Complete walk: no clause at all.
         let complete = TestRecommendations {
             reachable: vec![entry(0)],
             reachable_total: 1,
@@ -564,7 +535,6 @@ mod tests {
             vec!["Reachable tests (call/import edges): tests/T0.php".to_string()]
         );
 
-        // Nothing reachable but the walk was cut: the summary still says so.
         let empty_capped = TestRecommendations {
             reach_walk_capped: true,
             unwalked_files: vec!["src/B.php".to_string()],
@@ -818,10 +788,6 @@ mod tests {
 
     #[test]
     fn high_risk_objection_includes_clustered_omitted_files() {
-        // Five hot files in one directory: clustering keeps full detail for
-        // the top 3 and demotes the 4th+ to bare `omitted_files` names. Every
-        // file here clears 0.60, so the high-risk objection must name all
-        // five — not just the three that survived clustering.
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open_in_memory().unwrap();
         let clustered: Vec<String> = (0..5).map(|i| format!("app/Hot/File{i}.php")).collect();
@@ -896,10 +862,6 @@ mod tests {
 
     #[test]
     fn scope_spread_keys_on_entry_directory_not_feature_id() {
-        // php-src regression shape: one source file owns 60+ features (each
-        // PHP function is its own feature), all sharing one entry directory.
-        // Counting feature_ids would fire scope-spread on a focused one-file
-        // patch; keying on the entry directory must not.
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open_in_memory().unwrap();
         let changed = "ext/standard/array.c";
@@ -956,9 +918,7 @@ mod tests {
 
     #[test]
     fn review_severity_ord_ranks_high_before_medium_before_low() {
-        // The objection sort relies on ReviewSeverity's derived Ord, which in
-        // turn relies on declaration order in protocol. Pin the contract so a
-        // careless reorder or extension of the enum fails here.
+        // Derived Ord follows enum declaration order.
         assert!(ReviewSeverity::High < ReviewSeverity::Medium);
         assert!(ReviewSeverity::Medium < ReviewSeverity::Low);
         assert!(ReviewSeverity::High < ReviewSeverity::Low);

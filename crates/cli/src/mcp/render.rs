@@ -6,10 +6,7 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use super::CodeSageServer;
 
 impl CodeSageServer {
-    /// Char budget for a context-bundle response, sized to the project's
-    /// indexed file count (see [`mcp_bundle_token_budget`]). Falls back to a
-    /// mid-tier default — still honoring the `CODESAGE_BUNDLE_TOKEN_BUDGET`
-    /// override — when the file count can't be read.
+    /// Scale bundle budgets by indexed file count; failed counts use the mid-tier default.
     pub(super) fn bundle_budget_chars(&self, project: &str) -> usize {
         let tokens = match self.with_project_db(project, |db| db.file_count()) {
             Ok(count) => mcp_bundle_token_budget(count),
@@ -18,10 +15,7 @@ impl CodeSageServer {
         tokens * MCP_CHARS_PER_TOKEN
     }
 
-    /// Render a tool result, then annotate it with a staleness banner if any of
-    /// the files it references have changed on disk since indexing. Handlers
-    /// route through this instead of the free `render_with_kind` so the project
-    /// context needed to stat files is available.
+    /// Render with project context for coverage and on-disk staleness checks.
     pub(super) fn render<T: serde::Serialize>(
         &self,
         project: &str,
@@ -31,10 +25,7 @@ impl CodeSageServer {
         self.render_coverage_gated(project, r, kind, true)
     }
 
-    /// [`Self::render`] with an explicit say over the coverage annotation.
-    /// `search` passes `false` when the caller asked for a page past the end
-    /// or a zero limit: the result is empty by request, and telling that
-    /// caller "no matches" would be a lie about the corpus.
+    /// Suppress coverage notes for intentionally empty pages (zero limit or exhausted offset).
     pub(super) fn render_coverage_gated<T: serde::Serialize>(
         &self,
         project: &str,
@@ -66,18 +57,11 @@ impl CodeSageServer {
         )
     }
 
-    /// Tools whose empty result is ambiguous between "no such code" and "that
-    /// code was never indexed". `impact_analysis` is deliberately absent: `[]`
-    /// there means a leaf nothing imports, which its own description already
-    /// states, so a coverage note would be noise on a correct answer.
+    /// Exclude impact_analysis: no dependents can be a correct leaf result.
     const COVERAGE_ANNOTATED_TOOLS: [&str; 4] =
         ["search", "find_symbol", "find_references", "find_similar"];
 
-    /// On an empty result, record what the index actually holds under
-    /// `_meta.coverage`. An agent that searches and gets nothing back cannot
-    /// otherwise tell a genuine absence from a language or directory that was
-    /// never indexed, and silently reads the empty list as proof the code does
-    /// not exist. Best-effort: any failure leaves the result untouched.
+    /// Disclose index coverage on ambiguous empty results; annotation failures leave the result intact.
     fn annotate_coverage(
         &self,
         project: &str,
@@ -93,9 +77,6 @@ impl CodeSageServer {
         if !has_empty_results(structured) {
             return result;
         }
-        // A zero-file index is NOT a reason to stay quiet — it is the case
-        // where an empty result misleads hardest, because nothing was ever
-        // looked at.
         let counts = match self.with_project_db(project, |db| db.file_counts_by_language()) {
             Ok(c) => c,
             Err(e) => {
@@ -104,15 +85,7 @@ impl CodeSageServer {
             }
         };
         let total: usize = counts.iter().map(|(_, n)| n).sum();
-        // `search` runs over semantic chunks, not the structural file table.
-        // Reporting the structural count for it would say "10,000 files
-        // indexed" about a project indexed with `--no-semantic`, where none of
-        // them were searched — recreating the false confidence this exists to
-        // prevent.
-        // Scoped to the ACTIVE model: `semantic_files` retains rows for every
-        // model that ever indexed this project, so an unscoped count would
-        // report a previous model's files for a search running against a newly
-        // configured model's empty table — the same false confidence again.
+        // Search sees only semantic files for the active model; structural or all-model counts overstate coverage.
         let semantic_files = if kind == "search" {
             self.resolve_project(project).ok().and_then(|st| {
                 let model = st.embedding_config.model.clone();
@@ -167,11 +140,7 @@ impl CodeSageServer {
         result
     }
 
-    /// If staleness checking is enabled and the result references indexed files
-    /// that have since changed on disk, prepend a `⚠️` banner to the content and
-    /// record the stale paths under `_meta.stale_files`. Best-effort: any error
-    /// (project not resolvable, DB unreadable) leaves the result untouched —
-    /// staleness is a hint, never a reason to fail a tool call.
+    /// Best-effort stale-path annotation; unreadable metadata must not fail the tool call.
     fn annotate_staleness(&self, project: &str, mut result: CallToolResult) -> CallToolResult {
         if result.is_error == Some(true) || !staleness_enabled() {
             return result;
@@ -215,10 +184,7 @@ impl CodeSageServer {
         result
     }
 
-    /// Of `rel_paths` (project-relative), return those whose current on-disk
-    /// content hash differs from the indexed hash (or that no longer exist).
-    /// Paths not present in the index are skipped — they may be synthetic or
-    /// out-of-index references, not drift.
+    /// Changed, missing, or unreadable indexed paths are stale; unindexed references are skipped.
     fn compute_stale_files(&self, project: &str, rel_paths: &[String]) -> Result<Vec<String>> {
         let state = self.resolve_project(project)?;
         let root = state
@@ -243,9 +209,6 @@ impl CodeSageServer {
                         stale.push(rel.clone());
                     }
                 }
-                // Indexed file gone or unreadable: treat as stale so the agent
-                // is told to look rather than trusting an indexed copy of a file
-                // that no longer matches the tree.
                 Err(_) => stale.push(rel.clone()),
             }
         }
@@ -273,21 +236,13 @@ fn confined_project_path(root: &Path, rel: &str) -> Option<PathBuf> {
     }
 }
 
-/// Token budget for a single MCP tool response. Above ~10k tokens Claude Code starts to
-/// reject results and the agent falls back to multi-call patterns that blow the prompt cache.
-/// 8000 leaves headroom and is the same number repowise's tool_context.py settled on.
+/// Leave headroom below client response limits.
 const MCP_TOKEN_BUDGET: usize = 8000;
-/// Conservative chars/token estimate. Replace with a real tokenizer if accuracy ever matters
-/// (it doesn't here: under-estimating just means we cap a touch early).
+/// Approximate token cost for response caps.
 const MCP_CHARS_PER_TOKEN: usize = 4;
 const MCP_BUDGET_CHARS: usize = MCP_TOKEN_BUDGET * MCP_CHARS_PER_TOKEN;
 
-/// Per-response token budget for context bundles, scaled by indexed repo
-/// size. Small repos rarely need a fat bundle and a tighter cap keeps the
-/// agent's context lean; large repos get more room because one bundle has to
-/// cover more ground before the agent falls back to multi-call discovery.
-/// Monotonic non-decreasing. `CODESAGE_BUNDLE_TOKEN_BUDGET=<tokens>` forces a
-/// fixed value (escape hatch + test determinism).
+/// Scale bundle budgets monotonically with repository size; the environment can override.
 fn mcp_bundle_token_budget(file_count: usize) -> usize {
     if let Ok(v) = std::env::var("CODESAGE_BUNDLE_TOKEN_BUDGET")
         && let Ok(n) = v.parse::<usize>()
@@ -303,17 +258,11 @@ fn mcp_bundle_token_budget(file_count: usize) -> usize {
     }
 }
 
-/// Render a handler's `Result<T>` as a structured MCP `CallToolResult`. Successful
-/// responses ship both the pretty-printed JSON (for the transcript) and the raw
-/// `Value` as `structured_content` so clients can parse without re-deserializing.
-/// Failures set `isError: true` per MCP spec; the full anyhow cause chain is
-/// included via `{:#}`.
+/// Return both readable JSON and structured content; errors retain the full anyhow cause chain.
 pub(super) fn render_with_kind<T: serde::Serialize>(r: Result<T>, kind: &str) -> CallToolResult {
     render_with_budget(r, kind, MCP_BUDGET_CHARS)
 }
 
-/// Like [`render_with_kind`] but with an explicit char budget. Used by the
-/// context-bundle tools, which size their budget by indexed repo file count.
 fn render_with_budget<T: serde::Serialize>(
     r: Result<T>,
     kind: &str,
@@ -323,20 +272,14 @@ fn render_with_budget<T: serde::Serialize>(
         Ok(v) => {
             let value = serde_json::to_value(&v).unwrap_or(serde_json::Value::Null);
             let capped = cap_to_budget_with(value, kind, budget_chars);
-            // MCP requires structuredContent to be a JSON object. Tools that
-            // return bare arrays (find_symbol, find_similar) get wrapped in
-            // {"results": [...]} so Claude's validator accepts the response.
-            // cap_to_budget already wraps over-budget arrays into
-            // {"results": ..., "_meta": {...}}; this covers the under-budget
-            // path so the shape is consistent regardless of size.
+            // MCP requires a structured-content object; normalize arrays regardless of budget.
             let structured = match capped {
                 serde_json::Value::Array(items) => serde_json::json!({ "results": items }),
                 other => other,
             };
             let text = serde_json::to_string_pretty(&structured).unwrap_or_default();
             let mut result = CallToolResult::structured(structured);
-            // `CallToolResult::structured` defaults content to a compact
-            // `value.to_string()`; replace with pretty JSON for transcript use.
+            // Override rmcp's compact JSON with readable transcript output.
             result.content = vec![ContentBlock::text(text)];
             result
         }
@@ -344,25 +287,12 @@ fn render_with_budget<T: serde::Serialize>(
     }
 }
 
-/// Cap on how many distinct files a single response triggers an on-disk hash
-/// for. Responses are already budget-capped, so the unique-file count is
-/// bounded in practice; this is a hard backstop against a pathological result.
+/// Bound per-response disk hashing even for unusually broad results.
 const STALENESS_MAX_FILES: usize = 50;
 
-/// JSON keys whose string value is a project-relative file path in a tool
-/// result — including strings nested in arrays under that key, so
-/// `Vec<Vec<String>>` shapes like `new_cycles` are reached.
-///
-/// Deliberately excludes `imports` (bare module names, `refs.to_name`),
-/// `clustered_directories` (directories), `omitted_files` (detail already
-/// dropped from the response, so the agent is not reading them), and `source`
-/// (`FeatureRecord.source` is a mapper token like `cargo-bin`, not a path).
-/// Note `imported_by` **is** listed: unlike `imports` it is `SELECT f.path`
-/// off the `files` table, so it carries real indexed paths.
-///
-/// Over-inclusion is harmless — `compute_stale_files` filters against the
-/// indexed file set — but under-inclusion silently misses drift, so err
-/// toward listing a key.
+/// Path-valued fields, including nested arrays. `imports` contains module names,
+/// while `imported_by` contains file paths; `source` is a mapper token.
+/// Omitted files and directory-only fields are not checked.
 const PATH_KEYS: &[&str] = &[
     "file_path",
     "path",
@@ -376,20 +306,10 @@ const PATH_KEYS: &[&str] = &[
     "wide_blast_files",
     "fix_heavy_files",
     "hotspot_files",
-    // `review_rehearsal` carries its patch file list as bare strings under
-    // `files`, both top-level and per-objection. Without this key the tool
-    // documented as the last step before a commit — run precisely when the
-    // working tree is dirtiest — never raised the staleness banner. Harmless
-    // for the `files: Vec<RiskAssessment>` / `Vec<FeatureFileRef>` shapes:
-    // non-string array items are skipped here and still picked up by the
-    // recursion through their own `file` / `path` keys.
+    // `files` may contain paths or records; record fields are visited recursively.
     "files",
-    // `list_dependencies` answers "who imports this file" with indexed paths;
-    // those are exactly the files an agent opens next.
     "imported_by",
-    // `recommend_tests` "always run these" list — bare test-file paths.
     "primary",
-    // `session_end` reports cycles as arrays of arrays of paths.
     "new_cycles",
     "resolved_cycles",
 ];
@@ -403,16 +323,8 @@ fn staleness_enabled() -> bool {
     )
 }
 
-/// Walk a serialized tool result, collecting project-relative file paths from
-/// the [`PATH_KEYS`] fields wherever they appear (recursing through nested
-/// objects and arrays).
-/// Collect the strings under a matched [`PATH_KEYS`] key, descending through
-/// nested arrays so `Vec<Vec<String>>` (session cycles) is reached.
-///
-/// Descends arrays only, never objects: an object under a path key is a record
-/// (`files: Vec<RiskAssessment>`), whose own path fields the caller's recursion
-/// already visits by key. Walking into it here would scoop up every string it
-/// holds — note prose, categories, titles — as if they were paths.
+/// Recurse through path arrays, not objects: record strings may be prose.
+/// The caller visits records' own path-valued fields separately.
 fn push_path_strings(value: &serde_json::Value, out: &mut Vec<String>) {
     match value {
         serde_json::Value::String(s) => out.push(s.clone()),
@@ -444,9 +356,7 @@ fn collect_referenced_paths(value: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
-/// True when the structured payload carries a `results` array with no entries.
-/// A payload with no `results` key at all is not "empty" — it is a different
-/// shape, and guessing at it would annotate tools this was never meant for.
+/// Only an empty `results` array qualifies; absent keys represent other response shapes.
 fn has_empty_results(structured: &serde_json::Value) -> bool {
     structured
         .get("results")
@@ -482,8 +392,6 @@ fn merge_coverage_meta(
         serde_json::Value::Object(by_language),
     );
     if let Some(n) = semantic_files {
-        // `search` only sees semantically-indexed files; structural coverage
-        // alone would overstate what was actually searched.
         coverage.insert(
             "semantically_indexed_files".to_string(),
             serde_json::Value::from(n),
@@ -500,9 +408,7 @@ fn merge_coverage_meta(
     meta.insert("coverage".to_string(), serde_json::Value::Object(coverage));
 }
 
-/// Record the stale paths under `_meta.stale_files` (+ a human `stale_warning`),
-/// merging into any existing `_meta` (e.g. a truncation marker) rather than
-/// overwriting it. No-op if the structured value isn't a JSON object.
+/// Merge staleness with existing envelope metadata.
 fn merge_stale_meta(structured: &mut serde_json::Value, stale: &[String]) {
     let serde_json::Value::Object(map) = structured else {
         return;
@@ -532,11 +438,7 @@ fn merge_stale_meta(structured: &mut serde_json::Value, stale: &[String]) {
     );
 }
 
-/// One silent numeric adjustment: the caller asked for `requested`, the tool
-/// ran with `applied`. Produced by the MCP cap helpers in `mod.rs` for every
-/// over-max `limit`/`offset`/`depth` and every out-of-range `min_jaccard`;
-/// surfaced under `_meta.clamps` so requested-vs-applied is visible instead
-/// of silently capped.
+/// Disclose requested-versus-applied numeric caps in `_meta.clamps`.
 #[derive(Debug, Clone)]
 pub(super) struct ClampNote {
     pub(super) param: &'static str,
@@ -544,11 +446,7 @@ pub(super) struct ClampNote {
     pub(super) applied: serde_json::Value,
 }
 
-/// Record requested-vs-applied numeric adjustments under `_meta.clamps`,
-/// merging into any existing `_meta` (truncation, coverage, staleness)
-/// rather than overwriting it. No-op on error results, on responses without
-/// structured content, or when nothing was clamped — the common case stays
-/// byte-identical.
+/// Merge clamp notes into successful structured results; leave unclamped results unchanged.
 pub(super) fn annotate_clamps(mut result: CallToolResult, notes: &[ClampNote]) -> CallToolResult {
     if notes.is_empty() || result.is_error == Some(true) {
         return result;
@@ -583,12 +481,7 @@ pub(super) fn annotate_clamps(mut result: CallToolResult, notes: &[ClampNote]) -
     result
 }
 
-/// Stamp `_meta.test_override: true` when the debug-only query-embedding
-/// override served this response (see `test_override_active` in `state.rs`:
-/// debug build plus a parseable `CODESAGE_MCP_TEST_QUERY_EMBEDDING`). Skipped
-/// on error results and when the override is inert — the common case stays
-/// byte-identical. Merges into any existing `_meta` (truncation, coverage,
-/// staleness, clamps) rather than overwriting it.
+/// Mark successful debug-override responses without replacing other metadata.
 pub(super) fn annotate_test_override(mut result: CallToolResult, active: bool) -> CallToolResult {
     if !active || result.is_error == Some(true) {
         return result;
@@ -609,13 +502,8 @@ pub(super) fn annotate_test_override(mut result: CallToolResult, active: bool) -
     result
 }
 
-/// Array fields that carry a documented per-element invariant and must not
-/// be silently trimmed: `assess_risk_diff` promises one `files` entry per
-/// patch file, and rollup arrays (`test_gap_files`, ...) cross-reference
-/// `files` / `clustered_directories` by name. Budget truncation prefers any
-/// other array; when a protected array is the only option, the dropped
-/// element identifiers are recorded under `_meta.dropped_files` so the
-/// invariant is at least visibly broken, never silently.
+/// These arrays promise per-element coverage or support cross-references.
+/// Prefer trimming elsewhere; if unavoidable, disclose dropped identities.
 const PROTECTED_TRUNCATION_KEYS: &[&str] = &["files", "clustered_directories"];
 
 /// Best-effort path/name identifier for a truncated array element, used to
@@ -630,10 +518,7 @@ fn element_identifier(item: &serde_json::Value) -> Option<String> {
     None
 }
 
-/// If the serialized value fits within MCP_BUDGET_CHARS, return as-is. Otherwise truncate
-/// the largest array field (or the whole value if it's already an array) and attach a
-/// top-level `_meta` describing the truncation. Agents pick up the meta and either refine
-/// or paginate via `offset`.
+/// Trim oversized arrays and disclose truncation. Protected arrays can force budget overshoot.
 fn cap_to_budget_with(
     value: serde_json::Value,
     kind: &str,
@@ -673,13 +558,7 @@ fn cap_to_budget_with(
             out
         }
         serde_json::Value::Object(mut map) => {
-            // Trim top-level arrays, largest first, until the payload fits.
-            // One pass is not enough: several response shapes carry more than
-            // one array that grows with the repo (`session_end`'s `new_files`
-            // + `removed_files`, `export_context`'s `primary` + `related`,
-            // `list_dependencies`' `imports` + `imported_by`). Trimming only
-            // the largest left every runner-up at full size, so the response
-            // stayed over budget by however much they weighed.
+            // Several arrays may exceed the budget; trimming only the largest is insufficient.
             let mut meta: Option<serde_json::Value> = None;
             let mut also_truncated: Vec<String> = Vec::new();
             let mut trimmed: Vec<String> = Vec::new();
@@ -694,10 +573,7 @@ fn cap_to_budget_with(
                 else {
                     break;
                 };
-                // A protected array (per-element invariant, see
-                // PROTECTED_TRUNCATION_KEYS) stays eligible only as the sole
-                // option on the first pass. Once another array has absorbed a
-                // trim, the invariant outranks the remaining overshoot.
+                // After any unprotected trim, preserving per-element invariants outranks the budget.
                 if protected && meta.is_some() {
                     break;
                 }
@@ -707,8 +583,7 @@ fn cap_to_budget_with(
                 let total = items.len();
                 let other_chars = current_len.saturating_sub(key_len);
                 let remaining = budget_chars.saturating_sub(other_chars);
-                // truncate_array keeps a prefix, so identifiers collected
-                // up-front let us name exactly the dropped tail elements.
+                // Prefix truncation lets original positions identify the dropped tail.
                 let identifiers: Vec<Option<String>> = if protected {
                     items.iter().map(element_identifier).collect()
                 } else {
@@ -724,9 +599,7 @@ fn cap_to_budget_with(
                     nested_dropped_total += nested.dropped_total;
                 }
                 if meta.is_some() {
-                    // `total_results` / `returned` stay scoped to the headline
-                    // `field` so their meaning does not shift; the additional
-                    // fields carry their own counts here instead.
+                    // Keep headline counts scoped to the first trimmed field; report additional cuts separately.
                     also_truncated.push(format!("{key} ({returned}/{total})"));
                     continue;
                 }
@@ -818,16 +691,13 @@ fn largest_trimmable_array(
     }
 }
 
-/// A depth-1 trim applied inside a kept array element, reported so the agent
-/// sees that the element it received is itself incomplete.
+/// Disclose truncation inside a surviving element, not just dropped top-level rows.
 struct NestedTrim {
     index: usize,
     field: String,
     kept: usize,
     total: usize,
-    /// Identifiers of the dropped entries, populated only when the nested
-    /// array is one of [`PROTECTED_TRUNCATION_KEYS`] — same visibility
-    /// contract as a protected array trimmed at the top level.
+    /// Protected nested arrays follow the top-level identity-disclosure contract.
     dropped_named: Vec<String>,
     /// How many entries were dropped from a protected nested array; 0 when the
     /// trimmed array was unprotected.
@@ -860,20 +730,13 @@ fn truncate_array_reporting(
             if !kept.is_empty() {
                 break;
             }
-            // First item alone overflows: try to shrink its `content` field
-            // before giving up. Without this, a single 50KB chunk blows past
-            // the 32KB token budget.
+            // Keep at least one result, shrinking its content before nested arrays.
             let remaining = budget_chars.saturating_sub(used);
             shrink_content_field(&mut item, remaining);
             let shrunk = serde_json::to_string(&item).map(|s| s.len()).unwrap_or(0);
             if shrunk > remaining {
-                // Content could not absorb the cut — either there is none, or
-                // the fields around it exceed the budget by themselves. The
-                // weight is in an array one level down, invisible to the
-                // top-level cap (`assess_risk_batch`'s `files[0].cycle_files`
-                // is populated uncapped, so one element can hold an entire
-                // import SCC). Trim that array, then give `content` the room
-                // that freed. Depth 1 only.
+                // Large nested arrays (such as an import cycle) can dominate a single row.
+                // Trim one level down, then retry content with the freed space.
                 nested = shrink_largest_nested_array(&mut item, remaining).map(|mut t| {
                     t.index = kept.len();
                     t
@@ -889,16 +752,10 @@ fn truncate_array_reporting(
     (kept, nested)
 }
 
-/// How many dropped entries of a protected *nested* array get named in
-/// `_meta.dropped_files`. Unlike a top-level protected array — bounded by the
-/// caller's own file list — a nested one can hold a whole import SCC, and
-/// naming every dropped entry would put back the bytes the trim just saved.
-/// The rest are covered by `_meta.dropped_count`.
+/// Sample dropped nested identities so their disclosure cannot undo the budget savings.
 const NESTED_DROPPED_SAMPLE: usize = 10;
 
-/// Best-effort identifier for a nested entry. Unlike the top-level shapes,
-/// a nested protected array is often a plain path list (`review_rehearsal`'s
-/// per-objection `files`), where the entry is its own identifier.
+/// Nested protected arrays may contain bare paths rather than records.
 fn nested_element_identifier(entry: &serde_json::Value) -> Option<String> {
     match entry {
         serde_json::Value::String(s) => Some(s.clone()),
@@ -906,12 +763,7 @@ fn nested_element_identifier(entry: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Trim the largest array field of `item` (an object) so the serialized
-/// element fits within `budget_chars`. Reuses [`largest_trimmable_array`], so
-/// an unprotected array is always preferred and a protected one is trimmed
-/// only as the sole option — and when it is, the dropped entries are named on
-/// the returned [`NestedTrim`]. Returns `None` when the element is not an
-/// object, holds no array, or nothing had to be dropped.
+/// Trim one nested array, preferring unprotected fields and disclosing protected drops.
 fn shrink_largest_nested_array(
     item: &mut serde_json::Value,
     budget_chars: usize,
@@ -1011,13 +863,8 @@ fn escaped_len(s: &str) -> usize {
     s.chars().map(escaped_char_len).sum()
 }
 
-/// Best-effort: if `item` is an object with a `content: String` field,
-/// truncate that string so the serialized item fits within `budget_chars`.
-/// Marks the truncation visibly so an agent reading the payload knows it's
-/// incomplete. No-op when the element already fits, and when the fields
-/// around `content` blow the budget on their own — cutting content cannot
-/// rescue that element, so the caller trims the array carrying the weight and
-/// calls back with the reduced overhead.
+/// Shrink content with a visible marker. If sibling fields already exceed the
+/// budget, leave content intact for a later pass after nested-array trimming.
 fn shrink_content_field(item: &mut serde_json::Value, budget_chars: usize) {
     let serde_json::Value::Object(map) = item else {
         return;
@@ -1026,11 +873,7 @@ fn shrink_content_field(item: &mut serde_json::Value, budget_chars: usize) {
         Some(serde_json::Value::String(s)) => std::mem::take(s),
         _ => return,
     };
-    // Reserve what the rest of the element actually costs, measured with the
-    // content emptied, rather than a fixed few hundred bytes. A fixed reserve
-    // undercounts a record carrying many sibling fields: the shrink then lands
-    // over budget and hands the residue to the nested trimmer, dropping
-    // entries the content could have absorbed on its own.
+    // Measure sibling overhead; a fixed reserve could needlessly truncate nested entries.
     let overhead = serde_json::to_string(&*map).map(|s| s.len()).unwrap_or(0);
     let marker = escaped_len(TRUNCATION_MARKER);
     if budget_chars <= overhead + marker || overhead + escaped_len(&content) <= budget_chars {
@@ -1055,7 +898,6 @@ fn shrink_content_field(item: &mut serde_json::Value, budget_chars: usize) {
         s.push_str(TRUNCATION_MARKER);
         s
     };
-    // Re-insert on the existing key, which keeps its position in the map.
     map.insert("content".to_string(), serde_json::Value::String(shrunk));
 }
 
@@ -1074,8 +916,6 @@ mod tests {
         "x".repeat(n)
     }
 
-    /// Prefix-only view of [`truncate_array_reporting`], for the cases that
-    /// assert on the kept elements and not on the nested-trim report.
     fn truncate_array(items: Vec<Value>, budget_chars: usize) -> Vec<Value> {
         truncate_array_reporting(items, budget_chars).0
     }
@@ -1089,8 +929,7 @@ mod tests {
 
     #[test]
     fn bundle_token_budget_is_monotonic_by_repo_size() {
-        // Env override not exercised here: setting env vars is `unsafe` and
-        // racy under edition 2024; tier coverage is what matters.
+        // Avoid process-global environment writes in parallel tests.
         let tiers = [
             mcp_bundle_token_budget(0),
             mcp_bundle_token_budget(149),
@@ -1113,7 +952,6 @@ mod tests {
 
     #[test]
     fn cap_respects_explicit_smaller_budget() {
-        // A small per-call budget truncates input that the default would pass.
         let items: Vec<Value> = (0..20)
             .map(|i| json!({"i": i, "blob": fat_string(500)}))
             .collect();
@@ -1125,7 +963,6 @@ mod tests {
 
     #[test]
     fn cap_truncates_top_level_array_when_over_budget() {
-        // Each item is ~1100 chars; 50 items = ~55k chars, well over 32k budget.
         let items: Vec<Value> = (0..50)
             .map(|i| json!({"i": i, "blob": fat_string(1000)}))
             .collect();
@@ -1138,15 +975,12 @@ mod tests {
         let returned = meta["returned"].as_u64().unwrap() as usize;
         assert!(returned > 0 && returned < 50, "got {returned}");
         assert_eq!(obj["results"].as_array().unwrap().len(), returned);
-        // find_symbol has no `offset` param, so the hint must not advise paging.
         let hint = meta["hint"].as_str().unwrap();
         assert!(!hint.contains("offset"), "{hint}");
     }
 
     #[test]
     fn cap_search_envelope_hint_keeps_pagination_advice() {
-        // `search` ships the `SearchResults` object envelope, not a bare
-        // array; the object branch must still tell the agent it can page.
         let results: Vec<Value> = (0..50)
             .map(|i| json!({"i": i, "blob": fat_string(1000)}))
             .collect();
@@ -1170,7 +1004,6 @@ mod tests {
 
     #[test]
     fn cap_trims_largest_array_field_in_object() {
-        // ContextBundle-like: small `primary` + huge `related`.
         let related: Vec<Value> = (0..50)
             .map(|i| json!({"i": i, "blob": fat_string(1000)}))
             .collect();
@@ -1204,10 +1037,6 @@ mod tests {
 
     #[test]
     fn cap_prefers_unprotected_array_over_protected_files() {
-        // assess_risk_diff shape: `files` carries the one-entry-per-patch-file
-        // invariant. Even when `files` is the LARGEST array, truncation must
-        // trim another array instead — rollups like test_gap_files
-        // cross-reference `files` by name.
         let files: Vec<Value> = (0..40)
             .map(|i| json!({"file": format!("src/f{i}.rs"), "blob": fat_string(1000)}))
             .collect();
@@ -1230,9 +1059,6 @@ mod tests {
 
     #[test]
     fn cap_records_dropped_files_when_protected_array_is_only_option() {
-        // When `files` is the only truncatable array, it may be trimmed —
-        // but the dropped entries must be named in _meta.dropped_files so
-        // the broken invariant is visible, never silent.
         let files: Vec<Value> = (0..40)
             .map(|i| json!({"file": format!("src/f{i}.rs"), "blob": fat_string(1000)}))
             .collect();
@@ -1255,8 +1081,6 @@ mod tests {
 
     #[test]
     fn cap_counts_dropped_elements_without_identifiers() {
-        // Protected-array elements with no path/name field fall back to a
-        // dropped_count so the truncation is still visible.
         let files: Vec<Value> = (0..40).map(|_| json!({"blob": fat_string(1000)})).collect();
         let v = json!({ "files": files });
         let out = cap_to_budget_with(v, "assess_risk_diff", MCP_BUDGET_CHARS);
@@ -1270,9 +1094,6 @@ mod tests {
 
     #[test]
     fn cap_trims_every_oversized_array_not_just_the_largest() {
-        // session_end shape: `new_files` and `removed_files` both grow with
-        // the repo. Trimming only the largest left the runner-up at full
-        // size, so the response stayed far over budget.
         let big = |n: usize, prefix: &str| -> Vec<Value> {
             (0..n)
                 .map(|i| json!(format!("{prefix}/{i}/{}", fat_string(200))))
@@ -1286,12 +1107,7 @@ mod tests {
         });
         let out = cap_to_budget_with(v, "session_end", MCP_BUDGET_CHARS);
         let serialized = serde_json::to_string(&out).unwrap();
-        // The cap measures element payloads, not the JSON envelope around
-        // them (key names, brackets, separators), so it lands a little over.
-        // What matters is that the overshoot is a fixed envelope cost rather
-        // than the full weight of every array after the first: trimming only
-        // `new_files` left `removed_files` whole, ~65 KB against a 32 KB
-        // budget, and that residue scales with the repo.
+        // Allow fixed JSON envelope overhead, not overshoot that scales with untrimmed arrays.
         assert!(
             serialized.len() < MCP_BUDGET_CHARS + 1024,
             "capped response must land at the budget, got {} chars",
@@ -1302,9 +1118,6 @@ mod tests {
         assert!(obj["removed_files"].as_array().unwrap().len() < 300);
         let meta = &obj["_meta"];
         assert_eq!(meta["truncated"], json!(true));
-        // The second field trimmed must be named with its kept/total counts,
-        // so an agent can tell that more than the headline `field` lost
-        // entries, and by how much.
         let also: Vec<&str> = meta["also_truncated_fields"]
             .as_array()
             .expect("also_truncated_fields")
@@ -1326,9 +1139,6 @@ mod tests {
 
     #[test]
     fn cap_leaves_protected_files_alone_after_another_array_absorbed_a_trim() {
-        // Second-pass trimming must not reach into `files`: once
-        // `summary_notes` has been trimmed, the per-element invariant on
-        // `files` outranks the remaining overshoot (PROTECTED_TRUNCATION_KEYS).
         let files: Vec<Value> = (0..40)
             .map(|i| json!({"file": format!("src/f{i}.rs"), "blob": fat_string(1000)}))
             .collect();
@@ -1346,8 +1156,6 @@ mod tests {
 
     #[test]
     fn cap_single_oversized_array_reports_no_also_truncated_fields() {
-        // The common case must keep its existing _meta shape: one `field`,
-        // no `also_truncated_fields` noise.
         let related: Vec<Value> = (0..50)
             .map(|i| json!({"i": i, "blob": fat_string(1000)}))
             .collect();
@@ -1360,11 +1168,6 @@ mod tests {
 
     #[test]
     fn cap_trims_nested_array_inside_the_surviving_element() {
-        // assess_risk_batch on a file inside a huge import SCC: `cycle_files`
-        // is populated uncapped and sits nested inside `files[0]`, invisible
-        // to the top-level cap. `files` is protected and has a single entry,
-        // so nothing can be dropped at the top level — the nested array is
-        // the only thing that can give.
         let cycle: Vec<Value> = (0..4200)
             .map(|i| json!(format!("src/module{i}/handler.rs")))
             .collect();
@@ -1389,8 +1192,7 @@ mod tests {
             serde_json::to_string(&obj["files"]).unwrap().len() <= MCP_BUDGET_CHARS,
             "trimmed payload must fit the budget"
         );
-        // Same envelope allowance as cap_trims_every_oversized_array_not_just_the_largest:
-        // the `_meta` marker is appended after the budget check.
+        // `_meta` is appended after the payload budget check.
         let serialized = serde_json::to_string(&out).unwrap();
         assert!(
             serialized.len() < MCP_BUDGET_CHARS + 1024,
@@ -1404,8 +1206,6 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(also, vec![format!("files[0].cycle_files ({kept}/4200)")]);
-        // The staleness scan reads whatever cycle_files paths remain; the
-        // trimmed shape must still walk cleanly.
         let mut paths = Vec::new();
         collect_referenced_paths(&out, &mut paths);
         assert!(paths.contains(&"src/hot.rs".to_string()));
@@ -1417,9 +1217,6 @@ mod tests {
 
     #[test]
     fn nested_trim_prefers_an_unprotected_array_over_a_protected_one() {
-        // Same preference the top-level pass applies: `files` carries a
-        // per-element invariant, so an unprotected sibling absorbs the cut
-        // even when it is the smaller of the two.
         let mut item = json!({
             "severity": "high",
             "files": (0..200).map(|i| json!(format!("src/patch{i}.rs"))).collect::<Vec<_>>(),
@@ -1441,11 +1238,6 @@ mod tests {
 
     #[test]
     fn nested_trim_names_dropped_entries_of_a_protected_array() {
-        // review_rehearsal shape: each objection carries its own bare-path
-        // `files` list. When that protected array is the element's only
-        // array, trimming it must report the dropped identities the same way
-        // the top-level protected path does — sampled, then counted, so the
-        // report does not put back the bytes the trim saved.
         let objection = json!({
             "severity": "high",
             "files": (0..900).map(|i| json!(format!("src/area{i}/handler.rs"))).collect::<Vec<_>>(),
@@ -1482,10 +1274,6 @@ mod tests {
 
     #[test]
     fn content_shrink_absorbs_the_cut_before_any_nested_trim() {
-        // A fixed envelope reserve undercounted sibling fields, so an element
-        // whose `content` could have absorbed the whole cut still lost nested
-        // entries. Budget 4000 against a 5000-byte content and ten nested
-        // paths: the content gives, the nested array keeps all ten.
         let item = json!({
             "file_path": "src/big.rs",
             "content": fat_string(5_000),
@@ -1510,10 +1298,6 @@ mod tests {
 
     #[test]
     fn nested_trim_leaves_a_small_content_field_intact() {
-        // Measuring the reserve against the siblings cuts both ways: when an
-        // array dominates the element, the room left for `content` is zero
-        // and cutting it saves nothing. The array must give instead, and a
-        // content field that costs 12 bytes must come back whole.
         let item = json!({
             "file_path": "src/a.rs",
             "content": "fn main() {}",
@@ -1532,9 +1316,6 @@ mod tests {
 
     #[test]
     fn nested_trim_charges_the_array_brackets() {
-        // The per-entry accounting omits the array's own `[]`, which put an
-        // exact fit one byte over. Sweep the boundary window rather than
-        // pinning one hand-computed budget.
         let entries: Vec<Value> = ["aaaaaaaa", "bbbbbbbb", "cccccccc", "dddddddd", "eeeeeeee"]
             .iter()
             .map(|s| json!(s))
@@ -1549,8 +1330,6 @@ mod tests {
 
     #[test]
     fn cap_leaves_under_budget_nested_arrays_byte_identical() {
-        // The nested trim is a last resort inside the over-budget path; an
-        // under-budget response must serialize byte-for-byte unchanged.
         let v = json!({
             "files": [{
                 "file_path": "src/a.rs",
@@ -1577,9 +1356,6 @@ mod tests {
 
     #[test]
     fn truncate_array_shrinks_oversized_first_content_field() {
-        // Regression: when the first item has a `content: String` that
-        // alone exceeds budget, shrink_content_field must trim it instead
-        // of letting the whole 50KB blob through verbatim.
         let huge = json!({"file_path": "src/big.rs", "content": fat_string(50_000)});
         let kept = truncate_array(vec![huge], 4_000);
         assert_eq!(kept.len(), 1);
@@ -1602,14 +1378,12 @@ mod tests {
         let items: Vec<Value> = (0..10)
             .map(|i| json!({"i": i, "blob": fat_string(100)}))
             .collect();
-        // Each item ~115 chars. Budget for 5 items = ~575 chars; allow some overhead.
         let kept = truncate_array(items, 600);
         assert!(
             (4..=6).contains(&kept.len()),
             "expected 4-6, got {}",
             kept.len()
         );
-        // Prefix order preserved
         for (n, item) in kept.iter().enumerate() {
             assert_eq!(item["i"], json!(n));
         }
@@ -1623,9 +1397,6 @@ mod tests {
 
     #[test]
     fn render_wraps_under_budget_array_as_results_object() {
-        // Tools like find_symbol return Result<Vec<T>>. Without the wrap,
-        // structuredContent ships as a bare JSON array and Claude's MCP
-        // client rejects it with `expected record, received array`.
         let r: Result<Vec<Value>> = Ok(vec![json!({"name": "foo"}), json!({"name": "bar"})]);
         let result = render_with_kind(r, "find_symbol");
         assert_ne!(result.is_error, Some(true));
@@ -1636,14 +1407,11 @@ mod tests {
         let items = obj["results"].as_array().expect("results is an array");
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["name"], json!("foo"));
-        // No truncation under budget: _meta must be absent.
         assert!(!obj.contains_key("_meta"));
     }
 
     #[test]
     fn render_passes_object_through_unchanged() {
-        // list_dependencies returns a struct (object); the wrap must not
-        // mutate it into a nested {"results": {...}}.
         let r: Result<Value> = Ok(json!({"file_path": "a.rs", "imports": ["b.rs"]}));
         let result = render_with_kind(r, "list_dependencies");
         let value = result.structured_content.expect("structured content");
@@ -1654,9 +1422,6 @@ mod tests {
 
     #[test]
     fn render_wraps_empty_array() {
-        // Empty array is still an array; must wrap so the response stays a
-        // valid record (empty find_symbol / find_references is the common
-        // miss case and would otherwise ship `[]`).
         let r: Result<Vec<Value>> = Ok(vec![]);
         let result = render_with_kind(r, "find_symbol");
         let value = result.structured_content.expect("structured content");
@@ -1668,9 +1433,6 @@ mod tests {
 
     #[test]
     fn render_over_budget_array_keeps_results_and_meta_shape() {
-        // cap_to_budget already wraps oversized arrays as {results, _meta}.
-        // Verify render_with_kind passes that wrapped object through without
-        // double-nesting it.
         let items: Vec<Value> = (0..50)
             .map(|i| json!({"i": i, "blob": fat_string(1000)}))
             .collect();
@@ -1685,7 +1447,6 @@ mod tests {
         assert_eq!(meta["truncated"], json!(true));
         assert_eq!(meta["kind"], json!("find_similar"));
         assert_eq!(meta["total_results"], json!(50));
-        // No double-wrapping: results sits directly under the top object.
         assert!(obj["results"].is_array());
     }
 
@@ -1711,15 +1472,11 @@ mod tests {
         let mut paths = Vec::new();
         collect_referenced_paths(&v, &mut paths);
         paths.sort();
-        // file_path, from_file, and cycle_files[*] collected; `imports`
-        // (bare module name) and `clustered_directories` (a dir) excluded.
         assert_eq!(paths, vec!["src/a.rs", "src/b.rs", "src/c.rs", "src/d.rs"]);
     }
 
     #[test]
     fn collect_referenced_paths_covers_review_rehearsal_file_lists() {
-        // Shape of a `review_rehearsal` result: bare string paths under
-        // `files`, top-level and inside each objection.
         let v = json!({
             "files": ["src/a.rs", "src/b.rs"],
             "objections": [
@@ -1735,8 +1492,6 @@ mod tests {
 
     #[test]
     fn collect_referenced_paths_reaches_nested_cycle_arrays() {
-        // session_end reports cycles as arrays of arrays of paths; a
-        // direct-items-only harvester saw none of them.
         let v = json!({
             "new_cycles": [["a.rs", "b.rs"], ["c.rs"]],
             "resolved_cycles": [["d.rs"]],
@@ -1754,8 +1509,6 @@ mod tests {
 
     #[test]
     fn collect_referenced_paths_does_not_scoop_object_strings_under_a_path_key() {
-        // `files` holds records here; only their own path-keyed fields count.
-        // Note prose and categories must not be mistaken for paths.
         let v = json!({
             "files": [
                 { "file": "a.rs", "notes": ["test gap: no test found"], "category": "hotspot" }
@@ -1768,9 +1521,6 @@ mod tests {
 
     #[test]
     fn collect_referenced_paths_files_key_tolerates_object_arrays() {
-        // `assess_risk_diff` / `feature_bundle` also use `files`, but with
-        // object items. The key must not break them: objects contribute
-        // nothing directly and are still walked for their own path keys.
         let v = json!({
             "files": [
                 { "file": "src/a.rs", "score": 0.5 },
@@ -1787,7 +1537,6 @@ mod tests {
     fn merge_stale_meta_preserves_existing_meta() {
         let mut v = json!({ "results": [], "_meta": { "truncated": true } });
         merge_stale_meta(&mut v, &["src/a.rs".to_string()]);
-        // existing key untouched, stale info added alongside.
         assert_eq!(v["_meta"]["truncated"], json!(true));
         assert_eq!(v["_meta"]["stale_files"], json!(["src/a.rs"]));
         assert!(v["_meta"]["stale_warning"].is_string());
@@ -1829,9 +1578,6 @@ mod tests {
 
     #[test]
     fn staleness_detects_changed_and_missing_files() {
-        // End-to-end against a real structural index: a file whose on-disk
-        // content matches its indexed hash is not stale; one that changed is;
-        // one deleted is; one never indexed is ignored (not in the index).
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let codesage_dir = root.join(".codesage");
@@ -1852,13 +1598,10 @@ mod tests {
             .unwrap();
         };
 
-        // unchanged on disk vs index
         write("src/same.rs", b"fn a() {}");
         index("src/same.rs", b"fn a() {}");
-        // changed on disk since indexing
         write("src/changed.rs", b"fn b() {} // edited");
         index("src/changed.rs", b"fn b() {}");
-        // indexed but deleted from disk
         index("src/gone.rs", b"fn c() {}");
         drop(db);
 
@@ -1882,8 +1625,6 @@ mod tests {
         assert!(stale.contains(&"src/gone.rs".to_string()));
         assert!(!stale.contains(&"src/never_indexed.rs".to_string()));
 
-        // annotate_staleness should prepend a banner and set _meta.stale_files
-        // when the result references a changed file.
         let result = render_with_kind(
             Ok(json!([{ "file_path": "src/changed.rs", "line": 1 }])),
             "search",
@@ -1902,9 +1643,6 @@ mod tests {
 
     #[test]
     fn coverage_annotates_only_empty_results_of_the_listed_tools() {
-        // An agent that gets `[]` back cannot otherwise tell a genuine absence
-        // from a language that was never indexed, and reads the empty list as
-        // proof the code does not exist.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let codesage_dir = root.join(".codesage");
@@ -1945,9 +1683,6 @@ mod tests {
             coverage_of("find_symbol", json!({ "results": [] })).is_some(),
             "find_symbol is in the annotated set"
         );
-        // `find_references` / `find_similar` returning [] is likewise
-        // ambiguous between "no such code" and "never indexed", so they
-        // carry the same annotation.
         assert!(
             coverage_of("find_references", json!({ "results": [] })).is_some(),
             "find_references is in the annotated set"
@@ -1956,7 +1691,6 @@ mod tests {
             coverage_of("find_similar", json!({ "results": [] })).is_some(),
             "find_similar is in the annotated set"
         );
-        // A non-empty result is not ambiguous, so it must stay untouched.
         assert!(
             coverage_of(
                 "search",
@@ -1965,32 +1699,23 @@ mod tests {
             .is_none(),
             "a non-empty result must not be annotated"
         );
-        // `impact_analysis` returning [] means a leaf nothing imports — a
-        // correct answer that a coverage note would only muddy.
         assert!(
             coverage_of("impact_analysis", json!({ "results": [] })).is_none(),
             "impact_analysis is deliberately outside the annotated set"
         );
-        // A payload with no `results` key is a different shape, not an empty one.
         assert!(
             coverage_of("search", json!({ "found": false })).is_none(),
             "a payload without `results` must not be treated as empty"
         );
 
-        // `search` reads the SEMANTIC set, not the structural file table.
-        // Nothing here was semantically indexed, so it must say so rather than
-        // report 3 files as though they had been searched.
         let sem = coverage_of("search", json!({ "results": [] })).unwrap();
         assert_eq!(sem["semantically_indexed_files"], json!(0));
-        // `find_symbol` is structural, so the semantic count does not apply.
         let structural = coverage_of("find_symbol", json!({ "results": [] })).unwrap();
         assert!(structural.get("semantically_indexed_files").is_none());
     }
 
     #[test]
     fn coverage_speaks_up_loudest_when_nothing_is_indexed() {
-        // The zero-file index is where an empty result misleads hardest:
-        // nothing was ever looked at. Staying silent here would be backwards.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let codesage_dir = root.join(".codesage");
@@ -2018,8 +1743,6 @@ mod tests {
 
     #[test]
     fn clamps_annotate_requested_vs_applied_and_spare_the_common_case() {
-        // No adjustment: the response must stay byte-identical, with no
-        // `_meta` injected.
         let plain = render_with_kind(Ok(json!({ "results": [] })), "search");
         let untouched = annotate_clamps(plain, &[]);
         assert!(
@@ -2032,7 +1755,6 @@ mod tests {
             "an unclamped response must not grow a `_meta` envelope"
         );
 
-        // One adjustment: requested-vs-applied lands under `_meta.clamps`.
         let capped = render_with_kind(Ok(json!({ "results": [] })), "search");
         let annotated = annotate_clamps(
             capped,
@@ -2048,8 +1770,6 @@ mod tests {
             json!([{ "param": "limit", "requested": 10_000, "applied": 100 }])
         );
 
-        // Error results stay errors: a clamp note must not decorate a
-        // failure or clear its error flag.
         let failed: CallToolResult =
             render_with_kind::<serde_json::Value>(Err(anyhow::anyhow!("boom")), "search");
         assert_eq!(failed.is_error, Some(true));
@@ -2091,8 +1811,6 @@ mod tests {
 
     #[test]
     fn test_override_marks_success_and_spares_the_common_case() {
-        // Marker present when active and merged with any existing `_meta`;
-        // absent when inert; error results never carry it.
         let marked =
             annotate_test_override(CallToolResult::structured(json!({"results": []})), true);
         assert_eq!(

@@ -1,38 +1,11 @@
-//! Extract decision-shape comments attached to a symbol's definition.
-//!
-//! "Rationale" here means a comment whose first non-whitespace token is one of
-//! the recognized markers (`WHY`, `NOTE`, `IMPORTANT`, `FIXME`, `HACK`, `XXX`,
-//! `TODO`) followed by a colon. The comment must be **immediately adjacent**
-//! to the symbol's definition node (one of its previous siblings, with only
-//! whitespace between).
-//!
-//! Two design choices worth keeping in mind:
-//!
-//! 1. **Marker-based, not all-doc-comments.** Filtering keeps the rationale
-//!    table small and high-signal. Plain API descriptions ("Returns the
-//!    parent of the path") are not stored — the agent recovers those from
-//!    the symbol name + signature anyway. See `notes/20260509-...md` §1.2
-//!    for the full reasoning.
-//! 2. **Language-specific by design.** This module covers Rust and Python with
-//!    dedicated walks, and C / C++ / Go / PHP through a shared C-family walk
-//!    (`extract_clike_rationale`). Each family needs a deliberate attachment
-//!    rule because comment placement varies (Rust `///` precedes the item,
-//!    Python docstrings live inside the body as the first `(string)` statement,
-//!    PHP `/** */` docblocks immediately precede — with the marker often on an
-//!    interior `*` line — and PHP 8 `#[...]` attributes sit between the docblock
-//!    and the definition).
+//! Extract marked rationale from adjacent comments and leading Python docstrings.
+//! `WHY`, `NOTE`, and `IMPORTANT` require a colon; `FIXME`, `HACK`, `XXX`, and
+//! `TODO` also accept whitespace. Ordinary API descriptions are not rationale.
 
 use codesage_protocol::{RationaleEntry, RationaleKind};
 use tree_sitter::Node;
 
-/// Walk previous siblings of `def_node`, collecting rationale-shape comments
-/// until a non-comment / non-attribute node breaks the contiguous block.
-///
-/// Stops at the first non-comment, non-attribute node so a rationale comment
-/// belonging to a *different* item earlier in the file doesn't bleed into
-/// this symbol's rationale list. Rust attribute macros (`#[derive(...)]`,
-/// `#[cfg(...)]`) are skipped over rather than treated as breakers because
-/// they routinely sit between the doc-comment and the item.
+/// Collect adjacent marked comments across Rust attributes, in source order.
 pub fn extract_rust_rationale(def_node: &Node, source: &[u8]) -> Vec<RationaleEntry> {
     let mut entries = Vec::new();
     let mut next_start_row = def_node.start_position().row;
@@ -40,12 +13,7 @@ pub fn extract_rust_rationale(def_node: &Node, source: &[u8]) -> Vec<RationaleEn
     while let Some(node) = sib {
         match node.kind() {
             "line_comment" | "block_comment" => {
-                // Adjacency guard (mirrors the Python walk): the comment must
-                // sit on the row immediately above the node we last accepted. A
-                // blank-line gap detaches it and stops the walk. Rust
-                // `line_comment` nodes include the trailing newline, so their
-                // end lands at column 0 of the *next* row; treat that row as
-                // one past the last content row rather than as content.
+                // Rust line comments include the newline; its next row is not content.
                 let end = node.end_position();
                 let last_content_row = if end.column == 0 && end.row > node.start_position().row {
                     end.row - 1
@@ -64,17 +32,13 @@ pub fn extract_rust_rationale(def_node: &Node, source: &[u8]) -> Vec<RationaleEn
                 next_start_row = node.start_position().row;
             }
             "attribute_item" | "inner_attribute_item" => {
-                // Skip attributes — they sit between docs and the item — but
-                // advance the adjacency anchor so a doc comment directly above
-                // the attribute stack still counts as adjacent.
+                // Attributes bridge the comment-to-definition adjacency chain.
                 next_start_row = node.start_position().row;
             }
             _ => break,
         }
         sib = node.prev_sibling();
     }
-    // We walked previous siblings, so entries is in reverse source order.
-    // Restore source order so consumers reading the list line up with the file.
     entries.reverse();
     entries
 }
@@ -82,20 +46,8 @@ pub fn extract_rust_rationale(def_node: &Node, source: &[u8]) -> Vec<RationaleEn
 /// Collect Python rationale from line comments immediately above a definition
 /// and from a leading triple-quoted docstring inside the definition body.
 ///
-/// Two tree-sitter shapes complicate the walk:
-///
-/// 1. **Decorators.** `@foo\ndef bar()` wraps as
-///    `decorated_definition[decorator(@foo), function_definition(bar)]`, so
-///    the rationale comment is a sibling of the wrapper, not of the inner
-///    def. Anchor the walk at the wrapper so `# TODO:` above `@app.route`,
-///    `@property`, `@dataclass`, `@lru_cache`, etc. still attaches — these
-///    patterns dominate real Python codebases.
-/// 2. **First statement in a class body.** Tree-sitter parks the leading
-///    comment inside a class as a child of `class_definition`, NOT inside
-///    the body `block`. The first method's prev_sibling chain therefore
-///    runs out before reaching the comment. When the anchor is the first
-///    child of a class block, climb to the block and continue the walk
-///    from its prev_siblings inside the class header.
+/// Decorated definitions anchor at their wrapper. A class's leading comment
+/// belongs to `class_definition`, outside its body block, so the walk may climb once.
 pub fn extract_python_rationale(def_node: &Node, source: &[u8]) -> Vec<RationaleEntry> {
     let mut entries = Vec::new();
     let initial_anchor = python_traversal_anchor(def_node);
@@ -104,12 +56,8 @@ pub fn extract_python_rationale(def_node: &Node, source: &[u8]) -> Vec<Rationale
     let exhausted =
         walk_python_prev_comments(&initial_anchor, &mut next_start_row, &mut entries, source);
 
-    // Climb once into the enclosing class header if we ran out of siblings
-    // inside the block without hitting any non-comment node — that's the
-    // "first method in a class" shape where the comment lives at
-    // class_definition level. Restricted to class_definition: climbing
-    // out of a function body would attribute the comment above the outer
-    // function to the inner nested def, which is wrong.
+    // Climb only from classes; climbing a function would steal its rationale
+    // for a nested definition.
     if exhausted
         && let Some(block) = initial_anchor.parent()
         && block.kind() == "block"
@@ -172,16 +120,8 @@ fn walk_python_prev_comments(
     true
 }
 
-/// Rationale walk for C-family grammars plus Go and PHP — all of which use a
-/// single `comment` node kind with C-style (`//`, `/* */`, `/** */`) and, for
-/// PHP, `#` line delimiters. Mirrors [`extract_rust_rationale`]'s adjacency walk
-/// over previous siblings. PHP 8 attribute lists (`#[Route(...)]`) are skipped
-/// the way Rust attributes are, so a docblock above the attribute stack still
-/// attaches.
-///
-/// Unlike the Rust path, a single block comment is scanned line-by-line for the
-/// first marker, so a `/**\n * WHY: ...\n */` docblock — the dominant PHP shape —
-/// attaches even though the marker isn't on the opening `/**` line.
+/// Collect adjacent C/C++/Go/PHP rationale across PHP attributes, in source order.
+/// Scan block-comment lines for the first marker, including interior docblock lines.
 pub fn extract_clike_rationale(def_node: &Node, source: &[u8]) -> Vec<RationaleEntry> {
     let mut entries = Vec::new();
     let mut next_start_row = def_node.start_position().row;
@@ -189,11 +129,7 @@ pub fn extract_clike_rationale(def_node: &Node, source: &[u8]) -> Vec<RationaleE
     while let Some(node) = sib {
         match node.kind() {
             "comment" => {
-                // Adjacency guard, identical to the Rust walk: the comment must
-                // sit on the row immediately above the last node we accepted. A
-                // blank-line gap detaches it. Some grammars park the trailing
-                // newline inside a line comment (end column 0 on the next row),
-                // so treat that row as one past the last content row.
+                // Some grammars include the newline; its next row is not content.
                 let end = node.end_position();
                 let last_content_row = if end.column == 0 && end.row > node.start_position().row {
                     end.row - 1
@@ -210,9 +146,7 @@ pub fn extract_clike_rationale(def_node: &Node, source: &[u8]) -> Vec<RationaleE
                 }
                 next_start_row = node.start_position().row;
             }
-            // PHP 8 attributes sit between the docblock and the item; skip them
-            // but advance the anchor so a docblock above the attribute stack
-            // still counts as adjacent.
+            // PHP attributes bridge the comment-to-definition adjacency chain.
             "attribute_list" => {
                 next_start_row = node.start_position().row;
             }
@@ -220,7 +154,6 @@ pub fn extract_clike_rationale(def_node: &Node, source: &[u8]) -> Vec<RationaleE
         }
         sib = node.prev_sibling();
     }
-    // Walked in reverse source order; restore file order for consumers.
     entries.reverse();
     entries
 }
@@ -321,14 +254,7 @@ fn parse_python_docstring(node: &Node, source: &[u8]) -> Option<RationaleEntry> 
     parse_marker_line(body.trim(), node)
 }
 
-/// Parse a comment body's first line for a `MARKER: rest` pattern. Multi-line
-/// block comments only have their first line examined for the marker; the
-/// full body is preserved as `text`. This matches author intent: the marker
-/// labels the whole comment, so all of it counts as the rationale.
-/// Node-free core of marker parsing: find a `MARKER: rest` / `MARKER rest`
-/// pattern in the first token of a comment body. Returns the recognized kind and
-/// the after-marker text. Unit tests exercise this directly so they cover the
-/// shipped path instead of a copy.
+/// Parse the first token as a marker, preserving the remaining body as text.
 fn parse_marker(body: &str) -> Option<(RationaleKind, String)> {
     let mut iter = body.splitn(2, |c: char| c == ':' || c.is_whitespace());
     let maybe_marker = iter.next()?.trim();
@@ -337,10 +263,7 @@ fn parse_marker(body: &str) -> Option<(RationaleKind, String)> {
     }
     let kind = RationaleKind::from_marker(maybe_marker)?;
 
-    // The no-colon path is restricted to the bare-tag markers
-    // (TODO/FIXME/XXX/HACK) that tooling conventionally writes without a colon.
-    // Prose markers like WHY/NOTE/IMPORTANT require a trailing colon, so plain
-    // sentences ("Note that ...", "Why not just ...") don't become rationale.
+    // Require colons on prose markers so "Note that ..." is not rationale.
     let has_colon = body.as_bytes().get(maybe_marker.len()) == Some(&b':');
     if !has_colon
         && !matches!(
@@ -351,9 +274,6 @@ fn parse_marker(body: &str) -> Option<(RationaleKind, String)> {
         return None;
     }
 
-    // Re-split on `:` specifically to capture only the after-colon body.
-    // If the first token was a bare-tag marker but no colon followed
-    // (e.g. "TODO ..." without a colon), we still record it.
     let after_marker = match body.find(':') {
         Some(idx) if idx == maybe_marker.len() => body[idx + 1..].trim().to_string(),
         Some(_) | None => body[maybe_marker.len()..]
@@ -406,9 +326,6 @@ mod tests {
         assert_eq!(s, "unterminated");
     }
 
-    // Marker parsing — node-independent paths
-
-    // Exercise the shipped node-free marker core directly.
     use super::parse_marker as parse_for_test;
 
     #[test]
@@ -442,9 +359,6 @@ mod tests {
     fn rejects_empty_body() {
         assert!(parse_for_test("").is_none());
     }
-
-    // End-to-end: parse a Rust source snippet, verify rationale appears
-    // attached to the right symbol.
 
     fn extract_for_source(src: &str) -> Vec<codesage_protocol::Symbol> {
         let tree = crate::parse::parse_file(src.as_bytes(), codesage_protocol::Language::Rust)
@@ -511,8 +425,6 @@ fn id<T>(x: T) -> T { x }
 
     #[test]
     fn blank_line_gapped_comment_does_not_attach() {
-        // Rationale (a): a marker comment separated from the item by a blank
-        // line is not adjacent and must not attach.
         let src = "\
 // NOTE: general file-level note, not about beta.
 
@@ -528,7 +440,6 @@ fn beta() {}
 
     #[test]
     fn adjacent_comment_still_attaches_after_guard() {
-        // Rationale (a): the guard must not regress the adjacent case.
         let src = "\
 // FIXME: needs bounds check.
 fn gamma() {}
@@ -541,15 +452,12 @@ fn gamma() {}
 
     #[test]
     fn note_without_colon_is_rejected() {
-        // Rationale (b): the no-colon path is restricted to bare-tag markers.
         assert!(parse_for_test("Note that this is prose").is_none());
         assert!(parse_for_test("Why not just inline it").is_none());
         assert!(parse_for_test("Important consideration here").is_none());
-        // Bare-tag markers still accepted without a colon.
         assert!(parse_for_test("FIXME broken").is_some());
         assert!(parse_for_test("HACK workaround").is_some());
         assert!(parse_for_test("XXX revisit").is_some());
-        // Prose markers still accepted *with* a colon.
         assert_eq!(
             parse_for_test("NOTE: real note").unwrap().0,
             RationaleKind::Note
@@ -570,8 +478,6 @@ fn beta() {}
         assert_eq!(alpha.rationale.len(), 1);
         assert!(beta.rationale.is_empty());
     }
-
-    // C-family / Go / PHP rationale (extract_clike_rationale)
 
     fn extract_lang(
         src: &str,

@@ -1,23 +1,16 @@
-//! Iterative Tarjan strongly-connected-components over a `(from, to)` edge
-//! list. Shared by the session structural diff (`session.rs`) and the
-//! git-history risk cycle detection (`git_history::risk`) — both build a
-//! file-level import graph and want its SCCs.
+//! Iterative Tarjan strongly-connected components for file import graphs.
 
 use std::collections::HashMap;
 
 /// Iterative Tarjan's strongly-connected-components algorithm.
 ///
-/// Standard recursive Tarjan risks a stack overflow on deep import chains
-/// (php-src has some really deep include webs). The iterative form is
-/// marginally more code but bounded in stack usage by the explicit work-queue
-/// size.
+/// An explicit DFS stack avoids call-stack overflow on deep import chains.
 ///
 /// Input: edge list `(from, to)`. Output: list of SCCs, each a `Vec<String>`
 /// of node names. Nodes not in any edge are omitted (they can't be part of a
 /// multi-node cycle). Order within each SCC matches finish-order from the DFS;
 /// callers that need stable output should sort.
 pub(crate) fn tarjan_scc(edges: &[(String, String)]) -> Vec<Vec<String>> {
-    // Build adjacency and a stable node list (0-indexed).
     let mut idx_of: HashMap<&str, usize> = HashMap::new();
     let mut nodes: Vec<&str> = Vec::new();
     for (a, b) in edges {
@@ -44,9 +37,7 @@ pub(crate) fn tarjan_scc(edges: &[(String, String)]) -> Vec<Vec<String>> {
     let mut stack: Vec<usize> = Vec::new();
     let mut components: Vec<Vec<String>> = Vec::new();
 
-    // Work-queue entries: (node, next-child-index-to-visit). The second element
-    // encodes how far through adj[node] we've gotten so we can resume after a
-    // descent without the actual call stack.
+    // Entries retain (node, next child) so DFS can resume after descending.
     for start in 0..n {
         if index[start] != UNVISITED {
             continue;
@@ -62,8 +53,6 @@ pub(crate) fn tarjan_scc(edges: &[(String, String)]) -> Vec<Vec<String>> {
         while let Some(&(v, i)) = work.last() {
             if i < adj[v].len() {
                 let w = adj[v][i];
-                // Advance the parent's child cursor before descending so that
-                // when we pop back we continue from the next child.
                 work.last_mut().unwrap().1 = i + 1;
                 if index[w] == UNVISITED {
                     index[w] = index_counter;
@@ -76,8 +65,6 @@ pub(crate) fn tarjan_scc(edges: &[(String, String)]) -> Vec<Vec<String>> {
                     lowlink[v] = lowlink[v].min(index[w]);
                 }
             } else {
-                // All children visited. If v is an SCC root, pop off the
-                // component. Otherwise propagate its lowlink to the parent.
                 if lowlink[v] == index[v] {
                     let mut component: Vec<String> = Vec::new();
                     loop {

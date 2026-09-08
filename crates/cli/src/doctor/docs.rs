@@ -1,8 +1,5 @@
-//! `codesage doctor --docs`: check markdown claims against the index and the
-//! working tree. Four claim classes are extracted from prose (file paths and
-//! link targets, `path:line` anchors, code-shaped symbol names, and constant
-//! values) and each is verified read-only. Anything the checker cannot decide
-//! is dropped from the count instead of reported: a noisy checker gets ignored.
+//! Check markdown paths, anchors, symbols, and constants against the index and
+//! working tree. Undecidable claims are neither counted nor reported.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -35,7 +32,7 @@ impl ClaimClass {
     }
 }
 
-/// How a symbol token was written; the verdict rules differ per shape.
+/// Token shape determines which symbol verdicts are possible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SymbolShape {
     /// `a::b::c`
@@ -65,8 +62,7 @@ pub(crate) enum ClaimDetail {
         owner: Option<String>,
         member: String,
         shape: SymbolShape,
-        /// Written with a trailing `()`: the author means a callable, so a
-        /// missing member on a type is a missing method, not a field.
+        /// Trailing `()` distinguishes methods from unindexed fields.
         called: bool,
     },
     Constant {
@@ -92,14 +88,11 @@ pub(crate) struct Finding {
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggestion: Option<String>,
-    /// Repo-relative paths the suggestion points at (a relocated file, the
-    /// directory a module became, the file a symbol moved within); empty when
-    /// the finding names nothing concrete.
+    /// Repo-relative suggestion targets; empty without a concrete location.
     pub candidates: Vec<String>,
 }
 
-/// A suggestion with the paths it names, so JSON consumers get the paths
-/// without parsing the prose.
+/// Keep paths separate so JSON consumers need not parse the suggestion prose.
 struct Hint {
     text: String,
     candidates: Vec<String>,
@@ -167,8 +160,7 @@ pub(crate) fn run(json: bool, strict: bool, paths: &[PathBuf]) -> Result<()> {
         .and_then(|d| d.exclude_patterns)
         .unwrap_or_default();
 
-    // Explicit PATH arguments win over `[docs] exclude_patterns`, the way
-    // `git add -f` overrides `.gitignore`; only the default sweep is filtered.
+    // Explicit paths bypass config exclusions.
     let (selection, explicit) = if paths.is_empty() {
         (default_docs(&root), false)
     } else {
@@ -277,9 +269,6 @@ fn default_docs(root: &Path) -> ExplicitDocs {
     }
 }
 
-/// Explicit PATH arguments: directories are swept for markdown, files are
-/// taken as given when they are markdown. Anything else is returned
-/// separately so the caller can name it as skipped instead of parsing it.
 fn explicit_docs(paths: &[PathBuf]) -> ExplicitDocs {
     let mut set = DocSet::default();
     let mut out = ExplicitDocs::default();
@@ -294,7 +283,6 @@ fn explicit_docs(paths: &[PathBuf]) -> ExplicitDocs {
         } else if is_markdown(p) && p.is_file() {
             set.push(p.clone());
         } else {
-            // Wrong extension, or a pipe / socket / device: nothing to parse.
             out.not_markdown.push(p.clone());
         }
     }
@@ -303,8 +291,6 @@ fn explicit_docs(paths: &[PathBuf]) -> ExplicitDocs {
     out
 }
 
-/// Selected markdown files and explicit file arguments that were skipped or
-/// missing. Directories contribute their discovered markdown files only.
 #[derive(Default)]
 struct ExplicitDocs {
     docs: Vec<PathBuf>,
@@ -314,9 +300,6 @@ struct ExplicitDocs {
     failed: Vec<(PathBuf, String)>,
 }
 
-/// The documents to check, each once: a file named twice (directly and via
-/// the directory that holds it, or through a symlink) is keyed by its
-/// canonical path, and CHANGELOG.md is never a candidate.
 #[derive(Default)]
 struct DocSet {
     seen: HashSet<PathBuf>,
@@ -325,9 +308,7 @@ struct DocSet {
 }
 
 impl DocSet {
-    /// Dedupes on the canonical path but keeps the path as spelled (made
-    /// absolute and lexically normalised), so a document reached through a
-    /// symlink inside the repo still reads as the repo's own.
+    /// Dedupe canonically, but preserve spelling so symlinked-in docs remain internal.
     fn push(&mut self, p: PathBuf) {
         if !p.is_file() || is_changelog(&p) {
             return;
@@ -361,9 +342,7 @@ fn is_changelog(p: &Path) -> bool {
         .is_some_and(|n| n.eq_ignore_ascii_case("CHANGELOG.md"))
 }
 
-/// Recursive markdown sweep. `visited` holds canonical directories, so a
-/// symlink back into an ancestor (`a/self -> a`) is walked once, not until
-/// the path length limit.
+/// Canonical directory keys stop symlink cycles.
 fn walk_markdown(
     dir: &Path,
     out: &mut Vec<PathBuf>,
@@ -412,27 +391,20 @@ fn display_doc_path(root: &Path, doc: &Path) -> String {
         .unwrap_or_else(|_| abs_doc.display().to_string())
 }
 
-/// The whole trimmed prose line must be the directive; a mention inside a
-/// code span or a fence (documentation of the directive itself) is not one.
+/// A directive example inside prose or code must not skip its own document.
 static SKIP_DIRECTIVE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^<!--\s*codesage-docs:\s*skip-file\s*-->$").expect("static regex")
 });
 
-/// One pass over the index's file table plus the repo-level facts the verdicts
-/// need, reused across every document so the path checks never turn into one
-/// query per backticked token.
+/// Cache index facts across documents to avoid one query per token.
 struct IndexView {
     files: HashSet<String>,
-    /// Every directory prefix of an indexed file (`crates`, `crates/graph`,
-    /// `crates/graph/src`), so a parent directory can be confirmed without
-    /// touching the disk.
+    /// Indexed directory prefixes avoid disk probes for known parents.
     dirs: HashSet<String>,
     by_basename: HashMap<String, Vec<String>>,
-    /// Parsed language per indexed file; the naming convention a member must
-    /// follow is a property of the owner's language.
+    /// The owner's language determines member naming conventions.
     languages: HashMap<String, Language>,
-    /// Top-level names the repo's `.gitignore` excludes (plus `.codesage`):
-    /// runtime artifacts that differ per machine, never doc drift.
+    /// Gitignored roots and `.codesage` are machine-local artifacts, not drift.
     ignored_roots: HashSet<String>,
     /// Crate names declared in the root and `crates/*/Cargo.toml` dependency
     /// tables, `-` normalised to `_`. A `dep::item` path is foreign code.
@@ -519,8 +491,7 @@ fn dependency_crates(root: &Path) -> HashSet<String> {
         }
         collect_dependency_keys(&table, &mut out);
     }
-    // Workspace members depend on each other; their paths are checkable
-    // against the index, so they are not foreign.
+    // Workspace members remain checkable even when listed as dependencies.
     for member in members {
         out.remove(&member);
     }
@@ -538,8 +509,7 @@ fn collect_dependency_keys(table: &toml::Table, out: &mut HashSet<String>) {
         ) {
             for (dep, spec) in inner {
                 out.insert(dep.replace('-', "_"));
-                // `alias = { package = "real-name" }` is used under the alias
-                // in code, but docs may also spell the crate's real name.
+                // Docs may use the package name instead of its code alias.
                 if let Some(real) = spec.get("package").and_then(|p| p.as_str()) {
                     out.insert(real.replace('-', "_"));
                 }
@@ -589,8 +559,6 @@ pub(crate) fn check_documents(
             });
             continue;
         }
-        // One unreadable or non-UTF-8 document must not abort the sweep; it
-        // is named as failed and the rest are still checked.
         let text = match std::fs::read_to_string(doc) {
             Ok(text) => text,
             Err(e) => {
@@ -609,9 +577,7 @@ pub(crate) fn check_documents(
             });
             continue;
         }
-        // A document is internal when either spelling of its path sits under
-        // the root: the canonical one, or the one the operator used (a
-        // `docs/` directory symlinked out of the repo is still this repo's).
+        // A docs directory symlinked outside the root still belongs to this repo.
         let spelled =
             normalize_lexically(&std::path::absolute(doc).unwrap_or_else(|_| doc.clone()));
         let canonical = std::fs::canonicalize(doc).unwrap_or_else(|_| doc.clone());
@@ -639,12 +605,10 @@ struct Checker<'a> {
     symbols_by_file: HashMap<String, Vec<Symbol>>,
     line_counts: HashMap<String, Option<usize>>,
     rust_extensions: Option<HashSet<String>>,
-    /// The document being checked lives outside the project root.
     doc_external: bool,
 }
 
-/// Basenames that exist in nearly every tree; a same-named indexed file is
-/// not a relocation candidate for a path named from outside the repo.
+/// Common basenames cannot establish a relocation.
 const GENERIC_BASENAMES: &[&str] = &[
     "README.md",
     "index.md",
@@ -665,8 +629,7 @@ const GENERIC_SEGMENTS: &[&str] = &[
     "src", "crates", "lib", "tests", "test", "docs", "app", "pkg", "internal", "cmd", "",
 ];
 
-/// Directory names nearly every repository has; a two-segment path under one
-/// of them, named from outside the repo, is not evidence about this repo.
+/// Short paths under common roots cannot tie an external document to this repo.
 const UBIQUITOUS_ROOTS: &[&str] = &[
     "docs", "scripts", "src", "lib", "tests", "test", ".github", "app", "config",
 ];
@@ -677,8 +640,7 @@ enum Verdict {
         reason: String,
         suggestion: Option<Hint>,
     },
-    /// The claim could not be decided (unknown constant, foreign example
-    /// path, foreign symbol); it is neither counted nor reported.
+    /// Neither counted nor reported.
     Undecidable,
 }
 
@@ -691,8 +653,7 @@ impl Checker<'_> {
     ) -> (usize, Vec<Finding>) {
         let mut checked = 0;
         let mut findings = Vec::new();
-        // Links resolve from where the document really lives: a symlinked
-        // document's siblings sit next to the target, not next to the link.
+        // Relative links belong to the symlink target's directory.
         let real_doc = std::fs::canonicalize(doc_abs).unwrap_or_else(|_| doc_abs.to_path_buf());
         let doc_dir = real_doc.parent().unwrap_or(Path::new(""));
         for claim in claims {
@@ -741,9 +702,7 @@ impl Checker<'_> {
         self.root.join(path).is_file() || self.index.files.contains(path)
     }
 
-    /// A missing path is reported only when its first directory is real and
-    /// tracked: a Laravel `app/Http/...` example in a Rust repo's docs is not
-    /// drift, and neither is a gitignored runtime artifact under `.codesage/`.
+    /// Require an existing parent to avoid treating foreign examples as drift.
     fn plausibly_repo_relative(&self, path: &str) -> bool {
         self.plausible_path(path, true)
     }
@@ -755,15 +714,10 @@ impl Checker<'_> {
         if self.index.ignored_roots.contains(first) {
             return false;
         }
-        // A document outside the repo (a cross-project wiki note) that names
-        // `docs/x.md` or `scripts/y.sh` is almost always naming another
-        // repo's file under a root every repo has.
         if self.doc_external && path.matches('/').count() == 1 && UBIQUITOUS_ROOTS.contains(&first)
         {
             return false;
         }
-        // The immediate parent must exist: a missing file in a real directory
-        // is drift, a missing file in a missing tree is another codebase.
         if !require_parent {
             return true;
         }
@@ -773,13 +727,10 @@ impl Checker<'_> {
         self.root.join(parent).is_dir() || self.index.dirs.contains(parent)
     }
 
-    /// Same-named indexed files that share at least one directory segment
-    /// with the claimed path, generic segments (`src`, `crates`, …) aside; a
-    /// `query.rs` somewhere unrelated is not what the author meant.
+    /// A unique basename supplies a hint; shared distinctive directories strengthen it.
     fn suggest_by_basename(&self, path: &str) -> Option<Hint> {
         let (dir, base) = path.rsplit_once('/')?;
-        // Parser fixtures are inputs, not places a file could have moved to;
-        // a real test file (`tests/impact_test.rs`) is.
+        // Fixture inputs are not relocation candidates; real test files are.
         let candidates: Vec<&String> = self
             .index
             .by_basename
@@ -787,8 +738,6 @@ impl Checker<'_> {
             .iter()
             .filter(|c| !is_fixture_path(c))
             .collect();
-        // A basename the index holds twice or more, or a conventionally
-        // generic one, names nothing in particular: no hint at all.
         if GENERIC_BASENAMES.contains(&base) || candidates.len() != 1 {
             return None;
         }
@@ -821,16 +770,10 @@ impl Checker<'_> {
         self.missing_path_verdict(path)
     }
 
-    /// The verdict for a plausible path that is not there. An in-repo doc is
-    /// reported outright. A doc outside the repo (a cross-project note) may
-    /// be naming another repo's file whose parent happens to exist here too,
-    /// so it is reported only when the checker can name a concrete
-    /// relocation: a same-named indexed file with a non-generic basename, or
-    /// the path now being a directory (`mcp.rs` → `mcp/`).
+    /// External documents require a concrete relocation to establish drift;
+    /// an existing parent alone may belong to another codebase too.
     fn missing_path_verdict(&self, path: &str) -> Verdict {
-        // `mcp.rs` → `mcp/`: only when that directory holds indexed source of
-        // the claimed kind, so `queries.rs` does not relocate into a directory
-        // of `.scm` files.
+        // A module-to-directory relocation must preserve the source extension.
         let (stem, ext) = path.rsplit_once('.').unwrap_or((path, ""));
         let dir_prefix = format!("{stem}/");
         let dir_has_same_kind = self.index.files.iter().any(|f| {
@@ -854,8 +797,6 @@ impl Checker<'_> {
                 suggestion,
             };
         }
-        // Outside the repo only a concrete relocation is evidence: a single
-        // same-named non-generic file, worded by how related it looks.
         match suggestion {
             Some(hint) => Verdict::Drift {
                 reason: "file not found on disk or in the index".to_string(),
@@ -865,9 +806,6 @@ impl Checker<'_> {
         }
     }
 
-    /// A relative link resolves from the document's own directory, so a moved
-    /// or renamed sibling page is caught even when the doc lives outside the
-    /// repo root.
     fn check_link(&self, doc_dir: &Path, target: &str) -> Verdict {
         let target = percent_decode(target.split('?').next().unwrap_or(target));
         let target = target.as_str();
@@ -875,10 +813,7 @@ impl Checker<'_> {
         if resolved.is_file() || resolved.is_dir() {
             return Verdict::Holds;
         }
-        // Static-site generators resolve `./page` and `../section/` to
-        // `page.md`, `section/index.md`, or `section/README.md`, sometimes
-        // case-insensitively; a target without an explicit extension that
-        // none of those probes finds is a routing question, not drift.
+        // Unresolved extensionless links may use static-site routing, so remain undecidable.
         let basename = target
             .trim_end_matches('/')
             .rsplit('/')
@@ -901,9 +836,7 @@ impl Checker<'_> {
                 if self.index.files.contains(rel.as_str()) {
                     return Verdict::Holds;
                 }
-                // A link is spelled relative to its own page, so a wrong
-                // `../` count lands in a directory that never existed; the
-                // parent-directory rule would hide exactly that mistake.
+                // Requiring an existing parent would hide a wrong `../` count.
                 if !self.plausible_path(&rel, false) {
                     return Verdict::Undecidable;
                 }
@@ -912,8 +845,6 @@ impl Checker<'_> {
                     suggestion: self.suggest_by_basename(&rel),
                 }
             }
-            // Outside the repo the index cannot help; the disk check above
-            // is the whole answer.
             Err(_) => Verdict::Drift {
                 reason: "link target not found".to_string(),
                 suggestion: None,
@@ -984,9 +915,7 @@ impl Checker<'_> {
         if matching.is_empty() || matching.iter().any(contains) {
             return Verdict::Holds;
         }
-        // A line inside no indexed symbol is a header, import, or call site:
-        // the nearby name is context for it, not a claim that it is defined
-        // there.
+        // Outside indexed definitions, a nearby name may describe a call site.
         if !symbols
             .iter()
             .any(|s| contains(&(s.line_start, s.line_end)))
@@ -1003,9 +932,7 @@ impl Checker<'_> {
         }
     }
 
-    /// Indexed definitions of `name`, minus anything under a fixture or test
-    /// path: a `UserController` in `tests/fixtures/sample.php` is parser input,
-    /// not a type this repo's docs can be making claims about.
+    /// Exclude test and fixture definitions from evidence about documented APIs.
     fn find(&self, name: &str) -> Vec<Symbol> {
         let mut found = self.db.find_symbols(name, None).unwrap_or_default();
         found.retain(|s| {
@@ -1015,11 +942,8 @@ impl Checker<'_> {
         found
     }
 
-    /// Symbol verdicts fail closed towards "undecidable": only a member of an
-    /// owner the index knows by that exact name can be reported missing, and
-    /// only when the member cannot be a field or variant (neither is indexed):
-    /// the owner is a module-like symbol, or the token is call-shaped. Foreign
-    /// crates, unresolvable owners, and bare calls never produce a finding.
+    /// Report missing members only for an exact indexed owner and a shape that
+    /// cannot denote an unindexed field or variant. Unknown owners remain undecidable.
     fn check_symbol(
         &mut self,
         owner: Option<&str>,
@@ -1034,8 +958,7 @@ impl Checker<'_> {
                 Verdict::Holds
             };
         };
-        // `Cargo.toml` or `CHANGELOG.md` has the `Type.member` shape but names a
-        // file; a token that is an existing file is not a symbol claim.
+        // Filenames such as Cargo.toml also have the Type.member shape.
         if shape == SymbolShape::Member {
             let as_file = format!("{owner}.{member}");
             if self.root.join(&as_file).is_file() || self.index.by_basename.contains_key(&as_file) {
@@ -1055,10 +978,7 @@ impl Checker<'_> {
         }
         let owners = self.find(owner);
         if owners.is_empty() {
-            // `a::b::c`: `a::b` unknown as written, but a symbol named `b`
-            // whose file defines `c` still confirms the claim. The fallback
-            // can only confirm; reporting drift against a guessed owner
-            // would name the wrong thing.
+            // An owner-tail match may confirm a claim, never establish drift.
             if owner.contains("::") {
                 let owner_tail = owner.rsplit("::").next().unwrap_or(owner);
                 let files: BTreeSet<String> = self
@@ -1080,10 +1000,8 @@ impl Checker<'_> {
                 return Verdict::Holds;
             }
         }
-        // A module or namespace can own a member; a type needs a call-shaped
-        // token to distinguish methods from unindexed fields and variants.
-        // A constant, function, or macro cannot own `::member`, so
-        // a same-named owner there is a homonym, not evidence.
+        // Types require call syntax because fields and variants are unindexed.
+        // Constant, function, and macro homonyms cannot establish member ownership.
         let module_like = owners
             .iter()
             .any(|s| matches!(s.kind, SymbolKind::Module | SymbolKind::Namespace));
@@ -1107,10 +1025,7 @@ impl Checker<'_> {
         {
             return Verdict::Undecidable;
         }
-        // A camelCase member on a snake_case-language owner (`Symbol::renderToFile`
-        // against a Rust struct) is a same-named type from another codebase.
-        // Go is not in the set: its exported methods are camelCase by
-        // convention, so the rule would suppress real misses there.
+        // camelCase suggests a foreign Rust/Python homonym; Go permits capitals.
         let snake_languages = owner_files.iter().all(|f| {
             matches!(
                 self.index.languages.get(f),
@@ -1126,8 +1041,7 @@ impl Checker<'_> {
         } else {
             format!(" ({})", files.join(", "))
         };
-        // A cross-project note names its own project's types; a same-named
-        // owner here is a homonym, so no symbol finding leaves an external doc.
+        // External documents may name unrelated types with the same owner name.
         if self.doc_external {
             return Verdict::Undecidable;
         }
@@ -1285,8 +1199,7 @@ static MACRO_ARGUMENTS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b[A-Za-z_][A-Za-z0-9_]*!\s*[({\[]([^;]*?)[)}\]]").expect("static regex")
 });
 
-/// Mirrors the fixture-directory rule `recommend_tests` applies: contents of
-/// these directories are inputs, never definitions a doc can be about.
+/// Match recommend_tests: fixture contents are inputs, not API definitions.
 const FIXTURE_SEGMENTS: &[&str] = &[
     "fixtures",
     "fixture",
@@ -1303,9 +1216,6 @@ fn is_fixture_path(path: &str) -> bool {
         .any(|seg| lower.contains(&format!("/{seg}/")) || lower.starts_with(&format!("{seg}/")))
 }
 
-/// The files a static-site generator would serve for an extensionless link
-/// target: `<t>.md`, `<t>/index.md`, `<t>/README.md`, or a sibling whose
-/// name matches the target case-insensitively (with or without `.md`).
 fn ssg_target_exists(resolved: &Path) -> bool {
     if resolved.with_extension("md").is_file()
         || resolved.join("index.md").is_file()
@@ -1326,7 +1236,6 @@ fn ssg_target_exists(resolved: &Path) -> bool {
     })
 }
 
-/// `%20` and friends in a link target are the on-disk bytes, spelled for a URL.
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -1347,8 +1256,7 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Resolve `.` and `..` components without touching the filesystem, so a
-/// target whose file is gone still yields the path the author meant.
+/// Preserve resolution of missing targets without filesystem canonicalization.
 fn normalize_lexically(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
@@ -1372,8 +1280,7 @@ static SOURCE_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     .expect("static regex")
 });
 
-/// The literal a constant is defined as, when its right-hand side *is* a
-/// literal. `60 * 5`, a call, or a path is not one and yields `None`.
+/// Accept literal RHS values only; expressions are not evaluated.
 fn source_literal(rhs: &str) -> Option<String> {
     let caps = SOURCE_LITERAL.captures(rhs)?;
     let whole = caps.get(0)?.as_str();
@@ -1404,9 +1311,7 @@ fn source_literal(rhs: &str) -> Option<String> {
     Some(whole.to_string())
 }
 
-/// Canonical form for comparing a doc literal with a source literal: strings
-/// lose their quotes, numbers lose `_` / `,` separators, and `K` / `M` / `G`
-/// multipliers are expanded (`1.5M` == `1_500_000` == `1,500,000`).
+/// Compare quoted strings and numeric spellings such as `1.5M` and `1_500_000`.
 pub(crate) fn normalize_literal(raw: &str) -> String {
     let s = raw.trim().trim_matches('`').trim();
     if (s.starts_with('"') && s.ends_with('"') && s.len() >= 2)
@@ -1477,9 +1382,7 @@ static CONSTANT_TAIL: LazyLock<Regex> = LazyLock::new(|| {
 
 const ANCHOR_SYMBOL_DISTANCE: usize = 80;
 
-/// A number followed by one of these is a quantity in prose (`is 30 seconds`),
-/// not the constant's literal; `30` against a source `30_000` would be a
-/// false drift.
+/// Unit-bearing quantities cannot be compared directly with source literals.
 const UNIT_WORDS: &[&str] = &[
     "s",
     "sec",
@@ -1509,10 +1412,8 @@ const UNIT_WORDS: &[&str] = &[
     "x",
 ];
 
-/// Inline code spans of one line as `(start, end)` byte ranges of the span
-/// content (backticks excluded). `None` when the backticks do not pair up: the
-/// line opens a multi-line code span, whose contents are not prose claims, so
-/// the whole line is skipped rather than guessed at.
+/// Content byte ranges exclude backticks. Unpaired delimiters make the line
+/// undecidable because they may open a multiline code span.
 fn code_spans(line: &str) -> Option<Vec<(usize, usize)>> {
     let mut spans = Vec::new();
     let mut open: Option<(usize, usize)> = None;
@@ -1539,8 +1440,7 @@ fn code_spans(line: &str) -> Option<Vec<(usize, usize)>> {
     open.is_none().then_some(spans)
 }
 
-/// End of the sentence that starts at `from`: the first `. ` (dot followed by
-/// whitespace) or the end of the line. A dot inside `1.5M` never qualifies.
+/// A decimal point inside a number must not end the sentence.
 fn sentence_end(line: &str, from: usize) -> usize {
     let bytes = line.as_bytes();
     let mut i = from;
@@ -1588,15 +1488,12 @@ fn strip_html_comments(line: &str, in_comment: &mut bool) -> String {
     }
 }
 
-/// Width of `text` in columns, a tab counting as four. Applied to a list-item
-/// prefix (`  - `) it is the column where the item's content starts.
+/// Count tabs as four columns when locating list content.
 fn columns(text: &str) -> usize {
     text.chars().map(|c| if c == '\t' { 4 } else { 1 }).sum()
 }
 
-/// Where a list item's content starts, given its `  - ` prefix. CommonMark
-/// caps the gap after the marker: five or more spaces mean the content column
-/// is marker plus one and the rest of the first line is indented code.
+/// CommonMark treats gaps of five or more spaces as one space plus indented code.
 fn list_content_column(prefix: &str) -> usize {
     let marker = prefix.trim_end_matches([' ', '\t']);
     let gap = columns(&prefix[marker.len()..]);
@@ -1607,7 +1504,6 @@ fn list_content_column(prefix: &str) -> usize {
     }
 }
 
-/// A line's indentation in columns.
 fn leading_indent(line: &str) -> usize {
     let ws_len = line.len() - line.trim_start_matches([' ', '\t']).len();
     columns(&line[..ws_len])
@@ -1640,10 +1536,7 @@ fn fence_content(mut line: &str) -> &str {
     }
 }
 
-/// Everything one pass over a document yields: the prose claims and whether
-/// a bare `<!-- codesage-docs: skip-file -->` line asked for the file to be
-/// skipped. Both are decided by the same fence / code-span walk, so a doc
-/// that merely documents the directive in a code span does not skip itself.
+/// Claims and skip directives share the same code-block exclusions.
 pub(crate) struct Extraction {
     pub claims: Vec<Claim>,
     pub skip_directive: bool,
@@ -1662,8 +1555,6 @@ pub(crate) fn extract(markdown: &str) -> Extraction {
     let mut in_comment = false;
     let mut prev_blank = true;
     let mut in_indented = false;
-    // Content column of the innermost open list item (`- ` at column 0 puts
-    // content at 2); `None` outside any list.
     let mut list_content_col: Option<usize> = None;
 
     for (idx, raw_line) in markdown.lines().enumerate() {
@@ -1676,13 +1567,9 @@ pub(crate) fn extract(markdown: &str) -> Extraction {
             }
             continue;
         }
-        // An indented block opened after a blank line is code, and is judged
-        // before fence detection so a literal ``` inside it opens nothing.
-        // Inside a list item CommonMark measures the indent from the item's
-        // content column: four more columns is code, anything less is the
-        // item's continuation paragraph. Judged on the raw line: a
-        // blanked-out comment must not read as indentation or as a blank
-        // separator.
+        // Check indentation before fences; a literal fence inside code opens nothing.
+        // Lists measure four columns from their content start. Use the raw line
+        // so blanked-out HTML comments cannot create indentation or separators.
         let blank = raw_line.trim().is_empty();
         let indent = leading_indent(raw_line);
         let code_col = list_content_col.map_or(4, |col| col + 4);
@@ -1871,9 +1758,7 @@ fn fence_marker(trimmed: &str) -> Option<String> {
     None
 }
 
-/// An anchor must start at the line start or after whitespace, `(`, `[`, or a
-/// backtick, and must not run straight into more path or line characters;
-/// the check is done by hand so two anchors separated by one space both match.
+/// Check boundaries without consuming the space shared by adjacent anchors.
 fn anchor_boundaries_ok(line: &str, start: usize, end: usize) -> bool {
     let before_ok = line[..start]
         .chars()
@@ -1959,8 +1844,6 @@ pub(crate) fn classify_path(tok: &str) -> Option<String> {
     Some(path.to_string())
 }
 
-/// `lowerCamel` with an interior capital; `snake_case`, `SCREAMING_CASE`,
-/// and `PascalCase` are not.
 fn is_camel_case(name: &str) -> bool {
     let mut chars = name.chars();
     chars.next().is_some_and(|c| c.is_ascii_lowercase())
@@ -1974,10 +1857,7 @@ const PLACEHOLDER_SEGMENTS: &[&str] = &["foo", "bar", "baz", "qux"];
 const PLACEHOLDER_OWNERS: &[&str] = &["Type", "Class", "Foo", "Bar", "Baz", "X", "Y", "T", "U"];
 const PLACEHOLDER_MEMBERS: &[&str] = &["method", "func", "fn", "name", "foo", "bar"];
 
-/// A backticked token shaped like a code symbol: a `::` path, a call `foo()`,
-/// or `Type.method` / `Type->method` with an uppercase type. Returns the
-/// owner (everything before the last segment), the member, and the shape.
-/// Placeholder spellings (`Type::method`, `Foo.bar`) are not claims.
+/// Return owner, member, and syntax shape; placeholder spellings are not claims.
 pub(crate) fn classify_symbol(tok: &str) -> Option<(Option<String>, String, SymbolShape)> {
     let without_arrow = tok.replace("->", "");
     if tok.contains(|c: char| c.is_whitespace())
@@ -2675,9 +2555,7 @@ A column anchor crates/cli/src/main.rs:12:7 is fine.
     #[test]
     fn missing_path_is_reported_with_basename_suggestion() {
         let fx = seeded();
-        // `src/db/net/mux.go` shares `db`; `src/mux2.go` shares only the
-        // generic `src`; `lib.rs` and `index.js` (indexed twice) are generic
-        // basenames and get no hint at all.
+        // Distinguish distinctive shared directories from generic names and duplicate basenames.
         let root = fx.dir.path();
         std::fs::create_dir_all(root.join("src/web")).unwrap();
         for file in ["src/mux2.go", "src/index.js", "src/web/index.js"] {
@@ -2824,7 +2702,6 @@ A column anchor crates/cli/src/main.rs:12:7 is fine.
         assert_eq!(selection.changelog, vec![root.join("CHANGELOG.md")]);
         assert_eq!(selection.not_markdown, vec![socket]);
         assert!(selection.missing.is_empty());
-        // The default sweep still drops CHANGELOG.md without a word.
         let defaults = default_docs(root).docs;
         assert!(defaults.iter().all(|d| !is_changelog(d)), "{defaults:?}");
     }
@@ -2834,8 +2711,6 @@ A column anchor crates/cli/src/main.rs:12:7 is fine.
     fn links_resolve_from_the_real_document_directory() {
         let fx = seeded();
         let root = fx.dir.path();
-        // docs/guide.md is real and docs/sibling.md sits next to it; the link
-        // is followed through a symlink placed in another directory.
         std::fs::write(root.join("docs/sibling.md"), "# s\n").unwrap();
         std::fs::write(
             root.join("docs/guide.md"),
@@ -2898,7 +2773,6 @@ A column anchor crates/cli/src/main.rs:12:7 is fine.
         assert_eq!(report.drifted.len(), 1);
         assert_eq!(report.drifted[0].claim, "src/db/mux.go");
 
-        // The same text inside the repo is checked in full.
         let (checked, drifted) = check(
             &fx,
             "`docs/x.md`, `scripts/run.sh`, `src/gone.rs` are another repo's; `src/db/mux.go` moved.\n",
@@ -2911,14 +2785,7 @@ A column anchor crates/cli/src/main.rs:12:7 is fine.
         let fx = seeded();
         let outside = tempfile::tempdir().unwrap();
         let doc = outside.path().join("note.md");
-        // `src/db/README.md`: parent exists, basename generic, no relocation.
-        // `src/db/lib.rs`: generic basename, undecidable even with a candidate.
-        // `src/db/mux.go`: same-named `src/mux.go` is a relocation.
-        // `src/db/mods.rs`: the module is now the directory `src/db/mods/`.
-        // `src/db/gone.rs`: nothing to point at, undecidable.
-        // `src/db/mods.rs`: `src/db/mods/` holds indexed `.rs`, a relocation.
-        // `src/db/queries.rs`: `src/db/queries/` holds only `.go`, undecidable.
-        // `src/db/old/util.rs`: `util.rs` is indexed twice, generic by count.
+        // External findings require unambiguous relocations with the same source kind.
         let root = fx.dir.path();
         for (dir, file, lang) in [
             ("src/db/mods", "src/db/mods/x.rs", Language::Rust),
@@ -3079,14 +2946,11 @@ A column anchor crates/cli/src/main.rs:12:7 is fine.
         )
         .unwrap();
         std::os::unix::fs::symlink(outside.path(), fx.dir.path().join("linked")).unwrap();
-        // Through the same discovery the CLI uses: the doc set must keep the
-        // spelled path, or the canonical one would read as external.
+        // Canonicalizing away the operator's spelling would make this doc external.
         let selection = explicit_docs(&[fx.dir.path().join("linked/note.md")]);
         assert!(selection.not_markdown.is_empty() && selection.missing.is_empty());
         let report = check_documents(fx.dir.path(), &fx.db, &selection.docs, &[]).unwrap();
         assert_eq!(report.files, vec!["linked/note.md"]);
-        // Internal: both two-segment paths are checked (`docs/x.md` parent
-        // exists, `src/gone.rs` parent exists) and both are missing.
         assert_eq!(report.claims_checked, 2, "{:?}", report.drifted);
         assert_eq!(report.drifted.len(), 2);
     }
@@ -3381,8 +3245,7 @@ A column anchor crates/cli/src/main.rs:12:7 is fine.
     #[test]
     fn anchor_outside_any_symbol_is_undecidable() {
         let fx = seeded();
-        // Line 11 of src/lib.rs is the closing brace of `impl Database`: no
-        // indexed symbol spans it, so the nearby name is context, not a claim.
+        // Line 11 closes impl Database; no indexed symbol spans it.
         let (checked, drifted) = check(&fx, "`truncate_page` is called near `src/lib.rs:11`.\n");
         assert_eq!(checked, 0, "{drifted:?}");
         assert!(drifted.is_empty(), "{drifted:?}");
@@ -3403,8 +3266,6 @@ A column anchor crates/cli/src/main.rs:12:7 is fine.
     #[test]
     fn constant_homonym_owner_is_not_evidence() {
         let fx = seeded();
-        // `BATCH_SIZE` is an indexed constant; a doc about another codebase's
-        // `BATCH_SIZE::transaction()` has found a homonym, not a missing method.
         let (checked, drifted) = check(&fx, "Wrap it in `BATCH_SIZE::transaction()`.\n");
         assert_eq!(checked, 0, "{drifted:?}");
         assert!(drifted.is_empty(), "{drifted:?}");

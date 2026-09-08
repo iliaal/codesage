@@ -83,14 +83,7 @@ fn mcp_shim_starts_daemon_and_lists_tools() {
 
 #[test]
 fn shim_exits_when_daemon_dies() {
-    // Regression: proxy_stdio previously used try_join!, which only
-    // returns when BOTH copy directions finish. If the daemon crashes
-    // but the MCP client keeps stdin open, the shim stayed alive with
-    // no server behind it. Symptom for the agent: an MCP session that
-    // appears stuck on initialize or a tool call.
-    //
-    // Cover: start shim → wait for daemon to bind → kill daemon →
-    // assert shim exits within a few seconds.
+    // Keep stdin open so only daemon EOF can end the shim.
     let runtime = tempfile::tempdir().unwrap();
     let runtime_dir = runtime.path().to_path_buf();
     let _daemon_cleanup = DaemonCleanup {
@@ -109,7 +102,6 @@ fn shim_exits_when_daemon_dies() {
             .expect("spawn codesage mcp"),
     };
 
-    // Initialize so we know the shim is talking to the daemon.
     let stdout = child.child.stdout.take().expect("child stdout");
     let (tx, rx) = mpsc::channel();
     let reader = thread::spawn(move || {
@@ -131,9 +123,6 @@ fn shim_exits_when_daemon_dies() {
     let init = recv_response(&rx, 1);
     assert_eq!(init["result"]["serverInfo"]["name"], "codesage");
 
-    // Daemon is up. Kill it. The shim should detect the closed socket
-    // and exit on its own. Previously the shim's stdin pump kept
-    // blocking even after socket EOF and the process hung indefinitely.
     kill_daemon(&runtime_dir);
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -155,11 +144,7 @@ fn shim_exits_when_daemon_dies() {
 
 #[test]
 fn concurrent_shims_share_one_daemon() {
-    // L4: the daemon's point is that multiple shims share one process.
-    // Race two shims at startup; whoever wins the StartLock spawns the
-    // daemon, the loser waits for the socket and connects to the same
-    // daemon. Both initialize successfully and observe the same
-    // serverInfo (same process answering).
+    // Race startup to exercise the shared start lock.
     let runtime = tempfile::tempdir().unwrap();
     let runtime_dir = runtime.path().to_path_buf();
     let _daemon_cleanup = DaemonCleanup {
@@ -208,10 +193,6 @@ fn concurrent_shims_share_one_daemon() {
     assert_eq!(resp_a["result"]["serverInfo"]["name"], "codesage");
     assert_eq!(resp_b["result"]["serverInfo"]["name"], "codesage");
 
-    // The runtime dir should contain exactly one socket — both shims
-    // connected to the same daemon. Without M1+M2 fixes this still
-    // holds if startup races resolve correctly, so the strong signal
-    // here is "no startup error" + "both shims got a response".
     let socks: Vec<_> = std::fs::read_dir(&runtime_dir)
         .unwrap()
         .flatten()
@@ -234,11 +215,8 @@ fn concurrent_shims_share_one_daemon() {
 
 #[test]
 fn silent_client_that_never_initializes_is_dropped() {
-    // A peer that connects and never sends `initialize` parks the connection
-    // task inside the handshake await. The per-connection idle ceiling only
-    // starts *after* that await, so before the handshake was bounded such a
-    // peer held the daemon's active-client count above zero permanently and
-    // the whole-daemon idle backstop could never fire again.
+    // Connection-idle timing starts after initialization; the handshake
+    // timeout must release the active-client count for a silent peer.
     use std::io::Read;
     use std::os::unix::net::UnixStream;
 
@@ -283,8 +261,6 @@ fn silent_client_that_never_initializes_is_dropped() {
         .set_read_timeout(Some(Duration::from_secs(15)))
         .unwrap();
 
-    // Say nothing. The daemon must close the connection on its own; a read
-    // returning 0 bytes is that EOF.
     let mut buf = [0u8; 64];
     let n = stream.read(&mut buf).expect("read should return, not hang");
     assert_eq!(
@@ -297,10 +273,6 @@ fn silent_client_that_never_initializes_is_dropped() {
 
 #[test]
 fn daemon_cleans_runtime_files_on_sigterm() {
-    // M6: SIGTERM should let the daemon remove its socket + pid files
-    // instead of leaving stale artefacts. Without graceful shutdown the
-    // next shim startup has to do remove_stale_socket and the pid file
-    // lingers indefinitely.
     let runtime = tempfile::tempdir().unwrap();
     let runtime_dir = runtime.path().to_path_buf();
     let _daemon_cleanup = DaemonCleanup {
@@ -317,11 +289,7 @@ fn daemon_cleans_runtime_files_on_sigterm() {
         .spawn()
         .expect("spawn codesage daemon");
 
-    // Wait for the daemon to bind. The daemon writes the socket (via
-    // UnixListener::bind) BEFORE writing the pid file, so polling on
-    // the socket alone races: a read_dir scan that lands between the
-    // two operations sees the socket but no pid, exits the loop, and
-    // then `pid_file.expect(...)` panics spuriously. Wait for both.
+    // Binding precedes the PID-file write; wait for both to avoid that race.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut socket: Option<PathBuf> = None;
     let mut pid_file: Option<PathBuf> = None;
@@ -343,7 +311,6 @@ fn daemon_cleans_runtime_files_on_sigterm() {
     let socket = socket.expect("daemon socket never appeared");
     let pid_file = pid_file.expect("daemon pid file never appeared");
 
-    // Send SIGTERM by reading the pid.
     let pid = read_daemon_pid_file(&pid_file).expect("read pid file");
     let _ = Command::new("kill")
         .arg("-TERM")
@@ -372,10 +339,6 @@ fn daemon_cleans_runtime_files_on_sigterm() {
 
 #[test]
 fn daemon_sigterm_with_parked_client_exits_bounded_and_cleans_up() {
-    // Graceful shutdown drains in-flight connections for a bounded window.
-    // A parked client (connected but idle) must not stall SIGTERM shutdown
-    // forever: after the drain bound the daemon aborts the connection,
-    // removes its runtime files, and exits.
     let runtime = tempfile::tempdir().unwrap();
     let runtime_dir = runtime.path().to_path_buf();
     let _daemon_cleanup = DaemonCleanup {
@@ -384,7 +347,6 @@ fn daemon_sigterm_with_parked_client_exits_bounded_and_cleans_up() {
     let mut session = McpSession::start(&runtime_dir);
     session.initialize();
 
-    // Locate the daemon's runtime files while the shim stays connected.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut socket: Option<PathBuf> = None;
     let mut pid_file: Option<PathBuf> = None;
@@ -408,8 +370,7 @@ fn daemon_sigterm_with_parked_client_exits_bounded_and_cleans_up() {
 
     kill_daemon(&runtime_dir);
 
-    // 5s drain bound + margin. Failing here means shutdown hangs on the
-    // parked connection instead of bounding the wait.
+    // Allow the 5s connection-drain bound plus scheduling margin.
     let deadline = Instant::now() + Duration::from_secs(9);
     while (socket.exists() || pid_file.exists()) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(100));
@@ -426,11 +387,6 @@ fn daemon_sigterm_with_parked_client_exits_bounded_and_cleans_up() {
 
 #[test]
 fn daemon_self_exits_after_idle_timeout() {
-    // Idle backstop: with no client ever connecting, the daemon must reap
-    // itself once CODESAGE_DAEMON_IDLE_TIMEOUT_SECS elapses instead of pinning
-    // the embedder/reranker pools in memory forever after every agent exits.
-    // Set a 1s timeout and assert the process exits on its own (no signal sent)
-    // and cleans up its runtime files the same way a SIGTERM would.
     let runtime = tempfile::tempdir().unwrap();
     let runtime_dir = runtime.path().to_path_buf();
     let _daemon_cleanup = DaemonCleanup {
@@ -448,8 +404,6 @@ fn daemon_self_exits_after_idle_timeout() {
         .spawn()
         .expect("spawn codesage daemon");
 
-    // Wait for the daemon to bind (socket + pid both present) before timing
-    // the idle exit, matching the SIGTERM test's two-file wait.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut socket: Option<PathBuf> = None;
     let mut pid_file: Option<PathBuf> = None;
@@ -471,8 +425,7 @@ fn daemon_self_exits_after_idle_timeout() {
     let socket = socket.expect("daemon socket never appeared");
     let pid_file = pid_file.expect("daemon pid file never appeared");
 
-    // No signal sent: the 1s idle timeout (polled at 1s granularity) should
-    // trip within a couple of ticks.
+    // The idle timeout is polled at 1s granularity.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match daemon.try_wait() {
@@ -500,12 +453,6 @@ fn daemon_self_exits_after_idle_timeout() {
 
 #[test]
 fn active_client_survives_past_client_idle_max() {
-    // The per-connection ceiling must be measured from the client's last
-    // request, not from connection start. A client that keeps sending requests
-    // faster than CODESAGE_CLIENT_IDLE_MAX_SECS must never be dropped, however
-    // old the connection gets. Pre-fix the ceiling was an absolute
-    // timeout(CLIENT_SESSION_MAX, waiting()) that guillotined healthy sessions
-    // at 1h regardless of activity.
     let runtime = tempfile::tempdir().unwrap();
     let _daemon_cleanup = DaemonCleanup {
         runtime_dir: runtime.path().to_path_buf(),
@@ -551,8 +498,7 @@ fn active_client_survives_past_client_idle_max() {
     let init = recv_response(&rx, 1);
     assert_eq!(init["result"]["serverInfo"]["name"], "codesage");
 
-    // Send a request every 800ms for ~5s — well past the 2s ceiling. Each
-    // response must come back, proving the ceiling resets on every request.
+    // Requests stay within the 2s idle limit while the session exceeds it.
     for id in 2u64..8 {
         thread::sleep(Duration::from_millis(800));
         {
@@ -584,11 +530,7 @@ fn active_client_survives_past_client_idle_max() {
 
 #[test]
 fn idle_client_dropped_after_client_idle_max() {
-    // The ceiling must still fire when a client goes silent (a hung tool call
-    // or an agent that wandered off without disconnecting). With a 2s ceiling
-    // and no requests after initialize, the daemon drops the connection; the
-    // shim then sees its socket close and exits on its own. stdin is left open
-    // so the only thing that can end the shim is the daemon-side idle drop.
+    // Keep stdin open so the daemon-side idle timeout causes the exit.
     let runtime = tempfile::tempdir().unwrap();
     let _daemon_cleanup = DaemonCleanup {
         runtime_dir: runtime.path().to_path_buf(),
@@ -628,8 +570,6 @@ fn idle_client_dropped_after_client_idle_max() {
     let init = recv_response(&rx, 1);
     assert_eq!(init["result"]["serverInfo"]["name"], "codesage");
 
-    // Now go silent. Within a couple of 2s polls the daemon should drop the
-    // idle connection, and the shim exits when its socket closes.
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         match child.child.try_wait() {
@@ -649,9 +589,7 @@ fn idle_client_dropped_after_client_idle_max() {
 
 #[test]
 fn status_finds_daemon_in_env_runtime_dir() {
-    // The fallback path is covered by daemon.rs unit tests; this integration
-    // test uses an explicit runtime dir so it never collides with a developer's
-    // real daemon under /tmp while still exercising status against a live child.
+    // Isolate the live child from the operator's daemon; unit tests cover fallback paths.
     let scratch = tempfile::tempdir().unwrap();
     let runtime = scratch.path().join("runtime");
     let xdg = tempfile::tempdir().unwrap();
@@ -670,8 +608,7 @@ fn status_finds_daemon_in_env_runtime_dir() {
             .expect("spawn codesage daemon"),
     };
 
-    // Wait for both socket and pid file — status reads the pid file and the
-    // daemon binds the socket before writing it.
+    // Status needs the PID file, which is written after the socket binds.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut socket: Option<PathBuf> = None;
     let mut pid_file: Option<PathBuf> = None;
@@ -732,8 +669,7 @@ fn tools_call_unknown_tool_returns_jsonrpc_error() {
     let err = resp
         .get("error")
         .unwrap_or_else(|| panic!("unknown tool must be a JSON-RPC error, got: {resp}"));
-    // rmcp's ToolRouter rejects unknown tools with invalid_params (-32602),
-    // message "tool not found" — not the spec's -32601 method-not-found.
+    // rmcp reports unknown tools as invalid_params (-32602).
     assert_eq!(err["code"], -32602, "unexpected error shape: {err}");
     let msg = err["message"].as_str().unwrap_or_default();
     assert!(
@@ -755,9 +691,7 @@ fn tools_call_find_coupling_rejects_unparseable_limit_with_named_value() {
         2,
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"find_coupling","arguments":{"project":"/nonexistent","file_path":"a.rs","limit":"not-a-number"}}}"#,
     );
-    // rmcp surfaces a parameter-deserialization failure as a tool RESULT with
-    // isError=true (not a protocol-level -32602), with the serde message in
-    // the content text.
+    // rmcp returns parameter-deserialization failures as tool results.
     assert!(
         resp.get("error").is_none(),
         "param failures come back as tool results, got protocol error: {resp}"
@@ -770,8 +704,7 @@ fn tools_call_find_coupling_rejects_unparseable_limit_with_named_value() {
     let text = resp["result"]["content"][0]["text"]
         .as_str()
         .unwrap_or_default();
-    // The offending value must be quoted so an agent can self-correct; the
-    // exact phrasing around it is free to change.
+    // Preserve the offending value without pinning the surrounding prose.
     assert!(
         text.contains("not-a-number"),
         "error must quote the offending value, got: {text:?}"
@@ -780,9 +713,6 @@ fn tools_call_find_coupling_rejects_unparseable_limit_with_named_value() {
 
 #[test]
 fn tools_call_find_coupling_coerces_stringy_limit() {
-    // The documented dominant real-world agent error is `"limit": "5"` (a
-    // JSON string instead of a number). The server coerces it, so the call
-    // must get PAST parameter validation — no -32602 — and run the tool.
     let project = tempfile::tempdir().unwrap();
     onboard_fixture_project(project.path());
 
@@ -1013,6 +943,10 @@ fn tools_call_search_round_trips_tool_error_without_protocol_failure() {
         ),
     );
 
+    assert_eq!(
+        resp["id"], 2,
+        "error must retain the failed search request ID"
+    );
     assert!(
         resp.get("error").is_none(),
         "search tool errors must be rendered as tool results, not JSON-RPC errors: {resp}"
@@ -1029,30 +963,134 @@ fn tools_call_search_round_trips_tool_error_without_protocol_failure() {
         text.contains("not on CodeSage's validated-model allowlist"),
         "expected allowlist error text, got: {text:?}"
     );
+    assert!(
+        text.contains("resolving model files for \"not-on/allowlist\""),
+        "outer model-resolution context must survive alongside the cause: {text:?}"
+    );
+
+    let healthy = session.request(
+        3,
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "find_symbol", "arguments": {
+                "project": project.path(), "name": "hello_symbol"
+            }}
+        })
+        .to_string(),
+    );
+    assert_ne!(healthy["result"]["isError"], true, "{healthy}");
+    assert!(
+        healthy["result"]["structuredContent"]["results"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["name"] == "hello_symbol")),
+        "a subsequent structural query must still return a real symbol: {healthy}"
+    );
 }
 
-/// Every tool that advertises an `outputSchema` must answer a representative
-/// successful call with a **populated, data-bearing** `structuredContent`.
-///
-/// Claude Code treats `structuredContent` as THE result once a tool declares
-/// an output schema, so a tool that ships `{}` there renders as an empty
-/// object no matter how good its text block is.
-///
-/// Two things make this test non-vacuous, and both matter:
-///
-/// 1. The fixture (see [`onboard_rich_fixture`]) carries real data for every
-///    tool — git history with a co-change pair, a sibling test file, a Python
-///    import chain with edges in both directions, a near-clone pair, seeded
-///    semantic chunks. Against a bare `src/lib.rs`, half this surface answers
-///    `{"results": []}` or `{"found": false}`, which is a populated object and
-///    would pass a shape-only assertion without ever running the tool's
-///    data-bearing branch.
-/// 2. Each tool names the specific keys that must be non-empty, not just "some
-///    non-`_meta` key exists".
-///
-/// Tools with a real precondition are driven through it rather than exempted:
-/// `feature_bundle` gets an id resolved from `list_features`, and `session_end`
-/// runs after `session_start` plus an actual tree change and reindex.
+#[test]
+fn malformed_protocol_request_returns_error_with_logged_frame_and_cause() {
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut session = McpSession::start_with_env(runtime.path(), &[("RUST_LOG", "debug")]);
+    session.initialize();
+    let token = format!("malformed-{}", runtime.path().display());
+    let frame = serde_json::json!({
+        "jsonrpc": "2.0", "id": 72, "method": 47, "params": {"query": token}
+    })
+    .to_string();
+    session.send(&frame);
+    let line = session
+        .rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("malformed frame must receive a protocol error")
+        .unwrap();
+    let response: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(response["error"]["code"], -32600, "{response}");
+    assert!(response.get("result").is_none(), "{response}");
+    let log_path = std::fs::read_dir(runtime.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "log"))
+        .expect("daemon log must exist");
+    let log = std::fs::read_to_string(log_path).unwrap();
+    let diagnostic = log
+        .lines()
+        .find(|line| line.contains("Failed to parse message receive:") && line.contains(&frame))
+        .unwrap_or_else(|| panic!("failed frame context was lost: {log}"));
+    assert!(
+        diagnostic.contains("data did not match any variant"),
+        "transport parsing cause was lost: {diagnostic}"
+    );
+    let healthy = session.request(3, r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
+    assert!(
+        healthy["result"]["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "search")),
+        "the same connection must recover after an invalid frame: {healthy}"
+    );
+}
+
+#[test]
+fn daemon_initialize_write_failure_logs_nested_transport_cause() {
+    use std::{net::Shutdown, os::unix::net::UnixStream};
+
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut healthy = McpSession::start_with_env(runtime.path(), &[("RUST_LOG", "debug")]);
+    healthy.initialize();
+    let socket = std::fs::read_dir(runtime.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "sock"))
+        .expect("initialized daemon must have a socket");
+    let log_path = socket.with_extension("log");
+    let mut failed = UnixStream::connect(&socket).unwrap();
+    failed.shutdown(Shutdown::Read).unwrap();
+    writeln!(
+        failed,
+        "{}",
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 71, "method": "initialize",
+            "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                "clientInfo": {"name": "diagnostic-failure", "version": "0"}}
+        })
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        if let Some(diagnostic) = log
+            .lines()
+            .find(|line| line.contains("sending initialize response"))
+        {
+            assert!(
+                diagnostic.contains("MCP daemon server error:"),
+                "{diagnostic}"
+            );
+            assert!(diagnostic.contains("Broken pipe"), "{diagnostic}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "transport error was not logged: {log}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let response = healthy.request(2, r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
+    assert!(
+        response["result"]["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "search")),
+        "a failed peer must leave the healthy connection usable: {response}"
+    );
+}
+
+/// Require nonempty tool-specific results; shape-only checks accept empty branches.
+/// Claude Code displays `structuredContent` when a tool advertises an output schema.
 #[test]
 fn every_schema_bearing_tool_returns_populated_structured_content() {
     let project = tempfile::tempdir().unwrap();
@@ -1066,8 +1104,7 @@ fn every_schema_bearing_tool_returns_populated_structured_content() {
     };
     let mut session = McpSession::start_with_env(
         runtime.path(),
-        // Lets `search` run without a model download; the seeded chunk table
-        // is 4-dimensional to match.
+        // Match the seeded 4D chunks without downloading a model.
         &[("CODESAGE_MCP_TEST_QUERY_EMBEDDING", "0.1,0.2,0.3,0.4")],
     );
     session.initialize();
@@ -1088,9 +1125,7 @@ fn every_schema_bearing_tool_returns_populated_structured_content() {
         "no tool advertises an outputSchema: {listed}"
     );
 
-    // Feature ids are content hashes, so `feature_bundle` has to be handed a
-    // real one — a made-up id lands on the `found: false` branch, which is a
-    // populated object too and would never exercise the loaded-bundle path.
+    // A fabricated feature ID would only exercise the empty-bundle branch.
     let features = session.request(
         3,
         &format!(
@@ -1102,8 +1137,7 @@ fn every_schema_bearing_tool_returns_populated_structured_content() {
         .unwrap_or_else(|| panic!("fixture Cargo.toml should map a library feature: {features}"))
         .to_string();
 
-    // (tool, arguments, keys that must carry data). `session_end` must follow
-    // `session_start` on the same id, so the table is ordered, not a map.
+    // Preserve order: session_end requires the preceding session_start.
     let calls: Vec<(&str, Value, &[&str])> = vec![
         (
             "edit_check",
@@ -1119,8 +1153,7 @@ fn every_schema_bearing_tool_returns_populated_structured_content() {
         (
             "project_overview",
             serde_json::json!({}),
-            // `top_risk_files` is empty until git history is indexed, so it
-            // doubles as proof the fixture's git-index pass took effect.
+            // Nonempty risk rows also verify the fixture's git-history pass.
             &["languages", "file_count", "top_risk_files", "entrypoints"],
         ),
         (
@@ -1145,10 +1178,7 @@ fn every_schema_bearing_tool_returns_populated_structured_content() {
         ),
         (
             "list_dependencies",
-            // The one fixture file with edges in BOTH directions: it imports
-            // `py/util.py` and is imported by `py/main.py`. Rust `use crate::`
-            // paths do not resolve back to files, so a Rust-only fixture
-            // leaves `imported_by` empty on every file.
+            // Python supplies resolved import edges in both directions.
             serde_json::json!({"file_path": "py/app.py"}),
             &["imports", "imported_by"],
         ),
@@ -1188,8 +1218,7 @@ fn every_schema_bearing_tool_returns_populated_structured_content() {
         ),
         (
             "assess_risk",
-            // `top_coupled` is verbose-only; the default trim is pinned by
-            // `assess_risk_default_response_omits_verbose_fields`.
+            // top_coupled requires verbose output.
             serde_json::json!({"file_path": "src/helper.rs", "verbose": true}),
             &["found", "score", "notes", "top_coupled", "top_symbols"],
         ),
@@ -1227,8 +1256,6 @@ fn every_schema_bearing_tool_returns_populated_structured_content() {
         (
             "session_end",
             serde_json::json!({"session_id": "inv"}),
-            // Non-empty only because the loop adds a file and reindexes right
-            // before this call; on an unchanged tree every array here is [].
             &["session_id", "new_files", "summary_notes"],
         ),
     ];
@@ -1246,8 +1273,7 @@ fn every_schema_bearing_tool_returns_populated_structured_content() {
 
     for (index, (tool, args, required)) in calls.iter().enumerate() {
         if *tool == "session_end" {
-            // Drive the real precondition instead of exempting the tool: a
-            // session diff over an unchanged tree is all-empty by definition.
+            // An unchanged tree would exercise only an empty session diff.
             std::fs::write(
                 project.path().join("src/added_mid_session.rs"),
                 "pub fn added_mid_session() -> u32 {\n    3\n}\n",
@@ -1300,11 +1326,7 @@ fn every_schema_bearing_tool_returns_populated_structured_content() {
             );
         }
 
-        // The text block must not disagree with the structured payload: an
-        // agent reading either one has to see the same facts. `_meta` is
-        // exempt — coverage and staleness annotations are merged into the
-        // structured value after the text is rendered, and their human-facing
-        // half is prepended as its own banner block.
+        // _meta is added after text rendering and has a separate banner block.
         let content = resp["result"]["content"]
             .as_array()
             .unwrap_or_else(|| panic!("{tool} must ship a content array: {resp}"));
@@ -1339,9 +1361,7 @@ fn every_schema_bearing_tool_returns_populated_structured_content() {
     }
 }
 
-/// Whether a response field actually carries a result rather than the shape of
-/// one. `[]`, `""`, `{}`, `0`, `false` and `null` all mean "the tool ran but
-/// found nothing", which is exactly the vacuous pass this guards against.
+/// Reject empty branches even when their response shape is valid.
 fn carries_data(value: &Value) -> bool {
     match value {
         Value::Array(items) => !items.is_empty(),
@@ -1353,11 +1373,7 @@ fn carries_data(value: &Value) -> bool {
     }
 }
 
-/// The risk tools hide the per-signal decomposition and `top_coupled` unless
-/// the caller passes `verbose: true` (`cycle_files` is exempt — the staleness
-/// scan needs it). Pinned over the daemon wire, on the same fixture the
-/// populated-content test uses, so the data-bearing branch (a file with
-/// co-change history) is what gets trimmed.
+/// Use real co-change history so trimming cannot pass on an empty result.
 #[test]
 fn assess_risk_default_response_omits_verbose_fields() {
     let project = tempfile::tempdir().unwrap();
@@ -1406,7 +1422,6 @@ fn assess_risk_default_response_omits_verbose_fields() {
     };
     let object = |v: Value| v.as_object().cloned().expect("object");
 
-    // assess_risk: default trims, verbose restores.
     let default = object(call(
         &mut session,
         2,
@@ -1443,7 +1458,6 @@ fn assess_risk_default_response_omits_verbose_fields() {
         "trim must not change the score"
     );
 
-    // assess_risk_batch and assess_risk_diff apply the same gate per entry.
     let files = serde_json::json!(["src/helper.rs", "src/util.rs"]);
     for (id, tool) in [(4u64, "assess_risk_batch"), (5, "assess_risk_diff")] {
         let default = object(call(
@@ -1479,12 +1493,7 @@ fn assess_risk_default_response_omits_verbose_fields() {
     }
 }
 
-/// `trace_call_path` (MCP) and `codesage trace --json` (CLI) must carry the
-/// same per-step evidence. `call_line` is the whole point of the tool — it
-/// names the line in the caller's body where the next hop is invoked — and it
-/// is `skip_serializing_if = "Option::is_none"`, exactly the kind of field
-/// that can vanish from one surface unnoticed. Both shapes are pinned
-/// explicitly, then checked against each other.
+/// Require call-site evidence before comparing surfaces; both could omit it.
 #[test]
 fn trace_call_path_mcp_and_cli_json_agree_on_step_fields() {
     let project = tempfile::tempdir().unwrap();
@@ -1522,9 +1531,7 @@ fn trace_call_path_mcp_and_cli_json_agree_on_step_fields() {
     );
     let mcp_report = resp["result"]["structuredContent"].clone();
 
-    // The fixture has a real cross-file edge, so both surfaces must find it.
-    // Without this the comparisons below would pass vacuously over two empty
-    // `steps` arrays.
+    // Two empty step arrays would satisfy parity without exercising a hop.
     assert_eq!(cli_report["found"], Value::Bool(true), "CLI: {cli_report}");
     assert_eq!(mcp_report["found"], Value::Bool(true), "MCP: {mcp_report}");
 
@@ -1540,8 +1547,6 @@ fn trace_call_path_mcp_and_cli_json_agree_on_step_fields() {
         "need a hop to check call_line evidence: {cli_report}"
     );
 
-    // Pin each shape absolutely, not just relative to the other — two
-    // surfaces that lose the same field together would still agree.
     for (surface, steps) in [("CLI", cli_steps), ("MCP", mcp_steps)] {
         for (i, step) in steps.iter().enumerate() {
             for field in ["name", "qualified_name", "file_path", "line_start"] {
@@ -1563,8 +1568,6 @@ fn trace_call_path_mcp_and_cli_json_agree_on_step_fields() {
         );
     }
 
-    // Field-set parity key by key, so a field added or dropped on one surface
-    // only is caught even if both still satisfy the pins above.
     for (i, (c, m)) in cli_steps.iter().zip(mcp_steps).enumerate() {
         let ckeys: Vec<&String> = c.as_object().expect("CLI step object").keys().collect();
         let mkeys: Vec<&String> = m.as_object().expect("MCP step object").keys().collect();
@@ -1593,11 +1596,7 @@ fn trace_call_path_mcp_and_cli_json_agree_on_step_fields() {
 
 #[test]
 fn from_trace_subdirectory_project_still_reads_the_workspace_manifest() {
-    // A name-only Rust frame (no `at` line) can only resolve through the
-    // Cargo manifest: `fixture::helper::inner_step` ↔ package `fixture`,
-    // `src/helper.rs`. Passing a subdirectory as `project` resolves the same
-    // index; the handler must hand the graph layer the canonical root, not
-    // the subdirectory, or the manifest is never found.
+    // Name-only Rust frames need the root Cargo manifest, even for a subdirectory project.
     let project = tempfile::tempdir().unwrap();
     onboard_rich_fixture(project.path());
 
@@ -1631,25 +1630,8 @@ fn from_trace_subdirectory_project_still_reads_the_workspace_manifest() {
     assert_eq!(report["resolved"], 2, "{report}");
 }
 
-/// A fixture with real data for every MCP tool, so an assertion that a tool
-/// returned something is not satisfied by an empty result. It carries:
-///
-/// - a cross-file call edge `outer_step` → `inner_step` (`trace_call_path`,
-///   `impact_analysis`, `find_references`)
-/// - a structurally identical `twin_a` / `twin_b` pair (`find_similar`)
-/// - a Python import chain where `py/app.py` both imports and is imported, the
-///   only shape that gives `list_dependencies` non-empty edges in both
-///   directions (Rust `use crate::` paths do not resolve back to files)
-/// - a sibling test file (`recommend_tests`, and the feature-test-gap
-///   objection in `review_rehearsal`)
-/// - four commits, each touching `src/helper.rs` and `src/util.rs` together,
-///   which clears the min-count-3 co-change threshold (`find_coupling`) and
-///   gives churn a percentile to report (`assess_risk`, `project_overview`'s
-///   `top_risk_files`)
-/// - a Cargo manifest, so the feature mapper produces a slice
-///   (`list_features`, `find_feature`, `feature_bundle`)
-///
-/// Indexed structurally only: no model download, no network.
+/// Supply calls, clones, imports, tests, co-change history, and a mapped slice
+/// so each tool's populated branch can be exercised without model downloads.
 fn onboard_rich_fixture(root: &std::path::Path) {
     let write = |rel: &str, body: &str| {
         let path = root.join(rel);
@@ -1712,8 +1694,7 @@ fn onboard_rich_fixture(root: &std::path::Path) {
     git(&["init", "-q", "."]);
     git(&["add", "-A"]);
     git(&["commit", "-qm", "initial"]);
-    // Three more commits touching the same pair, clearing the min-count-3
-    // co-change threshold so `find_coupling` has a row to return.
+    // Clear the min-count-3 co-change threshold.
     for rev in 2..=4 {
         for rel in ["src/helper.rs", "src/util.rs"] {
             append_line(&root.join(rel), &format!("// rev {rev}"));
@@ -1746,10 +1727,7 @@ fn run_codesage(root: &std::path::Path, args: &[&str]) {
     );
 }
 
-/// Seed semantic chunks for the fixture's Rust files so `search`,
-/// `export_context` and `feature_bundle` have content to return without a
-/// model download. Line spans cover each file whole, so a symbol lookup
-/// anywhere in them resolves to an overlapping chunk.
+/// Whole-file spans ensure every symbol overlaps a seeded chunk.
 fn seed_fixture_chunks(root: &std::path::Path) {
     let db_path = root.join(".codesage").join("index.db");
     let db = Database::open_for_model(&db_path, "jinaai/jina-embeddings-v2-base-code", 4).unwrap();
@@ -1766,8 +1744,6 @@ fn seed_fixture_chunks(root: &std::path::Path) {
     }
 }
 
-/// One MCP shim (stdin/stdout JSON-RPC) with a line-reader thread, so
-/// tools/call tests don't re-inline the pump plumbing per test.
 struct McpSession {
     child: ChildGuard,
     rx: Receiver<std::io::Result<String>>,
@@ -1785,8 +1761,7 @@ impl McpSession {
             .arg("mcp")
             .arg("--runtime-dir")
             .arg(runtime_dir)
-            // The daemon inherits the first shim's env; keep the
-            // per-project watcher out of tool-call tests.
+            // The daemon inherits the first shim's environment.
             .env("CODESAGE_WATCH", "0")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1830,8 +1805,6 @@ impl McpSession {
     }
 }
 
-/// Onboard a throwaway project offline: `init` + structural-only index
-/// (`--no-semantic` needs no model download, no network).
 fn onboard_fixture_project(root: &std::path::Path) {
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/lib.rs"), "pub fn hello_symbol() {}\n").unwrap();

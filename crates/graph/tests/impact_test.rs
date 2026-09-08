@@ -440,10 +440,7 @@ fn impact_by_ambiguous_bare_name_requires_disambiguation() {
 
 #[test]
 fn impact_by_bare_name_proceeds_when_definitions_share_a_qualified_name() {
-    // A `.d.ts` declaration beside its `.js` implementation is the norm in
-    // JS/TS, and neither carries a namespace, so both definitions qualify to
-    // the same bare name. Erroring here told the caller to "qualify with one
-    // of: Headers, Headers".
+    // The declaration and implementation share a bare qualified name.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
 
@@ -466,9 +463,7 @@ fn impact_by_bare_name_proceeds_when_definitions_share_a_qualified_name() {
     let db = Database::open_in_memory().unwrap();
     full_index(root, &db, &[], false).unwrap();
 
-    // Pin the precondition. Without it, a parser change that stopped emitting a
-    // symbol for the `.d.ts` would leave one definition, and the test would
-    // pass while exercising none of the behavior it exists to cover.
+    // Keep two definitions so parser changes cannot bypass ambiguity handling.
     let defs = db.find_symbols("Headers", None).unwrap();
     assert_eq!(defs.len(), 2, "expected a .d.ts and a .js definition");
     let distinct: std::collections::HashSet<&str> =
@@ -578,10 +573,7 @@ fn export_context_callees_resolve_imported_helper_not_homonym() {
 
 #[test]
 fn reverse_impact_attributes_caller_to_imported_helper_only() {
-    // Reverse counterpart of the forward test above: `service.rs` imports
-    // `helpers_a::helper`, so it must inflate `helpers_a`'s reverse blast radius
-    // but NOT `helpers_b`'s homonym. Before import-aware reverse resolution,
-    // `find_references` tail-matched "helper" and attributed the caller to both.
+    // Reverse resolution must attribute `helper` to its imported definition only.
     let (_dir, db) = setup_ambiguous_helper_rust_project();
 
     let reverse_files = |path: &str| -> Vec<String> {
@@ -671,10 +663,7 @@ fn export_context_unknown_symbol_returns_empty_bundle() {
     assert!(bundle.target_description.contains("not found"));
 }
 
-/// A same-namespace subclass writes `extends Base` with no `use` statement, so
-/// the reference row records the short name. Keying the reverse lookup on the
-/// symbol's qualified name matched `to_name` exactly and found none of them,
-/// so a widely-inherited base class reported zero dependents.
+/// Same-namespace PHP inheritance records a short name without a `use` import.
 #[test]
 fn same_namespace_inheritance_is_not_lost_to_the_qualified_lookup() {
     let dir = tempfile::tempdir().unwrap();
@@ -684,7 +673,6 @@ fn same_namespace_inheritance_is_not_lost_to_the_qualified_lookup() {
         b"<?php\nnamespace App\\Handler;\nabstract class BaseHandler {\n  abstract public function handle();\n}\n",
     )
     .unwrap();
-    // Same namespace as the base, so PHP needs no `use` and the ref is short.
     for (file, cls) in [
         ("AlphaHandler.php", "AlphaHandler"),
         ("BetaHandler.php", "BetaHandler"),
@@ -720,9 +708,7 @@ fn same_namespace_inheritance_is_not_lost_to_the_qualified_lookup() {
     );
 }
 
-/// A trait used by a class in its own namespace has the same shape as the
-/// inheritance case: `use SomeTrait;` inside the class body records the short
-/// name, and the qualified lookup missed it.
+/// Same-namespace PHP trait use records the short name.
 #[test]
 fn same_namespace_trait_use_is_not_lost_to_the_qualified_lookup() {
     let dir = tempfile::tempdir().unwrap();
@@ -803,12 +789,9 @@ fn call_path_finds_the_shortest_chain_and_reports_why_it_cannot() {
     let names: Vec<&str> = report.steps.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, vec!["handle", "apply", "persist", "run_command"]);
     assert_eq!(report.length, 3);
-    // Every step after the origin carries the line it is invoked on.
     assert!(report.steps[0].call_line.is_none());
     assert!(report.steps[1..].iter().all(|s| s.call_line.is_some()));
 
-    // A genuinely unreachable target is reported as unreachable, not as a
-    // bound — the caller needs to tell "no path" from "stopped looking".
     let none = codesage_graph::trace_call_path(
         &db,
         &CallPathRequest {
@@ -821,7 +804,6 @@ fn call_path_finds_the_shortest_chain_and_reports_why_it_cannot() {
     assert!(!none.found);
     assert!(!none.bounded, "not a bound: {:?}", none.note);
 
-    // Too shallow a bound must say so, so an empty answer is not read as proof.
     let shallow = codesage_graph::trace_call_path(
         &db,
         &CallPathRequest {
@@ -869,8 +851,7 @@ fn call_path_depth_bound_is_inclusive_and_cycles_terminate() {
     let db = Database::open_in_memory().unwrap();
     full_index(root, &db, &[], false).unwrap();
 
-    // A direct call must be found at max_depth 1 — the bound counts hops, so
-    // an off-by-one here would make the shallowest useful query return nothing.
+    // Depth counts hops, including the direct-call case.
     let direct = codesage_graph::trace_call_path(
         &db,
         &CallPathRequest {
@@ -883,7 +864,6 @@ fn call_path_depth_bound_is_inclusive_and_cycles_terminate() {
     assert!(direct.found, "one hop at max_depth 1: {:?}", direct.note);
     assert_eq!(direct.length, 1);
 
-    // A mutual-recursion cycle must not hang path reconstruction.
     let cyclic = codesage_graph::trace_call_path(
         &db,
         &CallPathRequest {
@@ -902,9 +882,7 @@ fn call_path_depth_bound_is_inclusive_and_cycles_terminate() {
 fn call_path_refuses_edges_that_are_not_calls() {
     use codesage_protocol::CallPathRequest;
 
-    // A type annotation is not control reaching the callee. Reporting it as a
-    // call chain would answer "does request input reach this sink" with a
-    // confident yes on the strength of a parameter type.
+    // A type annotation cannot establish a call chain.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     std::fs::write(
@@ -970,7 +948,6 @@ fn call_path_does_not_credit_an_outer_symbol_with_a_nested_symbols_calls() {
         report.steps.iter().map(|s| &s.name).collect::<Vec<_>>()
     );
 
-    // The real caller still resolves.
     let real = codesage_graph::trace_call_path(
         &db,
         &CallPathRequest {
@@ -991,11 +968,7 @@ fn call_path_does_not_credit_an_outer_symbol_with_a_nested_symbols_calls() {
 fn call_path_repeated_callee_names_resolve_consistently() {
     use codesage_protocol::CallPathRequest;
 
-    // A hub body calling one name dozens of times resolves the same
-    // (file, name) pair per call site; the per-pair cache must return the
-    // same import-filtered definitions as a fresh lookup each time. The
-    // second `sink` definition (never imported) proves filtering still
-    // applies on the cached path: the chain must land in sink.rs, not other.rs.
+    // The unimported homonym detects loss of import filtering on cached lookups.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     std::fs::write(root.join("sink.rs"), b"pub fn sink() {}\n").unwrap();

@@ -47,16 +47,8 @@ fn is_symbol_header_line(line: &str) -> bool {
     SYMBOL_KIND_STRS.contains(&kind)
 }
 
-/// Prefix the body lines of a bundle chunk with 1-based file line numbers
-/// (`  12 | code`) starting at `start_line`, so an agent can cite
-/// `file:line` straight from the bundle without re-reading. Applied at read
-/// time only — stored and embedded chunk text is never touched.
-///
-/// The augmentation header (`# <file_path>` plus `# <symbol> (<kind>)`
-/// lines that `semantic.rs` prepends) passes through unnumbered. Detection
-/// is anchored on the chunk's own `file_path` for line 1, so a C/Rust chunk
-/// (no header) or a source line that merely starts with `#` is never
-/// mistaken for header.
+/// Add source line numbers at read time, leaving stored embeddings unchanged.
+/// Skip augmentation headers only when anchored by this chunk's file path.
 fn number_chunk_lines(content: &str, file_path: &str, start_line: u32) -> String {
     if content.is_empty() {
         return String::new();
@@ -83,15 +75,13 @@ fn number_chunk_lines(content: &str, file_path: &str, start_line: u32) -> String
         let n = start_line as usize + offset;
         out.push_str(&format!("{n:>width$} | {body_line}\n"));
     }
-    // `lines()` drops a trailing newline; we always append one per line.
-    // Restore the original trailing-newline shape so the chunk doesn't grow.
+    // Preserve the original trailing-newline shape after `lines()` drops it.
     if !content.ends_with('\n') {
         out.pop();
     }
     out
 }
 
-/// Apply read-time line numbering to every chunk in a bundle, when enabled.
 fn finalize_bundle(mut bundle: ContextBundle) -> ContextBundle {
     if bundle_line_numbers_enabled() {
         for r in bundle.primary.iter_mut().chain(bundle.related.iter_mut()) {
@@ -201,10 +191,7 @@ pub fn export_context_for_symbol(
         });
     }
 
-    // A zero limit would otherwise return `found: true` with empty
-    // everything — the symbol resolved, but every `take(0)`/cap below drops
-    // it again. `feature_bundle` normalizes 0 to 5; do the same here so both
-    // entry points agree on what "no limit given" means.
+    // Match feature_bundle's zero-limit default instead of returning an empty hit.
     let limit = if req.limit == 0 { 5 } else { req.limit };
     let defs: Vec<Symbol> = defs.into_iter().take(limit).collect();
     let mut primary: Vec<SearchResult> = Vec::new();
@@ -246,10 +233,7 @@ pub fn export_context_for_symbol(
     }))
 }
 
-/// Build a curated [`ContextBundle`] for one feature_id. Composes the
-/// feature's already-curated file list (entry + owned + tests + context)
-/// with the existing chunk store and symbol graph, so an agent doesn't
-/// have to fan out per-file `Read` calls after `find_feature` / `list_features`.
+/// Build a [`ContextBundle`] from a feature's curated files and symbol graph.
 ///
 /// Layout:
 /// - `primary[]` — chunks from owned + entry files, capped at `limit`.
@@ -259,9 +243,7 @@ pub fn export_context_for_symbol(
 ///   any symbol definitions discovered while building primary chunks.
 /// - `target_description` — `"feature: <title> (<feature_id>)"`.
 ///
-/// When the feature_id doesn't resolve, returns an empty bundle with
-/// `found=false` and a `not found` marker in `target_description` (mirrors
-/// `export_context_for_symbol`'s missing-symbol behavior).
+/// Unknown feature IDs return an empty bundle with `found=false`.
 pub fn feature_bundle(
     db: &Database,
     feature_id: &str,
@@ -287,13 +269,7 @@ pub fn feature_bundle(
 
     let mut primary: Vec<SearchResult> = Vec::new();
     let mut primary_keys: HashSet<(String, u32)> = HashSet::new();
-    // Entry first so it's the first chunk in primary order. For the entry
-    // file itself, prefer the chunk overlapping the feature's entry symbol
-    // — `crates/cli/src/main.rs` opens with 400 lines of `use` statements
-    // before `fn main()` starts, and an agent reviewing the feature wants
-    // the body, not the imports. Fall back to first-chunk when the entry
-    // symbol can't be located (no entry_symbol on the feature, or symbol
-    // line is outside any chunk).
+    // Prefer the entry symbol's body over file-leading imports.
     let entry_line = feature.entry_symbol.as_ref().and_then(|sym| {
         entry_symbol_line(db, sym, &feature.entry_path)
             .ok()
@@ -311,8 +287,6 @@ pub fn feature_bundle(
             && let Some(line) = entry_line
         {
             add_chunk_at_line(db, &f.path, line, &mut primary, &mut primary_keys)?;
-            // Fall back to first-chunk only when the symbol-overlap path
-            // produced nothing (no chunk covers that line yet).
             if primary.is_empty() {
                 add_first_chunk_of_file(db, &f.path, &mut primary, &mut primary_keys)?;
             }
@@ -324,13 +298,7 @@ pub fn feature_bundle(
     let mut related: Vec<SearchResult> = Vec::new();
     let mut related_keys: HashSet<(String, u32)> = primary_keys.clone();
 
-    // Symbol definitions: entry symbol (if any) + symbols overlapping the
-    // primary chunks (annotated already by add_first_chunk_of_file).
-    // Filter entry-symbol matches to definitions that live in the
-    // feature's entry file when possible — `main` is a common-enough
-    // name that an unqualified lookup pulls in unrelated definitions
-    // (e.g. Python `if __name__ == "__main__"` modules share the same
-    // entry_symbol = "main" string as Rust binaries).
+    // Prefer the entry file to avoid unrelated homonyms such as `main`.
     let mut symbol_definitions: Vec<Symbol> = Vec::new();
     let mut seen_sym: HashSet<String> = HashSet::new();
     if let Some(entry_sym) = &feature.entry_symbol {
@@ -362,10 +330,7 @@ pub fn feature_bundle(
         }
     }
 
-    // Caller/callee expansion of the entry symbol when requested.
     if (include_callers || include_callees) && !symbol_definitions.is_empty() {
-        // Use the entry symbol's definition(s) as the anchor — limited to
-        // the first few so tests still fit inside the existing related cap.
         let anchors: Vec<Symbol> = symbol_definitions.iter().take(3).cloned().collect();
         add_related_for_symbols(
             db,
@@ -378,9 +343,7 @@ pub fn feature_bundle(
         )?;
     }
 
-    // Backfill tests (run-this-after-review signal), then context. Expansion
-    // goes first only when explicitly requested; without graph candidates,
-    // tests and context retain the full related budget.
+    // Give unused caller/callee capacity to tests, then context.
     for role in [FeatureFileRole::Test, FeatureFileRole::Context] {
         for f in feature.files.iter().filter(|f| f.role == role) {
             if related.len() >= limit {
@@ -402,12 +365,7 @@ pub fn feature_bundle(
     }))
 }
 
-/// Insert the chunk of `file_path` whose `[start_line, end_line]` covers
-/// `line` (the entry symbol's `line_start`). Falls back silently when no
-/// chunk covers that line — the outer caller then drops back to
-/// `add_first_chunk_of_file`. Mirrors `add_related_from_file`'s
-/// covering-chunk lookup but stays in the primary-chunk track for
-/// feature_bundle.
+/// Add a covering chunk, leaving first-chunk fallback to the caller on a miss.
 fn add_chunk_at_line(
     db: &Database,
     file_path: &str,
@@ -440,12 +398,7 @@ fn add_chunk_at_line(
     Ok(())
 }
 
-/// Resolve the `line_start` of `entry_symbol` in `entry_path`. Used by
-/// `feature_bundle` to pick the chunk that holds the entry symbol's
-/// definition rather than the file's first chunk (which is usually
-/// imports/use statements). Returns `Ok(None)` when the symbol can't be
-/// uniquely placed inside the entry file — the caller falls back to
-/// first-chunk lookup.
+/// Locate the first matching definition in the feature's entry file.
 fn entry_symbol_line(db: &Database, entry_symbol: &str, entry_path: &str) -> Result<Option<u32>> {
     let defs = db.find_symbols(entry_symbol, None)?;
     Ok(defs
@@ -454,11 +407,7 @@ fn entry_symbol_line(db: &Database, entry_symbol: &str, entry_path: &str) -> Res
         .map(|d| d.line_start))
 }
 
-/// Insert the first chunk of `file_path` into `out` (deduped by
-/// `(path, start_line)`). Skips files that haven't been semantically
-/// indexed yet — their chunks just don't exist. Used by `feature_bundle`
-/// where we always want a deterministic per-file entry, not best-match
-/// search semantics.
+/// Add the first stored chunk, deduplicated by path and start line.
 fn add_first_chunk_of_file(
     db: &Database,
     file_path: &str,
@@ -580,8 +529,6 @@ pub(crate) fn resolve_callee_definitions(
 ) -> Result<Vec<Symbol>> {
     let candidates = db.find_symbols(to_name, None)?;
     if is_qualified_symbol_name(to_name) {
-        // Exact spelling first, preserving current behavior wherever the
-        // callsite spells the name exactly as indexed.
         let exact: Vec<Symbol> = candidates
             .iter()
             .filter(|s| s.qualified_name == to_name || s.name == to_name)
@@ -590,12 +537,7 @@ pub(crate) fn resolve_callee_definitions(
         if !exact.is_empty() {
             return Ok(exact);
         }
-        // Normalized pass for case-only mismatches (PHP class names are
-        // case-insensitive; barrels re-export under a different case). When
-        // even that finds nothing, fall through to the import-evidence
-        // filter below instead of returning empty: a qualified callsite
-        // whose spelling matches neither form previously dropped every
-        // reverse edge for the symbol.
+        // Case-only mismatches may resolve; otherwise try import evidence.
         let folded: Vec<Symbol> = candidates
             .iter()
             .filter(|s| qualified_name_matches_normalized(s, to_name))
@@ -610,21 +552,11 @@ pub(crate) fn resolve_callee_definitions(
     }
     let import_refs = import_refs_for_file(db, caller_file)?;
 
-    // A definition in the caller's own file is a valid target: a same-file
-    // call emits no import edge, so without this the local
-    // definition is filtered out and the reverse edge (read by
-    // `impact_analysis` / `assess_risk` through `references_for_symbol`) is
-    // lost. Mirrors the same-file preference in `resolve_def_summary`.
+    // Local calls need no import edge.
     let is_local = |s: &Symbol| s.file_path == caller_file;
 
-    // One filter over both kinds of evidence. Letting path specifiers win
-    // outright was tried and removed: it measured identically on axios and
-    // monolog (F1 0.61 / 0.79 either way) while carrying a real failure mode,
-    // because `import_refs_for_file` pools every specifier in the file without
-    // recording which binding each introduced — so an unrelated import could
-    // match a same-named candidate and suppress the correct one. Dropping a
-    // real dependent is the unsafe direction for a what-to-review signal;
-    // over-inclusion is not.
+    // Import refs do not associate bindings with specifiers. Keep both forms
+    // of evidence so an unrelated path import cannot suppress a real target.
     let filtered: Vec<Symbol> = candidates
         .into_iter()
         .filter(|s| {
@@ -637,20 +569,12 @@ pub(crate) fn resolve_callee_definitions(
     Ok(filtered)
 }
 
-// Covers everything `list_file_dependencies().imports` would add: that list
-// is DISTINCT to_name over the same file's refs restricted to import/include,
-// a strict subset of the import/include/trait_use filter here — so the
-// expensive imported_by half of that call is never needed on this path.
+// Fetch outgoing imports without computing list_file_dependencies' reverse edges.
 fn import_refs_for_file(db: &Database, caller_file: &str) -> Result<Vec<String>> {
     let mut refs = Vec::new();
     if let Some(file_id) = db.file_id_for_path(caller_file)? {
         for (to_name, kind) in db.refs_outgoing_for_file_id(file_id)? {
-            // `ImportBinding` is safe to admit here only because the caller
-            // consults path evidence first: a bare binding name matches every
-            // same-named candidate, so it must never compete with a specifier
-            // that identifies one. As pure fallback it recovers the files whose
-            // specifier points at a re-exporting barrel rather than at the
-            // defining module.
+            // Bindings retain evidence when a specifier names a re-exporting barrel.
             if matches!(
                 kind,
                 ReferenceKind::Import
@@ -681,13 +605,7 @@ fn import_ref_targets_symbol(
     if import_ref == sym.qualified_name || import_ref == sym.name {
         return true;
     }
-    // Path-style specifiers name a file, not a symbol: JS/TS records
-    // `import X from './headers.js'` as `./headers.js`, C/C++ records
-    // `#include "dir/foo.h"` as `dir/foo.h`. Neither can ever equal a symbol
-    // name, so before this branch every candidate was filtered out and any
-    // symbol with two same-named definitions lost all its reverse edges. In
-    // JS/TS that is the common case, not a corner: a `.d.ts` declaration
-    // beside its `.js` implementation gives two definitions of one name.
+    // JS/TS imports and C/C++ includes can name a file instead of a symbol.
     if is_path_specifier(import_ref) {
         return import_path_targets_file(import_ref, caller_file, &sym.file_path);
     }
@@ -702,12 +620,8 @@ fn import_ref_targets_symbol(
         .any(|c| c == &sym.file_path)
 }
 
-/// File paths a Rust `use` module path may resolve to. `crate::` is relative
-/// to the importer's own crate root: when the importer path shows a `src/`
-/// root, resolve against that root ONLY — adding the generic repo-root
-/// guesses alongside would let `crates/a/src/lib.rs` claim the root crate's
-/// `src/util.rs`. The generic layouts remain the fallback for importers with
-/// no derivable src root (e.g. a root-level `lib.rs`).
+/// Resolve within the importer's `src/` root to avoid claiming sibling crates.
+/// Try generic layouts only when no such root is derivable.
 fn rust_module_candidates(module: &str, importer_file: &str) -> Vec<String> {
     let module = module.strip_prefix("crate::").unwrap_or(module);
     if module.is_empty() || module == "crate" {
@@ -869,13 +783,8 @@ fn import_path_targets_file(spec: &str, caller_file: &str, sym_file: &str) -> bo
             None => false,
         };
     }
-    // Non-relative specifiers are one of two things: a C include, which names a
-    // real file and always carries its extension, or a package path, which
-    // names nothing in this repo. So match exactly or on a separator-anchored
-    // suffix, and never guess an extension — otherwise the npm specifier
-    // `pkg/sub` claims the unrelated project file `pkg/sub.ts`, and a Go dot
-    // import of `github.com/x/y` claims `github.com/x/y.ts`. The separator
-    // anchor is what stops `net/utils.h` from claiming `net_utils.h`.
+    // Do not infer extensions for package paths. Include suffixes require a
+    // separator boundary so `net/utils.h` cannot claim `net_utils.h`.
     spec == sym_file || sym_file.ends_with(&format!("/{spec}"))
 }
 
@@ -904,15 +813,10 @@ fn relative_file_matches(resolved: &str, sym_file: &str) -> bool {
     if resolved == sym_file {
         return true;
     }
-    // Look for the extension in the last path segment only. A specifier like
-    // `./dir.v1/foo` has its last dot in the *directory* part, and splitting on
-    // that yields the stem `dir`, which then matches an unrelated `dir.ts`.
+    // Directory dots are not file extensions (`dir.v1/foo` must not claim `dir.ts`).
     let segment_start = resolved.rfind('/').map_or(0, |i| i + 1);
     match resolved[segment_start..].rfind('.') {
-        // The specifier carries an extension. It may still differ from the file
-        // on disk — TypeScript ESM requires the emitted `.js` for a `.ts`
-        // source — so swap it. Do not also append, or `./foo.js` claims
-        // `foo.js.ts`.
+        // Swap emitted extensions, but do not append: `foo.js` must not claim `foo.js.ts`.
         Some(dot) => {
             let stem = &resolved[..segment_start + dot];
             IMPORT_EXTENSIONS
@@ -1031,7 +935,6 @@ mod import_path_tests {
             "lib/core/client.js",
             "lib/helpers/util.js"
         ));
-        // Same basename in a different directory is not the same file.
         assert!(!import_path_targets_file(
             "./headers.js",
             "lib/core/client.js",
@@ -1041,13 +944,11 @@ mod import_path_tests {
 
     #[test]
     fn specifier_extension_may_differ_from_the_file_on_disk() {
-        // TypeScript ESM requires the emitted extension in the specifier.
         assert!(import_path_targets_file(
             "./foo.js",
             "src/client.ts",
             "src/foo.ts"
         ));
-        // Omitted entirely, and the directory-index form.
         assert!(import_path_targets_file(
             "./foo",
             "src/client.ts",
@@ -1062,8 +963,6 @@ mod import_path_tests {
 
     #[test]
     fn mts_cts_extensions_resolve_like_their_emit_targets() {
-        // `.mts`/`.cts` are indexed as TypeScript; the extension swap must
-        // admit them both bare and under their emitted `.mjs`/`.cjs` names.
         assert!(import_path_targets_file(
             "./foo",
             "src/client.ts",
@@ -1084,7 +983,6 @@ mod import_path_tests {
             "src/client.ts",
             "src/foo.cts"
         ));
-        // The directory-index form applies to them as well.
         assert!(import_path_targets_file(
             "./utils",
             "src/client.ts",
@@ -1094,9 +992,6 @@ mod import_path_tests {
 
     #[test]
     fn go_import_path_does_not_match_an_unrelated_file() {
-        // The last dot of `github.com/x/y` sits in the directory part. Splitting
-        // the extension over the whole path produced the stem `github`, which
-        // matched any same-named source file elsewhere in a mixed repo.
         assert!(!import_path_targets_file(
             "github.com/x/y",
             "cmd/app/main.go",
@@ -1116,7 +1011,6 @@ mod import_path_tests {
             "a/client.js",
             "x.js"
         ));
-        // The same specifier from two directories deep is in range.
         assert!(import_path_targets_file(
             "../../x.js",
             "a/b/client.js",
@@ -1126,13 +1020,11 @@ mod import_path_tests {
 
     #[test]
     fn declaration_files_resolve_through_both_branches() {
-        // Specifier carries no extension, so one is appended.
         assert!(import_path_targets_file(
             "./foo",
             "src/client.ts",
             "src/foo.d.ts"
         ));
-        // Specifier carries `.js`, which is swapped.
         assert!(import_path_targets_file(
             "./foo.js",
             "src/client.ts",
@@ -1142,7 +1034,6 @@ mod import_path_tests {
 
     #[test]
     fn specifier_with_an_extension_is_not_also_appended_to() {
-        // `./foo.js` must not claim `foo.js.ts`.
         assert!(!import_path_targets_file(
             "./foo.js",
             "src/client.ts",
@@ -1152,7 +1043,6 @@ mod import_path_tests {
 
     #[test]
     fn rust_use_paths_resolve_to_module_files() {
-        // Item import: the parent module names the file.
         assert!(import_ref_targets_file(
             "crate::util::helper",
             "src/lib.rs",
@@ -1163,35 +1053,26 @@ mod import_path_tests {
             "lib.rs",
             "util/mod.rs"
         ));
-        // Whole-module import: the path itself names the file.
         assert!(import_ref_targets_file(
             "crate::util",
             "src/lib.rs",
             "src/util.rs"
         ));
-        // Workspace member: `crate::` is the importer's own src root.
         assert!(import_ref_targets_file(
             "crate::util::helper",
             "crates/app/src/lib.rs",
             "crates/app/src/util.rs"
         ));
-        // A sibling crate's same-named module is not in `crate::`. The
-        // repo-root `src/` guess cannot fire here (no such path), and the
-        // src-root candidate is derived from the importer.
         assert!(!import_ref_targets_file(
             "crate::util::helper",
             "crates/app/src/lib.rs",
             "crates/other/src/util.rs"
         ));
-        // An importer with its own src root must not claim the ROOT crate's
-        // module either: the generic `src/` guess is a fallback, not an
-        // always-on candidate.
         assert!(!import_ref_targets_file(
             "crate::util::helper",
             "crates/app/src/lib.rs",
             "src/util.rs"
         ));
-        // External paths derive candidates that match no indexed file.
         assert!(!import_ref_targets_file(
             "std::io::Read",
             "src/lib.rs",
@@ -1207,7 +1088,6 @@ mod import_path_tests {
             "src/util.h"
         ));
         assert!(import_ref_targets_file("util.h", "main.c", "util.h"));
-        // Exact join only: no claiming a same-named header elsewhere.
         assert!(!import_ref_targets_file(
             "util.h",
             "src/main.c",
@@ -1219,19 +1099,16 @@ mod import_path_tests {
 
     #[test]
     fn directory_includes_resolve_exactly_never_by_suffix() {
-        // Includer-directory join.
         assert!(import_ref_targets_file(
             "sub/foo.h",
             "app/main.c",
             "app/sub/foo.h"
         ));
-        // Project-root join (`-I.` style include).
         assert!(import_ref_targets_file(
             "sub/foo.h",
             "app/main.c",
             "sub/foo.h"
         ));
-        // No suffix match: an unrelated tree's `*/sub/foo.h` stays unclaimed.
         assert!(!import_ref_targets_file(
             "sub/foo.h",
             "app/main.c",
@@ -1255,7 +1132,6 @@ mod import_path_tests {
 
     #[test]
     fn a_dot_in_a_directory_component_is_not_an_extension() {
-        // Stem must come from the last segment: `dir.v1/foo` is not `dir`.
         assert!(!import_path_targets_file(
             "./dir.v1/foo",
             "src/client.ts",
@@ -1270,13 +1146,11 @@ mod import_path_tests {
 
     #[test]
     fn package_specifiers_do_not_claim_same_named_project_files() {
-        // An npm subpath import, not a relative path to `pkg/sub.ts`.
         assert!(!import_path_targets_file(
             "pkg/sub",
             "src/client.ts",
             "pkg/sub.ts"
         ));
-        // A Go dot import names a package directory, not a source file.
         assert!(!import_path_targets_file(
             "github.com/x/y",
             "cmd/app/main.go",
@@ -1291,7 +1165,6 @@ mod import_path_tests {
             "src/main.c",
             "include/net/utils.h"
         ));
-        // `utils.h` must not be claimed by `net_utils.h`.
         assert!(!import_path_targets_file(
             "net/utils.h",
             "src/main.c",
@@ -1309,17 +1182,14 @@ mod line_number_tests {
         let content = "# app/Svc.php\n# App\\Svc (class)\n<?php\nclass Svc {}";
         let out = number_chunk_lines(content, "app/Svc.php", 10);
         let lines: Vec<&str> = out.lines().collect();
-        // Header lines pass through unnumbered.
         assert_eq!(lines[0], "# app/Svc.php");
         assert_eq!(lines[1], "# App\\Svc (class)");
-        // Body numbered from start_line.
         assert_eq!(lines[2], "  10 | <?php");
         assert_eq!(lines[3], "  11 | class Svc {}");
     }
 
     #[test]
     fn numbers_from_line_one_when_no_header() {
-        // C/Rust chunks are not augmented — first line is real source.
         let content = "fn main() {\n    let x = 1;\n}";
         let out = number_chunk_lines(content, "src/main.rs", 42);
         let lines: Vec<&str> = out.lines().collect();
@@ -1330,9 +1200,6 @@ mod line_number_tests {
 
     #[test]
     fn source_comment_resembling_header_is_not_stripped() {
-        // Python body whose first line is a `# word (word)` comment must
-        // not be mistaken for a symbol-header line: `(later)` is not a
-        // SymbolKind, so numbering still starts at the comment.
         let content = "# app/x.py\n# cleanup (later)\nx = 1";
         let out = number_chunk_lines(content, "app/x.py", 5);
         let lines: Vec<&str> = out.lines().collect();
@@ -1343,8 +1210,6 @@ mod line_number_tests {
 
     #[test]
     fn header_anchor_must_match_this_files_path() {
-        // A `# something` first line that is not THIS chunk's path anchor
-        // is treated as body, not header.
         let content = "# not a path\ncode";
         let out = number_chunk_lines(content, "app/x.py", 1);
         assert_eq!(out.lines().next().unwrap(), "   1 | # not a path");
@@ -1422,9 +1287,7 @@ mod context_export_tests {
                 mk("inc.php", ReferenceKind::Include),
                 mk("App\\SomeTrait", ReferenceKind::TraitUse),
                 mk("helper", ReferenceKind::Call),
-                // Same name referenced again on another line: exercises the
-                // by-name dedupe below. An identical (line, col) duplicate
-                // would be rejected by the uq_refs_identity backstop.
+                // Change the line to test name deduplication without violating row identity.
                 Reference {
                     line: 2,
                     ..mk("App\\Imported", ReferenceKind::Import)
@@ -1444,9 +1307,7 @@ mod context_export_tests {
             "import/include/trait_use names, sorted and deduped; calls excluded"
         );
 
-        // The imports half of list_file_dependencies must stay a subset of
-        // this result — that is what lets import_refs_for_file skip the
-        // expensive imported_by UNION that call also computes.
+        // The cheaper lookup must retain every import from list_file_dependencies.
         let deps = db.list_file_dependencies("app/a.php").unwrap();
         assert!(!deps.imports.is_empty(), "fixture must produce imports");
         for imp in &deps.imports {
@@ -1500,11 +1361,6 @@ mod context_export_tests {
 
     #[test]
     fn same_file_definition_resolves_when_name_is_ambiguous() {
-        // `helper` is defined in both a.rs and b.rs (ambiguous bare name). A call
-        // to `helper` from a.rs has no import edge for the local definition, so
-        // the import filter alone would drop it and lose the same-file reverse
-        // edge. The same-file fallback keeps a.rs's definition; the unimported
-        // homonym in b.rs is still excluded.
         let db = Database::open_in_memory().unwrap();
         let a = db
             .upsert_file(&FileInfo {

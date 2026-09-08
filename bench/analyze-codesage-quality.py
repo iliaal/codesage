@@ -44,11 +44,7 @@ from typing import Any
 
 TOOL_PREFIX = "mcp__codesage__"
 
-# CodeSage MCP tools that answer *retrieval* questions (where is X defined,
-# where is X used, what does this module depend on, bundle this context).
-# Excludes pure risk/coupling tools like `assess_risk` because those are a
-# different workflow — the tool-selection-rate metric is specifically about
-# "when the agent wants to find code, does it pick codesage or Grep?"
+# Risk and coupling calls are outside the retrieval-selection denominator.
 RETRIEVAL_CODESAGE_TOOLS = {
     "search",
     "find_symbol",
@@ -58,20 +54,13 @@ RETRIEVAL_CODESAGE_TOOLS = {
     "list_dependencies",
 }
 
-# Identifier shape — matches ASCII code tokens: function names, type names,
-# constants. Permissive on length so short tokens like `fd` and `pt` count.
+# Short ASCII identifiers such as `fd` and `pt` count.
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-# Regex metacharacters that, if present in a Grep pattern, mean the agent
-# wanted something more than a literal-identifier search. `|` and whitespace
-# are excluded because pipe-joined identifiers / multi-word keywords (`fn foo`)
-# are still identifier-shaped lookups from CodeSage's perspective.
+# Allow `|` and whitespace for identifier alternatives and keywords (`fn foo`).
 REGEX_META_RE = re.compile(r"[.\\\[\](){}^$*+?]")
 
 
-# -----------------------------------------------------------------------------
-# Extraction (mirrors analyze-codesage-usage.py walker)
-# -----------------------------------------------------------------------------
 
 
 def is_subagent_transcript(path: Path) -> bool:
@@ -141,10 +130,7 @@ def extract_events(transcript: Path) -> list[dict[str, Any]]:
             content = msg.get("content")
             ts = obj.get("timestamp") if isinstance(obj, dict) else None
 
-            # User text turn: role=user with string content, or role=user
-            # with a list whose entries are plain text (not tool_result).
-            # tool_result blocks also ride on role=user envelopes, so a
-            # message carrying one falls through to the block loop below.
+            # tool_result blocks also use role=user; they are not user questions.
             if role == "user":
                 user_text = ""
                 has_tool_result = False
@@ -203,9 +189,6 @@ def extract_events(transcript: Path) -> list[dict[str, Any]]:
     return events
 
 
-# -----------------------------------------------------------------------------
-# Quality signals
-# -----------------------------------------------------------------------------
 
 
 def classify_codesage_result(text: str) -> str:
@@ -220,8 +203,6 @@ def classify_codesage_result(text: str) -> str:
         return "empty"
     if t.startswith("MCP error") or t.startswith("Error:") or t.startswith("Exit code "):
         return "error"
-    # Try JSON parse. Empty arrays and empty {results: []} -like shapes are
-    # treated as empty responses.
     try:
         data = json.loads(t)
     except (json.JSONDecodeError, ValueError):
@@ -231,7 +212,6 @@ def classify_codesage_result(text: str) -> str:
     if isinstance(data, list) and not data:
         return "empty"
     if isinstance(data, dict):
-        # A result dict is "empty" if every top-level collection is empty.
         has_content = False
         for v in data.values():
             if isinstance(v, list) and v:
@@ -248,23 +228,14 @@ def classify_codesage_result(text: str) -> str:
     return "ok"
 
 
-# Tighter than the first draft after sampling real transcripts:
-# the broad keyword list (`auth|config|...`) over-matched conversational
-# messages, and pasted slash-command bodies were being treated as user
-# questions. Now we require an actual question shape AND filter out
-# pasted bodies / task notifications before classifying.
+# Require question or implementation-request phrasing, not just topic keywords.
 SEMANTIC_QUESTION_RES = [
-    # Formal "where does X happen?" / "how does X work?" phrasings.
     re.compile(r"\bwhere\s+(does|is|are|do\s+we)\b.*\b(handle|happen|live|loaded|defined|managed|stored|implemented|done|fire|trigger)",
                re.IGNORECASE),
     re.compile(r"\bhow\s+(does|do\s+we|is)\b.*\b(work|handle|implement|done|done\b)", re.IGNORECASE),
     re.compile(r"\bfind\s+(the\s+)?(file|place|spot|code|spot)\s+(that|where)\b", re.IGNORECASE),
     re.compile(r"\bwhich\s+file\s+(handles|implements|contains|holds|owns)", re.IGNORECASE),
     re.compile(r"\bwhat\s+(handles|implements|does)\b", re.IGNORECASE),
-    # Implementation-request shapes that imply retrieval first ("look at the
-    # auth flow", "show me where config is loaded", "fix the search code").
-    # These are the way real users actually phrase concept-shaped requests
-    # in conversational sessions — formal "where does X?" phrasing is rare.
     re.compile(r"\b(look|take\s+a\s+look)\s+at\s+(the\s+)?\w+\s+(flow|module|code|pipeline|logic|path|handler|system|layer)",
                re.IGNORECASE),
     re.compile(r"\bshow\s+me\s+(where|the|how)\s+\w+", re.IGNORECASE),
@@ -273,14 +244,10 @@ SEMANTIC_QUESTION_RES = [
     re.compile(r"\bexplain\s+(the\s+|how\s+)?\w+\s+(flow|works|module|code|logic)", re.IGNORECASE),
 ]
 IDENTIFIER_QUESTION_RES = [
-    # Backtick-quoted identifiers: `Foo`, `do_the_thing`, `Foo::bar`.
     re.compile(r"`[A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)*`"),
-    # "where is Foo defined / declared / called / used"
     re.compile(r"\bwhere\s+is\s+[A-Za-z_][A-Za-z0-9_]{3,}\s+(defined|declared|called|used|implemented)",
                re.IGNORECASE),
-    # "find references to Foo" / "find callers of Foo"
     re.compile(r"\bfind\s+(all\s+)?(references?|callers?|callees?)\s+(to|of)\s+[A-Za-z_]"),
-    # "what calls X" / "who calls X"
     re.compile(r"\b(what|who)\s+calls\s+[A-Za-z_]"),
 ]
 LITERAL_QUESTION_RES = [
@@ -289,10 +256,7 @@ LITERAL_QUESTION_RES = [
     re.compile(r"\bsearch\s+for\s+[\"']", re.IGNORECASE),
     re.compile(r"\b(error|warning|log)\s+message\b", re.IGNORECASE),
 ]
-# Skip-patterns: these aren't real user questions, they're pasted text
-# from slash-command bodies, hook events, or system notifications that
-# happen to arrive on a `role=user` envelope. Bucketing them inflates
-# every shape and dilutes the rate.
+# Pasted commands and harness notifications also arrive as role=user.
 NON_QUESTION_RES = [
     re.compile(r"<task-notification>", re.IGNORECASE),
     re.compile(r"<command-(name|args|message)>", re.IGNORECASE),
@@ -312,8 +276,7 @@ def is_real_user_question(text: str) -> bool:
     if not text or not text.strip():
         return False
     if len(text) > 2000:
-        # Real user questions are short. Long bodies are almost always
-        # pasted command/skill text.
+        # Long messages are likely pasted command or skill bodies.
         return False
     for r in NON_QUESTION_RES:
         if r.search(text):
@@ -359,13 +322,9 @@ def identifier_shaped_grep(pattern: str) -> bool:
     """
     if not pattern or len(pattern) < 2:
         return False
-    # Strip outer quoting artifacts (some transcripts include surrounding quotes).
     p = pattern.strip()
-    # Fast reject on regex metacharacters.
     if REGEX_META_RE.search(p):
         return False
-    # Split on top-level `|`. Each alternative must be either a single
-    # identifier or a whitespace-separated list of identifiers.
     for alt in p.split("|"):
         tokens = alt.strip().split()
         if not tokens:
@@ -382,10 +341,7 @@ def extract_grep_identifiers(pattern: str) -> set[str]:
     if not pattern:
         return set()
     out: set[str] = set()
-    # Be permissive: even if the pattern isn't identifier-shaped overall,
-    # pull out any bareword tokens that happen to be present. A mixed
-    # pattern like `'foo\b|bar'` still tells us the agent cared about
-    # `foo` and `bar` as symbols.
+    # Mixed regexes can still identify subjects for follow-up matching.
     for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", pattern):
         if len(token) >= 3:  # skip noise like 'a', 'if', 'fn'
             out.add(token)
@@ -406,7 +362,6 @@ def extract_codesage_subject(event: dict[str, Any]) -> set[str]:
             for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", val):
                 if len(token) >= 3:
                     subjects.add(token)
-    # Cheap peek into response text for small payloads.
     text = event.get("text") or ""
     if text and len(text) < 8192:
         for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text):
@@ -415,36 +370,24 @@ def extract_codesage_subject(event: dict[str, Any]) -> set[str]:
     return subjects
 
 
-# -----------------------------------------------------------------------------
-# Terminality (ripwire METHODOLOGY.md §9, adapted)
-# -----------------------------------------------------------------------------
 
 DEFAULT_TERMINALITY_WINDOW = 3
 
-# Regex fallback for non-JSON result text. The extension must start with a
-# letter so version strings (`0.26.1`) and decimals don't register, and a
-# candidate must contain `/` so prose mentions of bare basenames don't.
+# Require a slash and a letter-led extension to exclude basenames and decimals.
 RESULT_PATH_RE = re.compile(r"[\w./-]+/[\w.-]+\.[A-Za-z]\w*")
 LEADING_DOT_SEGMENTS_RE = re.compile(r"^(\.\.?/)+")
-# JSON keys whose string values (or list-of-string values) are file paths in
-# the MCP result shapes (`crates/protocol/src/lib.rs`): `file_path`, `file`,
-# `path`, `files: Vec<String>`, `stale_files`, `dropped_files`, `max_risk_file`.
+# Only explicit path fields supply follow-through evidence in structured results.
 RESULT_PATH_KEYS = {"file_path", "file", "path"}
 RESULT_PATH_KEY_SUFFIXES = ("_file", "_path", "files", "paths")
 
-# Bash command words that are native retrieval in their own right.
 NATIVE_GREP_WORDS = {"grep", "egrep", "fgrep", "rg"}
-# Sentinel working directory after pushd/popd or a subshell: relative
-# arguments can no longer be resolved and fail the path guard.
+# Untracked directory changes make relative paths ineligible for retrieval.
 CWD_UNKNOWN = "<unknown-cwd>"
-# Revision syntax that is never a pathspec.
 GIT_REF_RE = re.compile(r"^(origin|upstream|refs)/|\.\.|[\^~]|@\{")
-# Launchers / wrappers that precede the real command word. `rtk proxy grep`
-# is how this workstation's transcripts spell a raw grep.
+# Include RTK wrappers when locating the underlying command.
 BASH_WRAPPER_WORDS = {
     "rtk", "proxy", "sudo", "command", "nice", "time", "timeout", "nohup", "env", "stdbuf", "xvfb-run",
 }
-# Wrapper flags that take a separate argument (`sudo -u nobody`, `timeout -s KILL`).
 WRAPPER_FLAG_ARGS: dict[str, set[str]] = {
     "sudo": {"-u", "--user", "-g", "--group", "-C", "-D", "-h", "-p", "-r", "-t", "-T", "-U"},
     "timeout": {"-s", "-k", "--signal", "--kill-after"},
@@ -455,9 +398,7 @@ WRAPPER_FLAG_ARGS: dict[str, set[str]] = {
 }
 TIMEOUT_DURATION_RE = re.compile(r"^\d+(\.\d+)?[smhd]?$")
 ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-# grep / rg flags whose argument is a separate token; the argument is never
-# a path (`-e PATTERN`, `-f FILE`, `-A 25`, `-m 1`). Combined short flags
-# ending in one of these letters consume the next token too (`-rne foo`).
+# Flag arguments are not search paths; combined flags can consume them too.
 GREP_ARG_FLAG_RES = {
     "grep": re.compile(r"^-[A-Za-z]*[ABCDdefm]$"),
     "rg": re.compile(r"^-[A-Za-z]*[ABCEefgjmMtT]$"),
@@ -469,44 +410,34 @@ GREP_PATTERN_FLAG_RES = {
 GREP_PATTERN_ATTACHED_RE = re.compile(r"^-[ef](\S+)$")
 GREP_PATTERN_LONG_PREFIXES = ("--regexp=", "--file=")
 GREP_PATTERN_LONG_FLAGS = {"--regexp", "--file"}
-# A `git log` positional is a pathspec (not a ref like `v0.26.1` or
-# `main..HEAD`) only when it has a directory component or a source extension.
+# Directory components or source extensions distinguish pathspecs from refs.
 SOURCE_EXT_RE = re.compile(
     r"\.(rs|py|php|phpt|c|h|cc|cpp|cxx|hpp|hh|java|js|jsx|mjs|ts|tsx|go|toml|yaml|yml|json|md|txt|sh|"
     r"scm|sql|m4|w32|lock|cfg|ini|xml|html|css|scss|proto|rb|pl|swift|kt|zig)$",
     re.IGNORECASE,
 )
-# Tools that are not actions in the retrieval sense and must not consume a
-# window slot: asking the user, spawning or messaging agents, bookkeeping.
+# Orchestration and bookkeeping must not consume retrieval-window slots.
 NON_SLOT_TOOLS = {
     "AskUserQuestion", "Agent", "Task", "Skill", "TodoWrite", "Monitor", "ListAgents", "SendMessage",
     "ToolSearch", "TaskOutput", "TaskStop", "TaskUpdate",
 }
-# Statement separators only. A single `|` is NOT a boundary: only the first
-# command of a pipeline can be retrieval; `... | grep -E error:` filters
-# output and is not a search of the code base.
-# `\;` is find's -exec terminator, not a statement separator. Accepted trade:
-# an escaped backslash right before `;` (`echo a\\; grep ...`) is also read
-# as an escape, so that statement boundary is swallowed.
+# Keep pipelines intact: a downstream grep only filters output.
+# Preserve find's escaped `\;` terminator. A preceding escaped backslash
+# also swallows the boundary because shell quoting is not fully modeled.
 BASH_STATEMENT_SPLIT_RE = re.compile(r"\|\||&&|(?<!\\);|\n")
 HEREDOC_START_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 GREP_RECURSIVE_FLAG_RE = re.compile(r"^-[A-Za-z]*[rR][A-Za-z]*$")
-# Shell redirections are not path arguments: `2>/dev/null`, `>out.txt`,
-# `2>&1`, `&>log`, and the two-token form `2> /dev/null`.
+# Redirection targets are not retrieval paths.
 REDIRECT_BARE_RE = re.compile(r"^(\d*>{1,2}|\d*<{1,3}|&>{1,2})$")
 REDIRECT_ATTACHED_RE = re.compile(r"^(\d*>{1,2}|\d*<{1,3}|&>{1,2})\S")
 FIND_NAME_PREDICATES = {"-name", "-iname", "-path", "-ipath", "-wholename", "-regex"}
-# Actions that make a `find` housekeeping rather than retrieval. The `-exec`
-# family is judged by the utility it runs: read-only utilities keep the find
-# as retrieval (`-exec grep -n foo {} \;`), anything else (`rm`, `sed`, `awk`,
-# `mv`, ...) rejects it.
+# Only allowlisted read-only utilities keep find -exec eligible for retrieval.
 FIND_MUTATING_ACTIONS = {"-delete", "-fls", "-fprint", "-fprint0", "-fprintf"}
 FIND_EXEC_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir"}
 FIND_READONLY_EXEC_UTILS = {
     "cat", "grep", "rg", "egrep", "fgrep", "head", "tail", "wc", "ls", "stat", "file", "echo", "nl", "od", "jq",
 }
 FIND_EXEC_TERMINATORS = {";", "+", "{}"}
-# Paths that are scratch / diagnostic output, never code retrieval.
 NON_CODE_PATH_PREFIXES = ("/tmp/", "/proc/", "/dev/", "/var/log/", "/var/tmp/", "/run/")
 NON_CODE_PATH_SUFFIXES = (".log", ".output", ".out", ".err")
 
@@ -587,8 +518,7 @@ def extract_result_paths(text: str) -> set[str]:
         _walk_json_paths(data, None, out)
         return out
     if "{" in t or "[" in t:
-        # Bracketed but unparseable: a truncated or malformed structured
-        # payload. Do not fall back to regex over what may be code text.
+        # Do not extract paths from code inside malformed structured payloads.
         return out
     for m in RESULT_PATH_RE.finditer(t):
         p = _norm_path(m.group(0))
@@ -667,8 +597,6 @@ def _code_path_arg(arg: str, project_root: str | None, cwd: str | None = None) -
     expanded = os.path.expanduser(a)
     if not os.path.isabs(expanded):
         if cwd == CWD_UNKNOWN:
-            # After pushd/popd or inside a subshell the working directory
-            # cannot be followed; a relative path is not provably code.
             return False
         if cwd:
             expanded = os.path.join(cwd, expanded)
@@ -954,8 +882,7 @@ def shell_retrieval_detail(
         if not tokens:
             continue
         if tokens[0].startswith("("):
-            # Subshell: its cd's do not leak out and we do not model the
-            # nesting, so the working directory is unknown from here on.
+            # Subshell nesting is not modeled, so subsequent relative paths are unknown.
             cwd_lost = True
             tokens[0] = tokens[0][1:]
             if not tokens[0]:
@@ -1007,9 +934,7 @@ def shell_retrieval_detail(
             word = os.path.basename(tok)
             args = _command_args(tokens, j + 1)
             if after_xargs and word in NATIVE_GREP_WORDS | {"find"}:
-                # Paths arrive on stdin: judge the producer stage's arguments
-                # (`ls crates | xargs grep foo` searches crates/; a list read
-                # from /tmp does not).
+                # xargs receives paths from stdin; judge the producer's paths.
                 pipes = [idx for idx in range(i) if tokens[idx] == "|"]
                 if not pipes:
                     continue
@@ -1017,8 +942,7 @@ def shell_retrieval_detail(
                 stage = stage[_skip_wrappers(stage, 0):]
                 producer_args = [a for a in stage[1:] if not a.startswith("-")]
                 if any(_code_path_arg(a, stmt_root, cwd_for_statement) for a in producer_args):
-                    # Paths come from stdin, so the pattern is parsed
-                    # without the path guard.
+                    # The producer already passed the path guard.
                     pattern = _parse_grep(word, args)[0] if word in NATIVE_GREP_WORDS else None
                     return word, pattern, stmt_root
                 continue
@@ -1074,8 +998,7 @@ def is_onboarded_root(root: str | None, session_roots: set[str], cache: dict[str
     """
     if not root or root == CWD_UNKNOWN:
         return False
-    # A relative root cannot be located (abspath would resolve it against
-    # the analyzer's own cwd, which is meaningless here).
+    # abspath would resolve a relative root against the analyzer's own directory.
     expanded = os.path.expanduser(root)
     if not os.path.isabs(expanded):
         return False
@@ -1196,9 +1119,7 @@ def _window_calls(events: list[dict[str, Any]], start: int, window: int) -> list
     for e in events[start + 1:]:
         kind = e.get("kind")
         if kind == "user":
-            # Only a real user question re-baselines the agent. Harness
-            # injections (task notifications, system reminders, pasted
-            # command bodies) also arrive as role=user and must not cut.
+            # Harness injections also use role=user and must not cut the window.
             if is_real_user_question(e.get("text") or ""):
                 break
             continue
@@ -1286,9 +1207,6 @@ def merge_terminality(parts: list[dict[str, Any]], window: int) -> dict[str, Any
     return {"window": window, "tools": tools, "all": overall, "evidence": evidence}
 
 
-# -----------------------------------------------------------------------------
-# Aggregation
-# -----------------------------------------------------------------------------
 
 
 def aggregate(
@@ -1301,24 +1219,15 @@ def aggregate(
     transcript; the Bash working directory is carried across calls only in
     main sessions.
     """
-    # Per-tool result categorization
     quality: dict[str, dict[str, int]] = defaultdict(lambda: {"ok": 0, "empty": 0, "error": 0})
 
-    # Utility signals. "Grep" here means the Grep tool plus shell greps
-    # (`grep`/`rg`/`git grep` at a pipeline head, or a `find -exec grep`
-    # whose pattern was recovered; see `shell_retrieval`).
     grep_tool_calls = 0
     grep_tool_calls_all = 0
-    # Shell greps under an onboarded root: one of the `project` values seen
-    # in any CodeSage call of the session, or a directory holding
-    # `.codesage/index.db`, either directly or in an ancestor. Only these
-    # are decisions where CodeSage was actually available;
-    # `shell_grep_calls_all` also counts the rest.
+    # Only onboarded roots offered a CodeSage alternative; retain all-root totals too.
     shell_grep_calls = 0
     shell_grep_calls_all = 0
     identifier_grep_in_codesage_sessions_all = 0
-    # Shell greps whose pattern could not be recovered (`-f FILE`, `--file`):
-    # reported, but kept out of the identifier-shaped denominator.
+    # Unknown file-supplied patterns stay outside the identifier denominator.
     shell_grep_unparsed = 0
     followup_grep_events = 0
     grep_identifier_shaped = 0
@@ -1326,32 +1235,14 @@ def aggregate(
     followup_grep_after_codesage = 0
     codesage_results_total = 0
 
-    # Tool-selection signals (recommendations doc §2.3 active half):
-    # count retrieval-class calls by tool so "when the agent faced a
-    # retrieval decision, which tool did it pick?" is directly answerable.
     codesage_retrieval_calls: dict[str, int] = defaultdict(int)
-    # Sessions that had at least one codesage MCP tool attached (i.e. the
-    # agent could have used codesage if it wanted to). Isolates the
-    # availability-bias case: rate on sessions where codesage wasn't even
-    # registered would trivially be 0 and would mask signal.
     sessions_with_codesage_available = 0
     sessions_total = 0
     identifier_grep_in_codesage_sessions = 0
     codesage_retrieval_in_codesage_sessions = 0
 
-    # Ratio: after each codesage tool_result, how many Reads before the next
-    # non-Read, non-Grep event? Accumulated as a list for distribution stats.
     reads_after_codesage: list[int] = []
 
-    # Per-question-shape breakdown (recommendations doc §2.3 path-(b) follow-up,
-    # 2026-04-30 — option (2) of "do agents skip CodeSage on questions where
-    # it would actually win?"). Each user message that prompts a retrieval-
-    # shape first action is bucketed by its question shape (semantic /
-    # identifier / literal / other). The "first retrieval action" is the
-    # first tool_use of {Grep, Read, Glob, mcp__codesage__*} after the
-    # user message and before the next user message — this is the agent's
-    # tool-selection decision in response to the question.
-    # Counters: per shape, count first tools chosen.
     shape_counts: dict[str, dict[str, int]] = defaultdict(
         lambda: {
             "questions": 0,
@@ -1364,14 +1255,9 @@ def aggregate(
         }
     )
 
-    # Per-run filesystem cache for `is_onboarded_root`, keyed on the queried path.
     onboarded_cache: dict[str, bool] = {}
 
-    # Retrieval-class first tools: these are the ones we count as a
-    # "retrieval decision". Read counts because the agent may have
-    # decided to read a specific file rather than search — that's still
-    # a retrieval choice, just one CodeSage doesn't compete with directly
-    # (Read needs a known path).
+    # Reading a known path is a retrieval choice, even without a search.
     def first_retrieval_tool(
         events: list[dict[str, Any]], start: int, project_root: str | None
     ) -> str | None:
@@ -1422,11 +1308,8 @@ def aggregate(
             grep_identifier_shaped += 1
             if session_had_codesage:
                 identifier_grep_in_codesage_sessions += 1
-            # Multi-identifier patterns are strictly stronger: the agent
-            # would have needed N find_symbol calls, not one.
             if "|" in pattern or len(pattern.split()) > 1:
                 grep_multi_ident += 1
-        # Follow-up grep on a recent codesage subject?
         grep_idents = extract_grep_identifiers(pattern)
         if not grep_idents:
             return
@@ -1509,10 +1392,7 @@ def aggregate(
     for idx_transcript, events in enumerate(events_per_transcript):
         sessions_total += 1
         is_subagent = bool(subagent_flags[idx_transcript]) if subagent_flags else False
-        # Detect whether codesage was registered in this session at all.
-        # Any `tool_use` naming a codesage tool is proof the tool was
-        # available; without at least one call we can't tell from the
-        # transcript whether the agent *could* have reached for codesage.
+        # A call proves availability; its absence cannot prove CodeSage was unavailable.
         had_codesage = any(
             ev["kind"] == "tool_use" and (ev.get("tool") or "").startswith(TOOL_PREFIX)
             for ev in events
@@ -1523,22 +1403,10 @@ def aggregate(
         session_roots = set(session_roots_list)
         session_project = session_roots_list[0] if session_roots_list else None
 
-        # Question-shape pass (does not depend on the streaming detail walk
-        # below — keeps the new code self-contained and easier to remove if
-        # the metric is rotated out later).
         shape_walk(events, had_codesage, session_project)
 
-        # Track recent codesage subject-sets with a tiny buffer. A follow-up
-        # Grep within 5 subsequent tool_uses on any tracked subject counts
-        # as "codesage didn't satisfy" — 5 is a heuristic, short enough to
-        # stay topical, long enough to survive incidental intermediate
-        # actions like Read.
         recent_codesage_subjects: list[dict[str, Any]] = []
-        # Working directory the Bash tool carries between calls, when the
-        # last cd/pushd target was absolute; shell greps are judged against
-        # it, else against the session's codesage project root (§2.3 rule).
         bash_cwd: str | None = None
-        # Stream events in order.
         i = 0
         n = len(events)
         while i < n:
@@ -1559,14 +1427,12 @@ def aggregate(
                 cat = classify_codesage_result(e.get("text") or "")
                 quality[tool][cat] += 1
                 codesage_results_total += 1
-                # Also update subject set with whatever the response names.
                 subj = extract_codesage_subject(e)
                 if subj:
                     if recent_codesage_subjects:
                         recent_codesage_subjects[-1]["subjects"] |= subj
                     else:
                         recent_codesage_subjects.append({"subjects": subj, "hit": False})
-                # Count Reads until next non-(Read|Grep) tool_use.
                 reads = 0
                 j = i + 1
                 while j < n:
@@ -1578,17 +1444,12 @@ def aggregate(
                             j += 1
                             continue
                         if tname == "Grep":
-                            # Grep after codesage counts as a pile-on too; but
-                            # we stop the Read-counter here since the agent
-                            # switched tactics.
                             break
                         break
                     j += 1
                 reads_after_codesage.append(reads)
             elif e["kind"] == "tool_use" and e.get("tool") == "Grep":
-                # Same onboarded-root gate as shell greps: an absolute
-                # `path` is judged on its own; a relative or absent path
-                # means the tool searched from the session's working tree.
+                # Relative or absent Grep paths inherit the session working tree.
                 grep_input = e.get("input") or {}
                 grep_path = grep_input.get("path") if isinstance(grep_input, dict) else None
                 if isinstance(grep_path, str) and os.path.isabs(os.path.expanduser(grep_path)):
@@ -1606,19 +1467,12 @@ def aggregate(
                 elif is_onboarded_root(grep_root, session_roots, onboarded_cache):
                     grep_tool_calls += 1
             elif e["kind"] == "tool_use" and e.get("tool") == "Bash":
-                # Shell greps are the same retrieval decision as the Grep
-                # tool; this corpus reaches for `rtk proxy grep` far more
-                # often than for Grep, so counting only the tool would make
-                # the tool-selection rate a denominator artifact.
+                # Shell greps belong in the same denominator as native Grep calls.
                 command = (e.get("input") or {}).get("command")
-                # The command starts in the cwd the previous call left
-                # behind (main sessions only); an absolute cd inside it
-                # re-roots the statements that follow, not the ones before.
+                # An absolute cd re-roots only subsequent statements.
                 label, pattern, stmt_root = shell_retrieval_detail(
                     command, bash_cwd or session_project, root_follows_cd=True
                 )
-                # A `find -exec grep PATTERN` is a grep of the tree and is
-                # accounted as one (its pattern was recovered).
                 if label in NATIVE_GREP_WORDS or label == "git grep" or (label == "find" and pattern is not None):
                     if not pattern:
                         shell_grep_unparsed += 1
@@ -1630,8 +1484,6 @@ def aggregate(
                         if is_onboarded_root(stmt_root, session_roots, onboarded_cache):
                             shell_grep_calls += 1
                             account_grep_pattern(pattern, had_codesage, recent_codesage_subjects)
-                        # else: non-onboarded root — CodeSage was not an
-                        # option there, so not a tool-selection decision.
                 if not is_subagent:
                     bash_cwd = last_absolute_cd(command) or bash_cwd
             i += 1
@@ -1664,9 +1516,6 @@ def aggregate(
     }
 
 
-# -----------------------------------------------------------------------------
-# Rendering
-# -----------------------------------------------------------------------------
 
 
 def pct(n: int, d: int) -> str:
@@ -1717,7 +1566,6 @@ def render(
     )
     out.append("")
 
-    # ------------------------------------------------------------------ quality
     out.append("## Quality: empty / error / ok by tool")
     out.append("")
     if not q:
@@ -1744,7 +1592,6 @@ def render(
         )
     out.append("")
 
-    # ----------------------------------------------------------------- utility
     out.append("## Utility: Grep tool + shell greps that CodeSage would have answered")
     out.append("")
     gc = agg["grep_calls"]
@@ -1886,7 +1733,6 @@ def render(
     )
     out.append("")
 
-    # ------------------------------------------------------------ terminality
     term = agg.get("terminality") or {}
     term_window = term.get("window", DEFAULT_TERMINALITY_WINDOW)
     out.append(
@@ -1963,11 +1809,8 @@ def render(
                 out.append(f"- `{row.get('tool')}` → `{row.get('followup')}`: `{snippet}`")
     out.append("")
 
-    # --------------------------------------------------------- verdict section
     out.append("## Verdict")
     out.append("")
-    # Verdict is deliberately short and conservative; thresholds reflect the
-    # dominant failure modes the analyzer was designed to detect.
     notes: list[str] = []
     total_codesage = cr
     if total_codesage < 20:
@@ -2006,7 +1849,6 @@ def render(
         out.append(f"- {n}")
     out.append("")
 
-    # ----- Per-question-shape breakdown (§2.3 path-(b) follow-up, option 2)
     shape_counts: dict[str, dict[str, int]] = agg.get("question_shape_counts") or {}
     if shape_counts:
         out.append("## Tool selection by user-question shape")
@@ -2058,7 +1900,6 @@ def render(
             )
         out.append("")
 
-        # Explicit interpretation note: the metric that decides path (c).
         sem = shape_counts.get("semantic") or {}
         sem_q = sem.get("questions", 0)
         sem_cs = sem.get("first_codesage_retrieval", 0)
@@ -2107,9 +1948,6 @@ def render(
     return "\n".join(out)
 
 
-# -----------------------------------------------------------------------------
-# CLI
-# -----------------------------------------------------------------------------
 
 
 def main() -> int:

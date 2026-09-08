@@ -28,14 +28,9 @@ pub(crate) fn cmd_install_hooks(with_leak_check: bool) -> Result<()> {
         })?
         .to_owned();
 
-    // Background indexers run niced + ionice'd so they can't soak the foreground.
-    // `nice` is portable; `ionice` is Linux-only (util-linux), gated on `command -v`
-    // so the hook stays a no-op on macOS / *BSD instead of failing.
     let hook_body = generate_post_commit_hook_body(&codesage_path);
 
-    // post-rewrite fires on amend/rebase. It reshapes history, so the stored last_sha may
-    // no longer be an ancestor of HEAD — incremental mode detects this and falls back to
-    // full automatically, so we can safely reuse the same body here.
+    // Incremental git indexing detects rewritten ancestry and falls back to a full scan.
     let hook_names = ["post-commit", "post-merge", "post-checkout", "post-rewrite"];
     let mut installed: Vec<PathBuf> = Vec::new();
     for name in &hook_names {
@@ -78,48 +73,11 @@ pub(crate) fn cmd_install_hooks(with_leak_check: bool) -> Result<()> {
     Ok(())
 }
 
-/// Generate the post-commit/post-merge/post-checkout/post-rewrite hook body
-/// that runs structural+semantic index then git-history index sequentially
-/// in one background subshell. Both subcommands take the same project
-/// lock; if launched in parallel one would silently skip on lock
-/// contention. Each pass runs regardless of the other's outcome, and each
-/// pass's output and exit status append to `.codesage/hooks.log` (truncated
-/// once it grows past 1 MB) so a failing hook leaves a trace instead of
-/// vanishing into /dev/null.
-///
-/// The daemon's filesystem watcher is a third lock contender: it
-/// debounce-indexes ~1s after an edit, i.e. right around commit time,
-/// but covers only structural+semantic — never feature mapping or git
-/// history. `--lock-wait` makes each hook pass poll the lock for up to
-/// 60s instead of skipping, so a watcher pass in flight delays the hook
-/// by seconds rather than silently starving the hook-only passes.
-///
-/// Before launching anything the hook compares HEAD plus a `cksum` of
-/// `git status --porcelain` (with `.codesage/` itself excluded, so the log
-/// and stamp this hook writes never perturb the digest in a clone whose
-/// `.codesage/.gitignore` is missing) against `.codesage/hook-state`, which the
-/// previous hook run wrote after both passes exited 0. A match means
-/// nothing the hook indexes has changed (a release commit that touched
-/// only ignored files, a checkout back to the same tree, a rewrite that
-/// kept HEAD), and the binary is not invoked at all. The digest covers
-/// CONTENT — every tracked file that differs from HEAD and every untracked
-/// file, listed NUL-delimited and checksummed by content under one shared
-/// byte budget, plus the name list itself so a deletion or rename is
-/// visible — not `git status`, whose output is status letters and paths: a
-/// second edit to an already-modified file left that unchanged and a
-/// same-HEAD hook skipped the reindex. Every stage's
-/// exit status is checked; any failure leaves the stamp empty, which never
-/// matches and is never written, so the binary runs. The stamp is taken
-/// before the run and written after it, so a worktree that moves during the
-/// run never matches the next time. A pass that exits nonzero — including
-/// `EXIT_LOCK_HELD` when another indexer held the lock for the whole wait —
-/// withholds the stamp, so the next hook retries.
-///
-/// The index pass names no device: the few changed files an incremental
-/// hook run embeds go through the running daemon's resident session when one
-/// answers, and otherwise to the configured device. A CPU pass over a table
-/// of CUDA-produced vectors would mix two backends' output (they are not
-/// bit-identical) under one fingerprint, so no fallback is offered.
+/// Sequence both passes because they share the index lock; failure in one must not skip the other.
+/// Wait for the watcher, which never refreshes features or git history.
+/// Record pre-run HEAD/content state only after both passes succeed so failures and concurrent
+/// edits force a retry. Exclude .codesage state from the digest to avoid self-invalidation.
+/// Keep the configured device: mixing CPU/CUDA vectors would violate the fingerprint.
 pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
     let bin = shell_single_quote(bin);
     format!(
@@ -246,14 +204,8 @@ fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\"'\"'"))
 }
 
-/// Install a pre-commit leak-check hook wrapping the repo's `scripts/leak-check.sh`.
-/// Keeps the hook a thin wrapper that invokes the repo's own script so the pattern
-/// list and script logic can be iterated without re-running install-hooks.
-///
-/// Opt-in only (`--with-leak-check`): unlike the other hooks, which exec the
-/// trusted codesage binary, this one execs a repo-shipped script — auto-wiring
-/// it would hand a fresh clone of a malicious repo code execution on the
-/// user's next commit.
+/// Opt-in because this executes repository-supplied code on the next commit.
+/// Delegate to the script so changes do not require reinstalling the hook.
 fn install_leak_check_hook(
     root: &std::path::Path,
     hooks_dir: &std::path::Path,
@@ -316,18 +268,12 @@ fn install_leak_check_hook(
     Ok(())
 }
 
-/// Where git looks for hooks in this repo, and what that location is.
 #[derive(Debug)]
 pub(crate) enum HooksLayout {
-    /// Plain git: `<git_common>/hooks`, or a `core.hooksPath` that resolves
-    /// to it.
+    /// Default shared hooks directory.
     Git(PathBuf),
-    /// Husky: `core.hooksPath` names husky's generated runtime dir
-    /// (`.husky/_` in husky 9, whose `h` shim runs the sibling `.husky/<hook>`
-    /// files). Hooks belong in `user_dir`; `runtime_present` says whether the
-    /// generated dir exists yet. Husky regenerates it on every package-manager
-    /// install, so nothing may be written there, and until it exists git runs
-    /// no hooks at all for this repo.
+    /// Install in user_dir: package installation overwrites the generated runtime directory.
+    /// Git runs no hooks until that runtime exists.
     Husky {
         user_dir: PathBuf,
         runtime_dir: PathBuf,
@@ -336,8 +282,7 @@ pub(crate) enum HooksLayout {
 }
 
 pub(crate) fn read_hooks_path(root: &std::path::Path) -> Option<String> {
-    // `--type=path` expands a leading `~`, as git itself does when it
-    // resolves the hooks dir; the raw value would land under `<root>/~/…`.
+    // Match Git's tilde expansion instead of resolving a literal ~/ below root.
     std::process::Command::new("git")
         .arg("config")
         .arg("--type=path")
@@ -356,8 +301,6 @@ pub(crate) fn read_hooks_path(root: &std::path::Path) -> Option<String> {
         })
 }
 
-/// Classify `core.hooksPath` (`configured`, as `git config --get` prints it)
-/// against the repo at `root`. Env-free so tests can drive every branch.
 pub(crate) fn classify_hooks_path(
     root: &std::path::Path,
     configured: Option<&str>,
@@ -373,10 +316,7 @@ pub(crate) fn classify_hooks_path(
     } else {
         root.join(path)
     };
-    // A `core.hooksPath` that resolves to the default `<git_common>/hooks`
-    // is a no-op redundancy; treat it like an unset value rather than
-    // refusing. Seen in the wild on PHP-extension repos that share a
-    // config template.
+    // Explicit configuration of the default directory needs no special treatment.
     if let Some(common) = git_common_dir(root) {
         let default_hooks = common.join("hooks");
         if util::paths_resolve_same(&resolved, &default_hooks) {
@@ -384,12 +324,7 @@ pub(crate) fn classify_hooks_path(
         }
     }
     let runtime_present = resolved.join("h").is_file() || resolved.join("husky.sh").is_file();
-    // Husky 9 writes `.husky/_` only when its `prepare` script runs (a
-    // package-manager install), so a fresh clone has `core.hooksPath`
-    // pointing at a directory that does not exist yet. The layout is still
-    // unmistakable: the final component is `_` and the user's hook dir is
-    // its parent. Refusing here left hooks in `.git/hooks`, which git never
-    // consults once `core.hooksPath` is set.
+    // Fresh Husky clones may lack the generated runtime; recognize its directory layout.
     let looks_like_husky_runtime = resolved.file_name().is_some_and(|n| n == "_")
         && resolved.parent().is_some_and(|p| p.is_dir());
     if runtime_present || looks_like_husky_runtime {
@@ -494,8 +429,6 @@ mod tests {
         }
     }
 
-    // ---------- core.hooksPath classification ----------
-
     #[test]
     fn husky9_runtime_dir_is_recognized_even_before_it_is_generated() {
         let root = tempfile::tempdir().unwrap();
@@ -543,19 +476,12 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("does not look like a Husky setup"), "{err}");
-        // A bare `_` whose parent is missing is not a husky layout either.
         let orphan = root.path().join("nope/_");
         assert!(classify_hooks_path(root.path(), Some(orphan.to_str().unwrap())).is_err());
     }
 
-    // ---------- post-commit hook body contract ----------
-
     #[test]
     fn post_commit_hook_runs_both_passes_independently() {
-        // Both subcommands run inside ONE background subshell (parallel
-        // launch would race on the project lock), and neither pass is
-        // conditioned on the other: an `&&` chain would let an index
-        // failure silently starve git-index of every incremental update.
         let body = generate_post_commit_hook_body("/usr/local/bin/codesage");
         assert!(
             body.contains("'/usr/local/bin/codesage' index --lock-wait 60 >>\"$log\" 2>&1; rc=$?"),
@@ -579,9 +505,6 @@ mod tests {
             body.contains("index exit=$rc") && body.contains("git-index exit=$rc"),
             "each pass's exit status must be logged, got:\n{body}"
         );
-        // Only one background `&` should appear at the top level —
-        // we sequence inside one subshell, then background the whole
-        // group. Two `&` (one per command) would re-introduce the race.
         let backgrounded_lines: Vec<&str> = body
             .lines()
             .filter(|l| l.trim_end().ends_with(" &"))
@@ -610,8 +533,7 @@ mod tests {
             !body.contains(") >/dev/null"),
             "hook output must not be discarded to /dev/null:\n{body}"
         );
-        // Installer idempotence and doctor's hook detection both key on
-        // this marker string; template changes must preserve it.
+        // Installer idempotence and doctor detection share this marker.
         assert!(
             body.contains("codesage install-hooks"),
             "marker string must survive template changes:\n{body}"
@@ -648,11 +570,6 @@ mod tests {
             body.contains("state=\"$root/.codesage/hook-state\""),
             "expected the hook-state path, got:\n{body}"
         );
-        // Content, not status: every tracked change and every untracked
-        // file is listed NUL-delimited and checksummed by content. `git
-        // status --porcelain` must be gone — its output is unchanged by a
-        // second edit to an already-modified file — and so must `git diff
-        // --binary`, which read every changed byte outside the budget.
         assert!(
             !body.contains("git status"),
             "the stamp must not be keyed on `git status` output:\n{body}"
@@ -683,8 +600,6 @@ mod tests {
             body.contains("[ \"$size\" -gt 8388608 ] || [ \"$size\" -gt \"$budget\" ]"),
             "a large file or an exhausted budget must fall back to size+mtime, got:\n{body}"
         );
-        // One budget for the whole digest: read from and written back to a
-        // file so a second xargs batch continues where the first stopped.
         assert!(
             body.contains("budget=\"$(cat \"$budget_file\")\" || exit 1")
                 && body.contains("printf \"%s\" \"$budget\" >\"$budget_file\" || exit 1")
@@ -712,8 +627,6 @@ mod tests {
             body.contains("if [ -n \"$stamp\" ] && [ -f \"$state\" ] && [ \"$(cat \"$state\" 2>/dev/null)\" = \"$stamp\" ]; then"),
             "expected the skip comparison gated on a non-empty stamp, got:\n{body}"
         );
-        // The skip must be decided before the binary is launched, and the
-        // stamp written only after both passes exited 0.
         let skip = body.find("hook skip:").unwrap();
         let launch = body.find("hook start").unwrap();
         let record = body.find("printf '%s\\n' \"$stamp\" >\"$state\"").unwrap();
@@ -724,7 +637,6 @@ mod tests {
             ),
             "stamp must require a computed digest and both passes exiting 0, got:\n{body}"
         );
-        // Same symlink guard as the log, before the first use of $state.
         assert!(
             body.contains(
                 "if [ -L \"$state\" ] || { [ -e \"$state\" ] && [ ! -f \"$state\" ]; }; then state=/dev/null; fi"
@@ -805,7 +717,6 @@ mod tests {
             }
         };
 
-        // First run: no stamp yet, both passes run, stamp recorded.
         assert!(run_script(&hook, root).success());
         wait_for("] git-index exit=0");
         let state = root.join(".codesage/hook-state");
@@ -827,7 +738,6 @@ mod tests {
             "stub ran: index\nstub ran: git-index\n"
         );
 
-        // Second run with the same HEAD and worktree: skipped before the binary.
         assert!(run_script(&hook, root).success());
         let content = wait_for("hook skip:");
         assert_eq!(content.matches("hook start").count(), 1, "{content}");
@@ -837,7 +747,6 @@ mod tests {
             "the binary must not run on an unchanged tree"
         );
 
-        // A worktree change with the same HEAD defeats the skip.
         std::fs::write(root.join("a.txt"), "changed\n").unwrap();
         assert!(run_script(&hook, root).success());
         let starts_after = |n: usize, why: &str| {
@@ -870,15 +779,12 @@ mod tests {
         };
         let stamp_modified = wait_stamp_change(&stamp);
 
-        // The file is still "modified" in `git status` terms, so a status
-        // digest would be identical here; the content digest must not be.
+        // Status letters stay unchanged on a second edit; the content digest must change.
         std::fs::write(root.join("a.txt"), "changed again\n").unwrap();
         assert!(run_script(&hook, root).success());
         starts_after(3, "a second edit to an already-modified file must re-run");
         let stamp_modified_again = wait_stamp_change(&stamp_modified);
 
-        // Untracked content is part of the digest too: creating the file and
-        // then editing it are two changes, and both must run the passes.
         std::fs::write(root.join("u.txt"), "u1\n").unwrap();
         assert!(run_script(&hook, root).success());
         starts_after(4, "a new untracked file must re-run");
@@ -888,7 +794,6 @@ mod tests {
         starts_after(5, "an edit to an untracked file must re-run");
         wait_stamp_change(&stamp_untracked);
 
-        // Same tree once more: skipped.
         assert!(run_script(&hook, root).success());
         let content = wait_for("hook skip:");
         assert_eq!(content.matches("hook skip:").count(), 2, "{content}");
@@ -955,8 +860,7 @@ mod tests {
         }
     }
 
-    /// Number of `hook start` lines once the log records `n` completed
-    /// git-index passes; waits for the backgrounded subshell.
+    /// Wait for the background subshell to complete n git-index passes.
     #[cfg(unix)]
     fn wait_for_passes(log: &std::path::Path, n: usize) -> String {
         use std::time::Duration;
@@ -1003,16 +907,13 @@ mod tests {
         let log = root.join(".codesage/hooks.log");
         let state = root.join(".codesage/hook-state");
 
-        // `git ls-files` prints this name C-quoted on a newline-delimited
-        // listing; `-f` on the quoted spelling fails, and the file used to be
-        // recorded as "(special)" — a constant, whatever its content.
+        // Newline listings quote this name; using the quoted spelling would miss its content.
         let odd = root.join("odd\nname.txt");
         std::fs::write(&odd, "u1\n").unwrap();
         assert!(run_script(&hook, root).success());
         wait_for_passes(&log, 1);
         let first = wait_for_stamp(&state, "");
 
-        // Same name, same length, different content: the passes must run.
         std::fs::write(&odd, "u2\n").unwrap();
         assert!(run_script(&hook, root).success());
         let content = wait_for_passes(&log, 2);
@@ -1024,7 +925,6 @@ mod tests {
         let second = wait_for_stamp(&state, &first);
         assert_ne!(first, second);
 
-        // Unchanged: skipped.
         assert!(run_script(&hook, root).success());
         let content = wait_for_log(&log, "hook skip:");
         assert_eq!(content.matches("hook start").count(), 2, "{content}");
@@ -1038,10 +938,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         git_repo_with_one_commit(root);
-        // Commit a large tracked file, then modify it in the worktree: the
-        // old digest ran `git diff --binary` over the whole change, unbounded
-        // and outside the untracked side's budget. Now it is keyed exactly as
-        // a large untracked file is.
         let big = root.join("big.bin");
         let size = 8 * 1024 * 1024 + 1;
         std::fs::write(&big, vec![b'0'; size]).unwrap();
@@ -1070,8 +966,7 @@ mod tests {
         wait_for_passes(&log, 1);
         let first = wait_for_stamp(&state, "");
 
-        // Same size, same mtime, every byte different: a content read would
-        // see it; the size+mtime key does not, and the hook skips.
+        // Same-size/mtime rewrites are deliberately invisible above the read budget.
         write_big(b'b', stamp_time);
         assert!(run_script(&hook, root).success());
         let content = wait_for_log(&log, "hook skip:");
@@ -1081,7 +976,6 @@ mod tests {
             "a large tracked change's content must not be read into the digest:\n{content}"
         );
 
-        // A moved mtime is visible.
         write_big(b'b', stamp_time + Duration::from_secs(60));
         assert!(run_script(&hook, root).success());
         wait_for_passes(&log, 2);
@@ -1103,8 +997,7 @@ mod tests {
         wait_for_passes(&log, 1);
         let first = wait_for_stamp(&state, "");
 
-        // The deleted path has no content to checksum; only the name list
-        // can carry the change.
+        // Deletions have no content; the name list must invalidate the stamp.
         std::fs::remove_file(root.join("a.txt")).unwrap();
         assert!(run_script(&hook, root).success());
         let content = wait_for_passes(&log, 2);
@@ -1116,14 +1009,11 @@ mod tests {
         let second = wait_for_stamp(&state, &first);
         assert_ne!(first, second);
 
-        // Unchanged again: skipped.
         assert!(run_script(&hook, root).success());
         let content = wait_for_log(&log, "hook skip:");
         assert_eq!(content.matches("hook start").count(), 2, "{content}");
     }
 
-    /// `shellcheck -s sh` over the generated hook. Skips (with a note) when
-    /// shellcheck is not installed; CI installs it.
     #[cfg(unix)]
     #[test]
     fn post_commit_hook_passes_shellcheck() {
@@ -1181,7 +1071,6 @@ mod tests {
         git_repo_with_one_commit(root);
         let hook = install_hook_with_stub(root, "#!/bin/sh\nexit 0\n");
         let log = root.join(".codesage/hooks.log");
-        // A live lock: the hook must skip without invoking the binary.
         std::fs::create_dir_all(root.join(".codesage/hook-index.lock")).unwrap();
         assert!(run_script(&hook, root).success());
         let content = wait_for_log(&log, "another index already running");
@@ -1204,7 +1093,6 @@ mod tests {
         let log = root.join(".codesage/hooks.log");
         let state = root.join(".codesage/hook-state");
 
-        // Just over the 8 MB per-file bound. Content is never read for it.
         let big = root.join("big.bin");
         let size = 8 * 1024 * 1024 + 1;
         let stamp_time = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
@@ -1220,8 +1108,7 @@ mod tests {
         wait_for_passes(&log, 1);
         let first = wait_for_stamp(&state, "");
 
-        // Same size, same mtime, every byte different: the digest is the
-        // same and the hook skips — the bound means the content is not read.
+        // Above the read budget, content changes alone do not invalidate the stamp.
         write_big(b'b', stamp_time);
         assert!(run_script(&hook, root).success());
         let content = wait_for_log(&log, "hook skip:");
@@ -1231,7 +1118,6 @@ mod tests {
             "a large file's content must not be part of the digest:\n{content}"
         );
 
-        // A moved mtime is visible.
         write_big(b'b', stamp_time + Duration::from_secs(60));
         assert!(run_script(&hook, root).success());
         wait_for_passes(&log, 2);
@@ -1252,9 +1138,7 @@ mod tests {
             "#!/bin/sh\necho \"stub ran: $1\" >> \"$(git rev-parse --show-toplevel)/.codesage/stub.mark\"\nexit 0\n",
         );
 
-        // A `git` whose `diff` fails, ahead of the real one on PATH. The old
-        // stamp piped this failure into a successful `cksum`, so a broken
-        // digest still matched itself and the binary was skipped.
+        // A successful checksum must not hide failure in the preceding Git command.
         let real_git = String::from_utf8(
             std::process::Command::new("sh")
                 .args(["-c", "command -v git"])
@@ -1328,8 +1212,7 @@ mod tests {
                 !content.contains("hook skip:"),
                 "run {run}: a failed digest must never match a stamp:\n{content}"
             );
-            // Both passes exited 0, yet nothing may be recorded: an empty
-            // stamp would otherwise be written and match itself forever.
+            // Successful passes cannot attest an unavailable digest.
             std::thread::sleep(std::time::Duration::from_millis(100));
             assert!(
                 !state.exists(),
@@ -1345,10 +1228,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn post_commit_hook_withholds_the_stamp_when_index_exits_lock_held() {
-        // `codesage index` exits EXIT_LOCK_HELD (75) when another indexer
-        // held the lock for the whole wait: nothing was indexed. The hook
-        // must not record the tree as indexed, or every later run on this
-        // HEAD would skip and the index would stay stale for good.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         git_repo_with_one_commit(root);
@@ -1374,7 +1253,6 @@ mod tests {
             "a lock-held index pass indexed nothing; the stamp must be withheld"
         );
 
-        // The next hook on the same tree retries instead of skipping.
         assert!(run_script(&hook, root).success());
         let content = {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1414,7 +1292,6 @@ mod tests {
 
     #[test]
     fn post_commit_hook_refuses_a_symlinked_codesage_dir() {
-        // `-d` follows symlinks, so the `-L` guard must sit beside it.
         let body = generate_post_commit_hook_body("/x");
         assert!(
             body.contains("[ -L \"$root/.codesage\" ] && exit 0"),
@@ -1430,9 +1307,6 @@ mod tests {
 
     #[test]
     fn post_commit_hook_refuses_non_regular_log_target() {
-        // A hostile repo can ship `.codesage/hooks.log` as a symlink (or a
-        // fifo); appending — and the >1MB truncation — would then hit the
-        // symlink's target. The template must drop to /dev/null instead.
         let body = generate_post_commit_hook_body("/x");
         assert!(
             body.contains(
@@ -1440,7 +1314,6 @@ mod tests {
             ),
             "expected the symlink/non-regular log guard, got:\n{body}"
         );
-        // The guard must run before the first use of $log (the truncation).
         let guard_pos = body.find("[ -L \"$log\" ]").unwrap();
         let truncate_pos = body.find("wc -c").unwrap();
         assert!(
@@ -1465,13 +1338,11 @@ mod tests {
         assert!(status.success(), "git init failed");
         std::fs::create_dir_all(root.join(".codesage")).unwrap();
 
-        // Victim file a hostile repo would target via a shipped symlink.
         let victim = root.join("victim.txt");
         std::fs::write(&victim, "").unwrap();
         std::os::unix::fs::symlink(&victim, root.join(".codesage/hooks.log")).unwrap();
 
-        // Stub records its runs in a separate marker file since the log is
-        // (correctly) discarded in this scenario.
+        // The log is discarded here; observe execution through a separate marker.
         let stub = root.join("codesage-stub");
         std::fs::write(
             &stub,
@@ -1492,7 +1363,6 @@ mod tests {
         let status = run_script(&hook, root);
         assert!(status.success(), "hook must exit 0");
 
-        // Wait for both backgrounded passes to run.
         let mark = root.join("stub.mark");
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
@@ -1534,8 +1404,6 @@ mod tests {
         assert!(status.success(), "git init failed");
         std::fs::create_dir_all(root.join(".codesage")).unwrap();
 
-        // Stub binary fails on `index` and succeeds on `git-index`, proving
-        // the second pass runs even when the first one breaks.
         let stub = root.join("codesage-stub");
         std::fs::write(
             &stub,
@@ -1556,7 +1424,6 @@ mod tests {
         let status = run_script(&hook, root);
         assert!(status.success(), "hook must exit 0");
 
-        // The indexing subshell is backgrounded; poll the log it writes.
         let log = root.join(".codesage/hooks.log");
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
@@ -1580,8 +1447,6 @@ mod tests {
         }
     }
 
-    // ---------- leak-check hook opt-in gate ----------
-
     fn leak_check_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
@@ -1594,10 +1459,6 @@ mod tests {
 
     #[test]
     fn leak_check_hook_requires_explicit_opt_in() {
-        // The leak-check hook execs a repo-shipped script. Auto-installing it
-        // on `install-hooks` would give a fresh clone of a malicious repo
-        // code execution on the user's next commit, so without
-        // --with-leak-check nothing may be written.
         let (_dir, root, hooks_dir) = leak_check_fixture();
         let mut installed = Vec::new();
 

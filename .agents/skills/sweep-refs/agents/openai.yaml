@@ -1,0 +1,4 @@
+interface:
+  display_name: "CodeSage reference sweep"
+  short_description: "Refresh reference tools and update recommendation beads"
+  default_prompt: "Use $sweep-refs to refresh CodeSage's reference mirrors and create or update recommendation beads."

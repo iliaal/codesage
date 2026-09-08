@@ -1,7 +1,4 @@
-; Tree-sitter assigns one pattern_index per top-level S-expression below.
-; Keep this list in lock-step with the `c_ref_kind` match in
-; `crates/parser/src/references.rs`: adding a pattern here means adding a
-; case there.
+; Keep top-level pattern order synchronized with `c_ref_kind` in references.rs.
 
 ; Pattern 0: #include <lib.h>
 (preproc_include path: (system_lib_string) @ref)

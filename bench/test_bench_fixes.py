@@ -47,9 +47,7 @@ def check(cond: bool, label: str) -> None:
 
 # --------------------------------------------------------------------
 # agent-tool-selection-harness.py — fnd_178331ec / fnd_ac7bcade
-# The harness must not pass --dangerously-skip-permissions (which would let
-# the model use any tool regardless of --allowedTools), must disallow
-# exec/write tools, and must strip the global MCP config in the "without" arm.
+# Skipping permissions would bypass --allowedTools and contaminate the comparison.
 # --------------------------------------------------------------------
 harness = _load("agent-tool-selection-harness.py", "harness")
 
@@ -74,7 +72,6 @@ check(
     "--strict-mcp-config" not in with_cmd,
     "harness: with-arm keeps the global MCP config (codesage available)",
 )
-# The with-arm allow-list contains the codesage tools; the without-arm does not.
 with_allow = with_cmd[with_cmd.index("--allowedTools") + 1]
 without_allow = without_cmd[without_cmd.index("--allowedTools") + 1]
 check("mcp__codesage__search" in with_allow, "harness: with-arm allow-lists codesage tools")
@@ -269,8 +266,6 @@ def _tool_result(path: Path) -> str:
 
 with tempfile.TemporaryDirectory() as td:
     root = Path(td)
-    # A normal path normalizes; a newline-bearing path is rejected so it can
-    # never reach the YAML writer.
     (root / "real.py").write_text("x = 1\n")
     check(
         extract.normalize_path(str(root / "real.py"), str(root)) == "real.py",
@@ -324,11 +319,8 @@ with tempfile.TemporaryDirectory() as td:
         f"extract: root-level allowed files are retained in cases (got {cases!r})",
     )
 
-# Contamination guard: a window in which CodeSage itself was called must not
-# become an eval case by default, or the benchmark grades its own retrieval.
-# The fixture root is named `codesage` so the clean turns carry the
-# `cd <repo-root>` / `git -C <repo-root>` prefixes that a substring test, or a
-# lookahead that accepts any word, would misclassify.
+# Exclude CodeSage-derived cases so the benchmark does not grade its own retrieval.
+# Naming the root `codesage` tests that cd/git prefixes do not count as CodeSage calls.
 with tempfile.TemporaryDirectory() as td:
     root = Path(td) / "codesage"
     sessions = Path(td) / "sessions"
@@ -383,9 +375,7 @@ with tempfile.TemporaryDirectory() as td:
         f"extract: --include-codesage-sessions keeps and tags contaminated cases (got {tagged!r})",
     )
 
-# CODESAGE_SUBCOMMANDS is a hand-copied mirror of the clap `Commands` enum; a
-# subcommand added there and not here is silently undetected. Parse the enum
-# and diff the two sets.
+# Compare against clap's enum so new subcommands cannot evade contamination detection.
 _VARIANT_RE = re.compile(r"^\s*([A-Z][A-Za-z0-9]*)\s*(?:\{|\(|,)")
 
 
@@ -672,8 +662,6 @@ with tempfile.TemporaryDirectory() as td:
         f"extract: raw duplicate cap does not starve older unique sessions (got {cases!r})",
     )
 
-# The emitted YAML for a path with a metacharacter round-trips as a string,
-# not injected structure.
 with tempfile.TemporaryDirectory() as td:
     out = Path(td) / "corpus.yaml"
     extract.write_yaml(
@@ -697,22 +685,17 @@ clean_state = {
     "schema_migrations": [],
     "foreign_key_violations": [],
 }
-# One success + one timeout (returncode None) must be a TIMEOUT verdict, not
-# "serialized" — the pre-fix bug gave this a green checkmark.
 v = audit.classify_verdict(
     [{"returncode": 0}, {"returncode": None}], clean_state
 )
 check("TIMEOUT" in v, f"audit: success+timeout is a TIMEOUT verdict (got {v!r})")
-# One success + one lock error stays "serialized".
 v = audit.classify_verdict(
     [{"returncode": 0}, {"returncode": 1, "stderr_tail": "database is locked"}],
     clean_state,
 )
 check("serialized" in v, f"audit: success+lock-error is serialized (got {v!r})")
-# Both succeed → clean.
 v = audit.classify_verdict([{"returncode": 0}, {"returncode": 0}], clean_state)
 check("clean" in v, f"audit: both-ok is clean (got {v!r})")
-# One lockfile skip at rc=0 is serialized, not a false green "both succeeded".
 v = audit.classify_verdict(
     [
         {"returncode": 0},
@@ -724,7 +707,6 @@ v = audit.classify_verdict(
     clean_state,
 )
 check("serialized" in v, f"audit: lockfile skip is serialized (got {v!r})")
-# Corruption wins over everything, even a timeout.
 corrupt_state = dict(clean_state, integrity="row 5 missing")
 v = audit.classify_verdict([{"returncode": 0}, {"returncode": None}], corrupt_state)
 check("CORRUPT" in v, f"audit: corruption wins over timeout (got {v!r})")
@@ -754,7 +736,6 @@ with tempfile.TemporaryDirectory() as td:
     )
 
 # --------------------------------------------------------------------
-# Round-2 findings
 # --------------------------------------------------------------------
 
 # extract-eval-cases.py — fnd_f243e0e9: control chars in query text must not
@@ -771,7 +752,7 @@ if yaml is not None:
             out,
         )
         try:
-            loaded = yaml.safe_load(out.read_text())  # pre-fix: raises ReaderError
+            loaded = yaml.safe_load(out.read_text())
             ok = loaded["cases"][0]["query"] == "color [31mred[0m output"
         except yaml.YAMLError:
             ok = False
@@ -785,15 +766,13 @@ if yaml is not None:
         [{"id": "llm-001-foo: bar", "query": "q", "expected_files": ["src/a.py"]}],
     )
     try:
-        loaded = yaml.safe_load(doc)  # pre-fix: 'mapping values are not allowed here'
+        loaded = yaml.safe_load(doc)
         ok = loaded["cases"][0]["id"] == "llm-001-foo: bar"
     except yaml.YAMLError:
         ok = False
     check(ok, "gen: id with ': ' round-trips through YAML")
 
-# concurrency-audit.py — fnd_c8431abd: two hanging children must be bounded to
-# ONE timeout window (shared deadline), not N. Pre-fix each got a fresh timeout
-# so two hangs took ~2x. (Also exercises file-redirect, not PIPE.)
+# concurrency-audit.py — fnd_c8431abd: children share one timeout deadline.
 hang = [sys.executable, "-c", "import time; time.sleep(30)"]
 t0 = time.time()
 results = audit.run_parallel([hang, hang], Path("."), timeout_s=2)
@@ -883,13 +862,7 @@ check(raised, "harness: failed subprocess results cannot be scored")
 
 
 # --------------------------------------------------------------------
-# semble-ndcg-runner — a degraded run must never read as a clean number.
-# Every case below was a silent false-pass at some point: the exit-134
-# teardown abort (cs-search-teardown-abort-evy) scored crashed queries 0.000,
-# and the first fix for it still accepted `{}` / `{"results": null}` as clean.
-
-# semble-ndcg-runner has no .py suffix, so spec_from_file_location cannot infer
-# a loader and returns None. Name the source loader explicitly.
+# Extensionless scripts need an explicit SourceFileLoader.
 _ndcg_spec = importlib.util.spec_from_loader(
     "semble_ndcg_runner",
     importlib.machinery.SourceFileLoader(
@@ -901,12 +874,13 @@ _ndcg_spec.loader.exec_module(ndcg_runner)
 
 
 class _FakeProc:
-    def __init__(self, stdout, returncode):
+    def __init__(self, stdout, returncode, stderr=""):
         self.stdout = stdout
         self.returncode = returncode
+        self.stderr = stderr
 
 
-def _run_search(monkey_stdout, returncode=0, raise_timeout=False):
+def _run_search(monkey_stdout, returncode=0, raise_timeout=False, stderr="", diagnostics=False):
     """Drive search() against a stubbed subprocess.run."""
     import subprocess as _sp
 
@@ -914,12 +888,13 @@ def _run_search(monkey_stdout, returncode=0, raise_timeout=False):
 
     def fake(*a, **kw):
         if raise_timeout:
-            raise _sp.TimeoutExpired(cmd="x", timeout=1, output=monkey_stdout)
-        return _FakeProc(monkey_stdout, returncode)
+            raise _sp.TimeoutExpired(cmd="x", timeout=1, output=monkey_stdout, stderr=stderr)
+        return _FakeProc(monkey_stdout, returncode, stderr)
 
     ndcg_runner.subprocess.run = fake
     try:
-        return ndcg_runner.search("/bin/true", ".", "q", 10)
+        result = ndcg_runner.search("/bin/true", ".", "q", 10)
+        return result if diagnostics else result[:2]
     finally:
         ndcg_runner.subprocess.run = real
 
@@ -929,14 +904,12 @@ GOOD = json.dumps({"results": [{"file_path": "a.rs"}]})
 paths, status = _run_search(GOOD, 0)
 check((paths, status) == (["a.rs"], "ok"), "ndcg-runner: clean run is ok")
 
-# The teardown abort: complete output, nonzero exit. Results must survive.
 paths, status = _run_search(GOOD, 134)
 check(
     (paths, status) == (["a.rs"], "crashed-with-output"),
     "ndcg-runner: exit 134 keeps its results and is flagged",
 )
 
-# Valid JSON, unusable envelope. Previously scored as a clean zero.
 for payload, label in (
     ("{}", "missing results key"),
     (json.dumps({"results": None}), "null results"),
@@ -948,13 +921,11 @@ for payload, label in (
         f"ndcg-runner: {label} is invalid-output, not a clean zero",
     )
 
-# Garbage stdout still separates crash from clean-exit garbage.
 paths, status = _run_search("not json", 0)
 check((paths, status) == ([], "unparseable"), "ndcg-runner: clean-exit garbage")
 paths, status = _run_search("not json", 134)
 check((paths, status) == ([], "crashed"), "ndcg-runner: crash with no output")
 
-# A hung process that already printed results keeps them.
 paths, status = _run_search(GOOD, raise_timeout=True)
 check(
     (paths, status) == (["a.rs"], "timeout-with-output"),
@@ -962,6 +933,114 @@ check(
 )
 paths, status = _run_search("", raise_timeout=True)
 check((paths, status) == ([], "timeout"), "ndcg-runner: timeout with no output")
+
+RERANK_FAILURE = "cross-encoder rerank failed; keeping pre-rerank order"
+for timed_out, returncode, expected in (
+    (False, 134, "crashed-with-output"),
+    (True, 0, "timeout-with-output"),
+):
+    result = _run_search(GOOD.encode() if timed_out else GOOD, returncode,
+                         raise_timeout=timed_out,
+                         stderr=RERANK_FAILURE.encode() if timed_out else RERANK_FAILURE,
+                         diagnostics=True)
+    check(result[:2] == (["a.rs"], expected),
+          "ndcg-runner: timeout/crash takes precedence over soft degradation")
+    check(result[2]["stderr"] == RERANK_FAILURE
+          and result[2]["quality_degradation"] == ["rerank-failed"]
+          and result[2]["returncode"] == (None if timed_out else returncode),
+          "ndcg-runner: transport failures retain decoded stderr and degradation evidence")
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    binary = root / "codesage-fixture"
+    binary.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "if '--version' in sys.argv:\n"
+        "    print('codesage 0.27.0 (fixture)'); sys.exit(0)\n"
+        "warnings = {\n"
+        f" 'q': 'WARN codesage_graph::search: {RERANK_FAILURE}',\n"
+        " 'daemon': 'WARN codesage::query_reranker: daemon reranking failed error=connection reset',\n"
+        " 'cpu': 'WARN codesage_embed::model: CODESAGE_ALLOW_CPU_FALLBACK: CUDA was requested but its libraries are not mapped; this session runs on the CPU and fingerprints as a CPU setup',\n"
+        " 'transport': 'WARN codesage::query_reranker: reranker input exceeds daemon byte caps; reranking privately',\n"
+        " 'embed-connect': 'WARN codesage::daemon_embed: daemon cannot embed for this run; embedding privately',\n"
+        " 'embed-private': 'WARN codesage::daemon_embed: daemon request failed; embedding these privately',\n"
+        " 'benign': 'INFO codesage::daemon_embed: embedding through the running daemon\\nWARN no [embedding].pooling set; defaulting to mean pooling. If this model expects CLS pooling, set pooling = \"cls\" explicitly.\\nSome nodes were not assigned to the preferred execution providers',\n"
+        "}\n"
+        "if os.environ.get('RUST_LOG') != 'off':\n"
+        "    print(warnings[sys.argv[-1]], file=sys.stderr)\n"
+        "print(json.dumps({'results': [{'file_path': 'a.rs'}]}))\n"
+    )
+    binary.chmod(0o755)
+    previous_log = os.environ.get("RUST_LOG")
+    os.environ["RUST_LOG"] = "off"
+    try:
+        result = ndcg_runner.search(str(binary), root, "q", 10)
+    finally:
+        if previous_log is None:
+            os.environ.pop("RUST_LOG", None)
+        else:
+            os.environ["RUST_LOG"] = previous_log
+    check(
+        result[:2] == (["a.rs"], "degraded"),
+        "ndcg-runner: real exit-zero JSON retains paths but exposes rerank failure despite inherited log suppression",
+    )
+    for query, status, quality, transport in (
+        ("daemon", "degraded", ["daemon-rerank-failed"], []),
+        ("cpu", "degraded", ["cpu-fallback"], []),
+        ("transport", "transport-fallback", [], ["rerank-byte-cap"]),
+        ("embed-connect", "transport-fallback", [], ["embed-connect"]),
+        ("embed-private", "transport-fallback", [], ["embed-private"]),
+        ("benign", "ok", [], []),
+    ):
+        paths, actual, evidence = ndcg_runner.search(str(binary), root, query, 10)
+        check(paths == ["a.rs"] and actual == status
+              and evidence["quality_degradation"] == quality
+              and evidence["transport_fallbacks"] == transport
+              and evidence["returncode"] == 0 and not evidence["timed_out"]
+              and bool(evidence["stderr"]),
+              f"ndcg-runner: {query} classification preserves actual process evidence")
+
+    corpus = root / "corpus" / "fixture"
+    (corpus / ".codesage").mkdir(parents=True)
+    with sqlite3.connect(corpus / ".codesage" / "index.db") as con:
+        con.execute("CREATE TABLE semantic_files (file_path TEXT)")
+        con.execute("INSERT INTO semantic_files VALUES ('a.rs')")
+    annotations = root / "annotations"
+    annotations.mkdir()
+    (annotations / "fixture.json").write_text(json.dumps([
+        {"query": query, "relevant": ["a.rs"]} for query in ("q", "benign", "transport")
+    ]))
+    repos = root / "repos.json"
+    repos.write_text(json.dumps([{"name": "fixture", "language": "rust"}]))
+    artifact = root / "score.json"
+    proc = ndcg_runner.subprocess.run([
+        sys.executable, str(HERE / "semble-ndcg-runner"),
+        "--corpus", str(root / "corpus"), "--annotations", str(annotations),
+        "--repos", str(repos), "--codesage-bin", str(binary), "--json", str(artifact),
+    ], capture_output=True, text=True, timeout=20)
+    check(proc.returncode == 0, "ndcg-runner: real CLI writes diagnostic score artifact")
+    report = json.loads(artifact.read_text())
+    repo = report["per_repo"]["fixture"]
+    check(repo["ndcg@10"] == 1.0 and report["by_language"]["rust"]["ndcg@10"] == 1.0,
+          "ndcg-runner: diagnostic classification preserves NDCG calculation")
+    check(repo["degraded"] == {"degraded": 1, "transport-fallback": 1}
+          and report["by_language"]["rust"]["degraded"] == repo["degraded"],
+          "ndcg-runner: repository and language cells disclose degradation")
+    rows = repo["query_results"]
+    check([r["query_index"] for r in rows] == [0, 1, 2]
+          and [r["status"] for r in rows] == ["degraded", "ok", "transport-fallback"]
+          and RERANK_FAILURE in rows[0]["stderr"]
+          and rows[0]["quality_degradation"] == ["rerank-failed"]
+          and rows[1]["quality_degradation"] == rows[1]["transport_fallbacks"] == []
+          and rows[2]["transport_fallbacks"] == ["rerank-byte-cap"],
+          "ndcg-runner: every query, including benign stderr, retains auditable evidence")
+    import hashlib
+    check(report["provenance"]["runner_sha256"] == hashlib.sha256(
+              (HERE / "semble-ndcg-runner").read_bytes()).hexdigest()
+          and report["provenance"]["search_log_filter"] == "warn,codesage=info"
+          and report["provenance"]["diagnostic_policy"]["quality_warnings"]["rerank-failed"] == RERANK_FAILURE,
+          "ndcg-runner: artifact pins actual runner bytes and diagnostic/logging policy")
 
 
 if failures:

@@ -3,12 +3,6 @@
 //! per-package `bin` and selected scripts (`start`/`build`/`test`/`lint`/
 //! `typecheck`/`format`), Next.js `app/**/{page,route}.{ts,tsx,js,jsx}` and
 //! `pages/**/*.{ts,tsx}`, React Router `<Route>` declarations.
-//!
-//! Workspace decomposition is the per-package surface ported from clawpatch
-//! (`src/mappers/node.ts`). Source-group partitioning is intentionally NOT
-//! ported — it produces browse-only `list_features` rows without an actionable
-//! downstream consumer (LLM-utility-filter, codified in
-//! `feedback_llm_utility_filter.md`).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -42,9 +36,6 @@ impl PackageInfo {
     }
 }
 
-/// Detected package manager. Drives the `testCommand` formatting on per-package
-/// bin seeds so an agent gets a runnable command directly from the feature
-/// record instead of having to inspect `package.json` + lockfile separately.
 #[derive(Clone, Copy)]
 enum NodePm {
     Pnpm,
@@ -71,48 +62,24 @@ impl FeatureMapper for JsMapper {
         };
         let packages = discover_packages(root, pkg_at_root.as_ref());
         let pm = detect_node_package_manager(root);
-        // Turbo presence is a workspace-wide signal — if turbo.json is
-        // at the repo root, we re-route every workspace test_command
-        // through `turbo run test --filter=<pkg>` so the agent gets the
-        // dependency-aware orchestration that monorepos rely on. See
-        // `compose_turbo_test_command` for the formatting.
         let turbo = read_turbo_config(root);
         for info in &packages {
             seeds.extend(package_seeds_for(ctx, info, pm));
         }
-        // Next.js routes — run per discovered package root so monorepos
-        // with `apps/web/app/...` or `apps/marketing/pages/...` get
-        // their routes mapped. Falls back to repo root when no packages
-        // were discovered (single-app layout).
         let scan_roots = next_scan_roots(&packages, root);
         for prefix in &scan_roots {
             seeds.extend(next_app_routes_at(ctx, prefix)?);
             seeds.extend(next_pages_routes_at(ctx, prefix)?);
         }
-        // React Router `<Route path element>` declarations. Gate on
-        // *any* discovered package declaring React — a monorepo with
-        // apps/web/package.json declaring react but no root dep would
-        // otherwise miss every React Router slice. Same logic for the
-        // Node-server scanner below.
         if any_package_has_dep(&packages, pkg_at_root.as_ref(), has_react_dependency) {
             seeds.extend(react_router_routes(ctx, &packages)?);
-            // Component slices (one `react-component` feature per .tsx /
-            // .jsx file under conventional component dirs). Pass the
-            // current seed list so the component walker can skip files
-            // already owned by a route seed — a `<Route>` declaration
-            // file shouldn't double-emit as both `react-router-route`
-            // and `react-component`.
+            // Route-owned files must not also emit component seeds.
             seeds.extend(react_components(ctx, &packages, &seeds)?);
         }
-        // Express / Fastify / Hono server routes — accept devDependencies
-        // too because TS-only API servers often pin framework type
-        // packages on the dev side.
         if any_package_has_dep(&packages, pkg_at_root.as_ref(), has_node_server_dependency) {
             seeds.extend(node_server_routes(ctx)?);
         }
-        // Retag workspace seeds with Turbo-aware test commands when
-        // turbo.json is present and declares a `test` task. Run last
-        // so it sees every prior seed.
+        // Rewrite after all mappers have contributed their seeds.
         if let Some(turbo_cfg) = &turbo
             && turbo_cfg.has_test_task
         {
@@ -123,9 +90,7 @@ impl FeatureMapper for JsMapper {
     }
 }
 
-/// True when the predicate fires on the root package OR any discovered
-/// workspace package. Lets the route walkers run for monorepos that put
-/// the framework dep on a workspace member instead of the root.
+/// Framework dependencies may belong to a workspace member rather than the root.
 fn any_package_has_dep(
     packages: &[PackageInfo],
     root_pkg: Option<&Value>,
@@ -148,11 +113,7 @@ fn has_react_dependency(pkg: &Value) -> bool {
     false
 }
 
-/// Cheap gate for the node-server-routes walker: only run when the root
-/// package declares Express, Fastify, or Hono in deps or devDeps. Avoids
-/// the per-file scan cost on every non-server JS repo. Includes `@hono/*`
-/// adapter packages because Hono apps often depend only on the adapter
-/// (e.g. `@hono/node-server`) and import `Hono` transitively.
+/// Gate server scanning on framework dependencies, including known Hono adapters.
 fn has_node_server_dependency(pkg: &Value) -> bool {
     let server_deps = [
         "express",
@@ -180,11 +141,7 @@ fn language_for_entry(entry: &str) -> Language {
     }
 }
 
-/// Build the per-package seed set. `is_root` flips on the "common scripts"
-/// gate (clawpatch's `includeCommonScripts`): only the root package emits
-/// `start`/`build`/`test`/etc. as standalone seeds so a monorepo doesn't get
-/// N copies of those entries. Workspace packages still emit their own bin
-/// seeds, because per-package `bin` is the routing-actionable surface.
+/// Only the root emits common-script seeds; workspace members emit package and bin seeds.
 fn package_seeds_for(ctx: &MapperContext, info: &PackageInfo, pm: NodePm) -> Vec<FeatureSeed> {
     let root = ctx.root;
     let mut out = Vec::new();
@@ -196,7 +153,6 @@ fn package_seeds_for(ctx: &MapperContext, info: &PackageInfo, pm: NodePm) -> Vec
         None
     };
 
-    // bin: string or { name: path } map. Each bin emits a cli-command seed.
     if let Some(bin_val) = pkg.get("bin") {
         let entries: Vec<(String, String)> = match bin_val {
             Value::String(s) => {
@@ -214,10 +170,6 @@ fn package_seeds_for(ctx: &MapperContext, info: &PackageInfo, pm: NodePm) -> Vec
             _ => Vec::new(),
         };
         for (cmd, path) in entries {
-            // Source-back resolution: dist/foo.js → src/foo.ts when that
-            // source file exists. Lets `feature-for src/foo.ts` route to
-            // the bin feature instead of the build artifact (which an
-            // agent should not be editing).
             let entry_rel = resolve_package_bin_entry(root, &info.root_rel, &path);
             let abs = root.join(&entry_rel);
             if !is_safe_file(root, &abs) {
@@ -268,9 +220,6 @@ fn package_seeds_for(ctx: &MapperContext, info: &PackageInfo, pm: NodePm) -> Vec
         }
     }
 
-    // Common scripts: only emit standalone seeds for the root package.
-    // Workspace packages get the package seed below instead so a Turborepo
-    // doesn't produce 30 copies of "npm script `build`".
     if info.is_root()
         && let Some(scripts) = pkg.get("scripts").and_then(|v| v.as_object())
     {
@@ -310,11 +259,6 @@ fn package_seeds_for(ctx: &MapperContext, info: &PackageInfo, pm: NodePm) -> Vec
         }
     }
 
-    // Workspace package manifest seed. Routes `find_feature(packages/api/...)`
-    // to the local manifest + test command so an agent gets the right `pnpm
-    // --dir packages/api test` instead of the root-level fallback. Emitted
-    // ONLY for workspace members so the root repo's existing per-script
-    // seeds remain the agent-facing surface there.
     if !info.is_root() {
         let package_name = package_display_name(info);
         let mut context_files = Vec::new();
@@ -330,14 +274,7 @@ fn package_seeds_for(ctx: &MapperContext, info: &PackageInfo, pm: NodePm) -> Vec
                 });
             }
         }
-        // NOTE: the inferred test command surfaces via the summary string and
-        // via `entry_command` only. Earlier drafts populated `tests` with a
-        // SeedTest entry pointing at `package.json` to attach the command —
-        // but `SeedTest.path` is documented as a test FILE, and the
-        // orchestrator inserts `seed.tests[]` rows as `role: Test`. That
-        // would surface `packages/api/package.json` as a test file in
-        // `feature_bundle` output. Leave tests empty so nearby_tests
-        // discovery attaches real test files.
+        // Keep the test command separate from test files: package.json is not a test.
         let summary = match &test_cmd {
             Some(cmd) => format!(
                 "Node workspace package `{package_name}` at {} (test: `{cmd}`)",
@@ -348,12 +285,7 @@ fn package_seeds_for(ctx: &MapperContext, info: &PackageInfo, pm: NodePm) -> Vec
                 info.root_rel
             ),
         };
-        // Enumerate the workspace's source files (cap 2_000) and attach as
-        // owned_files so `feature-for packages/api/src/auth.ts` actually
-        // routes to this seed. Without this, the storage exact-match query
-        // `feature_files.path = ?1` returned empty for any file under the
-        // workspace — the routing-by-workspace contract advertised in
-        // CHANGELOG was a no-op.
+        // Feature routing matches exact file paths, not workspace prefixes.
         let mut owned_files = vec![SeedFile {
             path: info.manifest_rel.clone(),
             reason: "package manifest".to_string(),
@@ -371,10 +303,7 @@ fn package_seeds_for(ctx: &MapperContext, info: &PackageInfo, pm: NodePm) -> Vec
             summary,
             source: "node-package",
             entry_symbol: Some(package_name.clone()),
-            // entry_command stays None on library features — it's part of
-            // the feature_id hash and would destabilize identity whenever
-            // the project's test script (or package manager) changed.
-            // The runnable test invocation goes in test_command instead.
+            // entry_command affects feature identity; test-script changes must not.
             test_command: test_cmd.clone(),
             tags: vec![
                 "javascript".to_string(),
@@ -396,12 +325,10 @@ fn package_seeds_for(ctx: &MapperContext, info: &PackageInfo, pm: NodePm) -> Vec
     out
 }
 
-// ---- Workspace discovery ------------------------------------------------
-
 fn discover_packages(root: &Path, root_pkg: Option<&Value>) -> Vec<PackageInfo> {
     let mut roots: BTreeSet<String> = BTreeSet::new();
     if root_pkg.is_some() {
-        roots.insert(String::new()); // "" represents repo root
+        roots.insert(String::new());
     }
     let patterns = workspace_patterns(root, root_pkg);
     let excludes: Vec<String> = patterns
@@ -461,12 +388,7 @@ fn workspace_patterns(root: &Path, root_pkg: Option<&Value>) -> Vec<String> {
             patterns.insert(p);
         }
     }
-    // Convention fallback: ONLY when no explicit workspace declaration
-    // exists (either as `workspaces` in package.json or in pnpm-workspace.yaml).
-    // An incidental `packages/stray/package.json` in a repo that declares
-    // `workspaces: ["apps/*"]` should NOT be treated as a workspace — that
-    // would inflate `list_features` with seeds for sidecar directories the
-    // author didn't opt in to.
+    // Fallback prefixes must not widen an explicit workspace include set.
     let has_explicit = patterns.iter().any(|p| !p.starts_with('!'));
     if !has_explicit {
         for fallback in ["packages", "apps", "extensions", "plugins"] {
@@ -500,9 +422,7 @@ fn package_workspace_patterns(pkg: &Value) -> Vec<String> {
     Vec::new()
 }
 
-/// Hand-rolled `pnpm-workspace.yaml` parser. Avoids pulling a YAML crate for
-/// a 5-line file. Reads the top-level `packages:` block and returns the
-/// `- <path>` entries (quoted or unquoted). Mirrors clawpatch's `parsePnpmWorkspace`.
+/// Read quoted or unquoted list entries under the top-level `packages:` key.
 fn parse_pnpm_workspace(source: &str) -> Vec<String> {
     let mut patterns = Vec::new();
     let mut in_packages = false;
@@ -601,8 +521,6 @@ fn glob_segments_match(pattern: &[&str], candidate: &[&str]) -> bool {
 }
 
 fn glob_segment_matches(segment: &str, candidate: &str) -> bool {
-    // Build a tiny regex for each segment. `*` → `[^/]*`, `?` → `[^/]`,
-    // everything else literal.
     let mut re = String::from("^");
     for c in segment.chars() {
         match c {
@@ -684,9 +602,8 @@ fn visit_glob(root: &Path, base: &str, remaining: &[&str], out: &mut Vec<String>
         return;
     }
     if *segment == "**" {
-        // ** matches zero segments here…
+        // `**` consumes zero or more directory segments.
         visit_glob(root, base, rest, out);
-        // …or one segment that recurses with the same pattern.
         for entry in safe_directory_entries(root, base) {
             let next_base = if base.is_empty() {
                 entry.clone()
@@ -738,11 +655,7 @@ fn discover_into(root: &Path, prefix: &str, remaining_depth: usize, out: &mut Ve
     }
 }
 
-/// Enumerate immediate child directory NAMES under `<root>/<prefix>`,
-/// honoring `.gitignore` and the shared skip rules. Workspace discovery
-/// (`packages/*`, `apps/*`, …) drives `find_feature` routing, so a
-/// gitignored workspace must NOT be surfaced as a feature — it'd point at
-/// files the structural indexer skipped.
+/// Enumerate child directory names using the structural indexer's ignore rules.
 fn safe_directory_entries(root: &Path, prefix: &str) -> Vec<String> {
     let dir = if prefix.is_empty() {
         root.to_path_buf()
@@ -755,8 +668,6 @@ fn safe_directory_entries(root: &Path, prefix: &str) -> Vec<String> {
         .collect()
 }
 
-// ---- Per-package helpers ------------------------------------------------
-
 fn package_scripts(pkg: &Value) -> serde_json::Map<String, Value> {
     pkg.get("scripts")
         .and_then(|v| v.as_object())
@@ -764,9 +675,6 @@ fn package_scripts(pkg: &Value) -> serde_json::Map<String, Value> {
         .unwrap_or_default()
 }
 
-/// Caller contract: only invoked for workspace members (`!info.is_root()`).
-/// The root package never emits a `node-package` seed, so the root branch
-/// is unreachable and intentionally absent.
 fn package_display_name(info: &PackageInfo) -> String {
     debug_assert!(!info.is_root(), "package_display_name called for root info");
     if let Some(name) = info.pkg.get("name").and_then(|v| v.as_str())
@@ -812,10 +720,7 @@ fn script_command(pm: NodePm, package_root: &str, script: &str) -> String {
     }
 }
 
-/// Resolve a `bin` entry path, mapping `dist/foo.js` → `src/foo.ts` when the
-/// TypeScript source exists. Falls back to the declared dist path when no
-/// source candidate exists on disk. Lets agents edit the source instead of
-/// the build artifact.
+/// Prefer an existing TypeScript source for generated bins; otherwise keep the declared path.
 fn resolve_package_bin_entry(root: &Path, package_root: &str, path: &str) -> String {
     let normalized = normalize_package_path(path);
     let source_candidate = source_candidate_for_generated_bin(&normalized);
@@ -834,9 +739,6 @@ fn resolve_package_bin_entry(root: &Path, package_root: &str, path: &str) -> Str
 }
 
 fn source_candidate_for_generated_bin(path: &str) -> Option<String> {
-    // Three common output dirs: `dist/` (TS / Rollup / esbuild), `build/`
-    // (Babel default), `lib/` (older Babel / TypeScript libraries that
-    // publish via `lib/`). Each one maps back to `src/<stem>.ts`.
     let stripped = path
         .strip_prefix("dist/")
         .or_else(|| path.strip_prefix("build/"))
@@ -863,14 +765,7 @@ fn package_relative_path(package_root: &str, path: &str) -> String {
     format!("{package_root}/{stripped}")
 }
 
-/// Walk a workspace's directory and return its source files (cap 2_000).
-/// Used to populate the `node-package` seed's `owned_files` so storage's
-/// exact-match `features_for_file` query resolves any workspace-member
-/// file to the package feature. Honors `.gitignore` and project
-/// `[index].exclude_patterns` via `walk_files`. Filters out test/spec
-/// files, type declarations, and generated bundles — those belong on
-/// other seeds (or not at all). Excludes the manifest itself; callers
-/// dedupe it back in.
+/// Collect bounded workspace-owned sources, honoring ignores and excluding support files.
 fn workspace_source_files(ctx: &MapperContext, workspace_root: &str) -> Vec<String> {
     let root = ctx.root;
     let dir = if workspace_root.is_empty() {
@@ -895,9 +790,6 @@ fn has_node_source_ext(path: &str) -> bool {
     )
 }
 
-/// Match what clawpatch's `isReviewableNodeSourceFile` accepts but without
-/// porting the source-group seeds. Used by `workspace_source_files` to
-/// attach a sensible owned-file set to each workspace feature for routing.
 fn is_reviewable_node_source(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     if !has_node_source_ext(path) {
@@ -1038,10 +930,7 @@ fn next_pages_routes_at(ctx: &MapperContext, package_rel: &str) -> Result<Vec<Fe
         if !ends_with_any(&rel, &[".tsx", ".ts", ".jsx", ".js"]) {
             continue;
         }
-        // Next.js special pages-router files are not routes: `_app`,
-        // `_document`, `_error` (and any other `_`-prefixed convention
-        // file) plus `middleware`. Without this filter they surfaced as
-        // bogus `/_app`-style route features.
+        // Next.js convention files are not URL routes.
         let basename = rel.rsplit('/').next().unwrap_or(&rel);
         let stem = basename.rsplit_once('.').map_or(basename, |(head, _)| head);
         if stem.starts_with('_') || stem == "middleware" {
@@ -1094,13 +983,7 @@ fn next_pages_routes_at(ctx: &MapperContext, package_rel: &str) -> Result<Vec<Fe
     Ok(out)
 }
 
-/// Choose the set of directory prefixes to run Next.js route mapping
-/// against. The default is every discovered workspace package root
-/// (including `""` for the repo root). When no workspaces are declared
-/// AND the repo root has no `app/` or `pages/`, we additionally probe
-/// the conventional nested-frontend dirs (`frontend`, `client`, `web`,
-/// `ui`) so a repo that wraps a Vite/Next app one level down still
-/// gets its routes mapped.
+/// Scan package roots and, when the root has no Next routes, conventional frontend dirs.
 fn next_scan_roots(packages: &[PackageInfo], root: &Path) -> Vec<String> {
     let mut out: Vec<String> = packages
         .iter()
@@ -1137,9 +1020,6 @@ fn next_scan_roots(packages: &[PackageInfo], root: &Path) -> Vec<String> {
     out
 }
 
-/// Trimmed view of a `turbo.json` config — we only care whether a
-/// `test` task is declared, because that's what drives the Turbo-aware
-/// `test_command` substitution for workspace packages.
 struct TurboConfig {
     has_test_task: bool,
 }
@@ -1162,10 +1042,7 @@ fn read_turbo_config(root: &Path) -> Option<TurboConfig> {
     Some(TurboConfig { has_test_task })
 }
 
-/// Rewrite the `test_command` on every workspace package seed to flow
-/// through Turbo so the agent gets dependency-aware orchestration
-/// (build deps run first, cached output reused). Repo-root seeds keep
-/// their plain script command — root tests don't filter to a package.
+/// Use Turbo for workspace tests; root tests retain their unfiltered command.
 fn apply_turbo_test_commands(seeds: &mut [FeatureSeed], packages: &[PackageInfo]) {
     use std::collections::HashMap;
     let by_root: HashMap<&str, &Value> = packages
@@ -1177,7 +1054,6 @@ fn apply_turbo_test_commands(seeds: &mut [FeatureSeed], packages: &[PackageInfo]
         if seed.test_command.is_none() {
             continue;
         }
-        // Find the package root this seed's entry_path lives under.
         let owning = by_root
             .iter()
             .filter(|(root_rel, _)| seed.entry_path.starts_with(*root_rel))
@@ -1194,21 +1070,11 @@ fn ends_with_any(s: &str, suffixes: &[&str]) -> bool {
     suffixes.iter().any(|sfx| s.ends_with(sfx))
 }
 
-/// Scan `src/` and `app/` for React Router `<Route path="..." element={<C/>}>`
-/// declarations. Each matched `<Route>` becomes a `route` feature, keyed
-/// by the path. The entry file is the route-declaration source — we
-/// don't resolve the component back to its import here; that would
-/// require parsing TS/JSX imports, and the route declaration is the
-/// most reliable single anchor for "what handles /users?" agent
-/// questions.
+/// Anchor React Router features to route declarations; component imports are unresolved.
 fn react_router_routes(ctx: &MapperContext, packages: &[PackageInfo]) -> Result<Vec<FeatureSeed>> {
     let root = ctx.root;
     let mut out = Vec::new();
-    // Extract `<Route …>` attribute bodies with a `{}`-depth-aware
-    // scanner — a single regex with `[^>]*?` fails on JSX like
-    // `element={<UsersPage />}` because the nested `/>` ends the
-    // capture mid-tag. We then locate `path=` and `element=` in the
-    // body independently, so prop order doesn't matter.
+    // Extract attributes independently so JSX prop order does not matter.
     let path_attr_re = Regex::new(r#"\bpath\s*=\s*["']([^"']+)["']"#)?;
     let element_attr_re = Regex::new(r"\belement\s*=\s*\{\s*<([A-Z][A-Za-z0-9_]*)")?;
 
@@ -1217,9 +1083,6 @@ fn react_router_routes(ctx: &MapperContext, packages: &[PackageInfo]) -> Result<
             .into_iter()
             .collect();
 
-    // Scan src/ and app/ relative to each discovered package root
-    // (including the repo root), so a monorepo with apps/web/src/Routes.tsx
-    // gets covered too.
     let scan_prefixes: Vec<String> = react_router_scan_roots(packages);
     for prefix in &scan_prefixes {
         let scan_dir = if prefix.is_empty() {
@@ -1230,9 +1093,6 @@ fn react_router_routes(ctx: &MapperContext, packages: &[PackageInfo]) -> Result<
         if !is_safe_dir(root, &scan_dir) {
             continue;
         }
-        // For each pkg root we scan the package's src/ and app/ subdirs.
-        // For the bare repo root we keep the original behavior (top-level
-        // src/, app/).
         for subdir in ["src", "app"] {
             let sub_root = scan_dir.join(subdir);
             if !is_safe_dir(root, &sub_root) {
@@ -1313,11 +1173,8 @@ fn react_router_routes(ctx: &MapperContext, packages: &[PackageInfo]) -> Result<
     Ok(out)
 }
 
-/// Walk `source` and yield the attribute body of each `<Route …>` /
-/// `<Route … />` opening tag. Tracks `{` `}` depth so a nested
-/// `element={<UsersPage />}` doesn't end the tag at the inner `/>`.
-/// All structural delimiters (`<`, `>`, `{`, `}`) are ASCII, so the
-/// byte indexing here is safe on UTF-8 input.
+/// Track brace depth so nested JSX cannot close the outer Route tag.
+/// ASCII delimiters keep slice boundaries valid in UTF-8 input.
 fn extract_route_tag_bodies(source: &str) -> Vec<String> {
     let bytes = source.as_bytes();
     let needle = b"<Route";
@@ -1328,8 +1185,7 @@ fn extract_route_tag_bodies(source: &str) -> Vec<String> {
             break;
         };
         let body_start = i + pos + needle.len();
-        // Require whitespace, `/`, or `>` after `<Route` so we don't
-        // match `<Routes>` or `<RouteSwitch>`.
+        // Reject longer names such as Routes and RouteSwitch.
         if body_start >= bytes.len() {
             break;
         }
@@ -1338,7 +1194,6 @@ fn extract_route_tag_bodies(source: &str) -> Vec<String> {
             i = body_start;
             continue;
         }
-        // Walk to the closing `>` at depth 0.
         let mut j = body_start;
         let mut depth: i32 = 0;
         while j < bytes.len() {
@@ -1360,10 +1215,7 @@ fn extract_route_tag_bodies(source: &str) -> Vec<String> {
     out
 }
 
-/// Per-package roots to search for React Router declarations. Always
-/// includes the repo root (`""`) so single-app layouts keep working;
-/// adds each non-root workspace package so monorepos with React in
-/// `apps/web` are covered.
+/// Include every package and the repo root, even without a root package.json.
 fn react_router_scan_roots(packages: &[PackageInfo]) -> Vec<String> {
     let mut out: Vec<String> = packages
         .iter()
@@ -1384,11 +1236,7 @@ fn react_router_scan_roots(packages: &[PackageInfo]) -> Vec<String> {
     out
 }
 
-/// Path looks like a React component file: `.tsx`/`.jsx` extension,
-/// not a test (`.test.tsx` etc.) or type-decl (`.d.ts`), not under a
-/// Storybook / fixtures / testdata directory. Bare `.ts`/`.js` are
-/// excluded — component detection without a JSX extension would
-/// require parsing the file body and produces too many false positives.
+/// Require JSX extensions to avoid inferring components from ordinary TS/JS files.
 fn is_react_component_file(rel: &str) -> bool {
     if !(rel.ends_with(".tsx") || rel.ends_with(".jsx")) {
         return false;
@@ -1399,9 +1247,6 @@ fn is_react_component_file(rel: &str) -> bool {
     is_reviewable_react_support_path(rel)
 }
 
-/// Inverse of clawpatch's `isReactSupportPath` — returns `true` when
-/// the file is NOT under one of the conventional support / fixture
-/// trees. Naming kept consistent with the upstream donor for traceability.
 fn is_reviewable_react_support_path(rel: &str) -> bool {
     let support_segments = [
         "/stories/",
@@ -1425,7 +1270,6 @@ fn is_reviewable_react_support_path(rel: &str) -> bool {
     if support_prefixes.iter().any(|p| rel.starts_with(p)) {
         return false;
     }
-    // `Foo.stories.tsx` / `Foo.story.tsx`
     let base = rel.rsplit('/').next().unwrap_or(rel);
     if base.contains(".stories.") || base.contains(".story.") {
         return false;
@@ -1433,8 +1277,6 @@ fn is_reviewable_react_support_path(rel: &str) -> bool {
     true
 }
 
-/// Component name from a file path: the basename's stem. `Button.tsx`
-/// → `Button`; `forms/SignUp.tsx` → `SignUp`.
 fn react_component_name(rel: &str) -> String {
     let base = rel.rsplit('/').next().unwrap_or(rel);
     base.rsplit_once('.')
@@ -1442,16 +1284,7 @@ fn react_component_name(rel: &str) -> String {
         .unwrap_or_else(|| base.to_string())
 }
 
-/// Map React components into one feature per file. Ports clawpatch
-/// react.ts `componentSeeds` (commit af0ad0e): scan `src/pages` and
-/// `src/components` under each discovered React package, emit one
-/// `react-component` / `FeatureKind::Library` seed per `.tsx` / `.jsx`
-/// file, capped at 100 per package. Files already owned by a
-/// `react-router-route`, `next-app-route`, `next-app-page`, or
-/// `next-pages-route` seed are excluded so a route declaration file
-/// doesn't double-emit. Component seeds give `find_feature` an answer
-/// for unrouted components (Button, Card, FormField) that previously
-/// returned nothing.
+/// Map at most 100 component files per package, excluding files already owned by routes.
 fn react_components(
     ctx: &MapperContext,
     packages: &[PackageInfo],
@@ -1543,8 +1376,6 @@ fn react_components(
     Ok(out)
 }
 
-/// Per-framework label attached to the emitted route seed. Determined
-/// by the constructor that defined the route receiver.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NodeServerFramework {
     Express,
@@ -1576,20 +1407,12 @@ impl NodeServerFramework {
     }
 }
 
-/// Match `app.get('/path', handler)` / `router.post('/path', handler)` /
-/// `fastify.delete('/path', …)` calls inside Express, Fastify, or Hono
-/// servers. Conservative on purpose: requires the route receiver to be a
-/// local variable initialized from a recognized framework constructor in
-/// the same file, so generic client/helper objects don't pattern-match.
-/// Cross-file mount prefixes (Express `app.use('/api', router)`,
-/// Fastify `register`, Hono `route`) are NOT resolved — emitting the
-/// inferred path would mislead more than it'd inform.
+/// Require a same-file framework constructor before treating receiver calls as routes.
+/// Cross-file mount prefixes remain unresolved.
 fn node_server_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
     let root = ctx.root;
     let mut out = Vec::new();
 
-    // Constructor patterns. Captures receiver name in group 1, framework
-    // tag derived from which branch matched.
     let express_ctor = Regex::new(
         r"(?m)\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:\(\s*\)\s*=>\s*)?(?:new\s+)?(?:express\s*\(\s*\)|express\s*\.\s*Router\s*\(\s*\)|Router\s*\(\s*\))",
     )?;
@@ -1600,9 +1423,6 @@ fn node_server_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
         r"(?m)\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*new\s+Hono\s*\(",
     )?;
 
-    // Single root walk avoids the dedup headache of overlapping
-    // prefix scans (`src/` + `.` would otherwise visit the same files
-    // twice).
     {
         let files = walk_files(root, root, 10_000, ctx.excludes);
         for rel in files {
@@ -1624,8 +1444,6 @@ fn node_server_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
             let Ok(Some(raw)) = read_to_string_bounded(&abs) else {
                 continue;
             };
-            // Cheap pre-filter: skip the regex/parse cost when none of
-            // the framework names appear at all.
             if !raw.contains("express")
                 && !raw.contains("Fastify")
                 && !raw.contains("fastify")
@@ -1633,10 +1451,7 @@ fn node_server_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
             {
                 continue;
             }
-            // Two passes: ctor_src has comments + all strings + templates
-            // blanked (constructor regex looks at identifiers only);
-            // route_src has comments + templates blanked but keeps
-            // quoted strings so the path capture still works.
+            // Constructor scans exclude strings; route scans need quoted path arguments.
             let ctor_src = strip_js_comments_strings_and_templates(&raw);
             let route_src = strip_js_comments_and_templates(&raw);
             let mut receivers: Vec<(String, NodeServerFramework)> = Vec::new();
@@ -1678,9 +1493,7 @@ fn node_server_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
                         continue;
                     }
                     let language = language_for_entry(&rel);
-                    // "GET /users" — matches the laravel-route shape so
-                    // two methods on the same path don't collapse to a
-                    // single feature_id (orchestrator keys on entry_route).
+                    // Include the method in feature identity to distinguish same-path routes.
                     let route_label = format!("{} {}", key.0, path);
                     let mut tags = vec![
                         if language == Language::TypeScript {
@@ -1723,20 +1536,12 @@ fn node_server_routes(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
     Ok(out)
 }
 
-/// Test-shaped (canonical JS/TS rules — suffix conventions plus
-/// `__tests__/` and root `tests/` dirs) or a `.d.ts` type declaration.
-/// Every caller is an exclusion scan ("don't treat as source"), so the
-/// broad shape is the right one. The JS and TS arms of the canonical
-/// predicate are identical; one call covers both extension families.
+/// The shared TypeScript test predicate covers both JS and TS extensions.
 fn is_node_test_or_decl(rel: &str) -> bool {
     crate::nearby_tests::is_test_file(rel, Language::TypeScript) || rel.ends_with(".d.ts")
 }
 
-/// Blank out the content of `//` / `/* */` comments and `` ` ` ``
-/// template literals, leaving regular `"…"` and `'…'` strings intact.
-/// Used by the route-method scan so the path argument (a quoted string)
-/// is still capturable while a `\`app.get("/x", h)\`` template literal
-/// won't false-match.
+/// Blank comments and templates while retaining quoted route paths.
 fn strip_js_comments_and_templates(src: &str) -> String {
     strip_comments(
         src,
@@ -1748,9 +1553,7 @@ fn strip_js_comments_and_templates(src: &str) -> String {
     )
 }
 
-/// Like [`strip_js_comments_and_templates`] but also blanks `"…"` and
-/// `'…'`. Used by the constructor scan, which is identifier-only and
-/// must not match a `"const app = express()"` string literal.
+/// Also blank quoted strings so constructor-like examples cannot match.
 fn strip_js_comments_strings_and_templates(src: &str) -> String {
     strip_comments(
         src,
@@ -1830,7 +1633,6 @@ const App = () => (
             routes.contains(&"/settings"),
             "expected /settings route, got {routes:?}"
         );
-        // Framework components (Outlet etc.) must not produce features.
         let bad: Vec<&str> = react_seeds
             .iter()
             .filter_map(|s| s.entry_symbol.as_deref())
@@ -1876,8 +1678,6 @@ const App = () => (
         assert_eq!(s.language, Language::TypeScript);
     }
 
-    // ---- Workspace decomposition ----------------------------------------
-
     #[test]
     fn npm_workspaces_array_emits_per_package_seeds() {
         let dir = tempdir().unwrap();
@@ -1920,12 +1720,6 @@ const App = () => (
             "expected @acme/web workspace seed, got {names:?}"
         );
 
-        // The api workspace seed carries a per-package test command on
-        // `entry_command`. The manifest must NOT appear in tests[] —
-        // `SeedTest.path` is documented as a test FILE and the orchestrator
-        // inserts every tests[] row as `role: Test`; populating it with the
-        // package.json would surface the manifest as a test in
-        // `feature_bundle` output.
         let api = pkg_seeds
             .iter()
             .find(|s| s.entry_symbol.as_deref() == Some("@acme/api"))
@@ -1935,10 +1729,6 @@ const App = () => (
             api.tests.is_empty(),
             "node-package seed must not populate tests[] with the manifest"
         );
-        // Library features keep entry_command empty (argv[0]-shape only)
-        // so feature IDs stay stable across test-script changes; the
-        // runnable invocation surfaces on the dedicated test_command
-        // field.
         assert!(api.entry_command.is_none());
         assert_eq!(
             api.test_command.as_deref(),
@@ -1965,7 +1755,6 @@ const App = () => (
             "libs/util/package.json",
             r#"{"name":"@acme/util"}"#,
         );
-        // pnpm-lock.yaml flips pm detection.
         write(dir.path(), "pnpm-lock.yaml", "lockfileVersion: '9'\n");
 
         let seeds = JsMapper.map(&MapperContext::for_root(dir.path())).unwrap();
@@ -1977,9 +1766,6 @@ const App = () => (
         assert!(names.contains(&"@acme/admin"));
         assert!(names.contains(&"@acme/util"));
 
-        // pnpm package-manager detection drives the test-command formatting,
-        // surfaced on the dedicated `test_command` field (entry_command
-        // stays None on library features).
         let admin = seeds
             .iter()
             .find(|s| s.entry_symbol.as_deref() == Some("@acme/admin"))
@@ -1993,8 +1779,6 @@ const App = () => (
 
     #[test]
     fn fallback_workspace_prefixes_discovered() {
-        // No explicit `workspaces` declaration; a `packages/` directory with
-        // child manifests should still produce per-package seeds.
         let dir = tempdir().unwrap();
         write(dir.path(), "package.json", r#"{"name":"monorepo"}"#);
         write(
@@ -2016,8 +1800,6 @@ const App = () => (
 
     #[test]
     fn bin_source_back_resolves_to_typescript() {
-        // package.json points at dist/cli.js, but a src/cli.ts exists. The
-        // bin seed's entry path should resolve to the source, not the dist.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -2037,9 +1819,6 @@ const App = () => (
 
     #[test]
     fn bin_source_back_falls_back_when_no_typescript() {
-        // dist/foo.js with no src/foo.ts → keep the dist path. We don't
-        // skip the seed; the bin is still real, we just don't have a
-        // better entry to point at.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -2088,8 +1867,6 @@ const App = () => (
 
     #[test]
     fn root_package_does_not_emit_node_package_seed() {
-        // node-package seed is workspace-only. The root keeps the existing
-        // per-script and per-bin behavior; one less list_features row.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -2101,17 +1878,11 @@ const App = () => (
             !seeds.iter().any(|s| s.source == "node-package"),
             "root-only repo should not produce a node-package seed"
         );
-        // But the script seed should still be there.
         assert!(seeds.iter().any(|s| s.source == "package-json-script"));
     }
 
     #[test]
     fn workspace_seed_owns_source_files_for_routing() {
-        // Regression: `find_feature("packages/api/src/auth.ts")` had no
-        // chance because the node-package seed only persisted the
-        // manifest. The workspace walk now attaches .ts/.js/.tsx files as
-        // owned so the storage exact-match query resolves any workspace
-        // member to its package feature.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -2133,8 +1904,6 @@ const App = () => (
             "packages/api/src/helpers.ts",
             "export const helper = 1;\n",
         );
-        // Spec/test files belong on a future test-suite surface, not the
-        // package seed; .d.ts files are type-declaration stubs.
         write(
             dir.path(),
             "packages/api/src/auth.test.ts",
@@ -2170,11 +1939,6 @@ const App = () => (
 
     #[test]
     fn fallback_prefixes_skipped_when_explicit_workspaces_declared() {
-        // Regression: an incidental `packages/stray/package.json` sitting
-        // in a repo that declares `workspaces: ["apps/*"]` must NOT be
-        // discovered as a workspace. The fallback prefix list
-        // (`packages/`, `apps/`, …) only applies when no explicit
-        // declaration was made.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -2206,11 +1970,6 @@ const App = () => (
 
     #[test]
     fn gitignored_workspace_is_excluded() {
-        // Regression: a workspace matching `packages/*` but listed in
-        // .gitignore must NOT be discovered as a feature. The structural
-        // indexer skips its files via gitignore; surfacing a feature whose
-        // entry_path points at gitignored content would route `find_feature`
-        // to files that don't exist in the project's index.
         let dir = tempdir().unwrap();
         write(dir.path(), ".gitignore", "packages/internal-only/\n");
         write(
@@ -2243,10 +2002,6 @@ const App = () => (
 
     #[test]
     fn workspace_packages_skip_common_scripts() {
-        // Per the includeCommonScripts gate: only the root emits standalone
-        // `npm script `build`` seeds. Workspace packages produce a single
-        // `node-package` seed instead so a Turborepo doesn't get 30 build
-        // seeds.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -2270,8 +2025,6 @@ const App = () => (
             api_scripts.iter().map(|s| &s.title).collect::<Vec<_>>()
         );
     }
-
-    // ---------- Node server routes (clawpatch PR #47) ----------
 
     fn write_pkg_with_dep(dir: &Path, dep: &str) {
         write(
@@ -2412,8 +2165,6 @@ app.get("/real", (_, res) => res.send("ok"));
 
     #[test]
     fn unrelated_receiver_does_not_emit_routes() {
-        // A `.get()` call on an object that wasn't initialized from a
-        // framework constructor must not be classified as a route.
         let dir = tempdir().unwrap();
         write_pkg_with_dep(dir.path(), "express");
         write(
@@ -2468,8 +2219,6 @@ app.get("/should-not-surface", () => {});
 
     #[test]
     fn react_router_matches_element_before_path() {
-        // Regression: prior regex required path= before element=. JSX
-        // prop order isn't significant; element-first is common.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -2507,9 +2256,6 @@ export const r = (
 
     #[test]
     fn react_router_gates_on_workspace_package_dep() {
-        // Regression: gate previously checked only the root package's
-        // deps. A monorepo declaring react in apps/web/package.json
-        // (not at the root) should still trigger the React Router scan.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -2541,9 +2287,6 @@ export const r = <Route path="/users" element={<UsersPage />} />;
 
     #[test]
     fn express_routes_gate_on_workspace_package_dep() {
-        // Regression mirror for Express/Fastify/Hono: workspace-declared
-        // server dep should trigger the route scan even without root
-        // package having it.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -2576,10 +2319,6 @@ app.get("/health", (_, res) => res.send("ok"));
 
     #[test]
     fn route_path_preserves_non_ascii_utf8() {
-        // Regression: byte-level `b as char` mangled
-        // non-ASCII UTF-8 (`é` C3 A9 → `Ã©` C3 83 C2 A9), corrupting
-        // entry_route values and making find_feature(...) miss them.
-        // Char-based walk should round-trip cleanly.
         let dir = tempdir().unwrap();
         write_pkg_with_dep(dir.path(), "express");
         write(
@@ -2604,8 +2343,6 @@ app.get("/health", (_, res) => res.send("ok"));
             "non-ASCII Cyrillic (/привет) corrupted: {routes:?}"
         );
     }
-
-    // ---------- JS monorepo (clawpatch PRs #4 / #18 / #37) ----------
 
     #[test]
     fn next_routes_emitted_per_workspace_package() {
@@ -2721,8 +2458,6 @@ app.get("/health", (_, res) => res.send("ok"));
     #[test]
     fn nested_frontend_discovered_when_root_has_no_next() {
         let dir = tempdir().unwrap();
-        // Repo root has no app/ or pages/ — only a Rust workspace
-        // wrapping a Next frontend in a conventional `frontend/` dir.
         write(
             dir.path(),
             "Cargo.toml",
@@ -2896,8 +2631,6 @@ app.get("/health", (_, res) => res.send("ok"));
 
     #[test]
     fn react_component_excludes_files_owned_by_router_seeds() {
-        // `src/pages/Routes.tsx` declares <Route>s — it should be a
-        // `react-router-route` seed, not double-emitted as a component.
         let dir = tempdir().unwrap();
         write(
             dir.path(),

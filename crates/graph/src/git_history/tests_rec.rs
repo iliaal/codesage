@@ -1,6 +1,4 @@
-//! Sibling-test heuristics per language convention + `recommend_tests` entry
-//! point. `risk::assess_risk` also consumes `test_sibling_exists` through the
-//! `pub(super)` door.
+//! Test recommendations from language conventions, co-change history, and reachability.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -16,11 +14,8 @@ use codesage_storage::Database;
 
 use crate::impact::{WalkBudget, WalkCache, impact_analysis_walk_shared};
 
-/// Per-level frontier for the reachability walk. `impact::MAX_FRONTIER` (512)
-/// exists to bound an unbudgeted walk; here the step budget and the deadline
-/// do that, and 512 truncates the depth-2 level of any widely-used class
-/// (laravel's `Model` overflows it with a 100M-step budget and no deadline),
-/// which would report every such file as capped regardless of budget.
+/// Step and time budgets bound this walk; a 512-symbol frontier would truncate
+/// widely used classes even when those budgets permit more work.
 const REACH_FRONTIER: usize = 8_192;
 
 /// Directory segments whose contents are inputs to tests, not test entry
@@ -35,7 +30,6 @@ const FIXTURE_SEGMENTS: [&str; 6] = [
     "__snapshots__",
 ];
 
-/// Test-shaped paths under a fixture directory are never something to run.
 fn is_fixture(path: &str) -> bool {
     let lower = path.to_lowercase();
     FIXTURE_SEGMENTS
@@ -81,16 +75,11 @@ fn normalize_input_path(root: Option<&Path>, path: &str) -> String {
     parts.join("/")
 }
 
-/// All sibling test files for `file_path` that exist in the index, by language
-/// convention, plus the tests that exist but were withheld from the list (a
-/// `.phpt` directory above [`PHPT_LIST_CAP`]). Used by `recommend_tests` and by
-/// `test_sibling_exists`, which must count withheld tests as existing — "too
-/// many tests to list" and "no tests" are opposite claims.
+/// Indexed sibling tests and withheld `.phpt` tests above [`PHPT_LIST_CAP`].
+/// Withheld tests still count as existing for test-gap detection.
 fn test_sibling_paths(db: &Database, file_path: &str) -> Result<(Vec<String>, Vec<String>)> {
     let mut withheld = Vec::new();
-    // First-dot stem: `foo.test.ts` stems to `foo`, so dotted basenames
-    // still key the convention candidates. (Last-dot split left `foo.test`,
-    // which no candidate pattern ever matched.)
+    // First-dot stemming matches dotted names such as `foo.test.ts`.
     let stem = file_path
         .rsplit('/')
         .next()
@@ -102,36 +91,26 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<(Vec<String>, Ve
     let dir = file_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
 
     let candidates: Vec<String> = vec![
-        // PHP: FooTest.php in same dir or app/tests
         format!("{dir}/{stem}Test.php"),
         format!("tests/Unit/{stem}Test.php"),
         format!("tests/Feature/{stem}Test.php"),
-        // Python: test_foo.py / foo_test.py in same dir or tests/
         format!("{dir}/test_{stem}.py"),
         format!("{dir}/{stem}_test.py"),
         format!("tests/test_{stem}.py"),
-        // Go: foo_test.go
         format!("{dir}/{stem}_test.go"),
-        // JS/TS: foo.test.ts(x), foo.spec.ts(x)
         format!("{dir}/{stem}.test.ts"),
         format!("{dir}/{stem}.test.tsx"),
         format!("{dir}/{stem}.test.js"),
         format!("{dir}/{stem}.spec.ts"),
         format!("{dir}/{stem}.spec.tsx"),
         format!("{dir}/{stem}.spec.js"),
-        // Java: FooTest.java sibling (Maven mirror-tree handled below).
         format!("{dir}/{stem}Test.java"),
-        // Rust: foo.rs uses inline #[cfg(test)] mod tests so often no separate
-        // file. Skip the explicit rust check; absence here just means the rust
-        // file relies on inline tests.
     ];
 
     let mut found = Vec::new();
     for c in &candidates {
         let normalized = c.trim_start_matches('/').to_string();
-        // First-dot stemming means a test file passed as input names itself
-        // (`foo.test.ts` stems to `foo`, regenerating `foo.test.ts`); the
-        // edited file is never its own test.
+        // First-dot stemming can regenerate the input test's own path.
         if normalized == file_path {
             continue;
         }
@@ -140,10 +119,7 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<(Vec<String>, Ve
         }
     }
 
-    // Rust: integration tests live in `<crate_root>/tests/*.rs`, not as siblings
-    // and not name-keyed to the source file. List every `.rs` file under the
-    // crate's `tests/` directory; the agent can filter further if it has more
-    // context. Skips fixture files since those aren't test entry points.
+    // Rust integration tests are crate-scoped, without per-source-file names.
     if file_path.ends_with(".rs")
         && let Some(idx) = file_path.rfind("/src/")
     {
@@ -155,10 +131,7 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<(Vec<String>, Ve
             }
         }
     }
-    // Workspace-root case: src/foo.rs paired with tests/*.rs at the same level.
-    // Guard against a nested `.../src/.../src/...` path that the crate-local
-    // block above already resolved, so we don't list the root `tests/` for a
-    // sub-crate source file too.
+    // Nested crates must not also inherit workspace-root integration tests.
     if file_path.ends_with(".rs") && file_path.starts_with("src/") && !file_path.contains("/src/") {
         for path in db.indexed_files_with_prefix("tests/")? {
             if path.ends_with(".rs") && !is_fixture(&path) && !found.contains(&path) {
@@ -167,14 +140,7 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<(Vec<String>, Ve
         }
     }
 
-    // PHP internals (.c/.h source): .phpt tests live in `<dir>/tests/*.phpt`.
-    // The naming convention is loose (bug12345.phpt, gh21709.phpt, feature
-    // descriptions) so we list the directory like Rust integration tests
-    // rather than try to name-match. The agent or coupled-test signal can
-    // narrow further. Skip if the tests dir would dump >PHPT_LIST_CAP files
-    // (typical for ext/standard/tests) — too noisy as a "primary"
-    // recommendation — but report the withheld files so callers don't read
-    // the omission as "this file has no tests".
+    // PHPT names rarely match source stems. List sibling suites, disclosing withheld large suites.
     if (file_path.ends_with(".c") || file_path.ends_with(".h"))
         && let Some((dir, _)) = file_path.rsplit_once('/')
     {
@@ -191,10 +157,7 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<(Vec<String>, Ve
         }
     }
 
-    // Laravel mirror-tree: source at `app/<rest>/<file>.php` pairs with test at
-    // `tests/{Unit,Feature,Integration,Browser}/<rest>/<file>Test.php`. This is
-    // the convention most modern Laravel projects use; the flat
-    // `tests/Unit/FooTest.php` candidates above only cover root-level sources.
+    // Laravel tests mirror the app tree under one of these suite directories.
     if file_path.ends_with(".php")
         && let Some(rest) = file_path.strip_prefix("app/")
         && let Some((rest_dir, stem_with_ext)) = rest.rsplit_once('/')
@@ -208,9 +171,7 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<(Vec<String>, Ve
         }
     }
 
-    // Symfony mirror-tree: source at `src/<rest>/<file>.php` pairs with test at
-    // `tests/<rest>/<file>Test.php` (no Unit/Feature subdivisor; Symfony tests
-    // mirror src/ directly).
+    // Symfony mirrors src directly under tests.
     if file_path.ends_with(".php")
         && let Some(rest) = file_path.strip_prefix("src/")
         && let Some((rest_dir, stem_with_ext)) = rest.rsplit_once('/')
@@ -221,8 +182,6 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<(Vec<String>, Ve
             found.push(candidate);
         }
     }
-    // Java Maven mirror-tree: source at `src/main/java/<rest>/Foo.java`
-    // pairs with `src/test/java/<rest>/FooTest.java`.
     if file_path.ends_with(".java")
         && let Some(rest) = file_path.strip_prefix("src/main/java/")
         && let Some((rest_dir, _)) = rest.rsplit_once('/')
@@ -233,8 +192,6 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<(Vec<String>, Ve
         }
     }
 
-    // C/C++: `foo_test.<ext>` / `test_foo.<ext>` next to the source or under
-    // `tests/`, keeping the source extension (covers .c/.h/.cc/.cpp/.cxx/.hpp).
     if let Some(ext) = ["c", "h", "cc", "cpp", "cxx", "hpp"]
         .into_iter()
         .find(|ext| file_path.ends_with(&format!(".{ext}")))
@@ -262,18 +219,13 @@ fn test_sibling_paths(db: &Database, file_path: &str) -> Result<(Vec<String>, Ve
 /// this the directory is named in a note instead of dumped file-by-file.
 const PHPT_LIST_CAP: usize = 50;
 
-/// Heuristic: do any indexed files look like tests for `file_path`? Exposed as
-/// `pub(super)` so `risk::assess_risk` can consume it without re-implementing
-/// sibling detection. A `.phpt` directory withheld from listing by
-/// [`PHPT_LIST_CAP`] still counts: those tests exist.
+/// Whether any indexed sibling tests exist, including withheld `.phpt` suites.
 pub(super) fn test_sibling_exists(db: &Database, file_path: &str) -> Result<bool> {
     let (paths, withheld) = test_sibling_paths(db, file_path)?;
     Ok(!paths.is_empty() || !withheld.is_empty())
 }
 
-/// Env override for the total resolution-step budget.
 const REACH_BUDGET_ENV: &str = "CODESAGE_REACH_BUDGET";
-/// Env override for the wall-clock deadline, in milliseconds.
 const REACH_DEADLINE_MS_ENV: &str = "CODESAGE_REACH_DEADLINE_MS";
 
 const REACH_BUDGET_DEFAULT: usize = 1_500_000;
@@ -288,42 +240,23 @@ fn env_usize(var: &str) -> Option<usize> {
     std::env::var(var).ok()?.trim().parse().ok()
 }
 
-/// Knobs for [`recommend_tests_with_reachability`]. The defaults are the
-/// shipped contract (two of them env-overridable: `CODESAGE_REACH_BUDGET`
-/// and `CODESAGE_REACH_DEADLINE_MS`); tests override them to exercise caps
-/// without building large fixtures.
+/// Bounds for [`recommend_tests_with_reachability`]. Budget and deadline defaults
+/// honor `CODESAGE_REACH_BUDGET` and `CODESAGE_REACH_DEADLINE_MS`.
 #[derive(Debug, Clone)]
 pub struct ReachabilityOptions {
-    /// Reverse-dependency depth. The default matches the depth `assess_risk`
-    /// walks for its blast-radius and test-reach signals so the two tools
-    /// agree on what "reaches" means.
+    /// Reverse-dependency depth, matching `assess_risk` by default.
     pub depth: usize,
-    /// Largest `reachable` listing returned verbatim. On a repo like php-src
-    /// every test transitively reaches `zend_hash.c`; without the cap the
-    /// bucket would dump the whole suite.
+    /// Maximum number of reachable tests listed.
     pub list_cap: usize,
-    /// Resolution steps (caller files × same-named candidate definitions per
-    /// symbol; a unique name costs its caller-file count) the whole request
-    /// may spend: one pool that inputs draw from in request order. Each input
-    /// may spend everything left in the pool except one `min_input_budget`
-    /// reserved for every input still queued behind it (see
-    /// `min_input_budget`). Σ spent ≤ `work_budget` always. The order
-    /// dependence is real: put the files you care about first, because the
-    /// inputs after the pool runs dry are the ones that land in
-    /// `unwalked_files`. At the measured ~1.5 µs per step the default is
-    /// about two seconds of resolution work, which is why the deadline exists.
+    /// Total resolution steps: caller files × candidate definitions per symbol.
+    /// Inputs draw from one pool in request order, reserving `min_input_budget`
+    /// for each queued input. Put priority inputs first; exhausted inputs are
+    /// reported in `unwalked_files`.
     pub work_budget: usize,
-    /// Reserved per queued input. Input `i` of `n` draws
-    /// `max(pool - min_input_budget × (n - i - 1), min(min_input_budget,
-    /// pool))`: the whole remaining pool minus a floor held back for each
-    /// input after it, never less than the floor while the pool can pay it.
-    /// A file that completes alone completes unchanged when a cheap input is
-    /// appended, since only the floor is set aside for it. With a long file
-    /// list the floor lets the first `work_budget / min_input_budget` inputs
-    /// each get a walk of useful size instead of every input getting a
-    /// useless sliver; the inputs after them find the pool empty and land in
-    /// `unwalked_files`. A cheap input's unspent share stays in the pool for
-    /// the inputs after it.
+    /// Per-input floor. Input `i` of `n` draws
+    /// `max(pool - min_input_budget × (n - i - 1), min(min_input_budget, pool))`.
+    /// Unspent steps remain available to later inputs. The floor lets early inputs
+    /// make useful progress instead of splitting a small budget into useless shares.
     pub min_input_budget: usize,
     /// Wall-clock limit for the whole request. Checked between admitted
     /// symbols, at the start of pricing each level and every 256 symbols
@@ -382,11 +315,7 @@ fn base_recommendations(db: &Database, file_paths: &[String]) -> Result<BaseReco
     let mut withheld: Vec<String> = Vec::new();
     let mut coupled_cut_sources: Vec<String> = Vec::new();
 
-    // Batched co-change queries for the whole file list instead of one
-    // `co_changes_for` per file. Same per-file order as `find_coupling`
-    // (weight halved for non-recurring pairs, name tiebreak) —
-    // `co_changes_for_many` reproduces the per-file LIMIT exactly.
-    // One row past the cap tells us the cap cut.
+    // Match find_coupling's per-file ranking and fetch one extra row to detect truncation.
     let multiplier = super::risk::one_off_multiplier_from_env();
     let path_refs: Vec<&str> = file_paths.iter().map(String::as_str).collect();
     let co_batched = db.co_changes_for_many(&path_refs, COUPLED_FETCH_CAP + 1, multiplier)?;
@@ -423,13 +352,9 @@ fn base_recommendations(db: &Database, file_paths: &[String]) -> Result<BaseReco
         }
     }
 
-    // Drop coupled entries that are also in primary; primary already says "run me".
     coupled.retain(|c| !primary.contains(&c.file));
 
-    // Order by the same key `find_coupling` ranks with (raw weight for
-    // recurring pairs, demoted for one-offs) and dedupe by file, keeping the
-    // strongest pairing so the agent sees the strongest signal. Source
-    // attribution refers to that pairing.
+    // Keep each file's strongest pairing and its attribution, using recurrence ranking.
     let rank_key = |e: &CoupledTestEntry| {
         if e.recurring {
             e.weight
@@ -495,8 +420,6 @@ fn base_notes(
             );
             return notes;
         }
-        // The fetch did not see every partner, so the absence claim is scoped
-        // to what was consulted and the cut note below completes it.
         notes.push(format!(
             "no test files found via sibling conventions or among the top {COUPLED_FETCH_CAP} \
              co-change partners; run `codesage git-index` if you haven't, or add tests for \
@@ -513,8 +436,7 @@ fn base_notes(
             "{} additional test file(s) suggested by co-change history",
             base.coupled.len()
         ));
-        // A legacy row ranks at half weight without any span evidence; say
-        // so rather than let the demotion pass as a measured one-off.
+        // Unknown spans must not read as measured one-offs.
         let span_unknown = base.coupled.iter().filter(|c| !c.span_known).count();
         if span_unknown > 0 {
             notes.push(super::risk::span_unknown_note(
@@ -524,8 +446,6 @@ fn base_notes(
         }
     }
     if !base.coupled_cut_sources.is_empty() {
-        // A lower bound, not a verdict: a test ranked past the cap (a one-off
-        // partner demoted below twenty recurring ones, say) was never seen.
         notes.push(format!(
             "co-change partners beyond the top {COUPLED_FETCH_CAP} were not considered for {}; \
              `coupled` is a lower bound there (see `codesage coupling <file>` or \
@@ -534,8 +454,6 @@ fn base_notes(
         ));
     }
     if !base.suppressed_sources.is_empty() {
-        // Withheld, not absent: without this note the cap would turn a
-        // heavily-tested extension file into an "untested" report.
         notes.push(format!(
             "tests/ directory next to {} holds more than {PHPT_LIST_CAP} .phpt files — \
              omitted from `primary` to keep output bounded; run that directory's suite",
@@ -545,16 +463,8 @@ fn base_notes(
     notes
 }
 
-/// Tests an agent should run after editing the given files. Two layers:
-/// sibling tests (high confidence, language convention) plus tests that
-/// historically co-change (medium confidence, catches integration-style
-/// tests that don't follow naming conventions). Empty result means no
-/// matching test files in the index.
-///
-/// Cheap by construction: a handful of path lookups and one co-change query,
-/// no graph walk. The pre-edit hook (`build_edit_brief`) runs this on every
-/// Edit under a 10 s timeout, so the reachability bucket lives behind
-/// [`recommend_tests_with_reachability`] instead.
+/// Sibling and co-change recommendations without a graph walk. The pre-edit
+/// hook needs this cheap path; graph reachability is a separate entry point.
 pub fn recommend_tests(db: &Database, file_paths: &[String]) -> Result<TestRecommendations> {
     let base = base_recommendations(db, file_paths)?;
     let notes = base_notes(&base, base.primary.len(), None);
@@ -671,9 +581,6 @@ fn reachable_test_files(
     let mut pool = opts.work_budget;
     let mut budget = WalkBudget::new(0, Some(Instant::now() + opts.deadline));
     for (i, path) in walkable.iter().enumerate() {
-        // Only the floor is held back for the inputs still queued, so a
-        // file that completes alone still completes when a cheap input is
-        // appended after it.
         let queued = walkable.len() - i - 1;
         let reserved = opts.min_input_budget.saturating_mul(queued);
         let share = pool
@@ -696,8 +603,6 @@ fn reachable_test_files(
             Some(&mut budget),
             cache.as_deref_mut(),
         )?;
-        // Only what this input spent leaves the pool; a cheap input's
-        // remainder is available to the inputs after it.
         pool = pool.saturating_sub(share.saturating_sub(budget.remaining));
         if outcome.capped {
             out.partial.push(path.clone());
@@ -804,13 +709,8 @@ pub(crate) fn recommend_tests_with_walk_cache(
     opts: &ReachabilityOptions,
     cache: Option<&mut WalkCache>,
 ) -> Result<TestRecommendations> {
-    // A blank input names nothing. The project root itself (`.`, `./`, or
-    // the absolute root) normalizes to an empty path and names no file
-    // either. Both are dropped and said so. Every other input is looked up
-    // in its normalized form but reported back in the form the caller gave:
-    // `/root/..` normalizes to `..`, which no caller would recognise. Two
-    // spellings of one file (`./src/x.php`, `src/x.php`) are one input: the
-    // first spelling is the one reported, and the file is walked once.
+    // Match normalized paths, but report the caller's first spelling.
+    // Blank/root inputs name no file; equivalent spellings share one walk.
     let mut blank_inputs = 0usize;
     let mut root_inputs = 0usize;
     let mut duplicate_inputs = 0usize;
@@ -848,8 +748,6 @@ pub(crate) fn recommend_tests_with_walk_cache(
         ));
     }
     if file_paths.is_empty() {
-        // Nothing was looked up, so there is nothing to vouch for or to
-        // report absent; only the reason the inputs went unused is said.
         return Ok(TestRecommendations {
             notes: ignored_notes,
             ..Default::default()
@@ -862,19 +760,14 @@ pub(crate) fn recommend_tests_with_walk_cache(
             .collect()
     };
     let mut base = base_recommendations(db, &file_paths)?;
-    // Notes name inputs as the caller spelled them.
     base.coupled_cut_sources = restore(std::mem::take(&mut base.coupled_cut_sources));
     let sibling_count = base.primary.len();
 
-    // Triage before anything can short-circuit: a list of only brand-new
-    // test files must still come back saying the index has not seen them.
+    // Triage must disclose unindexed inputs even when later stages skip the walk.
     let triage = triage_inputs(db, &file_paths)?;
 
-    // Every input lacks a parser (CHANGELOG.md, composer.json). Nothing was
-    // walked and nothing could have been, so neither absence advice nor an
-    // unmodelled count describes anything; the co-change bucket, which
-    // needs no parser, is kept. An unindexed input keeps the ordinary path:
-    // its absence from the index is a lower-bound disclosure, not a skip.
+    // Unsupported paths cannot be walked but may have co-change evidence.
+    // Unindexed supported paths instead make the answer incomplete.
     if triage.walkable.is_empty() && triage.changed_tests.is_empty() && triage.unindexed.is_empty()
     {
         debug_assert_eq!(triage.unsupported.len(), file_paths.len());
@@ -891,12 +784,8 @@ pub(crate) fn recommend_tests_with_walk_cache(
         });
     }
 
-    // A changed file that is itself a test is the highest-confidence
-    // recommendation there is. It goes into `primary`, and stays out of the
-    // graph-derived buckets and the unmodelled count; it is still walked, so
-    // the tests that extend or call it land in `reachable` with it as `via`.
-    // Fixture files and test-shaped data (`tests/lang/en.json`) are not
-    // runnable, so the triage's language gate keeps them out.
+    // Changed runnable tests belong in primary and remain traversal seeds so
+    // dependent tests can be found. Fixtures and unsupported data are not runnable.
     let inputs: HashSet<&str> = file_paths.iter().map(String::as_str).collect();
     let mut primary = base.primary.clone();
     let mut changed_tests = 0usize;
@@ -910,18 +799,13 @@ pub(crate) fn recommend_tests_with_walk_cache(
         primary.sort();
     }
 
-    // `vouched` is the union used both to keep a test out of a second bucket
-    // and to exclude it from the unmodelled count. Withheld `.phpt` files
-    // are vouched for too: omitted from the listing, not unknown to the tool.
+    // Withheld PHPT paths remain vouched for and must not inflate the unmodelled count.
     let mut vouched: HashSet<String> = primary.iter().cloned().collect();
     vouched.extend(base.coupled.iter().map(|c| c.file.clone()));
     vouched.extend(base.withheld.iter().cloned());
 
-    // The denominator: test-category paths in the index, plus the siblings
-    // the conventions resolved that the category rule does not recognise
-    // (C's `foo_test.c` is a sibling but classifies as source). An index with
-    // no test files at all (tests excluded by config) has nothing for the
-    // walk to find, so the walk is skipped.
+    // Include convention-matched tests outside FileCategory's test rules, such as foo_test.c.
+    // An index without tests has nothing for the walk to find.
     let mut test_files: HashSet<String> = db
         .all_file_paths()?
         .into_iter()
@@ -945,8 +829,7 @@ pub(crate) fn recommend_tests_with_walk_cache(
         .into_values()
         .filter(|e| !vouched.contains(&e.path))
         .collect();
-    // Most-connected first within a distance, so a cap keeps the tests whose
-    // code touches the changed set most, not the alphabetically earliest.
+    // Prefer stronger connectivity within a hop distance when truncating the list.
     reachable.sort_by(|a, b| {
         a.distance
             .cmp(&b.distance)
@@ -1023,8 +906,6 @@ pub(crate) fn recommend_tests_with_walk_cache(
             opts.depth
         );
         match reach_cap_clause(&recs) {
-            // An incomplete answer cannot assert "no edge" about anything it
-            // never visited, so the unmodelled sentence is withheld.
             Some(clause) => {
                 note.push_str(&format!("; reachable is a lower bound ({clause})"));
             }
@@ -1180,8 +1061,7 @@ mod tests {
         assert_eq!(d.list_cap, 50);
         assert_eq!(d.min_input_budget, REACH_MIN_INPUT_BUDGET_DEFAULT);
         assert!(d.project_root.is_none());
-        // Only the parse path is pinned here: the env is process-global and
-        // other tests run concurrently, so it is not mutated.
+        // Avoid process-global environment mutation during concurrent tests.
         assert_eq!(env_usize("CODESAGE_REACH_TEST_UNSET_VAR"), None);
     }
 
@@ -1216,7 +1096,6 @@ mod tests {
             normalize_input_path(Some(root), "/proj/src/x.php"),
             "src/x.php"
         );
-        // Outside the root or without a root: left alone.
         assert_eq!(
             normalize_input_path(Some(root), "/elsewhere/x.php"),
             "/elsewhere/x.php"
@@ -1226,21 +1105,17 @@ mod tests {
             "/proj/src/x.php"
         );
         assert_eq!(normalize_input_path(None, "src/x.php"), "src/x.php");
-        // Repeated separators and `.` components anywhere.
         assert_eq!(normalize_input_path(None, ".//src/x.php"), "src/x.php");
         assert_eq!(normalize_input_path(None, "src/./x.php"), "src/x.php");
         assert_eq!(normalize_input_path(None, "src//x.php"), "src/x.php");
-        // Trailing slash on the root is irrelevant.
         assert_eq!(
             normalize_input_path(Some(Path::new("/proj/")), "/proj/src/x.php"),
             "src/x.php"
         );
-        // The root itself, in every spelling, is the empty path.
         assert_eq!(normalize_input_path(Some(root), "/proj"), "");
         assert_eq!(normalize_input_path(Some(root), "/proj/"), "");
         assert_eq!(normalize_input_path(None, "./"), "");
         assert_eq!(normalize_input_path(None, "."), "");
-        // Interior `..` is not resolved; the path is left as given.
         assert_eq!(
             normalize_input_path(Some(root), "/proj/src/../x.php"),
             "src/../x.php"
@@ -1375,7 +1250,6 @@ mod tests {
     #[test]
     fn reachable_excludes_tests_already_in_primary() {
         let db = graph();
-        // Sibling by convention *and* a direct caller: primary wins.
         add_test_calling(&db, "RepositoryTest.php", &["find"]);
 
         let r = recs(&db, &["Repository.php"]);
@@ -1388,11 +1262,9 @@ mod tests {
     #[test]
     fn fixture_callers_and_fixture_co_changes_are_not_recommendations() {
         let db = graph();
-        // A fixture that calls `find` is reachable by the graph but is not a
-        // test to run; a real test with no edges makes the index non-empty.
+        // Include a real test so fixture exclusion does not bypass the walk.
         add_test_calling(&db, "tests/fixtures/FixtureCaller.php", &["find"]);
         add_file(&db, "tests/OtherTest.php");
-        // A fixture that co-changes with the input is not a coupled test.
         db.upsert_git_file("Repository.php", 1.0, 0, 5, Some(1_700_000_000))
             .unwrap();
         db.upsert_git_file("tests/fixtures/data.php", 0.5, 0, 5, Some(1_700_000_000))
@@ -1413,7 +1285,6 @@ mod tests {
         assert!(!r.reach_walk_capped);
         assert_eq!(r.indexed_test_files, 1);
         assert_eq!(r.unmodelled, 1);
-        // Nothing vouched for anything: the absence advice stands.
         assert!(
             r.notes.iter().any(|n| n.contains("no test files found")),
             "notes: {:?}",
@@ -1435,7 +1306,6 @@ mod tests {
         assert!(!r.reach_walk_capped);
         assert_eq!(r.reachable[0].path, "tests/Fan00Test.php");
         assert_eq!(r.reachable[49].path, "tests/Fan49Test.php");
-        // The ten dropped by the cap are still reachable, not unmodelled.
         assert_eq!(r.unmodelled, 0);
         assert_eq!(r.indexed_test_files, 60);
         let note = reach_note(&r);
@@ -1475,7 +1345,6 @@ mod tests {
         let syms: Vec<Symbol> = names.iter().map(|n| symbol(n, "Repository.php")).collect();
         db.insert_symbols(repo, &syms).unwrap();
         let all: Vec<&str> = names.iter().map(String::as_str).collect();
-        // Alphabetically first but one edge short: must lose the single slot.
         add_test_calling(&db, "tests/AElevenTest.php", &all[..11]);
         add_test_calling(&db, "tests/ZTwelveTest.php", &all);
 
@@ -1503,8 +1372,6 @@ mod tests {
         let db = graph_with_hop_tests();
         add_file(&db, "tests/UnrelatedTest.php");
 
-        // `find` costs 2 steps and spends the budget, so the depth-2 hop to
-        // ServiceRunTest is never taken.
         let opts = ReachabilityOptions {
             work_budget: 2,
             ..unlimited()
@@ -1531,10 +1398,7 @@ mod tests {
     fn pool_never_spends_past_the_budget_and_the_floor_serves_the_first_inputs() {
         let db = graph_with_hop_tests();
 
-        // Budget 3, floor 3. Repository.php: pool 3 minus the 3 reserved for
-        // Service.php is 0, so it draws the floor, 3, and spends all of it;
-        // Service.php finds the pool empty and gets no walk. ⌊3 / 3⌋ = 1
-        // input served, Σ spent = 3 = budget.
+        // The first input draws the entire three-step floor, leaving no second walk.
         let opts = ReachabilityOptions {
             work_budget: 3,
             min_input_budget: 3,
@@ -1557,11 +1421,7 @@ mod tests {
     fn pool_lets_a_cheap_inputs_leftover_finish_a_later_input() {
         let db = graph_with_hop_tests();
 
-        // Budget 4 over 2 inputs, floor 3. Service.php may draw
-        // max(4 - 3, min(3, 4)) = 3, the floor; it spends 1 of it and
-        // completes; Repository.php, last in line with nothing
-        // reserved behind it, draws the whole remaining 3 and finishes. A
-        // fixed half-share of 2 would have cut Repository.php short.
+        // The first input spends one step; its unused floor lets the second finish.
         let opts = ReachabilityOptions {
             work_budget: 4,
             min_input_budget: 3,
@@ -1572,9 +1432,7 @@ mod tests {
         assert_eq!(r.partial_files, no_files());
         assert_eq!(r.reachable_total, 2);
 
-        // Budget 3, floor 0: Service.php may draw all 3, spends 1, and
-        // Repository.php still gets the remaining 2: `find` (2 caller
-        // files) resolves, `run` behind it does not.
+        // The remaining two steps reach `find`, but not the deeper `run`.
         let tight = ReachabilityOptions {
             work_budget: 3,
             min_input_budget: 0,
@@ -1600,11 +1458,7 @@ mod tests {
             .unwrap();
         add_test_calling(&db, "tests/Unit/AlphaTest.php", &["TestCase"]);
 
-        // Repository.php costs 3, TestCase.php costs 1. Budget 4, floor 1:
-        // alone, Repository.php draws 4 and finishes. With the changed test
-        // appended it draws 4 - 1 = 3 and still finishes; a cap of
-        // budget / inputs = 2 would have flipped the same file to "cut
-        // short" with byte-identical content.
+        // A one-step reservation leaves the original three-step walk intact.
         let opts = ReachabilityOptions {
             work_budget: 4,
             min_input_budget: 1,
@@ -1639,11 +1493,7 @@ mod tests {
     fn the_floor_reserved_for_later_inputs_keeps_the_first_from_starving_them() {
         let db = graph_with_hop_tests();
 
-        // Budget 4, floor 2. Repository.php may draw 4 - 2 = 2, spends it on
-        // `find` and is cut short before depth 2; Service.php draws the
-        // reserved 2, and `run` costs 1 and completes. With no floor the
-        // first input would take all 4 and the second would still get 1
-        // here, but a first input costing 4 would leave it nothing.
+        // The two-step floor preserves a complete walk for the second input.
         let opts = ReachabilityOptions {
             work_budget: 4,
             min_input_budget: 2,
@@ -1714,9 +1564,6 @@ mod tests {
         add_test_calling(&db, "tests/RepositoryFindTest.php", &["find"]);
         add_file(&db, "tests/UnrelatedTest.php");
 
-        // src/New.php has a parser but was never indexed: no edges, so no
-        // test can be shown to reach it, and nothing can be called
-        // unvouched-for.
         let r = recs(&db, &["Repository.php", "src/New.php"]);
         assert_eq!(
             shape(&r),
@@ -1738,8 +1585,6 @@ mod tests {
         add_test_calling(&db, "tests/RepositoryFindTest.php", &["find"]);
         add_file(&db, "tests/UnrelatedTest.php");
 
-        // CHANGELOG.md has no parser: it is never in the index, and that
-        // says nothing about the walk over Repository.php.
         let r = recs(&db, &["CHANGELOG.md", "Repository.php"]);
         assert_eq!(r.unsupported_files, files(&["CHANGELOG.md"]));
         assert_eq!(r.unindexed_files, no_files());
@@ -1784,11 +1629,7 @@ mod tests {
     fn a_list_of_only_new_test_files_is_still_disclosed() {
         let db = graph();
 
-        // The index holds no test files, so the walk is skipped — but the
-        // caller still learns that its one input is unknown to the index. A
-        // changed test is walked like any input, so one the index has not
-        // seen caps the answer like any unindexed input; it is still the
-        // recommendation.
+        // An unindexed changed test still caps the answer even when no tests are indexed.
         let r = recs(&db, &["tests/NewTest.php"]);
         assert_eq!(r.primary, files(&["tests/NewTest.php"]));
         assert_eq!(r.indexed_test_files, 0);
@@ -1850,10 +1691,7 @@ mod tests {
             .unwrap();
         add_test_calling(&db, "tests/Unit/AlphaTest.php", &["TestCase"]);
 
-        // Repository.php costs 3 steps, TestCase.php costs 1 (one caller
-        // file, unique name). A pool of 3 with a floor of 3 lets the first
-        // input spend everything; the changed test after it finds the pool
-        // empty and lands in `unwalked_files` like any later input.
+        // The first input spends the entire pool; a changed test still needs its own walk.
         let opts = ReachabilityOptions {
             work_budget: 3,
             min_input_budget: 3,
@@ -1872,9 +1710,7 @@ mod tests {
         assert_eq!(r.unwalked_files, files(&["tests/TestCase.php"]));
         assert!(r.reach_walk_capped);
 
-        // In the other order the changed test spends 1, and Repository.php
-        // gets the remaining 2: enough for `find` (2 caller files), not for
-        // `run` behind it.
+        // Reversing input order leaves two steps for the deeper dependency chain.
         let r = recs_with(&db, &["tests/TestCase.php", "Repository.php"], &opts);
         assert_eq!(
             shape(&r),
@@ -1897,8 +1733,6 @@ mod tests {
             ..unlimited()
         };
 
-        // `/proj/..` normalizes to `..`, which no caller would recognise;
-        // `./src/New.php` is looked up as `src/New.php` but named as given.
         let r = recs_with(
             &db,
             &["/proj/..", "./src/New.php", "./Repository.php"],
@@ -1986,8 +1820,6 @@ mod tests {
         add_test_calling(&db, "tests/RepositoryFindTest.php", &["find"]);
         add_file(&db, "tests/UnrelatedTest.php");
 
-        // `tests/` in the path does not make a JSON fixture a test to run,
-        // and its absence from the index says nothing about the walk.
         let r = recs(
             &db,
             &[
@@ -2019,8 +1851,7 @@ mod tests {
         let db = graph();
         add_file(&db, "ext/foo/tests/bar.phpt");
 
-        // Indexed or not, a `.phpt` has no grammar: nothing to walk, and
-        // its absence from the index is permanent, not pending.
+        // PHPT is runnable but has no parser, so absence from the graph is permanent.
         for db in [&db, &graph()] {
             let r = recs(db, &["ext/foo/tests/bar.phpt", "Repository.php"]);
             assert_eq!(r.primary, files(&["ext/foo/tests/bar.phpt"]));
@@ -2073,7 +1904,6 @@ mod tests {
         let db = graph();
         add_test_calling(&db, "tests/RepositoryFindTest.php", &["find"]);
 
-        // Trailing slash on the root is irrelevant.
         let slashed = ReachabilityOptions {
             project_root: Some(PathBuf::from("/proj/")),
             ..unlimited()
@@ -2085,11 +1915,7 @@ mod tests {
         );
         assert!(!r.reach_walk_capped);
 
-        // A root that is a subdirectory of the index root cannot relativize
-        // an absolute path outside it; the path stays absolute and is
-        // reported as unindexed. The MCP layer resolves the true root
-        // before calling, so this only reaches a caller that passed the
-        // wrong root directly.
+        // A root below the index root cannot relativize paths outside it.
         let subdir = ReachabilityOptions {
             project_root: Some(PathBuf::from("/proj/src")),
             ..unlimited()
@@ -2105,7 +1931,6 @@ mod tests {
         let db = graph();
         add_file(&db, "tests/UnrelatedTest.php");
 
-        // A zero budget means an empty pool: the input is never walked.
         let opts = ReachabilityOptions {
             work_budget: 0,
             ..unlimited()
@@ -2153,7 +1978,6 @@ mod tests {
             work_budget: 0,
             ..unlimited()
         };
-        // A zero budget would cap any walk that ran; none runs.
         let r = recs_with(&db, &["Repository.php"], &opts);
         assert_eq!(r.indexed_test_files, 0);
         assert!(!r.reach_walk_capped);
@@ -2221,8 +2045,6 @@ mod tests {
             "notes: {:?}",
             r.notes
         );
-        // Neither fixture counts toward the denominator. The fixture input is
-        // an ordinary indexed file to the walk, and it defines nothing.
         assert_eq!(r.indexed_test_files, 1);
         assert_eq!(r.unmodelled, 0);
         assert_eq!(
@@ -2265,8 +2087,6 @@ mod tests {
         )
         .unwrap();
 
-        // The changed test is walked like any input: its class is reached
-        // by nothing, which is a complete answer, and it never lists itself.
         let r = recs(&db, &["Repository.php", "tests/RepositoryFindTest.php"]);
         assert_eq!(r.primary, files(&["tests/RepositoryFindTest.php"]));
         assert!(r.reachable.is_empty(), "reachable: {:?}", r.reachable);
@@ -2294,9 +2114,6 @@ mod tests {
         add_test_calling(&db, "tests/RepositoryFindTest.php", &["find"]);
         add_file(&db, "tests/UnrelatedTest.php");
 
-        // Nothing was walked and nothing could have been: no absence advice,
-        // no unmodelled count, no cap. The two indexed tests are not
-        // "not vouched for"; they were never asked about.
         let r = recs(&db, &["CHANGELOG.md", "composer.json"]);
         assert_eq!(
             r.notes,
@@ -2311,8 +2128,6 @@ mod tests {
         assert_eq!(r.unmodelled, 0);
         assert_eq!(r.indexed_test_files, 0);
 
-        // An unindexed input alongside keeps the lower-bound disclosure: its
-        // absence from the index is a finding about the walk, not a skip.
         let r = recs(&db, &["CHANGELOG.md", "src/New.php"]);
         assert_eq!(r.unindexed_files, files(&["src/New.php"]));
         assert!(r.reach_walk_capped);
@@ -2328,8 +2143,7 @@ mod tests {
         let db = graph();
         add_test_calling(&db, "tests/RepositoryFindTest.php", &["find"]);
 
-        // Budget 3 covers exactly one walk of Repository.php; a second walk
-        // would find the pool empty and land in `unwalked_files`.
+        // The budget admits one walk only, exposing duplicate traversal.
         let opts = ReachabilityOptions {
             work_budget: 3,
             min_input_budget: 3,
@@ -2350,7 +2164,6 @@ mod tests {
             r.notes
         );
 
-        // The first spelling is the one reported; a duplicate is listed once.
         let r = recs_with(&db, &["./src/New.php", "src/New.php"], &opts);
         assert_eq!(r.unindexed_files, files(&["./src/New.php"]));
     }
@@ -2361,11 +2174,7 @@ mod tests {
         add_test_calling(&db, "tests/RepositoryFindTest.php", &["find"]);
         add_file(&db, "tests/EmptyTest.php");
 
-        // The chosen trade-off: an indexed test that defines nothing is
-        // still listed in `primary` (it is runnable), but its walk has no
-        // seed, so it lands in `no_symbol_files` and caps the answer like
-        // any other symbol-free input. Nothing can be said about what
-        // extends or calls it.
+        // A runnable test without symbols belongs in primary, but cannot seed a walk.
         let r = recs(&db, &["tests/EmptyTest.php"]);
         assert_eq!(r.primary, files(&["tests/EmptyTest.php"]));
         assert_eq!(r.no_symbol_files, files(&["tests/EmptyTest.php"]));

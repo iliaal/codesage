@@ -1,8 +1,5 @@
-//! opencode target: `mcp.codesage` in `opencode.jsonc` (global
-//! `$XDG_CONFIG_HOME/opencode/` or `~/.config/opencode/`, or project-local
-//! `./opencode.jsonc`). Edited through `jsonc-parser`'s CST so user comments
-//! and formatting survive a re-run. An existing `opencode.json` (no `c`) is
-//! preferred when present; otherwise `.jsonc` is created.
+//! Edit opencode MCP config through its CST to preserve formatting and comments.
+//! Reuse an existing opencode.json when no opencode.jsonc exists.
 
 use std::path::{Path, PathBuf};
 
@@ -20,8 +17,7 @@ impl OpencodeTarget {
         if ctx.global {
             global_config_dir(ctx.home)
         } else {
-            // `cmd_install`/`cmd_uninstall` resolve the project before any
-            // project-local target runs, so this is always `Some` here.
+            // Project-local commands resolve a root before invoking the target.
             ctx.project
                 .expect("project-local opencode install requires a project root")
                 .to_path_buf()
@@ -32,7 +28,6 @@ impl OpencodeTarget {
         let dir = self.dir(ctx);
         let jsonc = dir.join("opencode.jsonc");
         let json = dir.join("opencode.json");
-        // Prefer an existing plain `.json`; otherwise default to `.jsonc`.
         if !jsonc.exists() && json.exists() {
             json
         } else {
@@ -41,8 +36,6 @@ impl OpencodeTarget {
     }
 }
 
-/// Global opencode config dir, with the env read split out so the mapping
-/// itself is unit-testable without mutating process env.
 fn global_config_dir(home: &Path) -> PathBuf {
     global_config_dir_for(home, std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from))
 }
@@ -52,9 +45,6 @@ fn global_config_dir_for(home: &Path, xdg: Option<PathBuf>) -> PathBuf {
     base.join("opencode")
 }
 
-/// The `mcp.codesage` entry's command array: this binary plus `mcp`, with
-/// `--project <abs>` only when the registration is project-bound. Split
-/// out so both shapes are unit-testable without touching the filesystem.
 fn codesage_command(project_utf8: Option<&str>) -> Result<Vec<String>> {
     let (command, args) = super::mcp_command_args(project_utf8)?;
     Ok(std::iter::once(command).chain(args).collect())
@@ -104,8 +94,6 @@ impl AgentTarget for OpencodeTarget {
 
     fn uninstall(&self, ctx: &InstallCtx) -> Result<UninstallOutcome> {
         let path = self.path(ctx);
-        // Absent file → nothing to remove; a real read error propagates so we
-        // don't misreport an unreadable-but-present config as "not configured".
         if !path.exists() {
             return Ok(UninstallOutcome::NotConfigured);
         }
@@ -164,8 +152,6 @@ mod tests {
 
     #[test]
     fn codesage_command_bakes_project_only_when_bound() {
-        // A global registration made outside any onboarded project carries
-        // no `--project` default; the server resolves the project per call.
         let exe = std::env::current_exe().unwrap();
         let exe = exe.to_str().unwrap();
         assert_eq!(
@@ -188,7 +174,6 @@ mod tests {
         assert!(written.contains("--project"));
         assert!(written.contains(proj.path().to_string_lossy().as_ref()));
 
-        // Atomic write must not leave its same-dir temp file behind.
         let leftovers: Vec<_> = fs::read_dir(proj.path())
             .unwrap()
             .map(|e| e.unwrap().file_name())
@@ -221,8 +206,6 @@ mod tests {
 
     #[test]
     fn install_errors_on_unreadable_file_without_clobbering() {
-        // Invalid UTF-8: read fails but the file exists. Must propagate, not
-        // replace the user's config with a fresh `{}`.
         let proj = tempdir().unwrap();
         let cfg = proj.path().join("opencode.jsonc");
         fs::write(&cfg, [0xff, 0xfe, 0x00, 0x01]).unwrap();
@@ -238,17 +221,14 @@ mod tests {
         let t = OpencodeTarget;
         let c = ctx(proj.path());
 
-        // No file yet → NotConfigured, no file created.
         assert_eq!(t.uninstall(&c).unwrap(), UninstallOutcome::NotConfigured);
         assert!(!proj.path().join("opencode.jsonc").exists());
 
-        // File without mcp → NotConfigured, mcp not synthesized.
         let cfg = proj.path().join("opencode.jsonc");
         fs::write(&cfg, "{\n  \"theme\": \"dark\"\n}\n").unwrap();
         assert_eq!(t.uninstall(&c).unwrap(), UninstallOutcome::NotConfigured);
         assert!(!fs::read_to_string(&cfg).unwrap().contains("mcp"));
 
-        // After install, uninstall removes only codesage.
         t.install(&c).unwrap();
         assert_eq!(t.uninstall(&c).unwrap(), UninstallOutcome::Removed);
         let after = fs::read_to_string(&cfg).unwrap();

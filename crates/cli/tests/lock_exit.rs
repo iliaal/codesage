@@ -1,7 +1,4 @@
-//! A `codesage index` that finds the project lock held for its whole wait
-//! window must exit with a distinct nonzero status. It used to exit 0 with
-//! nothing indexed, and the installed git hook then recorded the tree as
-//! indexed and skipped every later run on the same HEAD.
+//! Lock contention must fail so git hooks do not record an unindexed HEAD.
 
 #![cfg(unix)]
 
@@ -13,7 +10,6 @@ fn index_exits_75_when_the_lock_is_held_for_the_whole_wait() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     std::fs::create_dir_all(root.join(".codesage")).unwrap();
-    // Hold the same advisory flock the binary takes.
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)

@@ -29,4 +29,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install CPU runtime for MCP fingerprint integration test
+        run: |
+          python3 -m pip install --only-binary=:all: --no-deps --target "$RUNNER_TEMP/onnxruntime" 'onnxruntime==1.24.4'
+          echo "ORT_DYLIB_PATH=$RUNNER_TEMP/onnxruntime/onnxruntime/capi/libonnxruntime.so.1.24.4" >> "$GITHUB_ENV"
       - run: cargo test --workspace --no-fail-fast

@@ -1,8 +1,4 @@
-//! `remove_file` must purge every per-path store — files (+ FK cascades),
-//! semantic freshness, git history, feature membership, and EVERY model's
-//! chunk table plus FTS sidecar — even when the database was opened
-//! structural-only (no active model), as `codesage index --no-semantic`
-//! does.
+//! Structural-only removal must purge every per-path store, including inactive models and FTS.
 
 use codesage_protocol::{
     FeatureConfidence, FeatureFileRef, FeatureFileRole, FeatureKind, FeatureRecord, FileInfo,
@@ -50,7 +46,6 @@ fn remove_file_purges_all_chunk_tables_fts_and_feature_files() {
     let table_a = model_table_name("model-a", 2);
     let table_b = model_table_name("model-b", 3);
 
-    // Model A: files, symbols, chunks for both a.rs and keep.rs, one feature.
     {
         let db = Database::open_for_model(&db_path, "model-a", 2).expect("open model-a");
         let file_id = db.upsert_file(&file_info("a.rs")).unwrap();
@@ -100,7 +95,6 @@ fn remove_file_purges_all_chunk_tables_fts_and_feature_files() {
             .unwrap();
     }
 
-    // Git history and semantic-freshness rows are path-keyed, seeded directly.
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         conn.execute("INSERT INTO git_files (path) VALUES ('a.rs')", [])

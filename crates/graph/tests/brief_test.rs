@@ -1,9 +1,5 @@
 //! What `build_edit_brief` will and will not say. Seeds git_files and
 //! git_co_changes directly so the inputs are controlled.
-//!
-//! These pin decisions that were made by reading real payloads across three
-//! repos, and each one is a thing that regresses silently: a wrong `tests:`
-//! line still looks like a plausible answer.
 
 use codesage_graph::{build_edit_brief, full_index};
 use codesage_storage::Database;
@@ -65,7 +61,6 @@ fn a_co_changed_test_is_not_reported_as_a_test_of_the_file() {
         "a co-changed test is a correlation, not a test OF this file: {:?}",
         brief.tests
     );
-    // Not lost, just labelled honestly.
     assert!(
         brief.coupled.iter().any(|c| c.contains("BillingTest")),
         "it should still surface as a co-changer: {:?}",

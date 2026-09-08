@@ -1,7 +1,4 @@
-//! `project_overview`: a one-call orientation snapshot for an agent starting
-//! work on a project. Pure aggregation over already-indexed facts — no new
-//! analysis, no semantic search. Bounded by construction (every list is
-//! capped) so the response stays a digest, not a dump.
+//! Bounded project orientation from indexed facts and Git state.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -15,15 +12,12 @@ use codesage_storage::Database;
 
 use crate::drift::{self, DriftKind};
 
-/// Cap on entrypoints and top-risk files surfaced in the overview.
 const ENTRYPOINT_CAP: usize = 15;
 const TOP_RISK_CAP: usize = 10;
 
-/// Build the bounded project overview from the index and git state.
 pub fn build_project_overview(root: &Path, db: &Database) -> Result<ProjectOverview> {
     let files = db.all_files_with_id_and_language()?;
 
-    // Per-language file counts, descending.
     let mut lang_counts: HashMap<Language, usize> = HashMap::new();
     for (_, _, lang) in &files {
         *lang_counts.entry(*lang).or_insert(0) += 1;
@@ -43,7 +37,6 @@ pub fn build_project_overview(root: &Path, db: &Database) -> Result<ProjectOverv
 
     let freshness = build_freshness(root, db);
 
-    // Features: grouped counts + a sample of entrypoints.
     let features = db.list_features(None, None, None, 0)?;
     let feature_count = features.len();
     let mut kind_counts: HashMap<FeatureKind, usize> = HashMap::new();
@@ -135,9 +128,7 @@ fn build_freshness(root: &Path, db: &Database) -> FreshnessInfo {
     }
 }
 
-/// One test-convention hint per indexed language. Mirrors the sibling
-/// conventions `recommend_tests` resolves, so an agent reads the same contract
-/// here that the tool enforces.
+// Keep these hints aligned with `recommend_tests` sibling conventions.
 fn test_conventions_for(languages: &[LanguageStat]) -> Vec<String> {
     languages
         .iter()
@@ -168,9 +159,6 @@ fn test_conventions_for(languages: &[LanguageStat]) -> Vec<String> {
         .collect()
 }
 
-/// Recommended next CodeSage calls for common intents. The stale-index entry is
-/// prepended only when the structural index is actually behind, so the agent is
-/// nudged to refresh before trusting structural results.
 fn suggested_next_calls(freshness: &FreshnessInfo) -> Vec<SuggestedCall> {
     let mut calls = Vec::new();
     if matches!(
@@ -264,8 +252,6 @@ mod tests {
 
     #[test]
     fn build_overview_on_empty_db_reports_zero_counts() {
-        // A valid but empty index must produce a real zero-count overview via
-        // the `?` paths, not a fabricated one masked by `.unwrap_or_default()`.
         let db = Database::open_in_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let overview = build_project_overview(dir.path(), &db)

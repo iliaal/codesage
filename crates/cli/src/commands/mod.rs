@@ -1,7 +1,4 @@
-//! CLI subcommand handlers, grouped by surface area. `main.rs` keeps the clap
-//! definitions, the dispatch match, and the small shared helpers (project-root
-//! resolution, DB opening, config loading); each module here owns the handler
-//! bodies for one command family.
+//! Subcommand handlers; clap definitions and dispatch live in main.rs.
 
 pub(crate) mod features;
 pub(crate) mod hooks;

@@ -72,8 +72,6 @@ name="$(basename "$project")"
 mkdir -p "$CORPUS_DIR"
 corpus_yaml="$CORPUS_DIR/${name}-session-eval.yaml"
 
-# Resolve helpers (runner + extractor) relative to the plugin layout, then fall
-# back to the canonical repo location.
 plugin_root="$(cd "$(dirname "$0")/../../.." && pwd)"
 if [ -z "$RUNNER" ]; then
     for cand in "$plugin_root/bench/codesage-bench-runner" "$HOME/ai/codesage/bench/codesage-bench-runner"; do
@@ -94,7 +92,6 @@ echo "    project:     $project"
 echo "    corpus yaml: $corpus_yaml"
 echo
 
-# --- Step 1: mine session cases ---
 if [ "$NO_EXTRACT" -eq 1 ]; then
     if [ ! -f "$corpus_yaml" ]; then
         echo "error: --no-extract passed but $corpus_yaml does not exist" >&2
@@ -131,7 +128,6 @@ fi
 
 echo
 
-# --- Step 2: run the bench ---
 echo "==> [2/2] running bench on $(basename "$corpus_yaml")"
 
 runner_args=("$corpus_yaml")

@@ -3,8 +3,6 @@
 use codesage_graph::{full_index, session_end, session_start};
 use codesage_storage::Database;
 
-/// Lays out a tiny .codesage/ directory under the temp dir so session_start
-/// has somewhere to write the snapshot file.
 fn setup_project_with_codesage_dir() -> (tempfile::TempDir, Database) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -82,18 +80,12 @@ fn session_end_fails_when_new_cycle_introduced() {
 
     let _snap = session_start(dir.path(), &db, "default").unwrap();
 
-    // Replace the linear A/B/C with a cyclic A<->B in the same DB.
-    // Removing prior files isn't easy through full_index; the simplest
-    // path is to wipe the DB and reindex with the cyclic layout.
     let db = Database::open_in_memory().unwrap();
     write_cyclic_php(dir.path());
-    // Remove C so it doesn't linger from the prior layout.
     let _ = std::fs::remove_file(dir.path().join("C.php"));
     full_index(dir.path(), &db, &[], false).unwrap();
 
-    // Snapshot was written to disk during session_start; the new in-memory DB
-    // doesn't matter for the snapshot read. session_end re-derives current
-    // state from `db` which now has the cyclic graph.
+    // The snapshot is on disk, so replacing the in-memory DB preserves the baseline.
     let diff = session_end(dir.path(), &db, "default").unwrap();
     assert!(!diff.pass, "new A<->B cycle should fail the gate");
     assert_eq!(
@@ -114,9 +106,7 @@ fn session_end_fails_when_new_cycle_introduced() {
     );
 }
 
-// A cycle wired only through PHP group-use syntax must be detected. Before
-// grouped-import refs were captured, the group-use clauses emitted no import
-// edges, so this cycle was invisible and session_start reported none.
+// PHP group-use clauses must contribute import edges to cycle detection.
 fn write_cyclic_php_group_use(root: &std::path::Path) {
     std::fs::write(
         root.join("A.php"),
@@ -157,7 +147,6 @@ fn session_end_reports_resolved_cycle() {
     let snap = session_start(dir.path(), &db, "default").unwrap();
     assert_eq!(snap.cycles.len(), 1, "baseline should have the A<->B cycle");
 
-    // Replace cyclic layout with acyclic.
     let db = Database::open_in_memory().unwrap();
     let _ = std::fs::remove_file(dir.path().join("A.php"));
     let _ = std::fs::remove_file(dir.path().join("B.php"));
@@ -196,9 +185,6 @@ fn session_end_errors_when_snapshot_missing() {
 
 #[test]
 fn session_start_overwrites_existing_snapshot() {
-    // Re-running session_start with the same id should reset the baseline.
-    // Verified by confirming the second snapshot's file_count reflects the
-    // current state, not the prior one.
     let (dir, db) = setup_project_with_codesage_dir();
     write_acyclic_php(dir.path());
     full_index(dir.path(), &db, &[], false).unwrap();
@@ -206,7 +192,6 @@ fn session_start_overwrites_existing_snapshot() {
     let snap1 = session_start(dir.path(), &db, "default").unwrap();
     assert_eq!(snap1.file_count, 3);
 
-    // Add a fourth file and re-snapshot.
     std::fs::write(
         dir.path().join("D.php"),
         b"<?php\nnamespace App;\nclass Standalone {}\n",
@@ -218,8 +203,6 @@ fn session_start_overwrites_existing_snapshot() {
     let snap2 = session_start(dir.path(), &db, "default").unwrap();
     assert_eq!(snap2.file_count, 4, "second snapshot should see 4 files");
 
-    // session_end against the (overwritten) snapshot should now compare
-    // against the 4-file baseline; with no further changes it must pass.
     let diff = session_end(dir.path(), &db, "default").unwrap();
     assert!(diff.pass);
     assert!(diff.new_files.is_empty());

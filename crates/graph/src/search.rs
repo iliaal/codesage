@@ -12,16 +12,8 @@ use codesage_storage::{Database, RawSearchRow, SemanticValidityToken, embedding_
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use regex::Regex;
 
-/// Parse a `Language` value out of a DB-stored language string. Every row was
-/// written by `Language::as_str()`, so an unknown value means version skew (an
-/// older binary reading an index a newer one wrote with a language it lacks) or
-/// a corrupt/hand-edited DB.
-///
-/// This must not panic. It runs in the per-row mapping of every search/export,
-/// and in the daemon a panic in a tool handler is silently swallowed by rmcp
-/// (no `catch_unwind`), leaving the client hung waiting for a reply that never
-/// comes. Degrade instead: warn once and keep the row with a placeholder label.
-/// The content is what the caller searched for; the language tag is annotation.
+/// Preserve rows with unknown language tags (version skew or corruption).
+/// Warn once and use a placeholder; a handler panic can leave MCP clients waiting.
 pub(crate) fn parse_db_language(s: &str) -> Language {
     Language::parse(s).unwrap_or_else(|| {
         static WARNED: std::sync::Once = std::sync::Once::new();
@@ -37,24 +29,14 @@ pub(crate) fn parse_db_language(s: &str) -> Language {
 }
 
 fn l2_to_score(distance: f32) -> f32 {
-    // Clamp to 0: for a distance > √2 (negative cosine similarity) the raw
-    // formula is negative, and the downstream multiplicative stages
-    // (`apply_path_penalties`, file/directory saturation, qualified-name boost)
-    // then *invert* ranking on those rows — a 0.15 penalty multiplies a
-    // negative score UP, promoting a worse match. With scores floored at 0 the
-    // multiplicative stages are no-ops on the tail and order falls to the stable
-    // sort + additive boosts. Mirrors the `.max(0.0)` clamp already used on
-    // `rrf_merge`'s synthetic distance.
+    // Negative similarity would turn multiplicative penalties into promotions.
     (1.0 - distance * distance / 2.0).max(0.0)
 }
 
 const RERANK_OVERFETCH: usize = 5;
 
-/// Upper bound on the candidate pool fed to KNN + cross-encoder reranking.
-/// `limit + offset` times the overfetch factor would otherwise grow without
-/// bound on deep pagination (`offset=1000` → 5000+ rows through the
-/// cross-encoder); cap it so rerank cost stays bounded. Pages past this depth
-/// return fewer / no results, which is acceptable for semantic search.
+/// Bound deep-pagination retrieval/reranking; large explicit limits may exceed
+/// this cap. Deeper pages can return fewer or no results.
 const MAX_SEMANTIC_FETCH: usize = 500;
 
 /// Extra KNN candidates to fetch before applying path globs. Path filters are
@@ -68,39 +50,20 @@ const MAX_PATH_FILTER_KNN_FETCH: usize = 5_000;
 /// damp the influence of absolute rank position, smaller values amplify it.
 const RRF_K: f64 = 60.0;
 
-/// Minimum usable span of the semantic candidates' scores for the fused-score
-/// rescale in [`rrf_merge`]. Below this, the min-max rescale would compress
-/// every fused row into a band the flat +0.1 symbol boost dwarfs, so the
-/// synthetic-span fallback fires instead. 0.05 keeps genuinely-informative
-/// spans (typical KNN spreads are well above it) while catching both exact
-/// ties and the near-tie degenerate corpora an epsilon test let through.
+/// Use a synthetic score span below this threshold so flat +0.1 boosts do not
+/// overwhelm fusion when semantic scores are tied or nearly tied.
 const MIN_FUSED_RESCALE_SPAN: f32 = 0.05;
 
-/// Doc-frequency threshold below which a query token counts as "rare" for
-/// the gate. 1% of the corpus is the memo's suggested cutoff — distinctive
-/// enough that BM25 actually has signal, not so rare that every typo
-/// triggers the hybrid path.
+/// A present token below 1% document frequency qualifies as rare.
 const RARE_TOKEN_DF_THRESHOLD: f64 = 0.01;
 
 /// Minimum token length for the length-based rare check. Short tokens
 /// (`fd`, `pt`, `if`) match too broadly regardless of doc frequency.
 const RARE_TOKEN_MIN_LEN: usize = 8;
 
-/// True when `query` contains a literal token distinctive enough to
-/// justify a BM25 boost on top of the semantic score. Two qualifying
-/// shapes:
-///
-/// 1. **Distinctive punctuation**: backticked identifiers (`` `doc_cfg` ``),
-///    file-extension globs (`*.svelte.ts`), scope-resolution operators
-///    (`ModuleRef::create`). These shapes are strong priors for a literal
-///    match even if the exact token isn't in the FTS vocab yet.
-/// 2. **Long rare tokens**: any whitespace- or pipe-separated token of at
-///    least 8 characters that shows up in <1% of indexed chunks. Requires
-///    a live FTS5 `fts5vocab` probe, so this returns `Ok(false)` when the
-///    FTS sidecar is empty (fresh install before reindex).
-///
-/// Dotted identifier pairs also qualify. `CODESAGE_QUALIFIED_GROUPS=1`
-/// additionally admits the experimental backslash-qualified name shape.
+/// Gate BM25 on backticks, extension globs, ::, dotted identifiers, or code-shaped
+/// tokens of at least 8 bytes present in fewer than 1% of indexed chunks.
+/// CODESAGE_QUALIFIED_GROUPS=1 also admits backslash-qualified names.
 pub(crate) fn query_has_rare_literal(db: &Database, query: &str) -> Result<bool> {
     query_has_rare_literal_with_groups(db, query, qualified_groups_enabled())
 }
@@ -128,13 +91,7 @@ fn query_has_rare_literal_with_groups(db: &Database, query: &str, groups: bool) 
             continue;
         }
         if !token_looks_code_shaped(tok) {
-            // Pure lowercase English words (`resolution`, `handler`,
-            // `middleware`) can be rare in a domain corpus without carrying
-            // the "this is the exact identifier I need" signal BM25 is
-            // supposed to catch. Measured regression on nest canary
-            // (`git-15198c650d`): "resolution" DF 0.19% tripped this branch
-            // but the expected file did not contain the word. Restrict the
-            // length branch to tokens that look like code identifiers.
+            // Corpus rarity alone does not make an English word an identifier.
             continue;
         }
         let (doc, total) = db.token_doc_frequency(tok)?;
@@ -142,9 +99,7 @@ fn query_has_rare_literal_with_groups(db: &Database, query: &str, groups: bool) 
             continue;
         }
         let df = doc as f64 / total as f64;
-        // Both halves of the threshold matter: a token must appear (doc>0)
-        // AND be rare (df < 1%). `doc == 0` means the token isn't in the
-        // index — no BM25 win possible, skip.
+        // An absent token cannot contribute a BM25 match.
         if doc > 0 && df < RARE_TOKEN_DF_THRESHOLD {
             return Ok(true);
         }
@@ -152,11 +107,7 @@ fn query_has_rare_literal_with_groups(db: &Database, query: &str, groups: bool) 
     Ok(false)
 }
 
-/// True when a token carries syntactic markers of a code identifier —
-/// contains `_`, at least one uppercase letter, or a digit. This filters
-/// out ordinary English words that may be rare in a specific corpus but
-/// don't carry the "exact identifier match" signal BM25 is supposed to
-/// contribute.
+/// Exclude ordinary English words from the rare-token branch.
 fn token_looks_code_shaped(tok: &str) -> bool {
     tok.contains('_')
         || tok.chars().any(|c| c.is_ascii_uppercase())
@@ -206,12 +157,8 @@ fn extract_dotted_identifier_tokens(query: &str) -> Vec<&str> {
     out
 }
 
-/// Components of each `::`- or `\`-separated qualified name in the query.
-///
-/// Dotted names are deliberately excluded. `moduleref.create` splitting into
-/// two OR terms is a measured win on the nest corpus, and the namespace-prefix
-/// dilution this exists to address does not arise there: a dotted pair's left
-/// side is a receiver, not a namespace shared by hundreds of chunks.
+/// Split :: and backslash namespaces. Keep dotted receiver/member pairs separate:
+/// their OR terms improved the nest benchmark without broad namespace prefixes.
 fn extract_qualified_name_groups_legacy(query: &str) -> Vec<Vec<String>> {
     let mut groups = Vec::new();
     for raw in query.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
@@ -236,44 +183,17 @@ fn extract_qualified_name_groups_legacy(query: &str) -> Vec<Vec<String>> {
 /// at query time. Empty when no usable tokens are extracted.
 fn build_fts_match_query_legacy(query: &str) -> String {
     use std::collections::HashSet;
-    // Split aggressively so things like `ModuleRef::create`, `foo.bar`, and
-    // `*.svelte.ts` yield each alphanumeric+underscore segment as its own
-    // term, not concatenated nonsense. FTS5's unicode61 tokenizer (with
-    // tokenchars '_') would produce the same splits at index time, so what
-    // we emit here matches what was actually indexed.
-    //
-    // Filter: only include tokens that look like code identifiers. Common
-    // English glue words (`use`, `the`, `and`, `of`, `instead`) in a
-    // 10-word commit subject would flood the BM25 ranking and bury the
-    // one or two distinctive tokens we actually care about. Measured on
-    // ripgrep: the query `printer: use \`doc_cfg\` instead of
-    // \`doc_auto_cfg\`` without this filter produces a MATCH disjunction
-    // of 6 tokens where 4 are common glue, and the target file drops out
-    // of the top 10 because the glue tokens match everything.
-    //
-    // Exception: dotted-identifier components like `moduleref.create`
-    // survive even when individually lowercase, because the dotted pair
-    // context signals code identity.
+    // Match unicode61 token boundaries and exclude English glue from the OR query.
+    // Dotted-pair context admits lowercase components as code identifiers.
     let is_sep = |c: char| !c.is_alphanumeric() && c != '_';
     let mut seen: HashSet<String> = HashSet::new();
     let mut tokens: Vec<String> = Vec::new();
 
-    // A qualified name's leading components are namespaces, and each one on
-    // its own matches every chunk in that namespace: `Illuminate\Routing\Router`
-    // became `"Illuminate" OR "Routing" OR "Router"`, where the first two pull
-    // in most of the framework and outvote the symbol actually asked for. Drop
-    // them and keep the tail, which is the symbol being asked about.
-    //
-    // Emitting the full name as an FTS5 phrase alongside was tried and
-    // reverted: it measured -0.006 NDCG@10 on the 40 semble C++ queries, the
-    // only corpus queries carrying a `::` at all.
+    // Namespace prefixes swamp selective tails. Full-name phrases regressed
+    // semble C++ NDCG@10 by 0.006, so only selective tails replace prefixes.
     let mut suppressed: HashSet<String> = HashSet::new();
     for parts in extract_qualified_name_groups_legacy(query) {
-        // The tail stays a term of its own: it is the symbol name, the most
-        // selective component, and the spelling a caller may use unqualified.
-        // It must still clear the code-shape filter, or a plain-lowercase tail
-        // like `ModuleRef::create` would reintroduce as an OR term exactly the
-        // common word this is removing.
+        // Lowercase tails such as create must still pass the code-shape filter.
         let tail_is_selective = parts.last().is_some_and(|t| token_looks_code_shaped(t));
         if tail_is_selective
             && let Some(tail) = parts.last()
@@ -281,12 +201,7 @@ fn build_fts_match_query_legacy(query: &str) -> String {
         {
             tokens.push(format!("\"{tail}\""));
         }
-        // Dropping the prefix is only safe when something selective survives.
-        // With a lowercase tail the phrase is the sole remaining term, and it
-        // matches only where the components are adjacent — so a query like
-        // `ColdFusion::register` against code that names the class but not
-        // that exact pair would produce an empty MATCH and no BM25 leg at all.
-        // Keep the prefix in that case and let the phrase add precision on top.
+        // Keep prefixes when the tail is not selective, or MATCH could become empty.
         if tail_is_selective {
             for prefix in &parts[..parts.len() - 1] {
                 suppressed.insert(prefix.to_lowercase());
@@ -307,9 +222,7 @@ fn build_fts_match_query_legacy(query: &str) -> String {
         if !token_looks_code_shaped(raw) {
             continue;
         }
-        // Dedupe by lowercased form — FTS5 is case-insensitive for this
-        // tokenizer, so `Foo` and `foo` would collapse at MATCH time
-        // anyway. Fewer OR-terms keeps the MATCH expression parseable.
+        // unicode61 matches case-insensitively.
         let key = raw.to_lowercase();
         if suppressed.contains(&key) {
             continue;
@@ -398,23 +311,8 @@ fn build_fts_match_query(query: &str) -> String {
 }
 
 fn build_fts_match_query_mode(query: &str, fallback: bool) -> String {
-    // Split aggressively so things like `ModuleRef::create`, `foo.bar`, and
-    // `*.svelte.ts` yield each alphanumeric+underscore segment as its own
-    // term, not concatenated nonsense. FTS5's unicode61 tokenizer (with
-    // tokenchars '_') would produce the same splits at index time, so what
-    // we emit here matches what was actually indexed.
-    //
-    // Filter: only include tokens that look like code identifiers. Common
-    // English glue words (`use`, `the`, `and`, `of`, `instead`) in a
-    // 10-word commit subject would flood the BM25 ranking and bury the
-    // one or two distinctive tokens we actually care about. Measured on
-    // ripgrep: the query `printer: use \`doc_cfg\` instead of
-    // \`doc_auto_cfg\`` without this filter produces a MATCH disjunction
-    // of 6 tokens where 4 are common glue, and the target file drops out
-    // of the top 10 because the glue tokens match everything.
-    //
-    // Qualified names retain lowercase components inside a conjunction;
-    // none of those components broadens the disjunction on its own.
+    // Apply the legacy token/code-shape rules. Qualified components stay in
+    // conjunctions, so lowercase members do not broaden the OR expression.
     let is_sep = |c: char| !c.is_alphanumeric() && c != '_';
     let mut seen: HashSet<String> = HashSet::new();
     let mut tokens: Vec<String> = Vec::new();
@@ -464,9 +362,6 @@ fn build_fts_match_query_mode(query: &str, fallback: bool) -> String {
         if !token_looks_code_shaped(raw) {
             continue;
         }
-        // Dedupe by lowercased form — FTS5 is case-insensitive for this
-        // tokenizer, so `Foo` and `foo` would collapse at MATCH time
-        // anyway. Fewer OR-terms keeps the MATCH expression parseable.
         let key = raw.to_lowercase();
         if !seen.insert(key) {
             continue;
@@ -477,15 +372,7 @@ fn build_fts_match_query_mode(query: &str, fallback: bool) -> String {
 }
 
 /// Weight applied to BM25 contributions in the gated hybrid RRF merge.
-/// Symmetric RRF underweights BM25 on queries where the target file is
-/// absent from the semantic top-N but present in the BM25 top-N: the
-/// target then competes only against rank-1 of the list where it does
-/// appear, and any semantic-only top-1 item edges it out by a hair.
-/// Measured on nest (`moduleref.create` → `module-ref.ts` case): BM25
-/// correctly ranks `module-ref.ts` at rank 2, but unweighted RRF leaves
-/// it under the top-10 because semantic's long tail contributes one
-/// score per rank. Weighting BM25 at 2x closes this specific gap without
-/// overwhelming the semantic ranking on queries where semantic is correct.
+/// Give selective lexical hits enough weight to beat semantic-only candidates.
 const BM25_WEIGHT: f64 = 2.0;
 
 /// Reciprocal Rank Fusion over two ranked lists. Each list contributes
@@ -499,8 +386,7 @@ fn rrf_merge(
     limit: usize,
 ) -> Vec<RawSearchRow> {
     use std::collections::HashMap;
-    // Span of the semantic candidates' scores, used to rescale fused RRF
-    // scores back onto the scale the downstream boost stages were tuned for.
+    // Keep fused scores on the scale downstream boosts were tuned for.
     let (sem_min, sem_max) = semantic
         .iter()
         .map(|r| l2_to_score(r.distance))
@@ -510,25 +396,15 @@ fn rrf_merge(
     let (sem_min, sem_max) = if sem_min.is_finite() && sem_max.is_finite() {
         (sem_min, sem_max)
     } else {
-        // No semantic candidates (BM25-only fusion): fall back to the full
-        // valid score range.
         (0.0, 1.0)
     };
-    // When the semantic candidates' scores (near-)collapse — exact ties from
-    // duplicated chunks, or scores a few ULPs apart on a tiny corpus — the
-    // rescale below would compress every fused row into a band far narrower
-    // than the flat +0.1 symbol boost, which could then reorder the fused
-    // ranking freely. Anything under MIN_FUSED_RESCALE_SPAN gets a synthetic
-    // span below the top score instead, so fused order survives with headroom
-    // under the additive boost. An exact-epsilon test here was not enough:
-    // spans like 1e-6 passed it and still collapsed the rescale.
+    // Near-tied scores need a synthetic span; an epsilon-only guard would still
+    // let flat +0.1 boosts overwhelm the entire fused ranking.
     let (sem_min, sem_max) = if sem_max - sem_min < MIN_FUSED_RESCALE_SPAN {
         ((sem_max - 0.2).clamp(0.0, 1.0), sem_max.clamp(0.0, 1.0))
     } else {
         (sem_min, sem_max)
     };
-    // Key is (path, start, end). Two chunks at the same location appearing
-    // in both rankings collapse to one row with the summed RRF score.
     let mut scores: HashMap<(String, u32, u32), (f64, RawSearchRow)> = HashMap::new();
     for (rank, row) in semantic.into_iter().enumerate() {
         let contrib = 1.0 / (RRF_K + rank as f64 + 1.0);
@@ -547,27 +423,15 @@ fn rrf_merge(
             .or_insert((contrib, row));
     }
     let mut ranked: Vec<(f64, RawSearchRow)> = scores.into_values().collect();
-    // `scores` is a HashMap, so ties must be broken explicitly or the
-    // truncation below keeps an arbitrary subset that varies per call. Exact
-    // f64 ties are reachable here, not just theoretical: with RRF_K=60 and
-    // BM25_WEIGHT=2.0 a semantic rank-1 (1/62) plus a BM25 rank-63 (2/124)
-    // sums bit-identically to a BM25 rank-1 (2/62), and the fetch depth
-    // reaches those ranks.
+    // Break reachable exact f64 ties before truncation; HashMap order is random.
     ranked.sort_by(|a, b| {
         b.0.total_cmp(&a.0)
             .then_with(|| a.1.file_path.cmp(&b.1.file_path))
             .then_with(|| a.1.start_line.cmp(&b.1.start_line))
     });
     ranked.truncate(limit);
-    // Convert each fused RRF score to the `distance` field downstream code
-    // reads through `l2_to_score`. Order alone is not enough: the boost
-    // stages are additive (+0.1 per symbol token), so score *scale* matters.
-    // Raw RRF scores top out around 3/(RRF_K+1) ≈ 0.05, which l2_to_score
-    // would compress into a ~0.03-wide band — a single +0.1 boost on a
-    // mid-ranked row would then overwrite the entire fused ranking. Min-max
-    // rescale the fused scores onto the semantic candidates' span instead,
-    // then invert l2_to_score (d = sqrt(2*(1-score))) so the downstream read
-    // reproduces the rescaled score.
+    // Raw RRF spans are too narrow for additive boosts. Rescale onto the semantic
+    // span, then invert l2_to_score so its downstream read preserves that scale.
     let fused_hi = ranked.first().map(|(s, _)| *s).unwrap_or(0.0);
     let fused_lo = ranked.last().map(|(s, _)| *s).unwrap_or(0.0);
     let fused_range = fused_hi - fused_lo;
@@ -600,15 +464,9 @@ pub struct CliffCut {
     pub confidence: SearchConfidence,
 }
 
-/// Locate the largest relative score drop between adjacent rows of a page
-/// sorted best-first. `scores` is read as produced by the pipeline: every
-/// stage keeps scores finite and non-negative (`l2_to_score` clamps at 0, the
-/// reranker blend is a convex combination of [0,1] terms, penalties and
-/// saturation are multiplicative on non-negative values, boosts are additive
-/// and positive), so `(s_i - s_{i+1}) / s_i` is meaningful without shifting.
-/// Pairs whose leading score is 0 or non-finite are skipped rather than
-/// divided through; a drop onto an exact 0 counts as 100%. Ties produce a 0%
-/// drop and can never be selected, so a cut never splits equal scores.
+/// Find the largest adjacent relative drop in descending non-negative scores.
+/// Skip non-finite pairs and non-positive leaders; a drop to zero is 100%.
+/// Equal scores never split. Confidence uses the rounded disclosed percentage.
 pub fn relevance_cliff(scores: &[f32]) -> CliffCut {
     let mut best_drop = 0.0f32;
     let mut best_cut = scores.len();
@@ -683,15 +541,8 @@ fn bm25_candidates_with_fallback(
     bm25_search_candidates(db, &fallback, fetch_limit, languages, paths)
 }
 
-/// Reranker callback for [`search`] / [`export_context`]. Takes the query
-/// text + candidate documents, returns one cross-encoder score per doc.
-///
-/// Boxed so the caller can hold the reranker behind whatever locking
-/// discipline fits their runtime — `&mut Reranker` for the single-process
-/// CLI, `Arc<Mutex<Reranker>>` for the multi-client MCP daemon. The lock
-/// is acquired only when search() calls back, not for the duration of
-/// the SQL retrieval, so concurrent agents on the same project can
-/// interleave their SQL work while one is in the (slow) ORT call.
+/// Return one cross-encoder score per candidate. The callback owns locking so
+/// callers can keep SQL retrieval outside the reranker lock.
 pub type RerankFn<'a> = Box<dyn FnMut(&str, &[&str]) -> Result<Vec<f32>> + 'a>;
 
 fn semantic_knn_candidates(
@@ -709,9 +560,7 @@ fn semantic_knn_candidates(
             db.search_knn(embedding_bytes, fetch, Some(langs[0].as_str()))
         }
         Some(langs) => {
-            // Fan-out per language (sqlite-vec's partition key forces
-            // per-value queries) and merge in-memory. sort+truncate is
-            // simpler than a bounded BinaryHeap and fetch_k stays bounded.
+            // sqlite-vec partition keys require one query per language.
             let mut merged: Vec<RawSearchRow> = Vec::new();
             for lang in langs {
                 let lang_rows = db.search_knn(embedding_bytes, fetch, Some(lang.as_str()))?;
@@ -807,17 +656,6 @@ pub fn search_page(
         .saturating_mul(overfetch)
         .min(limit.max(MAX_SEMANTIC_FETCH));
 
-    // Gate: is this a query where BM25 would help? Two distinctive shapes
-    // covered by `query_has_rare_literal`: backticked identifiers / glob
-    // patterns / `::` scoped lookups, and long tokens (>=8 chars) that show
-    // up in <1% of chunks. Retrospective analysis on external corpora
-    // (ripgrep, nestjs/nest) measured these as the specific failure mode
-    // semantic-only retrieval misses. See
-    // `notes/20260411-code-intelligence-landscape.md` §1.4 for the memo chain.
-    // `CODESAGE_HYBRID` overrides the gate for ablation: `always` fuses every
-    // query, `never` disables fusion outright, and the default keys off the
-    // rare-literal test above. It exists to settle default-on vs conditional
-    // with a measurement rather than an argument.
     let hybrid_gate = match hybrid_mode() {
         HybridMode::Always => true,
         HybridMode::Never => false,
@@ -841,23 +679,14 @@ pub fn search_page(
         )?
     };
 
-    // Hybrid BM25+semantic fusion, only when the gate triggered. Keeps the
-    // semantic-only path identical to pre-hybrid behavior for the 80%+ of
-    // queries that don't contain a rare literal, so the ecosystem default
-    // doesn't get copy-pasted in where the memo's net-negative finding still
-    // applies. `fused` records whether RRF fusion actually ran — the gate can
-    // fire while BM25 contributes nothing (empty MATCH expression, no hits),
-    // in which case rows stay purely semantic.
+    // A triggered gate can still yield no BM25 hits; reranking depends on actual fusion.
     let mut fused = false;
     let rows = if hybrid_gate {
         let match_expr = build_fts_match_query(&req.query);
         if match_expr.is_empty() {
             rows
         } else {
-            // Filter the BM25 leg to the FULL requested language set. Left
-            // unfiltered, foreign-language rows would occupy rrf_merge slots
-            // only to be retained away afterwards — pushing matching-language
-            // candidates out of the fused pool entirely.
+            // Filter before fusion or excluded languages can displace valid candidates.
             let bm25_languages: Option<Vec<&str>> = req
                 .languages
                 .as_ref()
@@ -935,17 +764,8 @@ pub fn search_page(
         apply_definition_boost(&mut results, &req.query);
     }
 
-    // When a rare-token match drove the fused ranking it should stay the
-    // dominant signal, so fused queries pin the blend to the SHORT_ID weight
-    // (0.35) rather than skipping the cross-encoder outright. Skipping cost
-    // scope-qualified C++ queries the reranker entirely: `absl::`/`fmt::` is
-    // ordinary namespacing, not the rare literal the code-literal gate is
-    // calibrated for, and those queries scored 0.777 against 0.870 for the
-    // rest of the C++ corpus. Keyed on `fused`, not `hybrid_gate`: a gated
-    // query whose BM25 leg came back empty is still purely semantic.
-    // The ripgrep canary in `project_hybrid_bm25_rrf.md` (reranker demoting
-    // `lib.rs` out of top-10 on ``use `doc_cfg` `` queries) is what the
-    // reduced weight has to keep passing.
+    // Fused reranking is opt-in; its reduced weight preserves more of BM25's signal.
+    // A gated query with no BM25 hits still follows the ordinary reranker path.
     if let Some(mut rerank) = rerank
         && (!fused || fused_rerank_enabled())
     {
@@ -953,13 +773,7 @@ pub fn search_page(
         apply_reranking(&mut rerank, &req.query, &mut results, weight_override);
     }
 
-    // Path penalties run AFTER reranking so they land on the final blended
-    // score. Ahead of it they were diluted: the merge is
-    // `(1-w)*score + w*ce_norm` with `ce_norm` renormalized to [0,1], so a
-    // pre-blend demote survived at only `1-w` strength — 40% on natural
-    // language queries, where most of these penalties matter. Reranking reads
-    // only chunk content and scores every candidate, so the set it sees is
-    // unchanged by the move.
+    // Apply penalties after blending; before it, their strength shrinks by 1 - w.
     if path_penalty_enabled() {
         apply_path_penalties(&mut results, &req.query);
     }
@@ -968,10 +782,7 @@ pub fn search_page(
         apply_version_demote(&mut results, &req.query);
     }
 
-    // Also after reranking, and for a stronger reason than the penalties: a
-    // filename-stem match is metadata the cross-encoder cannot see. It scores
-    // chunk content only, so blending a pre-rerank stem boost would dilute a
-    // signal the reranker had no way to form an opinion about.
+    // The cross-encoder cannot see filenames, so do not dilute the stem boost in its blend.
     if stem_match_boost_enabled() {
         apply_stem_match_boost(&mut results, &req.query);
     }
@@ -984,11 +795,7 @@ pub fn search_page(
         apply_directory_saturation(&mut results);
     }
 
-    // Last, on the final blended scores: a candidate the query names outright
-    // (a pasted path, a `Type::method`) is lifted onto a ladder directly under
-    // the current top result. After saturation on purpose, so a per-file
-    // decay cannot undo the lift; inert when the query names nothing and on
-    // every page but the first.
+    // Anchor after saturation so decay cannot undo the lift; first page only.
     apply_mention_anchor(
         &mut results,
         &req.query,
@@ -1019,8 +826,6 @@ fn extract_known_symbols(db: &Database, query: &str) -> Result<Vec<String>> {
         if token.len() < 3 || !looks_like_identifier(token) {
             continue;
         }
-        // `symbol_exists` issues a LIMIT 1 probe instead of materializing every
-        // matching Symbol row just to test non-emptiness.
         if db.symbol_exists(token)? {
             known.push(token.to_lowercase());
         }
@@ -1041,13 +846,8 @@ fn looks_like_identifier(s: &str) -> bool {
         || s.chars().all(|c| c.is_alphanumeric() || c == '_') && s.len() >= 4
 }
 
-/// Identifier test for the adaptive-rerank SHORT_ID branch. Stricter than
-/// [`looks_like_identifier`]: the token must carry an explicit identifier
-/// signal — `_` (snake_case), `-` (kebab-case), an uppercase letter
-/// (camel/PascalCase), `::` scoping, or a digit. `looks_like_identifier`'s
-/// length clause admits any all-lowercase word ≥4 chars because its caller
-/// verifies the token against the symbol table; here there is no existence
-/// check, so a plain English word ("authentication") must not qualify.
+/// Unlike looks_like_identifier, this has no symbol-table check. Require explicit
+/// identifier syntax so long lowercase English words do not get SHORT_ID weight.
 fn looks_like_short_identifier(s: &str) -> bool {
     let first = match s.chars().next() {
         Some(c) => c,
@@ -1068,12 +868,7 @@ fn apply_symbol_boost(results: &mut [SearchResult], known_symbols: &[String]) {
         let content_lower = result.content.to_lowercase();
         let mut boost = 0.0f32;
         for sym in known_symbols {
-            // Token-boundary match, not substring: a raw `contains` lets a
-            // short query token fire inside a longer identifier (`test`
-            // boosting "latest", `log` boosting "catalog"). Both sides are
-            // already lowercased (`extract_known_symbols` lowercases the
-            // symbols; `content_lower` here), so the comparison is
-            // case-insensitive by construction.
+            // Whole tokens prevent test matching latest or log matching catalog.
             if contains_token(&content_lower, sym) {
                 boost += 0.1;
             }
@@ -1108,42 +903,13 @@ fn contains_token(haystack: &str, needle: &str) -> bool {
     })
 }
 
-// Multiplicative ×2.0 boost when a query-derived identifier token matches the
-// *qualified name* of a symbol overlapping the chunk. Pattern ported from
-// code-review-graph commit c04af36 ("feat: deterministic eval pipeline,
-// multi-hop benchmark, search lift") as the §2.12 A/B candidate.
-//
-// Different from `apply_symbol_boost`: that one matches tokens against raw
-// chunk *content* (a chunk mentioning `parse_config` in a comment gets the
-// +0.1); this one matches against the chunk's overlapping *symbols*'
-// qualified names. Stronger signal, harder boost.
-//
-// Anti-trigger filter: a previous A/B run (notes/20260526-search-lift-ab-
-// report.md) showed pure lexical matching produces false positives when a
-// query word doubles as a Rust trait/method name. Query "load default
-// command options..." picked up `Mode::default` and bumped the wrong file
-// over the right one. Anti-trigger tokens (common English verbs and Rust
-// trait methods) only fire when the query token matches a NON-LEAF segment
-// of the qualified-name — i.e., the type/module part, not the method part.
-// `default` matching `Mode::default` (leaf-only) is suppressed; `ignore`
-// matching `Ignore::add_child_path` (root match) survives.
-//
-// Idempotent: each result is boosted at most once even if multiple
-// qualified-names match — the goal is "this chunk contains the named
-// symbol, definitively," not "the more names matched, the harder to boost."
-//
-// Default-off; opt-in via `CODESAGE_QUALIFIED_NAME_BOOST=1` for the §2.12
-// A/B. Annotation must have already populated `result.symbols`.
+// Boost annotated qualified-name matches once per chunk. Common method names
+// require a non-leaf match to avoid treating prose such as default as Mode::default.
+// Default-off via CODESAGE_QUALIFIED_NAME_BOOST; annotation must run first.
 const QUALIFIED_NAME_BOOST_FACTOR: f32 = 2.0;
 
-// Query words that double as Rust trait methods / common method names. When a
-// query token here matches a qualified-name's LEAF segment only, the boost
-// is suppressed — leaf-only matches are statistically dominated by
-// false-positives (e.g. `Mode::default` matched on the English word "default"
-// in a config-loading query). Stem-based filter still allows the boost when
-// the token matches a non-leaf (type/module) segment of the qualified-name.
+// These common words boost only type/module segments, never a leaf method name.
 const ANTI_TRIGGER_TOKENS: &[&str] = &[
-    // Rust trait methods
     "default",
     "new",
     "clone",
@@ -1156,14 +922,12 @@ const ANTI_TRIGGER_TOKENS: &[&str] = &[
     "hash",
     "partial_eq",
     "partial_cmp",
-    // Common accessor patterns
     "get",
     "set",
     "has",
     "is",
     "len",
     "size",
-    // Verbs that double as method names
     "init",
     "build",
     "run",
@@ -1183,10 +947,8 @@ const ANTI_TRIGGER_TOKENS: &[&str] = &[
     "update",
     "delete",
     "remove",
-    // Iter
     "next",
     "iter",
-    // Common but-not-distinctive
     "test",
     "config",
 ];
@@ -1204,24 +966,14 @@ fn qualified_name_segments(qn: &str) -> Vec<&str> {
 fn qualified_name_matches(token: &str, qn: &str, name: &str) -> bool {
     let segments = qualified_name_segments(qn);
     if segments.is_empty() {
-        // Empty qn (shouldn't happen in practice) — fall back to bare name.
         return !is_anti_trigger(token) && name == token;
     }
     if is_anti_trigger(token) {
-        // Anti-trigger tokens only fire when matching a NON-LEAF segment.
-        // For `Mode::default` (segments ["mode", "default"]) and token
-        // `default`, non-leaf is ["mode"] — no match, suppress. For
-        // `Config::load` (segments ["config", "load"]) and token `config`,
-        // non-leaf is ["config"] — match, allow.
         if segments.len() < 2 {
-            // Bare name: the lone segment is the leaf, no non-leaf to check.
             return false;
         }
         segments[..segments.len() - 1].contains(&token)
     } else {
-        // Non-anti-trigger: any segment match. Matches both root (e.g. token
-        // `ignore` against `Ignore::add_child_path` — the §2.12 win case)
-        // and leaf (e.g. token `login` against `AuthService::login`).
         segments.contains(&token)
     }
 }
@@ -1245,9 +997,6 @@ fn apply_qualified_name_boost(results: &mut [SearchResult], known_symbols: &[Str
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 }
 
-// Default-off, unlike the other gates: this exists to A/B the §2.12
-// hypothesis without shipping the new boost to existing users. Promote to
-// default-on if the bench shows lift.
 fn qualified_name_boost_enabled() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| {
@@ -1258,16 +1007,8 @@ fn qualified_name_boost_enabled() -> bool {
     })
 }
 
-// Definition boost: when the query is a bare symbol (CamelCase, snake_case,
-// namespace-qualified), strongly promote candidate chunks that contain a
-// language-keyword + symbol_name match (e.g. `class FooBar`, `fn foo_bar`,
-// `defmodule My.FooBar`). Pattern from Semble's boosting.py
-// _boost_symbol_definitions: additive boost = 3 * max_score, with a 1.5x
-// multiplier when the file stem also matches the symbol. Applied after the
-// existing apply_symbol_boost (which only does +0.1 per known-symbol token)
-// and BEFORE path_penalty (so a definition in a test file is still boosted,
-// then discounted by 0.3x — the correct net signal for "this IS the
-// definition, but it's the test version, not the production one").
+// Definition matches receive 3 * max_score, with a 1.5x matching-stem bonus.
+// Run before path penalties so test definitions retain their demotion.
 const DEFINITION_KEYWORDS: &[&str] = &[
     // Order matters for regex alternation: longest-first so `abstract class`
     // matches before `class`. Same trick for `data class`.
@@ -1297,14 +1038,8 @@ const DEFINITION_KEYWORDS: &[&str] = &[
 ];
 
 const DEFINITION_BOOST_MULTIPLIER: f32 = 3.0;
-// File stem matches the symbol name (e.g. login_controller.rs for
-// LoginController) — the file is almost certainly the canonical home of
-// this symbol, so push it harder.
 const DEFINITION_FILE_STEM_BONUS: f32 = 1.5;
-// Half-strength when the symbol is embedded in an NL query rather than the
-// whole query ("how does StateManager initialize?" vs bare `StateManager`).
-// The user is asking *about* the symbol but may want explanatory context, so
-// the definition chunk is still a strong signal — just not the dominant one.
+// Embedded symbols get half strength: prose queries may want surrounding context.
 const EMBEDDED_SYMBOL_BOOST_SCALE: f32 = 0.5;
 
 static SYMBOL_QUERY_RE: OnceLock<Regex> = OnceLock::new();
@@ -1333,13 +1068,7 @@ static EMBEDDED_SYMBOL_RE: OnceLock<Regex> = OnceLock::new();
 
 fn embedded_symbol_re() -> &'static Regex {
     EMBEDDED_SYMBOL_RE.get_or_init(|| {
-        // CamelCase or PascalCase tokens embedded in otherwise-NL text.
-        // Requires an internal capital so plain words ("session") don't
-        // match. Excludes pure acronyms (XML, HTTP) — those would be matched
-        // by `[A-Z][a-z][a-zA-Z0-9]*[A-Z]` only if a lowercase letter follows
-        // the leading capital.
-        //   PascalCase: StateManager, LoginController, XmlParser
-        //   camelCase:  getCurrentUser, isLoggedIn
+        // Require an internal capital and a lowercase letter; exclude plain words and acronyms.
         Regex::new(
             r"\b(?:[A-Z][a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*|[a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]+)\b",
         )
@@ -1375,9 +1104,7 @@ fn extract_symbol_name(query: &str) -> String {
     q.to_string()
 }
 
-/// Upper bound on cached compiled definition patterns. One entry per distinct
-/// symbol name; without a cap a pathological query stream (random tokens that
-/// pass the symbol-existence probe) grows the cache without bound.
+/// Bound compiled patterns under streams of distinct symbol queries.
 const DEFINITION_PATTERN_CACHE_CAP: usize = 64;
 
 static DEFINITION_PATTERN_CACHE: LazyLock<Mutex<HashMap<String, Regex>>> =
@@ -1387,10 +1114,7 @@ fn build_definition_pattern(symbol_name: &str) -> Option<Regex> {
     if symbol_name.is_empty() {
         return None;
     }
-    // Hit: Regex clones cheaply (Arc-backed automaton), so handing out a
-    // clone keeps the cache entry while avoiding a recompile per symbol per
-    // query. Lock recovered rather than panicked: a poisoned mutex here
-    // must degrade to a recompile, not hang the search call.
+    // Regex clones share the automaton; recover poisoned locks to avoid handler panics.
     if let Some(cached) = DEFINITION_PATTERN_CACHE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1402,9 +1126,7 @@ fn build_definition_pattern(symbol_name: &str) -> Option<Regex> {
     let mut cache = DEFINITION_PATTERN_CACHE
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    // Simple eviction: drop the whole map at capacity. Definition-pattern
-    // demand is bursty per query, so clearing keeps the bound with no LRU
-    // bookkeeping; the next query recompiles what it still needs.
+    // Clear at capacity; bursty queries do not justify LRU bookkeeping.
     if cache.len() >= DEFINITION_PATTERN_CACHE_CAP {
         cache.clear();
     }
@@ -1414,9 +1136,6 @@ fn build_definition_pattern(symbol_name: &str) -> Option<Regex> {
 
 fn compile_definition_pattern(symbol_name: &str) -> Option<Regex> {
     let escaped = regex::escape(symbol_name);
-    // The keyword alternation is constant; build it once. Only `escaped`
-    // (the symbol) varies between calls, so the full regex still has to compile
-    // per distinct symbol, but the per-call string churn is gone.
     static KW_ALTS: OnceLock<String> = OnceLock::new();
     let kw_alts = KW_ALTS.get_or_init(|| {
         DEFINITION_KEYWORDS
@@ -1447,10 +1166,6 @@ fn apply_definition_boost(results: &mut [SearchResult], query: &str) {
         return;
     }
 
-    // Two paths:
-    //  - bare symbol query: full-strength boost on the symbol name itself.
-    //  - NL query: half-strength boost on each CamelCase token embedded in
-    //    the NL ("how does StateManager initialize?" -> StateManager).
     let symbols: Vec<String> = if is_symbol_query(query) {
         let name = extract_symbol_name(query);
         if name.len() < 2 {
@@ -1498,32 +1213,7 @@ fn apply_definition_boost(results: &mut [SearchResult], query: &str) {
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 }
 
-/// Environment toggles for the search scoring pipeline, named once here so
-/// the `CODESAGE_*` strings aren't scattered as duplicated literals. Every
-/// toggle is read once per process and cached (`OnceLock`).
-///
-/// Boolean gates, default-on — disable with `=0` / `=false` (see
-/// `env_default_on`):
-///
-/// - `DEFINITION_BOOST`: keyword + symbol-name definition-chunk boost
-/// - `STEM_SCAN`: non-candidate stem-scan chunk injection
-/// - `TEST_QUERY_AWARE`: test-intent query classification (lifts the
-///   test-path demote on test-shaped queries)
-/// - `PATH_PENALTY`: test / compat / examples / barrel / `.d.ts` path demotes
-/// - `FILE_SATURATION`: per-file chunk-count decay
-/// - `DIR_SATURATION`: per-directory chunk-count decay
-/// - `ADAPTIVE_RERANK`: query-shape-adaptive rerank blend weight
-/// - `MENTION_ANCHOR`: lift candidates the query literally names (paths,
-///   `Type::method`) onto a slot ladder under the top result
-///
-/// Boolean gate, default-off — enable with `=1` / `=true` / `=yes`:
-///
-/// - `QUALIFIED_NAME_BOOST`: ×2 qualified-name symbol-match boost (§2.12 A/B)
-///
-/// Numeric overrides (invalid values fall back to the built-in default):
-///
-/// - `DIR_SATURATION_THRESHOLD`: integer ≥ 1, default 2
-/// - `DIR_SATURATION_DECAY`: float in (0.0, 1.0], default 0.75
+/// Search tuning names. Stage gates and numeric overrides are cached on first read.
 mod tuning {
     pub(super) const QUALIFIED_NAME_BOOST: &str = "CODESAGE_QUALIFIED_NAME_BOOST";
     pub(super) const DEFINITION_BOOST: &str = "CODESAGE_DEFINITION_BOOST";
@@ -1544,19 +1234,12 @@ mod tuning {
     pub(super) const MENTION_ANCHOR: &str = "CODESAGE_MENTION_ANCHOR";
 }
 
-// The `is_symbol_query` gate makes the definition boost provably inert on NL
-// queries (commit subjects, "how does X work" prose); manual A/B on
-// bare-symbol queries against the nest index showed the definition chunk
-// surfaces over reference / method-body chunks (ApplicationConfig: rank-1
-// score 0.76 → def chunk 1.45; MicroservicesModule: 0.65 → 2.57).
-/// True unless the named env var is explicitly set to `0` / `false`. The
-/// default-on gate shape shared by the post-retrieval scoring stages.
+/// True unless explicitly set to 0 or false.
 pub(crate) fn env_default_on(var: &str) -> bool {
     !matches!(std::env::var(var).as_deref(), Ok("0") | Ok("false"))
 }
 
-/// True only when the named env var is explicitly set to `1` / `true`. The
-/// gate shape for stages that are not validated well enough to ship on.
+/// True only when explicitly set to 1 or true.
 pub(crate) fn env_default_off(var: &str) -> bool {
     matches!(std::env::var(var).as_deref(), Ok("1") | Ok("true"))
 }
@@ -1579,9 +1262,7 @@ fn php_declaration_demote_enabled() -> bool {
     *PHP_DECLARATION_DEMOTE_ENABLED.get_or_init(|| env_default_off(tuning::PHP_DECLARATION_DEMOTE))
 }
 
-/// How the BM25+RRF fusion gate behaves. Default `Gated` keys off
-/// `query_has_rare_literal`; the other two exist so the default-on question is
-/// answerable by measurement.
+/// Hybrid fusion mode; Always/Never support ablation of the default literal gate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum HybridMode {
     Gated,
@@ -1595,43 +1276,22 @@ fn hybrid_mode() -> HybridMode {
     *HYBRID_MODE.get_or_init(|| match std::env::var(tuning::HYBRID).as_deref() {
         Ok("always") => HybridMode::Always,
         Ok("never") => HybridMode::Never,
-        // Anything else, including unset and typos, keeps shipped behavior.
         _ => HybridMode::Gated,
     })
 }
 
 static STEM_MATCH_BOOST_ENABLED: OnceLock<bool> = OnceLock::new();
 
-// Default OFF, and the A/B is why rather than caution: measured on the semble
-// corpus it is +0.001 pooled, which is noise. Per language, rust +0.008 and
-// cpp -0.004; c, php and typescript do not move. Four queries improve, one
-// regresses, and the regression is large (nlohmann "ADL-based to_json and
-// from_json", 1.000 -> 0.500) because adl_serializer.hpp is the target while
-// the query names to_json and from_json.
-//
-// Worth keeping rather than deleting: rust +0.008 with no rust regression is
-// the only positive movement any proposal has produced for the language with
-// the largest remaining gap (0.785 against semble's 0.856), so this is a
-// reasonable per-project opt-in for Rust-heavy repos. It is not a default.
+// Default-off: semble pooled +0.001 was noise (Rust +0.008, C++ -0.004).
+// The nlohmann ADL query regressed 1.000 to 0.500; retain as a Rust-project opt-in.
 fn stem_match_boost_enabled() -> bool {
     *STEM_MATCH_BOOST_ENABLED.get_or_init(|| env_default_off(tuning::STEM_MATCH_BOOST))
 }
 
 static FUSED_RERANK_ENABLED: OnceLock<bool> = OnceLock::new();
 
-// Default OFF: measured net-negative. Scope-qualified C++ queries really do
-// miss the cross-encoder — 20 of 60 cpp corpus queries trip the code-literal
-// gate and scored 0.777 against 0.870 for the rest — but reranking them at
-// 0.35 does not recover it. On the semble corpus the change is -0.0012 pooled
-// (c -0.008, cpp +0.004, ts -0.002) and turns 3 regressions into 6, trading
-// wins of +0.37/+0.15/+0.13 against losses of -0.50/-0.37/-0.11. That spread
-// with no net gain is the failure mode `project_hybrid_bm25_rrf.md` predicted:
-// where BM25 fired, it is already the better signal.
-//
-// Kept as a gate rather than reverted because the underlying gap is real and
-// the plumbing is the expensive part; a future attempt likely needs a
-// different remedy (a narrower gate that excludes `::` from the code-literal
-// test, say) rather than a different weight.
+// Default-off: reduced-weight fused reranking measured -0.0012 pooled on semble;
+// C++ improved 0.004, but C lost 0.008 and TypeScript lost 0.002.
 fn fused_rerank_enabled() -> bool {
     *FUSED_RERANK_ENABLED.get_or_init(|| env_default_off(tuning::FUSED_RERANK))
 }
@@ -1642,10 +1302,7 @@ fn definition_boost_enabled() -> bool {
     *DEFINITION_BOOST_ENABLED.get_or_init(|| env_default_on(tuning::DEFINITION_BOOST))
 }
 
-/// Precomputed lookup from a file's stem — lowercased, and separator-
-/// normalized via [`normalize_stem`] — to every indexed file path sharing
-/// it. Replaces the per-query `all_chunk_file_paths()` full scan plus
-/// per-file lowercasing that used to run on every symbol-shaped search.
+/// Cached lowercase and separator-normalized stems avoid a full path scan per query.
 struct StemIndex {
     token: SemanticValidityToken,
     by_lower: HashMap<String, Vec<String>>,
@@ -1702,11 +1359,8 @@ impl StemIndex {
 type StemCacheKey = (String, String);
 type StemCacheMap = HashMap<StemCacheKey, Arc<StemIndex>>;
 
-/// Process-lifetime cache of per-project [`StemIndex`]es, keyed by
-/// (db file path, chunk table). Entries rebuild when the cheap validity
-/// token from `semantic_files` changes, so the watcher's reindex naturally
-/// invalidates them. Values hold only stems + paths, so memory stays small
-/// even with many projects pooled in one daemon.
+/// Cache stems/paths per database and chunk table. The aggregate validity token
+/// is a heuristic invalidator; see SemanticValidityToken for collision limits.
 static STEM_CACHE: LazyLock<Mutex<StemCacheMap>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn stem_index_from_cache(
@@ -1714,12 +1368,7 @@ fn stem_index_from_cache(
     key: StemCacheKey,
     db: &Database,
 ) -> Result<Arc<StemIndex>> {
-    // Read the validity token, then check the cache under the lock and drop
-    // it immediately. Building a cold or invalidated index (a full
-    // `all_chunk_file_paths` scan) must happen OUTSIDE the global lock: this
-    // cache is shared across every pooled project in the daemon, so holding
-    // it across a build would serialize the stem stage of concurrent searches
-    // on unrelated projects behind one project's rebuild.
+    // Build outside the global lock so one project's rebuild cannot block others.
     let token = db.semantic_files_validity_token()?;
     {
         let cache = cache.lock().unwrap_or_else(|p| p.into_inner());
@@ -1729,13 +1378,9 @@ fn stem_index_from_cache(
             return Ok(Arc::clone(hit));
         }
     }
-    // Build unlocked. A concurrent builder racing on the same key produces an
-    // equivalent index, so a duplicate build is wasted work but never wrong.
     let built = Arc::new(StemIndex::build(db, token)?);
     let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
-    // Re-check: a racer may have inserted a fresh entry for the same token
-    // while we built. Prefer the already-cached Arc so concurrent callers
-    // converge on one instance.
+    // Reuse a racing builder's Arc when it has the same validity token.
     if let Some(hit) = cache.get(&key)
         && hit.token == token
     {
@@ -1748,8 +1393,7 @@ fn stem_index_from_cache(
 fn stem_index_for(db: &Database) -> Result<Arc<StemIndex>> {
     match db.semantic_cache_key() {
         Some(key) => stem_index_from_cache(&STEM_CACHE, key, db),
-        // In-memory handles have no stable identity to key a process cache
-        // on; build fresh (the single-shot CLI cost profile).
+        // In-memory handles have no stable process-cache identity.
         None => {
             let token = db.semantic_files_validity_token()?;
             Ok(Arc::new(StemIndex::build(db, token)?))
@@ -1757,12 +1401,7 @@ fn stem_index_for(db: &Database) -> Result<Arc<StemIndex>> {
     }
 }
 
-// Non-candidate stem scan: when a bare-symbol query (e.g. "FooBar") didn't
-// surface the file with a matching stem (`foo_bar.rs`, `FooBar.java`), scan
-// it directly for a definition match and inject the chunk into the pool.
-// Backstop for embedding misses on small / oddly-chunked files where the
-// definition is the right answer but didn't crack top-50 candidates.
-// Pattern from Semble's boosting.py `_scan_non_candidates`.
+// Recover embedding misses by scanning matching file stems for a definition.
 fn apply_non_candidate_stem_scan(
     db: &Database,
     results: &mut Vec<SearchResult>,
@@ -1791,13 +1430,10 @@ fn apply_non_candidate_stem_scan(
         if candidate_set.contains(&file_path) {
             continue;
         }
-        // Stem matches; scan this file's chunks for the definition.
         let chunks = db.chunks_for_file(&file_path)?;
         for chunk in chunks {
             if pattern.is_match(&chunk.content) {
-                // Inject with score=0; downstream definition_boost adds
-                // 3 * max_score * 1.5 (file-stem bonus). Path penalty and
-                // reranker then judge it on its merits.
+                // Definition boosting supplies the initial score after injection.
                 injected.push(SearchResult {
                     file_path: chunk.file_path,
                     language: parse_db_language(&chunk.language),
@@ -1822,15 +1458,7 @@ fn stem_scan_enabled() -> bool {
     *STEM_SCAN_ENABLED.get_or_init(|| env_default_on(tuning::STEM_SCAN))
 }
 
-// Path-penalty multipliers, ported from Semble's ranking/penalties.py. Applied
-// multiplicatively AFTER cross-encoder reranking (see the call order in
-// `search`), so the final blended score carries the full demote: blending a
-// pre-rerank demote would dilute it to `1 - weight` strength through the
-// `(1 - w) * score + w * ce_norm` merge. Tests/benches/compat/examples are
-// still indexed (see
-// HARD_EXCLUDE_PATTERNS vs TEST_LIKE_EXCLUDE_PATTERNS in parser/discover.rs)
-// so find_references / find_symbol remain accurate; this only down-weights
-// them in semantic `search` results where they're rarely the right answer.
+// Search-only demotions: structural indexing and reference queries keep these files.
 const SOFT_PENALTY_STRONG: f32 = 0.3; // tests, benches, compat, legacy, examples
 const SOFT_PENALTY_MODERATE: f32 = 0.5; // re-export barrels (__init__.py, package-info.java)
 const SOFT_PENALTY_MILD: f32 = 0.7; // .d.ts type declaration stubs
@@ -1849,8 +1477,6 @@ fn test_like_globset() -> &'static GlobSet {
             .iter()
             .map(|s| (*s).to_string())
             .collect();
-        // Patterns are static and known-good; an unwrap here would only fire
-        // on a code edit that breaks them, which the workspace tests catch.
         build_exclude_set(&patterns).expect("TEST_LIKE_EXCLUDE_PATTERNS compile")
     })
 }
@@ -1859,15 +1485,7 @@ fn has_dir_segment(path: &str, names: &[&str]) -> bool {
     path.split('/').any(|seg| names.contains(&seg))
 }
 
-// Query-aware path penalty. `query_is_test_shaped` tells the function whether
-// the user query mentions test/spec/fixture intent — when true, we skip the
-// test-like demote so legitimate test-intent queries surface test files and
-// they compete on merit ("find the test for X" surfaces them above the
-// production file). Non-test-shaped queries get the full 0.15x demote
-// (0.3x baseline × 0.5x extra) — §2.11 motivation: 0.3x alone wasn't enough
-// to surface `InterceptorManager.js` over 9 sibling `*.test.js` files on the
-// axios "request and response interceptors" query.
-// Compat/examples/d.ts/re-export demotes are query-independent.
+// Test intent lifts only the test-path demotion; other path penalties still compose.
 pub(crate) fn path_penalty_for_query(path: &str, query_is_test_shaped: bool) -> f32 {
     let normalized = if path.contains('\\') {
         path.replace('\\', "/")
@@ -1897,21 +1515,8 @@ pub(crate) fn path_penalty_for_query(path: &str, query_is_test_shaped: bool) -> 
     penalty
 }
 
-// Declaration headers in C projects describe an API; the `.c` file implements
-// it, and the implementation is what a behavior query wants. Measured on the
-// semble corpus, 22% of files ranked above a C target were headers while only
-// 2% of C targets were.
-//
-// Gating on the row language is what makes this safe, and it must not be
-// relaxed to "any header": in C++ the header IS the implementation
-// (nlohmann-json, abseil and fmtlib are header-only, and every C++ target in
-// that corpus is a header). Simulated ungated the demote costs C++ 0.134.
-// The discovery layer already resolves a bare `.h` to Cpp for any project
-// carrying an unambiguous C++ extension, so `Language::C` here means the
-// project really is C.
-//
-// `-inl.h` / `_inl.h` carry inline definitions rather than declarations —
-// libuv's `heap-inl.h` is a legitimate target — so they are exempt.
+// Prefer C implementations over declaration headers. C++ headers often contain
+// implementations, so gate by detected language; exempt -inl.h and _inl.h.
 fn declaration_header_penalty(path: &str, language: Language) -> f32 {
     if language != Language::C {
         return 1.0;
@@ -1927,15 +1532,8 @@ fn declaration_header_penalty(path: &str, language: Language) -> f32 {
     SOFT_PENALTY_MILD
 }
 
-// Host-platform directories. A project carrying parallel per-platform trees
-// (libuv's `src/unix/` and `src/win/`) answers most behavior queries with the
-// tree that actually runs on the caller's machine.
-//
-// Default OFF. The mechanism is verified — win/tcp.c outranking unix/tcp.c is
-// a clean mirror pair across 10 libuv queries — but every measured point comes
-// from that one repo, and its ground truth may encode the same host assumption
-// the rule does. Needs validation on C repos outside the corpus before this
-// can be considered for default-on.
+// Default-off: host-platform preference is measured only on libuv and may encode
+// its benchmark's host assumptions. Validate other C repositories before enabling.
 const WINDOWS_PLATFORM_DIR_NAMES: &[&str] = &["win", "win32", "windows"];
 const UNIX_PLATFORM_DIR_NAMES: &[&str] = &["unix", "posix", "linux", "darwin", "macos", "bsd"];
 
@@ -2021,18 +1619,10 @@ fn php_declaration_penalty(result: &SearchResult, query: &str) -> f32 {
     if explicit { 1.0 } else { SOFT_PENALTY_MODERATE }
 }
 
-// Extra multiplier applied to test-like paths when the query is non-test-shaped.
-// Stacks on top of SOFT_PENALTY_STRONG, so total = 0.3 * 0.5 = 0.15x.
-// 0.15x is empirically motivated: the §2.11 axios case had 9 test files at
-// ~0.3x dominating top-10. A 0.5x extra demote (→ 0.15x total) was the smallest
-// nudge that surfaced the conceptual target in a follow-up spot check.
+// Combined test demotion is 0.3 * 0.5 = 0.15; 0.3 alone left axios tests dominant.
 const EXTRA_TEST_DEMOTE_NON_TEST_QUERY: f32 = 0.5;
 
-// Test-intent keywords for query classification. Whole-token match against the
-// query (case-insensitive). Tokens checked are alphanumeric runs split out of
-// the query — so "Login.test.js" → ["login", "test", "js"] which would
-// (correctly) classify as a test-shaped query, while "interceptors" doesn't
-// match.
+// Whole alphanumeric tokens, case-insensitive: Login.test.js qualifies, testimony does not.
 const TEST_INTENT_KEYWORDS: &[&str] = &[
     "test", "tests", "testing", "spec", "specs", "fixture", "fixtures",
     "phpt", // PHP testing convention
@@ -2051,8 +1641,6 @@ fn query_is_test_shaped(query: &str) -> bool {
         })
 }
 
-// When disabled, query_is_test_shaped always returns false → path_penalty
-// behaves as the pre-§1.22 fixed 0.3x for test-like paths regardless of query.
 static TEST_QUERY_AWARE_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn test_query_aware_enabled() -> bool {
@@ -2062,12 +1650,8 @@ fn test_query_aware_enabled() -> bool {
 fn apply_path_penalties(results: &mut [SearchResult], query: &str) {
     let is_test_query = query_is_test_shaped(query);
     let demote_php_declaration = php_declaration_demote_enabled();
-    // The header demote expresses a preference for the implementing `.c` over
-    // the header declaring it, so it only means anything when a `.c` is in the
-    // running. Header-only projects whose dialect resolves to C — fmtlib's
-    // `include/fmt` is all `.h` — would otherwise have every candidate demoted
-    // uniformly except the `-inl.h` exemption, which promotes that one file to
-    // rank 1 for free. Measured: it cost fmtlib three queries.
+    // Require a competing .c implementation; otherwise exempt inline headers get
+    // a free relative boost in header-only projects detected as C.
     let has_c_implementation = results
         .iter()
         .any(|r| r.language == Language::C && r.file_path.ends_with(".c"));
@@ -2087,32 +1671,14 @@ fn apply_path_penalties(results: &mut [SearchResult], query: &str) {
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 }
 
-// Bounded multiplier for a query token that names a candidate's file stem.
-// Deliberately mild: a move-to-front variant scored better on abseil but cost
-// nlohmann's "ADL-based to_json and from_json conversion hooks" a full rank
-// (to_json.hpp / from_json.hpp jumping over the adl_serializer.hpp target).
-//
-// What 1.2x actually bounds is the score ratio, not the rank movement: a
-// boosted candidate passes every result scoring below `its_score * 1.2`. Where
-// results are tightly clustered that can still be several positions. It caps
-// how far a boost can reach, not how many places it can travel.
+// Bound score ratios, not rank movement: tightly clustered rows can pass several
+// neighbors. Stronger promotion regressed nlohmann's ADL conversion query.
 const STEM_MATCH_BOOST: f32 = 1.2;
 // Counted in characters, not bytes — see `stem_match_tokens`.
 const STEM_MATCH_MIN_TOKEN_LEN: usize = 4;
 
-/// Query tokens specific enough to be worth matching against a file stem.
-///
-/// The gate is an identifier signal: an underscore, a digit, or mixed case
-/// carrying at least one lowercase letter. That admits `path_router`,
-/// `StrSplit`, `ABSL_LOG` and `Semaphore` while rejecting the bare all-caps
-/// acronyms that are ordinary prose vocabulary — `JSON`, `HTTP`, `MIME`. The
-/// exclusion is load-bearing: boosting on `JSON` pulls nlohmann's `json.hpp`
-/// up on nearly every query in that repo, which flipped a 9-query regression
-/// in the advisory simulation.
-///
-/// Note `ABSL_LOG` qualifies through the underscore rather than through case,
-/// which is why the rule is "has an identifier signal" and not "is not
-/// all-caps".
+/// Require an underscore, digit, or mixed case; bare acronyms such as JSON
+/// would boost ubiquitous filenames across unrelated queries. ABSL_LOG still qualifies.
 fn stem_match_tokens(query: &str) -> Vec<String> {
     let mut out = Vec::new();
     for token in query.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
@@ -2134,12 +1700,7 @@ fn stem_match_tokens(query: &str) -> Vec<String> {
     out
 }
 
-// Generalizes DEFINITION_FILE_STEM_BONUS, which only reaches results that
-// already matched the definition regex. That regex structurally cannot fire
-// for a C++ free function (`absl::StrSplit` has no class/struct keyword) or a
-// macro-attributed declaration (`class ABSL_LOCKABLE Mutex` breaks the
-// keyword+name pattern), which is exactly where the filename is the clearest
-// available signal.
+// Reach C++ free functions and macro-attributed declarations the definition regex misses.
 fn apply_stem_match_boost(results: &mut [SearchResult], query: &str) {
     let tokens = stem_match_tokens(query);
     if tokens.is_empty() {
@@ -2190,15 +1751,8 @@ fn query_names_version(query: &str) -> bool {
         })
 }
 
-// Packages that ship several major versions side by side (zod's `v3/` and
-// `v4/`) give the ranker no reason to prefer the current one, so the older
-// tree wins on raw similarity. Demote candidates below the highest version
-// present in the candidate set.
-//
-// The maximum is taken from the candidates rather than a repo census, which
-// keeps the rule stateless and makes it a no-op whenever the candidates all
-// share one version. Mild rather than strong, because an old line can still be
-// actively maintained.
+// Prefer the highest version among candidates, unless the query names an old line.
+// Candidate-local comparison leaves single-version pages unchanged.
 fn apply_version_demote(results: &mut [SearchResult], query: &str) {
     if query_names_version(query) {
         return;
@@ -2228,11 +1782,7 @@ fn path_penalty_enabled() -> bool {
     *PATH_PENALTY_ENABLED.get_or_init(|| env_default_on(tuning::PATH_PENALTY))
 }
 
-// File saturation decay: ranking the same file's Nth chunk gets multiplied by
-// 0.5^(N-1) so a single file can't monopolize the top-K. Walks results in
-// score order, counts per-file occurrences, decays subsequent chunks, then
-// re-sorts. Pattern from Semble's penalties.py rerank_topk file_saturation
-// branch. Threshold = 1: the second chunk from a file is the first to decay.
+// Decay repeated files by 0.5^(N-1) to prevent one file monopolizing the page.
 const FILE_SATURATION_THRESHOLD: usize = 1;
 const FILE_SATURATION_DECAY: f32 = 0.5;
 
@@ -2240,9 +1790,7 @@ fn apply_file_saturation(results: &mut [SearchResult]) {
     if results.is_empty() {
         return;
     }
-    // Pre-sort by current score so per-file count reflects rank order. The
-    // caller (search()) re-sorts after every score-mutating step, so this is
-    // usually redundant — but cheap and protects against future reorderings.
+    // Count repeated files in score order regardless of the caller's ordering.
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 
     let mut per_file: HashMap<String, usize> = HashMap::new();
@@ -2257,14 +1805,7 @@ fn apply_file_saturation(results: &mut [SearchResult]) {
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 }
 
-// Defaults retuned 2026-05-16 (was threshold=3, decay=0.85). A/B harness at
-// /tmp/dir-saturation-ab.py across laravel-framework + redux + flask showed
-// (2, 0.75) consistently wins or ties: laravel-framework NDCG@10 0.773 → 0.779,
-// flask 0.906 → 0.909, redux unchanged at 0.957, no recall regressions.
-// Earlier 0.85 decay was a guess; the §2.11 finding (laravel still surfaced
-// QueueManager.php only at rank 5) suggested room for a steeper decay, and
-// dropping the threshold from 3 to 2 cuts the noise earlier without
-// over-demoting clean repos.
+// (2, 0.75) improved or tied Laravel, Flask, and Redux in the saturation A/B.
 const DIR_SATURATION_THRESHOLD_DEFAULT: usize = 2;
 const DIR_SATURATION_DECAY_DEFAULT: f32 = 0.75;
 
@@ -2296,16 +1837,8 @@ fn dir_saturation_decay() -> f32 {
     })
 }
 
-/// Penalize chunks past threshold from the same parent directory, after
-/// `file_saturation` handles same-file. Motivated by the §2.10 semble-
-/// corpus laravel-framework finding: the query "queue connection
-/// resolution and connectors" returned 10 top results all from
-/// `Queue/Connectors/*Connector.php` (10 different files, same dir),
-/// pushing the conceptual target `QueueManager.php` off the page.
-/// Per-file saturation didn't catch it because each Connector is a
-/// distinct file. This signal applies after file_saturation so the two
-/// stack naturally — a file that's also in an oversaturated dir gets
-/// hit twice.
+/// Directory saturation catches sibling files missed by per-file saturation;
+/// the two penalties intentionally stack.
 fn apply_directory_saturation(results: &mut [SearchResult]) {
     if results.is_empty() {
         return;
@@ -2349,44 +1882,14 @@ fn file_saturation_enabled() -> bool {
     *FILE_SATURATION_ENABLED.get_or_init(|| env_default_on(tuning::FILE_SATURATION))
 }
 
-// Query-mention anchoring. An agent paste ("thread 'main' panicked at
-// crates/graph/src/search.rs:123", "why does Database::symbol_exists probe
-// with LIMIT 1") names its target outright, but to the embedding a path or a
-// qualified name is a handful of tokens, and the named file can rank under
-// prose-similar neighbours. This stage lifts candidates the query literally
-// names onto a slot ladder directly under the current top score: the first
-// anchored candidate lands at `top * (1 - MENTION_TOP_GAP_FRAC)`, the second
-// at `top * (1 - MENTION_TOP_GAP_FRAC)^2`, and so on, in original-rank order.
-// The rungs are relative, not absolute: each anchored row ends at or above
-// `top * (1 - MENTION_TOP_GAP_FRAC)^(slot + 1)`, and a row already above its
-// rung keeps its score, whatever the score scale. It never demotes and never
-// fetches: a named file that KNN did not retrieve stays absent (logged at
-// debug), so the stage reorders the candidate set and cannot widen it. Bare
-// identifiers are not mentions; the symbol boost already covers those.
-//
-// The stage runs only for the first page (`offset == 0`) and only over the
-// first `scan_limit` rows. It is the sole stage that promotes upward, and a
-// deeper page's pool is a different candidate set (KNN fetch, RRF pool, and
-// the reranker's min-max all scale with the pool), so a lift computed on
-// page 2 could land a row in ranks no page ever shows. Page 1 is the only
-// page the lift can help, and confining it there keeps every later page a
-// plain slice of the organic ranking.
-//
-// Measured 2026-09-07 (corpora under the gitignored `bench/corpora/`; not
-// reproducible from a clone) with the debug CUDA build of this branch (jina
-// v2 base-code + ms-marco reranker), `CODESAGE_MENTION_ANCHOR=0` against
-// default: `ripgrep-eval` (5 cases) and `ripgrep-llm-eval` (5 cases) are
-// per-case byte-identical, so the stage is inert on queries that name
-// nothing; a 16-case mention corpus against this repo (stack traces, absolute
-// pastes, `Type::method`, issue prose) moves miss rate 0.375 → 0.3125 and
-// recall@10 0.625 → 0.6875. The remaining misses are files KNN never
-// retrieved, which is the no-fetch contract above, not a matching gap.
+// Lift named candidates to at least top * (1 - gap)^(slot + 1), in original-rank
+// order. Never demote or fetch; absent candidates stay absent, and bare identifiers
+// do not qualify. Match only within scan_limit and on page one: deeper candidate
+// pools and score scales differ, so later-page lifts can make rows unreachable.
 const MENTION_TOP_GAP_FRAC: f32 = 0.05;
 const MENTION_MAX_FILES: usize = 4;
 const MENTION_MAX_CHUNKS_PER_FILE: usize = 3;
-// Total cap across all mentions, so anchored rows cannot fill a whole page
-// and evict every organic result. It binds before the per-file caps could
-// admit their 4 × 3 = 12 rows.
+// The total cap binds before 4 files * 3 chunks can fill the page.
 const MENTION_MAX_ANCHORED: usize = 5;
 // `name.ext` tokens with one of these are files, never `Type.method`.
 const MENTION_NON_CODE_EXTENSIONS: &[&str] = &[
@@ -2434,14 +1937,8 @@ fn strip_line_suffix(token: &str) -> &str {
     out
 }
 
-/// Path-like: at least one `/` and a final component whose extension the
-/// parser maps to a language (the parser's table is the single source of
-/// truth, so a new language reaches this stage without a mirror list). Both
-/// halves are load-bearing: `/` alone admits `read/write`, `TCP/IP`, `24/7`;
-/// an extension alone admits bare basenames (`mod.rs`, `index.js`) whose
-/// specificity cannot be judged without the whole corpus. Backslash paths
-/// are rejected outright: indexed paths are `/`-separated, so a Windows
-/// paste could only produce an unmatchable mention.
+/// Require / plus a parser-recognized extension to exclude slash prose and bare
+/// basenames. Reject backslashes because indexed paths use forward slashes.
 fn path_mention(token: &str) -> Option<String> {
     let t = strip_line_suffix(token);
     let t = t.strip_prefix("./").unwrap_or(t);
@@ -2491,8 +1988,7 @@ fn symbol_mention(token: &str) -> Option<QueryMention> {
     })
 }
 
-/// Mentions in query order, deduplicated. Path shape wins over symbol shape,
-/// so `search.rs` is a path and not `search::rs`.
+/// Deduplicated query-order mentions; path shape takes precedence over symbol shape.
 fn extract_query_mentions(query: &str) -> Vec<QueryMention> {
     let mut out = Vec::new();
     for raw in query.split_whitespace() {
@@ -2516,16 +2012,9 @@ fn extract_query_mentions(query: &str) -> Vec<QueryMention> {
     out
 }
 
-/// Whole-component suffix match, case-sensitive, in either direction, with
-/// at least two components on both sides. A repo-relative mention is a
-/// suffix of the indexed path (`src/search.rs` against
-/// `crates/graph/src/search.rs`); an absolute paste is longer than the
-/// indexed path, so then the indexed path must be a suffix of the mention.
-/// Fewer than two mention components (`/mod.rs`, `./lib.rs`) or a
-/// one-component indexed path (`lib.rs` against `/x/lib.rs`) match nothing,
-/// and neither does `earch.rs`. What this does NOT guarantee is uniqueness:
-/// `src/lib.rs` matches every crate's `src/lib.rs`, so the caller must still
-/// check that the matched rows belong to one file.
+/// Case-sensitive whole-component suffix in either direction, with at least two
+/// components on both sides. Supports absolute pastes but does not prove uniqueness;
+/// callers must reject matches spanning multiple candidate files.
 fn path_matches_mention(file_path: &str, mention: &str) -> bool {
     let candidate: Vec<&str> = file_path.rsplit('/').collect();
     let wanted: Vec<&str> = mention
@@ -2571,9 +2060,7 @@ fn symbols_match_mention(
                 == Some(owner))
 }
 
-/// Per-file and per-mention bookkeeping for the anchored set. One map serves
-/// path and symbol hits alike, so a symbol mention cannot lift more chunks of
-/// one file than a path mention could.
+/// Share caps across path and symbol mentions so combining them cannot bypass limits.
 struct AnchorLedger<'a> {
     anchored: Vec<usize>,
     per_file: HashMap<&'a str, usize>,
@@ -2635,11 +2122,8 @@ fn apply_mention_anchor(
                     );
                     continue;
                 }
-                // A suffix shared by several files (`src/lib.rs` in a
-                // workspace) names none of them; several chunks of one
-                // file are fine. Ambiguity outside the retrieved window is
-                // invisible: if KNN returned only one of the workspace's
-                // `src/lib.rs` files, that one anchors.
+                // Reject multi-file suffixes within the window. Ambiguity outside
+                // retrieved candidates is invisible; several chunks of one file are fine.
                 let distinct: HashSet<&str> =
                     hits.iter().map(|&i| window[i].file_path.as_str()).collect();
                 if distinct.len() > 1 {
@@ -2675,10 +2159,7 @@ fn apply_mention_anchor(
         return;
     }
 
-    // Results arrive score-descending, so ascending index order is "by
-    // original score, ties by original rank". `top` is still taken as the
-    // window maximum rather than `window[0]` so an unsorted caller cannot
-    // produce a ladder above the real top.
+    // Preserve original rank; use the window maximum defensively for unsorted input.
     anchored.sort_unstable();
     let top = window.iter().map(|r| r.score).fold(f32::MIN, f32::max);
     let mut lifted = false;
@@ -2704,26 +2185,8 @@ const RERANK_WEIGHT_DEFAULT: f32 = 0.5;
 const RERANK_WEIGHT_SHORT_ID: f32 = 0.35;
 const RERANK_WEIGHT_NATLANG: f32 = 0.6;
 
-/// Pick the rerank/semantic blend weight based on query shape. Adopted
-/// from semble's adaptive-α signal — see `notes/20260516-semble-
-/// classification.md`. This varies the **rerank vs semantic** blend for the
-/// dense leg of the pipeline; the gated BM25/RRF leg
-/// ([`query_has_rare_literal`]/[`rrf_merge`]) is fused *before* reranking,
-/// and fused queries bypass this derivation via `weight_override` (pinned to
-/// `RERANK_WEIGHT_SHORT_ID` so the rare-token prior stays dominant) rather
-/// than skipping the cross-encoder outright.
-///
-/// - **Short identifier queries** (`FooBar`, `parse_config`,
-///   `Middleware`): trust the cross-encoder less. Symbol-boost and
-///   definition-boost already promote the right candidates; the
-///   cross-encoder's semantic judgement adds noise on bare identifiers.
-///   Weight: `RERANK_WEIGHT_SHORT_ID = 0.35`.
-/// - **Natural-language queries** (≥3 alphabetic words, e.g. "queue
-///   connection resolution and connectors"): trust the cross-encoder
-///   more. Semantic-only retrieval can over-cluster on sibling files;
-///   the cross-encoder's query/doc relevance scoring untangles them.
-///   Weight: `RERANK_WEIGHT_NATLANG = 0.6`.
-/// - **Mixed / fallback**: keep the historical 0.5.
+/// Use 0.35 for a single identifier, 0.6 for at least three alphabetic words,
+/// and 0.5 otherwise. Opt-in fused reranking overrides this with 0.35.
 fn adaptive_rerank_weight(query: &str) -> f32 {
     if !adaptive_rerank_weight_enabled() {
         return RERANK_WEIGHT_DEFAULT;
@@ -2732,17 +2195,10 @@ fn adaptive_rerank_weight(query: &str) -> f32 {
     if trimmed.is_empty() {
         return RERANK_WEIGHT_DEFAULT;
     }
-    // Short identifier shape: single token carrying an explicit identifier
-    // signal (snake_case, kebab-case, camel/PascalCase, `::` scoping, or a
-    // digit — see `looks_like_short_identifier`). A single all-lowercase
-    // alphabetic word ("authentication") is natural language, not an
-    // identifier, and falls through to the default weight.
     let single_token = !trimmed.chars().any(char::is_whitespace);
     if single_token && looks_like_short_identifier(trimmed) {
         return RERANK_WEIGHT_SHORT_ID;
     }
-    // Natural language: 3+ alphabetic words, none of them looking like
-    // a hard identifier.
     let alpha_words: Vec<&str> = trimmed
         .split(|c: char| c.is_whitespace() || c == ',' || c == '.' || c == ';')
         .filter(|s| s.chars().all(|c| c.is_alphabetic()) && s.len() >= 2)
@@ -2759,14 +2215,8 @@ fn adaptive_rerank_weight_enabled() -> bool {
     *ADAPTIVE_RERANK_ENABLED.get_or_init(|| env_default_on(tuning::ADAPTIVE_RERANK))
 }
 
-/// `weight_override` forces a blend weight instead of deriving one from the
-/// query shape. Fused (BM25/RRF) queries use it to keep the rare-token prior
-/// dominant while still consulting the cross-encoder.
-///
-/// Returns whether the cross-encoder scores were blended in. A reranker
-/// failure keeps the pre-rerank order (with a warning) instead of silently
-/// degrading: callers and tests use the return to tell "reranked" apart from
-/// "semantic order survived".
+/// Return whether reranking succeeded; failures retain scores/order and warn.
+/// weight_override bypasses query-shape weighting for opt-in fused reranking.
 fn apply_reranking(
     rerank: &mut RerankFn<'_>,
     query: &str,
@@ -2812,7 +2262,6 @@ pub(crate) fn annotate_with_symbols(db: &Database, results: &mut [SearchResult])
         return Ok(());
     }
 
-    // Batched lookup: one multi-path query instead of one per distinct file.
     let distinct_files: Vec<String> = {
         let set: HashSet<&str> = results.iter().map(|r| r.file_path.as_str()).collect();
         set.into_iter().map(|s| s.to_string()).collect()
@@ -2918,7 +2367,6 @@ mod hybrid_tests {
     fn gate_rejects_plain_english_query() {
         let db = Database::open_in_memory().unwrap();
         seed_chunks(&db);
-        // Common words only; none should qualify as rare under DF < 1%.
         assert!(!query_has_rare_literal(&db, "where is authentication handled").unwrap());
     }
 
@@ -2926,20 +2374,13 @@ mod hybrid_tests {
     fn gate_triggers_on_rare_long_identifier() {
         let db = Database::open_in_memory().unwrap();
         seed_chunks(&db);
-        // "ColdFusion" length 10, appears once in 4 chunks (25% DF — above
-        // the 1% threshold on this tiny corpus, so it does NOT trigger the
-        // length-based branch). This test verifies the threshold logic: on
-        // a real corpus of >1000 chunks the 1-in-N-chunks result would drop
-        // DF below 1% and trigger correctly. On a toy 4-chunk corpus every
-        // real token is "too common", so we assert non-trigger here.
+        // ColdFusion occurs in 1/4 chunks: 25% exceeds the 1% rarity threshold.
         assert!(!query_has_rare_literal(&db, "ColdFusion support").unwrap());
     }
 
     #[test]
     fn build_fts_match_query_quotes_identifiers() {
         let q = build_fts_match_query("printer: use `doc_cfg` instead of `doc_auto_cfg`");
-        // Each bareword becomes a quoted OR term. Backticks stripped as
-        // separators; empty/length-1 tokens dropped.
         assert!(q.contains("\"doc_cfg\""));
         assert!(q.contains("\"doc_auto_cfg\""));
         assert!(q.contains(" OR "));
@@ -2953,23 +2394,18 @@ mod hybrid_tests {
 
     #[test]
     fn build_fts_match_query_drops_plain_english() {
-        // Pure-English query contributes no terms.
         assert_eq!(build_fts_match_query("use this instead of that"), "");
     }
 
     #[test]
     fn gate_triggers_on_dotted_identifier_pair() {
         let db = Database::open_in_memory().unwrap();
-        // Both sides ≥3 chars, all lowercase — not code-shaped individually,
-        // but the dotted-pair context signals code identity.
         assert!(query_has_rare_literal(&db, "fix moduleref.create edge").unwrap());
     }
 
     #[test]
     fn gate_does_not_trigger_on_sentence_punctuation() {
         let db = Database::open_in_memory().unwrap();
-        // Short sides — `e`, `g`, `i` — below the 3-char minimum, so
-        // sentence abbreviations don't slip through.
         assert!(!query_has_rare_literal(&db, "fix e.g. the handler").unwrap());
         assert!(!query_has_rare_literal(&db, "fix i.e. the handler").unwrap());
     }
@@ -2986,7 +2422,6 @@ mod hybrid_tests {
         let q = build_fts_match_query("printer: use `doc_cfg` instead of `doc_auto_cfg`");
         assert!(q.contains("\"doc_cfg\""));
         assert!(q.contains("\"doc_auto_cfg\""));
-        // Plain words should be absent.
         assert!(!q.contains("\"printer\""));
         assert!(!q.contains("\"use\""));
         assert!(!q.contains("\"instead\""));
@@ -3018,9 +2453,7 @@ mod hybrid_tests {
             end_line: 1,
             distance: 0.0,
         };
-        // Semantic ranks a, b, c. BM25 ranks c first (and only).
-        // RRF should put c first since it gets a high score from BM25
-        // AND a low score from semantic; but a+b only get one contribution.
+        // c receives semantic and BM25 contributions; a and b receive one.
         let semantic = vec![a.clone(), b.clone(), c.clone()];
         let bm25 = vec![c.clone()];
         let out = rrf_merge(semantic, bm25, 3);
@@ -3086,14 +2519,11 @@ mod hybrid_tests {
         assert_eq!(all_tied.cut, 3);
         assert_eq!(all_tied.drop_pct, 0);
 
-        // Tied pairs on both sides of the drop stay whole: the cut lands
-        // between the two distinct values, never inside a run.
         let two_bands = relevance_cliff(&[1.0, 1.0, 0.5, 0.5]);
         assert_eq!(two_bands.confidence, SearchConfidence::High);
         assert_eq!(two_bands.cut, 2);
         assert_eq!(two_bands.drop_pct, 50);
 
-        // A tail clamped to exactly 0 is a 100% drop, not a division error.
         let zero_tail = relevance_cliff(&[0.5, 0.5, 0.0, 0.0]);
         assert_eq!(zero_tail.confidence, SearchConfidence::High);
         assert_eq!(zero_tail.cut, 2);
@@ -3112,8 +2542,6 @@ mod hybrid_tests {
             (single.confidence, single.cut, single.drop_pct),
             (SearchConfidence::Low, 1, 0)
         );
-        // NaN / infinities are skipped pairwise, never propagated into the
-        // percentage or the cut.
         let nan_mid = relevance_cliff(&[1.0, f32::NAN, 0.9]);
         assert_eq!(nan_mid.confidence, SearchConfidence::Low);
         assert_eq!(nan_mid.cut, 3);
@@ -3126,9 +2554,6 @@ mod hybrid_tests {
 
     #[test]
     fn search_page_discloses_cliff_and_keeps_full_page_by_default() {
-        // The cross-encoder singles out the authentication chunk, so the page
-        // has a sharp drop after it. Without `adaptive_limit` every requested
-        // row still comes back; the cliff is disclosed alongside.
         let db = Database::open_in_memory().unwrap();
         seed_chunks(&db);
         let emb = mk_embedding(0.1);
@@ -3157,7 +2582,6 @@ mod hybrid_tests {
         );
         assert!(page.margin_pct.unwrap() >= 20);
 
-        // Opt in: the page is cut exactly where the disclosure said.
         let rerank: RerankFn = Box::new(|_q, docs| {
             Ok(docs
                 .iter()
@@ -3180,9 +2604,7 @@ mod hybrid_tests {
 
     #[test]
     fn adaptive_limit_does_not_cut_a_flat_page() {
-        // Four identical chunks in four different directories: no saturation,
-        // no boosts, every score equal. Low confidence means `adaptive_limit`
-        // is inert and the full page comes back.
+        // Separate directories avoid saturation; identical chunks yield equal scores.
         let db = Database::open_in_memory().unwrap();
         for path in ["a.rs", "b/x.rs", "c/y.rs", "d/z.rs"] {
             db.insert_chunks(
@@ -3205,9 +2627,6 @@ mod hybrid_tests {
 
     #[test]
     fn search_bm25_returns_chunks_containing_rare_literal() {
-        // Integration: seed chunks, run BM25 for a rare literal, assert the
-        // correct chunk is in the result. Proves the FTS5 insert path is
-        // actually populating the sidecar.
         let db = Database::open_in_memory().unwrap();
         seed_chunks(&db);
         let rows = db.search_bm25("\"ColdFusion\"", 10, None, None).unwrap();
@@ -3231,14 +2650,12 @@ mod hybrid_tests {
         )
         .unwrap();
 
-        // Single language in the set: only the rust hit.
         let rows = db
             .search_bm25("\"ColdFusion\"", 10, Some(&["rust"]), None)
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].file_path, "src/reg.rs");
 
-        // Two languages: both hits, nothing else.
         let mut rows = db
             .search_bm25("\"ColdFusion\"", 10, Some(&["rust", "php"]), None)
             .unwrap();
@@ -3246,7 +2663,6 @@ mod hybrid_tests {
         let paths: Vec<&str> = rows.iter().map(|r| r.file_path.as_str()).collect();
         assert_eq!(paths, ["src/legacy.php", "src/reg.rs"]);
 
-        // Empty set behaves like no filter.
         let rows = db
             .search_bm25("\"ColdFusion\"", 10, Some(&[]), None)
             .unwrap();
@@ -3337,11 +2753,6 @@ mod hybrid_tests {
 
     #[test]
     fn bm25_leg_filters_to_requested_language_set_so_matches_are_not_displaced() {
-        // Regression for the unfiltered multi-language BM25 leg: with 2+
-        // requested languages the BM25 candidates used to come back
-        // unfiltered, so foreign-language rows occupied the rrf_merge slots
-        // and were only retained away afterwards — pushing the
-        // matching-language BM25 hit out of the fused pool entirely.
         let db = Database::open_in_memory().unwrap();
         // Rust decoys sitting right on the query embedding, no rare token:
         // they fill the semantic candidate pool.
@@ -3424,10 +2835,7 @@ mod hybrid_tests {
 
     #[test]
     fn gated_query_with_empty_bm25_still_applies_reranking() {
-        // `Zzz::qqq` fires the hybrid gate (`::`), but no indexed chunk
-        // contains "Zzz", so BM25 comes back empty and the rows stay purely
-        // semantic. The reranker must still run — skipping it too would drop
-        // BOTH ranking stages for this query.
+        // :: triggers the gate but absent Zzz yields no BM25 hits.
         let db = Database::open_in_memory().unwrap();
         seed_chunks(&db);
         let emb = mk_embedding(0.1);
@@ -3446,10 +2854,6 @@ mod hybrid_tests {
 
     #[test]
     fn fused_query_skips_reranking_by_default() {
-        // "ColdFusion" is in src/reg.rs, so BM25 has hits and fusion runs. The
-        // reranker stays skipped: reranking fused queries at the reduced
-        // weight measured net-negative on the semble corpus (see
-        // `fused_rerank_enabled`), so where BM25 fired it keeps the ranking.
         let db = Database::open_in_memory().unwrap();
         seed_chunks(&db);
         let emb = mk_embedding(0.1);
@@ -3464,16 +2868,9 @@ mod hybrid_tests {
 
     #[test]
     fn reduced_fused_weight_protects_a_win_that_the_natlang_weight_would_lose() {
-        // The point of pinning fused queries to RERANK_WEIGHT_SHORT_ID rather
-        // than letting them take the natural-language weight. A rare-token
-        // winner leading by 0.60 with the cross-encoder ranking it last
-        // survives at 0.35 and does not at 0.6.
-        //
-        // This is a margin, not an invariant. Against a maximally hostile
-        // cross-encoder the lead has to clear w/(1-w) — about 0.54 at weight
-        // 0.35, and an unreachable 1.5 at 0.6 — so a narrow fused win can
-        // still be flipped. The empirical guard is the ripgrep canary in
-        // `project_hybrid_bm25_rrf.md`, not this test.
+        // A hostile cross-encoder requires a lead > w/(1-w): ~0.54 at 0.35,
+        // 1.5 at 0.6. This 0.60 lead survives only the reduced weight;
+        // narrower fused wins can still flip.
         use super::{RERANK_WEIGHT_NATLANG, RERANK_WEIGHT_SHORT_ID, apply_reranking};
 
         let mk = |file: &str, score: f32| SearchResult {
@@ -3522,12 +2919,6 @@ mod hybrid_tests {
 
     #[test]
     fn fused_scores_rescale_to_semantic_span_so_flat_boost_cannot_invert() {
-        // Regression for score compression: raw RRF scores (≤ ~3/61) read
-        // through l2_to_score used to land every fused row in ~[0.52, 0.55],
-        // so a flat +0.1 symbol boost on a mid-ranked row (2-3x the whole
-        // spread) overwrote the fused ranking. Rescaled onto the semantic
-        // candidates' span, the fused top hit keeps a margin a single +0.1
-        // boost can't erase.
         let top = RawSearchRow {
             file_path: "top.rs".into(),
             language: "rust".into(),
@@ -3558,7 +2949,6 @@ mod hybrid_tests {
                 symbols: Vec::new(),
             })
             .collect();
-        // Fused scores span the semantic candidates' range, not ~[0.52, 0.55].
         assert_eq!(results[0].file_path, "top.rs");
         assert!(
             (results[0].score - 0.98).abs() < 1e-3,
@@ -3571,21 +2961,12 @@ mod hybrid_tests {
             results[1].score
         );
 
-        // A single +0.1 boost on the mid-ranked row must not displace the
-        // fused top hit. Under the old 1.0-rrf_score compression, mid would
-        // jump from ~0.516 to ~0.616 past top's ~0.548.
         apply_symbol_boost(&mut results, &["known_sym".to_string()]);
         assert_eq!(results[0].file_path, "top.rs");
     }
 
     #[test]
     fn fused_rescale_spreads_rows_when_all_semantic_scores_are_equal() {
-        // Degenerate corpus: every semantic candidate shares one score
-        // (duplicated chunks / tiny index), so sem_max == sem_min. Without the
-        // synthetic-span fallback the rescale maps all fused rows to that one
-        // value, and a single +0.1 boost on a mid row then reorders the fused
-        // ranking freely. The fallback opens a span below the shared score so
-        // fused order is preserved with headroom the boost can't erase.
         let mk_row = |path: &str, content: &str| RawSearchRow {
             file_path: path.into(),
             language: "rust".into(),
@@ -3594,7 +2975,6 @@ mod hybrid_tests {
             end_line: 1,
             distance: 0.2, // identical for every row => l2_to_score = 0.98
         };
-        // Fused order follows semantic rank: r0 (top) .. r3 (bottom).
         let semantic = vec![
             mk_row("top.rs", "fn top() {}"),
             mk_row("second.rs", "fn second() {}"),
@@ -3615,8 +2995,6 @@ mod hybrid_tests {
             })
             .collect();
 
-        // The rescale must not collapse: the top fused hit keeps a strictly
-        // higher score than the bottom one.
         assert_eq!(results[0].file_path, "top.rs");
         assert!(
             results[0].score > results.last().unwrap().score,
@@ -3624,19 +3002,12 @@ mod hybrid_tests {
             results.iter().map(|r| r.score).collect::<Vec<_>>()
         );
 
-        // A single +0.1 boost on the mid row must not displace the top hit.
-        // Without the fallback every score would be 0.98, so the boosted row
-        // (1.08) would jump straight past the top.
         apply_symbol_boost(&mut results, &["known_sym".to_string()]);
         assert_eq!(results[0].file_path, "top.rs");
     }
 
     #[test]
     fn fused_rescale_uses_synthetic_span_on_near_tied_semantic_scores() {
-        // Scores differing by a few ULPs (~1e-6 span) passed the old exact-tie
-        // epsilon check, so the min-max rescale compressed every fused row
-        // into a sub-microscopic band a flat +0.1 boost reordered at will.
-        // Near-ties must take the synthetic-span path exactly like exact ties.
         let mk_row = |path: &str, content: &str, distance: f32| RawSearchRow {
             file_path: path.into(),
             language: "rust".into(),
@@ -3674,7 +3045,6 @@ mod hybrid_tests {
             results.iter().map(|r| r.score).collect::<Vec<_>>()
         );
 
-        // A single +0.1 boost on the mid row must not displace the top hit.
         apply_symbol_boost(&mut results, &["known_sym".to_string()]);
         assert_eq!(results[0].file_path, "top.rs");
     }
@@ -3684,9 +3054,6 @@ mod hybrid_tests {
 mod path_penalty_tests {
     use super::path_penalty_for_query;
 
-    // The non-test-query shape — the production `search()` path for ordinary
-    // queries. Test-like paths get 0.3 (baseline) * 0.5 (extra) = 0.15;
-    // compat/examples/re-export/d.ts demotes are query-independent.
     fn penalty(path: &str) -> f32 {
         path_penalty_for_query(path, false)
     }
@@ -3726,7 +3093,6 @@ mod path_penalty_tests {
         assert_penalty("src/compat/php7.php", 0.3);
         assert_penalty("src/_compat/legacy_api.rs", 0.3);
         assert_penalty("packages/legacy/v1/foo.ts", 0.3);
-        // Query-independent: a test-shaped query does not lift the compat demote.
         let p = path_penalty_for_query("src/compat/php7.php", true);
         assert!((p - 0.3).abs() < 1e-6, "got {p}");
     }
@@ -3741,8 +3107,6 @@ mod path_penalty_tests {
     #[test]
     fn reexport_barrels_get_moderate_penalty() {
         assert_penalty("src/auth/__init__.py", 0.5);
-        // `com.example.*` Java/Kotlin namespace must NOT trigger the examples
-        // penalty; we only match plural forms.
         assert_penalty("com/example/foo/package-info.java", 0.5);
     }
 
@@ -3768,11 +3132,8 @@ mod path_penalty_tests {
 
     #[test]
     fn substring_match_does_not_trigger_dir_penalty() {
-        // "compatibility" should not match "compat" as a directory segment.
         assert_penalty("src/compatibility/check.rs", 1.0);
-        // "examplesite" should not match "examples".
         assert_penalty("src/examplesite/index.ts", 1.0);
-        // "test_helpers" file in src/ should NOT trigger (no test-like glob match).
         assert_penalty("src/utilities.rs", 1.0);
     }
 }
@@ -3808,15 +3169,12 @@ mod test_query_aware_penalty_tests {
         assert!(!query_is_test_shaped("request and response interceptors"));
         assert!(!query_is_test_shaped("queue connection resolution"));
         assert!(!query_is_test_shaped("authentication handler"));
-        // "testimony" contains "test" as a prefix but is not a whole token.
         assert!(!query_is_test_shaped("testimony"));
-        // "contest" similarly.
         assert!(!query_is_test_shaped("contest results"));
     }
 
     #[test]
     fn non_test_query_demotes_tests_harder() {
-        // 0.3 (baseline) * 0.5 (extra) = 0.15
         let p = path_penalty_for_query("tests/integration.rs", false);
         assert!((p - 0.15).abs() < 1e-6, "got {}", p);
         let p = path_penalty_for_query("src/__tests__/login.test.ts", false);
@@ -3825,13 +3183,11 @@ mod test_query_aware_penalty_tests {
 
     #[test]
     fn test_query_lifts_test_penalty() {
-        // Test-shaped query → no test-like demote (compete on merit).
         assert_eq!(path_penalty_for_query("tests/integration.rs", true), 1.0);
         assert_eq!(
             path_penalty_for_query("src/__tests__/login.test.ts", true),
             1.0
         );
-        // Compat/examples/d.ts demotes still apply regardless (query-independent).
         assert!(
             (path_penalty_for_query("src/compat/php7.php", true) - 0.3).abs() < 1e-6,
             "compat dir should still demote on test queries"
@@ -3840,15 +3196,7 @@ mod test_query_aware_penalty_tests {
 
     #[test]
     fn axios_interceptor_failure_mode_repro() {
-        // §2.11 finding: query "request and response interceptors" surfaced
-        // 9 test files in top-10, all with "interceptor" in path. Even
-        // post-0.3x demote they beat the production target. With the new
-        // 0.15x extra-demote on non-test queries the production file should
-        // surface above the test cluster.
-        //
-        // Synthetic candidate set: production target with mediocre similarity
-        // (0.65), test files with strong similarity (0.85) because they
-        // contain "interceptor" in path and body.
+        // Synthetic axios candidates reproduce tests crowding out the implementation.
         let mut results = vec![
             mk("tests/browser/interceptors.browser.test.js", 0.85),
             mk("tests/smoke/esm/tests/interceptors.smoke.test.js", 0.84),
@@ -3859,16 +3207,11 @@ mod test_query_aware_penalty_tests {
 
         apply_path_penalties(&mut results, "request and response interceptors");
 
-        // After query-aware demote: tests → 0.85*0.15=0.1275 etc., production
-        // stays at 0.65. Production target should now be rank 1.
         assert_eq!(results[0].file_path, "lib/core/InterceptorManager.js");
     }
 
     #[test]
     fn test_query_does_not_regress_test_for_x_case() {
-        // Inverse: user asks "test for InterceptorManager". Test files
-        // should NOT be demoted; the test file with the strongest match
-        // should win.
         let mut results = vec![
             mk("tests/browser/interceptors.browser.test.js", 0.85),
             mk("lib/core/InterceptorManager.js", 0.80),
@@ -3877,9 +3220,6 @@ mod test_query_aware_penalty_tests {
 
         apply_path_penalties(&mut results, "test for InterceptorManager");
 
-        // Test file stays at rank 1; production target stays at rank 2.
-        // Without the lift, the production file (0.80) would beat the
-        // demoted test file (0.85*0.3=0.255).
         assert_eq!(
             results[0].file_path,
             "tests/browser/interceptors.browser.test.js"
@@ -3890,13 +3230,9 @@ mod test_query_aware_penalty_tests {
     #[test]
     fn l2_to_score_clamps_negative_similarity_to_zero() {
         use super::l2_to_score;
-        // distance > √2 ⇒ negative cosine similarity ⇒ raw formula goes
-        // negative. Must clamp to 0 so the multiplicative ranking stages don't
-        // invert order on the tail.
         assert_eq!(l2_to_score(2.0), 0.0); // 1 - 4/2 = -1 → 0
         assert_eq!(l2_to_score(1.6), 0.0); // 1 - 2.56/2 = -0.28 → 0
         assert!(l2_to_score(1.41) >= 0.0);
-        // Strong matches are unchanged.
         assert!((l2_to_score(0.0) - 1.0).abs() < 1e-6);
         assert!((l2_to_score(1.0) - 0.5).abs() < 1e-6);
     }
@@ -3904,18 +3240,13 @@ mod test_query_aware_penalty_tests {
     #[test]
     fn negative_similarity_does_not_invert_path_penalty_ranking() {
         use super::l2_to_score;
-        // A weak-match query returns KNN rows past √2 distance (negative cosine
-        // similarity). The production file is the *better* match (smaller
-        // distance) but is a non-test path, so the test path's 0.15 penalty
-        // would multiply its larger-magnitude negative score UP and overtake the
-        // production file. Build scores exactly the way search() does.
+        // Without clamping, a penalty raises a negative score and promotes the worse match.
         let prod_score = l2_to_score(1.5); // better match
         let test_score = l2_to_score(1.6); // worse match
         let mut results = vec![
             mk("src/auth/session.rs", prod_score),
             mk("tests/auth/session_test.rs", test_score),
         ];
-        // Non-test-shaped query so the test path gets the 0.15 demote.
         apply_path_penalties(&mut results, "validate session token");
         let prod_idx = results
             .iter()
@@ -3963,7 +3294,6 @@ mod file_saturation_tests {
 
     #[test]
     fn second_chunk_from_same_file_decays_50pct() {
-        // a.rs has two chunks; second one decays 0.5x → 0.45
         let mut rs = vec![mk("a.rs", 1.0), mk("a.rs", 0.9), mk("b.rs", 0.7)];
         apply_file_saturation(&mut rs);
         assert_eq!(rs[0].file_path, "a.rs");
@@ -3983,7 +3313,6 @@ mod file_saturation_tests {
             mk("b.rs", 0.5),
         ];
         apply_file_saturation(&mut rs);
-        // After decay+sort: a(1.0), b(0.5), a(0.45), a(0.20)
         assert_eq!(rs[0].file_path, "a.rs");
         assert_eq!(rs[0].score, 1.0);
         assert_eq!(rs[1].file_path, "b.rs");
@@ -3996,7 +3325,6 @@ mod file_saturation_tests {
 
     #[test]
     fn diversity_promotes_lower_scored_distinct_file() {
-        // Without saturation: a, a, a, b. With: a, b, a, a.
         let mut rs = vec![
             mk("a.rs", 1.0),
             mk("a.rs", 0.9),
@@ -4039,7 +3367,6 @@ mod symbol_boost_tests {
         assert!(contains_token("let test = 1;", "test"));
         assert!(contains_token("test", "test"));
         assert!(contains_token("(test)", "test"));
-        // Substring inside a longer identifier must not match.
         assert!(!contains_token("latest news", "test"));
         assert!(!contains_token("catalog of logs", "log"));
         assert!(!contains_token("attested", "test"));
@@ -4137,7 +3464,6 @@ mod definition_boost_tests {
         assert!(!pat.is_match("let x = FooBar::new();"));
         assert!(!pat.is_match("call_something(FooBar)"));
         assert!(!pat.is_match("FooBar.method()"));
-        // Must be preceded by a definition keyword.
         assert!(!pat.is_match("// FooBar is a struct"));
     }
 
@@ -4148,7 +3474,6 @@ mod definition_boost_tests {
             mk("src/foo_bar.rs", "pub struct FooBar { x: i32 }", 0.5),
         ];
         apply_definition_boost(&mut rs, "FooBar");
-        // Definition chunk + file-stem-bonus should now lead.
         assert_eq!(rs[0].file_path, "src/foo_bar.rs");
         assert!(rs[0].score > rs[1].score);
     }
@@ -4167,8 +3492,6 @@ mod definition_boost_tests {
 
     #[test]
     fn nl_query_with_embedded_camelcase_triggers_half_strength_boost() {
-        // Query contains "StateManager"; embedded path applies 0.5x
-        // strength. Definition chunk should overtake reference chunk.
         let mut rs = vec![
             mk("src/uses.rs", "let x = StateManager::new();", 1.0),
             mk("src/state.rs", "pub struct StateManager { v: u32 }", 0.5),
@@ -4181,13 +3504,10 @@ mod definition_boost_tests {
     #[test]
     fn embedded_symbol_extraction_skips_acronyms_and_words() {
         use super::extract_embedded_symbols;
-        // Pure acronyms (HTTP, XML) excluded; plain words excluded.
         let syms = extract_embedded_symbols("HTTP request and XML parser handle login");
         assert!(syms.is_empty(), "got: {syms:?}");
-        // XmlParser matches PascalCase; HTTP does not.
         let syms = extract_embedded_symbols("how does XmlParser work for HTTP requests");
         assert_eq!(syms, vec!["XmlParser"]);
-        // camelCase tokens both match.
         let syms = extract_embedded_symbols("call getCurrentUser before isLoggedIn");
         assert_eq!(syms, vec!["getCurrentUser", "isLoggedIn"]);
     }
@@ -4204,14 +3524,11 @@ mod definition_boost_tests {
             mk("src/other.rs", "fn unrelated() {}", 0.5),
         ];
         apply_definition_boost(&mut rs, "how do StateManager and LoginController interact?");
-        // Both definition chunks should now lead; the unrelated one trails.
         assert_eq!(rs[2].file_path, "src/other.rs");
     }
 
     #[test]
     fn file_stem_bonus_applies_with_underscore_normalization() {
-        // login_controller.rs (stem "login_controller", normalized "logincontroller")
-        // should match symbol "LoginController".
         let mut rs = vec![
             mk(
                 "src/login_controller.rs",
@@ -4221,7 +3538,6 @@ mod definition_boost_tests {
             mk("src/other.rs", "pub struct LoginController;", 0.5),
         ];
         apply_definition_boost(&mut rs, "LoginController");
-        // Both got the base boost; login_controller.rs got the 1.5x file-stem bonus.
         assert_eq!(rs[0].file_path, "src/login_controller.rs");
         assert!(rs[0].score > rs[1].score);
     }
@@ -4244,8 +3560,6 @@ mod definition_boost_tests {
         let pat = build_definition_pattern("doStuff").unwrap();
         assert!(pat.is_match("    fun doStuff(): Unit { }"));
     }
-
-    // typedef intentionally not supported (see DEFINITION_KEYWORDS comment).
 }
 
 #[cfg(test)]
@@ -4297,8 +3611,6 @@ mod stem_scan_tests {
     fn injects_stem_matched_definition_when_not_in_candidates() {
         let db = Database::open_in_memory().unwrap();
         seed(&db);
-        // Candidate pool only has the reference chunk; the definition file
-        // (foo_bar.rs) is NOT in the candidates.
         let mut results = vec![mk("src/uses_foo.rs", "let x = FooBar::new();", 0.6)];
         apply_non_candidate_stem_scan(&db, &mut results, "FooBar").unwrap();
         let injected = results
@@ -4306,7 +3618,6 @@ mod stem_scan_tests {
             .find(|r| r.file_path == "src/foo_bar.rs")
             .expect("stem-matched definition should be injected");
         assert!(injected.content.contains("struct FooBar"));
-        // Score is 0.0; downstream definition_boost will lift it.
         assert_eq!(injected.score, 0.0);
     }
 
@@ -4314,7 +3625,6 @@ mod stem_scan_tests {
     fn does_not_inject_when_definition_already_in_candidates() {
         let db = Database::open_in_memory().unwrap();
         seed(&db);
-        // foo_bar.rs IS already a candidate. Should NOT be re-injected.
         let mut results = vec![mk("src/foo_bar.rs", "pub struct FooBar { x: i32 }", 0.7)];
         let before = results.len();
         apply_non_candidate_stem_scan(&db, &mut results, "FooBar").unwrap();
@@ -4328,13 +3638,11 @@ mod stem_scan_tests {
         db.insert_chunks(
             "src/foo_bar.rs",
             "rust",
-            // No `struct`/`fn`/etc. keyword preceding FooBar.
             &[("// FooBar is documented elsewhere", 1, 5, zero.as_slice())],
         )
         .unwrap();
         let mut results = vec![mk("src/other.rs", "let x = FooBar::new();", 0.6)];
         apply_non_candidate_stem_scan(&db, &mut results, "FooBar").unwrap();
-        // foo_bar.rs has no definition keyword → not injected.
         assert!(!results.iter().any(|r| r.file_path == "src/foo_bar.rs"));
     }
 
@@ -4354,7 +3662,6 @@ mod stem_scan_tests {
         seed(&db);
         let mut results = vec![mk("src/uses_foo.rs", "use Fb;", 0.6)];
         let before = results.len();
-        // 2-letter symbol is below MIN_LEN; no scan.
         apply_non_candidate_stem_scan(&db, &mut results, "Fb").unwrap();
         assert_eq!(results.len(), before);
     }
@@ -4396,8 +3703,6 @@ mod stem_scan_tests {
         let first = stem_index_from_cache(&cache, key.clone(), &db).unwrap();
         assert!(!first.by_lower.contains_key("new_thing"));
 
-        // Indexing a new file bumps the semantic_files validity token, which
-        // must rebuild the cache entry so the new stem becomes visible.
         let zero = vec![0.0f32; codesage_storage::db::DEFAULT_EMBEDDING_DIM];
         db.insert_chunks(
             "src/new_thing.rs",
@@ -4437,8 +3742,6 @@ mod adaptive_rerank_tests {
 
     #[test]
     fn natural_language_leans_reranker() {
-        // 5-word natural-language phrase (the laravel-framework
-        // failure case from the §2.10 semble-corpus bench).
         assert_eq!(
             adaptive_rerank_weight("queue connection resolution and connectors"),
             RERANK_WEIGHT_NATLANG
@@ -4451,10 +3754,7 @@ mod adaptive_rerank_tests {
 
     #[test]
     fn mixed_short_queries_use_default() {
-        // Two words isn't enough for the natlang branch; not a single
-        // identifier either. Fall back to default.
         assert_eq!(adaptive_rerank_weight("http server"), RERANK_WEIGHT_DEFAULT);
-        // Identifier-shaped but two tokens → not the short_id branch.
         assert_eq!(
             adaptive_rerank_weight("FooBar BarBaz"),
             RERANK_WEIGHT_DEFAULT
@@ -4469,8 +3769,6 @@ mod adaptive_rerank_tests {
 
     #[test]
     fn plain_english_word_is_not_a_short_identifier() {
-        // All-lowercase alphabetic single words are natural language, not
-        // identifiers — they must not get the reduced cross-encoder weight.
         assert_eq!(
             adaptive_rerank_weight("authentication"),
             RERANK_WEIGHT_DEFAULT
@@ -4595,10 +3893,6 @@ mod dir_saturation_tests {
 
     #[test]
     fn penalizes_chunks_past_threshold_from_same_directory() {
-        // 5 chunks all from `Queue/Connectors/` mimicking the
-        // laravel-framework failure mode. With default threshold=2 and
-        // decay=0.75, the first 2 keep their scores and chunks 3-5 decay
-        // by 0.75^excess.
         let mut results = vec![
             mk("Queue/Connectors/AConnector.php", 0.95),
             mk("Queue/Connectors/BConnector.php", 0.94),
@@ -4613,14 +3907,11 @@ mod dir_saturation_tests {
             .iter()
             .map(|r| (r.file_path.clone(), r.score))
             .collect();
-        // First 2 chunks at the threshold keep their scores.
         assert!((by_path["Queue/Connectors/AConnector.php"] - 0.95).abs() < 1e-6);
         assert!((by_path["Queue/Connectors/BConnector.php"] - 0.94).abs() < 1e-6);
-        // Chunks 3-5 decay; absolute value strictly < pre-decay.
         assert!(by_path["Queue/Connectors/CConnector.php"] < 0.93);
         assert!(by_path["Queue/Connectors/DConnector.php"] < 0.92);
         assert!(by_path["Queue/Connectors/EConnector.php"] < 0.91);
-        // QueueManager untouched (different dir).
         assert!((by_path["Queue/QueueManager.php"] - 0.80).abs() < 1e-6);
     }
 
@@ -4629,8 +3920,6 @@ mod dir_saturation_tests {
         let mut results = vec![mk("src/a.rs", 0.9), mk("src/b.rs", 0.8)];
         let before: Vec<f32> = results.iter().map(|r| r.score).collect();
         apply_directory_saturation(&mut results);
-        // 2 chunks from `src/` is at threshold — no decay (decay starts when
-        // `already >= THRESHOLD`, i.e. on the 3rd chunk).
         let by_path: std::collections::HashMap<_, _> = results
             .iter()
             .map(|r| (r.file_path.clone(), r.score))
@@ -4642,8 +3931,6 @@ mod dir_saturation_tests {
 
     #[test]
     fn repo_root_files_bucket_together() {
-        // No `/` in the path means parent_dir is `""`. All three are
-        // in the same bucket; only the 4th would decay.
         let mut results = vec![
             mk("README.md", 0.9),
             mk("Cargo.toml", 0.8),
@@ -4652,8 +3939,6 @@ mod dir_saturation_tests {
         apply_directory_saturation(&mut results);
         assert_eq!(results.len(), 3); // sanity
     }
-
-    // ---- §2.12 qualified-name boost with anti-trigger filter ----
 
     fn mk_with_symbols(file: &str, score: f32, symbols: Vec<(&str, &str)>) -> SearchResult {
         SearchResult {
@@ -4676,38 +3961,22 @@ mod dir_saturation_tests {
 
     #[test]
     fn anti_trigger_leaf_only_match_does_not_boost() {
-        // The §2.12 false-positive case: query "load default command
-        // options..." extracts `default`; chunk has `Mode::default`. The
-        // ×2.0 boost is suppressed because `default` matches only the
-        // leaf segment of `mode::default`.
         assert!(!qualified_name_matches(
             "default",
             "mode::default",
             "default"
         ));
-        // Same for plain `default` (bare name, no separator) — the lone
-        // segment is the leaf, no non-leaf to anchor.
         assert!(!qualified_name_matches("default", "default", "default"));
     }
 
     #[test]
     fn anti_trigger_root_match_does_boost() {
-        // The §2.12 true-positive that should NOT regress: query word
-        // matches a type/module-level qualified-name segment. Even when
-        // the token is in the anti-trigger list (e.g. `config`), a root
-        // match indicates the user is asking about that type/module.
         assert!(qualified_name_matches("config", "config::load", "load"));
         assert!(qualified_name_matches("default", "default::clone", "clone"));
     }
 
     #[test]
     fn non_anti_trigger_any_segment_match_boosts() {
-        // Tokens NOT in the anti-trigger list match any segment (leaf
-        // included) — these are distinctive enough that lexical match
-        // signals real intent. The §2.12 win case (`Ignore::add_child_path`
-        // matched on token `ignore`) survives because `ignore` isn't
-        // in the anti-trigger list, AND would also pass the anti-trigger
-        // stem filter via the root-match path.
         assert!(qualified_name_matches(
             "login",
             "authservice::login",
@@ -4734,23 +4003,17 @@ mod dir_saturation_tests {
 
     #[test]
     fn qualified_name_boost_anti_trigger_regression_blocked() {
-        // End-to-end regression: the original §2.12 A/B regression case.
-        // Query word `default` extracts as known symbol; one chunk has
-        // `Mode::default` (leaf-only); the boost must NOT lift it.
         let mut results = vec![
             mk_with_symbols("src/correct.rs", 0.80, vec![]),
             mk_with_symbols("src/wrong.rs", 0.77, vec![("default", "Mode::default")]),
         ];
         apply_qualified_name_boost(&mut results, &["default".to_string()]);
-        // wrong.rs stays at 0.77 (no boost — anti-trigger leaf match);
-        // correct.rs stays at 0.80 — original ranking preserved.
         assert_eq!(results[0].file_path, "src/correct.rs");
         assert!((results[1].score - 0.77).abs() < 1e-6);
     }
 
     #[test]
     fn qualified_name_boost_idempotent_per_chunk() {
-        // Two matching symbols in one chunk still get ×2.0 once.
         let mut results = vec![mk_with_symbols(
             "src/auth.rs",
             0.5,
@@ -4799,7 +4062,6 @@ mod language_and_version_penalty_tests {
 
     #[test]
     fn demotes_declaration_headers_only_in_c_projects() {
-        // curl: cfilters.h took rank 1 over the connect.c that implements it.
         assert_eq!(
             declaration_header_penalty("lib/cfilters.h", Language::C),
             SOFT_PENALTY_MILD
@@ -4812,9 +4074,6 @@ mod language_and_version_penalty_tests {
 
     #[test]
     fn leaves_cpp_headers_alone() {
-        // nlohmann-json, abseil and fmtlib are header-only: the header IS the
-        // implementation, and every C++ target in the semble corpus is one.
-        // Demoting here cost C++ 0.134 in simulation.
         assert_eq!(
             declaration_header_penalty("include/nlohmann/json.hpp", Language::Cpp),
             1.0
@@ -4827,7 +4086,6 @@ mod language_and_version_penalty_tests {
 
     #[test]
     fn exempts_inline_definition_headers() {
-        // libuv's heap-inl.h carries definitions and is a legitimate target.
         assert_eq!(
             declaration_header_penalty("src/heap-inl.h", Language::C),
             1.0
@@ -4846,7 +4104,6 @@ mod language_and_version_penalty_tests {
         );
         assert_eq!(version_dir_of("packages/zod/src/v3/types.ts"), Some(3));
         assert_eq!(version_dir_of("src/validate.ts"), None);
-        // Not a version segment: needs digits after the `v`.
         assert_eq!(version_dir_of("src/view/index.ts"), None);
     }
 
@@ -4863,7 +4120,6 @@ mod language_and_version_penalty_tests {
 
     #[test]
     fn keeps_old_version_when_the_query_asks_for_it() {
-        // "v3 compatibility error types and ZodError" wants v3 on purpose.
         assert!(query_names_version(
             "v3 compatibility error types and ZodError"
         ));
@@ -4895,7 +4151,6 @@ mod language_and_version_penalty_tests {
             false
         ));
         assert!(query_names_foreign_platform("IOCP completion port", false));
-        // "window size" must not read as Windows intent.
         assert!(!query_names_foreign_platform(
             "tty terminal raw mode and window size",
             false
@@ -4909,7 +4164,6 @@ mod language_and_version_penalty_tests {
             SOFT_PENALTY_MILD
         );
         assert_eq!(foreign_platform_penalty("src/unix/tcp.c", false), 1.0);
-        // Substring of a longer segment must not match.
         assert_eq!(foreign_platform_penalty("src/window/tcp.c", false), 1.0);
     }
 
@@ -5051,10 +4305,7 @@ mod header_demote_scope_tests {
 
     #[test]
     fn header_demote_is_inert_without_a_c_implementation_in_play() {
-        // fmtlib's benchmark root is all `.h`, and its dialect resolves to C
-        // because nothing there carries an unambiguous C++ extension. Demoting
-        // every candidate but the `-inl.h` exemption promoted format-inl.h to
-        // rank 1 and cost three queries.
+        // All-.h projects may detect as C; exempt inline headers must not gain a free boost.
         let mut results = vec![
             mk("include/fmt/format-inl.h", Language::C, 0.80),
             mk("include/fmt/compile.h", Language::C, 0.90),
@@ -5070,7 +4321,6 @@ mod header_demote_scope_tests {
 
     #[test]
     fn header_demote_fires_when_a_c_file_competes() {
-        // curl: connect.c implements what cfilters.h declares.
         let mut results = vec![
             mk("lib/cfilters.h", Language::C, 0.90),
             mk("lib/connect.c", Language::C, 0.85),
@@ -5099,21 +4349,15 @@ mod stem_match_boost_tests {
 
     #[test]
     fn admits_identifier_shaped_tokens() {
-        // `Router` qualifies on mixed case, the same rule that admits the
-        // cited `Semaphore` case. A leading capital is not distinguished from
-        // an internal one, so sentence-initial words can enter; requiring an
-        // internal capital would reject `Semaphore` too. The corpus A/B is
-        // what decides whether that extra noise costs anything.
+        // Leading capitals qualify, so sentence-initial prose can pass this gate.
         assert_eq!(
             stem_match_tokens("Router path_router implementation"),
             vec!["pathrouter", "router"]
         );
-        // Mixed case with a lowercase letter.
         assert_eq!(
             stem_match_tokens("absl::StrSplit and StrJoin"),
             vec!["strjoin", "strsplit"]
         );
-        // Underscore qualifies even though the token is all-caps.
         assert_eq!(
             stem_match_tokens("logging macros ABSL_LOG"),
             vec!["absllog"]
@@ -5122,21 +4366,14 @@ mod stem_match_boost_tests {
 
     #[test]
     fn rejects_bare_acronyms_and_plain_words() {
-        // Boosting json.hpp on the word JSON regressed 9 nlohmann queries.
         assert!(stem_match_tokens("JSON parser and tokenizer").is_empty());
         assert!(stem_match_tokens("HTTP client request sending").is_empty());
         assert!(stem_match_tokens("how formatters transform log records").is_empty());
-        // Too short to be specific.
         assert!(stem_match_tokens("Foo").is_empty());
     }
 
     #[test]
     fn boosts_the_file_the_query_names() {
-        // Covers the helper's own matching, not a gap in the definition
-        // boost: for a bare `Semaphore` query that boost already discriminates
-        // these two via DEFINITION_FILE_STEM_BONUS. The gap this stage exists
-        // to fill is the case where the definition regex cannot fire at all —
-        // a C++ free function, or a macro-attributed declaration.
         let mut r = vec![
             mk("tokio/src/sync/batch_semaphore.rs", 0.90),
             mk("tokio/src/sync/semaphore.rs", 0.85),
@@ -5158,12 +4395,7 @@ mod stem_match_boost_tests {
 
     #[test]
     fn bounded_boost_cannot_leapfrog_a_clear_winner() {
-        // 1.2x cannot overturn THIS lead. It does not generalize to "the
-        // target loses at most one place": the multiplier bounds the score
-        // ratio a boost can overcome, so against tightly clustered results a
-        // boosted candidate can pass several at once. Measured, the real
-        // nlohmann "ADL-based to_json and from_json" query regresses
-        // 1.000 -> 0.500, where the target's lead is far under the 0.40 here.
+        // The multiplier bounds score ratios, not positions moved in a clustered ranking.
         let mut r = vec![
             mk("include/nlohmann/adl_serializer.hpp", 1.00),
             mk("include/nlohmann/to_json.hpp", 0.60),
@@ -5179,11 +4411,8 @@ mod stem_match_token_edge_tests {
 
     #[test]
     fn minimum_length_counts_characters_not_bytes() {
-        // `Äbc` is 3 characters but 4 UTF-8 bytes; a byte-length gate would
-        // admit it through the mixed-case rule despite being under the
-        // documented four-character minimum.
+        // Äbc has three characters but four UTF-8 bytes.
         assert!(stem_match_tokens("Äbc").is_empty());
-        // Four real characters still qualify.
         assert_eq!(stem_match_tokens("Äbcd"), vec!["äbcd"]);
     }
 }
@@ -5500,8 +4729,6 @@ mod mention_anchor_tests {
         QueryMention::Path(p.to_string())
     }
 
-    /// Seven distinct files, scores 0.90 down to 0.30 in 0.10 steps; the
-    /// mentioned file sits at rank 7.
     fn ladder_fixture() -> Vec<SearchResult> {
         vec![
             mk("crates/graph/src/index.rs", 0.90),
@@ -5629,15 +4856,12 @@ mod mention_anchor_tests {
             true,
         );
         assert_on_rungs(&r, 0.90, &["crates/storage/src/db/structural.rs"]);
-        // `Other::symbol_exists` shares the member but not the owner.
         assert_eq!(r[3].file_path, "crates/storage/src/db/mod.rs");
         assert!(close(r[3].score, 0.10));
     }
 
     #[test]
     fn file_stem_stands_in_for_the_owner_of_a_scoped_free_function() {
-        // Rust free functions have a bare qualified name; `search::foo`
-        // resolves through the file stem instead.
         let mut r = vec![
             mk("crates/graph/src/index.rs", 0.90),
             mk("crates/graph/src/lookups.rs", 0.80),
@@ -5669,12 +4893,10 @@ mod mention_anchor_tests {
         let before = snapshot(&r);
         apply_mention_anchor(&mut r, "request.headers is empty", ALL, PAGE1, true);
         assert_eq!(snapshot(&r), before);
-        // The reviewer's literal case: `body` is also too short for the
-        // dotted form, so it never becomes a mention at all.
+        // body is too short to distinguish from a file extension.
         assert!(extract_query_mentions("request.body is undefined").is_empty());
         apply_mention_anchor(&mut r, "request.body is undefined", ALL, PAGE1, true);
         assert_eq!(snapshot(&r), before);
-        // With the qualified name present, the dotted form does lift.
         r[2].symbols[0].qualified_name = "request.headers".to_string();
         apply_mention_anchor(&mut r, "request.headers is empty", ALL, PAGE1, true);
         assert_on_rungs(&r, 0.90, &["src/request.js"]);
@@ -5713,7 +4935,6 @@ mod mention_anchor_tests {
             r.push(c);
         }
         apply_mention_anchor(&mut r, "x/many.rs is huge", ALL, PAGE1, true);
-        // Original-score order is kept on the ladder: chunk at line 100 first.
         assert_on_rungs(&r, 1.00, &["x/many.rs"; MENTION_MAX_CHUNKS_PER_FILE]);
         assert_eq!(r[1].start_line, 100);
         assert_eq!(r[2].start_line, 200);
@@ -5725,9 +4946,7 @@ mod mention_anchor_tests {
 
     #[test]
     fn total_anchored_rows_are_capped_so_a_page_keeps_organic_results() {
-        // Four mentioned files x three chunks = twelve eligible under the
-        // per-file caps; the total cap stops at five, in mention order then
-        // original rank.
+        // 12 eligible rows exceed the total cap of 5; admission follows mention order.
         let mut r = vec![mk("x/top.rs", 1.00)];
         for f in ["x/a.rs", "x/b.rs", "x/c.rs", "x/d.rs"] {
             for c in 0..3 {
@@ -5770,9 +4989,7 @@ mod mention_anchor_tests {
 
     #[test]
     fn symbol_hits_are_bounded_by_the_total_cap_across_files() {
-        // Three files x three matching chunks = nine eligible under the
-        // per-file caps; the total cap (5) binds, so five rows sit on rungs
-        // in original-rank order and the sixth eligible row stays organic.
+        // Nine symbol hits exceed the total cap of five.
         let mut r = vec![mk("x/top.rs", 1.00)];
         for f in 0..3 {
             for c in 0..3 {
@@ -5831,7 +5048,6 @@ mod mention_anchor_tests {
         let before = snapshot(&r);
         apply_mention_anchor(&mut r, "src/lib.rs re-exports", ALL, PAGE1, true);
         assert_eq!(snapshot(&r), before);
-        // Naming the crate disambiguates, and both chunks of that file lift.
         apply_mention_anchor(
             &mut r,
             "crates/graph/src/lib.rs re-exports",
@@ -5981,9 +5197,6 @@ mod mention_anchor_tests {
 
     #[test]
     fn file_like_tokens_never_become_symbol_mentions() {
-        // Known non-code extensions, short lowercase "members", and bare
-        // basenames with a code extension are all files, and a bare file
-        // name is not specific enough to anchor.
         assert!(extract_query_mentions("bump Cargo.toml").is_empty());
         assert!(extract_query_mentions("update README.md").is_empty());
         assert!(extract_query_mentions("port Foo.kt").is_empty());
@@ -5992,7 +5205,6 @@ mod mention_anchor_tests {
 
     #[test]
     fn parser_language_table_drives_the_path_extension_set() {
-        // No mirror list to drift: whatever `detect_language` maps is a path.
         for tok in [
             "x/a.mts", "x/b.pyi", "x/c.cu", "x/d.cxx", "x/e.go", "x/f.java", "x/g.php", "x/h.cc",
         ] {
@@ -6030,7 +5242,6 @@ mod mention_anchor_tests {
         assert!(!path_matches_mention(indexed, "earch.rs"));
         assert!(!path_matches_mention(indexed, "Search.rs"));
         assert!(!path_matches_mention(indexed, "graph/search.rs"));
-        // One component after filtering never matches, whatever the prefix.
         assert!(!path_matches_mention(indexed, "search.rs"));
         assert!(!path_matches_mention(indexed, "/search.rs"));
         assert!(!path_matches_mention(indexed, "./search.rs"));
@@ -6038,8 +5249,6 @@ mod mention_anchor_tests {
             indexed,
             "/home/x/other/src/search.rs"
         ));
-        // An absolute mention longer than the indexed path needs two
-        // matching components, so `/x/lib.rs` cannot claim every `lib.rs`.
         assert!(!path_matches_mention("lib.rs", "/x/lib.rs"));
         assert!(path_matches_mention("src/lib.rs", "/x/src/lib.rs"));
     }
@@ -6104,8 +5313,6 @@ mod mention_anchor_pipeline_tests {
         let expected = page1[0].score * (1.0 - MENTION_TOP_GAP_FRAC);
         assert!((page1[1].score - expected).abs() < 1e-6);
 
-        // A later page is the organic slice: no lift, and misc.rs is
-        // reachable where the ranking puts it.
         let page2 = search(&db, &emb, None, &req(query, 2, 2)).unwrap();
         let files: Vec<&str> = page2.iter().map(|r| r.file_path.as_str()).collect();
         assert_eq!(files, vec!["src/reg.rs", "src/misc.rs"]);

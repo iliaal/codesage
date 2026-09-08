@@ -35,10 +35,7 @@ impl SemanticFreshness {
 }
 
 pub fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
-    // LE-only: one memcpy instead of a per-element `to_le_bytes` loop. f32 has
-    // no padding, so its byte layout is exactly `len * 4`. A compile_error on
-    // unsupported endianness is intentional — the binary would silently produce
-    // wrong vec0 bytes otherwise, and none of our supported targets are BE.
+    // sqlite-vec uses little-endian float32; unsupported targets must fail to build.
     #[cfg(not(target_endian = "little"))]
     compile_error!("embedding_to_bytes assumes little-endian f32 layout");
 
@@ -68,10 +65,7 @@ pub fn embedding_from_bytes(bytes: &[u8]) -> Result<Vec<f32>> {
         .collect())
 }
 
-/// Map a `(file_path, language, content, start_line, end_line, distance)` row —
-/// the column order returned by the KNN, fullscan, and BM25 searches — into a
-/// `RawSearchRow`. `distance` is read as `f64` and narrowed so a BM25 `score`
-/// (a REAL) and a vec0 `distance` decode the same way.
+/// Shared search-column order; narrow SQLite REAL distances/BM25 scores from f64.
 fn row_to_raw_search(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSearchRow> {
     Ok(RawSearchRow {
         file_path: row.get(0)?,
@@ -83,10 +77,6 @@ fn row_to_raw_search(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSearchRow> 
     })
 }
 
-/// Append a `(file_path GLOB ?N OR …)` condition for the given path patterns,
-/// binding each as a positional parameter after the ones already in
-/// `param_values`. No-op on an empty slice. Shared by `search_fullscan` and
-/// `search_bm25`, which build the identical clause.
 fn push_path_glob(
     conditions: &mut Vec<String>,
     param_values: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
@@ -125,15 +115,8 @@ fn push_language_filter(
     }
 }
 
-/// Available bytes on the filesystem holding `path`, or `None` when it can't
-/// be determined (non-unix target, statvfs failure). `f_bavail` — blocks
-/// available to unprivileged processes — times the fragment size matches what
-/// `df` reports as available.
-///
-/// The `useless_conversion` allow is platform-width, not a shortcut:
-/// `f_bavail` / `f_frsize` are u32 on macOS and u64 on Linux, so the
-/// widening is required on the narrow platforms and a same-type no-op that
-/// clippy flags on the wide ones.
+/// Unprivileged free space (f_bavail × f_frsize), or None if unavailable.
+/// The conversions accommodate u32 macOS fields and u64 Linux fields.
 #[cfg(unix)]
 #[allow(clippy::useless_conversion)]
 fn available_disk_space(path: &str) -> Option<u64> {
@@ -157,9 +140,6 @@ fn available_disk_space(_path: &str) -> Option<u64> {
 }
 
 impl Database {
-    /// FTS5 sidecar name for the active chunk table. Kept private to the
-    /// storage layer — callers should go through `search_bm25` /
-    /// `token_doc_frequency` rather than querying by name directly.
     fn fts_table(&self) -> String {
         crate::schema::fts_table_name(&self.chunk_table)
     }
@@ -170,13 +150,7 @@ impl Database {
         language: &str,
         chunks: &[(&str, u32, u32, &[f32])],
     ) -> Result<()> {
-        // Each chunk inserts a vec0 row and a matching FTS5 row, keyed by the
-        // same rowid. A failure between the two leaves vec0 with an orphaned
-        // row that has no FTS sidecar entry — `repair_fts_sidecar` heals this
-        // on the next write-path open, but until then BM25 search misses the row. All
-        // current callers wrap in `execute_batch`, but pulling the BEGIN /
-        // COMMIT in here keeps the function safe against future direct use.
-        // The savepoint is a no-op when the caller already opened a tx.
+        // Keep vec0 and FTS5 rowids atomic, including calls inside an outer transaction.
         self.conn.execute_batch("SAVEPOINT insert_chunks")?;
         let result = (|| -> Result<()> {
             let sql = format!(
@@ -283,11 +257,6 @@ impl Database {
             stmt.query_map(params![embedding_bytes, k as i64], row_to_raw_search)?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        // Chunks at an identical distance (duplicate or near-duplicate code)
-        // would otherwise come back in whatever order the vec index produced,
-        // so a repeated query could hand downstream truncation a different
-        // top-N. Total-order the ties here; vec0 will not accept the extra
-        // ORDER BY terms in SQL.
         rows.sort_by(|a, b| {
             a.distance
                 .total_cmp(&b.distance)
@@ -401,10 +370,7 @@ impl Database {
         Ok(n as usize)
     }
 
-    /// Distinct files with at least one semantic chunk indexed, across all
-    /// model chunk tables. Model-agnostic (reads `semantic_files`, a shared
-    /// table) so it works on a plain structural handle. Backs the semantic
-    /// freshness signal in `project_overview`.
+    /// Distinct semantic files across all models; works on structural-only handles.
     pub fn semantic_file_count(&self) -> Result<usize> {
         let n: i64 =
             self.conn
@@ -414,13 +380,7 @@ impl Database {
         Ok(n as usize)
     }
 
-    /// Files with semantic chunks under `model`'s tables only.
-    ///
-    /// [`Self::semantic_file_count`] spans every model that ever indexed this
-    /// project, which overstates what a search can actually reach: after a
-    /// model switch the old model's rows remain until `codesage cleanup`, so
-    /// the unscoped count would report the previous model's 10,000 files for a
-    /// search running against a new model's empty table.
+    /// Count only this model's semantic files; old models remain until cleanup.
     pub fn semantic_file_count_for_model(&self, model: &str) -> Result<usize> {
         let prefix = crate::schema::model_table_prefix(model);
         let n: i64 = self.conn.query_row(
@@ -605,11 +565,7 @@ impl Database {
         Ok((doc.unwrap_or(0) as u64, total))
     }
 
-    /// Chunk count across **every** vec0 chunk table in the DB, not just the
-    /// currently-selected model's. Used by `codesage status` where the caller
-    /// opens via [`Database::open`] (no chunk table selected) and just wants a
-    /// total index size. Returns `Ok(0)` on a DB that has never run a semantic
-    /// index.
+    /// Total across all models, including on structural-only handles; zero if unindexed.
     pub fn total_chunk_count(&self) -> Result<usize> {
         let tables = self.list_vec_tables()?;
         let mut total: i64 = 0;
@@ -643,11 +599,8 @@ impl Database {
     }
 
     pub fn vacuum(&self) -> Result<()> {
-        // VACUUM rewrites the database into a temporary copy, needing up to
-        // ~2x the DB size in free space; running it into a full filesystem
-        // fails midway after heavy I/O. Bail early when the volume clearly
-        // lacks headroom. Advisory only: any stat/statvfs failure (in-memory
-        // DB, exotic filesystem, non-unix target) skips the check.
+        // VACUUM needs a temporary copy. This advisory headroom check is skipped
+        // when filesystem statistics are unavailable; it cannot guarantee completion.
         if let Some(path) = self.conn.path().filter(|p| !p.is_empty())
             && let Ok(meta) = std::fs::metadata(path)
             && let Some(available) = available_disk_space(path)
@@ -701,10 +654,6 @@ impl Database {
              ORDER BY start_line",
             quote_ident(&self.chunk_table)
         );
-        // Cached: chunks_for_file is called once per file during bundle
-        // assembly (entry + owned + context). The table name is fixed per
-        // connection, so the SQL string is stable and the cached statement is
-        // reused across all files in one feature_bundle / export_context call.
         let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt
             .query_map(params![file_path], |row| {
@@ -751,25 +700,11 @@ impl Database {
         }
     }
 
-    /// Cheap validity token that changes whenever the set of semantically
-    /// indexed file paths for the active chunk table changes. Reads the
-    /// regular `semantic_files` bookkeeping table, not the vec0 chunk table:
-    /// new files bump `COUNT(*)` / `MAX(rowid)`, removals drop `COUNT(*)`,
-    /// and any (re)index touches `MAX(indexed_at)`.
-    ///
-    /// `COUNT(*)` + `MAX(rowid)` + `MAX(indexed_at)` alone can be spoofed:
-    /// `semantic_files` has no AUTOINCREMENT, so deleting the highest-rowid
-    /// row and inserting a *different* path within the same second (a
-    /// watcher-debounced rename batch) reuses the freed rowid and restores an
-    /// identical `(count, max_rowid, max_indexed_at)` triple even though the
-    /// path set changed. `SUM(length(path))` and `SUM(unicode(path))` (the
-    /// summed first-char code point) are path-content-sensitive, so a rename
-    /// that changes total path length OR any leading character shifts the
-    /// token even when the counts and rowids line up. The residual blind spot
-    /// is a same-second rename that preserves both aggregates (e.g. an
-    /// anagram-length swap of the max-rowid row); content-only re-embeds of an
-    /// existing path may likewise leave the token unchanged within one second
-    /// — fine for consumers that only depend on the path set.
+    /// Heuristic path-set token for the active table; reads semantic_files, not vec0.
+    /// Path-length and first-character sums distinguish same-second delete/insert
+    /// batches that reuse the highest rowid and preserve count/indexed_at.
+    /// Renames preserving both sums can still collide; same-second content-only
+    /// re-embeds may also collide, so use only for path-set caches.
     pub fn semantic_files_validity_token(&self) -> Result<SemanticValidityToken> {
         let token = self.conn.query_row(
             "SELECT COUNT(*), COALESCE(MAX(rowid), 0), COALESCE(MAX(indexed_at), 0),
@@ -787,6 +722,44 @@ mod tests {
     use crate::Database;
 
     #[test]
+    fn search_row_accepts_numeric_distance() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT 'src/query.rs', 'rust', 'fn query() {}', 3, 5, 0.375 AS distance",
+                [],
+                super::row_to_raw_search,
+            )
+            .unwrap();
+        assert_eq!(row.file_path, "src/query.rs");
+        assert_eq!(row.distance, 0.375);
+    }
+
+    #[test]
+    fn search_rows_reject_null_distance_without_partial_success() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT 'src/first.rs', 'rust', 'fn first() {}', 1, 1, 0.25 AS distance
+                 UNION ALL SELECT 'src/second.rs', 'rust', 'fn second() {}', 1, 1, NULL",
+            )
+            .unwrap();
+        let error = stmt
+            .query_map([], super::row_to_raw_search)
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                rusqlite::Error::InvalidColumnType(5, ref name, rusqlite::types::Type::Null)
+                    if name == "distance"
+            ),
+            "NULL distance must identify the failing column: {error}"
+        );
+    }
+
+    #[test]
     fn vacuum_succeeds_on_file_backed_db() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vacuum.db");
@@ -797,7 +770,6 @@ mod tests {
 
     #[test]
     fn vacuum_succeeds_on_in_memory_db() {
-        // No file path → the free-space pre-flight is skipped entirely.
         let db = Database::open_in_memory().unwrap();
         db.vacuum()
             .expect("in-memory vacuum must skip the pre-flight");
@@ -815,10 +787,7 @@ mod tests {
             .unwrap();
         let before = db.semantic_files_validity_token().unwrap();
 
-        // Delete the highest-rowid row and insert a different path. SQLite has
-        // no AUTOINCREMENT here, so the freed rowid is reused: COUNT(*),
-        // MAX(rowid), and (pinned) MAX(indexed_at) all match `before`. The old
-        // 3-component token collided here even though the path set changed.
+        // Reusing the highest rowid preserves the old three-component token.
         db.delete_semantic_file_hash("bbbb").unwrap();
         db.upsert_semantic_file_hash("ccccccc", "h").unwrap();
         db.conn

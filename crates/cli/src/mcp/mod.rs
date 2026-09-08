@@ -44,31 +44,18 @@ const MAX_MCP_FEATURE_LIMIT: usize = 500;
 const MAX_MCP_FEATURE_SCAN_LIMIT: usize = 5_000;
 const MAX_MCP_OFFSET: usize = 1_000;
 const MAX_MCP_TRACE_FRAMES: usize = 50;
-/// Per-call ceiling for the hidden `embed_texts` tool. The CLI sends one
-/// commit batch (50 files) per call, so this is headroom, not a target.
+/// Headroom for CLI commit batches of 50 files.
 pub(crate) const MAX_MCP_EMBED_TEXTS: usize = 4_096;
-/// Per-text byte ceiling for `embed_texts`. A chunk is at most
-/// `DEFAULT_CHUNK_SIZE` characters plus its overlap and symbol header; 32×
-/// the chunk size in bytes covers four-byte UTF-8 and a dense header many
-/// times over, while a whole file pasted as one text is refused.
+/// Allow UTF-8 expansion, overlap, and symbol headers without accepting whole files.
 pub(crate) const MAX_MCP_EMBED_TEXT_BYTES: usize = 32 * codesage_embed::chunk::DEFAULT_CHUNK_SIZE;
-/// Aggregate byte ceiling per `embed_texts` call: every text at four bytes
-/// per chunk character, times the count cap (24 MiB at the defaults). The
-/// count cap alone let one call carry gigabytes.
+/// Bound aggregate allocation independently of the count and per-text caps.
 pub(crate) const MAX_MCP_EMBED_TOTAL_BYTES: usize =
     MAX_MCP_EMBED_TEXTS * 4 * codesage_embed::chunk::DEFAULT_CHUNK_SIZE;
-/// Prefix of every `embed_texts` cap refusal. The CLI client keys its
-/// private-embedder fallback on it, so a daemon of another build still
-/// speaks the same refusal.
+/// Stable refusal prefix that triggers the CLI's private-embedder fallback.
 pub(crate) const EMBED_TEXTS_OVER_CAP: &str = "embed_texts: over cap:";
-/// Prefix of every `embed_texts` fingerprint refusal: the caller's expected
-/// semantic fingerprint is not the one this daemon's session produces. The
-/// CLI client aborts its pass on it and never embeds privately in its place,
-/// because the vectors it would produce carry another identity.
+/// Stable identity refusal prefix: the CLI must abort rather than fall back privately.
 pub(crate) const EMBED_TEXTS_FINGERPRINT_MISMATCH: &str = "embed_texts: fingerprint mismatch:";
 
-/// Refuse an `embed_texts` request whose count, any single text, or total
-/// bytes exceed the caps. The message names the cap that was hit.
 fn check_embed_texts_caps(texts: &[String]) -> Result<(), String> {
     if texts.len() > MAX_MCP_EMBED_TEXTS {
         return Err(format!(
@@ -94,17 +81,10 @@ fn check_embed_texts_caps(texts: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Tools the router dispatches but `tools/list` never advertises: the CLI
-/// calls them over the daemon socket so that one process holds the model
-/// (and on a GPU device, the one CUDA context), and an agent has no use for
-/// raw vectors.
-const HIDDEN_TOOLS: &[&str] = &["embed_texts"];
+/// CLI-only daemon operations reuse resident models without exposing raw vectors to agents.
+const HIDDEN_TOOLS: &[&str] = &["embed_texts", "rerank_pairs"];
 
-/// Cap an optional numeric param at `max` (defaulting when omitted) and
-/// report the adjustment: over-max requests are capped and the
-/// requested-vs-applied pair is returned for the `_meta.clamps` annotation
-/// (see `render.rs`) instead of being silent.
-/// Returns `(applied, note)`; `note` is `None` in the common case.
+/// Report capped values through `_meta.clamps` as requested/applied pairs.
 fn capped_limit_tracked(
     value: Option<usize>,
     default: usize,
@@ -126,10 +106,7 @@ fn capped_limit_tracked(
     }
 }
 
-/// `list_features` limit: `None` → default, `Some(0)` → unbounded (the
-/// schema promise and the CLI's `0 = no limit`), else capped to the ceiling
-/// with a `_meta.clamps` note. Returns `(applied, note)`; `applied == 0`
-/// means "no limit" downstream.
+/// Preserve `Some(0)` as unbounded; only omission takes the default.
 fn capped_limit_or_unbounded(
     value: Option<usize>,
     default: usize,
@@ -143,8 +120,6 @@ fn capped_limit_or_unbounded(
     }
 }
 
-/// Cap an optional result-set limit at `max` and report the adjustment for
-/// `_meta.clamps`. Returns `(applied, note)`.
 fn capped_optional_limit_tracked(
     value: Option<usize>,
     max: usize,
@@ -163,10 +138,7 @@ fn capped_optional_limit_tracked(
     }
 }
 
-/// Normalize the `find_similar` threshold at the param layer: finite
-/// out-of-range values clamp to `[0, 1]`, non-finite values (rejected at the
-/// serde layer, so unreachable here) fall back to the default. Returns
-/// `(applied, note)`; a present `note` lands under `_meta.clamps`.
+/// Preserve graph-layer normalization and disclose adjustments through `_meta.clamps`.
 fn clamp_min_jaccard_tracked(requested: Option<f32>) -> (f32, Option<render::ClampNote>) {
     const DEFAULT: f32 = 0.85;
     let Some(v) = requested else {
@@ -218,9 +190,6 @@ fn validate_file_list_len(paths: &[String], tool: &str) -> Result<()> {
 fn validate_non_empty_file_list(paths: &[String], tool: &str) -> Result<()> {
     validate_file_list_len(paths, tool)?;
     if paths.is_empty() {
-        // The CLI's "no file paths provided" sentence, extended with the
-        // "at least one file path" remediation the integration contract
-        // (`tools_call_file_list_tools_reject_empty_lists`) requires.
         anyhow::bail!(
             "{tool}: no file paths provided (pass at least one file path as args or pipe via stdin)"
         );
@@ -258,24 +227,12 @@ impl CodeSageServer {
         }
     }
 
-    /// Run a blocking tool-handler body off the tokio runtime threads.
-    ///
-    /// Every handler does blocking work — SQLite, ONNX inference, and on a cold
-    /// miss a model load that includes a (network) HuggingFace download. Run
-    /// directly on a runtime worker, enough concurrent calls block every worker
-    /// and the daemon stops answering even `initialize`/`ping`.
-    /// Offloading to the blocking pool keeps the async workers free.
-    ///
-    /// `spawn_blocking` also gives a panic boundary: rmcp dispatches tool calls
-    /// with no `catch_unwind`, so a panic in a handler is otherwise silently
-    /// swallowed and the client hangs forever waiting for a reply that never
-    /// comes. Here a panic surfaces as a `JoinError` we turn into an
-    /// error result the client actually receives.
+    /// Keep SQLite/model work off async workers so initialize/ping remain responsive.
+    /// Convert panics to tool errors; uncaught handler panics otherwise leave clients waiting.
     async fn blocking<F>(&self, f: F) -> CallToolResult
     where
         F: FnOnce(&Self) -> CallToolResult + Send + 'static,
     {
-        // Cheap: state is an Arc, the tool_router is an Arc-backed map clone.
         let this = self.clone();
         match tokio::task::spawn_blocking(move || f(&this)).await {
             Ok(result) => result,
@@ -310,11 +267,8 @@ impl ServerHandler for CodeSageServer {
             )
     }
 
-    // Override the macro-generated `list_tools` to strip schemars' non-standard
-    // numeric `format` annotations (so strict MCP clients don't log "unknown
-    // format" warnings) and stamp read-only / closed-world tool annotations (so
-    // read-only-gated clients can call the surface). The macro only generates
-    // `list_tools` when the impl doesn't already define one.
+    // Defining list_tools suppresses the macro version, allowing strict-client schema
+    // cleanup and tool annotations before advertisement.
     async fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
@@ -327,8 +281,6 @@ impl ServerHandler for CodeSageServer {
 }
 
 impl CodeSageServer {
-    /// The `tools/list` payload: every routed tool except [`HIDDEN_TOOLS`],
-    /// finalized for listing.
     fn advertised_tools(&self) -> Vec<rmcp::model::Tool> {
         let mut tools = self.tool_router.list_all();
         tools.retain(|t| !HIDDEN_TOOLS.contains(&t.name.as_ref()));
@@ -371,12 +323,17 @@ impl CodeSageServer {
     ) -> CallToolResult {
         self.blocking(move |s| {
             let file_paths = params.file_paths.clone();
-            // Unlike the CLI (which falls back to piped stdin or the
-            // working-tree diff), MCP has no implicit file set: an empty
-            // list is a caller error, rejected with the CLI's message.
+            // MCP has no stdin or working-tree fallback for an omitted file set.
             s.render(
                 &params.project,
                 validate_non_empty_file_list(&file_paths, "review_rehearsal").and_then(|()| {
+                    let root = crate::evidence_root(Path::new(&params.project))?;
+                    if !crate::db_path(&root).try_exists()? {
+                        return Ok(codesage_graph::build_branch_only_rehearsal(
+                            &root,
+                            &file_paths,
+                        ));
+                    }
                     s.with_project_root_db(&params.project, |root, db| {
                         codesage_graph::build_review_rehearsal(root, db, &file_paths)
                     })
@@ -530,9 +487,7 @@ impl CodeSageServer {
                 adaptive_limit: params.adaptive_limit.unwrap_or(false),
             };
             let query_for_embed = req.query.clone();
-            // A page past the end, or a zero limit, empties the result by
-            // request. Coverage would report that as "no matches", which is
-            // false about the corpus.
+            // Offset and zero-limit requests cannot establish absence from the corpus.
             let paged = req.offset.unwrap_or(0) > 0 || req.limit == Some(0);
             let result = s.render_coverage_gated(
                 &params.project,
@@ -567,8 +522,7 @@ impl CodeSageServer {
             if let Err(refusal) = check_embed_texts_caps(&params.texts) {
                 return CallToolResult::error(vec![ContentBlock::text(refusal)]);
             }
-            // Raw vectors, not a rendered digest: the budget cap and coverage
-            // annotation the other tools go through would corrupt them.
+            // Digest budgeting/truncation would corrupt raw vectors.
             match s.embed_texts_for(
                 &params.project,
                 &params.model,
@@ -584,6 +538,30 @@ impl CodeSageServer {
                 Err(e) => CallToolResult::error(vec![ContentBlock::text(format!("{e:#}"))]),
             }
         })
+        .await
+    }
+
+    #[tool(
+        name = "rerank_pairs",
+        description = "Internal: score query/document pairs with the shared reranker session for the codesage CLI; not advertised to agents.",
+        output_schema = schema_for_type::<RerankPairsResult>()
+    )]
+    async fn rerank_pairs_tool(
+        &self,
+        Parameters(params): Parameters<RerankPairsParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> CallToolResult {
+        self.blocking(
+            move |s| match s.rerank_pairs_for(&params, || context.ct.is_cancelled()) {
+                Ok(result) => match serde_json::to_value(result) {
+                    Ok(value) => CallToolResult::structured(value),
+                    Err(error) => CallToolResult::error(vec![ContentBlock::text(format!(
+                        "rerank_pairs: serializing result: {error}"
+                    ))]),
+                },
+                Err(error) => CallToolResult::error(vec![ContentBlock::text(format!("{error:#}"))]),
+            },
+        )
         .await
     }
 
@@ -624,7 +602,7 @@ impl CodeSageServer {
         Parameters(params): Parameters<FromTraceParams>,
     ) -> CallToolResult {
         self.blocking(move |s| {
-            // `limit: 0` means "the default", as it does for `list_features`.
+            // Unlike list_features, zero selects the default frame limit.
             let (limit, clamp) = capped_limit_tracked(
                 params.limit.filter(|&l| l > 0),
                 MAX_MCP_TRACE_FRAMES,
@@ -637,9 +615,7 @@ impl CodeSageServer {
             };
             let result = s.render(
                 &params.project,
-                // The canonical root, not `params.project`: a subdirectory
-                // resolves the same index but holds no `Cargo.toml`, which
-                // would silently disable Rust module-path agreement.
+                // Rust module resolution needs the index root's Cargo.toml, not a supplied subdirectory.
                 s.with_project_root_db(&params.project, |root, db| from_trace(db, root, &req)),
                 "from_trace",
             );
@@ -849,9 +825,7 @@ impl CodeSageServer {
             s.render(
                 &params.project,
                 validate_non_empty_file_list(&file_paths, "recommend_tests").and_then(|()| {
-                    // The resolved index root, not the raw argument: a caller
-                    // may pass a subdirectory, and absolute inputs must be
-                    // relativized against the root the index was built from.
+                    // Relativize absolute inputs against the index root, not a supplied subdirectory.
                     s.with_project_root_db(&params.project, |root, db| {
                         let opts = codesage_graph::ReachabilityOptions {
                             project_root: Some(root.to_path_buf()),
@@ -906,18 +880,12 @@ impl CodeSageServer {
             let language = params.language;
             let tag = params.tag.clone();
             let since = params.since.clone();
-            // `Some(0)` is unbounded per the schema promise (and the CLI's
-            // `0 = no limit`); the storage layer treats limit 0 as "all".
-            // Unbounded is safe here: the feature table is small in practice
-            // and the budget cap still bounds the wire response.
+            // Limit zero remains unbounded; response budgeting still applies.
             let (limit, limit_clamp) =
                 capped_limit_or_unbounded(params.limit, 100, MAX_MCP_FEATURE_LIMIT, "limit");
             let clamps = limit_clamp.as_slice();
-            // With `since`, fetch unbounded then cap after the changed-file
-            // intersection, mirroring the CLI: the SQL LIMIT runs before the
-            // diff filter, so a pre-filter limit would truncate candidates.
-            // The scan cap bounds that pre-filter fetch unless the caller
-            // explicitly asked for unbounded (limit 0).
+            // SQL LIMIT precedes the diff filter: overfetch to the scan cap, then truncate.
+            // Explicit limit zero also removes the scan cap.
             let query_limit = if since.is_some() && limit != 0 {
                 MAX_MCP_FEATURE_SCAN_LIMIT
             } else {
@@ -980,11 +948,7 @@ impl CodeSageServer {
             let include_callees = params.include_callees.unwrap_or(false);
             let (limit, limit_clamp) =
                 capped_limit_tracked(params.limit, 5, MAX_MCP_CONTEXT_LIMIT, "limit");
-            // Use the context DB (binds to the configured embedding model's
-            // chunk table) so `primary`/`related` resolve real chunks. The
-            // structural-only db variant points at the default chunk table
-            // and returns empty content on projects using a non-default
-            // model (php-src uses jina v2 768-dim, MiniLM is the default).
+            // Select the configured model's table; the default table may contain no chunks.
             let budget = s.bundle_budget_chars(&params.project);
             let result = s.render_budget(
                 &params.project,
@@ -1025,12 +989,7 @@ impl CodeSageServer {
     }
 }
 
-/// If `line` is a JSON-RPC `tools/call` whose `params.arguments` lacks a
-/// non-empty `project`, inject `default`; otherwise return the line
-/// unchanged. Lets non-Claude agents (registered via `codesage mcp
-/// --project <root>`) call tools without threading the absolute project
-/// path on every call. Non-JSON lines and other methods pass through
-/// untouched.
+/// Fill omitted/empty projects on tools/call messages and batches; preserve other lines.
 pub(crate) fn inject_default_project_line(line: &str, default: &str) -> String {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -1039,8 +998,6 @@ pub(crate) fn inject_default_project_line(line: &str, default: &str) -> String {
     let Ok(mut v) = serde_json::from_str::<serde_json::Value>(trimmed) else {
         return line.to_string();
     };
-    // Handle a JSON-RPC batch (top-level array) by injecting into each
-    // contained message, as well as a single message.
     let changed = match &mut v {
         serde_json::Value::Array(items) => items
             .iter_mut()
@@ -1053,9 +1010,7 @@ pub(crate) fn inject_default_project_line(line: &str, default: &str) -> String {
     serde_json::to_string(&v).unwrap_or_else(|_| line.to_string())
 }
 
-/// Inject `default` into one JSON-RPC message if it is a `tools/call` whose
-/// arguments omit a non-empty `project`. Returns whether it changed `v`.
-/// Creates an empty `arguments` object when the call omits it entirely.
+/// Fill omitted/null arguments and missing/empty projects; leave malformed values for validation.
 fn inject_into_message(v: &mut serde_json::Value, default: &str) -> bool {
     if v.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
         return false;
@@ -1087,10 +1042,7 @@ fn inject_into_message(v: &mut serde_json::Value, default: &str) -> bool {
     true
 }
 
-/// Pump newline-delimited JSON-RPC from `reader` to `writer`, injecting
-/// `default_project` into `tools/call` messages that omit it. Used by both
-/// the daemon shim (stdin → socket) and the direct-mode server (stdin →
-/// in-process transport).
+/// Forward newline-delimited JSON-RPC, supplying the default project on tools/call.
 pub(crate) async fn pump_lines_injecting<R, W>(
     reader: R,
     mut writer: W,
@@ -1114,8 +1066,6 @@ where
 pub async fn run_mcp_server(default_project: Option<String>) -> Result<()> {
     match default_project {
         Some(dp) => {
-            // Feed stdin through the project-injecting pump into an
-            // in-process pipe that backs the MCP transport's read half.
             let (mut feed, server_read) = tokio::io::duplex(64 * 1024);
             tokio::spawn(async move {
                 use tokio::io::AsyncWriteExt;
@@ -1136,10 +1086,7 @@ pub async fn run_mcp_server(default_project: Option<String>) -> Result<()> {
                     1
                 }
             };
-            // The spawned stdin pump owns a blocking read that can't be
-            // cancelled; if the server exits first, the runtime drop in
-            // cmd_mcp would block on it forever. Exit the process directly,
-            // mirroring the daemon shim's proxy_stdio rationale.
+            // Tokio's stdin read cannot be cancelled; runtime drop could wait forever.
             std::process::exit(code);
         }
         None => {
@@ -1175,15 +1122,12 @@ mod tests {
         assert!(err.starts_with(EMBED_TEXTS_OVER_CAP), "{err}");
         assert!(err.contains("per-call cap"), "{err}");
 
-        // One text over the per-text cap is refused even though the count is
-        // tiny: the count cap alone let a single call carry a whole file.
         let one_big = vec![String::from("ok"), "b".repeat(MAX_MCP_EMBED_TEXT_BYTES + 1)];
         let err = check_embed_texts_caps(&one_big).unwrap_err();
         assert!(err.starts_with(EMBED_TEXTS_OVER_CAP), "{err}");
         assert!(err.contains("text 1 is"), "{err}");
         assert!(err.contains("per-text cap"), "{err}");
 
-        // Every text under the per-text cap, but together over the aggregate.
         let per_text = MAX_MCP_EMBED_TEXT_BYTES;
         let count = MAX_MCP_EMBED_TOTAL_BYTES / per_text + 1;
         assert!(
@@ -1198,8 +1142,6 @@ mod tests {
 
     #[test]
     fn typed_kind_params_advertise_enum_in_input_schema() {
-        // The whole point of the typed params: the generated inputSchema
-        // must carry the legal values so agents see them before calling.
         let server = CodeSageServer::new();
         let tools = server.tool_router.list_all();
         let find_symbol = tools
@@ -1213,11 +1155,62 @@ mod tests {
         );
     }
 
-    /// Drives a real `tools/call` through the rmcp server (in-process duplex
-    /// transport) so the assertion covers the `Parameters<T>` extractor, not
-    /// just `serde_json::from_value`. rmcp maps the deserialization failure
-    /// to a tool result with `isError: true` whose text is the serde
-    /// message, so the caller sees the unknown field and the valid set.
+    #[tokio::test]
+    async fn rehearsal_returns_branch_evidence_without_onboarding() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-b", "base"]);
+        std::fs::write(dir.path().join("shared.rs"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+        git(&["checkout", "-b", "sibling"]);
+        std::fs::write(dir.path().join("shared.rs"), "sibling\n").unwrap();
+        git(&["commit", "-am", "sibling"]);
+        git(&["checkout", "-b", "current", "base"]);
+        std::fs::write(dir.path().join("current.rs"), "current\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "current"]);
+        let server = CodeSageServer::new();
+        let result = server
+            .review_rehearsal_tool(Parameters(ReviewRehearsalParams {
+                project: dir.path().to_string_lossy().into_owned(),
+                file_paths: vec!["shared.rs".to_string()],
+            }))
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let value = result.structured_content.unwrap();
+        assert_eq!(value["objections"][0]["category"], "branch-overlap");
+        assert!(
+            value["summary_notes"][0]
+                .as_str()
+                .unwrap()
+                .contains("did not run")
+        );
+        assert!(!dir.path().join(".codesage").exists());
+    }
+
+    /// Exercise rmcp's Parameters extractor over transport, including its tool-error envelope.
     #[tokio::test]
     async fn tools_call_with_unknown_argument_is_refused_naming_the_field() {
         use rmcp::ServiceExt;
@@ -1383,12 +1376,6 @@ mod tests {
         assert_eq!(value["primary"].as_array().unwrap().len(), 1);
     }
 
-    /// Every registered MCP tool must carry a valid output schema. Catches
-    /// the regression where a tool ships without `output_schema = ...` (then
-    /// agents have to guess the response shape) and where the schema's root
-    /// is not a JSON object (which the MCP spec requires; rmcp rejects it
-    /// at registration time but the assertion here makes the contract
-    /// explicit in test output).
     #[test]
     fn embed_texts_is_routed_but_never_advertised() {
         let server = CodeSageServer::new();
@@ -1404,6 +1391,24 @@ mod tests {
         );
         assert_eq!(advertised.len(), routed.len() - HIDDEN_TOOLS.len());
         assert!(advertised.iter().any(|t| t.name.as_ref() == "search"));
+    }
+
+    #[test]
+    fn rerank_pairs_is_routed_but_never_advertised() {
+        let server = CodeSageServer::new();
+        assert!(
+            server
+                .tool_router
+                .list_all()
+                .iter()
+                .any(|t| t.name.as_ref() == "rerank_pairs")
+        );
+        assert!(
+            !server
+                .advertised_tools()
+                .iter()
+                .any(|t| t.name.as_ref() == "rerank_pairs")
+        );
     }
 
     #[test]
@@ -1435,9 +1440,6 @@ mod tests {
     }
     #[test]
     fn over_max_limits_cap_with_a_requested_vs_applied_note() {
-        // The STRICT contract: over-max values still cap (behavior
-        // compatible), but the adjustment must be visible under
-        // `_meta.clamps` instead of silent.
         let (applied, note) = capped_limit_tracked(Some(10_000), 10, MAX_MCP_LIMIT, "limit");
         assert_eq!(applied, MAX_MCP_LIMIT);
         let note = note.expect("over-max must produce a clamp note");
@@ -1473,8 +1475,6 @@ mod tests {
 
     #[test]
     fn list_features_limit_zero_is_unbounded() {
-        // Schema promise + CLI parity: `Some(0)` means no limit. Only `None`
-        // takes the default; over-max caps with a note.
         assert_eq!(
             capped_limit_or_unbounded(None, 100, MAX_MCP_FEATURE_LIMIT, "limit").0,
             100
@@ -1498,8 +1498,6 @@ mod tests {
 
     #[test]
     fn min_jaccard_clamps_to_unit_range_at_the_param_layer() {
-        // Out-of-range is a clamp (reported), not an error: the graph layer
-        // historically clamped, so erroring would break callers.
         let (applied, note) = clamp_min_jaccard_tracked(None);
         assert_eq!(applied, 0.85);
         assert!(note.is_none());
@@ -1519,8 +1517,6 @@ mod tests {
 
     #[test]
     fn empty_file_lists_are_rejected_with_the_cli_sentence() {
-        // Parity with the CLI's risk-diff/batch/tests-for error; extended to
-        // review_rehearsal, which has no stdin/working-tree fallback over MCP.
         for tool in [
             "assess_risk_diff",
             "assess_risk_batch",

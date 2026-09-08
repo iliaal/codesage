@@ -2,11 +2,8 @@
 //! more [`TrustBoundary`] tags. Single source of truth: the boundary
 //! derivation engine in [`crate::trust_boundary`] reads these tables.
 //!
-//! The rule set is deliberately conservative. False positives (a file imports
-//! `reqwest` but only uses its `Url` type, not its client) are accepted as a
-//! cost for keeping the engine simple and import-graph-driven. The risk score
-//! cares about *boundary count*, not perfect attribution, so a small amount
-//! of over-tagging is fine.
+//! Imports imply possible capabilities, not proven use: importing `reqwest::Url`
+//! still marks a network boundary.
 //!
 //! Adding entries: pick the most specific prefix that uniquely identifies the
 //! capability. For Rust paths use `module::sub` with no trailing `::`; the
@@ -451,7 +448,7 @@ const PHP_RULES: &[TrustBoundaryRule] = &[
 ];
 
 /// C: matches the include path verbatim, as recorded between `<...>` or `"..."`.
-/// Tree-sitter strips the brackets/quotes, so the rule patterns are bare paths.
+/// Boundary derivation strips brackets/quotes before matching these bare paths.
 const C_RULES: &[TrustBoundaryRule] = &[
     // network
     rule("sys/socket.h", MatchMode::Exact, NETWORK),
@@ -521,10 +518,8 @@ const CPP_EXTRA_RULES: &[TrustBoundaryRule] = &[
     // STL
     rule("filesystem", MatchMode::Exact, FS),
     rule("fstream", MatchMode::Exact, FS),
-    // A bare `#include <iostream>` fires on every hello-world, so key user-input
-    // off actual `std::cin` usage instead of the include. The parser only records
-    // `std::cin` as a ref via `using std::cin;` (it is not a call expression), so
-    // this is deliberately narrow — output-only I/O (`std::cout`) no longer taints.
+    // The parser records `using std::cin;`; an iostream include alone does not
+    // distinguish input from output.
     rule("std::cin", MatchMode::PrefixDoubleColon, USER_INPUT),
     // Boost / asio
     rule("boost/asio.hpp", MatchMode::Exact, NETWORK),
@@ -557,11 +552,8 @@ const PYTHON_RULES: &[TrustBoundaryRule] = &[
     rule("starlette", MatchMode::PrefixDot, NETWORK),
     rule("django", MatchMode::PrefixDot, NETWORK),
     rule("tornado", MatchMode::PrefixDot, NETWORK),
-    // filesystem. Bare `os` fires Filesystem for a plain `import os`:
-    // call rows for `os.open(...)`/`os.read(...)` record only the bare
-    // attribute name, so without this those files derive no boundary at
-    // all. The engine unions matches, so `os.environ`/`os.system` keep
-    // their Secrets/ProcessExec tags alongside this one.
+    // Calls such as os.open record bare attribute names, so the import supplies
+    // the filesystem boundary. More specific rules add their boundaries by union.
     rule("os", MatchMode::PrefixDot, FS),
     rule("os.path", MatchMode::PrefixDot, FS),
     rule("pathlib", MatchMode::PrefixDot, FS),
@@ -602,10 +594,7 @@ const PYTHON_RULES: &[TrustBoundaryRule] = &[
     rule("sqlalchemy", MatchMode::PrefixDot, DB),
     rule("redis", MatchMode::PrefixDot, DB),
     rule("pymongo", MatchMode::PrefixDot, DB),
-    // user-input. Deliberately no bare `sys` rule: `sys.exit`/`sys.path`
-    // manipulation signal no boundary, and tagging every `import sys`
-    // as user input would drown the signal. Only `sys.argv` (genuine
-    // untrusted-input surface) fires.
+    // A bare sys import does not distinguish argv from exit/path operations.
     rule("argparse", MatchMode::PrefixDot, USER_INPUT),
     rule("click", MatchMode::PrefixDot, USER_INPUT),
     rule("typer", MatchMode::PrefixDot, USER_INPUT),
@@ -636,10 +625,7 @@ const GO_RULES: &[TrustBoundaryRule] = &[
     rule("github.com/gin-gonic/gin", MatchMode::PrefixSlash, NETWORK),
     rule("github.com/gofiber/fiber", MatchMode::PrefixSlash, NETWORK),
     rule("github.com/labstack/echo", MatchMode::PrefixSlash, NETWORK),
-    // filesystem (`os` is Exact: subpaths like `os/exec` and `os/user`
-    // carry their own rules below, and a PrefixSlash here would shadow
-    // their intent. Bare `os` covers file I/O; env/process entry points
-    // surface as `os.Getenv`-style call rows.)
+    // Exact matching keeps the filesystem boundary off subpackages such as os/exec.
     rule("os", MatchMode::Exact, FS),
     rule("io/ioutil", MatchMode::PrefixSlash, FS),
     rule("io/fs", MatchMode::PrefixSlash, FS),
@@ -711,9 +697,7 @@ const JS_RULES: &[TrustBoundaryRule] = &[
     rule("node:child_process", MatchMode::Exact, EXEC),
     rule("child_process", MatchMode::Exact, EXEC),
     rule("execa", MatchMode::PrefixSlash, EXEC),
-    // secrets / env. `process.env` matches by Contains: recorded names
-    // vary (`process.env`, `process.env.DB_URL`), and no narrower mode
-    // covers both the bare and suffixed forms.
+    // Contains also matches process.env within a longer recorded expression.
     rule("process.env", MatchMode::Contains, SECRETS),
     rule("node:crypto", MatchMode::Exact, SECRETS),
     rule("crypto", MatchMode::Exact, SECRETS),
@@ -814,11 +798,6 @@ mod tests {
 
     #[test]
     fn laravel_facades_cover_the_common_boundary_categories() {
-        // Laravel code abstracts auth/storage/queue/env behind facades
-        // rather than calling getenv/exec/openssl_* directly. Each row
-        // below names a facade plus the boundary it must fire so the
-        // rule table stays honest as a checklist when entries are
-        // added or removed.
         let table = rules_for(Language::Php)[0];
         let cases: &[(&str, TrustBoundary)] = &[
             ("Illuminate\\Support\\Facades\\Hash", TrustBoundary::Secrets),
@@ -960,9 +939,6 @@ mod tests {
 
     #[test]
     fn python_os_module_exec_sinks_fire_process_exec() {
-        // `os.system(user_input)` and friends are the classic shell-exec sinks;
-        // without these rules a file using them derives too few boundaries to
-        // trip the >=3 "security review recommended" note.
         for name in [
             "os.system",
             "os.popen",
@@ -984,8 +960,6 @@ mod tests {
 
     #[test]
     fn python_os_path_and_environ_still_route_correctly() {
-        // The new exec rules must not steal os.path (filesystem) / os.environ
-        // (secrets) — those share the `os.` prefix but different capabilities.
         assert!(python_fires("os.path", TrustBoundary::Filesystem));
         assert!(python_fires("os.environ", TrustBoundary::Secrets));
         assert!(!python_fires("os.path", TrustBoundary::ProcessExec));
@@ -1001,16 +975,12 @@ mod tests {
 
     #[test]
     fn cpp_system_error_include_is_not_process_exec() {
-        // `<system_error>` is std error-handling, not a process launcher; the
-        // real exec sink `std::system` keeps its own rule.
         assert!(!cpp_fires("system_error", TrustBoundary::ProcessExec));
         assert!(cpp_fires("std::system", TrustBoundary::ProcessExec));
     }
 
     #[test]
     fn cpp_iostream_include_does_not_taint_user_input() {
-        // A bare `#include <iostream>` no longer implies user input; only
-        // `std::cin` (recorded via `using std::cin;`) does.
         assert!(!cpp_fires("iostream", TrustBoundary::UserInput));
         assert!(cpp_fires("std::cin", TrustBoundary::UserInput));
     }
@@ -1047,8 +1017,6 @@ mod tests {
 
     #[test]
     fn go_bare_os_yields_filesystem() {
-        // `import "os"` is the most common Go file-surface import; without
-        // a bare rule those files derived no boundary at all.
         let table = rules_for(Language::Go)[0];
         let os = table
             .iter()
@@ -1077,8 +1045,6 @@ mod tests {
 
     #[test]
     fn python_bare_os_yields_filesystem() {
-        // Plain `import os` plus `os.open(...)`-style calls (recorded under
-        // the bare attribute name) previously derived nothing.
         assert!(python_fires("os", TrustBoundary::Filesystem));
         assert!(python_fires("os.open", TrustBoundary::Filesystem));
         // Union semantics: specific rules still fire alongside the bare one.
@@ -1109,8 +1075,6 @@ mod tests {
 
     #[test]
     fn js_process_env_yields_secrets() {
-        // The table docstring claims process.env coverage; this locks it.
-        // Contains covers both the bare form and `process.env.DB_URL`.
         let table = rules_for(Language::JavaScript)[0];
         let env = table
             .iter()
@@ -1125,9 +1089,6 @@ mod tests {
 
     #[test]
     fn c_mbedtls_include_yields_secrets_network() {
-        // Regression lock: the mbedtls rule must name the real header
-        // (`mbedtls/ssl.h` with no space). A spaced variant would never
-        // match a recorded include and silently disable the rule.
         let table = rules_for(Language::C)[0];
         let mbedtls: Vec<_> = table
             .iter()

@@ -1,0 +1,4 @@
+interface:
+  display_name: "CodeSage release"
+  short_description: "Audit, validate, and cut a CodeSage release"
+  default_prompt: "Use $release to cut a CodeSage release for the version I specify."

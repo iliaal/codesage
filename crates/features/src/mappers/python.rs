@@ -1,21 +1,4 @@
-//! Python mapper. Emits:
-//! - `python-project` library seed for any project with a manifest
-//!   (`pyproject.toml`/`setup.py`/`setup.cfg`/`requirements.txt`), so
-//!   `find_feature("src/foo.py")` resolves to the package even without an
-//!   explicit script entry.
-//! - `pyproject.toml` `[project.scripts]` and `[tool.poetry.scripts]` entry
-//!   points as `cli-command` seeds.
-//! - `setup.py` `entry_points={'console_scripts': [...]}` as `cli-command`
-//!   seeds (best-effort regex fallback).
-//! - Files containing top-level `if __name__ == "__main__":` as
-//!   `cli-command` seeds (test-shaped files filtered out).
-//! - `python-test-suite` seeds per suite-root with pytest files, with a
-//!   package-manager-aware test command (uv/poetry/pdm/hatch/bare pytest)
-//!   attached per test.
-//!
-//! Source-group partitioning (clawpatch's `python-source-group`) is
-//! intentionally NOT ported per the LLM-utility filter — browse-only rows
-//! dilute `list_features` without unlocking a new agent action.
+//! Python project, script, HTTP-route, and pytest-suite feature mapping.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -30,9 +13,7 @@ use crate::mappers::shared::{
 };
 use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile, SeedTest};
 
-/// Extract the body of a `[name]` section from a TOML-like document
-/// (returns until the next `[...]` header or EOF). Avoids look-around
-/// regex which the Rust `regex` crate doesn't support.
+/// Read a TOML-like section through the next header, without unsupported regex look-around.
 fn extract_section(body: &str, section: &str) -> Option<String> {
     let header = format!("[{section}]");
     let mut lines = body.lines();
@@ -74,9 +55,7 @@ impl FeatureMapper for PythonMapper {
         seeds.extend(pyproject_poetry_scripts(ctx)?);
         seeds.extend(setup_py_entry_points(ctx)?);
         seeds.extend(setup_cfg_entry_points(ctx)?);
-        // Walk the tree once and read each `.py` once (bounded); the four
-        // source scanners below share this set instead of each re-walking
-        // and re-reading every file with an unbounded `read_to_string`.
+        // Share one bounded source scan across the four detectors.
         let py_files = collect_python_source_files(ctx);
         seeds.extend(main_guard_modules(&py_files)?);
         seeds.extend(flask_routes(&py_files)?);
@@ -96,14 +75,8 @@ fn read_pyproject(root: &std::path::Path) -> Option<String> {
     read_to_string_bounded(&path).ok().flatten()
 }
 
-/// Detect the project's test driver. Priority order: uv → poetry → pdm →
-/// hatch → bare pytest, keyed off the **lockfile** only. A `[tool.X]`
-/// section in `pyproject.toml` was previously also accepted but produced
-/// false positives — projects that declare uv/poetry/pdm metadata in
-/// pyproject for dev-dep management while still running `pytest` directly.
-/// The lockfile is the higher-precision signal (the team committed to that
-/// driver). When no lockfile exists, return bare `pytest` so an agent gets
-/// a runnable command rather than nothing.
+/// Prefer uv, Poetry, or PDM only with a lockfile; tool metadata alone is ambiguous.
+/// Otherwise use pytest when a Python manifest exists.
 fn detect_python_test_command(root: &std::path::Path, pyproject: Option<&str>) -> Option<String> {
     let probe_lock = |name: &str| -> bool { is_safe_file(root, &root.join(name)) };
     if probe_lock("uv.lock") {
@@ -115,9 +88,7 @@ fn detect_python_test_command(root: &std::path::Path, pyproject: Option<&str>) -
     if probe_lock("pdm.lock") {
         return Some("pdm run pytest".to_string());
     }
-    // No hatch.lock convention exists; hatch is purely lockfile-less, so we
-    // don't have a precise way to detect it. Fall through to bare `pytest`
-    // for hatch users — still runnable in the hatch shell.
+    // Hatch has no lockfile signal; its projects use the pytest fallback.
     if pyproject.is_some()
         || is_safe_file(root, &root.join("setup.py"))
         || is_safe_file(root, &root.join("setup.cfg"))
@@ -128,9 +99,7 @@ fn detect_python_test_command(root: &std::path::Path, pyproject: Option<&str>) -
     None
 }
 
-/// One project-level library seed for projects with any Python manifest.
-/// Routes `find_feature("src/foo.py")` to the project even when no script
-/// entry resolves to it — clawpatch's `python-project` shape.
+/// Give Python source files a project owner even without script entrypoints.
 fn python_project_seed(
     ctx: &MapperContext,
     pyproject: Option<&str>,
@@ -166,23 +135,10 @@ fn python_project_seed(
             });
         }
     }
-    // Source-file ownership for `find_feature` routing. Without these
-    // entries, `feature-for src/acme/foo.py` returned nothing — the storage
-    // query is an exact `feature_files.path = ?` lookup and the only files
-    // attached previously were the manifest + README / AGENTS / tsconfig.
-    // Walk the project's Python source roots (cap 2_000 to keep the
-    // feature_files table bounded for monolithic monorepos) and tag each
-    // hit as `project source`.
+    // File-to-feature lookup matches exact paths, so attach source files explicitly.
     let project_files = python_project_source_files(ctx);
-    // NOTE: the inferred test command is surfaced via the summary string
-    // (and via `entry_command`) only. Earlier drafts populated `tests`
-    // with a SeedTest entry pointing at the manifest just to attach the
-    // command — but `SeedTest.path` is documented as a test FILE, and the
-    // mapper orchestrator inserts every `seed.tests[]` row as a
-    // `role: Test` `FeatureFileRef`. That would surface `pyproject.toml`
-    // as a "test" in `feature_bundle` output, which is wrong. Leaving
-    // tests empty here lets the orchestrator's `nearby_tests` discovery
-    // attach real test files instead.
+    // SeedTest paths become Test-role files. Leave tests empty for nearby discovery;
+    // the manifest is not a test merely because it declares a test command.
     let mut owned_files = vec![SeedFile {
         path: manifest.to_string(),
         reason: "package manifest".to_string(),
@@ -203,10 +159,7 @@ fn python_project_seed(
         },
         source: "python-project",
         entry_symbol: Some(project_name.clone()),
-        // entry_command stays None on library features — it's part of the
-        // feature_id hash and would destabilize identity whenever the
-        // project's test runner changed. The runnable test invocation
-        // goes in test_command instead.
+        // entry_command affects feature IDs; changing test runners must not change identity.
         test_command: test_cmd.map(String::from),
         tags: vec!["python".to_string(), "package".to_string()],
         owned_files,
@@ -233,8 +186,6 @@ fn python_project_source_files(ctx: &MapperContext) -> Vec<String> {
         .map(|d| root.join(d))
         .filter(|d| is_safe_dir(root, d))
         .collect();
-    // No `src/` layout: the project keeps its source at the repo root.
-    // Walk the whole root, bounded a bit wider than the per-dir case.
     let (scan_dirs, walk_cap) = if scan_dirs.is_empty() {
         (vec![root.to_path_buf()], 10_000)
     } else {
@@ -246,9 +197,7 @@ fn python_project_source_files(ctx: &MapperContext) -> Vec<String> {
         walk_cap,
         |rel| rel.ends_with(".py"),
         |rel| {
-            // Broad canonical shape for this exclusion scan: anything under
-            // a tests/ dir (conftest.py, helpers, fixtures) belongs to the
-            // python-test-suite slice, not the project's owned sources.
+            // Test helpers and fixtures belong to test suites, not project-owned source.
             crate::nearby_tests::is_test_file(rel, Language::Python)
                 || rel.ends_with("_pb2.py")
                 || rel.ends_with(".gen.py")
@@ -281,9 +230,6 @@ fn pyproject_poetry_scripts(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
     )
 }
 
-/// Shared parser for `[project.scripts]` and `[tool.poetry.scripts]` (PEP 621
-/// vs Poetry conventions). Both sections share `name = "module:fn"` syntax;
-/// only the section header, the `source` tag, and the title format differ.
 fn pyproject_scripts_section(
     ctx: &MapperContext,
     section: &str,
@@ -316,11 +262,7 @@ fn pyproject_scripts_section(
         if name.is_empty() {
             continue;
         }
-        // Target shape: `module.path:fn_name`. Resolve the dotted module to
-        // a real `.py` file so `codesage feature-for <module.py>` can find
-        // the script — recording `pyproject.toml` as entry_path makes the
-        // file→feature contract a lie ("what feature owns acme/cli.py?"
-        // would return nothing).
+        // Anchor resolved scripts to their source so file-to-feature lookup can find them.
         let module = target.split(':').next().unwrap_or(&target).to_string();
         let resolved = resolve_script_module_path(ctx, &module);
         let entry_path = resolved
@@ -404,11 +346,7 @@ fn setup_py_entry_points(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
     Ok(out)
 }
 
-/// `setup.cfg` `[options.entry_points]` `console_scripts = …` entries.
-/// Sibling to [`setup_py_entry_points`]; setup.cfg is INI-style and
-/// stores console_scripts as a multi-line `name = module:fn` block under
-/// a single key. Ported from clawpatch PR #28's expansion of Python
-/// packaging support beyond `pyproject.toml` / `setup.py`.
+/// setup.cfg stores console_scripts as an INI multiline `name = module:fn` value.
 fn setup_cfg_entry_points(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
     let root = ctx.root;
     let mut out = Vec::new();
@@ -423,9 +361,6 @@ fn setup_cfg_entry_points(ctx: &MapperContext) -> Result<Vec<FeatureSeed>> {
     let Some(entry_points) = extract_section(&body, "options.entry_points") else {
         return Ok(out);
     };
-    // Pull the `console_scripts = …` block. The value is a multi-line
-    // INI continuation: subsequent indented lines belong to the same
-    // key until the next bare-left-column line.
     let Some(block) = extract_ini_multiline_value(&entry_points, "console_scripts") else {
         return Ok(out);
     };
@@ -494,8 +429,6 @@ fn extract_ini_multiline_value(section_body: &str, key: &str) -> Option<String> 
             }
             continue;
         }
-        // Continuation: indented or blank. A non-empty, non-indented
-        // line ends the value.
         if line.is_empty() {
             continue;
         }
@@ -522,10 +455,7 @@ fn resolve_script_module_path(ctx: &MapperContext, module: &str) -> Option<Strin
         return None;
     }
     let joined = parts.join("/");
-    // Probe `<module>.py`, `<module>/__init__.py`, and the same shapes
-    // under `src/`. Order matters: a top-level `<module>.py` beats a
-    // namespace-package `<module>/__init__.py`, because real projects
-    // most commonly have the former.
+    // Prefer root modules over packages, then try the src layout.
     let candidates = [
         format!("{joined}.py"),
         format!("{joined}/__init__.py"),
@@ -545,16 +475,12 @@ fn resolve_script_module_path(ctx: &MapperContext, module: &str) -> Option<Strin
     None
 }
 
-/// A `.py` file read once during `map`, shared by every source scanner so
-/// the tree is walked once and each file read once (bounded).
+/// Shared bounded source read for the main-guard and framework scanners.
 struct PyFile {
     rel: String,
     contents: String,
 }
 
-/// Walk the project once, reading each `.py` file with the bounded reader.
-/// Files above the reader's size cap (or unreadable) are dropped. The
-/// 30_000 file cap matches the per-scanner walk it replaces.
 fn collect_python_source_files(ctx: &MapperContext) -> Vec<PyFile> {
     let root = ctx.root;
     let mut out = Vec::new();
@@ -576,11 +502,7 @@ fn main_guard_modules(files: &[PyFile]) -> Result<Vec<FeatureSeed>> {
     let guard_re = Regex::new(r#"(?m)^if\s+__name__\s*==\s*['"]__main__['"]"#)?;
     for f in files {
         let rel = &f.rel;
-        // Test files with `if __name__ == "__main__":` are ad-hoc test
-        // runners, not CLI commands. They're often excluded by the
-        // project's `[index].exclude_patterns`, so emitting features
-        // for them produces rows whose entry_path isn't in the `files`
-        // table.
+        // Main guards in test files are test runners, not CLI commands.
         if matches!(FileCategory::classify(rel), FileCategory::Test) {
             continue;
         }
@@ -609,29 +531,14 @@ fn main_guard_modules(files: &[PyFile]) -> Result<Vec<FeatureSeed>> {
     Ok(out)
 }
 
-// ---- Flask / FastAPI route mapping ------------------------------------
-
-/// Flask route detection. Scans `.py` files that import flask for
-/// `@<receiver>.route('/path', methods=['GET','POST'])` decorators where
-/// `receiver` is a local variable initialized from `Flask(...)` or
-/// `Blueprint(...)`. Emits one `route` feature per `(method, path)`.
-/// Defaults to `GET` when `methods=` is absent (Flask's default).
-///
-/// Known limitations: blueprint `url_prefix` is NOT expanded into mounted
-/// paths; non-literal paths or method lists are intentionally skipped
-/// rather than guessed.
+/// Map literal Flask/Blueprint routes, defaulting to GET when methods are absent
+/// or unparseable. Blueprint mount prefixes are not expanded.
 fn flask_routes(files: &[PyFile]) -> Result<Vec<FeatureSeed>> {
     python_framework_routes(files, PythonFramework::Flask)
 }
 
-/// FastAPI route detection. Scans `.py` files that import fastapi for
-/// `@<receiver>.METHOD('/path')` or `@<receiver>.api_route('/path',
-/// methods=[...])` decorators where `receiver` is a `FastAPI(...)` or
-/// `APIRouter(...)` instance.
-///
-/// Known limitations: `include_router(prefix=…)` mount prefixes are NOT
-/// expanded — upstream clawpatch doesn't expand them either. Non-literal
-/// paths are skipped.
+/// Map literal FastAPI/APIRouter routes; api_route needs parseable explicit methods.
+/// include_router mount prefixes are not expanded.
 fn fastapi_routes(files: &[PyFile]) -> Result<Vec<FeatureSeed>> {
     python_framework_routes(files, PythonFramework::FastApi)
 }
@@ -709,9 +616,6 @@ fn python_framework_routes(
 
     for f in files {
         let raw = &f.contents;
-        // Cheap gates: framework token must appear, and an import line
-        // must confirm it (avoids matching a string literal that
-        // mentions the framework name).
         if !raw.contains(framework.import_token()) {
             continue;
         }
@@ -736,21 +640,14 @@ fn python_framework_routes(
     Ok(out)
 }
 
-/// Pending decorator captured at scan time, holding the args needed to
-/// emit one or more route seeds once the handler `def` is reached. A
-/// stack of these accumulates while stacked decorators bind to the same
-/// function.
+/// Stacked route decorators await the same handler definition.
 struct PendingDecorator {
     path: String,
     methods: Vec<String>,
 }
 
-/// Line-based scanner for both Flask and FastAPI. Walks the source line
-/// by line, accumulates multi-line decorator argument lists by tracking
-/// paren depth, then attaches a handler function name pulled from the
-/// next `def` line as the seed's `entry_symbol`. Stacked decorators all
-/// resolve to the same function; intervening blank lines / comments /
-/// other decorators don't reset the pending list.
+/// Accumulate multiline and stacked decorators until the handler definition.
+/// Blank lines, comments, and unrelated decorators preserve pending routes.
 fn emit_python_routes_for(
     source: &str,
     rel: &str,
@@ -856,9 +753,7 @@ fn parse_decorator(
     let methods = match method_token.as_str() {
         // Flask `route` defaults to GET when no `methods=` kwarg is supplied.
         "route" => parse_methods_kwarg(rest).unwrap_or_else(|| vec!["GET".to_string()]),
-        // FastAPI `api_route` is variadic and REQUIRES `methods=[...]`; a
-        // missing/unparseable methods list means we can't determine the
-        // method set and drop the decorator rather than guessing.
+        // Require explicit parseable methods for api_route; do not infer a method set.
         "api_route" => parse_methods_kwarg(rest)?,
         verb => vec![verb.to_uppercase()],
     };
@@ -931,10 +826,7 @@ fn parse_methods_kwarg(args: &str) -> Option<Vec<String>> {
     Some(methods)
 }
 
-/// Net paren count for a line, ignoring `(` and `)` that appear inside
-/// `"..."` / `'...'` string literals. Used to drive multi-line decorator
-/// accumulation: a decorator continues until its paren depth returns to
-/// zero.
+/// Net parenthesis depth outside strings, for multiline decorator accumulation.
 fn paren_delta(line: &str) -> i32 {
     let mut delta = 0i32;
     let mut quote: Option<char> = None;
@@ -961,11 +853,6 @@ fn paren_delta(line: &str) -> i32 {
     delta
 }
 
-/// Per-file scanner state bundle: the output vector, dedup set, and the
-/// file/receiver/framework triple that stays constant across every seed
-/// emitted from the same `(file, receiver)` pair. Lifts the function-arg
-/// count of [`push_python_route_seed`] under the clippy threshold and
-/// keeps each call site focused on what varies (method, path, handler).
 struct RouteEmitCtx<'a> {
     out: &'a mut Vec<FeatureSeed>,
     emitted: &'a mut BTreeSet<(String, String)>,
@@ -1027,21 +914,9 @@ fn push_python_route_seed(
     });
 }
 
-// ---- Django URLconf route mapping -------------------------------------
-
-/// Django route detection. Scans `.py` files that import from `django.urls`
-/// / `django.conf.urls` and declare a `urlpatterns = [...]` list for
-/// `path()`, `re_path()`, and (legacy) `url()` route entries. Emits one
-/// `route` feature per distinct normalized URL, with the view's symbol as
-/// `entry_symbol` when it can be resolved.
-///
-/// Known limitations (deliberately conservative, matching the Flask /
-/// FastAPI mappers): `include(...)` mounts are NOT expanded into their
-/// sub-URLConf — the mount prefix is dropped rather than guessed, so the
-/// child app's own `urls.py` contributes its routes without the prefix.
-/// Non-literal route patterns (a variable instead of a string) are skipped.
-/// Django binds no HTTP method at the URL layer, so route labels carry the
-/// path only; the `auth-sensitive` tag therefore fires on path shape alone.
+/// Map literal path/re_path/url entries in urlpatterns. Skip include mounts;
+/// child URLconfs contribute unprefixed routes. HTTP methods are unavailable at
+/// this layer, so auth-sensitive tags depend only on path shape.
 fn django_routes(files: &[PyFile]) -> Result<Vec<FeatureSeed>> {
     let mut out = Vec::new();
     let import_re = Regex::new(
@@ -1054,7 +929,6 @@ fn django_routes(files: &[PyFile]) -> Result<Vec<FeatureSeed>> {
     for f in files {
         let rel = &f.rel;
         let raw = &f.contents;
-        // Cheap gates before the comment strip + regex work.
         if !raw.contains("urlpatterns") || !raw.contains("django") {
             continue;
         }
@@ -1237,18 +1111,10 @@ fn convert_django_named_groups(s: &str) -> String {
     out
 }
 
-/// Resolve a Django view argument to a symbol name: `views.article_list`
-/// → `article_list`, `ArticleView.as_view()` → `ArticleView`, a bare
-/// `home` → `home`. Returns `None` when the result isn't a clean
-/// identifier (e.g. a `view=` kwarg or an inline lambda), or when the
-/// argument is a urlconf mount rather than a view: a bare dotted attribute
-/// ending in `.urls` (`admin.site.urls`, `app.urls`) names an included
-/// URLconf, so its leaf (`urls`) is a meaningless "handler" — keep the
-/// route, drop the symbol. (`include('app.urls')` is filtered earlier; this
-/// catches the attribute-style mount Django's own templates use.)
+/// Map views.foo to foo and Class.as_view() to Class. Invalid identifiers and
+/// attribute URLconf mounts (e.g. admin.site.urls) produce no handler symbol.
 fn django_view_symbol(raw: &str) -> Option<String> {
     let head = raw.split('(').next().unwrap_or(raw).trim();
-    // Attribute-style urlconf mount (no call): `x.y.urls` with ≥2 segments.
     if !head.contains("()") && head.ends_with(".urls") && head.matches('.').count() >= 1 {
         return None;
     }
@@ -1407,16 +1273,8 @@ fn ensure_leading_slash(p: &str) -> String {
     }
 }
 
-// ---- pytest test-suite mapping ----------------------------------------
-
-/// Per-suite-root pytest seeds. Walks `tests/`, `test/`, and any source-
-/// root the project declares (`src/`, top-level packages); filters to
-/// `test_*.py` / `*_test.py`; skips `__fixtures__` / `fixtures` /
-/// `testdata` directories; caps at 200 files per project; groups files by
-/// their suite root (the top-level dir containing the test). One seed per
-/// suite root keeps `list_features` clean — a project with `tests/api/`
-/// and `tests/unit/` produces ONE `python-test-suite` for `tests`, not
-/// two, matching how a developer thinks about pytest runs.
+/// Scan tests/, test/, and src/ for up to 200 runnable pytest files total.
+/// Group by top-level root so nested suites remain one feature.
 fn pytest_test_suites(ctx: &MapperContext, test_cmd: Option<&str>) -> Result<Vec<FeatureSeed>> {
     let root = ctx.root;
     let scan_dirs = ["tests", "test", "src"];
@@ -1433,9 +1291,6 @@ fn pytest_test_suites(ctx: &MapperContext, test_cmd: Option<&str>) -> Result<Vec
             }
             test_files.push(rel);
             if test_files.len() >= PYTEST_FILE_CAP {
-                // The cap is global, not per-scan-dir; once 200 pytest
-                // files have been collected from any combination of
-                // tests/, test/, and src/, bail entirely.
                 break 'outer;
             }
         }
@@ -1446,10 +1301,6 @@ fn pytest_test_suites(ctx: &MapperContext, test_cmd: Option<&str>) -> Result<Vec
     test_files.sort();
     test_files.dedup();
 
-    // Bucket by suite root (top-level dir). `tests/api/test_x.py` and
-    // `tests/unit/test_y.py` both go under `tests/`. A top-level
-    // `test_something.py` (no dir) buckets under `""` and gets a single
-    // umbrella seed.
     let mut by_root: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
     for file in test_files {
@@ -1495,10 +1346,7 @@ fn pytest_test_suites(ctx: &MapperContext, test_cmd: Option<&str>) -> Result<Vec
             source: "python-test-suite",
             confidence: FeatureConfidence::High,
             entry_symbol: Some(label.clone()),
-            // Test-suite features identify by the suite label (`tests` /
-            // `test` / source-root name). The runnable command goes in
-            // test_command, keeping entry_command free for the argv[0]-
-            // shape contract (this seed has no such command).
+            // Keep the runnable test command separate from command-based feature identity.
             test_command: test_cmd.map(String::from),
             tags: vec!["python".to_string(), "tests".to_string()],
             owned_files: owned,
@@ -1519,11 +1367,7 @@ fn pytest_test_suites(ctx: &MapperContext, test_cmd: Option<&str>) -> Result<Vec
     Ok(out)
 }
 
-/// Match `test_*.py` and `*_test.py`. Excludes fixture/testdata paths and
-/// generated python (`*_pb2.py`, `*.gen.py`) — even when they live under a
-/// test root, they're not the test files an agent runs. The basename
-/// convention itself is single-sourced in `nearby_tests`; this adds the
-/// runnable-file carve-outs on top.
+/// Use canonical pytest basenames, excluding fixtures and generated files.
 fn is_pytest_file(rel: &str) -> bool {
     let lower = rel.to_ascii_lowercase();
     if !lower.ends_with(".py") {
@@ -1567,7 +1411,6 @@ name = "acme"
 acme = "acme.cli:main"
 "#,
         );
-        // No module file on disk → entry falls back to the manifest.
         let seeds = PythonMapper
             .map(&MapperContext::for_root(dir.path()))
             .unwrap();
@@ -1582,9 +1425,6 @@ acme = "acme.cli:main"
 
     #[test]
     fn pyproject_script_entry_resolves_to_module_file() {
-        // The advertised contract: `codesage feature-for acme/cli.py`
-        // must find this feature. That requires entry_path to be the
-        // module file, not the manifest.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -1610,7 +1450,6 @@ acme = "acme.cli:main"
 
     #[test]
     fn pyproject_script_entry_resolves_src_layout() {
-        // `src/<pkg>/<mod>.py` is the other common Python layout.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -1635,7 +1474,6 @@ acme = "acme.cli:main"
 
     #[test]
     fn pyproject_script_entry_resolves_package_init() {
-        // Namespace/package script: target `acme:main` → `acme/__init__.py`.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -1660,10 +1498,6 @@ acme = "acme:main"
 
     #[test]
     fn pyproject_script_entry_falls_back_when_excluded() {
-        // If the resolved module file is excluded by [index].exclude_patterns,
-        // we can't ship a feature pointing at a file the rest of the
-        // pipeline ignores. Fall back to the manifest so the seed at
-        // least exists with a valid entry_path.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -1707,8 +1541,6 @@ acme = "acme.cli:main"
 
     #[test]
     fn main_guard_skips_test_files() {
-        // `test_*.py` / `*_test.py` / files under `tests/` with a
-        // `__main__` guard must not produce cli-command features.
         let dir = tempdir().unwrap();
         write(
             dir.path(),
@@ -1765,8 +1597,6 @@ acme = "acme.cli:main"
         assert_eq!(s.entry_command.as_deref(), Some("acme"));
         assert_eq!(s.entry_path, "acme/cli.py");
     }
-
-    // ---- Python-project + pytest + test-command -------------------------
 
     #[test]
     fn python_project_seed_emitted_with_pyproject() {
@@ -1869,7 +1699,6 @@ acme = "acme.cli:main"
             .iter()
             .filter(|s| s.source == "python-test-suite")
             .collect();
-        // ONE seed per top-level suite root (`tests`), not three.
         assert_eq!(
             suite_seeds.len(),
             1,
@@ -1879,7 +1708,6 @@ acme = "acme.cli:main"
         let s = suite_seeds[0];
         assert_eq!(s.entry_symbol.as_deref(), Some("tests"));
         assert_eq!(s.kind, FeatureKind::TestSuite);
-        // All three test files attach to the seed.
         let test_paths: BTreeSet<&str> = s.tests.iter().map(|t| t.path.as_str()).collect();
         assert!(test_paths.contains("tests/api/test_users.py"));
         assert!(test_paths.contains("tests/unit/test_helpers.py"));
@@ -2007,17 +1835,11 @@ acme = "acme.cli:main"
 
     #[test]
     fn python_project_seed_owns_source_files_for_routing() {
-        // Regression: `find_feature("src/acme/foo.py")` had no chance
-        // because the project seed only persisted the manifest. Walking the
-        // source root and attaching the .py files lets the storage exact-
-        // match query (`feature_files.path = ?1`) resolve any project file.
         let dir = tempdir().unwrap();
         write(dir.path(), "pyproject.toml", "[project]\nname = \"acme\"\n");
         write(dir.path(), "src/acme/__init__.py", "");
         write(dir.path(), "src/acme/foo.py", "def foo(): pass\n");
         write(dir.path(), "src/acme/bar.py", "def bar(): pass\n");
-        // Test files belong on the python-test-suite seed, not the project
-        // seed; verify they don't bleed in.
         write(dir.path(), "tests/test_foo.py", "def test_foo(): pass\n");
         let seeds = PythonMapper
             .map(&MapperContext::for_root(dir.path()))
@@ -2039,8 +1861,6 @@ acme = "acme.cli:main"
             "test files must NOT be on the project seed: got {owned_paths:?}"
         );
     }
-
-    // ---------- Flask / FastAPI / setup.cfg (clawpatch #11 / #15 / #28) ----------
 
     #[test]
     fn flask_basic_route_defaults_to_get() {
@@ -2130,8 +1950,6 @@ def ping():
 
     #[test]
     fn flask_requires_flask_import() {
-        // No flask import → no route seeds, even if a `@app.route` decorator
-        // happens to be present (could be a different library).
         let dir = tempdir().unwrap();
         write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
         write(
@@ -2248,9 +2066,6 @@ async def handle_any():
 
     #[test]
     fn fastapi_api_route_without_methods_kwarg_is_dropped() {
-        // `api_route` without `methods=[...]` has no determinable method
-        // set. We drop it rather than guessing GET (Flask's default
-        // doesn't apply here).
         let dir = tempdir().unwrap();
         write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
         write(
@@ -2418,9 +2233,6 @@ def items():
 
     #[test]
     fn fastapi_stacked_decorators_share_handler() {
-        // A second decorator between the route decorator and `def`
-        // must not break the binding — both upstream and our scanner
-        // hold the pending route until any `def` line is reached.
         let dir = tempdir().unwrap();
         write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
         write(
@@ -2481,13 +2293,11 @@ urlpatterns = [
             "converter not stripped: {routes:?}"
         );
         assert!(routes.contains("/admin/"), "got: {routes:?}");
-        // view symbol resolved off the `views.` attribute access
         let home = seeds
             .iter()
             .find(|s| s.source == "django-route" && s.entry_route.as_deref() == Some("/"))
             .unwrap();
         assert_eq!(home.entry_symbol.as_deref(), Some("home"));
-        // path-shape auth-sensitive tag fires on /admin/
         let admin = seeds
             .iter()
             .find(|s| s.source == "django-route" && s.entry_route.as_deref() == Some("/admin/"))
@@ -2497,7 +2307,6 @@ urlpatterns = [
             "admin route should be auth-sensitive: {:?}",
             admin.tags
         );
-        // a plain GET-shape article route should not be flagged
         let archive = seeds
             .iter()
             .find(|s| {
@@ -2559,13 +2368,11 @@ urlpatterns = [
             .filter(|s| s.source == "django-route")
             .filter_map(|s| s.entry_route.clone())
             .collect();
-        // class-based view resolves to the class name
         let cbv = seeds
             .iter()
             .find(|s| s.source == "django-route" && s.entry_route.as_deref() == Some("/articles/"))
             .expect("CBV route missing");
         assert_eq!(cbv.entry_symbol.as_deref(), Some("ArticleList"));
-        // include() mount is NOT emitted as a route of its own
         assert!(
             !routes.contains("/blog/"),
             "include() mount should be skipped: {routes:?}"
@@ -2574,9 +2381,6 @@ urlpatterns = [
 
     #[test]
     fn django_admin_site_urls_mount_keeps_route_drops_symbol() {
-        // `path('admin/', admin.site.urls)` — the stock Django route present
-        // in every project. It's a urlconf mount, not a view; the route is
-        // real (and auth-sensitive) but `urls` is a junk handler symbol.
         let dir = tempdir().unwrap();
         write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
         write(
@@ -2611,10 +2415,6 @@ urlpatterns = [
 
     #[test]
     fn django_ignores_urlpatterns_examples_in_docstring() {
-        // The stock `startproject` urls.py carries example `path(...)` calls
-        // inside its module docstring. The import gate + urlpatterns anchor
-        // must not emit phantom routes from that prose. Real-repo trap
-        // caught in the GitNexus Django fixture smoke test (2026-06-01).
         let dir = tempdir().unwrap();
         write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
         write(
@@ -2652,8 +2452,6 @@ urlpatterns = [
 
     #[test]
     fn django_requires_django_import() {
-        // `urlpatterns` present but no django.urls import → skip (could be a
-        // coincidental variable name).
         let dir = tempdir().unwrap();
         write(dir.path(), "pyproject.toml", "[project]\nname=\"app\"\n");
         write(

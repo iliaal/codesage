@@ -1,6 +1,4 @@
-//! Storage-layer tests for V2b git history tables. Exercises the in-memory accessors:
-//! upsert + on-conflict replacement, co-change query symmetry across pair sides,
-//! churn percentile math, and clear_git_data.
+//! Git-history storage: replacement, pair symmetry, recurrence, decay, and churn percentiles.
 
 use codesage_storage::Database;
 use codesage_storage::db::CoChangeWrite;
@@ -44,7 +42,6 @@ fn co_change_recurrence_columns_round_trip_and_default_to_one_window() {
     // Legacy 5-arg upsert: mask 0, windows 1, first == last.
     db.upsert_git_co_change("a.rs", "b.rs", 1.0, 3, Some(1_700_000_000))
         .unwrap();
-    // Four bits set, spanning two timestamps.
     db.upsert_git_co_change_full(
         "a.rs",
         "c.rs",
@@ -57,7 +54,6 @@ fn co_change_recurrence_columns_round_trip_and_default_to_one_window() {
         ),
     )
     .unwrap();
-    // Mask 0 still reads as one window, never 0.
     db.upsert_git_co_change_full("a.rs", "d.rs", &write(1.0, 3, 0, None, None))
         .unwrap();
     // Bit 63 survives the signed INTEGER column.
@@ -77,10 +73,8 @@ fn co_change_recurrence_columns_round_trip_and_default_to_one_window() {
     assert_eq!(by_file("d.rs").windows, 1);
     assert_eq!(by_file("e.rs").window_mask, 1 << 63 | 1);
     assert_eq!(by_file("e.rs").windows, 2);
-    // The other side's commit total rides along; a missing git_files row is 0.
     assert_eq!(by_file("c.rs").other_commits, 6);
     assert_eq!(by_file("b.rs").other_commits, 0);
-    // Replacement upsert overwrites the recurrence columns too.
     db.upsert_git_co_change_full("a.rs", "c.rs", &write(1.0, 3, 0b11, None, None))
         .unwrap();
     let c = db
@@ -245,7 +239,6 @@ fn git_file_returns_none_for_unknown_path() {
 #[test]
 fn co_changes_for_returns_from_both_pair_sides() {
     let db = Database::open_in_memory().unwrap();
-    // Pair stored sorted: (a, b) where a < b lexicographically.
     db.upsert_git_co_change("src/a.rs", "src/b.rs", 5.0, 7, Some(1700000000))
         .unwrap();
     db.upsert_git_co_change("src/a.rs", "src/c.rs", 3.0, 5, Some(1700001000))
@@ -253,12 +246,10 @@ fn co_changes_for_returns_from_both_pair_sides() {
     db.upsert_git_co_change("src/b.rs", "src/c.rs", 1.0, 4, Some(1700002000))
         .unwrap();
 
-    // Querying from the smaller side (file_a) returns the larger side.
     let from_a = db.co_changes_for("src/a.rs", 10).unwrap();
     let names: Vec<&str> = from_a.iter().map(|r| r.file.as_str()).collect();
     assert_eq!(names, vec!["src/b.rs", "src/c.rs"], "weight-sorted desc");
 
-    // Querying from the larger side (file_b) returns pairs from BOTH columns.
     let from_b = db.co_changes_for("src/b.rs", 10).unwrap();
     let names: Vec<&str> = from_b.iter().map(|r| r.file.as_str()).collect();
     // a (weight 5.0 from a-b pair) + c (weight 1.0 from b-c pair).
@@ -275,7 +266,6 @@ fn co_changes_respects_limit() {
     }
     let top3 = db.co_changes_for("src/main.rs", 3).unwrap();
     assert_eq!(top3.len(), 3);
-    // Highest weights first (10.0, 9.0, 8.0)
     assert!((top3[0].weight - 10.0).abs() < 1e-9);
     assert!((top3[1].weight - 9.0).abs() < 1e-9);
     assert!((top3[2].weight - 8.0).abs() < 1e-9);
@@ -291,7 +281,6 @@ fn churn_percentile_returns_zero_for_unknown_path() {
 #[test]
 fn churn_percentile_ranks_correctly() {
     let db = Database::open_in_memory().unwrap();
-    // Four files with churns 1, 2, 3, 4.
     for (path, churn) in [("a", 1.0), ("b", 2.0), ("c", 3.0), ("d", 4.0)] {
         db.upsert_git_file(path, churn, 0, 1, None).unwrap();
     }
@@ -353,7 +342,6 @@ fn git_index_state_round_trip() {
     assert_eq!(sha, "abc123");
     assert!(at > 0, "indexed_at stamped via unixepoch()");
 
-    // Update with a new SHA replaces the row, not appends.
     db.set_git_index_state("def456").unwrap();
     let (sha2, _) = db.get_git_index_state().unwrap().expect("state present");
     assert_eq!(sha2, "def456");
@@ -419,8 +407,6 @@ fn co_change_pair_exists_detects_both_orderings() {
     db.upsert_git_co_change("a.rs", "b.rs", 1.0, 3, Some(1700000000))
         .unwrap();
     assert!(db.co_change_pair_exists("a.rs", "b.rs").unwrap());
-    // Pairs are stored sorted, so b/a (unsorted) would be a debug_assert hit in incr_;
-    // exists() also requires sorted input. Validate the sorted lookup works.
     assert!(!db.co_change_pair_exists("a.rs", "c.rs").unwrap());
 }
 
@@ -452,19 +438,14 @@ fn scale_git_decay_multiplies_churn_and_pair_weights() {
 #[test]
 fn remove_file_cascades_to_git_tables() {
     let db = Database::open_in_memory().unwrap();
-    // Seed: one git_files row for the doomed path, and co-change pairs using it on
-    // both sides.
     db.upsert_git_file("src/doomed.rs", 4.0, 2, 8, Some(1700000000))
         .unwrap();
     db.upsert_git_file("src/survivor.rs", 2.0, 1, 3, Some(1700001000))
         .unwrap();
-    // pair with doomed as file_a
     db.upsert_git_co_change("src/doomed.rs", "src/z.rs", 3.0, 5, Some(1700000100))
         .unwrap();
-    // pair with doomed as file_b (lexicographic ordering puts a_file first)
     db.upsert_git_co_change("src/a_file.rs", "src/doomed.rs", 2.0, 4, Some(1700000200))
         .unwrap();
-    // unrelated pair that must stay
     db.upsert_git_co_change("src/a_file.rs", "src/z.rs", 1.0, 3, Some(1700000300))
         .unwrap();
 

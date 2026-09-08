@@ -28,9 +28,7 @@ pub(crate) fn cmd_features_list(
             Some(Language::parse(l).ok_or_else(|| anyhow::anyhow!("unknown language: {l}"))?)
         }
     };
-    // With `--since`, fetch unbounded then cap after the changed-file
-    // intersection — the SQL LIMIT runs before our filter, so a default
-    // limit would truncate candidates the diff filter hasn't seen yet.
+    // Apply the limit after the diff filter; SQL LIMIT would discard unseen candidates.
     let query_limit = if since.is_some() { 0 } else { limit };
     let mut features = db.list_features(kind, language, tag, query_limit)?;
     if let Some(git_ref) = since {
@@ -127,10 +125,7 @@ pub(crate) fn cmd_feature_bundle(
     json: bool,
 ) -> Result<()> {
     let root = find_project_root()?;
-    // Open against the configured embedding model so `primary` / `related`
-    // resolve real chunks. The default-model `open_db` points at the
-    // MiniLM 384-dim chunk table and returns empty content on projects
-    // configured for a different model (e.g. php-src uses jina v2 768-dim).
+    // Context chunks belong to the configured model's table, not the default model.
     let db = load_symbol_context_db(&root)?;
     let bundle = codesage_graph::feature_bundle(&db, id, include_callers, include_callees, limit)?;
     if json {

@@ -21,7 +21,6 @@ fn has_ref(refs: &[codesage_protocol::Reference], name: &str, kind: ReferenceKin
 
 #[test]
 fn rust_grouped_glob_and_renamed_use_emit_prefixed_imports() {
-    // Grouped / glob / `as` use forms previously emitted zero imports.
     let src = "use std::io::{Read, Write};\nuse a::b::*;\nuse x::y as z;\nuse std::{fmt, cmp::Ordering};\n";
     let refs = refs_from_source(src, Language::Rust);
     assert!(has_ref(&refs, "std::io::Read", ReferenceKind::Import));
@@ -60,8 +59,6 @@ fn javascript_reexport_inheritance_and_instantiation() {
 
 #[test]
 fn typescript_reexport_inheritance_and_instantiation() {
-    // Same three edges as the JS test, but under the TSX grammar
-    // (`extends_clause` form, which plain JS does not emit).
     let src = "export { a } from \"./m\";\nclass Foo extends Bar {}\nconst x = new Baz();\n";
     let refs = refs_from_source(src, Language::TypeScript);
     assert!(has_ref(&refs, "./m", ReferenceKind::Import));
@@ -116,15 +113,11 @@ fn php_extracts_instance_nullsafe_and_static_method_calls() {
 
 #[test]
 fn javascript_import_bindings_are_captured_separately_from_the_module() {
-    // The module specifier alone left a file that imports a symbol and uses it
-    // only as `Foo.staticMethod()` or `x instanceof Foo` with no row naming
-    // that symbol, so it dropped out of the symbol's dependents.
     let src = "import Foo from './foo.js';\n\
                import { Bar, Baz as Qux } from './bar.js';\n\
                import * as ns from './ns.js';\n";
     let refs = refs_from_source(src, Language::JavaScript);
 
-    // The modules stay `Import` so file-level dependency listings are unchanged.
     assert!(has_ref(&refs, "./foo.js", ReferenceKind::Import));
     assert!(has_ref(&refs, "./bar.js", ReferenceKind::Import));
 
@@ -135,7 +128,6 @@ fn javascript_import_bindings_are_captured_separately_from_the_module() {
     // symbol, which is what a dependents query is asking about.
     assert!(has_ref(&refs, "Baz", ReferenceKind::ImportBinding));
 
-    // Bindings must not leak into the module list.
     assert!(!has_ref(&refs, "Foo", ReferenceKind::Import));
 }
 
@@ -154,9 +146,6 @@ fn typescript_import_bindings_are_captured_separately_from_the_module() {
 
 #[test]
 fn javascript_reexport_and_commonjs_destructuring_name_their_bindings() {
-    // A barrel file forwards symbols; a CommonJS consumer destructures them.
-    // Both used to record only the module string, so neither appeared in the
-    // forwarded symbol's dependents.
     let src = "export { x, y as z } from './m.js';\n\
                const { a, b } = require('./n.js');\n\
                a.staticMethod();\n";
@@ -197,10 +186,6 @@ fn typescript_reexport_and_commonjs_destructuring_name_their_bindings() {
 
 #[test]
 fn javascript_barrel_destructure_and_local_reexport_name_their_symbols() {
-    // The shape axios' index.js uses: import the default, unwrap named symbols
-    // off it, re-export them. Neither the destructure (RHS is a value, not a
-    // `require` call) nor the sourceless `export { ... }` named those symbols,
-    // so a barrel every consumer imports through contributed no edges.
     let src = "import axios from './lib/axios.js';\n\
                const { Axios, CancelToken, formToJSON: toJSON } = axios;\n\
                export { axios as default, Axios, CancelToken };\n";
@@ -211,17 +196,12 @@ fn javascript_barrel_destructure_and_local_reexport_name_their_symbols() {
         "{refs:?}"
     );
     assert!(has_ref(&refs, "CancelToken", ReferenceKind::ImportBinding));
-    // Aliased destructuring still names the source symbol, not the alias.
     assert!(has_ref(&refs, "formToJSON", ReferenceKind::ImportBinding));
     assert!(!has_ref(&refs, "toJSON", ReferenceKind::ImportBinding));
 }
 
 #[test]
 fn javascript_destructuring_a_non_module_value_is_ignored() {
-    // The old pattern bound ANY bare identifier on the right, so this
-    // recorded a bogus ImportBinding for `data`. Value-destructures now
-    // require the RHS to be a same-file import binding; `response` is not
-    // imported here, so no edge is recorded.
     let src = "const { data } = response;\n";
     let refs = refs_from_source(src, Language::JavaScript);
     assert!(!has_ref(&refs, "data", ReferenceKind::ImportBinding));
@@ -229,9 +209,6 @@ fn javascript_destructuring_a_non_module_value_is_ignored() {
 
 #[test]
 fn javascript_destructuring_an_import_binding_is_captured() {
-    // The positive half of the filter: `response` IS imported, so unwrapping
-    // `data` off it names the module's export. Aliased keys record the
-    // source symbol, not the local alias.
     let src = "import response from './r.js';\n\
                const { data, meta: m } = response;\n";
     let refs = refs_from_source(src, Language::JavaScript);
@@ -261,11 +238,6 @@ fn typescript_barrel_destructure_and_local_reexport_name_their_symbols() {
 
 #[test]
 fn javascript_require_then_destructure_is_captured_but_plain_unpack_is_not() {
-    // Regression: `const axios = require('axios')` bound a local the
-    // value-destructure filter did not know (patterns 7-9 are ESM-only and
-    // pattern 1 keeps only the module string), so `const { Foo } = axios`
-    // named no symbol. The require-bound LHS is now an ImportBinding, which
-    // admits it to the filter — while an unbound `resp` still drops.
     let src = "const axios = require('axios');\n\
                const { Foo, Bar: B } = axios;\n\
                const { data } = resp;\n";
@@ -275,17 +247,13 @@ fn javascript_require_then_destructure_is_captured_but_plain_unpack_is_not() {
         has_ref(&refs, "Foo", ReferenceKind::ImportBinding),
         "{refs:?}"
     );
-    // Aliased keys record the source symbol, not the local alias.
     assert!(has_ref(&refs, "Bar", ReferenceKind::ImportBinding));
     assert!(!has_ref(&refs, "B", ReferenceKind::ImportBinding));
-    // `resp` binds nothing import-like, so its unpack stays dropped.
     assert!(!has_ref(&refs, "data", ReferenceKind::ImportBinding));
 }
 
 #[test]
 fn typescript_require_then_destructure_is_captured_but_plain_unpack_is_not() {
-    // TS mirror of the JS regression above: same require-then-destructure
-    // shape under the TSX grammar, same discrimination against `resp`.
     let src = "const axios = require('axios');\n\
                const { Foo, Bar: B } = axios;\n\
                const { data } = resp;\n";
@@ -302,8 +270,6 @@ fn typescript_require_then_destructure_is_captured_but_plain_unpack_is_not() {
 
 #[test]
 fn python_decorators_name_the_applied_symbol() {
-    // Parity with Java's annotation patterns: decoration sites surface as
-    // Call rows naming the decorator, whether bare, called, dotted, or both.
     let src = "@property\n\
                def name(self):\n    return 1\n\
                @retry(tries=3)\n\

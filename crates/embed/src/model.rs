@@ -330,15 +330,8 @@ fn validate_site_packages_dir(line: &str) -> Option<PathBuf> {
     Some(path)
 }
 
-/// Verifies that the current Linux process has the CUDA runtime + cuDNN +
-/// cuBLAS libraries actually mapped, after a session has been built with
-/// `device = "gpu"`. The reason for this check, from a 2026-05-02 incident:
-/// ORT can register a CUDA execution provider successfully (logs "Successfully
-/// registered CUDAExecutionProvider") and still run inference entirely on CPU
-/// when the underlying CUDA loader couldn't bind the shared libraries — and
-/// it does so silently. The visible symptom was a 10+ minute reindex on a
-/// 256-file project that should have taken ~10s on GPU. This check makes
-/// that failure mode loud.
+/// ORT can report CUDA registration success while running on CPU.
+/// Require mapped CUDA runtime and math libraries after session creation.
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 pub(crate) fn require_cuda_libs_mapped() -> anyhow::Result<()> {
     let maps = std::fs::read_to_string("/proc/self/maps")
@@ -505,11 +498,7 @@ fn discover_ort_dylib() -> Option<PathBuf> {
     None
 }
 
-/// `ORT_DYLIB_PATH` as the loader honours it: an empty value is the same as
-/// unset (an empty path would otherwise count as "caller took control" in
-/// `init_ort_dylib` and then hard-fail inside ORT, where unsetting it would
-/// have discovered the library). One helper so discovery and the
-/// fingerprint's runtime probe agree on what counts as set.
+/// Treat an empty ORT_DYLIB_PATH as unset so discovery and fingerprints agree.
 #[cfg(not(target_vendor = "apple"))]
 fn ort_dylib_path_from_env() -> Option<PathBuf> {
     std::env::var_os("ORT_DYLIB_PATH")
@@ -545,15 +534,10 @@ pub fn init_ort_dylib() {
     });
 }
 
-/// Embedding / reranker models this project has validated end-to-end. The
-/// model name comes from the indexed repo's own `.codesage/config.toml`, so
-/// it is attacker-controlled when indexing a cloned repo; passing it straight
-/// to hf-hub would let that repo pick an arbitrary ONNX graph to download and
-/// load into the native ONNX Runtime. Gate every load on this allowlist plus
-/// pinned artifact hashes unless the user (not the repo) activates the
-/// per-project bypass: `CODESAGE_ALLOW_ANY_MODEL=1` for eligibility plus the
-/// project's canonical root listed in the user-owned allowlist file (see
-/// [`allow_any_model_from_env`]). The env var alone never suffices.
+/// Repo-local model names are untrusted: require an allowlisted model and
+/// pinned hashes before native ONNX loading. Bypass requires both env eligibility
+/// and a canonical project root in the user-owned allowlist; see
+/// [`allow_any_model_from_env`].
 const ALLOWED_MODELS: &[&str] = &[
     "sentence-transformers/all-MiniLM-L6-v2",
     "cross-encoder/ms-marco-MiniLM-L6-v2",
@@ -566,15 +550,9 @@ struct ModelPin {
     revision: &'static str,
     tokenizer_sha256: &'static str,
     onnx_sha256: &'static str,
-    /// Pin-authoring contract: when the ONNX graph at `revision` uses external
-    /// weights (`onnx/model.onnx_data`), this must be `Some`. `None` is read as
-    /// "this revision ships no sidecar": the loader never fetches one, and
-    /// resolution refuses to proceed when a `model.onnx_data` is already on
-    /// disk next to the graph (`refuse_undeclared_sidecar`). That refusal is
-    /// what keeps a mis-authored `None` from loading unverified weights: ONNX
-    /// Runtime resolves external data relative to the graph file's directory
-    /// on its own, so a sidecar left there by an earlier run or an external
-    /// download would be loaded whether or not CodeSage fetched it.
+    /// Required when this revision uses external weights. `None` forbids an
+    /// on-disk sidecar: ORT loads adjacent weights independently of our fetches,
+    /// so [`refuse_undeclared_sidecar`] must reject unverified leftovers.
     onnx_data_sha256: Option<&'static str>,
 }
 
@@ -781,17 +759,8 @@ pub fn cached_model_artifacts(model: &str) -> Option<ModelArtifacts> {
     })
 }
 
-/// The directory `hf_hub::Cache::from_env` would consult, built without its
-/// unset-`HF_HOME` fallback: `Cache::default` is
-/// `dirs::home_dir().expect(..)`, and `dirs::home_dir` is `None` when `HOME`
-/// is unset or empty and the UID has no passwd entry (`env -i`, a systemd
-/// unit without `Environment=HOME`, a container UID absent from
-/// `/etc/passwd`). That panic sits on the per-tool-call path in the daemon,
-/// where it is a request with no response. `HF_HOME` is read with
-/// `std::env::var` exactly as hf-hub reads it, so a non-UTF-8 value falls
-/// back the same way. The `HOME`-only fallback drops `dirs`' passwd lookup
-/// (`dirs` is not a dependency of this crate): with `HOME` unset the answer
-/// is `None` rather than a passwd-derived directory.
+/// Match hf-hub's HF_HOME precedence without Cache::default's HOME-less panic.
+/// Non-UTF-8 HF_HOME falls back to HOME; no passwd lookup is attempted.
 fn hf_cache_from_env() -> Option<hf_hub::Cache> {
     let root = match std::env::var("HF_HOME") {
         Ok(hf_home) => PathBuf::from(hf_home).join("hub"),
@@ -868,31 +837,10 @@ struct ArtifactMemo {
     sidecar: Option<Option<PathBuf>>,
 }
 
-// Resolved snapshot paths are revision-pinned and stable for the life of
-// the process, while each hf-hub lookup builds a fresh API client (two TLS
-// agents, a token-file read) and then reads `refs/<revision>` and stats the
-// snapshot path — and the fingerprint asks for
-// them on every query. An eviction plus refetch of a corrupted artifact
-// recreates the symlink at the same snapshot path, so a memoized path stays
-// valid across it; the bytes behind it are re-digested because
-// `fingerprint::cached_file_digest` keys on size and mtime. Three
-// resolutions run per MCP semantic query — the embedder pool key, the
-// session fingerprint, and the table fingerprint — so an unmemoized
-// resolution cost nine hub-client constructions per query before this
-// (measured on a live daemon: 60 over a six-query probe, six of them the
-// cold session load). A memo hit replaces a resolution's two lookups for a
-// pinned model, three when a sidecar is fetched, with two or three
-// `fs::metadata` calls: a path whose file is gone — the cache
-// was cleared by hand, an `hf cache delete` ran, or an eviction's refetch
-// failed — is dropped so the next resolution re-downloads instead of every
-// later query failing with ENOENT until the daemon restarts. `fs::metadata`
-// rather than `symlink_metadata`, so a snapshot symlink over a deleted blob
-// counts as gone too and the entry is dropped; that case does not recover
-// by itself, though. hf-hub's `symlink_or_rename` skips when `dst.exists()`
-// (false for a dangling link) and then `symlink`s onto the occupied name,
-// so the refetch fails with `EEXIST` on every resolution until the dangling
-// link is removed by hand. A deleted file re-downloads; a dangling snapshot
-// symlink surfaces an error.
+// Memoize snapshot paths to avoid repeated hub-client construction on queries.
+// Refetches preserve paths; content digests separately track size and mtime.
+// Follow symlinks when checking existence so deleted blobs invalidate the memo.
+// hf-hub cannot replace dangling snapshot links (EEXIST); those require removal.
 static ARTIFACT_PATHS: OnceLock<Mutex<HashMap<ArtifactKey, ArtifactMemo>>> = OnceLock::new();
 
 fn artifact_paths_memo() -> &'static Mutex<HashMap<ArtifactKey, ArtifactMemo>> {
@@ -927,34 +875,14 @@ fn memoized_artifacts(key: &ArtifactKey) -> Option<ArtifactMemo> {
     }
 }
 
-/// The three artifact paths for `model` at `revision` under `hf_home`,
-/// fetched through `fetch` on the first call for that key and served from
-/// the memo afterwards while the files still exist. A failed tokenizer or
-/// graph fetch memoizes nothing.
+/// Memoize paths while their files exist; tokenizer/graph failures cache nothing.
+/// Pinned absence is checked on disk even on memo hits. Failed required-sidecar
+/// fetches remain unresolved and retry on the next call.
 ///
-/// The sidecar is settled by `expectation` first. A pin answers outright:
-/// `Absent` is memoized without a fetch or a probe, after one stat of the
-/// path ONNX Runtime would load a sidecar from (`refuse_undeclared_sidecar`,
-/// repeated on every memo hit so a sidecar that appears later is caught
-/// too); `Required` is fetched and a failed fetch is left unresolved for the
-/// loader's pin check to report (the next call re-attempts only that
-/// fetch). Only `Unknown` reaches the network to find out.
-///
-/// For `Unknown`, a failed sidecar fetch is not an answer by itself: hf-hub
-/// reports a 404, a 503, a refused connection, a DNS miss, and a TLS failure
-/// through the one `ApiError::RequestError` variant (ureq's
-/// `http_status_as_error` is on and hf-hub sets `max_retries: 0`), so
-/// inferring absence from the error would let one blip during warm-up
-/// memoize "no external weights" for the process lifetime and every later
-/// session build fail on the missing sidecar. Absence is established
-/// positively instead, through `sidecar_listed`, the hub's file list for the
-/// revision: listed and fetch failed, or list unavailable, leaves the
-/// sidecar unresolved so the next call re-attempts only that fetch; not
-/// listed memoizes absence. For an unpinned model without a sidecar that is
-/// one extra metadata request per key per process, after the 404, not per
-/// query. The lock is never held across `fetch` or `sidecar_listed`, which
-/// may block on the network: two first-callers racing on one key both fetch
-/// and both insert the same paths.
+/// Unpinned fetch errors cannot prove absence: hf-hub conflates HTTP and network
+/// failures. Only the revision's file list can settle absence. An unavailable
+/// list or a listed-but-unfetched sidecar leaves that sidecar retryable.
+/// Never hold the memo lock across network calls; racing first calls may refetch.
 fn resolve_hf_artifact_paths(
     hf_home: Option<&Path>,
     model: &str,
@@ -986,12 +914,7 @@ fn resolve_hf_artifact_paths(
         }) => (tokenizer, onnx),
         None => (fetch("tokenizer.json")?, fetch("onnx/model.onnx")?),
     };
-    // External-weights sidecar (>2GB models like Jina v2 base, BGE-large).
-    // Most models don't have this file — a 404 is the expected outcome and
-    // not worth surfacing. Every failure gets a debug-level breadcrumb so
-    // users running with RUST_LOG=debug don't have to guess when
-    // commit_from_file later errors with an opaque ORT external-data load
-    // failure.
+    // Keep fetch diagnostics: ORT's later external-data error omits this cause.
     let sidecar = match expectation {
         SidecarExpectation::Absent => {
             refuse_undeclared_sidecar(&onnx)?;
@@ -1099,29 +1022,11 @@ fn resolve_model_artifacts_at(
     })
 }
 
-/// Migration note (cs-72x): `CODESAGE_ALLOW_ANY_MODEL=1` used to be a
-/// process-global bypass — export it once in a shell profile and every cloned
-/// repo indexed from that shell could point `.codesage/config.toml` at an
-/// arbitrary ONNX graph and have it downloaded and executed. It now grants
-/// only *eligibility*; the bypass *activates* only for a project the user
-/// opted in by listing its canonical root, one per line, in the user-owned
-/// allowlist file from [`user_allowlist_path`] (default
-/// `~/.config/codesage/allowed-models`; blank lines and `#` comments
-/// ignored). To migrate a workflow that relied on the old global bypass for
-/// a project you trust, keep the env var and append that project's root:
-/// `mkdir -p ~/.config/codesage && pwd >> ~/.config/codesage/allowed-models`.
-///
-/// There is deliberately no repo-local opt-in (no `.codesage/allow-any-model`
-/// marker): the model name comes from the project's own config, so anything
-/// inside the project directory is attacker-controlled for a cloned repo — a
-/// repo-local marker would let a malicious repo self-authorize under a
-/// globally-exported env var, the exact bypass this closes. Activation state
-/// lives outside every repo, under the user's config home.
-///
-/// The current project is the nearest ancestor of the process working
-/// directory holding a `.codesage/` directory; outside any project the answer
-/// is `false` (fail closed). Name kept for the `doctor` check and the
-/// existing callers; semantics are now "env-eligible AND project opted in".
+/// Bypass requires CODESAGE_ALLOW_ANY_MODEL plus the project's canonical root
+/// in the user-owned allowlist (one path per line; blanks and # comments ignored).
+/// Repo-local opt-in would let a cloned repo authorize its own ONNX graph.
+/// The project is the nearest cwd ancestor with .codesage/; none fails closed.
+/// See [`user_allowlist_path`] for the external configuration location.
 pub fn allow_any_model_from_env() -> bool {
     if !allow_any_eligible_from_env() {
         return false;
@@ -1149,9 +1054,6 @@ fn current_project_root() -> Option<PathBuf> {
     find_project_root_from(&std::env::current_dir().ok()?)
 }
 
-/// Pure core over an explicit start directory (the env/cwd wrappers above
-/// cannot be touched by unit tests without racing process-global state):
-/// walk up until a directory holding a `.codesage/` entry is found.
 fn find_project_root_from(start: &Path) -> Option<PathBuf> {
     start
         .ancestors()
@@ -1171,8 +1073,6 @@ fn project_allow_any_opted_in(root: &Path) -> bool {
     let Ok(contents) = std::fs::read_to_string(&path) else {
         return false;
     };
-    // Eligibility was established by the caller (`allow_any_model_from_env`);
-    // this is the activation half, through the same pure core the tests pin.
     allow_any_for_project_root(Some(&canonical), true, &contents)
 }
 
@@ -1188,8 +1088,6 @@ fn user_allowlist_path() -> Option<PathBuf> {
     )
 }
 
-/// Pure core of [`user_allowlist_path`] so tests can prove the precedence
-/// without touching process env.
 fn user_allowlist_path_from(
     xdg_config_home: Option<&OsStr>,
     home: Option<&OsStr>,
@@ -1216,10 +1114,7 @@ fn project_listed_in_allowlist(canonical_root: &Path, contents: &str) -> bool {
     })
 }
 
-/// Effective bypass for an explicit project root: env eligibility AND that
-/// project listed in `allowlist_contents`. Pure core so unit tests can prove
-/// the matrix without touching process env or cwd: an env flag set for a
-/// non-allowlisted project still refuses.
+/// Require both env eligibility and an explicitly allowlisted project.
 fn allow_any_for_project_root(
     project_root: Option<&Path>,
     eligible: bool,
@@ -1277,9 +1172,6 @@ fn verify_model_artifact_sha256(
     path: &Path,
     expected: &str,
 ) -> Result<()> {
-    // Shares the fingerprint's per-process digest cache: the same bytes are
-    // digested for the pin gate and for the table fingerprint, and a model
-    // file is read once for both.
     let actual = crate::fingerprint::cached_file_digest(path)
         .with_context(|| format!("reading {artifact} for pinned model {model:?}"))?;
     if actual != expected {
@@ -1449,13 +1341,8 @@ fn verify_pinned_model_artifacts(
             );
         }
         (None, Some(path)) => {
-            // Unreachable on the pinned path: `SidecarExpectation::Absent`
-            // never fetches the sidecar, so resolution cannot hand one back.
-            // The live guard for a pin that declares none is
-            // `refuse_undeclared_sidecar`, which runs during resolution
-            // against the on-disk path ONNX Runtime would load. Retained as
-            // the fail-closed arm should resolution ever grow another way to
-            // produce a path for such a pin.
+            // Resolution normally rejects this in refuse_undeclared_sidecar;
+            // retain the verification guard if another resolver supplies a path.
             anyhow::bail!(
                 "pinned model {model:?} unexpectedly resolved onnx/model.onnx_data at {}; refusing unpinned sidecar",
                 path.display()
@@ -1537,11 +1424,6 @@ pub(crate) fn load_onnx_session_with_provider(model: &str, device: &str) -> Resu
         );
     }
     if allow_any {
-        // Unpinned by construction (`load_pin` returns `None` under the
-        // bypass): the hub head executes with no hash check. Loud on purpose —
-        // the line names the model plus the resolved revision so the log alone
-        // answers "what ran unpinned". Session builds are cached, so this
-        // fires once per session, not per query.
         let unpinned = unpinned_load_message(model, load_revision(model, allow_any));
         tracing::warn!("{unpinned}");
     }
@@ -1623,16 +1505,7 @@ pub(crate) fn load_onnx_session_with_provider(model: &str, device: &str) -> Resu
 
     let session = builder.commit_from_file(&model_path)?;
 
-    // Hard-fail when device = "gpu" was requested but ORT silently fell back to
-    // CPU. Failure mode observed 2026-05-02 on a flip-all script: CUDA
-    // registration logged "Successfully registered" but the process had ZERO
-    // cuda libs mapped per /proc/self/maps and ran for 10+ minutes on a
-    // 256-file project. Rather than time-based heuristics, assert the CUDA
-    // loader actually ran by checking the process has libcuda + libcudart +
-    // (libcudnn OR libcublas) mapped. No-op on non-Linux. Bypass with
-    // CODESAGE_ALLOW_CPU_FALLBACK=1 (e.g. for unit tests) — the session then
-    // reports `cpu` as its provider, so the vectors it produces are never
-    // attested as CUDA output.
+    // Linux CUDA fallback must fingerprint as CPU, never attest CUDA vectors.
     let configured = crate::fingerprint::configured_execution_provider(device);
     #[cfg(all(feature = "cuda", target_os = "linux"))]
     let execution_provider = if want_cuda {
@@ -1655,14 +1528,8 @@ pub(crate) fn load_onnx_session_with_provider(model: &str, device: &str) -> Resu
         configured
     };
     #[cfg(not(all(feature = "cuda", target_os = "linux")))]
-    // No functional check here for CoreML, deliberately: unlike CUDA — whose
-    // loader can report "Successfully registered" while binding nothing,
-    // which is what the /proc/self/maps guard above catches — the CoreML
-    // provider is registered with `error_on_failure`, so a registration
-    // failure is already loud, and ORT exposes no query for the provider a
-    // committed session actually runs on nor any userspace-visible mapping
-    // to assert. The attested provider is the configured one (pinned by
-    // `coreml_provider_is_attested_from_configuration`).
+    // CoreML registration errors are fatal, but ORT exposes no post-commit
+    // provider query or mapping check. Attest the configured provider.
     let execution_provider = configured;
 
     let has_token_type_ids = wants_token_type_ids(session.inputs().iter().map(|i| i.name()));
@@ -1765,8 +1632,6 @@ impl Embedder {
         }
 
         let ids_tensor = ort::value::Tensor::from_array(([batch_size, seq_len], input_ids))?;
-        // Moved, not cloned: mean pooling reads the same values back from
-        // `encodings` below instead of a second copy of this vector.
         let mask_tensor = ort::value::Tensor::from_array(([batch_size, seq_len], attention_mask))?;
 
         let outputs = if self.has_token_type_ids {
@@ -1787,13 +1652,8 @@ impl Embedder {
 
         let (_shape, hidden) = outputs[0].try_extract_tensor::<f32>()?;
 
-        // The pooling loops below index `hidden` as a `[batch, seq, dim]`
-        // tensor. `detect_dim` only validates the last dimension, so a model
-        // whose first output is already pooled (`[batch, dim]`) passes load but
-        // would make the `(i*seq_len + j)*dim` offsets run off the end of the
-        // slice — an out-of-bounds panic on the first embed. In the daemon that
-        // panic is swallowed by rmcp and the client hangs. Verify the shape up
-        // front and fail with an actionable message instead.
+        // detect_dim accepts pre-pooled [batch, dim] outputs, but these loops
+        // require token-level [batch, seq, dim] data to avoid out-of-bounds access.
         let expected = batch_size
             .checked_mul(seq_len)
             .and_then(|n| n.checked_mul(self.dim))
@@ -1865,10 +1725,6 @@ fn detect_dim(session: &Session) -> Result<usize> {
     {
         return Ok(d as usize);
     }
-    // Refuse to guess. A silent fallback to 384 stores wrong-dimension
-    // vectors (or the right dimension by coincidence with MiniLM-L6),
-    // and `search_knn` then returns either an error or noise — either way,
-    // the failure shows up far from the cause. Better to fail at load time.
     anyhow::bail!(
         "could not infer embedding dimension from model output shape; \
          the model's first output tensor has no static last-dimension. \
@@ -2129,7 +1985,6 @@ mod tests {
             "codesage-evict-escape-test-{}-{unique}",
             std::process::id()
         ));
-        // Cache layout with a victim file OUTSIDE the cache entry.
         let cache = base.join("cache");
         let blobs = cache.join("blobs");
         let snapshots = cache.join("snapshots");
@@ -2219,9 +2074,6 @@ mod tests {
         let listed = "/home/user/trusted\n";
         let trusted = Path::new("/home/user/trusted");
         let cloned = Path::new("/home/user/cloned-evil");
-        // The env flag is "set" (eligible) in both cases; only the opted-in
-        // project activates the bypass, so a cloned repo cannot ride a
-        // globally-exported flag.
         assert!(
             validate_model_allowed(
                 "evil/backdoored-model",
@@ -2805,7 +2657,6 @@ mod tests {
             )
         };
 
-        // Nothing on disk: resolution succeeds and is memoized.
         let first = resolve("test/stray-sidecar-later").unwrap();
         assert_eq!(fetches.get(), 2);
         assert_eq!(first.2, None);
@@ -3050,7 +2901,6 @@ mod tests {
         let as_configured =
             crate::fingerprint::SemanticFingerprint::with_artifact_digest(&cuda, 384, "d");
 
-        // Libraries mapped: the session runs where it was asked to.
         let (provider, fell_back) =
             effective_execution_provider(configured, Ok(()), false).unwrap();
         assert_eq!((provider, fell_back), ("cuda", false));
@@ -3059,14 +2909,11 @@ mod tests {
             as_configured
         );
 
-        // Libraries missing, fallback refused: the load fails as before.
         let err =
             effective_execution_provider(configured, Err(anyhow::anyhow!("no libcuda")), false)
                 .unwrap_err();
         assert!(err.to_string().contains("no libcuda"));
 
-        // Libraries missing, fallback allowed: the session runs on the CPU
-        // and its fingerprint is the CPU one, not the configured CUDA one.
         let (provider, fell_back) =
             effective_execution_provider(configured, Err(anyhow::anyhow!("no libcuda")), true)
                 .unwrap();
@@ -3256,10 +3103,6 @@ mod tests {
 
     #[test]
     fn coreml_provider_is_attested_from_configuration() {
-        // There is no functional CoreML check (see the why-not at the
-        // provider selection in `load_onnx_session_with_provider`): ORT
-        // exposes no post-commit provider query, so the attested provider
-        // is the configured one. Pin that mapping here.
         assert_eq!(
             crate::fingerprint::configured_execution_provider("coreml"),
             "coreml"

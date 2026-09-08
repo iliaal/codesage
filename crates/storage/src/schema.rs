@@ -176,10 +176,7 @@ CREATE TABLE IF NOT EXISTS feature_trust_boundaries (
 "#;
 
 pub(crate) fn semantic_schema(table_name: &str, dim: usize) -> String {
-    // `table_name` can name a table recorded by an older binary (the open
-    // path re-ensures whatever `semantic_models` points at), so it is not
-    // trusted the way the sanitized `model_table_name` output is: escape
-    // through `quote_ident` or a `"` in the name breaks out of the DDL.
+    // Legacy registry names need quoting even when generated names are sanitized.
     let table = quote_ident(table_name);
     format!(
         "CREATE VIRTUAL TABLE IF NOT EXISTS \"{table}\" USING vec0(\
@@ -193,10 +190,6 @@ pub(crate) fn semantic_schema(table_name: &str, dim: usize) -> String {
     )
 }
 
-/// Name of the FTS5 sidecar for a given chunk table. Synced row-for-row with
-/// the vec0 table during `insert_chunks`; used by the gated hybrid BM25 path.
-/// Keeping the name a mechanical suffix means one `ensure_chunk_table` call
-/// provisions both sides together.
 pub fn fts_table_name(chunk_table: &str) -> String {
     format!("{chunk_table}_fts")
 }
@@ -206,8 +199,6 @@ pub fn fts_table_name(chunk_table: &str) -> String {
 /// them into half-useful tokens. No Porter stemmer — we match code
 /// identifiers verbatim, not English.
 pub(crate) fn fts_schema(table_name: &str) -> String {
-    // Same quoting contract as `semantic_schema`: sidecar names derive from
-    // the chunk table name, so they inherit whatever quoting it needs.
     let table = quote_ident(table_name);
     format!(
         "CREATE VIRTUAL TABLE IF NOT EXISTS \"{table}\" USING fts5(\
@@ -277,11 +268,7 @@ pub enum FtsRepairOutcome {
     SkippedOverCap { chunk_rows: i64 },
 }
 
-/// Largest chunk table a synchronous open-path repair will rebuild. The
-/// repair is a full DELETE + INSERT…SELECT rewrite, linear in row count with
-/// FTS5 index build on top; past ~100 k chunks it dominates process startup
-/// (seconds to minutes) on every query-shaped open. Over the cap the open
-/// proceeds with a stale BM25 sidecar and reports it instead of stalling.
+/// Cap synchronous FTS rewrites at open; larger tables require explicit repair.
 pub const FTS_REPAIR_ROW_CAP: i64 = 100_000;
 
 fn fts_sidecar_counts(
@@ -291,11 +278,7 @@ fn fts_sidecar_counts(
 ) -> rusqlite::Result<(i64, i64, bool)> {
     let chunk_count = table_row_count(conn, chunk_table)?;
     let fts_count = table_row_count(conn, fts_table)?;
-    // Equal counts alone miss paired delete+insert divergence (one row
-    // removed, a different one added leaves counts equal but content stale).
-    // Count + MAX(rowid) together is a much stronger invariant for the
-    // append/delete workload the indexer produces, and stays two cheap
-    // queries — no checksums.
+    // MAX(rowid) also catches equal-count delete/insert drift; this is no checksum.
     let in_sync = chunk_count == fts_count
         && table_max_id(conn, chunk_table, "id")? == table_max_id(conn, fts_table, "rowid")?;
     Ok((chunk_count, fts_count, in_sync))
@@ -327,13 +310,7 @@ pub(crate) fn repair_fts_sidecar(
 ) -> rusqlite::Result<()> {
     let chunk_table = quote_ident(chunk_table);
     let fts_table = quote_ident(fts_table);
-    // Wrap DELETE + INSERT…SELECT in one savepoint. Without it, a crash
-    // between the two statements leaves the FTS sidecar empty while the
-    // chunk table still has data; BM25 search returns zero results until
-    // the next write-path open re-runs the repair. A savepoint (not a raw
-    // BEGIN/COMMIT) composes when this runs inside an outer transaction —
-    // a bare BEGIN errors with "cannot start a transaction within a
-    // transaction."
+    // Keep DELETE/repopulate atomic; savepoints compose with outer transactions.
     let sql = format!(
         "SAVEPOINT repair_fts;
          DELETE FROM \"{fts_table}\";
@@ -372,8 +349,6 @@ pub(crate) fn repair_fts_sidecar_capped(
         });
     }
     repair_fts_sidecar(conn, chunk_table, fts_table)?;
-    // Re-read the sidecar count for the report rather than trusting the
-    // pre-repair chunk count: a concurrent writer could have moved it.
     let _ = fts_count;
     Ok(FtsRepairOutcome::Repaired { rows: chunk_count })
 }
@@ -409,24 +384,11 @@ pub(crate) fn init_vec_extension() {
     });
 }
 
-/// How long a read-only connection waits on a locked database before failing
-/// with `SQLITE_BUSY` instead. A long write transaction (a full semantic
-/// re-index committing thousands of chunk rows) holds the lock well past the
-/// 5 s the write path tolerates, and a reader that fails instantly turns an
-/// ordinary concurrent index into a user-visible error. 30 s still bounds the
-/// wait — SQLite retries internally for the whole window, so this is the
-/// bounded retry-on-busy the read path gets — while covering any realistic
-/// single-transaction commit on a derived index.
+/// Readers tolerate longer indexing transactions than the 5-second writer timeout.
+/// SQLite retries internally until this bound, then returns SQLITE_BUSY.
 pub(crate) const READ_BUSY_TIMEOUT_MS: i64 = 30_000;
 
-/// Pragmas for a connection that will only ever read.
-///
-/// [`init_db`] cannot be used on a read-only handle: `journal_mode=WAL` is
-/// itself a write, and the migration runner that follows it writes too. This
-/// sets only the pragmas that are connection-local and need no write access —
-/// the busy timeout so a concurrent indexer's checkpoint window does not fail
-/// the read outright, and the same mmap/cache sizing the read path benefits
-/// from.
+/// Connection-local read pragmas; init_db also changes journal mode and migrates.
 pub fn init_db_read_only(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(&format!("PRAGMA busy_timeout={READ_BUSY_TIMEOUT_MS};"))?;
     conn.execute_batch("PRAGMA mmap_size=268435456;")?;
@@ -437,21 +399,11 @@ pub fn init_db_read_only(conn: &Connection) -> rusqlite::Result<()> {
 pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch("PRAGMA journal_mode=WAL;")?;
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-    // Wait up to 5s for a competing writer instead of failing immediately
-    // with `SQLITE_BUSY`. The advisory lockfile (see graph::indexing) already
-    // serializes writers, but a second MCP session reading mid-index would
-    // otherwise hit instant-busy on the brief WAL-checkpoint windows. Match
-    // repowise's posture (see notes/2026-04-29 sweep, §1.8).
+    // Cover brief checkpoint contention even when callers bypass the writer lockfile.
     conn.execute_batch("PRAGMA busy_timeout=5000;")?;
-    // synchronous=NORMAL is the documented safe pairing with WAL: fsync only at
-    // checkpoint, not on every commit. Durability across a power loss is
-    // unchanged for WAL (only the last transaction(s) since the last checkpoint
-    // can be lost, and the DB stays consistent) — and this is a derived index,
-    // rebuildable from source, so the trade is firmly worth it for indexer
-    // commit throughput. mmap_size and a larger page cache cut syscall and
-    // page-fault overhead on the read-heavy search path (KNN + chunk rows).
-    // negative cache_size is in KiB; -65536 ≈ 64 MiB. mmap is backed by the OS
-    // page cache, so it doesn't pin RSS.
+    // WAL/NORMAL may lose commits since the last checkpoint on power loss, but
+    // this derived index is rebuildable. Negative cache_size is KiB (64 MiB);
+    // mmap uses the OS page cache without pinning RSS.
     conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
     conn.execute_batch("PRAGMA mmap_size=268435456;")?;
     conn.execute_batch("PRAGMA cache_size=-65536;")?;
@@ -460,18 +412,9 @@ pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Hard rule for anyone adding a new migration to [`MIGRATIONS`]: the `up` body
-/// must be **safe when run against an already-current schema**. On a fresh DB,
-/// [`init_db`] creates the latest `SCHEMA` first, then still runs every entry
-/// in [`MIGRATIONS`] to record them in `schema_migrations` (registry + fresh
-/// schema are decoupled). Each migration therefore needs to self-check its
-/// target state (existence of a column, index, or row) and no-op if already
-/// applied. The existing `0001_refs_name_tail` migration is the template.
-///
-/// `up` functions do NOT need to open their own transactions; the runner opens
-/// one transaction per migration and records the migration in
-/// `schema_migrations` within that same transaction, so either both land or
-/// neither does.
+/// Migration bodies must be safe on an already-current schema: init_db creates
+/// SCHEMA before running the registry. Check target state and no-op if present.
+/// The runner atomically commits each body with its stamp; do not nest transactions.
 type MigrationUp = fn(&Connection) -> rusqlite::Result<()>;
 
 /// Reserved name prefix for destructive migrations. A future migration that
@@ -627,10 +570,7 @@ fn migrate_0016_semantic_models_artifact_stat_key(conn: &Connection) -> rusqlite
     Ok(())
 }
 
-/// Widen `idx_git_files_churn` to `(churn_score DESC, path)` so the top-churn
-/// query's tie-breaking `path` term is served by the index instead of a full
-/// scan into a temp b-tree. Safe to re-run: drops and recreates, and the fresh
-/// `SCHEMA` already declares the wide form.
+/// Include path tie-breaking in the index to avoid a temp sorter before LIMIT.
 fn migrate_0014_git_files_churn_path(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "DROP INDEX IF EXISTS idx_git_files_churn;
@@ -643,8 +583,6 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     run_migration_list(conn, MIGRATIONS)
 }
 
-/// [`run_migrations`] over an explicit list, so tests can drive the loop
-/// with synthetic migrations.
 fn run_migration_list(
     conn: &Connection,
     migrations: &[(&str, MigrationUp)],
@@ -656,28 +594,9 @@ fn run_migration_list(
              applied_at INTEGER NOT NULL DEFAULT (unixepoch())
          );",
     )?;
-    // Each migration runs in its own transaction, opened with BEGIN
-    // IMMEDIATE rather than a deferred BEGIN. A deferred transaction takes
-    // no lock until its first write, so two processes opening the DB at
-    // once could both run the same migration body and only collide at
-    // COMMIT — the loser failing with SQLITE_BUSY after doing the work.
-    // BEGIN IMMEDIATE takes the RESERVED lock up front, serializing the
-    // second opener at transaction start instead.
-    //
-    // Caller-side serialization this relies on:
-    // - Writer commands (`index`, `git-index`, `cleanup`) hold the
-    //   project advisory lockfile (`.codesage/indexing.lock`, acquired via
-    //   `lockfile::acquire_with_wait` in the CLI; the daemon watcher
-    //   defers its pass on `AlreadyHeld`), so two writers never reach
-    //   here together — the normal case is single-flighted.
-    // - Lock-bypass opens (query/daemon read paths that call `init_db`
-    //   without holding the lockfile) fall back on the 5 s `busy_timeout`
-    //   pragma `init_db` sets before this runner: SQLite retries the
-    //   blocked BEGIN IMMEDIATE internally for the whole window, so the
-    //   second opener waits out the first migration and then sees the
-    //   `schema_migrations` row and skips — no new hard-error class, the
-    //   same SQLITE_BUSY only past the window that a deferred BEGIN
-    //   produced at COMMIT time.
+    // BEGIN IMMEDIATE serializes migrations before their first write.
+    // Writer commands also hold indexing.lock; lock-bypass opens rely on
+    // init_db's 5-second busy timeout and may still fail after that window.
     for (name, up) in migrations {
         let already: i64 = conn.query_row(
             "SELECT COUNT(*) FROM schema_migrations WHERE name = ?1",
@@ -688,10 +607,7 @@ fn run_migration_list(
             continue;
         }
         conn.execute_batch("BEGIN IMMEDIATE")?;
-        // Re-check under the write lock: another opener may have applied and
-        // stamped this migration between the unlocked probe above and our
-        // BEGIN IMMEDIATE. Running `up` twice is usually idempotent, but the
-        // stamp INSERT would then violate the UNIQUE name and fail the open.
+        // Another opener may have stamped this migration since the unlocked probe.
         let stamped_meanwhile: i64 = match conn.query_row(
             "SELECT COUNT(*) FROM schema_migrations WHERE name = ?1",
             rusqlite::params![name],
@@ -728,11 +644,7 @@ fn run_migration_list(
     Ok(())
 }
 
-/// Migration names that once shipped in a development build and were renamed
-/// before release. An index stamped with one of these is fully covered by the
-/// renamed migration (which re-runs idempotently), so the stale row is
-/// dropped rather than reported as "migrated by a newer codesage" on every
-/// open.
+/// Development-build names replaced by idempotent migrations in the current list.
 const SUPERSEDED_MIGRATIONS: &[&str] = &["0017_git_co_changes_windows"];
 
 fn forget_superseded_migrations(conn: &Connection) -> rusqlite::Result<()> {
@@ -881,14 +793,8 @@ fn migrate_0010_files_boundaries_derived_at(conn: &Connection) -> rusqlite::Resu
     Ok(())
 }
 
-/// Adds `features.test_command` as a free-form shell-command column. Lets
-/// the mapper surface a runnable test invocation (e.g. `pnpm --dir
-/// packages/api test`, `go test ./pkg/util/...`, `uv run pytest`) without
-/// abusing `entry_command` — which is documented as an argv[0]-shape
-/// token and contributes to the feature-id hash. Test commands routinely
-/// change as the project's package-manager / lockfile evolves, so they
-/// must not destabilize feature identity. Existing rows default to NULL
-/// and get populated on the next `codesage index` mapper pass.
+/// Keep mutable test commands outside entry_command, which contributes to feature
+/// identity. Legacy NULLs populate on the next mapping pass.
 fn migrate_0011_features_test_command(conn: &Connection) -> rusqlite::Result<()> {
     let has_column: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('features') WHERE name = 'test_command'",
@@ -901,31 +807,12 @@ fn migrate_0011_features_test_command(conn: &Connection) -> rusqlite::Result<()>
     Ok(())
 }
 
-/// Adds UNIQUE indexes as a DB-level backstop for the natural row identity of
-/// `symbols`, `refs`, and `symbol_fingerprints`. Dedup was previously pure
-/// app-level (`upsert_file` deletes a file's rows before re-insert), so a
-/// missed delete silently accumulated duplicates. Pre-existing duplicates are
-/// removed first (lowest id / rowid per key wins) so the index build cannot
-/// fail; on healthy DBs the DELETEs match nothing. These indexes must NOT be
-/// added to the base `SCHEMA` — init_db runs `SCHEMA` before migrations, and
-/// a unique index created there would fail on a legacy DB carrying duplicates
-/// before this dedupe gets its chance (the 6498ec2 ordering-bug class).
-///
-/// The dedupe DELETEs use one GROUP BY pass per table (a temp b-tree sort,
-/// O(n log n) regardless of duplicate distribution): measured 1.2s for the
-/// whole migration on a php-src-scale index (362k refs, 67k symbols). The
-/// correlated-EXISTS alternative was rejected — its probe degrades
-/// quadratically on hot `to_name` values (>120s on the same DB).
-///
-/// `refs` uniqueness is scoped to parser-extracted rows: synthetic
-/// `route_handler` edges live outside `upsert_file`'s delete-then-insert
-/// contract (the feature mapper rewrites them wholesale per kind), always
-/// carry `col = 0`, and two same-line registrations of one handler would
-/// collide on the positional key — so the partial index leaves them alone.
-///
-/// Additive, not `breaking_`-prefixed: older binaries run unchanged against
-/// the new indexes because their normal delete-then-insert flow never inserts
-/// duplicate rows.
+/// Deduplicate before adding UNIQUE indexes; never add them to base SCHEMA,
+/// which runs before this cleanup on legacy databases. Lowest id/rowid wins.
+/// GROUP BY avoids correlated-EXISTS quadratic probes on hot names.
+/// Exclude synthetic route_handler rows: same-line registrations share col=0
+/// and the mapper replaces them by kind, outside parser row identity.
+/// Additive: older writers already use delete-then-insert.
 fn migrate_0013_structural_unique_keys(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "DELETE FROM symbols WHERE id NOT IN (
@@ -1023,13 +910,8 @@ fn migrate_0009_feature_tables(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Adds `file_trust_boundaries` table for per-file trust-boundary tags (the
-/// new term feeding `assess_risk`). Idempotent via `IF NOT EXISTS`; existing
-/// indexes pick up boundary rows on the next file-touch + reindex (or via
-/// `features::derive_for_index` against the live DB). No backfill in the
-/// migration body itself — the next index pass writes real rows and the risk
-/// score reads them; a file with no row simply contributes a zero
-/// trust-boundary term, preserving the prior behavior until rederivation.
+/// Boundary rows populate on reindex/rederivation, not during migration;
+/// files without rows contribute zero trust-boundary risk until then.
 fn migrate_0008_file_trust_boundaries(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS file_trust_boundaries (
@@ -1079,9 +961,6 @@ fn migrate_0006_refs_name_tail_dot(conn: &Connection) -> rusqlite::Result<()> {
     backfill_refs_name_tail(conn)
 }
 
-/// Adds `structural_index_state` for tracking the last HEAD SHA the structural
-/// index was built against. Parallel shape to `git_index_state` and safe on a
-/// current schema (guarded by `IF NOT EXISTS`).
 fn migrate_0002_structural_index_state(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS structural_index_state (
@@ -1113,10 +992,8 @@ fn migrate_0003_semantic_files(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// `semantic_files` was introduced as path-only state during the 0.4.6
-/// development cycle. Freshness is actually per chunk table because each
-/// embedding model has its own vec0 table, so upgrade any path-only table by
-/// discarding freshness rows and forcing the next semantic pass to re-index.
+/// Replace legacy path-only freshness with per-model-table state; discarding
+/// old stamps forces semantic reindexing instead of reusing another model's hash.
 fn migrate_0004_semantic_files_chunk_table(conn: &Connection) -> rusqlite::Result<()> {
     let has_chunk_table: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('semantic_files') WHERE name = 'chunk_table'",
@@ -1162,13 +1039,8 @@ fn migrate_0005_semantic_models(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Create the vec0 chunk table and its FTS5 sidecar + vocab table when they
-/// are missing. DDL only, deliberately no repair: the sidecar rebuild is a
-/// full DELETE + INSERT…SELECT rewrite that used to run on every
-/// `open_for_model`, stalling query-shaped opens on large indexes. Write-path
-/// opens run the bounded [`repair_fts_sidecar_capped`] instead (row-capped,
-/// with a health signal on skip); read paths probe with
-/// [`fts_sidecar_health`] and never rewrite.
+/// DDL only: create missing vec0/FTS/vocab tables without a potentially large rebuild.
+/// Write paths use capped repair; read paths inspect health without rewriting.
 pub(crate) fn ensure_chunk_table(
     conn: &Connection,
     table_name: &str,
@@ -1422,9 +1294,6 @@ mod tests {
 
     #[test]
     fn init_db_sets_busy_timeout() {
-        // Repowise alignment (sweep §1.8): a non-zero busy_timeout means a
-        // second MCP session reading mid-index waits briefly instead of
-        // failing instantly with SQLITE_BUSY. Default is 0.
         let conn = open_initialized();
         let timeout_ms = pragma_int(&conn, "busy_timeout");
         assert!(
@@ -1442,8 +1311,6 @@ mod tests {
         let fts = fts_table_name(table);
         conn.execute(&format!("DELETE FROM \"{fts}\""), []).unwrap();
 
-        // A cap below the table size reports the divergence without paying
-        // for the rewrite — the over-cap health signal open paths log.
         assert_eq!(
             repair_fts_sidecar_capped(&conn, table, &fts, 1).unwrap(),
             FtsRepairOutcome::SkippedOverCap { chunk_rows: 2 }
@@ -1464,7 +1331,6 @@ mod tests {
             fts_sidecar_health(&conn, table, &fts).unwrap(),
             FtsSidecarHealth::InSync
         );
-        // In-sync is a no-op report, not a rewrite.
         assert_eq!(
             repair_fts_sidecar_capped(&conn, table, &fts, 0).unwrap(),
             FtsRepairOutcome::InSync
@@ -1473,8 +1339,6 @@ mod tests {
 
     #[test]
     fn init_db_read_only_sets_raised_busy_timeout() {
-        // A long write transaction holds the lock well past the write path's
-        // 5 s; readers wait it out instead of failing SQLITE_BUSY outright.
         let conn = Connection::open_in_memory().expect("open in-memory db");
         init_db_read_only(&conn).expect("init_db_read_only");
         let timeout_ms = pragma_int(&conn, "busy_timeout");
@@ -1488,10 +1352,6 @@ mod tests {
         );
     }
 
-    /// Re-running `init_db` must not re-apply migrations: the registry row
-    /// count is stable and the schema still works. (The BEGIN IMMEDIATE
-    /// change keeps this true under concurrency — the second opener blocks
-    /// at transaction start, then sees the row and skips.)
     #[test]
     fn init_db_double_run_does_not_reapply_migrations() {
         let conn = open_initialized();
@@ -1537,10 +1397,6 @@ mod tests {
         assert!(complete);
     }
 
-    /// Two concurrent `init_db` opens on the same file must both succeed:
-    /// BEGIN IMMEDIATE serializes the second at transaction start (inside
-    /// the 5 s busy_timeout window) instead of failing at COMMIT after
-    /// doing migration work.
     #[test]
     fn concurrent_init_db_opens_both_succeed() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1617,8 +1473,6 @@ mod tests {
         }
     }
 
-    /// A `"` in a chunk-table name must not break out of the vec0/FTS DDL:
-    /// the escaped identifier names one table instead of injecting SQL.
     #[test]
     fn chunk_ddl_escapes_quote_in_table_name() {
         let ddl = semantic_schema("chunks_evil\"_2", 2);
@@ -1631,7 +1485,6 @@ mod tests {
             fts.contains("\"chunks_evil\"\"_2_fts\""),
             "FTS DDL must double the embedded quote, got: {fts}"
         );
-        // End to end: the escaped DDL actually creates the weirdly-named table.
         init_vec_extension();
         let conn = Connection::open_in_memory().expect("open in-memory db");
         init_db(&conn).expect("init_db");

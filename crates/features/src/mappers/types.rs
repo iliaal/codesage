@@ -9,19 +9,15 @@ use anyhow::Result;
 use codesage_protocol::{FeatureConfidence, FeatureKind, Language};
 use globset::GlobSet;
 
-/// Context handed to every mapper. Bundles the project root with a
-/// pre-compiled `GlobSet` of the project's `[index].exclude_patterns`, so
-/// every walker honors the same exclusion contract as the structural
-/// indexer. Pass `&MapperContext::for_root(root)` when no excludes apply
-/// (tests, narrow programmatic callers).
+/// Project root and compiled `[index].exclude_patterns`, shared with the
+/// structural indexer's exclusion contract.
 pub struct MapperContext<'a> {
     pub root: &'a Path,
     pub excludes: Option<&'a GlobSet>,
 }
 
 impl<'a> MapperContext<'a> {
-    /// Context with no exclusion globs. Equivalent to mapper behavior
-    /// before `[index].exclude_patterns` was plumbed.
+    /// Context with no project exclusion globs.
     pub fn for_root(root: &'a Path) -> Self {
         Self {
             root,
@@ -35,11 +31,8 @@ impl<'a> MapperContext<'a> {
         self.excludes.is_some_and(|g| g.is_match(rel))
     }
 
-    /// Inverse of [`excluded`]; convenience for filter chains where the
-    /// affirmative read ("is this candidate allowed?") is clearer than
-    /// the negated form. Empty path is treated as allowed — the seed-
-    /// level entry_path check is the only consumer of empty paths and a
-    /// blank entry already gets dropped further downstream.
+    /// Inverse of [`excluded`]. Empty paths pass here; blank entry paths
+    /// are rejected downstream.
     pub fn allowed(&self, rel: &str) -> bool {
         if rel.is_empty() {
             return true;
@@ -81,12 +74,8 @@ pub struct FeatureSeed {
     pub entry_symbol: Option<String>,
     pub entry_route: Option<String>,
     pub entry_command: Option<String>,
-    /// Free-form shell command to exercise this feature's tests (e.g.
-    /// `pnpm --dir packages/api test`, `go test ./pkg/util/...`, `uv run
-    /// pytest`). Surfaced on the `FeatureRecord.test_command` field — kept
-    /// out of `entry_command` because that's used in the feature-id hash
-    /// and must not change when the project's test config evolves. `None`
-    /// when the mapper has no test runner to recommend.
+    /// Test command, or `None` when unknown. Separate from `entry_command`
+    /// so test configuration changes do not alter the feature-ID hash.
     pub test_command: Option<String>,
     pub language: Language,
     pub tags: Vec<String>,
@@ -107,10 +96,7 @@ pub struct FeatureSeed {
 }
 
 impl FeatureSeed {
-    /// Base constructor covering the four fields every seed sets; the rest
-    /// default to empty/`None` (`confidence: Medium`, `source: ""`). Sites
-    /// fill their non-default fields with struct-update syntax:
-    /// `FeatureSeed { source: "...", ..FeatureSeed::new(...) }`.
+    /// Defaults to medium confidence and empty optional fields.
     pub fn new(
         kind: FeatureKind,
         language: Language,

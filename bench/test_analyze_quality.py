@@ -84,8 +84,6 @@ def bucket(events, tool="find_symbol", window=3):
     return aq.terminality(events, window)["tools"][tool]
 
 
-# --------------------------------------------------------------------
-# Terminal: codesage call followed only by non-retrieval actions.
 events = (
     cs_call("find_symbol", FS_RESULT, name="foo")
     + native("Bash", command="cargo test -p graph")
@@ -95,7 +93,6 @@ b = bucket(events)
 check(b["calls"] == 1 and b["terminal"] == 1 and b["non_terminal"] == 0 and b["chained"] == 0, "terminal: plain")
 check(b["top_followups"] == [] and b["terminal_rate"] == 1.0 and b["terminal_rate_strict"] == 1.0, "terminal: rates")
 
-# Non-terminal: Grep within the window.
 events = (
     cs_call("find_symbol", FS_RESULT, name="foo")
     + native("Bash", command="cargo build")
@@ -107,13 +104,11 @@ check(b["terminal"] == 0 and b["non_terminal"] == 1, "non-terminal: Grep after")
 check(b["top_followups"] == [("Grep", 1)], "non-terminal: first follow-up is Grep")
 check(t["evidence"] == [{"tool": "find_symbol", "followup": "Grep", "evidence": "foo"}], "non-terminal: evidence row")
 
-# Non-terminal: Glob.
 events = cs_call("search", "{}", query="where is foo") + native("Glob", pattern="**/*.rs")
 b = bucket(events, tool="search")
 check(b["non_terminal"] == 1 and b["top_followups"] == [("Glob", 1)], "non-terminal: Glob after")
 
-# --------------------------------------------------------------------
-# Bash classification (BLOCKER-1, MINOR-4, MINOR-5).
+# Shell retrieval classification.
 POSITIVE_BASH = [
     ("rtk proxy grep -rn foo crates/", "grep"),
     ("grep -rn foo", "grep"),  # -r with no path searches the working tree
@@ -135,14 +130,14 @@ POSITIVE_BASH = [
     ("grep -rn foo /repo/../repo/crates", "grep"),
     ("grep -rn foo crates/ 2>/dev/null > /tmp/hits.txt", "grep"),  # redirects ignored, path still counts
     ("find crates -name '*.rs' | xargs grep -n foo", "find"),
-    # CR-002: explicit pattern flags consumed, paths still judged.
+    # explicit pattern flags consumed, paths still judged.
     ("grep -rn -e foo crates/", "grep"),
     ("grep -rn -e foo", "grep"),  # -r with no path: working tree under the root
     ("grep -rne foo crates/", "grep"),
     ("grep --regexp=foo -r crates/", "grep"),
     ("rg -t rust foo", "rg"),
     ("rg -e foo -g '*.rs' crates", "rg"),
-    # CR-004: wrappers with flags / flag arguments.
+    # wrappers with flags / flag arguments.
     ("timeout 30 grep -rn foo crates/", "grep"),
     ("timeout -s KILL 5m rg foo", "rg"),
     ("sudo -u nobody grep -rn foo crates/", "grep"),
@@ -151,28 +146,28 @@ POSITIVE_BASH = [
     ("stdbuf -oL rg foo crates", "rg"),
     ("nohup grep -rn foo crates/ &", "grep"),
     ("xvfb-run -a git blame crates/a.rs", "git blame"),
-    # CR-005: cd tracked across statements.
+    # cd tracked across statements.
     ("cd /repo && find . -name '*.rs'", "find"),
     ("cd crates && grep -rn foo .", "grep"),
     ("cd /tmp; cd /repo/crates && rg foo", "rg"),
-    # CR-007: pathspecs with a directory component or source extension.
+    # pathspecs with a directory component or source extension.
     ("git log --oneline Cargo.toml", "git log"),
     ("git log -3 crates/", "git log"),
-    # CR-305: combined short flags carrying -r with a pattern flag.
+    # combined short flags carrying -r with a pattern flag.
     ("grep -rne foo", "grep"),
     ("grep -rn -e foo -e bar crates/", "grep"),
     ("grep -rn crates/ --regexp foo", "grep"),  # --regexp as last pair
     ("grep -r -efoo crates/", "grep"),
-    # CR-309: long wrapper flags with arguments.
+    # long wrapper flags with arguments.
     ("sudo --user nobody grep -rn foo crates/", "grep"),
     ("sudo --group wheel rg foo crates", "rg"),
     ("timeout --signal KILL 30 grep -rn foo crates/", "grep"),
     ("env --unset HOME rg foo crates", "rg"),
     ("env -C /repo grep -rn foo .", "grep"),
     ("env --chdir=/repo/crates rg foo", "rg"),
-    # CR-301: git grep parsed like grep.
+    # git grep parsed like grep.
     ("git grep -n foo_bar", "git grep"),
-    # CR-701: -exec with a read-only utility keeps the find as retrieval.
+    # -exec with a read-only utility keeps the find as retrieval.
     ("find crates -name '*.rs' -exec cat {} \\;", "find"),
     ("find crates -name '*.rs' -exec grep -n foo {} \\;", "find"),
     ("find . -name '*.toml' -exec /usr/bin/head -5 {} +", "find"),
@@ -196,7 +191,7 @@ NEGATIVE_BASH = [
     "grep foo",  # stdin filter, no -r
     "find . -type f -newer Cargo.toml",  # find without a name/path predicate
     "find /tmp -name '*.sock'",
-    # CR-601/701: a find that acts on its matches is housekeeping, not retrieval.
+    # a find that acts on its matches is housekeeping, not retrieval.
     "find . -name __pycache__ -delete",
     "find crates -name '*.orig' -exec rm {} +",
     "find . -name '*.rs' -execdir touch {} \\;",
@@ -205,8 +200,7 @@ NEGATIVE_BASH = [
     "find . -name '*.rs' -exec sed -i 's/a/b/' {} \\;",  # sed is not read-only
     "find . -name '*.rs' -exec awk '{print}' {} \\;",
     "find . -name '*.rs' -exec /bin/mv {} /tmp/ \\;",
-    # CR-802: `\;` must not split the statement, or the trailing action is
-    # never seen and the read-only exec would be judged alone.
+    # Keep the escaped semicolon within find so the trailing mutation is checked.
     "find crates -name '*.rs' -exec cat {} \\; -delete",
     "find crates -name '*.rs' -exec grep -l foo {} \\; -exec rm {} \\;",
     'until [ -x bin/php ] || grep -q "^rc=" /tmp/claude-1000/tasks/b3.output 2>/dev/null; do sleep 10; done',
@@ -214,7 +208,7 @@ NEGATIVE_BASH = [
     "grep -q foo /tmp/x.txt > out.txt 2>&1",
     "cat /tmp/list.txt | xargs grep -l foo",  # xargs fed from scratch
     "ls /tmp/x | xargs -0 rg foo",
-    # CR-002: the pattern token is never a path.
+    # the pattern token is never a path.
     "grep -rn -e panic /var/log/syslog",
     "grep -q -e foo /tmp/x.txt",
     "grep --regexp panic /var/log/syslog",
@@ -224,28 +218,28 @@ NEGATIVE_BASH = [
     "grep -rn 'fn x' -A 25 /tmp/task.output",  # -A's argument is not a path
     "rg -g '*.rs' foo /tmp/x",
     "grep foo /tmp/x.txt &",  # trailing & is not a path
-    # CR-004: wrapper flag arguments are not command words or paths.
+    # wrapper flag arguments are not command words or paths.
     "sudo -u nobody cat crates/a.rs",
     "timeout 30 cargo test",
     "env FOO=1 cargo build",
-    # CR-005: cd into scratch, then a relative search.
+    # cd into scratch, then a relative search.
     "cd /tmp && grep -rn foo .",
     "cd /tmp && find . -name '*.sock'",
     "cd /tmp/work; rg foo",
     "cd /other/project && grep -rn foo src/",
-    # CR-305: no -r in the combined token means stdin.
+    # no -r in the combined token means stdin.
     "grep -ne foo",
     "grep -n -e foo -e bar",
-    # CR-304: pushd/popd and subshells lose the working directory.
+    # pushd/popd and subshells lose the working directory.
     "pushd /tmp && grep foo src/",
     "pushd /repo && grep -rn foo src/",
     "popd; grep -rn foo src/",
     "( cd /tmp && grep foo src/ )",
     "(cd /repo && grep -rn foo src/)",
     "cd /repo; ( grep -rn foo src/ )",
-    # CR-309: env -C into scratch.
+    # env -C into scratch.
     "env -C /tmp grep -rn foo .",
-    # CR-302: slash-shaped and operator refs are not pathspecs.
+    # slash-shaped and operator refs are not pathspecs.
     "git log origin/master",
     "git log -3 upstream/main",
     "git log refs/heads/master --oneline",
@@ -253,7 +247,7 @@ NEGATIVE_BASH = [
     "git log HEAD^ --stat",
     "git log @{u} --oneline",
     "git log master..origin/master",
-    # CR-007: refs are not pathspecs.
+    # refs are not pathspecs.
     "git log v0.26.1",
     "git log main..HEAD --oneline",
     "git log 1.2.3 -3",
@@ -272,13 +266,11 @@ for cmd in NEGATIVE_BASH:
     got = aq.bash_native_retrieval(cmd, ROOT)
     check(got is None, f"bash negative {cmd!r}: got {got}")
 check(aq.bash_native_retrieval(None, ROOT) is None, "bash_native_retrieval: non-string")
-# shell_retrieval also yields the grep pattern (feeds the identifier-shape metric).
 check(aq.shell_retrieval("rtk proxy grep -rn foo_bar crates/", ROOT) == ("grep", "foo_bar"), "shell_retrieval: pattern")
 check(aq.shell_retrieval("grep -rn -e needle crates/", ROOT) == ("grep", "needle"), "shell_retrieval: -e pattern")
 check(aq.shell_retrieval("rg --regexp=needle crates", ROOT) == ("rg", "needle"), "shell_retrieval: --regexp= pattern")
 check(aq.shell_retrieval("find . -name '*.rs'", ROOT) == ("find", None), "shell_retrieval: find has no pattern")
 check(aq.shell_retrieval("cargo test | grep error", ROOT) == (None, None), "shell_retrieval: filter")
-# CR-301: patterns recovered for git grep, xargs greps, and flag forms; -f yields "".
 check(aq.shell_retrieval("git grep -n foo_bar -- crates", ROOT) == ("git grep", "foo_bar"), "shell_retrieval: git grep pattern")
 check(aq.shell_retrieval("git -C /repo grep -e needle", ROOT) == ("git grep", "needle"), "shell_retrieval: git grep -e pattern")
 check(aq.shell_retrieval("ls crates | xargs grep -l foo_bar", ROOT) == ("grep", "foo_bar"), "shell_retrieval: xargs grep pattern")
@@ -288,7 +280,6 @@ check(aq.shell_retrieval("grep -r -efoo_bar crates/", ROOT) == ("grep", "foo_bar
 check(aq.shell_retrieval("grep -rn -f /tmp/pats.txt crates/", ROOT) == ("grep", ""), "shell_retrieval: -f FILE has no pattern")
 check(aq.shell_retrieval("git grep -f pats.txt", ROOT) == ("git grep", ""), "shell_retrieval: git grep -f has no pattern")
 check(aq.shell_retrieval("git blame crates/a.rs", ROOT) == ("git blame", None), "shell_retrieval: blame has no pattern")
-# CR-303: the working directory a command leaves behind.
 check(aq.last_absolute_cd("cd /other/project && ls") == "/other/project", "last_absolute_cd: absolute")
 check(aq.last_absolute_cd("cd /a; cd /b/../c") == "/c", "last_absolute_cd: last one wins, normalized")
 check(aq.last_absolute_cd("cd /a && cd sub") is None, "last_absolute_cd: relative after absolute is unknown")
@@ -299,7 +290,6 @@ check(aq.last_absolute_cd("pushd /a && make") == "/a", "last_absolute_cd: pushd 
 check(aq.bash_native_retrieval("grep foo /repo/crates", None) is None, "bash: absolute path needs a project root")
 check(aq.bash_native_retrieval("grep foo crates", None) == "grep", "bash: relative path needs no project root")
 
-# The Bash verdict drives the window scorer, with the command as evidence.
 events = cs_call("find_symbol", FS_RESULT, name="foo") + native("Bash", command="cargo test 2>&1 | grep error")
 check(bucket(events)["terminal"] == 1, "scorer: pipe-consumer grep is neutral")
 events = cs_call("find_symbol", FS_RESULT, name="foo") + native("Bash", command="rtk proxy grep -rn foo crates/")
@@ -307,8 +297,6 @@ t = aq.terminality(events)
 check(t["tools"]["find_symbol"]["top_followups"] == [("Bash(grep)", 1)], "scorer: Bash(grep) label")
 check(t["evidence"][0]["evidence"] == "rtk proxy grep -rn foo crates/", "scorer: Bash evidence is the command")
 
-# --------------------------------------------------------------------
-# Policy-read exclusion: Read then Edit of the same path inside the window.
 events = (
     cs_call("find_symbol", FS_RESULT, name="foo")
     + native("Read", file_path="/repo/crates/cli/src/main.rs")
@@ -318,7 +306,6 @@ b = bucket(events)
 check(b["terminal"] == 1 and b["policy_read"] == 1, "policy-read: Read then Edit same path")
 check(b["follow_through_read"] == 0, "policy-read: not counted as follow-through")
 
-# MultiEdit counts as an edit.
 events = (
     cs_call("find_symbol", FS_RESULT, name="foo")
     + native("Read", file_path="/repo/crates/cli/src/main.rs")
@@ -326,7 +313,6 @@ events = (
 )
 check(bucket(events)["policy_read"] == 1, "policy-read: MultiEdit is an edit")
 
-# Same Read without the Edit is an unexplained Read -> non-terminal.
 events = cs_call("find_symbol", FS_RESULT, name="foo") + native(
     "Read", file_path="/repo/crates/cli/src/main.rs"
 )
@@ -336,7 +322,6 @@ check(b["non_terminal"] == 1 and b["policy_read"] == 0, "unexplained Read: non-t
 check(b["top_followups"] == [("Read", 1)], "unexplained Read: first follow-up is Read")
 check(t["evidence"][0]["evidence"] == "/repo/crates/cli/src/main.rs", "unexplained Read: evidence is the path")
 
-# Read then Edit of a *different* path is still an unexplained Read.
 events = (
     cs_call("find_symbol", FS_RESULT, name="foo")
     + native("Read", file_path="/repo/crates/cli/src/main.rs")
@@ -344,7 +329,6 @@ events = (
 )
 check(bucket(events)["non_terminal"] == 1, "policy-read: different path does not excuse")
 
-# Edit outside the window does not excuse the Read (window=3: Read, Bash, Bash, Edit).
 events = (
     cs_call("find_symbol", FS_RESULT, name="foo")
     + native("Read", file_path="/repo/crates/cli/src/main.rs")
@@ -355,8 +339,6 @@ events = (
 check(bucket(events)["non_terminal"] == 1, "policy-read: Edit past the window does not excuse")
 check(bucket(events, window=4)["policy_read"] == 1, "policy-read: Edit inside window=4 excuses")
 
-# --------------------------------------------------------------------
-# Follow-through exclusion: Read of a path the result named.
 events = cs_call("find_symbol", FS_RESULT, name="foo") + native(
     "Read", file_path="/repo/crates/graph/src/search.rs"
 )
@@ -364,7 +346,6 @@ b = bucket(events)
 check(b["terminal"] == 1 and b["follow_through_read"] == 1, "follow-through: Read of result path")
 check(b["policy_read"] == 0, "follow-through: not counted as policy-read")
 
-# Follow-through takes precedence over policy-read when both apply.
 events = (
     cs_call("find_symbol", FS_RESULT, name="foo")
     + native("Read", file_path="/repo/crates/graph/src/search.rs")
@@ -373,7 +354,6 @@ events = (
 b = bucket(events)
 check(b["follow_through_read"] == 1 and b["policy_read"] == 0, "follow-through precedence over policy-read")
 
-# A follow-through Read consumes a slot but a later Grep still fails the call.
 events = (
     cs_call("find_symbol", FS_RESULT, name="foo")
     + native("Read", file_path="/repo/crates/graph/src/search.rs")
@@ -382,8 +362,7 @@ events = (
 b = bucket(events)
 check(b["non_terminal"] == 1 and b["follow_through_read"] == 1, "follow-through then Grep: non-terminal, still counted")
 
-# MAJOR-3: paths mentioned in prose / code snippets inside a JSON result do
-# not excuse a Read; only structured path fields do.
+# Only structured path fields justify follow-through reads; snippets do not.
 SEARCH_RESULT = json.dumps({
     "results": [
         {
@@ -404,7 +383,6 @@ check(b["non_terminal"] == 1 and b["follow_through_read"] == 0, "follow-through:
 events = cs_call("search", SEARCH_RESULT, query="query loading") + native("Read", file_path="/repo/crates/parser/src/lib.rs")
 check(bucket(events, tool="search")["follow_through_read"] == 1, "follow-through: structured file_path IS excused")
 
-# Structured fields: exact match under the project root, no bare-basename suffix match.
 paths = aq.extract_result_paths(json.dumps({"files": ["Cargo.toml", "crates/a.rs"], "max_risk_file": "crates/b.rs",
                                             "top_risk_files": [{"file": "crates/c.rs"}], "note": "see docs/x.md"}))
 check(paths == {"Cargo.toml", "crates/a.rs", "crates/b.rs", "crates/c.rs"}, f"extract_result_paths: structured keys {paths}")
@@ -412,18 +390,15 @@ check(aq.read_hits_result("/repo/Cargo.toml", paths, ROOT), "read_hits_result: r
 check(not aq.read_hits_result("/repo/crates/x/Cargo.toml", paths, ROOT), "read_hits_result: nested Cargo.toml does not")
 check(not aq.read_hits_result("/other/crates/a.rs", paths, ROOT), "read_hits_result: same suffix outside root does not")
 check(aq.read_hits_result("/repo/crates/./a.rs", paths, ROOT), "read_hits_result: normalized")
-# Without a project root, fall back to suffix match on paths with a directory component only.
 check(aq.read_hits_result("/abs/repo/crates/a.rs", {"crates/a.rs"}), "read_hits_result: suffix without root")
 check(not aq.read_hits_result("/abs/repo/xcrates/a.rs", {"crates/a.rs"}), "read_hits_result: component boundary")
 check(not aq.read_hits_result("/abs/repo/x/Cargo.toml", {"Cargo.toml"}), "read_hits_result: bare basename never suffix-matches")
 
-# Non-JSON text: regex fallback requires a `/`; numerics and bare basenames excluded.
 paths = aq.extract_result_paths("hit at ./crates/a.rs:12 (score 0.35, v0.26.1); also Cargo.toml e.g. foo")
 check(paths == {"crates/a.rs"}, f"extract_result_paths: text fallback {paths}")
 check(aq.extract_result_paths("") == set() and aq.extract_result_paths("[]") == set(), "extract_result_paths: empty")
 
-# CR-008: fenced or prose-prefixed JSON is recovered; bracketed-but-broken
-# payloads never fall through to the regex.
+# Broken JSON must not fall back to extracting paths from snippets.
 fenced = "```json\n" + json.dumps({"results": [{"file_path": "crates/a.rs"}]}) + "\n```"
 check(aq.extract_result_paths(fenced) == {"crates/a.rs"}, "extract_result_paths: fenced JSON")
 prose = "Found 1 result:\n" + json.dumps({"results": [{"file_path": "crates/a.rs"}]}) + "\nDone."
@@ -431,9 +406,6 @@ check(aq.extract_result_paths(prose) == {"crates/a.rs"}, "extract_result_paths: 
 broken = '{"results": [{"file_path": "crates/a.rs", "content": "see crates/parser/src/queries/rust.scm"'
 check(aq.extract_result_paths(broken) == set(), "extract_result_paths: truncated JSON yields nothing")
 
-# --------------------------------------------------------------------
-# Window cut by a second codesage call -> `chained`, and the Grep after it
-# charges the second call only.
 events = (
     cs_call("find_symbol", FS_RESULT, name="foo")
     + cs_call("find_references", json.dumps({"results": [{"file_path": "crates/x.rs"}]}), name="foo")
@@ -445,7 +417,6 @@ check(b1["chained"] == 1 and b1["terminal"] == 0 and b1["non_terminal"] == 0, "w
 check(b1["terminal_rate"] == 0.0 and b1["terminal_rate_strict"] is None, "window cut: rates with chained only")
 check(t["tools"]["find_references"]["non_terminal"] == 1, "window cut: second call non-terminal")
 check(t["all"]["calls"] == 2 and t["all"]["chained"] == 1 and t["all"]["non_terminal"] == 1, "window cut: overall row")
-# A codesage call that arrives after the window is exhausted is not `chained`.
 events = (
     cs_call("find_symbol", FS_RESULT, name="foo")
     + native("Bash", command="cargo build")
@@ -455,7 +426,6 @@ events = (
 )
 check(bucket(events)["terminal"] == 1 and bucket(events)["chained"] == 0, "window exhausted before codesage: terminal")
 
-# CR-010: bookkeeping / agent / user-facing tools do not consume window slots; Bash does.
 events = (
     cs_call("find_symbol", FS_RESULT, name="foo")
     + native("TodoWrite", todos=[])
@@ -486,8 +456,7 @@ events = (
 )
 check(bucket(events)["terminal"] == 1, "non-slot tools: Bash still consumes a slot")
 
-# CR-001: only a real user question cuts the window; harness-injected
-# role=user envelopes (system reminders, task notifications) do not.
+# Injected role=user envelopes must not end the question's retrieval window.
 for injected in [
     "<system-reminder>\nThe TodoWrite tool hasn't been used recently.\n</system-reminder>",
     "<task-notification>\n<task-id>abc</task-id>\n<status>completed</status>\n</task-notification>",
@@ -497,7 +466,6 @@ for injected in [
     events = cs_call("find_symbol", FS_RESULT, name="foo") + user(injected) + native("Grep", pattern="foo")
     check(bucket(events)["non_terminal"] == 1, f"injected user envelope does not cut: {injected[:20]!r}")
 
-# MAJOR-2: a real user turn ends the window; the next question's Grep is not charged.
 events = (
     cs_call("find_symbol", FS_RESULT, name="foo")
     + user("now something else: where is bar configured?")
@@ -514,7 +482,6 @@ events = (
 )
 check(bucket(events)["terminal"] == 1, "user turn cuts the window after a neutral call")
 
-# Window boundary: Grep as the 4th call after codesage — outside N=3, inside N=4.
 events = (
     cs_call("find_symbol", FS_RESULT, name="foo")
     + native("Bash", command="cargo build")
@@ -526,28 +493,22 @@ check(bucket(events, window=3)["terminal"] == 1, "window N=3: 4th call not inspe
 check(bucket(events, window=4)["non_terminal"] == 1, "window N=4: 4th call inspected")
 check(aq.terminality(events, 4)["window"] == 4, "window recorded in result")
 
-# Result text only: a result without paths never yields follow-through.
 events = cs_call("find_symbol", "[]", name="foo") + native("Read", file_path="/repo/crates/graph/src/search.rs")
 b = bucket(events)
 check(b["non_terminal"] == 1 and b["follow_through_read"] == 0, "empty result: no follow-through")
 
-# Codesage call with no tool_result (pending at end of transcript) still counts.
 u = use(CS + "search", project=ROOT, query="foo")
 b = bucket([u, use("Grep", pattern="foo")], tool="search")
 check(b["calls"] == 1 and b["non_terminal"] == 1, "pending result: still scored")
 
-# Codesage tool_use with a missing id still counts and never pairs with a result.
 no_id = {"kind": "tool_use", "tool": CS + "search", "id": None, "input": {"project": ROOT, "query": "q"}, "ts": None}
 stray = {"kind": "tool_result", "id": None, "text": FS_RESULT, "ts": None, "pair_tool": None, "pair_input": {}}
 b = bucket([no_id, stray] + native("Read", file_path="/repo/crates/graph/src/search.rs"), tool="search")
 check(b["calls"] == 1 and b["non_terminal"] == 1 and b["follow_through_read"] == 0, "missing id: scored, no pairing")
 
-# Read with a non-string file_path is neutral.
 events = cs_call("find_symbol", FS_RESULT, name="foo") + native("Read", file_path=None)
 check(bucket(events)["terminal"] == 1, "Read without a string path is neutral")
 
-# --------------------------------------------------------------------
-# Top follow-ups: ranked by count desc then name, exactly 5 retained.
 events = []
 for tool_name, cnt in [("Grep", 3), ("Glob", 2), ("Read", 1)]:
     for _ in range(cnt):
@@ -576,7 +537,6 @@ check(
 )
 check(len(b["first_followups"]) == 7, "top follow-ups: all 7 labels kept in the raw counter")
 
-# merge_terminality folds per-transcript results and recomputes top follow-ups and rates.
 t1 = aq.terminality(cs_call("search", "{}", query="q") + native("Grep", pattern="x"))
 t2 = aq.terminality(cs_call("search", "{}", query="q") + native("Glob", pattern="x")
                     + cs_call("search", "{}", query="q") + native("Grep", pattern="y")
@@ -588,8 +548,6 @@ check(s["top_followups"] == [("Grep", 2), ("Glob", 1)], "merge: follow-ups re-ra
 check(abs(s["terminal_rate"] - 0.2) < 1e-9 and abs(s["terminal_rate_strict"] - 0.25) < 1e-9, "merge: both rates")
 check(merged["all"]["calls"] == 5 and len(merged["evidence"]) == 3, "merge: overall row and evidence")
 
-# --------------------------------------------------------------------
-# aggregate wires the metric in; render prints the section with the window.
 agg = aq.aggregate([cs_call("find_symbol", FS_RESULT, name="foo") + native("Grep", pattern="foo")],
                    terminality_window=5)
 check(agg["terminality"]["window"] == 5, "aggregate: window threaded through")
@@ -601,12 +559,10 @@ check("- `find_symbol` → `Grep`: `foo`" in report, "render: evidence line")
 check("Unscoped calls (no `project` argument; shell paths scored conservatively): 0 of 1." in report, "render: unscoped footer")
 check("Grep tool + shell greps" in report, "render: grep section label")
 
-# CR-006: calls without a `project` argument are counted as unscoped.
 no_root = use(CS + "search", query="q")
 t = aq.terminality([no_root, result(no_root, "{}")] + native("Bash", command="grep -rn foo /repo/crates"))
 check(t["all"]["unscoped"] == 1 and t["all"]["terminal"] == 1, "unscoped: counted and absolute path scored conservatively")
 
-# CR-003: shell greps feed the Grep-tool metrics in aggregate.
 events = (
     cs_call("find_symbol", FS_RESULT, name="foo")
     + native("Bash", command="rtk proxy grep -rn foo_bar crates/")  # identifier-shaped shell grep
@@ -620,16 +576,13 @@ check(agg["grep_calls"] == 4 and agg["grep_tool_calls"] == 1 and agg["shell_grep
 check(agg["grep_identifier_shaped"] == 4, "aggregate: shell grep patterns classified")
 check(agg["followup_grep_after_codesage"] >= 1, "aggregate: shell grep follow-up on codesage subject")
 check(agg["identifier_grep_in_codesage_sessions"] == 4, "aggregate: tool-selection denominator includes shell greps")
-# CR-306: two follow-up greps on one result count the result once; the event count keeps both.
 check(agg["followup_grep_after_codesage"] == 1 and agg["followup_grep_events"] == 2, f"aggregate: one follow-up per result {agg['followup_grep_after_codesage']}/{agg['followup_grep_events']}")
 followup_report = aq.render(agg, window_days=7, transcripts=1, now="now")
 check("followed by at least one Grep on a mentioned identifier within 5 tool_uses**: 1 (100.0%)" in followup_report, "render: follow-up percentage capped by results")
 check("**Follow-up greps per followed result** (mean): 2.00 (2 greps)" in followup_report, "render: follow-up mean")
 check("shell greps with no recoverable pattern" in followup_report and "session-scoped" in followup_report, "render: unparsed note and session-scoped rule")
 
-# CR-301 end to end: git grep and xargs grep carry patterns; -f greps are unparsed
-# and stay out of the identifier denominator; a cd to another project re-roots
-# later shell greps (CR-303).
+# Pattern-file greps have no identifier denominator; cd re-roots later greps.
 events = (
     cs_call("find_symbol", FS_RESULT, name="foo")
     + native("Bash", command="git grep -n alpha_one")
@@ -648,12 +601,8 @@ check(agg["grep_identifier_shaped"] == 2, f"aggregate e2e: identifier-shaped {ag
 check(agg["grep_calls"] == 2, "aggregate e2e: unparsed and non-onboarded greps excluded from the denominator")
 check(agg["identifier_grep_in_codesage_sessions_all"] == 4, "aggregate e2e: ungated denominator keeps them")
 
-# Onboarded-root gate: a shell grep counts toward tool selection only when its
-# per-command root is a session `project` or holds `.codesage/index.db`.
-# The fixture lives under $HOME: /tmp is a scratch prefix the path guard
-# rejects before the gate is consulted, and a directory inside this repo
-# would be onboarded through the walk-up (the repo root holds
-# `.codesage/index.db`).
+# Use $HOME: /tmp is rejected before the gate, and this repo would supply
+# an inherited index.db, preventing the non-onboarded control.
 _home = Path.home()
 _home_onboarded = any((p / ".codesage" / "index.db").is_file() for p in [_home, *_home.parents])
 if _home_onboarded:
@@ -684,7 +633,6 @@ else:
         check("**Grep tool + shell grep calls observed (onboarded roots)**: 3 (Grep tool 0, shell greps 3); all roots: 5 (Grep tool 0, shell greps 5)" in gate_report, "render: header shows gated and all-roots counts")
         check("Excluded from the denominator below: 0 Grep tool calls and 2 shell greps under non-onboarded roots, 0 shell greps with no recoverable pattern" in gate_report, "render: named exclusions")
 
-        # CR-402: a grep from a subdirectory (or a worktree) of an onboarded root counts.
         (onboarded / "crates" / "graph").mkdir(parents=True)
         (onboarded / ".claude" / "worktrees" / "agent-x").mkdir(parents=True)
         events = (
@@ -696,7 +644,6 @@ else:
         agg = aq.aggregate([events])
         check(agg["shell_grep_calls"] == 3 and agg["shell_grep_calls_all"] == 3, f"gate walk-up: {agg['shell_grep_calls']} of {agg['shell_grep_calls_all']}")
 
-# CR-403: statements are judged against the cwd in effect at that statement.
 events = cs_call("find_symbol", FS_RESULT, name="foo") + native("Bash", command="grep -rn foo crates/ && cd /nowhere")
 agg = aq.aggregate([events])
 check(agg["shell_grep_calls"] == 1, "per-statement root: grep before a cd to nowhere counts")
@@ -707,7 +654,6 @@ check(aq.shell_retrieval_detail("grep -rn foo crates/ && cd /nowhere", ROOT, roo
 check(aq.shell_retrieval_detail("cd /repo/x && grep -rn foo .", "/elsewhere", root_follows_cd=True) == ("grep", "foo", "/repo/x"), "shell_retrieval_detail: re-rooted by an absolute cd")
 check(aq.shell_retrieval_detail("cd /repo/x && grep -rn foo .", "/elsewhere") == (None, None, None), "shell_retrieval_detail: fixed root without root_follows_cd")
 
-# CR-404: the Bash cwd carries across calls in a main session, not in a subagent transcript.
 events = (
     cs_call("find_symbol", FS_RESULT, name="foo")
     + native("Bash", command="cd /elsewhere/proj")
@@ -723,7 +669,6 @@ events = (
 check(aq.aggregate([events])["shell_grep_calls_all"] == 1, "cwd carry-over: absolute path under the carried root counts (all)")
 check(aq.aggregate([events], subagent_flags=[True])["shell_grep_calls_all"] == 0, "cwd carry-over: subagent does not carry the cd")
 
-# CR-409: the first retrieval decision skips bookkeeping tools and non-retrieval Bash.
 events = (
     user("where is foo_bar defined?")
     + native("TodoWrite", todos=[])
@@ -739,7 +684,6 @@ check(shape["first_codesage_retrieval"] == 1, f"shape walk: non-retrieval Bash i
 events = user("where is foo_bar defined?") + native("Bash", command="find . -name '*.rs'") + cs_call("find_symbol", FS_RESULT, name="foo")
 shape = aq.aggregate([events])["question_shape_counts"]["identifier"]
 check(shape["first_glob"] == 1, f"shape walk: shell find is first=Glob {shape}")
-# CR-501: git log / git blame are shell retrieval but not a Grep/Glob decision; skipped.
 for cmd in ["git log -p -3 -- crates/", "git blame crates/graph/src/search.rs"]:
     events = user("where is foo_bar defined?") + native("Bash", command=cmd) + cs_call("find_symbol", FS_RESULT, name="foo")
     shape = aq.aggregate([events])["question_shape_counts"]["identifier"]
@@ -749,7 +693,6 @@ check(aq.aggregate([events])["question_shape_counts"]["identifier"]["first_grep"
 report_501 = aq.render(aq.aggregate([events]), window_days=7, transcripts=1, now="now")
 check("shell grep (`grep`/`rg`/`git grep`, or `find -exec grep` with a recovered pattern) is filed under `first=Grep` and any other retrieval `find` under `first=Glob`" in report_501, "render: §2.3 legend names the Bash mapping")
 
-# CR-502: the Grep tool is gated on its `path` like a shell grep.
 events = (
     cs_call("find_symbol", FS_RESULT, name="foo")
     + native("Grep", pattern="alpha_one", path="/other/project/src")  # absolute, not onboarded
@@ -764,9 +707,7 @@ check(agg["grep_calls"] == 3, "Grep tool gate: grep_calls uses the gated count")
 report_502 = aq.render(agg, window_days=7, transcripts=1, now="now")
 check("(onboarded roots)**: 3 (Grep tool 3, shell greps 0); all roots: 4 (Grep tool 4, shell greps 0)" in report_502, "render: header carries both Grep tool halves")
 check("Excluded from the denominator below: 1 Grep tool calls and 0 shell greps under non-onboarded roots" in report_502, "render: Grep tool exclusion named")
-# CR-604: tilde paths are expanded before the gate; a tilde path outside the
-# session project must not fall back to the session root, and a tilde session
-# project must match a tilde Grep path under it.
+# Expand both tilde roots and paths before deciding whether the grep is onboarded.
 events = cs_call("find_symbol", FS_RESULT, name="foo") + native("Grep", pattern="foo_bar", path="~/other-repo")
 agg = aq.aggregate([events])
 check(agg["grep_tool_calls"] == 0 and agg["grep_tool_calls_all"] == 1, "Grep tool gate: tilde path outside the project is not onboarded")
@@ -776,28 +717,21 @@ agg = aq.aggregate([events])
 check(agg["grep_tool_calls"] == 1, "Grep tool gate: tilde session project matches a tilde path under it")
 events = [tilde_call, result(tilde_call, FS_RESULT)] + native("Bash", command=f"grep -rn foo_bar {Path.home()}/tilde-proj/src")
 check(aq.aggregate([events])["shell_grep_calls"] == 1, "shell grep gate: expanded absolute path matches a tilde session project")
-# A Grep tool call in a session with no CodeSage call has no onboarded root.
 agg = aq.aggregate([native("Grep", pattern="foo")])
 check(agg["grep_tool_calls"] == 0 and agg["grep_tool_calls_all"] == 1, "Grep tool gate: no session root → not a decision")
 
-# CR-503: a relative `env -C` does not advance the root; an absolute one does.
 check(aq.shell_retrieval_detail("env -C crates rg foo", ROOT, root_follows_cd=True) == ("rg", "foo", ROOT), "env -C relative keeps the root")
 check(aq.shell_retrieval_detail("env -C /repo/crates rg foo", ROOT, root_follows_cd=True) == ("rg", "foo", "/repo/crates"), "env -C absolute re-roots")
 check(aq.shell_retrieval_detail("env --chdir=crates rg foo", ROOT, root_follows_cd=True) == ("rg", "foo", ROOT), "env --chdir= relative keeps the root")
 check(aq.shell_retrieval_detail("env --chdir=/repo/crates rg foo", ROOT, root_follows_cd=True) == ("rg", "foo", "/repo/crates"), "env --chdir= absolute re-roots")
 
-# CR-701: `find -exec grep PATTERN` is retrieval and keeps its own pattern, never a later statement's.
 check(aq.shell_retrieval("find crates -name '*.rs' -exec grep -n degree {} \\; ; echo done; grep -rn other_pat crates/", ROOT) == ("find", "degree"), "find -exec grep keeps its own pattern")
 check(aq.shell_retrieval("find crates -name '*.rs' -exec grep -l -e degree {} +", ROOT) == ("find", "degree"), "find -exec grep -e pattern")
 check(aq.shell_retrieval("find crates -name '*.rs' -exec cat {} \\;", ROOT) == ("find", None), "find -exec cat has no pattern")
-# CR-805: `{}` is never read as the grep pattern.
 check(aq.shell_retrieval("find crates -name '*.rs' -exec grep -A 3 {} \\;", ROOT) == ("find", None), "find -exec grep with no pattern: {} is not a pattern")
 check(aq.shell_retrieval("find crates -name '*.rs' -exec grep -n {} +", ROOT) == ("find", None), "find -exec grep -n {} +: no pattern")
-# A rejected find must not borrow a later statement's pattern either: the later
-# statement is judged on its own (here it is a genuine grep, so it wins).
 check(aq.shell_retrieval("find . -name '*.orig' -exec rm {} + ; grep -rn later_pat crates/", ROOT) == ("grep", "later_pat"), "rejected find, later grep judged on its own")
 check(aq.shell_retrieval("find . -name '*.orig' -exec rm {} + ; cargo test", ROOT) == (None, None), "rejected find, nothing else")
-# A find -exec grep is accounted as a shell grep in §2.3 and is first=Grep in the shape walk.
 events = cs_call("find_symbol", FS_RESULT, name="foo") + native("Bash", command="find crates -name '*.rs' -exec grep -n foo_bar {} \\;") + native("Bash", command="find crates -name '*.rs' -exec cat {} \\;")
 agg = aq.aggregate([events])
 check(agg["shell_grep_calls"] == 1 and agg["grep_identifier_shaped"] == 1, f"find -exec grep counted as a shell grep {agg['shell_grep_calls']}/{agg['grep_identifier_shaped']}")
@@ -806,8 +740,7 @@ check(aq.aggregate([events])["question_shape_counts"]["identifier"]["first_grep"
 events = user("where is foo_bar defined?") + native("Bash", command="find crates -name '*.rs' -exec cat {} \\;") + cs_call("find_symbol", FS_RESULT, name="foo")
 check(aq.aggregate([events])["question_shape_counts"]["identifier"]["first_glob"] == 1, "shape walk: find -exec cat is first=Glob")
 
-# CR-703: a tilde project root is expanded inside shell_retrieval_detail; pinned
-# against a controlled $HOME so the assertion does not depend on the runner.
+# Pin HOME so tilde expansion does not depend on the runner.
 _real_home = os.environ.get("HOME")
 os.environ["HOME"] = "/home/x"
 try:
@@ -819,7 +752,6 @@ finally:
     else:
         os.environ["HOME"] = _real_home
 
-# CR-704: a relative root never resolves against the analyzer's cwd.
 with tempfile.TemporaryDirectory() as td:
     (Path(td) / "myproj" / ".codesage").mkdir(parents=True)
     (Path(td) / "myproj" / ".codesage" / "index.db").write_bytes(b"")
@@ -832,19 +764,15 @@ with tempfile.TemporaryDirectory() as td:
     finally:
         os.chdir(_cwd)
 
-# CR-705: a relative `project` value is not a session root.
 rel_call = use(CS + "find_symbol", project="codesage", name="foo")
 agg = aq.aggregate([[rel_call, result(rel_call, FS_RESULT)] + native("Grep", pattern="foo_bar") + native("Bash", command="grep -rn foo_bar crates/")])
 check(agg["grep_tool_calls"] == 0 and agg["grep_tool_calls_all"] == 1, "relative project: Grep tool has no onboarded root")
 check(agg["shell_grep_calls"] == 0 and agg["shell_grep_calls_all"] == 1, "relative project: shell grep has no onboarded root")
-# Terminality is unaffected by the gate: a grep under a non-onboarded root still ends the window.
 events = cs_call("find_symbol", FS_RESULT, name="foo") + native("Bash", command="grep -rn foo crates/")
 check(bucket(events)["non_terminal"] == 1, "gate: terminality unchanged")
 
-# CR-304 in the scorer: a pushd before a relative grep leaves the call terminal.
 events = cs_call("find_symbol", FS_RESULT, name="foo") + native("Bash", command="pushd /repo && grep -rn foo src/")
 check(bucket(events)["terminal"] == 1, "scorer: pushd loses cwd, relative grep not charged")
-# A shell grep as the first action after a real question counts as first=Grep in the shape table.
 events = user("where is foo_bar defined?") + native("Bash", command="rg foo_bar crates") + cs_call("find_symbol", FS_RESULT, name="foo")
 shape = aq.aggregate([events])["question_shape_counts"]["identifier"]
 check(shape["first_grep"] == 1 and shape["first_other_or_none"] == 0, f"shape walk: shell grep is first=Grep {shape}")
@@ -852,10 +780,7 @@ check("**Transcripts scanned**: 3 (1 session, 2 subagent)" in report, "render: s
 empty_report = aq.render(aq.aggregate([]), window_days=7, transcripts=0, now="now")
 check("_No codesage tool calls in the window._" in empty_report, "render: empty placeholder")
 
-# --------------------------------------------------------------------
-# extract_events must emit tool_result events. Claude Code puts tool_result
-# blocks on role=user envelopes (string or list content); a user-text turn
-# with no tool_result is still a `user` event.
+# Claude Code puts tool results on role=user envelopes, alongside actual user turns.
 rows = [
     {"type": "user", "timestamp": "t0", "message": {"role": "user", "content": "where is foo?"}},
     {"type": "assistant", "timestamp": "t1", "message": {"role": "assistant", "content": [
@@ -885,8 +810,6 @@ check(b.get("terminal") == 1 and b.get("follow_through_read") == 1, "extract_eve
 agg = aq.aggregate([evs])
 check(agg["codesage_results_total"] == 1 and agg["quality"]["find_symbol"]["ok"] == 1, "extract_events -> quality counts")
 
-# --------------------------------------------------------------------
-# iter_transcripts picks up session and subagent transcripts, mtime-filtered.
 with tempfile.TemporaryDirectory() as td:
     proj = Path(td) / "-home-x-proj"
     sub = proj / "sess1" / "subagents"

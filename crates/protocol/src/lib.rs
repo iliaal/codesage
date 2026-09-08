@@ -301,7 +301,6 @@ pub enum TrustBoundary {
     Concurrency,
 }
 
-// `as_str` is the stable lowercase-kebab string used in DB rows, JSON, and CLI output.
 str_enum!(TrustBoundary {
     Network => "network",
     Filesystem => "filesystem",
@@ -560,8 +559,6 @@ pub enum FileCategory {
 impl FileCategory {
     pub fn classify(path: &str) -> Self {
         let lower_owned = path.to_lowercase();
-        // Strip a leading `./` so relative paths (`./tests/foo.rs`) still match
-        // the directory-prefix checks below.
         let lower = lower_owned
             .strip_prefix("./")
             .unwrap_or(lower_owned.as_str());
@@ -580,11 +577,7 @@ impl FileCategory {
             || lower.ends_with(".spec.tsx")
             || lower.ends_with(".spec.js")
             || lower.ends_with(".spec.jsx")
-            // Java / PHPUnit conventions require an uppercase `Test`
-            // boundary (`FooTest.java`, `FooTests.java`, `FooTest.php`).
-            // Matching against the lowercased path here would also catch
-            // unrelated source files like `Latest.java`, `Manifests.java`,
-            // or `latest.php`.
+            // Case-sensitive Test/Tests avoids treating Latest.java or Manifests.java as tests.
             || path.ends_with("Test.php")
             || path.ends_with("Test.java")
             || path.ends_with("Tests.java")
@@ -1838,6 +1831,30 @@ pub struct EditBrief {
     /// anything above, which is why these signals were the ones chosen.
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub branch_overlap: Option<BranchOverlapReport>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct BranchOverlapReport {
+    pub current_commit: Option<String>,
+    pub scanned_refs: usize,
+    pub total_refs: Option<usize>,
+    pub complete: bool,
+    pub matching_branches: usize,
+    pub branches: Vec<BranchOverlap>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct BranchOverlap {
+    pub branch: String,
+    pub commit: String,
+    pub merge_base: String,
+    pub files: Vec<String>,
+    pub files_total: usize,
+    pub basis: String,
 }
 
 /// One symbol on a call chain, with the line in the *previous* step's body
@@ -2327,11 +2344,6 @@ mod tests {
 
     #[test]
     fn file_category_does_not_misclassify_source_files_named_like_tests() {
-        // Regression: the previous Java/PHP arms used
-        // a lowercase-suffix match without a separator, so source files
-        // whose names happen to end in `test.java`/`tests.java`/
-        // `test.php` got classified as tests and dropped from
-        // impact_analysis with source_only=true.
         assert_eq!(
             FileCategory::classify("src/main/java/com/acme/Latest.java"),
             FileCategory::Source
@@ -2344,7 +2356,6 @@ mod tests {
             FileCategory::classify("app/Models/Latest.php"),
             FileCategory::Source
         );
-        // Sanity: legitimate test conventions still classify as tests.
         assert_eq!(
             FileCategory::classify("src/main/java/com/acme/UserServiceTest.java"),
             FileCategory::Test
@@ -2429,10 +2440,6 @@ mod tests {
             other => panic!("known file extension must be a file target, got {other:?}"),
         }
 
-        // Regression: `.java` was missing from the
-        // allow-list after Java was added to `Language`, so bare
-        // `UserService.java` resolved as a symbol name and produced an
-        // empty impact result.
         match ImpactTarget::from_hint("UserService.java".into(), None) {
             ImpactTarget::File { path } => assert_eq!(path, "UserService.java"),
             other => panic!(".java target must be a file target, got {other:?}"),
@@ -2481,8 +2488,6 @@ mod tests {
 
     #[test]
     fn empty_legend_is_omitted_from_json() {
-        // Empty BTreeMap is gated by `skip_serializing_if = "BTreeMap::is_empty"`.
-        // Confirms no spurious `_legend: {}` lands in responses with no aliasing.
         let a = RiskDiffAssessment::default();
         let json = serde_json::to_string(&a).unwrap();
         assert!(
@@ -2683,9 +2688,7 @@ mod tests {
             );
         }
 
-        // Size claim the trim exists for: the hidden fields were measured at
-        // ~48% of a real `assess_risk_batch` payload, so this fixture must
-        // shed at least that much.
+        // The hidden fields measured ~48% of a real assess_risk_batch payload.
         let saved = full_json.len() - trimmed_json.len();
         assert!(
             saved * 100 >= full_json.len() * 48,
@@ -2840,8 +2843,6 @@ mod tests {
         assert!(!json.contains("\"col_start\""), "{json}");
         assert!(!json.contains("\"col_end\""), "{json}");
         let back: Symbol = serde_json::from_str(&json).unwrap();
-        // The wire drops the columns by design, so the round-trip restores
-        // everything except them; they come back at their default.
         let expected = Symbol {
             col_start: 0,
             col_end: 0,

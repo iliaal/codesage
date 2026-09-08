@@ -1,11 +1,5 @@
 //! Map a pasted stack trace onto indexed symbols.
 //!
-//! A debugging-by-symptom session otherwise starts with one `search` plus one
-//! `find_symbol` round-trip per frame, each guessing at how the runtime printed
-//! the path. This parses the trace once, resolves every frame against the
-//! `files` and `symbols` tables, and marks what it could not place instead of
-//! picking the nearest name.
-//!
 //! Rust module paths are matched against the workspace's `Cargo.toml`
 //! packages under the conventional `<crate>/src/` layout; a `[lib]` or
 //! `[[bin]]` target with a `path` outside `src/` is not modelled, so frames
@@ -81,10 +75,7 @@ struct Format {
 
 /// Longest `candidates` list on a frame; `candidates_total` keeps the count.
 const MAX_CANDIDATES: usize = 10;
-/// Cap for a frame that names no file at all. Such frames are the ones that
-/// repeat (`[internal function]: Closure->__invoke()` forty times over), and
-/// each lead there is weaker than one anchored to a call site; at 10 a
-/// 42-frame closure trace still overran the 32,000-char MCP budget.
+/// Weak name-only leads get a smaller cap to leave room for other frames.
 const MAX_CANDIDATES_NAME_ONLY: usize = 5;
 
 const FORMATS: &[Format] = &[
@@ -568,18 +559,12 @@ fn parse_with(f: &Format, lines: &[&str]) -> Parsed {
     let (ordered, root_cause_first): (Vec<Vec<RawFrame>>, bool) = match f.stack_order {
         StackOrder::AsPrinted => (stacks.into_iter().map(|(_, _, s)| s).collect(), false),
         StackOrder::Reversed => {
-            // The cause chain runs primary → cause → deeper cause, so the
-            // deepest is the root. `Suppressed:` blocks are siblings raised
-            // alongside (try-with-resources close failures), never the cause,
-            // and go last in printed order — together with any `Caused by:`
-            // printed at their indent or deeper, which is the suppressed
-            // exception's own cause, not the primary chain's.
+            // Reverse the primary cause chain. Suppressed exceptions and their
+            // nested causes remain last in printed order.
             let mut chain: Vec<Vec<RawFrame>> = Vec::new();
             let mut side: Vec<Vec<RawFrame>> = Vec::new();
-            // Indents of the `Suppressed:` blocks still open at this point,
-            // innermost last. A header at a shallower indent closes every
-            // deeper block; a `Caused by:` belongs to the primary chain only
-            // when no suppressed block is open at all.
+            // Open suppressed-block indents, innermost last. A cause joins the
+            // primary chain only after every suppressed block closes.
             let mut open: Vec<usize> = Vec::new();
             for (header, indent, frames) in stacks {
                 let Some(h) = header else {
@@ -736,21 +721,9 @@ fn qualified_segments(q: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Whether a definition's stored qualified name and a frame's printed name
-/// agree on more than the bare leaf.
-///
-/// A printed name that is a suffix of the stored one always agrees: a bare
-/// `Model->save()` pins `Illuminate\…\Model\save`, `Foo.run` pins
-/// `com.acme.Foo.run`. The other direction (stored name shorter) agrees only
-/// where the index stores relative names — Rust's `Type::method` under a
-/// printed `crate::mod::Type::method`. Where the index stores absolute names
-/// (PHP, Java) a shorter stored name is a different, shallower namespace:
-/// `App\Domain\Rules\Invokable->__invoke()` must not land on a top-level
-/// `Invokable\__invoke`.
-///
-/// A stored name with no qualifier at all (Rust free functions) falls back
-/// to the definition's file path: `codesage_graph::search::f` agrees with an
-/// `f` defined in `crates/graph/src/search.rs`.
+/// Require agreement beyond the bare name. A shorter printed name may match
+/// a stored suffix; a shorter stored name is allowed only for relative-name
+/// languages. Rust free functions can instead agree through their crate path.
 fn qualified_agrees(
     def: &Symbol,
     frame_segs: &[String],
@@ -785,7 +758,7 @@ re!(TOML_NAME, r#"(?m)^\s*name\s*=\s*"(?P<name>[^"]+)""#);
 re!(TOML_MEMBERS, r"(?ms)^\s*members\s*=\s*\[(?P<inside>.*?)\]");
 re!(TOML_STRING, r#""(?P<s>[^"]+)""#);
 
-/// Manifests larger than this are not Cargo manifests worth reading.
+/// Bound reads of repository-supplied manifests.
 const MAX_MANIFEST_BYTES: u64 = 1 << 20;
 
 fn read_manifest(path: &Path) -> Option<String> {
@@ -794,7 +767,6 @@ fn read_manifest(path: &Path) -> Option<String> {
         return None;
     }
     let raw = std::fs::read_to_string(path).ok()?;
-    // Strip `#` comments so a commented-out member or name is not read.
     Some(
         raw.lines()
             .map(|l| l.split_once('#').map_or(l, |(code, _)| code))
@@ -1050,10 +1022,7 @@ fn name_pool(db: &Database, index: &Index, format: &Format, segs: &[String]) -> 
     Ok(NamePool { qualified, bare })
 }
 
-/// Mark `frame` ambiguous over `candidates`, keeping the first
-/// `MAX_CANDIDATES` (`MAX_CANDIDATES_NAME_ONLY` when the frame names no
-/// file) and the full count. A frame with hundreds of same-named leads would
-/// otherwise crowd every other frame out of the MCP budget.
+/// Cap ambiguous candidates while preserving their total count.
 fn set_ambiguous(frame: &mut TraceFrame, candidates: Vec<String>) {
     frame.status = TraceFrameStatus::Ambiguous;
     frame.symbol = None;
@@ -1123,8 +1092,6 @@ fn resolve_frame(
     let has_qualifier = segs.len() >= 2;
 
     let Some(file) = frame.file.clone() else {
-        // Nothing but a name (Rust without debuginfo, Java `Unknown Source`,
-        // PHP `[internal function]`).
         if !segs.is_empty() {
             let pool = name_pool(db, index, format, &segs)?;
             if !apply_qualified(&mut frame, &pool) {
@@ -1136,10 +1103,7 @@ fn resolve_frame(
 
     let matches = match_files(&index.paths, &file);
     let path = match matches.as_slice() {
-        // Outside the index: vendor, stdlib, `<frozen …>`, `node:internal`.
-        // A PHP call site in vendor code may still name a project method
-        // (framework → controller); only a qualified match counts, since a
-        // bare name could as easily be the library's own function.
+        // Vendor PHP call sites may name project methods; require qualified evidence.
         [] => {
             if format.location == Location::CallSite && has_qualifier {
                 let pool = name_pool(db, index, format, &segs)?;
@@ -1162,17 +1126,13 @@ fn resolve_frame(
 
     match format.location {
         Location::InBody => {
-            // The spanning symbol whose name is the frame's is certain.
             if let Some(c) = container
                 && leaf.as_deref().is_none_or(|n| n == c.name)
             {
                 frame.symbol = Some(trace_symbol(c));
                 return Ok(frame);
             }
-            // Otherwise the printed name disagrees with the span (closure or
-            // lambda inside another function, trait impl the parser did not
-            // record). Prefer a same-file definition of the printed name; a
-            // project-wide lookup would ignore the file the trace just named.
+            // Resolve conflicting names within the printed file, not project-wide.
             if let Some(n) = &leaf {
                 let in_file: Vec<&Symbol> = symbols.iter().filter(|s| s.name == *n).collect();
                 match in_file.as_slice() {
@@ -1255,13 +1215,11 @@ pub fn from_trace(db: &Database, root: &Path, req: &FromTraceRequest) -> Result<
     };
     let format = format_of(parsed.format).expect("parsed format is registered");
     let total: usize = parsed.stacks.iter().map(Vec::len).sum();
-    // `limit: 0` means "the default", as `list_features` treats it, not zero
-    // frames.
+    // Zero selects the default limit.
     let keep = req.limit.filter(|&l| l > 0).map_or(total, |l| l.min(total));
     let stack_count = parsed.stacks.len();
     let note = (keep < total).then(|| {
-        // Under several stacks the cut drops whole trailing stacks, which a
-        // reader must know about: "innermost" would suggest one stack.
+        // Distinguish a partial stack from entirely dropped trailing stacks.
         let mut seen = 0usize;
         let last_kept_stack = parsed
             .stacks
@@ -1327,7 +1285,6 @@ mod tests {
     use super::*;
     use codesage_protocol::FileInfo;
 
-    /// All frames flattened in report order, with their stack id.
     fn frames_of(trace: &str) -> (&'static str, Vec<(u32, RawFrame)>) {
         let p = parse_trace(trace).expect("trace should parse");
         let flat = p
@@ -1772,8 +1729,6 @@ SUMMARY: AddressSanitizer: heap-use-after-free /home/u/proj/src/parse.c:123:12 i
         assert!(parse_trace("").is_none());
     }
 
-    // ---------- resolution ----------
-
     fn sym(name: &str, qualified: &str, kind: SymbolKind, path: &str, a: u32, b: u32) -> Symbol {
         Symbol {
             name: name.to_string(),
@@ -2097,10 +2052,7 @@ SUMMARY: AddressSanitizer: heap-use-after-free /home/u/proj/src/parse.c:123:12 i
 
         let empty = tempfile::tempdir().unwrap();
         assert!(CrateMap::load(empty.path()).dirs.is_empty());
-        // Absolute and parent-traversing members are never followed.
-        // Absolute and parent-traversing members are never followed. The
-        // bait manifests exist at exactly the escaped locations, so the
-        // assertion fails if the guard is removed regardless of TMPDIR.
+        // Place real manifests at escaped paths so the guard test is non-vacuous.
         let hostile = tempfile::tempdir().unwrap();
         let root = hostile.path().join("outside/root");
         let sibling = hostile.path().join("outside/sibling");
@@ -2123,7 +2075,6 @@ SUMMARY: AddressSanitizer: heap-use-after-free /home/u/proj/src/parse.c:123:12 i
             ),
         )
         .unwrap();
-        // The bait is reachable when the guard is off: prove the fixture bites.
         assert_eq!(
             package_name(&read_manifest(&sibling.join("Cargo.toml")).unwrap()).as_deref(),
             Some("escapee")
@@ -2522,8 +2473,6 @@ SUMMARY: AddressSanitizer: heap-use-after-free /home/u/proj/src/parse.c:123:12 i
 
     #[test]
     fn candidates_are_capped_with_the_total_kept() {
-        // Paths the size laravel actually has (~70 chars), so the budget
-        // arithmetic below is the real one.
         let db = Database::open_in_memory().unwrap();
         for i in 0..57 {
             let path = format!(
@@ -2545,7 +2494,6 @@ SUMMARY: AddressSanitizer: heap-use-after-free /home/u/proj/src/parse.c:123:12 i
                 )],
             );
         }
-        // A frame with a call site keeps 10 leads.
         let r = run(
             &db,
             "#0 /srv/app/src/Illuminate/Console/View/Components/Mutators/EnsureDynamicContentIsHighlighted00.php(5): Closure->__invoke()\n",
@@ -2554,7 +2502,6 @@ SUMMARY: AddressSanitizer: heap-use-after-free /home/u/proj/src/parse.c:123:12 i
         assert_eq!(f.status, TraceFrameStatus::Ambiguous);
         assert_eq!(f.candidates.len(), MAX_CANDIDATES);
         assert_eq!(f.candidates_total, 57);
-        // A frame with no file keeps 5.
         let r = run(&db, "#0 [internal function]: Closure->__invoke()\n");
         let f = &r.frames[0];
         assert_eq!(f.status, TraceFrameStatus::Ambiguous);
@@ -2562,9 +2509,7 @@ SUMMARY: AddressSanitizer: heap-use-after-free /home/u/proj/src/parse.c:123:12 i
         assert_eq!(f.candidates_total, 57);
         assert!(f.candidates[0].ends_with("Highlighted00.php:13"));
 
-        // 42 name-only frames must fit the 32,000-char MCP budget; at 10
-        // leads each with these paths they ran to ~34,000 and MCP evicted
-        // frames, uncapped they carried 57 apiece.
+        // Long name-only traces must leave enough MCP budget to retain every frame.
         let mut trace = String::new();
         for i in 0..42 {
             trace.push_str(&format!("#{i} [internal function]: Closure->__invoke()\n"));
@@ -2595,7 +2540,6 @@ SUMMARY: AddressSanitizer: heap-use-after-free /home/u/proj/src/parse.c:123:12 i
             json.len()
         );
 
-        // The file-suffix candidate list is capped the same way.
         let db = Database::open_in_memory().unwrap();
         for i in 0..12 {
             seed(&db, &format!("pkg{i:02}/src/util.rs"), Language::Rust, &[]);

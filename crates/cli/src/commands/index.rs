@@ -23,10 +23,7 @@ use crate::{
     open_db_for_model_rebuild,
 };
 
-/// FNV-1a fold shared by the structural and manifest fingerprint passes.
-/// Stable across processes and binary rebuilds, unlike `DefaultHasher`,
-/// because the value is persisted in `.codesage/feature-map.state` and
-/// compared on later runs.
+/// Persisted fingerprints must remain stable across processes and binary rebuilds.
 fn fnv1a(mut h: u64, bytes: &[u8]) -> u64 {
     for &b in bytes {
         h ^= u64::from(b);
@@ -52,12 +49,7 @@ fn structural_state_fingerprint(hashes: &std::collections::HashMap<String, Strin
     h
 }
 
-/// Build-manifest basenames the feature mappers read directly. Most are not
-/// source files, so the structural indexer never hashes them and
-/// `all_file_hashes` alone would miss a manifest-only edit (e.g. adding a
-/// `bin` entry to package.json). Laravel `routes/*.php`, Next.js route files,
-/// and `setup.py` are also structurally indexed, but membership here is
-/// harmless — the stat fold just covers them twice.
+/// Most mapper manifests are not structurally indexed; hash them separately.
 const MAPPER_MANIFEST_BASENAMES: &[&str] = &[
     "CMakeLists.txt",
     "Cargo.toml",
@@ -72,14 +64,8 @@ const MAPPER_MANIFEST_BASENAMES: &[&str] = &[
     "setup.py",
 ];
 
-/// Stat every mapper-input manifest under `root` (honoring the same exclude
-/// globs as the mapper) and fold path + mtime + size into `seed`.
-///
-/// Stat-based (mtime + size) rather than content-hashed on purpose: this runs
-/// on every no-op incremental pass, and reading every manifest would erode
-/// the very cost the skip gate exists to avoid. The trade-off is that a
-/// same-size rewrite within the mtime granularity can go unnoticed until the
-/// next real change — rare enough to accept for a cache-invalidation marker.
+/// Fold manifest path, mtime, and size into the structural fingerprint.
+/// Stat-only checks keep no-op passes cheap but miss same-size rewrites with unchanged mtime.
 fn manifest_state_fingerprint(seed: u64, root: &Path, exclude_patterns: &[String]) -> u64 {
     let excludes = if exclude_patterns.is_empty() {
         None
@@ -103,9 +89,7 @@ fn manifest_state_fingerprint(seed: u64, root: &Path, exclude_patterns: &[String
             if excludes.is_match(rel_path.as_ref()) {
                 return false;
             }
-            // Directory patterns like `**/node_modules/**` match contents,
-            // not the bare dir path; probe with the same suffix trick the
-            // structural discovery filter uses so pruning stays consistent.
+            // Probe a child path because `**/node_modules/**` does not match the directory itself.
             if entry.file_type().is_some_and(|ft| ft.is_dir())
                 && (excludes.is_match(format!("{rel_path}/"))
                     || excludes.is_match(format!("{rel_path}/_")))
@@ -155,10 +139,7 @@ fn manifest_state_fingerprint(seed: u64, root: &Path, exclude_patterns: &[String
     h
 }
 
-/// Fingerprint of everything feature mapping consumes: the structural
-/// file-hash set plus the build manifests the mappers read directly. `None`
-/// when the DB can't produce the file-hash set (mapping then proceeds
-/// unconditionally — the safe direction).
+/// Combine structural and manifest state; unavailable hashes force mapping.
 fn feature_map_fingerprint(db: &Database, root: &Path, exclude_patterns: &[String]) -> Option<u64> {
     let hashes = match db.all_file_hashes() {
         Ok(hashes) => hashes,
@@ -187,9 +168,7 @@ fn read_feature_map_state(root: &Path) -> Option<u64> {
 }
 
 fn write_feature_map_state(root: &Path, fingerprint: u64) {
-    // `.codesage/feature-map.state` is repository-supplied like the rest of the
-    // directory, so a planted symlink here would turn this marker write into an
-    // arbitrary-path truncate on the documented `codesage index` path.
+    // Repository-supplied symlinks must not redirect marker writes.
     let write = |path: &Path| -> std::io::Result<()> {
         use std::io::Write as _;
         let mut f = crate::fsguard::create_no_follow(path)?;
@@ -200,10 +179,7 @@ fn write_feature_map_state(root: &Path, fingerprint: u64) {
     }
 }
 
-/// Record the skip marker after a mapping run — but only when the run was
-/// clean. A partial run (a mapper errored mid-collection) persisted what it
-/// could and skipped garbage collection; stamping the marker would suppress
-/// the retry that reconciles the debt on the next pass.
+/// Partial mapping skips garbage collection; leave the marker unchanged to force a retry.
 fn record_feature_map_state(
     root: &Path,
     db: &Database,
@@ -221,14 +197,8 @@ fn record_feature_map_state(
     }
 }
 
-/// An incremental `codesage index` may skip feature mapping only when this
-/// process changed nothing (no files parsed or removed, no trust-boundary
-/// backfill) AND the mapper-input fingerprint matches the one recorded at
-/// the last successful map. The fingerprint check is what keeps the skip
-/// safe against the daemon watcher, which advances structural state in the
-/// same DB without ever running feature mapping. `current_fingerprint` is a
-/// closure so the fingerprint (a DB scan plus a manifest walk) is only
-/// computed once the cheap conditions already hold.
+/// The watcher changes structural state without mapping features, so local no-op
+/// stats alone cannot justify a skip. Defer fingerprinting until cheap checks pass.
 fn can_skip_feature_mapping(
     full: bool,
     files_indexed: usize,
@@ -246,9 +216,7 @@ fn can_skip_feature_mapping(
     current_fingerprint().is_some_and(|cur| cur == last)
 }
 
-/// The fingerprint an index pass compares and attests against, resolved
-/// through the table's recorded attestation so a no-change pass reads no
-/// model file. Downloads on a cache miss, as the loader it stands in for.
+/// Reuse recorded artifact attestations; resolve/download artifacts on a cache miss.
 pub(crate) fn resolved_fingerprint(
     db: &Database,
     emb_config: &EmbeddingConfig,
@@ -262,30 +230,20 @@ pub(crate) fn resolved_fingerprint(
     })
 }
 
-/// Dimension the existing index already records for `model`, or `None` when
-/// this model has never indexed the project (or the lookup itself fails, in
-/// which case the eager path reports the same error the old code did).
+/// Reuse the recorded dimension; unavailable records fall back to eager loading.
 fn recorded_semantic_dim(root: &Path, model: &str) -> Option<usize> {
     let db = open_context_db_for_existing_model(root, model).ok()?;
     db.recorded_semantic_dim().ok().flatten()
 }
 
-/// Open the index for `emb_config.model` and produce the embedder the
-/// semantic pass will use.
-///
-/// On an incremental run against a model that already has a recorded table,
-/// the dimension comes from that record and the embedder is a
-/// [`LazyEmbedder`]: no ONNX session, no CUDA context, until the semantic
-/// pass has computed a non-empty file set. A full rebuild, or a model with no
-/// recorded table yet, needs the model for its dimension and builds it
-/// eagerly — it is about to embed every file anyway.
+/// Reuse the recorded dimension to defer ONNX/CUDA loading until files need embedding.
+/// Full rebuilds and models without a recorded table load eagerly to obtain dimensions.
 fn open_index_db_and_embedder(
     root: &Path,
     full: bool,
     emb_config: &EmbeddingConfig,
 ) -> Result<(Database, Box<dyn TextEmbedder>, SemanticFingerprint)> {
-    // Surface a bad batch size now, as the eager constructor always did,
-    // rather than only on the first run that has something to embed.
+    // Validate batch size even when no files need embedding.
     emb_config.effective_batch_size()?;
 
     let recorded_dim = if full {
@@ -335,9 +293,7 @@ fn open_index_db_and_embedder(
     Ok((db, Box::new(lazy), fingerprint))
 }
 
-/// The running daemon's resident session for `model`, with its dimension,
-/// when a daemon spawned from this binary answers. `None` means embed
-/// privately; the refusal has already been logged.
+/// Reuse this binary's daemon session; `None` falls back to private embedding.
 fn daemon_embedder(
     root: &Path,
     emb_config: &EmbeddingConfig,
@@ -364,12 +320,8 @@ pub(crate) fn cmd_index(
     lock_wait: Duration,
 ) -> Result<()> {
     let root = find_project_root()?;
-    // Acquire the project-level indexing lock before loading embedders or
-    // touching the DB. `--lock-wait` bounds a polling wait first: the
-    // daemon's watcher debounce-indexes around commit time but never runs
-    // feature mapping, so a skip here would leave feature slices stale.
-    // Contention past the window exits EXIT_LOCK_HELD: nothing was indexed,
-    // and the installed hook records its skip stamp only on exit 0.
+    // Lock before loading models or opening the DB. Wait for the watcher because
+    // it never maps features; hooks must not stamp a skipped index as successful.
     let _lock = acquire_index_lock(&root, "skipping", lock_wait)?;
     let config = load_project_config(&root)?;
     let excludes = get_exclude_patterns(&config);
@@ -442,11 +394,7 @@ pub(crate) fn cmd_index(
         }
     }
 
-    // Targeted trust-boundary backfill. `files_pending_boundary_derivation`
-    // returns files that have never been derived (or were indexed before
-    // the marker column existed); the structural indexer only derives
-    // inline for files it parses this pass, so the catch-up here picks
-    // up the rest without reprocessing rule-clean files.
+    // Unchanged files may lack boundaries from older indexes; backfill only those.
     let mut boundaries_backfilled = 0usize;
     match db.files_pending_boundary_derivation() {
         Ok(pending) if !pending.is_empty() => {
@@ -478,18 +426,7 @@ pub(crate) fn cmd_index(
         }
     }
 
-    // Feature mapping runs after structural (which populated `refs` and
-    // `file_trust_boundaries`) and before semantic so per-feature
-    // trust-boundary tags are fresh. Errors here are fatal: a mid-run
-    // failure must surface as command failure, not a silent eprintln
-    // with feature tables left in a partial state.
-    //
-    // An incremental pass may skip mapping, but only when the mapper-input
-    // state (file hashes + build manifests) is byte-identical to what the
-    // last successful map saw. This process's own stats are not enough: the
-    // daemon's watcher indexes structurally around commit time without ever
-    // mapping features, so a hook-invoked pass can report 0 parsed files
-    // while the DB did change.
+    // Mapping needs structural references and boundaries before semantic indexing.
     if no_features {
         if verbose {
             tracing::info!("feature mapping skipped (--no-features)");
@@ -590,9 +527,7 @@ pub(crate) fn cmd_index(
         }
     }
 
-    // Stamp the HEAD SHA we just indexed against. Skipped in non-git dirs.
-    // Failures here only degrade drift telemetry, so they warn rather than
-    // propagate — the index itself is already durable on disk.
+    // Failure only degrades drift telemetry; the index is already durable.
     if let Some(sha) = codesage_graph::drift::git_head_sha(&root)
         && let Err(e) = db.set_structural_index_state(&sha)
     {
@@ -604,11 +539,7 @@ pub(crate) fn cmd_index(
 
 pub(crate) fn cmd_map(json: bool) -> Result<()> {
     let root = find_project_root()?;
-    // `map_features` writes the feature tables in multiple transactions and runs
-    // a GC pass; take the same project writer lock that cmd_index / cmd_git_index
-    // / cmd_cleanup hold so a manual `codesage map` doesn't race the background
-    // hook-driven indexer (which maps features itself) into SQLITE_BUSY or a
-    // partial multi-transaction state. Skip if an indexer already holds it.
+    // Mapping spans transactions and garbage collection; serialize it with other writers.
     let _lock = acquire_index_lock(&root, "skipping map", Duration::ZERO)?;
     let db = open_db(&root)?;
     let config = load_project_config(&root)?;
@@ -630,10 +561,6 @@ pub(crate) fn cmd_map(json: bool) -> Result<()> {
     Ok(())
 }
 
-/// JSON envelope for `codesage status --json`. Composes existing serializable
-/// state (the drift report serializes as-is) with the same counts the prose
-/// output prints; `semantic` mirrors the prose semantic line because storage's
-/// `SemanticFreshness` does not serialize.
 #[derive(serde::Serialize)]
 struct StatusReport {
     project_root: String,
@@ -668,8 +595,7 @@ struct SemanticStatus {
     missing_files: Option<usize>,
 }
 
-/// The `state` label: file hashes alone cannot make a table fresh when its
-/// vectors were produced under an unknown or different setup.
+// Matching file hashes do not attest which model produced the vectors.
 fn semantic_state_label(files_fresh: bool, table: &SemanticTableState) -> &'static str {
     if files_fresh && table.is_current() {
         "fresh"
@@ -712,10 +638,7 @@ fn semantic_status(root: &Path) -> Result<SemanticStatus> {
     let Some(freshness) = db.semantic_freshness()? else {
         return Ok(unavailable(model, "unresolved"));
     };
-    // The recorded dimension names the table; the fingerprint needs the
-    // model files on disk. Either missing leaves freshness undecidable,
-    // which is never reported as fresh. A status line never downloads a
-    // model: files absent from the local cache are `unknown`.
+    // Status never downloads model files; absent artifacts leave freshness unknown.
     let Some(dim) = db.recorded_semantic_dim()? else {
         return Ok(unavailable(model, "unresolved"));
     };
@@ -802,9 +725,7 @@ pub(crate) fn cmd_status(json: bool) -> Result<()> {
 
 pub(crate) fn cmd_cleanup(dry_run: bool) -> Result<()> {
     let root = find_project_root()?;
-    // Cleanup drops orphan vec tables (from prior model switches) — also
-    // a writer-style operation that races with in-flight indexers. Same
-    // lock coordination.
+    // Table removal must not race index writers.
     let _lock = acquire_index_lock(&root, "skipping cleanup", Duration::ZERO)?;
     let config = load_project_config(&root)?;
     let emb_config = config.embedding.unwrap_or_default();
@@ -878,8 +799,6 @@ pub(crate) fn cmd_cleanup(dry_run: bool) -> Result<()> {
     println!("Dropped:        {dropped} tables");
     if failed > 0 {
         println!("Failed:         {failed} tables");
-        // Non-zero exit so a scripted auto-clean (e.g. /codesage-reindex) can
-        // detect that orphan tables were left behind.
         bail!("failed to drop {failed} orphan vec table(s); see errors above");
     }
     Ok(())
@@ -888,8 +807,6 @@ pub(crate) fn cmd_cleanup(dry_run: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---------- feature-mapping skip gate ----------
 
     fn fp_of(v: u64) -> impl FnOnce() -> Option<u64> {
         move || Some(v)
@@ -906,7 +823,6 @@ mod tests {
             Some(fp),
             fp_of(fp)
         ));
-        // Full index always maps.
         assert!(!can_skip_feature_mapping(
             true,
             0,
@@ -915,7 +831,6 @@ mod tests {
             Some(fp),
             fp_of(fp)
         ));
-        // Any structural change this pass maps.
         assert!(!can_skip_feature_mapping(
             false,
             1,
@@ -932,7 +847,6 @@ mod tests {
             Some(fp),
             fp_of(fp)
         ));
-        // Trust-boundary backfill changes per-feature aggregates.
         assert!(!can_skip_feature_mapping(
             false,
             0,
@@ -941,10 +855,7 @@ mod tests {
             Some(fp),
             fp_of(fp)
         ));
-        // No recorded map state: never skip.
         assert!(!can_skip_feature_mapping(false, 0, 0, 0, None, fp_of(fp)));
-        // DB advanced since the last map (e.g. the daemon watcher indexed
-        // files without mapping): fingerprints differ, must map.
         assert!(!can_skip_feature_mapping(
             false,
             0,
@@ -953,14 +864,11 @@ mod tests {
             Some(fp + 1),
             fp_of(fp)
         ));
-        // Unavailable fingerprint: never skip.
         assert!(!can_skip_feature_mapping(false, 0, 0, 0, Some(fp), || None));
     }
 
     #[test]
     fn fingerprint_is_not_computed_when_cheap_conditions_already_fail() {
-        // The fingerprint costs a DB scan + a manifest walk; a pass that
-        // already indexed files (or has no marker) must not pay it.
         let must_not_run = || -> Option<u64> { panic!("fingerprint must not be computed") };
         assert!(!can_skip_feature_mapping(
             true,
@@ -1021,9 +929,6 @@ mod tests {
 
     #[test]
     fn manifest_only_change_defeats_feature_map_skip() {
-        // package.json is a mapper input but not a structurally indexed
-        // source file, so `all_file_hashes` never covers it. Editing only the
-        // manifest must still change the combined fingerprint.
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open_in_memory().unwrap();
         std::fs::write(dir.path().join("package.json"), "{\"name\":\"a\"}").unwrap();
@@ -1044,8 +949,6 @@ mod tests {
 
     #[test]
     fn nested_manifest_change_defeats_feature_map_skip() {
-        // Mapper inputs live in subdirectories too (crates/*/Cargo.toml,
-        // ext/*/config.m4); the walk must not stop at the root level.
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open_in_memory().unwrap();
         let nested = dir.path().join("crates/foo");
@@ -1099,8 +1002,6 @@ mod tests {
 
     #[test]
     fn excluded_manifest_does_not_affect_fingerprint() {
-        // The mapper honors [index].exclude_patterns; a vendored manifest the
-        // mapper never reads must not defeat the skip either.
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open_in_memory().unwrap();
         let vendored = dir.path().join("node_modules/dep");
@@ -1121,8 +1022,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn write_feature_map_state_refuses_a_symlinked_marker() {
-        // Sink-level: reverting `write_feature_map_state` to `fs::write` must
-        // turn this red, so it exercises the real function, not the helper.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join(PROJECT_DIR)).unwrap();
@@ -1138,8 +1037,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn read_feature_map_state_refuses_a_symlinked_source() {
-        // Points at an ordinary file rather than /dev/zero so that reverting
-        // the guard fails this test instead of hanging the suite.
+        // An ordinary file makes a guard regression fail instead of hanging on /dev/zero.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join(PROJECT_DIR)).unwrap();
@@ -1157,15 +1055,40 @@ mod tests {
         assert_eq!(read_feature_map_state(dir.path()), None);
         write_feature_map_state(dir.path(), 0xDEAD_BEEF);
         assert_eq!(read_feature_map_state(dir.path()), Some(0xDEAD_BEEF));
-        // Corrupt marker reads as absent (maps on next run).
         std::fs::write(feature_map_state_path(dir.path()), "not a number\n").unwrap();
         assert_eq!(read_feature_map_state(dir.path()), None);
     }
 
     #[test]
+    fn interrupted_feature_marker_forces_recomputation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(PROJECT_DIR)).unwrap();
+        let fingerprint = 1234567890;
+        let marker = format!("{fingerprint}");
+        for length in 0..marker.len() {
+            std::fs::write(feature_map_state_path(dir.path()), &marker[..length]).unwrap();
+            assert!(!can_skip_feature_mapping(
+                false,
+                0,
+                0,
+                0,
+                read_feature_map_state(dir.path()),
+                || Some(fingerprint)
+            ));
+        }
+        std::fs::write(feature_map_state_path(dir.path()), marker).unwrap();
+        assert!(can_skip_feature_mapping(
+            false,
+            0,
+            0,
+            0,
+            read_feature_map_state(dir.path()),
+            || Some(fingerprint)
+        ));
+    }
+
+    #[test]
     fn record_feature_map_state_skips_marker_on_mapper_failure() {
-        // A partial mapping run (mapper_errors non-empty) must not advance
-        // the marker — the next pass has to re-map to reconcile the debt.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(PROJECT_DIR)).unwrap();
         let db = Database::open_in_memory().unwrap();
@@ -1183,8 +1106,6 @@ mod tests {
             "clean run must advance the marker"
         );
     }
-
-    // ---------- status --json ----------
 
     #[test]
     fn status_semantic_state_serializes_prose_equivalent_fields() {

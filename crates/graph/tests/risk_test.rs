@@ -5,9 +5,7 @@ use codesage_graph::{assess_risk, full_index};
 use codesage_protocol::{FileInfo, Language};
 use codesage_storage::Database;
 
-/// Build a small project so impact_analysis has a graph to walk. One class, two
-/// callers, one test. The structural data is only needed to give assess_risk's
-/// dependent-file BFS something to find.
+/// One class, two callers, and one test supply the structural risk signals.
 fn setup_project() -> (tempfile::TempDir, Database) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -97,10 +95,8 @@ fn missing_path_is_unknown_not_test_gap() {
 fn hotspot_fix_heavy_file_scores_high_and_emits_notes() {
     let (_dir, db) = setup_project();
 
-    // Seed a hot, fix-heavy file with lots of churn and high fix ratio.
     db.upsert_git_file("Repository.php", 100.0, 40, 80, Some(1_700_000_000))
         .unwrap();
-    // A few cooler files so churn_percentile is well-defined and our target ends up on top.
     for (p, c) in [
         ("Controller.php", 1.0_f64),
         ("Service.php", 2.0),
@@ -111,8 +107,6 @@ fn hotspot_fix_heavy_file_scores_high_and_emits_notes() {
     }
 
     let r = assess_risk(&db, "Repository.php").unwrap();
-    // hotspot+fix-heavy+test-gap with no trust boundaries:
-    // 0.32 churn + 0.18 fix + 0.13 test-gap ≈ 0.54.
     assert!(
         r.score >= 0.5,
         "hotspot+fix-heavy should score >= 0.5, got {}",
@@ -132,7 +126,6 @@ fn hotspot_fix_heavy_file_scores_high_and_emits_notes() {
 fn cold_isolated_file_scores_low() {
     let (_dir, db) = setup_project();
 
-    // Give a few files history so churn_percentile has a distribution.
     for p in ["Repository.php", "Controller.php", "Service.php"] {
         db.upsert_git_file(p, 10.0, 0, 5, Some(1_700_000_000))
             .unwrap();
@@ -176,11 +169,9 @@ fn test_gap_false_when_coupled_to_test_file() {
 #[test]
 fn test_gap_false_when_sibling_test_exists_without_coupling() {
     let (_dir, db) = setup_project();
-    // Same directory, PHP sibling convention.
     db.upsert_git_file("Repository.php", 1.0, 0, 5, Some(1_700_000_000))
         .unwrap();
     index_test_file(&db, "RepositoryTest.php");
-    // No co-change relationship seeded.
     let r = assess_risk(&db, "Repository.php").unwrap();
     assert!(
         !r.test_gap,
@@ -209,9 +200,7 @@ fn test_gap_true_when_no_test_sibling_and_no_coupled_test() {
     assert!(r.notes.iter().any(|n| n.contains("test gap")));
 }
 
-/// A test that reaches the file through the dependency graph closes the gap
-/// even with no sibling test and no co-change history — the newly-added-helper
-/// case that convention-plus-history reports as untested.
+/// Structural test reachability closes gaps missed by convention and co-change history.
 #[test]
 fn test_gap_false_when_a_test_depends_on_the_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -253,8 +242,7 @@ fn test_gap_false_when_a_test_depends_on_the_file() {
     );
 }
 
-/// The gap note names the three checks that ran rather than asserting the file
-/// is untested. Guards against a future edit reintroducing an absolute claim.
+/// Scope the absence claim to the checks that ran.
 #[test]
 fn test_gap_note_states_what_was_measured() {
     let (_dir, db) = setup_project();
@@ -308,10 +296,7 @@ fn high_coupling_triggers_coupling_note() {
 #[test]
 fn wide_blast_radius_note_fires_when_many_dependents() {
     let (_dir, db) = setup_project();
-    // Repository.php has 2 direct callers in the fixture. Force 10 dependents by
-    // seeding git_files rows so the risk function still runs, but then assert the
-    // note only fires when impact_analysis returns >=10 deps. On this tiny fixture
-    // the impact depth-2 is 2, so the "wide blast radius" note must NOT fire.
+    // Extra git rows do not add dependency edges to the two-caller fixture.
     db.upsert_git_file("Repository.php", 1.0, 0, 5, Some(1_700_000_000))
         .unwrap();
 
@@ -327,8 +312,6 @@ fn wide_blast_radius_note_fires_when_many_dependents() {
         r.notes
     );
 }
-
-// ----- assess_risk_diff -----
 
 #[test]
 fn risk_diff_empty_input_returns_defaults() {
@@ -346,7 +329,6 @@ fn risk_diff_empty_input_returns_defaults() {
 fn risk_diff_aggregates_max_and_mean_across_files() {
     let (_dir, db) = setup_project();
 
-    // Hot+fix-heavy + lots of cooler files for a wide percentile distribution.
     db.upsert_git_file("Repository.php", 100.0, 40, 80, Some(1_700_000_000))
         .unwrap();
     db.upsert_git_file("Controller.php", 1.0, 0, 5, Some(1_700_000_000))
@@ -364,7 +346,6 @@ fn risk_diff_aggregates_max_and_mean_across_files() {
 
     assert_eq!(r.files.len(), 2);
     assert_eq!(r.max_risk_file.as_deref(), Some("Repository.php"));
-    // See note on threshold change in `hotspot_fix_heavy_file_scores_high_and_emits_notes`.
     assert!(
         r.max_score >= 0.5,
         "max should reflect the hot file, got {}",
@@ -387,8 +368,6 @@ fn risk_diff_aggregates_max_and_mean_across_files() {
 #[test]
 fn risk_diff_clusters_directories_past_threshold() {
     let (_dir, db) = setup_project();
-    // Seed 6 files in one directory and 2 in another. Only the crowded dir
-    // should cluster; the other keeps per-file detail.
     let crowded: Vec<String> = (0..6)
         .map(|i| format!("app/Actions/Foo/File{i}.php"))
         .collect();
@@ -406,7 +385,6 @@ fn risk_diff_clusters_directories_past_threshold() {
     input.extend_from_slice(&others);
     let r = codesage_graph::assess_risk_diff(&db, &input).unwrap();
 
-    // Crowded dir collapses; other two files stay verbatim.
     assert_eq!(r.files.len(), 2, "expected 2 un-clustered files");
     assert_eq!(
         r.clustered_directories.len(),
@@ -422,9 +400,6 @@ fn risk_diff_clusters_directories_past_threshold() {
 
 #[test]
 fn risk_diff_below_threshold_keeps_flat_shape() {
-    // 4 files in one dir is below the 5-file threshold; shape stays flat so
-    // existing agent prompts that assume `files` holds everything don't
-    // break on typical small patches.
     let (_dir, db) = setup_project();
     let files: Vec<String> = (0..4).map(|i| format!("app/Foo/File{i}.php")).collect();
     for p in &files {
@@ -438,13 +413,8 @@ fn risk_diff_below_threshold_keeps_flat_shape() {
 
 #[test]
 fn risk_diff_cluster_preserves_rollup_coverage() {
-    // A clustered file that trips a rollup (e.g. hotspot, test_gap) must
-    // still appear in the rollup arrays even though its per-file detail was
-    // omitted. That is how an agent cross-references clusters back to
-    // specific concerns.
+    // Clustering removes display detail, not membership in risk rollups.
     let (_dir, db) = setup_project();
-    // 5 files in the same dir: one hot, four cool, plus some other repo
-    // files so the hot one actually percentiles.
     db.upsert_git_file("app/Risk/Hot.php", 100.0, 10, 40, Some(1_700_000_000))
         .unwrap();
     for p in [
@@ -456,7 +426,6 @@ fn risk_diff_cluster_preserves_rollup_coverage() {
         db.upsert_git_file(p, 0.1, 0, 5, Some(1_700_000_000))
             .unwrap();
     }
-    // A few cool files elsewhere to pull Hot.php's percentile high.
     for p in ["unrelated_a.php", "unrelated_b.php", "unrelated_c.php"] {
         db.upsert_git_file(p, 0.05, 0, 5, Some(1_700_000_000))
             .unwrap();
@@ -488,7 +457,6 @@ fn risk_diff_summary_includes_max_score_warning_when_high() {
             .unwrap();
     }
     let r = codesage_graph::assess_risk_diff(&db, &["Repository.php".to_string()]).unwrap();
-    // See note on threshold change in `hotspot_fix_heavy_file_scores_high_and_emits_notes`.
     assert!(r.max_score >= 0.5);
     assert!(
         r.summary_notes.iter().any(|n| n.contains("max risk score")),
@@ -497,12 +465,8 @@ fn risk_diff_summary_includes_max_score_warning_when_high() {
     );
 }
 
-// ----- assess_risk: per-file cycle membership -----
-
 #[test]
 fn assess_risk_flags_file_in_two_file_cycle() {
-    // A <-> B cycle. Per-file assess_risk should set in_cycle=true,
-    // cycle_size=2, and list the other member in cycle_files.
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     std::fs::write(
@@ -540,9 +504,6 @@ fn assess_risk_flags_file_in_two_file_cycle() {
 
 #[test]
 fn assess_risk_suggests_lowest_co_change_break_edge_in_cycle() {
-    // A <-> B cycle with a recorded co-change weight. assess_risk should surface
-    // a candidate break edge naming a cycle edge and its co-change weight, so an
-    // agent knows which dependency to invert/remove to break the cycle.
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     std::fs::write(
@@ -561,7 +522,6 @@ fn assess_risk_suggests_lowest_co_change_break_edge_in_cycle() {
         .unwrap();
     db.upsert_git_file("B.php", 1.0, 0, 5, Some(1_700_000_000))
         .unwrap();
-    // Co-change pair stored sorted (A.php < B.php).
     db.upsert_git_co_change("A.php", "B.php", 2.5, 4, Some(1_700_000_000))
         .unwrap();
 
@@ -572,7 +532,6 @@ fn assess_risk_suggests_lowest_co_change_break_edge_in_cycle() {
         .iter()
         .find(|n| n.contains("candidate break point"))
         .unwrap_or_else(|| panic!("expected break-point note, got {:?}", r.notes));
-    // Deterministic tie-break picks the edge sorted first (A.php → B.php).
     assert!(note.contains("A.php"), "note: {note}");
     assert!(note.contains("B.php"), "note: {note}");
     assert!(
@@ -583,10 +542,7 @@ fn assess_risk_suggests_lowest_co_change_break_edge_in_cycle() {
 
 #[test]
 fn assess_risk_reframes_hub_dominated_cycle_as_decoupling_targets() {
-    // Hub-spoke cycle: Resource imports P1/P2/P3 and each Pn imports Resource.
-    // Resource has in-degree 3 within the cycle, so it's hub-dominated, not a
-    // ring — cutting one edge won't break it. assess_risk should surface the
-    // hub as a decoupling target instead of a single break edge.
+    // Cutting one edge cannot break every cycle in a hub-and-spoke graph.
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     std::fs::write(
@@ -619,7 +575,6 @@ fn assess_risk_reframes_hub_dominated_cycle_as_decoupling_targets() {
         note.contains("Resource.php"),
         "the hub (Resource.php) should be the top decoupling target: {note}"
     );
-    // The single-break-edge note must NOT fire for a hub-dominated cycle.
     assert!(
         !r.notes.iter().any(|n| n.contains("candidate break point")),
         "hub-dominated cycle should not emit a single break-edge note: {:?}",
@@ -658,7 +613,6 @@ fn risk_batch_reuses_patch_cycles_for_per_file_cycle_signal() {
 
 #[test]
 fn assess_risk_no_cycle_signal_in_acyclic_codebase() {
-    // Linear A -> B -> C. Touching A: in_cycle should stay false.
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     std::fs::write(
@@ -694,10 +648,7 @@ fn assess_risk_no_cycle_signal_in_acyclic_codebase() {
 
 #[test]
 fn assess_risk_cycle_term_lifts_score_for_otherwise_quiet_file() {
-    // Two files with no churn, no fix history, no test gap (sibling tests
-    // present), and no other risk inputs — the only signal that should fire
-    // is cycle membership. Score should be small but strictly above the
-    // baseline (0.0) thanks to the 0.10-weighted cycle term.
+    // Isolate cycle pressure by removing churn, fixes, and test gaps.
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     std::fs::write(
@@ -710,12 +661,10 @@ fn assess_risk_cycle_term_lifts_score_for_otherwise_quiet_file() {
         b"<?php\nnamespace App;\nuse App\\Controller;\nclass Repository { public function y(Controller $c) { return $c->x(null); } }\n",
     )
     .unwrap();
-    // Sibling test files close the test_gap so test_gap_term doesn't dominate.
     std::fs::write(root.join("ATest.php"), b"<?php\nclass ATest {}\n").unwrap();
     std::fs::write(root.join("BTest.php"), b"<?php\nclass BTest {}\n").unwrap();
     let db = Database::open_in_memory().unwrap();
     codesage_graph::full_index(root, &db, &[], false).unwrap();
-    // Seed sibling tests in git_files so test_sibling_exists picks them up.
     db.upsert_git_file("ATest.php", 0.1, 0, 1, Some(1_700_000_000))
         .unwrap();
     db.upsert_git_file("BTest.php", 0.1, 0, 1, Some(1_700_000_000))
@@ -728,9 +677,6 @@ fn assess_risk_cycle_term_lifts_score_for_otherwise_quiet_file() {
     let r = assess_risk(&db, "A.php").unwrap();
     assert!(r.in_cycle, "A.php is in cycle");
     assert!(!r.test_gap, "sibling test seeded, test_gap should be false");
-    // Cycle of size 2 contributes 0.10 * 0.25 = 0.025; churn percentile is
-    // ~0 across uniform churn. We just want to confirm the cycle term moves
-    // the needle above zero.
     assert!(
         r.score > 0.0,
         "cycle membership should lift score above 0, got {}",
@@ -738,12 +684,8 @@ fn assess_risk_cycle_term_lifts_score_for_otherwise_quiet_file() {
     );
 }
 
-// ----- assess_risk_diff: cycles_touching_patch -----
-
 #[test]
 fn risk_diff_finds_two_file_cycle_touching_patch() {
-    // A uses Repository (defined in B); B uses Controller (defined in A).
-    // The structural indexer turns that into a file-level A <-> B cycle.
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     std::fs::write(
@@ -758,7 +700,6 @@ fn risk_diff_finds_two_file_cycle_touching_patch() {
     .unwrap();
     let db = Database::open_in_memory().unwrap();
     codesage_graph::full_index(root, &db, &[], false).unwrap();
-    // Seed enough git_files so the risk pass has a distribution.
     for f in ["A.php", "B.php"] {
         db.upsert_git_file(f, 1.0, 0, 5, Some(1_700_000_000))
             .unwrap();
@@ -783,7 +724,6 @@ fn risk_diff_finds_two_file_cycle_touching_patch() {
 
 #[test]
 fn risk_diff_skips_cycles_not_involving_patch_files() {
-    // A <-> B cycle, but the patch only touches C (which is not in the cycle).
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     std::fs::write(
@@ -819,8 +759,6 @@ fn risk_diff_skips_cycles_not_involving_patch_files() {
 
 #[test]
 fn risk_diff_cycle_pick_max_churn_points_at_hottest_member() {
-    // A <-> B cycle; B has much higher churn. `max_churn_file` should
-    // name B as the refactor target rather than A.
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     std::fs::write(
@@ -851,7 +789,6 @@ fn risk_diff_cycle_pick_max_churn_points_at_hottest_member() {
 
 #[test]
 fn risk_diff_no_cycles_in_trivially_acyclic_codebase() {
-    // Linear import chain A -> B -> C, no cycles.
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     std::fs::write(
@@ -880,8 +817,6 @@ fn risk_diff_no_cycles_in_trivially_acyclic_codebase() {
         r.cycles_touching_patch
     );
 }
-
-// ----- recommend_tests -----
 
 #[test]
 fn recommend_tests_returns_empty_when_no_test_signal() {
@@ -932,7 +867,6 @@ fn recommend_tests_finds_structural_sibling_without_git_history() {
 #[test]
 fn recommend_tests_finds_coupled_test_via_co_change() {
     let (_dir, db) = setup_project();
-    // No sibling file. Coupled test surfaces via co-change.
     db.upsert_git_file("Repository.php", 1.0, 0, 5, Some(1_700_000_000))
         .unwrap();
     db.upsert_git_file(
@@ -964,8 +898,6 @@ fn recommend_tests_finds_coupled_test_via_co_change() {
 #[test]
 fn recommend_tests_dedupes_coupled_when_also_primary() {
     let (_dir, db) = setup_project();
-    // Same file shows up as both sibling and a co-changer; recommend_tests should
-    // only list it once, in primary, to avoid duplicate "run me" lines.
     db.upsert_git_file("Repository.php", 1.0, 0, 5, Some(1_700_000_000))
         .unwrap();
     index_test_file(&db, "RepositoryTest.php");
@@ -1009,14 +941,11 @@ fn recommend_tests_aggregates_across_multiple_input_files() {
 #[test]
 fn recommend_tests_finds_rust_integration_tests_under_crate_tests_dir() {
     let (_dir, db) = setup_project();
-    // Rust convention: source at crates/<name>/src/, integration tests at
-    // crates/<name>/tests/. There's no per-file naming convention, so the
-    // recommender lists every .rs file in that tests/ directory.
+    // Rust integration tests are crate-scoped, without per-source-file names.
     db.upsert_git_file("crates/storage/src/db.rs", 1.0, 0, 5, Some(1_700_000_000))
         .unwrap();
     index_test_file(&db, "crates/storage/tests/db_integration.rs");
     index_test_file(&db, "crates/storage/tests/schema_migration_test.rs");
-    // A test under a different crate must NOT leak in.
     index_test_file(&db, "crates/parser/tests/extract_test.rs");
 
     let r =
@@ -1049,7 +978,6 @@ fn recommend_tests_skips_fixture_files_under_rust_tests_dir() {
     )
     .unwrap();
     index_test_file(&db, "crates/parser/tests/extract_test.rs");
-    // Fixture files are NOT test entry points; should not be recommended.
     index_test_file(&db, "crates/parser/tests/fixtures/sample.rs");
 
     let r = codesage_graph::recommend_tests(&db, &["crates/parser/src/extract.rs".to_string()])
@@ -1064,12 +992,10 @@ fn recommend_tests_skips_fixture_files_under_rust_tests_dir() {
 #[test]
 fn recommend_tests_finds_phpt_tests_for_c_source() {
     let (_dir, db) = setup_project();
-    // php-src convention: source at Zend/zend_compile.c, tests at Zend/tests/*.phpt.
     db.upsert_git_file("Zend/zend_compile.c", 5.0, 0, 10, Some(1_700_000_000))
         .unwrap();
     index_test_file(&db, "Zend/tests/bug12345.phpt");
     index_test_file(&db, "Zend/tests/gh21709.phpt");
-    // Different subsystem's tests must not leak in.
     index_test_file(&db, "ext/standard/tests/array_test.phpt");
 
     let r = codesage_graph::recommend_tests(&db, &["Zend/zend_compile.c".to_string()]).unwrap();
@@ -1088,7 +1014,6 @@ fn recommend_tests_skips_phpt_tests_dir_when_oversized() {
     let (_dir, db) = setup_project();
     db.upsert_git_file("ext/standard/array.c", 5.0, 0, 10, Some(1_700_000_000))
         .unwrap();
-    // Seed 60 .phpt files — should be skipped as too noisy for "primary".
     for i in 0..60 {
         let p = format!("ext/standard/tests/test_{i:03}.phpt");
         index_test_file(&db, &p);
@@ -1100,8 +1025,7 @@ fn recommend_tests_skips_phpt_tests_dir_when_oversized() {
         "tests dir over the 50-file threshold should not be returned as primary, got {} entries",
         r.primary.len()
     );
-    // Withheld is not absent: the note must say the tests exist but were not
-    // listed, and the "no test files found" claim must not fire.
+    // Withheld tests still disprove an absence claim.
     assert!(
         r.notes
             .iter()
@@ -1141,7 +1065,6 @@ fn oversized_phpt_dir_still_counts_as_sibling_test_for_risk() {
 fn recommend_tests_finds_java_maven_mirror_test() {
     let (_dir, db) = setup_project();
     index_test_file(&db, "src/test/java/com/app/FooTest.java");
-    // Same-package unrelated test must not leak in.
     index_test_file(&db, "src/test/java/com/app/BarTest.java");
 
     let r = codesage_graph::recommend_tests(&db, &["src/main/java/com/app/Foo.java".to_string()])
@@ -1176,11 +1099,9 @@ fn recommend_tests_first_dot_stem_matches_dotted_basename() {
     let (_dir, db) = setup_project();
     index_test_file(&db, "src/foo.test.ts");
 
-    // The source pairs with the dotted test file by first-dot stem.
     let r = codesage_graph::recommend_tests(&db, &["src/foo.ts".to_string()]).unwrap();
     assert_eq!(r.primary, vec!["src/foo.test.ts".to_string()]);
 
-    // ...but the test file itself is never its own test.
     let r = codesage_graph::recommend_tests(&db, &["src/foo.test.ts".to_string()]).unwrap();
     assert!(
         !r.primary.contains(&"src/foo.test.ts".to_string()),
@@ -1192,18 +1113,12 @@ fn recommend_tests_first_dot_stem_matches_dotted_basename() {
 #[test]
 fn recommend_tests_finds_laravel_mirror_tree_tests() {
     let (_dir, db) = setup_project();
-    // Laravel convention seen in real projects: source at
-    // app/Actions/Foo/Bar.php paired with test at
-    // tests/Integration/Actions/Foo/BarTest.php (mirror tree under
-    // tests/{Unit,Feature,Integration,Browser}). The flat sibling check
-    // (tests/Unit/BarTest.php) misses these because the test path has the
-    // intermediate Actions/Foo segments.
+    // Nested Laravel test paths require mirror-tree matching, not flat siblings.
     let src = "app/Actions/CredentialingApplication/ExportZipAction.php";
     let test = "tests/Integration/Actions/CredentialingApplication/ExportZipActionTest.php";
     db.upsert_git_file(src, 1.0, 0, 5, Some(1_700_000_000))
         .unwrap();
     index_test_file(&db, test);
-    // A test for an unrelated class must not leak in.
     index_test_file(
         &db,
         "tests/Integration/Actions/Other/UnrelatedActionTest.php",
@@ -1236,13 +1151,8 @@ fn recommend_tests_finds_laravel_test_under_unit_or_feature_too() {
     );
 }
 
-// ----- find_coupling (CouplingReport shape) -----
-
 #[test]
 fn find_coupling_unindexed_file_returns_explanatory_note() {
-    // File has no git_files row at all — path is wrong, brand-new, or
-    // gitignored. CouplingReport must tell the agent so, not `coupled: []`
-    // with no context.
     let (_dir, db) = setup_project();
     let r = codesage_graph::find_coupling(&db, "does/not/exist.rs", 5).unwrap();
     assert!(!r.found);
@@ -1258,9 +1168,6 @@ fn find_coupling_unindexed_file_returns_explanatory_note() {
 
 #[test]
 fn find_coupling_indexed_but_below_threshold_explains_why() {
-    // File has commits but no co-change pair above the min-count=3 threshold
-    // — "this file changes in isolation." Agent should see the total-commits
-    // count so it can judge whether the verdict is trustworthy.
     let (_dir, db) = setup_project();
     db.upsert_git_file("solitary.rs", 1.0, 0, 7, Some(1_700_000_000))
         .unwrap();
@@ -1278,8 +1185,6 @@ fn find_coupling_indexed_but_below_threshold_explains_why() {
 
 #[test]
 fn find_coupling_new_file_under_three_commits_has_dedicated_note() {
-    // Low-commit files get a different note pointing at the threshold itself
-    // (they might accumulate signal later).
     let (_dir, db) = setup_project();
     db.upsert_git_file("fresh.rs", 0.1, 0, 1, Some(1_700_000_000))
         .unwrap();
@@ -1296,15 +1201,12 @@ fn find_coupling_new_file_under_three_commits_has_dedicated_note() {
 
 #[test]
 fn find_coupling_populated_result_carries_index_state() {
-    // Non-empty response still carries file_indexed + file_commits so a thin
-    // result (fewer than `limit` entries) is still interpretable.
     let (_dir, db) = setup_project();
     db.upsert_git_file("a.rs", 1.0, 0, 10, Some(1_700_000_000))
         .unwrap();
     db.upsert_git_file("b.rs", 0.5, 0, 10, Some(1_700_000_000))
         .unwrap();
-    // A recurring pair: a page made only of one-off pairs carries its own
-    // note (covered in coupling_test.rs), so seed two windows here.
+    // Seed recurrence so this case does not exercise the one-off-page note.
     db.upsert_git_co_change_full(
         "a.rs",
         "b.rs",
@@ -1331,11 +1233,7 @@ fn find_coupling_populated_result_carries_index_state() {
 
 #[test]
 fn risk_diff_legend_aliases_repeated_test_gap_notes() {
-    // 4 files with indexed symbols but no co-located test → all get the same
-    // full three-check "test gap: …" note (files WITHOUT symbols get the
-    // distinct unmeasured variant, aliased as `TU`, not `T`). Threshold for
-    // aliasing is 3 occurrences, so this should fire and produce a single
-    // `_legend` entry with the 4 per-file notes replaced by `"T"`.
+    // Indexed symbols allow the full three-check note; symbol-less files use `TU`.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let files = ["ClassA.php", "ClassB.php", "ClassC.php", "ClassD.php"];
@@ -1387,8 +1285,6 @@ fn risk_diff_legend_aliases_repeated_test_gap_notes() {
 
 #[test]
 fn risk_diff_legend_does_not_fire_below_threshold() {
-    // 2 test-gap files: under the ≥3 threshold, so no aliasing. Notes stay
-    // verbatim; legend is empty.
     let (_dir, db) = setup_project();
     let files = ["src/a.rs", "src/b.rs"];
     for p in &files {
@@ -1435,7 +1331,6 @@ fn risk_batch_returns_per_file_in_input_order() {
     assert_eq!(r.files[0].file, "Service.php");
     assert_eq!(r.files[1].file, "Repository.php");
     assert_eq!(r.files[2].file, "Controller.php");
-    // Repository (the hot fix-heavy file) should out-score the cooler ones.
     assert!(
         r.files[1].score > r.files[0].score,
         "Repository.php should score higher than Service.php"
@@ -1452,8 +1347,6 @@ fn risk_batch_empty_returns_default() {
 
 #[test]
 fn risk_batch_legend_aliases_no_git_history_at_threshold() {
-    // 4 indexed files (with symbols) and no git history at all → each gets the
-    // categorical "no git history…" note. Should alias to `NG`.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let files = ["ClassA.php", "ClassB.php", "ClassC.php", "ClassD.php"];
@@ -1470,8 +1363,6 @@ fn risk_batch_legend_aliases_no_git_history_at_threshold() {
     let input: Vec<String> = files.iter().map(|s| s.to_string()).collect();
     let r = codesage_graph::assess_risk_batch(&db, &input).unwrap();
 
-    // 4 files with no git history also have no test sibling, so both
-    // categorical notes (NG and T) fire on every file. Both should alias.
     assert!(
         r.legend.contains_key("NG"),
         "NG missing in legend, got {:?}",
@@ -1499,8 +1390,6 @@ fn risk_batch_legend_aliases_no_git_history_at_threshold() {
 #[test]
 fn recommend_tests_finds_symfony_mirror_tree_tests() {
     let (_dir, db) = setup_project();
-    // Symfony convention: src/<rest>/<stem>.php pairs with tests/<rest>/<stem>Test.php
-    // (no Unit/Feature subdir; tests/ mirrors src/ directly).
     let src = "src/Domain/Order/OrderService.php";
     let test = "tests/Domain/Order/OrderServiceTest.php";
     db.upsert_git_file(src, 1.0, 0, 5, Some(1_700_000_000))
@@ -1516,9 +1405,6 @@ fn trust_boundaries_populate_via_indexer_and_feed_risk_score() {
     use codesage_protocol::TrustBoundary;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    // PHP file that imports a network namespace AND calls exec — distinct
-    // boundary tags should land in file_trust_boundaries after indexing,
-    // and the trust_boundary_term contributes to the score.
     std::fs::write(
         root.join("Risky.php"),
         b"<?php\nuse GuzzleHttp\\Client;\nclass Risky {\n  public function run() {\n    exec('ls');\n  }\n}\n",
@@ -1537,9 +1423,7 @@ fn trust_boundaries_populate_via_indexer_and_feed_risk_score() {
         "RiskAssessment must carry the tags, got {:?}",
         r.trust_boundaries
     );
-    // 3 boundaries (network, external-api, process-exec) — Guzzle's
-    // network+external-api plus exec's process-exec. The aggregate-notes
-    // line fires at >=3 boundaries.
+    // Guzzle contributes network and external-api; exec adds process-exec.
     assert!(
         r.notes.iter().any(|n| n.contains("trust boundaries")),
         "expected trust-boundary note, got {:?}",
@@ -1550,8 +1434,6 @@ fn trust_boundaries_populate_via_indexer_and_feed_risk_score() {
 #[test]
 fn trust_boundaries_field_empty_when_file_has_no_signal() {
     let (_dir, db) = setup_project();
-    // Repository.php has no risky imports/calls in the fixture; trust_boundaries
-    // should be an empty Vec, not None, and contribute 0 to the score.
     let r = assess_risk(&db, "Repository.php").unwrap();
     assert!(
         r.trust_boundaries.is_empty(),
@@ -1560,17 +1442,12 @@ fn trust_boundaries_field_empty_when_file_has_no_signal() {
     );
 }
 
-// ----- top_symbols breakdown (§1.15) -----
-
-/// Unit test: with three symbols of different sizes and ref counts, the
-/// ranking must reflect the heuristic ln(1 + line_count) + ref_count.
-/// Seeds the structural tables directly so the math is the only variable.
+/// Seed structural rows to isolate the symbol-ranking formula.
 #[test]
 fn top_symbols_rank_by_line_count_and_ref_count() {
     use codesage_protocol::{FileInfo, Language, Reference, ReferenceKind, Symbol, SymbolKind};
 
     let db = Database::open_in_memory().unwrap();
-    // Caller file that hosts the refs to our three symbols.
     let caller_id = db
         .upsert_file(&FileInfo {
             path: "caller.rs".into(),
@@ -1578,7 +1455,6 @@ fn top_symbols_rank_by_line_count_and_ref_count() {
             content_hash: "c".into(),
         })
         .unwrap();
-    // Target file: three symbols of different shapes.
     let target_id = db
         .upsert_file(&FileInfo {
             path: "target.rs".into(),
@@ -1624,8 +1500,7 @@ fn top_symbols_rank_by_line_count_and_ref_count() {
     refs.push(mk_ref("tiny", 200));
     db.insert_references(caller_id, &refs).unwrap();
 
-    // No git history seeded — assess_risk still runs with score=0 inputs;
-    // we only care about top_symbols ordering, which is independent of churn.
+    // Symbol ranking is independent of churn, so no git history is needed.
     let r = assess_risk(&db, "target.rs").unwrap();
 
     assert_eq!(
@@ -1634,13 +1509,10 @@ fn top_symbols_rank_by_line_count_and_ref_count() {
         "expected all three symbols ranked, got {:?}",
         r.top_symbols
     );
-    // Ranking: small_hot (refs dominate) > big (length wins over tiny) > tiny.
     assert_eq!(r.top_symbols[0].name, "small_hot");
     assert_eq!(r.top_symbols[1].name, "big");
     assert_eq!(r.top_symbols[2].name, "tiny");
 
-    // Cycle is false for this fixture (no import edges); `why` should not
-    // mention a cycle clause.
     for t in &r.top_symbols {
         assert!(
             !t.why.contains("cycle"),
@@ -1653,7 +1525,6 @@ fn top_symbols_rank_by_line_count_and_ref_count() {
             t.why
         );
     }
-    // Spot-check the small_hot rendering captures both the line and ref count.
     let hot = &r.top_symbols[0];
     assert_eq!(hot.line, 110);
     assert_eq!(hot.kind, "function");
@@ -1664,9 +1535,6 @@ fn top_symbols_rank_by_line_count_and_ref_count() {
     );
 }
 
-/// Integration test: on a known-hot file (high churn + fix history) the
-/// `top_symbols` list is populated, sorted descending, every entry has a
-/// non-empty `why` of the documented shape, and the cap is honored.
 #[test]
 fn top_symbols_populates_on_known_hot_file_and_caps_at_five() {
     use codesage_protocol::{FileInfo, Language, Reference, ReferenceKind, Symbol, SymbolKind};
@@ -1687,7 +1555,6 @@ fn top_symbols_populates_on_known_hot_file_and_caps_at_five() {
         })
         .unwrap();
 
-    // Seed 8 symbols, ascending in size. Largest should win on length alone.
     let mut syms: Vec<Symbol> = Vec::new();
     for i in 0..8u32 {
         let line_count = (i + 1) * 10;
@@ -1707,8 +1574,7 @@ fn top_symbols_populates_on_known_hot_file_and_caps_at_five() {
     }
     db.insert_symbols(hot_id, &syms).unwrap();
 
-    // A handful of refs into the smallest symbol so it sneaks into the top via
-    // ref_count, proving ranking isn't pure length.
+    // Calls to the smallest symbol distinguish ref-count ranking from length alone.
     let refs: Vec<Reference> = (0..30)
         .map(|i| Reference {
             from_file: "caller.rs".into(),
@@ -1721,7 +1587,6 @@ fn top_symbols_populates_on_known_hot_file_and_caps_at_five() {
         .collect();
     db.insert_references(caller_id, &refs).unwrap();
 
-    // Hot churn + fix-heavy so the file scores meaningfully.
     db.upsert_git_file("hot.rs", 100.0, 40, 80, Some(1_700_000_000))
         .unwrap();
     for (p, c) in [
@@ -1735,7 +1600,6 @@ fn top_symbols_populates_on_known_hot_file_and_caps_at_five() {
 
     let r = assess_risk(&db, "hot.rs").unwrap();
 
-    // Cap honored: 8 symbols in, 5 out.
     assert_eq!(
         r.top_symbols.len(),
         5,
@@ -1743,8 +1607,6 @@ fn top_symbols_populates_on_known_hot_file_and_caps_at_five() {
         r.top_symbols.len()
     );
 
-    // Descending by score (we re-derive the same heuristic here as a guard
-    // against silent ordering regressions).
     let mut prev = f64::INFINITY;
     for t in &r.top_symbols {
         let sym = syms
@@ -1764,10 +1626,8 @@ fn top_symbols_populates_on_known_hot_file_and_caps_at_five() {
         prev = score;
     }
 
-    // The 30-ref small symbol must be ranked first; pure ref_count dominance.
     assert_eq!(r.top_symbols[0].name, "sym_00");
 
-    // `why` shape: "hot: N lines, M refs" — and no cycle clause on this fixture.
     for t in &r.top_symbols {
         assert!(
             t.why.starts_with("hot: ") && t.why.contains("lines") && t.why.contains("refs"),
@@ -1782,10 +1642,6 @@ fn top_symbols_populates_on_known_hot_file_and_caps_at_five() {
     }
 }
 
-/// Edge case: a file with zero indexed symbols (text file, generated file,
-/// unindexed shape) must produce an empty `top_symbols` Vec — no panic, no
-/// error, and the field disappears from JSON via the serde skip-if-empty
-/// attribute.
 #[test]
 fn top_symbols_empty_when_file_has_no_symbols() {
     let (_dir, db) = setup_project();
@@ -1797,7 +1653,6 @@ fn top_symbols_empty_when_file_has_no_symbols() {
         "files with no indexed symbols must return empty top_symbols, got {:?}",
         r.top_symbols
     );
-    // Schema discipline: empty Vec must not surface in JSON.
     let json = serde_json::to_string(&r).unwrap();
     assert!(
         !json.contains("top_symbols"),
@@ -1805,17 +1660,10 @@ fn top_symbols_empty_when_file_has_no_symbols() {
     );
 }
 
-// ----- zero-dependents honesty -----
-
-/// A file with no indexed symbols never enters the reverse-dependency walk, so
-/// its zero dependents means "unmeasured", not "leaf". The assessment must say
-/// so instead of letting the zero read as low blast radius, and the test-gap
-/// note must not claim a dependency-hop check that never ran.
+/// A symbol-less file has no traversal seeds: zero dependents means unmeasured.
 #[test]
 fn zero_dependents_without_symbols_is_flagged_unknown() {
     let (_dir, db) = setup_project();
-    // Tracked in git, absent from the structural index: the shape of a config
-    // file, generated file, or unsupported language.
     db.upsert_git_file("deploy/settings.yaml", 2.0, 0, 6, Some(1_700_000_000))
         .unwrap();
 
@@ -1846,13 +1694,10 @@ fn zero_dependents_without_symbols_is_flagged_unknown() {
     );
 }
 
-/// A genuine leaf — indexed symbols, but nothing imports it — keeps the plain
-/// zero and the full three-check test-gap note. The honesty note is reserved
-/// for the case where the walk could not run.
+/// An indexed leaf retains a measured zero and the completed hop-check note.
 #[test]
 fn zero_dependents_with_symbols_is_a_genuine_leaf() {
     let (_dir, db) = setup_project();
-    // Controller.php defines symbols but nothing references it.
     db.upsert_git_file("Controller.php", 1.0, 0, 5, Some(1_700_000_000))
         .unwrap();
 
@@ -1875,9 +1720,7 @@ fn zero_dependents_with_symbols_is_a_genuine_leaf() {
     );
 }
 
-/// Aggregate honesty must match per-file honesty: when every counted test-gap
-/// file is symbol-less (hop check never ran), the diff summary must not claim
-/// the gap was verified "within 2 dependency hops".
+/// Aggregate notes must not claim hop checks for symbol-less inputs.
 #[test]
 fn diff_summary_does_not_claim_hop_check_for_unmeasured_files() {
     let (_dir, db) = setup_project();
@@ -1912,8 +1755,7 @@ fn diff_summary_does_not_claim_hop_check_for_unmeasured_files() {
     );
 }
 
-/// Mixed patch: one gap file with a completed hop check, three unmeasured.
-/// The summary must split the counts instead of flattening to either side.
+/// Separate completed and unmeasured hop checks in a mixed patch.
 #[test]
 fn diff_summary_splits_verified_and_unmeasured_gap_counts() {
     let (_dir, db) = setup_project();
@@ -1925,7 +1767,6 @@ fn diff_summary_splits_verified_and_unmeasured_gap_counts() {
         db.upsert_git_file(p, 1.0, 0, 5, Some(1_700_000_000))
             .unwrap();
     }
-    // Repository.php has indexed symbols, so its hop check completes.
     db.upsert_git_file("Repository.php", 1.0, 0, 5, Some(1_700_000_000))
         .unwrap();
     input.push("Repository.php".to_string());
@@ -1948,7 +1789,6 @@ fn diff_summary_splits_verified_and_unmeasured_gap_counts() {
     );
 }
 
-/// The fully-verified wording survives when every gap file's hop check ran.
 #[test]
 fn diff_summary_keeps_hop_claim_when_all_gap_checks_completed() {
     let (_dir, db) = setup_project();

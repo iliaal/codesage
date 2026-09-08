@@ -143,24 +143,12 @@ NEIGHBOURHOOD_LANGUAGES = frozenset({"c", "cpp", "go"})
 # or translation-unit neighbourhood. Rust, Python and JS/TS require an import.
 SAME_DIR_TYPE_LANGUAGES = frozenset({"php", "go", "c", "cpp"})
 RECEIVER_SUFFIXES = (".", "->")
-# Row classes in precedence order: the first accepted class decides "kept",
-# the first present class decides which class a dropped file is charged to.
-# Every class can be dropped, type-ref included (a foreign-qualified type row
-# or a bare one with neither same-directory nor import evidence).
+# First accepted class decides kept files; first present class labels drops.
 REF_ROW_CLASSES = ("qualified", "type-ref", "source-qualified", "receiver", "bare", "import-only")
-# Row kinds by which a candidate file names a type: importing, extending, using
-# a trait, type-hinting, or instantiating it. Any of these makes the type a
-# plausible receiver owner for a method call in that file.
+# Naming the type makes it a plausible receiver owner, not a proven one.
 OWNER_EVIDENCE_KINDS = ("import", "include", "inheritance", "trait_use", "type_hint", "instantiation")
-# Non-call rows that name the symbol itself (`extends Base`, `new Base`, a type
-# hint). Qualified ones run `qualifier_accepted`; bare ones need an import row
-# naming the type, or the defining file's directory for
-# SAME_DIR_TYPE_LANGUAGES (`type_ref_accepted`).
 TYPE_REF_KINDS = frozenset({"inheritance", "trait_use", "type_hint", "instantiation"})
-# Method names that builtin containers / protocols also expose. A receiver
-# call to one of these cannot be attributed to a user type by file-level
-# owner evidence alone (the file may import the owner for unrelated reasons
-# while `x.values()` targets a dict), so receiver-class acceptance is off.
+# File-level owner evidence cannot disambiguate builtin-method homonyms.
 BUILTIN_METHOD_NAMES: dict[str, frozenset[str]] = {
     "python": frozenset("""
         values items keys update get pop append extend insert remove clear copy sort index count
@@ -303,10 +291,6 @@ class SymbolCandidate:
     gate_rows: tuple[tuple[str, "RefVerdict"], ...] = ()
 
 
-# ---------------------------------------------------------------------------
-# Path filters
-# ---------------------------------------------------------------------------
-
 def is_test_path(path: str) -> bool:
     lower = path.lower()
     if lower.startswith("./"):
@@ -439,10 +423,6 @@ def is_source_candidate(
 def is_markdown_path(path: str) -> bool:
     return path.lower().endswith(MARKDOWN_SUFFIXES)
 
-
-# ---------------------------------------------------------------------------
-# Index access
-# ---------------------------------------------------------------------------
 
 def open_index(project: Path) -> sqlite3.Connection:
     db = project / ".codesage" / "index.db"
@@ -832,9 +812,7 @@ class RefVerdict:
     path: str
     cls: str
     accepted: bool
-    # True when the file is kept by a type-ref row whose only evidence is the
-    # shared directory: no accepted type-ref row via qualifier or import, and
-    # no other accepted row class.
+    # Shared directory is the only accepted evidence across all row classes.
     same_dir: bool = False
 
 
@@ -849,32 +827,10 @@ def reference_verdicts(
 ) -> list[RefVerdict]:
     """Per-file verdicts for same-language files that reference `name`.
 
-    Type rows (`extends`, trait use, type hint, instantiation) naming the
-    symbol count when qualified and the qualifier passes `qualifier_accepted`,
-    or bare and the file imports the type from the defining file, or (PHP,
-    Go, C/C++ only) shares the defining directory (`type_ref_accepted`; a
-    kept file resting on the directory alone is flagged `same_dir` for the
-    gate sub-count). Call rows recorded with a qualifier count
-    when the qualifier passes `qualifier_accepted`. Call rows recorded bare
-    are classified from the source text at their line/col: (a) receiver
-    calls (`x.name()`, `x->name()`) count only when the definition's owner
-    type is named by the candidate file (imported, extended, trait-used,
-    type-hinted, instantiated, or defined there; see OWNER_EVIDENCE_KINDS)
-    and the method name is not a builtin-protocol name for the language
-    (BUILTIN_METHOD_NAMES), so a parent reached only through a grandparent
-    stays dropped; (b) calls qualified in source but recorded bare
-    (`A::name()`, `A\\name()`) recover the qualifier and run
-    `qualifier_accepted`; (c) truly bare calls need an import row naming the
-    symbol (C/C++/Go: or the same directory / an include row naming the
-    defining file, see `bare_call_accepted`), and are still dropped when the
-    file binds the name locally (`binds_name_locally`). Files whose only rows
-    are `import` / `include` are dropped. Callers guarantee the name has
-    exactly one defining file; otherwise exact-name rows would collect
-    homonym callers. Rust and Python glob imports count only when their
-    explicit wildcard path resolves to the defining module. Python additionally
-    requires a static top-level function export; dynamic exports stay dropped. Legacy rows
-    without that marker need a full reindex. The caller filters test/excluded
-    paths and counts the gate.
+    Callers guarantee one defining file, then filter excluded/test paths and
+    count the gate. Import-only rows do not establish behavior. Receiver calls
+    require file-level owner evidence and exclude builtin-method homonyms;
+    other rows use the qualifier, type, and bare-call gates.
     """
     rows = conn.execute(
         "SELECT files.id AS fid, files.path AS path, refs.to_name AS to_name, "
@@ -951,10 +907,6 @@ def referencing_paths(
         conn, project, name, defining_file_id, defining_path, defining_qualified, language,
     ) if v.accepted]
 
-
-# ---------------------------------------------------------------------------
-# Mode: cochange
-# ---------------------------------------------------------------------------
 
 def _git(project: Path, args: list[str]) -> subprocess.CompletedProcess | None:
     try:
@@ -1109,10 +1061,6 @@ def build_cochange_cases(
         ))
     return cases
 
-
-# ---------------------------------------------------------------------------
-# Mode: known-item — comment extraction
-# ---------------------------------------------------------------------------
 
 _ATTRIBUTE_PREFIXES = ("#[", "#![", "@")
 _SLASH_COMMENT_PREFIXES = ("///", "//!", "//")
@@ -1344,10 +1292,6 @@ def stable_case_id(path: str, name: str) -> str:
     return f"ki-{digest[:8]}"
 
 
-# ---------------------------------------------------------------------------
-# Mode: known-item — candidate selection
-# ---------------------------------------------------------------------------
-
 class SourceCache:
     """Holds the lines of one path at a time; rows arrive ordered by path."""
 
@@ -1483,10 +1427,6 @@ def build_known_item_cases(
         ))
     return cases
 
-
-# ---------------------------------------------------------------------------
-# Output
-# ---------------------------------------------------------------------------
 
 def _first_line(text: str) -> str:
     return text.strip().splitlines()[0] if text.strip() else ""
@@ -1635,10 +1575,6 @@ def write_corpus(out_dir: Path, filename: str, text: str) -> Path:
     path.write_text(text, encoding="utf-8")
     return path
 
-
-# ---------------------------------------------------------------------------
-# Entry
-# ---------------------------------------------------------------------------
 
 def run_cochange(project: Path, args: argparse.Namespace, conn: sqlite3.Connection) -> Path | None:
     stats = CochangeStats()

@@ -1,10 +1,6 @@
 use std::sync::Arc;
 
-/// JSON Schema standard `format` values (Draft 2020-12 + the common format
-/// vocabulary). `schemars` emits Rust-specific formats (`uint32`, `uint`,
-/// `int64`, `float`, `double`, …) for numeric fields that are NOT in this set;
-/// strict MCP clients (e.g. opencode) log "unknown format uint32" warnings on
-/// them. We strip the non-standard ones from advertised tool schemas.
+/// Strict clients warn about schemars' Rust-specific numeric formats; advertise only standard formats.
 fn is_standard_json_schema_format(fmt: &str) -> bool {
     matches!(
         fmt,
@@ -66,10 +62,7 @@ fn strip_nonstandard_schema_formats(value: &mut serde_json::Value) {
 /// and therefore must not advertise `readOnlyHint: true`.
 const NON_READONLY_TOOLS: &[&str] = &["session_start", "session_end"];
 
-/// Schema for the `_meta` object the render layer may inject at the top level
-/// of ANY tool response (budget truncation, protected-array drops, stale-file
-/// annotations — see `render.rs`). Merged into every tool's outputSchema as an
-/// optional property so schema-consulting agents aren't surprised by it.
+/// Optional render-layer annotations shared by all output schemas.
 fn meta_property_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -103,9 +96,7 @@ fn meta_property_schema() -> serde_json::Value {
     })
 }
 
-/// Add the shared `_meta` fragment to an output schema's `properties` without
-/// marking it required. Output schemas are plain object schemas from schemars
-/// (no `additionalProperties: false`), so the merge never conflicts.
+/// Merge optional envelope fields into schemars' open output objects.
 fn merge_meta_property(schema: &mut serde_json::Map<String, serde_json::Value>) {
     let props = schema
         .entry("properties")
@@ -116,15 +107,8 @@ fn merge_meta_property(schema: &mut serde_json::Map<String, serde_json::Value>) 
     }
 }
 
-/// Finalize the router's tool list for the MCP `tools/list` response: strip
-/// schemars' non-standard numeric `format` keys from each schema and stamp the
-/// read-only / closed-world annotations. The server never mutates project
-/// source and reads a local index rather than the open internet, so
-/// `readOnlyHint`/`openWorldHint` hold for the surface — except the session
-/// tools, which write snapshots under `.codesage/` and are stamped
-/// `readOnlyHint: false`. Read-only-gated clients (e.g. Cursor's Ask mode)
-/// refuse to call a tool that doesn't advertise `readOnlyHint`, so the
-/// annotation is a reachability fix.
+/// Normalize schemas and advertise query tools as read-only for gated clients.
+/// Session tools write snapshots and must remain marked as writers.
 pub(super) fn finalize_tools_for_listing(tools: &mut [rmcp::model::Tool]) {
     for tool in tools.iter_mut() {
         let mut input = serde_json::Value::Object((*tool.input_schema).clone());
@@ -158,8 +142,6 @@ mod tests {
 
     #[test]
     fn strips_nonstandard_numeric_formats() {
-        // Shape mirrors what schemars emits for `Option<usize>` / `Option<f32>`
-        // params and `u32` line numbers in nested output schemas.
         let mut schema = json!({
             "type": "object",
             "properties": {
@@ -181,26 +163,18 @@ mod tests {
         strip_nonstandard_schema_formats(&mut schema);
 
         let props = &schema["properties"];
-        // uint* formats dropped, minimum:0 added to preserve non-negativity.
         assert!(props["limit"].get("format").is_none());
         assert_eq!(props["limit"]["minimum"], json!(0));
-        // float dropped, no minimum injected.
         assert!(props["min_jaccard"].get("format").is_none());
         assert!(props["min_jaccard"].get("minimum").is_none());
-        // Recurses into array items.
         let item = &props["results"]["items"]["properties"];
         assert!(item["line"].get("format").is_none());
         assert_eq!(item["line"]["minimum"], json!(0));
         assert!(item["delta"].get("format").is_none());
         assert!(item["delta"].get("minimum").is_none());
-        // Standard formats are left untouched.
         assert_eq!(props["created_at"]["format"], json!("date-time"));
     }
 
-    /// Every tool's outputSchema must declare the render-injected `_meta`
-    /// envelope as an optional property: agents that consult outputSchema
-    /// before calling would otherwise meet undeclared top-level fields on
-    /// truncated or stale responses.
     #[test]
     fn every_tool_output_schema_declares_optional_meta() {
         let server = CodeSageServer::new();
@@ -239,7 +213,6 @@ mod tests {
                     tool.name
                 );
             }
-            // Optional: injected only on trimmed/flagged responses.
             if let Some(required) = out.get("required").and_then(|r| r.as_array()) {
                 assert!(
                     !required.iter().any(|v| v == "_meta"),
@@ -256,11 +229,6 @@ mod tests {
         }
     }
 
-    /// Every params struct is `deny_unknown_fields`, and schemars renders
-    /// that as `additionalProperties: false`, so the advertised inputSchema
-    /// and the server's validation agree by construction. Runs through
-    /// `finalize_tools_for_listing` to prove the format strip leaves the
-    /// key in place.
     #[test]
     fn every_tool_input_schema_closes_additional_properties() {
         let server = CodeSageServer::new();
@@ -279,9 +247,6 @@ mod tests {
         );
     }
 
-    /// The truncation hint's paging advice is satisfiable only on tools whose
-    /// params declare `offset`; bind the const to the advertised schemas so a
-    /// new paged tool or a dropped `offset` cannot leave the two apart.
     #[test]
     fn offset_paged_kinds_match_tools_declaring_offset() {
         let server = CodeSageServer::new();
@@ -310,10 +275,6 @@ mod tests {
         );
     }
 
-    /// The payload trim must show in the advertised schemas: the risk fields
-    /// gated behind `verbose` stay described but optional, the switch itself
-    /// is not a wire field, and the dropped column fields are not advertised
-    /// on symbol or reference rows.
     #[test]
     fn output_schemas_reflect_payload_trim() {
         let server = CodeSageServer::new();
@@ -371,8 +332,6 @@ mod tests {
             );
         }
 
-        // The relevance-cliff disclosure rides on the `search` envelope as
-        // optional fields, and the opt-in cut is an optional boolean input.
         let search = schema("search");
         for key in ["confidence", "margin_pct", "cliff_at"] {
             assert!(
@@ -401,9 +360,6 @@ mod tests {
         assert!(!refs.contains("\"col\""), "{refs}");
     }
 
-    /// The graph tools disclose that their counts are floors over name-based
-    /// edges; the schema must advertise those fields so an agent consulting
-    /// `outputSchema` knows to read them.
     #[test]
     fn graph_tools_declare_resolution_honesty_fields() {
         let server = CodeSageServer::new();
@@ -432,12 +388,6 @@ mod tests {
         }
     }
 
-    /// Every tool must advertise annotations through the `tools/list`
-    /// finalization path: `readOnlyHint: true` + `openWorldHint: false` for
-    /// the query surface, `readOnlyHint: false` for the session tools (they
-    /// write `.codesage/sessions/<id>.json` inside the project — advertising
-    /// them read-only would be a lie to read-only-gated clients). Exercises
-    /// the same `finalize_tools_for_listing` the `list_tools` override uses.
     #[test]
     fn every_tool_advertises_correct_readonly_annotation() {
         let server = CodeSageServer::new();

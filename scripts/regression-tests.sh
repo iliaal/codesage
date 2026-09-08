@@ -287,6 +287,156 @@ PYEOF
 	remote_after_failed_refresh="$(git ls-remote origin refs/heads/master | awk '{print $1}')"
 	[[ "${remote_after_failed_refresh}" == "${remote_before_failed_refresh}" ]]
 	grep -Fq 'Claude Code plugin refresh failed; release not pushed.' "${tmp}/release-script-claude-refresh-failure.out"
+
+	local daemon_calls daemon_failure expected_calls actual_calls daemon_status scenario
+	local target_version installed_version mcp_mode expected_error install_before install_after
+	daemon_calls="${tmp}/daemon-calls"
+	mkdir -p target/release
+	cat >target/release/codesage <<'EOF'
+#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import sys
+
+command = " ".join(sys.argv[1:])
+if command == "--version":
+    is_target = pathlib.Path(sys.argv[0]).resolve() == pathlib.Path("target/release/codesage").resolve()
+    version = os.environ.get("TARGET_VERSION" if is_target else "INSTALLED_VERSION", "1.2.4")
+    print(f"codesage {version} (release)\n  target: x86_64-unknown-linux\n  features compiled: cpu, cuda\n  device configured: cpu")
+    sys.exit(0)
+
+def log(message):
+    with open(os.environ["DAEMON_CALLS_FILE"], "a") as calls:
+        print(message, file=calls)
+
+log(f"1.2.4 {sys.argv[0]} {command}")
+if command == os.environ.get("FAIL_DAEMON_COMMAND"):
+    sys.exit(f"simulated daemon command failure: {command}")
+if command == "daemon status":
+    print("reachable: no")
+    sys.exit(0)
+if command == "daemon stop":
+    sys.exit(0)
+if command != "mcp":
+    sys.exit(f"unexpected command: {command}")
+
+mode = os.environ.get("MCP_MODE", "success")
+if mode == "empty":
+    sys.exit(0)
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request["method"]
+    log(f"rpc {method}")
+    if method == "initialize":
+        assert request["params"]["clientInfo"]["version"] == "1.2.4"
+        if mode == "malformed":
+            print("not-json", flush=True)
+            continue
+        result = {
+            "protocolVersion": "invalid" if mode == "wrong-protocol" else request["params"]["protocolVersion"],
+            "capabilities": {},
+            "serverInfo": {"name": "codesage", "version": "1.2.3" if mode == "wrong-version" else "1.2.4"},
+        }
+    elif method == "notifications/initialized":
+        continue
+    elif method == "ping":
+        if mode == "timeout":
+            continue
+        result = {}
+    else:
+        sys.exit(f"unexpected MCP method: {method}")
+    response = {"jsonrpc": "2.0", "id": request["id"], "result": result}
+    if mode == "protocol-error" or (mode == "ping-error" and method == "ping"):
+        response = {"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32603, "message": "simulated failure"}}
+    print(json.dumps(response), flush=True)
+EOF
+	chmod +x target/release/codesage
+	chmod u+w "${fake_bin}/codesage"
+	for scenario in success stop startup empty malformed protocol-error wrong-version wrong-protocol ping-error timeout stale-target wrong-install; do
+		daemon_failure=''
+		target_version=1.2.4
+		installed_version=1.2.4
+		mcp_mode="${scenario}"
+		expected_error=''
+		case "${scenario}" in
+		success) ;;
+		stop)
+			daemon_failure='daemon stop'
+			expected_error='daemon stop failed'
+			;;
+		startup)
+			daemon_failure=mcp
+			expected_error='MCP shim closed before completing the handshake'
+			;;
+		empty)
+			expected_error='MCP shim closed before completing the handshake'
+			DAEMON_CALLS_FILE="${daemon_calls}" "${fake_bin}/codesage" daemon status >"${tmp}/unreachable-status.out"
+			grep -Fxq 'reachable: no' "${tmp}/unreachable-status.out"
+			;;
+		malformed) expected_error='daemon handshake failed: Expecting value' ;;
+		protocol-error | ping-error) expected_error='MCP request failed:' ;;
+		wrong-version) expected_error='expected codesage 1.2.4 daemon' ;;
+		wrong-protocol) expected_error='invalid MCP initialize response:' ;;
+		timeout) expected_error='MCP handshake timed out after 10 seconds' ;;
+		stale-target)
+			target_version=1.2.3
+			expected_error="release binary is 'codesage 1.2.3 (release)', expected 'codesage 1.2.4 (release)'"
+			printf '\n# existing-install-%s\n' "${tmp}" >>"${fake_bin}/codesage"
+			;;
+		wrong-install)
+			installed_version=1.2.3
+			expected_error="installed binary is 'codesage 1.2.3 (release)', expected 'codesage 1.2.4 (release)'"
+			;;
+		*)
+			printf 'unknown release verification scenario: %s\n' "${scenario}" >&2
+			return 1
+			;;
+		esac
+		install_before="$(sha256sum "${fake_bin}/codesage")"
+		: >"${daemon_calls}"
+		daemon_status=0
+		printf 'n\n' | FAIL_DAEMON_COMMAND="${daemon_failure}" DAEMON_CALLS_FILE="${daemon_calls}" \
+			TARGET_VERSION="${target_version}" INSTALLED_VERSION="${installed_version}" MCP_MODE="${mcp_mode}" PATH="${fake_bin}:${PATH}" \
+			"${release_script}" 1.2.4 >"${tmp}/release-script-daemon.out" 2>&1 || daemon_status=$?
+		if [[ "${scenario}" == success ]]; then
+			[[ "${daemon_status}" -eq 0 ]]
+			grep -Fq 'Daemon restarted.' "${tmp}/release-script-daemon.out"
+		else
+			if [[ "${daemon_status}" -eq 0 ]]; then
+				printf 'release script accepted failed daemon verification: %s\n' "${scenario}" >&2
+				cat "${tmp}/release-script-daemon.out" >&2
+				return 1
+			fi
+			grep -Fq "${expected_error}" "${tmp}/release-script-daemon.out"
+			if grep -Fq 'Daemon restarted.' "${tmp}/release-script-daemon.out"; then
+				printf 'release script claimed a restart after failed verification: %s\n' "${scenario}" >&2
+				return 1
+			fi
+		fi
+		expected_calls="1.2.4 ${fake_bin}/codesage daemon stop"
+		if [[ "${scenario}" == stale-target || "${scenario}" == wrong-install ]]; then
+			expected_calls=''
+		elif [[ "${scenario}" != stop ]]; then
+			expected_calls+=$'\n'"1.2.4 ${fake_bin}/codesage mcp"
+			if [[ "${scenario}" != startup && "${scenario}" != empty ]]; then
+				expected_calls+=$'\n'"rpc initialize"
+			fi
+			if [[ "${scenario}" == success || "${scenario}" == ping-error || "${scenario}" == timeout ]]; then
+				expected_calls+=$'\n'"rpc notifications/initialized"$'\n'"rpc ping"
+			fi
+		fi
+		actual_calls="$(cat "${daemon_calls}")"
+		if [[ "${actual_calls}" != "${expected_calls}" ]]; then
+			printf 'release did not verify versions, stop, and complete the daemon handshake in order (scenario=%s)\n' "${scenario}" >&2
+			cat "${daemon_calls}" "${tmp}/release-script-daemon.out" >&2
+			return 1
+		fi
+		if [[ "${scenario}" == stale-target ]]; then
+			install_after="$(sha256sum "${fake_bin}/codesage")"
+			[[ "${install_after}" == "${install_before}" ]]
+		fi
+	done
 	cd "$repo_root"
 }
 

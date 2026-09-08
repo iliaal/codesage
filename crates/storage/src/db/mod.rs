@@ -1,16 +1,4 @@
-//! `Database` connection wrapper + split impls.
-//!
-//! Public API is stable: `Database`, `RawSearchRow`, `GitFileRow`, `CoChangeRow`,
-//! and `embedding_to_bytes` are re-exported from this module so existing callers
-//! (`use codesage_storage::{Database, RawSearchRow, embedding_to_bytes}`) keep
-//! working. The methods themselves live in one of three `impl Database` blocks:
-//!
-//! - `structural` — files / symbols / refs / dependencies
-//! - `semantic` — chunk table + sqlite-vec KNN + fullscan
-//! - `git_hist` — git_files / git_co_changes / git_index_state
-//!
-//! Each `.rs` file owns a focused concern. Helpers that are truly shared across
-//! blocks (row-kind parsers, embedding bytes) stay here.
+//! Database connections and shared helpers; storage operations live in submodules.
 
 use std::path::Path;
 #[cfg(unix)]
@@ -41,10 +29,7 @@ pub use git_hist::{
 pub use semantic::{RawSearchRow, SemanticFreshness, SemanticValidityToken, embedding_to_bytes};
 pub use structural::{FingerprintInput, StoredFingerprint};
 
-/// Decode a stored DB string column into an enum via its `parse`, surfacing an
-/// unknown value as a typed rusqlite error rather than silently relabeling it.
-/// Loud failure is the right default: an unknown value almost always means
-/// schema/binary skew. `label` names the enum in the error.
+/// Reject unknown stored enums as typed conversion errors; never relabel schema skew.
 pub(super) fn row_enum<T>(
     s: &str,
     parse: impl Fn(&str) -> Option<T>,
@@ -59,15 +44,8 @@ pub(super) fn row_enum<T>(
     })
 }
 
-/// Whether `e` is, or wraps anywhere in its chain, a SQLite UNIQUE or
-/// PRIMARY KEY violation: the only constraint failures that mean "this
-/// file's rows collide with each other". Callers writing many files use this
-/// to separate that recoverable case (skip the file) from everything that
-/// must abort the whole pass: `SQLITE_FULL`, `SQLITE_IOERR`,
-/// `SQLITE_READONLY`, `SQLITE_BUSY`, a missing table, and the other
-/// constraint kinds (CHECK, NOT NULL, FOREIGN KEY, `RAISE(ABORT)`), which
-/// share the `SQLITE_CONSTRAINT` primary code but indicate a schema/binary
-/// mismatch that would fail every file the same way.
+/// Match only UNIQUE/PRIMARY KEY violations anywhere in the error chain.
+/// Other constraints and storage failures are systemic, not skippable file collisions.
 pub fn is_unique_violation(e: &anyhow::Error) -> bool {
     e.chain().any(|cause| {
         matches!(
@@ -87,11 +65,8 @@ pub(super) fn row_reference_kind(s: &str) -> rusqlite::Result<ReferenceKind> {
     row_enum(s, ReferenceKind::parse, "ReferenceKind")
 }
 
-/// Read a single-row (`id = 1`) index-state table's `(last_sha,
-/// last_indexed_at)`, treating a missing row or an empty SHA as "no state".
-/// Shared by the structural and git-history index-state accessors, which differ
-/// only in the table name. `table` is a hardcoded constant at every call site,
-/// never user input, so interpolation is safe.
+/// Read (last_sha, last_indexed_at) at id=1; missing/empty SHA means no state.
+/// `table` must be a hardcoded identifier, never user input.
 pub(super) fn get_index_state(conn: &Connection, table: &str) -> Result<Option<(String, i64)>> {
     let sql = format!("SELECT last_sha, last_indexed_at FROM {table} WHERE id = 1");
     let row = conn.query_row(&sql, [], |r| {
@@ -167,20 +142,10 @@ fn harden_db_path_permissions_impl(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Refuse to reach the index database through a symlink.
-///
-/// `.codesage/` ships inside the repository work tree, so a cloned repo can
-/// plant `index.db` as a symlink (git stores those as mode-120000 blobs and
-/// checkout materializes them). Neither layer below refuses one on its own:
-/// `OpenOptions` has no `O_NOFOLLOW` by default, and SQLite's unix VFS resolves
-/// the path itself in `unixFullPathname` before its own `O_NOFOLLOW` is applied,
-/// so the pager opens the *resolved* target. Guarding the one funnel every
-/// `Database` constructor goes through covers create- and read-mode opens
-/// alike.
+/// Reject repo-planted symlinks before SQLite resolves unixFullPathname;
+/// its later O_NOFOLLOW would otherwise protect only the resolved target.
 fn reject_symlinked_db_path(path: &Path) -> Result<()> {
-    // The `.codesage` directory itself is plantable as a symlink, and guarding
-    // only the final component would still let it redirect the whole directory
-    // (creating `index.db` and its `-wal`/`-shm` siblings wherever it points).
+    // A symlinked .codesage directory also redirects the DB and WAL/SHM files.
     if let Some(parent) = path.parent()
         && parent.file_name().and_then(|n| n.to_str()) == Some(".codesage")
         && std::fs::symlink_metadata(parent)
@@ -198,8 +163,6 @@ fn reject_symlinked_db_path(path: &Path) -> Result<()> {
             "refusing to use index database {}: it is a symlink",
             path.display()
         ),
-        // A repo can also ship this name as a directory (or any other
-        // non-regular entry); SQLite would fail later with a confusing error.
         Ok(meta) if !meta.is_file() => anyhow::bail!(
             "refusing to use index database {}: it is not a regular file",
             path.display()
@@ -217,10 +180,7 @@ fn create_private_db_file(path: &Path) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
 
     if !path.exists() {
-        // `!path.exists()` is follow-semantics, so a *dangling* symlink planted
-        // at `.codesage/index.db` reads as "missing" here. O_NOFOLLOW makes the
-        // create fail with ELOOP instead of materializing the database at the
-        // link's target.
+        // exists() misses dangling links; O_NOFOLLOW prevents creating their target.
         OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -238,11 +198,7 @@ fn create_private_db_file(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Open the SQLite connection behind every `Database` constructor. With
-/// `create` false the open refuses to materialize a missing file (no
-/// `SQLITE_OPEN_CREATE`): read-shaped callers on an existing project must
-/// surface "index gone" instead of silently recreating an empty index that
-/// answers every query with zero results.
+/// Without create, a deleted index must error instead of becoming an empty index.
 fn open_connection(path: &Path, create: bool) -> Result<Connection> {
     init_vec_extension();
     reject_symlinked_db_path(path)?;
@@ -281,14 +237,8 @@ fn open_connection(path: &Path, create: bool) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Open a read/write connection that runs no migrations and no schema batch:
-/// only connection-local pragmas. Read and diagnostic paths (which must keep
-/// working on a database a newer binary migrated, or one whose later schema
-/// objects are damaged) use this instead of [`open_connection`]. The tradeoff
-/// is the one [`Database::open_read_only`] already documents: callers must
-/// tolerate whatever schema is on disk rather than assume the current one.
-/// `journal_mode` is deliberately left alone — changing it is a write, and a
-/// persisted WAL mode from an earlier indexed open applies as-is.
+/// Read/write handle with connection-local pragmas only: no migrations or
+/// journal-mode change. Callers must tolerate older/newer or damaged schemas.
 fn open_connection_no_migrations(path: &Path) -> Result<Connection> {
     init_vec_extension();
     reject_symlinked_db_path(path)?;
@@ -324,10 +274,7 @@ fn open_connection_no_migrations(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Whether `semantic_models` exists on this connection. A migration-free read
-/// open meets whatever schema is on disk, including one from before the
-/// semantic-models registry existed — metadata lookups must degrade to
-/// "unknown" instead of failing with `no such table`.
+/// Migration-free reads may predate semantic_models; absence means unknown.
 fn semantic_models_table_exists(conn: &Connection) -> Result<bool> {
     Ok(conn
         .query_row(
@@ -470,10 +417,7 @@ pub(super) fn drop_chunk_table_group(conn: &Connection, table_name: &str) -> Res
     }
 }
 
-/// Refusal to serve or reuse vectors whose provenance is unknown or foreign:
-/// the chunk table holds rows no recorded fingerprint vouches for, or a
-/// fingerprint other than the one the caller runs under. Typed so CLI layers
-/// can map it to `EXIT_STALE_INDEX` instead of a generic failure.
+/// Unknown/foreign vector provenance, mapped to EXIT_STALE_INDEX by CLI callers.
 #[derive(Debug)]
 pub struct StaleSemanticFingerprint {
     /// Chunk table whose vectors cannot be vouched for.
@@ -600,12 +544,8 @@ fn clear_semantic_fingerprint_for(conn: &Connection, chunk_table: &str) -> Resul
     Ok(())
 }
 
-/// What a completed semantic pass records about the vectors a chunk table
-/// holds: the fingerprint text every reader compares, plus the model-file
-/// digest it was built over and the stat key (paths, sizes, mtimes) of
-/// those files, so the next process can answer "unchanged" without reading
-/// hundreds of megabytes. Both extras are optional: a row attested by an
-/// older build has neither.
+/// Completed-pass fingerprint plus optional artifact digest/stat key for reuse
+/// without rereading model files. Older attestations may omit those extras.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticAttestation {
     pub fingerprint: String,
@@ -637,8 +577,7 @@ fn record_semantic_model_table(
 }
 
 impl Database {
-    /// Open a DB for read-only (structural) queries. No chunk/vec table is created;
-    /// semantic queries will fail until `open_for_model` is used instead.
+    /// Open/create a structural handle without selecting a semantic chunk table.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = open_connection(path, true)?;
         harden_db_path_permissions(path)?;
@@ -648,10 +587,7 @@ impl Database {
         })
     }
 
-    /// Like [`Database::open`], but refuses to create a missing database
-    /// file. Read paths on already-onboarded projects (the MCP daemon) use
-    /// this so a deleted index surfaces an error instead of being silently
-    /// recreated empty.
+    /// Open a structural handle without recreating a missing index.
     pub fn open_existing(path: &Path) -> Result<Self> {
         let conn = open_connection(path, false)?;
         harden_db_path_permissions(path)?;
@@ -661,18 +597,9 @@ impl Database {
         })
     }
 
-    /// Open an existing index for structural reads without running the schema
-    /// batch or the migration runner. Read and diagnostic paths (status,
-    /// drift checks, doctor) use this so a pure read keeps working when the
-    /// database was migrated by a newer binary or its later schema objects
-    /// are damaged: [`Database::open_existing`] would fail those opens in
-    /// `run_migrations` before the first query runs.
-    ///
-    /// Unlike [`Database::open_read_only`] the handle is read-write (WAL
-    /// sidecars work normally), but nothing in the open writes: callers must
-    /// tolerate whatever schema is on disk. Writers must keep using
-    /// [`Database::open_existing`] / [`Database::open_for_model_existing`],
-    /// which migrate first.
+    /// Migration-free structural reads tolerate the schema on disk, including
+    /// newer or damaged schemas. The handle is read/write for WAL support;
+    /// writers must use open_existing/open_for_model_existing to migrate first.
     pub fn open_existing_read(path: &Path) -> Result<Self> {
         let conn = open_connection_no_migrations(path)?;
         harden_db_path_permissions(path)?;
@@ -859,10 +786,7 @@ impl Database {
             );
         }
         record_semantic_model_table(&conn, &chunk_table, model, dim)?;
-        // A rebuild is about to rewrite every row. Until it has, the table
-        // holds a mix of old and new vectors that no fingerprint describes;
-        // a compatible reopen used to carry the previous attestation across
-        // a rebuild that then failed on some files.
+        // Interrupted rebuilds must not leave an old attestation over mixed vectors.
         clear_semantic_fingerprint_for(&conn, &chunk_table)?;
         harden_db_path_permissions(path)?;
         Ok(Database { conn, chunk_table })
@@ -1122,11 +1046,7 @@ impl Database {
         match f(self) {
             Ok(()) => match self.conn.execute_batch("COMMIT") {
                 Ok(()) => Ok(()),
-                // SQLITE_BUSY or an I/O error during COMMIT can leave the
-                // connection inside an open transaction; without an explicit
-                // rollback every subsequent statement on this connection
-                // fails with "cannot start a transaction within a
-                // transaction" and poisons the long-lived MCP connection.
+                // A failed COMMIT can leave the transaction open and block later batches.
                 Err(commit_err) => {
                     let _ = self.conn.execute_batch("ROLLBACK");
                     Err(commit_err.into())
@@ -1372,8 +1292,6 @@ mod tests {
     #[test]
     #[ignore = "timing probe, run explicitly"]
     fn bench_open_read_only_vs_open() {
-        // Step 1 of the serve-don't-recommend memo asks what the no-op path
-        // costs. Compare the two opens on the same file.
         let path = std::path::Path::new("../../.codesage/index.db");
         if !path.exists() {
             eprintln!("skip: no index at {}", path.display());
@@ -1416,9 +1334,6 @@ mod tests {
     fn open_read_only_reads_without_touching_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        // `Database::open` hardens permissions on every call, so a plain read
-        // silently widens a mode an operator narrowed and costs two chmods per
-        // invocation. A per-edit hook must do neither.
         let dir = tempfile::tempdir().unwrap();
         let cs = dir.path().join(".codesage");
         std::fs::create_dir_all(&cs).unwrap();
@@ -1456,8 +1371,6 @@ mod tests {
     fn plain_open_does_widen_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        // The behaviour the read-only path exists to avoid, pinned so the
-        // contrast is a test rather than a claim in a comment.
         let dir = tempfile::tempdir().unwrap();
         let cs = dir.path().join(".codesage");
         std::fs::create_dir_all(&cs).unwrap();
@@ -2190,7 +2103,6 @@ mod tests {
         assert_eq!(sha, "abc123");
         assert!(at > 0, "last_indexed_at should be stamped with unixepoch");
 
-        // Second stamp replaces rather than stacking (single-row table, id=1).
         db.set_structural_index_state("def456").unwrap();
         let (sha2, _) = db.get_structural_index_state().unwrap().unwrap();
         assert_eq!(sha2, "def456");
@@ -2198,10 +2110,6 @@ mod tests {
 
     #[test]
     fn total_chunk_count_zero_on_fresh_db_open() {
-        // A DB opened via `Database::open` has no chunk_table selected. Before
-        // the total_chunk_count helper landed, `codesage status` would error
-        // with "no such table: " because `chunk_count()` interpolated the
-        // empty chunk_table. The replacement must tolerate the no-model case.
         use std::path::PathBuf;
         let tmp = std::env::temp_dir().join(format!(
             "codesage-total-chunk-test-{}.db",
@@ -2209,8 +2117,6 @@ mod tests {
         ));
         let tmp = PathBuf::from(&tmp);
         let _ = std::fs::remove_file(&tmp);
-        // Materialize a DB with schema but no chunk tables. Using open() (no
-        // model) is the code path exercised by `codesage status`.
         {
             let db = Database::open(&tmp).unwrap();
             assert_eq!(db.total_chunk_count().unwrap(), 0);
@@ -2664,9 +2570,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn open_refuses_a_symlinked_index_db() {
-        // A cloned repo ships `.codesage/`, so `index.db` can be a symlink.
-        // SQLite's unix VFS resolves the link itself and opens the target, so
-        // the refusal has to happen before the connection is opened.
         let dir = tempfile::tempdir().unwrap();
         let victim = dir.path().join("victim.txt");
         std::fs::write(&victim, b"victim contents").unwrap();
@@ -2753,7 +2656,6 @@ mod tests {
         std::fs::create_dir(&project).unwrap();
         std::os::unix::fs::symlink(&victim_dir, project.join(".codesage")).unwrap();
 
-        // The open is now refused outright; the chmod must not have landed either.
         let db_path = project.join(".codesage").join("index.db");
         let err = match Database::open(&db_path) {
             Ok(_) => panic!("expected a symlink refusal"),
@@ -2916,8 +2818,6 @@ mod tests {
     #[test]
     fn structural_index_state_treats_empty_sha_as_absent() {
         let db = Database::open_in_memory().unwrap();
-        // Direct INSERT rather than going through set_* so we can exercise the
-        // empty-string branch of get_*.
         db.conn
             .execute(
                 "INSERT INTO structural_index_state (id, last_sha, last_indexed_at)
@@ -2943,7 +2843,6 @@ mod tests {
                 .unwrap();
         };
 
-        // Attested table: the recorded fingerprint opens, any other refuses.
         {
             let db = Database::open_for_model(&path, MODEL, DIM).unwrap();
             chunk(&db);
@@ -2979,8 +2878,6 @@ mod tests {
         let populated = dir.path().join("populated.db");
         let empty = dir.path().join("empty.db");
 
-        // Rows with no attestation are unknown, never a match — denying them
-        // is what closes the silent stale-vector reuse on setup change.
         {
             let db = Database::open_for_model(&populated, MODEL, DIM).unwrap();
             db.insert_chunks("a.rs", "rust", &[("fn one() {}", 1, 3, &[0.0, 0.0])])
@@ -3067,8 +2964,6 @@ mod tests {
         diverge(&db);
         drop(db);
 
-        // A query-shaped open never pays for the sidecar rebuild — but it says
-        // so instead of silently serving degraded BM25.
         let db = Database::open_for_model_existing(&path, MODEL, DIM).unwrap();
         assert!(
             matches!(db.fts_health().unwrap(), FtsSidecarHealth::Diverged { .. }),
@@ -3079,7 +2974,6 @@ mod tests {
         assert_eq!(db.fts_health().unwrap(), FtsSidecarHealth::InSync);
         assert!(db.repair_fts_sidecar().is_ok(), "repair is idempotent");
 
-        // A write-shaped open heals a small divergence itself.
         diverge(&db);
         drop(db);
         let db = Database::open_for_model(&path, MODEL, DIM).unwrap();

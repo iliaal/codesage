@@ -2,18 +2,13 @@ use std::path::Path;
 
 use codesage_protocol::Language;
 
-/// Pure path-based language detection. `.h` and `.c` always map to C here.
-/// For project-aware `.h`-as-C++ routing (when the same project also contains
-/// `.cpp`/`.hpp`/etc.), use [`detect_language_with_dialect`] from the discovery
-/// layer.
+/// Path-based detection; `.h` and `.c` map to C. Discovery uses
+/// [`detect_language_with_dialect`] for project-aware header routing.
 pub fn detect_language(path: &Path) -> Option<Language> {
     detect_language_with_dialect(path, false)
 }
 
-/// Path-based language detection with header-dialect override. When
-/// `header_is_cpp` is true, bare `.h` files map to [`Language::Cpp`] instead of
-/// [`Language::C`]. `.c` always stays C — a `.c` file inside a C++ project is
-/// still C by convention, and the C grammar parses it correctly.
+/// With `header_is_cpp`, `.h` maps to C++; `.c` always maps to C.
 pub fn detect_language_with_dialect(path: &Path, header_is_cpp: bool) -> Option<Language> {
     let ext = path.extension()?.to_str()?;
     match ext {
@@ -25,29 +20,20 @@ pub fn detect_language_with_dialect(path: &Path, header_is_cpp: bool) -> Option<
         } else {
             Language::C
         }),
-        // CUDA sources/headers parse as C++ (the tree-sitter-cpp grammar
-        // handles the includes/functions/calls we extract; `__global__` &c.
-        // produce a few error nodes but don't block extraction). Kept OUT of
-        // `is_unambiguous_cpp_extension` so a C project that happens to carry
-        // a `.cu` file doesn't have its `.h` headers re-routed to C++.
+        // C++ error recovery tolerates CUDA qualifiers. CUDA alone must not
+        // switch the project's C headers to C++.
         "cu" | "cuh" => Some(Language::Cpp),
-        // Unambiguous C++ source / header / module extensions. Single source of
-        // truth in `is_unambiguous_cpp_extension`, shared with `.h`-dialect routing.
         _ if is_unambiguous_cpp_extension(ext) => Some(Language::Cpp),
         "java" => Some(Language::Java),
         "rs" => Some(Language::Rust),
         "js" | "mjs" | "cjs" | "jsx" => Some(Language::JavaScript),
-        // `.mts`/`.cts` are the explicit-ESM/CJS TypeScript flavors; without
-        // an arm they fell through to None and were silently excluded.
         "ts" | "tsx" | "mts" | "cts" => Some(Language::TypeScript),
         "go" => Some(Language::Go),
         _ => None,
     }
 }
 
-/// True for any extension that proves a project is using C++ (i.e. its `.h`
-/// files should be parsed as C++ rather than C). The discovery layer scans the
-/// file list once, sets a project-wide flag, then re-routes `.h` files.
+/// Extensions that switch project-wide `.h` parsing to C++.
 pub fn is_unambiguous_cpp_extension(ext: &str) -> bool {
     matches!(
         ext,
@@ -96,7 +82,6 @@ mod tests {
             detect_language_with_dialect(Path::new("header.h"), true),
             Some(Language::Cpp)
         );
-        // .c never flips, even when the project is C++.
         assert_eq!(
             detect_language_with_dialect(Path::new("main.c"), true),
             Some(Language::C)
@@ -143,8 +128,6 @@ mod tests {
 
     #[test]
     fn cuda_extension_does_not_route_c_headers_to_cpp() {
-        // `.cu`/`.cuh` are NOT in is_unambiguous_cpp_extension, so a project
-        // carrying a `.cu` file must not flip its `.h` headers to C++.
         assert!(!is_unambiguous_cpp_extension("cu"));
         assert!(!is_unambiguous_cpp_extension("cuh"));
     }

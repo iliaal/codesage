@@ -39,12 +39,8 @@ def expect(actual, expected, label: str) -> None:
         failures.append(f"  {label}: expected {expected!r}, got {actual!r}")
 
 
-# --------------------------------------------------------------------
-# is_real_user_question — should reject non-question system messages
-# --------------------------------------------------------------------
 expect(is_real(""), False, "empty string is rejected")
 expect(is_real("   "), False, "whitespace-only is rejected (no real content)")
-# `is_real_user_question` strips before testing, so whitespace-only is rejected.
 expect(
     is_real("<task-notification>foo</task-notification>"),
     False,
@@ -85,7 +81,6 @@ expect(
     False,
     ">2000-char body rejected (too long for a real question)",
 )
-# Genuine short user question must pass.
 expect(
     is_real("where does auth happen in this codebase?"),
     True,
@@ -93,11 +88,6 @@ expect(
 )
 
 
-# --------------------------------------------------------------------
-# classify_user_question — bucket assignment
-# --------------------------------------------------------------------
-
-# semantic: paraphrase / concept / implementation-request shapes
 expect(
     classify("where does auth happen?"),
     "semantic",
@@ -129,7 +119,6 @@ expect(
     "show-me-where → semantic",
 )
 
-# identifier: backticked symbols, "where is X defined", "find references"
 expect(
     classify("where is `EmbeddingConfig` defined?"),
     "identifier",
@@ -151,7 +140,6 @@ expect(
     "what-calls-X → identifier",
 )
 
-# literal: TODO, search-for-quoted, error-message
 expect(
     classify("look for TODO markers in src/"),
     "literal",
@@ -168,7 +156,6 @@ expect(
     "error-message → literal",
 )
 
-# other: conversational, no clear retrieval shape
 expect(classify(""), "other", "empty → other")
 expect(classify("yes"), "other", "ack → other")
 expect(classify("commit and push"), "other", "imperative → other")
@@ -179,29 +166,18 @@ expect(
 )
 
 
-# --------------------------------------------------------------------
-# Precedence: identifier > literal > semantic > other
-# --------------------------------------------------------------------
-
-# Backticked symbol embedded in a paraphrase question — should still
-# classify as identifier because the symbol is the stronger signal.
 expect(
     classify("where is `EmbeddingConfig` defined? how does it work?"),
     "identifier",
     "identifier wins over semantic when both fire",
 )
 
-# Literal TODO embedded in a paraphrase shape — literal wins over semantic.
 expect(
     classify("how does the TODO scanning work in our linter?"),
     "literal",
     "literal wins over semantic when both fire",
 )
 
-
-# --------------------------------------------------------------------
-# Done
-# --------------------------------------------------------------------
 
 if failures:
     print(f"FAIL: {len(failures)} assertions did not match:")

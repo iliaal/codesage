@@ -27,12 +27,8 @@ use crate::mappers::{
 };
 use crate::nearby_tests::{TestFileIndex, nearby_tests_indexed};
 
-/// [`map_features`] result plus per-mapper failure visibility.
-/// `mapper_errors` holds one `"<mapper>: <error>"` entry per mapper that
-/// failed during seed collection — non-empty means the run was partial:
-/// the failed mapper's seeds are missing and the stale-feature GC was
-/// skipped. Lives here (not on the protocol `FeatureMapStats`) so the
-/// wire/stats shape is unchanged and existing callers keep compiling.
+/// Mapping stats and one `"<mapper>: <error>"` entry per failed mapper.
+/// Any mapper failure makes the run partial and prevents stale-feature deletion.
 #[derive(Debug, Clone)]
 pub struct FeatureMapOutcome {
     pub stats: FeatureMapStats,
@@ -53,19 +49,11 @@ pub fn map_features(
     Ok(map_features_detailed(root, db, exclude_patterns)?.stats)
 }
 
-/// `exclude_patterns` is the project's `[index].exclude_patterns` list. It
-/// is compiled into a `GlobSet` once and threaded into every mapper through
-/// `MapperContext` so feature output honors the same file-filter contract
-/// as the structural indexer — no ghost features for files the rest of the
-/// pipeline never sees.
+/// Apply the structural indexer's `[index].exclude_patterns` to every mapper.
 ///
-/// When **any** mapper errors mid-collection, the orchestrator still
-/// persists the seeds it did collect but **skips the garbage-collect
-/// pass** — otherwise a single mapper failure (corrupted composer.json,
-/// unreadable Cargo.toml, etc.) could silently delete every feature
-/// owned by that language. Stale-feature debt is reconciled on the
-/// next clean run. Each failure is reported in
-/// [`FeatureMapOutcome::mapper_errors`].
+/// Persist collected seeds even if a mapper fails, but skip stale-feature
+/// deletion to retain that mapper's existing features until a clean run.
+/// Failures appear in [`FeatureMapOutcome::mapper_errors`].
 pub fn map_features_detailed(
     root: &Path,
     db: &Database,
@@ -87,13 +75,10 @@ pub fn map_features_detailed(
     let mut keep_ids: Vec<String> = Vec::with_capacity(seeds.len());
     let mut created = 0usize;
     let mut updated = 0usize;
-    // Snapshot of repo files for the nearby-test walker. Capped to keep
-    // big repos under a couple seconds of wall-time.
+    // Bound nearby-test discovery on large repositories.
     const MAPPER_WALK_CAP: usize = 50_000;
     let all_files = walk_files(root, root, MAPPER_WALK_CAP, ctx.excludes);
     let walk_truncated = all_files.len() >= MAPPER_WALK_CAP;
-    // Classify the inventory's test-shaped files once; every seed's
-    // nearby-test discovery scans this index instead of the full list.
     let test_index = TestFileIndex::build(&all_files);
     // Framework route edges are derived from the filesystem before opening the
     // write transaction, then persisted atomically with feature rows below.
@@ -105,9 +90,7 @@ pub fn map_features_detailed(
                 continue;
             }
             let mut record = build_record(seed, &test_index, walk_truncated);
-            // Final safety net: even when a mapper forgets to filter, no
-            // FeatureFileRef should reference a path the structural
-            // indexer excludes. Drop any leaked refs before persisting.
+            // Enforce exclusions even for paths an individual mapper did not filter.
             retain_allowed_files_and_refresh_boundaries(db, &mut record, |path| ctx.allowed(path))?;
             let exists = db.feature_exists(&record.feature_id)?;
             db.upsert_feature(&record)?;
@@ -119,11 +102,7 @@ pub fn map_features_detailed(
             }
         }
 
-        // Framework route edges: synthesize `RouteHandler` references so
-        // `impact_analysis` / `find_references` traverse Laravel routing.
-        // Re-derived every run and rewritten wholesale (delete-of-kind then
-        // insert) so edges from removed routes don't linger. Non-Laravel repos
-        // produce an empty set; the delete then just clears any prior edges.
+        // Replace route edges wholesale so removed routes leave no stale references.
         db.delete_references_of_kind(ReferenceKind::RouteHandler)?;
         let mut by_file: BTreeMap<&str, Vec<Reference>> = BTreeMap::new();
         for r in &route_refs {
@@ -160,9 +139,7 @@ pub fn map_features_detailed(
 
 struct CollectedSeeds {
     seeds: Vec<FeatureSeed>,
-    /// One `"<mapper>: <error>"` entry per failed mapper. Non-empty tells
-    /// the caller to skip destructive cleanup (the pass was partial) and
-    /// surfaces on `FeatureMapOutcome::mapper_errors`.
+    /// Non-empty on a partial pass, which must not delete stale features.
     errors: Vec<String>,
 }
 
@@ -215,10 +192,7 @@ fn collect_seeds_from(
     Ok(CollectedSeeds { seeds: out, errors })
 }
 
-// Trust boundaries stay empty here on purpose: the caller runs
-// `retain_allowed_files_and_refresh_boundaries` on every record before
-// persisting, and that pass recomputes the boundary set wholesale from the
-// retained files.
+// Boundaries are derived after exclusions, from the retained files only.
 fn build_record(
     seed: &FeatureSeed,
     test_index: &TestFileIndex,
@@ -227,13 +201,8 @@ fn build_record(
     let disc = seed.discriminator();
     let feature_id = feature_id::build(seed.kind, seed.source, &seed.entry_path, &disc);
 
-    // Build the file ref set: entry + owned + context + (seed tests union
-    // nearby tests), deduped by PATH with role precedence Entry > Owned >
-    // Context > Test (first insertion of a path wins). Keying by path alone is
-    // load-bearing: several mappers — notably the C/C++ `filter_target_sources`
-    // — return the entry file again inside `owned_files`, so a `(path, role)`
-    // key would persist that file twice (once Entry, once Owned). The doc that
-    // used to say "entry always wins over owned" now actually holds.
+    // Deduplicate by path with Entry > Owned > Context > Test precedence;
+    // mappers may also list the entry in owned_files.
     let mut files_by_path: BTreeMap<String, FeatureFileRef> = BTreeMap::new();
     files_by_path.insert(
         seed.entry_path.clone(),
@@ -261,7 +230,6 @@ fn build_record(
                 reason: Some(f.reason.clone()),
             });
     }
-    // Seed-attached tests.
     for t in &seed.tests {
         files_by_path
             .entry(t.path.clone())
@@ -412,9 +380,6 @@ mod tests {
     fn entry_file_repeated_in_owned_is_deduped_to_entry_role() {
         use crate::mappers::types::SeedFile;
         use codesage_protocol::{FeatureConfidence, FeatureFileRole, Language};
-        // The C/C++ mapper's filter_target_sources returns ALL target sources as
-        // owned, including the file picked as the entry. build_record must
-        // persist that file once, as Entry — not twice (Entry + Owned).
         let seed = FeatureSeed {
             source: "cmake-target",
             confidence: FeatureConfidence::High,
@@ -535,7 +500,6 @@ mod tests {
 
         map_features(root, &db, &[]).unwrap();
 
-        // Qualified lookup (the impact_analysis path) resolves the edge.
         let qualified = db
             .find_references("App\\Http\\Controllers\\UserController\\index", None)
             .unwrap();
@@ -547,7 +511,6 @@ mod tests {
         assert_eq!(qualified[0].kind, ReferenceKind::RouteHandler);
         assert_eq!(qualified[0].from_file, "routes/web.php");
 
-        // Unqualified (tail) lookup also resolves it.
         let by_tail = db.find_references("index", None).unwrap();
         assert!(
             by_tail
@@ -556,7 +519,6 @@ mod tests {
             "tail lookup missed route edge: {by_tail:?}"
         );
 
-        // A second map run must not duplicate the edge.
         map_features(root, &db, &[]).unwrap();
         let after = db
             .find_references("App\\Http\\Controllers\\UserController\\index", None)
@@ -566,11 +528,6 @@ mod tests {
 
     #[test]
     fn map_features_respects_index_exclude_patterns() {
-        // A Python script under `scripts/` would normally produce a
-        // `python-main-guard` feature. With `scripts/**` in
-        // `exclude_patterns`, the feature must be dropped — otherwise the
-        // features pipeline emits rows whose entry_path is invisible to
-        // the structural indexer (the "ghost feature" failure mode).
         let dir = tempdir().unwrap();
         let root = dir.path();
         write(
@@ -601,10 +558,6 @@ mod tests {
 
     #[test]
     fn rust_bin_under_exclude_is_dropped() {
-        // Regression: a `src/bin/<name>.rs` that matches
-        // `[index].exclude_patterns` must not produce a cargo-bin
-        // feature, otherwise the row references a path the structural
-        // indexer ignored.
         let dir = tempdir().unwrap();
         let root = dir.path();
         write(
@@ -631,8 +584,6 @@ mod tests {
 
     #[test]
     fn rust_integration_test_under_exclude_is_dropped() {
-        // Integration tests under `tests/` must respect `**/tests/**`
-        // excludes.
         let dir = tempdir().unwrap();
         let root = dir.path();
         write(
@@ -653,8 +604,6 @@ mod tests {
 
     #[test]
     fn cmake_target_under_exclude_is_dropped() {
-        // Regression: a CMake target whose entry resolves to an excluded
-        // path must not emit a feature.
         let dir = tempdir().unwrap();
         let root = dir.path();
         write(
@@ -680,9 +629,6 @@ mod tests {
 
     #[test]
     fn cmake_owned_files_under_exclude_are_dropped() {
-        // Even if the target's entry is allowed, sources listed under
-        // `add_executable(target src1 src2)` that are themselves excluded
-        // must not show up as owned/context refs on the emitted feature.
         let dir = tempdir().unwrap();
         let root = dir.path();
         write(
@@ -786,12 +732,6 @@ mod tests {
 
     #[test]
     fn feature_id_stable_when_test_command_changes() {
-        // Regression: feature_id hashes (kind, source, entry_path,
-        // command|route|symbol). The test command (e.g. `pnpm --dir api
-        // test`) must NOT contribute — projects edit their test script /
-        // package manager often, and cross-session IDs should survive
-        // that. Verifies by changing the package's lock file (npm →
-        // pnpm) and asserting the feature_id is unchanged.
         let dir = tempdir().unwrap();
         let root = dir.path();
         write(
@@ -815,8 +755,7 @@ mod tests {
             .find(|f| f.source == "node-package")
             .expect("api package feature before lock swap");
 
-        // Add a pnpm-lock.yaml so the detected package manager flips
-        // from npm → pnpm, changing the inferred test command.
+        // A lockfile swap changes the inferred test command, not the feature identity.
         write(root, "pnpm-lock.yaml", "lockfileVersion: '9'\n");
         map_features(root, &db, &[]).unwrap();
         let after = db

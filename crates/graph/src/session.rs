@@ -1,11 +1,4 @@
-//! Session baseline: snapshot the structural state of the index at the
-//! start of an agent's editing session, diff it against current state at
-//! the end. Closes the loop on "did this batch of edits introduce import
-//! cycles or regress risk on hot files."
-//!
-//! Pattern borrowed from sentrux's session_start / session_end MCP tools,
-//! reimplemented around CodeSage's existing risk + cycle infrastructure.
-//! Snapshots persist as JSON under `.codesage/sessions/<id>.json`.
+//! Structural session baselines persisted under `.codesage/sessions/<id>.json`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -16,39 +9,24 @@ use codesage_storage::Database;
 
 use crate::git_history::{assess_risk, assess_risk_batch};
 
-/// Subdirectory under `.codesage/` where session snapshots live.
 const SESSIONS_DIR: &str = "sessions";
 
-/// Number of highest-risk files to capture as the regression baseline at
-/// snapshot time. Files outside this set don't get a per-file risk delta
-/// in `session_end`, which keeps the snapshot bounded on huge repos.
+/// Only these highest-risk files receive per-file deltas at session end.
 const TOP_RISK_BASELINE: usize = 50;
 
-/// Per-file risk-score delta that counts as a regression. Below this we
-/// treat the change as noise (recomputation jitter, churn-percentile
-/// shifts as other files change).
+/// Ignore smaller deltas caused by churn-percentile shifts and scoring jitter.
 const RISK_REGRESSION_THRESHOLD: f64 = 0.05;
 
-/// Maximum risk regression that still passes the session gate. Stricter
-/// than the per-file threshold: a single file moving from 0.40 to 0.55
-/// is normal during active editing; one moving past 0.10 in delta is
-/// the kind of signal worth pausing on.
+/// A delta at or above this threshold fails the session gate.
 const RISK_FAIL_THRESHOLD: f64 = 0.10;
 
-/// Upper bound on snapshot file size before read/parse. Large monorepos store
-/// full file lists; this caps hostile or corrupted snapshots.
+/// Bound reads of repository-supplied snapshots before parsing.
 const MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Tolerated forward skew on a snapshot's `created_at`. A backwards clock
-/// step (NTP correction, WSL2 resume) can leave the stamp ahead of the
-/// current wall clock; only skew beyond this bound is treated as a corrupt
-/// or hostile snapshot. The computed session duration clamps to ≥ 0.
+/// Tolerate backwards clock corrections; duration still clamps to zero.
 const MAX_SNAPSHOT_FUTURE_SKEW_SECS: i64 = 24 * 60 * 60;
 
-/// Take a snapshot of the current index state and persist it under
-/// `.codesage/sessions/<session_id>.json`. Overwrites any existing
-/// snapshot for the same id (re-running session_start is how you reset
-/// a baseline mid-session).
+/// Persist the current index baseline, replacing any snapshot with the same ID.
 pub fn session_start(
     project_root: &Path,
     db: &Database,
@@ -79,9 +57,7 @@ pub fn session_start(
     Ok(snapshot)
 }
 
-/// Load the snapshot for `session_id` and diff it against current index
-/// state. The snapshot file is left in place so the same id can be
-/// re-diffed (useful for "is the regression still there after I fixed it?").
+/// Diff the current index against a saved baseline, retaining it for reuse.
 pub fn session_end(project_root: &Path, db: &Database, session_id: &str) -> Result<SessionDiff> {
     validate_session_id(session_id)?;
     let snapshot = read_snapshot(project_root, session_id).with_context(|| {
@@ -117,8 +93,6 @@ pub fn session_end(project_root: &Path, db: &Database, session_id: &str) -> Resu
         .collect();
     resolved_cycles.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
 
-    // File removed during the session — counted under removed_files,
-    // not as a regression.
     let baseline_files: Vec<String> = snapshot
         .top_risk_files
         .iter()
@@ -136,8 +110,7 @@ pub fn session_end(project_root: &Path, db: &Database, session_id: &str) -> Resu
             continue;
         }
         let Some(&after) = after_by_file.get(entry.file.as_str()) else {
-            // Scored set omits files whose per-file fallback failed; the
-            // failure flag is already set, keep the gate failing closed.
+            // Missing fallback scores must fail the gate closed.
             risk_assessment_failed = true;
             continue;
         };
@@ -274,17 +247,11 @@ fn compute_top_risk(
     files: &[String],
     limit: usize,
 ) -> Result<Vec<SessionRiskEntry>> {
-    // `assess_risk` runs a depth-2 reverse-dep BFS per file, so scoring every
-    // file is O(files × graph) and dominates session_start / project_overview
-    // on large repos. Churn is the dominant risk component, so when the file
-    // set is large, narrow to the highest-churn candidates before the BFS.
-    // Files absent from git history score ~0 anyway.
+    // Bound per-file dependency walks by selecting high-churn candidates.
     const CANDIDATE_BUDGET: usize = 400;
     let candidates: Vec<String> = if files.len() > CANDIDATE_BUDGET {
         let ranked = db.top_churn_files(CANDIDATE_BUDGET)?;
         if ranked.is_empty() {
-            // No git history → every file scores ~0; nothing to rank without
-            // running the full O(N) BFS sweep for no signal.
             return Ok(Vec::new());
         }
         let allowed: std::collections::HashSet<&str> = files.iter().map(String::as_str).collect();
@@ -309,14 +276,8 @@ fn compute_top_risk(
     Ok(scored)
 }
 
-/// Risk scores for `files` via one `assess_risk_batch` call, which computes
-/// the import-cycle SCC set and the churn-percentile table once instead of
-/// per file (per-file `assess_risk` re-runs both — tens of ms each on large
-/// repos, unaffordable across a 400-candidate sweep).
-///
-/// If the batch call fails as a whole, falls back to per-file scoring to
-/// preserve the skip-on-error semantics: files that error are logged and
-/// omitted, and the returned flag reports whether any file failed.
+/// Batch shared graph work; fall back to per-file scoring on batch failure.
+/// Omit failed files and return a flag indicating incomplete scores.
 fn risk_scores(db: &Database, files: &[String]) -> (Vec<(String, f64)>, bool) {
     if files.is_empty() {
         return (Vec::new(), false);
@@ -412,21 +373,8 @@ fn write_snapshot(project_root: &Path, snap: &SessionSnapshot) -> Result<()> {
         "snapshot payload too large to write ({} bytes, max {MAX_SNAPSHOT_BYTES})",
         json.len()
     );
-    let parent = path
-        .parent()
-        .context("snapshot path must have a parent directory")?;
-    let tmp_name = format!(
-        ".{}.tmp",
-        path.file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("snapshot")
-    );
-    let tmp_path = parent.join(tmp_name);
-    reject_snapshot_symlink(&tmp_path)?;
-    std::fs::write(&tmp_path, &json)
-        .with_context(|| format!("writing temp snapshot {}", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, &path)
-        .with_context(|| format!("renaming {} to {}", tmp_path.display(), path.display()))?;
+    crate::state_file::replace(&path, &json)
+        .with_context(|| format!("writing snapshot {}", path.display()))?;
     Ok(())
 }
 
@@ -460,15 +408,7 @@ fn read_snapshot(project_root: &Path, session_id: &str) -> Result<SessionSnapsho
     Ok(snap)
 }
 
-/// Refuse to read or write through a symlinked snapshot path — same posture as
-/// the MCP daemon's runtime-dir guard.
-/// Refuse to read or write a snapshot through a symlinked parent directory.
-///
-/// [`reject_snapshot_symlink`] inspects only the final path component, so a
-/// repo-planted `.codesage/sessions` (or `.codesage` itself) directory symlink
-/// would otherwise redirect `create_dir_all`, the temp write and the rename
-/// outside the project tree. Only components under `project_root` are checked;
-/// the root's own path may legitimately run through symlinks the user owns.
+/// Reject repository-planted parent symlinks; the project root may use trusted symlinks.
 fn reject_symlinked_parents(project_root: &Path, target: &Path) -> Result<()> {
     let Ok(rel) = target.strip_prefix(project_root) else {
         return Ok(());
@@ -490,9 +430,7 @@ fn reject_symlinked_parents(project_root: &Path, target: &Path) -> Result<()> {
 }
 
 fn reject_snapshot_symlink(path: &Path) -> Result<()> {
-    // lstat directly rather than gating on `Path::exists()`, which follows
-    // links: a *dangling* symlink reads as absent there, and the write would
-    // then create the file at the link's target.
+    // `exists()` misses dangling symlinks that could redirect a write.
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -504,8 +442,6 @@ fn reject_snapshot_symlink(path: &Path) -> Result<()> {
             path.display()
         );
     }
-    // A cloned repo can also ship a directory at this name: the temp file
-    // would be written and only the rename would fail, leaving state behind.
     if !meta.is_file() {
         bail!(
             "refusing to use session snapshot {}: it is not a regular file",
@@ -518,6 +454,24 @@ fn reject_snapshot_symlink(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_snapshots_of_one_session_remain_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(dir.path(), &snapshot_with_created_at("same", now_unix())).unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let root = dir.path();
+                scope.spawn(move || {
+                    for _ in 0..20 {
+                        write_snapshot(root, &snapshot_with_created_at("same", now_unix()))
+                            .unwrap();
+                        assert_eq!(read_snapshot(root, "same").unwrap().session_id, "same");
+                    }
+                });
+            }
+        });
+    }
 
     #[test]
     fn validate_session_id_accepts_basic_ids() {
@@ -550,9 +504,6 @@ mod tests {
 
     #[test]
     fn session_end_tolerates_small_future_created_at_with_zero_duration() {
-        // A backwards clock step (NTP correction, WSL2 resume) can leave the
-        // snapshot stamp slightly ahead of the wall clock; session_end must
-        // still work rather than hard-failing until time catches up.
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open_in_memory().unwrap();
         let snap = snapshot_with_created_at("skew", now_unix() + 60);
@@ -582,8 +533,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn write_snapshot_refuses_a_symlinked_sessions_dir() {
-        // `.codesage/sessions` ships with the repo, so it can be a directory
-        // symlink; `create_dir_all` and the rename would follow it out of tree.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let outside = root.join("outside");
@@ -625,9 +574,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn write_snapshot_refuses_a_dangling_symlinked_temp_file() {
-        // The temp name is derived from the session id, so it is predictable
-        // and plantable. A dangling link reads as absent to `Path::exists()`.
+    fn write_snapshot_does_not_use_a_planted_legacy_temp_file() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let target = root.join("created-by-attacker");
@@ -635,20 +582,14 @@ mod tests {
         std::fs::create_dir_all(&sessions).unwrap();
         std::os::unix::fs::symlink(&target, sessions.join(".s1.json.tmp")).unwrap();
 
-        let err = write_snapshot(root, &snapshot_with_created_at("s1", now_unix())).unwrap_err();
-
-        assert!(
-            format!("{err:#}").contains("is a symlink"),
-            "expected a symlink refusal, got: {err:#}"
-        );
+        write_snapshot(root, &snapshot_with_created_at("s1", now_unix())).unwrap();
+        assert_eq!(read_snapshot(root, "s1").unwrap().session_id, "s1");
         assert!(!target.exists(), "the temp write created the link's target");
     }
 
     #[cfg(unix)]
     #[test]
     fn write_snapshot_refuses_a_dangling_final_snapshot_symlink() {
-        // `reject_snapshot_symlink` used to gate on `Path::exists()`, which
-        // follows links, so a dangling link read as absent.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let target = root.join("created-by-attacker");
@@ -668,8 +609,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn write_snapshot_refuses_a_directory_at_the_snapshot_path() {
-        // A cloned directory here used to pass the symlink-only check: the
-        // temp file was written and only the rename failed.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let sessions = root.join(".codesage").join(SESSIONS_DIR);

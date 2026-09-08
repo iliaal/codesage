@@ -3,14 +3,7 @@ use rmcp::schemars;
 
 const PROJECT_ARG_DESC: &str = "Absolute path to the project root. Must be an onboarded CodeSage project (contains .codesage/index.db).";
 
-/// Accept integer numeric params from agents that occasionally JSON-encode
-/// numbers as strings (`{"limit": "5"}` instead of `{"limit": 5}`). The
-/// default `Option<usize>` serde derive rejects the string form with
-/// `invalid type: string "5", expected usize` — a hard error at the MCP
-/// protocol layer that leaves the caller guessing. Retrospective session
-/// analysis (`bench/analyze-codesage-quality.py`) found this was 100% of
-/// the `find_coupling` error results, so the fix applies across every
-/// integer param: `limit`, `offset`, `depth`.
+/// Agents may encode numeric arguments as strings; accept both forms.
 fn deser_optional_usize<'de, D>(d: D) -> std::result::Result<Option<usize>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -54,9 +47,7 @@ where
         S(String),
     }
 
-    // NaN/inf make every `value >= min_jaccard` comparison false, so a
-    // non-finite threshold silently returns zero results instead of erroring.
-    // `f32::parse` accepts "nan"/"inf", so reject non-finite on both paths.
+    // f32 parsing accepts NaN/inf, which make similarity thresholds silently reject matches.
     fn finite<E: serde::de::Error>(n: f32) -> std::result::Result<f32, E> {
         if n.is_finite() {
             Ok(n)
@@ -426,6 +417,24 @@ pub struct EmbedTextsResult {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct RerankPairsParams {
+    #[schemars(description = PROJECT_ARG_DESC)]
+    pub project: String,
+    pub model: String,
+    pub device: String,
+    pub query: String,
+    pub documents: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct RerankPairsResult {
+    pub model: String,
+    pub device: String,
+    pub scores: Vec<f32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectOverviewParams {
     #[schemars(description = PROJECT_ARG_DESC)]
     pub project: String,
@@ -461,8 +470,6 @@ mod tests {
 
     #[test]
     fn coupling_params_accept_stringy_limit() {
-        // Session logs showed 100% of find_coupling MCP -32602 errors were
-        // agents sending `"limit": "5"` as a JSON string. Must parse.
         let p: CouplingParams = serde_json::from_value(json!({
             "project": "/p",
             "file_path": "a.rs",
@@ -490,8 +497,6 @@ mod tests {
             "limit": "not-a-number",
         }));
         assert!(r.is_err(), "non-numeric string must still error");
-        // Error should name the offending value rather than be a generic
-        // "expected usize" so the agent can fix its request.
         let msg = r.unwrap_err().to_string();
         assert!(
             msg.contains("not-a-number"),
@@ -583,10 +588,6 @@ mod tests {
 
     #[test]
     fn find_similar_params_accept_out_of_range_min_jaccard_for_param_layer_clamp() {
-        // Out-of-range is a clamp, not a deser error: the tool layer clamps
-        // to [0, 1] and reports the applied value under `_meta.clamps`.
-        // (Non-finite values ARE still rejected here — NaN/inf silently
-        // zero the results instead of erroring.)
         for v in [1.5, -0.2, 0.0, 1.0] {
             let p: FindSimilarParams = serde_json::from_value(json!({
                 "project": "/p",
@@ -625,9 +626,6 @@ mod tests {
 
     #[test]
     fn find_symbol_rejects_unknown_kind() {
-        // Pre-fix, a bad kind silently dropped the filter and returned
-        // unfiltered results. Typed enum params make it a serde error the
-        // MCP layer reports as -32602.
         let r: Result<FindSymbolParams, _> = serde_json::from_value(json!({
             "project": "/p",
             "name": "x",
@@ -752,11 +750,6 @@ mod tests {
         assert!(r.is_err(), "unknown language must error, not unfilter");
     }
 
-    /// Pre-`deny_unknown_fields`, a misspelled or invented argument
-    /// (`max_results` for `limit`, `token_budget` for nothing) was silently
-    /// dropped and the tool answered with defaults. Every params struct must
-    /// now refuse it, and the error must name the offending field, say
-    /// `expected`, and list at least one field the caller could have meant.
     #[test]
     fn every_params_struct_rejects_an_unknown_field_and_names_the_valid_set() {
         fn check<T: serde::de::DeserializeOwned>(struct_name: &str, mut valid: serde_json::Value) {
@@ -848,8 +841,6 @@ mod tests {
 
     #[test]
     fn search_unknown_field_error_offers_limit_as_the_alternative() {
-        // The agent that sent `max_results` needs to see `limit` in the
-        // refusal to self-correct on the next call.
         let err = serde_json::from_value::<SearchParams>(json!({
             "project": "/p",
             "query": "auth",
@@ -865,9 +856,6 @@ mod tests {
 
     #[test]
     fn impact_params_accept_every_declared_field_with_stringy_numerics() {
-        // Guards against the closed field set accidentally excluding a
-        // declared field: every ImpactParams field, string-encoded numerics
-        // included, must still deserialize.
         let p: ImpactParams = serde_json::from_value(json!({
             "project": "/p",
             "target": "Foo",

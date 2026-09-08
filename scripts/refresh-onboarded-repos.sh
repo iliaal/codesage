@@ -44,7 +44,6 @@ while [ $# -gt 0 ]; do
 done
 
 repo_root() {
-	# echo the project root for a .codesage dir
 	dirname "$1"
 }
 
@@ -67,11 +66,7 @@ if [ ! -x "$onboard_bin" ]; then
 	onboard_bin=""
 fi
 
-# Discover onboarded repos. `find` is bounded to common roots to avoid a
-# whole-filesystem scan; extend the list as needed.
-# Build the find-root list, dropping any that don't exist so find won't
-# error out on missing dirs (e.g. ~/projects/ on a machine that doesn't
-# use that convention).
+# Bound discovery to existing common roots, avoiding a whole-filesystem scan.
 search_roots=()
 for r in "$HOME/ai" "$HOME/cred" "$HOME/php-src" "$HOME"/php-src-* "$HOME/projects"; do
 	[ -d "$r" ] && search_roots+=("$r")
@@ -112,10 +107,7 @@ if [ "$dry_run" -eq 1 ]; then
 	exit 0
 fi
 
-# `codesage index` exits 75 (EX_TEMPFAIL) when another indexer held the
-# project lock for the whole wait: nothing was indexed and nothing broke.
-# That repo is reported for a later retry, and its hook and hint refresh
-# still run — they do not need the index.
+# Lock contention leaves indexing pending; hooks and hints can still refresh.
 EXIT_LOCK_HELD=75
 
 failures=()
@@ -152,11 +144,6 @@ for root in "${active[@]:-}"; do
 
 	if [ -n "$onboard_bin" ]; then
 		echo "    [3/3] refresh hint"
-		# --no-mcp / --no-hooks: those steps were just done by `index` and
-		# `install-hooks` above; skip the duplicate. Pass --no-mcp at the
-		# global level only if it would otherwise re-register; the onboard
-		# script is idempotent so this is safe either way. We keep --no-hooks
-		# to avoid re-running install-hooks twice.
 		if ! "$onboard_bin" --refresh-hint --no-mcp --no-hooks "$root" 2>&1 | sed 's/^/        /'; then
 			failures+=("$root (hint)")
 			echo "        FAILED"

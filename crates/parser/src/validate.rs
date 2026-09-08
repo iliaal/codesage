@@ -1,13 +1,4 @@
-//! Validation gate for the embedded tree-sitter queries.
-//!
-//! Symbol and reference `.scm` queries are compiled lazily (per language, on
-//! first use) via `LazyLock` with a panicking `.expect()`. That means a
-//! tree-sitter grammar version bump that renames or removes a node type or
-//! field doesn't fail the build — it panics the indexer worker the first time a
-//! file of the affected language is parsed, in production. `Query::new`
-//! validates the query against the grammar's node-type/field schema, so
-//! force-compiling every query up front turns that latent runtime panic into an
-//! eager, CI-visible error.
+//! Validate lazy tree-sitter queries before incompatible grammars panic at first use.
 
 use anyhow::{Result, bail};
 use codesage_protocol::Language;
@@ -15,15 +6,8 @@ use tree_sitter::Query;
 
 use crate::parse::ts_language;
 
-/// Compile every embedded symbol and reference query against its grammar and
-/// verify the capture names the extractors depend on (`@name`/`@def` for symbol
-/// queries, `@ref` for reference queries) exist. Returns an aggregated error
-/// naming every failing (language, query-kind) pair rather than stopping at the
-/// first — a grammar bump usually breaks several queries at once, and seeing all
-/// of them is more useful than fixing them one panic at a time.
-///
-/// Backs the `cargo test` gate in this module and the `queries` check in
-/// `codesage doctor`.
+/// Compile all queries and verify required captures and positional kind mappings.
+/// Aggregate failures by language and query kind for tests and `codesage doctor`.
 pub fn validate_all_queries() -> Result<()> {
     let mut errors = Vec::new();
 
@@ -46,13 +30,8 @@ pub fn validate_all_queries() -> Result<()> {
     }
 }
 
-/// Expected top-level pattern count per (language, query-kind) pair.
-/// Tree-sitter pattern indices are positional and the `*_kind_map`
-/// functions in `extract`/`references` map them by number, so appending,
-/// removing, or reordering a pattern in an `.scm` file silently re-kinds
-/// every pattern after it. `Query::new` already catches grammar bumps; this
-/// table catches same-schema drift. When you change an `.scm` file, update
-/// the count here AND the corresponding kind map.
+/// Keep counts and kind maps synchronized with `.scm` pattern order.
+/// Counts catch additions/removals, but cannot detect same-count reordering.
 const EXPECTED_SYMBOL_PATTERN_COUNTS: &[(Language, usize)] = &[
     (Language::Php, 8),
     (Language::Python, 2),
@@ -176,10 +155,6 @@ mod tests {
 
     #[test]
     fn all_embedded_queries_compile_against_their_grammars() {
-        // Grammar-bump guard: if a tree-sitter dependency renames a node type or
-        // field, the matching .scm query stops compiling. Without this gate that
-        // surfaces as a runtime panic on the first file of the affected language;
-        // with it, the break fails CI.
         if let Err(e) = validate_all_queries() {
             panic!("embedded tree-sitter queries failed validation:\n{e:#}");
         }
@@ -187,9 +162,6 @@ mod tests {
 
     #[test]
     fn source_tables_cover_every_language() {
-        // The validation gate is only as good as its coverage: if a language is
-        // added to extract/references but left out of the SOURCES tables, its
-        // queries would never be checked. Assert all four tables list all 9.
         let langs = [
             Language::Php,
             Language::Python,
@@ -231,8 +203,6 @@ mod tests {
 
     #[test]
     fn pattern_counts_match_the_kind_maps() {
-        // The positional contract itself: every compiled query has exactly
-        // the tabled number of patterns, and each one maps to a kind.
         if let Err(e) = validate_all_queries() {
             panic!("pattern-count gate failed:\n{e:#}");
         }

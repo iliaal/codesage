@@ -69,14 +69,6 @@ fn ignores_python_non_rationale_comments_and_string_literals() {
 
 #[test]
 fn attaches_rationale_above_decorated_python_defs() {
-    // Regression: a rationale comment above a `@decorator`-prefixed def
-    // is a sibling of `decorated_definition`, not of the inner
-    // `function_definition`. Walking prev_sibling from the inner node
-    // hits the `decorator` (non-comment) and breaks before reaching the
-    // comment. This pattern dominates real-world Python (`@app.route`,
-    // `@property`, `@dataclass`, `@lru_cache`, `@staticmethod`) — every
-    // decorated def would silently miss its rationale without the
-    // wrapper-anchored walk.
     let symbols = python_rationale_symbols();
 
     let single = symbol(&symbols, "single_decorator_todo");
@@ -89,9 +81,6 @@ fn attaches_rationale_above_decorated_python_defs() {
     assert_eq!(stacked.rationale[0].kind, RationaleKind::Fixme);
     assert_eq!(stacked.rationale[0].text, "race on shared state");
 
-    // Decorated methods inside a class body — same wrapper, different
-    // parent (class block instead of module). Verifies the anchor
-    // resolves correctly regardless of containing scope.
     let cached = symbol(&symbols, "cached_value");
     assert_eq!(cached.rationale.len(), 1);
     assert_eq!(cached.rationale[0].kind, RationaleKind::Note);
@@ -108,8 +97,7 @@ fn attaches_rationale_above_decorated_python_defs() {
         "must be a classmethod for the registry"
     );
 
-    // Regression: rationale parked at class_definition level (sibling of the
-    // body block, not inside it) must attach to the first method.
+    // The first method's comment is outside the body block, under class_definition.
     let first_method = symbol(&symbols, "first_method");
     assert_eq!(first_method.rationale.len(), 1);
     assert_eq!(first_method.rationale[0].kind, RationaleKind::Why);

@@ -1,27 +1,8 @@
-//! Convert tree-sitter byte-based column offsets to UTF-8 character columns.
-//!
-//! Tree-sitter's `Node::start_position()` / `end_position()` return a `Point`
-//! whose `column` field is bytes from the start of the line, not codepoints.
-//! For ASCII source that's the same number, but a single CJK ideograph or
-//! emoji at the start of a line shifts the byte column past where any editor
-//! would render the cursor — goto-definition jumps land in the wrong place.
-//!
-//! The 0.26 Rust binding doesn't expose `ts_node_*_point_utf8`, so we do the
-//! conversion in-tree: walk back to the line start, decode the prefix as
-//! UTF-8, count the chars.
+//! Convert tree-sitter byte columns to Unicode codepoint columns.
 
 use tree_sitter::Node;
 
-/// UTF-8 character column for `byte_offset` within `source`.
-///
-/// `byte_offset` is the absolute byte index in `source` (typically
-/// `node.start_byte()` or `node.end_byte()`). The function locates the
-/// containing line by scanning back to the previous `\n`, then counts UTF-8
-/// `char` codepoints in the prefix between the line start and `byte_offset`.
-///
-/// Falls back to the byte count when the prefix isn't valid UTF-8 — better
-/// to return the wrong-but-monotonic byte column than to panic on a binary
-/// blob that slipped past the discovery filter.
+/// Column at an absolute byte offset; invalid UTF-8 falls back to byte count.
 fn utf8_column_for_byte(source: &[u8], byte_offset: usize) -> u32 {
     let byte_offset = byte_offset.min(source.len());
     let line_start = source[..byte_offset]
@@ -65,8 +46,6 @@ mod tests {
 
     #[test]
     fn cjk_codepoints_count_as_one_column() {
-        // Each CJK char is 3 UTF-8 bytes. Byte column would be 9 at the end of
-        // 「日本語」; codepoint column should be 3.
         let source = "日本語 = 1;\n".as_bytes();
         let after_cjk = "日本語".len(); // 9 bytes
         assert_eq!(utf8_column_for_byte(source, after_cjk), 3);
@@ -74,7 +53,6 @@ mod tests {
 
     #[test]
     fn emoji_counts_as_one_column() {
-        // A single 🦀 is 4 UTF-8 bytes but one char.
         let source = "🦀 crab\n".as_bytes();
         let after_crab = "🦀".len(); // 4 bytes
         assert_eq!(utf8_column_for_byte(source, after_crab), 1);
@@ -82,7 +60,6 @@ mod tests {
 
     #[test]
     fn column_resets_at_each_line() {
-        // Second line starts after the newline; columns count from there.
         let source = b"alpha\nbeta\n";
         let beta_offset = "alpha\n".len(); // 6
         assert_eq!(utf8_column_for_byte(source, beta_offset), 0);
@@ -95,8 +72,6 @@ mod tests {
         let mut source = b"abc".to_vec();
         source.push(0xFF); // not a valid UTF-8 start byte
         source.push(b'd');
-        // byte_offset 5 (after the invalid byte and one more letter)
-        // prefix "abc\xFFd" is not valid UTF-8 — fallback returns byte length.
         assert_eq!(utf8_column_for_byte(&source, 5), 5);
     }
 }

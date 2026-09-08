@@ -12,11 +12,7 @@ static CPP_REF_QUERY: &str = include_str!("queries/cpp_refs.scm");
 static JAVA_REF_QUERY: &str = include_str!("queries/java_refs.scm");
 static RUST_REF_QUERY: &str = include_str!("queries/rust_refs.scm");
 static JS_REF_QUERY: &str = include_str!("queries/javascript_refs.scm");
-// TypeScript mirrors JavaScript's reference patterns (import / require / call /
-// member-call / re-export / instantiation) but adds one TS-only pattern for
-// class inheritance: TS wraps the superclass in an `extends_clause` node that
-// does not exist in the JavaScript grammar, so it cannot live in the shared
-// JS file (the query would fail to compile against tree-sitter-javascript).
+// TS `extends_clause` and type patterns cannot compile against the JS grammar.
 static TS_REF_QUERY: &str = include_str!("queries/typescript_refs.scm");
 static GO_REF_QUERY: &str = include_str!("queries/go_refs.scm");
 
@@ -180,9 +176,7 @@ fn python_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
         3 => Some(ReferenceKind::ImportBinding), // from X import Y as Z (aliased)
         4 | 5 => Some(ReferenceKind::Call),      // call expression
         6 => Some(ReferenceKind::Import),        // relative import module (from . import x)
-        // Decorators (@property, @retry(..), @app.route, @app.route(..)).
-        // Filed as Call to match Java's annotation handling, so decoration
-        // sites surface through the same kind query.
+        // Classify decorators as calls, matching Java annotations.
         7..=10 => Some(ReferenceKind::Call),
         _ => None,
     }
@@ -213,9 +207,7 @@ fn java_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
         1..=3 => Some(ReferenceKind::Instantiation), // object_creation_expression
         4..=9 => Some(ReferenceKind::Inheritance),   // extends / implements
         10 | 11 => Some(ReferenceKind::Import),      // import_declaration
-        // Annotation usages (`@Override`, `@Test(...)`, `@pkg.Foo`). Filed as
-        // Call to match Python decorator handling — agents querying
-        // `find_references("Test", kind="call")` get the decoration sites.
+        // Classify annotations as calls, matching Python decorators.
         12..=15 => Some(ReferenceKind::Call),
         _ => None,
     }
@@ -357,9 +349,7 @@ pub fn extract_references(
     let mut matches = cursor.matches(query, root, source);
     let rhs_idx = spec.rhs_idx;
 
-    // Collect first: the JS/TS value-destructure filter below needs the full
-    // set of same-file import bindings before it can judge any one match.
-    // Nodes borrow the tree, so holding them past the cursor is free.
+    // Receiver filtering needs all same-file import bindings before judging matches.
     struct Pending<'a> {
         pattern: usize,
         node: tree_sitter::Node<'a>,
@@ -379,11 +369,7 @@ pub fn extract_references(
         });
     }
 
-    // Names bound to an imported module in this file (see
-    // `js_ts_binding_pattern`). A value-destructure `const { X } = rhs` or a
-    // member access `rhs.X` only names a module export when `rhs` is one of
-    // these; otherwise it is an arbitrary object (`const { data } =
-    // response`, `response.data`) and its keys are not references to anything.
+    // Only imported receivers identify module exports; arbitrary object keys do not.
     let imports_js_ts = matches!(language, Language::JavaScript | Language::TypeScript);
     let import_bindings: std::collections::HashSet<String> = if imports_js_ts {
         pending
@@ -401,10 +387,6 @@ pub fn extract_references(
             continue;
         };
 
-        // Receiver-gated patterns (JS and TS): keep only shapes whose receiver
-        // is a same-file import binding. `const { Axios } = axios` and
-        // `axios.CancelToken` (imported) stay; `const { data } = response` and
-        // `response.data` (not imported) are dropped.
         if imports_js_ts && js_ts_receiver_gated_pattern(language, p.pattern) {
             let rhs_bound = p
                 .rhs
@@ -488,15 +470,7 @@ pub fn extract_references(
     Ok(refs)
 }
 
-/// Strip a single pair of matching surrounding `"` or `'` quotes from a
-/// reference token (import source paths, `require()` arguments). Returns
-/// the inner slice on a match, the original on no match.
-///
-/// Length guard avoids a slice panic on a tree-sitter `(string)` capture
-/// of a single bare quote — possible from malformed/truncated source where
-/// the parser still emits a partial node. Without it,
-/// `s[1..s.len() - 1]` on a 1-byte string panics with
-/// `slice index starts at 1 but ends at 0` and aborts the indexer worker.
+/// Strip matching quotes, preserving partial one-byte captures from malformed input.
 fn strip_surrounding_quotes(s: &str) -> &str {
     if s.len() < 2 {
         return s;
@@ -532,10 +506,6 @@ mod tests {
 
     #[test]
     fn does_not_panic_on_single_bare_quote() {
-        // Regression: the previous inline `[1..len-1]`
-        // slice panicked on `"\""`, aborting the rayon-parallel indexer
-        // worker for the entire run when tree-sitter emitted a 1-byte
-        // string capture on malformed input.
         assert_eq!(strip_surrounding_quotes("\""), "\"");
         assert_eq!(strip_surrounding_quotes("'"), "'");
     }
@@ -596,8 +566,6 @@ mod tests {
 
     #[test]
     fn javascript_member_access_off_an_import_binding_names_the_property() {
-        // `axios.CancelToken.source()`: pattern 3 records the callee `source`;
-        // the receiver `CancelToken` used to be recorded nowhere.
         let src = "import axios from './lib/axios.js';\n\
                    const source = axios.CancelToken.source();\n\
                    assert.strictEqual(typeof axios.CancelToken, 'function');\n\
@@ -605,8 +573,6 @@ mod tests {
         let refs = refs_from_source(src, Language::JavaScript);
         assert_eq!(rows(&refs, "CancelToken", ReferenceKind::ImportBinding), 3);
         assert_eq!(rows(&refs, "source", ReferenceKind::Call), 1);
-        // Callee members stay pattern 3's row only: no second row for `source`
-        // or `strictEqual`.
         assert_eq!(rows(&refs, "source", ReferenceKind::ImportBinding), 0);
         assert_eq!(rows(&refs, "strictEqual", ReferenceKind::ImportBinding), 0);
     }
@@ -621,11 +587,7 @@ mod tests {
 
     #[test]
     fn javascript_member_access_off_an_unbound_receiver_is_ignored() {
-        // Nothing binds `response` or `exports` to a module here, so neither
-        // `data` nor `CancelToken` may become a reference: `response.data`
-        // would otherwise make every HTTP test a dependent of any symbol
-        // named `data`. This is the deliberate gap: a receiver bound by
-        // `await import(...)` is also unbound and its members are dropped.
+        // Dynamic `await import(...)` bindings are intentionally unsupported.
         let src = "import axios from './lib/axios.js';\n\
                    const response = await axios.get('/x');\n\
                    const body = response.data;\n\
@@ -635,8 +597,6 @@ mod tests {
         assert_eq!(rows(&refs, "data", ReferenceKind::ImportBinding), 0);
         assert_eq!(rows(&refs, "CancelToken", ReferenceKind::ImportBinding), 0);
         assert_eq!(rows(&refs, "get", ReferenceKind::Call), 1);
-        // The callee member is pattern 3's row alone: `member_is_callee`
-        // keeps pattern 16 from adding a duplicate ImportBinding for `get`.
         assert_eq!(rows(&refs, "get", ReferenceKind::ImportBinding), 0);
     }
 

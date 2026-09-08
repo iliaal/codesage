@@ -190,7 +190,6 @@ def main() -> int:
         env_extra={"CODESAGE_QUALIFIED_NAME_BOOST": "1"},
     )
 
-    # Per-query deltas (only rows that moved).
     moves = []
     for b, c in zip(baseline["rows"], cfg2["rows"]):
         if b["rank"] != c["rank"]:
@@ -208,7 +207,6 @@ def main() -> int:
         delta = "✓" if cc is not None and (bb is None or cc < bb) else "✗" if bb is not None and (cc is None or cc > bb) else "·"
         print(f"  {delta} [{before:>4s} → {after:<4s}]  {q}")
 
-    # JSON sidecar for downstream aggregation.
     sidecar = {
         "repo": project_root.name,
         "baseline": {k: v for k, v in baseline.items() if k != "rows"},

@@ -1,5 +1,19 @@
 ## [Unreleased]
 
+### Added
+
+- `brief` and `review_rehearsal` report other branches editing the same files, with scan limits disclosed; branch evidence works without a structural index.
+
+### Changed
+
+- CLI `search` and `export` reuse the running daemon's reranker session instead of loading a private model.
+
+### Fixed
+
+- The watcher reconciles live `.gitignore` changes and reports pending or parked reconciliation in `watch status`.
+- `codesage mcp` and `codesage daemon` reject overlong Unix socket paths before startup and identify runtime-directory remedies.
+- Preserve watcher status, session snapshots, and valid brief-fire and drift log records during concurrent or interrupted writes.
+
 ## [0.27.0] - 2026-09-08
 
 ### Added

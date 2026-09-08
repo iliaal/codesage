@@ -40,15 +40,9 @@ const SECONDS_PER_DAY: f64 = 86_400.0;
 const CHURN_CLAMP: f64 = 3.0;
 const CHURN_DIVISOR: f64 = 100.0;
 const MIN_CO_CHANGE_COUNT: u32 = 3;
-/// Walk only the last ~2 years of history. With τ=180d, commits older than
-/// ~3-4 half-lives contribute weight below the rounding floor (~0.017 at 2y);
-/// pre-window commits are essentially zero-weight and just inflate first-onboard
-/// time. On long-history projects (php-src: 146k commits back to 1999) this
-/// trims the walk by ~7×. Slow-coupling pairs that only co-change once every
-/// 8-12 months still accumulate count ≥ 3 within the window.
+/// Bound onboarding cost by excluding old commits whose decayed weight is small.
 const HISTORY_WINDOW_DAYS: f64 = 730.0;
-/// Avoid building O(n²) pair sets for sweeping refactor commits. Anything bigger than this
-/// is almost certainly a vendored update or auto-formatter, not a meaningful co-change.
+/// Bound quadratic pair generation and suppress broad mechanical co-changes.
 const MAX_FILES_PER_COMMIT_FOR_COCHANGE: usize = 30;
 /// Cell width of the fixed 90-day calendar grid (from the unix epoch) used
 /// for the recurrence window mask. Commits in different cells set different
@@ -117,14 +111,12 @@ pub enum IndexMode {
     Auto,
 }
 
-/// Shorthand: full-mode scan with no extra excludes. Used by tests that want the
-/// simplest entry point; production callers go through `git_history_index_with_options`.
+/// Full scan with no extra excludes.
 pub fn git_history_index(db: &Database, root: &Path) -> Result<GitIndexStats> {
     git_history_index_with_options(db, root, &[], IndexMode::Full)
 }
 
-/// Full control: excludes + mode. Public entry point for CLI/hook callers that want
-/// incremental behavior.
+/// Index history with additional excludes and the requested scan mode.
 pub fn git_history_index_with_options(
     db: &Database,
     root: &Path,
@@ -183,9 +175,8 @@ pub fn git_history_index_with_options(
 /// Returns two glob sets:
 /// - `hard_exclude`: files that don't enter `git_files` at all (vendor, build
 ///   outputs, binaries, lock files, generated docs).
-/// - `test_like`: files that enter `git_files` (so `recommend_tests` and
-///   `assess_risk` test-gap detection can find them) but are dropped from
-///   co-change pair generation. Tests, benches.
+/// - `test_like`: files retained in `git_files` and source-test pairs, but
+///   excluded from test-test pairs.
 fn compile_excludes(extra: &[String]) -> Result<(GlobSet, GlobSet)> {
     let mut hard: Vec<String> = DEFAULT_EXCLUDE_PATTERNS
         .iter()
@@ -235,10 +226,7 @@ fn run_full(
         );
     }
 
-    // Wrap clear + every upsert in one transaction. SQLite default-mode commits
-    // each execute, which means N rows = N fsync()s. On large repos (php-src
-    // ~25k files + ~10k pairs) that turns into a multi-minute disk wait
-    // (jbd2_log_wait_commit). One transaction = one fsync.
+    // Replace the index atomically and avoid one durable commit per row.
     let mut co_change_kept = 0usize;
     db.execute_batch(|db| {
         db.clear_git_data()?;
@@ -303,10 +291,7 @@ fn run_incremental(
         );
     }
 
-    // One transaction wraps decay-scale + every upsert. See run_full for the
-    // fsync motivation. Decay scale needs to be inside the same transaction
-    // as the deltas, otherwise a crash mid-write leaves us with scaled-but-
-    // not-incremented rows.
+    // Commit decay and deltas together so a crash cannot leave only the decay applied.
     let mut co_change_kept = 0usize;
     db.execute_batch(|db| {
         decay_git_history_to_now(db, last_indexed_at, now)?;
@@ -406,12 +391,7 @@ fn accumulate(
         stats.churn_score += weight;
     }
 
-    // Skip pairs where BOTH sides are test-like. Test-test co-changes are noise
-    // (running multiple test files in one PR doesn't imply the underlying code
-    // is related). Source-test pairs are kept — that's the signal
-    // `recommend_tests` uses to surface tests that historically follow a source
-    // change (essential for codebases like php-src where .phpt tests are the
-    // primary partner of .c source edits). Source-source pairs are kept as before.
+    // Source-test pairs support test recommendations; test-test pairs add noise.
     if kept_changes.len() <= MAX_FILES_PER_COMMIT_FOR_COCHANGE {
         for i in 0..kept_changes.len() {
             for j in (i + 1)..kept_changes.len() {
@@ -454,28 +434,13 @@ fn resolve_head_sha(root: &Path) -> Result<String> {
         .to_string())
 }
 
-/// Files that changed on `HEAD` since it diverged from `git_ref`, as a set
-/// of repo-relative POSIX paths. Runs `git diff --name-only --relative
-/// <git_ref>...HEAD` — the three-dot form (merge-base symmetric difference),
-/// matching clawpatch's `changedFilesSince`, so the result is "what HEAD
-/// changed relative to where it branched from `git_ref`" rather than every
-/// difference between the two tips. `--relative` yields paths relative to
-/// the repo root (cwd), which is how `feature_files.path` is stored, so the
-/// caller can intersect directly without normalization.
-///
-/// Returns an error if the ref can't be resolved (exit 128) so the caller
-/// can surface a clear "unknown git ref" message rather than silently
-/// treating it as "nothing changed".
+/// Repo-relative paths changed between the merge base of `git_ref` and `HEAD`
+/// and `HEAD` itself. Unresolvable refs return an error, not an empty set.
 pub fn changed_files_since(
     root: &Path,
     git_ref: &str,
 ) -> Result<std::collections::HashSet<String>> {
-    // Reject a leading-dash ref so it can never be parsed as a git option.
-    // `since` arrives from the MCP `list_features` arg and the `--since` CLI
-    // flag as free-form text; a value like `-O/path` would otherwise be
-    // consumed as an option (the trailing `...HEAD` defuses long flags but not
-    // short attached-value ones). The `--` separator below is the structural
-    // guard; this is the belt-and-suspenders message.
+    // Appending `...HEAD` does not neutralize attached-value options such as `-O/path`.
     if git_ref.starts_with('-') {
         return Err(anyhow!(
             "invalid git ref `{git_ref}`: must not start with '-'"
@@ -504,16 +469,8 @@ pub fn changed_files_since(
         .collect())
 }
 
-/// Whether a feature should survive a `--since <ref>` filter: true when any
-/// of its entry / owned / context files is in `changed`. Test-role files are
-/// excluded on purpose — a slice whose own code is untouched shouldn't
-/// resurface just because a neighbouring test moved; the test suite has its
-/// own slice (anchored on the test file as Entry) that surfaces instead.
-///
-/// Entry is included because for many slice kinds (Rust crates, route
-/// handlers, C `main()` binaries) the entrypoint IS the source file and is
-/// recorded only with the `Entry` role; dropping it made `--since` return
-/// nothing for those, the bug this predicate was extracted to guard.
+/// Match changed entry, owned, or context files. Entry-only slices count;
+/// test-role changes belong to the test suite's own slice.
 pub fn feature_touched_since(
     files: &[codesage_protocol::FeatureFileRef],
     changed: &std::collections::HashSet<String>,
@@ -528,11 +485,7 @@ pub fn feature_touched_since(
 }
 
 fn is_ancestor(root: &Path, old: &str, new: &str) -> Result<bool> {
-    // Distinguishes spawn failure (git missing / setup error -> propagate) from a clean
-    // exit-1 (genuine "not an ancestor", caller falls back to full rescan). Exit-128
-    // (sha doesn't exist after force-push or shallow clone) is also Ok(false): same
-    // recovery path, but worth a note in logs because it tells you why a hook is
-    // doing extra work.
+    // Missing ancestry or an unavailable SHA requires a full scan; spawn errors propagate.
     let status = Command::new("git")
         .args(["merge-base", "--is-ancestor", old, new])
         .current_dir(root)
@@ -613,9 +566,7 @@ fn parse_log(raw: &str) -> Vec<Commit> {
             }
             let mut parts = rest.splitn(3, '\t');
             let _sha = parts.next().unwrap_or("");
-            // Drop commits with unparseable timestamps. ts=0 would survive as a
-            // 1970-01-01 commit that contributes nothing to churn (decay≈0) yet still
-            // increments fix_count and total_commits, silently skewing fix_ratio.
+            // A fabricated timestamp of zero would still affect fix counts despite zero churn.
             let ts: Option<i64> = parts.next().and_then(|s| s.parse().ok());
             let Some(ts) = ts else {
                 skipped_commits += 1;
@@ -655,9 +606,7 @@ fn parse_log(raw: &str) -> Vec<Commit> {
         if path.is_empty() || added_s == "-" || deleted_s == "-" {
             continue;
         }
-        // Drop the change rather than fabricate zeros: a parse failure was
-        // indistinguishable from "0 lines added/deleted", which means a corrupt log
-        // line silently turned into a zero-churn commit-to-file entry.
+        // Malformed counts must not become zero-churn history entries.
         let (Ok(added), Ok(deleted)) = (added_s.parse::<u32>(), deleted_s.parse::<u32>()) else {
             skipped_changes += 1;
             continue;
@@ -701,12 +650,8 @@ fn normalize_rename_path(raw: &str) -> String {
         let suffix = &raw[close + 1..];
         return format!("{prefix}{after_arrow_in_braces}{suffix}");
     }
-    // Braceless form carries full paths on both sides with no shared
-    // prefix/suffix elision, so the destination is everything right of the
-    // arrow. Case-only renames arrive in this form (no common substring to
-    // brace), and resolving to the right side keeps the on-disk spelling.
-    // Both sides must be non-empty: a literal `=>` in a filename is
-    // vanishingly rare, but an empty side means this is not a rename line.
+    // Braceless renames carry full paths, including case-only renames.
+    // Empty sides indicate a literal arrow rather than a rename.
     if let Some((src, dest)) = raw.rsplit_once(" => ")
         && !src.is_empty()
         && !dest.is_empty()
@@ -766,8 +711,6 @@ mod tests {
 
     #[test]
     fn changed_files_since_rejects_dash_prefixed_ref() {
-        // SS-002: a `since` value starting with '-' must be rejected before it
-        // can be parsed by git as an option (e.g. `-O/path`).
         let dir = tempfile::tempdir().unwrap();
         let err = changed_files_since(dir.path(), "-O/etc/passwd").unwrap_err();
         assert!(
@@ -789,12 +732,10 @@ mod tests {
                 .into_iter()
                 .collect();
 
-        // Entry-only match (the Rust-crate / route-handler case the bug hit).
         assert!(feature_touched_since(
             &[f("src/main.rs", FeatureFileRole::Entry)],
             &changed
         ));
-        // Owned and Context also count.
         assert!(feature_touched_since(
             &[f("src/main.rs", FeatureFileRole::Owned)],
             &changed
@@ -803,12 +744,10 @@ mod tests {
             &[f("src/main.rs", FeatureFileRole::Context)],
             &changed
         ));
-        // A test-only match does NOT surface the slice.
         assert!(!feature_touched_since(
             &[f("tests/it.rs", FeatureFileRole::Test)],
             &changed
         ));
-        // No file in the changed set -> not touched.
         assert!(!feature_touched_since(
             &[f("src/other.rs", FeatureFileRole::Entry)],
             &changed
@@ -889,8 +828,6 @@ mod tests {
 
     #[test]
     fn accumulate_keeps_source_test_pair_drops_test_test_pair() {
-        // The v0.3.1 fix: the previous behavior dropped tests entirely from
-        // pair generation; this test pins down the corrected rule.
         let now = 1_700_000_100;
         let commit = Commit {
             timestamp: 1_700_000_000,
@@ -899,16 +836,15 @@ mod tests {
             ..Commit::default()
         };
         let changes = [
-            make_change("Repository.php"),     // source
-            make_change("RepositoryTest.php"), // test
-            make_change("AnotherTest.php"),    // test
+            make_change("Repository.php"),
+            make_change("RepositoryTest.php"),
+            make_change("AnotherTest.php"),
         ];
         let kept: Vec<&FileChange> = changes.iter().collect();
         let mut files = HashMap::new();
         let mut pairs = HashMap::new();
         accumulate(&mut files, &mut pairs, &commit, &kept, now, &test_glob());
 
-        // Source <-> test pair MUST be present (the v0.3.1 signal we want).
         assert!(
             pairs.contains_key(&("Repository.php".into(), "RepositoryTest.php".into())),
             "source-test pair must be kept; got pairs: {:?}",
@@ -918,12 +854,10 @@ mod tests {
             pairs.contains_key(&("AnotherTest.php".into(), "Repository.php".into())),
             "source-test pair must be kept regardless of stem"
         );
-        // Test <-> test pair MUST NOT be present (still noise).
         assert!(
             !pairs.contains_key(&("AnotherTest.php".into(), "RepositoryTest.php".into())),
             "test-test pair must be skipped"
         );
-        // All three files contribute to per-file churn (test files stay in git_files).
         assert!(files.contains_key("Repository.php"));
         assert!(files.contains_key("RepositoryTest.php"));
         assert!(files.contains_key("AnotherTest.php"));
@@ -931,7 +865,6 @@ mod tests {
 
     #[test]
     fn accumulate_keeps_source_source_pairs_when_tests_present() {
-        // Sanity: source <-> source pairs unaffected by the test filter.
         let now = 1_700_000_100;
         let commit = Commit {
             timestamp: 1_700_000_000,

@@ -150,10 +150,6 @@ def parse_failure_count(value, where: str) -> int:
         raise Refused(f"{where}: meta.search_failures is not an integer ({value!r})")
 
 
-# ---------------------------------------------------------------------------
-# Held-out split
-# ---------------------------------------------------------------------------
-
 def split_of(case_id: str, salt: str) -> str:
     digest = hashlib.sha256((salt + "\0" + case_id).encode("utf-8")).digest()
     return "train" if digest[0] < 128 else "heldout"
@@ -187,10 +183,6 @@ def split_report(corpus_path: Path, salt: str) -> list[str]:
         lines.append(f"- {name}: {counts[name]} of {total} ({share:.1%})")
     return lines
 
-
-# ---------------------------------------------------------------------------
-# Loading
-# ---------------------------------------------------------------------------
 
 def load_records(paths: list[Path], *, allow_partial: bool) -> tuple[dict, dict[str, dict]]:
     """Concatenate result files into (meta, id-keyed records).
@@ -282,10 +274,6 @@ def provenance_mismatch(base_meta: dict, cand_meta: dict) -> list[str]:
     return diffs
 
 
-# ---------------------------------------------------------------------------
-# Per-case scoring
-# ---------------------------------------------------------------------------
-
 def first_hit_rank(rec: dict) -> int | None:
     rank = rec.get("first_hit_rank")
     if rank is not None:
@@ -340,10 +328,6 @@ def cluster_of(rec: dict, key: str) -> str:
     source = str(rec.get("source") or "?")
     return source.split(":", 1)[0]
 
-
-# ---------------------------------------------------------------------------
-# Aggregation
-# ---------------------------------------------------------------------------
 
 def mean(xs: list[float]) -> float:
     return sum(xs) / len(xs) if xs else 0.0
@@ -410,10 +394,6 @@ def clustered_bootstrap(
     }
 
 
-# ---------------------------------------------------------------------------
-# Verdict
-# ---------------------------------------------------------------------------
-
 def verdict(
     r10_delta: float,
     r10_lb: float,
@@ -448,10 +428,6 @@ def verdict(
         )
     return (not failing), failing
 
-
-# ---------------------------------------------------------------------------
-# Report
-# ---------------------------------------------------------------------------
 
 def fmt_median(v: int | None) -> str:
     return str(v) if v is not None else "MISS"

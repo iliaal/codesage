@@ -336,6 +336,7 @@ dependencies = [
  "libc",
  "rayon",
  "regex",
+ "rustix",
  "schemars",
  "serde",
  "serde_json",

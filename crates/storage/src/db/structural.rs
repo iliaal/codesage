@@ -13,10 +13,7 @@ use super::{
     Database, get_index_state, row_enum, row_reference_kind, row_symbol_kind, set_index_state,
 };
 
-/// Decode the JSON-encoded `rationale` column. A malformed value (manual DB
-/// edit, schema drift, etc.) becomes an empty Vec rather than failing the
-/// row read — rationale is auxiliary metadata and a corrupt entry must not
-/// break `find_symbol`.
+/// Malformed auxiliary rationale must not prevent reading the symbol.
 fn deserialize_rationale(s: &str) -> Vec<RationaleEntry> {
     serde_json::from_str(s).unwrap_or_default()
 }
@@ -40,9 +37,6 @@ fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
     })
 }
 
-/// Map an `(id, path, language)` row into its typed triple. Shared by
-/// `all_files_with_id_and_language` and `files_pending_boundary_derivation`,
-/// which differ only in their WHERE clause.
 fn row_to_file_lang(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, String, Language)> {
     let id: i64 = row.get(0)?;
     let path: String = row.get(1)?;
@@ -126,11 +120,7 @@ impl Database {
         set_index_state(&self.conn, "structural_index_state", sha)
     }
 
-    // prepare_cached throughout the per-file index loop (`upsert_file` +
-    // `insert_symbols` / `insert_references` / `insert_fingerprints`): these
-    // run once per file, so a plain `prepare` re-plans the same SQL thousands
-    // of times on a large repo. Connections are long-lived per index pass, so
-    // the cached statements are reused across every file.
+    // Reuse prepared statements across the per-file indexing pass.
     pub fn upsert_file(&self, file: &FileInfo) -> Result<i64> {
         self.conn
             .prepare_cached(
@@ -178,10 +168,6 @@ impl Database {
         )?;
 
         for s in symbols {
-            // Empty rationale serializes to "[]"; non-empty serializes the
-            // full Vec. Failure here would mean a serde bug, not a data
-            // problem — fall back to the empty marker rather than aborting
-            // the whole insert pass.
             let rationale_json =
                 serde_json::to_string(&s.rationale).unwrap_or_else(|_| "[]".to_string());
             stmt.execute(params![
@@ -241,9 +227,7 @@ impl Database {
         Ok(())
     }
 
-    /// Every stored function fingerprint with its file path. Loaded whole by
-    /// `find_similar`, which builds the LSH index in memory. Scales with the
-    /// function count; fine for repos up to the low hundreds of thousands.
+    /// Load all function fingerprints for the in-memory LSH index.
     pub fn all_fingerprints(&self) -> Result<Vec<StoredFingerprint>> {
         let mut stmt = self.conn.prepare(
             "SELECT f.path, f.language, sf.name, sf.kind, sf.line_start, sf.line_end, sf.leaf_count, sf.fp
@@ -293,9 +277,7 @@ impl Database {
         Ok(token)
     }
 
-    /// Resolve a repo-relative path to its `files.id`, or `None` if the
-    /// file isn't indexed. Used by the feature mapper to attach
-    /// framework-derived references (route edges) to their source file.
+    /// Resolve an indexed repo-relative path to its files.id; None if absent.
     pub fn file_id_for_path(&self, path: &str) -> Result<Option<i64>> {
         let mut stmt = self.conn.prepare("SELECT id FROM files WHERE path = ?1")?;
         match stmt.query_row(params![path], |row| row.get::<_, i64>(0)) {
@@ -316,10 +298,7 @@ impl Database {
         Ok(rows)
     }
 
-    /// Delete every reference of a given kind across all files. The feature
-    /// mapper calls this before re-inserting synthetic edges (e.g.
-    /// `RouteHandler`) so a remap stays idempotent and drops edges whose
-    /// route declaration was removed.
+    /// Clear synthetic references before remapping, including removed declarations.
     pub fn delete_references_of_kind(&self, kind: ReferenceKind) -> Result<usize> {
         let n = self
             .conn
@@ -339,10 +318,7 @@ impl Database {
         }
     }
 
-    /// Single-query preload of every (path, content_hash) row from the `files`
-    /// table. Callers use this instead of `get_file_hash` in a loop to avoid an
-    /// N+1 on large repos (25k+ files × one round-trip each is dominant vs one
-    /// sequential scan that returns everything).
+    /// Preload file hashes to avoid per-file lookups during indexing.
     pub fn all_file_hashes(&self) -> Result<std::collections::HashMap<String, String>> {
         let mut stmt = self.conn.prepare("SELECT path, content_hash FROM files")?;
         let rows = stmt
@@ -353,22 +329,13 @@ impl Database {
         Ok(rows)
     }
 
-    /// Cheap existence test for a symbol name. Used by the search-boost pipeline
-    /// which only cares whether the token matches any indexed symbol, not the
-    /// full row contents. Matches `find_symbols`' branch shape (qualified name
-    /// goes against `qualified_name`, bare goes against `name`) and uses exact
-    /// match in both — the boost heuristic over-triggers on substrings.
+    /// Exact bare/qualified match; substring matches would over-trigger search boosts.
     pub fn symbol_exists(&self, name: &str) -> Result<bool> {
         let sql = if name.contains('\\') || name.contains('.') || name.contains("::") {
             "SELECT 1 FROM symbols WHERE qualified_name = ?1 LIMIT 1"
         } else {
             "SELECT 1 FROM symbols WHERE name = ?1 LIMIT 1"
         };
-        // prepare_cached: symbol_exists is called once per query token, and
-        // find_symbols/find_references run in per-reference loops during bundle
-        // assembly. Connections are per-tool-call, so the cached statement is
-        // reused across the loop iterations within one call. Only two distinct
-        // SQL strings here, so the cache stays tiny.
         let mut stmt = self.conn.prepare_cached(sql)?;
         match stmt.query_row(params![name], |_| Ok(())) {
             Ok(()) => Ok(true),
@@ -466,8 +433,6 @@ impl Database {
     }
 
     fn query_refs(&self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<Reference>> {
-        // Cached: find_references runs in per-symbol loops during bundle
-        // assembly; a handful of distinct SQL strings flow through here.
         let mut stmt = self.conn.prepare_cached(sql)?;
         let rows = stmt.query_map(params, |row| {
             let kind_str: String = row.get(3)?;
@@ -483,19 +448,8 @@ impl Database {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// All distinct file → file import edges across the whole index.
-    ///
-    /// An edge `(a, b)` exists when file `a` has at least one `ref` of
-    /// kind `import` / `include` / `inheritance` / `trait_use` whose
-    /// `to_name` matches a symbol defined in file `b` (by short name or
-    /// by qualified name — PHP fully-qualified, Python dotted, Rust
-    /// path-style all land in `qualified_name`). Self-edges excluded.
-    ///
-    /// Used by the cycle-detection pass in `assess_risk_diff` and kept
-    /// as a standalone method so other consumers (future RFC'd cross-repo
-    /// graph merge, for instance) can reuse it. Scales with the refs
-    /// table size: a typical mid-size TS project (~13k refs, ~1300 files)
-    /// returns in tens of ms on a warm cache.
+    /// Distinct cross-file import/include/inheritance/trait-use edges, plus Python
+    /// import bindings. Match qualified names or short names unique to one file.
     pub fn enumerate_file_import_edges(&self) -> Result<Vec<(String, String)>> {
         let sql = r#"
             SELECT DISTINCT f_from.path, f_to.path
@@ -587,10 +541,7 @@ impl Database {
         Ok(rows)
     }
 
-    /// Every import/include reference project-wide as `(from_path, to_name)`
-    /// pairs, unresolved. One set-based query backing `list_dependencies`'
-    /// path/module-import resolution sweep, which would otherwise be a
-    /// per-file N+1 over `refs_outgoing_for_file_id`.
+    /// Unresolved (from_path, to_name) import/include pairs for bulk resolution.
     pub fn import_include_refs_all(&self) -> Result<Vec<(String, String)>> {
         let sql = r#"
             SELECT DISTINCT f.path, r.to_name
@@ -650,11 +601,7 @@ impl Database {
         Ok(token)
     }
 
-    /// Directed file→file import edges where BOTH endpoints are in `files`.
-    /// Targeted variant of `enumerate_file_import_edges`: callers in the
-    /// per-file risk path (e.g. ranking a break edge inside one import cycle)
-    /// pass a small file set and avoid the full O(all-edges) enumeration, which
-    /// would otherwise run once per scored file in the top-risk sweep.
+    /// Import edges with both endpoints in `files`, avoiding a whole-index sweep.
     pub fn import_edges_within(&self, files: &[&str]) -> Result<Vec<(String, String)>> {
         if files.len() < 2 {
             return Ok(Vec::new());
@@ -787,10 +734,6 @@ impl Database {
              ORDER BY s.line_start",
             placeholders.join(",")
         );
-        // Cached per placeholder-count. The bundle helpers call this with a
-        // single path each (`annotate_with_symbols` on a one-element slice), so
-        // the N=1 form is reused across every file added to a bundle within one
-        // tool call instead of re-preparing each time.
         let mut stmt = self.conn.prepare_cached(&sql)?;
         let params: Vec<&dyn rusqlite::types::ToSql> = file_paths
             .iter()
@@ -884,9 +827,7 @@ impl Database {
             self.conn
                 .prepare_cached("DELETE FROM semantic_files WHERE path = ?1")?
                 .execute(params![path])?;
-            // git tables are path-keyed (not FK'd to `files`, because git-index can run
-            // without a structural index), so cascade manually. Without this, deleted
-            // files stay visible in `find_coupling` / `assess_risk` / future hotspots.
+            // Git history can exist without a structural index, so it has no FK cascade.
             self.conn
                 .prepare_cached("DELETE FROM git_files WHERE path = ?1")?
                 .execute(params![path])?;
@@ -946,11 +887,7 @@ impl Database {
         Ok(n as usize)
     }
 
-    /// Indexed file count per language, descending. Aggregated in SQL rather
-    /// than by loading every row like `all_files_with_id_and_language`, because
-    /// this runs on the empty-result annotation path where the caller already
-    /// got nothing back and must not pay a full table read for the
-    /// explanation.
+    /// File count per language, descending, without hydrating file rows.
     pub fn file_counts_by_language(&self) -> Result<Vec<(String, usize)>> {
         let mut stmt = self.conn.prepare(
             "SELECT language, COUNT(*) AS n FROM files
@@ -998,21 +935,9 @@ impl Database {
             out.entry(n.clone()).or_insert(0);
         }
         let placeholders: Vec<String> = (1..=names.len()).map(|i| format!("?{i}")).collect();
-        // Each ref contributes once per (name, count) — we resolve by short
-        // name. A ref whose `to_name_tail` matches the queried short name
-        // counts the same as a direct `to_name` match (the indexer keeps
-        // tail in sync via `name_tail()`).
-        // Count distinct source sites, not rows. One import statement can emit
-        // two rows naming the same short name — `import Foo from "./Foo"`
-        // stores the module (whose `to_name_tail` is `Foo`) and the binding
-        // `Foo` — and counting both scored a single statement twice in the
-        // top-symbol ranking. The two rows share a (file, line), so keying on
-        // that collapses them. Known cost: two real calls on ONE line
-        // (`Foo(); Foo();`, or minified source) collapse too, because `col` is
-        // deliberately left out — including it would separate the module from
-        // its binding again, since they sit at different columns of the same
-        // statement. Under-counting compact source beats double-counting every
-        // extensionless import.
+        // Count (name, file, line) sites: an import's module and binding can both
+        // name the same symbol at different columns. Omitting column avoids that
+        // double count but also collapses multiple real calls on one line.
         let sql = format!(
             "SELECT name, COUNT(*) AS c FROM (
                 SELECT DISTINCT name, from_file_id, line FROM (
@@ -1044,10 +969,7 @@ impl Database {
         Ok(out)
     }
 
-    /// Enumerate all indexed files with their database id and parsed language,
-    /// in stable `path` order. Used by re-derivation passes (trust boundaries,
-    /// feature mappers) that need to walk every file without touching symbols
-    /// or refs first.
+    /// Indexed (id, path, language) rows in stable path order.
     pub fn all_files_with_id_and_language(&self) -> Result<Vec<(i64, String, Language)>> {
         let mut stmt = self
             .conn
@@ -1058,10 +980,7 @@ impl Database {
         Ok(rows)
     }
 
-    /// Outgoing references for one file: `(to_name, kind)` rows from `refs`
-    /// where `from_file_id = ?`. Used by the trust-boundary derivation pass
-    /// to re-classify a file's boundaries from its already-extracted refs
-    /// without re-parsing the source.
+    /// Outgoing (to_name, kind) references for derivation without reparsing.
     pub fn refs_outgoing_for_file_id(&self, file_id: i64) -> Result<Vec<(String, ReferenceKind)>> {
         let mut stmt = self
             .conn
@@ -1089,15 +1008,10 @@ impl Database {
         self.conn
             .execute_batch("SAVEPOINT replace_file_trust_boundaries")?;
         let result = (|| -> Result<()> {
-            // prepare_cached: called once per file in the boundary-derivation
-            // loop, same rationale as the index-loop inserts above.
             self.conn
                 .prepare_cached("DELETE FROM file_trust_boundaries WHERE file_id = ?1")?
                 .execute(params![file_id])?;
-            // Stamp `boundaries_derived_at` on every write — including when
-            // the derived set is empty — so a rule-clean file (no matches)
-            // stays distinguishable from a never-derived one (zero matches
-            // because derivation never ran).
+            // An empty derived set must remain distinguishable from never-derived.
             self.conn
                 .prepare_cached(
                     "UPDATE files SET boundaries_derived_at = unixepoch() WHERE id = ?1",
@@ -1154,9 +1068,6 @@ impl Database {
         Ok(rows)
     }
 
-    /// Count rows in `file_trust_boundaries` across the whole project.
-    /// Cheap COUNT(*) for diagnostics; the targeted backfill uses
-    /// `files_pending_boundary_derivation` instead.
     pub fn file_trust_boundary_count(&self) -> Result<usize> {
         let n: i64 =
             self.conn

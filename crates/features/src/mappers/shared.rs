@@ -11,8 +11,6 @@ use globset::GlobSet;
 use crate::mappers::types::MapperContext;
 
 /// Returns true if `candidate` is inside `root` after symlink resolution.
-/// Used to defend mappers against repos that contain symlinks pointing
-/// outside the tree (rare but real; clawpatch's mapper guard inspired this).
 pub fn is_inside_root(root: &Path, candidate: &Path) -> bool {
     let real_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let real_candidate = fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf());
@@ -44,7 +42,7 @@ pub fn is_safe_dir(root: &Path, candidate: &Path) -> bool {
 }
 
 /// Convert an absolute path inside `root` to a repo-relative POSIX string.
-/// Falls back to the absolute path on canonicalization failure.
+/// Falls back to the absolute path when it is outside `root`.
 pub fn rel_path(root: &Path, abs: &Path) -> String {
     let stripped = abs.strip_prefix(root).unwrap_or(abs);
     let s = stripped.to_string_lossy().into_owned();
@@ -75,11 +73,7 @@ pub fn walk_files(
         .require_git(false)
         .build();
 
-    // Collect-then-sort-then-truncate: the walker yields entries in
-    // readdir order, so truncating mid-walk would make the survivors
-    // (and every downstream seed list) depend on filesystem order.
-    // Walking the full subtree costs a full traversal on over-cap repos,
-    // but keeps output identical across machines and runs.
+    // Traverse fully before sorting/truncation so the cap is independent of readdir order.
     let mut out: Vec<String> = Vec::new();
     for entry in walker.flatten() {
         let path = entry.path();
@@ -104,15 +98,8 @@ pub fn walk_files(
     out
 }
 
-/// Directory- or file-relative ignore predicate. Belt-and-suspenders to
-/// `ignore::WalkBuilder`'s gitignore support: catches the directory names
-/// that appear in mapper output even on repos whose gitignore is empty or
-/// missing a relevant entry (vendored sandboxes, sandbox checkouts).
-///
-/// `.worktrees` is included specifically because the user-flow for git
-/// worktrees in this repo plants them at `.worktrees/<branch>/...` and
-/// they shouldn't surface as their own feature slices — they're the same
-/// codebase at a different commit.
+/// Exclude dependency, build, cache, and worktree directories even without
+/// matching gitignore entries. Worktrees would duplicate the repository's features.
 pub fn should_skip(rel: &str) -> bool {
     if rel.is_empty() || rel == "." {
         return false;
@@ -213,8 +200,7 @@ pub fn collect_source_files(
 /// Depth-1 file listing of `dir` under the same skip contract as
 /// [`walk_files`] (gitignore, hard-excludes, optional project excludes,
 /// symlink rejection). Yields sorted repo-relative paths for which `pred`
-/// holds. Replaces per-mapper hand-rolled `fs::read_dir` loops so single-
-/// directory scans can't bypass the walker's filter rules.
+/// holds.
 pub fn list_dir_files(
     root: &Path,
     dir: &Path,
@@ -230,10 +216,8 @@ pub fn list_dir_subdirs(root: &Path, dir: &Path, excludes: Option<&GlobSet>) -> 
     list_dir_children(root, dir, excludes, true, &|_| true)
 }
 
-/// `fs::read_dir` in sorted (lexicographic path) order. `read_dir` yields
-/// entries in arbitrary filesystem order, so any mapper loop whose output
-/// or seed order depends on iteration order must go through this instead
-/// of the raw call. Returns an empty vec on I/O error.
+/// Directory entries in lexicographic path order for deterministic mapping.
+/// Returns an empty vector on I/O error.
 pub fn sorted_read_dir(dir: &Path) -> Vec<PathBuf> {
     let Ok(rd) = fs::read_dir(dir) else {
         return Vec::new();
@@ -258,10 +242,7 @@ pub fn read_to_string_bounded(path: &Path) -> Result<Option<String>> {
     Ok(fs::read_to_string(path).ok())
 }
 
-/// Strip TOML `#`-style line comments while leaving the strings inside
-/// quoted values intact. Cheap helper used by mappers that parse
-/// `Cargo.toml` or similar without pulling in a full toml crate. Matches
-/// clawpatch's `stripLineComment` behavior.
+/// Strip line comments beginning with `marker`, preserving double-quoted strings.
 pub fn strip_line_comments(source: &str, marker: char) -> String {
     let mut out = String::with_capacity(source.len());
     for line in source.lines() {
@@ -328,11 +309,8 @@ pub struct CommentSyntax {
     pub template_literals: bool,
 }
 
-/// Blank comments (and optionally strings) out of source text while
-/// preserving byte-for-char offsets: every stripped char becomes a space,
-/// newlines survive so line numbers still line up for downstream regex
-/// scans. One scanner parameterized per language; the per-language configs
-/// live next to their mappers.
+/// Replace stripped characters with spaces and preserve newlines for regex
+/// scans. A multibyte character becomes one space, so byte offsets can change.
 pub fn strip_comments(input: &str, syntax: CommentSyntax) -> String {
     enum State {
         Code,
@@ -433,13 +411,8 @@ pub fn strip_comments(input: &str, syntax: CommentSyntax) -> String {
     out
 }
 
-/// Tag attached to route seeds whose shape suggests a privileged or
-/// state-changing surface (see [`route_is_auth_sensitive`]). Kept as a
-/// free-form seed tag rather than a derived trust boundary: the boundary
-/// model stays single-sourced from parsed imports/references, while this
-/// surfaces a route-shape heuristic for humans and agents reviewing the
-/// slice. Ported from clawpatch's per-route boundary heuristic, demoted to
-/// a tag here.
+/// Route-shape heuristic kept separate from trust boundaries, which derive
+/// only from parsed imports and references. See [`route_is_auth_sensitive`].
 pub const AUTH_SENSITIVE_TAG: &str = "auth-sensitive";
 
 /// Heuristic: does a route's shape suggest it needs a closer security look?
@@ -479,9 +452,6 @@ mod tests {
 
     #[test]
     fn should_skip_hard_excludes_worktrees() {
-        // Belt-and-suspenders: even when `.gitignore` doesn't list
-        // `.worktrees/`, the mapper must not surface sibling worktrees
-        // as their own feature slices.
         assert!(should_skip(".worktrees/feature-x/src/main.rs"));
         assert!(should_skip("worktrees/feature-x/src/main.rs"));
         assert!(should_skip("some/nested/.worktrees/feature/file.rs"));
@@ -489,8 +459,6 @@ mod tests {
 
     #[test]
     fn walk_honors_gitignore_entries() {
-        // gitignore'd directories must not show up in mapper output —
-        // WalkBuilder reads .gitignore at the walk root.
         let dir = tempdir().unwrap();
         let root = dir.path();
         fs::write(root.join(".gitignore"), b".worktrees/\nignored_lib/\n").unwrap();
@@ -519,7 +487,6 @@ mod tests {
         let root = dir.path();
         let outside = tempdir().unwrap();
         fs::write(root.join("real.rs"), b"fn main() {}").unwrap();
-        // symlink pointing outside the root should not be walked.
         let _ = symlink(outside.path(), root.join("escape"));
         let walked = walk_files(root, root, 100, None);
         assert!(walked.iter().any(|p| p == "real.rs"));
@@ -532,8 +499,6 @@ mod tests {
 
     #[test]
     fn walk_filters_against_exclude_globset() {
-        // Project-level `[index].exclude_patterns` are honored in addition
-        // to gitignore and the hardcoded should_skip list.
         let dir = tempdir().unwrap();
         let root = dir.path();
         fs::write(root.join("keep.rs"), b"// keep").unwrap();
@@ -553,8 +518,6 @@ mod tests {
 
     #[test]
     fn walk_truncates_sorted_survivors() {
-        // Over-cap walks must keep the lexicographically-first paths, not
-        // whichever readdir yielded first: collect-then-sort-then-truncate.
         let dir = tempdir().unwrap();
         let root = dir.path();
         for name in ["z.rs", "a.rs", "m.rs", "b.rs"] {
@@ -562,7 +525,6 @@ mod tests {
         }
         let walked = walk_files(root, root, 2, None);
         assert_eq!(walked, vec!["a.rs".to_string(), "b.rs".to_string()]);
-        // And repeated walks agree with each other.
         assert_eq!(walked, walk_files(root, root, 2, None));
     }
 
@@ -623,8 +585,6 @@ mod tests {
 
     #[test]
     fn strip_comments_blank_mode_blanks_strings_and_comments() {
-        // C-source shape: comments AND string literals (delimiters
-        // included) blank out; code and offsets survive.
         let src = "int x; // trailing\nchar *s = \"PHP_FUNCTION(fake)\";\n/* block\n */ int y;\n";
         let out = strip_comments(src, C_STRIP);
         assert_eq!(out.len(), src.len(), "offsets must be preserved");

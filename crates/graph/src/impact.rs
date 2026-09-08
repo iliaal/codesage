@@ -16,12 +16,7 @@ pub(crate) fn is_qualified_symbol_name(name: &str) -> bool {
     name.contains('\\') || name.contains('.') || name.contains("::")
 }
 
-/// Per-level frontier cap. A symbol referenced by hundreds of files explodes
-/// the frontier and the per-symbol `references_for_symbol` queries at the next
-/// depth, so each level is deduped and capped. When the cap fires, deeper
-/// levels are incomplete — `impact_analysis_walk` reports that so consumers
-/// (`assess_risk`'s blast-radius and test-reach checks) can say "lower bound"
-/// instead of presenting a truncated count as the whole answer.
+/// Bound per-level fan-out; capped walks report counts as lower bounds.
 pub(crate) const MAX_FRONTIER: usize = 512;
 
 pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactEntry>> {
@@ -31,8 +26,6 @@ pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactE
 /// [`impact_analysis`] plus a `frontier_capped` flag: `true` when any level's
 /// frontier was truncated at `max_frontier`, meaning entries at deeper
 /// distances may be missing and every derived count is a lower bound.
-/// `max_frontier` is a parameter only so tests can force the cap without
-/// building a 512-symbol fixture.
 pub(crate) fn impact_analysis_walk(
     db: &Database,
     req: &ImpactRequest,
@@ -42,7 +35,6 @@ pub(crate) fn impact_analysis_walk(
     Ok((outcome.entries, outcome.capped))
 }
 
-/// Result of [`impact_analysis_walk_budgeted`].
 #[derive(Debug)]
 pub(crate) struct WalkOutcome {
     pub entries: Vec<ImpactEntry>,
@@ -186,15 +178,8 @@ impl WalkBudget {
         false
     }
 
-    /// Predicted cost of resolving the references to `sym`: distinct caller
-    /// files × candidate definitions sharing the short name.
-    /// `resolve_callee_definitions` runs once per caller file and filters
-    /// every candidate against that file's imports, so that product is the
-    /// work, not the row count — on home-assistant, `__init__` is 4215 rows
-    /// but 2970 files × 5927 candidates, and took 27 s where every other
-    /// symbol in the file took under 40 ms. A unique name costs its
-    /// caller-file count. Both counts are COUNT queries memoized per name, so
-    /// pricing a symbol never hydrates a row.
+    /// Price resolution as caller files × same-name definitions, not reference rows.
+    /// Memoized COUNT queries avoid hydrating candidates just to price them.
     fn cost(&mut self, db: &Database, sym: &Symbol) -> Result<usize> {
         let files = match self.caller_file_counts.get(&sym.name) {
             Some(n) => *n,
@@ -216,14 +201,8 @@ impl WalkBudget {
     }
 }
 
-/// [`impact_analysis_walk`] with an optional [`WalkBudget`]. Per level, every
-/// unvisited frontier symbol is priced, the cheapest are admitted until the
-/// budget runs out, and the admitted ones are then resolved in their original
-/// frontier order — so a walk that skips nothing is identical to the
-/// unbudgeted walk, and a hub name spends the budget instead of starving the
-/// precise neighbours that came after it in file order. A symbol in a hot
-/// file can have tens of thousands of reference rows, and a caller that only
-/// needs "which tests reach this" must not pay for all of them.
+/// Admit cheaper symbols first within the budget, then resolve in frontier order.
+/// Unrestricted walks retain their original result ordering.
 pub(crate) fn impact_analysis_walk_budgeted(
     db: &Database,
     req: &ImpactRequest,
@@ -254,14 +233,8 @@ pub(crate) fn impact_analysis_walk_shared(
         ImpactTarget::Symbol { name } => {
             let syms = db.find_symbols(name, None)?;
             if !is_qualified_symbol_name(name) && syms.len() > 1 {
-                // Only distinct qualified names are disambiguable. Languages
-                // without namespaces (JS/TS) give every definition the bare
-                // name, so a `.d.ts` declaration beside its `.js`
-                // implementation used to produce "qualify with one of: Foo,
-                // Foo" — an instruction no input can satisfy. When the names
-                // collapse to one, seed on every definition and let the union
-                // of dependents stand; over-inclusion is the safe direction
-                // for an advisory what-to-review signal.
+                // Identical qualified names cannot disambiguate definitions;
+                // retain their union instead of suggesting an unusable name.
                 let mut candidates: Vec<String> =
                     syms.iter().map(|s| s.qualified_name.clone()).collect();
                 candidates.sort();
@@ -337,21 +310,13 @@ pub(crate) fn impact_analysis_walk_shared(
 
     for depth in 1..=req.depth as u32 {
         let mut next_files = Vec::new();
-        // First pass: collect refs, update file_reasons, record (from_file, line) pairs
-        // that need caller-symbol lookups for the next frontier.
         let mut pending_callers: Vec<(String, Option<String>, u32)> = Vec::new();
         let mut budget_spent = false;
         let mut level: Vec<(&Symbol, Arc<Vec<Reference>>)> = Vec::new();
         if let Some(b) = budget.as_deref_mut() {
-            // Admission is greedy cheapest-first over the priced level;
-            // resolution then runs in frontier order over the admitted set
-            // only, so the reason ordering (and therefore the output) matches
-            // the unbudgeted walk whenever nothing is skipped.
             let mut priced: Vec<(usize, usize)> = Vec::new();
             for (idx, sym) in frontier.iter().enumerate() {
-                // Pricing is two COUNT queries per symbol; on a wide level
-                // that alone can outlast the deadline, so it is checked here
-                // too: once at the start of every level and every 256 symbols.
+                // Pricing alone can exhaust the deadline on wide frontiers.
                 if idx % 256 == 0 && b.over_deadline() {
                     break;
                 }
@@ -407,11 +372,7 @@ pub(crate) fn impact_analysis_walk_shared(
                 if entry.0 > depth {
                     entry.0 = depth;
                 }
-                // Seeding on several definitions that share one qualified name
-                // walks the same reference row once per definition, so the
-                // identical reason arrives repeatedly. Reason count feeds the
-                // ranking below, which would let a duplicate decide which files
-                // survive a result limit.
+                // Same-named seeds can repeat a row; duplicates must not inflate ranking.
                 let reason = ImpactReason {
                     via_symbol: sym.name.clone(),
                     kind: r.kind,
@@ -500,8 +461,6 @@ pub(crate) fn impact_analysis_walk_shared(
         }
 
         if budget_spent {
-            // Rows fetched so far are recorded; the next level would need more
-            // fetches, so everything deeper is unknown.
             frontier_capped = true;
             break;
         }
@@ -509,8 +468,6 @@ pub(crate) fn impact_analysis_walk_shared(
             break;
         }
 
-        // Batched caller-symbol lookup: one query per distinct file, regardless of
-        // how many lines in that file triggered the lookup.
         let distinct_files: Vec<String> = {
             let mut set: HashSet<String> = HashSet::new();
             pending_callers.iter().for_each(|(f, _, _)| {
@@ -518,8 +475,7 @@ pub(crate) fn impact_analysis_walk_shared(
             });
             set.into_iter().collect()
         };
-        // The caller lookup for a level is unpriced: it hydrates every symbol
-        // of every file the level reached. Check the clock once before it.
+        // Caller hydration is not included in the step price.
         if let Some(b) = budget.as_deref_mut()
             && b.over_deadline()
         {
@@ -533,9 +489,7 @@ pub(crate) fn impact_analysis_walk_shared(
             let Some(syms) = syms_by_file.get(from_file) else {
                 continue;
             };
-            // Precise path: the reference recorded its enclosing symbol, so jump
-            // straight to that one symbol instead of every symbol spanning the
-            // line (which conflated a method with its containing class).
+            // Prefer the recorded owner over enclosing classes or functions.
             if let Some(qn) = from_symbol
                 && let Some(s) = syms.iter().find(|s| &s.qualified_name == qn)
             {
@@ -559,9 +513,6 @@ pub(crate) fn impact_analysis_walk_shared(
             }
         }
 
-        // Bound fan-out: dedup by qualified name and cap each level so a wide
-        // blast radius can't make impact analysis unbounded (see
-        // [`MAX_FRONTIER`]).
         let mut seen_symbols: HashSet<(String, String, u32)> = HashSet::new();
         next_frontier.retain(|s| seen_symbols.insert(symbol_identity_key(s)));
         if next_frontier.len() > max_frontier {
@@ -607,11 +558,7 @@ pub(crate) fn impact_analysis_walk_shared(
         .filter(|e| !req.source_only || e.category == FileCategory::Source)
         .collect();
 
-    // `file_reasons` is a HashMap, so its iteration order is reseeded per map
-    // instance — tied entries would otherwise land in a different order on
-    // every call, and callers truncate (`ImpactOptions::limit`, the MCP budget
-    // cap), so an unchanged query could return a different set of files. Ties
-    // are routine here: every depth-1 file with the same reason count ties.
+    // Break ties before callers truncate, keeping identical queries deterministic.
     entries.sort_by(|a, b| {
         a.distance
             .cmp(&b.distance)
@@ -655,7 +602,6 @@ pub fn impact_analysis_report(
         truncated = true;
     }
 
-    // Collapse each file's reason list to a single exemplar when summarizing.
     if opts.summary_only {
         for e in &mut entries {
             e.reasons.truncate(1);
@@ -669,10 +615,7 @@ pub fn impact_analysis_report(
         if opts.include_forward {
             let mut fwd: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
             for f in &target_files {
-                // Storage call, not `lookups::list_dependencies`: only the
-                // `imports` half is read here, and the wrapper's per-file
-                // `imported_by` resolution sweep would run once per target
-                // file for nothing.
+                // Avoid the wrapper's imported_by resolution; only imports are needed.
                 for imp in db.list_file_dependencies(f)?.imports {
                     fwd.insert(imp);
                 }
@@ -697,7 +640,6 @@ pub fn impact_analysis_report(
     })
 }
 
-/// Resolve the file(s) the impact target lives in.
 fn impact_target_files(db: &Database, target: &ImpactTarget) -> Result<Vec<String>> {
     match target {
         ImpactTarget::File { path } => Ok(vec![path.clone()]),
@@ -735,7 +677,6 @@ fn collect_sibling_symbols(
             {
                 continue;
             }
-            // Collapse repeated implementations (same name+kind) to one signature.
             let key = format!("{}::{}", s.kind.as_str(), s.name);
             if !seen_names.insert(key) {
                 continue;
@@ -790,21 +731,8 @@ fn build_impact_summary(entries: &[ImpactEntry]) -> ImpactSummary {
 }
 
 pub(crate) fn references_for_symbol(db: &Database, sym: &Symbol) -> Result<Vec<Reference>> {
-    // Look up by the SHORT name, never the qualified one. `find_references`
-    // treats a qualified key as an exact `to_name` match, but a reference is
-    // recorded under whatever spelling the source used: a PHP subclass in the
-    // same namespace writes `extends Foo` with no `use`, so its row says `Foo`,
-    // not `App\Foo`. Keying on the qualified name therefore matched only the
-    // rows that happen to spell it out — in monolog, `Logger` kept the 15
-    // `use Monolog\Logger` rows and dropped the 87 call/instantiation rows,
-    // and `AbstractProcessingHandler` (30 subclasses, never imported because
-    // they share its namespace) resolved to zero dependents.
-    //
-    // The short name goes through the `to_name_tail` branch, which matches both
-    // spellings. Precision is not lost: the import-aware resolution below is
-    // exactly the mechanism that narrows a broad tail match back down, and it
-    // already had to handle this for symbols whose qualified name equals their
-    // short name.
+    // Source references may use a bare spelling even for qualified definitions.
+    // Tail lookup admits both; import-aware resolution filters candidates below.
     let raw = db.find_references(&sym.name, None)?;
     resolve_references_to_symbol(db, sym, raw)
 }
@@ -816,17 +744,8 @@ fn resolve_references_to_symbol(
     sym: &Symbol,
     raw: Vec<Reference>,
 ) -> Result<Vec<Reference>> {
-    // Import-aware reverse resolution. `find_references` matches by
-    // `to_name_tail`, so an unqualified name fans out to *every* same-named
-    // definition — a call to one class's `getAttributes` was counted toward
-    // all of them, inflating the reverse blast radius that `impact_analysis`
-    // and `assess_risk` read. `resolve_callee_definitions` already filters
-    // candidates by the caller file's imports (the forward path); routing each
-    // candidate reference back through it makes a reverse edge exist iff the
-    // matching forward edge does. Unique names short-circuit in the resolver
-    // (≤1 candidate), so distinctively-named symbols are untouched — only
-    // genuinely ambiguous names get import-filtered. Resolutions are cached per
-    // `(from_file, to_name)` because a hot symbol's callers repeat both.
+    // A reverse edge must agree with forward import-aware resolution.
+    // Cache repeated (caller file, spelling) lookups.
     let mut out = Vec::with_capacity(raw.len());
     let mut cache: HashMap<(String, String), Vec<Symbol>> = HashMap::new();
     for r in raw {

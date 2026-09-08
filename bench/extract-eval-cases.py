@@ -84,9 +84,7 @@ def extract_file_paths_from_value(value) -> set[str]:
     return paths
 
 
-# Top-level subcommands of the `codesage` binary: the `Commands` enum in
-# crates/cli/src/main.rs (clap kebab-case), mirrored by the "CLI commands"
-# line in the root CLAUDE.md.
+# Keep aligned with Commands in crates/cli/src/main.rs (clap kebab-case).
 CODESAGE_SUBCOMMANDS = frozenset(
     {
         "init", "index", "overview", "search", "brief", "find-symbol",
@@ -99,12 +97,8 @@ CODESAGE_SUBCOMMANDS = frozenset(
     }
 )
 
-# `codesage` as a command word (bare or the last path component) followed on
-# the same line by a real subcommand, optionally across a `--` separator
-# (`cargo run -p codesage -- search`). A plain substring test is useless on
-# this repo's own transcripts: `cd <repo-root>; ...` prefixes nearly every
-# Bash call when the repo dir is named codesage, and `git -C <repo-root> log`
-# or `cd <repo-root>\ncargo build` put an unrelated word right after it.
+# Require a same-line subcommand to distinguish invocations from paths named
+# codesage; allow `--` for `cargo run -p codesage -- search`.
 CODESAGE_BASH_RE = re.compile(
     r"(?:^|[\s;|&(`'\"=])(?:\S*/)?codesage(?=[ \t]+(?:--[ \t]+)?(?:"
     + "|".join(sorted(CODESAGE_SUBCOMMANDS, key=len, reverse=True))
@@ -189,12 +183,7 @@ def is_search_query(text: str) -> bool:
 
 
 def normalize_path(path: str, project_root: str) -> str | None:
-    # Plain startswith on the raw string lets sibling directories with a
-    # shared prefix slip in (e.g. `<root>-test/foo.py` past `<root>`),
-    # producing malformed leading-separator relative paths that don't
-    # exist under the real project root. Resolve both sides and use
-    # is_relative_to so the comparison is on path segments, not
-    # character offsets. fnd_69176952.
+    # Compare resolved path segments; string prefixes admit sibling directories.
     try:
         p = Path(path).expanduser().resolve()
         root = Path(project_root).expanduser().resolve()
@@ -207,10 +196,7 @@ def normalize_path(path: str, project_root: str) -> str | None:
     rel_str = rel.as_posix()
     if not rel_str or rel_str == ".":
         return None
-    # Reject control characters (notably newline — legal in POSIX filenames and
-    # capturable by the `"file_path":"([^"]+)"` regex, which matches across
-    # newlines). A newline-bearing path would split the emitted YAML list item
-    # into injected structure downstream. fnd_32ebb1d9.
+    # POSIX filenames can contain control characters that corrupt emitted YAML.
     if any(ord(ch) < 0x20 for ch in rel_str):
         return None
     return rel_str
@@ -336,15 +322,7 @@ def _slugify(text: str, max_len: int = 60) -> str:
 
 
 def _yaml_dq(s: str) -> str:
-    """Double-quoted YAML scalar: strip C0 control chars, then escape
-    backslashes and double quotes. Safe for arbitrary one-line text.
-
-    YAML forbids raw control characters (other than tab) anywhere in a document,
-    including inside double-quoted scalars — PyYAML rejects them with a
-    ReaderError, so one ANSI escape in mined query text (pasted terminal output)
-    would poison the whole corpus. normalize_path drops control chars for the
-    path channel; this covers the query channel and any future caller.
-    """
+    """Quote one-line YAML text; quotes alone do not permit raw control characters."""
     cleaned = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", str(s))
     return '"' + cleaned.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
@@ -378,10 +356,6 @@ def write_yaml(cases: list[dict], project_root: str, project_name: str, out_path
         lines.append("    source: session")
         if c.get("codesage_used"):
             lines.append("    codesage_used: true")
-        # Quote the query and every path defensively (double-quoted scalar with
-        # backslash/quote escaping) so user-derived text and mined paths can't
-        # inject YAML structure. normalize_path already drops control chars;
-        # this covers ordinary metacharacters (`: `, `#`, leading specials).
         lines.append(f"    query: {_yaml_dq(query)}")
         lines.append("    expected_files:")
         for f in c["files"]:

@@ -1,12 +1,5 @@
-//! Opening files that live inside a repository work tree.
-//!
-//! CodeSage keeps its per-project state in `<repo>/.codesage/`, which means a
-//! cloned third-party repository can ship any of those names as a symlink (git
-//! stores symlinks as mode-120000 blobs and checkout materializes them). Every
-//! writer under that directory must therefore refuse to follow a link out of
-//! the tree. `O_NOFOLLOW` is the race-free way to do it: the kernel fails the
-//! open with `ELOOP` instead of leaving a window between an lstat check and the
-//! write.
+//! Repository state paths are untrusted: clones can plant symlinks under `.codesage/`.
+//! O_NOFOLLOW rejects leaf symlinks at open time; parent checks are separate.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -18,20 +11,13 @@ pub(crate) fn no_follow_options() -> OpenOptions {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        // O_NONBLOCK alongside O_NOFOLLOW: a regular file ignores it, but it
-        // stops a non-regular target from blocking the open before the
-        // file-type check below can reject it.
+        // O_NONBLOCK prevents FIFOs from blocking before the file-type check.
         opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     opts
 }
 
-/// Fail closed on targets without `O_NOFOLLOW`.
-///
-/// `codesage mcp` has a deliberate non-Unix path (it runs the MCP server
-/// directly, without the daemon), but none of the guards in this module have a
-/// non-Unix implementation: `OpenOptions` there would follow links and reparse
-/// points silently. Refuse rather than degrade without saying so.
+/// Non-Unix MCP still runs, but these state guards lack a safe implementation there.
 #[cfg(not(unix))]
 fn unsupported_platform(path: &Path) -> io::Error {
     io::Error::new(
@@ -43,10 +29,7 @@ fn unsupported_platform(path: &Path) -> io::Error {
     )
 }
 
-/// Open a `.codesage/` state file for locking: no symlink, regular file only.
-///
-/// `no_follow_options()` is a plain `OpenOptions` off-Unix, so callers that use
-/// it directly must go through here rather than reimplementing the checks.
+/// Open a regular, non-symlink state file for locking; refuse unsupported platforms.
 pub(crate) fn open_lockfile(path: &Path) -> io::Result<File> {
     #[cfg(not(unix))]
     {
@@ -66,7 +49,6 @@ pub(crate) fn open_lockfile(path: &Path) -> io::Result<File> {
     }
 }
 
-/// Reject an opened handle that is not a regular file.
 fn require_regular_file(file: &File, path: &Path) -> io::Result<()> {
     if !file.metadata()?.is_file() {
         return Err(io::Error::new(
@@ -77,11 +59,7 @@ fn require_regular_file(file: &File, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Refuse to write into a `.codesage` directory that is itself a symlink.
-///
-/// `O_NOFOLLOW` only guards the final path component, so without this a planted
-/// `.codesage` directory symlink still redirects every fixed-name file below it
-/// (`watch.status`, `indexing.lock`, `feature-map.state`, …) out of the tree.
+/// O_NOFOLLOW protects only the leaf; reject a symlinked `.codesage` parent separately.
 pub(crate) fn reject_symlinked_project_dir(path: &Path) -> io::Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
@@ -121,21 +99,11 @@ pub(crate) fn create_no_follow(path: &Path) -> io::Result<File> {
     }
 }
 
-/// Largest project-state file any of the readers below will accept.
-///
-/// The files are our own small markers and configs; the cap exists so a
-/// repo-planted character device or a huge regular file cannot exhaust memory.
+/// Bound memory consumption from untrusted marker and config files.
 pub(crate) const MAX_STATE_BYTES: u64 = 1 << 20;
 
-/// Read a `.codesage/` state file without following symlinks and without
-/// trusting its size.
-///
-/// `fs::read_to_string` on a repo-controlled path is its own bypass class: a
-/// planted `config.toml -> /dev/zero` yields valid UTF-8 NUL bytes forever
-/// (unbounded memory), and a fifo blocks the caller indefinitely. Neither is a
-/// write primitive, so the O_NOFOLLOW write guards do not cover it. Refuse a
-/// symlinked `.codesage` parent, open the leaf with O_NOFOLLOW, require a
-/// regular file, and cap the read.
+/// Read bounded regular state files only; symlinked devices can stream forever
+/// and FIFOs can block before a read.
 pub(crate) fn read_state_to_string(path: &Path) -> io::Result<String> {
     use std::io::Read as _;
 
@@ -157,8 +125,7 @@ pub(crate) fn read_state_to_string(path: &Path) -> io::Result<String> {
             ),
         ));
     }
-    // Cap the read itself too: the size check above is advisory for anything
-    // whose length does not describe how much it will hand us.
+    // A file may grow after stat; bound the read itself.
     let mut buf = String::new();
     file.take(MAX_STATE_BYTES + 1).read_to_string(&mut buf)?;
     if buf.len() as u64 > MAX_STATE_BYTES {
@@ -173,10 +140,7 @@ pub(crate) fn read_state_to_string(path: &Path) -> io::Result<String> {
     Ok(buf)
 }
 
-/// Remove a `.codesage/` state file, refusing a symlinked project directory.
-///
-/// Unlinking a symlinked *leaf* removes the link, not its target, so only the
-/// parent needs guarding here.
+/// Unlinking a leaf symlink leaves its target intact; guard only the project parent.
 pub(crate) fn remove_state_file(path: &Path) -> io::Result<()> {
     reject_symlinked_project_dir(path)?;
     std::fs::remove_file(path)
@@ -225,10 +189,7 @@ mod tests {
 
     #[test]
     fn read_state_refuses_a_symlinked_source() {
-        // The case that matters is a character device such as /dev/zero, whose
-        // NUL bytes are valid UTF-8 forever. This points at an ordinary file on
-        // purpose: reverting O_NOFOLLOW must fail deterministically here rather
-        // than hang the test suite.
+        // Use a regular target so removing O_NOFOLLOW fails deterministically instead of hanging on /dev/zero.
         let dir = tempfile::tempdir().unwrap();
         let victim = dir.path().join("victim.toml");
         std::fs::write(&victim, b"secret = true").unwrap();

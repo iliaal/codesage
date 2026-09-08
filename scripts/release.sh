@@ -17,8 +17,8 @@
 #      master + tag. If either CLI is unavailable or its integration fails to
 #      refresh, stop before the push so the release can be resumed after repair.
 #   7. Refresh whichever `codesage` is on PATH so the maintainer's local install
-#      jumps to the new version. Skipped silently if no install is found or the
-#      binary path is not writable.
+#      jumps to the new version, then restart and check the shared daemon.
+#      Skipped if no install is found or the binary path is not writable.
 #
 # The two prompts are deliberate: every hard-to-reverse step stops and asks.
 # Pass `-y` / `--yes` to auto-confirm both prompts when driving the script from
@@ -275,22 +275,114 @@ else
 	echo "  git push origin master && git push origin v$VERSION"
 fi
 
-# Refresh the local install if there's already a `codesage` on PATH.
-# The mv-then-cp dance avoids "Text file busy" when an MCP server (or any
-# other long-running `codesage` process) is holding the old binary's inode:
-# the running process keeps the old inode alive until exit, the new binary
-# lands at the original path, and the next session picks it up.
+# Replace the pathname without overwriting an inode held by running processes.
 local_install="$(command -v codesage 2>/dev/null || true)"
 if [[ -n "$local_install" && -w "$local_install" ]]; then
 	if [[ -f target/release/codesage ]]; then
+		built_version="$(target/release/codesage --version)" || die "could not check the release binary version"
+		built_version="${built_version%%$'\n'*}"
+		[[ "${built_version}" == "codesage ${VERSION} (release)" ]] ||
+			die "release binary is '${built_version}', expected 'codesage ${VERSION} (release)'; rebuild before refreshing the local install"
 		backup="${local_install}.old-pre-${VERSION}"
 		echo
 		echo "Refreshing local install at $local_install ..."
 		mv "$local_install" "$backup"
 		cp target/release/codesage "$local_install"
+		installed_version="$("$local_install" --version)" ||
+			die "could not check the installed binary version; original install is at ${backup}"
+		installed_version="${installed_version%%$'\n'*}"
+		[[ "${installed_version}" == "codesage ${VERSION} (release)" ]] ||
+			die "installed binary is '${installed_version}', expected 'codesage ${VERSION} (release)'; original install is at ${backup}"
 		rm -f "$backup"
-		installed_version="$("$local_install" --version 2>/dev/null || echo '?')"
 		echo "Local install: $installed_version"
+		echo "Restarting the shared MCP daemon ..."
+		"${local_install}" daemon stop || die "daemon stop failed after local install refresh"
+		python3 - "${local_install}" "${VERSION}" <<'PYEOF' || die "daemon verification failed after local install refresh"
+import json
+import os
+import select
+import subprocess
+import sys
+import time
+
+binary, version = sys.argv[1:]
+
+def verify_daemon():
+    # The daemon must outlive the release terminal and this verification shim.
+    proc = subprocess.Popen(
+        [binary, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 10
+    buffered = b""
+
+    def send(message):
+        proc.stdin.write(json.dumps(message).encode() + b"\n")
+        proc.stdin.flush()
+
+    def response(request_id):
+        nonlocal buffered
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("MCP handshake timed out after 10 seconds")
+            if b"\n" not in buffered:
+                if not select.select([proc.stdout], [], [], remaining)[0]:
+                    raise RuntimeError("MCP handshake timed out after 10 seconds")
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                if not chunk:
+                    raise RuntimeError("MCP shim closed before completing the handshake")
+                buffered += chunk
+                if len(buffered) > 1048576:
+                    raise RuntimeError("MCP handshake response exceeded 1 MiB")
+                continue
+            line, buffered = buffered.split(b"\n", 1)
+            message = json.loads(line)
+            if not isinstance(message, dict):
+                raise RuntimeError("MCP handshake returned a non-object message")
+            if "id" not in message:
+                continue
+            if message.get("id") != request_id or message.get("jsonrpc") != "2.0":
+                raise RuntimeError(f"unexpected MCP response: {message}")
+            if "error" in message or not isinstance(message.get("result"), dict):
+                raise RuntimeError(f"MCP request failed: {message}")
+            return message["result"]
+
+    try:
+        send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25", "capabilities": {},
+            "clientInfo": {"name": "codesage-release", "version": version},
+        }})
+        initialized = response(1)
+        if initialized.get("protocolVersion") != "2025-11-25" or not isinstance(initialized.get("capabilities"), dict):
+            raise RuntimeError(f"invalid MCP initialize response: {initialized}")
+        server = initialized.get("serverInfo", {})
+        if not isinstance(server, dict) or server.get("name") != "codesage" or server.get("version") != version:
+            raise RuntimeError(f"expected codesage {version} daemon, received {server}")
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        send({"jsonrpc": "2.0", "id": 2, "method": "ping"})
+        response(2)
+    finally:
+        proc.stdin.close()
+        try:
+            status = proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            try:
+                status = proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                status = proc.wait()
+        proc.stdout.close()
+    if status != 0:
+        raise RuntimeError(f"MCP verification shim exited with status {status}")
+
+try:
+    verify_daemon()
+except (OSError, ValueError, RuntimeError) as error:
+    sys.exit(f"daemon handshake failed: {error}")
+PYEOF
+		echo "Daemon restarted. Reconnect existing agent MCP sessions to use the new daemon."
 	else
 		echo
 		echo "No target/release/codesage binary (resumed run?); skipping local install refresh."

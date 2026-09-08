@@ -1,16 +1,8 @@
 use codesage_protocol::Chunk;
 
-// 1500 chars ≈ 380–500 tokens for typical code (3–4 chars/token), which
-// stays under the 512-token embed-time cap (MAX_SEQ_LENGTH) with slack
-// for the ~30-token augmentation header and special tokens. The earlier
-// 1000-char value paired with a 256-token cap caused silent truncation
-// on dense chunks; the cap-and-chunk pair was raised together. See
-// `bench/history/cap512-1500-2026-05-04.md` for the validating bench.
-//
-// The budgets below are character counts, not bytes: byte accounting
-// over-chunks multibyte text ~2-3x (a 1500-byte CJK slice is only ~500
-// chars). Byte offsets are still used for slicing and line numbers —
-// only the size comparisons count characters.
+// Character budgets avoid over-chunking UTF-8; slicing still uses byte offsets.
+// 1500 chars typically occupy 380–500 tokens under the 512-token embedding cap.
+// See bench/history/cap512-1500-2026-05-04.md for the paired chunk/token benchmark.
 pub const DEFAULT_CHUNK_SIZE: usize = 1500;
 pub const DEFAULT_MIN_CHUNK_SIZE: usize = 350;
 pub const DEFAULT_CHUNK_OVERLAP: usize = 200;
@@ -18,10 +10,6 @@ pub const DEFAULT_CHUNK_OVERLAP: usize = 200;
 /// Version of the splitting algorithm below. Bump it when a change to
 /// `chunk_text` can produce different chunk texts for the same input; it is
 /// part of the semantic fingerprint that gates stored-vector reuse.
-///
-/// Version 2 switched the budgets from bytes to characters: ASCII chunking
-/// is unchanged (one byte per char), multibyte text now chunks at the
-/// designed granularity instead of ~2-3x finer.
 pub const CHUNKER_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
@@ -48,10 +36,7 @@ pub fn chunk_text(content: &str, config: &ChunkConfig) -> Vec<Chunk> {
         return Vec::new();
     }
 
-    // A zero chunk_size would make the char-fallback loop in
-    // `split_recursive` compute `end == pos` and never advance — an infinite
-    // loop on any non-empty input. Clamp once at the entry so every consumer
-    // (split, merge, overlap) sees the same floor.
+    // The character-splitting fallback must advance on every iteration.
     let chunk_size = config.chunk_size.max(1);
 
     let raw = split_recursive(content, chunk_size, 0);
@@ -60,17 +45,13 @@ pub fn chunk_text(content: &str, config: &ChunkConfig) -> Vec<Chunk> {
 
     apply_overlap(&mut merged, content, config.overlap, chunk_size);
 
-    // Rescanning content[..pos] per chunk boundary is O(file × chunks);
-    // one newline-offset pass plus a binary search per boundary keeps large
-    // files linear. Overlap can move a chunk's start behind its
-    // predecessor's, so boundaries aren't monotonic and a running cursor
-    // wouldn't be safe.
+    // Avoid O(file × chunks) rescans. Overlap makes boundaries non-monotonic,
+    // so a running newline cursor cannot replace these binary searches.
     let newline_offsets: Vec<usize> = content
         .bytes()
         .enumerate()
         .filter_map(|(i, b)| (b == b'\n').then_some(i))
         .collect();
-    // Line number at a byte offset = 1 + newlines strictly before it.
     let line_at = |pos: usize| 1 + newline_offsets.partition_point(|&nl| nl < pos) as u32;
 
     merged
@@ -79,10 +60,7 @@ pub fn chunk_text(content: &str, config: &ChunkConfig) -> Vec<Chunk> {
             let start = snap_to_char_boundary(content, seg.start);
             let end = find_char_boundary(content, seg.end);
             let start_line = line_at(start);
-            // A chunk's own trailing newline terminates its last line rather
-            // than starting a new one; counting it would report an end_line
-            // one past the chunk's content (a "aaa\n" chunk is line 1, not
-            // lines 1-2) and misattribute symbols at chunk boundaries.
+            // A trailing newline terminates the last line; it does not add one.
             let count_end = if end > start && content.as_bytes()[end - 1] == b'\n' {
                 end - 1
             } else {
@@ -136,10 +114,7 @@ fn split_recursive(text: &str, max_size: usize, sep_idx: usize) -> Vec<Segment> 
     let mut segments = Vec::new();
     let mut current_start = 0;
     let mut current_end = 0;
-    // Characters in `text[current_start..current_end]`, tracked
-    // incrementally: recounting the whole candidate per part would be
-    // quadratic in the part count. Parts tile the input contiguously, so
-    // each part's chars are counted exactly once.
+    // Count each contiguous part once to avoid quadratic character rescans.
     let mut current_len = 0;
 
     for (part_start, part_end) in parts {
@@ -226,9 +201,6 @@ fn merge_small_chunks(
 
     let mut merged: Vec<Segment> = Vec::new();
     for seg in segments {
-        // Merge when either neighbor is sub-`min_size` and the result still
-        // fits `max_size` — so a small segment following a large one is also
-        // absorbed, not just a small predecessor.
         if let Some(last) = merged.last_mut()
             && (segment_chars(text, last) < min_size || segment_chars(text, &seg) < min_size)
             && segment_chars(text, last) + segment_chars(text, &seg) <= max_size
@@ -473,8 +445,6 @@ mod tests {
 
     #[test]
     fn end_line_excludes_chunk_trailing_newline() {
-        // First chunk is exactly "aaa\n": its content is line 1 only, and the
-        // second chunk ("bbb", no trailing newline) is line 2 only.
         let config = ChunkConfig {
             chunk_size: 4,
             min_chunk_size: 1,
@@ -594,8 +564,6 @@ mod tests {
 
     #[test]
     fn zero_chunk_size_terminates_with_sane_output() {
-        // Regression: chunk_size = 0 used to hang the char-fallback splitting
-        // loop. The entry clamp treats it as 1.
         let config = ChunkConfig {
             chunk_size: 0,
             min_chunk_size: DEFAULT_MIN_CHUNK_SIZE,

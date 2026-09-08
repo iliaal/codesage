@@ -33,13 +33,11 @@ def parse_version_banner(out: str) -> dict[str, str]:
     if not lines:
         return info
     first = lines[0]
-    # Strip the bin name so headers that prefix with "CodeSage:" don't double
-    # up ("CodeSage: codesage 0.4.0"); keep a `(release)`/`(debug)` suffix.
+    # Scorecard headers already name CodeSage; retain the build suffix.
     if first.lower().startswith("codesage "):
         first = first[len("codesage "):].strip()
     info["version"] = first or "unknown"
-    # Whitespace-free tokens for the METRICS comment: `0.26.1 (release)`
-    # becomes version_token=0.26.1 build=release.
+    # METRICS consumers require whitespace-free values.
     parts = info["version"].split(None, 1)
     info["version_token"] = parts[0]
     if len(parts) == 2:

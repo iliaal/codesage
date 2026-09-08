@@ -12,14 +12,11 @@ use codesage_storage::Database;
 use parking_lot::Mutex;
 
 use super::CodeSageServer;
-use super::params::EmbedTextsResult;
+use super::params::{EmbedTextsResult, RerankPairsParams, RerankPairsResult};
 
 const MCP_TEST_QUERY_EMBEDDING_ENV: &str = "CODESAGE_MCP_TEST_QUERY_EMBEDDING";
 
-/// Ceiling for the attacker-controlled `CODESAGE_MCP_TEST_QUERY_EMBEDDING`
-/// dimension, enforced before the value reaches `open_for_model_existing`.
-/// Real text-embedding dims top out at 4096; the harness seeds use 4.
-/// Anything larger is junk that would otherwise mint absurd chunk tables.
+/// Bound debug-override dimensions before selecting a chunk table.
 const MAX_TEST_QUERY_EMBEDDING_DIM: usize = 4096;
 
 #[derive(Debug, Clone)]
@@ -32,23 +29,15 @@ pub(super) struct ProjectState {
     /// `None` (the default) starts it on the first semantic query only.
     watch: Option<bool>,
     exclude_patterns: Vec<String>,
-    /// mtime of `.codesage/config.toml` when this state was loaded; `None`
-    /// means the file was absent (defaults in effect). Checked on every
-    /// resolution so a model switch or a config fix takes effect without a
-    /// daemon restart — a stale cached config would keep embedding
-    /// into the old `chunks_{model}_{dim}` table and silently fork the
-    /// semantic index.
+    /// Revalidate each resolution so config edits, creation, and deletion invalidate cached state.
     config_mtime: Option<std::time::SystemTime>,
 }
 
 impl ProjectState {
     fn config_path(&self) -> Option<PathBuf> {
-        // db_path = <root>/.codesage/index.db; config.toml sits beside it.
         self.db_path.parent().map(|dir| dir.join("config.toml"))
     }
 
-    /// True when the on-disk config no longer matches what this state was
-    /// built from (edited, created, or deleted since load).
     fn config_changed(&self) -> bool {
         match self.config_path() {
             Some(path) => config_toml_mtime(&path) != self.config_mtime,
@@ -56,11 +45,7 @@ impl ProjectState {
         }
     }
 
-    /// True when this cached state can still serve calls. Beyond the config
-    /// check, the index DB itself must still exist: `/codesage-reset` deletes
-    /// it under a live daemon, and serving the stale state would let a
-    /// downstream open recreate an empty index that answers every query with
-    /// zero results.
+    /// A reset deletes index.db; cached state must not recreate an empty index.
     fn still_valid(&self) -> bool {
         !self.config_changed() && self.db_path.exists()
     }
@@ -78,12 +63,8 @@ struct LoadedEmbeddingConfig {
     exclude_patterns: Vec<String>,
 }
 
-/// Whether a tool call should make sure a live watcher runs. A watcher
-/// re-embeds every saved file, so it is not worth starting for a session
-/// that only reads structure: it starts on the first semantic query, or on
-/// any call when the project config opts in with `[index] watch = true`.
-/// Existing watchers still reconcile config on structural calls; an
-/// explicit opt-out stops them regardless of the query kind.
+/// Start on semantic queries unless explicitly configured; structural calls still
+/// reconcile existing watchers and honor opt-out.
 fn watcher_start_wanted(config_watch: Option<bool>, semantic_query: bool) -> bool {
     match config_watch {
         Some(true) => true,
@@ -92,20 +73,10 @@ fn watcher_start_wanted(config_watch: Option<bool>, semantic_query: bool) -> boo
     }
 }
 
-/// One model "slot" per key — the outer mutex serializes the cold load
-/// for that key, the inner option holds the loaded model once init
-/// succeeds. Concurrent callers for the same key wait on the per-key
-/// mutex; callers for different keys run in parallel because they
-/// hold different slots. Previously `get_or_load_*` checked the map,
-/// dropped the lock, called `new()`, then raced to insert — two
-/// concurrent cold misses for the same model loaded two ORT sessions
-/// and the loser was thrown away.
+/// Per-key locks serialize cold loads without blocking unrelated model keys.
 type ModelSlot<T> = Arc<Mutex<Option<Arc<Mutex<T>>>>>;
 
-/// A pooled model: its load slot plus the last time it was requested.
-/// `last_used` is protected by the enclosing map mutex (stamped on every
-/// `get_or_load_slot` and read by the idle reaper), so it needs no lock
-/// of its own.
+/// The enclosing map mutex protects `last_used`.
 struct ModelEntry<T> {
     slot: ModelSlot<T>,
     last_used: Instant,
@@ -113,18 +84,7 @@ struct ModelEntry<T> {
 
 type ModelMap<T> = Mutex<HashMap<String, ModelEntry<T>>>;
 
-/// Find or create the slot for `key` and, if not yet populated, run
-/// `load()` under the slot lock. Returns the shared `Arc<Mutex<T>>`
-/// either way. The map lock is held only long enough to find-or-insert
-/// the slot (and stamp `last_used`); the loader runs while only the
-/// per-key slot lock is held, so concurrent calls for *different* keys
-/// never wait on each other.
-///
-/// The race this closes was `check map → drop → load → insert`: two threads
-/// hitting the same cold key both ran `load()` and the loser's value
-/// got dropped. This helper closes that window — for a single key, the
-/// first thread to reach the slot lock runs `load()` exactly once; the
-/// rest read the populated `Some(arc)` and return immediately.
+/// Hold the map lock only for lookup; load under the per-key lock to prevent duplicate sessions.
 fn get_or_load_slot<T, F>(map: &ModelMap<T>, key: String, load: F) -> Result<Arc<Mutex<T>>>
 where
     F: FnOnce() -> Result<T>,
@@ -148,15 +108,8 @@ where
     Ok(arc)
 }
 
-/// Drop pooled models that have sat unused longer than `timeout` and are
-/// not currently in flight, returning how many were evicted. The loaded
-/// model (and its ORT `Session`) is dropped *outside* the map lock so a
-/// slow CUDA teardown never stalls other lookups.
-///
-/// "Not in flight" is `Arc::strong_count(inner) == 1` — only the pool
-/// holds the model, no tool call has a clone out. We `try_lock` each
-/// slot rather than block: a slot held by an in-flight cold load is
-/// skipped this round instead of pinning the map lock for seconds.
+/// Evict idle models only when the pool owns the last reference. Skip busy load
+/// slots and drop models outside the map lock because CUDA teardown can block.
 fn evict_idle_from_map<T>(map: &ModelMap<T>, timeout: Duration) -> usize {
     let mut taken: Vec<Arc<Mutex<T>>> = Vec::new();
     {
@@ -184,67 +137,39 @@ fn evict_idle_from_map<T>(map: &ModelMap<T>, timeout: Duration) -> usize {
 
 pub(crate) struct CodeSageServerState {
     projects: Mutex<HashMap<PathBuf, ProjectState>>,
-    /// Fast-path cache keyed by the raw `project` arg string. Agents pass the
-    /// same literal absolute path on every call, so this lets `resolve_project`
-    /// skip `canonicalize()`'s per-component lstat on the hot path. `projects`
-    /// (keyed by canonical path) stays the source of truth and dedupes distinct
-    /// spellings of the same root.
+    /// Raw-path cache avoids repeated canonicalization; `projects` deduplicates canonical roots.
     resolved: Mutex<HashMap<String, ProjectState>>,
     embedders: ModelMap<Embedder>,
     rerankers: ModelMap<Reranker>,
-    /// Live filesystem watchers, one per project, keyed by canonical root.
-    /// Spawned lazily on first tool call for a project (see
-    /// [`CodeSageServer::ensure_watcher`]) and reaped on daemon shutdown.
+    /// One watcher per canonical project root, started lazily and reaped on shutdown.
     watchers: Mutex<HashMap<PathBuf, WatcherEntry>>,
     watcher_lifecycle: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
 }
 
-/// Handle to a per-project watcher thread. `alive` flips to false when the
-/// thread exits (idle timeout, disabled marker, error), so `ensure_watcher`
-/// can tell a dead entry from a running one and respawn. `config_key`
-/// records the embedding and exclusion config the watcher was spawned with
-/// so a config change can retire it (see [`watcher_config_key`]). `thread` is the
-/// spawned thread's join handle, taken by whichever stop path waits it out;
-/// `None` while the spawn is still in flight or once the handle is taken.
-///
-/// An entry with `shutdown` set and `alive` still true is STOPPING: its
-/// thread is force-draining. The slot stays occupied until the thread has
-/// exited, so a start request for the same root waits instead of spawning a
-/// second watcher beside it (see [`reserve_watcher_slot`]).
+/// A signalled but alive watcher retains its slot while draining. A restart waits
+/// for exit to avoid overlapping indexing and status-file writes.
 struct WatcherEntry {
     shutdown: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
     config_key: String,
     thread: Option<std::thread::JoinHandle<()>>,
-    /// When the entry was first observed STOPPING (shutdown signalled, thread
-    /// not yet exited). Bounds the reserve: a watcher wedged past
-    /// [`WATCHER_STUCK_FORCE_DETACH`] is detached so one wedged thread cannot
-    /// disable semantic reindex process-wide forever.
+    /// First observed stop; bounds how long a wedged thread reserves its slot.
     stopping_since: Option<Instant>,
 }
 
-/// How long a start request waits for a stopping watcher on the same root
-/// before giving up on spawning for this call. Bounded because it runs
-/// inside a tool call; the next call retries.
+/// Bound restart waits inside tool calls; later calls retry.
 const WATCHER_RESTART_WAIT: Duration = Duration::from_secs(5);
 
-/// How long a stopping watcher may hold its slot before a start request
-/// detaches it. Past this the thread is wedged (its drain normally takes
-/// seconds); keeping the slot would silently disable semantic reindex for
-/// the project forever. Detaching orphans the old thread — it still exits
-/// through its `AliveGuard` on its own handle — so a fresh watcher can spawn.
+/// Detach long-wedged watchers so one stuck drain cannot permanently disable reindexing.
+/// The detached thread retains its own AliveGuard.
 const WATCHER_STUCK_FORCE_DETACH: Duration = Duration::from_secs(15 * 60);
 
 /// How long the last-client stop waits for each watcher to finish its drain
 /// before leaving its slot in place as still-stopping.
 pub(crate) const WATCHER_STOP_WAIT: Duration = Duration::from_secs(60);
 
-/// Poll interval for the alive-flag waits below. The watcher loop notices
-/// `shutdown` within its own 500 ms poll, so finer polling buys nothing.
 const WATCHER_EXIT_POLL: Duration = Duration::from_millis(20);
 
-/// Block until `alive` reads false or `deadline` passes. True when the
-/// thread has exited.
 fn wait_for_watcher_exit(alive: &AtomicBool, deadline: Instant) -> bool {
     loop {
         if !alive.load(Ordering::SeqCst) {
@@ -258,23 +183,14 @@ fn wait_for_watcher_exit(alive: &AtomicBool, deadline: Instant) -> bool {
     }
 }
 
-/// Signal every live watcher, then wait (up to `wait` in total) for each to
-/// exit, joining its thread and freeing its slot only once it has. A slot
-/// whose thread outlives the wait stays in the map as stopping, with its
-/// handle put back for whoever finishes the wait later; nothing may spawn
-/// into that slot meanwhile. Returns how many watchers were still stopping
-/// at the deadline.
+/// Signal all watchers and share one wait deadline. Timed-out slots retain their
+/// join handles and remain unavailable for replacement.
 fn stop_all_watchers(watchers: &Mutex<HashMap<PathBuf, WatcherEntry>>, wait: Duration) -> usize {
     stop_all_watchers_if(watchers, wait, || true).expect("an unconditional stop never aborts")
 }
 
-/// [`stop_all_watchers`], gated: `still_wanted` is evaluated under the
-/// registry lock immediately before the first shutdown signal, and a `false`
-/// aborts the whole stop with `None` and no watcher signalled. The
-/// last-client stop passes the client count here: a client that connected
-/// between the disconnect that scheduled the stop and this point would
-/// otherwise see its watcher running and then stopped under it, because a
-/// start request only waits on the slot once the signal has landed.
+/// Check `still_wanted` under the registry lock before signalling. This closes the
+/// race between last-client disconnect and a new client finding the old watcher.
 fn stop_all_watchers_if(
     watchers: &Mutex<HashMap<PathBuf, WatcherEntry>>,
     wait: Duration,
@@ -331,7 +247,6 @@ fn stop_all_watchers_if(
     Some(still_stopping)
 }
 
-/// Decision of [`reserve_watcher_slot`].
 #[derive(Debug, PartialEq, Eq)]
 enum WatcherSlot {
     /// A live watcher with this config already owns the slot.
@@ -344,14 +259,8 @@ enum WatcherSlot {
     StillStopping,
 }
 
-/// Claim the watcher slot for `root` with the given `shutdown`/`alive`
-/// tokens. A live watcher with a matching `config_key` keeps the slot; one
-/// with a stale key is signalled to stop. A stopping watcher — signalled by
-/// a config change or by the last client's disconnect — is waited out (up to
-/// `wait`) before the slot is handed over, so a shim reconnecting while the
-/// previous watcher force-drains never gets a second watcher on the same
-/// root: overlapping watchers reindex the same saves twice and race on the
-/// status file.
+/// Retire stale configurations and wait for draining watchers before reserving.
+/// Overlapping watchers duplicate indexing and race on the status file.
 fn reserve_watcher_slot(
     watchers: &Mutex<HashMap<PathBuf, WatcherEntry>>,
     root: &Path,
@@ -370,9 +279,6 @@ fn reserve_watcher_slot(
                 if entry.config_key == config_key {
                     return WatcherSlot::Running;
                 }
-                // Spawned with an outdated embedding config (model switch
-                // in config.toml). Retire it; the wait below sees it out so
-                // the respawn never overlaps the drain.
                 entry.shutdown.store(true, Ordering::SeqCst);
             }
             let old_alive = entry.alive.clone();
@@ -380,20 +286,13 @@ fn reserve_watcher_slot(
             drop(guard);
             if !wait_for_watcher_exit(&old_alive, deadline) {
                 let mut guard = watchers.lock();
-                // The slot still belongs to the stopping watcher: put its
-                // handle back and wait for the next call — unless it has been
-                // wedged past the bound, in which case detach the slot so a
-                // fresh watcher can spawn (the old thread keeps its own
-                // `alive` token and still exits through its `AliveGuard`).
+                // Restore the handle only if this is still our slot; detach only past the wedge timeout.
                 let wedged = match guard
                     .get_mut(root)
                     .filter(|entry| Arc::ptr_eq(&entry.alive, &old_alive))
                 {
                     Some(entry) => {
                         entry.thread = thread;
-                        // First sighting of the wedge starts the clock; a
-                        // later call past the bound detaches instead of
-                        // waiting out a thread that will never exit.
                         let since = *entry.stopping_since.get_or_insert_with(Instant::now);
                         if since.elapsed() >= WATCHER_STUCK_FORCE_DETACH {
                             guard.remove(root);
@@ -440,11 +339,7 @@ fn reserve_watcher_slot(
     }
 }
 
-/// Flips a watcher's `alive` flag to false when its thread exits by ANY
-/// path — including a panic unwinding out of `run_statewatcher`.
-/// Without the guard a panicked watcher left `alive` true forever and
-/// `ensure_watcher`'s hot check never respawned it. Mirrors statewatcher's
-/// `StatusGuard` pattern.
+/// Clear liveness even when the watcher unwinds, allowing later calls to respawn it.
 struct AliveGuard(Arc<AtomicBool>);
 
 impl Drop for AliveGuard {
@@ -453,12 +348,7 @@ impl Drop for AliveGuard {
     }
 }
 
-/// Removes a reserved watcher-map entry unless [`disarm`](Self::disarm)ed.
-/// `ensure_watcher` inserts the entry BEFORE dropping the map lock so a
-/// concurrent caller can't double-spawn; this guard makes sure the
-/// reservation can't leak when a path between the insert and a successful
-/// thread spawn bails out. Identity is checked via `Arc::ptr_eq` on the
-/// `shutdown` handle so the guard never removes an entry it doesn't own.
+/// Release failed spawns' reservations; token identity prevents removing a replacement.
 struct WatcherReservation<'a> {
     watchers: &'a Mutex<HashMap<PathBuf, WatcherEntry>>,
     root: PathBuf,
@@ -487,19 +377,9 @@ impl Drop for WatcherReservation<'_> {
     }
 }
 
-/// Key identifying the embedding setup and exclusions a watcher runs with.
-/// A watcher whose key no longer matches the project's current config is retired
-/// (shutdown signalled) so the next resolution respawns it with the fresh
-/// config instead of embedding into the old model's chunk table forever.
-///
-/// Every input of the semantic fingerprint is in the key — model, device,
-/// batch size, pooling, and the identity of the model files on disk —
-/// because a watcher that survives any of them changing keeps producing
-/// vectors the new fingerprint disowns. The file identity is path, size, and
-/// mtime of the cached artifacts (the key the content digest is cached by),
-/// never a read of their bytes: this runs on every tool call and must not
-/// block on hashing a model or on a download. An uncached model keys as
-/// `uncached`; the first load changes the key and restarts the watcher once.
+/// Retire watchers when embedding identity or exclusions change. Use cached artifact
+/// stat metadata, not hashing or downloads, on this per-call path. First load replaces
+/// `uncached` and causes one restart.
 fn watcher_config_key(state: &ProjectState) -> String {
     let embedding =
         if state.embedding_config.model.is_empty() || state.embedding_config_error.is_some() {
@@ -529,12 +409,7 @@ fn cached_artifact_identity(model: &str) -> String {
     }
 }
 
-/// Pool key for a resident [`Embedder`]: everything `Embedder::new` bakes
-/// into the session's output. Pooling is part of it — a project that
-/// switches `[embedding].pooling` under the same model name must get a fresh
-/// session, not the one still pooling the other way — and so is the digest
-/// of the model files, so a same-name model whose bytes changed on disk gets
-/// a session over the new bytes rather than the one loaded from the old.
+/// Include pooling and artifact digest: the same model name may produce incompatible vectors.
 fn embedder_pool_key(config: &EmbeddingConfig, artifact_digest: &str) -> Result<String> {
     let batch_size = config.effective_batch_size()?;
     Ok(format!(
@@ -555,9 +430,7 @@ fn resolved_embedder_pool_key(config: &EmbeddingConfig) -> Result<String> {
     embedder_pool_key(config, &digest)
 }
 
-/// The semantic fingerprint of the vectors a resident `embedder` loaded for
-/// `config` produces. The artifact digest is already cached from the pool
-/// key the load resolved, so this reads no model file.
+/// Include the resident execution provider; artifact digests are cached by pool-key resolution.
 fn session_fingerprint(
     config: &EmbeddingConfig,
     embedder: &Embedder,
@@ -568,11 +441,8 @@ fn session_fingerprint(
     )
 }
 
-/// The `embed_texts` fingerprint gate: a caller's `expected` fingerprint
-/// must equal the one this session `produces`; a non-empty request must
-/// carry one. A probe (empty texts) may omit it. Refusals carry
-/// [`super::EMBED_TEXTS_FINGERPRINT_MISMATCH`] so the client aborts rather
-/// than embedding privately.
+/// Non-empty batches must attest this session's fingerprint. Empty probes may omit it.
+/// The mismatch marker tells clients to abort rather than fall back privately.
 fn check_expected_fingerprint(expected: Option<&str>, produces: &str, probe: bool) -> Result<()> {
     match expected {
         Some(expected) if expected != produces => bail!(
@@ -600,31 +470,20 @@ impl CodeSageServerState {
         }
     }
 
-    /// Drop pooled embedders + rerankers idle longer than `timeout`,
-    /// returning how many were evicted. Frees the ORT `Session` (and thus
-    /// its GPU VRAM); the host-side `malloc_trim` is the caller's job so it
-    /// runs once per sweep rather than per model. Models with an in-flight
-    /// call (a held `Arc` clone) are left alone. Called periodically by the
-    /// daemon's model-eviction task.
+    /// Evict unused models without touching in-flight references. Call malloc_trim once
+    /// after the sweep, not per model.
     pub(crate) fn evict_idle_models(&self, timeout: Duration) -> usize {
         evict_idle_from_map(&self.embedders, timeout)
             + evict_idle_from_map(&self.rerankers, timeout)
     }
 
-    /// Signal every live watcher to drain and exit, then wait up to `wait`
-    /// for them to do so, freeing each registry slot only once its thread
-    /// has been joined. Called when the last client disconnects and on
-    /// daemon exit. A watcher still draining at the deadline keeps its slot
-    /// as stopping, so a start request for that root waits rather than
-    /// spawning beside it. Blocks; call from a blocking context.
+    /// Stop and join watchers within `wait`; timed-out slots stay reserved.
+    /// Blocks: call outside async workers.
     pub(crate) fn shutdown_all_watchers(&self, wait: Duration) -> usize {
         stop_all_watchers(&self.watchers, wait)
     }
 
-    /// The last-client variant of [`Self::shutdown_all_watchers`]: stops
-    /// only if `active_clients` still reads zero under the registry lock,
-    /// and returns `None` without signalling any watcher when a client has
-    /// connected since the disconnect that scheduled this stop.
+    /// Abort without signalling if a new client arrived before the registry lock was acquired.
     pub(crate) fn shutdown_watchers_if_no_client(
         &self,
         wait: Duration,
@@ -643,10 +502,6 @@ impl CodeSageServer {
         Ok(state)
     }
 
-    /// Spawn (or respawn after an idle exit) the project's live watcher when
-    /// [`watcher_start_wanted`] says this call warrants one. Cheap when a
-    /// watcher is already running. Root is `<...>/.codesage/index.db` → two
-    /// parents.
     fn maybe_start_watcher(&self, state: &ProjectState, semantic_query: bool) {
         let Some(root) = state.db_path.parent().and_then(|p| p.parent()) else {
             return;
@@ -733,12 +588,7 @@ impl CodeSageServer {
     }
 
     fn resolve_project_inner(&self, project: &str) -> Result<ProjectState> {
-        // Fast path: same raw arg string seen before — skip canonicalize().
-        // Two stats guard the cache: config.toml (an edited / created /
-        // deleted config falls through to a reload, so model switches and
-        // config fixes take effect without a daemon restart) and
-        // index.db (a deleted index falls through to the cold path's
-        // not-onboarded gate instead of being silently recreated).
+        // Cached roots still need config-mtime and index-existence checks after edits or resets.
         {
             let guard = self.state.resolved.lock();
             if let Some(state) = guard.get(project)
@@ -771,12 +621,7 @@ impl CodeSageServer {
                 return Ok(state);
             }
         }
-        // Mirror the CLI's `find_project_root`: a `project` pointing at a
-        // subdirectory of an onboarded tree resolves to the enclosing root
-        // instead of failing as "not onboarded". The nearest ancestor wins,
-        // so a nested `.codesage` still resolves to its own project, never
-        // an outer one. `canonical` is the root from here on, so the state
-        // cache, drift log, and db path below all key on the root.
+        // Match CLI root discovery: the nearest onboarded ancestor owns nested paths.
         let mut enclosing = canonical.clone();
         loop {
             if enclosing.join(".codesage").join("index.db").exists() {
@@ -795,9 +640,7 @@ impl CodeSageServer {
         let codesage_dir = canonical.join(".codesage");
         let db_path = codesage_dir.join("index.db");
         let config_path = codesage_dir.join("config.toml");
-        // Stamp the mtime BEFORE reading: if the file is replaced between the
-        // stat and the read we hold an older stamp and reload on the next
-        // call, never serving a config newer than the stamp claims.
+        // Stat before reading so a racing replacement leaves an old stamp and forces a reload.
         let config_mtime = config_toml_mtime(&config_path);
         let embedding_config = load_embedding_config(&config_path);
         let state = ProjectState {
@@ -808,23 +651,15 @@ impl CodeSageServer {
             exclude_patterns: embedding_config.exclude_patterns,
             config_mtime,
         };
-        // A load error is never cached: structural tools still work off this
-        // state for the current call (semantic paths surface the error), but
-        // the next resolution re-reads the config so fixing the file doesn't
-        // need a daemon restart.
+        // Keep structural calls available, but never cache errors that a config repair can fix.
         if state.embedding_config_error.is_some() {
             return Ok(state);
         }
-        // `insert` (not insert-if-absent): a config reload must replace the
-        // stale entry. First registration still gets the drift log below.
+        // Reloads replace stale state; only first registration writes drift telemetry.
         let newly_registered = {
             let mut guard = self.state.projects.lock();
             guard.insert(canonical.clone(), state.clone()).is_none()
         };
-        // Drift telemetry: on first resolution of a project in this MCP
-        // session, append one JSON line to `.codesage/drift.log`. Non-fatal —
-        // telemetry errors stay in tracing so a drift write never blocks a
-        // tool call.
         if newly_registered && let Err(e) = write_drift_log_for_project(&canonical, &db_path) {
             tracing::debug!(error = %e, "drift log append failed");
         }
@@ -835,21 +670,13 @@ impl CodeSageServer {
         Ok(state)
     }
 
-    /// Ensure a live filesystem watcher is running for `root`, spawning one if
-    /// absent and the project hasn't opted out. The watcher reuses the daemon's
-    /// pooled embedder (no extra model load) and self-exits after idle; this
-    /// just guarantees one exists. Errors are logged, never propagated.
+    /// Ensure a pooled-model watcher exists. Spawn errors are logged without failing the tool call.
     fn ensure_watcher(&self, root: &Path, state: &ProjectState) {
         let config_key = watcher_config_key(state);
         let shutdown = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(true));
 
-        // Hot path: a live watcher already exists. Just a lock + atomic load,
-        // no config I/O — this runs on every tool call. The (re)spawn path
-        // reserves the map entry under the SAME lock before spawning, so two
-        // concurrent first calls can't both spawn a watcher and orphan one
-        // entry's shutdown/alive handles; a stopping watcher is waited out
-        // first so the respawn never overlaps its drain.
+        // Reserve under the registry lock to prevent concurrent first calls from double-spawning.
         match reserve_watcher_slot(
             &self.state.watchers,
             root,
@@ -868,8 +695,7 @@ impl CodeSageServer {
             }
             WatcherSlot::Reserved => {}
         }
-        // Every early return below must release the reservation, else the
-        // hot check would treat a never-spawned watcher as alive forever.
+        // Early returns must release the reservation or a never-spawned watcher looks alive forever.
         let reservation = WatcherReservation {
             watchers: &self.state.watchers,
             root: root.to_path_buf(),
@@ -877,11 +703,7 @@ impl CodeSageServer {
             armed: true,
         };
 
-        // (Re)spawn path: load config and honor opt-out / disabled marker.
-        // A config that fails to load must not fall back to defaults: the
-        // watcher would silently index with default exclude patterns while
-        // `codesage index` hard-errors on the same file. Skip the spawn; the
-        // next resolution retries once the file is fixed.
+        // Invalid config must not silently substitute default exclusions; retry after repair.
         let project_config = match crate::load_project_config(root) {
             Ok(config) => config,
             Err(e) => {
@@ -900,8 +722,7 @@ impl CodeSageServer {
 
         let exclude_patterns = crate::get_exclude_patterns(&project_config);
 
-        // Hand the watcher the daemon's pooled embedder, resolved lazily so an
-        // idle watcher never forces a model load. `None` = structural-only.
+        // Resolve the pooled model lazily so idle watchers do not force a load.
         let embedder: Option<crate::statewatcher::EmbedderProvider> =
             if state.embedding_config.model.is_empty() || state.embedding_config_error.is_some() {
                 None
@@ -990,9 +811,7 @@ impl CodeSageServer {
         Ok(&state.embedding_config)
     }
 
-    /// Open the chunk table a semantic query reads, refusing one whose
-    /// fingerprint is absent or differs from the configured setup: its
-    /// vectors are another setup's output and the error names the repair.
+    /// Require an attested chunk table matching the configured vector identity.
     fn open_db_for(&self, state: &ProjectState) -> Result<Database> {
         let config = self.semantic_embedding_config(state)?;
         let embedder_arc = self.get_or_load_embedder(config)?;
@@ -1012,20 +831,8 @@ impl CodeSageServer {
         Database::open_for_existing_model(&state.db_path, &config.model)
     }
 
-    // Daemon integration tests spawn the real binary, where ordinary
-    // `#[cfg(test)]` fakes are unavailable. This test-named env var lets that
-    // binary exercise MCP search with a seeded vector table and no model
-    // download. Release binaries never honor it: `cfg!(debug_assertions)` is
-    // false there, so a leaked or attacker-set variable in production is
-    // inert. Only debug builds — the harness's `CARGO_BIN_EXE_codesage` —
-    // take the override branch in `with_project_query`, and even there the
-    // dimension is capped and the freshness gate in `open_test_override_db`
-    // still applies.
-    // In-tree consumers (debug harness only):
-    // - crates/cli/tests/mcp_daemon.rs
-    //   `tools_call_search_returns_seeded_hits_without_model_download`
-    // - crates/cli/tests/mcp_daemon.rs
-    //   `every_schema_bearing_tool_returns_populated_structured_content`
+    // Real-binary integration tests cannot use cfg(test) fakes. Honor seeded vectors only
+    // in debug builds; retain dimension/freshness checks and mark override responses.
     fn test_query_embedding_override(&self) -> Result<Option<Vec<f32>>> {
         Self::parse_test_query_embedding_override(
             std::env::var(MCP_TEST_QUERY_EMBEDDING_ENV).ok().as_deref(),
@@ -1033,10 +840,7 @@ impl CodeSageServer {
         )
     }
 
-    /// Pure core of [`Self::test_query_embedding_override`]. `honored` is
-    /// `cfg!(debug_assertions)` in production; threading it as a parameter
-    /// keeps the release-path behavior (override ignored even when set)
-    /// unit-testable under a debug test build.
+    /// Parameterize the build guard to test release-path logic in a debug test binary.
     fn parse_test_query_embedding_override(
         raw: Option<&str>,
         honored: bool,
@@ -1074,10 +878,6 @@ impl CodeSageServer {
         if embedding.is_empty() {
             bail!("{MCP_TEST_QUERY_EMBEDDING_ENV} must contain at least one f32");
         }
-        // Cap the attacker-controlled dimension before it reaches
-        // `open_for_model_existing`, where a huge dim would mint a junk chunk
-        // table. `open_test_override_db` refines this to equality with the
-        // model's recorded dim.
         if embedding.len() > MAX_TEST_QUERY_EMBEDDING_DIM {
             bail!(
                 "{MCP_TEST_QUERY_EMBEDDING_ENV} has {} components, over the {MAX_TEST_QUERY_EMBEDDING_DIM} cap",
@@ -1087,14 +887,7 @@ impl CodeSageServer {
         Ok(Some(embedding))
     }
 
-    /// Whether the debug-only query-embedding override would fire for this
-    /// process: debug build plus a parseable env value. Probe for the render
-    /// layer's `_meta.test_override` annotation — `with_project_query` is
-    /// generic over its result type and cannot stamp the envelope itself.
-    /// False in release builds (where the override is inert) and when the
-    /// variable is unset; a malformed value reads false here and surfaces as
-    /// a tool error on the query path itself; called by the `search` and
-    /// `export_context` tool handlers to stamp `_meta.test_override`.
+    /// Render-layer probe for `_meta.test_override`; malformed overrides fail on the query path.
     pub(super) fn test_override_active() -> bool {
         Self::parse_test_query_embedding_override(
             std::env::var(MCP_TEST_QUERY_EMBEDDING_ENV).ok().as_deref(),
@@ -1103,26 +896,9 @@ impl CodeSageServer {
         .is_ok_and(|opt| opt.is_some())
     }
 
-    /// Open the chunk table for the debug-only test override. Unlike the
-    /// normal path this loads no embedder (no model download — the reason
-    /// the escape exists), but it is not a freshness bypass:
-    ///
-    /// - `open_for_existing_model` runs no migrations and creates nothing,
-    ///   so an override for an unindexed model fails instead of minting
-    ///   tables; the recorded dimension must then equal the override's, so
-    ///   the vector queries exactly the table the configured model recorded
-    ///   — never another setup's, never a fresh empty one. The final open
-    ///   reuses that recorded dim, not the attacker-controlled length.
-    /// - The fingerprint gate still runs, cheapest-first: an unattested
-    ///   table (the harness's seeded tables, by construction) carries
-    ///   nothing to compare, so artifact resolution is skipped entirely —
-    ///   resolving would digest hundreds of megabytes of model files on the
-    ///   request path. An attested table resolves the expectation from the
-    ///   local cache only (`CachedOnly`, never a network download) and a
-    ///   recorded `Mismatch` is refused like the production path; absent
-    ///   local artifacts (the harness's offline case) leave nothing to
-    ///   compare, so the model-identity + dim-equality gate above is all
-    ///   that is enforced — see `enforce_test_override_freshness`.
+    /// Open an existing debug-fixture table without downloading a model. Require the
+    /// recorded dimension; compare fingerprints only when both attestation and local
+    /// artifacts exist. Never create a table for an override.
     fn open_test_override_db(
         &self,
         state: &ProjectState,
@@ -1142,14 +918,8 @@ impl CodeSageServer {
                 config.model
             );
         }
-        // Fingerprint gate, cheapest-first: an unattested table carries
-        // nothing to compare, so skip artifact resolution entirely for it.
-        // Resolving would digest hundreds of megabytes of model files on the
-        // request path (the harness's seeded tables are unattested by
-        // construction, and the seeded-search daemon tests run under a
-        // 5-second response budget). Attested tables still resolve the
-        // expectation from the local cache only — never a download — and a
-        // recorded `Mismatch` is refused like the production path.
+        // Unattested fixtures have nothing to compare; avoid expensive artifact resolution.
+        // Attested tables resolve locally and still reject mismatches.
         if db.semantic_fingerprint()?.is_some() {
             let expected = codesage_graph::resolve_semantic_fingerprint(
                 &db,
@@ -1166,18 +936,8 @@ impl CodeSageServer {
         Database::open_for_model_existing(&state.db_path, &config.model, recorded)
     }
 
-    /// The override's share of the production freshness gate, as a pure
-    /// function of the resolved expectation so every case is unit-testable
-    /// without model artifacts on disk:
-    /// - `None` (artifacts absent from the local cache): nothing to compare
-    ///   against without a network download; the dim gate stands alone.
-    /// - `Current`: the attested table matches this setup; proceed.
-    /// - `Mismatch`: stale table; refused exactly like the production path.
-    /// - `Unrecorded`: the harness's seeded tables carry vectors but no
-    ///   attestation by construction; demanding one here would force the
-    ///   model download the escape exists to avoid, so the dim gate stands
-    ///   alone. Any real indexing pass attests its table and returns to the
-    ///   `Current`/`Mismatch` arms.
+    /// Debug fixtures may lack attestation or cached artifacts; enforce dimension alone
+    /// in those cases. A comparable recorded mismatch is still an error.
     fn enforce_test_override_freshness(
         db: &Database,
         expected: Option<&codesage_graph::SemanticFingerprint>,
@@ -1205,8 +965,6 @@ impl CodeSageServer {
         }
     }
 
-    /// Resolve project, open its DB, run `f` with the DB. Error handling funnel:
-    /// each handler's body lives under this so the tool dispatch stays one-liner.
     pub(super) fn with_project_db<F, R>(&self, project: &str, f: F) -> Result<R>
     where
         F: FnOnce(&Database) -> Result<R>,
@@ -1216,16 +974,13 @@ impl CodeSageServer {
         f(&db)
     }
 
-    /// Variant of `with_project_db` that also passes the canonical project
-    /// root path. Used by tools like `session_start` that need to write
-    /// alongside `.codesage/index.db` (e.g. `.codesage/sessions/<id>.json`).
+    /// Also expose the canonical root for tools that persist project state.
     pub(super) fn with_project_root_db<F, R>(&self, project: &str, f: F) -> Result<R>
     where
         F: FnOnce(&Path, &Database) -> Result<R>,
     {
         let state = self.resolve_project(project)?;
         let db = self.open_structural_db_for(&state)?;
-        // db_path = <project_root>/.codesage/index.db; pop twice to recover root.
         let root = state
             .db_path
             .parent()
@@ -1243,31 +998,9 @@ impl CodeSageServer {
         f(&db)
     }
 
-    /// Resolve a project, embed `query`, and call `f` with the resulting
-    /// query embedding + a reranker callback that lazily locks the shared
-    /// reranker only when the search pipeline actually invokes it.
-    ///
-    /// The lock scopes are deliberately tight: the embedder mutex is held
-    /// only for the `embed_one` call, the reranker mutex is held only for
-    /// the (single) `score_pairs` call inside `search`. SQLite retrieval
-    /// and result post-processing run lock-free, so concurrent agents on
-    /// the same project can interleave their SQL work while one is in the
-    /// (slow) ORT call. Pre-daemon each shim had a per-process embedder
-    /// pool so calls were already parallel; this preserves that property
-    /// under the shared-daemon model.
-    /// Embed `texts` with the project's resident embedder for the hidden
-    /// `embed_texts` tool. `model` must be the project's configured model:
-    /// the caller is about to write these vectors into that model's chunk
-    /// table, and a daemon whose config moved on would silently fork the
-    /// index. An empty `texts` probes model, dimension, and fingerprint.
-    ///
-    /// `expected_fingerprint` is the full semantic fingerprint the caller
-    /// will attest the vectors under. Model and dimension alone let a
-    /// same-model pooling, device, or model-file change on this side slip
-    /// into a table recorded under the caller's original identity, so a
-    /// non-empty request without one, or with one that differs from the
-    /// fingerprint this session produces, is refused under
-    /// [`super::EMBED_TEXTS_FINGERPRINT_MISMATCH`].
+    /// Embed with the configured resident model; empty texts probe its identity.
+    /// Non-empty requests must supply the full fingerprint, since model name and
+    /// dimension alone cannot detect pooling, device, or artifact changes.
     pub(super) fn embed_texts_for(
         &self,
         project: &str,
@@ -1304,21 +1037,55 @@ impl CodeSageServer {
         })
     }
 
+    pub(super) fn rerank_pairs_for(
+        &self,
+        params: &RerankPairsParams,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<RerankPairsResult> {
+        let documents: Vec<&str> = params.documents.iter().map(String::as_str).collect();
+        crate::query_reranker::check_caps(&params.query, &documents)?;
+        anyhow::ensure!(!cancelled(), "rerank_pairs request cancelled");
+        let state = self.resolve_project(&params.project)?;
+        let config = self.semantic_embedding_config(&state)?;
+        anyhow::ensure!(
+            config.reranker.as_deref() == Some(params.model.as_str())
+                && config.device == params.device,
+            "daemon reranker model/device differs from requested configuration; re-run after the config change settles"
+        );
+        let scores = if documents.is_empty() {
+            Vec::new()
+        } else {
+            let reranker = self.get_or_load_reranker(&params.model, &params.device)?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            loop {
+                anyhow::ensure!(!cancelled(), "rerank_pairs request cancelled");
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "rerank_pairs timed out waiting for the pooled reranker"
+                );
+                if let Some(mut guard) = reranker.try_lock_for(Duration::from_millis(25)) {
+                    anyhow::ensure!(!cancelled(), "rerank_pairs request cancelled");
+                    break guard.score_pairs(&params.query, &documents)?;
+                }
+            }
+        };
+        crate::query_reranker::check_scores(&scores, documents.len())?;
+        Ok(RerankPairsResult {
+            model: params.model.clone(),
+            device: params.device.clone(),
+            scores,
+        })
+    }
+
     pub(super) fn with_project_query<F, R>(&self, project: &str, query: &str, f: F) -> Result<R>
     where
         F: FnOnce(&Database, &[f32], Option<codesage_graph::RerankFn<'_>>) -> Result<R>,
     {
         let state = self.resolve_project(project)?;
-        // A semantic query is what a live watcher exists to keep fresh.
         self.maybe_start_watcher(&state, true);
         let config = self.semantic_embedding_config(&state)?;
         if let Some(query_embedding) = self.test_query_embedding_override()? {
-            // Debug-harness escape: no embedder load, no reranker. The open
-            // still validates the dim against the recorded table and runs
-            // the fingerprint gate whenever it is locally computable; the
-            // `_meta.test_override` marker is stamped by the render layer
-            // via `test_override_active` (this function is generic over `R`
-            // and cannot touch the response envelope itself).
+            // The override skips model loads; table compatibility remains checked and the render layer marks it.
             let dim = query_embedding.len();
             let db = self.open_test_override_db(&state, config, dim)?;
             return f(&db, &query_embedding, None);
@@ -1333,19 +1100,14 @@ impl CodeSageServer {
 
         let query_embedding = {
             let mut guard = embedder_arc.lock();
-            // The table is current for the configured setup; the query
-            // vector must come from a session producing that same identity,
-            // or its neighbours are another setup's. Refused as the stale
-            // table is, naming `codesage index --full`.
+            // Config compatibility is insufficient: verify the resident session's execution provider too.
             let produces = session_fingerprint(config, &guard)?;
             codesage_graph::require_current_semantic_table(&db, &produces)?;
             guard.embed_one(query)?
         };
 
         let rerank_fn: Option<codesage_graph::RerankFn<'_>> = reranker_arc.map(|rr| {
-            // Closure captures the Arc; per-call .lock() means the reranker
-            // mutex is held only across the score_pairs call inside search,
-            // not for the surrounding SQL retrieval and post-processing.
+            // Hold the model lock only during inference, not SQL retrieval or post-processing.
             Box::new(move |q: &str, docs: &[&str]| rr.lock().score_pairs(q, docs))
                 as Box<dyn FnMut(&str, &[&str]) -> Result<Vec<f32>>>
         });
@@ -1354,18 +1116,8 @@ impl CodeSageServer {
     }
 }
 
-/// Load the per-project embedding config for the MCP server.
-///
-/// MCP serves multiple projects through one process; a malformed
-/// `.codesage/config.toml` in one project must not poison structural tools
-/// (`assess_risk`, `find_coupling`, `find_symbol`, ...). Read or parse failures
-/// keep defaults available for those structural paths, but semantic tools fail
-/// before loading a model or creating a default vec table because the indexed
-/// model is no longer trustworthy.
-///
-/// The CLI path (`load_project_config` in `main.rs`) deliberately keeps the
-/// loud-fail behavior: a user running `codesage index` interactively wants to
-/// know their config is broken.
+/// Config failures disable semantic tools but preserve structural queries.
+/// CLI indexing still rejects the malformed config.
 fn load_embedding_config(path: &Path) -> LoadedEmbeddingConfig {
     let content = match crate::fsguard::read_state_to_string(path) {
         Ok(c) => c,
@@ -1431,10 +1183,7 @@ fn load_embedding_config(path: &Path) -> LoadedEmbeddingConfig {
     }
 }
 
-/// Opens the project DB read-only-enough to compute a drift snapshot and
-/// append one JSON line to `.codesage/drift.log`. Returns quickly — the DB
-/// handle drops at the end of this call. Failures propagate so the caller
-/// can log them; drift telemetry never kills a tool call.
+/// Record drift on registration; the caller logs failures without failing tool calls.
 fn write_drift_log_for_project(project_root: &Path, db_path: &Path) -> Result<()> {
     let db = Database::open_existing(db_path)?;
     let report = codesage_graph::drift::check_drift(project_root, &db);
@@ -1458,13 +1207,10 @@ mod tests {
         let timeout = Duration::from_secs(900);
         let map: ModelMap<i32> = Mutex::new(HashMap::new());
 
-        // fresh: used just now -> kept.
         map.lock()
             .insert("fresh".into(), loaded_entry(1, Duration::from_secs(0)));
-        // idle + unreferenced -> evicted.
         map.lock()
             .insert("idle".into(), loaded_entry(2, Duration::from_secs(1200)));
-        // idle but a tool call holds a clone (strong_count > 1) -> kept.
         let idle_busy = loaded_entry(3, Duration::from_secs(1200));
         let in_flight = idle_busy.slot.lock().as_ref().expect("loaded").clone();
         map.lock().insert("idle_busy".into(), idle_busy);
@@ -1520,7 +1266,6 @@ mod tests {
             "codesage-mcp-test-missing-{}.toml",
             std::process::id()
         ));
-        // ensure path doesn't exist
         let _ = std::fs::remove_file(&path);
         let loaded = load_embedding_config(&path);
         assert_eq!(loaded.config.model, EmbeddingConfig::default().model);
@@ -1544,8 +1289,6 @@ mod tests {
 
     #[test]
     fn config_without_embedding_section_returns_defaults() {
-        // A valid TOML that just doesn't have an `[embedding]` table — the
-        // file is fine, the embedding section is absent, defaults apply.
         let path = write_tmp("no-embedding", "[project]\nname = \"foo\"\n");
         let loaded = load_embedding_config(&path);
         assert_eq!(loaded.config.model, EmbeddingConfig::default().model);
@@ -1576,9 +1319,6 @@ mod tests {
 
     #[test]
     fn alive_guard_flips_flag_when_thread_panics() {
-        // Regression: the watcher thread previously stored `false` AFTER
-        // run_statewatcher returned, so a panic unwound past the store and
-        // `alive` stayed true forever — ensure_watcher never respawned.
         let alive = Arc::new(AtomicBool::new(true));
         let alive_thread = alive.clone();
         let joined = std::thread::spawn(move || {
@@ -1628,8 +1368,6 @@ mod tests {
             "changed model bytes must not keep the watcher"
         );
 
-        // The running watcher was spawned under mean pooling; the next
-        // resolution under CLS must signal it and take the slot.
         let watchers: Mutex<HashMap<PathBuf, WatcherEntry>> = Mutex::new(HashMap::new());
         let root = PathBuf::from("/proj");
         let (old_shutdown, _old_alive) =
@@ -1655,9 +1393,6 @@ mod tests {
 
     #[test]
     fn watcher_reservation_releases_on_drop_and_keeps_on_disarm() {
-        // The reservation placed under the first lock must be
-        // removed on any bail-out path (watch disabled, spawn failure) and
-        // kept once a thread owns it.
         let watchers: Mutex<HashMap<PathBuf, WatcherEntry>> = Mutex::new(HashMap::new());
         let root = PathBuf::from("/proj");
         let make_entry = || {
@@ -1672,7 +1407,6 @@ mod tests {
             (shutdown, entry)
         };
 
-        // Armed drop removes the reserved entry.
         let (token, entry) = make_entry();
         watchers.lock().insert(root.clone(), entry);
         drop(WatcherReservation {
@@ -1683,7 +1417,6 @@ mod tests {
         });
         assert!(watchers.lock().is_empty(), "armed drop must release");
 
-        // Disarmed drop keeps the entry.
         let (token, entry) = make_entry();
         watchers.lock().insert(root.clone(), entry);
         WatcherReservation {
@@ -1695,7 +1428,6 @@ mod tests {
         .disarm();
         assert!(watchers.lock().contains_key(&root), "disarm must keep");
 
-        // A reservation never removes an entry it doesn't own.
         let (_other_token, entry) = make_entry();
         watchers.lock().insert(root.clone(), entry);
         drop(WatcherReservation {
@@ -1710,9 +1442,7 @@ mod tests {
         );
     }
 
-    /// A stand-in watcher thread: spins until `shutdown`, then keeps running
-    /// for `drain` (the force-drain a real watcher performs), then exits and
-    /// flips `alive` through the same guard the real spawn uses.
+    /// Simulate a watcher drain, using the production liveness guard.
     fn fake_watcher(
         watchers: &Mutex<HashMap<PathBuf, WatcherEntry>>,
         root: &Path,
@@ -1744,9 +1474,6 @@ mod tests {
 
     #[test]
     fn stop_then_start_race_yields_exactly_one_watcher() {
-        // Last client disconnects (stop) while a reconnecting shim resolves
-        // the same project (start). The old watcher force-drains for a
-        // while; the start must wait for it, not spawn beside it.
         let watchers: Arc<Mutex<HashMap<PathBuf, WatcherEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let root = PathBuf::from("/proj");
@@ -1793,10 +1520,6 @@ mod tests {
 
     #[test]
     fn a_watcher_wedged_in_shutdown_is_detached_past_the_bound() {
-        // A watcher whose thread never exits (shutdown signalled, `alive`
-        // stuck true) must not hold its slot — and disable semantic reindex
-        // for the project — forever. The first call waits it out; a call
-        // past the bound detaches the slot and reserves it afresh.
         let watchers: Mutex<HashMap<PathBuf, WatcherEntry>> = Mutex::new(HashMap::new());
         let root = PathBuf::from("/proj");
         watchers.lock().insert(
@@ -1817,7 +1540,6 @@ mod tests {
             watchers.lock().get(&root).unwrap().stopping_since.is_some(),
             "first sighting of the wedge must start the clock"
         );
-        // Wind the clock past the bound: the next call detaches and reserves.
         watchers.lock().get_mut(&root).unwrap().stopping_since =
             Some(Instant::now() - WATCHER_STUCK_FORCE_DETACH - Duration::from_secs(1));
         let fresh_shutdown = Arc::new(AtomicBool::new(false));
@@ -1843,8 +1565,6 @@ mod tests {
 
     #[test]
     fn a_session_producing_another_identity_than_the_table_is_refused_as_stale() {
-        // The table was attested under the configured CUDA setup; a resident
-        // session producing the CPU identity must not answer its queries.
         let config = EmbeddingConfig {
             device: "cuda".to_string(),
             ..EmbeddingConfig::default()
@@ -1907,10 +1627,6 @@ mod tests {
 
     #[test]
     fn last_client_stop_aborts_when_a_client_connected_before_it_landed() {
-        // The last client disconnects and schedules the stop; a new client
-        // connects BEFORE the stop signal lands. The stop must observe that
-        // client and leave the watcher untouched, or the reconnecting
-        // client sees its watcher running and then stopped under it.
         let watchers: Mutex<HashMap<PathBuf, WatcherEntry>> = Mutex::new(HashMap::new());
         let root = PathBuf::from("/proj");
         let (shutdown, alive) = fake_watcher(&watchers, &root, "k", Duration::ZERO);
@@ -1926,7 +1642,6 @@ mod tests {
         assert!(alive.load(Ordering::SeqCst), "the watcher keeps running");
         assert!(watchers.lock().contains_key(&root));
 
-        // That client leaves: the next stop goes through.
         active.fetch_sub(1, Ordering::SeqCst);
         let stopped = stop_all_watchers_if(&watchers, Duration::from_secs(5), || {
             active.load(Ordering::SeqCst) == 0
@@ -1969,7 +1684,6 @@ mod tests {
             );
         }
 
-        // Once the drain finishes, the next start request takes the slot.
         assert!(wait_for_watcher_exit(
             &old_alive,
             Instant::now() + Duration::from_secs(5)
@@ -2007,7 +1721,6 @@ mod tests {
             &alive,
             Instant::now() + Duration::from_secs(5)
         ));
-        // A second stop finds it exited and frees the slot.
         assert_eq!(stop_all_watchers(&watchers, Duration::from_millis(30)), 0);
         assert!(watchers.lock().is_empty());
     }
@@ -2029,7 +1742,6 @@ mod tests {
         assert_eq!(slot, WatcherSlot::Running);
         assert!(!shutdown.load(Ordering::SeqCst));
 
-        // A stale config key retires it and waits it out before reserving.
         let new_alive = Arc::new(AtomicBool::new(true));
         let slot = reserve_watcher_slot(
             &watchers,
@@ -2104,9 +1816,6 @@ mod tests {
 
     #[test]
     fn resolve_project_walks_up_to_the_enclosing_onboarded_root() {
-        // Mirror the CLI's `find_project_root`: a `project` pointing inside
-        // an onboarded tree resolves to that project instead of failing as
-        // "not onboarded".
         let (_dir, root) = onboarded_project(None);
         let sub = root.join("src").join("nested");
         std::fs::create_dir_all(&sub).unwrap();
@@ -2117,8 +1826,6 @@ mod tests {
 
     #[test]
     fn resolve_project_prefers_the_nearest_enclosing_codesage() {
-        // A nested `.codesage` resolves to its own project, never the outer
-        // one — same nearest-ancestor rule as the CLI walk.
         let (_outer_dir, outer) = onboarded_project(None);
         let inner = outer.join("inner");
         std::fs::create_dir_all(inner.join(".codesage")).unwrap();
@@ -2134,17 +1841,11 @@ mod tests {
 
     #[test]
     fn resolve_project_errors_after_index_db_deleted_without_recreating_it() {
-        // The warm-daemon fast path must revalidate the DB file, not just
-        // config.toml: /codesage-reset deletes .codesage/index.db under a
-        // live daemon, and a cached ProjectState that survives the deletion
-        // would let the storage layer recreate an empty index that serves
-        // zero-result answers forever.
         let (_dir, root) = onboarded_project(None);
         let project = root.to_str().unwrap();
         let server = CodeSageServer::new();
 
         server.resolve_project_inner(project).unwrap();
-        // Second resolution serves from the fast-path cache.
         server.resolve_project_inner(project).unwrap();
 
         let db_path = root.join(".codesage/index.db");
@@ -2189,13 +1890,10 @@ mod tests {
 
     #[test]
     fn watcher_starts_on_semantic_queries_or_explicit_opt_in_only() {
-        // Default: structural calls never start a watcher, semantic ones do.
         assert!(!watcher_start_wanted(None, false));
         assert!(watcher_start_wanted(None, true));
-        // Explicit opt-in: any call.
         assert!(watcher_start_wanted(Some(true), false));
         assert!(watcher_start_wanted(Some(true), true));
-        // Explicit opt-out: never, not even for a semantic query.
         assert!(!watcher_start_wanted(Some(false), false));
         assert!(!watcher_start_wanted(Some(false), true));
     }
@@ -2259,8 +1957,6 @@ mod tests {
 
     #[test]
     fn ensure_watcher_skips_spawn_when_config_is_malformed() {
-        // A config that `codesage index` hard-errors on must not produce a
-        // watcher running with default exclude patterns.
         let (_dir, root) = onboarded_project(Some("embedding = { this is not valid toml ==="));
         let server = CodeSageServer::new();
         let state = server
@@ -2278,9 +1974,6 @@ mod tests {
 
     #[test]
     fn resolve_project_retries_after_config_error_is_fixed() {
-        // An error state must never be cached — previously, a transient
-        // config read/parse failure at first resolution pinned the semantic
-        // error for the daemon's whole life.
         let (_dir, root) = onboarded_project(Some("embedding = { this is not valid toml ==="));
         let project = root.to_str().unwrap();
         let server = CodeSageServer::new();
@@ -2307,9 +2000,6 @@ mod tests {
 
     #[test]
     fn resolve_project_reloads_config_on_mtime_change() {
-        // A model switch in config.toml must be picked up by the
-        // cached ProjectState — otherwise the daemon keeps embedding into
-        // the old `chunks_{model}_{dim}` table until restarted.
         let (_dir, root) =
             onboarded_project(Some("[embedding]\nmodel = \"model/a\"\ndevice = \"cpu\"\n"));
         let project = root.to_str().unwrap();
@@ -2318,7 +2008,6 @@ mod tests {
 
         let first = server.resolve_project_inner(project).unwrap();
         assert_eq!(first.embedding_config.model, "model/a");
-        // Second call is a cache hit (exercises the fast path's mtime check).
         let cached = server.resolve_project_inner(project).unwrap();
         assert_eq!(cached.embedding_config.model, "model/a");
 
@@ -2345,8 +2034,6 @@ mod tests {
 
     #[test]
     fn resolve_project_picks_up_config_created_after_first_resolution() {
-        // Missing config is its own cached state (mtime None); creating the
-        // file later must invalidate it.
         let (_dir, root) = onboarded_project(None);
         let project = root.to_str().unwrap();
         let server = CodeSageServer::new();
@@ -2369,18 +2056,11 @@ mod tests {
 
     #[test]
     fn slot_loader_runs_exactly_once_under_concurrent_first_callers() {
-        // Regression: the old path was check map → drop lock → call new()
-        // → race to insert. Two cold misses for the same key both ran
-        // the loader and the loser's value was thrown away. With the
-        // per-key slot lock, only the first thread runs `load`; the rest
-        // observe Some(arc) and return it.
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let map: Arc<ModelMap<u32>> = Arc::new(Mutex::new(HashMap::new()));
         let load_count = Arc::new(AtomicUsize::new(0));
 
-        // Gate the loader on a shared start signal so all threads are
-        // poised to race, then release them simultaneously.
         let start = Arc::new(std::sync::Barrier::new(16));
 
         let handles: Vec<_> = (0..16)
@@ -2392,8 +2072,7 @@ mod tests {
                     start.wait();
                     get_or_load_slot(&map, "shared-key".to_string(), || {
                         load_count.fetch_add(1, Ordering::SeqCst);
-                        // Brief sleep widens the race window so a buggy
-                        // implementation actually loses.
+                        // Widen the concurrent cold-load window.
                         std::thread::sleep(std::time::Duration::from_millis(20));
                         Ok::<u32, anyhow::Error>(42 + i as u32)
                     })
@@ -2409,8 +2088,6 @@ mod tests {
             "loader must run exactly once across all concurrent callers"
         );
 
-        // All callers must observe the SAME Arc (pointer equality), not
-        // separate constructions.
         let first = results[0].as_ref().unwrap().clone();
         for r in &results {
             let arc = r.as_ref().unwrap();
@@ -2420,10 +2097,6 @@ mod tests {
 
     #[test]
     fn slot_loader_runs_per_key_in_parallel() {
-        // Distinct keys must hold distinct slots — different cold loads
-        // should not serialize on each other. Verify by measuring that
-        // two loaders that each block for ~80ms complete in well under
-        // 160ms (they run concurrently, not back-to-back).
         let map: Arc<ModelMap<u32>> = Arc::new(Mutex::new(HashMap::new()));
         let start = Arc::new(std::sync::Barrier::new(2));
 
@@ -2463,10 +2136,6 @@ mod tests {
 
     #[test]
     fn slot_loader_failure_leaves_slot_retryable() {
-        // A failed load must not poison the slot: the next caller should
-        // be able to retry. Pre-fix code had the same behavior (the
-        // failed value never went into the map); the helper preserves
-        // that property by writing to *slot_guard only on Ok.
         let map: Arc<ModelMap<u32>> = Arc::new(Mutex::new(HashMap::new()));
 
         let first: Result<_, anyhow::Error> =
@@ -2498,6 +2167,63 @@ mod tests {
             .unwrap();
 
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn rerank_pairs_validates_caps_cancellation_and_configuration_before_loading() {
+        let (_dir, root) = onboarded_project(Some(
+            "[embedding]\nmodel = \"codesage-test/missing\"\nreranker = \"codesage-test/reranker\"\ndevice = \"cpu\"\n[index]\nwatch = false\n",
+        ));
+        let server = CodeSageServer::new();
+        let mut params = RerankPairsParams {
+            project: root.to_str().unwrap().into(),
+            model: "codesage-test/reranker".into(),
+            device: "cpu".into(),
+            query: "query".into(),
+            documents: Vec::new(),
+        };
+        assert!(
+            server
+                .rerank_pairs_for(&params, || false)
+                .unwrap()
+                .scores
+                .is_empty()
+        );
+        params.documents.push("doc".into());
+        assert!(
+            server
+                .rerank_pairs_for(&params, || true)
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        params.device = "gpu".into();
+        assert!(
+            server
+                .rerank_pairs_for(&params, || false)
+                .unwrap_err()
+                .to_string()
+                .contains("configuration")
+        );
+        params.device = "cpu".into();
+        params.model = "other".into();
+        assert!(
+            server
+                .rerank_pairs_for(&params, || false)
+                .unwrap_err()
+                .to_string()
+                .contains("configuration")
+        );
+        params.documents = vec!["x".repeat(crate::query_reranker::MAX_RERANK_TEXT_BYTES + 1)];
+        assert!(
+            server
+                .rerank_pairs_for(&params, || false)
+                .unwrap_err()
+                .to_string()
+                .contains("over cap")
+        );
+        assert!(server.state.rerankers.lock().is_empty());
+        assert!(server.state.embedders.lock().is_empty());
     }
 
     #[test]
@@ -2554,10 +2280,7 @@ mod tests {
 
     #[test]
     fn test_override_ignored_when_not_honored_release_path() {
-        // Release binaries never honor the escape: even with the variable
-        // set, `honored = false` (what `cfg!(debug_assertions)` evaluates to
-        // in a release build) yields None. This runs under a debug test
-        // build, so it proves the release-path logic, not the build flag.
+        // This debug test verifies release-path logic, not the release build flag.
         assert!(
             CodeSageServer::parse_test_query_embedding_override(Some("0.1,0.2,0.3,0.4"), false)
                 .unwrap()
@@ -2569,9 +2292,6 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        // The render-layer probe upholds the same invariant (it feeds the
-        // pending `_meta.test_override` annotation): active implies a debug
-        // build, so release responses can never carry the marker.
         assert!(
             !CodeSageServer::test_override_active() || cfg!(debug_assertions),
             "override must never report active in a release build"
@@ -2595,7 +2315,6 @@ mod tests {
 
     #[test]
     fn test_override_rejects_malformed_components() {
-        // Every malformed shape errors rather than serving a partial vector.
         for raw in [
             "",
             "   ",
@@ -2646,9 +2365,7 @@ mod tests {
             "[embedding]\nmodel = \"codesage-test/does-not-exist\"\ndevice = \"cpu\"\n",
         );
         assert_eq!(state.embedding_config.model, MODEL);
-        // Seed a dim-4 chunk table for the model. The fake model name keeps
-        // `CachedOnly` resolution at `None` on every machine, so these tests
-        // never depend on a local model cache.
+        // The nonexistent model keeps CachedOnly resolution independent of local caches.
         let db_path = root.join(".codesage").join("index.db");
         Database::open_for_model(&db_path, MODEL, 4).unwrap();
         (dir, root, server, state)
@@ -2706,7 +2423,6 @@ mod tests {
         let (_dir, _root, server, state) = onboarded_project_and_state(
             "[embedding]\nmodel = \"codesage-test/does-not-exist\"\ndevice = \"cpu\"\n",
         );
-        // No `open_for_model` call: the model never indexed this project.
         let err = server
             .open_test_override_db(&state, &state.embedding_config, 4)
             .err()
@@ -2725,11 +2441,9 @@ mod tests {
         let config = EmbeddingConfig::default();
         let db = Database::open_for_model(&db_path, &config.model, 4).unwrap();
 
-        // No expectation resolvable offline: the dim gate stands alone.
         CodeSageServer::enforce_test_override_freshness(&db, None)
             .expect("absent artifacts must not fail a debug-only override");
 
-        // Unattested table (the harness seeds): nothing recorded to compare.
         let expected = codesage_graph::SemanticFingerprint::with_artifact_digest(
             &config,
             4,
@@ -2738,7 +2452,6 @@ mod tests {
         CodeSageServer::enforce_test_override_freshness(&db, Some(&expected))
             .expect("unattested table must not fail the debug-only override");
 
-        // Attested but stale: refused like the production path.
         db.record_semantic_fingerprint("stale-setup-fingerprint")
             .unwrap();
         let err = CodeSageServer::enforce_test_override_freshness(&db, Some(&expected))
@@ -2749,7 +2462,6 @@ mod tests {
             "stale table must name the repair: {err}"
         );
 
-        // Attested and current: proceeds.
         db.record_semantic_fingerprint(expected.as_str()).unwrap();
         CodeSageServer::enforce_test_override_freshness(&db, Some(&expected))
             .expect("current table must pass the override gate");

@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 import importlib.util
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("analyze", Path(__file__).with_name("analyze.py"))
@@ -26,7 +29,85 @@ def tool(name, **kwargs):
     ]}}
 
 
+BRANCH_PAYLOAD = (
+    'branch overlap: "feature/topic" edits "src/alpha.py" '
+    '(same-file, HEAD...branch; merge base ' + 'a' * 40 + ')\n'
+    'Branch overlap: 1 matching branch(es); scanned 2/3 refs '
+    '(local and remote-tracking refs; same-tip matches counted once; not a liveness check).\n'
+)
+
+
 class ScorerTest(unittest.TestCase):
+    def test_branch_context_preserves_mixed_digest_and_action(self):
+        payload = "tests: tests/test_alpha.py\n" + BRANCH_PAYLOAD
+        events = [hook_event(payload.rstrip("\n")),
+                  hook_event(payload.rstrip("\n"), kind="hook_additional_context"),
+                  tool("Bash", command="pytest tests/test_alpha.py"),
+                  hook_event(payload, "edit-2")]
+        hits = analyze.payload_occurrences(events)[analyze.fnv1a64(payload)]
+        self.assertEqual(hits, [(0, payload), (3, payload)])
+        tests, coupled = analyze.parse_payload(payload)
+        self.assertEqual((tests, coupled), (["tests/test_alpha.py"], []))
+        self.assertEqual(analyze.score_serve(events, hits[0][0], tests, coupled), "acted")
+        self.assertEqual(analyze.score_serve(events, hits[1][0], tests, coupled), "no-op")
+
+    def test_branch_render_variants_preserve_full_payload(self):
+        branch = BRANCH_PAYLOAD.splitlines()[0]
+        extended = (
+            'hotspot: churn percentile 95%, 2 of 4 commits were fixes\n'
+            'changes with: src/beta.py\n'
+            + branch.replace('"feature/topic"', '"feature/quoted\\\"name"') + '\n'
+            + branch.replace('a' * 40, 'b' * 64).replace('"src/alpha.py"', '"src/a b.py", "src/beta.py"') + '\n'
+            + BRANCH_PAYLOAD.splitlines()[1].replace('1 matching', '3 matching')
+            + ' Showing 2 branches. Branch overlap incomplete: Git time budget exhausted.\n'
+        )
+        hits = analyze.payload_occurrences([hook_event(extended)])[analyze.fnv1a64(extended)]
+        self.assertEqual(hits, [(0, extended)])
+        self.assertEqual(analyze.parse_payload(extended), ([], ["src/beta.py"]))
+
+    def test_branch_only_exposure_is_not_scoreable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "projects" / analyze.munge_project("/repo")
+            project.mkdir(parents=True)
+            row = {"t": 100, "s": "session", "p": "/repo", "f": "alpha.py",
+                   "d": "served", "h": analyze.fnv1a64(BRANCH_PAYLOAD)}
+            (root / analyze.FIRE_LOG).write_text(json.dumps(row) + "\n")
+            events = [hook_event(BRANCH_PAYLOAD), tool("Read", file_path="/repo/src/alpha.py")]
+            (project / "session.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+            result = subprocess.run(["python3", str(Path(__file__).with_name("analyze.py")),
+                                     "--ledger-dir", str(root), "--projects-dir", str(root / "projects"),
+                                     "--json"], text=True, capture_output=True, check=True)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["served_scored"]["verdicts"], {"branch-only": 1})
+            self.assertEqual(report["served_scored"]["scoreable_n"], 0)
+            self.assertFalse(report["observational_sample_ready"])
+            self.assertFalse(report["default_on_ready"])
+            self.assertNotIn("unmatched_reason", report["serves"][0])
+            text_result = subprocess.run(["python3", str(Path(__file__).with_name("analyze.py")),
+                                          "--ledger-dir", str(root), "--projects-dir", str(root / "projects")],
+                                         text=True, capture_output=True, check=True)
+            self.assertIn("branch-only: 1", text_result.stdout)
+
+    def test_branch_exposure_requires_valid_hook_and_complete_payload(self):
+        failed = hook_event(BRANCH_PAYLOAD)
+        failed["attachment"]["exitCode"] = 1
+        malformed = hook_event(BRANCH_PAYLOAD)
+        malformed["attachment"]["stdout"] = '{"hookSpecificOutput":'
+        self.assertFalse(analyze.payload_occurrences([
+            tool("Bash", command=BRANCH_PAYLOAD),
+            {"type": "user", "message": {"content": BRANCH_PAYLOAD}},
+            {"attachment": {"type": "other", "additionalContext": BRANCH_PAYLOAD}},
+            failed, malformed,
+        ]))
+        for payload in (
+            BRANCH_PAYLOAD.splitlines()[0] + "\n",
+            BRANCH_PAYLOAD.splitlines()[1] + "\n",
+            BRANCH_PAYLOAD.replace("merge base", "not a merge base"),
+        ):
+            self.assertNotIn(analyze.fnv1a64(payload),
+                             analyze.payload_occurrences([hook_event(payload)]), payload)
+
     def test_observed_actions_never_satisfy_default_on_gate(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -44,7 +125,42 @@ class ScorerTest(unittest.TestCase):
                                      "--json"], text=True, capture_output=True, check=True)
             report = json.loads(result.stdout)
             self.assertEqual(report["served_scored"]["verdicts"], {"acted": 51})
+            self.assertEqual(report["served_scored"]["scoreable_n"], 51)
+            self.assertTrue(report["observational_sample_ready"])
+            self.assertEqual(report["required_scoreable_serves"], 50)
             self.assertFalse(report["default_on_ready"])
+
+    def test_raw_serves_do_not_satisfy_observational_threshold(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "projects" / analyze.munge_project("/repo")
+            project.mkdir(parents=True)
+            payload = "tests: tests/test_alpha.py\n"
+            hotspot = "hotspot: churn percentile 99\n"
+            rows = [
+                {"t": i, "s": "session", "p": "/repo", "f": "a.py",
+                 "d": "served", "h": analyze.fnv1a64(payload)} for i in range(50)
+            ]
+            rows.append({"t": 51, "s": "missing", "p": "/repo", "f": "b.py",
+                         "d": "served", "h": analyze.fnv1a64(payload)})
+            rows.append({"t": 52, "s": "session", "p": "/repo", "f": "c.py",
+                         "d": "served", "h": analyze.fnv1a64(hotspot)})
+            (root / analyze.FIRE_LOG).write_text("".join(json.dumps(r) + "\n" for r in rows))
+            (project / "session.jsonl").write_text(json.dumps(hook_event(hotspot)) + "\n")
+            result = subprocess.run(["python3", str(Path(__file__).with_name("analyze.py")),
+                                     "--ledger-dir", str(root), "--projects-dir", str(root / "projects"),
+                                     "--min-served", "3", "--json"],
+                                    text=True, capture_output=True, check=True)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["served_scored"]["n"], 52)
+            self.assertEqual(report["served_scored"]["scoreable_n"], 0)
+            self.assertFalse(report["observational_sample_ready"])
+            self.assertEqual(report["required_scoreable_serves"], 3)
+            self.assertFalse(report["default_on_ready"])
+            self.assertEqual(report["serves"][0]["unmatched_reason"], "exposure-not-found")
+            self.assertEqual(report["serves"][50]["unmatched_reason"], "transcript-not-resolved")
+            self.assertEqual(report["serves"][51]["verdict"], "hotspot-only")
+            self.assertNotIn("unmatched_reason", report["serves"][51])
 
     def test_identical_same_second_fires_are_distinct(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -52,6 +168,76 @@ class ScorerTest(unittest.TestCase):
             row = {"t": 100, "s": "session", "p": "/repo", "f": "a.py", "d": "repeat"}
             (root / analyze.FIRE_LOG).write_text((json.dumps(row) + "\n") * 2)
             self.assertEqual(len(analyze.load_fires(root, root)), 2)
+
+    @unittest.skipUnless(os.name == "posix" and os.geteuid() != 0,
+                         "permission denial requires a non-root POSIX user")
+    def test_unreadable_transcript_is_not_missing_exposure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "projects" / analyze.munge_project("/repo")
+            project.mkdir(parents=True)
+            payload = "tests: tests/test_alpha.py\n"
+            row = {"t": 100, "s": "session", "p": "/repo", "f": "a.py",
+                   "d": "served", "h": analyze.fnv1a64(payload)}
+            (root / analyze.FIRE_LOG).write_text(json.dumps(row) + "\n")
+            transcript = project / "session.jsonl"
+            transcript.write_text(json.dumps(hook_event(payload)) + "\n")
+            transcript.chmod(0)
+            try:
+                result = subprocess.run(["python3", str(Path(__file__).with_name("analyze.py")),
+                                         "--ledger-dir", str(root), "--projects-dir", str(root / "projects"),
+                                         "--json"], text=True, capture_output=True, check=True)
+            finally:
+                transcript.chmod(0o600)
+            report = json.loads(result.stdout)
+            self.assertIn("cannot read transcript", result.stderr)
+            self.assertEqual(report["serves"][0]["unmatched_reason"], "transcript-read-failed")
+            self.assertEqual(report["served_scored"]["scoreable_n"], 0)
+            self.assertFalse(report["observational_sample_ready"])
+
+    def test_partial_transcript_read_discards_exposure_and_base_rate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "projects" / analyze.munge_project("/repo")
+            project.mkdir(parents=True)
+            payload = "tests: tests/test_alpha.py\n"
+            row = {"t": 100, "s": "session", "p": "/repo", "f": "alpha.py",
+                   "d": "served", "h": analyze.fnv1a64(payload)}
+            (root / analyze.FIRE_LOG).write_text(json.dumps(row) + "\n")
+            transcript = project / "session.jsonl"
+            transcript.touch()
+            events = [hook_event(payload), tool("Edit", file_path="/repo/alpha.py"),
+                      tool("Bash", command="pytest tests/test_alpha.py")]
+
+            class InterruptedRead:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+                def __iter__(self):
+                    yield from (json.dumps(event) + "\n" for event in events)
+                    raise OSError("interrupted transcript read")
+
+            original_open = Path.open
+
+            def open_path(path, *args, **kwargs):
+                if path == transcript:
+                    return InterruptedRead()
+                return original_open(path, *args, **kwargs)
+
+            stdout, stderr = io.StringIO(), io.StringIO()
+            argv = ["analyze.py", "--ledger-dir", str(root),
+                    "--projects-dir", str(root / "projects"), "--json"]
+            with patch("sys.argv", argv), patch.object(Path, "open", open_path), \
+                    contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                self.assertEqual(analyze.main(), 0)
+            report = json.loads(stdout.getvalue())
+            self.assertIn("interrupted transcript read", stderr.getvalue())
+            self.assertEqual(report["serves"][0]["unmatched_reason"], "transcript-read-failed")
+            self.assertEqual(report["served_scored"]["scoreable_n"], 0)
+            self.assertEqual(report["base_rate"]["edits"], 0)
 
     def test_serialized_context_is_one_exposure_per_tool(self):
         payload = "tests: tests/test_alpha.py\n"

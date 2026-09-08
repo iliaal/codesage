@@ -6,12 +6,6 @@
 # `claude --append-system-prompt-file -` or paste into a `~/.claude/
 # settings.json` `appendSystemPrompt` slot.
 #
-# Pattern adopted from Serena's `cc-system-prompt-override` (see
-# notes/20260429-reference-tool-recommendations.md §1.7 / §2.3
-# rerun 2026-04-30: prompt-level hardening of tool descriptions did
-# not move tool-selection rate from 0%, so the system-prompt slot is
-# the next lever).
-
 cat <<'EOF'
 
 # CodeSage MCP tool selection

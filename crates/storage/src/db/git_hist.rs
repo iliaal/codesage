@@ -1,4 +1,4 @@
-//! V2b git history tables: `git_files`, `git_co_changes`, `git_index_state`.
+//! Git history: git_files, git_co_changes, and git_index_state.
 
 use anyhow::Result;
 
@@ -81,11 +81,7 @@ impl Database {
         Ok(())
     }
 
-    /// Order a co-change pair for storage. Pairs are stored once with
-    /// `file_a < file_b` lexicographically; the write path normalizes here
-    /// instead of trusting callers (a `debug_assert` was a no-op in release,
-    /// letting a reversed pair silently insert a mirrored duplicate row).
-    /// A self-pair (`file_a == file_b`) is meaningless — error, don't store.
+    /// Store one lexicographically ordered pair; reject self-pairs.
     fn order_co_change_pair<'a>(file_a: &'a str, file_b: &'a str) -> Result<(&'a str, &'a str)> {
         if file_a == file_b {
             anyhow::bail!("co-change pair must be two distinct files, got {file_a:?} twice");
@@ -189,15 +185,8 @@ impl Database {
         super::set_index_state(&self.conn, "git_index_state", sha)
     }
 
-    /// Apply a global multiplicative decay factor to existing churn and co-change weights.
-    /// Used in incremental mode to age rows to "now" before adding new-commit deltas.
-    ///
-    /// Atomic unit: both UPDATEs run inside one savepoint, so a crash or
-    /// error between them cannot leave `git_files` decayed while
-    /// `git_co_changes` still holds pre-decay weights (or vice versa) —
-    /// the two tables would then disagree about the age of the same pass.
-    /// A savepoint (not a bare BEGIN) composes with a caller's outer
-    /// transaction elsewhere in the indexer.
+    /// Age churn and co-change weights atomically before incremental deltas.
+    /// The savepoint composes with the indexer's outer transaction.
     pub fn scale_git_decay(&self, factor: f64) -> Result<()> {
         self.conn.execute_batch("SAVEPOINT scale_git_decay")?;
         let result = (|| -> Result<()> {
@@ -276,18 +265,9 @@ impl Database {
         )
     }
 
-    /// Additive upsert for a co-change pair: weight and count add, the window
-    /// mask ORs, `first_observed_at` takes the older and `last_observed_at`
-    /// the newer timestamp, and `windows` is recomputed from the merged mask.
-    /// Exact under incremental indexing because the mask is keyed to a fixed
-    /// epoch, so a delta's bits are the same bits a full rescan would set.
-    ///
-    /// A row with `first_observed_at IS NULL` was written before migration
-    /// 0017 and has never been baselined by a `--full` pass. An incremental
-    /// delta must leave it that way: writing the delta's oldest commit would
-    /// turn "unknown" into a wrong measured span, and a mask built from a
-    /// partial range would be misleading. NULL stays the "not baselined"
-    /// marker until `--full` rewrites the row.
+    /// Add weight/count, OR fixed-epoch window masks, and extend timestamp bounds.
+    /// Preserve NULL first_observed_at and its mask on unbaselined legacy rows:
+    /// an incremental delta cannot establish full-history recurrence; --full must.
     pub fn incr_git_co_change_full(
         &self,
         file_a: &str,
@@ -428,7 +408,6 @@ impl Database {
         })
     }
 
-    /// Fetch git_files row for one path, if present.
     pub fn git_file(&self, path: &str) -> Result<Option<GitFileRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT path, churn_score, fix_count, total_commits, last_commit_at
@@ -467,10 +446,6 @@ impl Database {
         limit: usize,
         one_off_multiplier: f64,
     ) -> Result<Vec<CoChangeRow>> {
-        // Pair is stored with file_a < file_b. For a given path, results live on
-        // either side, so query both columns and union-rank. The LEFT JOIN
-        // picks up the other file's commit total for the reverse confidence;
-        // a missing git_files row reads as 0.
         let mut stmt = self.conn.prepare(
             "SELECT p.other, p.weight, p.count, p.last_observed_at, p.windows,
                     COALESCE(g.total_commits, 0), p.first_observed_at, p.window_mask
@@ -515,15 +490,8 @@ impl Database {
         })
     }
 
-    /// Top-`limit` co-changing files for every path in `paths`, in bounded queries.
-    /// Bulk counterpart of [`Database::co_changes_for_ranked`] for callers
-    /// scoring many files at once (`recommend_tests`' coupled bucket):
-    /// `one_off_multiplier` demotes pairs whose span is under
-    /// [`RECURRING_SPAN_SECS`] or unknown, `1.0` for raw order. Batched
-    /// row-numbered passes over the union of both pair sides reproduce the
-    /// per-file `ORDER BY ... LIMIT` exactly, ties included, so it agrees
-    /// with `find_coupling`. Every requested path is present in the map, with
-    /// an empty vec when it has no recorded pairs.
+    /// Batched co_changes_for_ranked with the same per-path limits and tie order.
+    /// Missing paths have empty entries; 1.0 disables one-off demotion.
     pub fn co_changes_for_many(
         &self,
         paths: &[&str],
@@ -535,8 +503,6 @@ impl Database {
         for p in paths {
             out.entry(p.to_string()).or_default();
         }
-        // Duplicate inputs share one map entry: query each distinct path once
-        // so its rows are not pushed twice.
         let mut seen = HashSet::new();
         let mut unique = Vec::new();
         for p in paths {
@@ -635,13 +601,8 @@ impl Database {
         Ok(lower as f64 / total as f64)
     }
 
-    /// Churn percentile for every path in `git_files`, in one query. Bulk
-    /// counterpart of [`Database::churn_percentile`] for callers scoring many
-    /// files at once. `CUME_DIST()` is defined as
-    /// `count(rows with value <= current) / count(*)` — the exact formula the
-    /// per-file query computes, ties included — so both paths return identical
-    /// values. Paths absent from the map score 0.0, matching the per-file
-    /// no-row fallback.
+    /// CUME_DIST equals the per-file count(churn <= x)/count(*) with ties.
+    /// Missing paths must score 0.0, matching churn_percentile.
     pub fn churn_percentiles(&self) -> Result<std::collections::HashMap<String, f64>> {
         let mut stmt = self
             .conn
@@ -659,11 +620,6 @@ impl Database {
 mod tests {
     use super::{CoChangeWrite, Database, RECURRING_SPAN_SECS};
 
-    /// A row indexed before migration 0017 carries `first_observed_at IS NULL`
-    /// and `window_mask = 0`. Incremental deltas must leave both alone (a
-    /// delta's oldest commit is not the pair's, and a mask from a partial
-    /// range misleads), so NULL stays the "not baselined" marker and the row
-    /// ranks as one-off until a `--full` pass rewrites it.
     #[test]
     fn incremental_delta_onto_legacy_row_with_null_first_observed_at() {
         let db = Database::open_in_memory().unwrap();
@@ -791,10 +747,6 @@ mod tests {
         );
     }
 
-    /// Tied weights at the LIMIT boundary must not let the cap pick an
-    /// arbitrary subset: without a secondary sort key, which peers survive
-    /// `LIMIT` is whatever order SQLite produced, so an agent re-running the
-    /// same query can get a different answer with no underlying change.
     #[test]
     fn co_changes_break_weight_ties_deterministically_under_limit() {
         let db = Database::open_in_memory().unwrap();
@@ -858,7 +810,6 @@ mod tests {
         );
     }
 
-    /// Same hazard on the top-churn candidate set that bounds risk scoring.
     #[test]
     fn top_churn_files_break_score_ties_deterministically() {
         let db = Database::open_in_memory().unwrap();
@@ -954,7 +905,6 @@ mod tests {
         let bulk = db
             .co_changes_for_many(&paths, 3, super::ONE_OFF_RANK_MULTIPLIER)
             .expect("batch co-change lookup");
-        // Every requested path is present, even the unknown and duplicated one.
         assert_eq!(bulk.len(), 3);
         assert!(bulk["unknown.rs"].is_empty());
         for p in ["target.rs", "solo.rs"] {
@@ -974,16 +924,11 @@ mod tests {
                 assert_eq!(got.last_observed_at, want.last_observed_at);
             }
         }
-        // The tie under the cap resolves the same total order both ways.
         let files: Vec<&str> = bulk["target.rs"].iter().map(|r| r.file.as_str()).collect();
         assert_eq!(files, vec!["heavy.rs", "a.rs", "b.rs"]);
         assert!(db.co_changes_for_many(&[], 3, 1.0).unwrap().is_empty());
     }
 
-    /// The bulk path feeds `recommend_tests`' coupled bucket; it must apply
-    /// the same span-based demotion as `find_coupling`, so a heavier one-off
-    /// pair ranks below a lighter recurring one and the per-path cap cuts the
-    /// one-off, not the recurring pair.
     #[test]
     fn co_changes_for_many_demotes_one_off_pairs_like_find_coupling() {
         let db = Database::open_in_memory().unwrap();
@@ -1028,7 +973,6 @@ mod tests {
             .unwrap();
         let files: Vec<&str> = bulk["target.rs"].iter().map(|r| r.file.as_str()).collect();
         assert_eq!(files, vec!["recurring.rs", "one-off.rs", "legacy.rs"]);
-        // Raw weights are reported.
         assert_eq!(bulk["target.rs"][1].weight, 5.0);
 
         let capped = db
@@ -1037,7 +981,6 @@ mod tests {
         assert_eq!(capped["target.rs"].len(), 1);
         assert_eq!(capped["target.rs"][0].file, "recurring.rs");
 
-        // Agrees with the per-file recurrence-ranked query.
         let single = db
             .co_changes_for_ranked("target.rs", 10, super::ONE_OFF_RANK_MULTIPLIER)
             .unwrap();
@@ -1050,10 +993,6 @@ mod tests {
         assert_eq!(raw_files, vec!["one-off.rs", "legacy.rs", "recurring.rs"]);
     }
 
-    /// Reversed pairs must land on the same stored row, not a mirrored
-    /// duplicate: the old `debug_assert!(file_a < file_b)` was compiled out
-    /// in release, so a reversed call silently inserted a second row and
-    /// double-counted the pair in every downstream weight query.
     #[test]
     fn reversed_co_change_pair_normalizes_to_one_row() {
         let db = Database::open_in_memory().unwrap();
@@ -1061,7 +1000,6 @@ mod tests {
             .unwrap();
         db.upsert_git_co_change("a.rs", "b.rs", 3.0, 2, None)
             .unwrap();
-        // Second upsert overwrote the first (UPSERT), it did not add a row.
         let n: i64 = db
             .conn
             .query_row("SELECT COUNT(*) FROM git_co_changes", [], |r| r.get(0))
@@ -1069,17 +1007,12 @@ mod tests {
         assert_eq!(n, 1, "reversed pair must not create a mirrored row");
         assert_eq!(db.co_change_weight("a.rs", "b.rs").unwrap(), 0.0);
         assert_eq!(db.co_change_weight("b.rs", "a.rs").unwrap(), 0.0);
-        // Existence probes are order-insensitive too.
         assert!(!db.co_change_pair_exists("b.rs", "a.rs").unwrap());
-        // Additive path normalizes as well.
         db.incr_git_co_change("b.rs", "a.rs", 1.0, 1, None).unwrap();
         assert!(db.co_change_pair_exists("b.rs", "a.rs").unwrap());
         assert_eq!(db.co_change_weight("a.rs", "b.rs").unwrap(), 4.0);
     }
 
-    /// A self-pair has no meaning (a file never co-changes with itself) and
-    /// previously passed the `debug_assert` only when `file_a < file_b`
-    /// happened to hold vacuously false — it must be a runtime error.
     #[test]
     fn self_pair_co_change_is_rejected() {
         let db = Database::open_in_memory().unwrap();
@@ -1096,9 +1029,6 @@ mod tests {
         assert_eq!(n, 0, "rejected self-pair must not leave a row");
     }
 
-    /// Decay must move both tables together: a partial application (files
-    /// aged, co-changes not) would make the next incremental pass add fresh
-    /// deltas onto inconsistently-aged baselines.
     #[test]
     fn scale_git_decay_applies_to_both_tables() {
         let db = Database::open_in_memory().unwrap();

@@ -955,14 +955,8 @@ def merge_document(
 
 
 def reject_symlinked_components(destination):
-    """Refuse to write through a repository-planted symlink.
-
-    `.codesage/findings` and its `history/` subdirectory live inside the
-    repository work tree, so a cloned repo can ship either as a directory
-    symlink; `mkdir(exist_ok=True)`, the temp file, and `os.replace` would then
-    all land outside the project. Only components at or below `.codesage` are
-    checked -- the path leading to the project root may legitimately run
-    through symlinks the user owns.
+    """Reject clone-planted symlinks below .codesage; allow user-owned links
+    leading to the project root.
     """
     destination = Path(destination)
     parts = destination.parts
@@ -1002,9 +996,7 @@ def atomic_write_json(destination, value):
         raise
 
 
-# Largest findings/state document this tool will read. These are our own JSON
-# files; the cap exists because they live inside the repository work tree and a
-# cloned repo controls what is at those names.
+# A clone can supply oversized state documents.
 MAX_STATE_BYTES = 1 << 24
 
 

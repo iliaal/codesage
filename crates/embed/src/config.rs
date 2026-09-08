@@ -5,15 +5,7 @@ use serde::{Deserialize, Serialize};
 
 pub use codesage_protocol::DEFAULT_EMBEDDING_DIM;
 
-// Embed-time max tokens per sequence. Most code embedders we target
-// (Jina v2 base-code, MiniLM, MS-MARCO MiniLM) accept ≥512 natively.
-// The previous value (256) was chosen at a time when the index used
-// MiniLM-L6 with a smaller default; it created a silent-truncation gap
-// versus the char-based chunker (DEFAULT_CHUNK_SIZE=1000 ≈ 250–330
-// tokens for code), so dense chunks at the long tail had their right
-// edge dropped before pooling. Raising to 512 closes that gap and lets
-// chunks grow to ~1500 chars with no truncation. The bench A/B that
-// validated this lives in `bench/history/cap512-1500-2026-05-04.md`.
+// Paired with DEFAULT_CHUNK_SIZE; see bench/history/cap512-1500-2026-05-04.md.
 pub const MAX_SEQ_LENGTH: usize = 512;
 #[cfg(not(target_vendor = "apple"))]
 pub const BATCH_SIZE: usize = 64;
@@ -21,27 +13,15 @@ pub const BATCH_SIZE: usize = 64;
 pub const BATCH_SIZE: usize = 10;
 pub const MAX_BATCH_SIZE: usize = 256;
 
-/// Whether a configured `device` string requests the CUDA / GPU execution path.
-/// Case-insensitive so `"GPU"` / `"CUDA"` take the GPU path like `"gpu"`.
 pub fn wants_cuda(device: &str) -> bool {
     matches!(device.trim().to_ascii_lowercase().as_str(), "gpu" | "cuda")
 }
 
-/// Whether a configured `device` string requests the CoreML execution provider.
-/// CoreML accelerates ONNX inference on Apple Silicon via ONNX Runtime's CoreML EP.
 pub fn wants_coreml(device: &str) -> bool {
     matches!(device.trim().to_ascii_lowercase().as_str(), "coreml")
 }
 
-/// Validate a configured `device` string. Accepts `cpu` / `gpu` / `cuda` /
-/// `coreml` (case-insensitive); errors on anything else.
-///
-/// Without this, any unrecognized value — `"GPU"` before the case fix,
-/// `"cuda:0"`, or a typo — made [`wants_cuda`] false and silently ran on CPU
-/// with no error and no warning: the exact silent-CPU-fallback failure this
-/// crate goes out of its way to make loud elsewhere (the `/proc/self/maps`
-/// guard in `model.rs`). Validating up front turns a near-miss into an
-/// actionable error instead of a 10x-slower run.
+/// Reject unknown devices before provider selection can silently choose CPU.
 pub fn validate_device(device: &str) -> Result<()> {
     match device.trim().to_ascii_lowercase().as_str() {
         "cpu" | "gpu" | "cuda" | "coreml" => Ok(()),
@@ -66,7 +46,6 @@ mod device_tests {
 
     #[test]
     fn validate_device_rejects_unknown_values() {
-        // Pre-fix these silently ran on CPU; now they error.
         for d in ["cuda:0", "gpuu", "CPU0", "metal", ""] {
             assert!(validate_device(d).is_err(), "{d} should be rejected");
         }
@@ -97,12 +76,8 @@ pub struct EmbeddingConfig {
     pub device: String,
     #[serde(default)]
     pub reranker: Option<String>,
-    /// Override the pooling strategy. When omitted, falls back to a
-    /// case-insensitive model-name heuristic (`bge-*` → CLS, everything
-    /// else → Mean). The heuristic is silent and wrong for any non-`bge-`
-    /// model that uses CLS pooling (intfloat/e5-*, etc.) or any `bge-`
-    /// model that uses Mean — both produce semantically wrong vectors with
-    /// no error. Set this explicitly when picking a non-default model.
+    /// Override the case-insensitive heuristic (`bge-*` → CLS, otherwise Mean).
+    /// Set explicitly when a custom model's pooling differs from that heuristic.
     #[serde(default)]
     pub pooling: Option<PoolingStrategy>,
     /// Embedding batch size. When omitted, falls back to
@@ -161,17 +136,10 @@ impl EmbeddingConfig {
         if let Some(p) = self.pooling {
             return p;
         }
-        // Lowercase once: the `bge-` match used to be case-sensitive while
-        // the `minilm` gate below was not, so an uppercase `BGE-...` id (or
-        // any custom CLS model) fell through to mean pooling and embedded
-        // wrong vectors behind only a log line.
         let model = self.model.to_lowercase();
         if model.contains("bge-") {
             PoolingStrategy::Cls
         } else {
-            // Mean is correct for MiniLM/E5-style models but wrong for any
-            // CLS model not named `bge-*`. Warn once so a silent pooling
-            // mismatch on a custom model surfaces.
             if !model.contains("minilm") {
                 static WARNED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);

@@ -626,7 +626,7 @@ def commit_files(git_root: Path, base: Path, subject: str, paths: list[str]) -> 
 
 
 COMMITS: list[tuple[str, list[str]]] = [
-    # Scaffold: 57 indexed source candidates, dropped at the default --max-files 10.
+    # The scaffold exceeds the default --max-files 10.
     ("touch everything in the bulk tree at once", [f"src/bulk/file_{i:02d}.rs" for i in range(BULK_COUNT)]),
     ("solo: touch gamma", ["src/gamma.py"]),
     ("pair: alpha and beta together",
@@ -816,7 +816,6 @@ def unit_checks() -> None:
     finally:
         se.DASH_COMMENT_LANGUAGES = saved_dash
 
-    # References classification helpers.
     check(se.owner_type("Database::file_id_for_path", "file_id_for_path") == "Database"
           and se.owner_type("Monolog\\Handler\\AbstractHandler\\setLevel", "setLevel") == "AbstractHandler"
           and se.owner_type("MapperContext<'a>::allowed", "allowed") == "MapperContext"
@@ -912,7 +911,6 @@ def main() -> int:
         out = Path(td) / "out"
         unit_checks()
 
-        # ---------------- cochange ----------------
         rc, stdout = run_main(["--mode", "cochange", "--project", str(repo), "--out", str(out), "--commits", "20"])
         check(rc == 0, "cochange: exit 0")
         check("commits in scope: 10 of 10 scanned" in stdout, f"cochange: in-scope count (stdout: {stdout.splitlines()[:1]})")
@@ -973,7 +971,6 @@ def main() -> int:
               f"cochange: subdirectory project matches index paths (got {sorted(cc_sub)})")
         check("commits in scope: 10 of 11 scanned" in stdout, "cochange: outside commit counted as out of scope")
 
-        # ---------------- known-item (defining) ----------------
         rc, stdout = run_main(["--mode", "known-item", "--project", str(repo), "--out", str(out), "--seed", "7"])
         check(rc == 0, "known-item: exit 0")
         check("no/too many references" not in stdout and "doc-only (2..3 defining files): 5" in stdout,
@@ -1034,7 +1031,7 @@ def main() -> int:
               and "recall@k <= k/|gold|" in ki_text, "known-item: contamination, saturation, gold, cap notes in header")
         check_provenance(header_of(ki_path), "known-item")
 
-        # Deterministic sampling and stable ids (provenance line differs by timestamp only).
+        # Compare corpus bodies because provenance timestamps differ.
         def body(path: Path) -> str:
             return path.read_text(encoding="utf-8").split("project_root:", 1)[1]
 
@@ -1060,7 +1057,6 @@ def main() -> int:
         check("test_alpha" in inc_names and "alpha_test_helper" not in inc_names,
               "known-item: --include-tests admits tests/ symbols but not #[cfg(test)] modules")
 
-        # ---------------- known-item (references) ----------------
         rc, stdout = run_main(["--mode", "known-item", "--project", str(repo), "--out", str(out), "--gold", "references"])
         refs_path = out / "fixture-known-item-refs.yaml"
         check(rc == 0 and refs_path.is_file(), "known-item refs: writes <name>-known-item-refs.yaml")
@@ -1153,8 +1149,6 @@ def main() -> int:
         check("only symbols that emit a case" in refs_text and "drawn by --sample" in refs_text,
               "known-item refs: header states the case-emitting, post-sample gate scope")
 
-        # Gate counts cover the sampled symbols only: with --sample 1 exactly one
-        # language line appears, and its kept files equal the emitted gold.
         for seed in (1, 2, 3, 4, 5):
             rc, s_out = run_main(["--mode", "known-item", "--project", str(repo), "--out", str(out / f"rs{seed}"),
                                   "--gold", "references", "--sample", "1", "--seed", str(seed)])
@@ -1166,7 +1160,6 @@ def main() -> int:
                   and kept == len(s_cases[0]["expected_files"]),
                   f"known-item refs: --sample 1 seed {seed} gate counts the sampled symbol only (got {s_gate})")
 
-        # type_ref_accepted arms: qualified / import / same-dir (PHP, Go, C/C++ only) / dropped.
         no_imports = (frozenset(), ())
         tra = se.type_ref_accepted
         check(tra("Ns\\Message", "Message", "Message", "src/far/X.php", no_imports, "src/Ns/Message.php", {"Message"}, "php")
@@ -1192,7 +1185,6 @@ def main() -> int:
                       "src/Ns/Message.php", set(), "php") is None,
               "type_ref_accepted: import arm rejects foreign qualifiers and longer identifiers sharing the suffix")
 
-        # ---------------- provenance helpers ----------------
         digest_a = se.index_digest(se.open_index(repo))
         digest_b = se.index_digest(se.open_index(repo))
         check(digest_a == digest_b, "index_digest: identical across two runs")
@@ -1229,7 +1221,6 @@ def main() -> int:
         finally:
             se.subprocess.run = real_run
 
-        # ---------------- runner: defining_file exclusion ----------------
         loader = importlib.machinery.SourceFileLoader("bench_runner", str(HERE / "codesage-bench-runner"))
         runner_spec = importlib.util.spec_from_loader("bench_runner", loader)
         runner = importlib.util.module_from_spec(runner_spec)
@@ -1265,12 +1256,10 @@ def main() -> int:
         )
         check(not any("Refs-mode adjustment" in l for l in hdr_plain), "runner: no refs-mode line without defining_file cases")
 
-        # ---------------- both ----------------
         rc, _ = run_main(["--mode", "both", "--project", str(repo), "--out", str(out / "both")])
         check(rc == 0 and (out / "both" / "fixture-cochange.yaml").is_file()
               and (out / "both" / "fixture-known-item.yaml").is_file(), "both: writes two YAMLs")
 
-        # ---------------- CLI: validation exits, warnings, non-git project ----------------
         def run_cli(*argv: str) -> subprocess.CompletedProcess:
             return subprocess.run([sys.executable, str(SCRIPT), *argv], capture_output=True, text=True, timeout=120)
 

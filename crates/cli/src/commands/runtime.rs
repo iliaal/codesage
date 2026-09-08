@@ -56,7 +56,6 @@ pub(crate) fn cmd_daemon_stop(runtime_dir: Option<PathBuf>) -> Result<()> {
     rt.block_on(daemon::run_daemon_stop(runtime_dir))
 }
 
-/// Resolve the target list from a CLI argument (`all` or a single id).
 fn resolve_install_targets(target: &str) -> Result<Vec<Box<dyn installer::AgentTarget>>> {
     if target == "all" {
         return Ok(installer::all_targets());
@@ -90,11 +89,7 @@ fn canonical_project_utf8() -> Result<(PathBuf, String)> {
     Ok((canon, utf8))
 }
 
-/// Project root for install/uninstall. Project-local mode requires an
-/// onboarded project; global mode resolves opportunistically so `install
-/// --global` (and global `uninstall`) work outside onboarded projects —
-/// the registration then carries no `--project` default and the server
-/// resolves the project per call instead.
+/// Global registration can omit a project; local registration requires an onboarded root.
 fn resolve_install_project(global: bool) -> Result<(Option<PathBuf>, Option<String>)> {
     if !global {
         return canonical_project_utf8().map(|(p, s)| (Some(p), Some(s)));
@@ -184,11 +179,7 @@ const SENSITIVE_HOME_DIRS: &[&str] = &[
     ".password-store",
 ];
 
-/// Why a directory is refused as an indexing root, or `None` if acceptable.
-///
-/// Both sides are canonicalized so a symlinked `$HOME` or credential dir
-/// doesn't dodge a lexical comparison. Foot-gun protection, not a security
-/// boundary — `--force` bypasses it by design.
+/// Canonicalize both sides to catch symlinked sensitive roots. `--force` intentionally bypasses this guard.
 fn init_root_refusal(cwd: &std::path::Path) -> Option<String> {
     let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     if cwd.parent().is_none() {
@@ -270,12 +261,7 @@ pub(crate) fn cmd_init(force: bool) -> Result<()> {
         ),
     )?;
 
-    // Keep the index, session/review state, and other generated artifacts out
-    // of version control. An in-tree .gitignore is shared across the team —
-    // unlike a per-clone .git/info/exclude — so teammates who never run
-    // `codesage init` (e.g. onboarded via the plugin) still don't commit
-    // session snapshots or the index db. `*` + `!.gitignore` ignores the whole
-    // directory but lets this file itself be committed.
+    // A committed .codesage/.gitignore protects teammates who did not run init themselves.
     std::fs::write(
         project_dir.join(".gitignore"),
         "# CodeSage local index and session state — not for version control.\n*\n!.gitignore\n",
@@ -319,10 +305,6 @@ pub(crate) fn cmd_watch_run(project: Option<PathBuf>, debounce_ms: Option<u64>) 
     let config = load_project_config(&root)?;
     let excludes = get_exclude_patterns(&config);
     let emb_config = config.embedding.clone().unwrap_or_default();
-    // The env path (`resolve_debounce_ms`) already warns through tracing when
-    // it clamps; an explicit flag previously skipped the floor entirely, so
-    // a zero `--reindex-debounce` re-indexed hot. Floor it here and say so
-    // on stderr, where the operator will actually see it.
     let debounce = match debounce_ms {
         Some(ms) => {
             let floored = statewatcher::floor_debounce_ms(ms);
@@ -337,9 +319,7 @@ pub(crate) fn cmd_watch_run(project: Option<PathBuf>, debounce_ms: Option<u64>) 
         None => statewatcher::resolve_debounce_ms(),
     };
 
-    // An explicit foreground run overrides a prior `watch stop`. A clone can
-    // ship `watch.disabled` as a directory, which no removal clears: surface
-    // that instead of announcing startup and then exiting.
+    // Foreground watch overrides a prior stop; failure to clear the marker must abort startup.
     clear_watch_disabled_marker(&root)?;
 
     let shutdown = statewatcher::register_shutdown_flag();
@@ -375,11 +355,7 @@ pub(crate) fn cmd_watch_run(project: Option<PathBuf>, debounce_ms: Option<u64>) 
     statewatcher::run_statewatcher(watcher_config)
 }
 
-/// Clear a `watch.disabled` marker, tolerating only its absence.
-///
-/// Remove unconditionally rather than gating on `exists()`, which follows
-/// links: a dangling marker symlink reads as absent there, so it would survive
-/// `watch start` and then block every later `watch stop`.
+/// Remove unconditionally: exists() misses dangling symlinks that would block later stop commands.
 fn clear_watch_disabled_marker(root: &std::path::Path) -> Result<()> {
     let marker = statewatcher::watch_disabled_path(root);
     match crate::fsguard::remove_state_file(&marker) {
@@ -394,8 +370,6 @@ fn clear_watch_disabled_marker(root: &std::path::Path) -> Result<()> {
 pub(crate) fn cmd_watch_status(project: Option<PathBuf>, json: bool) -> Result<()> {
     let root = resolve_watch_root(project)?;
     let status = statewatcher::read_status(&root);
-    // lstat, not `exists()`: a dangling marker symlink must read the same way
-    // here as it does to `watch_enabled()`.
     let disabled = statewatcher::watch_disabled_marker_present(&root);
 
     if json {
@@ -409,17 +383,20 @@ pub(crate) fn cmd_watch_status(project: Option<PathBuf>, json: bool) -> Result<(
     } else {
         match status {
             Some(s) => {
-                // `stale_parked` is already in the JSON object above; the
-                // human line must not hide it — parked paths are stale, and
-                // a status that reads "active" with no hint would lie about
-                // their visibility.
                 let parked_note = match s.stale_parked {
                     0 => String::new(),
                     1 => ", 1 path parked after repeated failures".to_string(),
                     n => format!(", {n} paths parked after repeated failures"),
                 };
+                let reconciliation_note = if s.reconciliation_parked {
+                    ", watch coverage/index reconciliation incomplete; retry parked for up to 30 minutes"
+                } else if s.reconciliation_pending {
+                    ", watch coverage/index reconciliation pending"
+                } else {
+                    ""
+                };
                 println!(
-                    "watcher active for {} (mode: {:?}, pid: {}{parked_note})",
+                    "watcher active for {} (mode: {:?}, pid: {}{parked_note}{reconciliation_note})",
                     root.display(),
                     s.mode,
                     s.pid
@@ -440,8 +417,7 @@ pub(crate) fn cmd_watch_stop(project: Option<PathBuf>) -> Result<()> {
     // The marker both stops any running watcher (its loop polls for it) and
     // suppresses auto-restart on the next tool call.
     let marker = statewatcher::watch_disabled_path(&root);
-    // O_NOFOLLOW, not `fs::write`: a repo-planted `watch.disabled` symlink would
-    // otherwise let this O_CREAT|O_TRUNC truncate an arbitrary host file.
+    // Repository-controlled marker paths must not redirect truncation through a symlink.
     crate::fsguard::create_no_follow(&marker)
         .with_context(|| format!("writing {}", marker.display()))?;
     println!("watcher stopped and disabled for {}", root.display());
@@ -482,8 +458,6 @@ mod tests {
             assert!(init_root_refusal(&home.join(".ssh")).is_some());
             assert!(init_root_refusal(&home.join(".aws/config-dir")).is_some());
             assert!(init_root_refusal(&home.join("projects/app")).is_none());
-            // A directory that merely shares a name prefix with a sensitive
-            // dir must not be refused (.sshfs is not .ssh).
             assert!(init_root_refusal(&home.join(".sshfs")).is_none());
         }
         assert!(init_root_refusal(std::path::Path::new("/tmp/some/project")).is_none());

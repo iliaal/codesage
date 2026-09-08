@@ -1,15 +1,10 @@
-//! `find_coupling` report tests over seeded git tables: asymmetric confidence,
-//! the recurrence rank multiplier, span-based recurrence, and the one-off
-//! note variants. The indexer is bypassed so the row values are controlled;
-//! recurrence derivation itself is covered by the indexer unit tests and
-//! `git_history_integration_test`.
+//! Seeded git rows isolate report semantics; indexer tests cover recurrence derivation.
 
 use codesage_graph::{assess_risk, find_coupling, find_coupling_ranked, recommend_tests};
 use codesage_storage::Database;
 use codesage_storage::db::CoChangeWrite;
 
 const DAY: i64 = 86_400;
-/// Reference "now" for seeded timestamps.
 const T0: i64 = 1_750_000_000;
 
 fn pair(weight: f64, count: u32, window_mask: u64, first: i64, last: i64) -> CoChangeWrite {
@@ -22,12 +17,10 @@ fn pair(weight: f64, count: u32, window_mask: u64, first: i64, last: i64) -> CoC
     }
 }
 
-/// A recurring pair: two window bits, spanning 200 days.
 fn recurring(weight: f64, count: u32) -> CoChangeWrite {
     pair(weight, count, 0b11, T0 - 200 * DAY, T0)
 }
 
-/// A one-off pair: one window bit, all commits within `span` days.
 fn one_off(weight: f64, count: u32, span: i64) -> CoChangeWrite {
     pair(weight, count, 0b1, T0 - span * DAY, T0)
 }
@@ -86,18 +79,14 @@ fn recurring_pairs_outrank_one_offs_of_higher_raw_weight() {
     // Span-recurring: one window bit, 66 days of sustained coupling.
     db.upsert_git_co_change_full("target.rs", "span.rs", &one_off(6.0, 11, 66))
         .unwrap();
-    // Boundary straddle: two window bits but only 8 days apart. Under the
-    // window rule this ranked as recurring; under the span rule it is a
-    // one-off and halves to 2.0.
+    // Crossing a window boundary does not make an eight-day burst recurring.
     db.upsert_git_co_change_full(
         "target.rs",
         "straddle.rs",
         &pair(4.0, 4, 0b11, T0 - 8 * DAY, T0),
     )
     .unwrap();
-    // A lighter genuinely recurring competitor: raw 2.5 < straddle's 4.0, but
-    // it keeps its weight while the straddle halves, so it must come out
-    // ahead of the straddle.
+    // Recurrence ranking must reverse these raw-weight ranks.
     db.upsert_git_co_change_full("target.rs", "light.rs", &recurring(2.5, 3))
         .unwrap();
     // A single mass commit, raw 3.0: halves to 1.5, last.
@@ -121,7 +110,6 @@ fn recurring_pairs_outrank_one_offs_of_higher_raw_weight() {
     assert_eq!(by_file("straddle.rs").recurrence, 2);
     assert!(by_file("light.rs").recurring);
     assert!(!by_file("mass.rs").recurring);
-    // Raw weights are reported, not the ranking values.
     assert_eq!(by_file("straddle.rs").weight, 4.0);
     assert_eq!(by_file("mass.rs").weight, 3.0);
 
@@ -132,17 +120,13 @@ fn recurring_pairs_outrank_one_offs_of_higher_raw_weight() {
 
 #[test]
 fn a_month_of_co_changes_inside_one_window_is_recurring() {
-    // mcp/mod.rs <-> params.rs on the real repo: 11 co-changes over 66 days,
-    // all inside one calendar window. One window bit, but a 66-day span is
-    // sustained coupling, not a mass commit.
+    // One calendar window can contain more than 30 days of sustained coupling.
     let db = Database::open_in_memory().unwrap();
     db.upsert_git_file("mod.rs", 1.0, 0, 30, None).unwrap();
     db.upsert_git_co_change_full("mod.rs", "params.rs", &one_off(6.0, 11, 66))
         .unwrap();
-    // 29 days is still a burst.
     db.upsert_git_co_change_full("mod.rs", "burst.rs", &one_off(1.0, 3, 29))
         .unwrap();
-    // Exactly 30 days crosses the line.
     db.upsert_git_co_change_full("mod.rs", "month.rs", &one_off(1.0, 3, 30))
         .unwrap();
 
@@ -159,15 +143,12 @@ fn a_month_of_co_changes_inside_one_window_is_recurring() {
         report.note.is_none(),
         "a page with recurring rows has no note"
     );
-    // Span-recurring rows rank at raw weight, like window-recurring ones.
     assert_eq!(report.coupled[0].file, "params.rs");
 }
 
 #[test]
 fn note_says_evidence_is_too_short_when_the_index_spans_under_thirty_days() {
-    // A 20-day-old repository: no pair can reach the 30-day recurrence span
-    // yet, and the note must say that rather than call the coupling one-off
-    // or suggest a reindex.
+    // A young index cannot establish whether coupling recurs.
     let db = Database::open_in_memory().unwrap();
     db.upsert_git_file("target.rs", 1.0, 0, 8, None).unwrap();
     db.upsert_git_co_change_full("target.rs", "x.rs", &one_off(2.0, 3, 10))
@@ -186,9 +167,7 @@ fn note_says_evidence_is_too_short_when_the_index_spans_under_thirty_days() {
 
 #[test]
 fn note_is_short_burst_when_a_recurring_pair_exists_inside_ninety_days() {
-    // 5-day pair on the queried file, 40-day recurring pair elsewhere: the
-    // index is 40 days old and already shows recurrence, so the note must not
-    // claim recurrence "cannot be observed yet".
+    // Recurrence elsewhere disproves a claim that the index is too young.
     let db = Database::open_in_memory().unwrap();
     db.upsert_git_file("target.rs", 1.0, 0, 8, None).unwrap();
     db.upsert_git_co_change_full("target.rs", "x.rs", &one_off(2.0, 3, 5))
@@ -203,7 +182,6 @@ fn note_is_short_burst_when_a_recurring_pair_exists_inside_ninety_days() {
     assert!(note.contains("within 5 days"), "{note}");
     assert!(!note.contains("cannot be observed"), "{note}");
     assert!(!note.contains("--full"), "{note}");
-    // The recurring pair itself reads as such.
     let other = find_coupling(&db, "other.rs", 10).unwrap();
     assert!(other.coupled[0].recurring);
     assert!(other.note.is_none());
@@ -211,9 +189,7 @@ fn note_is_short_burst_when_a_recurring_pair_exists_inside_ninety_days() {
 
 #[test]
 fn note_says_short_burst_throughout_when_a_rebuilt_index_has_no_recurring_pair() {
-    // 400 days of history, every pair fully populated (no NULL
-    // first_observed_at), none spanning 30 days: a freshly rebuilt index whose
-    // project really does couple in bursts. The reindex hint would be false.
+    // Fully baselined short bursts do not warrant a reindex hint.
     let db = Database::open_in_memory().unwrap();
     db.upsert_git_file("target.rs", 1.0, 0, 8, None).unwrap();
     db.upsert_git_co_change_full("target.rs", "x.rs", &one_off(2.0, 3, 5))
@@ -231,8 +207,6 @@ fn note_says_short_burst_throughout_when_a_rebuilt_index_has_no_recurring_pair()
     assert!(note.contains("within 5 days"), "{note}");
     assert!(!note.contains("--full"), "{note}");
 
-    // Once any pair anywhere recurs, the note describes the page as
-    // short-burst evidence instead.
     db.upsert_git_co_change_full("p.rs", "q.rs", &recurring(1.0, 3))
         .unwrap();
     let report = find_coupling(&db, "target.rs", 10).unwrap();
@@ -241,7 +215,6 @@ fn note_says_short_burst_throughout_when_a_rebuilt_index_has_no_recurring_pair()
     assert!(!note.contains("throughout"), "{note}");
     assert!(!note.contains("--full"), "{note}");
 
-    // A recurring pair on the page clears the note.
     db.upsert_git_co_change_full("target.rs", "w.rs", &recurring(0.5, 3))
         .unwrap();
     let report = find_coupling(&db, "target.rs", 10).unwrap();
@@ -250,9 +223,7 @@ fn note_says_short_burst_throughout_when_a_rebuilt_index_has_no_recurring_pair()
 
 #[test]
 fn note_suggests_full_reindex_only_when_legacy_rows_explain_the_absence() {
-    // Same long history, nothing recurring, but one pair still has no
-    // first_observed_at (written before migration 0017): the missing data can
-    // explain the absence, so the note points at `--full`.
+    // An unbaselined pair can explain missing recurrence; recommend a full reindex.
     let db = Database::open_in_memory().unwrap();
     db.upsert_git_file("target.rs", 1.0, 0, 8, None).unwrap();
     db.upsert_git_co_change_full("target.rs", "x.rs", &one_off(2.0, 3, 0))
@@ -279,9 +250,7 @@ fn note_suggests_full_reindex_only_when_legacy_rows_explain_the_absence() {
 
 #[test]
 fn legacy_rows_win_over_the_too_short_wording_when_spans_collapse_to_zero() {
-    // Every row is legacy-shaped except the queried pair, whose commits sit in
-    // one day: the whole-table span reads 0 (< 30), which used to pick the
-    // "cannot be observed yet" arm and hide the reindex hint.
+    // A zero whole-table span must not mask legacy rows needing a reindex.
     let db = Database::open_in_memory().unwrap();
     db.upsert_git_file("target.rs", 1.0, 0, 8, None).unwrap();
     db.upsert_git_co_change_full("target.rs", "x.rs", &one_off(2.0, 3, 0))
@@ -319,9 +288,7 @@ fn legacy(weight: f64, count: u32, last: i64) -> CoChangeWrite {
 
 #[test]
 fn span_unknown_note_wins_when_the_page_has_legacy_rows_even_if_another_pair_in_the_table_recurs() {
-    // The queried file's pairs are all unbaselined while a baselined recurring
-    // pair exists elsewhere: the page cannot be called short-burst, it is
-    // simply unmeasured.
+    // Unbaselined pairs are unmeasured, even when recurrence exists elsewhere.
     let db = Database::open_in_memory().unwrap();
     db.upsert_git_file("target.rs", 1.0, 0, 8, None).unwrap();
     db.upsert_git_co_change_full("target.rs", "x.rs", &legacy(2.0, 3, T0))
@@ -347,7 +314,6 @@ fn span_unknown_note_wins_when_the_page_has_legacy_rows_even_if_another_pair_in_
     assert!(note.contains("codesage git-index --full"), "{note}");
     assert!(!note.contains("short-burst"), "{note}");
 
-    // A mixed page counts only the unbaselined rows.
     db.upsert_git_co_change_full("target.rs", "w.rs", &one_off(0.5, 3, 3))
         .unwrap();
     let report = find_coupling(&db, "target.rs", 10).unwrap();
@@ -360,9 +326,7 @@ fn span_unknown_note_wins_when_the_page_has_legacy_rows_even_if_another_pair_in_
 
 #[test]
 fn span_unknown_note_appears_on_a_mixed_page_with_a_recurring_row() {
-    // The normal post-upgrade state under the hooks: legacy rows next to one
-    // 0017-aware recurring pair on the same page. The recurring row must not
-    // silence the disclosure, and the rows themselves say which are unknown.
+    // A recurring row must not silence unknown-span disclosure on a mixed page.
     let db = Database::open_in_memory().unwrap();
     db.upsert_git_file("target.rs", 1.0, 0, 8, None).unwrap();
     db.upsert_git_co_change_full("target.rs", "x.rs", &legacy(2.0, 3, T0))
@@ -388,7 +352,6 @@ fn span_unknown_note_appears_on_a_mixed_page_with_a_recurring_row() {
     );
     assert!(note.contains("codesage git-index --full"), "{note}");
 
-    // A fully baselined page with a recurring row carries no note.
     db.upsert_git_co_change_full("target.rs", "x.rs", &one_off(2.0, 3, 2))
         .unwrap();
     db.upsert_git_co_change_full("target.rs", "y.rs", &one_off(1.0, 3, 2))
@@ -448,9 +411,7 @@ fn assess_risk_reports_span_unknown_rows_in_top_coupled() {
 
 #[test]
 fn assess_risk_counts_a_test_promoted_into_the_ranked_list() {
-    // Ten one-off sources at 10.0 push a recurring test at 9.0 out of the raw
-    // top ten; the ranked page halves the sources to 5.0 and the test leads.
-    // A raw-only coupled-test check would report a test gap here.
+    // Raw-only lookup misses the test that recurrence ranking promotes into the top ten.
     let db = Database::open_in_memory().unwrap();
     db.upsert_git_file("target.rs", 1.0, 0, 40, None).unwrap();
     for i in 0..10 {
@@ -471,8 +432,7 @@ fn assess_risk_counts_a_test_promoted_into_the_ranked_list() {
 
 #[test]
 fn recommend_tests_scopes_the_absence_advice_when_the_fetch_was_cut() {
-    // Twenty-one non-test partners and no test anywhere: the absence claim is
-    // limited to what was consulted and the cut note follows it.
+    // Absence claims must disclose a truncated partner lookup.
     let db = Database::open_in_memory().unwrap();
     db.upsert_git_file("target.rs", 1.0, 0, 60, None).unwrap();
     for i in 0..21 {
@@ -510,9 +470,7 @@ fn recommend_tests_scopes_the_absence_advice_when_the_fetch_was_cut() {
 
 #[test]
 fn assess_risk_names_a_coupled_test_demoted_out_of_the_ranked_list() {
-    // A one-off test at raw rank 5 keeps `test_gap` false but is demoted below
-    // ten recurring sources in the ranked `top_coupled`; the note must name it
-    // so the two fields do not contradict.
+    // A raw-page test can close the gap while disappearing from the ranked display.
     let db = Database::open_in_memory().unwrap();
     db.upsert_git_file("target.rs", 1.0, 0, 40, None).unwrap();
     for (i, w) in [13.0, 12.0, 11.0, 10.0, 5.9, 5.8, 5.7, 5.6, 5.5, 5.4]
@@ -525,7 +483,6 @@ fn assess_risk_names_a_coupled_test_demoted_out_of_the_ranked_list() {
     db.upsert_git_co_change_full("target.rs", "tests/hidden_test.rs", &one_off(6.0, 4, 0))
         .unwrap();
 
-    // Sanity on the two pages.
     let raw = db.co_changes_for("target.rs", 10).unwrap();
     assert_eq!(raw[4].file, "tests/hidden_test.rs", "raw rank 5");
     let ranked = find_coupling(&db, "target.rs", 10).unwrap();
@@ -597,16 +554,12 @@ fn assess_risk_names_a_coupled_test_demoted_out_of_the_ranked_list() {
 /// order `find_coupling` reports for the tests among them.
 fn seed_test_partners(db: &Database) -> Vec<String> {
     db.upsert_git_file("target.rs", 1.0, 0, 30, None).unwrap();
-    // one-off test, strongest raw weight (6.0 -> 3.0 demoted).
     db.upsert_git_co_change_full("target.rs", "tests/burst_test.rs", &one_off(6.0, 4, 3))
         .unwrap();
-    // recurring test, lighter (4.0, keeps 4.0).
     db.upsert_git_co_change_full("target.rs", "tests/steady_test.rs", &recurring(4.0, 5))
         .unwrap();
-    // recurring test, lightest (2.0).
     db.upsert_git_co_change_full("target.rs", "tests/slow_test.rs", &recurring(2.0, 3))
         .unwrap();
-    // a source partner between them, ignored by the coupled bucket.
     db.upsert_git_co_change_full("target.rs", "helper.rs", &recurring(5.0, 5))
         .unwrap();
     find_coupling(db, "target.rs", 20)
@@ -645,7 +598,6 @@ fn recommend_tests_coupled_bucket_orders_like_find_coupling() {
     assert!(!burst.recurring);
     assert!(recs.coupled[0].recurring);
     assert_eq!(recs.coupled[0].span_days, 200);
-    // Well under the fetch cap: no cut note.
     assert!(
         !recs.notes.iter().any(|n| n.contains("beyond the top")),
         "{:?}",
@@ -655,9 +607,7 @@ fn recommend_tests_coupled_bucket_orders_like_find_coupling() {
 
 #[test]
 fn recommend_tests_discloses_when_the_co_change_fetch_cap_cut_candidates() {
-    // Twenty-one recurring source partners outrank a strong one-off test once
-    // it is demoted, pushing it past the 20 consulted; the bucket must say so
-    // instead of silently omitting the test.
+    // A test demoted below the fetch cap must produce a truncation disclosure.
     let db = Database::open_in_memory().unwrap();
     db.upsert_git_file("target.rs", 1.0, 0, 60, None).unwrap();
     db.upsert_git_co_change_full("target.rs", "tests/burst_test.rs", &one_off(9.0, 4, 2))
@@ -670,8 +620,6 @@ fn recommend_tests_discloses_when_the_co_change_fetch_cap_cut_candidates() {
         )
         .unwrap();
     }
-    // Sanity: find_coupling with a wide limit still lists the test, below the
-    // recurring sources.
     let full = find_coupling(&db, "target.rs", 50).unwrap();
     assert_eq!(full.coupled.len(), 22);
     assert_eq!(full.coupled[21].file, "tests/burst_test.rs");
@@ -685,8 +633,7 @@ fn recommend_tests_discloses_when_the_co_change_fetch_cap_cut_candidates() {
         .unwrap_or_else(|| panic!("cut must be disclosed, notes: {:?}", recs.notes));
     assert!(note.contains("target.rs"), "{note}");
 
-    // With nineteen sources the test is the 20th row by rank, inside the
-    // cap after the +1 probe; it appears and no cut is reported.
+    // The twentieth ranked partner is inside the cap; the overflow probe is not.
     let db = Database::open_in_memory().unwrap();
     db.upsert_git_file("target.rs", 1.0, 0, 60, None).unwrap();
     db.upsert_git_co_change_full("target.rs", "tests/burst_test.rs", &one_off(9.0, 4, 2))
@@ -707,8 +654,7 @@ fn recommend_tests_discloses_when_the_co_change_fetch_cap_cut_candidates() {
 
 #[test]
 fn legacy_rows_without_recurrence_columns_read_as_one_off() {
-    // Rows written by the 5-argument upsert (or before migration 0017) carry
-    // mask 0 and no span; they read as recurrence 1, span 0, not recurring.
+    // Legacy rows have unknown spans; their zero values are not evidence of a burst.
     let db = Database::open_in_memory().unwrap();
     db.upsert_git_file("a.rs", 1.0, 0, 6, None).unwrap();
     db.upsert_git_co_change("a.rs", "b.rs", 2.0, 3, Some(T0))

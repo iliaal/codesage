@@ -1,11 +1,7 @@
 //! CLI `--json` output-shape regression tests.
 //!
-//! The MCP server wraps every list-shaped tool result in a `{"results": [...]}`
-//! envelope (protocol `*Results` structs). The CLI used to emit bare arrays for
-//! `find-symbol` / `find-references` / `search` / `similar`, so the same data
-//! had two shapes depending on the entrypoint. These tests pin the envelope on
-//! the CLI side. (`search` is exercised only via code symmetry — it needs a
-//! model + embedder, which integration tests can't assume.)
+//! CLI list results must use the MCP `{"results": [...]}` envelope.
+//! This suite excludes `search`, which requires an embedding model.
 
 use std::path::Path;
 use std::process::Command;

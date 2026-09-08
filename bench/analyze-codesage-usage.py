@@ -32,9 +32,6 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-# -----------------------------------------------------------------------------
-# Extraction
-# -----------------------------------------------------------------------------
 
 TOOL_PREFIX = "mcp__codesage__"
 
@@ -131,14 +128,6 @@ def _flatten_result(content: Any) -> str:
     return ""
 
 
-# -----------------------------------------------------------------------------
-# Compression simulations
-#
-# Each rule takes the raw response text and returns the *compressed* size in
-# bytes. If the rule is inapplicable to the shape (e.g. group-by-dir on a
-# plain scalar JSON), it returns the original size. Rules never mutate any
-# on-disk state; they're pure size arithmetic for estimation.
-# -----------------------------------------------------------------------------
 
 
 def _compress_file_array(items: list[Any]) -> list[Any]:
@@ -153,11 +142,11 @@ def _compress_file_array(items: list[Any]) -> list[Any]:
     for it in items:
         p = it.get("file_path") or it.get("file")
         if not isinstance(p, str):
-            return items  # not file-shaped
+            return items
         d = os.path.dirname(p) or "."
         buckets[d].append(it)
     if all(len(v) < 3 for v in buckets.values()):
-        return items  # no directory has enough items to cluster
+        return items
     compressed: list[Any] = []
     for d, bucket in buckets.items():
         if len(bucket) >= 3:
@@ -233,7 +222,6 @@ def rule_dedupe_repeated_strings(text: str) -> int:
         counts, total = collect_notes(arr)
         if total < 3:
             return None
-        # Only dedupe strings that repeat in ≥50% of items and are ≥30 chars
         legend = [s for s, n in counts.items() if n >= max(2, total // 2) and len(s) >= 30]
         if not legend:
             return None
@@ -282,7 +270,6 @@ def rule_collapse_adjacent_refs(text: str) -> int:
     data = _safe_json(text)
     if not isinstance(data, list) or len(data) < 3:
         return len(text)
-    # Items must have file + line
     for item in data:
         if not (isinstance(item, dict) and ("file" in item or "file_path" in item) and "line" in item):
             return len(text)
@@ -333,9 +320,6 @@ def _safe_json(text: str) -> Any:
         return None
 
 
-# -----------------------------------------------------------------------------
-# Aggregation
-# -----------------------------------------------------------------------------
 
 
 def summarize(calls: list[dict[str, Any]]) -> dict[str, Any]:
@@ -346,11 +330,9 @@ def summarize(calls: list[dict[str, Any]]) -> dict[str, Any]:
         "group_by_directory": 0,
         "collapse_adjacent_refs": 0,
         "dedupe_repeated_strings": 0,
-        # Structured-best: min across rules that preserve parseable JSON.
-        # This is the number the verdict reads — real compressions only.
+        # Only parseable JSON contributes to the verdict.
         "structured_best": 0,
-        # Lossy hypothetical cap. Separate from the verdict surface because
-        # it would break clients that parse the response.
+        # Truncation can break JSON clients, so exclude it from the verdict.
         "middle_truncate_cap": 0,
     }
     for c in calls:
@@ -391,9 +373,6 @@ def percentiles(values: list[int]) -> tuple[int, int, int, int]:
     )
 
 
-# -----------------------------------------------------------------------------
-# Report
-# -----------------------------------------------------------------------------
 
 
 def render(summary: dict[str, Any], *, window_days: int, transcripts: int, now: str) -> str:
@@ -420,7 +399,6 @@ def render(summary: dict[str, Any], *, window_days: int, transcripts: int, now: 
     out.append("")
     out.append("| tool | calls | total bytes | p50 | p95 | p99 | max |")
     out.append("|---|---:|---:|---:|---:|---:|---:|")
-    # Sort by total bytes descending — compression effort should follow the cost center.
     tools_by_cost = sorted(
         per_tool.items(), key=lambda kv: sum(kv[1]), reverse=True
     )
@@ -450,9 +428,6 @@ def render(summary: dict[str, Any], *, window_days: int, transcripts: int, now: 
         out.append(f"| `{rule}` | {mark} | {saved:,} | {pct:.1f}% |")
     out.append("")
 
-    # Verdict logic. The only numbers that matter are the combined-best ceiling
-    # and the per-tool concentration: if >80% of bytes live in one tool, target
-    # that tool specifically; otherwise a horizontal compression layer.
     top_tool_total = sum(tools_by_cost[0][1]) if tools_by_cost else 0
     top_tool_share = (100.0 * top_tool_total / compressible_bytes) if compressible_bytes else 0.0
     combined_pct = (100.0 * savings["structured_best"] / compressible_bytes) if compressible_bytes else 0.0
@@ -493,9 +468,6 @@ def render(summary: dict[str, Any], *, window_days: int, transcripts: int, now: 
     return "\n".join(out)
 
 
-# -----------------------------------------------------------------------------
-# CLI
-# -----------------------------------------------------------------------------
 
 
 def main() -> int:

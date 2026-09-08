@@ -55,14 +55,11 @@
 (import_declaration
   (identifier) @ref)
 
-; Pattern 12: @Override -> annotation type usage (Call). Bare marker form
-; (no arguments). Spring/JUnit/JPA route off these — `find_references` on
-; the annotation type needs to surface decoration sites.
+; Pattern 12: @Override → Call (annotation without arguments).
 (marker_annotation
   name: (identifier) @ref)
 
-; Pattern 13: @Test(timeout = 1000) -> annotation type usage (Call). With-args
-; form. Same intent as pattern 12.
+; Pattern 13: @Test(timeout = 1000) → Call.
 (annotation
   name: (identifier) @ref)
 

@@ -80,30 +80,16 @@ except ImportError:
     sys.exit("pyyaml required: pip install pyyaml")
 
 
-# Base retrieval tools available in BOTH arms — the grep+read baseline CodeSage
-# is measured against. Bash/Edit/Write are deliberately absent: Bash would let
-# the agent shell out to the `codesage` CLI (a confound in the WITHOUT arm) or
-# mutate the benched repo.
+# Both arms exclude edits and Bash, which could bypass MCP isolation via the CLI.
 BASE_TOOLS = ["Grep", "Read", "Glob"]
 DISALLOWED_TOOLS = ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch"]
 
-# Wildcard grant enables every tool the CodeSage MCP server exposes. The bare
-# server name (`mcp__codesage`) is also valid per the docs, but the explicit
-# wildcard is the documented form and — under CLI 2.1.x's `--allowedTools` +
-# `--mcp-config` interaction — dodges a regression where the bare grant coincided
-# with a built-in (`Grep`) reporting "not enabled in this context". Confirm with
-# bench/probe-claude-tools.sh before a full run.
+# The bare grant broke Grep availability in CLI 2.1.x; probe flags before a run.
 CODESAGE_MCP_GRANT = "mcp__codesage__*"
 CODESAGE_TOOL_PREFIX = "mcp__codesage__"
 
-# Substrings meaning the WITH arm's CodeSage MCP wasn't available when the agent
-# reached for it — a measurement artifact, not a result. Scoped to codesage
-# specifically: a *generic* "No such tool available" / "tool not found" also
-# fires when the agent tries a DISALLOWED tool (e.g. Bash on a grep-hostile task)
-# or hallucinates a non-codesage tool name. Those are valid runs — the agent
-# falls back to Grep/Read — not codesage cold-starts, and must NOT be discarded.
-# Under-matching here is safe: a genuinely-raced run has cs=0 and is caught by
-# the cs-usage validity gate; over-matching silently throws away good data.
+# Match CodeSage-specific failures: generic tool errors also occur in valid
+# runs that try disallowed tools. Broader matching would bias exclusions.
 RACE_MARKERS = (
     "No such tool available: mcp__codesage",
     "tool not found: mcp__codesage",
@@ -123,10 +109,7 @@ def _is_claude_env_key(k: str) -> bool:
 
 
 def running_inside_claude_code() -> bool:
-    """Detect a nested invocation. Claude Code sets a family of CLAUDE_CODE_* /
-    CLAUDECODE / CLAUDE_PLUGIN_* vars; check the whole family, not a hand-picked
-    three (the original missed CLAUDE_CODE_CHILD_SESSION / _SESSION_ID, which let
-    a nested run slip through and spawn `claude -p` with the wrong tool set)."""
+    """Check the whole session-marker family; individual names miss child sessions."""
     return any(_is_claude_env_key(k) for k in os.environ)
 
 
@@ -188,26 +171,14 @@ def build_command(
     max_turns: int,
     max_budget_usd: float,
 ) -> list[str]:
-    """`claude -p` argv for one run. Both arms pass --strict-mcp-config so the
-    ONLY MCP servers in play are the ones this script chose: codesage (WITH) or
-    none (WITHOUT). Runs are ISOLATED from the operator's environment: `--bare`
-    skips auto-discovered hooks/LSP/plugins and `--permission-mode default` pins
-    an explicit gate — without these, `--setting-sources user` pulled in the
-    operator's personal settings (e.g. a `bypassPermissions` default + RTK-style
-    PreToolUse hooks), contaminating the measurement and defeating the tool gate.
-    Tools gate through the allow/disallow lists in `default` mode: listed tools
-    run, unlisted ones would prompt and are denied (no TTY headless)."""
+    """Pin the MCP inventory and permission mode for both arms."""
     tools = list(BASE_TOOLS)
     if with_codesage:
         tools.append(CODESAGE_MCP_GRANT)
     return [
         "claude", "-p", prompt,
-        # NOT --bare: it strips the built-in Grep/Read/Glob (leaves only the
-        # agent-orchestration primitives) — confirmed via bench/probe-claude-tools.py.
-        # --permission-mode default overrides an operator settings.json that may
-        # set defaultMode:bypassPermissions, restoring the intended allow/disallow
-        # gate without pulling in the operator's hooks the way --setting-sources
-        # user did.
+        # --bare removed built-in retrieval tools in the flag probe.
+        # Override inherited bypassPermissions to retain tool gating.
         "--permission-mode", "default",
         "--allowedTools", ",".join(tools),
         "--disallowedTools", ",".join(DISALLOWED_TOOLS),
@@ -223,12 +194,7 @@ def build_command(
 
 
 def build_prompt(query: str, *, steer_codesage: bool = False) -> str:
-    """Find-a-file task; the answer (a file path) stays cheaply scorable against
-    expected_files. Default is NEUTRAL ("use whatever tools") — which measures
-    whether the agent picks CodeSage on merit. `steer_codesage` prepends a nudge
-    toward the CodeSage MCP, applied to the WITH arm only, to measure CodeSage AS
-    SHIPPED WITH ITS prompt-override affordance (`/codesage-prompt-override`) —
-    i.e. "if used, is it cheaper?" rather than "is it picked?"."""
+    """Neutral by default; steering measures prompted use, not spontaneous choice."""
     steer = (
         "You have a code-intelligence MCP server available (`mcp__codesage__*`): "
         "semantic `search`, plus `find_symbol` / `find_references` / "
@@ -289,9 +255,7 @@ def run_once(
 
 
 def _coerce_cost(value: object) -> float:
-    # Model/CLI output is untrusted: a malformed total_cost_usd (e.g. "$1.2",
-    # None-as-string, dict) must score this run as $0, not kill the whole
-    # A/B aggregate with a ValueError/TypeError.
+    # Malformed cost metadata must not abort the aggregate.
     try:
         return float(value or 0.0)  # type: ignore[arg-type]
     except (TypeError, ValueError):
@@ -307,9 +271,7 @@ def _coerce_int(value: object) -> int:
 def parse_run_output(
     stdout: str, stderr: str, returncode: int, duration_s: float, *, with_codesage: bool
 ) -> dict[str, Any]:
-    """Turn one run's stream-json stdout into per-run metrics. Pure (no I/O) so
-    the bug-prone parsing — token summation, cost extraction, race detection — is
-    unit-testable against synthetic transcripts."""
+    """Parse one run's stream-json output into metrics."""
     tool_uses: list[str] = []
     tokens = 0
     cost_usd = 0.0
@@ -342,9 +304,6 @@ def parse_run_output(
 
     blob = stdout + "\n" + stderr
     raced = with_codesage and any(m in blob for m in RACE_MARKERS)
-    # First line that explains a failure, so raced/errored runs are diagnosable
-    # from the console instead of guessed at (opaque "raced" with no reason is
-    # what made the first grep-hostile run impossible to interpret).
     diag = ""
     for _line in blob.splitlines():
         _low = _line.lower()
@@ -438,12 +397,8 @@ def run_arm(
         "arm": arm,
         "runs_total": len(raw),
         "runs_used": len(usable),
-        # How many usable WITH runs actually called a CodeSage tool. If this is
-        # ~0 the WITH arm never exercised CodeSage — the A/B has degenerated to
-        # A/A (both arms grep+read) and the deltas are variance, not signal.
-        # NOT excluded like a race: a race is an infra artifact, but the agent
-        # *choosing* grep over CodeSage is a real outcome, and dropping those
-        # runs would flatter CodeSage by only counting favorable ones.
+        # Choosing not to use CodeSage is an outcome, not an exclusion reason.
+        # Disclose usage so an A/A comparison is not mistaken for product effect.
         "cs_used_runs": sum(1 for r in usable if r["codesage_calls"] >= 1),
         "raced": sum(1 for r in raw if r["raced"]),
         "errored": sum(1 for r in raw if r["error"]),
@@ -574,8 +529,7 @@ def render_scorecard(
 
 
 def codesage_version(codesage_bin: str) -> str:
-    # First banner line only; the multi-line 0.26+ banner would otherwise
-    # break the single-line `- **CodeSage**:` report field.
+    # Report headers require a single line.
     return parse_version_banner(run_version_banner(codesage_bin, timeout=10))["version"]
 
 

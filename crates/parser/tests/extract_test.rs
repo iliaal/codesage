@@ -147,13 +147,10 @@ fn cpp_extracts_all_symbol_types() {
 fn cpp_methods_inside_class() {
     let syms = symbols_for("sample.cpp", Language::Cpp);
 
-    // In-class method definitions refined to Method via parent walk.
     assert!(has_symbol(&syms, "send", SymbolKind::Method));
     assert!(has_symbol(&syms, "push", SymbolKind::Method));
-    // Out-of-line method defs (`void Foo::bar() {}`) -> Method directly.
     assert!(has_symbol(&syms, "open", SymbolKind::Method));
     assert!(has_symbol(&syms, "close", SymbolKind::Method));
-    // Out-of-line template method (`T Buffer<T>::pop() {}`) -> Method.
     assert!(has_symbol(&syms, "pop", SymbolKind::Method));
 }
 
@@ -161,13 +158,9 @@ fn cpp_methods_inside_class() {
 fn cpp_constructor_destructor_operator() {
     let syms = symbols_for("sample.cpp", Language::Cpp);
 
-    // Out-of-line ctor/dtor (Method) -- the in-class declarations have no body
-    // so they don't surface as function_definitions.
     let ctors: Vec<_> = syms.iter().filter(|s| s.name == "Connection").collect();
-    // One Class + one Method (ctor). Destructor name is `~Connection`.
     assert!(ctors.iter().any(|s| s.kind == SymbolKind::Method));
     assert!(has_symbol(&syms, "~Connection", SymbolKind::Method));
-    // Operator overload defined in-class -> Method.
     let op = syms
         .iter()
         .find(|s| s.name == "operator=")
@@ -179,26 +172,21 @@ fn cpp_constructor_destructor_operator() {
 fn cpp_qualified_names_with_namespace() {
     let syms = symbols_for("sample.cpp", Language::Cpp);
 
-    // Free function inside `namespace app { namespace net { ... } }`.
     let ff = syms
         .iter()
         .find(|s| s.name == "free_function")
         .expect("free_function symbol");
     assert_eq!(ff.qualified_name, "app::net::free_function");
 
-    // In-class method definition.
     let send = syms.iter().find(|s| s.name == "send").expect("send symbol");
     assert_eq!(send.qualified_name, "app::net::Connection::send");
 
-    // Class symbol carries namespace prefix.
     let conn_class = syms
         .iter()
         .find(|s| s.name == "Connection" && s.kind == SymbolKind::Class)
         .expect("Connection class");
     assert_eq!(conn_class.qualified_name, "app::net::Connection");
 
-    // Out-of-line method: captured name `app::net::Connection::open` is used
-    // as-is for qualified_name.
     let open = syms.iter().find(|s| s.name == "open").expect("open method");
     assert_eq!(open.qualified_name, "app::net::Connection::open");
 }
@@ -248,8 +236,6 @@ fn rust_qualified_names() {
     let new_method = syms.iter().find(|s| s.name == "new").unwrap();
     assert_eq!(new_method.qualified_name, "Config::new");
 
-    // Two `serialize` symbols now exist: the trait method signature
-    // (`Serializable::serialize`) and the impl (`Config::serialize`).
     let impl_serialize = syms
         .iter()
         .find(|s| s.name == "serialize" && s.qualified_name == "Config::serialize")
@@ -321,7 +307,6 @@ fn javascript_qualified_names() {
 fn javascript_does_not_capture_local_consts() {
     let syms = symbols_for("sample.js", Language::JavaScript);
 
-    // 'app' is a const inside createApp(), should NOT be captured
     let apps: Vec<_> = syms.iter().filter(|s| s.name == "app").collect();
     assert!(apps.is_empty(), "local const 'app' should not be extracted");
 }
@@ -401,8 +386,6 @@ fn symbols_from_source(source: &str, language: Language) -> Vec<codesage_protoco
 
 #[test]
 fn nested_function_in_python_method_is_not_a_method() {
-    // A local helper defined inside a method must stay a Function with an
-    // unprefixed qualified name — not Method `A.helper`.
     let src = "class A:\n    def m(self):\n        def helper():\n            return 1\n        return helper()\n";
     let syms = symbols_from_source(src, Language::Python);
     let helper = syms
@@ -418,7 +401,6 @@ fn nested_function_in_python_method_is_not_a_method() {
         helper.qualified_name, "helper",
         "nested def must not get a class prefix"
     );
-    // The real method is unaffected.
     let m = syms
         .iter()
         .find(|s| s.name == "m")
@@ -429,8 +411,6 @@ fn nested_function_in_python_method_is_not_a_method() {
 
 #[test]
 fn rust_trait_method_signature_is_captured() {
-    // `function_signature_item` (a trait method without a body) must
-    // surface as a Method qualified by the trait name.
     let src = "trait Store {\n    fn get(&self, k: &str) -> u8;\n}\n";
     let syms = symbols_from_source(src, Language::Rust);
     let get = syms
@@ -443,8 +423,6 @@ fn rust_trait_method_signature_is_captured() {
 
 #[test]
 fn rust_default_trait_method_is_a_method() {
-    // With `trait_item` added to is_inside_impl_or_class, a default method
-    // (a `function_item` with a body inside a trait) refines Function -> Method.
     let src = "trait Store {\n    fn touch(&self) { let _ = self; }\n}\n";
     let syms = symbols_from_source(src, Language::Rust);
     let touch = syms.iter().find(|s| s.name == "touch").unwrap();
@@ -458,19 +436,15 @@ fn typescript_abstract_class_and_methods() {
     let syms = symbols_from_source(src, Language::TypeScript);
     assert!(has_symbol(&syms, "Repo", SymbolKind::Class));
     assert!(has_symbol(&syms, "Base", SymbolKind::Class));
-    // Abstract method signature -> Method, qualified by the abstract class.
     let find = syms.iter().find(|s| s.name == "find").unwrap();
     assert_eq!(find.kind, SymbolKind::Method);
     assert_eq!(find.qualified_name, "Repo.find");
-    // Concrete method resolves its parent class name (abstract_class_declaration
-    // added to find_parent_class_name).
     let save = syms.iter().find(|s| s.name == "save").unwrap();
     assert_eq!(save.qualified_name, "Repo.save");
 }
 
 #[test]
 fn go_package_level_var_is_captured_but_not_locals() {
-    // Package-level `var` -> Constant; locals must stay uncaptured.
     let src =
         "package main\nvar Registry = 1\nvar A, B int\nfunc f() { var local = 2; _ = local }\n";
     let syms = symbols_from_source(src, Language::Go);
@@ -485,7 +459,6 @@ fn go_package_level_var_is_captured_but_not_locals() {
 
 #[test]
 fn generator_functions_are_captured() {
-    // `generator_function_declaration` -> Function in JS and TS.
     let js = symbols_from_source("function* gen() { yield 1; }\n", Language::JavaScript);
     assert!(has_symbol(&js, "gen", SymbolKind::Function));
     let ts = symbols_from_source("function* gen() { yield 1; }\n", Language::TypeScript);
@@ -494,7 +467,6 @@ fn generator_functions_are_captured() {
 
 #[test]
 fn top_level_var_is_captured_js_and_ts() {
-    // Cheap gap: top-level `var x` (variable_declaration, not lexical_declaration).
     let js = symbols_from_source("var legacy = 1;\n", Language::JavaScript);
     assert!(has_symbol(&js, "legacy", SymbolKind::Constant));
     let ts = symbols_from_source("var legacy = 1;\n", Language::TypeScript);
@@ -503,7 +475,7 @@ fn top_level_var_is_captured_js_and_ts() {
 
 #[test]
 fn c_double_pointer_return_function_is_captured() {
-    // Cheap gap: `char **f()` nests two pointer_declarator levels.
+    // `char **f()` nests two pointer_declarator levels.
     let syms = symbols_from_source("char **get_names(void) { return 0; }\n", Language::C);
     assert!(has_symbol(&syms, "get_names", SymbolKind::Function));
 }
@@ -534,9 +506,6 @@ fn nested_function_in_rust_method_is_not_a_method() {
 }
 #[test]
 fn cpp_forward_declarations_emit_no_symbols() {
-    // `class Foo;` parses as a bodiless class_specifier; without the `body:`
-    // requirement it emitted a phantom Class for a type defined elsewhere.
-    // Defined types (including template-wrapped) still surface.
     let src = "class Fwd;\n\
                struct Pod;\n\
                union U;\n\
@@ -622,11 +591,7 @@ fn c_unknown_toplevel_macros_do_not_hide_the_functions_around_them() {
 
 #[test]
 fn c_recovered_typedef_emits_each_symbol_row_once() {
-    // With `NTAPI` unknown, the recovered `type_definition` carries one
-    // `declarator: (type_identifier)` per parameter type, so the typedef
-    // pattern matches `ULONG` five times on one def node. Storage keys a
-    // symbol on (name, qualified_name, kind, span): five equal rows would
-    // trip the UNIQUE index and abort the write batch.
+    // Unknown `NTAPI` makes recovery capture `ULONG` five times on one definition.
     let tree = parse_file(NTAPI_TYPEDEF_C, Language::C).unwrap();
     assert!(
         tree.root_node().has_error(),

@@ -37,28 +37,13 @@ mod unix {
     const START_TIMEOUT: Duration = Duration::from_secs(5);
     const RETRY_DELAY: Duration = Duration::from_millis(25);
 
-    /// Total cap on waiting for a daemon this shim spawned itself. One
-    /// START_TIMEOUT covers a warm start, but a cold model load on a slow or
-    /// contended disk can exceed it — and bailing while the child is still
-    /// alive reports a spurious failure an instant before the daemon binds,
-    /// leaving it running orphaned. While the spawned child lives, the wait
-    /// loops in START_TIMEOUT rounds up to this cap so a truly wedged child
-    /// still fails. Matches the waiter branch's worst case (3 attempts x
-    /// START_TIMEOUT), so both paths give up on the same horizon.
+    /// Match the waiter's three-round cap while allowing a live child a slow start.
     const SPAWNER_WAIT_CAP: Duration = START_TIMEOUT.saturating_mul(3);
 
-    /// Bound on how long shutdown waits for in-flight client connections to
-    /// finish after the accept loop stops. Long enough for a typical tool
-    /// call to complete its response, short enough that `daemon stop`'s 10s
-    /// SIGTERM window is never exceeded even when a parked client holds its
-    /// connection open for the whole drain.
+    /// Leave room within `daemon stop`'s 10-second SIGTERM window for cleanup.
     const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
-    /// Lock an activity-clock mutex, recovering from poisoning. The clock is
-    /// a plain timestamp: a writer that panicked mid-store leaves the old
-    /// value intact, so `into_inner` recovery (rather than an `.unwrap()`
-    /// that crash-loops the daemon across the accept loop and every tick) is
-    /// the correct call.
+    /// A panicking timestamp writer leaves the previous value intact, so poison recovery is safe.
     fn lock_clock(mutex: &Mutex<Instant>) -> std::sync::MutexGuard<'_, Instant> {
         mutex
             .lock()
@@ -81,18 +66,11 @@ mod unix {
         0
     }
 
-    /// Default idle backstop: shut the daemon down after this long with zero
-    /// connected clients. The daemon is meant to be a warm pool shared across
-    /// sessions, so this is generous — a 30-minute gap between queries is rare
-    /// inside an active session, and the only cost of reaping is one model
-    /// reload on the next query. Without it the daemon outlives every agent and
-    /// pins the embedder/reranker in memory indefinitely. Override with
-    /// `CODESAGE_DAEMON_IDLE_TIMEOUT_SECS`; `0` disables idle exit entirely.
+    /// Release model memory when no clients remain. `CODESAGE_DAEMON_IDLE_TIMEOUT_SECS=0`
+    /// disables idle exit.
     const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(1800);
 
-    /// Resolve the idle backstop from the environment. `Duration::ZERO` means
-    /// "never reap" (the pre-backstop behavior). An unparseable value falls back
-    /// to the default rather than silently disabling the backstop.
+    /// Zero disables idle exit; invalid values retain the default.
     fn daemon_idle_timeout() -> Duration {
         match std::env::var("CODESAGE_DAEMON_IDLE_TIMEOUT_SECS") {
             Ok(raw) => match raw.trim().parse::<u64>() {
@@ -111,12 +89,8 @@ mod unix {
         }
     }
 
-    /// Default per-model idle eviction timeout: drop a pooled embedder /
-    /// reranker that has not been used for this long, freeing its ORT
-    /// `Session` (GPU VRAM + host buffers). Generous enough that genuinely
-    /// active sessions never reload, short enough that an idle warm daemon
-    /// gives memory back. Override with `CODESAGE_MODEL_IDLE_SECS`; `0`
-    /// disables per-model eviction (the daemon-level backstop still applies).
+    /// Evict unused models even while clients stay connected. `CODESAGE_MODEL_IDLE_SECS=0`
+    /// disables model eviction, not daemon idle exit.
     const DEFAULT_MODEL_IDLE_TIMEOUT: Duration = Duration::from_secs(900);
 
     fn model_idle_timeout() -> Duration {
@@ -136,11 +110,7 @@ mod unix {
         }
     }
 
-    /// Ask the allocator to return freed pages to the OS after a model
-    /// eviction. glibc retains freed heap by default, so dropping an ORT
-    /// `Session` frees the VRAM but leaves host RSS at its high-water mark
-    /// until this runs (measured: recovers ~170 MB after a Jina-base drop).
-    /// No-op off glibc.
+    /// glibc retains freed ORT host buffers after model eviction; return unused pages to the OS.
     fn free_retained_heap() {
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
         // SAFETY: malloc_trim is thread-safe and has no preconditions.
@@ -172,8 +142,17 @@ mod unix {
 
         fn for_exe(runtime_dir: PathBuf, exe: &Path) -> Result<Self> {
             let key = daemon_key_for_exe(exe)?;
+            let socket = runtime_dir.join(format!("mcp-{key}.sock"));
+            std::os::unix::net::SocketAddr::from_pathname(&socket).with_context(|| {
+                format!(
+                    "invalid daemon socket pathname {} ({} bytes); choose a shorter runtime \
+                     directory with CODESAGE_DAEMON_RUNTIME_DIR, XDG_RUNTIME_DIR, or --runtime-dir",
+                    socket.display(),
+                    socket.as_os_str().len(),
+                )
+            })?;
             Ok(Self {
-                socket: runtime_dir.join(format!("mcp-{key}.sock")),
+                socket,
                 lock: runtime_dir.join(format!("mcp-{key}.lock")),
                 pid: runtime_dir.join(format!("mcp-{key}.pid")),
                 log: runtime_dir.join(format!("mcp-{key}.log")),
@@ -208,11 +187,7 @@ mod unix {
         }
     }
 
-    /// Socket of a daemon spawned from THIS binary that is accepting
-    /// connections right now, or `None`. Never spawns one: a CLI command that
-    /// finds no daemon embeds privately rather than paying a daemon start it
-    /// would not wait for. The key derives from the executable's identity, so
-    /// a daemon left over from an older install is not a match.
+    /// Find a listening daemon for this executable's identity without starting one.
     pub(crate) fn running_daemon_socket() -> Option<PathBuf> {
         let paths = DaemonPaths::for_current_exe(None).ok()?;
         std::os::unix::net::UnixStream::connect(&paths.socket)
@@ -246,8 +221,7 @@ mod unix {
             std::process::exit(1);
         }
         let pid = pid_record.pid;
-        // Probe the socket: a stale pid + dead socket is rare but possible
-        // if the daemon was SIGKILL'd before the cleanup branch ran.
+        // PID liveness alone does not establish that the daemon accepts connections.
         let socket_reachable = UnixStream::connect(&paths.socket).await.is_ok();
         println!("running");
         println!("  pid:    {}", pid);
@@ -318,12 +292,7 @@ mod unix {
                 .with_context(|| format!("removing stale socket {}", paths.socket.display()))?;
         }
 
-        // M3: bind() honors the caller's umask, leaving a brief window
-        // where the new socket file could carry world or group bits before
-        // set_permissions tightens it to 0o600. Tighten the umask for the
-        // bind, then restore — that way the socket is born with restricted
-        // permissions and the explicit set_permissions below is just
-        // defense-in-depth.
+        // Restrict permissions at bind time to avoid a world-readable window before chmod.
         let prev_umask = unsafe { libc::umask(0o077) };
         let listener = UnixListener::bind(&paths.socket)
             .with_context(|| format!("binding {}", paths.socket.display()));
@@ -333,25 +302,14 @@ mod unix {
             .with_context(|| format!("setting permissions on {}", paths.socket.display()))?;
         write_daemon_pid(&paths.pid)?;
 
-        // Now that our own socket is bound and pid file written, reap any
-        // daemon left over from a previous build/version sharing this runtime
-        // dir. The version-keyed socket name means we just spawned fresh
-        // rather than attaching to the old one; without this sweep the old
-        // daemon pins a second copy of the embedder + reranker in memory
-        // until its 30-minute idle backstop fires.
+        // Reap older builds only after our runtime files exist; otherwise models remain duplicated.
         reap_stale_version_daemons(&paths);
 
         tracing::info!(socket = %paths.socket.display(), "codesage MCP daemon listening");
         let state = Arc::new(CodeSageServerState::new());
         let our_uid = unsafe { libc::getuid() };
 
-        // Per-model idle eviction. The whole-daemon backstop below can't fire
-        // while a client connection is parked open (the common interactive
-        // case), so a warm daemon otherwise pins its embedder + reranker —
-        // host context + GPU VRAM — for the whole session. This drops the
-        // individual models that have sat unused past the timeout, reclaiming
-        // their VRAM (and, via malloc_trim, some host pages) while keeping the
-        // daemon and its connections alive; the next query reloads them cold.
+        // Open client connections prevent daemon idle exit, so evict unused models separately.
         let model_idle = model_idle_timeout();
         if !model_idle.is_zero() {
             let state_evict = state.clone();
@@ -382,31 +340,15 @@ mod unix {
             });
         }
 
-        // M6: install a shutdown signal so SIGTERM / SIGINT exit the
-        // accept loop cleanly and remove socket + pid files. Without
-        // this, the daemon dies abruptly leaving stale runtime files
-        // and in-flight clients see broken pipes.
         let mut sigterm = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
         let mut sigint = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
 
-        // Idle backstop: track the number of connected clients and the last
-        // time that count changed. When it sits at zero past the idle timeout,
-        // the daemon reaps itself rather than leaking embedder/reranker memory
-        // after every agent has disconnected (the failure mode three peer tools
-        // — codegraph, GitNexus, repowise — all hardened independently).
         let idle_timeout = daemon_idle_timeout();
         let active = Arc::new(AtomicUsize::new(0));
         let last_activity = Arc::new(Mutex::new(Instant::now()));
-        // Last byte read from any client, stamped by every `ActivityStream`.
-        // The backstop below deliberately does not reap on this — the stdio
-        // shim is a raw proxy, so killing the daemon under a live-but-quiet
-        // session kills that session's MCP server. It exists so the log can
-        // distinguish "busy" from "held open by a parked shim", which is
-        // otherwise indistinguishable from outside the process.
+        // Byte activity is diagnostic only: reaping a quiet connected client kills its MCP session.
         let daemon_last_byte = Arc::new(Mutex::new(Instant::now()));
         let mut silence_reported = false;
-        // Poll often enough to honor short idle timeouts in tests, but never
-        // busier than once a minute for the production default.
         let idle_poll = if idle_timeout.is_zero() {
             Duration::from_secs(3600)
         } else {
@@ -417,18 +359,13 @@ mod unix {
         let mut idle_tick = tokio::time::interval(idle_poll);
         idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        // Track connection tasks so shutdown can wait for in-flight requests
-        // instead of aborting them mid-response when the runtime drops.
+        // Retain tasks so shutdown can drain in-flight responses.
         let mut clients: JoinSet<()> = JoinSet::new();
 
         let shutdown_reason = loop {
             tokio::select! {
                 accepted = listener.accept() => {
-                    // A transient accept() error (EMFILE/ENFILE under fd
-                    // pressure, ECONNABORTED on a racing client hangup) must
-                    // not tear down the daemon and drop every in-flight
-                    // session. Log, pause briefly so we don't spin on a
-                    // persistent error, and keep serving.
+                    // Retry accept failures without dropping existing clients; delay prevents a persistent-error spin.
                     let (stream, _) = match accepted {
                         Ok(pair) => pair,
                         Err(e) => {
@@ -442,11 +379,7 @@ mod unix {
                         }
                     };
 
-                    // M4: refuse connections whose peer UID doesn't match
-                    // ours. The 0o700 runtime dir + 0o600 socket already
-                    // gate this at the FS layer, but a misconfigured
-                    // $CODESAGE_DAEMON_RUNTIME_DIR could open a wider
-                    // path; SO_PEERCRED is cheap defense-in-depth.
+                    // Peer credentials also protect against a runtime directory with permissive access.
                     match stream.peer_cred() {
                         Ok(cred) if cred.uid() != our_uid => {
                             tracing::warn!(
@@ -482,16 +415,8 @@ mod unix {
                         // Reset the idle clock on disconnect so the timeout
                         // measures continuous idleness, not uptime.
                         *lock_clock(&last_activity_for_conn) = Instant::now();
-                        // With no client left there is nobody to keep an
-                        // index fresh for: stop every live watcher now rather
-                        // than letting it re-embed saved files for the rest of
-                        // its idle window. The next semantic query respawns it
-                        // — after this stop has joined the old thread, which is
-                        // why the wait runs off the async runtime and a start
-                        // request meanwhile waits on the slot. The count is
-                        // re-read under the registry lock right before the
-                        // signal: a client that connected since this
-                        // disconnect aborts the stop.
+                        // Stop watchers off-runtime because joining can block. Recheck the client count
+                        // under the registry lock so a new connection cancels the stop.
                         if remaining == 0 {
                             let state = state_for_conn.clone();
                             let stop = tokio::task::spawn_blocking(move || {
@@ -507,9 +432,7 @@ mod unix {
                         }
                     });
                 }
-                // Reap finished connection tasks so the tracked set doesn't
-                // grow for the daemon's lifetime. When the set is empty the
-                // pattern mismatch disables this arm for the iteration.
+                // `Some` disables this arm when the set is empty.
                 Some(_) = clients.join_next() => {}
                 _ = idle_tick.tick() => {
                     if !idle_timeout.is_zero() {
@@ -519,19 +442,8 @@ mod unix {
                                 break "idle";
                             }
                         } else {
-                            // Connections are open, so the backstop cannot
-                            // fire. Report it once the silence passes the
-                            // backstop window: past that point the daemon is
-                            // holding its pools for clients that have said
-                            // nothing, and only the per-connection ceiling
-                            // (CODESAGE_CLIENT_IDLE_MAX_SECS, 4h default) will
-                            // eventually release them.
                             let silent = lock_clock(&daemon_last_byte).elapsed();
-                            // Latch so a parked session logs once per silent
-                            // window rather than every tick for hours. The end
-                            // of the window is already observable: the
-                            // per-connection ceiling logs when it drops the
-                            // client. Re-armed below as soon as bytes arrive.
+                            // Log once per silent window; new bytes re-arm the report.
                             if silent >= idle_timeout && !silence_reported {
                                 silence_reported = true;
                                 tracing::info!(
@@ -557,11 +469,7 @@ mod unix {
             "codesage MCP daemon shutting down"
         );
 
-        // Signal any per-project live watchers to drain and exit before we
-        // tear down, waiting a bounded time for them. They share this
-        // process, so leaving them running past daemon exit would orphan
-        // inotify threads; one still draining at the deadline is reaped by
-        // the process exit as before.
+        // Give watchers a bounded drain before process exit reaps their remaining threads.
         let still_stopping = state.shutdown_all_watchers(SHUTDOWN_DRAIN);
         if still_stopping > 0 {
             tracing::warn!(
@@ -571,12 +479,7 @@ mod unix {
             );
         }
 
-        // Let in-flight client connections finish (bounded) before removing
-        // the runtime files; returning immediately would drop the runtime and
-        // abort them mid-request, so the client sees a truncated stream. The
-        // listener stays bound while draining: a late shim parks in the
-        // accept backlog instead of racing a replacement daemon for the
-        // socket path.
+        // Keep the listener bound while draining so late shims cannot race a replacement daemon.
         let in_flight = clients.len();
         let abandoned = if in_flight > 0 {
             tracing::info!(in_flight, "draining in-flight client connections");
@@ -598,12 +501,8 @@ mod unix {
         let _ = fs::remove_file(&paths.socket);
         let _ = fs::remove_file(&paths.pid);
 
-        // Exit without dropping the tokio Runtime: its drop joins the
-        // blocking pool, and abort_all cannot interrupt a spawn_blocking
-        // tool body (ONNX inference, SQLite) that is already running. A
-        // wedged one would hold the process past `daemon stop`'s 10s
-        // SIGTERM window. Cleanup above is complete; abandon the blocking
-        // work and leave.
+        // Runtime drop joins running `spawn_blocking` work, which abort_all cannot cancel.
+        // Exit directly so wedged ONNX/SQLite calls cannot hold shutdown past its deadline.
         if abandoned > 0 {
             tracing::warn!(
                 abandoned,
@@ -613,22 +512,12 @@ mod unix {
         std::process::exit(0)
     }
 
-    /// Default per-connection idle ceiling. A per-request timeout would
-    /// require introspecting the rmcp service's tool dispatch, which is
-    /// private to the crate, so we observe activity one layer down — at the
-    /// transport (see [`ActivityStream`]) — and drop a connection that has
-    /// gone this long without the client sending a byte. Measured from last
-    /// activity, NOT connection start: an active multi-hour sweep keeps
-    /// resetting the clock and is never guillotined mid-session, while a hung
-    /// tool call (which produces no further client bytes) or an agent that
-    /// wandered off without disconnecting is still reaped so the agent gets an
-    /// error instead of an indefinite hang. Override with
-    /// `CODESAGE_CLIENT_IDLE_MAX_SECS`; `0` disables the ceiling entirely.
+    /// Transport inactivity ceiling, measured from the last client byte, not connection start.
+    /// rmcp tool dispatch is private, so this also bounds hung requests without per-tool timeouts.
+    /// `CODESAGE_CLIENT_IDLE_MAX_SECS=0` disables the ceiling.
     const DEFAULT_CLIENT_IDLE_MAX: Duration = Duration::from_secs(4 * 3600);
 
-    /// Resolve the per-connection idle ceiling from the environment.
-    /// `Duration::ZERO` disables it. An unparseable value falls back to the
-    /// default rather than silently disabling the ceiling.
+    /// Zero disables the ceiling; invalid values retain the default.
     fn client_idle_max() -> Duration {
         match std::env::var("CODESAGE_CLIENT_IDLE_MAX_SECS") {
             Ok(raw) => match raw.trim().parse::<u64>() {
@@ -647,21 +536,11 @@ mod unix {
         }
     }
 
-    /// Transparent wrapper around the client [`UnixStream`] that stamps
-    /// `last_activity` on every non-empty read. `serve_client` reads this to
-    /// measure the idle ceiling from the client's last request rather than
-    /// from connection start. Reads are the right signal: a healthy session
-    /// reads (requests/pings) continuously, whereas a hung tool call leaves
-    /// the client blocked waiting for a response it never sent more bytes for,
-    /// so the clock advances and the connection is reaped.
+    /// Track client reads so active sessions extend their lifetime while hung requests time out.
     struct ActivityStream {
         inner: UnixStream,
         last_activity: Arc<Mutex<Instant>>,
-        /// Shared across every connection so the accept loop can answer "has
-        /// *any* client said anything recently?". The per-connection
-        /// `last_activity` above drives that connection's own idle ceiling;
-        /// this one exists purely so an operator can tell a busy daemon from
-        /// one held open by a parked shim.
+        /// Diagnostic activity across clients; separate from this connection's idle ceiling.
         daemon_last_byte: Arc<Mutex<Instant>>,
     }
 
@@ -714,16 +593,8 @@ mod unix {
         };
         let idle_max = client_idle_max();
 
-        // Bound the handshake. `serve` resolves once the client sends
-        // `initialize`; a peer that connects and then says nothing would
-        // otherwise park this task forever, and because the idle ceiling below
-        // only starts after this await, that connection holds the daemon's
-        // active-client count above zero permanently — blocking the whole-daemon
-        // backstop for good, not merely delaying it. A real shim cannot do this
-        // (it exits when its stdin closes), so this bounds a misbehaving or
-        // half-open peer, not normal traffic. Reuses the idle ceiling: a client
-        // that has not spoken within it is idle by definition, and `0` keeps
-        // that knob's "disabled" meaning.
+        // Bound pre-initialize silence too: the post-handshake idle check cannot reap these peers.
+        // Zero disables both ceilings.
         let serve_fut = server.serve(tracked);
         let service = if idle_max.is_zero() {
             serve_fut
@@ -751,8 +622,6 @@ mod unix {
             };
         }
 
-        // Poll often enough to notice idleness within a minute of the
-        // ceiling, but never busier than once a minute.
         let poll = idle_max
             .min(Duration::from_secs(60))
             .max(Duration::from_secs(1));
@@ -786,19 +655,11 @@ mod unix {
             return Ok(stream);
         }
 
-        // Bounded retry loop so a lock holder that dies mid-startup
-        // doesn't permanently strand all subsequent shims. Each pass:
-        // try to claim the start lock; if we get it, spawn; if not,
-        // wait for the socket; if the wait times out, check whether
-        // the lock holder is still alive, and only then take over.
+        // Reclaim a start lock only after its holder dies; live holders may still be starting.
         for attempt in 0..3 {
             match StartLock::try_acquire(&paths.lock)? {
                 Some(_lock) => {
                     if attempt > 0 {
-                        // OP3: surfacing recovery activity so a regression
-                        // that breaks daemon startup across the user base
-                        // shows up as warn-level log volume rather than
-                        // silent retries.
                         tracing::warn!(
                             attempt = attempt + 1,
                             "acquired daemon start lock after recovery"
@@ -818,16 +679,7 @@ mod unix {
                     match wait_for_socket(&paths.socket, START_TIMEOUT, paths).await {
                         Ok(stream) => return Ok(stream),
                         Err(wait_err) => {
-                            // Two distinct failure modes:
-                            //   (a) lock holder is still working — wait
-                            //       another round before giving up.
-                            //   (b) lock holder died — adopt the lock
-                            //       and become the spawner ourselves.
-                            // The old code blindly removed the lock file
-                            // and raced with peer shims also in recovery,
-                            // which let two starters land at once and
-                            // produced a misleading "another starter
-                            // still holds" error.
+                            // Never unlink a live holder's lock: competing shims could both become starters.
                             match clean_stale_lock(&paths.lock)? {
                                 LockCleanup::HolderDead => {
                                     tracing::warn!(
@@ -853,7 +705,6 @@ mod unix {
                                         attempt = attempt + 1,
                                         "daemon lock holder still alive; waiting for socket"
                                     );
-                                    // else: loop, wait again
                                 }
                             }
                         }
@@ -872,17 +723,11 @@ mod unix {
         HolderDead,
     }
 
-    /// Inspect the start-lock file's recorded PID. If the lock holder is
-    /// still alive, leave the lock alone and report `HolderAlive`. If the
-    /// holder is dead (or the lock file vanished, or the contents are
-    /// garbled), remove the lock and report `HolderDead` so the caller
-    /// can attempt to acquire it.
+    /// Retain a live holder's lock; remove dead or malformed records so acquisition can retry.
     fn clean_stale_lock(lock_path: &Path) -> Result<LockCleanup> {
         let contents = match fs::read_to_string(lock_path) {
             Ok(s) => s,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // Lock file already gone (holder's Drop ran between our
-                // try_acquire and now). Caller should re-try acquisition.
                 return Ok(LockCleanup::HolderDead);
             }
             Err(e) => return Err(e).with_context(|| format!("reading {}", lock_path.display())),
@@ -890,7 +735,6 @@ mod unix {
         let pid: i32 = match contents.trim().parse() {
             Ok(p) if p > 0 => p,
             _ => {
-                // Garbled file — treat as stale.
                 let _ = fs::remove_file(lock_path);
                 return Ok(LockCleanup::HolderDead);
             }
@@ -902,10 +746,7 @@ mod unix {
         Ok(LockCleanup::HolderDead)
     }
 
-    /// `kill(pid, 0)` is the standard POSIX "does this process exist?"
-    /// probe — it sends no signal and just runs the permission/existence
-    /// checks. ESRCH means dead; EPERM means alive but we're not allowed
-    /// to signal it (still counts as alive).
+    /// `kill(pid, 0)` sends no signal; EPERM still proves the process exists.
     fn pid_alive(pid: i32) -> bool {
         // SAFETY: kill is async-signal-safe and side-effect-free for sig=0.
         let r = unsafe { libc::kill(pid, 0) };
@@ -915,13 +756,7 @@ mod unix {
         matches!(io::Error::last_os_error().raw_os_error(), Some(libc::EPERM))
     }
 
-    /// Cap the daemon log at this size on shim-driven spawn. The shim is
-    /// the only spawn path; if the existing log is larger, rotate the
-    /// chain (.1 -> .2, .log -> .1) so we keep up to LOG_KEEP_GENERATIONS
-    /// generations of context but the active log doesn't grow without
-    /// bound across many daemon restarts. Multi-generation matters when
-    /// a daemon crashes repeatedly within one rotation cycle — keeping
-    /// only one .prev would lose earlier failures.
+    /// Rotate on spawn, retaining recent failures across repeated daemon crashes.
     const LOG_ROTATE_AT_BYTES: u64 = 4 * 1024 * 1024;
     const LOG_KEEP_GENERATIONS: usize = 3;
 
@@ -937,13 +772,8 @@ mod unix {
         cmd.arg("daemon")
             .arg("--runtime-dir")
             .arg(&paths.runtime_dir);
-        // Cap glibc's per-thread arena count. ORT + tokio are multithreaded,
-        // so the default (8×ncpu arenas) retains a lot of freed model-load
-        // scratch the daemon never gives back; 2 arenas trims the steady-state
-        // RSS (~60 MB measured) at negligible alloc-contention cost for this
-        // workload. MALLOC_ARENA_MAX is read at the child's first malloc, so it
-        // must be set here on the spawn, not from within the daemon. Respect an
-        // explicit operator override.
+        // Set before the child's first allocation: glibc's default arena count retains
+        // model-load scratch across ORT/tokio threads. Preserve operator overrides.
         if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
             cmd.env("MALLOC_ARENA_MAX", "2");
         }
@@ -983,15 +813,8 @@ mod unix {
         }
     }
 
-    /// Wait for the daemon `child` (spawned by this shim) to bind its
-    /// socket. A single [`wait_for_socket`] round is too short for a cold
-    /// model load, so loop it while the child process is still alive,
-    /// bounded by `cap` in total. A round can also end early — before
-    /// `round` elapses — when a stale same-key pid file trips
-    /// `wait_for_socket`'s liveness bail; the child overwrites that file
-    /// once it binds, so looping on child liveness rides out that window
-    /// too. `try_wait` also reaps the child on the exited path, so no
-    /// zombie lingers for the shim's lifetime.
+    /// Retry while the child lives, up to `cap`. Stale same-key PID files can end a
+    /// socket round early before the child binds and replaces them.
     async fn wait_for_spawned_daemon(
         child: &mut Child,
         paths: &DaemonPaths,
@@ -1041,17 +864,7 @@ mod unix {
         if meta.len() < LOG_ROTATE_AT_BYTES {
             return;
         }
-        // Best-effort rotation; if any rename fails the daemon will just
-        // continue appending to the existing log. The runtime is the
-        // user's home, so a transient EACCES isn't a reason to fail
-        // daemon startup.
-        //
-        // Walk highest -> lowest so each rename has a clean target:
-        //   .log.N-1 -> .log.N (dropping the oldest if it exists)
-        //   ...
-        //   .log.1   -> .log.2
-        //   .log     -> .log.1
-        // Result: at most LOG_KEEP_GENERATIONS files retained.
+        // Rotate oldest first to preserve generations. Logging failures must not block startup.
         for n in (1..LOG_KEEP_GENERATIONS).rev() {
             let src = generation_path(log, n);
             let dst = generation_path(log, n + 1);
@@ -1081,11 +894,7 @@ mod unix {
         }
     }
 
-    /// Poll for the socket to appear. Returns early with a `daemon exited`
-    /// error if the PID recorded in `paths.pid` is no longer alive — saves
-    /// the caller the full timeout wait when the daemon crashed during
-    /// init (model load failure, port conflict, etc.). The log path is
-    /// always included in the error so the user knows where to look.
+    /// Fail early when the recorded daemon exits; include its log path for diagnostics.
     async fn wait_for_socket(
         path: &Path,
         timeout: Duration,
@@ -1107,8 +916,6 @@ mod unix {
                     paths.log.display()
                 );
             }
-            // Liveness check at most every 100ms — cheap (one kill(pid, 0)
-            // syscall) but no point doing it every 25ms retry.
             if Instant::now().duration_since(last_alive_check) >= Duration::from_millis(100) {
                 if let Some(pid_record) = read_daemon_pid_file(&paths.pid)
                     && !daemon_pid_file_matches(paths, pid_record)
@@ -1189,24 +996,9 @@ mod unix {
         pid_alive(record.pid) && daemon_pid_matches_process(paths, record)
     }
 
-    /// SIGTERM codesage daemons in this runtime dir whose key differs from
-    /// ours — i.e. left over from a previous build or version. The daemon key
-    /// folds in the binary's version + on-disk identity, so a rebuilt or
-    /// upgraded binary boots a fresh daemon under a new socket name instead of
-    /// attaching to the incompatible old one. The old daemon then keeps its
-    /// embedder + reranker resident until the idle backstop fires (default 30
-    /// min) — a full second copy of the model memory for the whole overlap.
-    ///
-    /// Safety: we only signal processes that are (a) a live, start-time- or
-    /// cmdline- or socket-validated codesage daemon in *this* runtime dir,
-    /// validated against the SIBLING's own runtime files (our own socket is
-    /// already bound by the time this runs, so probing it would vacuously
-    /// succeed), and (b) started strictly before us. The strictly-before
-    /// guard means two daemons racing to start can never kill each other;
-    /// when either start time is unavailable (non-Linux) we skip rather than
-    /// kill — reaping is an optimization, SIGTERM'ing a recycled pid is not
-    /// recoverable. SIGTERM is graceful — the target drains in-flight clients
-    /// and removes its own socket/pid files on exit.
+    /// Reclaim model memory from older builds sharing this runtime directory.
+    /// Validate each sibling against its own paths, then require a strictly earlier
+    /// start time. Missing start times must never permit signalling a recycled PID.
     fn reap_stale_version_daemons(paths: &DaemonPaths) {
         let our_start = i32::try_from(std::process::id())
             .ok()
@@ -1235,8 +1027,6 @@ mod unix {
             let validated = daemon_pid_file_matches(&sibling_paths, record);
             match sibling_reap_action(validated, our_start, record.start_time_ticks) {
                 SiblingReapAction::CleanupFiles => {
-                    // Dead or recycled pid: clear its leftover runtime files so
-                    // `status` / `stop` don't trip over them, then move on.
                     cleanup_sibling_runtime_files(&sibling);
                 }
                 SiblingReapAction::Leave => {
@@ -1277,14 +1067,8 @@ mod unix {
         Reap,
     }
 
-    /// Pure reap decision for one sibling pid record. `validated` means the
-    /// record survived [`daemon_pid_file_matches`] against the sibling's own
-    /// paths (start-time match, cmdline match, or its socket accepting
-    /// connections). Reaping requires proof the sibling started strictly
-    /// before us; without comparable start times on both sides (non-Linux,
-    /// where `process_start_time_ticks` is `None`) we leave it alone — a
-    /// wrongly-killed innocent process is not recoverable, an unreaped
-    /// stale daemon merely holds memory until its idle backstop fires.
+    /// Require validation against the sibling's paths and comparable start times.
+    /// Strict ordering prevents racing daemons from reaping each other.
     fn sibling_reap_action(
         validated: bool,
         our_start: Option<u64>,
@@ -1379,9 +1163,6 @@ mod unix {
         let mut stdout = tokio::io::stdout();
 
         let stdin_to_socket = async {
-            // With a default project, rewrite tools/call messages that omit
-            // `project` before forwarding; otherwise raw-copy for zero
-            // overhead (the Claude-plugin path always passes project).
             let res = if let Some(dp) = default_project.as_ref() {
                 crate::mcp::pump_lines_injecting(&mut stdin, &mut socket_write, dp.clone()).await
             } else {
@@ -1398,21 +1179,9 @@ mod unix {
         tokio::pin!(stdin_to_socket);
         tokio::pin!(socket_to_stdout);
 
-        // select!, not try_join!: try_join! waits for BOTH futures, so
-        // if the daemon closed its write half but the MCP client kept
-        // stdin open, the stdin pump would block on read forever and
-        // the shim would hang with no server behind it.
-        //
-        // Two reasons we exit the process instead of returning Ok:
-        //   1. tokio::io::stdin() is backed by a blocking-pool thread
-        //      stuck in read(2). Dropping the future does not cancel
-        //      the syscall — the Runtime::drop in cmd_mcp waits for
-        //      it forever, and the natural process::exit in main is
-        //      never reached.
-        //   2. Stdio MCP semantics: client closes → server exits, and
-        //      vice versa. There's no reconnect protocol; once the
-        //      daemon goes, the shim has no useful work left.
-        // Both directions therefore terminate the process directly.
+        // `try_join!` would hang on open stdin after the daemon disconnects.
+        // Exit directly: dropping tokio's runtime joins the blocking stdin reader,
+        // whose read syscall cannot be cancelled by dropping its future.
         tokio::select! {
             res = &mut socket_to_stdout => {
                 if let Err(e) = &res {
@@ -1435,12 +1204,8 @@ mod unix {
     fn validate_runtime_dir(path: &Path) -> Result<()> {
         use std::os::unix::fs::MetadataExt;
 
-        // The /tmp fallback lives under a world-writable, sticky-bit dir, so a
-        // co-located local user can pre-stage `codesage-<uid>` as a symlink (or
-        // a dir they own) before our daemon does. Refuse anything that isn't a
-        // real directory we own before creating sockets or trusting pid files.
-        // lstat (symlink_metadata) does not follow the link, so a symlinked
-        // runtime dir is rejected here.
+        // Another user can pre-stage the shared-/tmp path. Reject symlinks and foreign
+        // ownership before creating sockets or trusting PID files.
         let meta =
             fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
         if meta.file_type().is_symlink() {
@@ -1489,14 +1254,7 @@ mod unix {
         }
     }
 
-    /// Every runtime dir a daemon could plausibly live in, in resolution
-    /// order. The first entry is the canonical choice ([`default_runtime_dir`]);
-    /// `status`/`stop` scan the whole list so they find a daemon that a
-    /// differently-environment'd process started. Concretely: a Claude Code
-    /// shim spawned without `XDG_RUNTIME_DIR` falls through to `/tmp`, while an
-    /// interactive `codesage daemon status` has `XDG_RUNTIME_DIR` set and would
-    /// otherwise look only under `/run/user/$UID/codesage`, missing the daemon
-    /// and falsely reporting "not running" (and `stop` would fail to stop it).
+    /// `status`/`stop` also inspect fallbacks: the spawning shim may have a different XDG environment.
     fn candidate_runtime_dirs() -> Vec<PathBuf> {
         candidate_runtime_dirs_from(
             std::env::var_os("CODESAGE_DAEMON_RUNTIME_DIR"),
@@ -1505,21 +1263,12 @@ mod unix {
         )
     }
 
-    /// Env-free core of [`candidate_runtime_dirs`], parameterized so tests
-    /// can exercise the resolution logic without mutating process-global
-    /// environment (a `set_var` here races every concurrent test that calls
-    /// `tempfile::tempdir()` or reads the same vars).
     fn candidate_runtime_dirs_from(
         override_dir: Option<OsString>,
         xdg_runtime_dir: Option<OsString>,
         system_tmp: &Path,
     ) -> Vec<PathBuf> {
-        // Treat set-but-empty env vars as unset. Documented workaround for the
-        // WSL2 `/run/user/$UID` trap is to inject `XDG_RUNTIME_DIR=""` in the
-        // client MCP env so the shim falls through to `/tmp`; without this
-        // guard `PathBuf::from("").join("codesage")` collapses to a relative
-        // `codesage/` that gets created next to whatever cwd the shim was
-        // spawned in.
+        // An empty XDG_RUNTIME_DIR must fall through, not create `codesage/` in the checkout.
         let nonempty = |var: Option<OsString>| var.filter(|v| !v.is_empty());
         let mut dirs: Vec<PathBuf> = Vec::new();
         if let Some(dir) = nonempty(override_dir) {
@@ -1528,12 +1277,7 @@ mod unix {
         if let Some(dir) = nonempty(xdg_runtime_dir) {
             dirs.push(PathBuf::from(dir).join("codesage"));
         }
-        // Suffix the /tmp fallback with the real numeric UID, not the UID/USER
-        // env vars. bash doesn't export UID, and a Claude Code shim's env may
-        // carry UID=1000 while an interactive shell falls back to USER=ilia —
-        // so env-derived suffixes disagree across processes and put the daemon
-        // and a later `status`/`stop` in different /tmp dirs. getuid() is
-        // stable regardless of environment (and matches the SO_PEERCRED check).
+        // UID/USER variables differ across launchers; getuid keeps runtime paths consistent.
         let uid = unsafe { libc::getuid() };
         let tmp = PathBuf::from("/tmp").join(format!("codesage-{uid}"));
         let legacy_tmp = system_tmp.join(format!("codesage-{uid}"));
@@ -1553,11 +1297,8 @@ mod unix {
             .expect("candidate_runtime_dirs always yields the /tmp fallback")
     }
 
-    /// Resolve the [`DaemonPaths`] of an existing daemon for `status`/`stop`.
-    /// With an explicit `runtime_dir` (e.g. `--runtime-dir` in tests), use only
-    /// that. Otherwise scan the candidate dirs and return the first whose pid
-    /// file exists, falling back to the canonical dir so the caller still
-    /// prints a coherent "not running" answer when no daemon is found anywhere.
+    /// Honor an explicit directory; otherwise prefer this binary's key, then a live
+    /// older build. Retain a canonical fallback for the "not running" diagnostic.
     fn existing_daemon_paths(runtime_dir: Option<PathBuf>) -> Result<DaemonPaths> {
         let exe = std::env::current_exe().context("resolving current executable")?;
         let explicit_runtime_dir = runtime_dir.is_some();
@@ -1566,9 +1307,6 @@ mod unix {
             None => candidate_runtime_dirs(),
         };
 
-        // First pass: the current binary's own key. This is the common case
-        // (same binary that spawned the daemon) and is preferred so we never
-        // pick a different daemon when ours is the one running.
         let mut fallback: Option<DaemonPaths> = None;
         let mut valid_dirs: Vec<&PathBuf> = Vec::new();
         for dir in &dirs {
@@ -1578,7 +1316,11 @@ mod unix {
                 Err(_) => continue,
             }
 
-            let paths = DaemonPaths::for_exe(dir.clone(), &exe)?;
+            let paths = match DaemonPaths::for_exe(dir.clone(), &exe) {
+                Ok(paths) => paths,
+                Err(err) if explicit_runtime_dir => return Err(err),
+                Err(_) => continue,
+            };
             if paths.pid.exists() {
                 return Ok(paths);
             }
@@ -1587,11 +1329,7 @@ mod unix {
             }
         }
 
-        // Second pass: any *live* `mcp-<key>.pid` regardless of key. The key is
-        // derived from the exe's dev/ino/len/mtime, so a rebuilt binary has a
-        // new key and the first pass misses a daemon a prior build left running
-        // (it would keep serving stale code while `stop` reported "not
-        // running"). Scan for a foreign-key daemon whose pid is still alive.
+        // A rebuild changes the executable key; still find the previous build for status/stop.
         for dir in valid_dirs {
             if let Some(paths) = scan_live_daemon(dir) {
                 return Ok(paths);
@@ -1601,10 +1339,7 @@ mod unix {
         fallback.ok_or_else(|| anyhow::anyhow!("no candidate runtime dir resolved"))
     }
 
-    /// Reconstruct [`DaemonPaths`] from a `<dir>/mcp-<key>.pid` path so
-    /// `status`/`stop` can address a daemon whose key differs from the current
-    /// binary's (e.g. after a rebuild). Returns `None` for names that don't fit
-    /// the `mcp-<key>.pid` shape.
+    /// Recover a different build's runtime paths from its `mcp-<key>.pid` filename.
     fn paths_from_pid_file(pid_path: &Path) -> Option<DaemonPaths> {
         let runtime_dir = pid_path.parent()?.to_path_buf();
         let name = pid_path.file_name()?.to_str()?;
@@ -1621,10 +1356,7 @@ mod unix {
         })
     }
 
-    /// Return the most-recently-started live daemon in `dir`, by scanning every
-    /// `mcp-*.pid` and keeping the newest whose pid is still alive. Newest wins
-    /// so that after a rebuild we address the freshest daemon when several keys
-    /// linger.
+    /// Prefer the newest live PID file when several executable keys remain.
     fn scan_live_daemon(dir: &Path) -> Option<DaemonPaths> {
         let mut newest: Option<(SystemTime, DaemonPaths)> = None;
         for entry in fs::read_dir(dir).ok()?.flatten() {
@@ -1677,11 +1409,7 @@ mod unix {
         ))
     }
 
-    /// FNV-1a 64-bit hash. Deterministic across Rust toolchain versions
-    /// and architectures — unlike `std::collections::hash_map::DefaultHasher`
-    /// whose output is documented to change. The daemon key only needs
-    /// to be stable within one binary's lifetime today, but keying the
-    /// runtime layout to an unstable hash is needless fragility.
+    /// FNV-1a keeps runtime keys deterministic across toolchains, unlike DefaultHasher.
     struct Fnv64 {
         state: u64,
     }
@@ -1712,6 +1440,57 @@ mod unix {
     mod tests {
         use super::*;
 
+        fn pathname_capacity() -> usize {
+            (1..1024)
+                .find(|&len| {
+                    std::os::unix::net::SocketAddr::from_pathname("a".repeat(len)).is_err()
+                })
+                .unwrap()
+                - 1
+        }
+
+        #[test]
+        fn daemon_socket_path_capacity_matches_platform_boundary() {
+            let dir = tempfile::tempdir_in("/tmp").unwrap();
+            let exe = dir.path().join("exe");
+            fs::write(&exe, "test").unwrap();
+            let suffix = format!("/mcp-{}.sock", daemon_key_for_exe(&exe).unwrap());
+            let padding = pathname_capacity() - dir.path().as_os_str().len() - suffix.len() - 1;
+            let runtime = dir.path().join("a".repeat(padding));
+            let paths = DaemonPaths::for_exe(runtime.clone(), &exe).unwrap();
+            assert_eq!(paths.socket.as_os_str().len(), pathname_capacity());
+            fs::create_dir(&runtime).unwrap();
+            let _listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+            let overlong = dir.path().join("a".repeat(padding + 1));
+            let err = DaemonPaths::for_exe(overlong.clone(), &exe).unwrap_err();
+            let diagnostic = format!("{err:#}");
+            assert!(diagnostic.contains(&overlong.display().to_string()));
+            assert!(diagnostic.contains("CODESAGE_DAEMON_RUNTIME_DIR"));
+            assert!(diagnostic.contains("XDG_RUNTIME_DIR"));
+        }
+
+        #[test]
+        fn daemon_socket_path_capacity_counts_bytes() {
+            let dir = tempfile::tempdir().unwrap();
+            let exe = dir.path().join("exe");
+            fs::write(&exe, "test").unwrap();
+            let runtime = PathBuf::from("é".repeat(pathname_capacity() / 2));
+            assert!(runtime.to_str().unwrap().chars().count() < pathname_capacity());
+            assert!(DaemonPaths::for_exe(runtime, &exe).is_err());
+        }
+
+        #[tokio::test]
+        async fn shim_retains_socket_path_error_before_runtime_creation() {
+            let dir = tempfile::tempdir().unwrap();
+            let runtime = dir.path().join("a".repeat(pathname_capacity()));
+            let err = run_mcp_shim(Some(runtime.clone()), None).await.unwrap_err();
+            let diagnostic = format!("{err:#}");
+            assert!(diagnostic.contains("socket pathname"), "{diagnostic}");
+            assert!(diagnostic.contains("CODESAGE_DAEMON_RUNTIME_DIR"));
+            assert!(diagnostic.contains(&runtime.display().to_string()));
+            assert!(!runtime.exists());
+        }
+
         #[test]
         fn daemon_paths_are_scoped_by_executable_metadata() {
             let dir = tempfile::tempdir().unwrap();
@@ -1728,11 +1507,6 @@ mod unix {
 
         #[test]
         fn default_runtime_dir_treats_empty_env_vars_as_unset() {
-            // Regression: the WSL2 workaround `XDG_RUNTIME_DIR=""` (and the
-            // analogous override on CODESAGE_DAEMON_RUNTIME_DIR) used to
-            // produce a relative `codesage/` runtime dir because var_os
-            // returns Some("") for set-but-empty vars. The shim then
-            // mkdir'd `codesage/` next to whatever cwd it spawned in.
             let candidates = candidate_runtime_dirs_from(
                 Some(OsString::new()),
                 Some(OsString::new()),
@@ -1777,9 +1551,6 @@ mod unix {
 
         #[test]
         fn prepare_runtime_dir_refuses_symlinked_dir() {
-            // SS-001: on a shared /tmp a co-located user can pre-stage the
-            // runtime dir as a symlink; prepare_runtime_dir must refuse it
-            // rather than follow the link and chmod the victim's target.
             let dir = tempfile::tempdir().unwrap();
             let real_target = dir.path().join("victim");
             fs::create_dir(&real_target).unwrap();
@@ -1814,8 +1585,6 @@ mod unix {
 
         #[test]
         fn paths_from_pid_file_round_trips_key() {
-            // `status`/`stop` reconstruct a daemon's paths from a
-            // foreign-key pid file (a daemon left by a different build).
             let exe = std::env::current_exe().unwrap();
             let runtime = std::path::Path::new("/tmp/codesage-test-runtime");
             let original = DaemonPaths::for_exe(runtime.to_path_buf(), &exe).unwrap();
@@ -1827,7 +1596,6 @@ mod unix {
             assert_eq!(reconstructed.log, original.log);
             assert_eq!(reconstructed.runtime_dir, original.runtime_dir);
 
-            // Non-matching names are rejected.
             assert!(paths_from_pid_file(std::path::Path::new("/tmp/other.pid")).is_none());
             assert!(paths_from_pid_file(std::path::Path::new("/tmp/mcp-.pid")).is_none());
         }
@@ -1882,10 +1650,6 @@ mod unix {
 
         #[test]
         fn clean_stale_lock_keeps_lock_when_pid_alive() {
-            // Our own PID is by definition alive: must report HolderAlive
-            // and leave the lock file untouched. Pre-M2 the recovery
-            // branch blindly removed the lock in this state, which let
-            // peer shims race to spawn duplicate daemons.
             let dir = tempfile::tempdir().unwrap();
             let lock_path = dir.path().join("daemon.lock");
             fs::write(&lock_path, std::process::id().to_string()).unwrap();
@@ -1898,11 +1662,7 @@ mod unix {
 
         #[test]
         fn clean_stale_lock_removes_when_pid_dead() {
-            // PID 1 owned by init in PID 1 namespace; on Linux it's
-            // permission-denied to kill(1,0) for non-root which returns
-            // EPERM = "alive". Use a PID we own that's gone. The safest
-            // portable choice is a high PID that's almost certainly
-            // never been allocated.
+            // Avoid PID 1: EPERM from kill(1, 0) means alive. Use a likely unallocated PID.
             let dir = tempfile::tempdir().unwrap();
             let lock_path = dir.path().join("daemon.lock");
             fs::write(&lock_path, "2147483646").unwrap();
@@ -1915,8 +1675,6 @@ mod unix {
 
         #[test]
         fn clean_stale_lock_handles_missing_file() {
-            // Lock file vanished between try_acquire and clean_stale_lock
-            // (holder's Drop ran). Caller should be told to retry.
             let dir = tempfile::tempdir().unwrap();
             let lock_path = dir.path().join("daemon.lock");
             assert!(matches!(
@@ -1941,7 +1699,6 @@ mod unix {
         fn rotate_log_rotates_when_oversize() {
             let dir = tempfile::tempdir().unwrap();
             let log = dir.path().join("daemon.log");
-            // Write LOG_ROTATE_AT_BYTES + 1 bytes so the threshold trips.
             fs::write(&log, vec![b'x'; (LOG_ROTATE_AT_BYTES + 1) as usize]).unwrap();
             rotate_log_if_large(&log);
             assert!(!log.exists(), "log should have been renamed");
@@ -1957,38 +1714,27 @@ mod unix {
             let log = dir.path().join("daemon.log");
             let oversize = vec![b'x'; (LOG_ROTATE_AT_BYTES + 1) as usize];
 
-            // First rotation: .log -> .log.1
             fs::write(&log, &oversize).unwrap();
             fs::write(&log, b"GEN1").unwrap();
-            // Force rotation by re-writing oversize before triggering.
             fs::write(&log, &oversize).unwrap();
             rotate_log_if_large(&log);
 
-            // Second rotation: .log.1 -> .log.2, .log -> .log.1
             fs::write(&log, b"GEN2-current").unwrap();
             fs::write(&log, &oversize).unwrap();
             rotate_log_if_large(&log);
 
-            // Third rotation: .log.2 -> .log.3, .log.1 -> .log.2, .log -> .log.1
             fs::write(&log, &oversize).unwrap();
             rotate_log_if_large(&log);
 
-            // Fourth rotation: .log.3 dropped (would become .log.4 which we don't keep);
-            // .log.2 -> .log.3, .log.1 -> .log.2, .log -> .log.1
             fs::write(&log, &oversize).unwrap();
             rotate_log_if_large(&log);
 
-            // After 4 rotations of oversize files we keep exactly KEEP_GENERATIONS - 1
-            // historical files (.1 through .KEEP_GENERATIONS-1).
             for n in 1..LOG_KEEP_GENERATIONS {
                 assert!(
                     generation_path(&log, n).exists(),
                     "generation .{n} should exist"
                 );
             }
-            // The oldest generation we'd write is LOG_KEEP_GENERATIONS - 1.
-            // Higher numbers should not appear because the rotate loop only
-            // walks up to LOG_KEEP_GENERATIONS - 1.
             assert!(
                 !generation_path(&log, LOG_KEEP_GENERATIONS + 1).exists(),
                 "should not retain .{} generation",
@@ -2009,7 +1755,6 @@ mod unix {
         #[test]
         fn rotate_log_noop_when_absent() {
             let dir = tempfile::tempdir().unwrap();
-            // log doesn't exist; should not panic / create anything.
             rotate_log_if_large(&dir.path().join("missing.log"));
         }
 
@@ -2031,9 +1776,6 @@ mod unix {
 
         #[test]
         fn cleanup_sibling_runtime_files_removes_socket_and_lock_despite_dotted_version() {
-            // The daemon key embeds the semver version, so the pid file name
-            // carries dots ("mcp-0.11.0-<hash>.pid"). with_extension must
-            // replace only the trailing ".pid", leaving the version intact.
             let dir = tempfile::tempdir().unwrap();
             let stem = "mcp-0.11.0-2808e07c624d3082";
             let pid = dir.path().join(format!("{stem}.pid"));
@@ -2051,8 +1793,6 @@ mod unix {
             assert!(!lock.exists(), "lock file should be removed");
             assert!(log.exists(), "log file should be left for diagnostics");
         }
-
-        // ---------- shutdown connection drain ----------
 
         #[tokio::test]
         async fn drain_client_tasks_waits_for_in_flight_connections() {
@@ -2108,12 +1848,7 @@ mod unix {
 
         #[tokio::test]
         async fn drain_reports_wedged_blocking_work_without_joining_it() {
-            // A tool body wedged inside spawn_blocking survives abort_all —
-            // aborting the connection task cannot interrupt a blocking
-            // thread that already started. The drain must return promptly
-            // and report the connection as still in flight; joining the
-            // blocking work is only avoidable at shutdown by exiting the
-            // process instead of dropping the runtime.
+            // Aborting a connection cannot interrupt an already-running blocking task.
             let mut clients = JoinSet::new();
             let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
             let entered = Arc::new(AtomicUsize::new(0));
@@ -2125,8 +1860,7 @@ mod unix {
                 })
                 .await;
             });
-            // Wait for the blocking body to actually start so the abort
-            // provably races a running (not queued) blocking task.
+            // Ensure abort races running work, not a queued task.
             while entered.load(Ordering::SeqCst) == 0 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -2143,12 +1877,9 @@ mod unix {
                 started.elapsed() < Duration::from_secs(2),
                 "drain must not wait for the wedged blocking body"
             );
-            // Release the blocking thread so this test runtime's drop
-            // (which does join the blocking pool) can complete.
+            // Test runtime drop must be able to join the blocking pool.
             release_tx.send(()).unwrap();
         }
-
-        // ---------- spawner wait-for-daemon ----------
 
         fn test_daemon_paths(dir: &Path) -> DaemonPaths {
             DaemonPaths {
@@ -2173,14 +1904,11 @@ mod unix {
                 spawner_wait_decision(true, Duration::from_secs(5), cap),
                 KeepWaiting
             );
-            // Boundary: reaching the cap exactly is a give-up.
             assert_eq!(spawner_wait_decision(true, cap, cap), CapExceeded);
             assert_eq!(
                 spawner_wait_decision(true, Duration::from_secs(20), cap),
                 CapExceeded
             );
-            // A dead child fails immediately regardless of elapsed time —
-            // even past the cap, its exit is the more informative failure.
             assert_eq!(
                 spawner_wait_decision(false, Duration::ZERO, cap),
                 ChildExited
@@ -2193,9 +1921,7 @@ mod unix {
 
         #[tokio::test]
         async fn spawner_keeps_waiting_while_child_alive_and_binds_late() {
-            // Slow-bind simulation: the child stand-in stays alive while a
-            // helper thread binds the socket only after the first wait round
-            // has already timed out. The old single-shot wait failed here.
+            // Bind after the first wait round while the child remains alive.
             let dir = tempfile::tempdir().unwrap();
             let paths = test_daemon_paths(dir.path());
             let mut child = Command::new("sleep")
@@ -2231,8 +1957,6 @@ mod unix {
             let dir = tempfile::tempdir().unwrap();
             let paths = test_daemon_paths(dir.path());
             let mut child = Command::new("true").stdin(Stdio::null()).spawn().unwrap();
-            // Guarantee the child is observably dead before the wait; the
-            // status is cached, so the later try_wait still sees it.
             child.wait().unwrap();
 
             let started = Instant::now();
@@ -2286,12 +2010,8 @@ mod unix {
             );
         }
 
-        // ---------- sibling reap decision table ----------
-
         #[test]
         fn sibling_reap_dead_or_recycled_pid_cleans_files() {
-            // A record that fails validation is a dead daemon or a recycled
-            // pid — never signal it, just clear its runtime files.
             assert_eq!(
                 sibling_reap_action(false, Some(100), Some(50)),
                 SiblingReapAction::CleanupFiles
@@ -2304,12 +2024,6 @@ mod unix {
 
         #[test]
         fn sibling_reap_requires_both_start_times() {
-            // Without comparable start times on BOTH sides (the non-Linux
-            // case, where process_start_time_ticks returns None) the
-            // strictly-before race guard can't run. Reaping is an
-            // optimization; killing an innocent same-UID process whose pid
-            // was recycled is not recoverable — so a validated sibling with
-            // missing start times is always left alone.
             assert_eq!(
                 sibling_reap_action(true, None, None),
                 SiblingReapAction::Leave
@@ -2330,8 +2044,6 @@ mod unix {
                 sibling_reap_action(true, Some(100), Some(50)),
                 SiblingReapAction::Reap
             );
-            // Equal or newer start time: could be a daemon racing us up —
-            // never reap.
             assert_eq!(
                 sibling_reap_action(true, Some(100), Some(100)),
                 SiblingReapAction::Leave
@@ -2371,9 +2083,6 @@ pub(crate) async fn run_mcp_shim(
     runtime_dir: Option<PathBuf>,
     default_project: Option<String>,
 ) -> Result<()> {
-    // L3: surface the unsupported flag instead of silently ignoring it.
-    // Non-Unix has no daemon path; --runtime-dir would have configured
-    // a daemon that can't exist, so failing loudly is right.
     if runtime_dir.is_some() {
         bail!("--runtime-dir is Unix-only; codesage MCP daemon is not supported on this platform");
     }
