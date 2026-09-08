@@ -49,8 +49,10 @@ For an unmatched row, `unmatched_reason` distinguishes a transcript that could
 not be resolved (`transcript-not-resolved`, including ambiguous session paths)
 from a transcript without a matching successful exposure (`exposure-not-found`).
 `transcript-read-failed` means the transcript could not be read completely;
-partial contents are excluded from scoring and the base rate.
-For the latter, check for the brief hook's successful attachment and decoded
+partial contents, malformed JSON, and invalid UTF-8 are excluded from scoring
+and the base rate. A failed read anywhere in the resolved session family
+leaves that session's served rows unmatched.
+For `exposure-not-found`, check for the brief hook's successful attachment and decoded
 `additionalContext`. Running `codesage brief --session` manually writes a served
 ledger row, but a command result is not proof that the PreToolUse hook injected
 context. Keep these rows unmatched; do not reconstruct attachment records.
@@ -141,11 +143,20 @@ strictly:
 - **unmatched** — transcript missing or the digest never found (e.g. the
   session ran on another machine, or the transcript was pruned).
 
-Only successful hook attachments count as exposure. The analyzer decodes JSON
+Only successful Edit/Write/MultiEdit PreToolUse attachments count as exposure.
+The analyzer decodes JSON
 `additionalContext` from `attachment.stdout`, and collapses duplicate hook
 records sharing a tool-use ID and payload digest. Ordinary quoted payload text
-does not establish exposure. A session that edited a sibling project can be
-matched across project directories only when its transcript is unique.
+does not establish exposure. The resolved session includes its parent transcript
+and native `SESSION/subagents/agent-*.jsonl` files. Each exposure is scored only
+against later actions in the transcript that received it. A parent copy with
+the same tool-use ID as a child attachment is ignored. If distinct transcripts
+contain the same digest after that deduplication, `exposure-ambiguous` leaves
+the row unmatched instead of guessing its recipient or interleaving actions.
+Symlinked transcript files and session/subagent directories are excluded.
+A session that edited a sibling project can be matched across project
+directories only when its session family is unique. The descriptive base rate
+still uses parent transcripts only; it is not a matched control for child actions.
 
 **Compliance ≠ adoption.** "acted" means the named action occurred after the
 serve — it does not prove the brief *caused* it. The agent may have run those
@@ -185,3 +196,6 @@ non-equivalent populations; it cannot decide whether to keep the hook or enable
 it by default. Default-on requires randomized exposure or controlled A/B task
 runs, as specified in the design memo. The analyzer always reports
 `default_on_ready: false` because it does not collect such controlled evidence.
+
+See [recorded evidence](RESULTS.md) for the retained sample and controlled-run
+outcomes, with production observations and historical experiments kept separate.

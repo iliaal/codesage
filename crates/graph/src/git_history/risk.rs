@@ -1003,6 +1003,7 @@ pub fn assess_risk_batch(db: &Database, file_paths: &[String]) -> Result<RiskBat
         .churn_percentiles()
         .context("bulk churn percentiles for risk batch")?;
     let now = super::bus_factor::unix_now();
+    let mut cache = WalkCache::default();
     let mut files: Vec<RiskAssessment> = file_paths
         .iter()
         .map(|p| {
@@ -1013,7 +1014,7 @@ pub fn assess_risk_batch(db: &Database, file_paths: &[String]) -> Result<RiskBat
                 Some(&percentiles),
                 MAX_FRONTIER,
                 now,
-                None,
+                Some(&mut cache),
             )
             .map(|(a, _)| a)
         })
@@ -1365,6 +1366,10 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         crate::full_index(root, &db, &[], false).unwrap();
         let paths = vec!["root.py".to_string()];
+        assert_batch_matches_uncached(
+            &db,
+            &["root.py".into(), "caller_0.py".into(), "root.py".into()],
+        );
         let plain = assess_risk_diff(&db, &paths).unwrap();
         assert!(
             plain.files[0]
@@ -1517,6 +1522,117 @@ mod tests {
             );
             assert_eq!(single.in_cycle, batched.in_cycle, "{path}: cycle flag");
             assert_eq!(single.cycle_size, batched.cycle_size, "{path}: cycle size");
+        }
+    }
+
+    fn assert_batch_matches_uncached(db: &Database, paths: &[String]) -> RiskBatchAssessment {
+        let batch = assess_risk_batch(db, paths).unwrap();
+        let now = batch
+            .files
+            .iter()
+            .find_map(|file| file.author_concentration.as_ref().map(|value| value.as_of))
+            .unwrap_or_else(super::super::bus_factor::unix_now);
+        let mut expected: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                assess_risk_with_context(db, path, None, None, MAX_FRONTIER, now, None)
+                    .unwrap()
+                    .0
+            })
+            .collect();
+        let mut refs: Vec<_> = expected.iter_mut().collect();
+        let legend = alias_categorical_notes_in_place(&mut refs);
+        assert_eq!(
+            serde_json::to_value(&batch).unwrap(),
+            serde_json::to_value(RiskBatchAssessment {
+                files: expected,
+                legend
+            })
+            .unwrap()
+        );
+        batch
+    }
+
+    #[test]
+    fn batch_reuses_walks_without_changing_results_or_retaining_old_edges() {
+        let (dir, db) = setup_project();
+        let root = dir.path();
+        for (path, content) in [
+            ("base.py", "def anchor():\n    return 1\n"),
+            ("other.py", "def anchor():\n    return 2\n"),
+            (
+                "caller.py",
+                "from base import anchor\ndef caller():\n    return anchor()\n",
+            ),
+            (
+                "lib.rs",
+                "mod first; mod second; fn caller() { first::anchor(); }",
+            ),
+            ("first.rs", "pub fn anchor() {}"),
+            ("second.rs", "pub fn anchor() {}"),
+        ] {
+            std::fs::write(root.join(path), content).unwrap();
+        }
+        crate::full_index(root, &db, &[], false).unwrap();
+        let mut paths = db.all_file_paths().unwrap();
+        paths.extend(["base.py".into(), "missing.py".into()]);
+        let before = assert_batch_matches_uncached(&db, &paths);
+        let base = |batch: &RiskBatchAssessment| {
+            batch
+                .files
+                .iter()
+                .find(|file| file.file == "base.py")
+                .unwrap()
+                .dependent_files
+        };
+        assert_eq!(base(&before), 1);
+
+        std::fs::write(root.join("caller.py"), "def caller():\n    return 2\n").unwrap();
+        db.upsert_git_file("base.py", 10.0, 4, 8, Some(1_700_000_000))
+            .unwrap();
+        crate::incremental_index(root, &db, &[], false).unwrap();
+        let after = assert_batch_matches_uncached(&db, &paths);
+        assert_eq!(base(&after), 0);
+        let score = |batch: &RiskBatchAssessment| {
+            batch
+                .files
+                .iter()
+                .find(|file| file.file == "base.py")
+                .unwrap()
+                .score
+        };
+        assert_ne!(score(&before), score(&after));
+    }
+
+    #[test]
+    #[ignore = "requires CODESAGE_OVERVIEW_BENCH_DB snapshot"]
+    fn measure_batch_risk_on_index() {
+        let db_path = std::env::var("CODESAGE_OVERVIEW_BENCH_DB").unwrap();
+        let db = Database::open(std::path::Path::new(&db_path)).unwrap();
+        let paths = db.all_file_paths().unwrap();
+        for round in 0..3 {
+            let start = std::time::Instant::now();
+            let result = assert_batch_matches_uncached(&db, &paths);
+            let parity_ms = start.elapsed().as_millis();
+            let start = std::time::Instant::now();
+            let repeated = assess_risk_batch(&db, &paths).unwrap();
+            assert_eq!(
+                result
+                    .files
+                    .iter()
+                    .map(|file| file.score)
+                    .collect::<Vec<_>>(),
+                repeated
+                    .files
+                    .iter()
+                    .map(|file| file.score)
+                    .collect::<Vec<_>>()
+            );
+            eprintln!(
+                "round={round} files={} parity_ms={parity_ms} batch_ms={}",
+                paths.len(),
+                start.elapsed().as_millis()
+            );
         }
     }
 

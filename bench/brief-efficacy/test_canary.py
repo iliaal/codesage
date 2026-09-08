@@ -19,6 +19,7 @@ SPEC.loader.exec_module(analyze)
 def hook_event(payload, tool_id="edit-1", kind="hook_success"):
     return {"type": "attachment", "attachment": {
         "type": kind, "toolUseID": tool_id, "exitCode": 0,
+        "hookEvent": "PreToolUse", "hookName": "PreToolUse:Edit",
         "stdout": json.dumps({"hookSpecificOutput": {"additionalContext": payload}}),
     }}
 
@@ -38,6 +39,100 @@ BRANCH_PAYLOAD = (
 
 
 class ScorerTest(unittest.TestCase):
+    def family_report(self, root, files, rows=1):
+        project = root / "projects" / analyze.munge_project("/repo")
+        project.mkdir(parents=True, exist_ok=True)
+        payload = "tests: tests/test_alpha.py\n"
+        row = {"t": 100, "s": "session", "p": "/repo", "f": "alpha.py",
+               "d": "served", "h": analyze.fnv1a64(payload)}
+        (root / analyze.FIRE_LOG).write_text((json.dumps(row) + "\n") * rows)
+        for name, events in files.items():
+            path = project / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("".join(json.dumps(e) + "\n" for e in events))
+        result = subprocess.run(["python3", str(Path(__file__).with_name("analyze.py")),
+                                 "--ledger-dir", str(root), "--projects-dir", str(root / "projects"),
+                                 "--json"], text=True, capture_output=True, check=True)
+        return json.loads(result.stdout)
+
+    def test_nested_native_exposure_uses_only_its_own_actions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            payload = "tests: tests/test_alpha.py\n"
+            report = self.family_report(Path(temp), {
+                "session.jsonl": [tool("Bash", command="pytest tests/test_alpha.py")],
+                "session/subagents/agent-one.jsonl": [hook_event(payload)],
+                "session/subagents/agent-two.jsonl": [tool("Bash", command="pytest tests/test_alpha.py")],
+                "wrong-session/subagents/agent-one.jsonl": [hook_event(payload)],
+            })
+            self.assertEqual(report["served_scored"]["verdicts"], {"no-op": 1})
+            self.assertEqual(report["served_scored"]["scoreable_n"], 1)
+
+    def test_parent_attachment_copy_does_not_duplicate_child_exposure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            payload = "tests: tests/test_alpha.py\n"
+            report = self.family_report(Path(temp), {
+                "session.jsonl": [hook_event(payload), tool("Bash", command="pytest tests/test_alpha.py")],
+                "session/subagents/agent-one.jsonl": [hook_event(payload)],
+            }, rows=2)
+            self.assertEqual(report["served_scored"]["verdicts"], {"no-op": 1, "unmatched": 1})
+
+    def test_distinct_child_exposures_with_same_digest_are_ambiguous(self):
+        with tempfile.TemporaryDirectory() as temp:
+            payload = "tests: tests/test_alpha.py\n"
+            report = self.family_report(Path(temp), {
+                "session/subagents/agent-one.jsonl": [hook_event(payload, "edit-one")],
+                "session/subagents/agent-two.jsonl": [hook_event(payload, "edit-two")],
+            })
+            self.assertEqual(report["serves"][0]["unmatched_reason"], "exposure-ambiguous")
+            self.assertEqual(report["served_scored"]["scoreable_n"], 0)
+
+    def test_malformed_tool_ids_do_not_abort_family_scoring(self):
+        for tool_id in ([], {}):
+            with self.subTest(tool_id=tool_id), tempfile.TemporaryDirectory() as temp:
+                report = self.family_report(Path(temp), {
+                    "session.jsonl": [hook_event("tests: tests/test_alpha.py\n", tool_id)],
+                })
+                self.assertEqual(report["served_scored"]["verdicts"], {"no-op": 1})
+
+    def test_symlinked_child_is_not_read(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "projects" / analyze.munge_project("/repo")
+            children = project / "session/subagents"
+            children.mkdir(parents=True)
+            outside = root / "outside.jsonl"
+            outside.write_text(json.dumps(hook_event("tests: tests/test_alpha.py\n")) + "\n")
+            (children / "agent-one.jsonl").symlink_to(outside)
+            report = self.family_report(root, {"session.jsonl": []})
+            self.assertEqual(report["served_scored"]["scoreable_n"], 0)
+            self.assertEqual(report["serves"][0]["unmatched_reason"], "exposure-not-found")
+
+    def test_symlinked_parent_is_excluded_from_base_rate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "projects" / analyze.munge_project("/repo")
+            project.mkdir(parents=True)
+            outside = root / "outside.jsonl"
+            events = [tool("Edit", file_path="/repo/alpha.py"),
+                      tool("Bash", command="pytest tests/test_alpha.py")]
+            outside.write_text("".join(json.dumps(e) + "\n" for e in events))
+            (project / "session.jsonl").symlink_to(outside)
+            report = self.family_report(root, {})
+            self.assertEqual(report["base_rate"]["edits"], 0)
+            self.assertEqual(report["served_scored"]["scoreable_n"], 0)
+
+    def test_malformed_child_tail_discards_its_exposure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "projects" / analyze.munge_project("/repo")
+            children = project / "session/subagents"
+            children.mkdir(parents=True)
+            child = children / "agent-one.jsonl"
+            child.write_text(json.dumps(hook_event("tests: tests/test_alpha.py\n")) + '\n{"type":')
+            report = self.family_report(root, {"session.jsonl": []})
+            self.assertEqual(report["serves"][0]["unmatched_reason"], "transcript-read-failed")
+            self.assertEqual(report["served_scored"]["scoreable_n"], 0)
+
     def test_branch_context_preserves_mixed_digest_and_action(self):
         payload = "tests: tests/test_alpha.py\n" + BRANCH_PAYLOAD
         events = [hook_event(payload.rstrip("\n")),
@@ -252,8 +347,11 @@ class ScorerTest(unittest.TestCase):
         payload = "tests: tests/test_alpha.py\n"
         failed = hook_event(payload)
         failed["attachment"]["exitCode"] = 1
+        wrong_hook = hook_event(payload)
+        wrong_hook["attachment"].update(hookName="UserPromptSubmit", hookEvent="UserPromptSubmit")
         self.assertFalse(analyze.payload_occurrences([
-            tool("Bash", command=payload), {"type": "user", "message": {"content": payload}}, failed,
+            tool("Bash", command=payload), {"type": "user", "message": {"content": payload}},
+            failed, wrong_hook,
         ]))
 
     def test_named_test_requires_execution_not_mention(self):
@@ -305,11 +403,11 @@ class ScorerTest(unittest.TestCase):
             (root / "other-cwd").mkdir()
             match = root / "other-cwd/session.jsonl"
             match.touch()
-            self.assertEqual(analyze.transcript_path(root, "/project", "session"), match)
+            self.assertEqual(analyze.transcript_family(root, "/project", "session"), [match])
             (root / "another-cwd").mkdir()
             (root / "another-cwd/session.jsonl").touch()
-            self.assertIsNone(analyze.transcript_path(root, "/project", "session"))
-            self.assertIsNone(analyze.transcript_path(root, "/project", "../session"))
+            self.assertEqual(analyze.transcript_family(root, "/project", "session"), [])
+            self.assertEqual(analyze.transcript_family(root, "/project", "../session"), [])
 
 
 class HookTest(unittest.TestCase):

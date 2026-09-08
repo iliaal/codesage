@@ -161,15 +161,51 @@ def munge_project(path: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "-", path)
 
 
-def transcript_path(projects_dir: Path, project: str, session: str) -> Path | None:
+def transcript_family(projects_dir: Path, project: str, session: str) -> list[Path]:
     if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}", session):
+        return []
+
+    def members(directory: Path) -> list[Path]:
+        if directory.is_symlink():
+            return []
+        parent = directory / f"{session}.jsonl"
+        paths = [parent] if parent.is_file() and not parent.is_symlink() else []
+        session_dir = directory / session
+        children = session_dir / "subagents"
+        if not session_dir.is_symlink() and not children.is_symlink():
+            paths.extend(sorted(p for p in children.glob("agent-*.jsonl")
+                                if p.is_file() and not p.is_symlink()))
+        return paths
+
+    expected = projects_dir / munge_project(project)
+    paths = members(expected)
+    if paths:
+        return paths
+    if not projects_dir.is_dir():
+        return []
+    families = [paths for d in projects_dir.iterdir() if d.is_dir()
+                and (paths := members(d))]
+    return families[0] if len(families) == 1 else []
+
+
+def family_hits(family: list[Path], transcripts: dict[Path, list[dict]],
+                occurrences: dict[Path, dict[str, list[tuple[int, str]]]],
+                digest: str) -> list[tuple[Path, int, str]] | None:
+    hits = [(p, i, payload) for p in family
+            for i, payload in occurrences[p].get(digest, [])]
+    child_ids = {
+        transcripts[p][i].get("attachment", {}).get("toolUseID")
+        for p, i, _ in hits if p.parent.name == "subagents"
+        and isinstance(transcripts[p][i].get("attachment", {}).get("toolUseID"), str)
+    } - {None, ""}
+    # Forwarded parent attachments do not establish the parent's exposure.
+    hits = [(p, i, payload) for p, i, payload in hits
+            if p.parent.name == "subagents"
+            or not isinstance(transcripts[p][i].get("attachment", {}).get("toolUseID"), str)
+            or transcripts[p][i].get("attachment", {}).get("toolUseID") not in child_ids]
+    if len({p for p, _, _ in hits}) > 1:
         return None
-    d = projects_dir / munge_project(project)
-    p = d / f"{session}.jsonl"
-    if p.is_file():
-        return p
-    matches = list(projects_dir.glob(f"*/{session}.jsonl"))
-    return matches[0] if len(matches) == 1 else None
+    return hits
 
 
 def payload_candidates(text: str):
@@ -211,6 +247,10 @@ def payload_occurrences(events: list[dict]) -> dict[str, list[tuple[int, str]]]:
         ):
             continue
         if attachment.get("exitCode", 0) != 0:
+            continue
+        if attachment.get("hookName") not in (
+            "PreToolUse:Edit", "PreToolUse:Write", "PreToolUse:MultiEdit",
+        ):
             continue
         strings = []
         for key in ("stdout", "content", "additionalContext"):
@@ -488,13 +528,11 @@ def main() -> int:
             evs = []
             try:
                 # Avoid a second whole-file copy of large transcripts.
-                with p.open(encoding="utf-8", errors="replace") as f:
+                with p.open(encoding="utf-8") as f:
                     for line in f:
-                        try:
+                        if line.strip():
                             evs.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            continue
-            except OSError as e:
+            except (OSError, UnicodeError, json.JSONDecodeError) as e:
                 failed_transcripts.add(p)
                 evs = []
                 print(f"[warn] cannot read transcript {p}: {e}", file=sys.stderr)
@@ -502,7 +540,7 @@ def main() -> int:
         return transcripts[p]
 
     occurrences: dict[Path, dict[str, list[tuple[int, str]]]] = {}
-    consumed: Counter = Counter()  # (transcript path, digest) -> occurrences used
+    consumed: Counter = Counter()  # (transcript family, digest) -> occurrences used
 
     serves = []
     for f in fires:
@@ -513,23 +551,31 @@ def main() -> int:
             "file": f.get("f"), "digest": f.get("h"), "verdict": "unmatched",
             "unmatched_reason": "transcript-not-resolved",
         }
-        tp = transcript_path(args.projects_dir, f.get("p", ""), f.get("s", ""))
-        if tp is not None:
+        family = transcript_family(args.projects_dir, f.get("p", ""), f.get("s", ""))
+        if family:
             row["unmatched_reason"] = "exposure-not-found"
-            events = load_transcript(tp)
-            if tp in failed_transcripts:
+            for tp in family:
+                events = load_transcript(tp)
+                if tp not in occurrences:
+                    occurrences[tp] = payload_occurrences(events)
+            if any(tp in failed_transcripts for tp in family):
                 row["unmatched_reason"] = "transcript-read-failed"
                 serves.append(row)
                 continue
-            if tp not in occurrences:
-                occurrences[tp] = payload_occurrences(events)
+            hits = family_hits(family, transcripts, occurrences, f["h"])
+            if hits is None:
+                row["unmatched_reason"] = "exposure-ambiguous"
+                serves.append(row)
+                continue
             # Consume each exposure once, in ledger order.
-            slot = consumed[(tp, f["h"])]
-            hits = occurrences[tp].get(f["h"], [])
+            key = (tuple(family), f["h"])
+            slot = consumed[key]
             if slot < len(hits):
                 del row["unmatched_reason"]
-                consumed[(tp, f["h"])] += 1
-                idx, payload = hits[slot]
+                consumed[key] += 1
+                tp, idx, payload = hits[slot]
+                events = transcripts[tp]
+                row["transcript"] = str(tp)
                 tests, coupled = parse_payload(payload)
                 if tests or coupled:
                     row["verdict"] = score_serve(events, idx, tests, coupled)
@@ -544,9 +590,11 @@ def main() -> int:
     base_edits = base_followed = 0
     for proj in by_project:
         d = args.projects_dir / munge_project(proj)
-        if not d.is_dir():
+        if not d.is_dir() or d.is_symlink():
             continue
         for tp in d.glob("*.jsonl"):
+            if tp.is_symlink() or not tp.is_file():
+                continue
             e, fl = base_rate_for_transcript(load_transcript(tp))
             base_edits += e
             base_followed += fl

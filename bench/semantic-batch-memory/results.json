@@ -1,0 +1,601 @@
+[
+  {
+    "chunk_bytes": 1881814,
+    "chunk_sha256": "da6d47a08f2147d4996ae1929aaf7a6dfc4cf32423053f9d019123f6960d5cf5",
+    "chunks": 1484,
+    "hashes_sha256": "16d6676578486c5b291c1c2c50ad941ee8cd5b9c7413429f26477a9363fe248b",
+    "mode": "full",
+    "output_sha256": "111b5655bc862d592748e99d955084731a6dc4439a413ca5c9702c27e4191f17",
+    "provider": "cuda",
+    "seconds": 17.982819828,
+    "stats": {
+      "chunks_created": 1484,
+      "chunks_reused": 0,
+      "failed_paths": [],
+      "files_failed": 0,
+      "files_processed": 50,
+      "files_removed": 0,
+      "files_skipped": 0
+    },
+    "vector_bytes": 4558848,
+    "vector_sha256": "d9445cf0bafce60bad6c0827437ea98b44e1e30f8bb873f5dfa5d402e705be14",
+    "key": "ordinary-full-baseline-0",
+    "wall_seconds": 21.160619825997856,
+    "sampled_peak_rss_kib": 1193436,
+    "sampled_peak_private_kib": 1188392,
+    "samples": 638,
+    "batches": [
+      {
+        "chunk_capacity": 1881814,
+        "chunks": 1484,
+        "files": 50,
+        "vector_capacity": 4558848
+      }
+    ]
+  },
+  {
+    "chunk_bytes": 1881814,
+    "chunk_sha256": "da6d47a08f2147d4996ae1929aaf7a6dfc4cf32423053f9d019123f6960d5cf5",
+    "chunks": 1484,
+    "hashes_sha256": "16d6676578486c5b291c1c2c50ad941ee8cd5b9c7413429f26477a9363fe248b",
+    "mode": "full",
+    "output_sha256": "a7ef75a00deecbe62a580feda781e831e0fb183c167e1d7a364920f593606777",
+    "provider": "cuda",
+    "seconds": 17.830924268,
+    "stats": {
+      "chunks_created": 1484,
+      "chunks_reused": 0,
+      "failed_paths": [],
+      "files_failed": 0,
+      "files_processed": 50,
+      "files_removed": 0,
+      "files_skipped": 0
+    },
+    "vector_bytes": 4558848,
+    "vector_sha256": "0d5754fe2d87cce3f81a3be845af0955eeec8dea201b393023643f59e6e2d5c0",
+    "key": "ordinary-full-budget-0",
+    "wall_seconds": 20.961104371002875,
+    "sampled_peak_rss_kib": 1203156,
+    "sampled_peak_private_kib": 1198084,
+    "samples": 638,
+    "batches": [
+      {
+        "chunk_capacity": 224104,
+        "chunks": 176,
+        "files": 10,
+        "vector_capacity": 540672
+      },
+      {
+        "chunk_capacity": 300817,
+        "chunks": 241,
+        "files": 5,
+        "vector_capacity": 740352
+      },
+      {
+        "chunk_capacity": 239261,
+        "chunks": 190,
+        "files": 10,
+        "vector_capacity": 583680
+      },
+      {
+        "chunk_capacity": 219133,
+        "chunks": 173,
+        "files": 4,
+        "vector_capacity": 531456
+      },
+      {
+        "chunk_capacity": 223511,
+        "chunks": 165,
+        "files": 6,
+        "vector_capacity": 506880
+      },
+      {
+        "chunk_capacity": 287245,
+        "chunks": 228,
+        "files": 7,
+        "vector_capacity": 700416
+      },
+      {
+        "chunk_capacity": 211729,
+        "chunks": 171,
+        "files": 3,
+        "vector_capacity": 525312
+      },
+      {
+        "chunk_capacity": 176014,
+        "chunks": 140,
+        "files": 5,
+        "vector_capacity": 430080
+      }
+    ]
+  },
+  {
+    "chunk_bytes": 1881814,
+    "chunk_sha256": "da6d47a08f2147d4996ae1929aaf7a6dfc4cf32423053f9d019123f6960d5cf5",
+    "chunks": 1484,
+    "hashes_sha256": "16d6676578486c5b291c1c2c50ad941ee8cd5b9c7413429f26477a9363fe248b",
+    "mode": "watcher",
+    "output_sha256": "111b5655bc862d592748e99d955084731a6dc4439a413ca5c9702c27e4191f17",
+    "provider": "cuda",
+    "seconds": 18.185323728,
+    "stats": {
+      "chunks_created": 1484,
+      "chunks_reused": 0,
+      "failed_paths": [],
+      "files_failed": 0,
+      "files_processed": 50,
+      "files_removed": 0,
+      "files_skipped": 0
+    },
+    "vector_bytes": 4558848,
+    "vector_sha256": "d9445cf0bafce60bad6c0827437ea98b44e1e30f8bb873f5dfa5d402e705be14",
+    "key": "ordinary-watcher-baseline-0",
+    "wall_seconds": 21.745901403017342,
+    "sampled_peak_rss_kib": 1180824,
+    "sampled_peak_private_kib": 1175780,
+    "samples": 658,
+    "batches": [
+      {
+        "chunk_capacity": 1881814,
+        "chunks": 1484,
+        "files": 50,
+        "vector_capacity": 4558848
+      }
+    ]
+  },
+  {
+    "chunk_bytes": 1881814,
+    "chunk_sha256": "da6d47a08f2147d4996ae1929aaf7a6dfc4cf32423053f9d019123f6960d5cf5",
+    "chunks": 1484,
+    "hashes_sha256": "16d6676578486c5b291c1c2c50ad941ee8cd5b9c7413429f26477a9363fe248b",
+    "mode": "watcher",
+    "output_sha256": "a7ef75a00deecbe62a580feda781e831e0fb183c167e1d7a364920f593606777",
+    "provider": "cuda",
+    "seconds": 17.599560836,
+    "stats": {
+      "chunks_created": 1484,
+      "chunks_reused": 0,
+      "failed_paths": [],
+      "files_failed": 0,
+      "files_processed": 50,
+      "files_removed": 0,
+      "files_skipped": 0
+    },
+    "vector_bytes": 4558848,
+    "vector_sha256": "0d5754fe2d87cce3f81a3be845af0955eeec8dea201b393023643f59e6e2d5c0",
+    "key": "ordinary-watcher-budget-0",
+    "wall_seconds": 20.89349269797094,
+    "sampled_peak_rss_kib": 1201348,
+    "sampled_peak_private_kib": 1196164,
+    "samples": 623,
+    "batches": [
+      {
+        "chunk_capacity": 224104,
+        "chunks": 176,
+        "files": 10,
+        "vector_capacity": 540672
+      },
+      {
+        "chunk_capacity": 300817,
+        "chunks": 241,
+        "files": 5,
+        "vector_capacity": 740352
+      },
+      {
+        "chunk_capacity": 239261,
+        "chunks": 190,
+        "files": 10,
+        "vector_capacity": 583680
+      },
+      {
+        "chunk_capacity": 219133,
+        "chunks": 173,
+        "files": 4,
+        "vector_capacity": 531456
+      },
+      {
+        "chunk_capacity": 223511,
+        "chunks": 165,
+        "files": 6,
+        "vector_capacity": 506880
+      },
+      {
+        "chunk_capacity": 287245,
+        "chunks": 228,
+        "files": 7,
+        "vector_capacity": 700416
+      },
+      {
+        "chunk_capacity": 211729,
+        "chunks": 171,
+        "files": 3,
+        "vector_capacity": 525312
+      },
+      {
+        "chunk_capacity": 176014,
+        "chunks": 140,
+        "files": 5,
+        "vector_capacity": 430080
+      }
+    ]
+  },
+  {
+    "chunk_bytes": 10746210,
+    "chunk_sha256": "41f9fceb9f46f11b4d337c9ebf1608ff3e8b49aafc52534391ca1f12a88bf385",
+    "chunks": 7180,
+    "hashes_sha256": "28e7b85906fd3a2053c2a223bc56c4d82069de646fe4845537c22620b53d89df",
+    "mode": "full",
+    "output_sha256": "554e43b7f122a9842117534791454e756e7e9d653379d61ae35bfaf007afb1c9",
+    "provider": "cuda",
+    "seconds": 106.169545056,
+    "stats": {
+      "chunks_created": 7180,
+      "chunks_reused": 0,
+      "failed_paths": [],
+      "files_failed": 0,
+      "files_processed": 50,
+      "files_removed": 0,
+      "files_skipped": 0
+    },
+    "vector_bytes": 22056960,
+    "vector_sha256": "64f2097134285cf115065c855019e6d6fc9228ab752a78dff3a61f8b50861f12",
+    "key": "skewed-full-baseline-0",
+    "wall_seconds": 114.39272709900979,
+    "sampled_peak_rss_kib": 1323684,
+    "sampled_peak_private_kib": 1318440,
+    "samples": 2933,
+    "batches": [
+      {
+        "chunk_capacity": 10746210,
+        "chunks": 7180,
+        "files": 50,
+        "vector_capacity": 22056960
+      }
+    ]
+  },
+  {
+    "chunk_bytes": 10746210,
+    "chunk_sha256": "41f9fceb9f46f11b4d337c9ebf1608ff3e8b49aafc52534391ca1f12a88bf385",
+    "chunks": 7180,
+    "hashes_sha256": "28e7b85906fd3a2053c2a223bc56c4d82069de646fe4845537c22620b53d89df",
+    "mode": "full",
+    "output_sha256": "7dbbe43932864cae5072187d29bc304072ca78153fe9064ce318b473cd92a1b3",
+    "provider": "cuda",
+    "seconds": 100.503847117,
+    "stats": {
+      "chunks_created": 7180,
+      "chunks_reused": 0,
+      "failed_paths": [],
+      "files_failed": 0,
+      "files_processed": 50,
+      "files_removed": 0,
+      "files_skipped": 0
+    },
+    "vector_bytes": 22056960,
+    "vector_sha256": "173311384eef120211dd4c517ecdf9b0392e3523d1eda766e3da90ff14600236",
+    "key": "skewed-full-budget-0",
+    "database": "/tmp/codesage-semantic-memory-final/skewed-full-budget-0-2700a4db4bca48b78af54151fa52c95d.db",
+    "wall_seconds": 117.6134462869959,
+    "sampled_peak_rss_kib": 1279116,
+    "sampled_peak_private_kib": 1274008,
+    "samples": 2883,
+    "batches": [
+      {
+        "chunk_capacity": 534521,
+        "chunks": 357,
+        "files": 1,
+        "vector_capacity": 1096704
+      },
+      {
+        "chunk_capacity": 534521,
+        "chunks": 357,
+        "files": 1,
+        "vector_capacity": 1096704
+      },
+      {
+        "chunk_capacity": 534521,
+        "chunks": 357,
+        "files": 1,
+        "vector_capacity": 1096704
+      },
+      {
+        "chunk_capacity": 534521,
+        "chunks": 357,
+        "files": 1,
+        "vector_capacity": 1096704
+      },
+      {
+        "chunk_capacity": 534521,
+        "chunks": 357,
+        "files": 1,
+        "vector_capacity": 1096704
+      },
+      {
+        "chunk_capacity": 534521,
+        "chunks": 357,
+        "files": 1,
+        "vector_capacity": 1096704
+      },
+      {
+        "chunk_capacity": 534521,
+        "chunks": 357,
+        "files": 1,
+        "vector_capacity": 1096704
+      },
+      {
+        "chunk_capacity": 534521,
+        "chunks": 357,
+        "files": 1,
+        "vector_capacity": 1096704
+      },
+      {
+        "chunk_capacity": 534521,
+        "chunks": 357,
+        "files": 1,
+        "vector_capacity": 1096704
+      },
+      {
+        "chunk_capacity": 534521,
+        "chunks": 357,
+        "files": 1,
+        "vector_capacity": 1096704
+      },
+      {
+        "chunk_capacity": 526918,
+        "chunks": 352,
+        "files": 1,
+        "vector_capacity": 1081344
+      },
+      {
+        "chunk_capacity": 526918,
+        "chunks": 352,
+        "files": 1,
+        "vector_capacity": 1081344
+      },
+      {
+        "chunk_capacity": 526918,
+        "chunks": 352,
+        "files": 1,
+        "vector_capacity": 1081344
+      },
+      {
+        "chunk_capacity": 526918,
+        "chunks": 352,
+        "files": 1,
+        "vector_capacity": 1081344
+      },
+      {
+        "chunk_capacity": 526918,
+        "chunks": 352,
+        "files": 1,
+        "vector_capacity": 1081344
+      },
+      {
+        "chunk_capacity": 526918,
+        "chunks": 352,
+        "files": 1,
+        "vector_capacity": 1081344
+      },
+      {
+        "chunk_capacity": 526918,
+        "chunks": 352,
+        "files": 1,
+        "vector_capacity": 1081344
+      },
+      {
+        "chunk_capacity": 526918,
+        "chunks": 352,
+        "files": 1,
+        "vector_capacity": 1081344
+      },
+      {
+        "chunk_capacity": 526918,
+        "chunks": 352,
+        "files": 1,
+        "vector_capacity": 1081344
+      },
+      {
+        "chunk_capacity": 526918,
+        "chunks": 352,
+        "files": 1,
+        "vector_capacity": 1081344
+      },
+      {
+        "chunk_capacity": 131820,
+        "chunks": 90,
+        "files": 30,
+        "vector_capacity": 276480
+      }
+    ]
+  },
+  {
+    "chunk_bytes": 10746210,
+    "chunk_sha256": "41f9fceb9f46f11b4d337c9ebf1608ff3e8b49aafc52534391ca1f12a88bf385",
+    "chunks": 7180,
+    "hashes_sha256": "28e7b85906fd3a2053c2a223bc56c4d82069de646fe4845537c22620b53d89df",
+    "mode": "watcher",
+    "output_sha256": "554e43b7f122a9842117534791454e756e7e9d653379d61ae35bfaf007afb1c9",
+    "provider": "cuda",
+    "seconds": 101.012088184,
+    "stats": {
+      "chunks_created": 7180,
+      "chunks_reused": 0,
+      "failed_paths": [],
+      "files_failed": 0,
+      "files_processed": 50,
+      "files_removed": 0,
+      "files_skipped": 0
+    },
+    "vector_bytes": 22056960,
+    "vector_sha256": "64f2097134285cf115065c855019e6d6fc9228ab752a78dff3a61f8b50861f12",
+    "key": "skewed-watcher-baseline-0",
+    "database": "/tmp/codesage-semantic-memory-final/skewed-watcher-baseline-0-a299af2ae6f54e49a3dd7a8261f27aaa.db",
+    "wall_seconds": 110.62551402999088,
+    "sampled_peak_rss_kib": 1324884,
+    "sampled_peak_private_kib": 1319680,
+    "samples": 2564,
+    "batches": [
+      {
+        "chunk_capacity": 10746210,
+        "chunks": 7180,
+        "files": 50,
+        "vector_capacity": 22056960
+      }
+    ]
+  },
+  {
+    "chunk_bytes": 10746210,
+    "chunk_sha256": "41f9fceb9f46f11b4d337c9ebf1608ff3e8b49aafc52534391ca1f12a88bf385",
+    "chunks": 7180,
+    "hashes_sha256": "28e7b85906fd3a2053c2a223bc56c4d82069de646fe4845537c22620b53d89df",
+    "mode": "watcher",
+    "output_sha256": "7dbbe43932864cae5072187d29bc304072ca78153fe9064ce318b473cd92a1b3",
+    "provider": "cuda",
+    "seconds": 102.236728684,
+    "stats": {
+      "chunks_created": 7180,
+      "chunks_reused": 0,
+      "failed_paths": [],
+      "files_failed": 0,
+      "files_processed": 50,
+      "files_removed": 0,
+      "files_skipped": 0
+    },
+    "vector_bytes": 22056960,
+    "vector_sha256": "173311384eef120211dd4c517ecdf9b0392e3523d1eda766e3da90ff14600236",
+    "key": "skewed-watcher-budget-0",
+    "database": "/tmp/codesage-semantic-memory-final/skewed-watcher-budget-0-559c1e4b838445d288977c2a3a778d45.db",
+    "wall_seconds": 109.96208151604515,
+    "sampled_peak_rss_kib": 1277960,
+    "sampled_peak_private_kib": 1272728,
+    "samples": 2472,
+    "batches": [
+      {
+        "chunk_capacity": 534521,
+        "chunks": 357,
+        "files": 1,
+        "vector_capacity": 1096704
+      },
+      {
+        "chunk_capacity": 534521,
+        "chunks": 357,
+        "files": 1,
+        "vector_capacity": 1096704
+      },
+      {
+        "chunk_capacity": 534521,
+        "chunks": 357,
+        "files": 1,
+        "vector_capacity": 1096704
+      },
+      {
+        "chunk_capacity": 534521,
+        "chunks": 357,
+        "files": 1,
+        "vector_capacity": 1096704
+      },
+      {
+        "chunk_capacity": 534521,
+        "chunks": 357,
+        "files": 1,
+        "vector_capacity": 1096704
+      },
+      {
+        "chunk_capacity": 534521,
+        "chunks": 357,
+        "files": 1,
+        "vector_capacity": 1096704
+      },
+      {
+        "chunk_capacity": 534521,
+        "chunks": 357,
+        "files": 1,
+        "vector_capacity": 1096704
+      },
+      {
+        "chunk_capacity": 534521,
+        "chunks": 357,
+        "files": 1,
+        "vector_capacity": 1096704
+      },
+      {
+        "chunk_capacity": 534521,
+        "chunks": 357,
+        "files": 1,
+        "vector_capacity": 1096704
+      },
+      {
+        "chunk_capacity": 534521,
+        "chunks": 357,
+        "files": 1,
+        "vector_capacity": 1096704
+      },
+      {
+        "chunk_capacity": 526918,
+        "chunks": 352,
+        "files": 1,
+        "vector_capacity": 1081344
+      },
+      {
+        "chunk_capacity": 526918,
+        "chunks": 352,
+        "files": 1,
+        "vector_capacity": 1081344
+      },
+      {
+        "chunk_capacity": 526918,
+        "chunks": 352,
+        "files": 1,
+        "vector_capacity": 1081344
+      },
+      {
+        "chunk_capacity": 526918,
+        "chunks": 352,
+        "files": 1,
+        "vector_capacity": 1081344
+      },
+      {
+        "chunk_capacity": 526918,
+        "chunks": 352,
+        "files": 1,
+        "vector_capacity": 1081344
+      },
+      {
+        "chunk_capacity": 526918,
+        "chunks": 352,
+        "files": 1,
+        "vector_capacity": 1081344
+      },
+      {
+        "chunk_capacity": 526918,
+        "chunks": 352,
+        "files": 1,
+        "vector_capacity": 1081344
+      },
+      {
+        "chunk_capacity": 526918,
+        "chunks": 352,
+        "files": 1,
+        "vector_capacity": 1081344
+      },
+      {
+        "chunk_capacity": 526918,
+        "chunks": 352,
+        "files": 1,
+        "vector_capacity": 1081344
+      },
+      {
+        "chunk_capacity": 526918,
+        "chunks": 352,
+        "files": 1,
+        "vector_capacity": 1081344
+      },
+      {
+        "chunk_capacity": 131820,
+        "chunks": 90,
+        "files": 30,
+        "vector_capacity": 276480
+      }
+    ]
+  }
+]

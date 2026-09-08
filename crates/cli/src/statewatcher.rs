@@ -30,6 +30,11 @@ const BACKPRESSURE_MAX_DEFER: Duration = Duration::from_secs(15 * 60);
 const BATCH_THRESHOLD: usize = 10;
 const BATCH_WINDOW: Duration = Duration::from_secs(3);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+const EVENT_QUEUE_CAPACITY: usize = 256;
+const EVENT_PATH_LIMIT: usize = 64;
+const EVENT_PATH_BYTES: usize = 64 * 1024;
+const PENDING_PATH_LIMIT: usize = 4096;
+const PENDING_PATH_BYTES: usize = 4 * 1024 * 1024;
 /// Coalesce backlog replay: events queued during a bulk pass must not trigger another pass per batch.
 const BULK_COOLDOWN: Duration = Duration::from_secs(3);
 const DEFAULT_IDLE_SECS: u64 = 1800;
@@ -152,7 +157,7 @@ impl FilterRefresh {
     fn request(&mut self, now: Instant) {
         self.reload = true;
         if self.failures == 0 {
-            self.retry_at = Some(now);
+            self.retry_at = Some(self.retry_at.unwrap_or(now).max(now));
         }
     }
 
@@ -190,17 +195,26 @@ pub fn run_statewatcher(config: StateWatcherConfig) -> Result<()> {
 }
 
 fn run_statewatcher_with_registration(
+    config: StateWatcherConfig,
+    register: impl FnMut(&mut RecommendedWatcher, &Path, &WatchFilter) -> Result<()>,
+) -> Result<()> {
+    let (admission, rx) = EventAdmission::channel(EVENT_QUEUE_CAPACITY);
+    run_statewatcher_with_admission(config, register, admission, rx)
+}
+
+fn run_statewatcher_with_admission(
     mut config: StateWatcherConfig,
     mut register: impl FnMut(&mut RecommendedWatcher, &Path, &WatchFilter) -> Result<()>,
+    admission: EventAdmission,
+    rx: mpsc::Receiver<Event>,
 ) -> Result<()> {
     // FSEvents resolves symlinks (including /var); registration and strip_prefix must agree.
     config.project_root = canonical_root(&config.project_root);
 
-    let (tx, rx) = mpsc::channel();
     let project_root = config.project_root.clone();
 
     // Backend errors can mean lost events and require reconciliation.
-    let mut watcher = event_watcher(tx.clone())?;
+    let mut watcher = event_watcher(admission.clone(), &project_root)?;
 
     let mut filter = WatchFilter::new(&config.project_root, &config.exclude_patterns)?;
     register(&mut watcher, &project_root, &filter)?;
@@ -238,29 +252,51 @@ fn run_statewatcher_with_registration(
         root = %config.project_root.display(),
         debounce_ms = config.debounce_ms,
         mode = ?config.mode,
+        event_queue_capacity = EVENT_QUEUE_CAPACITY,
+        event_path_bytes = EVENT_PATH_BYTES,
+        pending_path_bytes = PENDING_PATH_BYTES,
         "statewatcher started"
     );
 
     let exit_reason = loop {
+        if pending_work_exceeds_budget(
+            pending
+                .keys()
+                .chain(currently_indexing.iter())
+                .chain(recheck_queue.iter())
+                .chain(semantic_retries.keys())
+                .chain(parked.keys())
+                .map(|path| path.as_os_str().len())
+                .chain(
+                    removed_paths
+                        .iter()
+                        .chain(removed_prefixes.iter())
+                        .map(String::len),
+                ),
+        ) {
+            pending.clear();
+            removed_paths.clear();
+            removed_prefixes.clear();
+            recheck_queue.clear();
+            semantic_retries.clear();
+            parked.clear();
+            batch_event_times.clear();
+            admission.lost.store(true, Ordering::Release);
+        }
+        if admission.lost.swap(false, Ordering::AcqRel) {
+            refresh.request(Instant::now());
+            refresh.retry_at = Some(
+                refresh
+                    .retry_at
+                    .unwrap_or_else(Instant::now)
+                    .max(bulk_cooldown_until.unwrap_or_else(Instant::now)),
+            );
+            tracing::warn!(
+                "filesystem notification loss; retaining full reconciliation obligation"
+            );
+        }
         match rx.recv_timeout(POLL_INTERVAL) {
-            Ok(Ok(event)) => {
-                // inotify overflow and FSEvents rescan requests arrive as Ok events, not backend errors.
-                if event.need_rescan() {
-                    refresh.request(Instant::now());
-                    tracing::warn!(
-                        "watch backend requested rescan (events dropped); \
-                         scheduling bulk reconciliation pass"
-                    );
-                    bulk_retry_at = schedule_watch_error_catchup(
-                        &mut pending,
-                        &mut removed_paths,
-                        Instant::now(),
-                        debounce,
-                        bulk_cooldown_until,
-                    );
-                    continue;
-                }
-
+            Ok(event) => {
                 for path in &event.paths {
                     if path.starts_with(&config.project_root)
                         && path.file_name().is_some_and(|name| name == ".gitignore")
@@ -297,7 +333,9 @@ fn run_statewatcher_with_registration(
                                         pending.entry(rel)
                                     {
                                         e.insert(now);
-                                        batch_event_times.push(now);
+                                        if batch_event_times.len() < BATCH_THRESHOLD {
+                                            batch_event_times.push(now);
+                                        }
                                     }
                                 }
                             }
@@ -356,7 +394,9 @@ fn run_statewatcher_with_registration(
                             // A delayed removal must not delete a re-created file's rows.
                             removed_paths.retain(|p| *p != rel_str);
                             pending.insert(rel, Instant::now());
-                            batch_event_times.push(Instant::now());
+                            if batch_event_times.len() < BATCH_THRESHOLD {
+                                batch_event_times.push(Instant::now());
+                            }
                         }
                         EventKind::Remove(_) => {
                             removed_paths.push(rel_str);
@@ -408,20 +448,6 @@ fn run_statewatcher_with_registration(
                     continue;
                 }
             }
-            Ok(Err(e)) => {
-                refresh.request(Instant::now());
-                tracing::warn!(
-                    error = %e,
-                    "filesystem watcher reported an error; scheduling bulk reconciliation pass"
-                );
-                bulk_retry_at = schedule_watch_error_catchup(
-                    &mut pending,
-                    &mut removed_paths,
-                    Instant::now(),
-                    debounce,
-                    bulk_cooldown_until,
-                );
-            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break "watcher channel closed",
         }
@@ -452,7 +478,7 @@ fn run_statewatcher_with_registration(
         if refresh.reload && refresh.due(Instant::now()) {
             let replacement = (|| {
                 let next_filter = WatchFilter::new(&config.project_root, &config.exclude_patterns)?;
-                let mut next_watcher = event_watcher(tx.clone())?;
+                let mut next_watcher = event_watcher(admission.clone(), &project_root)?;
                 // Register before scanning: edits in newly admitted trees must
                 // queue while reconciliation runs, including during lock retries.
                 register(&mut next_watcher, &project_root, &next_filter)?;
@@ -509,7 +535,11 @@ fn run_statewatcher_with_registration(
             );
         }
 
-        let next_status = (parked.len(), refresh.pending(), refresh.parked());
+        let next_status = (
+            parked.len(),
+            refresh.pending() || admission.lost.load(Ordering::Acquire),
+            refresh.parked(),
+        );
         if status_written != Some(next_status) {
             if let Err(error) = write_status(
                 &config.project_root,
@@ -590,6 +620,7 @@ fn run_statewatcher_with_registration(
             || !parked.is_empty()
             || bulk_retry_at.is_some()
             || refresh.pending()
+            || admission.lost.load(Ordering::Acquire)
         {
             last_activity = Instant::now();
         } else if is_idle(last_activity, config.idle_timeout) {
@@ -1509,14 +1540,24 @@ fn run_bulk_incremental(config: &StateWatcherConfig, embedder: &mut EmbedderHand
         }
     };
 
-    if let Err(e) = codesage_graph::incremental_index(
+    match codesage_graph::incremental_index(
         &config.project_root,
         &db,
         &config.exclude_patterns,
         false,
     ) {
-        tracing::warn!(error = %e, "bulk incremental structural reindex failed");
-        return WorkOutcome::Failed;
+        Ok(stats) if stats.files_failed == 0 => {}
+        Ok(stats) => {
+            tracing::warn!(
+                files_failed = stats.files_failed,
+                "bulk structural reconciliation left unreadable or failed files"
+            );
+            return WorkOutcome::Failed;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "bulk incremental structural reindex failed");
+            return WorkOutcome::Failed;
+        }
     }
 
     let emb_arc = match embedder.get() {
@@ -1555,7 +1596,7 @@ fn run_bulk_incremental(config: &StateWatcherConfig, embedder: &mut EmbedderHand
                 return WorkOutcome::Failed;
             }
         };
-        if let Err(e) = codesage_graph::semantic_incremental_index(
+        match codesage_graph::semantic_incremental_index(
             &config.project_root,
             &db,
             &mut *emb,
@@ -1563,19 +1604,123 @@ fn run_bulk_incremental(config: &StateWatcherConfig, embedder: &mut EmbedderHand
             &fingerprint,
             false,
         ) {
-            tracing::warn!(error = %e, "bulk incremental semantic reindex failed");
-            return WorkOutcome::Failed;
+            Ok(stats) if stats.files_failed == 0 => {}
+            Ok(stats) => {
+                tracing::warn!(
+                    files_failed = stats.files_failed,
+                    "bulk semantic reconciliation left unreadable or failed files"
+                );
+                return WorkOutcome::Failed;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "bulk incremental semantic reindex failed");
+                return WorkOutcome::Failed;
+            }
         }
     }
 
     WorkOutcome::Done
 }
 
-fn event_watcher(tx: mpsc::Sender<Result<Event, notify::Error>>) -> Result<RecommendedWatcher> {
-    notify::recommended_watcher(move |res| {
-        let _ = tx.send(res);
+#[derive(Clone)]
+struct EventAdmission {
+    tx: mpsc::SyncSender<Event>,
+    lost: Arc<AtomicBool>,
+}
+
+impl EventAdmission {
+    fn channel(capacity: usize) -> (Self, mpsc::Receiver<Event>) {
+        let (tx, rx) = mpsc::sync_channel(capacity);
+        (
+            Self {
+                tx,
+                lost: Arc::new(AtomicBool::new(false)),
+            },
+            rx,
+        )
+    }
+
+    fn admit(&self, result: Result<Event, notify::Error>) {
+        let Ok(event) = result else {
+            self.lost.store(true, Ordering::Release);
+            return;
+        };
+        if event.need_rescan() {
+            self.lost.store(true, Ordering::Release);
+            return;
+        }
+        if !matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+        ) {
+            return;
+        }
+        if event.paths.len() > EVENT_PATH_LIMIT
+            || event
+                .paths
+                .iter()
+                .map(|path| path.as_os_str().len())
+                .sum::<usize>()
+                > EVENT_PATH_BYTES
+        {
+            self.lost.store(true, Ordering::Release);
+            return;
+        }
+        // Backend allocation capacities and optional diagnostic strings are not admission budgets.
+        let mut bounded = Event::new(event.kind);
+        bounded.paths = event
+            .paths
+            .iter()
+            .map(|path| path.as_path().to_path_buf())
+            .collect();
+        if bounded.paths.iter().map(PathBuf::capacity).sum::<usize>() > EVENT_PATH_BYTES
+            || self.tx.try_send(bounded).is_err()
+        {
+            self.lost.store(true, Ordering::Release);
+        }
+    }
+}
+
+fn pending_work_exceeds_budget(lengths: impl Iterator<Item = usize>) -> bool {
+    let mut bytes = 0usize;
+    for (index, length) in lengths.enumerate() {
+        bytes = bytes.saturating_add(length);
+        if index >= PENDING_PATH_LIMIT || bytes > PENDING_PATH_BYTES {
+            return true;
+        }
+    }
+    false
+}
+
+fn event_watcher(admission: EventAdmission, project_root: &Path) -> Result<RecommendedWatcher> {
+    let root = project_root.to_path_buf();
+    notify::recommended_watcher(move |mut res: Result<Event, notify::Error>| {
+        if let Ok(event) = &mut res
+            && !event.need_rescan()
+        {
+            event.paths.retain(|path| relevant_watch_path(&root, path));
+            if event.paths.is_empty() {
+                return;
+            }
+        }
+        admission.admit(res);
     })
     .context("creating filesystem watcher")
+}
+
+fn relevant_watch_path(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    if relative
+        .file_name()
+        .is_some_and(|name| name == ".gitignore")
+    {
+        return true;
+    }
+    !relative
+        .components()
+        .any(|part| part.as_os_str().to_string_lossy().starts_with('.'))
 }
 
 // Avoid watching ignored top-level trees and their build/VCS churn.
@@ -1995,6 +2140,451 @@ mod tests {
             embedder: None,
             shutdown: Arc::new(AtomicBool::new(false)),
             backpressure: false,
+        }
+    }
+
+    fn saturate_admission(admission: &EventAdmission) {
+        for _ in 0..EVENT_QUEUE_CAPACITY + 1 {
+            admission.admit(Ok(Event::new(EventKind::Modify(ModifyKind::Any))));
+        }
+        assert!(admission.lost.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn event_admission_bounds_storage_without_blocking_the_producer() {
+        let (admission, rx) = EventAdmission::channel(EVENT_QUEUE_CAPACITY);
+        let producer = admission.clone();
+        let thread = std::thread::spawn(move || {
+            for i in 0..100_000 {
+                producer.admit(Ok(Event::new(EventKind::Modify(ModifyKind::Any))
+                    .add_path(PathBuf::from(format!("path-{i}.rs")))));
+            }
+        });
+        await_watcher_condition(|| thread.is_finished());
+        thread.join().unwrap();
+        assert!(admission.lost.load(Ordering::Acquire));
+        assert_eq!(rx.try_iter().count(), EVENT_QUEUE_CAPACITY);
+        admission.lost.store(false, Ordering::Release);
+        for _ in 0..1000 {
+            admission.admit(Ok(Event::new(EventKind::Access(
+                notify::event::AccessKind::Any,
+            ))));
+        }
+        assert!(!admission.lost.load(Ordering::Acquire));
+        assert!(rx.try_recv().is_err());
+        for _ in 0..EVENT_QUEUE_CAPACITY + 1 {
+            let mut event = Event::new(EventKind::Modify(ModifyKind::Any));
+            event.paths = vec![
+                PathBuf::from("x".repeat(EVENT_PATH_BYTES / EVENT_PATH_LIMIT));
+                EVENT_PATH_LIMIT
+            ];
+            admission.admit(Ok(event));
+        }
+        let events: Vec<_> = rx.try_iter().collect();
+        assert_eq!(events.len(), EVENT_QUEUE_CAPACITY);
+        let allocated_path_bytes: usize = events
+            .iter()
+            .flat_map(|event| &event.paths)
+            .map(PathBuf::capacity)
+            .sum();
+        assert_eq!(
+            allocated_path_bytes,
+            EVENT_QUEUE_CAPACITY * EVENT_PATH_BYTES
+        );
+        eprintln!(
+            "saturated admission: {} events, {} path allocation bytes; 100000-event producer completed without a receiver",
+            events.len(),
+            allocated_path_bytes
+        );
+        assert!(admission.lost.load(Ordering::Acquire));
+        for paths in [
+            vec![PathBuf::from("x"); EVENT_PATH_LIMIT + 1],
+            vec![PathBuf::from("x".repeat(EVENT_PATH_BYTES + 1))],
+        ] {
+            admission.lost.store(false, Ordering::Release);
+            let mut event = Event::new(EventKind::Modify(ModifyKind::Any));
+            event.paths = paths;
+            admission.admit(Ok(event));
+            assert!(admission.lost.load(Ordering::Acquire));
+            assert!(rx.try_recv().is_err());
+        }
+        admission.lost.store(false, Ordering::Release);
+        admission.admit(Err(notify::Error::generic("backend lost coverage")));
+        assert!(admission.lost.load(Ordering::Acquire));
+        admission.lost.store(false, Ordering::Release);
+        admission.admit(Ok(
+            Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan)
+        ));
+        assert!(admission.lost.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn accumulated_work_is_bounded_by_paths_and_bytes() {
+        assert!(!pending_work_exceeds_budget(std::iter::repeat_n(
+            1,
+            PENDING_PATH_LIMIT
+        )));
+        assert!(pending_work_exceeds_budget(std::iter::repeat_n(
+            1,
+            PENDING_PATH_LIMIT + 1
+        )));
+        assert!(!pending_work_exceeds_budget(
+            [PENDING_PATH_BYTES].into_iter()
+        ));
+        assert!(pending_work_exceeds_budget(
+            [PENDING_PATH_BYTES, 1].into_iter()
+        ));
+    }
+
+    #[test]
+    fn accumulated_path_overflow_requires_repair_even_without_channel_loss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join(".codesage")).unwrap();
+        std::fs::write(root.join("main.rs"), "fn latest_disk_state() {}\n").unwrap();
+        let config = test_config(root);
+        let db = Database::open(&config.db_path).unwrap();
+        let lock = hold_lock(root);
+        let (admission, rx) = EventAdmission::channel(EVENT_QUEUE_CAPACITY);
+        for batch in 0..=PENDING_PATH_LIMIT / EVENT_PATH_LIMIT {
+            let mut event = Event::new(EventKind::Modify(ModifyKind::Any));
+            for index in 0..EVENT_PATH_LIMIT {
+                event
+                    .paths
+                    .push(root.join(format!("pending-{}-{index}.rs", batch)));
+            }
+            admission.admit(Ok(event));
+        }
+        assert!(!admission.lost.load(Ordering::Acquire));
+        let shutdown = config.shutdown.clone();
+        let watcher = RunningWatcher {
+            shutdown,
+            thread: Some(std::thread::spawn(move || {
+                run_statewatcher_with_admission(config, watch_tree, admission, rx)
+            })),
+        };
+        await_watcher_condition(|| {
+            read_status(root).is_some_and(|status| status.reconciliation_pending)
+        });
+        assert!(!db.symbol_exists("latest_disk_state").unwrap());
+        drop(lock);
+        await_watcher_condition(|| {
+            db.symbol_exists("latest_disk_state").unwrap()
+                && read_status(root).is_some_and(|status| !status.reconciliation_pending)
+        });
+        drop(watcher);
+        assert_eq!(db.all_files_with_id_and_language().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn bulk_reconciliation_retries_partial_structural_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join(".codesage")).unwrap();
+        std::fs::write(root.join("main.rs"), "fn failed_then_recovered() {}\n").unwrap();
+        let config = test_config(root);
+        let db = Database::open(&config.db_path).unwrap();
+        db.execute_raw_for_tests("CREATE TRIGGER reject_symbols BEFORE INSERT ON symbols BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;").unwrap();
+        let mut embedder = EmbedderHandle::new(None);
+        assert_eq!(
+            run_bulk_incremental(&config, &mut embedder),
+            WorkOutcome::Failed
+        );
+        assert!(!db.symbol_exists("failed_then_recovered").unwrap());
+        db.execute_raw_for_tests("DROP TRIGGER reject_symbols")
+            .unwrap();
+        assert_eq!(
+            run_bulk_incremental(&config, &mut embedder),
+            WorkOutcome::Done
+        );
+        assert!(db.symbol_exists("failed_then_recovered").unwrap());
+    }
+
+    #[test]
+    fn lost_events_survive_failed_registration_and_loss_during_repair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join(".codesage")).unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir(root.join("generated")).unwrap();
+        std::fs::write(root.join(".gitignore"), "generated/\n").unwrap();
+        std::fs::write(root.join("gone.rs"), "fn deleted_during_loss() {}\n").unwrap();
+        std::fs::write(root.join("main.rs"), "fn before_loss() {}\n").unwrap();
+        std::fs::write(root.join("generated/api.rs"), "fn newly_admitted() {}\n").unwrap();
+        let mut config = test_config(root);
+        config.idle_timeout = Duration::from_millis(100);
+        let db = Database::open(&config.db_path).unwrap();
+        codesage_graph::incremental_index(root, &db, &[], false).unwrap();
+        assert!(db.symbol_exists("deleted_during_loss").unwrap());
+        let (admission, rx) = EventAdmission::channel(1);
+        let producer = admission.clone();
+        let registrations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts = registrations.clone();
+        let recovered = Arc::new(AtomicBool::new(false));
+        let permit_recovery = recovered.clone();
+        let shutdown = config.shutdown.clone();
+        let mut overflow_during_repair = false;
+        let watcher = RunningWatcher {
+            shutdown,
+            thread: Some(std::thread::spawn(move || {
+                run_statewatcher_with_admission(
+                    config,
+                    move |watcher, root, filter| {
+                        let attempt = attempts.fetch_add(1, Ordering::AcqRel);
+                        if attempt == 0 {
+                            watch_tree(watcher, root, filter)?;
+                            saturate_admission(&producer);
+                        } else if !permit_recovery.load(Ordering::Acquire) {
+                            anyhow::bail!("registration unavailable");
+                        } else {
+                            watch_tree(watcher, root, filter)?;
+                            if !overflow_during_repair {
+                                saturate_admission(&producer);
+                                overflow_during_repair = true;
+                            }
+                        }
+                        Ok(())
+                    },
+                    admission,
+                    rx,
+                )
+            })),
+        };
+        await_watcher_condition(|| read_status(root).is_some_and(|s| s.reconciliation_pending));
+        assert!(!watcher.thread.as_ref().unwrap().is_finished());
+        std::fs::remove_file(root.join("gone.rs")).unwrap();
+        std::fs::write(root.join(".gitignore"), "excluded.rs\n").unwrap();
+        std::fs::write(root.join("excluded.rs"), "fn must_be_excluded() {}\n").unwrap();
+        std::fs::write(root.join("main.rs"), "fn after_loss() {}\n").unwrap();
+        std::fs::create_dir(root.join("adopted")).unwrap();
+        std::fs::write(root.join("adopted/new.rs"), "fn new_watch_root() {}\n").unwrap();
+        recovered.store(true, Ordering::Release);
+        await_watcher_condition(|| {
+            db.symbol_exists("after_loss").unwrap()
+                && db.symbol_exists("new_watch_root").unwrap()
+                && db.symbol_exists("newly_admitted").unwrap()
+        });
+        await_watcher_condition(|| registrations.load(Ordering::Acquire) >= 4);
+        drop(watcher);
+        let fresh = Database::open(&root.join(".codesage/fresh.db")).unwrap();
+        codesage_graph::incremental_index(root, &fresh, &[], false).unwrap();
+        let paths = |db: &Database| {
+            let mut rows: Vec<_> = db
+                .all_files_with_id_and_language()
+                .unwrap()
+                .into_iter()
+                .map(|(_, path, lang)| (path, lang))
+                .collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            rows
+        };
+        assert_eq!(paths(&db), paths(&fresh));
+        for name in [
+            "deleted_during_loss",
+            "before_loss",
+            "must_be_excluded",
+            "after_loss",
+            "newly_admitted",
+            "new_watch_root",
+        ] {
+            assert_eq!(
+                db.symbol_exists(name).unwrap(),
+                fresh.symbol_exists(name).unwrap(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the pinned Jina model and CUDA runtime; run with --features cuda"]
+    fn saturated_indexing_repairs_structural_and_semantic_state_with_real_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join(".codesage")).unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir(root.join("generated")).unwrap();
+        std::fs::write(root.join(".gitignore"), "generated/\n").unwrap();
+        std::fs::write(root.join("gone.rs"), "fn removed_after_scan() {}\n").unwrap();
+        std::fs::write(root.join("main.rs"), "fn before_scan() {}\n").unwrap();
+        std::fs::write(
+            root.join("generated/api.rs"),
+            "fn admitted_after_scan() {}\n",
+        )
+        .unwrap();
+        let mut config = test_config(root);
+        config.embed_config.model = "jinaai/jina-embeddings-v2-base-code".into();
+        config.embed_config.device = "gpu".into();
+        let model = Arc::new(Mutex::new(Embedder::new(&config.embed_config).unwrap()));
+        let shared = model.clone();
+        let provider: EmbedderProvider = Arc::new(move || Ok(shared.clone()));
+        assert_eq!(
+            run_bulk_incremental(&config, &mut EmbedderHandle::new(Some(provider.clone()))),
+            WorkOutcome::Done
+        );
+        let dim = model.lock().dim();
+        let db =
+            Database::open_for_model(&config.db_path, &config.embed_config.model, dim).unwrap();
+        assert!(!db.chunks_for_file("gone.rs").unwrap().is_empty());
+        let (admission, rx) = EventAdmission::channel(1);
+        let producer = admission.clone();
+        let source_root = root.to_path_buf();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider_attempts = attempts.clone();
+        config.embedder = Some(Arc::new(move || {
+            let attempt = provider_attempts.fetch_add(1, Ordering::AcqRel);
+            if attempt == 0 {
+                std::fs::remove_file(source_root.join("gone.rs"))?;
+                std::fs::write(source_root.join(".gitignore"), "excluded.rs\n")?;
+                std::fs::write(
+                    source_root.join("excluded.rs"),
+                    "fn excluded_after_scan() {}\n",
+                )?;
+                std::fs::write(source_root.join("main.rs"), "fn changed_after_scan() {}\n")?;
+                std::fs::create_dir(source_root.join("adopted"))?;
+                std::fs::write(
+                    source_root.join("adopted/new.rs"),
+                    "fn adopted_after_scan() {}\n",
+                )?;
+                saturate_admission(&producer);
+            }
+            if attempt < 2 {
+                anyhow::bail!("model temporarily unavailable after structural scan");
+            }
+            if attempt == 2 {
+                std::fs::write(
+                    source_root.join("main.rs"),
+                    "fn changed_during_repair() {}\n",
+                )?;
+                saturate_admission(&producer);
+            }
+            Ok(model.clone())
+        }));
+        let mut fresh_config = test_config(root);
+        fresh_config.db_path = root.join(".codesage/fresh.db");
+        fresh_config.embed_config = config.embed_config.clone();
+        let shutdown = config.shutdown.clone();
+        let watcher = RunningWatcher {
+            shutdown,
+            thread: Some(std::thread::spawn(move || {
+                run_statewatcher_with_admission(config, watch_tree, admission, rx)
+            })),
+        };
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let repaired = attempts.load(Ordering::Acquire) >= 4
+                && db.symbol_exists("changed_during_repair").unwrap()
+                && read_status(root).is_some_and(|status| !status.reconciliation_pending);
+            if repaired {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "real-model watcher repair timed out: attempts={}, status={:?}, symbols={:?}",
+                attempts.load(Ordering::Acquire),
+                read_status(root),
+                db.symbols_for_file("main.rs").unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::fs::write(
+            root.join("adopted/new.rs"),
+            "fn edited_through_new_watch() {}\n",
+        )
+        .unwrap();
+        await_watcher_condition(|| {
+            db.symbol_exists("edited_through_new_watch").unwrap()
+                && db
+                    .chunks_for_file("adopted/new.rs")
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.content.contains("edited_through_new_watch"))
+                && read_status(root).is_some_and(|status| !status.reconciliation_pending)
+        });
+        drop(watcher);
+        assert_eq!(
+            run_bulk_incremental(&fresh_config, &mut EmbedderHandle::new(Some(provider))),
+            WorkOutcome::Done
+        );
+        let fresh =
+            Database::open_for_model(&fresh_config.db_path, &fresh_config.embed_config.model, dim)
+                .unwrap();
+        let mut actual_paths = db.all_chunk_file_paths().unwrap();
+        let mut expected_paths = fresh.all_chunk_file_paths().unwrap();
+        actual_paths.sort();
+        expected_paths.sort();
+        assert_eq!(actual_paths, expected_paths);
+        assert_eq!(
+            actual_paths,
+            vec!["adopted/new.rs", "generated/api.rs", "main.rs"]
+        );
+        assert_eq!(
+            db.all_file_hashes().unwrap(),
+            fresh.all_file_hashes().unwrap()
+        );
+        assert_eq!(
+            db.all_semantic_file_hashes().unwrap(),
+            fresh.all_semantic_file_hashes().unwrap()
+        );
+        assert!(db.semantic_fingerprint().unwrap().is_some());
+        assert_eq!(
+            db.semantic_fingerprint().unwrap(),
+            fresh.semantic_fingerprint().unwrap()
+        );
+        for path in actual_paths {
+            let chunks = |db: &Database| {
+                db.chunks_for_file(&path)
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| (row.content, row.start_line, row.end_line))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(chunks(&db), chunks(&fresh), "{path}");
+            let symbols = |db: &Database| {
+                db.symbols_for_file(&path)
+                    .unwrap()
+                    .into_iter()
+                    .map(|symbol| (symbol.name, symbol.line_start, symbol.line_end))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(symbols(&db), symbols(&fresh), "{path}");
+            let mut actual_vectors = db.chunk_embeddings_for_file(&path).unwrap();
+            let mut expected_vectors = fresh.chunk_embeddings_for_file(&path).unwrap();
+            actual_vectors.sort_by(|a, b| a.0.cmp(&b.0));
+            expected_vectors.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(actual_vectors.len(), expected_vectors.len());
+            assert!(!actual_vectors.is_empty());
+            for ((actual_text, actual), (expected_text, expected)) in
+                actual_vectors.iter().zip(&expected_vectors)
+            {
+                assert_eq!(actual_text, expected_text);
+                assert_eq!(actual.len(), dim);
+                assert_eq!(actual.len(), expected.len());
+                assert!(actual.iter().chain(expected).all(|value| value.is_finite()));
+                let dot: f64 = actual
+                    .iter()
+                    .zip(expected)
+                    .map(|(&a, &b)| f64::from(a) * f64::from(b))
+                    .sum();
+                let norm = |vector: &[f32]| {
+                    vector
+                        .iter()
+                        .map(|&v| f64::from(v).powi(2))
+                        .sum::<f64>()
+                        .sqrt()
+                };
+                assert!(
+                    dot / (norm(actual) * norm(expected)) > 0.99999,
+                    "{path}: vector direction differs from fresh inference"
+                );
+            }
+        }
+        for name in [
+            "removed_after_scan",
+            "before_scan",
+            "excluded_after_scan",
+            "changed_after_scan",
+        ] {
+            assert!(!db.symbol_exists(name).unwrap(), "{name}");
         }
     }
 

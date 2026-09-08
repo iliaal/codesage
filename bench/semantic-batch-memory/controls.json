@@ -1,0 +1,26 @@
+{
+  "growth": {
+    "initial_source_bytes": 17,
+    "grown_source_bytes": 11534353,
+    "read_chunk_bytes": 11534553
+  },
+  "controlled_inference_failure": {
+    "adapter": "test-only FailAfter300; zero vectors are not performance evidence",
+    "baseline": {"stored_chunks": 0, "stored_hashes": 0},
+    "budget": {"stored_chunks": 176, "stored_hashes": 10}
+  },
+  "real_vector_comparison": {
+    "ordinary": {
+      "vectors": 1484,
+      "changed_vectors": 567,
+      "max_abs_difference": 0.00014956295490264893,
+      "min_cosine": 0.9999997689635717
+    },
+    "skewed": {
+      "vectors": 7180,
+      "changed_vectors": 768,
+      "max_abs_difference": 0.00016678590327501297,
+      "min_cosine": 0.9999997886350438
+    }
+  }
+}

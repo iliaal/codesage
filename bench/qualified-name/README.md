@@ -6,6 +6,68 @@ The frozen validation result was 0 percentage points, with a lower bound of 0.
 Both arms found 129 of 130 targets. Better first-hit ranks on six queries and
 worse ranks on two do not satisfy that acceptance gate.
 
+## Resolution review, 2026-09-08
+
+**VERIFIED ANSWER:** reject default adoption of this grouped-name candidate.
+The implementation and evaluation are complete; the default-on acceptance gate
+is unsatisfied. Retain the existing opt-in for reproducible investigation. This
+decision does not establish that every qualified-name retrieval approach fails.
+
+The frozen holdout has only one baseline miss. Even a perfect candidate could
+improve its hit rate by at most `100 / 130 = 0.7692` percentage points, below the
+required 2. Repeating or tuning against this holdout cannot clear the unchanged
+gate. This ceiling limits the experiment's ability to detect a useful ranking
+change; it is not evidence for lowering the threshold or shipping the candidate.
+
+The strongest counterargument is that grouping improves lexical selectivity and
+some first-hit ranks even when semantic retrieval already finds the target.
+Fresh development replay supports that distinction: Laravel lexical hits rose
+from 26/30 to 30/30, while complete-pipeline hits rose only from 29/30 to 30/30.
+Scoped and dotted Serde lexical hits stayed at 29/30 each; their complete-pipeline
+hits stayed at 30/30 each. The held-out rank regressions and zero hit improvement
+still outweigh this development-only evidence under the frozen decision rule.
+
+The next-best alternative is a separate prospective evaluation of qualified-name
+resolution through indexed symbol ownership, rather than requiring every owner
+component to occur in a chunk's text. The current zero-hit fallback cannot help
+when a wrong chunk contains all components but the desired method chunk omits
+its owner. That is a source-derived failure scenario, not a measured prevalence
+claim or a new implementation commitment.
+
+Premortem: a replacement could overvalue common owner names, miss imported aliases
+or inherited methods, or mistake nearby component mentions for the requested
+declaration. Another symbol-definition corpus could again saturate before it
+tests those failures. Prospective cases should come from independently selected
+PHP/Rust change or investigation tasks, with expected files established before
+running either arm; include natural-language, dotted-name, and existing C++
+controls. Keep the current holdout as a regression set, never a tuning set.
+
+Confidence is high that this candidate has not met its acceptance gate, and low
+that these near-ceiling symbol queries settle broader task value. Reverse the
+default-adoption decision only after a frozen prospective task sample supports
+at least 2 percentage points of mean top-10 hit improvement with a strictly
+positive lower confidence bound, while its preregistered controls remain
+acceptable. A new mechanism also needs its own implementation review; a better
+score alone does not establish correct qualified-name resolution.
+
+### Fresh verification
+
+At CodeSage `8be4cbb`, the packaged CUDA pipeline runner reproduced all 90
+development baseline/candidate first-hit rank pairs in `results.json`. With the
+experiment disabled, all 90 complete returned file-path pages matched baseline
+`136dba6` in order. Both runs used the existing Laravel and Serde revisions listed
+in `results.json`, disposable SQLite backups, Jina embeddings, and the MiniLM
+reranker; the runner checked the CUDA execution provider. This is a development
+replay, not another independent holdout or validation of index freshness.
+
+The compiled current query builder also produced identical default/experimental
+MATCH expressions for 220 existing local evaluation queries without `::`, a
+backslash, or a dot. That check covers expression preservation only, not end-to-end
+natural-language retrieval. No product source, ranking weight, query annotation,
+or acceptance threshold changed in this resolution review.
+
+## Existing experiment
+
 The default search path preserves the baseline query builder, hybrid gate,
 and retrieval without the new fallback. Set `CODESAGE_QUALIFIED_GROUPS=1` only
 to opt into the experiment: qualified `::`, backslash, and dotted names become

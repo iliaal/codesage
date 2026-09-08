@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Fixed
+
+- The watcher bounds queued filesystem events and retains reconciliation work after event loss or failed recovery.
+
 ## [0.28.0] - 2026-09-08
 
 ### Added

@@ -1,0 +1,9 @@
+ACCOUNT {"chunk_capacity":224104,"chunks":176,"files":10,"vector_capacity":540672}
+ACCOUNT {"chunk_capacity":300817,"chunks":241,"files":5,"vector_capacity":740352}
+ACCOUNT {"chunk_capacity":239261,"chunks":190,"files":10,"vector_capacity":583680}
+ACCOUNT {"chunk_capacity":219133,"chunks":173,"files":4,"vector_capacity":531456}
+ACCOUNT {"chunk_capacity":240949,"chunks":178,"files":6,"vector_capacity":546816}
+ACCOUNT {"chunk_capacity":287245,"chunks":228,"files":7,"vector_capacity":700416}
+ACCOUNT {"chunk_capacity":211729,"chunks":171,"files":3,"vector_capacity":525312}
+ACCOUNT {"chunk_capacity":176014,"chunks":140,"files":5,"vector_capacity":430080}
+corrupted double-linked list

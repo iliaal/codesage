@@ -1,0 +1,114 @@
+[
+  {
+    "chunk_bytes": 1899252,
+    "chunk_sha256": "9ccafe888238cd6b96f261b3787ab0b55af27aa905a3b809ab81767601a5fd45",
+    "chunks": 1497,
+    "hashes_sha256": "caae3990b376fa4b71fb9902a9e5401c5644a4fc118329520f3c5c00bc17705b",
+    "mode": "watcher",
+    "output_sha256": "a2ed336db200d1c4a43239efb6e2f78de2c9cefef99f45d748e8887e2601863a",
+    "provider": "cuda",
+    "seconds": 19.927156664,
+    "stats": {
+      "chunks_created": 1497,
+      "chunks_reused": 0,
+      "failed_paths": [],
+      "files_failed": 0,
+      "files_processed": 50,
+      "files_removed": 0,
+      "files_skipped": 0
+    },
+    "vector_bytes": 4598784,
+    "vector_sha256": "a2a821d2bb071462a886b29326efdc6060ae1e0b7e4d8b160653659f5b9bf6b0",
+    "key": "ordinary-watcher-baseline-0",
+    "database": "/tmp/codesage-semantic-memory-abort-repeat/ordinary-watcher-baseline-0-bf721dada86e47b096502a6cafb74114.db",
+    "wall_seconds": 25.972888128017075,
+    "sampled_peak_rss_kib": 1211408,
+    "sampled_peak_private_kib": 1206268,
+    "samples": 569,
+    "batches": [
+      {
+        "chunk_capacity": 1899252,
+        "chunks": 1497,
+        "files": 50,
+        "vector_capacity": 4598784
+      }
+    ]
+  },
+  {
+    "chunk_bytes": 1899252,
+    "chunk_sha256": "9ccafe888238cd6b96f261b3787ab0b55af27aa905a3b809ab81767601a5fd45",
+    "chunks": 1497,
+    "hashes_sha256": "caae3990b376fa4b71fb9902a9e5401c5644a4fc118329520f3c5c00bc17705b",
+    "mode": "watcher",
+    "output_sha256": "cef4c97b9dee8f0a2e3ae71b8304de1e746ba81011b25cb886c9ff42992d19f4",
+    "provider": "cuda",
+    "seconds": 20.729104186,
+    "stats": {
+      "chunks_created": 1497,
+      "chunks_reused": 0,
+      "failed_paths": [],
+      "files_failed": 0,
+      "files_processed": 50,
+      "files_removed": 0,
+      "files_skipped": 0
+    },
+    "vector_bytes": 4598784,
+    "vector_sha256": "ed14709dd3d3d9cb87a6045d0505f4e5dbd821b547a68c7fff0374e58e4140be",
+    "key": "ordinary-watcher-budget-0",
+    "database": "/tmp/codesage-semantic-memory-abort-repeat/ordinary-watcher-budget-0-bcbac23ad2fb477293d23cb3c11a84f8.db",
+    "wall_seconds": 28.343448187049944,
+    "sampled_peak_rss_kib": 1211380,
+    "sampled_peak_private_kib": 1206196,
+    "samples": 551,
+    "batches": [
+      {
+        "chunk_capacity": 224104,
+        "chunks": 176,
+        "files": 10,
+        "vector_capacity": 540672
+      },
+      {
+        "chunk_capacity": 300817,
+        "chunks": 241,
+        "files": 5,
+        "vector_capacity": 740352
+      },
+      {
+        "chunk_capacity": 239261,
+        "chunks": 190,
+        "files": 10,
+        "vector_capacity": 583680
+      },
+      {
+        "chunk_capacity": 219133,
+        "chunks": 173,
+        "files": 4,
+        "vector_capacity": 531456
+      },
+      {
+        "chunk_capacity": 240949,
+        "chunks": 178,
+        "files": 6,
+        "vector_capacity": 546816
+      },
+      {
+        "chunk_capacity": 287245,
+        "chunks": 228,
+        "files": 7,
+        "vector_capacity": 700416
+      },
+      {
+        "chunk_capacity": 211729,
+        "chunks": 171,
+        "files": 3,
+        "vector_capacity": 525312
+      },
+      {
+        "chunk_capacity": 176014,
+        "chunks": 140,
+        "files": 5,
+        "vector_capacity": 430080
+      }
+    ]
+  }
+]
