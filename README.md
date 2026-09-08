@@ -173,7 +173,7 @@ codesage doctor
 
 ## ⚙️ Recipes
 
-Before writing a proposed declaration, you can call MCP `edit_check` with `project`, `file_path`, `symbol_name`, and `replacement` (the complete declaration, including its signature and body). It compares against Git HEAD and reports signature and overload changes without modifying source or the index. Proven caller breakage is currently limited to same-file Rust free functions called through explicit `self::` or `super::` paths without imports, macros, or attributes. Other callers remain unknown; run the compiler and tests after applying the edit.
+Before applying a proposed declaration, you can call MCP `edit_check` with `project`, `file_path`, `symbol_name`, and `replacement` (the complete declaration, including its signature and body). It compares against Git HEAD and reports signature and overload changes without modifying source or the index. Proven caller breakage is currently limited to same-file Rust free functions called through explicit `self::` or `super::` paths without imports, macros, or attributes. Other callers remain unknown; run the compiler and tests after applying the edit.
 
 `codesage risk FILE --json` also reports `author_concentration` after `codesage git-index --full`. Contributions have a 180-day half-life within a 730-day window. `bus_factor` is the smallest number of author identities accounting for at least half the weighted commits; identities use normalized email, falling back to name, and need not represent distinct people. This information does not change the risk score. Missing history remains unknown.
 

@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.27.0] - 2026-09-08
+
 ### Added
 
 - `edit_check` compares a proposed declaration with Git HEAD and reports signature changes and provably incompatible same-file Rust callers without writing the file.
@@ -908,5 +910,7 @@ Initial public release.
 
 [0.26.0]: https://github.com/iliaal/codesage/releases/tag/v0.26.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.26.1...HEAD
 [0.26.1]: https://github.com/iliaal/codesage/releases/tag/v0.26.1
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.27.0...HEAD
+[0.27.0]: https://github.com/iliaal/codesage/releases/tag/v0.27.0
