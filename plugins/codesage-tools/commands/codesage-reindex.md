@@ -1,78 +1,45 @@
 ---
 name: codesage-reindex
-description: Force an incremental codesage re-index (use when git hooks didn't fire). Auto-cleans orphan vec tables if the config model has changed.
+description: Refresh a project's index incrementally and report retained totals separately from work performed. Clean orphan model tables after successful indexing.
 argument-hint: "[project-path — defaults to cwd]"
 ---
 
-# Force incremental CodeSage re-index
+# Refresh a CodeSage index
 
-Wraps `codesage index` for cases when you want an immediate refresh without waiting for a commit/merge/checkout hook. If the project's `config.toml` embedding model no longer matches the active model in the DB, the script detects this and runs `codesage cleanup` first to drop orphan vec tables from the previous model.
+Resolve `$ARGUMENTS` to an absolute project path, defaulting to the current directory. Require `.codesage/index.db`; otherwise direct the user to `/codesage-onboard`. Run commands from that project directory.
 
-## Step 1: Resolve the target project
+Before touching `.codesage/`, reject symlinked directories and symlinked or non-regular leaves, including configuration, database companions, and `indexing.lock`. Use `test -L` to detect dangling links as well. Do not follow repository-controlled links when capturing state or running maintenance.
 
-`$ARGUMENTS` is the project path. If empty, use the current working directory. Verify it has `.codesage/index.db` — if not, tell the user to run `/codesage-onboard <path>` first and stop.
+## Capture the baseline
 
-## Step 2: Detect model mismatch
+Run `codesage status --json`. Record `files`, `chunks`, and `semantic.model`. These are retained index totals, not the amount processed by the next indexing pass. Preserve any status failure; do not substitute zero for an unavailable baseline.
 
-Run a dry-run cleanup to detect orphan vec tables left behind from a previous model:
+## Index
 
-```
-cd <project> && codesage cleanup --dry-run
-```
+Run `codesage index --lock-wait 30`. This uses the project's indexing lock, waiting up to 30 seconds for an existing writer. Exit 75 means contention prevented the pass; report it without claiming an index refresh. Do not remove the lock file or database to bypass contention.
 
-Output format:
+Read both the exit status and the structural/semantic summaries. A successful process can still report failed files. Report named failures, syntax-error recovery counts, and whether further work is needed. If the operation takes more than 30 seconds, use the host's background process handle and poll that same handle.
 
-- `Active model:` and `Active table:` header lines reflect what `config.toml` currently says
-- One `keep:` line per table that matches the active model
-- One `DRY-RUN drop:` line per orphan table from a previous model
+The index summaries describe this pass:
 
-If any `DRY-RUN drop:` lines appear, the user switched models in `config.toml` without wiping the DB. Run the real cleanup:
+- `Structural: N files (X skipped, Y failed, Z removed), S symbols, R references` records structural work performed. An optional `D parsed with syntax errors` suffix identifies recovered parses, not failed files.
+- `Semantic: N files (X skipped, Y failed, Z removed), C chunks` records semantic work performed. **C is chunks created during this pass, not the retained index total.**
+- Feature and trust-boundary summaries describe their own work; preserve their failures and warnings too.
 
-```
-cd <project> && codesage cleanup
-```
+## Clean orphan tables after successful indexing
 
-Report which tables were dropped and the DB size reclaimed.
+Only after indexing succeeds without failed files, run `codesage cleanup --dry-run`. Its `Active model:` and `Active table:` identify the configured model, `keep:` identifies its table, and `DRY-RUN drop:` identifies orphan tables.
 
-If the dry-run shows only `keep:` lines, skip the cleanup step entirely — no output, no narration.
+If orphan tables exist, run `codesage cleanup` and report the dropped tables and reported database size change. Otherwise skip real cleanup. Cleanup also acquires the indexing lock; contention leaves tables untouched. Other failures can occur after some or all drops: preserve the error, report observed successful and failed drops, and inspect remaining tables with `codesage cleanup --dry-run` before describing their state.
 
-## Step 3: Pre-count
+Do not clean before indexing a newly configured model: cleanup refuses to drop old tables when no active table exists for that model. A model switch may require embedding every file. Switching back to a previously indexed model can reuse its valid table, so do not promise that every model switch rebuilds everything.
 
-```
-cd <project> && codesage status
-```
+## Read retained totals and report
 
-Capture the chunk count so you can report the delta after reindexing.
+Run `codesage status --json` again after indexing and any cleanup. Use its `files` and `chunks` in the final summary, and calculate chunk delta as **post-status chunks minus pre-status chunks**. On a no-op pass, zero chunks created can coexist with an unchanged nonzero retained total.
 
-## Step 4: Incremental index
+Report per-pass files processed/skipped/failed/removed and chunks created separately from retained totals. Include elapsed time, failures, semantic freshness, and cleanup outcome. If cleanup removed old model tables, explain that the total change includes removal of those tables; it is not evidence of missing current-model coverage. Report exact old/new model names only when observed; `semantic.model` reflects current configuration and does not prove the previous model's identity.
 
-```
-cd <project> && codesage index
-```
+If post-status fails, report the total and delta as unknown and retain the error. Never use the indexing summary as a replacement total.
 
-Incremental — only changed files get re-processed. On a warm GPU with no changes it's under 5 seconds. On a large delta, minutes.
-
-If the command runs over ~30 seconds, background it and poll.
-
-If the mismatch path ran, the semantic portion will rebuild from scratch for everything (because the cleanup dropped the vec tables). Warn the user up front that this pass is doing real work, not a cheap incremental.
-
-## Step 5: Report
-
-Parse the `codesage index` output. It prints these lines:
-
-- `Structural: N files (X skipped, Y failed, Z removed), S symbols, R references` — with an optional suffix `, D parsed with syntax errors` when tree-sitter recovered from ERROR nodes in D files (those files are indexed, not failed)
-- `  failed (retried next pass): <path>, <path>, … (+N more)` (only when Y > 0; names the files that could not be read or stored, capped at 10)
-- `Trust boundaries: backfilled N/M pending files` (only when a boundary backfill runs)
-- `Features:   created=… updated=… removed=… total=…`
-- `Semantic: N files (X skipped, Y failed, Z removed), C chunks`
-- `  failed to read (retried next pass): <path>, …` (only when the semantic Y > 0)
-
-Report the structural and semantic file counts, the degraded (syntax-error) count if present, the named failed paths if any, the semantic chunk count and its delta vs. the pre-count, whether cleanup ran (and which model → which model), and any errors.
-
-End with one line: `<project>: <N> chunks, <M> files indexed, took <time>s`. If cleanup ran, prefix with `[model switched: old → new]`.
-
-## Notes
-
-- This is a no-op wrapper for `codesage index` plus conditional `codesage cleanup`. The value over raw CLI is structured pre/post reporting and the model-mismatch safety check.
-- For a full destructive rebuild, use `/codesage-reset` instead.
-- Reindex does NOT touch the global MCP registration.
+End with `<project>: <N> retained chunks, <M> indexed files, took <time>s`, using post-status totals. For regeneration after parser, device, or embedding settings changes, use `/codesage-reset`.

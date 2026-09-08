@@ -232,7 +232,7 @@ Pass that on every call. The server uses it to route to the right index.
 - \`find_symbol\` / \`find_references\`: exact symbol lookups, callers/callees, dependency mapping. \`find_references\` rows carry \`from_symbol\` (the enclosing caller), so you get caller→callee edges directly.
 - \`impact_analysis\`: before renaming a symbol or modifying a widely-used class or function. Identifies tests to run. Add \`include_forward\` / \`include_siblings\` for the target's own deps and same-file neighbours; \`limit\` / \`summary_only\` to cap a wide blast radius.
 - \`export_context\`: package code for another LLM around a free-form query or a single named symbol. For an already-mapped feature slice, use \`feature_bundle\` instead — it avoids re-running semantic search.
-- grep / ripgrep: exact strings, constants, error messages; when you already have the exact symbol name.
+- grep / ripgrep: literal occurrences, including identifier-shaped config keys, test names, constants, and error messages. Route by intent: every occurrence of a name needs literal search; its definition or structural uses need \`find_symbol\` or \`find_references\`, regardless of spelling.
 
 ### Feature slices and trust boundaries (0.7.0)
 
@@ -260,7 +260,9 @@ Patch-level (slice 2, added in 0.3.0):
   - Go: \`foo_test.go\`.
   - JavaScript/TypeScript: \`foo.test.ts(x)\`, \`foo.spec.ts(x)\`, \`.js\` variants.
   - Rust: integration tests under \`<crate_root>/tests/*.rs\`. (Inline \`#[cfg(test)] mod tests\` not surfaced — they ride along with the source file.)
-- \`review_rehearsal\`: the LAST step before committing. Pass the patch's file list; returns severity-ranked objections (missing tests, high-risk / blast-radius / fix-prone / hotspot files with hot-symbol evidence, import cycles, trust-boundary expansion, feature-test gaps, and \`scope-spread\` when the patch touches ≥4 unrelated feature areas) plus paste-ready \`summary_notes\`. Composes \`assess_risk_diff\` + \`recommend_tests\` + drift + feature mapping — fix or consciously accept each objection. CLI: \`git diff --name-only | codesage rehearse\`.
+- \`review_rehearsal\`: the LAST step before committing. Pass the patch's file list; returns severity-ranked objections (missing tests, high-risk / blast-radius / fix-prone / hotspot files with hot-symbol evidence, import cycles, trust-boundary expansion, feature-test gaps, and \`scope-spread\` when the patch touches ≥4 unrelated feature areas) plus paste-ready \`summary_notes\`. Composes \`assess_risk_diff\` + \`recommend_tests\` + drift + feature mapping — fix or consciously accept each objection. CLI: \`codesage rehearse -- <files...>\`.
+
+For patch risk, test selection, and rehearsal, inspect \`git status --short --untracked-files=all\`, the staged diff, and the unstaged diff. Pass one explicit set of repository-relative paths covering all staged, unstaged, and relevant untracked files in the intended patch. Include deleted paths and both sides of renames; inspect unrelated work before excluding it. For branch reviews, also inspect the diff against the merge base. Keep every path as one quoted argument (or a JSON array element for MCP); do not pipe newline-separated filenames or use unquoted command substitution. Automated collection must preserve Git's NUL-delimited output until constructing the argument array. Do not call these commands with an empty file set.
 
 All four of \`assess_risk\` / \`assess_risk_batch\` / \`assess_risk_diff\` / \`recommend_tests\` require git history indexed. Initial \`codesage git-index\` runs at onboard; subsequent commits/merges auto-refresh via git hooks. Run \`codesage git-index --full\` weekly to rebaseline. Empty results mean either no history yet or the file is too new.
 
@@ -269,7 +271,7 @@ All four of \`assess_risk\` / \`assess_risk_batch\` / \`assess_risk_diff\` / \`r
 - Structural + semantic + feature mapping + trust-boundary derivation all auto-refresh on commit/merge/checkout via installed git hooks (\`codesage index\` runs the whole pipeline).
 - Git history index auto-refreshes incrementally on commit/merge/checkout/rebase via the same hooks. Weekly \`codesage git-index --full\` to rebaseline is still good hygiene.
 - Manual refresh: \`codesage index\`, or \`/codesage-reindex\`. Force a full git-history rescan with \`codesage git-index --full\`.
-- CLI: \`codesage search --limit 5 'query'\`, \`codesage coupling <file>\`, \`codesage risk <file>\`, \`codesage risk-batch <files...>\`, \`codesage risk-diff <files...>\`, \`codesage tests-for <files...>\` (all the multi-file commands accept stdin too: \`git diff --name-only | codesage risk-diff\`).
+- CLI: \`codesage search --limit 5 'query'\`, \`codesage coupling <file>\`, \`codesage risk <file>\`, \`codesage risk-batch -- <files...>\`, \`codesage risk-diff -- <files...>\`, \`codesage tests-for -- <files...>\` (replace the placeholders with the complete, individually quoted file set described above).
 - Feature CLI: \`codesage map\`, \`codesage features-list [--kind --lang --tag --json]\`, \`codesage feature-show <id>\`, \`codesage feature-for <file>\`, \`codesage feature-bundle <id>\`, \`codesage trust-boundaries <file>\`.
 
 ## Feature-slice review workflow (plugin slash commands)

@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Added
+
+- `codesage-report` renders filtered findings through a deterministic formatter with acknowledgement diagnostics.
+
 ### Fixed
 
 - The watcher bounds queued filesystem events and retains reconciliation work after event loss or failed recovery.

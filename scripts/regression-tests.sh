@@ -182,7 +182,8 @@ EOF
 	mkdir -p scripts
 	cp "$repo_root/scripts/check-changelog.py" scripts/check-changelog.py
 	cp "$repo_root/scripts/check-plugin-versions.py" scripts/check-plugin-versions.py
-	git add Cargo.toml CHANGELOG.md .claude-plugin/marketplace.json scripts/check-changelog.py scripts/check-plugin-versions.py plugins/codesage-tools/.codex-plugin/plugin.json plugins/codesage-tools/.claude-plugin/plugin.json
+	printf '# Example\n' >README.md
+	git add README.md Cargo.toml CHANGELOG.md .claude-plugin/marketplace.json scripts/check-changelog.py scripts/check-plugin-versions.py plugins/codesage-tools/.codex-plugin/plugin.json plugins/codesage-tools/.claude-plugin/plugin.json
 	git commit -q -m initial
 	git push -q origin master
 
@@ -212,8 +213,54 @@ EOF
 		return 1
 	fi
 
+	printf '\nApproved prose.\n' >>README.md
+	if PATH="${fake_bin}:${PATH}" "${release_script}" --yes "${version}" >"${tmp}/prose-unapproved.out" 2>&1; then
+		printf 'release accepted dirty prose without its explicit option\n' >&2
+		return 1
+	fi
+	grep -Fq 'working tree has uncommitted changes' "${tmp}/prose-unapproved.out"
+	printf '\n# unrelated\n' >>Cargo.toml
+	git add Cargo.toml
+	git show HEAD:Cargo.toml >Cargo.toml
+	if PATH="${fake_bin}:${PATH}" "${release_script}" --include-approved-prose --yes "${version}" >"${tmp}/prose-mixed.out" 2>&1; then
+		printf 'release accepted an unrelated staged change canceled in the worktree\n' >&2
+		return 1
+	fi
+	grep -Fq 'changes outside approved' "${tmp}/prose-mixed.out"
+	git restore --staged Cargo.toml
+	chmod +x README.md
+	if PATH="${fake_bin}:${PATH}" "${release_script}" --include-approved-prose --yes "${version}" >"${tmp}/prose-mode.out" 2>&1; then
+		printf 'release accepted prose mode change\n' >&2
+		return 1
+	fi
+	grep -Fq 'contents only' "${tmp}/prose-mode.out"
+	chmod -x README.md
+	mv README.md "${tmp}/approved-readme"
+	ln -s "${tmp}/approved-readme" README.md
+	if PATH="${fake_bin}:${PATH}" "${release_script}" --include-approved-prose --yes "${version}" >"${tmp}/prose-type.out" 2>&1; then
+		printf 'release accepted symlinked prose\n' >&2
+		return 1
+	fi
+	grep -Fq 'must be a regular file' "${tmp}/prose-type.out"
+	rm README.md
+	if PATH="${fake_bin}:${PATH}" "${release_script}" --include-approved-prose --yes "${version}" >"${tmp}/prose-deleted.out" 2>&1; then
+		printf 'release accepted deleted prose\n' >&2
+		return 1
+	fi
+	grep -Fq 'must be a regular file' "${tmp}/prose-deleted.out"
+	mv "${tmp}/approved-readme" README.md
+	git add README.md
+	python3 - <<'PYEOF'
+from pathlib import Path
+path = Path("CHANGELOG.md")
+path.write_text(path.read_text().replace("- Example fix.", "- Approved example fix."))
+PYEOF
 	CODEX_CALLS_FILE="${codex_calls}" CLAUDE_CALLS_FILE="${claude_calls}" PATH="${fake_bin}:${PATH}" \
-		"${release_script}" --yes "${version}" >"${tmp}/release-script.out" 2>&1
+		"${release_script}" --include-approved-prose --yes "${version}" >"${tmp}/release-script.out" 2>&1
+	[[ "$(git show HEAD:README.md)" == $'# Example\n\nApproved prose.' ]]
+	git show HEAD:CHANGELOG.md | grep -Fq -- '- Approved example fix.'
+	git diff --quiet
+	git diff --cached --quiet
 
 	changelog="$(cat CHANGELOG.md)"
 	[[ "$changelog" == *"[Unreleased]: https://github.com/iliaal/codesage/compare/v$version...HEAD"* ]]
@@ -267,6 +314,13 @@ PYEOF
 		return 1
 	fi
 	remote_before_failed_refresh="$(git ls-remote origin refs/heads/master | awk '{print $1}')"
+	printf '\nToo late for tagged release.\n' >>README.md
+	if PATH="${fake_bin}:${PATH}" "${release_script}" --include-approved-prose --yes 1.2.4 >"${tmp}/prose-resume.out" 2>&1; then
+		printf 'release resumed an existing tag with uncommitted prose\n' >&2
+		return 1
+	fi
+	grep -Fq 'cannot resume with uncommitted changes' "${tmp}/prose-resume.out"
+	git restore README.md
 	if FAIL_CODEX_REFRESH=1 CODEX_CALLS_FILE="${codex_calls}" CLAUDE_CALLS_FILE="${claude_calls}" PATH="${fake_bin}:${PATH}" \
 		"${release_script}" --yes 1.2.4 >"${tmp}/release-script-refresh-failure.out" 2>&1; then
 		printf 'release script continued after a Codex plugin refresh failure\n' >&2

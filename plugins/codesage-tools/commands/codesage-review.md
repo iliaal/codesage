@@ -64,7 +64,14 @@ Write `$PROJECT/.codesage/reviews/<RUN_ID>.json` with the run ID, start time, fi
 
 ## 2. Discover, check freshness, and rank
 
-Unless `--feature` names one slice, call `mcp__codesage__list_features(project, kind?, limit=500)`. If exactly 500 records return, the inventory may be truncated: record `inventory_truncated: true` in the run record and say so in the summary — coverage beyond the cap is not claimed. For `--feature`, run `codesage feature-show --json <feature_id>` from the project and fail if the ID is unknown. Write the inventory to `$PROJECT/.codesage/reviews/<RUN_ID>/features.json` and each complete feature record to `$PROJECT/.codesage/reviews/<RUN_ID>/features/<feature_id>.json`.
+Run the inventory helper before fingerprinting or ranking:
+
+```bash
+"$REVIEW_STATE" inventory --project "$PROJECT" \
+  --output "$PROJECT/.codesage/reviews/$RUN_ID/features.json"
+```
+
+Pass `--feature <id>` for one explicit slice, or `--kind <kind>` for a kind filter. The helper runs `codesage features-list --json --limit 0` from the project (or `feature-show --json`), validates complete feature file records, and rejects explicit truncation metadata. MCP response budgets can truncate both inventory rows and nested file lists even when fewer than 500 records return. Never use an MCP inventory for freshness or planning. Fail discovery if the CLI fails; do not fall back to partial records. Write each validated complete feature record to `$PROJECT/.codesage/reviews/<RUN_ID>/features/<feature_id>.json`.
 
 Hash freshness for the inventory in one process:
 
@@ -80,7 +87,15 @@ The helper reads each unique slice file once even when features overlap. Skip on
 
 Apply `--focus` and `--kind`.
 
-Collect every candidate's entry and owned paths. Call `mcp__codesage__assess_risk_batch` in chunks of at most 100 unique paths. Write each feature's batch-shaped subset to `$PROJECT/.codesage/reviews/<RUN_ID>/risk/<feature_id>.json`, attach each full risk record to its feature, and compute `max_owned_risk`.
+Collect every candidate's entry and owned paths. Call `mcp__codesage__assess_risk_batch` in chunks of at most 100 unique paths. Reconcile every requested path against returned records before ranking: every existing entry/owned path needs exactly one finite numeric score. If `_meta.truncated` is true or paths are missing, retry smaller batches or use the CLI `risk-batch --json` from the project. Do not invent zero scores. Fail affected features when complete risk cannot be obtained, and mark the run partial. Write each feature's batch-shaped subset to `$PROJECT/.codesage/reviews/<RUN_ID>/risk/<feature_id>.json`, attach each full risk record to its feature, and compute `max_owned_risk`. `plan-feature` independently rejects truncated, duplicate, invalid, or missing required risk records before dispatch.
+
+For each batch, save the requested path array and raw risk response, then run the executable coverage gate before using its scores:
+
+```bash
+"$REVIEW_STATE" check-risk --paths "$REQUESTED_PATHS_JSON" --risk "$RISK_RESPONSE_JSON"
+```
+
+The helper rejects missing and unexpected rows, duplicate paths, nonfinite scores, and explicit truncation, regardless of returned count. Retry failed batches as above; never rank from their partial scores.
 
 Sort by:
 

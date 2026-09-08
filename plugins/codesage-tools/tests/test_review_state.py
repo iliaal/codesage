@@ -1911,5 +1911,180 @@ class AcknowledgementTests(unittest.TestCase):
         self.assertIn("`acknowledgement` unchanged", projection)
 
 
+class InventoryReportTests(unittest.TestCase):
+    def setUp(self):
+        self.state = load_review_state()
+
+    def test_inventory_rejects_under_cap_and_nested_truncation(self):
+        feature = {"feature_id": "feat_1", "files": [{"path": "a.rs", "role": "owned"}]}
+        for value in ({"results": [feature], "_meta": {"truncated": True, "total_results": 69}},
+                      {"results": [{**feature, "_meta": {"truncated": True}}]},
+                      {"results": [{"feature_id": "feat_1"}]}):
+            with self.assertRaises(ValueError):
+                self.state.complete_inventory(value)
+
+    def test_inventory_cli_requests_unlimited_and_retains_all_nested_files(self):
+        feature = {"feature_id": "feat_1", "files": [{"path": f"a{i}.rs", "role": "owned"} for i in range(800)]}
+        result = subprocess.CompletedProcess([], 0, json.dumps({"results": [feature]}), "")
+        with mock.patch.object(self.state.subprocess, "run", return_value=result) as run:
+            value = self.state.collect_inventory("/project")
+        self.assertEqual(len(value["results"][0]["files"]), 800)
+        self.assertEqual(run.call_args.args[0], ["codesage", "features-list", "--json", "--limit", "0"])
+        self.assertEqual(run.call_args.kwargs["cwd"], "/project")
+
+    def test_inventory_preserves_unknown_feature_and_database_error_diagnostics(self):
+        for diagnostic in ("no feature with id `feat_old` in this project", "unable to open database file"):
+            error = subprocess.CalledProcessError(1, ["codesage"], stderr=diagnostic)
+            with mock.patch.object(self.state.subprocess, "run", side_effect=error):
+                with self.assertRaises(ValueError) as raised:
+                    self.state.collect_inventory("/project", "feat_old")
+            self.assertIn(diagnostic, str(raised.exception))
+            self.assertIn("exit 1", str(raised.exception))
+
+    def test_risk_coverage_rejects_missing_duplicate_invalid_and_truncated(self):
+        row = {"file": "a.rs", "score": 0.2}
+        for response in ([row], [row, row], [{**row, "score": float("nan")}],
+                         {"files": [row], "_meta": {"truncated": True}}):
+            with self.assertRaises(ValueError):
+                self.state.complete_risk(["a.rs", "b.rs"], response)
+        self.assertEqual(self.state.complete_risk(["a.rs"], [row]), {"files": [row]})
+
+    def test_strict_plan_refuses_missing_entry_score(self):
+        feature = {"feature_id": "feat_1", "entry_path": "a.rs", "files": [{"path": "a.rs", "role": "entry"}]}
+        with self.assertRaisesRegex(ValueError, "missing risk"):
+            self.state.plan_feature_review(feature, [], [], strict_risk=True)
+
+    def report_fixture(self, project):
+        folder = project / ".codesage" / "findings"
+        folder.mkdir(parents=True)
+        document = {"feature_id": "feat_a", "reviewed_at": "2026-01-02T00:00:00Z",
+                    "trust_boundaries": ["network"], "ack_sweep": [{"finding_id": "fnd_old", "kind": "foreign", "reason": "not-emitted"}],
+                    "findings": [{"finding_id": "fnd_a", "file": "a.rs", "line": 2,
+                                  "severity": "high", "category": "bug", "status": "open",
+                                  "title": "A | title", "summary": "Summary", "evidence": ["``` odd fence"],
+                                  "suggested_fix": "Fix it", "acknowledgement": {"metric": "count", "value": 4}}]}
+        (folder / "feat_a.json").write_text(json.dumps(document))
+        return folder, document
+
+    def test_report_cli_stdout_output_parity_and_no_clock_or_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            self.report_fixture(project)
+            command = [str(SCRIPT), "report", directory]
+            first = subprocess.run(command, capture_output=True, check=True).stdout
+            second = subprocess.run(command, capture_output=True, check=True).stdout
+            output = project / "report.md"
+            written = subprocess.run([*command, "-o", str(output)], capture_output=True, check=True)
+            self.assertEqual(first, second)
+            self.assertEqual(first, output.read_bytes())
+            self.assertIn(b"Findings: 1", written.stdout)
+            self.assertIn(b"2026-01-02T00:00:00Z", first)
+            self.assertIn(b"metadata unavailable", first)
+            self.assertIn(b"current measurement unavailable", first)
+            self.assertIn(b"persisted last review scope", first)
+            self.assertIn(b"Live source acknowledgement diagnostics", first)
+            self.assertIn(b"````\n``` odd fence\n````", first)
+
+    def test_report_filters_leave_diagnostics_and_transfers_out_of_totals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            folder, original = self.report_fixture(project)
+            destination = {"feature_id": "feat_b", "findings": [{**original["findings"][0], "finding_id": "fnd_b",
+                           "ack_transferred_from": {"feature_id": "feat_a", "finding_id": "fnd_a"}}]}
+            (folder / "feat_b.json").write_text(json.dumps(destination))
+            args = self.state.build_parser().parse_args(["report", directory, "--severity", "low", "--feature", "feat_a"])
+            report, count, features = self.state.render_report(args)
+            self.assertEqual((count, features), (0, 0))
+            self.assertIn("Total findings in project: 1", report)
+            self.assertIn("Transfer audit", report)
+            self.assertIn("not-emitted", report)
+            self.assertNotIn("Live source acknowledgement diagnostics", report)
+
+    def test_report_refuses_symlink_findings_and_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            folder, _ = self.report_fixture(project)
+            target = project / "outside.json"
+            target.write_text("{}")
+            (folder / "planted.json").symlink_to(target)
+            args = self.state.build_parser().parse_args(["report", directory])
+            with self.assertRaises(OSError):
+                self.state.render_report(args)
+            output = project / "output.md"
+            output.symlink_to(target)
+            with self.assertRaises(OSError):
+                self.state.write_report(output, "overwrite")
+            self.assertEqual(target.read_text(), "{}")
+
+    def test_report_legacy_metadata_uses_complete_cli_once_or_frozen_inventory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            self.report_fixture(project)
+            inventory = {"results": [{"feature_id": "feat_a", "title": "Real feature", "kind": "library",
+                                      "entry_path": "actual.rs", "files": []}]}
+            args = self.state.build_parser().parse_args(["report", directory])
+            with mock.patch.object(self.state, "collect_inventory", return_value=inventory) as collect:
+                report, _, _ = self.state.render_report(args)
+            collect.assert_called_once_with(project)
+            self.assertIn("Real feature", report)
+            self.assertIn("actual.rs", report)
+            frozen = project / "inventory.json"
+            frozen.write_text(json.dumps(inventory))
+            args.features = str(frozen)
+            with mock.patch.object(self.state, "collect_inventory", side_effect=AssertionError("live lookup")):
+                repeated, _, _ = self.state.render_report(args)
+            self.assertEqual(report, repeated)
+            frozen.write_text(json.dumps({**inventory, "_meta": {"truncated": True}}))
+            with self.assertRaisesRegex(ValueError, "truncated"):
+                self.state.render_report(args)
+
+    def test_report_density_filters_and_boundary_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            folder, original = self.report_fixture(project)
+            original.update({"title": "Feature", "kind": "library", "entry_path": "a.rs", "feature_files": []})
+            original["findings"] = [{**original["findings"][0], "finding_id": f"fnd_{index}", "severity": "medium"} for index in range(9)]
+            (folder / "feat_a.json").write_text(json.dumps(original))
+            args = self.state.build_parser().parse_args(["report", directory, "--status", "open", "--severity", "medium", "--category", "bug"])
+            report, count, features = self.state.render_report(args)
+            self.assertEqual((count, features), (9, 1))
+            self.assertIn("| Finding | File:line |", report)
+            self.assertIn("network 1", report)
+            self.assertIn("accepted count = 4", report)
+            args.category = "security"
+            report, count, _ = self.state.render_report(args)
+            self.assertEqual(count, 0)
+            self.assertIn("Total findings in project: 9", report)
+            args.category = "not-a-category"
+            with self.assertRaises(ValueError):
+                self.state.render_report(args)
+
+    def test_report_rejects_explicit_bad_inventory_without_legacy_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            folder, original = self.report_fixture(project)
+            original.update({"title": "Feature", "kind": "library", "entry_path": "a.rs", "feature_files": []})
+            (folder / "feat_a.json").write_text(json.dumps(original))
+            inventory = project / "inventory.json"
+            args = self.state.build_parser().parse_args(["report", directory, "--features", str(inventory)])
+            for value in ("malformed json", json.dumps({"results": [], "_meta": {"truncated": True}})):
+                inventory.write_text(value)
+                with self.assertRaises(ValueError):
+                    self.state.render_report(args)
+
+    def test_report_rejects_invalid_findings_even_when_filters_exclude_them(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            folder, original = self.report_fixture(project)
+            args = self.state.build_parser().parse_args(["report", directory, "--feature", "feat_other"])
+            for field, value in (("status", "opne"), ("severity", "critical"), ("category", "typo"),
+                                 ("line", "2"), ("file", None), ("title", None), ("evidence", [42])):
+                invalid = json.loads(json.dumps(original))
+                invalid["findings"][0][field] = value
+                (folder / "feat_a.json").write_text(json.dumps(invalid))
+                with self.subTest(field=field), self.assertRaises(ValueError):
+                    self.state.render_report(args)
+
+
 if __name__ == "__main__":
     unittest.main()

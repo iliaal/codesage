@@ -23,7 +23,7 @@ The CodeSage MCP is registered globally outside this plugin. Do not add per-proj
 
 Use CodeSage for semantic and code-graph questions: behavior discovery, definitions, callers, imports, dependencies, feature ownership, blast radius, history-derived coupling, risk, and test selection.
 
-Use `rg` for exact literal strings, error messages, configuration keys, test names, documentation, and generated files. Prefer the smallest query that answers the question; do not export a broad context bundle when a symbol or dependency lookup is enough.
+Route by intent, regardless of identifier spelling. Use `find_symbol` for a definition and `find_references` for structural uses, including named tests and constants. Use `rg` for literal occurrences, including identifier-shaped configuration keys, test names, error messages, documentation, and generated files. A request for every occurrence of `TIMEOUT` needs `rg`; a request for its definition needs `find_symbol`. Prefer the smallest query that answers the question; do not export a broad context bundle when a symbol or dependency lookup is enough.
 
 ## Route MCP calls
 
@@ -57,10 +57,21 @@ codesage impact <symbol-or-file>
 codesage coupling <file> --limit 5
 codesage risk <file>
 codesage risk-batch <files...>
-git diff --name-only | codesage risk-diff
 codesage session-start
 codesage session-end
-git diff --name-only | codesage tests-for
 ```
+
+For patch risk, test selection, and rehearsal, first inspect `git status --short --untracked-files=all`, the staged diff, and the unstaged diff. Build one explicit array of repository-relative paths covering all staged, unstaged, and relevant untracked files in the intended patch. Include deleted paths and both sides of renames; exclude unrelated work only after inspecting it. Bare `git diff --name-only` misses staged and untracked files. For a branch review, also inspect the diff against its merge base.
+
+Replace these example paths with that complete set, then run from the repository root in Bash:
+
+```bash
+files=('crates/graph/src/query.rs' 'crates/graph/tests/impact_test.rs')
+codesage risk-diff -- "${files[@]}"
+codesage tests-for -- "${files[@]}"
+codesage rehearse -- "${files[@]}"
+```
+
+Pass the same set as the MCP tools' `file_paths` arrays, with the absolute `project` path. Keep each path as one argument; do not pipe newline-separated filenames or use unquoted command substitution. If automating collection, use Git's NUL-delimited output and preserve that separation until constructing the argument array. Do not invoke these commands with an empty array.
 
 If daemon startup itself is the suspected failure, run `codesage mcp --direct` to exercise the single-process stdio path. Do not use that diagnostic as a second persistent MCP registration.

@@ -1,75 +1,55 @@
 ---
 name: codesage-reset
-description: Drop a project's CodeSage index and rebuild from scratch (use after settings changes, device switches, or corruption)
+description: Fully regenerate a project's CodeSage index under its writer lock, with a separate offline recovery procedure for an unreadable database.
 argument-hint: "[project-path — defaults to cwd] [--yes]"
 ---
 
-# Reset and rebuild a CodeSage index
+# Rebuild a CodeSage index
 
-Drops `.codesage/index.db` and performs a full re-index. Use after:
+Use a full rebuild after parser upgrades, embedding model or pooling changes, or CPU/GPU device changes. It reparses source and regenerates embeddings without unlinking the live SQLite database. For an ordinary incremental refresh, use `/codesage-reindex`.
 
-- Editing `.codesage/config.toml` in a way that breaks the existing index (model switch, pooling change)
-- Switching embedding device (CPU ↔ GPU — embeddings produced on different devices are not bit-identical)
-- Index corruption or weird state
-- Upgrading CodeSage to a version with incompatible storage
+## Resolve the project and authority
 
-For routine refresh use `/codesage-reindex`. Reset is destructive and pays the full embedding cost.
+Resolve `$ARGUMENTS` to an absolute project path, defaulting to the current directory. Require an existing `.codesage` directory and configuration. Run commands from that project directory.
 
-> **Before touching any `.codesage/` path:** `.codesage/` is repository content, so a cloned
-> repo can ship it — or any directory under it — as a symlink. Refuse to read, write, create,
-> or delete through one. Check with `test -L <path>` (not `test -e`, which follows links) on
-> `.codesage` itself and on each subdirectory you are about to use, and stop with an error if
-> any is a symlink. Apply the same check to every **leaf** you touch: a `*.json` findings
-> file, or any temporary file you create beside it, may itself be a planted symlink or a
-> directory. Read or write a leaf only if it is a regular file (or absent, when creating),
-> and give temporary files a freshly generated unique name rather than a predictable one.
+Before touching any `.codesage/` path, reject symlinked directories and symlinked or non-regular leaves. Check with `test -L`, which detects dangling links too. Include the database, its `-wal` and `-shm` companions, `indexing.lock`, configuration, and watcher markers. Use freshly generated backup or temporary names.
 
-## Step 1: Resolve and confirm
+An explicit request to reset this project or `--yes` authorizes the ordinary full rebuild; do not ask again. If authority is missing, describe the target and full embedding cost before requesting it. Do not promise a fixed duration.
 
-`$ARGUMENTS` — project path (default cwd). Verify it has `.codesage/index.db`; if not, stop and tell the user to run `/codesage-onboard` first.
+## Capture the baseline
 
-Before touching anything, **confirm with the user**: "About to reset CodeSage index for `<project>`. This deletes `.codesage/index.db` and rebuilds from scratch — on CUDA this typically takes under a few minutes for most repos. Proceed?" Wait for explicit yes.
+Run `codesage status --json` and record retained `files` and `chunks`, plus semantic freshness. If status fails, preserve the exact error and classify it before proceeding. An embedding/configuration error does not prove database corruption. Use the offline recovery section only for a confirmed unreadable or incompatible database that cannot be rebuilt in place.
 
-Skip confirmation only if `--yes` is in `$ARGUMENTS`.
+## Rebuild in place
 
-## Step 2: Capture pre-reset state
+Run:
 
-```
-cd <project> && codesage status
+```sh
+codesage index --full --lock-wait 30
 ```
 
-Record chunk count and file count. This is the baseline for the post-reset diff. `codesage status` does not emit a language breakdown; run `codesage overview` if you want one.
+The command acquires the project's writer lock before opening the database. It waits up to 30 seconds for another writer, including the watcher. Exit 75 means contention prevented the rebuild; report that outcome and retry only after the holder finishes. Never delete the database or lock file to bypass contention.
 
-## Step 3: Drop the index
+Keep the same process handle when waiting for a long-running rebuild. Read the structural and semantic failed-file counts as well as the exit status; a zero exit status with failed files is a partial rebuild.
 
-CodeSage has no `reset` subcommand. Delete the DB directly:
+## Verify
 
-```
-rm -f <project>/.codesage/index.db
-```
+Run `codesage status --json` after the rebuild. Report retained files/chunks and their changes from the baseline, semantic freshness, elapsed time, and any failed files. The indexing summary's chunks count is work performed in this pass, not the retained total.
 
-Report what was removed.
+Run one project-relevant semantic query using the absolute project path. Report whether it succeeded and its top result. Investigate unexpected coverage loss; a chunk-count change alone does not prove missing coverage after parser or model changes.
 
-## Step 4: Re-index
+A full rebuild retains other model tables and auxiliary database state. Use `codesage cleanup --dry-run` followed by `codesage cleanup` after a successful rebuild if orphan model tables should be removed.
 
-```
-cd <project> && codesage index
-```
+## Offline recovery for an unreadable database
 
-Full rebuild. Background it if it takes more than ~30 seconds; stream the output file and report progress every minute or so.
+This is a maintenance operation, not an online reset. Obtain authority for the affected clients and downtime before stopping them; an index reset request does not authorize disrupting other projects hosted by the shared daemon.
 
-## Step 5: Verify and report
+1. Establish a maintenance window in which no process can open this project's index. Pause agent sessions, hooks, scheduled indexing, and other automation that can restart clients. Record whether `.codesage/watch.disabled` already exists, then run `codesage watch stop <absolute-project>`. Stop project-specific foreground watchers, direct MCP servers, and standalone CLI readers/writers. Close all affected daemon clients before running `codesage daemon stop`; a new shim can otherwise start the daemon again. A snapshot of open file descriptors is useful evidence, but cannot establish that future openers are prevented.
+2. Acquire an exclusive lock on the existing `.codesage/indexing.lock` with a bounded wait, using an OS lock compatible with CodeSage's `flock` on Unix. On Linux, `flock --exclusive --timeout 30 <absolute-project>/.codesage/indexing.lock <maintenance-command>` holds it for the maintenance command. Revalidate directory/leaf types before opening it. Do not unlink or replace the lock file.
+3. Inside that locked maintenance command, create a uniquely named private backup directory under `.codesage` with `mktemp -d`. Move `index.db` and every existing `index.db-wal` and `index.db-shm` into that same directory, preserving names. Do not delete any member or move only the main database: committed state may still be in the WAL. If a move fails, stop, report every original and backup location, and keep maintenance active until the set is reconciled.
+4. Release the maintenance lock, while keeping all clients and automation quiescent. Run `codesage index --full --lock-wait 30`, which acquires its own writer lock. Do not launch it while a separate process still holds the maintenance lock. Keep the backup until the rebuilt index has passed the status/query checks above. The backup is recovery evidence, not a promise that a corrupt database can be restored to a usable state.
+5. Resume clients and automation only after verification. If the watcher was enabled before maintenance, run `codesage watch start <absolute-project>`; otherwise preserve the existing disabled state. Report the backup path and rebuilt totals. If rebuilding fails, retain the backup and maintenance state and report the error; never silently overwrite either database.
 
-After index completes:
+If the maintenance precondition cannot be established, leave the database intact and name the clients or automation that prevent recovery. Do not substitute a process scan or writer lock for that precondition.
 
-- `cd <project> && codesage status` and compare against the pre-reset baseline
-- Chunk count should be similar; a drop > 20% is a red flag — surface it
-- Run one sanity query through the `codesage` MCP with `project: "<absolute path>"` and a generic term from the project ("authentication", "main", "config"). Report top hit and score.
-- Report: elapsed time, old vs. new chunk count, sanity-query top hit.
-
-## Notes
-
-- Device switch is the most common reason to reset — re-read `.codesage/config.toml` if the user just toggled `device = "cpu"` ↔ `device = "gpu"`.
-- Reset does NOT touch the global `codesage` MCP registration.
-- Git hooks installed by `/codesage-onboard` will auto-refresh after normal commits. Reset should only be needed for the scenarios listed above.
-- For a lighter path after a model switch (without wiping the whole DB), use `/codesage-reindex` — it detects model mismatch and runs `codesage cleanup` to drop orphan vec tables.
+Rebuild and recovery preserve the project's configuration and global MCP registration.

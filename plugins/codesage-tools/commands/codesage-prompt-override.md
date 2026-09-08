@@ -5,7 +5,7 @@ description: Print a system-prompt fragment that steers Claude Code to prefer Co
 
 # CodeSage system-prompt override
 
-Print a short system-prompt fragment users can pipe into `claude --append-system-prompt-file -` or paste into `~/.claude/settings.json` (`appendSystemPrompt`). The fragment names each CodeSage MCP tool by the question shape it answers and limits Grep to non-identifier literals.
+Print a short system-prompt fragment users can pipe into `claude --append-system-prompt-file -` or paste into `~/.claude/settings.json` (`appendSystemPrompt`). The fragment routes definitions and structural references to CodeSage and literal occurrences to `Grep` / `rg`, regardless of identifier spelling.
 
 Pattern adopted from Serena's `cc-system-prompt-override`. Background: two consecutive measurements (2026-04-24 and 2026-04-30, harness at `bench/agent-tool-selection-harness.py`) showed agents pick CodeSage retrieval tools 0/10 even when whitelisted in `--allowedTools`. CLAUDE.md and tool-description hardening did not move the rate. The system-prompt slot is the next lever — the override fragment lands ahead of every user message and is tagged as system-level instruction, which is more salient than CLAUDE.md content.
 
@@ -37,4 +37,4 @@ Pattern adopted from Serena's `cc-system-prompt-override`. Background: two conse
 
 - The fragment is ~400 tokens. It will reduce prompt-cache reuse slightly (the cache key changes), but only when the system prompt itself is what's being cached. For most agent sessions the user-message content dominates.
 - The fragment is intentionally language-neutral. It does not name specific paths or projects — those belong in each project's `.claude/CLAUDE.md`.
-- If the user reports that the override didn't move tool-selection behavior in their own sessions, the next escalation is path (c) — hooks that intercept Grep on identifier-shaped patterns. That's a heavier intervention; do not jump to it without measurement.
+- If the override does not improve tool selection, inspect the task intent and chosen tools before changing the policy. Identifier spelling alone cannot distinguish literal search from structural retrieval; do not use it to block Grep calls.

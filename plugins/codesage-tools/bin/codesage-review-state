@@ -39,7 +39,7 @@ FINDING_FIELDS = (
 )
 SEVERITIES = {"low", "medium", "high"}
 CATEGORIES = {"bug", "security", "perf", "maintainability"}
-REVIEW_PROTOCOL_VERSION = "5"
+REVIEW_PROTOCOL_VERSION = "6"
 
 
 def slim_priors(document):
@@ -112,6 +112,69 @@ def feature_state(project, feature, content_cache=None, params=None):
     return f"sha256:{digest.hexdigest()}"
 
 
+def complete_inventory(inventory):
+    if isinstance(inventory, dict):
+        if inventory.get("_meta", {}).get("truncated"):
+            raise ValueError("feature inventory is truncated; use CLI features-list --limit 0")
+        features = inventory.get("results")
+    else:
+        features = inventory
+    if not isinstance(features, list):
+        raise ValueError("feature inventory must be an array or a results object")
+    seen = set()
+    for feature in features:
+        if not isinstance(feature, dict):
+            raise ValueError("feature record must be an object")
+        identity = feature.get("feature_id", "")
+        if not re.fullmatch(r"feat_[A-Za-z0-9_]+", identity) or identity in seen:
+            raise ValueError("invalid or duplicate feature ID")
+        seen.add(identity)
+        if feature.get("_meta", {}).get("truncated") or not isinstance(feature.get("files"), list):
+            raise ValueError(f"incomplete feature files: {identity}")
+        for item in feature["files"]:
+            if not isinstance(item, dict) or not isinstance(item.get("path"), str) or not item["path"] or not item.get("role"):
+                raise ValueError(f"invalid feature file: {identity}")
+    return features
+
+
+def collect_inventory(project, feature_id=None, kind=None):
+    if not Path(project).is_absolute():
+        raise ValueError("inventory project must be absolute")
+    reject_symlinked_components(Path(project) / ".codesage" / "index.db")
+    command = ["codesage", "feature-show", "--json", feature_id] if feature_id else [
+        "codesage", "features-list", "--json", "--limit", "0"]
+    if kind and not feature_id:
+        command.extend(["--kind", kind])
+    try:
+        result = subprocess.run(command, cwd=project, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise ValueError(f"CodeSage inventory command failed (exit {exc.returncode}): {exc.stderr.strip() or 'no stderr provided'}") from exc
+    value = json.loads(result.stdout)
+    return {"results": complete_inventory([value] if feature_id else value)}
+
+
+def complete_risk(paths, risk):
+    if not isinstance(paths, list) or any(not isinstance(path, str) or not path for path in paths):
+        raise ValueError("requested risk paths must be a string array")
+    if isinstance(risk, dict) and risk.get("_meta", {}).get("truncated"):
+        raise ValueError("risk response is truncated; retry smaller batches")
+    records = risk.get("files") if isinstance(risk, dict) else risk
+    if not isinstance(records, list):
+        raise ValueError("risk records must be an array or files object")
+    found = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("risk record must be an object")
+        path, score = record.get("file"), record.get("score")
+        if not isinstance(path, str) or path in found or isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score):
+            raise ValueError("duplicate or invalid risk record")
+        found[path] = record
+    missing, unexpected = set(paths) - set(found), set(found) - set(paths)
+    if missing or unexpected:
+        raise ValueError(f"risk coverage mismatch: missing={sorted(missing)}, unexpected={sorted(unexpected)}")
+    return {"files": [found[path] for path in sorted(found)]}
+
+
 def feature_states(project, features, params=None):
     content_cache = {}
     return [
@@ -131,7 +194,7 @@ def plan_path_exists(project, path):
         return False
 
 
-def plan_feature_review(feature, risk, changed_files, project=None):
+def plan_feature_review(feature, risk, changed_files, project=None, strict_risk=False):
     if not isinstance(feature, dict):
         raise ValueError("feature must be an object")
     records = risk.get("files", []) if isinstance(risk, dict) else risk
@@ -165,12 +228,20 @@ def plan_feature_review(feature, risk, changed_files, project=None):
         if isinstance(path, str) and path in all_roles
     }
     scores = {}
+    if isinstance(risk, dict) and risk.get("_meta", {}).get("truncated"):
+        raise ValueError("risk response is truncated")
     for record in records:
         if not isinstance(record, dict):
             raise ValueError("risk record must be an object")
         path = record.get("file")
         if path in all_roles:
-            scores[path] = float(record.get("score", 0.0))
+            score = record.get("score")
+            if path in scores or isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score):
+                raise ValueError(f"duplicate or invalid risk record: {path}")
+            scores[path] = score
+    missing_risk = sorted(set(roles) - set(scores))
+    if strict_risk and missing_risk:
+        raise ValueError("missing risk records: " + ", ".join(missing_risk))
     universe = set(roles) | changed
     for path in universe:
         scores.setdefault(path, 0.0)
@@ -213,6 +284,7 @@ def plan_feature_review(feature, risk, changed_files, project=None):
         "eligible_file_count": len(universe),
         "omitted_file_count": max(len(universe) - len(must_read), 0),
         "max_owned_risk": max_risk,
+        "missing_risk": missing_risk,
         "expansion_reasons": expansion_reasons,
     }
 
@@ -1087,9 +1159,212 @@ def triage(project, finding_id, status, magnitude=None, note=None):
     return {"findings_path": str(path), "finding": finding}
 
 
+def markdown(value):
+    value = " ".join(str(value if value is not None else "unavailable").split())
+    for character in "\\`*_{}[]<>|#":
+        value = value.replace(character, "\\" + character)
+    return value
+
+
+def report_filter(value, allowed):
+    selected = set(value.split(","))
+    if not selected or selected - set(allowed):
+        raise ValueError(f"invalid report filter: {value}")
+    return selected
+
+
+def render_report(args):
+    project = Path(args.project)
+    if not project.is_absolute():
+        raise ValueError("report project must be absolute")
+    statuses = report_filter(args.status, {"open", "fixed", "false-positive", "wont-fix"})
+    severities = report_filter(args.severity, SEVERITIES)
+    categories = report_filter(args.category, CATEGORIES)
+    directory = project / ".codesage" / "findings"
+    reject_symlinked_components(directory)
+    for component in (project / ".codesage", directory):
+        if component.exists() and not component.is_dir():
+            raise OSError(f"findings directory is not a directory: {component}")
+    documents = [load_json(path) for path in sorted(directory.glob("*.json"))]
+    for document in documents:
+        if not isinstance(document, dict) or not isinstance(document.get("feature_id"), str) or not isinstance(document.get("findings", []), list):
+            raise ValueError("invalid findings document")
+        for finding in document.get("findings", []):
+            if not isinstance(finding, dict) or not isinstance(finding.get("finding_id"), str):
+                raise ValueError("invalid finding record")
+            if (finding.get("severity") not in SEVERITIES or finding.get("category") not in CATEGORIES
+                    or finding.get("status") not in {"open", "fixed", "false-positive", "wont-fix"}):
+                raise ValueError("invalid finding severity, category, or status")
+            if (not isinstance(finding.get("file"), str) or not finding["file"]
+                    or isinstance(finding.get("line"), bool) or not isinstance(finding.get("line"), int)
+                    or finding["line"] < 1):
+                raise ValueError("invalid finding location")
+            for field in ("title", "summary"):
+                if not isinstance(finding.get(field), str) or not finding[field]:
+                    raise ValueError(f"invalid finding {field}")
+            if not isinstance(finding.get("evidence", []), list) or any(not isinstance(item, str) for item in finding.get("evidence", [])):
+                raise ValueError("invalid finding evidence")
+    documents.sort(key=lambda document: document["feature_id"])
+    supplied_inventory = complete_inventory(load_json(args.features)) if args.features else None
+    metadata_fields = ("title", "kind", "entry_path", "feature_files")
+    legacy = [document for document in documents if any(document.get(field) is None for field in metadata_fields)]
+    if legacy:
+        try:
+            inventory = supplied_inventory if supplied_inventory is not None else complete_inventory(collect_inventory(project))
+            metadata = {feature["feature_id"]: feature for feature in inventory}
+        except (OSError, ValueError, subprocess.CalledProcessError):
+            if args.features:
+                raise
+            metadata = {}
+        for document in legacy:
+            feature = metadata.get(document["feature_id"], {})
+            for field in metadata_fields:
+                if document.get(field) is None:
+                    document[field] = feature.get("files" if field == "feature_files" else field)
+    transfers = transferred_acknowledgements(project)
+    all_rows = [(document, finding) for document in documents for finding in document.get("findings", [])
+                if (document["feature_id"], finding["finding_id"]) not in transfers]
+    selected_documents = [document for document in documents
+                          if args.feature is None or document["feature_id"] == args.feature]
+    rows = [(document, finding) for document, finding in all_rows
+            if document in selected_documents and finding.get("status") in statuses
+            and finding.get("severity") in severities and finding.get("category") in categories]
+    rows.sort(key=lambda row: (row[0]["feature_id"], row[1].get("file", ""),
+                              row[1].get("line", 0), row[1]["finding_id"]))
+    selected_ids = {document["feature_id"] for document in selected_documents}
+    affected = {document["feature_id"] for document, _ in rows}
+    lines = [f"# Code review findings — {markdown(project.name)}", "",
+             f"State updated {markdown(max((document.get('reviewed_at') or '' for document in documents), default='') or 'unavailable')} in .codesage/findings/.", ""]
+
+    def totals(label, field, values, findings):
+        lines.append(label + ": " + ", ".join(f"{value}: {sum(finding.get(field) == value for finding in findings)}" for value in values))
+
+    if not rows:
+        lines.extend(["No findings match the requested filters.", "", f"Project: {markdown(project)}",
+                      f"Filters: status={','.join(sorted(statuses))}, severity={','.join(sorted(severities))}, category={','.join(sorted(categories))}", "",
+                      f"Total findings in project: {len(all_rows)}"])
+        findings = [finding for _, finding in all_rows]
+        totals("By status", "status", ("open", "fixed", "false-positive", "wont-fix"), findings)
+    else:
+        lines.extend(["## Summary", "", f"{len(rows)} findings across {len(affected)} feature slices."])
+        findings = [finding for _, finding in rows]
+        totals("By status", "status", ("open", "fixed", "false-positive", "wont-fix"), findings)
+    totals("By severity", "severity", ("high", "medium", "low"), findings)
+    totals("By category", "category", sorted(CATEGORIES), findings)
+    boundaries = {}
+    for document in selected_documents:
+        if document["feature_id"] in affected:
+            for boundary in set(document.get("trust_boundaries", [])):
+                boundaries[boundary] = boundaries.get(boundary, 0) + 1
+    lines.extend(["Trust-boundary distribution on affected features: " + (", ".join(f"{markdown(key)} {value}" for key, value in sorted(boundaries.items())) or "none"), ""])
+    for severity in ("high", "medium", "low"):
+        group = [(document, finding) for document, finding in rows if finding["severity"] == severity]
+        if not group:
+            continue
+        lines.extend([f"## {severity.title()}-severity findings", ""])
+        compact = severity == "low" or (severity == "medium" and len(group) > 8)
+        if compact:
+            lines.extend(["| Finding | File:line | Title | Feature | Status |", "| --- | --- | --- | --- | --- |"])
+        for document, finding in group:
+            identity = markdown(finding["finding_id"])
+            feature = markdown(document["feature_id"])
+            metadata = (f"{document['kind']} — {document['title']}" if document.get("kind") and document.get("title") else "metadata unavailable")
+            location = markdown(f"{finding.get('file')}:{finding.get('line')}")
+            if compact:
+                lines.append(f"| {identity} | {location} | {markdown(finding.get('title'))} | {feature} ({markdown(metadata)}) | {markdown(finding.get('status'))} |")
+            else:
+                lines.extend([f"### {identity} — {markdown(finding.get('title'))}", "",
+                              f"- Feature: {feature} ({markdown(metadata)})",
+                              f"- Entry: {markdown(document.get('entry_path'))}",
+                              f"- File: {location}",
+                              f"- Status: {markdown(finding.get('status'))} (first seen {markdown(finding.get('first_seen_at'))}, last seen {markdown(finding.get('last_seen_at'))})",
+                              f"- Trust boundaries crossed: {markdown(', '.join(sorted(document.get('trust_boundaries', []))) or 'none')}", "",
+                              markdown(finding.get("summary")), ""])
+                if severity == "high":
+                    evidence = "\n".join(finding.get("evidence", []))
+                    fence = "`" * max(3, max((len(match.group()) + 1 for match in re.finditer(r"`+", evidence)), default=3))
+                    lines.extend([fence, evidence, fence, ""])
+                lines.extend([f"Fix: {markdown(finding.get('suggested_fix'))}", ""])
+        lines.append("")
+    annotations = []
+    for document, finding in rows:
+        if finding.get("acknowledgement"):
+            ack = finding["acknowledgement"]
+            measurement = finding.get("magnitude")
+            annotations.append(f"- {markdown(finding['finding_id'])}: accepted {markdown(ack.get('metric'))} = {markdown(ack.get('value'))}; current " +
+                               (f"{markdown(measurement.get('metric'))} = {markdown(measurement.get('value'))}" if measurement else "measurement unavailable"))
+        if finding.get("status") != "open":
+            notes = [event.get("note") for event in finding.get("history", []) if event.get("action") == "triage" and event.get("note")]
+            annotations.append(f"- {markdown(finding['finding_id'])}: {markdown(finding.get('status'))}; triaged {markdown(finding.get('triaged_at'))}; note: {markdown(notes[-1] if notes else 'unavailable')}")
+    if annotations:
+        lines.extend(["## Acknowledgements and triage", "", *annotations, ""])
+    audit = [f"- {markdown(feature)} / {markdown(finding)} → {markdown(json.dumps(destinations, sort_keys=True))}"
+             for (feature, finding), destinations in sorted(transfers.items()) if feature in selected_ids]
+    if audit:
+        lines.extend(["## Transfer audit (excluded from current totals)", "", *audit, ""])
+    persisted = [{"feature_id": document["feature_id"], **item} for document in selected_documents for item in document.get("ack_sweep", [])]
+    live = []
+    for document in selected_documents:
+        for finding in document.get("findings", []):
+            if not finding.get("acknowledgement") or (document["feature_id"], finding["finding_id"]) in transfers:
+                continue
+            try:
+                digest = file_content_digest(project, finding["file"], {})
+                reason = "source-missing" if digest == "missing" else "source-changed-since-review" if digest != finding.get("content_digest") else None
+            except (OSError, ValueError):
+                reason = "source-unreadable"
+            if reason:
+                live.append({"feature_id": document["feature_id"], "finding_id": finding["finding_id"], "kind": "stale", "reason": reason})
+    for heading, diagnostics in (("Acknowledgement diagnostics (persisted last review scope)", persisted), ("Live source acknowledgement diagnostics", live)):
+        if diagnostics:
+            lines.extend([f"## {heading}", ""])
+            lines.extend("- " + markdown(json.dumps(item, sort_keys=True)) for item in sorted(diagnostics, key=lambda item: json.dumps(item, sort_keys=True)))
+            lines.append("")
+    return "\n".join(lines).rstrip() + "\n", len(rows), len(affected)
+
+
+def write_report(destination, rendered):
+    destination = Path(destination).absolute()
+    for component in (destination, *destination.parents):
+        if component.is_symlink():
+            raise OSError(f"refusing symlink report output: {component}")
+    if destination.exists() and not destination.is_file():
+        raise OSError("report output is not a regular file")
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=destination.parent,
+                                     prefix=f".{destination.name}.", delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            handle.write(rendered)
+            handle.flush()
+            os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Deterministic CodeSage review-state operations")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    inventory = subparsers.add_parser("inventory")
+    inventory.add_argument("--project", required=True)
+    inventory.add_argument("--feature")
+    inventory.add_argument("--kind")
+    inventory.add_argument("--output", required=True)
+
+    risk_check = subparsers.add_parser("check-risk")
+    risk_check.add_argument("--paths", required=True)
+    risk_check.add_argument("--risk", required=True)
+    risk_check.add_argument("--output")
+
+    report = subparsers.add_parser("report")
+    report.add_argument("project")
+    report.add_argument("--status", default="open,wont-fix")
+    report.add_argument("--severity", default="high,medium,low")
+    report.add_argument("--category", default="bug,security,perf,maintainability")
+    report.add_argument("--feature")
+    report.add_argument("--features", help="Frozen complete CLI inventory for legacy metadata")
+    report.add_argument("--output", "-o")
 
     triage_parser = subparsers.add_parser("triage")
     triage_parser.add_argument("--project", required=True)
@@ -1154,6 +1429,25 @@ def build_parser():
 
 
 def run_cli(args):
+    if args.command == "check-risk":
+        value = complete_risk(load_json(args.paths), load_json(args.risk))
+        if args.output:
+            atomic_write_json(args.output, value)
+        print_json(value)
+        return
+    if args.command == "inventory":
+        value = collect_inventory(args.project, args.feature, args.kind)
+        atomic_write_json(args.output, value)
+        print_json(value)
+        return
+    if args.command == "report":
+        rendered, findings, features = render_report(args)
+        if args.output:
+            write_report(args.output, rendered)
+            print(f"Wrote findings report: {args.output}\n  Findings: {findings}\n  Features touched: {features}")
+        else:
+            sys.stdout.write(rendered)
+        return
     if args.command == "sweep-acks":
         print_json(sweep_acknowledgements(args.project))
         return
@@ -1187,9 +1481,7 @@ def run_cli(args):
 
     if args.command == "feature-states":
         inventory = load_json(args.features)
-        features = inventory.get("results", []) if isinstance(inventory, dict) else inventory
-        if not isinstance(features, list):
-            raise ValueError("feature inventory must be an array or a results object")
+        features = complete_inventory(inventory)
         findings_dir = Path(
             args.findings_dir or Path(args.project) / ".codesage" / "findings"
         )
@@ -1210,6 +1502,7 @@ def run_cli(args):
             load_json(args.risk),
             load_json(args.changed, []),
             project=args.project,
+            strict_risk=True,
         )
         if args.project:
             plan["feature_state"] = feature_state(
@@ -1308,7 +1601,7 @@ def main():
     args = parser.parse_args()
     try:
         run_cli(args)
-    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    except (OSError, TypeError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as exc:
         print(f"codesage-review-state: {exc}", file=sys.stderr)
         return 1
     return 0

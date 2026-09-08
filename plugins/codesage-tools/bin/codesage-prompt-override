@@ -10,10 +10,10 @@ cat <<'EOF'
 
 # CodeSage MCP tool selection
 
-When the active project has a `.codesage/index.db` directory, the
-`mcp__codesage__*` tools answer retrieval and code-graph questions
-faster and more precisely than `Grep`. Pick the right tool by the
-shape of the question:
+When the active project has a `.codesage/index.db` file and
+`codesage status` succeeds, use `mcp__codesage__*` for semantic
+retrieval and code-graph questions. Pick the tool by the requested
+evidence, regardless of identifier spelling:
 
 | Question shape | Tool |
 |---|---|
@@ -27,12 +27,12 @@ shape of the question:
 | "What's the risk of this patch?" / "What tests should I run?" / "What files co-change with this one?" | `mcp__codesage__assess_risk` / `mcp__codesage__assess_risk_diff` / `mcp__codesage__recommend_tests` / `mcp__codesage__find_coupling` |
 | "Before I commit — what will a reviewer flag?" (missing tests, risky/blast-radius files, cycles, trust boundaries, feature-test gaps, scope creep) | `mcp__codesage__review_rehearsal` |
 
-Use `Grep` / `Glob` / `Bash` only when the target is a non-identifier
-literal: error messages, log text, config keys, TODO/FIXME markers,
-quoted strings, cross-cutting English ("deprecated", "FIXME"). If the
-pattern matches `[A-Za-z_][A-Za-z0-9_]*` or is a `|`-joined list of
-such tokens, the question is symbol-shaped and the CodeSage tools win
-in one call where Grep would take 3-5.
+Use `Grep` / `rg` for literal occurrences, including identifier-shaped
+config keys, test names, constants, error messages, and documentation.
+For example, every occurrence of `TIMEOUT` needs literal search; its
+definition needs `find_symbol`, and structural uses need `find_references`.
+Use `Glob` for filename patterns. These retrieval choices do not restrict
+`Bash` for builds, tests, Git operations, or other shell work.
 
 CodeSage tools all require an absolute `project` argument. Read it
 from the project's `.claude/CLAUDE.md` (the codesage onboarder writes

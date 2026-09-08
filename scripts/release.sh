@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Release ceremony for codesage.
 #
-#   scripts/release.sh [-y|--yes] X.Y.Z
+#   scripts/release.sh [-y|--yes] [--include-approved-prose] X.Y.Z
 #
 # Does:
 #   1. Pre-flight checks (on master, clean tree, in sync with origin, tag free).
+#      --include-approved-prose permits only README.md/CHANGELOG.md content
+#      edits approved for this release; the release commit includes them.
 #      Exception: if a previous run already committed + tagged HEAD but never
 #      pushed, the script resumes at the push step instead of dying on the tag.
 #   2. Move `## [Unreleased]` content into a new `## [X.Y.Z] - YYYY-MM-DD` block
@@ -23,8 +25,8 @@
 # The two prompts are deliberate: every hard-to-reverse step stops and asks.
 # Pass `-y` / `--yes` to auto-confirm both prompts when driving the script from
 # a non-interactive context (e.g. an agent that has already run the lint/tests
-# gate via `.claude/commands/release.md`).
-# Pre-release lint/tests are the wrapper's job (see `.claude/commands/release.md`).
+# gate via `.agents/skills/release/references/workflow.md`).
+# Pre-release lint/tests are the shared release workflow's job.
 
 set -euo pipefail
 
@@ -34,10 +36,15 @@ die() {
 }
 
 ASSUME_YES=0
+INCLUDE_APPROVED_PROSE=0
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	-y | --yes)
 		ASSUME_YES=1
+		shift
+		;;
+	--include-approved-prose)
+		INCLUDE_APPROVED_PROSE=1
 		shift
 		;;
 	-*) die "unknown flag: $1" ;;
@@ -46,7 +53,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 VERSION="${1:-}"
-[[ -n "$VERSION" ]] || die "usage: scripts/release.sh [-y|--yes] X.Y.Z"
+[[ -n "$VERSION" ]] || die "usage: scripts/release.sh [-y|--yes] [--include-approved-prose] X.Y.Z"
+[[ $# -eq 1 ]] || die "expected exactly one version argument"
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "version must be X.Y.Z (got: $VERSION)"
 
 ROOT="$(git rev-parse --show-toplevel)"
@@ -55,7 +63,25 @@ cd "$ROOT"
 branch=$(git rev-parse --abbrev-ref HEAD)
 [[ "$branch" == "master" ]] || die "not on master (current: $branch)"
 
-git diff-index --quiet HEAD -- || die "working tree has uncommitted changes"
+if [[ "$INCLUDE_APPROVED_PROSE" -eq 1 ]]; then
+	for prose in README.md CHANGELOG.md; do
+		[[ -f "$prose" && ! -L "$prose" ]] || die "approved prose must be a regular file: $prose"
+		git ls-files --error-unmatch -- "$prose" >/dev/null 2>&1 ||
+			die "approved prose must already be tracked: $prose"
+	done
+	if ! git diff --quiet -- . ':(exclude)README.md' ':(exclude)CHANGELOG.md' ||
+		! git diff --cached --quiet -- . ':(exclude)README.md' ':(exclude)CHANGELOG.md'; then
+		die "working tree has changes outside approved README.md/CHANGELOG.md prose"
+	fi
+	prose_worktree_summary=$(git diff --summary -- README.md CHANGELOG.md)
+	prose_staged_summary=$(git diff --cached --summary -- README.md CHANGELOG.md)
+	[[ -z "$prose_worktree_summary" && -z "$prose_staged_summary" ]] ||
+		die "approved prose may change contents only, not file types, paths, or modes"
+else
+	if ! git diff --quiet || ! git diff --cached --quiet; then
+		die "working tree has uncommitted changes"
+	fi
+fi
 
 command -v codex >/dev/null 2>&1 ||
 	die "required 'codex' CLI not found on PATH; install it before releasing"
@@ -83,6 +109,9 @@ if git rev-parse "v$VERSION" >/dev/null 2>&1; then
 fi
 
 if [[ "$RESUME" -eq 1 ]]; then
+	if ! git diff --quiet || ! git diff --cached --quiet; then
+		die "cannot resume with uncommitted changes, including approved prose"
+	fi
 	git merge-base --is-ancestor origin/master HEAD ||
 		die "cannot resume: local master and origin/master have diverged"
 elif [[ "$local_sha" != "$remote_sha" ]]; then
@@ -189,6 +218,11 @@ PYEOF
 	echo
 	echo "--- CHANGELOG.md diff (head) ---"
 	git --no-pager diff CHANGELOG.md | head -80
+	if [[ "$INCLUDE_APPROVED_PROSE" -eq 1 ]]; then
+		echo
+		echo "--- Approved README.md diff ---"
+		git --no-pager diff HEAD -- README.md
+	fi
 	echo
 	echo "--- Plugin manifest diffs ---"
 	git --no-pager diff \
@@ -217,7 +251,8 @@ PYEOF
 
 	# Commit by pathspec, not `git commit -am`: -a would sweep stray edits
 	# and the Cargo.lock refresh into the release. These are exactly the
-	# files this script mutates above (CHANGELOG + version bumps) plus the
+	# files this script mutates above (CHANGELOG + version bumps), approved
+	# README prose when requested, plus the
 	# Cargo.lock the --features cuda build refreshes (absent in checkouts
 	# without a lockfile — only existing paths are committed).
 	RELEASE_FILES=(
@@ -228,6 +263,9 @@ PYEOF
 		plugins/codesage-tools/.claude-plugin/plugin.json
 		.claude-plugin/marketplace.json
 	)
+	if [[ "$INCLUDE_APPROVED_PROSE" -eq 1 ]]; then
+		RELEASE_FILES+=(README.md)
+	fi
 	EXISTING_FILES=()
 	for f in "${RELEASE_FILES[@]}"; do
 		[[ -e "$f" ]] && EXISTING_FILES+=("$f")

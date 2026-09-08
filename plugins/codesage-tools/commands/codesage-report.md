@@ -1,137 +1,31 @@
 ---
 name: codesage-report
-description: Render a Markdown findings report from .codesage/findings/. No LLM call — pure formatter.
+description: Render findings with the deterministic Python formatter; no model-generated report prose.
 argument-hint: "<project-path> [--status open,wont-fix] [--severity high,medium] [--category bug,security] [--feature <id>] [--output <path>]"
 ---
 
-# Render codesage findings as Markdown
+# Render CodeSage findings
 
-Format the project's findings into a Markdown report suitable for pasting into a PR description, a ticket, or a stakeholder email. No LLM call — this is a pure file walk + format.
+Run the packaged formatter with the user's arguments as distinct shell arguments:
 
-> **Before touching any `.codesage/` path:** `.codesage/` is repository content, so a cloned
-> repo can ship it — or any directory under it — as a symlink. Refuse to read, write, create,
-> or delete through one. Check with `test -L <path>` (not `test -e`, which follows links) on
-> `.codesage` itself and on each subdirectory you are about to use, and stop with an error if
-> any is a symlink. Apply the same check to every **leaf** you touch: a `*.json` findings
-> file, or any temporary file you create beside it, may itself be a planted symlink or a
-> directory. Read or write a leaf only if it is a regular file (or absent, when creating),
-> and give temporary files a freshly generated unique name rather than a predictable one.
-
-## Parse arguments
-
-First positional: absolute project path (required).
-
-Filters (intersected — multiple filters AND together):
-- `--status <s,s>` — comma-separated, default `open,wont-fix`. Triaged-out states (`false-positive`, `fixed`) excluded unless explicitly named.
-- `--severity <s,s>` — default `high,medium,low` (all).
-- `--category <c,c>` — default all.
-- `--feature <id>` — restrict to one feature's findings.
-
-Output:
-- `--output <path>` / `-o <path>` — write Markdown to this path. Without it, print to stdout.
-
-## Walk the findings
-
-Read every `.codesage/findings/<feature_id>.json` in the project. For each finding, apply filters. Drop anything that doesn't match.
-
-Run `${CLAUDE_PLUGIN_ROOT}/bin/codesage-review-state sweep-acks --project <absolute-path>` before filtering. Records marked `transferred` are historical: list them with their destinations in an audit section, excluding them from current finding totals. Always display each selected feature document's persisted `ack_sweep` entries in an acknowledgement diagnostics section, independently of status, severity, and category filters. Show the finding ID, kind (`stale` or `foreign`), and reason; these describe the last review scope, not a fresh source check. Label live source diagnostics from the sweep separately. Do not call omitted findings fixed. For findings carrying `acknowledgement`, render its metric and accepted value alongside the current `magnitude`, or say the current measurement is unavailable. Legacy findings without these optional fields render as before.
-
-If the resulting set is empty after filtering, write:
-
-```
-No findings match the requested filters.
-  Project: <path>
-  Filters: status=<>, severity=<>, category=<>
+```bash
+"${CLAUDE_PLUGIN_ROOT}/bin/codesage-review-state" report "$PROJECT"
 ```
 
-Then list the unfiltered totals so the user can adjust:
+Require an absolute project path. Pass optional `--status`, `--severity`, `--category`, `--feature`, and `--output` / `-o` directly. Do not generate, summarize, or rewrite the Markdown with a model. Return the helper's stdout verbatim; if it fails, report the error and do not fabricate a report.
 
-```
-Total findings in project: 47
-  By status: open: 23, fixed: 12, false-positive: 8, wont-fix: 4
-  By severity: high: 5, medium: 28, low: 14
-  By category: bug: 19, security: 11, perf: 9, maintainability: 8
-```
+Filters intersect. Defaults are statuses `open,wont-fix`, all three severities, and all four categories. Unknown filter values fail. Without `--output`, Markdown goes to stdout. With an output path, the helper atomically writes UTF-8 Markdown and prints the destination, selected finding count, and affected feature count. The destination's parent must already exist; symlink components and nonregular destinations are refused.
 
-## Pull feature metadata
+## Persisted state and coverage
 
-Read `title`, `kind`, `entry_path`, and `feature_files` from each findings document. Current review runs persist these fields during merge, so reporting needs no MCP lookup.
+Read `title`, `kind`, `entry_path`, and `feature_files` from findings documents. For legacy metadata gaps, the formatter makes one complete CLI inventory lookup (`features-list --json --limit 0`) and can join records by `feature_id`. Missing IDs or a failed lookup display `(metadata unavailable)`; never guess an entry from a finding's location. For repeatable archival rendering, pass `--features <inventory.json>` from the inventory helper instead of a live lookup. An explicitly supplied malformed or truncated inventory fails the report.
 
-For a legacy document missing metadata, call `mcp__codesage__list_features(project, limit=200)` once and join records by `feature_id`. Don't guess an entry path from an arbitrary finding file. If the join misses, render the feature ID with `(metadata unavailable)`.
+The helper checks `.codesage` path components and every findings JSON leaf, rejects symlinks and nonregular files, and fails on malformed state. It uses the latest persisted `reviewed_at` for the state timestamp, never the wall clock. Identical findings, metadata inventory, and source contents with identical arguments produce byte-identical output. Source contents matter because live acknowledgement diagnostics check whether cited files changed; these diagnostics can change even when findings JSON does not.
 
-## Render Markdown
+Transferred acknowledgements appear in a transfer audit, excluded from current totals. Persisted `ack_sweep` entries for selected feature documents appear independently of status, severity, and category filters, labeled as the last review scope. Live source checks appear separately. Neither kind of diagnostic declares an omitted finding fixed. Acknowledged selected findings include the accepted metric/value and current measurement, or explicitly state that the current measurement is unavailable.
 
-Output layout:
+An empty selection displays the requested filters and project-wide current totals, excluding transferred historical records. Feature filtering restricts findings and diagnostics; the empty-selection totals still cover the project.
 
-```markdown
-# Code review findings — <project basename>
+## Rendering
 
-State updated 2026-05-16T20:50:00Z in .codesage/findings/.
-
-## Summary
-
-- **23 open findings** across 11 feature slices.
-- By severity: **3 high**, **15 medium**, **5 low**.
-- By category: bug (10), security (7), perf (4), maintainability (2).
-- Trust-boundary distribution on affected features: network 8, secrets 5, filesystem 4, process-exec 3, database 2.
-
-## High-severity findings
-
-### fnd_abc12345 — Unauthenticated path bypasses token check
-
-- **Feature:** `feat_xyz789` (route — `GET /api/users/{id}`)
-- **File:** `src/api/handler.rs:142`
-- **Trust boundaries crossed:** network, secrets, user-input
-- **Status:** open (first seen 2026-05-16T20:30, last seen 2026-05-16T20:30)
-
-The token validator branches on `headers.get("x-api-key")` but returns the row if the header is absent. An unauthenticated request returns a 200 with the user record body.
-
-```rust
-  let token = req.headers.get("x-api-key").unwrap_or(&Default::default());
-  // ... handler proceeds to load and return the user row
-```
-
-**Fix:** Reject with 401 when the header is missing OR `validate_token()` returns false. The existing `auth::require_authenticated` middleware (used in 7 other handlers) is the pattern.
-
----
-
-[... next high-severity finding ...]
-
-## Medium-severity findings
-
-[... compact table or full sections, see "Density rule" below ...]
-
-## Low-severity findings
-
-[... compact table ...]
-
-## Triaged-out (informational)
-
-[Only when --status includes false-positive / wont-fix / fixed]
-
-- **fnd_def67890** (false-positive, 2026-05-16): `feat_abc/src/db.rs:84` — *"Race in connection pool"*. Note: "pool is single-threaded by construction; the comment in connection.rs:12 explains the invariant."
-```
-
-## Density rule
-
-- **High severity:** full section per finding (the example above).
-- **Medium severity:** compact one-paragraph form OR a table if there are more than 8. Table columns: `finding_id`, `file:line`, `title`, `feature` (short kind+name).
-- **Low severity:** always a table.
-
-## Step output
-
-If `--output` is set, write to the path AND print:
-
-```
-Wrote findings report: <output path>
-  Findings: 23 (3 high, 15 medium, 5 low)
-  Features touched: 11
-```
-
-If not, print the rendered Markdown directly.
-
-## Notes
-
-- Use the latest persisted `reviewed_at` value for the `State updated` line. Don't insert the current wall clock; identical findings state must render byte-identical output.
-- The trust-boundary distribution comes from each feature's record (`trust_boundaries: Vec<TrustBoundary>`), aggregated across the filtered features. It gives a quick read on whether the open findings cluster in security-sensitive code.
-- For just the high-severity section, run `--severity high`. For an audit-trail report including triaged-out findings, run `--status open,wont-fix,false-positive,fixed`.
+The formatter orders features and findings deterministically. High-severity findings have full sections with evidence and suggested fixes. Medium findings use sections up to eight records, then a table. Low findings always use a table. A separate section retains acknowledgement values and triage notes even for table rows. Summary counts distinguish statuses; `wont-fix` is not counted as open. Trust-boundary counts count each affected feature once per boundary.

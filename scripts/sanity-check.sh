@@ -9,16 +9,19 @@
 #
 # Usage:
 #   bash scripts/sanity-check.sh          # fmt + clippy + tests + script regressions
-#   bash scripts/sanity-check.sh --fast   # fmt + clippy only (skip tests)
+#   bash scripts/sanity-check.sh --fast   # validation/lint gates only (skip tests)
+#   bash scripts/sanity-check.sh --cuda   # also lint CUDA paths (release gate)
 
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
 FAST=0
+CUDA=0
 for arg in "$@"; do
 	case "$arg" in
 	--fast) FAST=1 ;;
+	--cuda) CUDA=1 ;;
 	-h | --help)
 		sed -n '2,16p' "$0"
 		exit 0
@@ -32,11 +35,22 @@ done
 
 step() { printf '\n── %s ──\n' "$1"; }
 
+step "python3 scripts/check-changelog.py"
+python3 scripts/check-changelog.py
+
+step "python3 scripts/check-plugin-versions.py --root ."
+python3 scripts/check-plugin-versions.py --root .
+
 step "cargo fmt --all -- --check"
 cargo fmt --all -- --check
 
 step "cargo clippy --workspace --all-targets -- -D warnings"
 cargo clippy --workspace --all-targets -- -D warnings
+
+if [[ $CUDA -eq 1 ]]; then
+	step "cargo clippy --workspace --all-targets --features codesage/cuda -- -D warnings"
+	cargo clippy --workspace --all-targets --features codesage/cuda -- -D warnings
+fi
 
 step "shellcheck scripts/*.sh"
 shellcheck scripts/*.sh
