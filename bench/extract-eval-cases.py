@@ -90,7 +90,7 @@ def extract_file_paths_from_value(value) -> set[str]:
 CODESAGE_SUBCOMMANDS = frozenset(
     {
         "init", "index", "overview", "search", "brief", "find-symbol",
-        "find-references", "dependencies", "impact", "trace", "export",
+        "find-references", "dependencies", "impact", "trace", "from-trace", "export",
         "status", "mcp", "daemon", "watch", "install-hooks", "install",
         "uninstall", "cleanup", "coverage", "git-index", "coupling", "risk",
         "risk-batch", "risk-diff", "similar", "tests-for", "rehearse",
