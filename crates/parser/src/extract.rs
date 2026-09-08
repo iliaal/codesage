@@ -281,8 +281,8 @@ pub fn extract_symbols(
             continue;
         };
 
-        let name_capture = m.captures.iter().find(|c| c.index == name_idx);
-        let def_capture = m.captures.iter().find(|c| c.index == def_idx);
+        let name_capture = m.captures().iter().find(|c| c.index == name_idx);
+        let def_capture = m.captures().iter().find(|c| c.index == def_idx);
 
         let (Some(name_cap), Some(def_cap)) = (name_capture, def_capture) else {
             continue;

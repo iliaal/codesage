@@ -143,8 +143,8 @@ pub fn file_fingerprints(
             continue;
         }
         let (Some(def_cap), Some(name_cap)) = (
-            m.captures.iter().find(|c| c.index == spec.def_idx),
-            m.captures.iter().find(|c| c.index == spec.name_idx),
+            m.captures().iter().find(|c| c.index == spec.def_idx),
+            m.captures().iter().find(|c| c.index == spec.name_idx),
         ) else {
             continue;
         };
