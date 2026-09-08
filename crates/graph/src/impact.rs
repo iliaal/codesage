@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -9,7 +10,7 @@ use codesage_protocol::{
 };
 use codesage_storage::Database;
 
-use crate::bundle::resolve_callee_definitions;
+use crate::bundle::{import_ref_targets_file, resolve_callee_definitions};
 
 pub(crate) fn is_qualified_symbol_name(name: &str) -> bool {
     name.contains('\\') || name.contains('.') || name.contains("::")
@@ -52,10 +53,79 @@ pub(crate) struct WalkOutcome {
     /// `ImpactEntry` keeps at most 10 `reasons`, so its length saturates on
     /// hub files and cannot rank them).
     pub edge_counts: HashMap<String, u32>,
-    /// Symbols the walk started from. Zero with `capped: false` means the
-    /// target is indexed but defines nothing, so an empty result is not a
-    /// finding about its dependents.
+    /// Symbol seeds, or one for a file-only root with a resolved import edge.
     pub seed_count: usize,
+}
+
+/// Request-local resolved edges shared across walks with different frontier
+/// and work limits. Admission is still charged on cache hits.
+#[derive(Default)]
+pub(crate) struct WalkCache {
+    references: HashMap<(String, String, u32), Arc<Vec<Reference>>>,
+    reference_bytes: usize,
+    file_imports: Option<Arc<Vec<Reference>>>,
+    import_matches: HashMap<String, Arc<Vec<usize>>>,
+    #[cfg(test)]
+    hits: usize,
+}
+
+impl WalkCache {
+    const MAX_SYMBOLS: usize = 8192;
+    const MAX_REFERENCE_BYTES: usize = 16 * 1024 * 1024;
+
+    #[cfg(test)]
+    pub(crate) fn stats(&self) -> (usize, usize, usize) {
+        (
+            self.hits,
+            self.references.len() + self.import_matches.len(),
+            self.reference_bytes,
+        )
+    }
+
+    fn references(&mut self, db: &Database, sym: &Symbol) -> Result<Arc<Vec<Reference>>> {
+        let key = symbol_identity_key(sym);
+        if let Some(rows) = self.references.get(&key) {
+            #[cfg(test)]
+            {
+                self.hits += 1;
+            }
+            return Ok(Arc::clone(rows));
+        }
+        let rows = Arc::new(references_for_symbol(db, sym)?);
+        let bytes = rows.iter().fold(
+            rows.capacity()
+                .saturating_mul(std::mem::size_of::<Reference>())
+                .saturating_add(key.0.capacity())
+                .saturating_add(key.1.capacity()),
+            |bytes, row| {
+                bytes
+                    .saturating_add(row.from_file.capacity())
+                    .saturating_add(row.to_name.capacity())
+                    .saturating_add(row.from_symbol.as_ref().map_or(0, String::capacity))
+            },
+        );
+        if self.references.len() + self.import_matches.len() < Self::MAX_SYMBOLS
+            && bytes <= Self::MAX_REFERENCE_BYTES.saturating_sub(self.reference_bytes)
+        {
+            self.reference_bytes += bytes;
+            self.references.insert(key, Arc::clone(&rows));
+        }
+        Ok(rows)
+    }
+
+    fn remember_imports(&mut self, file: &str, matches: Vec<usize>) {
+        let bytes = matches
+            .capacity()
+            .saturating_mul(std::mem::size_of::<usize>())
+            .saturating_add(file.len());
+        if self.references.len() + self.import_matches.len() < Self::MAX_SYMBOLS
+            && bytes <= Self::MAX_REFERENCE_BYTES.saturating_sub(self.reference_bytes)
+        {
+            self.reference_bytes += bytes;
+            self.import_matches
+                .insert(file.to_string(), Arc::new(matches));
+        }
+    }
 }
 
 /// Hard work budget for a walk, counted in resolution steps (see
@@ -73,6 +143,7 @@ pub(crate) struct WalkBudget {
     pub deadline_hit: bool,
     candidate_counts: HashMap<String, usize>,
     caller_file_counts: HashMap<String, usize>,
+    file_imports: Option<Arc<Vec<Reference>>>,
 }
 
 impl WalkBudget {
@@ -84,6 +155,7 @@ impl WalkBudget {
             deadline_hit: false,
             candidate_counts: HashMap::new(),
             caller_file_counts: HashMap::new(),
+            file_imports: None,
         }
     }
 
@@ -156,7 +228,17 @@ pub(crate) fn impact_analysis_walk_budgeted(
     db: &Database,
     req: &ImpactRequest,
     max_frontier: usize,
+    budget: Option<&mut WalkBudget>,
+) -> Result<WalkOutcome> {
+    impact_analysis_walk_shared(db, req, max_frontier, budget, None)
+}
+
+pub(crate) fn impact_analysis_walk_shared(
+    db: &Database,
+    req: &ImpactRequest,
+    max_frontier: usize,
     mut budget: Option<&mut WalkBudget>,
+    mut cache: Option<&mut WalkCache>,
 ) -> Result<WalkOutcome> {
     if let Some(b) = budget.as_deref_mut()
         && (b.exhausted || b.over_deadline())
@@ -198,7 +280,11 @@ pub(crate) fn impact_analysis_walk_budgeted(
         ImpactTarget::File { path } => db.symbols_for_file(path)?,
     };
 
-    if seed_symbols.is_empty() {
+    let mut file_frontier = match &req.target {
+        ImpactTarget::File { path } if db.file_id_for_path(path)?.is_some() => vec![path.clone()],
+        _ => Vec::new(),
+    };
+    if seed_symbols.is_empty() && file_frontier.is_empty() {
         return Ok(WalkOutcome {
             entries: Vec::new(),
             capped: false,
@@ -223,17 +309,39 @@ pub(crate) fn impact_analysis_walk_budgeted(
     type ReasonKey = (String, ReferenceKind, u32);
     let mut file_reasons: HashMap<String, (u32, Vec<ImpactReason>, HashSet<ReasonKey>)> =
         HashMap::new();
-    let seed_count = seed_symbols.len();
+    let mut seed_count = seed_symbols.len();
+    let file_imports = if file_frontier.is_empty() {
+        Arc::new(Vec::new())
+    } else if let Some(cache) = cache.as_deref_mut() {
+        if cache.file_imports.is_none() {
+            cache.file_imports = Some(Arc::new(db.file_import_references()?));
+        }
+        Arc::clone(
+            cache
+                .file_imports
+                .as_ref()
+                .expect("file imports initialized"),
+        )
+    } else if let Some(b) = budget.as_deref_mut() {
+        if b.file_imports.is_none() {
+            b.file_imports = Some(Arc::new(db.file_import_references()?));
+        }
+        Arc::clone(b.file_imports.as_ref().expect("file imports initialized"))
+    } else {
+        Arc::new(db.file_import_references()?)
+    };
+    let mut visited_files = HashSet::new();
     let mut frontier: Vec<Symbol> = seed_symbols;
     let mut visited_symbols: HashSet<(String, String, u32)> = HashSet::new();
     let mut frontier_capped = false;
 
     for depth in 1..=req.depth as u32 {
+        let mut next_files = Vec::new();
         // First pass: collect refs, update file_reasons, record (from_file, line) pairs
         // that need caller-symbol lookups for the next frontier.
         let mut pending_callers: Vec<(String, Option<String>, u32)> = Vec::new();
         let mut budget_spent = false;
-        let mut level: Vec<(&Symbol, Vec<Reference>)> = Vec::new();
+        let mut level: Vec<(&Symbol, Arc<Vec<Reference>>)> = Vec::new();
         if let Some(b) = budget.as_deref_mut() {
             // Admission is greedy cheapest-first over the priced level;
             // resolution then runs in frontier order over the admitted set
@@ -269,7 +377,11 @@ pub(crate) fn impact_analysis_walk_budgeted(
                 if b.over_deadline() {
                     break;
                 }
-                level.push((sym, references_for_symbol(db, sym)?));
+                let rows = match cache.as_deref_mut() {
+                    Some(cache) => cache.references(db, sym)?,
+                    None => Arc::new(references_for_symbol(db, sym)?),
+                };
+                level.push((sym, rows));
             }
             budget_spent = b.exhausted;
         } else {
@@ -277,11 +389,15 @@ pub(crate) fn impact_analysis_walk_budgeted(
                 if !visited_symbols.insert(symbol_identity_key(sym)) {
                     continue;
                 }
-                level.push((sym, references_for_symbol(db, sym)?));
+                let rows = match cache.as_deref_mut() {
+                    Some(cache) => cache.references(db, sym)?,
+                    None => Arc::new(references_for_symbol(db, sym)?),
+                };
+                level.push((sym, rows));
             }
         }
         for (sym, refs) in level {
-            for r in refs {
+            for r in refs.iter() {
                 if origin_files.contains(&r.from_file) {
                     continue;
                 }
@@ -309,8 +425,77 @@ pub(crate) fn impact_analysis_walk_budgeted(
                     entry.1.push(reason);
                 }
                 if depth < req.depth as u32 {
-                    pending_callers.push((r.from_file, r.from_symbol, r.line));
+                    if matches!(req.target, ImpactTarget::File { .. }) {
+                        next_files.push(r.from_file.clone());
+                    }
+                    pending_callers.push((r.from_file.clone(), r.from_symbol.clone(), r.line));
                 }
+            }
+        }
+
+        for file in &file_frontier {
+            if !visited_files.insert(file.clone()) {
+                continue;
+            }
+            if let Some(b) = budget.as_deref_mut() {
+                if b.exhausted || b.over_deadline() || file_imports.len() > b.remaining {
+                    b.exhausted = true;
+                    budget_spent = true;
+                    break;
+                }
+                b.charge(file_imports.len());
+            }
+            let cached_matches = cache
+                .as_deref()
+                .and_then(|cache| cache.import_matches.get(file))
+                .cloned();
+            let mut matches = Vec::new();
+            for index in 0..cached_matches
+                .as_ref()
+                .map_or(file_imports.len(), |rows| rows.len())
+            {
+                if index % 256 == 0
+                    && let Some(b) = budget.as_deref_mut()
+                    && b.over_deadline()
+                {
+                    budget_spent = true;
+                    break;
+                }
+                let reference_index = cached_matches.as_ref().map_or(index, |rows| rows[index]);
+                let r = &file_imports[reference_index];
+                if cached_matches.is_none()
+                    && !import_ref_targets_file(&r.to_name, &r.from_file, file)
+                {
+                    continue;
+                }
+                if cache.is_some() && cached_matches.is_none() {
+                    matches.push(reference_index);
+                }
+                if origin_files.contains(&r.from_file) {
+                    continue;
+                }
+                seed_count = seed_count.max(1);
+                let entry = file_reasons
+                    .entry(r.from_file.clone())
+                    .or_insert_with(|| (depth, Vec::new(), HashSet::new()));
+                entry.0 = entry.0.min(depth);
+                if entry.2.insert((r.to_name.clone(), r.kind, r.line)) && entry.1.len() < 10 {
+                    entry.1.push(ImpactReason {
+                        via_symbol: r.to_name.clone(),
+                        kind: r.kind,
+                        line: r.line,
+                    });
+                }
+                if depth < req.depth as u32 {
+                    next_files.push(r.from_file.clone());
+                    pending_callers.push((r.from_file.clone(), r.from_symbol.clone(), r.line));
+                }
+            }
+            if !budget_spent
+                && cached_matches.is_none()
+                && let Some(cache) = cache.as_deref_mut()
+            {
+                cache.remember_imports(file, matches);
             }
         }
 
@@ -320,7 +505,7 @@ pub(crate) fn impact_analysis_walk_budgeted(
             frontier_capped = true;
             break;
         }
-        if pending_callers.is_empty() {
+        if pending_callers.is_empty() && next_files.is_empty() {
             break;
         }
 
@@ -390,10 +575,18 @@ pub(crate) fn impact_analysis_walk_budgeted(
             frontier_capped = true;
         }
 
-        if next_frontier.is_empty() {
+        next_files.sort();
+        next_files.dedup();
+        next_files.retain(|file| !visited_files.contains(file));
+        if next_files.len() > max_frontier {
+            next_files.truncate(max_frontier);
+            frontier_capped = true;
+        }
+        if next_frontier.is_empty() && next_files.is_empty() {
             break;
         }
         frontier = next_frontier;
+        file_frontier = next_files;
     }
 
     let edge_counts: HashMap<String, u32> = file_reasons
@@ -705,6 +898,78 @@ mod tests {
         }
     }
 
+    fn assert_same_walk(left: &WalkOutcome, right: &WalkOutcome) {
+        assert_eq!(
+            serde_json::to_value(&left.entries).unwrap(),
+            serde_json::to_value(&right.entries).unwrap()
+        );
+        assert_eq!(left.capped, right.capped);
+        assert_eq!(left.seed_count, right.seed_count);
+        assert_eq!(left.edge_counts, right.edge_counts);
+    }
+
+    #[test]
+    fn shared_reverse_edges_preserve_frontiers_and_budget_admission() {
+        let (_dir, db) = setup_project_with_uneven_costs();
+        let request = ImpactRequest {
+            target: ImpactTarget::File {
+                path: "Repository.php".into(),
+            },
+            depth: 2,
+            source_only: false,
+        };
+        let mut cache = WalkCache::default();
+        for frontier in [1, MAX_FRONTIER, 8192] {
+            let plain = impact_analysis_walk_budgeted(&db, &request, frontier, None).unwrap();
+            let shared =
+                impact_analysis_walk_shared(&db, &request, frontier, None, Some(&mut cache))
+                    .unwrap();
+            assert_same_walk(&plain, &shared);
+            for steps in [0, 1, 3, 10, usize::MAX] {
+                let mut plain_budget = WalkBudget::new(steps, None);
+                let mut shared_budget = WalkBudget::new(steps, None);
+                let plain =
+                    impact_analysis_walk_budgeted(&db, &request, frontier, Some(&mut plain_budget))
+                        .unwrap();
+                let shared = impact_analysis_walk_shared(
+                    &db,
+                    &request,
+                    frontier,
+                    Some(&mut shared_budget),
+                    Some(&mut cache),
+                )
+                .unwrap();
+                assert_same_walk(&plain, &shared);
+                assert_eq!(plain_budget.remaining, shared_budget.remaining);
+                assert_eq!(plain_budget.exhausted, shared_budget.exhausted);
+            }
+        }
+        assert!(
+            cache.hits > 0,
+            "the walks must actually reuse resolved edges"
+        );
+        let hits = cache.hits;
+        let mut budget = WalkBudget::new(usize::MAX, Some(Instant::now()));
+        let expired =
+            impact_analysis_walk_shared(&db, &request, 8192, Some(&mut budget), Some(&mut cache))
+                .unwrap();
+        assert!(expired.capped);
+        assert!(expired.entries.is_empty());
+        assert_eq!(
+            cache.hits, hits,
+            "a warm cache cannot bypass an expired deadline"
+        );
+        let mut full_cache = WalkCache {
+            reference_bytes: WalkCache::MAX_REFERENCE_BYTES,
+            ..Default::default()
+        };
+        let plain = impact_analysis_walk_budgeted(&db, &request, 8192, None).unwrap();
+        let uncached =
+            impact_analysis_walk_shared(&db, &request, 8192, None, Some(&mut full_cache)).unwrap();
+        assert_same_walk(&plain, &uncached);
+        assert!(full_cache.references.is_empty());
+    }
+
     #[test]
     fn walk_reports_frontier_cap_and_keeps_shallow_entries() {
         let (_dir, db) = setup_project();
@@ -751,6 +1016,47 @@ mod tests {
         let (entries, capped) = impact_analysis_walk(&db, &req, MAX_FRONTIER).unwrap();
         assert!(entries.is_empty());
         assert!(!capped);
+    }
+
+    #[test]
+    fn file_only_walk_discloses_budget_and_frontier_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, source) in [
+            ("api.py", "# facade\n"),
+            ("a.py", "import api\n"),
+            ("b.py", "import api\n"),
+            ("outer.py", "import a\nimport b\n"),
+        ] {
+            std::fs::write(dir.path().join(path), source).unwrap();
+        }
+        let db = Database::open_in_memory().unwrap();
+        crate::full_index(dir.path(), &db, &[], false).unwrap();
+        let req = ImpactRequest {
+            target: ImpactTarget::File {
+                path: "api.py".into(),
+            },
+            depth: 2,
+            source_only: false,
+        };
+        let complete = impact_analysis_walk_budgeted(&db, &req, MAX_FRONTIER, None).unwrap();
+        assert!(!complete.capped);
+        assert_eq!(complete.entries.len(), 3);
+        assert_eq!(complete.seed_count, 1);
+        let limited = impact_analysis_walk_budgeted(&db, &req, 1, None).unwrap();
+        assert!(limited.capped);
+        assert_eq!(
+            limited
+                .entries
+                .iter()
+                .filter(|entry| entry.distance == 1)
+                .count(),
+            2
+        );
+        let mut budget = WalkBudget::new(1, None);
+        let limited =
+            impact_analysis_walk_budgeted(&db, &req, MAX_FRONTIER, Some(&mut budget)).unwrap();
+        assert!(limited.capped);
+        assert!(limited.entries.is_empty());
     }
 
     #[test]

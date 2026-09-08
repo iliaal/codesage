@@ -1,0 +1,97 @@
+# Qualified-name retrieval experiment
+
+Default-on adoption was rejected. The required mean top-10 hit improvement was
+at least 2 percentage points, with a strictly positive lower confidence bound.
+The frozen validation result was 0 percentage points, with a lower bound of 0.
+Both arms found 129 of 130 targets. Better first-hit ranks on six queries and
+worse ranks on two do not satisfy that acceptance gate.
+
+The default search path preserves the baseline query builder, hybrid gate,
+and retrieval without the new fallback. Set `CODESAGE_QUALIFIED_GROUPS=1` only
+to opt into the experiment: qualified `::`, backslash, and dotted names become
+conjunctions, with selective fallback when no grouped lexical matches exist.
+Unset the variable to restore the default. Other values do not enable it.
+
+| Validation group | Queries | Hits before / after | Discounted first hit before / after |
+| --- | ---: | ---: | ---: |
+| Laravel qualified classes | 30 | 30 / 30 | 0.9877 / 0.9754 |
+| Serde scoped methods | 30 | 30 / 30 | 0.9260 / 0.9631 |
+| Serde dotted methods | 30 | 30 / 30 | 0.9587 / 0.9631 |
+| Published fmtlib controls | 20 | 20 / 20 | 0.8074 / 0.8090 |
+| Published abseil-cpp controls | 20 | 19 / 19 | 0.7937 / 0.8021 |
+
+The two regressions were `Illuminate\Types\Model\Post` (rank 1 to 2) and
+`fmt::arg named arguments for use in format strings` (rank 3 to 6).
+Discounted first hit is `1 / log2(rank + 1)`, or zero beyond rank 10.
+Rank counts returned chunks. Multiple expected files are acceptable alternatives;
+this metric is not multi-relevance NDCG.
+
+## Inputs and scope
+
+`cases.json` freezes 60 Laravel class/interface/trait names and 60 Serde method
+names from existing indexes. Generic arguments are stripped from Rust names.
+Names with non-identifier components and paths under `tests/` are excluded.
+The first 60 names in SHA256 order are selected per repository; even positions
+are development and odd positions are validation. Queries rotate between a
+bare name, a backticked implementation query, and a `how … works` query.
+Dotted equivalents of the Rust queries retain the same split.
+
+Two Laravel validation cases refer to the framework's `types/` test declarations,
+including the rank regression above. They remain in the frozen sample and do
+not establish application-code benefit. The synthetic query wording asks for
+existing symbols; it does not model natural-language issue reports.
+
+The 40 C++ controls are all published fmtlib and abseil-cpp annotations from
+Semble, using their primary relevant files. These controls check the historical
+namespace regression. No annotation or expected path was changed after measuring.
+The PHP/Rust split is within repositories, so it does not test generalization
+to previously unseen repositories. The dotted/scoped pairs are correlated.
+
+Both arms compile their complete production `search.rs`: baseline `136dba6`
+and the candidate working file. They share the same CUDA embedding for each
+query, the same Jina model, the same MiniLM reranker, and the same disposable
+SQLite backups. All search stages run, including the hybrid gate and fallback.
+Source indexes remain unchanged. The experiment deliberately reuses existing
+vectors to isolate search behavior; it does not validate reindexing or the CLI's
+semantic-fingerprint freshness checks.
+
+The first development experiment tried conjunctions without fallback. Its
+lexical Serde hit rate fell from 29/30 to 22/30 because older chunks lacked the
+qualified owner context. The retained fallback runs only when the complete
+grouped lexical query has no hits. One invariant correction followed: lowercase
+dotted terms must remain eligible for the legacy fallback. That correction came
+from source inspection before reading validation results. The initial validation
+capture is retained locally as superseded and unread; the corrected snapshot was
+frozen before the reported validation run. No ranking adjustment followed those
+results. After review rejected default adoption, the frozen experimental path
+was retained behind the explicit default-off flag. The original default query
+builder and gate were restored, and the new fallback is disabled by default.
+No acceptance threshold, query, or ranking weight was changed to obtain approval.
+
+`results.json` records source hashes, repository revisions, aggregate scores,
+and every first-hit rank. The packaged runner reproduced the original A/B ranks.
+After adding the opt-in guard, all 90 development default pages matched the
+baseline file paths in rank order, and all 90 experimental pages matched the
+frozen candidate. These checks validated the guard without retuning the holdout.
+
+## Reproduce
+
+Build CUDA release dependencies, then opt into the experiment explicitly in the
+benchmark with your indexed clones:
+
+```bash
+cargo build --release -p codesage --features cuda
+python3 bench/qualified_name_eval.py --baseline 136dba6 \
+  --cases bench/qualified-name/cases.json --split holdout --pipeline --experimental \
+  --project laravel-framework=/path/to/laravel-framework \
+  --project serde=/path/to/serde \
+  --project fmtlib=/path/to/fmtlib \
+  --project abseil-cpp=/path/to/abseil-cpp
+```
+
+Use indexes built with `jinaai/jina-embeddings-v2-base-code`, mean pooling,
+CUDA, and the configured `cross-encoder/ms-marco-MiniLM-L6-v2` reranker.
+Use `--split development` for the 90 development queries. Omit `--pipeline`
+to measure only lexical candidates. Lexical results do not measure the hybrid
+gate, fusion, boosts, or reranking. Omit `--experimental` to compare the restored
+default against the baseline; the runner clears any inherited opt-in variable.

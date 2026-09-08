@@ -29,7 +29,9 @@ use crate::schema::{
 pub use codesage_protocol::DEFAULT_EMBEDDING_DIM;
 
 mod features;
+mod git_authors;
 mod git_hist;
+mod hash_cache;
 mod semantic;
 mod structural;
 

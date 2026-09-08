@@ -205,6 +205,8 @@ Omit `--verdicts` when verification is disabled. The helper writes `$PROJECT/.co
 
 ## 8. Complete the run record
 
+Run `"$REVIEW_STATE" sweep-acks --project "$PROJECT"` after merging. Include its diagnostics for all feature documents, including retired feature IDs. This read-only sweep flags missing or changed source and carries forward each document's last review non-emission diagnostics. Cross-feature rename imports keep a new feature-local ID and `ack_transferred_from`; the original record stays in the source document for audit. Report ambiguous or unproven transfers; they never suppress a new finding.
+
 Build the completion record from helper outputs rather than recounting findings by hand. Include feature counts, new/recurring/unverified/refuted/evidence-rejected counts, severity/category totals, errors, and high-severity IDs. Set `status: complete` only after every successful feature has merged; otherwise set `status: partial` and list errors.
 
 Print the same summary plus exact next commands for report, triage, and revalidation.
@@ -212,6 +214,6 @@ Print the same summary plus exact next commands for report, triage, and revalida
 ## Constraints
 
 - Reviewer and verifier agents only use Read, Grep, and read-only CodeSage MCP tools.
-- User triage owns `false-positive` and `wont-fix`; later reviews suppress both.
+- User triage without numeric acknowledgement preserves legacy `false-positive` and `wont-fix` suppression. Reviewers must re-emit applicable priors with `acknowledgement` and measure their explicit metric again; never convert severity into magnitude. Merge suppresses values at or below the acknowledged value, and reopens increases, missing measurements, or changed metrics. Include `suppressed` counts and every `ack_sweep` reason in the run report, even when there are no new findings. `stale` means the acknowledgement no longer covers comparable current evidence; `foreign` means the current feature review did not emit that finding, not proof that it was fixed. Surface evidence rejection alongside the sweep.
 - Static review doesn't justify speculative performance claims. Keep `perf` opt-in.
 - All state stays under ignored `.codesage/findings/` and `.codesage/reviews/`.

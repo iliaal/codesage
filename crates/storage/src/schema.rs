@@ -531,7 +531,38 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
         "0017_git_co_changes_recurrence",
         migrate_0017_git_co_changes_recurrence,
     ),
+    ("0018_git_author_events", migrate_0018_git_author_events),
+    ("0019_file_hash_cache", migrate_0019_file_hash_cache),
 ];
+
+fn migrate_0019_file_hash_cache(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS file_hash_cache (
+        path TEXT PRIMARY KEY,
+        size INTEGER NOT NULL,
+        mtime_ns INTEGER NOT NULL,
+        ctime_ns INTEGER NOT NULL,
+        content_hash TEXT NOT NULL,
+        hashed_at_ns INTEGER NOT NULL
+    );",
+    )
+}
+
+fn migrate_0018_git_author_events(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS git_author_events (
+            file_path TEXT NOT NULL,
+            commit_sha TEXT NOT NULL,
+            author TEXT NOT NULL,
+            committed_at INTEGER NOT NULL,
+            PRIMARY KEY (file_path, commit_sha)
+        );
+        CREATE TABLE IF NOT EXISTS git_author_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            complete INTEGER NOT NULL CHECK (complete IN (0, 1))
+        );",
+    )
+}
 
 /// Co-change recurrence columns on `git_co_changes`: `first_observed_at`
 /// (oldest shared commit), `window_mask` (bit `(ts / 90d) % 64` per shared
@@ -1473,6 +1504,37 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
             .unwrap();
         assert_eq!(again, count, "second init_db must be a registry no-op");
+    }
+
+    #[test]
+    fn author_event_migration_upgrades_and_preserves_existing_events() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch(
+            "DROP TABLE git_author_events;
+             DROP TABLE git_author_state;
+             DELETE FROM schema_migrations WHERE name = '0018_git_author_events';",
+        )
+        .unwrap();
+        init_db(&conn).unwrap();
+        let state: i64 = conn
+            .query_row("SELECT COUNT(*) FROM git_author_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, 0);
+        conn.execute_batch(
+            "INSERT INTO git_author_events VALUES ('src/a.rs', 'abc', 'email:author@example.com', 123);
+             INSERT INTO git_author_state VALUES (1, 1);",
+        ).unwrap();
+        migrate_0018_git_author_events(&conn).unwrap();
+        init_db(&conn).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM git_author_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        let complete: bool = conn
+            .query_row("SELECT complete FROM git_author_state", [], |r| r.get(0))
+            .unwrap();
+        assert!(complete);
     }
 
     /// Two concurrent `init_db` opens on the same file must both succeed:

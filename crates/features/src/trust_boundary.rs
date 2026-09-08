@@ -35,7 +35,9 @@ pub fn derive_from_refs(refs: &[Reference], language: Language) -> Vec<TrustBoun
     }
     let mut acc: BTreeSet<TrustBoundary> = BTreeSet::new();
     for r in refs {
-        if !ref_kind_signals_boundary(r.kind) {
+        if !(ref_kind_signals_boundary(r.kind)
+            || language == Language::Python && r.kind == ReferenceKind::ImportBinding)
+        {
             continue;
         }
         let name = normalize_ref_name(&r.to_name, r.kind);
@@ -170,6 +172,15 @@ mod tests {
             kind: ReferenceKind::Include,
             ..imp(to)
         }
+    }
+
+    #[test]
+    fn python_import_bindings_retain_boundary_signals() {
+        let reference = Reference {
+            kind: ReferenceKind::ImportBinding,
+            ..imp("socket")
+        };
+        assert!(derive_from_refs(&[reference], Language::Python).contains(&TrustBoundary::Network));
     }
 
     #[test]

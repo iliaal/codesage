@@ -1,0 +1,1694 @@
+{
+  "baseline_commit": "136dba61c4f8634a9bb6033acfc008e555f9c601",
+  "adoption": {
+    "default_on": "rejected",
+    "required_mean_hit_improvement_pp": 2,
+    "required_lower_confidence_bound_pp": "> 0",
+    "observed_mean_hit_improvement_pp": 0,
+    "observed_lower_confidence_bound_pp": 0,
+    "experiment": "CODESAGE_QUALIFIED_GROUPS=1",
+    "default": "exact baseline query expressions and hybrid gating; no new fallback",
+    "measurements": "Frozen experimental path before adding the opt-in guard; not evidence of default-on acceptance. No holdout-driven retuning followed rejection.",
+    "post_review_verification": {
+      "development_queries": 90,
+      "default_pages_equal_baseline": 90,
+      "opt_in_pages_equal_frozen_experiment": 90,
+      "compared": "Every returned file path in rank order, not only first-hit ranks",
+      "measured_source_sha256": "0af27afc57c276cc728b3c8577799915cd5c39db654c990a5cb7cac0e11f1f4d",
+      "later_edits": "Documentation comments only"
+    }
+  },
+  "freeze": {
+    "superseded_reason": "Inspection before reading holdout results found lowercase dotted terms incorrectly removed by the legacy fallback. Added direct SQLite regression and corrected the fallback. Original result kept unread.",
+    "superseded_source_sha256": "818ec1f684f8a5dbca4eef99aabe89ce555b4e14783b0b1bb96acfa09439262b",
+    "candidate_source_sha256": "acda52e9299a5dcdacba8097ce11b30b3e18a6c5030300ca301f2ca52bc42caa"
+  },
+  "runs": {
+    "development": {
+      "scope": "production search, shared CUDA embedding per query, shared reranker, SQLite backups",
+      "metric": "First acceptable file's chunk rank, alternatives count as one target; discounted hit is 1/log2(rank+1), zero past rank10. Not multi-relevance NDCG.",
+      "baseline": "136dba6",
+      "candidate_source_sha256": "acda52e9299a5dcdacba8097ce11b30b3e18a6c5030300ca301f2ca52bc42caa",
+      "cases_sha256": "c91168871ba290182752ff3f302646217b7b9130c9a232a326c60ee52bd7b343",
+      "split": "development",
+      "metrics": {
+        "laravel-framework": {
+          "queries": 30,
+          "baseline": {
+            "hit_rate_at_10": 0.9666666666666667,
+            "discounted_first_hit_at_10": 0.9666666666666667
+          },
+          "candidate": {
+            "hit_rate_at_10": 1.0,
+            "discounted_first_hit_at_10": 1.0
+          }
+        },
+        "serde": {
+          "queries": 30,
+          "baseline": {
+            "hit_rate_at_10": 1.0,
+            "discounted_first_hit_at_10": 0.8880595236178923
+          },
+          "candidate": {
+            "hit_rate_at_10": 1.0,
+            "discounted_first_hit_at_10": 0.9138836091666734
+          }
+        },
+        "serde dotted": {
+          "queries": 30,
+          "baseline": {
+            "hit_rate_at_10": 1.0,
+            "discounted_first_hit_at_10": 0.9261859507142916
+          },
+          "candidate": {
+            "hit_rate_at_10": 1.0,
+            "discounted_first_hit_at_10": 0.9261859507142916
+          }
+        }
+      },
+      "results": [
+        {
+          "project": "laravel-framework",
+          "query": "Illuminate\\View\\Compilers\\Concerns\\CompilesIncludes",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "how Illuminate\\Translation\\PotentiallyTranslatedString works",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "find `Illuminate\\Queue\\Console\\ClearCommand` implementation",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "Illuminate\\Support\\Traits\\InteractsWithData",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "how Illuminate\\Database\\Eloquent\\Attributes\\Connection works",
+          "group": "laravel-framework",
+          "baseline_rank": null,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "find `Illuminate\\Broadcasting\\InteractsWithBroadcasting` implementation",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "Illuminate\\Contracts\\Routing\\ResponseFactory",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "how Illuminate\\View\\Compilers\\Concerns\\CompilesConditionals works",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "find `Illuminate\\Queue\\Connectors\\RedisConnector` implementation",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "Illuminate\\Foundation\\Http\\Attributes\\RedirectToRoute",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "how Illuminate\\Validation\\Rules\\ExcludeIf works",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "find `Illuminate\\Container\\Attributes\\Singleton` implementation",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "Illuminate\\Queue\\Middleware\\ThrottlesExceptionsWithRedis",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "how Illuminate\\Support\\Facades\\DB works",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "find `Illuminate\\Database\\Schema\\Grammars\\Grammar` implementation",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "Illuminate\\View\\Engines\\CompilerEngine",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "how Illuminate\\Auth\\Events\\Attempting works",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "find `Illuminate\\Cache\\LuaScripts` implementation",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "Illuminate\\Routing\\Redirector",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "how Illuminate\\Broadcasting\\EncryptedPrivateChannel works",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "find `Illuminate\\Testing\\ParallelTestingServiceProvider` implementation",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "Illuminate\\Database\\Query\\Processors\\MariaDbProcessor",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "how Illuminate\\Notifications\\HasDatabaseNotifications works",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "find `Illuminate\\Database\\Eloquent\\Casts\\Json` implementation",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "Illuminate\\Routing\\Events\\ResponsePrepared",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "how Illuminate\\Support\\Facades\\Event works",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "find `Illuminate\\Contracts\\Pipeline\\Pipeline` implementation",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "Illuminate\\Foundation\\Support\\Providers\\EventServiceProvider",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "how Illuminate\\Contracts\\Concurrency\\Driver works",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "find `Illuminate\\Cache\\RateLimiting\\Limit` implementation",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "ArcWeak::deserialize",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how Wrapping::deserialize works",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `FlatMapDeserializer::deserialize_other` implementation",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "ContentSerializer::serialize_i32",
+          "group": "serde",
+          "baseline_rank": 2,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how ContentDeserializer::deserialize_f64 works",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `OptionVisitor::visit_some` implementation",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "ContentDeserializer::deserialize_tuple_struct",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how TaggedSerializer::serialize_bytes works",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `SystemTime::serialize` implementation",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "Result::serialize",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how SerializeStructVariant::serialize_field works",
+          "group": "serde",
+          "baseline_rank": 2,
+          "candidate_rank": 2
+        },
+        {
+          "project": "serde",
+          "query": "find `TagOrContentVisitor::expecting` implementation",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "ContentRefDeserializer::deserialize_ignored_any",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how VecInPlaceVisitor::visit_seq works",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `StrDeserializer::into_deserializer` implementation",
+          "group": "serde",
+          "baseline_rank": 2,
+          "candidate_rank": 2
+        },
+        {
+          "project": "serde",
+          "query": "net::IpAddr::deserialize",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how Container::ser_bound works",
+          "group": "serde",
+          "baseline_rank": 2,
+          "candidate_rank": 2
+        },
+        {
+          "project": "serde",
+          "query": "find `fmt::Error::custom` implementation",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 2
+        },
+        {
+          "project": "serde",
+          "query": "StrDeserializer::deserialize_any",
+          "group": "serde",
+          "baseline_rank": 2,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how ContentSerializer::serialize_unit works",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `TagContentOtherFieldVisitor::deserialize` implementation",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "SerializeSeq::serialize_element",
+          "group": "serde",
+          "baseline_rank": 3,
+          "candidate_rank": 2
+        },
+        {
+          "project": "serde",
+          "query": "how MapDeserializer::next_entry_seed works",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `CowStrVisitor::visit_borrowed_str` implementation",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "TagOrContentVisitor::visit_bytes",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how ContentDeserializer::invalid_type works",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `SerializeTupleVariantAsMapValue::serialize_field` implementation",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "RangeToVisitor::visit_map",
+          "group": "serde",
+          "baseline_rank": 2,
+          "candidate_rank": 2
+        },
+        {
+          "project": "serde",
+          "query": "how FlatMapDeserializer::deserialize_struct works",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `String::deserialize` implementation",
+          "group": "serde",
+          "baseline_rank": 6,
+          "candidate_rank": 2
+        },
+        {
+          "project": "serde",
+          "query": "ArcWeak.deserialize",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how Wrapping.deserialize works",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `FlatMapDeserializer.deserialize_other` implementation",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "ContentSerializer.serialize_i32",
+          "group": "serde dotted",
+          "baseline_rank": 2,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how ContentDeserializer.deserialize_f64 works",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `OptionVisitor.visit_some` implementation",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "ContentDeserializer.deserialize_tuple_struct",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how TaggedSerializer.serialize_bytes works",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `SystemTime.serialize` implementation",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "Result.serialize",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how SerializeStructVariant.serialize_field works",
+          "group": "serde dotted",
+          "baseline_rank": 2,
+          "candidate_rank": 2
+        },
+        {
+          "project": "serde",
+          "query": "find `TagOrContentVisitor.expecting` implementation",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "ContentRefDeserializer.deserialize_ignored_any",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how VecInPlaceVisitor.visit_seq works",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `StrDeserializer.into_deserializer` implementation",
+          "group": "serde dotted",
+          "baseline_rank": 2,
+          "candidate_rank": 2
+        },
+        {
+          "project": "serde",
+          "query": "net.IpAddr.deserialize",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how Container.ser_bound works",
+          "group": "serde dotted",
+          "baseline_rank": 2,
+          "candidate_rank": 2
+        },
+        {
+          "project": "serde",
+          "query": "find `fmt.Error.custom` implementation",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 2
+        },
+        {
+          "project": "serde",
+          "query": "StrDeserializer.deserialize_any",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how ContentSerializer.serialize_unit works",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `TagContentOtherFieldVisitor.deserialize` implementation",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "SerializeSeq.serialize_element",
+          "group": "serde dotted",
+          "baseline_rank": 2,
+          "candidate_rank": 2
+        },
+        {
+          "project": "serde",
+          "query": "how MapDeserializer.next_entry_seed works",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `CowStrVisitor.visit_borrowed_str` implementation",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "TagOrContentVisitor.visit_bytes",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how ContentDeserializer.invalid_type works",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `SerializeTupleVariantAsMapValue.serialize_field` implementation",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "RangeToVisitor.visit_map",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how FlatMapDeserializer.deserialize_struct works",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `String.deserialize` implementation",
+          "group": "serde dotted",
+          "baseline_rank": 2,
+          "candidate_rank": 2
+        }
+      ]
+    },
+    "holdout": {
+      "scope": "production search, shared CUDA embedding per query, shared reranker, SQLite backups",
+      "metric": "First acceptable file's chunk rank, alternatives count as one target; discounted hit is 1/log2(rank+1), zero past rank10. Not multi-relevance NDCG.",
+      "baseline": "136dba6",
+      "candidate_source_sha256": "acda52e9299a5dcdacba8097ce11b30b3e18a6c5030300ca301f2ca52bc42caa",
+      "cases_sha256": "c91168871ba290182752ff3f302646217b7b9130c9a232a326c60ee52bd7b343",
+      "split": "holdout",
+      "metrics": {
+        "abseil-cpp": {
+          "queries": 20,
+          "baseline": {
+            "hit_rate_at_10": 0.95,
+            "discounted_first_hit_at_10": 0.7937417454212582
+          },
+          "candidate": {
+            "hit_rate_at_10": 0.95,
+            "discounted_first_hit_at_10": 0.8020750787545914
+          }
+        },
+        "fmtlib": {
+          "queries": 20,
+          "baseline": {
+            "hit_rate_at_10": 1.0,
+            "discounted_first_hit_at_10": 0.8074356157188728
+          },
+          "candidate": {
+            "hit_rate_at_10": 1.0,
+            "discounted_first_hit_at_10": 0.8089836502947895
+          }
+        },
+        "laravel-framework": {
+          "queries": 30,
+          "baseline": {
+            "hit_rate_at_10": 1.0,
+            "discounted_first_hit_at_10": 0.9876976584523819
+          },
+          "candidate": {
+            "hit_rate_at_10": 1.0,
+            "discounted_first_hit_at_10": 0.9753953169047639
+          }
+        },
+        "serde": {
+          "queries": 30,
+          "baseline": {
+            "hit_rate_at_10": 1.0,
+            "discounted_first_hit_at_10": 0.9259880689316304
+          },
+          "candidate": {
+            "hit_rate_at_10": 1.0,
+            "discounted_first_hit_at_10": 0.9630929753571458
+          }
+        },
+        "serde dotted": {
+          "queries": 30,
+          "baseline": {
+            "hit_rate_at_10": 1.0,
+            "discounted_first_hit_at_10": 0.9587286502380972
+          },
+          "candidate": {
+            "hit_rate_at_10": 1.0,
+            "discounted_first_hit_at_10": 0.9630929753571458
+          }
+        }
+      },
+      "results": [
+        {
+          "project": "laravel-framework",
+          "query": "find `Illuminate\\Routing\\Middleware\\ValidateSignature` implementation",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "Illuminate\\Auth\\Recaller",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "how Illuminate\\Foundation\\Console\\TestMakeCommand works",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "find `Illuminate\\Contracts\\Auth\\Access\\Authorizable` implementation",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "Illuminate\\View\\DynamicComponent",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "how Illuminate\\Support\\Traits\\TransformsToResourceCollection works",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "find `Illuminate\\Types\\Model\\Post` implementation",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 2
+        },
+        {
+          "project": "laravel-framework",
+          "query": "Illuminate\\Foundation\\Console\\ExceptionMakeCommand",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "how Illuminate\\Testing\\Concerns\\TestViews works",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "find `Illuminate\\Support\\Facades\\Redirect` implementation",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "Illuminate\\Contracts\\Auth\\PasswordBroker",
+          "group": "laravel-framework",
+          "baseline_rank": 2,
+          "candidate_rank": 2
+        },
+        {
+          "project": "laravel-framework",
+          "query": "how Illuminate\\Process\\Exceptions\\ProcessTimedOutException works",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "find `Illuminate\\Routing\\Console\\MiddlewareMakeCommand` implementation",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "Illuminate\\Encryption\\Encrypter",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "how Illuminate\\Database\\Migrations\\DatabaseMigrationRepository works",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "find `Illuminate\\Types\\Foundation\\Testing\\InteractsWithTimeTestCase` implementation",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "Illuminate\\Contracts\\Process\\InvokedProcess",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "how Illuminate\\Foundation\\Application works",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "find `Illuminate\\Events\\Dispatcher` implementation",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "Illuminate\\Console\\View\\Components\\Factory",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "how Illuminate\\Support\\Facades\\Crypt works",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "find `Illuminate\\Support\\Facades\\MaintenanceMode` implementation",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "Illuminate\\Support\\DateFactory",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "how Illuminate\\Container\\ContextualBindingBuilder works",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "find `Illuminate\\Http\\Concerns\\InteractsWithContentTypes` implementation",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "Illuminate\\Foundation\\Testing\\DatabaseMigrations",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "how Illuminate\\Support\\Defer\\DeferredCallback works",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "find `Illuminate\\Foundation\\Console\\CastMakeCommand` implementation",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "Illuminate\\Process\\ProcessPoolResults",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "laravel-framework",
+          "query": "how Illuminate\\Foundation\\Testing\\Concerns\\InteractsWithAuthentication works",
+          "group": "laravel-framework",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `ReplaceReceiver::visit_type_param_bound_mut` implementation",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "MapAccessDeserializer::into_deserializer",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how MapRefDeserializer::size_hint works",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `BoolAttr::none` implementation",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "ContentRefDeserializer::deserialize_i8",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how ContentDeserializer::deserialize_bytes works",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `BorrowedBytesDeserializer::deserialize_any` implementation",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "SerializeTupleStruct::serialize_field",
+          "group": "serde",
+          "baseline_rank": 2,
+          "candidate_rank": 2
+        },
+        {
+          "project": "serde",
+          "query": "how Cow::into_deserializer works",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `u64::from` implementation",
+          "group": "serde",
+          "baseline_rank": 5,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "FlatMapSerializeMap::end",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how Impossible::serialize_field works",
+          "group": "serde",
+          "baseline_rank": 3,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `FlatMapDeserializer::deserialize_newtype_struct` implementation",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "RangeVisitor::expecting",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how TaggedContentVisitor::new works",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `DeTypeGenerics::in_place` implementation",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "CharVisitor::expecting",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how ContentVisitor::visit_unit works",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `ReplaceReceiver::visit_type_mut_impl` implementation",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "net::SocketAddr::serialize",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how PhantomDataVisitor::visit_unit works",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `PairRefVisitor::size_hint` implementation",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "TagOrContentVisitor::visit_seq",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how UntaggedUnitVisitor::visit_unit works",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `ContentDeserializer::deserialize_byte_buf` implementation",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "AdjacentlyTaggedEnumVariantSeed::deserialize",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how BorrowedBytesDeserializer::fmt works",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `TagOrContentVisitor::visit_borrowed_bytes` implementation",
+          "group": "serde",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "TagOrContentVisitor::visit_str",
+          "group": "serde",
+          "baseline_rank": 2,
+          "candidate_rank": 2
+        },
+        {
+          "project": "serde",
+          "query": "how SerializeMap::serialize_value works",
+          "group": "serde",
+          "baseline_rank": 2,
+          "candidate_rank": 2
+        },
+        {
+          "project": "serde",
+          "query": "find `ReplaceReceiver.visit_type_param_bound_mut` implementation",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "MapAccessDeserializer.into_deserializer",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how MapRefDeserializer.size_hint works",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `BoolAttr.none` implementation",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "ContentRefDeserializer.deserialize_i8",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how ContentDeserializer.deserialize_bytes works",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `BorrowedBytesDeserializer.deserialize_any` implementation",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "SerializeTupleStruct.serialize_field",
+          "group": "serde dotted",
+          "baseline_rank": 2,
+          "candidate_rank": 2
+        },
+        {
+          "project": "serde",
+          "query": "how Cow.into_deserializer works",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `u64.from` implementation",
+          "group": "serde dotted",
+          "baseline_rank": 2,
+          "candidate_rank": 2
+        },
+        {
+          "project": "serde",
+          "query": "FlatMapSerializeMap.end",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how Impossible.serialize_field works",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `FlatMapDeserializer.deserialize_newtype_struct` implementation",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "RangeVisitor.expecting",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how TaggedContentVisitor.new works",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `DeTypeGenerics.in_place` implementation",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "CharVisitor.expecting",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how ContentVisitor.visit_unit works",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `ReplaceReceiver.visit_type_mut_impl` implementation",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "net.SocketAddr.serialize",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how PhantomDataVisitor.visit_unit works",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `PairRefVisitor.size_hint` implementation",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "TagOrContentVisitor.visit_seq",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how UntaggedUnitVisitor.visit_unit works",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `ContentDeserializer.deserialize_byte_buf` implementation",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "AdjacentlyTaggedEnumVariantSeed.deserialize",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how BorrowedBytesDeserializer.fmt works",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "find `TagOrContentVisitor.visit_borrowed_bytes` implementation",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "TagOrContentVisitor.visit_str",
+          "group": "serde dotted",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "serde",
+          "query": "how SerializeMap.serialize_value works",
+          "group": "serde dotted",
+          "baseline_rank": 3,
+          "candidate_rank": 2
+        },
+        {
+          "project": "fmtlib",
+          "query": "how fmt::format and fmt::print format strings at runtime",
+          "group": "fmtlib",
+          "baseline_rank": 5,
+          "candidate_rank": 4
+        },
+        {
+          "project": "fmtlib",
+          "query": "basic_format_args and format_arg argument storage and type erasure",
+          "group": "fmtlib",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "fmtlib",
+          "query": "formatter specialization for custom type formatting",
+          "group": "fmtlib",
+          "baseline_rank": 3,
+          "candidate_rank": 3
+        },
+        {
+          "project": "fmtlib",
+          "query": "compile-time format string checking and FMT_COMPILE macro",
+          "group": "fmtlib",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "fmtlib",
+          "query": "color and text style formatting for terminal output",
+          "group": "fmtlib",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "fmtlib",
+          "query": "formatting ranges containers and tuples",
+          "group": "fmtlib",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "fmtlib",
+          "query": "chrono duration and time point formatting",
+          "group": "fmtlib",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "fmtlib",
+          "query": "ostream integration for writing to std::ostream",
+          "group": "fmtlib",
+          "baseline_rank": 3,
+          "candidate_rank": 2
+        },
+        {
+          "project": "fmtlib",
+          "query": "printf-compatible formatting with fmt::printf and fmt::sprintf",
+          "group": "fmtlib",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "fmtlib",
+          "query": "format_to and back_insert_iterator output adapters",
+          "group": "fmtlib",
+          "baseline_rank": 3,
+          "candidate_rank": 3
+        },
+        {
+          "project": "fmtlib",
+          "query": "memory buffer and basic_memory_buffer for efficient allocation",
+          "group": "fmtlib",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "fmtlib",
+          "query": "dynamic_format_arg_store for building argument lists at runtime",
+          "group": "fmtlib",
+          "baseline_rank": 2,
+          "candidate_rank": 2
+        },
+        {
+          "project": "fmtlib",
+          "query": "std::filesystem path formatting support",
+          "group": "fmtlib",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "fmtlib",
+          "query": "format_error and error handling for invalid format strings",
+          "group": "fmtlib",
+          "baseline_rank": 2,
+          "candidate_rank": 2
+        },
+        {
+          "project": "fmtlib",
+          "query": "width precision fill and alignment format specifiers",
+          "group": "fmtlib",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "fmtlib",
+          "query": "fmt::arg named arguments for use in format strings",
+          "group": "fmtlib",
+          "baseline_rank": 3,
+          "candidate_rank": 6
+        },
+        {
+          "project": "fmtlib",
+          "query": "how fmt handles integer floating point and string formatting",
+          "group": "fmtlib",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "fmtlib",
+          "query": "formatter",
+          "group": "fmtlib",
+          "baseline_rank": 3,
+          "candidate_rank": 3
+        },
+        {
+          "project": "fmtlib",
+          "query": "basic_format_args",
+          "group": "fmtlib",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "fmtlib",
+          "query": "basic_memory_buffer",
+          "group": "fmtlib",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "abseil-cpp",
+          "query": "absl::flat_hash_map and flat_hash_set hash table containers",
+          "group": "abseil-cpp",
+          "baseline_rank": 2,
+          "candidate_rank": 2
+        },
+        {
+          "project": "abseil-cpp",
+          "query": "raw_hash_set open addressing SIMD group-based slot probing implementation",
+          "group": "abseil-cpp",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "abseil-cpp",
+          "query": "absl::string_view for non-owning string references",
+          "group": "abseil-cpp",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "abseil-cpp",
+          "query": "absl::StrCat and StrAppend for efficient string concatenation",
+          "group": "abseil-cpp",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "abseil-cpp",
+          "query": "absl::StrSplit and StrJoin for string splitting and joining",
+          "group": "abseil-cpp",
+          "baseline_rank": 2,
+          "candidate_rank": 2
+        },
+        {
+          "project": "abseil-cpp",
+          "query": "absl::Status and StatusOr for error propagation",
+          "group": "abseil-cpp",
+          "baseline_rank": null,
+          "candidate_rank": null
+        },
+        {
+          "project": "abseil-cpp",
+          "query": "absl::Time and absl::Duration for time representation",
+          "group": "abseil-cpp",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "abseil-cpp",
+          "query": "absl::optional and absl::variant for vocabulary types",
+          "group": "abseil-cpp",
+          "baseline_rank": 7,
+          "candidate_rank": 3
+        },
+        {
+          "project": "abseil-cpp",
+          "query": "absl::Mutex and MutexLock for synchronization",
+          "group": "abseil-cpp",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "abseil-cpp",
+          "query": "absl logging macros ABSL_LOG and ABSL_CHECK",
+          "group": "abseil-cpp",
+          "baseline_rank": 5,
+          "candidate_rank": 5
+        },
+        {
+          "project": "abseil-cpp",
+          "query": "absl::Span for non-owning sequence view",
+          "group": "abseil-cpp",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "abseil-cpp",
+          "query": "absl::node_hash_map for pointer-stable hash map",
+          "group": "abseil-cpp",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "abseil-cpp",
+          "query": "absl::Hash and the Abseil hashing framework",
+          "group": "abseil-cpp",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "abseil-cpp",
+          "query": "absl::Notification for one-time event signaling between threads",
+          "group": "abseil-cpp",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "abseil-cpp",
+          "query": "absl::AnyInvocable for move-only callable wrapper",
+          "group": "abseil-cpp",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "abseil-cpp",
+          "query": "absl::btree_map and btree_set sorted containers",
+          "group": "abseil-cpp",
+          "baseline_rank": 2,
+          "candidate_rank": 2
+        },
+        {
+          "project": "abseil-cpp",
+          "query": "absl::StrFormat and string formatting API",
+          "group": "abseil-cpp",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "abseil-cpp",
+          "query": "flat_hash_map",
+          "group": "abseil-cpp",
+          "baseline_rank": 1,
+          "candidate_rank": 1
+        },
+        {
+          "project": "abseil-cpp",
+          "query": "Status",
+          "group": "abseil-cpp",
+          "baseline_rank": 2,
+          "candidate_rank": 2
+        },
+        {
+          "project": "abseil-cpp",
+          "query": "Mutex",
+          "group": "abseil-cpp",
+          "baseline_rank": 2,
+          "candidate_rank": 2
+        }
+      ]
+    }
+  },
+  "repositories": {
+    "laravel-framework": {
+      "head": "c1bc8e758a63ab3e404ead77f7fd85ca1dbd3c01"
+    },
+    "serde": {
+      "head": "fa7da4a93567ed347ad0735c28e439fca688ef26"
+    },
+    "fmtlib": {
+      "head": "382609a920d2c43c00f2951233bc0d578a783982"
+    },
+    "abseil-cpp": {
+      "head": "b9536c952c6f6bbcb37a5edb4fa88ee62d27cd7e"
+    }
+  }
+}

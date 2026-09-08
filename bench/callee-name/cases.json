@@ -1,0 +1,1536 @@
+[
+  {
+    "project": "serde",
+    "query": "code that calls `is_primitive_type`",
+    "expected": [
+      "serde_derive/src/internals/attr.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `serialize_unit_struct`",
+    "expected": [
+      "serde_derive/src/ser.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `parse_lit_into_ty`",
+    "expected": [
+      "serde_derive/src/internals/attr.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `diagnose_conflict`",
+    "expected": [
+      "serde_derive/src/internals/check.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `serialize_tuple_struct_visitor`",
+    "expected": [
+      "serde_derive/src/ser.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `wrap_deserialize_variant_with`",
+    "expected": [
+      "serde_derive/src/de/enum_externally.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `fmt_primitives`",
+    "expected": [
+      "serde_core/src/ser/fmt.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `forwarded_impl`",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `impl_deserialize_num`",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `respan_token`",
+    "expected": [
+      "serde_derive/src/internals/respan.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `type_of_item`",
+    "expected": [
+      "serde_derive/src/bound.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `deserialize_try_from`",
+    "expected": [
+      "serde_derive/src/de.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `expr_is_missing_seq`",
+    "expected": [
+      "serde_derive/src/de.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `visit_content_seq_ref`",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `serialize_struct_variant_with_flatten`",
+    "expected": [
+      "serde_derive/src/ser.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `deserialize_in_place_body`",
+    "expected": [
+      "serde_derive/src/de.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `InPlaceSeed`",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `deserialize_newtype_struct`",
+    "expected": [
+      "serde_derive/src/de/tuple.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `DeTypeGenerics`",
+    "expected": [
+      "serde_derive/src/de.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `is_reference`",
+    "expected": [
+      "serde_derive/src/internals/attr.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `parse_lit_into_lifetimes`",
+    "expected": [
+      "serde_derive/src/internals/attr.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `serialize_tuple_struct`",
+    "expected": [
+      "serde_derive/src/ser.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `deserialize_field_identifier`",
+    "expected": [
+      "serde_derive/src/de/struct_.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `serialize_struct_as_struct`",
+    "expected": [
+      "serde_derive/src/ser.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `get_multiple_renames`",
+    "expected": [
+      "serde_derive/src/internals/attr.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `FlatMapSerializeStruct`",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `check_internal_tag_field_name_conflict`",
+    "expected": [
+      "serde_derive/src/internals/check.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `enum_from_ast`",
+    "expected": [
+      "serde_derive/src/internals/ast.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `serialize_untagged_variant`",
+    "expected": [
+      "serde_derive/src/ser.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `variant_identifier`",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `content_clone`",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `InPlaceTypeGenerics`",
+    "expected": [
+      "serde_derive/src/de.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `deserialize_newtype_variant`",
+    "expected": [
+      "serde_derive/src/de/enum_untagged.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `InPlaceImplGenerics`",
+    "expected": [
+      "serde_derive/src/de.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `serialize_variant`",
+    "expected": [
+      "serde_derive/src/ser.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `pretend_variants_used`",
+    "expected": [
+      "serde_derive/src/pretend.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `get_member`",
+    "expected": [
+      "serde_derive/src/ser.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `decide_identifier`",
+    "expected": [
+      "serde_derive/src/internals/attr.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `is_option`",
+    "expected": [
+      "serde_derive/src/internals/attr.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "serde",
+    "query": "code that calls `check_transparent`",
+    "expected": [
+      "serde_derive/src/internals/check.rs"
+    ],
+    "group": "serde-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `isEmptyString`",
+    "expected": [
+      "src/Illuminate/Support/Traits/InteractsWithData.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `filterFiles`",
+    "expected": [
+      "src/Illuminate/Http/Request.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `pushToDatabase`",
+    "expected": [
+      "src/Illuminate/Queue/DatabaseQueue.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `dropAllTypes`",
+    "expected": [
+      "src/Illuminate/Database/Console/WipeCommand.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `checkForSpecificEnvironmentFile`",
+    "expected": [
+      "src/Illuminate/Foundation/Bootstrap/LoadEnvironmentVariables.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `sendOutputTo`",
+    "expected": [
+      "src/Illuminate/Console/Scheduling/Event.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `replaceInputPlaceholder`",
+    "expected": [
+      "src/Illuminate/Validation/Concerns/FormatsMessages.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `groupWhereSliceForScope`",
+    "expected": [
+      "src/Illuminate/Database/Eloquent/Builder.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `formatAssertionRecipient`",
+    "expected": [
+      "src/Illuminate/Mail/Mailable.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `withoutForeignKeyConstraints`",
+    "expected": [
+      "src/Illuminate/Foundation/Testing/DatabaseTruncation.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `compileHavingNull`",
+    "expected": [
+      "src/Illuminate/Database/Query/Grammars/Grammar.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `hasOldInput`",
+    "expected": [
+      "src/Illuminate/Testing/TestResponse.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `extractAuthParameters`",
+    "expected": [
+      "src/Illuminate/Broadcasting/Broadcasters/Broadcaster.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `broadcastType`",
+    "expected": [
+      "src/Illuminate/Notifications/Events/BroadcastNotificationCreated.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `shouldntReport`",
+    "expected": [
+      "src/Illuminate/Foundation/Exceptions/Handler.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `UrlWindow`",
+    "expected": [
+      "src/Illuminate/Pagination/LengthAwarePaginator.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `publishTag`",
+    "expected": [
+      "src/Illuminate/Foundation/Console/VendorPublishCommand.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `createMemcachedInstance`",
+    "expected": [
+      "src/Illuminate/Cache/MemcachedConnector.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `findComposerFile`",
+    "expected": [
+      "src/Illuminate/Support/Composer.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `parseFailedJob`",
+    "expected": [
+      "src/Illuminate/Queue/Console/ListFailedCommand.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `isDecimalCast`",
+    "expected": [
+      "src/Illuminate/Database/Eloquent/Concerns/HasAttributes.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `addToParent`",
+    "expected": [
+      "src/Illuminate/Console/Application.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `currentTags`",
+    "expected": [
+      "src/Illuminate/Cache/RedisStore.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `extractParameters`",
+    "expected": [
+      "src/Illuminate/Broadcasting/Broadcasters/Broadcaster.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `parseControllerCallback`",
+    "expected": [
+      "src/Illuminate/Routing/Route.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `createTokenRepository`",
+    "expected": [
+      "src/Illuminate/Auth/Passwords/PasswordBrokerManager.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `loadRoutesUsing`",
+    "expected": [
+      "src/Illuminate/Foundation/Configuration/ApplicationBuilder.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `getClassAttribute`",
+    "expected": [
+      "src/Illuminate/Queue/SerializesModels.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `addMonths`",
+    "expected": [
+      "src/Illuminate/Foundation/Testing/Wormhole.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `getNextJob`",
+    "expected": [
+      "src/Illuminate/Queue/Worker.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `hasOneThrough`",
+    "expected": [
+      "src/Illuminate/Database/Eloquent/PendingHasThroughRelationship.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `ensureParameterIsPrimitive`",
+    "expected": [
+      "src/Illuminate/Pagination/AbstractCursorPaginator.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `raiseBeforeJobPopEvent`",
+    "expected": [
+      "src/Illuminate/Queue/Worker.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `lockScript`",
+    "expected": [
+      "src/Illuminate/Redis/Limiters/ConcurrencyLimiter.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `createSingleConnection`",
+    "expected": [
+      "src/Illuminate/Database/Connectors/ConnectionFactory.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `resetChainPropertiesToDefaults`",
+    "expected": [
+      "src/Illuminate/Support/Testing/Fakes/BusFake.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `queuedMailablesOf`",
+    "expected": [
+      "src/Illuminate/Support/Testing/Fakes/MailFake.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `wrapJsonPathSegment`",
+    "expected": [
+      "src/Illuminate/Database/Concerns/CompilesJsonPaths.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `registerFailedJobServices`",
+    "expected": [
+      "src/Illuminate/Queue/QueueServiceProvider.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "code that calls `RouteServiceProvider`",
+    "expected": [
+      "src/Illuminate/Foundation/Testing/WithCachedRoutes.php"
+    ],
+    "group": "laravel-framework-caller",
+    "origin": "synthetic unique indexed caller probe"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\View\\Compilers\\Concerns\\CompilesIncludes",
+    "expected": [
+      "src/Illuminate/View/Compilers/Concerns/CompilesIncludes.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Translation\\PotentiallyTranslatedString works",
+    "expected": [
+      "src/Illuminate/Translation/PotentiallyTranslatedString.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Queue\\Console\\ClearCommand` implementation",
+    "expected": [
+      "src/Illuminate/Queue/Console/ClearCommand.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Support\\Traits\\InteractsWithData",
+    "expected": [
+      "src/Illuminate/Support/Traits/InteractsWithData.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Database\\Eloquent\\Attributes\\Connection works",
+    "expected": [
+      "src/Illuminate/Database/Eloquent/Attributes/Connection.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Broadcasting\\InteractsWithBroadcasting` implementation",
+    "expected": [
+      "src/Illuminate/Broadcasting/InteractsWithBroadcasting.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Contracts\\Routing\\ResponseFactory",
+    "expected": [
+      "src/Illuminate/Contracts/Routing/ResponseFactory.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\View\\Compilers\\Concerns\\CompilesConditionals works",
+    "expected": [
+      "src/Illuminate/View/Compilers/Concerns/CompilesConditionals.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Queue\\Connectors\\RedisConnector` implementation",
+    "expected": [
+      "src/Illuminate/Queue/Connectors/RedisConnector.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Foundation\\Http\\Attributes\\RedirectToRoute",
+    "expected": [
+      "src/Illuminate/Foundation/Http/Attributes/RedirectToRoute.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Validation\\Rules\\ExcludeIf works",
+    "expected": [
+      "src/Illuminate/Validation/Rules/ExcludeIf.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Container\\Attributes\\Singleton` implementation",
+    "expected": [
+      "src/Illuminate/Container/Attributes/Singleton.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Queue\\Middleware\\ThrottlesExceptionsWithRedis",
+    "expected": [
+      "src/Illuminate/Queue/Middleware/ThrottlesExceptionsWithRedis.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Support\\Facades\\DB works",
+    "expected": [
+      "src/Illuminate/Support/Facades/DB.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Database\\Schema\\Grammars\\Grammar` implementation",
+    "expected": [
+      "src/Illuminate/Database/Schema/Grammars/Grammar.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\View\\Engines\\CompilerEngine",
+    "expected": [
+      "src/Illuminate/View/Engines/CompilerEngine.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Auth\\Events\\Attempting works",
+    "expected": [
+      "src/Illuminate/Auth/Events/Attempting.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Cache\\LuaScripts` implementation",
+    "expected": [
+      "src/Illuminate/Cache/LuaScripts.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Routing\\Redirector",
+    "expected": [
+      "src/Illuminate/Routing/Redirector.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Broadcasting\\EncryptedPrivateChannel works",
+    "expected": [
+      "src/Illuminate/Broadcasting/EncryptedPrivateChannel.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Testing\\ParallelTestingServiceProvider` implementation",
+    "expected": [
+      "src/Illuminate/Testing/ParallelTestingServiceProvider.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Database\\Query\\Processors\\MariaDbProcessor",
+    "expected": [
+      "src/Illuminate/Database/Query/Processors/MariaDbProcessor.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Notifications\\HasDatabaseNotifications works",
+    "expected": [
+      "src/Illuminate/Notifications/HasDatabaseNotifications.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Database\\Eloquent\\Casts\\Json` implementation",
+    "expected": [
+      "src/Illuminate/Database/Eloquent/Casts/Json.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Routing\\Events\\ResponsePrepared",
+    "expected": [
+      "src/Illuminate/Routing/Events/ResponsePrepared.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Support\\Facades\\Event works",
+    "expected": [
+      "src/Illuminate/Support/Facades/Event.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Contracts\\Pipeline\\Pipeline` implementation",
+    "expected": [
+      "src/Illuminate/Contracts/Pipeline/Pipeline.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Foundation\\Support\\Providers\\EventServiceProvider",
+    "expected": [
+      "src/Illuminate/Foundation/Support/Providers/EventServiceProvider.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Contracts\\Concurrency\\Driver works",
+    "expected": [
+      "src/Illuminate/Contracts/Concurrency/Driver.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Cache\\RateLimiting\\Limit` implementation",
+    "expected": [
+      "src/Illuminate/Cache/RateLimiting/Limit.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework-control"
+  },
+  {
+    "project": "serde",
+    "query": "ArcWeak::deserialize",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "how Wrapping::deserialize works",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "find `FlatMapDeserializer::deserialize_other` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "ContentSerializer::serialize_i32",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "how ContentDeserializer::deserialize_f64 works",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "find `OptionVisitor::visit_some` implementation",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "ContentDeserializer::deserialize_tuple_struct",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "how TaggedSerializer::serialize_bytes works",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "find `SystemTime::serialize` implementation",
+    "expected": [
+      "serde_core/src/ser/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "Result::serialize",
+    "expected": [
+      "serde_core/src/ser/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "how SerializeStructVariant::serialize_field works",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "find `TagOrContentVisitor::expecting` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "ContentRefDeserializer::deserialize_ignored_any",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "how VecInPlaceVisitor::visit_seq works",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "find `StrDeserializer::into_deserializer` implementation",
+    "expected": [
+      "serde_core/src/de/value.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "net::IpAddr::deserialize",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "how Container::ser_bound works",
+    "expected": [
+      "serde_derive/src/internals/attr.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "find `fmt::Error::custom` implementation",
+    "expected": [
+      "serde_core/src/ser/fmt.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "StrDeserializer::deserialize_any",
+    "expected": [
+      "serde/src/private/de.rs",
+      "serde_core/src/de/value.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "how ContentSerializer::serialize_unit works",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "find `TagContentOtherFieldVisitor::deserialize` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "SerializeSeq::serialize_element",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "how MapDeserializer::next_entry_seed works",
+    "expected": [
+      "serde/src/private/de.rs",
+      "serde_core/src/de/value.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "find `CowStrVisitor::visit_borrowed_str` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "TagOrContentVisitor::visit_bytes",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "how ContentDeserializer::invalid_type works",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "find `SerializeTupleVariantAsMapValue::serialize_field` implementation",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "RangeToVisitor::visit_map",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "how FlatMapDeserializer::deserialize_struct works",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "find `String::deserialize` implementation",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "ArcWeak.deserialize",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "how Wrapping.deserialize works",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "find `FlatMapDeserializer.deserialize_other` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "ContentSerializer.serialize_i32",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "how ContentDeserializer.deserialize_f64 works",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "find `OptionVisitor.visit_some` implementation",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "ContentDeserializer.deserialize_tuple_struct",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "how TaggedSerializer.serialize_bytes works",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "find `SystemTime.serialize` implementation",
+    "expected": [
+      "serde_core/src/ser/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "Result.serialize",
+    "expected": [
+      "serde_core/src/ser/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "how SerializeStructVariant.serialize_field works",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "find `TagOrContentVisitor.expecting` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "ContentRefDeserializer.deserialize_ignored_any",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "how VecInPlaceVisitor.visit_seq works",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "find `StrDeserializer.into_deserializer` implementation",
+    "expected": [
+      "serde_core/src/de/value.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "net.IpAddr.deserialize",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "how Container.ser_bound works",
+    "expected": [
+      "serde_derive/src/internals/attr.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "find `fmt.Error.custom` implementation",
+    "expected": [
+      "serde_core/src/ser/fmt.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "StrDeserializer.deserialize_any",
+    "expected": [
+      "serde/src/private/de.rs",
+      "serde_core/src/de/value.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "how ContentSerializer.serialize_unit works",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "find `TagContentOtherFieldVisitor.deserialize` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "SerializeSeq.serialize_element",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "how MapDeserializer.next_entry_seed works",
+    "expected": [
+      "serde/src/private/de.rs",
+      "serde_core/src/de/value.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "find `CowStrVisitor.visit_borrowed_str` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "TagOrContentVisitor.visit_bytes",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "how ContentDeserializer.invalid_type works",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "find `SerializeTupleVariantAsMapValue.serialize_field` implementation",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "RangeToVisitor.visit_map",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "how FlatMapDeserializer.deserialize_struct works",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  },
+  {
+    "project": "serde",
+    "query": "find `String.deserialize` implementation",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde-control"
+  }
+]

@@ -1657,5 +1657,259 @@ class ProtocolContractTests(unittest.TestCase):
         self.assertIn("join records by `feature_id`", report)
 
 
+class AcknowledgementTests(unittest.TestCase):
+    def setUp(self):
+        self.state = load_review_state()
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.project = Path(self.temporary.name)
+        self.source = self.project / "old.rs"
+        self.source.write_text("let pending_items = collect_without_limit();\n")
+        self.feature = {"feature_id": "feat_123", "files": [{"path": "old.rs"}]}
+        self.candidate = {
+            "file": "old.rs", "line": 1, "severity": "medium", "category": "perf",
+            "title": "Unbounded pending work", "summary": "Pending work exceeds the limit.",
+            "evidence": ["let pending_items = collect_without_limit();"],
+            "suggested_fix": "Bound pending work.",
+            "magnitude": {"metric": "pending-items", "value": 10},
+        }
+        self.document, _ = self.review({}, [self.candidate])
+        self.finding_id = self.document["findings"][0]["finding_id"]
+        self.findings_path = self.state.default_findings_path(self.project, "feat_123")
+        self.state.atomic_write_json(self.findings_path, self.document)
+        self.state.triage(self.project, self.finding_id, "wont-fix",
+                          {"metric": "pending-items", "value": 10})
+        self.document = self.state.load_json(self.findings_path)
+
+    def review(self, existing, candidates, mode="review", targets=None):
+        validated = self.state.validate_response(
+            self.project, {"feature_id": "feat_123", "findings": candidates}, existing)
+        return self.state.merge_document(self.project, self.feature, existing, validated,
+                                         {}, "run", "2026-09-07", mode, targets)
+
+    def test_numeric_boundary_suppresses_equal_and_lower_reopens_higher(self):
+        for value in (0, 9, 10, 11):
+            with self.subTest(value=value):
+                candidate = copy.deepcopy(self.candidate)
+                candidate["magnitude"]["value"] = value
+                document, summary = self.review(self.document, [candidate])
+                finding = document["findings"][0]
+                self.assertEqual(finding["status"], "open" if value > 10 else "wont-fix")
+                self.assertEqual(summary["suppressed"], [] if value > 10 else [self.finding_id])
+                if value > 10:
+                    self.assertEqual(summary["ack_sweep"][0]["reason"], "magnitude-increased")
+                    self.assertEqual(summary["reopened"], [self.finding_id])
+
+    def test_incomparable_measurements_reopen_with_visible_reason(self):
+        for magnitude, reason in ((None, "magnitude-missing"),
+                                  ({"metric": "bytes", "value": 1}, "metric-changed")):
+            candidate = copy.deepcopy(self.candidate)
+            candidate.pop("magnitude")
+            if magnitude is not None:
+                candidate["magnitude"] = magnitude
+            document, summary = self.review(self.document, [candidate])
+            self.assertEqual(document["findings"][0]["status"], "open")
+            self.assertEqual(summary["ack_sweep"][0]["reason"], reason)
+
+    def test_unique_content_rename_survives_but_copy_or_rewrite_does_not(self):
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        renamed = self.project / "new.rs"
+        self.source.rename(renamed)
+        candidate = {**self.candidate, "file": "new.rs"}
+        document, summary = self.review(self.document, [candidate])
+        self.assertEqual(len(document["findings"]), 1)
+        self.assertEqual(document["findings"][0]["file"], "new.rs")
+        self.assertEqual(summary["suppressed"], [self.finding_id])
+        duplicate = self.project / "duplicate.rs"
+        duplicate.write_bytes(renamed.read_bytes())
+        document, summary = self.review(self.document, [candidate])
+        self.assertEqual(len(document["findings"]), 2)
+        self.assertEqual(summary["suppressed"], [])
+        self.assertEqual(document["findings"][-1]["status"], "open")
+        duplicate.unlink()
+        renamed.write_text(renamed.read_text() + "fn unrelated_rewrite() {}\n")
+        document, summary = self.review(self.document, [candidate])
+        self.assertEqual(len(document["findings"]), 2)
+        self.assertEqual(summary["suppressed"], [])
+
+    def test_foreign_ack_sweep_is_persisted_and_target_scoped(self):
+        document, summary = self.review(self.document, [])
+        self.assertEqual(summary["ack_sweep"], [{"finding_id": self.finding_id,
+                         "kind": "foreign", "reason": "not-emitted-by-current-review"}])
+        self.assertEqual(document["ack_sweep"], summary["ack_sweep"])
+        self.assertEqual(document["findings"][0]["status"], "wont-fix")
+        _, summary = self.review(self.document, [], "revalidate", [])
+        self.assertEqual(summary["ack_sweep"], [])
+
+    def test_legacy_triage_keeps_suppression_without_numeric_assumptions(self):
+        self.document["findings"][0].pop("acknowledgement")
+        candidate = copy.deepcopy(self.candidate)
+        candidate["magnitude"]["value"] = 100
+        document, summary = self.review(self.document, [candidate])
+        self.assertEqual(document["findings"][0]["status"], "wont-fix")
+        self.assertEqual(summary["reopened"], [])
+
+    def test_invalid_magnitudes_are_rejected(self):
+        for value in (True, -1, float("nan"), float("inf"), "10"):
+            candidate = copy.deepcopy(self.candidate)
+            candidate["magnitude"]["value"] = value
+            validated = self.state.validate_response(self.project,
+                {"feature_id": "feat_123", "findings": [candidate]}, {})
+            self.assertEqual(validated["findings"], [])
+            self.assertIn("finite and nonnegative", validated["evidence_rejected"][0]["reason"])
+
+    def test_triage_cli_requires_matching_measurement_and_preserves_history(self):
+        command = [str(SCRIPT), "triage", "--project", str(self.project),
+                   "--finding", self.finding_id, "--status", "false-positive"]
+        failed = subprocess.run(command + ["--magnitude", "10"], capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 1)
+        self.assertIn("supplied together", failed.stderr)
+        success = subprocess.run(command + ["--magnitude", "12", "--metric", "pending-items"],
+                                 capture_output=True, text=True)
+        self.assertEqual(success.returncode, 0, success.stderr)
+        finding = json.loads(success.stdout)["finding"]
+        self.assertEqual(finding["acknowledgement"]["value"], 12)
+        self.assertEqual(finding["history"][-1]["from_status"], "wont-fix")
+        self.source.write_text(self.source.read_text() + "fn changed() {}\n")
+        failed = subprocess.run(command + ["--magnitude", "12", "--metric", "pending-items"],
+                                capture_output=True, text=True)
+        self.assertEqual(failed.returncode, 1)
+        self.assertIn("source changed since review", failed.stderr)
+
+    def test_slim_priors_keep_ack_measurement_for_reviewer(self):
+        slim = self.state.slim_priors(self.document)
+        self.assertEqual(slim[0]["magnitude"], self.candidate["magnitude"])
+        self.assertEqual(slim[0]["acknowledgement"]["value"], 10)
+
+    def test_entrypoint_renames_transfer_between_feature_documents(self):
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        old_id = self.finding_id
+        for number in (1, 2):
+            new_name = f"new{number}.rs"
+            self.source.rename(self.project / new_name)
+            self.source = self.project / new_name
+            feature = {"feature_id": f"feat_new{number}", "files": [{"path": new_name}]}
+            response = {"feature_id": feature["feature_id"],
+                        "findings": [{**self.candidate, "file": new_name}]}
+            validated = self.state.validate_response(self.project, response, {})
+            document, summary = self.state.merge_document(self.project, feature, {}, validated,
+                {}, "rename", "2026-09-07", "review")
+            self.assertEqual(len(document["findings"]), 1)
+            finding = document["findings"][0]
+            self.assertEqual(finding["status"], "wont-fix")
+            self.assertEqual(finding["ack_transferred_from"]["finding_id"], old_id)
+            self.assertNotEqual(finding["finding_id"], old_id)
+            self.assertEqual(summary["suppressed"], [finding["finding_id"]])
+            old_id = finding["finding_id"]
+            self.state.atomic_write_json(
+                self.state.default_findings_path(self.project, feature["feature_id"]), document)
+        sweep = subprocess.run([str(SCRIPT), "sweep-acks", "--project", str(self.project)],
+                               capture_output=True, text=True)
+        self.assertEqual(sweep.returncode, 0, sweep.stderr)
+        diagnostics = json.loads(sweep.stdout)["ack_sweep"]
+        self.assertEqual({entry["feature_id"] for entry in diagnostics}, {"feat_123", "feat_new1"})
+        self.assertTrue(all(entry["kind"] == "transferred" for entry in diagnostics))
+        self.assertTrue(all(entry["reason"] == "superseded-by-destination" for entry in diagnostics))
+
+    def test_cross_feature_hash_ambiguity_does_not_transfer(self):
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        duplicate_document = copy.deepcopy(self.document)
+        duplicate_document["feature_id"] = "feat_duplicate"
+        self.state.atomic_write_json(
+            self.state.default_findings_path(self.project, "feat_duplicate"), duplicate_document)
+        self.source.rename(self.project / "new.rs")
+        response = {"feature_id": "feat_new", "findings": [{**self.candidate, "file": "new.rs"}]}
+        validated = self.state.validate_response(self.project, response, {})
+        self.assertEqual(validated["imported_priors"], [])
+        self.assertEqual(len(validated["new_finding_ids"]), 1)
+
+    def test_duplicate_lenses_cannot_hide_a_larger_or_incomparable_measurement(self):
+        for magnitude in ({"metric": "pending-items", "value": 11},
+                          {"metric": "bytes", "value": 1}, None):
+            candidate = copy.deepcopy(self.candidate)
+            candidate.pop("magnitude")
+            if magnitude is not None:
+                candidate["magnitude"] = magnitude
+            for candidates in ([self.candidate, candidate], [candidate, self.candidate]):
+                document, summary = self.review(self.document, candidates)
+                self.assertEqual(document["findings"][0]["status"], "open")
+                self.assertEqual(summary["suppressed"], [])
+
+    def cli_review(self, name, feature_id):
+        feature = self.project / "feature-input.json"
+        response = self.project / "response-input.json"
+        validated = self.project / "validated-input.json"
+        feature.write_text(json.dumps({"feature_id": feature_id, "files": [{"path": name}]}))
+        response.write_text(json.dumps({"feature_id": feature_id,
+            "findings": [{**self.candidate, "file": name}]}))
+        result = subprocess.run([str(SCRIPT), "validate", "--project", str(self.project),
+            "--response", str(response), "--output", str(validated)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = subprocess.run([str(SCRIPT), "merge", "--project", str(self.project),
+            "--feature", str(feature), "--validated", str(validated), "--run-id", "cli-test"],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        document = self.state.load_json(self.state.default_findings_path(self.project, feature_id))
+        current = [finding for finding in document["findings"] if not finding.get("ack_transferred_to")]
+        self.assertEqual(len(current), 1)
+        return current[0], summary
+
+    def test_cli_revocation_survives_rename_back_and_longer_chains(self):
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        for name, feature_id in (("b.rs", "feat_b"), ("c.rs", "feat_c")):
+            self.source.rename(self.project / name)
+            self.source = self.project / name
+            current, summary = self.cli_review(name, feature_id)
+            self.assertEqual(summary["suppressed"], [current["finding_id"]])
+        result = subprocess.run([str(SCRIPT), "triage", "--project", str(self.project),
+            "--finding", current["finding_id"], "--status", "open"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name, feature_id in (("old.rs", "feat_123"), ("b.rs", "feat_b"), ("old.rs", "feat_123")):
+            self.source.rename(self.project / name)
+            self.source = self.project / name
+            current, summary = self.cli_review(name, feature_id)
+            self.assertEqual(current["status"], "open")
+            self.assertNotIn("acknowledgement", current)
+            self.assertEqual(summary["suppressed"], [])
+
+    def test_cli_return_rename_uses_latest_ack_and_refuses_old_triage(self):
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        self.source.rename(self.project / "b.rs")
+        self.source = self.project / "b.rs"
+        current, _ = self.cli_review("b.rs", "feat_b")
+        result = subprocess.run([str(SCRIPT), "triage", "--project", str(self.project),
+            "--finding", current["finding_id"], "--status", "wont-fix", "--metric", "pending-items",
+            "--magnitude", "12"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.source.rename(self.project / "old.rs")
+        current, summary = self.cli_review("old.rs", "feat_123")
+        self.assertEqual(current["acknowledgement"]["value"], 12)
+        self.assertEqual(summary["suppressed"], [current["finding_id"]])
+        result = subprocess.run([str(SCRIPT), "triage", "--project", str(self.project),
+            "--finding", self.finding_id, "--status", "open"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("transferred", result.stderr)
+
+    def test_cli_revocation_survives_immediate_rename_back(self):
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        self.source.rename(self.project / "b.rs")
+        current, _ = self.cli_review("b.rs", "feat_b")
+        result = subprocess.run([str(SCRIPT), "triage", "--project", str(self.project),
+            "--finding", current["finding_id"], "--status", "open"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (self.project / "b.rs").rename(self.project / "old.rs")
+        current, summary = self.cli_review("old.rs", "feat_123")
+        self.assertEqual(current["status"], "open")
+        self.assertNotIn("acknowledgement", current)
+        self.assertEqual(summary["suppressed"], [])
+
+    def test_revalidation_contract_keeps_numeric_prior_fields(self):
+        text = (PLUGIN_ROOT / "commands" / "codesage-revalidate.md").read_text()
+        projection = next(line for line in text.splitlines() if line.startswith("3. Project only"))
+        self.assertIn("`magnitude`", projection)
+        self.assertIn("`acknowledgement` unchanged", projection)
+
+
 if __name__ == "__main__":
     unittest.main()

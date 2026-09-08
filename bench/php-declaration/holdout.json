@@ -1,0 +1,258 @@
+[
+  {
+    "project": "monolog",
+    "query": "How does logging avoid recursive logging loops inside handlers?",
+    "expected": [
+      "src/Monolog/Logger.php"
+    ],
+    "category": "php-behavior"
+  },
+  {
+    "project": "monolog",
+    "query": "Where are log processors applied before sending a record to handlers?",
+    "expected": [
+      "src/Monolog/Logger.php"
+    ],
+    "category": "php-behavior"
+  },
+  {
+    "project": "monolog",
+    "query": "How does writing a log stream acquire an exclusive file lock?",
+    "expected": [
+      "src/Monolog/Handler/StreamHandler.php"
+    ],
+    "category": "php-behavior"
+  },
+  {
+    "project": "monolog",
+    "query": "How are buffered log records flushed as a batch to the wrapped handler?",
+    "expected": [
+      "src/Monolog/Handler/BufferHandler.php"
+    ],
+    "category": "php-behavior"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "How does the in-memory cache store calculate expiry when saving a value?",
+    "expected": [
+      "src/Illuminate/Cache/ArrayStore.php"
+    ],
+    "category": "php-behavior"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Where does event dispatch stop propagation when a listener returns false?",
+    "expected": [
+      "src/Illuminate/Events/Dispatcher.php"
+    ],
+    "category": "php-behavior"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "How are wildcard event listeners registered and their cached matches cleared?",
+    "expected": [
+      "src/Illuminate/Events/Dispatcher.php"
+    ],
+    "category": "php-behavior"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "How does validation stop processing rules after the first failure?",
+    "expected": [
+      "src/Illuminate/Validation/Validator.php"
+    ],
+    "category": "php-behavior"
+  },
+  {
+    "project": "monolog",
+    "query": "Which handler interface declares whether a record stops bubbling?",
+    "expected": [
+      "src/Monolog/Handler/HandlerInterface.php"
+    ],
+    "category": "php-declaration"
+  },
+  {
+    "project": "monolog",
+    "query": "Which processor interface declares the callable that transforms a log record?",
+    "expected": [
+      "src/Monolog/Processor/ProcessorInterface.php"
+    ],
+    "category": "php-declaration"
+  },
+  {
+    "project": "monolog",
+    "query": "Which formatter interface declares single-record and batch formatting?",
+    "expected": [
+      "src/Monolog/Formatter/FormatterInterface.php"
+    ],
+    "category": "php-declaration"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Which cache store contract declares multi-key retrieval and timed writes?",
+    "expected": [
+      "src/Illuminate/Contracts/Cache/Store.php"
+    ],
+    "category": "php-declaration"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Which queue contract declares counts for pending delayed and reserved jobs?",
+    "expected": [
+      "src/Illuminate/Contracts/Queue/Queue.php"
+    ],
+    "category": "php-declaration"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Which validation contract declares retrieval of validated values and failed rules?",
+    "expected": [
+      "src/Illuminate/Contracts/Validation/Validator.php"
+    ],
+    "category": "php-declaration"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Where does the Cache facade identify its container accessor?",
+    "expected": [
+      "src/Illuminate/Support/Facades/Cache.php"
+    ],
+    "category": "php-declaration"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Where does the Event facade replace the dispatcher with a fake?",
+    "expected": [
+      "src/Illuminate/Support/Facades/Event.php"
+    ],
+    "category": "php-declaration"
+  },
+  {
+    "project": "php-src",
+    "query": "How does PHP fork a process on Unix?",
+    "expected": [
+      "ext/pcntl/pcntl.c"
+    ],
+    "category": "c-host-platform"
+  },
+  {
+    "project": "php-src",
+    "query": "How does PHP block and unblock POSIX signals using a signal mask?",
+    "expected": [
+      "ext/pcntl/pcntl.c"
+    ],
+    "category": "c-host-platform"
+  },
+  {
+    "project": "php-src",
+    "query": "Where does PHP obtain the real and effective Unix user IDs?",
+    "expected": [
+      "ext/posix/posix.c"
+    ],
+    "category": "c-host-platform"
+  },
+  {
+    "project": "php-src",
+    "query": "How does PHP create a pair of connected Unix sockets?",
+    "expected": [
+      "ext/sockets/sockets.c"
+    ],
+    "category": "c-host-platform"
+  },
+  {
+    "project": "php-src",
+    "query": "Where does opening a subprocess configure its standard input and output pipes?",
+    "expected": [
+      "ext/standard/proc_open.c"
+    ],
+    "category": "c-host-platform"
+  },
+  {
+    "project": "php-src",
+    "query": "Where does PHP resolve a host and establish a socket connection with a timeout?",
+    "expected": [
+      "main/network.c"
+    ],
+    "category": "c-host-platform"
+  },
+  {
+    "project": "php-src",
+    "query": "How does PHP read directory entries through the plain file stream wrapper?",
+    "expected": [
+      "main/streams/plain_wrapper.c"
+    ],
+    "category": "c-host-platform"
+  },
+  {
+    "project": "php-src",
+    "query": "Where does the PHP flock function parse the operation and would-block argument?",
+    "expected": [
+      "ext/standard/file.c"
+    ],
+    "category": "c-host-platform"
+  },
+  {
+    "project": "php-src",
+    "query": "How does Windows PHP emulate select for sockets and pipe handles?",
+    "expected": [
+      "win32/select.c"
+    ],
+    "category": "c-foreign-platform"
+  },
+  {
+    "project": "php-src",
+    "query": "How does Windows PHP implement gettimeofday and timezone information?",
+    "expected": [
+      "win32/time.c"
+    ],
+    "category": "c-foreign-platform"
+  },
+  {
+    "project": "php-src",
+    "query": "How does Windows PHP implement microsecond sleep using a waitable timer?",
+    "expected": [
+      "win32/time.c"
+    ],
+    "category": "c-foreign-platform"
+  },
+  {
+    "project": "php-src",
+    "query": "Where are Windows console CTRL event handlers registered for PHP callbacks?",
+    "expected": [
+      "win32/signal.c"
+    ],
+    "category": "c-foreign-platform"
+  },
+  {
+    "project": "php-src",
+    "query": "How does Windows PHP convert UTF-8 input into wide character strings?",
+    "expected": [
+      "win32/codepage.c"
+    ],
+    "category": "c-foreign-platform"
+  },
+  {
+    "project": "php-src",
+    "query": "How does Windows PHP unlink a wide-character filesystem path?",
+    "expected": [
+      "win32/ioutil.c"
+    ],
+    "category": "c-foreign-platform"
+  },
+  {
+    "project": "php-src",
+    "query": "Where does Windows PHP send email directly to an SMTP host?",
+    "expected": [
+      "win32/sendmail.c"
+    ],
+    "category": "c-foreign-platform"
+  },
+  {
+    "project": "php-src",
+    "query": "How does Windows PHP emulate a socket pair using bind listen and a second socket?",
+    "expected": [
+      "win32/sockets.c"
+    ],
+    "category": "c-foreign-platform"
+  }
+]

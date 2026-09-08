@@ -34,6 +34,8 @@ Output:
 
 Read every `.codesage/findings/<feature_id>.json` in the project. For each finding, apply filters. Drop anything that doesn't match.
 
+Run `${CLAUDE_PLUGIN_ROOT}/bin/codesage-review-state sweep-acks --project <absolute-path>` before filtering. Records marked `transferred` are historical: list them with their destinations in an audit section, excluding them from current finding totals. Always display each selected feature document's persisted `ack_sweep` entries in an acknowledgement diagnostics section, independently of status, severity, and category filters. Show the finding ID, kind (`stale` or `foreign`), and reason; these describe the last review scope, not a fresh source check. Label live source diagnostics from the sweep separately. Do not call omitted findings fixed. For findings carrying `acknowledgement`, render its metric and accepted value alongside the current `magnitude`, or say the current measurement is unavailable. Legacy findings without these optional fields render as before.
+
 If the resulting set is empty after filtering, write:
 
 ```

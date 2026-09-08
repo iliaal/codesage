@@ -3,6 +3,7 @@
 //! `tests/*.rs`. Translates clawpatch's Rust mapper (src/mappers/rust.ts)
 //! to native Rust with the same shape.
 
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
@@ -88,7 +89,7 @@ fn seed_for_package(
                 entry_symbol: Some("main".to_string()),
                 entry_command: Some(pkg_name.clone()),
                 tags: vec!["rust".to_string(), "cli".to_string()],
-                owned_files: lib_rs_as_owned(ctx, pkg_dir),
+                owned_files: binary_owned_files(ctx, pkg_dir, &main_rs),
                 context_files: cargo_toml_context(ctx, pkg_dir),
                 test_prefixes: vec![rel_path(root, &pkg_dir.join("tests"))],
                 ..FeatureSeed::new(
@@ -142,6 +143,7 @@ fn seed_for_package(
                     entry_symbol: Some("main".to_string()),
                     entry_command: Some(bin_name.clone()),
                     tags: vec!["rust".to_string(), "cli".to_string()],
+                    owned_files: binary_owned_files(ctx, pkg_dir, &p),
                     context_files: cargo_toml_context(ctx, pkg_dir),
                     test_prefixes: vec![rel_path(root, &pkg_dir.join("tests"))],
                     ..FeatureSeed::new(
@@ -220,6 +222,163 @@ fn lib_rs_as_owned(ctx: &MapperContext, pkg_dir: &Path) -> Vec<SeedFile> {
         path: rel,
         reason: "package library entry adjacent to binary".to_string(),
     }]
+}
+
+fn binary_owned_files(ctx: &MapperContext, pkg_dir: &Path, entry: &Path) -> Vec<SeedFile> {
+    let mut owned = BTreeSet::new();
+    let mut visited = HashSet::new();
+    let mut pending = vec![(entry.to_path_buf(), true, true)];
+    let root = ctx
+        .root
+        .canonicalize()
+        .unwrap_or_else(|_| ctx.root.to_path_buf());
+    while let Some((file, is_entry, use_parent)) = pending.pop() {
+        if !is_safe_file(ctx.root, &file) {
+            continue;
+        }
+        let Ok(file) = file.canonicalize() else {
+            continue;
+        };
+        let relative = rel_path(&root, &file);
+        if ctx.excluded(&relative) || !visited.insert((file.clone(), use_parent)) {
+            continue;
+        }
+        if !is_entry {
+            owned.insert(relative);
+        }
+        let Ok(Some(source)) = read_to_string_bounded(&file) else {
+            continue;
+        };
+        let Ok(tree) = codesage_parser::parse::parse_file(source.as_bytes(), Language::Rust) else {
+            continue;
+        };
+        let parent = file.parent().unwrap_or(&file);
+        let module_dir = if use_parent || file.file_name().is_some_and(|n| n == "mod.rs") {
+            parent.to_path_buf()
+        } else {
+            file.with_extension("")
+        };
+        let mut scopes = vec![(tree.root_node(), module_dir, parent.to_path_buf())];
+        while let Some((scope, module_dir, attribute_dir)) = scopes.pop() {
+            let mut path = None;
+            let mut cursor = scope.walk();
+            for child in scope.named_children(&mut cursor) {
+                if child.kind() == "attribute_item" {
+                    if let Some(value) = module_path_attribute(child, &source) {
+                        path = Some(value);
+                    }
+                    continue;
+                }
+                if matches!(child.kind(), "line_comment" | "block_comment") {
+                    continue;
+                }
+                let explicit_path = path.take();
+                if child.kind() != "mod_item" {
+                    continue;
+                }
+                let Some(name) = child.child_by_field_name("name") else {
+                    continue;
+                };
+                let name = source[name.byte_range()].trim_start_matches("r#");
+                if let Some(body) = child.child_by_field_name("body") {
+                    let directory = explicit_path
+                        .map_or_else(|| module_dir.join(name), |path| attribute_dir.join(path));
+                    scopes.push((body, directory.clone(), directory));
+                } else if let Some(path) = explicit_path {
+                    pending.push((attribute_dir.join(path), false, true));
+                } else {
+                    let flat = module_dir.join(format!("{name}.rs"));
+                    let nested = module_dir.join(name).join("mod.rs");
+                    match (
+                        is_safe_file(ctx.root, &flat),
+                        is_safe_file(ctx.root, &nested),
+                    ) {
+                        (true, false) => pending.push((flat, false, false)),
+                        (false, true) => pending.push((nested, false, false)),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    let mut files: Vec<_> = owned
+        .into_iter()
+        .map(|path| SeedFile {
+            path,
+            reason: "declared binary module".to_string(),
+        })
+        .collect();
+    files.extend(lib_rs_as_owned(ctx, pkg_dir));
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files.dedup_by(|a, b| a.path == b.path);
+    files
+}
+
+fn module_path_attribute(item: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    let attribute = item.named_child(0)?;
+    let name = attribute.named_child(0)?;
+    if &source[name.byte_range()] != "path" {
+        return None;
+    }
+    let value = attribute.child_by_field_name("value")?;
+    if value.kind() == "raw_string_literal" {
+        let mut cursor = value.walk();
+        return value
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "string_content")
+            .map(|content| source[content.byte_range()].to_string());
+    }
+    if value.kind() != "string_literal" {
+        return None;
+    }
+    let text = source[value.byte_range()]
+        .strip_prefix('"')?
+        .strip_suffix('"')?;
+    let mut chars = text.chars().peekable();
+    let mut output = String::new();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+        let escaped = match chars.next()? {
+            '\\' => '\\',
+            '"' => '"',
+            '\'' => '\'',
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            '0' => '\0',
+            'x' => {
+                let high = chars.next()?.to_digit(16)?;
+                let low = chars.next()?.to_digit(16)?;
+                char::from_u32(high * 16 + low)?
+            }
+            'u' => {
+                if chars.next()? != '{' {
+                    return None;
+                }
+                let mut digits = String::new();
+                loop {
+                    match chars.next()? {
+                        '}' => break,
+                        '_' => {}
+                        digit => digits.push(digit),
+                    }
+                }
+                char::from_u32(u32::from_str_radix(&digits, 16).ok()?)?
+            }
+            '\n' => {
+                while chars.peek().is_some_and(|ch| ch.is_ascii_whitespace()) {
+                    chars.next();
+                }
+                continue;
+            }
+            _ => return None,
+        };
+        output.push(escaped);
+    }
+    Some(output)
 }
 
 fn cargo_toml_context(ctx: &MapperContext, pkg_dir: &Path) -> Vec<SeedFile> {
@@ -381,6 +540,29 @@ mod tests {
             .expect("aux bin seeded");
         assert_eq!(aux.kind, FeatureKind::CliCommand);
         assert_eq!(aux.source, "cargo-bin");
+    }
+
+    #[test]
+    fn binary_owns_declared_modules_only() {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "Cargo.toml", "[package]\nname = \"app\"\n");
+        write(
+            dir.path(),
+            "src/main.rs",
+            "mod worker; fn main() { worker::run(); }",
+        );
+        write(dir.path(), "src/worker.rs", "mod nested; pub fn run() {}");
+        write(dir.path(), "src/worker/nested.rs", "pub fn work() {}");
+        write(dir.path(), "src/unrelated.rs", "pub fn other() {}");
+        let seeds = RustMapper
+            .map(&MapperContext::for_root(dir.path()))
+            .unwrap();
+        let binary = seeds
+            .iter()
+            .find(|s| s.entry_path == "src/main.rs")
+            .unwrap();
+        let owned: Vec<_> = binary.owned_files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(owned, ["src/worker.rs", "src/worker/nested.rs"]);
     }
 
     #[test]

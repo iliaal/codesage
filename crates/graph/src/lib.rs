@@ -2,6 +2,7 @@ mod brief;
 mod bundle;
 mod call_path;
 pub mod drift;
+pub mod edit_check;
 mod git_history;
 mod impact;
 mod index;

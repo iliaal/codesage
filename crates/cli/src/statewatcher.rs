@@ -238,7 +238,9 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
     // counted in watch.status so they are stale-but-visible, never silent.
     let mut parked: HashMap<PathBuf, Instant> = HashMap::new();
     let mut parked_written: usize = usize::MAX;
-    let mut bulk_retry_at: Option<Instant> = None;
+    // Register watches first: events racing the scan stay queued for replay.
+    let mut bulk_retry_at = Some(Instant::now());
+    let mut startup_failures = Some(0);
     let mut bulk_cooldown_until: Option<Instant> = None;
     let mut removal_retry_at: Option<Instant> = None;
     let mut removal_fail_count: u32 = 0;
@@ -410,7 +412,10 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
                         count = burst,
                         "batch threshold reached, triggering bulk incremental index"
                     );
-                    let outcome = run_bulk_guarded(&config, &mut embedder, &mut deferred_since);
+                    let outcome = startup_outcome(
+                        run_bulk_guarded(&config, &mut embedder, &mut deferred_since),
+                        &mut startup_failures,
+                    );
                     bulk_cooldown_until = bulk_cooldown_after(outcome, Instant::now());
                     if outcome == WorkOutcome::Done {
                         // Unconditional: a bulk pass can also delete the last
@@ -478,7 +483,10 @@ pub fn run_statewatcher(mut config: StateWatcherConfig) -> Result<()> {
         if let Some(at) = bulk_retry_at
             && Instant::now() >= at
         {
-            let outcome = run_bulk_guarded(&config, &mut embedder, &mut deferred_since);
+            let outcome = startup_outcome(
+                run_bulk_guarded(&config, &mut embedder, &mut deferred_since),
+                &mut startup_failures,
+            );
             bulk_cooldown_until = bulk_cooldown_after(outcome, Instant::now());
             if outcome == WorkOutcome::Done {
                 header_is_cpp = header_dialect_is_cpp(&config.db_path);
@@ -1375,6 +1383,27 @@ fn apply_bulk_outcome(
     }
 }
 
+fn startup_outcome(outcome: WorkOutcome, failures: &mut Option<u32>) -> WorkOutcome {
+    let Some(count) = failures.as_mut() else {
+        return outcome;
+    };
+    match outcome {
+        WorkOutcome::Done => *failures = None,
+        WorkOutcome::Failed => {
+            *count += 1;
+            if *count < 3 {
+                return WorkOutcome::Skipped;
+            }
+            tracing::warn!(
+                "startup reconciliation failed three times; run codesage index to retry"
+            );
+            *failures = None;
+        }
+        WorkOutcome::Skipped => {}
+    }
+    outcome
+}
+
 /// Apply a removal pass outcome to the accumulated removal state, returning
 /// when (if at all) the removal should be retried. `Done` clears the paths
 /// and prefixes and resets the failure counter. `Skipped` (transient lock
@@ -2114,6 +2143,129 @@ mod tests {
             lockfile::LockOutcome::Acquired(l) => l,
             lockfile::LockOutcome::AlreadyHeld => panic!("fresh tmpdir must lock"),
         }
+    }
+
+    struct RunningWatcher {
+        shutdown: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<Result<()>>>,
+    }
+
+    impl RunningWatcher {
+        fn start(config: StateWatcherConfig) -> Self {
+            Self {
+                shutdown: config.shutdown.clone(),
+                thread: Some(std::thread::spawn(move || run_statewatcher(config))),
+            }
+        }
+    }
+
+    impl Drop for RunningWatcher {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let result = thread.join();
+                if !std::thread::panicking() {
+                    result.unwrap().unwrap();
+                }
+            }
+        }
+    }
+
+    fn await_watcher_condition(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            assert!(Instant::now() < deadline, "watcher condition timed out");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn startup_reconciles_gap_and_post_start_edits_after_idle_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        std::fs::write(root.join("main.rs"), "fn before_gap() {}\n").unwrap();
+        std::fs::write(root.join("gone.rs"), "fn removed_in_gap() {}\n").unwrap();
+        let config = test_config(root);
+        let db = Database::open(&config.db_path).unwrap();
+        codesage_graph::incremental_index(root, &db, &[], false).unwrap();
+        assert!(db.symbol_exists("before_gap").unwrap());
+        std::fs::remove_file(root.join("gone.rs")).unwrap();
+        std::fs::write(root.join("main.rs"), "fn during_gap() {}\n").unwrap();
+
+        for (gap, next) in [("during_gap", "after_start"), ("idle_gap", "after_restart")] {
+            let mut config = test_config(root);
+            config.idle_timeout = Duration::from_secs(2);
+            let watcher = RunningWatcher::start(config);
+            await_watcher_condition(|| db.symbol_exists(gap).unwrap());
+            assert!(!db.symbol_exists("before_gap").unwrap());
+            assert!(!db.symbol_exists("removed_in_gap").unwrap());
+            std::fs::write(root.join("main.rs"), format!("fn {next}() {{}}\n")).unwrap();
+            await_watcher_condition(|| db.symbol_exists(next).unwrap());
+            assert!(!db.symbol_exists(gap).unwrap());
+            await_watcher_condition(|| watcher.thread.as_ref().unwrap().is_finished());
+            drop(watcher);
+            std::fs::write(root.join("main.rs"), "fn idle_gap() {}\n").unwrap();
+        }
+    }
+
+    #[test]
+    fn startup_reconciliation_waits_for_lock_and_replays_concurrent_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        std::fs::write(root.join("main.rs"), "fn before_lock() {}\n").unwrap();
+        let mut config = test_config(root);
+        config.exclude_patterns = vec!["**/excluded.rs".into()];
+        let db = Database::open(&config.db_path).unwrap();
+        codesage_graph::incremental_index(root, &db, &config.exclude_patterns, false).unwrap();
+        let lock = hold_lock(root);
+        std::fs::write(root.join("main.rs"), "fn gap_while_locked() {}\n").unwrap();
+        std::fs::write(root.join("excluded.rs"), "fn excluded_gap() {}\n").unwrap();
+        let _watcher = RunningWatcher::start(config);
+        await_watcher_condition(|| watch_status_path(root).exists());
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(db.symbol_exists("before_lock").unwrap());
+        assert!(!db.symbol_exists("gap_while_locked").unwrap());
+        std::fs::write(root.join("late.rs"), "fn arrived_while_locked() {}\n").unwrap();
+        drop(lock);
+        await_watcher_condition(|| {
+            db.symbol_exists("gap_while_locked").unwrap()
+                && db.symbol_exists("arrived_while_locked").unwrap()
+        });
+        std::fs::write(root.join("late.rs"), "fn post_reconciliation() {}\n").unwrap();
+        await_watcher_condition(|| db.symbol_exists("post_reconciliation").unwrap());
+        assert!(!db.symbol_exists("arrived_while_locked").unwrap());
+        assert!(!db.symbol_exists("excluded_gap").unwrap());
+    }
+
+    #[test]
+    fn startup_reconciliation_retries_hard_failures_with_a_bound() {
+        let mut failures = Some(0);
+        for expected in [
+            WorkOutcome::Skipped,
+            WorkOutcome::Skipped,
+            WorkOutcome::Failed,
+        ] {
+            assert_eq!(
+                startup_outcome(WorkOutcome::Failed, &mut failures),
+                expected
+            );
+        }
+        assert_eq!(failures, None);
+        let mut failures = Some(0);
+        for _ in 0..10 {
+            assert_eq!(
+                startup_outcome(WorkOutcome::Skipped, &mut failures),
+                WorkOutcome::Skipped
+            );
+        }
+        assert_eq!(failures, Some(0));
+        assert_eq!(
+            startup_outcome(WorkOutcome::Done, &mut failures),
+            WorkOutcome::Done
+        );
+        assert_eq!(failures, None);
     }
 
     #[test]

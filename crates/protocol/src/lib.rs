@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+pub mod stat_cache;
+
 pub const DEFAULT_EMBEDDING_DIM: usize = 384;
 
 /// Generate `as_str` / `parse` / `Display` for a string-keyed enum. The literal
@@ -880,6 +882,17 @@ pub struct TopSymbol {
     pub why: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AuthorConcentration {
+    pub author_count: usize,
+    pub dominant_share: f64,
+    pub effective_authors: f64,
+    pub bus_factor: usize,
+    pub half_life_days: u32,
+    pub history_days: u32,
+    pub as_of: i64,
+}
+
 /// Risk decomposition for a file. Score is the weighted sum; components let the agent
 /// see WHY a file is risky, not just the magnitude.
 ///
@@ -896,6 +909,11 @@ pub struct TopSymbol {
 /// `Deserialize` and the `JsonSchema` derive.
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct RiskAssessment {
+    /// Informational commit-author concentration; does not affect `score`.
+    /// Identities are normalized emails, falling back to names, not verified people.
+    /// Bus factor counts the fewest identities covering at least half the decayed commits.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub author_concentration: Option<AuthorConcentration>,
     /// False when the requested file does not exist in the structural or
     /// git-history index. A missing path is unknown, not low-risk.
     #[serde(default = "default_found")]
@@ -995,6 +1013,7 @@ impl Serialize for RiskAssessment {
         let emit_notes = !self.notes.is_empty();
         let emit_top_symbols = !self.top_symbols.is_empty();
         let len = 3
+            + usize::from(self.author_concentration.is_some())
             + if self.verbose { 10 } else { 0 }
             + usize::from(emit_cycle_files)
             + usize::from(emit_top_coupled)
@@ -1005,6 +1024,9 @@ impl Serialize for RiskAssessment {
         s.serialize_field("found", &self.found)?;
         s.serialize_field("file", &self.file)?;
         s.serialize_field("score", &self.score)?;
+        if let Some(authors) = &self.author_concentration {
+            s.serialize_field("author_concentration", authors)?;
+        }
         if self.verbose {
             s.serialize_field("churn_score", &self.churn_score)?;
             s.serialize_field("churn_percentile", &self.churn_percentile)?;
@@ -2536,6 +2558,7 @@ mod tests {
     /// cap), a small cycle, two boundaries, notes, one top symbol.
     fn risk_fixture() -> RiskAssessment {
         RiskAssessment {
+            author_concentration: None,
             found: true,
             file: "src/lib.rs".to_string(),
             score: 0.61,

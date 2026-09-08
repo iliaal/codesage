@@ -28,7 +28,7 @@ Use `rev_$(date -u +%Y%m%dT%H%M%SZ)` as `RUN_ID`. For each feature:
 
 1. Read `entry_path`, `title`, `kind`, and `feature_files` from the findings document. For legacy documents missing metadata, call `mcp__codesage__list_features(project, limit=200)` once and join by `feature_id`.
 2. Write the feature record under `$PROJECT/.codesage/reviews/<RUN_ID>/features/`.
-3. Project only the targeted findings. Include ID, location, severity, category, title, summary, evidence, suggested fix, and status. Strip `history`. Write their ID array to `$PROJECT/.codesage/reviews/<RUN_ID>/targets/<feature_id>.json`.
+3. Project only the targeted findings. Include ID, location, severity, category, title, summary, evidence, suggested fix, status, and optional `magnitude` and `acknowledgement` unchanged. Strip `history`. Run `codesage-review-state sweep-acks --project <absolute-path>` and exclude transferred source records from targets, directing explicit source-ID requests to their destination. Write their ID array to `$PROJECT/.codesage/reviews/<RUN_ID>/targets/<feature_id>.json`.
 4. Call `mcp__codesage__assess_risk_batch` once for the feature's entry and owned paths. Write the batch-shaped result to `$PROJECT/.codesage/reviews/<RUN_ID>/risk/<feature_id>.json`.
 5. Compute changed slice paths since `reviewed_at_sha`, when present, and union them with the targeted findings' paths. Write the array to `$PROJECT/.codesage/reviews/<RUN_ID>/changed/<feature_id>.json`.
 6. Run `codesage-review-state plan-feature` with the feature, risk, and changed/target path files, passing `--project "$PROJECT"` so deleted files drop out of the plan instead of deadlocking coverage. Write `$PROJECT/.codesage/reviews/<RUN_ID>/plans/<feature_id>.json` and pass it to the reviewer as `must_read`.
@@ -67,9 +67,10 @@ Merge with:
 
 The deterministic outcomes are:
 
-- Returned prior with valid evidence: `still-present`; preserve `open`, `false-positive`, or `wont-fix`. A returned `fixed` finding reopens to `open` because positive evidence disproves the fix claim.
+- Returned prior with valid evidence: `still-present`; preserve `open` and legacy triage without numeric acknowledgement. For a numeric acknowledgement, return the current measured magnitude: values at or below its threshold stay suppressed, while increases, missing measurements, or a changed metric reopen it. A returned `fixed` finding reopens to `open` because positive evidence disproves the fix claim.
 - Missing `open`: keep `open` and record one `needs-confirmation` event. Repeated omissions don't grow history.
 - Missing `fixed`, `false-positive`, or `wont-fix`: preserve status and history. Omission doesn't confirm or overturn user triage.
+- Report all `ack_sweep` entries and `suppressed` counts. Acknowledged targeted findings omitted from the response are flagged `foreign`; findings outside the target set are not swept.
 - New finding: apply the same verifier path as a normal review; keep unverified overflow open and label it.
 - Returned finding matching an untargeted prior: ignored by the merge and listed under `out_of_scope` in its output — not an error, and the untargeted prior is untouched.
 - Unselected finding in the same feature: preserve it unchanged; it was outside this revalidation run.

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -5,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 use anyhow::Result;
+use codesage_protocol::stat_cache::{CachedFileHash, FileStat};
 use codesage_protocol::{CoverageSurvey, FileInfo, Language};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use sha2::{Digest, Sha256};
@@ -39,6 +41,29 @@ pub fn discover_files_with_excludes(
     root: &Path,
     exclude_patterns: &[String],
 ) -> Result<Vec<FileInfo>> {
+    Ok(discover_files_report_with_excludes(root, exclude_patterns)?.files)
+}
+
+pub struct DiscoveryReport {
+    pub files: Vec<FileInfo>,
+    pub failed_paths: Vec<String>,
+    pub hash_cache: HashMap<String, CachedFileHash>,
+    pub hashes_reused: usize,
+    pub bytes_hashed: u64,
+}
+
+pub fn discover_files_report_with_excludes(
+    root: &Path,
+    exclude_patterns: &[String],
+) -> Result<DiscoveryReport> {
+    discover_files_report_with_cache(root, exclude_patterns, &HashMap::new())
+}
+
+pub fn discover_files_report_with_cache(
+    root: &Path,
+    exclude_patterns: &[String],
+    cache: &HashMap<String, CachedFileHash>,
+) -> Result<DiscoveryReport> {
     let excludes = if exclude_patterns.is_empty() {
         None
     } else {
@@ -78,10 +103,14 @@ pub fn discover_files_with_excludes(
     let saw_cpp = AtomicBool::new(false);
     let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
     let (tx, rx) = mpsc::channel::<FileInfo>();
+    let (failed_tx, failed_rx) = mpsc::channel::<String>();
+    let (cache_tx, cache_rx) = mpsc::channel();
     let root = root.to_path_buf();
 
     walker.run(|| {
         let tx = tx.clone();
+        let failed_tx = failed_tx.clone();
+        let cache_tx = cache_tx.clone();
         let excludes = excludes.clone();
         let saw_cpp = &saw_cpp;
         let first_err = &first_err;
@@ -133,33 +162,28 @@ pub fn discover_files_with_excludes(
                 );
                 return WalkState::Continue;
             }
-            let content = match read_indexable_content(path) {
-                Ok(Some(c)) => c,
-                Ok(None) => {
-                    tracing::warn!(
-                        path = %rel_path,
-                        cap = MAX_INDEXABLE_FILE_BYTES,
-                        "skipping oversized file (post-read or TOCTOU growth)"
-                    );
-                    return WalkState::Continue;
-                }
-                Err(e) => {
-                    // Skip an individual unreadable file rather than aborting the
-                    // whole index — matching the oversized-file branch above. A
-                    // permission-restricted file, or one deleted mid-walk (the
-                    // post-checkout git hook races `git checkout`/`stash`), must
-                    // not fail a whole-project reindex. Walk-entry errors (a
-                    // directory we can't traverse) still Quit above, since those
-                    // mean the discovered file set is genuinely incomplete.
-                    tracing::warn!(
-                        path = %rel_path,
-                        error = %e,
-                        "skipping unreadable file"
-                    );
-                    return WalkState::Continue;
-                }
-            };
-            let hash = content_hash(&content);
+            let (hash, observation, reused, bytes_hashed) =
+                match hash_indexable_file(path, cache.get(&rel_path)) {
+                    Ok(Some(c)) => c,
+                    Ok(None) => {
+                        tracing::warn!(
+                            path = %rel_path,
+                            cap = MAX_INDEXABLE_FILE_BYTES,
+                            "skipping oversized file (post-read or TOCTOU growth)"
+                        );
+                        return WalkState::Continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %rel_path,
+                            error = %e,
+                            "skipping unreadable file"
+                        );
+                        let _ = failed_tx.send(rel_path);
+                        return WalkState::Continue;
+                    }
+                };
+            let _ = cache_tx.send((rel_path.clone(), observation, reused, bytes_hashed));
             // Receiver drop is fine — just bail.
             if tx
                 .send(FileInfo {
@@ -175,6 +199,8 @@ pub fn discover_files_with_excludes(
         })
     });
     drop(tx);
+    drop(failed_tx);
+    drop(cache_tx);
 
     if let Some(err) = first_err.lock().unwrap().take() {
         return Err(err);
@@ -189,27 +215,105 @@ pub fn discover_files_with_excludes(
         }
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(files)
+    let mut failed_paths: Vec<String> = failed_rx.iter().collect();
+    failed_paths.sort();
+    let mut hash_cache = HashMap::new();
+    let mut hashes_reused = 0;
+    let mut bytes_hashed = 0;
+    for (path, entry, reused, bytes) in cache_rx {
+        if let Some(entry) = entry {
+            hash_cache.insert(path, entry);
+        }
+        hashes_reused += usize::from(reused);
+        bytes_hashed += bytes;
+    }
+    Ok(DiscoveryReport {
+        files,
+        failed_paths,
+        hash_cache,
+        hashes_reused,
+        bytes_hashed,
+    })
+}
+
+fn now_ns() -> Option<i64> {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos(),
+    )
+    .ok()
+}
+
+#[cfg(unix)]
+fn file_stat(meta: &std::fs::Metadata) -> Option<FileStat> {
+    use std::os::unix::fs::MetadataExt;
+    Some(FileStat {
+        size: i64::try_from(meta.len()).ok()?,
+        mtime_ns: meta
+            .mtime()
+            .checked_mul(1_000_000_000)?
+            .checked_add(meta.mtime_nsec())?,
+        ctime_ns: meta
+            .ctime()
+            .checked_mul(1_000_000_000)?
+            .checked_add(meta.ctime_nsec())?,
+    })
+}
+
+#[cfg(not(unix))]
+fn file_stat(_: &std::fs::Metadata) -> Option<FileStat> {
+    None
+}
+
+type HashObservation = (String, Option<CachedFileHash>, bool, u64);
+
+fn hash_indexable_file(
+    path: &Path,
+    cached: Option<&CachedFileHash>,
+) -> Result<Option<HashObservation>> {
+    let file = std::fs::File::open(path)?;
+    let before = file.metadata()?;
+    if before.len() > MAX_INDEXABLE_FILE_BYTES {
+        return Ok(None);
+    }
+    let started = now_ns();
+    let stat = file_stat(&before);
+    if let (Some(cached), Some(stat), Some(now)) = (cached, stat.as_ref(), started)
+        && cached.reusable(stat, now)
+    {
+        return Ok(Some((
+            cached.content_hash.clone(),
+            Some(cached.clone()),
+            true,
+            0,
+        )));
+    }
+    let mut content = Vec::new();
+    (&file)
+        .take(MAX_INDEXABLE_FILE_BYTES + 1)
+        .read_to_end(&mut content)?;
+    if content.len() as u64 > MAX_INDEXABLE_FILE_BYTES {
+        return Ok(None);
+    }
+    let hash = content_hash(&content);
+    let after = file_stat(&file.metadata()?);
+    let observation = match (stat, after, started) {
+        (Some(stat), Some(after), Some(hashed_at_ns)) if stat == after => Some(CachedFileHash {
+            stat,
+            content_hash: hash.clone(),
+            hashed_at_ns,
+        }),
+        _ => None,
+    };
+    Ok(Some((hash, observation, false, content.len() as u64)))
 }
 
 fn project_relative_path(root: &Path, path: &Path) -> Option<String> {
     path.strip_prefix(root)
         .ok()
         .map(|rel| rel.to_string_lossy().into_owned())
-}
-
-/// Read up to `MAX_INDEXABLE_FILE_BYTES` bytes. Returns `Ok(None)` when the
-/// file exceeds the cap (including a TOCTOU growth between metadata and read).
-fn read_indexable_content(path: &Path) -> Result<Option<Vec<u8>>> {
-    let file = std::fs::File::open(path)?;
-    let cap = MAX_INDEXABLE_FILE_BYTES;
-    let mut limited = file.take(cap.saturating_add(1));
-    let mut content = Vec::new();
-    limited.read_to_end(&mut content)?;
-    if content.len() as u64 > cap {
-        return Ok(None);
-    }
-    Ok(Some(content))
 }
 
 fn exclude_matches_path(excludes: &GlobSet, rel_path: &str, is_dir: bool) -> bool {

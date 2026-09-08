@@ -14,7 +14,7 @@ use codesage_protocol::{
 };
 use codesage_storage::Database;
 
-use crate::impact::{WalkBudget, impact_analysis_walk_budgeted};
+use crate::impact::{WalkBudget, WalkCache, impact_analysis_walk_shared};
 
 /// Per-level frontier for the reachability walk. `impact::MAX_FRONTIER` (512)
 /// exists to bound an unbudgeted walk; here the step budget and the deadline
@@ -665,6 +665,7 @@ fn reachable_test_files(
     walkable: &[String],
     inputs: &HashSet<&str>,
     opts: &ReachabilityOptions,
+    mut cache: Option<&mut WalkCache>,
 ) -> Result<ReachOutcome> {
     let mut out = ReachOutcome::empty();
     let mut pool = opts.work_budget;
@@ -688,7 +689,13 @@ fn reachable_test_files(
             depth: opts.depth,
             source_only: false,
         };
-        let outcome = impact_analysis_walk_budgeted(db, &req, REACH_FRONTIER, Some(&mut budget))?;
+        let outcome = impact_analysis_walk_shared(
+            db,
+            &req,
+            REACH_FRONTIER,
+            Some(&mut budget),
+            cache.as_deref_mut(),
+        )?;
         // Only what this input spent leaves the pool; a cheap input's
         // remainder is available to the inputs after it.
         pool = pool.saturating_sub(share.saturating_sub(budget.remaining));
@@ -787,6 +794,15 @@ pub fn recommend_tests_with_reachability(
     db: &Database,
     file_paths_in: &[String],
     opts: &ReachabilityOptions,
+) -> Result<TestRecommendations> {
+    recommend_tests_with_walk_cache(db, file_paths_in, opts, None)
+}
+
+pub(crate) fn recommend_tests_with_walk_cache(
+    db: &Database,
+    file_paths_in: &[String],
+    opts: &ReachabilityOptions,
+    cache: Option<&mut WalkCache>,
 ) -> Result<TestRecommendations> {
     // A blank input names nothing. The project root itself (`.`, `./`, or
     // the absolute root) normalizes to an empty path and names no file
@@ -918,7 +934,7 @@ pub fn recommend_tests_with_reachability(
     let reach = if indexed_test_files == 0 {
         ReachOutcome::empty()
     } else {
-        reachable_test_files(db, &triage.walkable, &inputs, opts)?
+        reachable_test_files(db, &triage.walkable, &inputs, opts, cache)?
     };
     let reach_walk_capped = !reach.unwalked.is_empty()
         || !reach.partial.is_empty()

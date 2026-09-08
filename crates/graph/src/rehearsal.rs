@@ -10,18 +10,19 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::git_history::{
-    ReachabilityOptions, assess_risk, assess_risk_diff, reach_cap_clause,
-    recommend_tests_with_reachability,
+    ReachabilityOptions, assess_risk, assess_risk_diff_with_walk_cache, reach_cap_clause,
+    recommend_tests_with_walk_cache,
 };
+use crate::impact::WalkCache;
 
 /// Reachable test paths named verbatim in the rehearsal summary; the rest
 /// are folded into a "+N more" count (`reachable_total` carries the number).
 const REHEARSAL_REACHABLE_NOTE_CAP: usize = 5;
 
 /// Wall-clock cap on the rehearsal's reachability walk. `assess_risk_diff`
-/// already ran a depth-2 reverse traversal over the same files for its
-/// blast-radius signal; until the two share one `WalkOutcome`, this second
-/// traversal is bounded tighter than the standalone tool's 5 s.
+/// shares resolved reverse edges with this walk while retaining its narrower
+/// frontier. The remaining test-discovery work stays bounded more tightly
+/// than the standalone tool's 5 s.
 const REHEARSAL_REACH_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1_500);
 use codesage_protocol::{
     FeatureFileRole, ReviewObjection, ReviewRehearsal, ReviewSeverity, RiskAssessment,
@@ -84,7 +85,8 @@ pub fn build_review_rehearsal(
     }
 
     // --- risk rollup for the patch ---
-    let risk = assess_risk_diff(db, files)?;
+    let mut walk_cache = WalkCache::default();
+    let risk = assess_risk_diff_with_walk_cache(db, files, Some(&mut walk_cache))?;
     // A clustered directory keeps full detail for only its top-3 files; the
     // rest survive as bare names in `omitted_files` with no score, so a 4th+
     // file that still clears a risk threshold would lose its objection line.
@@ -128,14 +130,26 @@ pub fn build_review_rehearsal(
         .collect();
 
     if !risk.test_gap_files.is_empty() {
+        let mut evidence = vec![
+            "Advisory: test discovery does not measure runtime coverage or establish whether this patch needs additional tests."
+                .to_string(),
+        ];
+        for file in &risk.test_gap_files {
+            if let Some(assessment) = by_file.get(file.as_str()) {
+                evidence.extend(assessment.notes.iter().map(|note| {
+                    let expanded = risk.legend.get(note).unwrap_or(note);
+                    format!("{file}: {expanded}")
+                }));
+            }
+        }
         objections.push(ReviewObjection {
-            severity: ReviewSeverity::High,
+            severity: ReviewSeverity::Medium,
             category: "missing-tests".to_string(),
             title: format!(
-                "{} changed file(s) have no sibling or coupled tests",
+                "No tests found for {} changed file(s) by the checks that completed",
                 risk.test_gap_files.len()
             ),
-            evidence: vec![format!("test-gap: {}", risk.test_gap_files.join(", "))],
+            evidence,
             files: risk.test_gap_files.clone(),
         });
     }
@@ -156,6 +170,10 @@ pub fn build_review_rehearsal(
         // which function to read first. `why` reflects structural load
         // (size × references × cycle), not edit frequency.
         let mut evidence = Vec::new();
+        evidence.push(
+            "Current-file risk is a review priority, not a judgment of this patch's correctness or test adequacy."
+                .to_string(),
+        );
         for a in &high {
             evidence.push(format!("{} (score {:.2})", a.file, a.score));
             for s in a.top_symbols.iter().take(HOTSPOT_EVIDENCE_CAP) {
@@ -397,7 +415,7 @@ pub fn build_review_rehearsal(
             .then_with(|| a.category.cmp(&b.category))
     });
 
-    let summary_notes = build_summary(root, db, files, &risk, &objections)?;
+    let summary_notes = build_summary(root, db, files, &risk, &objections, &mut walk_cache)?;
 
     Ok(ReviewRehearsal {
         files: files.to_vec(),
@@ -424,6 +442,7 @@ fn build_summary(
     files: &[String],
     risk: &codesage_protocol::RiskDiffAssessment,
     objections: &[ReviewObjection],
+    walk_cache: &mut WalkCache,
 ) -> Result<Vec<String>> {
     let mut notes = Vec::new();
 
@@ -455,7 +474,7 @@ fn build_summary(
         project_root: Some(root.to_path_buf()),
         ..ReachabilityOptions::default()
     };
-    let tests = recommend_tests_with_reachability(db, files, &opts)
+    let tests = recommend_tests_with_walk_cache(db, files, &opts, Some(walk_cache))
         .context("recommending tests for rehearsal summary")?;
     notes.extend(test_notes(&tests));
 
@@ -595,6 +614,142 @@ mod tests {
             content_hash: format!("test-hash-{path}"),
         })
         .unwrap();
+    }
+
+    #[test]
+    fn missing_tests_are_advisory_with_the_actual_check_bounds() {
+        use codesage_protocol::{Symbol, SymbolKind};
+
+        for has_symbols in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Database::open_in_memory().unwrap();
+            let paths: Vec<String> = (0..3).map(|i| format!("src/payment{i}.rs")).collect();
+            for path in &paths {
+                index_rust_file(&db, path);
+                if has_symbols {
+                    db.insert_symbols(
+                        db.file_id_for_path(path).unwrap().unwrap(),
+                        &[Symbol {
+                            name: "pay".to_string(),
+                            qualified_name: "pay".to_string(),
+                            kind: SymbolKind::Function,
+                            file_path: path.to_string(),
+                            line_start: 1,
+                            line_end: 2,
+                            col_start: 0,
+                            col_end: 1,
+                            rationale: Vec::new(),
+                        }],
+                    )
+                    .unwrap();
+                }
+            }
+            let risk = crate::git_history::assess_risk_diff(&db, &paths).unwrap();
+            let alias = if has_symbols { "T" } else { "TU" };
+            assert!(risk.legend.contains_key(alias));
+            assert!(
+                risk.files
+                    .iter()
+                    .all(|file| file.notes.iter().any(|note| note == alias))
+            );
+            let report = build_review_rehearsal(dir.path(), &db, &paths).unwrap();
+            let gap = report
+                .objections
+                .iter()
+                .find(|o| o.category == "missing-tests")
+                .expect("fixture has no discoverable tests");
+            assert_eq!(gap.severity, ReviewSeverity::Medium);
+            let evidence = gap.evidence.join("\n");
+            assert!(
+                evidence.contains("does not measure runtime coverage"),
+                "{gap:?}"
+            );
+            for path in &paths {
+                let file_evidence = gap
+                    .evidence
+                    .iter()
+                    .filter(|note| note.starts_with(&format!("{path}: ")))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if has_symbols {
+                    assert!(
+                        file_evidence.contains("within 2 dependency hops"),
+                        "{gap:?}"
+                    );
+                } else {
+                    assert!(file_evidence.contains("could not run"), "{gap:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn capped_test_gap_discloses_truncation_in_advisory_evidence() {
+        use codesage_protocol::{Reference, ReferenceKind, Symbol, SymbolKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let target = "src/payment.rs";
+        for i in 0..=crate::impact::MAX_FRONTIER + 1 {
+            let path = if i == 0 {
+                target.to_string()
+            } else {
+                format!("src/caller{i}.rs")
+            };
+            index_rust_file(&db, &path);
+            let id = db.file_id_for_path(&path).unwrap().unwrap();
+            let name = format!("pay{i}");
+            db.insert_symbols(
+                id,
+                &[Symbol {
+                    name: name.clone(),
+                    qualified_name: name.clone(),
+                    kind: SymbolKind::Function,
+                    file_path: path.clone(),
+                    line_start: 1,
+                    line_end: 3,
+                    col_start: 0,
+                    col_end: 1,
+                    rationale: Vec::new(),
+                }],
+            )
+            .unwrap();
+            if i > 0 {
+                db.insert_references(
+                    id,
+                    &[Reference {
+                        from_file: path,
+                        from_symbol: Some(name),
+                        to_name: "pay0".to_string(),
+                        kind: ReferenceKind::Call,
+                        line: 2,
+                        col: 0,
+                    }],
+                )
+                .unwrap();
+            }
+        }
+        let risk = assess_risk(&db, target).unwrap();
+        assert!(
+            risk.notes.iter().any(|note| note.contains("truncated")),
+            "{risk:?}"
+        );
+        let report = build_review_rehearsal(dir.path(), &db, &[target.to_string()]).unwrap();
+        let gap = report
+            .objections
+            .iter()
+            .find(|o| o.category == "missing-tests")
+            .unwrap();
+        assert_eq!(gap.severity, ReviewSeverity::Medium);
+        assert!(
+            gap.evidence.iter().any(|note| note.contains("truncated")),
+            "{gap:?}"
+        );
+        assert!(
+            gap.evidence.iter().any(|note| note.contains("lower bound")),
+            "{gap:?}"
+        );
     }
 
     #[test]
@@ -812,7 +967,7 @@ mod tests {
     #[test]
     fn objections_are_sorted_high_to_low() {
         // Scenario producing all three severities:
-        //   High   missing-tests (no sibling or coupled tests anywhere)
+        //   High   high-risk-file (hot history and trust boundaries)
         //   Medium feature-test-gap (feature has a mapped test not in the patch)
         //   Low    scope-spread (>= threshold distinct entry areas)
         let dir = tempfile::tempdir().unwrap();
@@ -825,6 +980,19 @@ mod tests {
                 FeatureFileRole::Test,
             )];
             index_rust_file(&db, &entry);
+            db.upsert_git_file(&entry, 100.0, 40, 80, Some(1_700_000_000))
+                .unwrap();
+            db.replace_file_trust_boundaries(
+                db.file_id_for_path(&entry).unwrap().unwrap(),
+                &[
+                    TrustBoundary::Network,
+                    TrustBoundary::Filesystem,
+                    TrustBoundary::Database,
+                    TrustBoundary::Secrets,
+                    TrustBoundary::ProcessExec,
+                ],
+            )
+            .unwrap();
             db.upsert_feature(&feature(&format!("feat_area_{i}"), &entry, tests))
                 .unwrap();
             changed.push(entry);

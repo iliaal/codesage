@@ -31,6 +31,7 @@ pub(super) struct ProjectState {
     /// watcher on the first call of any kind, `Some(false)` refuses one, and
     /// `None` (the default) starts it on the first semantic query only.
     watch: Option<bool>,
+    exclude_patterns: Vec<String>,
     /// mtime of `.codesage/config.toml` when this state was loaded; `None`
     /// means the file was absent (defaults in effect). Checked on every
     /// resolution so a model switch or a config fix takes effect without a
@@ -74,14 +75,15 @@ struct LoadedEmbeddingConfig {
     config: EmbeddingConfig,
     semantic_error: Option<String>,
     watch: Option<bool>,
+    exclude_patterns: Vec<String>,
 }
 
 /// Whether a tool call should make sure a live watcher runs. A watcher
 /// re-embeds every saved file, so it is not worth starting for a session
 /// that only reads structure: it starts on the first semantic query, or on
 /// any call when the project config opts in with `[index] watch = true`.
-/// `Some(false)` is honored again in `watch_enabled`; it is refused here too
-/// so the spawn path is never entered for it.
+/// Existing watchers still reconcile config on structural calls; an
+/// explicit opt-out stops them regardless of the query kind.
 fn watcher_start_wanted(config_watch: Option<bool>, semantic_query: bool) -> bool {
     match config_watch {
         Some(true) => true,
@@ -194,13 +196,14 @@ pub(crate) struct CodeSageServerState {
     /// Spawned lazily on first tool call for a project (see
     /// [`CodeSageServer::ensure_watcher`]) and reaped on daemon shutdown.
     watchers: Mutex<HashMap<PathBuf, WatcherEntry>>,
+    watcher_lifecycle: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
 }
 
 /// Handle to a per-project watcher thread. `alive` flips to false when the
 /// thread exits (idle timeout, disabled marker, error), so `ensure_watcher`
 /// can tell a dead entry from a running one and respawn. `config_key`
-/// records the embedding config the watcher was spawned with so a config
-/// change can retire it (see [`watcher_config_key`]). `thread` is the
+/// records the embedding and exclusion config the watcher was spawned with
+/// so a config change can retire it (see [`watcher_config_key`]). `thread` is the
 /// spawned thread's join handle, taken by whichever stop path waits it out;
 /// `None` while the spawn is still in flight or once the handle is taken.
 ///
@@ -484,8 +487,8 @@ impl Drop for WatcherReservation<'_> {
     }
 }
 
-/// Key identifying the embedding setup a watcher runs with. A live watcher
-/// whose key no longer matches the project's current config is retired
+/// Key identifying the embedding setup and exclusions a watcher runs with.
+/// A watcher whose key no longer matches the project's current config is retired
 /// (shutdown signalled) so the next resolution respawns it with the fresh
 /// config instead of embedding into the old model's chunk table forever.
 ///
@@ -498,11 +501,14 @@ impl Drop for WatcherReservation<'_> {
 /// block on hashing a model or on a download. An uncached model keys as
 /// `uncached`; the first load changes the key and restarts the watcher once.
 fn watcher_config_key(state: &ProjectState) -> String {
-    if state.embedding_config.model.is_empty() || state.embedding_config_error.is_some() {
-        return "structural-only".to_string();
-    }
-    let identity = cached_artifact_identity(&state.embedding_config.model);
-    watcher_key(&state.embedding_config, &identity)
+    let embedding =
+        if state.embedding_config.model.is_empty() || state.embedding_config_error.is_some() {
+            "structural-only".to_string()
+        } else {
+            let identity = cached_artifact_identity(&state.embedding_config.model);
+            watcher_key(&state.embedding_config, &identity)
+        };
+    format!("{embedding}|excludes:{:?}", state.exclude_patterns)
 }
 
 fn watcher_key(config: &EmbeddingConfig, artifact_identity: &str) -> String {
@@ -590,6 +596,7 @@ impl CodeSageServerState {
             embedders: Mutex::new(HashMap::new()),
             rerankers: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
+            watcher_lifecycle: Mutex::new(HashMap::new()),
         }
     }
 
@@ -641,11 +648,87 @@ impl CodeSageServer {
     /// watcher is already running. Root is `<...>/.codesage/index.db` → two
     /// parents.
     fn maybe_start_watcher(&self, state: &ProjectState, semantic_query: bool) {
-        if !watcher_start_wanted(state.watch, semantic_query) {
+        let Some(root) = state.db_path.parent().and_then(|p| p.parent()) else {
+            return;
+        };
+        let lifecycle = self
+            .state
+            .watcher_lifecycle
+            .lock()
+            .entry(root.to_path_buf())
+            .or_default()
+            .clone();
+        let _lifecycle = lifecycle.lock();
+        if !state.db_path.exists() {
+            self.stop_project_watcher(root);
             return;
         }
-        if let Some(root) = state.db_path.parent().and_then(|p| p.parent()) {
+        // A query may have resolved the old config before another query
+        // stopped its watcher. Never let that delayed query restore it.
+        let refreshed;
+        let state = if state.still_valid() {
+            state
+        } else {
+            match self.resolve_project_inner(&root.to_string_lossy()) {
+                Ok(current) => {
+                    refreshed = current;
+                    &refreshed
+                }
+                Err(error) => {
+                    tracing::warn!(%error, root = %root.display(), "could not refresh watcher config");
+                    self.stop_project_watcher(root);
+                    return;
+                }
+            }
+        };
+        if !crate::statewatcher::watch_enabled(root, state.watch)
+            || state.embedding_config_error.is_some()
+        {
+            self.stop_project_watcher(root);
+            return;
+        }
+        let already_started = self
+            .state
+            .watchers
+            .lock()
+            .get(root)
+            .is_some_and(|entry| entry.alive.load(Ordering::SeqCst));
+        if watcher_start_wanted(state.watch, semantic_query) || already_started {
             self.ensure_watcher(root, state);
+        }
+    }
+
+    fn stop_project_watcher(&self, root: &Path) {
+        let (alive, thread) = {
+            let mut watchers = self.state.watchers.lock();
+            let Some(entry) = watchers.get_mut(root) else {
+                return;
+            };
+            entry.shutdown.store(true, Ordering::SeqCst);
+            (entry.alive.clone(), entry.thread.take())
+        };
+        if wait_for_watcher_exit(&alive, Instant::now() + WATCHER_RESTART_WAIT) {
+            if let Some(thread) = thread
+                && thread.join().is_err()
+            {
+                tracing::warn!(root = %root.display(), "watcher thread panicked during config reload");
+            }
+            let mut watchers = self.state.watchers.lock();
+            if watchers
+                .get(root)
+                .is_some_and(|entry| Arc::ptr_eq(&entry.alive, &alive))
+            {
+                watchers.remove(root);
+            }
+        } else {
+            let mut watchers = self.state.watchers.lock();
+            if let Some(entry) = watchers
+                .get_mut(root)
+                .filter(|entry| Arc::ptr_eq(&entry.alive, &alive))
+            {
+                entry.thread = thread;
+            }
+            tracing::warn!(root = %root.display(), "disabled watcher still draining; replacement remains blocked");
         }
     }
 
@@ -722,6 +805,7 @@ impl CodeSageServer {
             embedding_config: embedding_config.config,
             embedding_config_error: embedding_config.semantic_error,
             watch: embedding_config.watch,
+            exclude_patterns: embedding_config.exclude_patterns,
             config_mtime,
         };
         // A load error is never cached: structural tools still work off this
@@ -1290,6 +1374,7 @@ fn load_embedding_config(path: &Path) -> LoadedEmbeddingConfig {
                 config: EmbeddingConfig::default(),
                 semantic_error: None,
                 watch: None,
+                exclude_patterns: Vec::new(),
             };
         }
         Err(e) => {
@@ -1305,12 +1390,15 @@ fn load_embedding_config(path: &Path) -> LoadedEmbeddingConfig {
                     path.display()
                 )),
                 watch: None,
+                exclude_patterns: Vec::new(),
             };
         }
     };
     #[derive(serde::Deserialize)]
     struct IndexSection {
         watch: Option<bool>,
+        #[serde(default)]
+        exclude_patterns: Vec<String>,
     }
     #[derive(serde::Deserialize)]
     struct Config {
@@ -1321,7 +1409,8 @@ fn load_embedding_config(path: &Path) -> LoadedEmbeddingConfig {
         Ok(parsed) => LoadedEmbeddingConfig {
             config: parsed.embedding.unwrap_or_default(),
             semantic_error: None,
-            watch: parsed.index.and_then(|i| i.watch),
+            watch: parsed.index.as_ref().and_then(|i| i.watch),
+            exclude_patterns: parsed.index.map(|i| i.exclude_patterns).unwrap_or_default(),
         },
         Err(e) => {
             tracing::warn!(
@@ -1336,6 +1425,7 @@ fn load_embedding_config(path: &Path) -> LoadedEmbeddingConfig {
                     path.display()
                 )),
                 watch: None,
+                exclude_patterns: Vec::new(),
             }
         }
     }
@@ -2140,6 +2230,31 @@ mod tests {
             .unwrap();
         assert_eq!(state2.watch, Some(true));
         assert_eq!(state2.embedding_config.model, "m");
+    }
+
+    #[test]
+    fn stale_enabled_query_cannot_restore_a_disabled_watcher() {
+        let (_dir, root) = onboarded_project(Some("[index]\nwatch = true\n"));
+        let server = CodeSageServer::new();
+        let stale = server
+            .resolve_project_inner(root.to_str().unwrap())
+            .unwrap();
+        let (shutdown, alive) = fake_watcher(
+            &server.state.watchers,
+            &root,
+            &watcher_config_key(&stale),
+            Duration::ZERO,
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(
+            root.join(".codesage/config.toml"),
+            "[index]\nwatch = false\n",
+        )
+        .unwrap();
+        server.maybe_start_watcher(&stale, true);
+        assert!(shutdown.load(Ordering::SeqCst));
+        assert!(!alive.load(Ordering::SeqCst));
+        assert!(server.state.watchers.lock().is_empty());
     }
 
     #[test]

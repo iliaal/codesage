@@ -18,7 +18,7 @@ The orchestrator supplies:
 - `must_read`: a deterministic bounded array of entry, owned, and changed slice paths. It may be absent for a legacy caller.
 - `severity_threshold`: `low`, `medium`, or `high`.
 - `categories`: any of `bug`, `security`, `perf`, `maintainability`.
-- `prior_findings`: slim feature-local records. Re-emit an applicable open finding with its existing ID. Suppress `false-positive` and `wont-fix` — unless the prompt marks them as targeted for revalidation, in which case return any targeted prior whose defect is present regardless of status.
+- `prior_findings`: slim feature-local records. Re-emit an applicable open finding with its existing ID. Suppress legacy `false-positive` and `wont-fix` records without `acknowledgement`, unless targeted for revalidation. Always re-emit applicable records with `acknowledgement`, including accepted findings, so the helper can compare current magnitude. Targeted revalidation returns any applicable prior regardless of status.
 - `lens`: optional `correctness`, `security`, or `lifecycle`.
 
 ## Gather context
@@ -99,5 +99,7 @@ Return exactly one fenced JSON object and no prose:
 ```
 
 New findings have no `finding_id`. Echo an applicable prior finding's ID with current location and evidence; the ID is advisory — the orchestrator re-derives identity from evidence and location, so accurate evidence matters more than the echo. Empty findings are valid. `reviewed_files` is required and contains repo-relative paths actually inspected during this response.
+
+A finding may include `"magnitude": {"metric": "unbounded-queue-items", "value": 12}` only when current evidence establishes that finite, nonnegative quantity. The metric names a stable measurement, including its unit and population where needed; larger values must mean worse impact. Explain how the evidence establishes the value in `summary`. Never derive magnitude from severity or invent a number for a qualitative defect. For an acknowledged prior, measure the same metric again and return its current value even when equal or lower. If the metric cannot be measured, return the applicable finding without magnitude; the helper reopens it with an explicit uncertainty reason. A renamed file can retain acknowledgement only through a unique whole-file content hash; the helper also checks other feature documents when an entrypoint rename changes feature identity. Do not infer identity from a rewrite or an echoed ID.
 
 Return an `error` field only when the feature ID is absent and no feature metadata exists. When semantic chunks are empty, use the supplied structural metadata instead of aborting.

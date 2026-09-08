@@ -58,10 +58,13 @@ expected_files, source}]`), so the existing runner scores them unchanged.
               the file binds the name to a local callable (closure, nested
               fn, def, lambda, arrow, const/static, all invisible to the
               extractor). Files whose only rows are `import` / `include` are
-              dropped (re-export lines carry no behaviour). Glob imports are
-              recorded as the module path (`use a::b::*` -> `a::b`) or not
-              at all (`use super::*`), so a caller that reaches the symbol
-              only through one is conservatively dropped (cs-zz6). The
+              dropped (re-export lines carry no behaviour). Rust and Python
+              glob imports count when their explicit wildcard path resolves
+              to the defining module. Python also requires a static top-level
+              function export: private names need literal __all__ inclusion;
+              dynamic module statements and export policies stay unverified.
+              Legacy rows without the wildcard
+              marker need a full reindex before they can supply evidence. The
               measured kept/dropped counts per language and row class are
               written to the corpus header. References mode requires exactly
               one defining file (exact-name rows cannot tell homonyms apart)
@@ -92,6 +95,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import ast
 import hashlib
 import random
 import re
@@ -632,8 +636,10 @@ def bare_call_accepted(
     name: str,
     defining_path: str,
     file_symbols: set[str],
+    project: Path | None = None,
+    defining_qualified: str | None = None,
 ) -> bool:
-    """Rule (c): a truly bare call needs an import row naming the symbol.
+    """Rule (c): a bare call needs a named import or a verified module glob.
 
     C/C++ and Go have no name-level imports, so there the candidate is also
     accepted when it lives in the defining file's directory (same package /
@@ -642,6 +648,13 @@ def bare_call_accepted(
     """
     tails, to_names = imports
     if name in tails:
+        return True
+    if any(glob_import_targets(to_name, language, candidate_path, defining_path) for to_name in to_names) and (
+        language != "python" or (
+            project is not None and defining_qualified == name
+            and python_glob_exports(_file_text(project, defining_path), name)
+        )
+    ):
         return True
     if language not in NEIGHBOURHOOD_LANGUAGES:
         return False
@@ -652,6 +665,102 @@ def bare_call_accepted(
         for to_name in to_names
         for seg in _include_segments(to_name)
     )
+
+
+def python_glob_exports(source: str | None, name: str) -> bool:
+    if source is None:
+        return False
+    try:
+        body = ast.parse(source).body
+    except (SyntaxError, ValueError):
+        return False
+    functions: set[str] = set()
+    bindings: set[str] = set()
+    exports: list[str] | tuple[str, ...] | None = None
+    for statement in body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if statement.name in {"__all__", "__getattr__"}:
+                return False
+            arguments = statement.args
+            if statement.decorator_list or statement.returns is not None or any(
+                arg.annotation is not None for arg in (
+                    arguments.posonlyargs + arguments.args + arguments.kwonlyargs
+                    + ([arguments.vararg] if arguments.vararg else [])
+                    + ([arguments.kwarg] if arguments.kwarg else [])
+                )
+            ):
+                return False
+            try:
+                for default in arguments.defaults + [d for d in arguments.kw_defaults if d is not None]:
+                    ast.literal_eval(default)
+            except (ValueError, TypeError, SyntaxError):
+                return False
+            functions.add(statement.name)
+            bindings.add(statement.name)
+        elif isinstance(statement, ast.Assign) and all(isinstance(t, ast.Name) for t in statement.targets):
+            try:
+                value = ast.literal_eval(statement.value)
+            except (ValueError, TypeError, SyntaxError):
+                return False
+            for target in statement.targets:
+                bindings.add(target.id)
+                functions.discard(target.id)
+                if target.id == "__all__":
+                    if not isinstance(value, (list, tuple)) or not all(isinstance(v, str) for v in value):
+                        return False
+                    exports = value
+        elif not (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
+                  and isinstance(statement.value.value, str)):
+            return False
+    if exports is not None and not set(exports).issubset(bindings):
+        return False
+    return name in functions and (name in exports if exports is not None else not name.startswith("_"))
+
+
+def glob_import_targets(import_name: str, language: str, importer: str, defining: str) -> bool:
+    target = Path(defining)
+    if language == "python" and import_name.endswith(".*"):
+        module = import_name[:-1]
+        dots = len(module) - len(module.lstrip("."))
+        tail = module[dots:].rstrip(".")
+        parts = list(Path(importer).parent.parts) if dots else []
+        for _ in range(max(0, dots - 1)):
+            if not parts:
+                return False
+            parts.pop()
+        if tail:
+            parts.extend(tail.split("."))
+        path = Path(*parts)
+        return target == Path(str(path) + ".py") or target == path / "__init__.py"
+    if language != "rust" or not import_name.endswith("::*"):
+        return False
+    module = import_name[:-3].split("::")
+    importer_parts = list(Path(importer).parts)
+    src_positions = [i for i, part in enumerate(importer_parts) if part == "src"]
+    split = src_positions[-1] + 1 if src_positions else 0
+    root = importer_parts[:split]
+    local = importer_parts[split:]
+    local[-1] = Path(local[-1]).stem
+    if local[-1] in {"lib", "main", "mod"}:
+        local.pop()
+    if module[0] == "crate":
+        local = []
+        module.pop(0)
+    elif module[0] == "self":
+        module.pop(0)
+    elif module[0] == "super":
+        while module and module[0] == "super":
+            if not local:
+                return False
+            local.pop()
+            module.pop(0)
+    else:
+        local = []
+    local.extend(module)
+    path = Path(*root, *local)
+    if not local:
+        return target in {path / "lib.rs", path / "main.rs"}
+    return target in {Path(str(path) + ".rs"), path / "mod.rs"}
 
 
 def import_names_type(
@@ -761,10 +870,11 @@ def reference_verdicts(
     file binds the name locally (`binds_name_locally`). Files whose only rows
     are `import` / `include` are dropped. Callers guarantee the name has
     exactly one defining file; otherwise exact-name rows would collect
-    homonym callers. Glob imports are recorded as the module path
-    (`use a::b::*` -> `a::b`) or not at all (`use super::*`), so a caller
-    that reaches the symbol only through one is conservatively dropped
-    (cs-zz6). The caller filters test/excluded paths and counts the gate.
+    homonym callers. Rust and Python glob imports count only when their
+    explicit wildcard path resolves to the defining module. Python additionally
+    requires a static top-level function export; dynamic exports stay dropped. Legacy rows
+    without that marker need a full reindex. The caller filters test/excluded
+    paths and counts the gate.
     """
     rows = conn.execute(
         "SELECT files.id AS fid, files.path AS path, refs.to_name AS to_name, "
@@ -811,7 +921,8 @@ def reference_verdicts(
             elif cls == "source-qualified":
                 ok = qualifier_accepted(qualifier, defining_path, file_symbols, language)
             else:
-                ok = bare_call_accepted(language, path, imports, name, defining_path, file_symbols)
+                ok = bare_call_accepted(language, path, imports, name, defining_path, file_symbols,
+                                        project, defining_qualified)
                 if ok:
                     text = _file_text(project, path)
                     ok = text is None or not binds_name_locally(name, text)
@@ -1491,9 +1602,10 @@ def render_corpus(
                 "# symbol, or for C/C++/Go the same directory as the defining file or an",
                 "# include/import row naming it, and are dropped when the file binds the",
                 "# name to a local callable. Files whose only rows are import/include are",
-                "# dropped. Glob imports are recorded as the module path (`use a::b::*` ->",
-                "# `a::b`) or not at all (`use super::*`), so callers reached only through",
-                "# one are conservatively dropped (cs-zz6). Only names with exactly one",
+                "# dropped. Rust and Python glob imports count when their explicit wildcard",
+                "# path resolves to the defining module. Python also requires a static",
+                "# top-level function export; dynamic exports stay dropped. Legacy rows without the marker",
+                "# need a full reindex. Only names with exactly one",
                 "# defining file are used. Each case carries `defining_file`; the runner",
                 "# drops it from the returned list before ranking, otherwise name queries",
                 "# carry a structural first-hit floor of 2 (the defining file ranks first",

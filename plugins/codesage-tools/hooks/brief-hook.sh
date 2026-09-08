@@ -16,63 +16,61 @@
 
 exec 2>/dev/null
 
+[[ ${CODESAGE_BRIEF_CANARY:-0} == 1 ]] || exit 0
+
 INPUT=$(cat) || exit 0
 
 # Field extraction stays pure-bash so the no-op path costs no subprocess.
 # A path containing an escape sequence would need real JSON decoding; those
 # are rare enough that bailing silently is cheaper than being wrong.
-[[ $INPUT =~ \"file_path\"[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]] || exit 0
+[[ ${INPUT} =~ \"file_path\"[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]] || exit 0
 FILE=${BASH_REMATCH[1]}
-[[ $FILE == *\\* ]] && exit 0
-[[ $FILE == /* ]] || exit 0
+[[ ${FILE} == *\\* ]] && exit 0
+[[ ${FILE} == /* ]] || exit 0
 # Reject `.`/`..` segments: with those gone, the lexical prefix strip below is
 # real containment, so `<root>/../outside` can never reach codesage as a
 # root-relative path.
-[[ $FILE =~ (^|/)\.\.?(/|$) ]] && exit 0
+[[ ${FILE} =~ (^|/)\.\.?(/|$) ]] && exit 0
 # An existing target must be a regular file (test -f follows symlinks): a FIFO
 # would stall codesage's read until the hook timeout. A not-yet-existing path
 # is fine — that is every Write of a new file.
-[[ -e $FILE && ! -f $FILE ]] && exit 0
+[[ -L ${FILE} || (-e ${FILE} && ! -f ${FILE}) ]] && exit 0
 
-# session_id is optional: a hook payload without one (or with an escaped,
-# non-decodable value) falls back to a session-less `codesage brief` call
-# below — ungated render, no repeat/cooldown/budget suppression — rather
-# than going fully silent. jq stays a hard prereq: without it the JSON
-# envelope cannot be built, so the hook stays silent per the never-block
-# contract above.
-[[ $INPUT =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]] && SESSION=${BASH_REMATCH[1]} || SESSION=""
-[[ $SESSION == *\\* ]] && SESSION=""
+# No session means no enforceable cumulative context budget.
+[[ ${INPUT} =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]] || exit 0
+SESSION=${BASH_REMATCH[1]}
+[[ ${SESSION} =~ ^[a-zA-Z0-9_-][a-zA-Z0-9_.-]{0,127}$ ]] || exit 0
 
 # Onboarded-project check: walk up from the file's directory for
 # .codesage/index.db. Stat-only; exits before any process is spawned when the
 # file is outside every onboarded project.
 ROOT=""
 DIR=${FILE%/*}
-while [[ -n $DIR ]]; do
-  if [[ -e "$DIR/.codesage/index.db" ]]; then
-    ROOT=$DIR
-    break
-  fi
-  [[ $DIR == "${DIR%/*}" ]] && break
-  DIR=${DIR%/*}
+while [[ -n ${DIR} ]]; do
+	[[ -L ${DIR} ]] && exit 0
+	if [[ -e "${DIR}/.codesage/index.db" ]]; then
+		ROOT=${DIR}
+		break
+	fi
+	[[ ${DIR} == "${DIR%/*}" ]] && break
+	DIR=${DIR%/*}
 done
-[[ -n $ROOT ]] || exit 0
+[[ -n ${ROOT} ]] || exit 0
 
 command -v codesage >/dev/null 2>&1 || exit 0
 # jq builds the JSON envelope below, so it is a hard prerequisite — without
 # it the hook stays silent (install jq to enable brief context).
 command -v jq >/dev/null 2>&1 || exit 0
+jq -e --arg file "${FILE}" --arg session "${SESSION}" \
+	'.session_id == $session and .tool_input.file_path == $file and
+   (.tool_name == "Edit" or .tool_name == "Write" or .tool_name == "MultiEdit")' \
+	<<<"${INPUT}" >/dev/null || exit 0
 
 # `codesage brief` resolves the project by walking up from cwd, and expects a
-# root-relative path. Suppressed or empty briefs print nothing. Without a
-# session id the --session flag is omitted (session-less render).
-if [[ -n ${SESSION:-} ]]; then
-	PAYLOAD=$(cd "$ROOT" && codesage brief --session "$SESSION" -- "${FILE#"$ROOT"/}") || exit 0
-else
-	PAYLOAD=$(cd "$ROOT" && codesage brief -- "${FILE#"$ROOT"/}") || exit 0
-fi
-[[ -n $PAYLOAD ]] || exit 0
+# root-relative path. Suppressed or empty briefs print nothing.
+PAYLOAD=$(cd "${ROOT}" && codesage brief --session "${SESSION}" -- "${FILE#"${ROOT}"/}") || exit 0
+[[ -n ${PAYLOAD} ]] || exit 0
 
-jq -cn --arg ctx "$PAYLOAD" \
-  '{hookSpecificOutput: {hookEventName: "PreToolUse", additionalContext: $ctx}}'
+jq -cn --arg ctx "${PAYLOAD}" \
+	'{hookSpecificOutput: {hookEventName: "PreToolUse", additionalContext: $ctx}}'
 exit 0

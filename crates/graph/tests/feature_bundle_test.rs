@@ -190,13 +190,14 @@ fn caller_expansion_reserves_related_capacity_when_tests_saturate() {
     write(
         root,
         "Cargo.toml",
-        "[package]\nname = \"acme\"\nversion = \"0.1.0\"\n",
+        "[package]\nname = \"acme\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
     );
     write(root, "src/helpers.rs", "pub fn helper() {}\n");
+    write(root, "src/lib.rs", "pub mod helpers;\n");
     write(
         root,
         "src/main.rs",
-        "mod helpers;\nuse helpers::helper;\nfn main() { helper(); }\n",
+        "use acme::helpers::helper;\nfn main() { helper(); }\n",
     );
     for index in 0..5 {
         write(
@@ -213,7 +214,7 @@ fn caller_expansion_reserves_related_capacity_when_tests_saturate() {
         &db,
         "src/main.rs",
         "rust",
-        "mod helpers;\nuse helpers::helper;\nfn main() { helper(); }\n",
+        "use acme::helpers::helper;\nfn main() { helper(); }\n",
     );
     for index in 0..5 {
         seed_chunk(
@@ -231,6 +232,12 @@ fn caller_expansion_reserves_related_capacity_when_tests_saturate() {
         .expect("main feature mapped");
 
     let bundle = feature_bundle(&db, &main_feature.feature_id, true, true, 5).unwrap();
+    assert!(
+        bundle
+            .primary
+            .iter()
+            .all(|c| c.file_path != "src/helpers.rs")
+    );
     let related_paths: Vec<&str> = bundle
         .related
         .iter()
@@ -254,12 +261,17 @@ fn caller_expansion_reserves_exactly_two_slots_with_three_callees() {
     write(
         root,
         "Cargo.toml",
-        "[package]\nname = \"acme\"\nversion = \"0.1.0\"\n",
+        "[package]\nname = \"acme\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
     );
     write(root, "src/alpha.rs", "pub fn alpha_helper() {}\n");
     write(root, "src/beta.rs", "pub fn beta_helper() {}\n");
     write(root, "src/gamma.rs", "pub fn gamma_helper() {}\n");
-    let main_src = "mod alpha;\nmod beta;\nmod gamma;\nuse alpha::alpha_helper;\nuse beta::beta_helper;\nuse gamma::gamma_helper;\nfn main() { alpha_helper(); beta_helper(); gamma_helper(); }\n";
+    write(
+        root,
+        "src/lib.rs",
+        "pub mod alpha;\npub mod beta;\npub mod gamma;\n",
+    );
+    let main_src = "use acme::alpha::alpha_helper;\nuse acme::beta::beta_helper;\nuse acme::gamma::gamma_helper;\nfn main() { alpha_helper(); beta_helper(); gamma_helper(); }\n";
     write(root, "src/main.rs", main_src);
     for index in 0..5 {
         write(
@@ -291,6 +303,13 @@ fn caller_expansion_reserves_exactly_two_slots_with_three_callees() {
         .expect("main feature mapped");
 
     let bundle = feature_bundle(&db, &main_feature.feature_id, true, true, 5).unwrap();
+    assert!(
+        bundle
+            .primary
+            .iter()
+            .all(|c| !["src/alpha.rs", "src/beta.rs", "src/gamma.rs"]
+                .contains(&c.file_path.as_str()))
+    );
     let related_paths: Vec<&str> = bundle
         .related
         .iter()
@@ -319,13 +338,14 @@ fn caller_expansion_with_limit_below_reservation_does_not_overflow() {
     write(
         root,
         "Cargo.toml",
-        "[package]\nname = \"acme\"\nversion = \"0.1.0\"\n",
+        "[package]\nname = \"acme\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
     );
     write(root, "src/helpers.rs", "pub fn helper() {}\n");
+    write(root, "src/lib.rs", "pub mod helpers;\n");
     write(
         root,
         "src/main.rs",
-        "mod helpers;\nuse helpers::helper;\nfn main() { helper(); }\n",
+        "use acme::helpers::helper;\nfn main() { helper(); }\n",
     );
     write(
         root,
@@ -340,7 +360,7 @@ fn caller_expansion_with_limit_below_reservation_does_not_overflow() {
         &db,
         "src/main.rs",
         "rust",
-        "mod helpers;\nuse helpers::helper;\nfn main() { helper(); }\n",
+        "use acme::helpers::helper;\nfn main() { helper(); }\n",
     );
     seed_chunk(
         &db,
@@ -356,6 +376,8 @@ fn caller_expansion_with_limit_below_reservation_does_not_overflow() {
         .expect("main feature mapped");
 
     let bundle = feature_bundle(&db, &main_feature.feature_id, true, true, 1).unwrap();
+    assert_eq!(bundle.related.len(), 1);
+    assert_eq!(bundle.related[0].file_path, "src/helpers.rs");
     assert!(
         bundle.related.len() <= 1,
         "related[] must respect a limit below the two-slot reservation, got {:?}",

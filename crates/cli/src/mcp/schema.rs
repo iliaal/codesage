@@ -112,6 +112,7 @@ fn merge_meta_property(schema: &mut serde_json::Map<String, serde_json::Value>) 
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
     if let serde_json::Value::Object(props) = props {
         props.insert("_meta".to_string(), meta_property_schema());
+        props.insert("next".to_string(), super::next::schema());
     }
 }
 

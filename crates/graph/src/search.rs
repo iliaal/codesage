@@ -98,17 +98,26 @@ const RARE_TOKEN_MIN_LEN: usize = 8;
 ///    least 8 characters that shows up in <1% of indexed chunks. Requires
 ///    a live FTS5 `fts5vocab` probe, so this returns `Ok(false)` when the
 ///    FTS sidecar is empty (fresh install before reindex).
+///
+/// Dotted identifier pairs also qualify. `CODESAGE_QUALIFIED_GROUPS=1`
+/// additionally admits the experimental backslash-qualified name shape.
 pub(crate) fn query_has_rare_literal(db: &Database, query: &str) -> Result<bool> {
+    query_has_rare_literal_with_groups(db, query, qualified_groups_enabled())
+}
+
+fn qualified_groups_enabled() -> bool {
+    std::env::var("CODESAGE_QUALIFIED_GROUPS").is_ok_and(|value| value == "1")
+}
+
+fn query_has_rare_literal_with_groups(db: &Database, query: &str, groups: bool) -> Result<bool> {
     if query.contains("::") || query.contains('`') || query.contains("*.") {
         return Ok(true);
     }
-    // Dotted-identifier pair shape (`moduleref.create`, `Foo.Bar`,
-    // `foo.bar_baz`). Both sides must be ≥3 chars so sentence punctuation
-    // like `e.g.` and `i.e.` doesn't trigger. Measured on nest:
-    // `moduleref.create` case in the remaining miss set — the individual
-    // tokens are all lowercase so neither qualifies as "code-shaped" on its
-    // own, but the dotted-pair context is a strong signal that they are.
-    if !extract_dotted_identifier_tokens(query).is_empty() {
+    if if groups {
+        !extract_qualified_name_groups(query).is_empty()
+    } else {
+        !extract_dotted_identifier_tokens(query).is_empty()
+    } {
         return Ok(true);
     }
     for tok in query
@@ -203,7 +212,7 @@ fn extract_dotted_identifier_tokens(query: &str) -> Vec<&str> {
 /// two OR terms is a measured win on the nest corpus, and the namespace-prefix
 /// dilution this exists to address does not arise there: a dotted pair's left
 /// side is a receiver, not a namespace shared by hundreds of chunks.
-fn extract_qualified_name_groups(query: &str) -> Vec<Vec<String>> {
+fn extract_qualified_name_groups_legacy(query: &str) -> Vec<Vec<String>> {
     let mut groups = Vec::new();
     for raw in query.split(|c: char| c.is_whitespace() || c == ',' || c == ';') {
         if !raw.contains("::") && !raw.contains('\\') {
@@ -225,7 +234,7 @@ fn extract_qualified_name_groups(query: &str) -> Vec<Vec<String>> {
 /// of quoted terms so code tokens like `doc_cfg` and `ModuleRef::create`
 /// survive FTS5's reserved-character parsing without raising syntax errors
 /// at query time. Empty when no usable tokens are extracted.
-fn build_fts_match_query(query: &str) -> String {
+fn build_fts_match_query_legacy(query: &str) -> String {
     use std::collections::HashSet;
     // Split aggressively so things like `ModuleRef::create`, `foo.bar`, and
     // `*.svelte.ts` yield each alphanumeric+underscore segment as its own
@@ -259,7 +268,7 @@ fn build_fts_match_query(query: &str) -> String {
     // reverted: it measured -0.006 NDCG@10 on the 40 semble C++ queries, the
     // only corpus queries carrying a `::` at all.
     let mut suppressed: HashSet<String> = HashSet::new();
-    for parts in extract_qualified_name_groups(query) {
+    for parts in extract_qualified_name_groups_legacy(query) {
         // The tail stays a term of its own: it is the symbol name, the most
         // selective component, and the spelling a caller may use unqualified.
         // It must still clear the code-shape filter, or a plain-lowercase tail
@@ -305,6 +314,160 @@ fn build_fts_match_query(query: &str) -> String {
         if suppressed.contains(&key) {
             continue;
         }
+        if !seen.insert(key) {
+            continue;
+        }
+        tokens.push(format!("\"{raw}\""));
+    }
+    tokens.join(" OR ")
+}
+
+struct QualifiedName<'a> {
+    start: usize,
+    end: usize,
+    parts: Vec<&'a str>,
+}
+
+fn identifier_end(query: &str, start: usize) -> usize {
+    let mut chars = query[start..].char_indices();
+    if !chars
+        .next()
+        .is_some_and(|(_, c)| c.is_alphabetic() || c == '_')
+    {
+        return start;
+    }
+    chars
+        .find(|(_, c)| !c.is_alphanumeric() && *c != '_')
+        .map_or(query.len(), |(offset, _)| start + offset)
+}
+
+fn extract_qualified_name_groups(query: &str) -> Vec<QualifiedName<'_>> {
+    let mut groups = Vec::new();
+    let mut cursor = 0;
+    while cursor < query.len() {
+        let start = cursor;
+        let mut end = identifier_end(query, start);
+        if end == start {
+            cursor += query[cursor..].chars().next().unwrap().len_utf8();
+            continue;
+        }
+        let mut parts = vec![&query[start..end]];
+        loop {
+            let suffix = &query[end..];
+            let separator_len = if suffix.starts_with("::") {
+                2
+            } else if suffix.starts_with(['\\', '.']) {
+                1
+            } else {
+                break;
+            };
+            let next_start = end + separator_len;
+            let next_end = identifier_end(query, next_start);
+            if next_end == next_start {
+                break;
+            }
+            let next = &query[next_start..next_end];
+            // Keep sentence abbreviations out of the dotted-identifier gate.
+            if suffix.starts_with('.')
+                && (parts.last().unwrap().chars().count() < 3 || next.chars().count() < 3)
+            {
+                break;
+            }
+            parts.push(next);
+            end = next_end;
+        }
+        if parts.len() >= 2 {
+            groups.push(QualifiedName { start, end, parts });
+        }
+        cursor = end;
+    }
+    groups
+}
+
+/// Build an FTS5 MATCH expression from a user query. Emits a disjunction
+/// of quoted terms, or experimental qualified-name conjunctions when opted in,
+/// so `doc_cfg` and `ModuleRef::create`
+/// survive FTS5's reserved-character parsing without raising syntax errors
+/// at query time. Empty when no usable tokens are extracted.
+fn build_fts_match_query(query: &str) -> String {
+    if qualified_groups_enabled() {
+        build_fts_match_query_mode(query, false)
+    } else {
+        build_fts_match_query_legacy(query)
+    }
+}
+
+fn build_fts_match_query_mode(query: &str, fallback: bool) -> String {
+    // Split aggressively so things like `ModuleRef::create`, `foo.bar`, and
+    // `*.svelte.ts` yield each alphanumeric+underscore segment as its own
+    // term, not concatenated nonsense. FTS5's unicode61 tokenizer (with
+    // tokenchars '_') would produce the same splits at index time, so what
+    // we emit here matches what was actually indexed.
+    //
+    // Filter: only include tokens that look like code identifiers. Common
+    // English glue words (`use`, `the`, `and`, `of`, `instead`) in a
+    // 10-word commit subject would flood the BM25 ranking and bury the
+    // one or two distinctive tokens we actually care about. Measured on
+    // ripgrep: the query `printer: use \`doc_cfg\` instead of
+    // \`doc_auto_cfg\`` without this filter produces a MATCH disjunction
+    // of 6 tokens where 4 are common glue, and the target file drops out
+    // of the top 10 because the glue tokens match everything.
+    //
+    // Qualified names retain lowercase components inside a conjunction;
+    // none of those components broadens the disjunction on its own.
+    let is_sep = |c: char| !c.is_alphanumeric() && c != '_';
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut tokens: Vec<String> = Vec::new();
+
+    let groups = extract_qualified_name_groups(query);
+    let mut outside_groups = Vec::new();
+    let mut cursor = 0;
+    for group in groups {
+        if fallback {
+            let dotted = query[group.start..group.end].contains('.');
+            let parts = if !dotted
+                && group
+                    .parts
+                    .last()
+                    .is_some_and(|part| token_looks_code_shaped(part))
+            {
+                &group.parts[group.parts.len() - 1..]
+            } else {
+                &group.parts[..]
+            };
+            for part in parts
+                .iter()
+                .filter(|part| dotted || token_looks_code_shaped(part))
+            {
+                if seen.insert(part.to_lowercase()) {
+                    tokens.push(format!("\"{part}\""));
+                }
+            }
+        } else {
+            let terms = group.parts.iter().map(|part| format!("\"{part}\""));
+            let expression = format!("({})", terms.collect::<Vec<_>>().join(" AND "));
+            if seen.insert(expression.to_lowercase()) {
+                tokens.push(expression);
+            }
+        }
+        outside_groups.push(&query[cursor..group.start]);
+        cursor = group.end;
+    }
+    outside_groups.push(&query[cursor..]);
+    for raw in outside_groups
+        .iter()
+        .flat_map(|fragment| fragment.split(is_sep))
+    {
+        if raw.len() < 2 {
+            continue;
+        }
+        if !token_looks_code_shaped(raw) {
+            continue;
+        }
+        // Dedupe by lowercased form — FTS5 is case-insensitive for this
+        // tokenizer, so `Foo` and `foo` would collapse at MATCH time
+        // anyway. Fewer OR-terms keeps the MATCH expression parseable.
+        let key = raw.to_lowercase();
         if !seen.insert(key) {
             continue;
         }
@@ -499,6 +662,27 @@ fn bm25_search_candidates(
     db.search_bm25(match_expr, fetch_limit, languages, paths)
 }
 
+fn bm25_candidates_with_fallback(
+    db: &Database,
+    match_expr: &str,
+    query: &str,
+    fetch_limit: usize,
+    languages: Option<&[&str]>,
+    paths: Option<&[&str]>,
+) -> Result<Vec<RawSearchRow>> {
+    let rows = bm25_search_candidates(db, match_expr, fetch_limit, languages, paths)?;
+    if !rows.is_empty() {
+        return Ok(rows);
+    }
+    // Older chunks may carry a method without its owner context.
+    // Keep the previous selective lookup when the grouped query has no hits.
+    let fallback = build_fts_match_query_mode(query, true);
+    if fallback.is_empty() || fallback == match_expr {
+        return Ok(rows);
+    }
+    bm25_search_candidates(db, &fallback, fetch_limit, languages, paths)
+}
+
 /// Reranker callback for [`search`] / [`export_context`]. Takes the query
 /// text + candidate documents, returns one cross-encoder score per doc.
 ///
@@ -682,13 +866,25 @@ pub fn search_page(
                 .paths
                 .as_ref()
                 .map(|p| p.iter().map(|s| s.as_str()).collect());
-            match bm25_search_candidates(
-                db,
-                &match_expr,
-                semantic_fetch,
-                bm25_languages.as_deref(),
-                bm25_paths.as_deref(),
-            ) {
+            let bm25_rows = if qualified_groups_enabled() {
+                bm25_candidates_with_fallback(
+                    db,
+                    &match_expr,
+                    &req.query,
+                    semantic_fetch,
+                    bm25_languages.as_deref(),
+                    bm25_paths.as_deref(),
+                )
+            } else {
+                bm25_search_candidates(
+                    db,
+                    &match_expr,
+                    semantic_fetch,
+                    bm25_languages.as_deref(),
+                    bm25_paths.as_deref(),
+                )
+            };
+            match bm25_rows {
                 Ok(bm25_rows) if !bm25_rows.is_empty() => {
                     fused = true;
                     rrf_merge(rows, bm25_rows, semantic_fetch)
@@ -1341,6 +1537,7 @@ mod tuning {
     pub(super) const ADAPTIVE_RERANK: &str = "CODESAGE_ADAPTIVE_RERANK";
     pub(super) const VERSION_DEMOTE: &str = "CODESAGE_VERSION_DEMOTE";
     pub(super) const PLATFORM_DEMOTE: &str = "CODESAGE_PLATFORM_DEMOTE";
+    pub(super) const PHP_DECLARATION_DEMOTE: &str = "CODESAGE_PHP_DECLARATION_DEMOTE";
     pub(super) const FUSED_RERANK: &str = "CODESAGE_FUSED_RERANK";
     pub(super) const STEM_MATCH_BOOST: &str = "CODESAGE_STEM_MATCH_BOOST";
     pub(super) const HYBRID: &str = "CODESAGE_HYBRID";
@@ -1374,6 +1571,12 @@ static PLATFORM_DEMOTE_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn platform_demote_enabled() -> bool {
     *PLATFORM_DEMOTE_ENABLED.get_or_init(|| env_default_off(tuning::PLATFORM_DEMOTE))
+}
+
+static PHP_DECLARATION_DEMOTE_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn php_declaration_demote_enabled() -> bool {
+    *PHP_DECLARATION_DEMOTE_ENABLED.get_or_init(|| env_default_off(tuning::PHP_DECLARATION_DEMOTE))
 }
 
 /// How the BM25+RRF fusion gate behaves. Default `Gated` keys off
@@ -1733,14 +1936,17 @@ fn declaration_header_penalty(path: &str, language: Language) -> f32 {
 // from that one repo, and its ground truth may encode the same host assumption
 // the rule does. Needs validation on C repos outside the corpus before this
 // can be considered for default-on.
-const FOREIGN_PLATFORM_DIR_NAMES: &[&str] = &["win", "win32", "windows"];
+const WINDOWS_PLATFORM_DIR_NAMES: &[&str] = &["win", "win32", "windows"];
+const UNIX_PLATFORM_DIR_NAMES: &[&str] = &["unix", "posix", "linux", "darwin", "macos", "bsd"];
 
-fn foreign_platform_penalty(path: &str) -> f32 {
-    if cfg!(windows) {
-        return 1.0;
-    }
+fn foreign_platform_penalty(path: &str, windows_host: bool) -> f32 {
     let normalized = path.replace('\\', "/");
-    if has_dir_segment(&normalized, FOREIGN_PLATFORM_DIR_NAMES) {
+    let names = if windows_host {
+        UNIX_PLATFORM_DIR_NAMES
+    } else {
+        WINDOWS_PLATFORM_DIR_NAMES
+    };
+    if has_dir_segment(&normalized, names) {
         SOFT_PENALTY_MILD
     } else {
         1.0
@@ -1748,18 +1954,71 @@ fn foreign_platform_penalty(path: &str) -> f32 {
 }
 
 // Whole-token match so "windowsize" or "rewind" can't trip the guard.
-const PLATFORM_INTENT_KEYWORDS: &[&str] = &[
+const WINDOWS_INTENT_KEYWORDS: &[&str] = &[
     "windows", "win32", "win64", "iocp", "msvc", "mingw", "winapi",
 ];
+const UNIX_INTENT_KEYWORDS: &[&str] = &[
+    "unix", "posix", "linux", "darwin", "macos", "bsd", "epoll", "kqueue", "inotify", "pthread",
+    "pthreads",
+];
 
-fn query_names_foreign_platform(query: &str) -> bool {
+fn query_names_foreign_platform(query: &str, windows_host: bool) -> bool {
+    let keywords = if windows_host {
+        UNIX_INTENT_KEYWORDS
+    } else {
+        WINDOWS_INTENT_KEYWORDS
+    };
     query
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
         .any(|t| {
             let lower = t.to_ascii_lowercase();
-            PLATFORM_INTENT_KEYWORDS.contains(&lower.as_str())
+            keywords.contains(&lower.as_str())
+                || matches!(
+                    lower.as_str(),
+                    "platform" | "platforms" | "portable" | "portability"
+                )
         })
+}
+
+fn apply_foreign_platform_penalties(results: &mut [SearchResult], query: &str, windows_host: bool) {
+    if query_names_foreign_platform(query, windows_host)
+        || !results
+            .iter()
+            .any(|r| foreign_platform_penalty(&r.file_path, !windows_host) < 1.0)
+    {
+        return;
+    }
+    for result in results {
+        result.score *= foreign_platform_penalty(&result.file_path, windows_host);
+    }
+}
+
+fn php_declaration_penalty(result: &SearchResult, query: &str) -> f32 {
+    if result.language != Language::Php {
+        return 1.0;
+    }
+    let normalized = result.file_path.replace('\\', "/");
+    let basename = normalized.rsplit('/').next().unwrap_or(&normalized);
+    let Some(stem) = basename.strip_suffix(".php") else {
+        return 1.0;
+    };
+    if !stem.ends_with("Interface") && !has_dir_segment(&normalized, &["Contracts", "Facades"]) {
+        return 1.0;
+    }
+    let explicit = query
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|token| {
+            matches!(
+                token.to_ascii_lowercase().as_str(),
+                "interface" | "interfaces" | "contract" | "contracts" | "facade" | "facades"
+            ) || token.eq_ignore_ascii_case(stem)
+                || result
+                    .symbols
+                    .iter()
+                    .any(|s| token.eq_ignore_ascii_case(&s.name))
+        });
+    if explicit { 1.0 } else { SOFT_PENALTY_MODERATE }
 }
 
 // Extra multiplier applied to test-like paths when the query is non-test-shaped.
@@ -1802,7 +2061,7 @@ fn test_query_aware_enabled() -> bool {
 
 fn apply_path_penalties(results: &mut [SearchResult], query: &str) {
     let is_test_query = query_is_test_shaped(query);
-    let demote_foreign_platform = platform_demote_enabled() && !query_names_foreign_platform(query);
+    let demote_php_declaration = php_declaration_demote_enabled();
     // The header demote expresses a preference for the implementing `.c` over
     // the header declaring it, so it only means anything when a `.c` is in the
     // running. Header-only projects whose dialect resolves to C — fmtlib's
@@ -1817,10 +2076,13 @@ fn apply_path_penalties(results: &mut [SearchResult], query: &str) {
         if has_c_implementation {
             penalty *= declaration_header_penalty(&result.file_path, result.language);
         }
-        if demote_foreign_platform {
-            penalty *= foreign_platform_penalty(&result.file_path);
+        if demote_php_declaration {
+            penalty *= php_declaration_penalty(result, query);
         }
         result.score *= penalty;
+    }
+    if cfg!(any(unix, windows)) && platform_demote_enabled() {
+        apply_foreign_platform_penalties(results, query, cfg!(windows));
     }
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 }
@@ -2686,14 +2948,7 @@ mod hybrid_tests {
     #[test]
     fn build_fts_match_query_handles_scoped() {
         let q = build_fts_match_query("call ModuleRef::create");
-        // `ModuleRef` is code-shaped (uppercase) so it survives. `call` and
-        // `create` are plain lowercase — filtered out. This is the fix that
-        // let the gate's BM25 path actually surface target chunks on long
-        // queries: only code-shaped tokens make it into the MATCH
-        // disjunction, so common English glue words don't flood the ranking.
-        assert!(q.contains("\"ModuleRef\""));
-        assert!(!q.contains("\"call\""));
-        assert!(!q.contains("\"create\""));
+        assert_eq!(q, "\"ModuleRef\"");
     }
 
     #[test]
@@ -4524,9 +4779,9 @@ mod dir_saturation_tests {
 #[cfg(test)]
 mod language_and_version_penalty_tests {
     use super::{
-        SOFT_PENALTY_MILD, apply_version_demote, declaration_header_penalty,
-        foreign_platform_penalty, query_names_foreign_platform, query_names_version,
-        version_dir_of,
+        SOFT_PENALTY_MILD, SOFT_PENALTY_MODERATE, apply_foreign_platform_penalties,
+        apply_version_demote, declaration_header_penalty, foreign_platform_penalty,
+        php_declaration_penalty, query_names_foreign_platform, query_names_version, version_dir_of,
     };
     use codesage_protocol::{Language, SearchResult};
 
@@ -4635,21 +4890,145 @@ mod language_and_version_penalty_tests {
 
     #[test]
     fn foreign_platform_guard_matches_whole_tokens() {
-        assert!(query_names_foreign_platform("windows named pipe handling"));
-        assert!(query_names_foreign_platform("IOCP completion port"));
+        assert!(query_names_foreign_platform(
+            "windows named pipe handling",
+            false
+        ));
+        assert!(query_names_foreign_platform("IOCP completion port", false));
         // "window size" must not read as Windows intent.
         assert!(!query_names_foreign_platform(
-            "tty terminal raw mode and window size"
+            "tty terminal raw mode and window size",
+            false
         ));
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "rule is host-conditional and inert on Windows")]
     fn demotes_foreign_platform_directories() {
-        assert_eq!(foreign_platform_penalty("src/win/tcp.c"), SOFT_PENALTY_MILD);
-        assert_eq!(foreign_platform_penalty("src/unix/tcp.c"), 1.0);
+        assert_eq!(
+            foreign_platform_penalty("src/win/tcp.c", false),
+            SOFT_PENALTY_MILD
+        );
+        assert_eq!(foreign_platform_penalty("src/unix/tcp.c", false), 1.0);
         // Substring of a longer segment must not match.
-        assert_eq!(foreign_platform_penalty("src/window/tcp.c"), 1.0);
+        assert_eq!(foreign_platform_penalty("src/window/tcp.c", false), 1.0);
+    }
+
+    #[test]
+    fn windows_host_demotes_unix_mirrors_but_preserves_explicit_intent() {
+        for directory in ["unix", "posix", "linux", "darwin", "macos", "bsd"] {
+            let mut results = vec![
+                mk(&format!("src/{directory}/tcp.c"), 1.0),
+                mk("src/win/tcp.c", 0.9),
+            ];
+            apply_foreign_platform_penalties(&mut results, "TCP socket connection", true);
+            assert_eq!(results[0].score, SOFT_PENALTY_MILD);
+            assert_eq!(results[1].score, 0.9);
+            for query in [
+                "POSIX socket connection",
+                "Linux epoll",
+                "pthread creation",
+                "portable TCP implementation",
+            ] {
+                let mut explicit = vec![
+                    mk(&format!("src/{directory}/tcp.c"), 1.0),
+                    mk("src/win/tcp.c", 0.9),
+                ];
+                apply_foreign_platform_penalties(&mut explicit, query, true);
+                assert_eq!(explicit[0].score, 1.0, "{query}");
+            }
+        }
+        assert_eq!(
+            foreign_platform_penalty("src\\unix\\tcp.c", true),
+            SOFT_PENALTY_MILD
+        );
+        assert_eq!(foreign_platform_penalty("src/unixish/tcp.c", true), 1.0);
+    }
+
+    #[test]
+    fn foreign_only_and_platform_neutral_pages_keep_scores() {
+        for (windows_host, directory) in [(false, "win"), (true, "unix")] {
+            let mut results = vec![
+                mk(&format!("src/{directory}/tcp.c"), 1.0),
+                mk("src/common.c", 0.9),
+            ];
+            apply_foreign_platform_penalties(&mut results, "TCP connections", windows_host);
+            assert_eq!(results[0].score, 1.0);
+            assert_eq!(results[1].score, 0.9);
+        }
+    }
+
+    #[test]
+    fn php_declarations_demote_only_for_implicit_behavior_queries() {
+        for path in [
+            "src/ClientInterface.php",
+            "src/Contracts/Dispatcher.php",
+            "src/Facades/Cache.php",
+            "src\\Contracts\\Dispatcher.php",
+        ] {
+            let mut row = mk(path, 1.0);
+            row.language = Language::Php;
+            assert_eq!(
+                php_declaration_penalty(&row, "how requests execute"),
+                SOFT_PENALTY_MODERATE,
+                "{path}"
+            );
+            for query in [
+                "interface definition",
+                "contracts for requests",
+                "facade proxy handling",
+                "interfaces",
+                "facades",
+            ] {
+                assert_eq!(php_declaration_penalty(&row, query), 1.0, "{query}");
+            }
+        }
+    }
+
+    #[test]
+    fn php_named_files_and_members_remain_legitimate_targets() {
+        let mut row = mk("src/Facades/Cache.php", 1.0);
+        row.language = Language::Php;
+        row.symbols.push(codesage_protocol::SymbolSummary {
+            name: "shouldReceive".into(),
+            qualified_name: "Cache::shouldReceive".into(),
+            kind: codesage_protocol::SymbolKind::Method,
+        });
+        for query in [
+            "Support/Facades/Cache.php",
+            "Cache::get",
+            "how shouldReceive works",
+        ] {
+            assert_eq!(php_declaration_penalty(&row, query), 1.0, "{query}");
+        }
+        row.file_path = "src/ClientInterface.php".into();
+        assert_eq!(
+            php_declaration_penalty(&row, "GuzzleHttp\\ClientInterface::request"),
+            1.0
+        );
+    }
+
+    #[test]
+    fn php_declaration_patterns_do_not_demote_other_languages_or_implementation_paths() {
+        for path in ["src/Contracts/Dispatcher.php", "src/ClientInterface.php"] {
+            assert_eq!(
+                php_declaration_penalty(&mk(path, 1.0), "request handling"),
+                1.0
+            );
+        }
+        for path in [
+            "src/ContractStore.php",
+            "src/Client.php",
+            "src/Interfaces/Adapter.php",
+            "src/Facades/Cache.js",
+        ] {
+            let mut row = mk(path, 1.0);
+            row.language = Language::Php;
+            assert_eq!(
+                php_declaration_penalty(&row, "request handling"),
+                1.0,
+                "{path}"
+            );
+        }
     }
 }
 
@@ -4811,114 +5190,257 @@ mod stem_match_token_edge_tests {
 
 #[cfg(test)]
 mod scoped_fts_evidence_tests {
-    use super::build_fts_match_query;
+    use super::{
+        bm25_candidates_with_fallback, build_fts_match_query_legacy, build_fts_match_query_mode,
+        query_has_rare_literal_with_groups,
+    };
+    use codesage_storage::Database;
+
+    fn build_fts_match_query(query: &str) -> String {
+        build_fts_match_query_mode(query, false)
+    }
 
     #[test]
-    fn namespace_components_never_reach_the_match_expression() {
-        // The premise behind "scope-qualified terms are OR-joined, diluting
-        // the signal" does not hold: a lowercase namespace prefix is not
-        // code-shaped, so it is filtered before any OR-join. There is no
-        // `absl` term to conjoin with `StrSplit`.
-        for (query, expect_absent) in [
-            ("absl::StrSplit for splitting", "absl"),
-            ("how fmt::format works", "fmt"),
-            ("std::vector usage", "std"),
-            ("call ModuleRef::create", "create"),
+    fn default_builder_preserves_legacy_expressions() {
+        for (query, expected) in [
+            ("ModuleRef::create", "\"ModuleRef\""),
+            ("fmt::format", ""),
+            ("Illuminate\\Routing\\Router", "\"Router\""),
+            ("moduleref.create", "\"moduleref\" OR \"create\""),
+            (
+                "use `doc_cfg` instead of `doc_auto_cfg`",
+                "\"doc_cfg\" OR \"doc_auto_cfg\"",
+            ),
         ] {
-            let q = build_fts_match_query(query);
-            assert!(
-                !q.contains(&format!("\"{expect_absent}\"")),
-                "{query:?} produced {q:?}, which still carries {expect_absent:?}"
-            );
+            assert_eq!(build_fts_match_query_legacy(query), expected);
         }
     }
 
     #[test]
-    fn a_lowercase_namespace_query_yields_only_the_identifier_terms() {
-        // One mechanical case, not a corpus-wide claim: with a lowercase
-        // namespace the surviving terms are the identifiers the query names.
-        let q = build_fts_match_query("absl::StrSplit and StrJoin for splitting and joining");
-        assert!(q.contains("\"StrSplit\""));
-        assert!(q.contains("\"StrJoin\""));
-        assert!(!q.contains("\"absl\""));
+    fn qualified_groups_environment_child() {
+        let enabled = std::env::var("CODESAGE_QUALIFIED_GROUPS").is_ok_and(|value| value == "1");
+        let query = "Illuminate\\Routing\\Router";
+        assert_eq!(
+            super::build_fts_match_query(query),
+            if enabled {
+                build_fts_match_query(query)
+            } else {
+                build_fts_match_query_legacy(query)
+            }
+        );
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(super::query_has_rare_literal(&db, query).unwrap(), enabled);
     }
 
     #[test]
-    fn every_corpus_query_carrying_a_scope_is_unchanged_by_the_suppression() {
-        // These are the 20 semble queries (of 1251) that carry a `::` in a
-        // CodeSage-supported language, verbatim. Every prefix is plain
-        // lowercase, so the code-shape filter already dropped it before this
-        // change and the emitted terms must be identical to the old behavior.
-        // Pinned because a full benchmark arm over these two repos costs ~16
-        // minutes and this settles the same question in milliseconds.
+    fn qualified_groups_requires_explicit_opt_in() {
+        let executable = std::env::current_exe().unwrap();
+        for value in [None, Some("0"), Some("true"), Some("1")] {
+            let mut command = std::process::Command::new(&executable);
+            command.args([
+                "--exact",
+                "search::scoped_fts_evidence_tests::qualified_groups_environment_child",
+            ]);
+            command.env_remove("CODESAGE_QUALIFIED_GROUPS");
+            if let Some(value) = value {
+                command.env("CODESAGE_QUALIFIED_GROUPS", value);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+    }
+
+    #[test]
+    fn qualified_components_remain_in_one_conjunction() {
+        for (query, expected) in [
+            (
+                "absl::StrSplit for splitting",
+                "(\"absl\" AND \"StrSplit\")",
+            ),
+            ("how fmt::format works", "(\"fmt\" AND \"format\")"),
+            ("std::vector usage", "(\"std\" AND \"vector\")"),
+            ("call ModuleRef::create", "(\"ModuleRef\" AND \"create\")"),
+            ("`foo_bar::Thing`", "(\"foo_bar\" AND \"Thing\")"),
+            (
+                "\\Illuminate\\Routing\\Router()",
+                "(\"Illuminate\" AND \"Routing\" AND \"Router\")",
+            ),
+            ("moduleref.create()", "(\"moduleref\" AND \"create\")"),
+            ("foo.bar.baz", "(\"foo\" AND \"bar\" AND \"baz\")"),
+            ("foo::bar.baz", "(\"foo\" AND \"bar\" AND \"baz\")"),
+            ("Δοκιμή::μέλος", "(\"Δοκιμή\" AND \"μέλος\")"),
+            ("a::b", "(\"a\" AND \"b\")"),
+        ] {
+            assert_eq!(build_fts_match_query(query), expected, "{query}");
+        }
+    }
+
+    #[test]
+    fn standalone_code_identifiers_remain_independent_alternatives() {
+        let q = build_fts_match_query("absl::StrSplit and StrJoin for splitting and joining");
+        assert_eq!(q, "(\"absl\" AND \"StrSplit\") OR \"StrJoin\"");
+    }
+
+    #[test]
+    fn scope_queries_preserve_lowercase_components_without_english_glue() {
         for (query, expect) in [
             (
                 "absl::StrCat and StrAppend for efficient string",
-                "\"StrCat\" OR \"StrAppend\"",
+                "(\"absl\" AND \"StrCat\") OR \"StrAppend\"",
             ),
             (
                 "absl::string_view for non-owning string references",
-                "\"string_view\"",
+                "(\"absl\" AND \"string_view\")",
             ),
             (
                 "absl::flat_hash_map and flat_hash_set hash tables",
-                "\"flat_hash_map\" OR \"flat_hash_set\"",
+                "(\"absl\" AND \"flat_hash_map\") OR \"flat_hash_set\"",
             ),
-            ("how fmt::format and fmt::print format strings", ""),
-            // A lowercase tail is filtered like any lowercase token, before
-            // and after — the suppression never gets a selective tail to keep.
-            ("std::filesystem path formatting support", ""),
+            (
+                "how fmt::format and fmt::print format strings",
+                "(\"fmt\" AND \"format\") OR (\"fmt\" AND \"print\")",
+            ),
+            (
+                "std::filesystem path formatting support",
+                "(\"std\" AND \"filesystem\")",
+            ),
         ] {
-            assert_eq!(
-                build_fts_match_query(query),
-                expect,
-                "query {query:?} must emit the same terms as before the change"
-            );
+            assert_eq!(build_fts_match_query(query), expect, "query {query:?}");
         }
     }
 
     #[test]
-    fn a_code_shaped_namespace_component_is_dropped_leaving_the_tail() {
-        // `absl`/`fmt`/`std` are filtered for being plain lowercase, not for
-        // being namespaces — so a namespace carrying an underscore or a
-        // capital used to reach the disjunction and dilute it. It now emits a
-        // phrase plus the tail, and no standalone prefix term.
-        let q = build_fts_match_query("foo_bar::Thing lookup");
-        assert!(q.contains("\"Thing\""), "tail stays selectable: {q:?}");
+    fn backslash_qualified_names_trigger_the_hybrid_gate() {
+        let db = Database::open_in_memory().unwrap();
         assert!(
-            !q.contains("\"foo_bar\""),
-            "prefix must not remain a term of its own: {q:?}"
+            query_has_rare_literal_with_groups(&db, "Illuminate\\Routing\\Router", true).unwrap()
         );
-
-        // PHP backslash-qualified names are the clearest instance: every
-        // component is capitalised, so before this all of them survived and
-        // the two namespace components outvoted the class.
-        let q = build_fts_match_query("Illuminate\\Routing\\Router dispatch");
-        assert!(q.contains("\"Router\""), "the class survives: {q:?}");
-        assert!(!q.contains("\"Illuminate\""), "got {q:?}");
-        assert!(!q.contains("\"Routing\""), "got {q:?}");
+        assert!(
+            !query_has_rare_literal_with_groups(&db, "Illuminate\\Routing\\Router", false).unwrap()
+        );
+        assert!(!query_has_rare_literal_with_groups(&db, "e.g. the handler", true).unwrap());
     }
 
     #[test]
-    fn a_suppressed_prefix_is_still_dropped_when_it_repeats_elsewhere() {
-        // The prefix is suppressed by name, so a later standalone mention does
-        // not smuggle it back in as its own OR term.
+    fn an_explicit_standalone_namespace_remains_an_independent_term() {
         let q = build_fts_match_query("Illuminate\\Routing\\Router and Illuminate helpers");
-        assert!(!q.contains("\"Illuminate\""), "got {q:?}");
-        assert!(q.contains("\"Router\""));
+        assert_eq!(
+            q,
+            "(\"Illuminate\" AND \"Routing\" AND \"Router\") OR \"Illuminate\""
+        );
     }
 
     #[test]
-    fn the_dotted_pair_route_bypasses_the_code_shape_filter() {
-        // extract_dotted_identifier_tokens runs BEFORE the filter, so a
-        // lowercase dotted pair reaches the disjunction where the same
-        // components behind `::` would not.
-        let q = build_fts_match_query("fix moduleref.create edge case");
-        assert!(q.contains("\"moduleref\""));
-        assert!(
-            q.contains("\"create\""),
-            "dotted route admits lowercase: {q:?}"
-        );
+    fn grouped_hits_exclude_partial_names_and_missing_groups_fall_back() {
+        let db = Database::open_in_memory().unwrap();
+        let embedding = vec![0.0; codesage_storage::db::DEFAULT_EMBEDDING_DIM];
+        for (path, content) in [
+            ("exact.php", "Illuminate Routing Router dispatch"),
+            ("other.php", "Unrelated Router dispatch"),
+            ("namespace.php", "Illuminate Routing helper"),
+        ] {
+            db.insert_chunks(path, "php", &[(content, 1, 1, &embedding)])
+                .unwrap();
+        }
+        let query = "Illuminate\\Routing\\Router";
+        let rows = bm25_candidates_with_fallback(
+            &db,
+            &build_fts_match_query(query),
+            query,
+            10,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file_path, "exact.php");
+        let query = "Missing\\Router";
+        let rows = bm25_candidates_with_fallback(
+            &db,
+            &build_fts_match_query(query),
+            query,
+            10,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row.file_path == "other.php"));
+        let rows = bm25_candidates_with_fallback(
+            &db,
+            &build_fts_match_query(query),
+            query,
+            10,
+            Some(&["rust"]),
+            None,
+        )
+        .unwrap();
+        assert!(rows.is_empty());
+        let rows = bm25_candidates_with_fallback(
+            &db,
+            &build_fts_match_query(query),
+            query,
+            10,
+            None,
+            Some(&["other.php"]),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file_path, "other.php");
+    }
+
+    #[test]
+    fn quotes_and_boolean_words_cannot_change_fts_syntax() {
+        let db = Database::open_in_memory().unwrap();
+        for query in [
+            "\"foo_bar::Thing\" OR \"Another",
+            "foo::bar) NOT Baz",
+            "foo::bar\"*",
+            "",
+            "💥::X",
+        ] {
+            let expression = build_fts_match_query(query);
+            if !expression.is_empty() {
+                assert!(
+                    db.search_bm25(&expression, 10, None, None).is_ok(),
+                    "{expression}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dotted_fallback_preserves_lowercase_legacy_terms() {
+        let db = Database::open_in_memory().unwrap();
+        let embedding = vec![0.0; codesage_storage::db::DEFAULT_EMBEDDING_DIM];
+        db.insert_chunks(
+            "receiver.ts",
+            "typescript",
+            &[("moduleref resolver", 1, 1, &embedding)],
+        )
+        .unwrap();
+        db.insert_chunks(
+            "member.ts",
+            "typescript",
+            &[("create handler", 1, 1, &embedding)],
+        )
+        .unwrap();
+        let query = "moduleref.create";
+        let rows = bm25_candidates_with_fallback(
+            &db,
+            &build_fts_match_query(query),
+            query,
+            10,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2);
     }
 }
 

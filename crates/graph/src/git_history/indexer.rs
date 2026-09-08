@@ -6,7 +6,7 @@
 //! - per-commit churn weight = decay * min((added+deleted)/100, 3.0); the clamp
 //!   prevents one historic refactor from dominating forever
 //! - co-change pair weight = sum over commits where both files appear, weighted by decay
-//! - min co-change count = 3 (drop pairs that only ever changed together once or twice)
+//! - min visible co-change count = 3 (retain smaller counts for incremental indexing)
 //! - soft-skip `chore:` / `build:` commits UNLESS message contains migrate/refactor/adopt/deprecate
 //! - no-merges only (merge commits double-count work already in their parents)
 //!
@@ -32,6 +32,8 @@ use codesage_protocol::GitIndexStats;
 use codesage_storage::Database;
 use codesage_storage::db::CoChangeWrite;
 use globset::GlobSet;
+
+use super::bus_factor::normalized_author;
 
 const DECAY_HALFLIFE_DAYS: f64 = 180.0;
 const SECONDS_PER_DAY: f64 = 86_400.0;
@@ -138,6 +140,7 @@ pub fn git_history_index_with_options(
             Some((last_sha, last_indexed_at)) if last_sha == head_sha => {
                 db.execute_batch(|db| {
                     decay_git_history_to_now(db, last_indexed_at, unix_now())?;
+                    db.prune_git_author_events(history_window_cutoff(unix_now()))?;
                     db.set_git_index_state(&head_sha)
                 })?;
                 return Ok(GitIndexStats {
@@ -239,6 +242,8 @@ fn run_full(
     let mut co_change_kept = 0usize;
     db.execute_batch(|db| {
         db.clear_git_data()?;
+        db.reset_git_authors()?;
+        write_author_events(db, &commits, exclude_set)?;
         for (path, stats) in &files {
             db.upsert_git_file(
                 path,
@@ -249,8 +254,8 @@ fn run_full(
             )?;
         }
         for ((a, b), stats) in &pairs {
+            db.upsert_git_co_change_full(a, b, &stats.write())?;
             if stats.count >= MIN_CO_CHANGE_COUNT {
-                db.upsert_git_co_change_full(a, b, &stats.write())?;
                 co_change_kept += 1;
             }
         }
@@ -298,11 +303,6 @@ fn run_incremental(
         );
     }
 
-    // Preload existing pair keys once, outside the write transaction, so the
-    // inner loop's "does this sub-threshold pair already exist in DB?" check is
-    // an in-memory HashMap lookup instead of one `SELECT COUNT(*)` per pair.
-    let existing_pairs = db.all_co_change_pairs()?;
-
     // One transaction wraps decay-scale + every upsert. See run_full for the
     // fsync motivation. Decay scale needs to be inside the same transaction
     // as the deltas, otherwise a crash mid-write leaves us with scaled-but-
@@ -310,6 +310,8 @@ fn run_incremental(
     let mut co_change_kept = 0usize;
     db.execute_batch(|db| {
         decay_git_history_to_now(db, last_indexed_at, now)?;
+        db.prune_git_author_events(history_window_cutoff(now))?;
+        write_author_events(db, &commits, exclude_set)?;
         for (path, stats) in &files {
             db.incr_git_file(
                 path,
@@ -320,12 +322,8 @@ fn run_incremental(
             )?;
         }
         for ((a, b), stats) in &pairs {
-            // Surface a pair if either it already exists in DB (accumulate onto it) or
-            // its delta alone cleared the min-count filter. Sub-threshold pairs that
-            // straddle the boundary will be caught by the next full rescan.
-            let pair_exists = existing_pairs.get(a).is_some_and(|rhs| rhs.contains(b));
-            if stats.count >= MIN_CO_CHANGE_COUNT || pair_exists {
-                db.incr_git_co_change_full(a, b, &stats.write())?;
+            db.incr_git_co_change_full(a, b, &stats.write())?;
+            if db.co_change_pair_exists(a, b)? {
                 co_change_kept += 1;
             }
         }
@@ -342,6 +340,23 @@ fn run_incremental(
 
 fn history_window_cutoff(now: i64) -> i64 {
     now - (HISTORY_WINDOW_DAYS * SECONDS_PER_DAY) as i64
+}
+
+fn write_author_events(db: &Database, commits: &[Commit], excludes: &GlobSet) -> Result<()> {
+    for commit in commits {
+        let Some(changes) = filter_kept(commit, excludes) else {
+            continue;
+        };
+        for change in changes {
+            db.upsert_git_author_event(
+                &change.path,
+                &commit.sha,
+                &commit.author,
+                commit.timestamp,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn decay_git_history_to_now(db: &Database, last_indexed_at: i64, now: i64) -> Result<()> {
@@ -537,8 +552,10 @@ fn is_ancestor(root: &Path, old: &str, new: &str) -> Result<bool> {
     Ok(status.success())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Commit {
+    sha: String,
+    author: String,
     timestamp: i64,
     subject: String,
     changes: Vec<FileChange>,
@@ -558,7 +575,7 @@ fn run_git_log(root: &Path, range: Option<&str>, since_epoch: i64) -> Result<Str
         "log",
         "--no-merges",
         "--numstat",
-        "--pretty=format:commit\x09%H\x09%ct\x09%s",
+        "--pretty=format:commit\x09%H\x09%ct\x09%ae%x1f%an%x1f%s",
         &since_arg,
     ];
     if let Some(r) = range {
@@ -608,10 +625,18 @@ fn parse_log(raw: &str) -> Vec<Commit> {
                 current = None;
                 continue;
             };
-            let subject = parts.next().unwrap_or("").to_string();
+            let remaining = parts.next().unwrap_or("");
+            let author_fields: Vec<&str> = remaining.splitn(3, '\u{1f}').collect();
+            let (author, subject) = if let [email, name, subject] = author_fields.as_slice() {
+                (normalized_author(email, name).unwrap_or_default(), *subject)
+            } else {
+                (String::new(), remaining)
+            };
             current = Some(Commit {
+                sha: _sha.to_string(),
+                author,
                 timestamp: ts,
-                subject,
+                subject: subject.to_string(),
                 changes: Vec::new(),
             });
             continue;
@@ -871,6 +896,7 @@ mod tests {
             timestamp: 1_700_000_000,
             subject: "fix: thing".into(),
             changes: vec![],
+            ..Commit::default()
         };
         let changes = [
             make_change("Repository.php"),     // source
@@ -911,6 +937,7 @@ mod tests {
             timestamp: 1_700_000_000,
             subject: "feat: x".into(),
             changes: vec![],
+            ..Commit::default()
         };
         let changes = [
             make_change("Repository.php"),
@@ -948,6 +975,7 @@ mod tests {
                 timestamp: ts,
                 subject: "feat: x".into(),
                 changes: vec![],
+                ..Commit::default()
             };
             accumulate(&mut files, &mut pairs, &commit, &kept, now, &test_glob());
         }
@@ -963,6 +991,7 @@ mod tests {
             timestamp: ts,
             subject: "feat: sweep".into(),
             changes: vec![],
+            ..Commit::default()
         };
         let changes = [
             make_change("a.rs"),

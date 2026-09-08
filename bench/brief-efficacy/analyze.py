@@ -22,6 +22,7 @@ import json
 import math
 import os
 import re
+import shlex
 import sys
 import tempfile
 from collections import Counter, defaultdict
@@ -102,9 +103,16 @@ def valid_fire(rec) -> bool:
     return True
 
 
-def read_generation(p: Path) -> list[dict]:
+def read_generation(p: Path, seen_files: set[tuple[int, int]] | None = None) -> list[dict]:
     try:
-        raw = p.read_text(errors="replace")
+        with p.open(encoding="utf-8", errors="replace") as stream:
+            stat = os.fstat(stream.fileno())
+            identity = (stat.st_dev, stat.st_ino)
+            if seen_files is not None:
+                if identity in seen_files:
+                    return []
+                seen_files.add(identity)
+            raw = stream.read()
     except FileNotFoundError:
         return []
     except OSError as e:
@@ -128,34 +136,18 @@ def read_generation(p: Path) -> list[dict]:
 
 
 def load_fires(*dirs: Path) -> list[dict]:
-    """Union of the ledgers in `dirs`, deduped and time-ordered. More than one
+    """Union of physical ledgers in `dirs`, time-ordered. More than one
     dir is the normal case after the move to the state dir: rows written before
     it sit in the runtime dir until the next reboot, and the ledger is a
     denominator, so both halves count."""
 
-    def snapshot(d: Path) -> list[dict]:
-        # Older generation first. Each read tolerates the file not existing.
-        return read_generation(d / (FIRE_LOG + ".1")) + read_generation(d / FIRE_LOG)
-
     fires: list[dict] = []
+    seen_files: set[tuple[int, int]] = set()
     for d in dirs:
-        rows = snapshot(d)
-        # A rotation between the two reads can surface the same rows in both
-        # generations; one retry re-reads a settled pair of files, and the
-        # dedupe below drops whatever overlap remains.
-        if not rows:
-            rows = snapshot(d)
-        fires.extend(rows)
-    seen: set[tuple] = set()
-    unique = []
-    for rec in fires:
-        key = (rec["t"], rec["s"], rec["f"], rec["d"], rec.get("h"))
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(rec)
-    unique.sort(key=lambda r: r["t"])
-    return unique
+        for path in (d / (FIRE_LOG + ".1"), d / FIRE_LOG):
+            fires.extend(read_generation(path, seen_files))
+    fires.sort(key=lambda r: r["t"])
+    return fires
 
 
 def munge_project(path: str) -> str:
@@ -164,20 +156,14 @@ def munge_project(path: str) -> str:
 
 
 def transcript_path(projects_dir: Path, project: str, session: str) -> Path | None:
+    if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}", session):
+        return None
     d = projects_dir / munge_project(project)
     p = d / f"{session}.jsonl"
-    return p if p.exists() else None
-
-
-def iter_strings(obj):
-    if isinstance(obj, str):
-        yield obj
-    elif isinstance(obj, dict):
-        for v in obj.values():
-            yield from iter_strings(v)
-    elif isinstance(obj, list):
-        for v in obj:
-            yield from iter_strings(v)
+    if p.is_file():
+        return p
+    matches = list(projects_dir.glob(f"*/{session}.jsonl"))
+    return matches[0] if len(matches) == 1 else None
 
 
 def payload_candidates(text: str):
@@ -197,7 +183,7 @@ def payload_candidates(text: str):
 def payload_occurrences(events: list[dict]) -> dict[str, list[tuple[int, str]]]:
     """digest -> [(event index, payload text), ...] in transcript order.
 
-    Every payload-shaped block in the transcript is indexed by its digest. Two
+    Only successful hook attachments count as exposure. Two
     files can be served byte-identical payloads (same digest, distinct ledger
     rows), so a serve must consume occurrences in order rather than always
     taking the first match — the caller pairs the nth ledger row carrying a
@@ -205,9 +191,35 @@ def payload_occurrences(events: list[dict]) -> dict[str, list[tuple[int, str]]]:
     most one occurrence per digest (a payload echoed twice inside a single
     event is one injection, not two)."""
     occ: dict[str, list[tuple[int, str]]] = defaultdict(list)
+    injections: set[tuple[str, str]] = set()
     for i, ev in enumerate(events):
+        if not isinstance(ev, dict):
+            continue
+        attachment = ev.get("attachment")
+        if not isinstance(attachment, dict) or attachment.get("type") not in (
+            "hook_success", "hook_additional_context",
+        ):
+            continue
+        if attachment.get("exitCode", 0) != 0:
+            continue
+        strings = []
+        for key in ("stdout", "content", "additionalContext"):
+            value = attachment.get(key)
+            if isinstance(value, str):
+                try:
+                    decoded = json.loads(value)
+                except ValueError:
+                    decoded = None
+                if isinstance(decoded, dict):
+                    output = decoded.get("hookSpecificOutput", {})
+                    if isinstance(output, dict) and isinstance(output.get("additionalContext"), str):
+                        strings.append(output["additionalContext"])
+                else:
+                    strings.append(value)
+            elif key == "content" and isinstance(value, list):
+                strings.extend(s for s in value if isinstance(s, str))
         seen_here: set[str] = set()
-        for s in iter_strings(ev):
+        for s in strings:
             if (
                 "hotspot: churn percentile" not in s
                 and "changes with: " not in s
@@ -218,6 +230,12 @@ def payload_occurrences(events: list[dict]) -> dict[str, list[tuple[int, str]]]:
                 d = fnv1a64(cand)
                 if d not in seen_here:
                     seen_here.add(d)
+                    tool_id = attachment.get("toolUseID")
+                    if isinstance(tool_id, str) and tool_id:
+                        key = (tool_id, d)
+                        if key in injections:
+                            continue
+                        injections.add(key)
                     occ[d].append((i, cand))
     return occ
 
@@ -235,6 +253,8 @@ def parse_payload(payload: str) -> tuple[list[str], list[str]]:
 def tool_uses(events: list[dict]):
     """(event index, tool name, input dict) for every assistant tool_use."""
     for i, ev in enumerate(events):
+        if not isinstance(ev, dict) or ev.get("type") != "assistant":
+            continue
         msg = ev.get("message")
         if not isinstance(msg, dict):
             continue
@@ -249,6 +269,93 @@ def tool_uses(events: list[dict]):
                     yield i, name, inp
 
 
+def runner_test_paths(runner: str, args: list[str]) -> list[str]:
+    if runner in ("python", "python3"):
+        while args and args[0] in ("-u", "-B", "-E", "-I", "-s", "-S", "-O", "-OO"):
+            args = args[1:]
+        if args[:2] in (["-m", "pytest"], ["-m", "unittest"]):
+            runner, args = args[1], args[2:]
+        elif len(args) == 1 and not args[0].startswith("-"):
+            return args
+        else:
+            return []
+
+    flags, values, short_flags = set(), set(), ""
+    if runner == "pytest":
+        flags = {"--disable-warnings", "--strict-markers", "--strict-config", "--no-header", "--no-summary"}
+        values = {"-k", "-m", "--maxfail", "--tb", "--capture", "--color"}
+        short_flags = "vqxs"
+    elif runner == "unittest":
+        flags = {"--verbose", "--quiet", "--failfast", "--buffer", "--catch"}
+        short_flags = "vqfbc"
+    elif runner == "phpunit":
+        flags = {"--testdox", "--stop-on-failure", "--stop-on-error", "--no-coverage"}
+        values = {"--filter", "--configuration", "-c", "--bootstrap", "--colors"}
+    elif runner in ("jest", "vitest"):
+        if runner == "vitest":
+            if args[:1] != ["run"]:
+                return []
+            args = args[1:]
+        flags = {"--runInBand", "--runTestsByPath", "--silent", "--bail"} if runner == "jest" else {"--silent"}
+        values = {"--testNamePattern", "-t"}
+    elif runner == "node":
+        if args[:1] != ["--test"]:
+            return []
+        args = args[1:]
+    else:
+        return []
+
+    paths = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        option, equals, _ = arg.partition("=")
+        if arg == "--":
+            paths.extend(args[index + 1:])
+            break
+        if option in values:
+            if not equals:
+                index += 1
+                if index >= len(args) or args[index].startswith("-"):
+                    return []
+        elif arg in flags:
+            pass
+        elif arg.startswith("-"):
+            if not short_flags or not re.fullmatch(f"-[{short_flags}]+", arg):
+                return []
+        else:
+            paths.append(arg)
+        index += 1
+    return paths
+
+
+def runs_named_test(command: str, tests: list[str]) -> bool:
+    if any(marker in command for marker in ("<<", "$(", "`")):
+        return False
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()<>\n")
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return False
+    if len(tokens) >= 4 and tokens[0] == "cd" and tokens[2] == "&&":
+        tokens = tokens[3:]
+    if any(token and all(c in ";&|()<>\n" for c in token) for token in tokens):
+        return False
+    words = tokens
+    if words[:2] == ["rtk", "proxy"]:
+        words = words[2:]
+    elif words[:1] == ["rtk"]:
+        words = words[1:]
+    if not words:
+        return False
+    runner = Path(words[0]).name
+    paths = runner_test_paths(runner, words[1:])
+    return any(path.split("::", 1)[0] == test or path.split("::", 1)[0].endswith("/" + test)
+               for path in paths for test in tests)
+
+
 def score_serve(events: list[dict], start: int, tests: list[str], coupled: list[str]) -> str:
     """Strict scoring: see README.md. `acted` needs a Bash run of a served
     test path or a full Read/Edit of a served co-change file after the serve.
@@ -259,13 +366,13 @@ def score_serve(events: list[dict], start: int, tests: list[str], coupled: list[
             continue
         if name == "Bash":
             cmd = inp.get("command", "")
-            if isinstance(cmd, str) and any(t in cmd for t in tests):
+            if isinstance(cmd, str) and runs_named_test(cmd, tests):
                 return "acted"
         elif name in ("Read", "Edit", "Write", "MultiEdit"):
             fp = inp.get("file_path", "")
             if not isinstance(fp, str):
                 continue
-            if any(fp.endswith(c) for c in coupled):
+            if any(fp == c or fp.endswith("/" + c) for c in coupled):
                 if name == "Read" and ("offset" in inp or "limit" in inp):
                     verdict = "ambiguous"
                 else:
@@ -464,6 +571,8 @@ def main() -> int:
             "rate": round(base_followed / base_edits, 3) if base_edits else None,
         },
         "z_score": round(z, 2) if z is not None else None,
+        "default_on_ready": False,
+        "decision": "Controlled A/B or randomized exposure is required; observational rates do not establish efficacy.",
         "serves": serves,
     }
 
@@ -489,17 +598,14 @@ def main() -> int:
         print(f"base rate: {base_followed}/{base_edits} = {base_followed / base_edits:.1%} "
               "(unconditioned file-named-test-after-edit; see README for bias)")
     if z is not None:
-        print(f"two-proportion z = {z:.2f} "
-              f"({'significant at ~95%' if abs(z) >= 1.96 else 'not significant'})")
+        print(f"descriptive two-proportion z = {z:.2f} (non-equivalent populations; not causal evidence)")
     if scored_n < args.min_served:
         print(f"\ndecision rule: not yet evaluable — {scored_n} scoreable serves, "
               f"need >= {args.min_served}.")
     else:
-        keep = z is not None and z >= 1.96
         print(f"\ndecision rule ({args.min_served}+ serves reached): "
-              + ("acted rate beats base rate — keep the hook."
-                 if keep else
-                 "acted rate statistically indistinguishable from base rate — remove the hook."))
+              "observational sample available; a controlled A/B or randomized exposure "
+              "is still required before default-on.")
     return 0
 
 

@@ -48,10 +48,6 @@ const SESSION_TOKEN_BUDGET: usize = 1500;
 /// Seconds before the same path may be served again, whatever the payload says.
 const PATH_COOLDOWN_SECS: u64 = 900;
 
-/// Session state older than this is deleted. A session that ran a day ago
-/// cannot be resumed into, and the runtime dir is not a place to accumulate.
-const STATE_TTL_SECS: u64 = 86_400;
-
 /// Characters per token. The replay measurements that set the budget above used
 /// the same divisor, so the two are consistent even though both are estimates.
 const CHARS_PER_TOKEN: usize = 4;
@@ -222,31 +218,6 @@ fn state_path(dir: &Path, session: &str) -> PathBuf {
     dir.join(format!("brief-{}.json", sanitize(session)))
 }
 
-/// Delete session state past its TTL. Called only when a session's own state is
-/// created, so this is once per session rather than once per fire.
-fn prune(dir: &Path, now: u64) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.starts_with("brief-") || !name.ends_with(".json") {
-            continue;
-        }
-        let stale = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| now.saturating_sub(d.as_secs()) > STATE_TTL_SECS)
-            .unwrap_or(false);
-        if stale {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-}
-
 /// Should this payload be served for `path` in `session`, and if not, why?
 ///
 /// [`Decision::Unavailable`] on any I/O or parse failure, per the fail-closed
@@ -261,28 +232,37 @@ pub(crate) fn evaluate(dir: &Path, session: &str, path: &str, payload: &str) -> 
     }
 
     let file = state_path(dir, session);
-    let existing = std::fs::read_to_string(&file).ok();
-    // A corrupt state file starts over rather than disabling the gate for the
-    // rest of the session; the budget it forgets is bounded by one session.
-    let mut state: GateState = existing
-        .as_deref()
-        .and_then(|raw| serde_json::from_str(raw).ok())
-        .unwrap_or_default();
+    let Ok(lock) = crate::fsguard::open_lockfile(&file.with_extension("lock")) else {
+        return Decision::Unavailable;
+    };
+    #[cfg(target_os = "android")]
+    let locked = crate::flock_override::try_flock_exclusive(&lock).is_ok();
+    #[cfg(not(target_os = "android"))]
+    let locked = lock.try_lock().is_ok();
+    if !locked {
+        return Decision::Unavailable;
+    }
+    let existing = match std::fs::read_to_string(&file) {
+        Ok(raw) => Some(raw),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Decision::Unavailable,
+    };
+    let mut state: GateState = match existing.as_deref() {
+        Some(raw) => match serde_json::from_str(raw) {
+            Ok(state) => state,
+            Err(_) => return Decision::Unavailable,
+        },
+        None => GateState::default(),
+    };
 
     let now = now_secs();
-    if existing.is_none() {
-        prune(dir, now);
-    }
 
     let decision = decide(&mut state, path, payload, now);
     if decision != Decision::Served {
         return decision;
     }
 
-    // Write to a session-and-pid-unique temp then rename, so a concurrent fire
-    // in the same session cannot observe a half-written file. Two fires racing
-    // can still lose one update; the cost of that is one duplicate payload,
-    // which is why this does not take a lock.
+    // The separate lock inode survives replacement of the state file.
     let Ok(encoded) = serde_json::to_string(&state) else {
         return Decision::Unavailable;
     };
@@ -571,12 +551,66 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_state_file_starts_over_rather_than_disabling_the_gate() {
+    fn a_corrupt_state_file_cannot_reset_the_budget() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
         std::fs::write(state_path(p, "sess"), "{not json").unwrap();
-        assert_eq!(evaluate(p, "sess", "a.rs", "x"), Decision::Served);
-        assert_eq!(evaluate(p, "sess", "a.rs", "x"), Decision::Repeat);
+        assert_eq!(evaluate(p, "sess", "a.rs", "x"), Decision::Unavailable);
+        assert_eq!(
+            std::fs::read_to_string(state_path(p, "sess")).unwrap(),
+            "{not json"
+        );
+    }
+
+    #[test]
+    fn concurrent_fires_cannot_exceed_the_session_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Barrier::new(16);
+        let payload = "x".repeat(SESSION_TOKEN_BUDGET * CHARS_PER_TOKEN);
+        let served = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|i| {
+                    let barrier = &barrier;
+                    let payload = &payload;
+                    let path = dir.path();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        evaluate(path, "concurrent", &format!("{i}.rs"), payload)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .filter(|d| *d == Decision::Served)
+                .count()
+        });
+        assert_eq!(served, 1);
+        let state: GateState = serde_json::from_str(
+            &std::fs::read_to_string(state_path(dir.path(), "concurrent")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state.tokens, SESSION_TOKEN_BUDGET);
+        assert_eq!(
+            evaluate(dir.path(), "concurrent", "later.rs", "y"),
+            Decision::Budget
+        );
+    }
+
+    #[test]
+    fn starting_another_session_cannot_reset_an_older_sessions_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = "x".repeat(SESSION_TOKEN_BUDGET * CHARS_PER_TOKEN);
+        assert_eq!(
+            evaluate(dir.path(), "old", "a.rs", &payload),
+            Decision::Served
+        );
+        std::fs::File::open(state_path(dir.path(), "old"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(UNIX_EPOCH))
+            .unwrap();
+        assert_eq!(evaluate(dir.path(), "new", "b.rs", "x"), Decision::Served);
+        assert_eq!(evaluate(dir.path(), "old", "c.rs", "x"), Decision::Budget);
     }
 
     #[test]

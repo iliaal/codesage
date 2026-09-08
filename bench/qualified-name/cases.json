@@ -1,0 +1,2026 @@
+[
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\View\\Compilers\\Concerns\\CompilesIncludes",
+    "expected": [
+      "src/Illuminate/View/Compilers/Concerns/CompilesIncludes.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Routing\\Middleware\\ValidateSignature` implementation",
+    "expected": [
+      "src/Illuminate/Routing/Middleware/ValidateSignature.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Translation\\PotentiallyTranslatedString works",
+    "expected": [
+      "src/Illuminate/Translation/PotentiallyTranslatedString.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Auth\\Recaller",
+    "expected": [
+      "src/Illuminate/Auth/Recaller.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Queue\\Console\\ClearCommand` implementation",
+    "expected": [
+      "src/Illuminate/Queue/Console/ClearCommand.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Foundation\\Console\\TestMakeCommand works",
+    "expected": [
+      "src/Illuminate/Foundation/Console/TestMakeCommand.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Support\\Traits\\InteractsWithData",
+    "expected": [
+      "src/Illuminate/Support/Traits/InteractsWithData.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Contracts\\Auth\\Access\\Authorizable` implementation",
+    "expected": [
+      "src/Illuminate/Contracts/Auth/Access/Authorizable.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Database\\Eloquent\\Attributes\\Connection works",
+    "expected": [
+      "src/Illuminate/Database/Eloquent/Attributes/Connection.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\View\\DynamicComponent",
+    "expected": [
+      "src/Illuminate/View/DynamicComponent.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Broadcasting\\InteractsWithBroadcasting` implementation",
+    "expected": [
+      "src/Illuminate/Broadcasting/InteractsWithBroadcasting.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Support\\Traits\\TransformsToResourceCollection works",
+    "expected": [
+      "src/Illuminate/Collections/Traits/TransformsToResourceCollection.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Contracts\\Routing\\ResponseFactory",
+    "expected": [
+      "src/Illuminate/Contracts/Routing/ResponseFactory.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Types\\Model\\Post` implementation",
+    "expected": [
+      "types/Database/Eloquent/Model.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\View\\Compilers\\Concerns\\CompilesConditionals works",
+    "expected": [
+      "src/Illuminate/View/Compilers/Concerns/CompilesConditionals.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Foundation\\Console\\ExceptionMakeCommand",
+    "expected": [
+      "src/Illuminate/Foundation/Console/ExceptionMakeCommand.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Queue\\Connectors\\RedisConnector` implementation",
+    "expected": [
+      "src/Illuminate/Queue/Connectors/RedisConnector.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Testing\\Concerns\\TestViews works",
+    "expected": [
+      "src/Illuminate/Testing/Concerns/TestViews.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Foundation\\Http\\Attributes\\RedirectToRoute",
+    "expected": [
+      "src/Illuminate/Foundation/Http/Attributes/RedirectToRoute.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Support\\Facades\\Redirect` implementation",
+    "expected": [
+      "src/Illuminate/Support/Facades/Redirect.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Validation\\Rules\\ExcludeIf works",
+    "expected": [
+      "src/Illuminate/Validation/Rules/ExcludeIf.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Contracts\\Auth\\PasswordBroker",
+    "expected": [
+      "src/Illuminate/Contracts/Auth/PasswordBroker.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Container\\Attributes\\Singleton` implementation",
+    "expected": [
+      "src/Illuminate/Container/Attributes/Singleton.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Process\\Exceptions\\ProcessTimedOutException works",
+    "expected": [
+      "src/Illuminate/Process/Exceptions/ProcessTimedOutException.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Queue\\Middleware\\ThrottlesExceptionsWithRedis",
+    "expected": [
+      "src/Illuminate/Queue/Middleware/ThrottlesExceptionsWithRedis.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Routing\\Console\\MiddlewareMakeCommand` implementation",
+    "expected": [
+      "src/Illuminate/Routing/Console/MiddlewareMakeCommand.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Support\\Facades\\DB works",
+    "expected": [
+      "src/Illuminate/Support/Facades/DB.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Encryption\\Encrypter",
+    "expected": [
+      "src/Illuminate/Encryption/Encrypter.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Database\\Schema\\Grammars\\Grammar` implementation",
+    "expected": [
+      "src/Illuminate/Database/Schema/Grammars/Grammar.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Database\\Migrations\\DatabaseMigrationRepository works",
+    "expected": [
+      "src/Illuminate/Database/Migrations/DatabaseMigrationRepository.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\View\\Engines\\CompilerEngine",
+    "expected": [
+      "src/Illuminate/View/Engines/CompilerEngine.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Types\\Foundation\\Testing\\InteractsWithTimeTestCase` implementation",
+    "expected": [
+      "types/Foundation/Testing/InteractsWithTime.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Auth\\Events\\Attempting works",
+    "expected": [
+      "src/Illuminate/Auth/Events/Attempting.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Contracts\\Process\\InvokedProcess",
+    "expected": [
+      "src/Illuminate/Contracts/Process/InvokedProcess.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Cache\\LuaScripts` implementation",
+    "expected": [
+      "src/Illuminate/Cache/LuaScripts.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Foundation\\Application works",
+    "expected": [
+      "src/Illuminate/Foundation/Application.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Routing\\Redirector",
+    "expected": [
+      "src/Illuminate/Routing/Redirector.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Events\\Dispatcher` implementation",
+    "expected": [
+      "src/Illuminate/Events/Dispatcher.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Broadcasting\\EncryptedPrivateChannel works",
+    "expected": [
+      "src/Illuminate/Broadcasting/EncryptedPrivateChannel.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Console\\View\\Components\\Factory",
+    "expected": [
+      "src/Illuminate/Console/View/Components/Factory.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Testing\\ParallelTestingServiceProvider` implementation",
+    "expected": [
+      "src/Illuminate/Testing/ParallelTestingServiceProvider.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Support\\Facades\\Crypt works",
+    "expected": [
+      "src/Illuminate/Support/Facades/Crypt.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Database\\Query\\Processors\\MariaDbProcessor",
+    "expected": [
+      "src/Illuminate/Database/Query/Processors/MariaDbProcessor.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Support\\Facades\\MaintenanceMode` implementation",
+    "expected": [
+      "src/Illuminate/Support/Facades/MaintenanceMode.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Notifications\\HasDatabaseNotifications works",
+    "expected": [
+      "src/Illuminate/Notifications/HasDatabaseNotifications.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Support\\DateFactory",
+    "expected": [
+      "src/Illuminate/Support/DateFactory.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Database\\Eloquent\\Casts\\Json` implementation",
+    "expected": [
+      "src/Illuminate/Database/Eloquent/Casts/Json.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Container\\ContextualBindingBuilder works",
+    "expected": [
+      "src/Illuminate/Container/ContextualBindingBuilder.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Routing\\Events\\ResponsePrepared",
+    "expected": [
+      "src/Illuminate/Routing/Events/ResponsePrepared.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Http\\Concerns\\InteractsWithContentTypes` implementation",
+    "expected": [
+      "src/Illuminate/Http/Concerns/InteractsWithContentTypes.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Support\\Facades\\Event works",
+    "expected": [
+      "src/Illuminate/Support/Facades/Event.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Foundation\\Testing\\DatabaseMigrations",
+    "expected": [
+      "src/Illuminate/Foundation/Testing/DatabaseMigrations.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Contracts\\Pipeline\\Pipeline` implementation",
+    "expected": [
+      "src/Illuminate/Contracts/Pipeline/Pipeline.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Support\\Defer\\DeferredCallback works",
+    "expected": [
+      "src/Illuminate/Support/Defer/DeferredCallback.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Foundation\\Support\\Providers\\EventServiceProvider",
+    "expected": [
+      "src/Illuminate/Foundation/Support/Providers/EventServiceProvider.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Foundation\\Console\\CastMakeCommand` implementation",
+    "expected": [
+      "src/Illuminate/Foundation/Console/CastMakeCommand.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Contracts\\Concurrency\\Driver works",
+    "expected": [
+      "src/Illuminate/Contracts/Concurrency/Driver.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "Illuminate\\Process\\ProcessPoolResults",
+    "expected": [
+      "src/Illuminate/Process/ProcessPoolResults.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "find `Illuminate\\Cache\\RateLimiting\\Limit` implementation",
+    "expected": [
+      "src/Illuminate/Cache/RateLimiting/Limit.php"
+    ],
+    "split": "development",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "laravel-framework",
+    "query": "how Illuminate\\Foundation\\Testing\\Concerns\\InteractsWithAuthentication works",
+    "expected": [
+      "src/Illuminate/Foundation/Testing/Concerns/InteractsWithAuthentication.php"
+    ],
+    "split": "holdout",
+    "group": "laravel-framework"
+  },
+  {
+    "project": "serde",
+    "query": "ArcWeak::deserialize",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "find `ReplaceReceiver::visit_type_param_bound_mut` implementation",
+    "expected": [
+      "serde_derive/src/internals/receiver.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "how Wrapping::deserialize works",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "MapAccessDeserializer::into_deserializer",
+    "expected": [
+      "serde_core/src/de/value.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "find `FlatMapDeserializer::deserialize_other` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "how MapRefDeserializer::size_hint works",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "ContentSerializer::serialize_i32",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "find `BoolAttr::none` implementation",
+    "expected": [
+      "serde_derive/src/internals/attr.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "how ContentDeserializer::deserialize_f64 works",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "ContentRefDeserializer::deserialize_i8",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "find `OptionVisitor::visit_some` implementation",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "how ContentDeserializer::deserialize_bytes works",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "ContentDeserializer::deserialize_tuple_struct",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "find `BorrowedBytesDeserializer::deserialize_any` implementation",
+    "expected": [
+      "serde_core/src/de/value.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "how TaggedSerializer::serialize_bytes works",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "SerializeTupleStruct::serialize_field",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "find `SystemTime::serialize` implementation",
+    "expected": [
+      "serde_core/src/ser/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "how Cow::into_deserializer works",
+    "expected": [
+      "serde_core/src/de/value.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "Result::serialize",
+    "expected": [
+      "serde_core/src/ser/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "find `u64::from` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "how SerializeStructVariant::serialize_field works",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "FlatMapSerializeMap::end",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "find `TagOrContentVisitor::expecting` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "how Impossible::serialize_field works",
+    "expected": [
+      "serde_core/src/ser/impossible.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "ContentRefDeserializer::deserialize_ignored_any",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "find `FlatMapDeserializer::deserialize_newtype_struct` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "how VecInPlaceVisitor::visit_seq works",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "RangeVisitor::expecting",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "find `StrDeserializer::into_deserializer` implementation",
+    "expected": [
+      "serde_core/src/de/value.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "how TaggedContentVisitor::new works",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "net::IpAddr::deserialize",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "find `DeTypeGenerics::in_place` implementation",
+    "expected": [
+      "serde_derive/src/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "how Container::ser_bound works",
+    "expected": [
+      "serde_derive/src/internals/attr.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "CharVisitor::expecting",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "find `fmt::Error::custom` implementation",
+    "expected": [
+      "serde_core/src/ser/fmt.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "how ContentVisitor::visit_unit works",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "StrDeserializer::deserialize_any",
+    "expected": [
+      "serde/src/private/de.rs",
+      "serde_core/src/de/value.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "find `ReplaceReceiver::visit_type_mut_impl` implementation",
+    "expected": [
+      "serde_derive/src/internals/receiver.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "how ContentSerializer::serialize_unit works",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "net::SocketAddr::serialize",
+    "expected": [
+      "serde_core/src/ser/impls.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "find `TagContentOtherFieldVisitor::deserialize` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "how PhantomDataVisitor::visit_unit works",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "SerializeSeq::serialize_element",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "find `PairRefVisitor::size_hint` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "how MapDeserializer::next_entry_seed works",
+    "expected": [
+      "serde/src/private/de.rs",
+      "serde_core/src/de/value.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "TagOrContentVisitor::visit_seq",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "find `CowStrVisitor::visit_borrowed_str` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "how UntaggedUnitVisitor::visit_unit works",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "TagOrContentVisitor::visit_bytes",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "find `ContentDeserializer::deserialize_byte_buf` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "how ContentDeserializer::invalid_type works",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "AdjacentlyTaggedEnumVariantSeed::deserialize",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "find `SerializeTupleVariantAsMapValue::serialize_field` implementation",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "how BorrowedBytesDeserializer::fmt works",
+    "expected": [
+      "serde_core/src/de/value.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "RangeToVisitor::visit_map",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "find `TagOrContentVisitor::visit_borrowed_bytes` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "how FlatMapDeserializer::deserialize_struct works",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "TagOrContentVisitor::visit_str",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "find `String::deserialize` implementation",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "how SerializeMap::serialize_value works",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "holdout",
+    "group": "serde"
+  },
+  {
+    "project": "serde",
+    "query": "ArcWeak.deserialize",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "find `ReplaceReceiver.visit_type_param_bound_mut` implementation",
+    "expected": [
+      "serde_derive/src/internals/receiver.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "how Wrapping.deserialize works",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "MapAccessDeserializer.into_deserializer",
+    "expected": [
+      "serde_core/src/de/value.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "find `FlatMapDeserializer.deserialize_other` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "how MapRefDeserializer.size_hint works",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "ContentSerializer.serialize_i32",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "find `BoolAttr.none` implementation",
+    "expected": [
+      "serde_derive/src/internals/attr.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "how ContentDeserializer.deserialize_f64 works",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "ContentRefDeserializer.deserialize_i8",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "find `OptionVisitor.visit_some` implementation",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "how ContentDeserializer.deserialize_bytes works",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "ContentDeserializer.deserialize_tuple_struct",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "find `BorrowedBytesDeserializer.deserialize_any` implementation",
+    "expected": [
+      "serde_core/src/de/value.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "how TaggedSerializer.serialize_bytes works",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "SerializeTupleStruct.serialize_field",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "find `SystemTime.serialize` implementation",
+    "expected": [
+      "serde_core/src/ser/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "how Cow.into_deserializer works",
+    "expected": [
+      "serde_core/src/de/value.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "Result.serialize",
+    "expected": [
+      "serde_core/src/ser/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "find `u64.from` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "how SerializeStructVariant.serialize_field works",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "FlatMapSerializeMap.end",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "find `TagOrContentVisitor.expecting` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "how Impossible.serialize_field works",
+    "expected": [
+      "serde_core/src/ser/impossible.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "ContentRefDeserializer.deserialize_ignored_any",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "find `FlatMapDeserializer.deserialize_newtype_struct` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "how VecInPlaceVisitor.visit_seq works",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "RangeVisitor.expecting",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "find `StrDeserializer.into_deserializer` implementation",
+    "expected": [
+      "serde_core/src/de/value.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "how TaggedContentVisitor.new works",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "net.IpAddr.deserialize",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "find `DeTypeGenerics.in_place` implementation",
+    "expected": [
+      "serde_derive/src/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "how Container.ser_bound works",
+    "expected": [
+      "serde_derive/src/internals/attr.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "CharVisitor.expecting",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "find `fmt.Error.custom` implementation",
+    "expected": [
+      "serde_core/src/ser/fmt.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "how ContentVisitor.visit_unit works",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "StrDeserializer.deserialize_any",
+    "expected": [
+      "serde/src/private/de.rs",
+      "serde_core/src/de/value.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "find `ReplaceReceiver.visit_type_mut_impl` implementation",
+    "expected": [
+      "serde_derive/src/internals/receiver.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "how ContentSerializer.serialize_unit works",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "net.SocketAddr.serialize",
+    "expected": [
+      "serde_core/src/ser/impls.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "find `TagContentOtherFieldVisitor.deserialize` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "how PhantomDataVisitor.visit_unit works",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "SerializeSeq.serialize_element",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "find `PairRefVisitor.size_hint` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "how MapDeserializer.next_entry_seed works",
+    "expected": [
+      "serde/src/private/de.rs",
+      "serde_core/src/de/value.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "TagOrContentVisitor.visit_seq",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "find `CowStrVisitor.visit_borrowed_str` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "how UntaggedUnitVisitor.visit_unit works",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "TagOrContentVisitor.visit_bytes",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "find `ContentDeserializer.deserialize_byte_buf` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "how ContentDeserializer.invalid_type works",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "AdjacentlyTaggedEnumVariantSeed.deserialize",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "find `SerializeTupleVariantAsMapValue.serialize_field` implementation",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "how BorrowedBytesDeserializer.fmt works",
+    "expected": [
+      "serde_core/src/de/value.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "RangeToVisitor.visit_map",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "find `TagOrContentVisitor.visit_borrowed_bytes` implementation",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "how FlatMapDeserializer.deserialize_struct works",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "TagOrContentVisitor.visit_str",
+    "expected": [
+      "serde/src/private/de.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "find `String.deserialize` implementation",
+    "expected": [
+      "serde_core/src/de/impls.rs"
+    ],
+    "split": "development",
+    "group": "serde dotted"
+  },
+  {
+    "project": "serde",
+    "query": "how SerializeMap.serialize_value works",
+    "expected": [
+      "serde/src/private/ser.rs"
+    ],
+    "split": "holdout",
+    "group": "serde dotted"
+  },
+  {
+    "project": "fmtlib",
+    "query": "how fmt::format and fmt::print format strings at runtime",
+    "expected": [
+      "include/fmt/format.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "fmtlib"
+  },
+  {
+    "project": "fmtlib",
+    "query": "basic_format_args and format_arg argument storage and type erasure",
+    "expected": [
+      "include/fmt/base.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "fmtlib"
+  },
+  {
+    "project": "fmtlib",
+    "query": "formatter specialization for custom type formatting",
+    "expected": [
+      "include/fmt/format.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "fmtlib"
+  },
+  {
+    "project": "fmtlib",
+    "query": "compile-time format string checking and FMT_COMPILE macro",
+    "expected": [
+      "include/fmt/compile.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "fmtlib"
+  },
+  {
+    "project": "fmtlib",
+    "query": "color and text style formatting for terminal output",
+    "expected": [
+      "include/fmt/color.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "fmtlib"
+  },
+  {
+    "project": "fmtlib",
+    "query": "formatting ranges containers and tuples",
+    "expected": [
+      "include/fmt/ranges.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "fmtlib"
+  },
+  {
+    "project": "fmtlib",
+    "query": "chrono duration and time point formatting",
+    "expected": [
+      "include/fmt/chrono.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "fmtlib"
+  },
+  {
+    "project": "fmtlib",
+    "query": "ostream integration for writing to std::ostream",
+    "expected": [
+      "include/fmt/ostream.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "fmtlib"
+  },
+  {
+    "project": "fmtlib",
+    "query": "printf-compatible formatting with fmt::printf and fmt::sprintf",
+    "expected": [
+      "include/fmt/printf.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "fmtlib"
+  },
+  {
+    "project": "fmtlib",
+    "query": "format_to and back_insert_iterator output adapters",
+    "expected": [
+      "include/fmt/format.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "fmtlib"
+  },
+  {
+    "project": "fmtlib",
+    "query": "memory buffer and basic_memory_buffer for efficient allocation",
+    "expected": [
+      "include/fmt/format.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "fmtlib"
+  },
+  {
+    "project": "fmtlib",
+    "query": "dynamic_format_arg_store for building argument lists at runtime",
+    "expected": [
+      "include/fmt/args.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "fmtlib"
+  },
+  {
+    "project": "fmtlib",
+    "query": "std::filesystem path formatting support",
+    "expected": [
+      "include/fmt/std.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "fmtlib"
+  },
+  {
+    "project": "fmtlib",
+    "query": "format_error and error handling for invalid format strings",
+    "expected": [
+      "include/fmt/base.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "fmtlib"
+  },
+  {
+    "project": "fmtlib",
+    "query": "width precision fill and alignment format specifiers",
+    "expected": [
+      "include/fmt/format.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "fmtlib"
+  },
+  {
+    "project": "fmtlib",
+    "query": "fmt::arg named arguments for use in format strings",
+    "expected": [
+      "include/fmt/args.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "fmtlib"
+  },
+  {
+    "project": "fmtlib",
+    "query": "how fmt handles integer floating point and string formatting",
+    "expected": [
+      "include/fmt/format.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "fmtlib"
+  },
+  {
+    "project": "fmtlib",
+    "query": "formatter",
+    "expected": [
+      "include/fmt/format.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "fmtlib"
+  },
+  {
+    "project": "fmtlib",
+    "query": "basic_format_args",
+    "expected": [
+      "include/fmt/base.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "fmtlib"
+  },
+  {
+    "project": "fmtlib",
+    "query": "basic_memory_buffer",
+    "expected": [
+      "include/fmt/format.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "fmtlib"
+  },
+  {
+    "project": "abseil-cpp",
+    "query": "absl::flat_hash_map and flat_hash_set hash table containers",
+    "expected": [
+      "absl/container/flat_hash_map.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "abseil-cpp"
+  },
+  {
+    "project": "abseil-cpp",
+    "query": "raw_hash_set open addressing SIMD group-based slot probing implementation",
+    "expected": [
+      "absl/container/internal/raw_hash_set.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "abseil-cpp"
+  },
+  {
+    "project": "abseil-cpp",
+    "query": "absl::string_view for non-owning string references",
+    "expected": [
+      "absl/strings/string_view.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "abseil-cpp"
+  },
+  {
+    "project": "abseil-cpp",
+    "query": "absl::StrCat and StrAppend for efficient string concatenation",
+    "expected": [
+      "absl/strings/str_cat.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "abseil-cpp"
+  },
+  {
+    "project": "abseil-cpp",
+    "query": "absl::StrSplit and StrJoin for string splitting and joining",
+    "expected": [
+      "absl/strings/str_split.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "abseil-cpp"
+  },
+  {
+    "project": "abseil-cpp",
+    "query": "absl::Status and StatusOr for error propagation",
+    "expected": [
+      "absl/status/status.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "abseil-cpp"
+  },
+  {
+    "project": "abseil-cpp",
+    "query": "absl::Time and absl::Duration for time representation",
+    "expected": [
+      "absl/time/time.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "abseil-cpp"
+  },
+  {
+    "project": "abseil-cpp",
+    "query": "absl::optional and absl::variant for vocabulary types",
+    "expected": [
+      "absl/types/optional.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "abseil-cpp"
+  },
+  {
+    "project": "abseil-cpp",
+    "query": "absl::Mutex and MutexLock for synchronization",
+    "expected": [
+      "absl/synchronization/mutex.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "abseil-cpp"
+  },
+  {
+    "project": "abseil-cpp",
+    "query": "absl logging macros ABSL_LOG and ABSL_CHECK",
+    "expected": [
+      "absl/log/absl_log.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "abseil-cpp"
+  },
+  {
+    "project": "abseil-cpp",
+    "query": "absl::Span for non-owning sequence view",
+    "expected": [
+      "absl/types/span.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "abseil-cpp"
+  },
+  {
+    "project": "abseil-cpp",
+    "query": "absl::node_hash_map for pointer-stable hash map",
+    "expected": [
+      "absl/container/node_hash_map.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "abseil-cpp"
+  },
+  {
+    "project": "abseil-cpp",
+    "query": "absl::Hash and the Abseil hashing framework",
+    "expected": [
+      "absl/hash/hash.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "abseil-cpp"
+  },
+  {
+    "project": "abseil-cpp",
+    "query": "absl::Notification for one-time event signaling between threads",
+    "expected": [
+      "absl/synchronization/notification.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "abseil-cpp"
+  },
+  {
+    "project": "abseil-cpp",
+    "query": "absl::AnyInvocable for move-only callable wrapper",
+    "expected": [
+      "absl/functional/any_invocable.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "abseil-cpp"
+  },
+  {
+    "project": "abseil-cpp",
+    "query": "absl::btree_map and btree_set sorted containers",
+    "expected": [
+      "absl/container/btree_map.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "abseil-cpp"
+  },
+  {
+    "project": "abseil-cpp",
+    "query": "absl::StrFormat and string formatting API",
+    "expected": [
+      "absl/strings/str_format.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "abseil-cpp"
+  },
+  {
+    "project": "abseil-cpp",
+    "query": "flat_hash_map",
+    "expected": [
+      "absl/container/flat_hash_map.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "abseil-cpp"
+  },
+  {
+    "project": "abseil-cpp",
+    "query": "Status",
+    "expected": [
+      "absl/status/status.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "abseil-cpp"
+  },
+  {
+    "project": "abseil-cpp",
+    "query": "Mutex",
+    "expected": [
+      "absl/synchronization/mutex.h"
+    ],
+    "split": "holdout",
+    "origin": "Semble published annotations; primary relevant files only",
+    "group": "abseil-cpp"
+  }
+]

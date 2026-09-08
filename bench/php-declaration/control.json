@@ -1,0 +1,1148 @@
+{
+  "control": true,
+  "candidate_sha256": "35d07ae92f6cacb80fb83cf63ac87af6747a8623530a3291c4f2993e1c3236b2",
+  "baseline_sha256": "374ce25dda928770e493416a7b504f51dbeb62360790cd7c01c05b84bbfac64d",
+  "cases_sha256": "0ddbd1c47a530b177f79cd714ce1acafab97d359bcf4476f763fb8e9bde42bf7",
+  "normalized_cases_sha256": "1f5430ebced8ccc700a8acf01c4710caee1ca31e50e36339553882b1c852c97a",
+  "revisions": {
+    "monolog": "68b974809baff3f071893de61447212e9e688ee7",
+    "laravel-framework": "c1bc8e758a63ab3e404ead77f7fd85ca1dbd3c01",
+    "php-src": "1364de0472b859917f5bc0be9193bd8068fc2061"
+  },
+  "groups": {
+    "c-foreign-platform": {
+      "cases": 8,
+      "baseline": {
+        "hits_at_10": 7,
+        "discounted_first_hit": 0.6532653242559633
+      },
+      "candidate": {
+        "hits_at_10": 7,
+        "discounted_first_hit": 0.6532653242559633
+      }
+    },
+    "c-host-platform": {
+      "cases": 8,
+      "baseline": {
+        "hits_at_10": 8,
+        "discounted_first_hit": 0.8663345697591741
+      },
+      "candidate": {
+        "hits_at_10": 8,
+        "discounted_first_hit": 0.8663345697591741
+      }
+    },
+    "php-behavior": {
+      "cases": 8,
+      "baseline": {
+        "hits_at_10": 8,
+        "discounted_first_hit": 1.0
+      },
+      "candidate": {
+        "hits_at_10": 8,
+        "discounted_first_hit": 1.0
+      }
+    },
+    "php-declaration": {
+      "cases": 8,
+      "baseline": {
+        "hits_at_10": 8,
+        "discounted_first_hit": 0.8663345697591741
+      },
+      "candidate": {
+        "hits_at_10": 8,
+        "discounted_first_hit": 0.8663345697591741
+      }
+    }
+  },
+  "records": [
+    {
+      "project": "monolog",
+      "query": "How does logging avoid recursive logging loops inside handlers?",
+      "expected": [
+        "src/Monolog/Logger.php"
+      ],
+      "category": "php-behavior",
+      "baseline_rank": 1,
+      "baseline_paths": [
+        "src/Monolog/Logger.php",
+        "src/Monolog/Handler/DeduplicationHandler.php",
+        "src/Monolog/Handler/HandlerInterface.php",
+        "src/Monolog/Handler/AbstractHandler.php",
+        "src/Monolog/Logger.php",
+        "src/Monolog/Handler/LogglyHandler.php",
+        "src/Monolog/Processor/IntrospectionProcessor.php",
+        "src/Monolog/Handler/OverflowHandler.php",
+        "src/Monolog/Handler/FingersCrossedHandler.php",
+        "src/Monolog/Logger.php"
+      ],
+      "candidate_rank": 1,
+      "candidate_paths": [
+        "src/Monolog/Logger.php",
+        "src/Monolog/Handler/DeduplicationHandler.php",
+        "src/Monolog/Handler/HandlerInterface.php",
+        "src/Monolog/Handler/AbstractHandler.php",
+        "src/Monolog/Logger.php",
+        "src/Monolog/Handler/LogglyHandler.php",
+        "src/Monolog/Processor/IntrospectionProcessor.php",
+        "src/Monolog/Handler/OverflowHandler.php",
+        "src/Monolog/Handler/FingersCrossedHandler.php",
+        "src/Monolog/Logger.php"
+      ]
+    },
+    {
+      "project": "monolog",
+      "query": "Where are log processors applied before sending a record to handlers?",
+      "expected": [
+        "src/Monolog/Logger.php"
+      ],
+      "category": "php-behavior",
+      "baseline_rank": 1,
+      "baseline_paths": [
+        "src/Monolog/Logger.php",
+        "src/Monolog/Handler/ProcessableHandlerTrait.php",
+        "src/Monolog/Handler/AbstractProcessingHandler.php",
+        "src/Monolog/Attribute/AsMonologProcessor.php",
+        "src/Monolog/Handler/HandlerInterface.php",
+        "src/Monolog/Processor/ClosureContextProcessor.php",
+        "src/Monolog/Processor/GitProcessor.php",
+        "src/Monolog/Logger.php",
+        "src/Monolog/Handler/GroupHandler.php",
+        "src/Monolog/Processor/IntrospectionProcessor.php"
+      ],
+      "candidate_rank": 1,
+      "candidate_paths": [
+        "src/Monolog/Logger.php",
+        "src/Monolog/Handler/ProcessableHandlerTrait.php",
+        "src/Monolog/Handler/AbstractProcessingHandler.php",
+        "src/Monolog/Attribute/AsMonologProcessor.php",
+        "src/Monolog/Handler/HandlerInterface.php",
+        "src/Monolog/Processor/ClosureContextProcessor.php",
+        "src/Monolog/Processor/GitProcessor.php",
+        "src/Monolog/Logger.php",
+        "src/Monolog/Handler/GroupHandler.php",
+        "src/Monolog/Processor/IntrospectionProcessor.php"
+      ]
+    },
+    {
+      "project": "monolog",
+      "query": "How does writing a log stream acquire an exclusive file lock?",
+      "expected": [
+        "src/Monolog/Handler/StreamHandler.php"
+      ],
+      "category": "php-behavior",
+      "baseline_rank": 1,
+      "baseline_paths": [
+        "src/Monolog/Handler/StreamHandler.php",
+        "src/Monolog/Handler/ProcessHandler.php",
+        "src/Monolog/Handler/StreamHandler.php",
+        "src/Monolog/Logger.php",
+        "src/Monolog/Handler/RotatingFileHandler.php",
+        "src/Monolog/Handler/SocketHandler.php",
+        "src/Monolog/Handler/DeduplicationHandler.php",
+        "tests/Monolog/Handler/StreamHandlerTest.php",
+        "src/Monolog/Handler/SyslogHandler.php",
+        "tests/Monolog/Handler/StreamHandlerTest.php"
+      ],
+      "candidate_rank": 1,
+      "candidate_paths": [
+        "src/Monolog/Handler/StreamHandler.php",
+        "src/Monolog/Handler/ProcessHandler.php",
+        "src/Monolog/Handler/StreamHandler.php",
+        "src/Monolog/Logger.php",
+        "src/Monolog/Handler/RotatingFileHandler.php",
+        "src/Monolog/Handler/SocketHandler.php",
+        "src/Monolog/Handler/DeduplicationHandler.php",
+        "tests/Monolog/Handler/StreamHandlerTest.php",
+        "src/Monolog/Handler/SyslogHandler.php",
+        "tests/Monolog/Handler/StreamHandlerTest.php"
+      ]
+    },
+    {
+      "project": "monolog",
+      "query": "How are buffered log records flushed as a batch to the wrapped handler?",
+      "expected": [
+        "src/Monolog/Handler/BufferHandler.php"
+      ],
+      "category": "php-behavior",
+      "baseline_rank": 1,
+      "baseline_paths": [
+        "src/Monolog/Handler/BufferHandler.php",
+        "src/Monolog/Handler/FingersCrossedHandler.php",
+        "src/Monolog/Logger.php",
+        "src/Monolog/Handler/DeduplicationHandler.php",
+        "src/Monolog/Handler/HandlerInterface.php",
+        "src/Monolog/Logger.php",
+        "src/Monolog/Handler/HandlerWrapper.php",
+        "src/Monolog/Handler/FallbackGroupHandler.php",
+        "src/Monolog/Handler/ChromePHPHandler.php",
+        "tests/Monolog/Handler/BufferHandlerTest.php"
+      ],
+      "candidate_rank": 1,
+      "candidate_paths": [
+        "src/Monolog/Handler/BufferHandler.php",
+        "src/Monolog/Handler/FingersCrossedHandler.php",
+        "src/Monolog/Logger.php",
+        "src/Monolog/Handler/DeduplicationHandler.php",
+        "src/Monolog/Handler/HandlerInterface.php",
+        "src/Monolog/Logger.php",
+        "src/Monolog/Handler/HandlerWrapper.php",
+        "src/Monolog/Handler/FallbackGroupHandler.php",
+        "src/Monolog/Handler/ChromePHPHandler.php",
+        "tests/Monolog/Handler/BufferHandlerTest.php"
+      ]
+    },
+    {
+      "project": "laravel-framework",
+      "query": "How does the in-memory cache store calculate expiry when saving a value?",
+      "expected": [
+        "src/Illuminate/Cache/ArrayStore.php"
+      ],
+      "category": "php-behavior",
+      "baseline_rank": 1,
+      "baseline_paths": [
+        "src/Illuminate/Cache/ArrayStore.php",
+        "src/Illuminate/Cache/DatabaseStore.php",
+        "src/Illuminate/Contracts/Cache/Store.php",
+        "src/Illuminate/Contracts/Cache/Repository.php",
+        "src/Illuminate/Cache/SessionStore.php",
+        "src/Illuminate/Cache/Events/KeyWritten.php",
+        "src/Illuminate/Cache/Repository.php",
+        "src/Illuminate/Support/Facades/Cache.php",
+        "src/Illuminate/Cache/DynamoDbStore.php",
+        "src/Illuminate/Cache/MemcachedStore.php"
+      ],
+      "candidate_rank": 1,
+      "candidate_paths": [
+        "src/Illuminate/Cache/ArrayStore.php",
+        "src/Illuminate/Cache/DatabaseStore.php",
+        "src/Illuminate/Contracts/Cache/Store.php",
+        "src/Illuminate/Contracts/Cache/Repository.php",
+        "src/Illuminate/Cache/SessionStore.php",
+        "src/Illuminate/Cache/Events/KeyWritten.php",
+        "src/Illuminate/Cache/Repository.php",
+        "src/Illuminate/Support/Facades/Cache.php",
+        "src/Illuminate/Cache/DynamoDbStore.php",
+        "src/Illuminate/Cache/MemcachedStore.php"
+      ]
+    },
+    {
+      "project": "laravel-framework",
+      "query": "Where does event dispatch stop propagation when a listener returns false?",
+      "expected": [
+        "src/Illuminate/Events/Dispatcher.php"
+      ],
+      "category": "php-behavior",
+      "baseline_rank": 1,
+      "baseline_paths": [
+        "src/Illuminate/Events/Dispatcher.php",
+        "src/Illuminate/Events/NullDispatcher.php",
+        "src/Illuminate/Foundation/Events/Dispatchable.php",
+        "src/Illuminate/Support/Testing/Fakes/EventFake.php",
+        "src/Illuminate/Support/Facades/Event.php",
+        "src/Illuminate/Database/Eloquent/Concerns/HasEvents.php",
+        "src/Illuminate/Events/Dispatcher.php",
+        "src/Illuminate/Support/Testing/Fakes/EventFake.php",
+        "src/Illuminate/Events/NullDispatcher.php",
+        "tests/Events/EventsDispatcherTest.php"
+      ],
+      "candidate_rank": 1,
+      "candidate_paths": [
+        "src/Illuminate/Events/Dispatcher.php",
+        "src/Illuminate/Events/NullDispatcher.php",
+        "src/Illuminate/Foundation/Events/Dispatchable.php",
+        "src/Illuminate/Support/Testing/Fakes/EventFake.php",
+        "src/Illuminate/Support/Facades/Event.php",
+        "src/Illuminate/Database/Eloquent/Concerns/HasEvents.php",
+        "src/Illuminate/Events/Dispatcher.php",
+        "src/Illuminate/Support/Testing/Fakes/EventFake.php",
+        "src/Illuminate/Events/NullDispatcher.php",
+        "tests/Events/EventsDispatcherTest.php"
+      ]
+    },
+    {
+      "project": "laravel-framework",
+      "query": "How are wildcard event listeners registered and their cached matches cleared?",
+      "expected": [
+        "src/Illuminate/Events/Dispatcher.php"
+      ],
+      "category": "php-behavior",
+      "baseline_rank": 1,
+      "baseline_paths": [
+        "src/Illuminate/Events/Dispatcher.php",
+        "src/Illuminate/Support/Testing/Fakes/EventFake.php",
+        "src/Illuminate/Events/Dispatcher.php",
+        "src/Illuminate/Foundation/Events/DiscoverEvents.php",
+        "src/Illuminate/Foundation/Support/Providers/EventServiceProvider.php",
+        "src/Illuminate/Foundation/Events/DiscoverEvents.php",
+        "src/Illuminate/Events/Dispatcher.php",
+        "tests/Events/EventsDispatcherTest.php",
+        "tests/Integration/Cache/MemoizedStoreTest.php",
+        "tests/Integration/Events/EventFakeTest.php"
+      ],
+      "candidate_rank": 1,
+      "candidate_paths": [
+        "src/Illuminate/Events/Dispatcher.php",
+        "src/Illuminate/Support/Testing/Fakes/EventFake.php",
+        "src/Illuminate/Events/Dispatcher.php",
+        "src/Illuminate/Foundation/Events/DiscoverEvents.php",
+        "src/Illuminate/Foundation/Support/Providers/EventServiceProvider.php",
+        "src/Illuminate/Foundation/Events/DiscoverEvents.php",
+        "src/Illuminate/Events/Dispatcher.php",
+        "tests/Events/EventsDispatcherTest.php",
+        "tests/Integration/Cache/MemoizedStoreTest.php",
+        "tests/Integration/Events/EventFakeTest.php"
+      ]
+    },
+    {
+      "project": "laravel-framework",
+      "query": "How does validation stop processing rules after the first failure?",
+      "expected": [
+        "src/Illuminate/Validation/Validator.php"
+      ],
+      "category": "php-behavior",
+      "baseline_rank": 1,
+      "baseline_paths": [
+        "src/Illuminate/Validation/Validator.php",
+        "src/Illuminate/Validation/Rules/Password.php",
+        "src/Illuminate/Validation/Rules/Email.php",
+        "src/Illuminate/Validation/Concerns/ValidatesAttributes.php",
+        "src/Illuminate/Validation/Validator.php",
+        "src/Illuminate/Validation/ClosureValidationRule.php",
+        "src/Illuminate/Validation/InvokableValidationRule.php",
+        "src/Illuminate/Validation/Rule.php",
+        "src/Illuminate/Validation/Concerns/ValidatesAttributes.php",
+        "tests/Foundation/FoundationFormRequestTest.php"
+      ],
+      "candidate_rank": 1,
+      "candidate_paths": [
+        "src/Illuminate/Validation/Validator.php",
+        "src/Illuminate/Validation/Rules/Password.php",
+        "src/Illuminate/Validation/Rules/Email.php",
+        "src/Illuminate/Validation/Concerns/ValidatesAttributes.php",
+        "src/Illuminate/Validation/Validator.php",
+        "src/Illuminate/Validation/ClosureValidationRule.php",
+        "src/Illuminate/Validation/InvokableValidationRule.php",
+        "src/Illuminate/Validation/Rule.php",
+        "src/Illuminate/Validation/Concerns/ValidatesAttributes.php",
+        "tests/Foundation/FoundationFormRequestTest.php"
+      ]
+    },
+    {
+      "project": "monolog",
+      "query": "Which handler interface declares whether a record stops bubbling?",
+      "expected": [
+        "src/Monolog/Handler/HandlerInterface.php"
+      ],
+      "category": "php-declaration",
+      "baseline_rank": 1,
+      "baseline_paths": [
+        "src/Monolog/Handler/HandlerInterface.php",
+        "src/Monolog/Handler/NoopHandler.php",
+        "src/Monolog/Logger.php",
+        "src/Monolog/Handler/AbstractHandler.php",
+        "src/Monolog/Handler/FallbackGroupHandler.php",
+        "src/Monolog/Handler/OverflowHandler.php",
+        "src/Monolog/Handler/WhatFailureGroupHandler.php",
+        "src/Monolog/Handler/FingersCrossedHandler.php",
+        "src/Monolog/Handler/GroupHandler.php",
+        "src/Monolog/Handler/FilterHandler.php"
+      ],
+      "candidate_rank": 1,
+      "candidate_paths": [
+        "src/Monolog/Handler/HandlerInterface.php",
+        "src/Monolog/Handler/NoopHandler.php",
+        "src/Monolog/Logger.php",
+        "src/Monolog/Handler/AbstractHandler.php",
+        "src/Monolog/Handler/FallbackGroupHandler.php",
+        "src/Monolog/Handler/OverflowHandler.php",
+        "src/Monolog/Handler/WhatFailureGroupHandler.php",
+        "src/Monolog/Handler/FingersCrossedHandler.php",
+        "src/Monolog/Handler/GroupHandler.php",
+        "src/Monolog/Handler/FilterHandler.php"
+      ]
+    },
+    {
+      "project": "monolog",
+      "query": "Which processor interface declares the callable that transforms a log record?",
+      "expected": [
+        "src/Monolog/Processor/ProcessorInterface.php"
+      ],
+      "category": "php-declaration",
+      "baseline_rank": 4,
+      "baseline_paths": [
+        "src/Monolog/Handler/ProcessableHandlerTrait.php",
+        "src/Monolog/Handler/ProcessableHandlerInterface.php",
+        "src/Monolog/Logger.php",
+        "src/Monolog/Processor/ProcessorInterface.php",
+        "src/Monolog/Processor/ClosureContextProcessor.php",
+        "src/Monolog/Attribute/AsMonologProcessor.php",
+        "src/Monolog/Processor/IntrospectionProcessor.php",
+        "src/Monolog/Handler/AbstractProcessingHandler.php",
+        "src/Monolog/Formatter/FormatterInterface.php",
+        "src/Monolog/Processor/PsrLogMessageProcessor.php"
+      ],
+      "candidate_rank": 4,
+      "candidate_paths": [
+        "src/Monolog/Handler/ProcessableHandlerTrait.php",
+        "src/Monolog/Handler/ProcessableHandlerInterface.php",
+        "src/Monolog/Logger.php",
+        "src/Monolog/Processor/ProcessorInterface.php",
+        "src/Monolog/Processor/ClosureContextProcessor.php",
+        "src/Monolog/Attribute/AsMonologProcessor.php",
+        "src/Monolog/Processor/IntrospectionProcessor.php",
+        "src/Monolog/Handler/AbstractProcessingHandler.php",
+        "src/Monolog/Formatter/FormatterInterface.php",
+        "src/Monolog/Processor/PsrLogMessageProcessor.php"
+      ]
+    },
+    {
+      "project": "monolog",
+      "query": "Which formatter interface declares single-record and batch formatting?",
+      "expected": [
+        "src/Monolog/Formatter/FormatterInterface.php"
+      ],
+      "category": "php-declaration",
+      "baseline_rank": 1,
+      "baseline_paths": [
+        "src/Monolog/Formatter/FormatterInterface.php",
+        "src/Monolog/Formatter/JsonFormatter.php",
+        "src/Monolog/Formatter/LogglyFormatter.php",
+        "src/Monolog/Handler/FormattableHandlerInterface.php",
+        "src/Monolog/Handler/FormattableHandlerTrait.php",
+        "src/Monolog/Formatter/MongoDBFormatter.php",
+        "src/Monolog/Handler/AmqpHandler.php",
+        "src/Monolog/Formatter/ChromePHPFormatter.php",
+        "src/Monolog/Handler/SamplingHandler.php",
+        "src/Monolog/Formatter/HtmlFormatter.php"
+      ],
+      "candidate_rank": 1,
+      "candidate_paths": [
+        "src/Monolog/Formatter/FormatterInterface.php",
+        "src/Monolog/Formatter/JsonFormatter.php",
+        "src/Monolog/Formatter/LogglyFormatter.php",
+        "src/Monolog/Handler/FormattableHandlerInterface.php",
+        "src/Monolog/Handler/FormattableHandlerTrait.php",
+        "src/Monolog/Formatter/MongoDBFormatter.php",
+        "src/Monolog/Handler/AmqpHandler.php",
+        "src/Monolog/Formatter/ChromePHPFormatter.php",
+        "src/Monolog/Handler/SamplingHandler.php",
+        "src/Monolog/Formatter/HtmlFormatter.php"
+      ]
+    },
+    {
+      "project": "laravel-framework",
+      "query": "Which cache store contract declares multi-key retrieval and timed writes?",
+      "expected": [
+        "src/Illuminate/Contracts/Cache/Store.php"
+      ],
+      "category": "php-declaration",
+      "baseline_rank": 1,
+      "baseline_paths": [
+        "src/Illuminate/Contracts/Cache/Store.php",
+        "src/Illuminate/Contracts/Cache/Repository.php",
+        "src/Illuminate/Cache/MemoizedStore.php",
+        "src/Illuminate/Cache/Repository.php",
+        "src/Illuminate/Cache/Events/WritingManyKeys.php",
+        "src/Illuminate/Cache/ArrayStore.php",
+        "src/Illuminate/Support/Facades/Cache.php",
+        "src/Illuminate/Cache/FailoverStore.php",
+        "src/Illuminate/Cache/RedisStore.php",
+        "src/Illuminate/Contracts/Cache/Store.php"
+      ],
+      "candidate_rank": 1,
+      "candidate_paths": [
+        "src/Illuminate/Contracts/Cache/Store.php",
+        "src/Illuminate/Contracts/Cache/Repository.php",
+        "src/Illuminate/Cache/MemoizedStore.php",
+        "src/Illuminate/Cache/Repository.php",
+        "src/Illuminate/Cache/Events/WritingManyKeys.php",
+        "src/Illuminate/Cache/ArrayStore.php",
+        "src/Illuminate/Support/Facades/Cache.php",
+        "src/Illuminate/Cache/FailoverStore.php",
+        "src/Illuminate/Cache/RedisStore.php",
+        "src/Illuminate/Contracts/Cache/Store.php"
+      ]
+    },
+    {
+      "project": "laravel-framework",
+      "query": "Which queue contract declares counts for pending delayed and reserved jobs?",
+      "expected": [
+        "src/Illuminate/Contracts/Queue/Queue.php"
+      ],
+      "category": "php-declaration",
+      "baseline_rank": 3,
+      "baseline_paths": [
+        "src/Illuminate/Queue/DatabaseQueue.php",
+        "src/Illuminate/Queue/SqsQueue.php",
+        "src/Illuminate/Contracts/Queue/Queue.php",
+        "src/Illuminate/Queue/Console/MonitorCommand.php",
+        "src/Illuminate/Queue/NullQueue.php",
+        "src/Illuminate/Contracts/Queue/Job.php",
+        "src/Illuminate/Support/Testing/Fakes/QueueFake.php",
+        "src/Illuminate/Bus/PendingBatch.php",
+        "src/Illuminate/Queue/SyncQueue.php",
+        "src/Illuminate/Support/Facades/Queue.php"
+      ],
+      "candidate_rank": 3,
+      "candidate_paths": [
+        "src/Illuminate/Queue/DatabaseQueue.php",
+        "src/Illuminate/Queue/SqsQueue.php",
+        "src/Illuminate/Contracts/Queue/Queue.php",
+        "src/Illuminate/Queue/Console/MonitorCommand.php",
+        "src/Illuminate/Queue/NullQueue.php",
+        "src/Illuminate/Contracts/Queue/Job.php",
+        "src/Illuminate/Support/Testing/Fakes/QueueFake.php",
+        "src/Illuminate/Bus/PendingBatch.php",
+        "src/Illuminate/Queue/SyncQueue.php",
+        "src/Illuminate/Support/Facades/Queue.php"
+      ]
+    },
+    {
+      "project": "laravel-framework",
+      "query": "Which validation contract declares retrieval of validated values and failed rules?",
+      "expected": [
+        "src/Illuminate/Contracts/Validation/Validator.php"
+      ],
+      "category": "php-declaration",
+      "baseline_rank": 1,
+      "baseline_paths": [
+        "src/Illuminate/Contracts/Validation/Validator.php",
+        "src/Illuminate/Validation/Validator.php",
+        "src/Illuminate/Validation/InvokableValidationRule.php",
+        "src/Illuminate/Validation/Concerns/ValidatesAttributes.php",
+        "src/Illuminate/Contracts/Validation/CompilableRules.php",
+        "src/Illuminate/Validation/Rule.php",
+        "src/Illuminate/Validation/Factory.php",
+        "src/Illuminate/Validation/Concerns/ValidatesAttributes.php",
+        "src/Illuminate/Validation/Validator.php",
+        "src/Illuminate/Validation/InvokableValidationRule.php"
+      ],
+      "candidate_rank": 1,
+      "candidate_paths": [
+        "src/Illuminate/Contracts/Validation/Validator.php",
+        "src/Illuminate/Validation/Validator.php",
+        "src/Illuminate/Validation/InvokableValidationRule.php",
+        "src/Illuminate/Validation/Concerns/ValidatesAttributes.php",
+        "src/Illuminate/Contracts/Validation/CompilableRules.php",
+        "src/Illuminate/Validation/Rule.php",
+        "src/Illuminate/Validation/Factory.php",
+        "src/Illuminate/Validation/Concerns/ValidatesAttributes.php",
+        "src/Illuminate/Validation/Validator.php",
+        "src/Illuminate/Validation/InvokableValidationRule.php"
+      ]
+    },
+    {
+      "project": "laravel-framework",
+      "query": "Where does the Cache facade identify its container accessor?",
+      "expected": [
+        "src/Illuminate/Support/Facades/Cache.php"
+      ],
+      "category": "php-declaration",
+      "baseline_rank": 1,
+      "baseline_paths": [
+        "src/Illuminate/Support/Facades/Cache.php",
+        "src/Illuminate/Container/Attributes/Cache.php",
+        "src/Illuminate/Cache/CacheManager.php",
+        "src/Illuminate/Cache/Repository.php",
+        "src/Illuminate/Container/Container.php",
+        "types/Support/Facades/Cache.php",
+        "src/Illuminate/Contracts/Cache/Repository.php",
+        "src/Illuminate/Cache/Events/RetrievingKey.php",
+        "src/Illuminate/Contracts/Cache/CanFlushLocks.php",
+        "src/Illuminate/Support/Facades/Cache.php"
+      ],
+      "candidate_rank": 1,
+      "candidate_paths": [
+        "src/Illuminate/Support/Facades/Cache.php",
+        "src/Illuminate/Container/Attributes/Cache.php",
+        "src/Illuminate/Cache/CacheManager.php",
+        "src/Illuminate/Cache/Repository.php",
+        "src/Illuminate/Container/Container.php",
+        "types/Support/Facades/Cache.php",
+        "src/Illuminate/Contracts/Cache/Repository.php",
+        "src/Illuminate/Cache/Events/RetrievingKey.php",
+        "src/Illuminate/Contracts/Cache/CanFlushLocks.php",
+        "src/Illuminate/Support/Facades/Cache.php"
+      ]
+    },
+    {
+      "project": "laravel-framework",
+      "query": "Where does the Event facade replace the dispatcher with a fake?",
+      "expected": [
+        "src/Illuminate/Support/Facades/Event.php"
+      ],
+      "category": "php-declaration",
+      "baseline_rank": 1,
+      "baseline_paths": [
+        "src/Illuminate/Support/Facades/Event.php",
+        "src/Illuminate/Support/Testing/Fakes/EventFake.php",
+        "src/Illuminate/Support/Facades/Event.php",
+        "src/Illuminate/Events/Dispatcher.php",
+        "src/Illuminate/Contracts/Events/Dispatcher.php",
+        "src/Illuminate/Events/NullDispatcher.php",
+        "src/Illuminate/Support/Testing/Fakes/EventFake.php",
+        "src/Illuminate/Support/Facades/Event.php",
+        "src/Illuminate/Contracts/Events/Dispatcher.php",
+        "src/Illuminate/Events/NullDispatcher.php"
+      ],
+      "candidate_rank": 1,
+      "candidate_paths": [
+        "src/Illuminate/Support/Facades/Event.php",
+        "src/Illuminate/Support/Testing/Fakes/EventFake.php",
+        "src/Illuminate/Support/Facades/Event.php",
+        "src/Illuminate/Events/Dispatcher.php",
+        "src/Illuminate/Contracts/Events/Dispatcher.php",
+        "src/Illuminate/Events/NullDispatcher.php",
+        "src/Illuminate/Support/Testing/Fakes/EventFake.php",
+        "src/Illuminate/Support/Facades/Event.php",
+        "src/Illuminate/Contracts/Events/Dispatcher.php",
+        "src/Illuminate/Events/NullDispatcher.php"
+      ]
+    },
+    {
+      "project": "php-src",
+      "query": "How does PHP fork a process on Unix?",
+      "expected": [
+        "ext/pcntl/pcntl.c"
+      ],
+      "category": "c-host-platform",
+      "baseline_rank": 1,
+      "baseline_paths": [
+        "ext/pcntl/pcntl.c",
+        "ext/standard/proc_open.h",
+        "ext/standard/proc_open.c",
+        "ext/pcntl/pcntl.stub.php",
+        "benchmark/shared.php",
+        "sapi/cgi/cgi_main.c",
+        "sapi/cli/php_cli_server.c",
+        "ext/posix/posix.c",
+        "ext/fileinfo/libmagic/compress.c",
+        "sapi/fpm/fpm/fpm_children.c"
+      ],
+      "candidate_rank": 1,
+      "candidate_paths": [
+        "ext/pcntl/pcntl.c",
+        "ext/standard/proc_open.h",
+        "ext/standard/proc_open.c",
+        "ext/pcntl/pcntl.stub.php",
+        "benchmark/shared.php",
+        "sapi/cgi/cgi_main.c",
+        "sapi/cli/php_cli_server.c",
+        "ext/posix/posix.c",
+        "ext/fileinfo/libmagic/compress.c",
+        "sapi/fpm/fpm/fpm_children.c"
+      ]
+    },
+    {
+      "project": "php-src",
+      "query": "How does PHP block and unblock POSIX signals using a signal mask?",
+      "expected": [
+        "ext/pcntl/pcntl.c"
+      ],
+      "category": "c-host-platform",
+      "baseline_rank": 1,
+      "baseline_paths": [
+        "ext/pcntl/pcntl.c",
+        "sapi/fpm/fpm/fpm_signals.c",
+        "Zend/zend_signal.c",
+        "ext/pcntl/php_signal.c",
+        "TSRM/TSRM.c",
+        "Zend/zend_signal.h",
+        "sapi/fpm/fpm/fpm_signals.h",
+        "win32/signal.h",
+        "ext/pcntl/php_signal.h",
+        "sapi/phpdbg/phpdbg_sigsafe.c"
+      ],
+      "candidate_rank": 1,
+      "candidate_paths": [
+        "ext/pcntl/pcntl.c",
+        "sapi/fpm/fpm/fpm_signals.c",
+        "Zend/zend_signal.c",
+        "ext/pcntl/php_signal.c",
+        "TSRM/TSRM.c",
+        "Zend/zend_signal.h",
+        "sapi/fpm/fpm/fpm_signals.h",
+        "win32/signal.h",
+        "ext/pcntl/php_signal.h",
+        "sapi/phpdbg/phpdbg_sigsafe.c"
+      ]
+    },
+    {
+      "project": "php-src",
+      "query": "Where does PHP obtain the real and effective Unix user IDs?",
+      "expected": [
+        "ext/posix/posix.c"
+      ],
+      "category": "c-host-platform",
+      "baseline_rank": 1,
+      "baseline_paths": [
+        "ext/posix/posix.c",
+        "ext/posix/posix.stub.php",
+        "main/main.c",
+        "ext/session/session.c",
+        "sapi/fpm/fpm/fpm_unix.c",
+        "ext/standard/pageinfo.c",
+        "main/php.h",
+        "ext/session/mod_user.h",
+        "main/streams/userspace.c",
+        "sapi/litespeed/lsapilib.c"
+      ],
+      "candidate_rank": 1,
+      "candidate_paths": [
+        "ext/posix/posix.c",
+        "ext/posix/posix.stub.php",
+        "main/main.c",
+        "ext/session/session.c",
+        "sapi/fpm/fpm/fpm_unix.c",
+        "ext/standard/pageinfo.c",
+        "main/php.h",
+        "ext/session/mod_user.h",
+        "main/streams/userspace.c",
+        "sapi/litespeed/lsapilib.c"
+      ]
+    },
+    {
+      "project": "php-src",
+      "query": "How does PHP create a pair of connected Unix sockets?",
+      "expected": [
+        "ext/sockets/sockets.c"
+      ],
+      "category": "c-host-platform",
+      "baseline_rank": 4,
+      "baseline_paths": [
+        "ext/standard/streamsfuncs.c",
+        "ext/sockets/sockets.stub.php",
+        "main/streams/xp_socket.c",
+        "ext/sockets/sockets.c",
+        "ext/standard/fsock.c",
+        "sapi/cli/php_cli_server.c",
+        "sapi/fpm/fpm/fpm_sockets.c",
+        "ext/mysqlnd/mysqlnd_vio.c",
+        "win32/sockets.c",
+        "ext/openssl/xp_ssl.c"
+      ],
+      "candidate_rank": 4,
+      "candidate_paths": [
+        "ext/standard/streamsfuncs.c",
+        "ext/sockets/sockets.stub.php",
+        "main/streams/xp_socket.c",
+        "ext/sockets/sockets.c",
+        "ext/standard/fsock.c",
+        "sapi/cli/php_cli_server.c",
+        "sapi/fpm/fpm/fpm_sockets.c",
+        "ext/mysqlnd/mysqlnd_vio.c",
+        "win32/sockets.c",
+        "ext/openssl/xp_ssl.c"
+      ]
+    },
+    {
+      "project": "php-src",
+      "query": "Where does opening a subprocess configure its standard input and output pipes?",
+      "expected": [
+        "ext/standard/proc_open.c"
+      ],
+      "category": "c-host-platform",
+      "baseline_rank": 1,
+      "baseline_paths": [
+        "ext/standard/proc_open.c",
+        "sapi/phpdbg/create-test.php",
+        "ext/standard/php_fopen_wrapper.c",
+        "main/streams/plain_wrapper.c",
+        "sapi/phpdbg/phpdbg.c",
+        "ext/fileinfo/libmagic/compress.c",
+        "sapi/fpm/fpm/fpm_stdio.c",
+        "run-tests.php",
+        "benchmark/shared.php",
+        "ext/standard/proc_open.c"
+      ],
+      "candidate_rank": 1,
+      "candidate_paths": [
+        "ext/standard/proc_open.c",
+        "sapi/phpdbg/create-test.php",
+        "ext/standard/php_fopen_wrapper.c",
+        "main/streams/plain_wrapper.c",
+        "sapi/phpdbg/phpdbg.c",
+        "ext/fileinfo/libmagic/compress.c",
+        "sapi/fpm/fpm/fpm_stdio.c",
+        "run-tests.php",
+        "benchmark/shared.php",
+        "ext/standard/proc_open.c"
+      ]
+    },
+    {
+      "project": "php-src",
+      "query": "Where does PHP resolve a host and establish a socket connection with a timeout?",
+      "expected": [
+        "main/network.c"
+      ],
+      "category": "c-host-platform",
+      "baseline_rank": 1,
+      "baseline_paths": [
+        "main/network.c",
+        "main/streams/xp_socket.c",
+        "main/streams/transports.c",
+        "ext/standard/streamsfuncs.c",
+        "main/php_network.h",
+        "ext/standard/fsock.c",
+        "sapi/cli/php_cli_server.c",
+        "ext/sockets/sockets.c",
+        "ext/mysqlnd/mysqlnd_connection.c",
+        "ext/sockets/sockets.stub.php"
+      ],
+      "candidate_rank": 1,
+      "candidate_paths": [
+        "main/network.c",
+        "main/streams/xp_socket.c",
+        "main/streams/transports.c",
+        "ext/standard/streamsfuncs.c",
+        "main/php_network.h",
+        "ext/standard/fsock.c",
+        "sapi/cli/php_cli_server.c",
+        "ext/sockets/sockets.c",
+        "ext/mysqlnd/mysqlnd_connection.c",
+        "ext/sockets/sockets.stub.php"
+      ]
+    },
+    {
+      "project": "php-src",
+      "query": "How does PHP read directory entries through the plain file stream wrapper?",
+      "expected": [
+        "main/streams/plain_wrapper.c"
+      ],
+      "category": "c-host-platform",
+      "baseline_rank": 3,
+      "baseline_paths": [
+        "main/streams/streams.c",
+        "ext/standard/dir.c",
+        "main/streams/plain_wrapper.c",
+        "ext/phar/dirstream.c",
+        "ext/phar/zip.c",
+        "ext/standard/dir.stub.php",
+        "ext/spl/spl_directory.h",
+        "ext/spl/spl_directory.c",
+        "main/php_streams.h",
+        "ext/fileinfo/fileinfo.c"
+      ],
+      "candidate_rank": 3,
+      "candidate_paths": [
+        "main/streams/streams.c",
+        "ext/standard/dir.c",
+        "main/streams/plain_wrapper.c",
+        "ext/phar/dirstream.c",
+        "ext/phar/zip.c",
+        "ext/standard/dir.stub.php",
+        "ext/spl/spl_directory.h",
+        "ext/spl/spl_directory.c",
+        "main/php_streams.h",
+        "ext/fileinfo/fileinfo.c"
+      ]
+    },
+    {
+      "project": "php-src",
+      "query": "Where does the PHP flock function parse the operation and would-block argument?",
+      "expected": [
+        "ext/standard/file.c"
+      ],
+      "category": "c-host-platform",
+      "baseline_rank": 1,
+      "baseline_paths": [
+        "ext/standard/file.c",
+        "ext/standard/basic_functions.stub.php",
+        "ext/spl/spl_directory.c",
+        "ext/standard/flock_compat.c",
+        "ext/opcache/ZendAccelerator.c",
+        "ext/sockets/sockets.c",
+        "ext/opcache/zend_shared_alloc.c",
+        "main/streams/plain_wrapper.c",
+        "ext/pcntl/pcntl.c",
+        "ext/standard/flock_compat.h"
+      ],
+      "candidate_rank": 1,
+      "candidate_paths": [
+        "ext/standard/file.c",
+        "ext/standard/basic_functions.stub.php",
+        "ext/spl/spl_directory.c",
+        "ext/standard/flock_compat.c",
+        "ext/opcache/ZendAccelerator.c",
+        "ext/sockets/sockets.c",
+        "ext/opcache/zend_shared_alloc.c",
+        "main/streams/plain_wrapper.c",
+        "ext/pcntl/pcntl.c",
+        "ext/standard/flock_compat.h"
+      ]
+    },
+    {
+      "project": "php-src",
+      "query": "How does Windows PHP emulate select for sockets and pipe handles?",
+      "expected": [
+        "win32/select.c"
+      ],
+      "category": "c-foreign-platform",
+      "baseline_rank": 1,
+      "baseline_paths": [
+        "win32/select.c",
+        "main/network.c",
+        "ext/standard/streamsfuncs.c",
+        "sapi/cli/php_cli_server.c",
+        "ext/mysqlnd/mysqlnd_connection.c",
+        "ext/standard/proc_open.c",
+        "win32/select.h",
+        "ext/curl/multi.c",
+        "main/streams/plain_wrapper.c",
+        "ext/openssl/xp_ssl.c"
+      ],
+      "candidate_rank": 1,
+      "candidate_paths": [
+        "win32/select.c",
+        "main/network.c",
+        "ext/standard/streamsfuncs.c",
+        "sapi/cli/php_cli_server.c",
+        "ext/mysqlnd/mysqlnd_connection.c",
+        "ext/standard/proc_open.c",
+        "win32/select.h",
+        "ext/curl/multi.c",
+        "main/streams/plain_wrapper.c",
+        "ext/openssl/xp_ssl.c"
+      ]
+    },
+    {
+      "project": "php-src",
+      "query": "How does Windows PHP implement gettimeofday and timezone information?",
+      "expected": [
+        "win32/time.c"
+      ],
+      "category": "c-foreign-platform",
+      "baseline_rank": null,
+      "baseline_paths": [
+        "ext/standard/microtime.c",
+        "win32/time.h",
+        "ext/intl/timezone/timezone_methods.cpp",
+        "ext/date/php_date.c",
+        "ext/intl/timezone/timezone_arginfo.h",
+        "ext/date/lib/parse_tz.c",
+        "ext/date/php_date.c",
+        "ext/intl/timezone/timezone_methods.cpp",
+        "ext/date/lib/timezonedb.h",
+        "ext/date/lib/timezonedb.h"
+      ],
+      "candidate_rank": null,
+      "candidate_paths": [
+        "ext/standard/microtime.c",
+        "win32/time.h",
+        "ext/intl/timezone/timezone_methods.cpp",
+        "ext/date/php_date.c",
+        "ext/intl/timezone/timezone_arginfo.h",
+        "ext/date/lib/parse_tz.c",
+        "ext/date/php_date.c",
+        "ext/intl/timezone/timezone_methods.cpp",
+        "ext/date/lib/timezonedb.h",
+        "ext/date/lib/timezonedb.h"
+      ]
+    },
+    {
+      "project": "php-src",
+      "query": "How does Windows PHP implement microsecond sleep using a waitable timer?",
+      "expected": [
+        "win32/time.c"
+      ],
+      "category": "c-foreign-platform",
+      "baseline_rank": 2,
+      "baseline_paths": [
+        "ext/standard/basic_functions.c",
+        "win32/time.c",
+        "main/poll/poll_backend_wsapoll.c",
+        "ext/standard/streamsfuncs.c",
+        "Zend/zend_execute_API.c",
+        "ext/date/lib/parse_date.c",
+        "ext/pcntl/pcntl.c",
+        "Zend/micro_bench.php",
+        "ext/standard/io_poll.c",
+        "win32/time.h"
+      ],
+      "candidate_rank": 2,
+      "candidate_paths": [
+        "ext/standard/basic_functions.c",
+        "win32/time.c",
+        "main/poll/poll_backend_wsapoll.c",
+        "ext/standard/streamsfuncs.c",
+        "Zend/zend_execute_API.c",
+        "ext/date/lib/parse_date.c",
+        "ext/pcntl/pcntl.c",
+        "Zend/micro_bench.php",
+        "ext/standard/io_poll.c",
+        "win32/time.h"
+      ]
+    },
+    {
+      "project": "php-src",
+      "query": "Where are Windows console CTRL event handlers registered for PHP callbacks?",
+      "expected": [
+        "win32/signal.c"
+      ],
+      "category": "c-foreign-platform",
+      "baseline_rank": 1,
+      "baseline_paths": [
+        "win32/signal.c",
+        "ext/dom/xpath_callbacks.c",
+        "sapi/cli/php_cli.c",
+        "ext/readline/readline_cli.c",
+        "win32/signal.h",
+        "sapi/cli/php_cli_server.c",
+        "ext/standard/io_poll.c",
+        "main/main.stub.php",
+        "ext/pcntl/pcntl.c",
+        "ext/readline/readline.c"
+      ],
+      "candidate_rank": 1,
+      "candidate_paths": [
+        "win32/signal.c",
+        "ext/dom/xpath_callbacks.c",
+        "sapi/cli/php_cli.c",
+        "ext/readline/readline_cli.c",
+        "win32/signal.h",
+        "sapi/cli/php_cli_server.c",
+        "ext/standard/io_poll.c",
+        "main/main.stub.php",
+        "ext/pcntl/pcntl.c",
+        "ext/readline/readline.c"
+      ]
+    },
+    {
+      "project": "php-src",
+      "query": "How does Windows PHP convert UTF-8 input into wide character strings?",
+      "expected": [
+        "win32/codepage.c"
+      ],
+      "category": "c-foreign-platform",
+      "baseline_rank": 2,
+      "baseline_paths": [
+        "win32/codepage.h",
+        "win32/codepage.c",
+        "ext/mbstring/libmbfl/filters/mbfilter_utf8.c",
+        "ext/mbstring/libmbfl/filters/mbfilter_utf32.c",
+        "ext/mbstring/mbstring.c",
+        "ext/mbstring/libmbfl/filters/mbfilter_ucs2.c",
+        "ext/mbstring/libmbfl/mbfl/mbfilter_8bit.c",
+        "ext/mbstring/libmbfl/filters/mbfilter_utf16.c",
+        "win32/ioutil.h",
+        "ext/mbstring/libmbfl/filters/mbfilter_cjk.c"
+      ],
+      "candidate_rank": 2,
+      "candidate_paths": [
+        "win32/codepage.h",
+        "win32/codepage.c",
+        "ext/mbstring/libmbfl/filters/mbfilter_utf8.c",
+        "ext/mbstring/libmbfl/filters/mbfilter_utf32.c",
+        "ext/mbstring/mbstring.c",
+        "ext/mbstring/libmbfl/filters/mbfilter_ucs2.c",
+        "ext/mbstring/libmbfl/mbfl/mbfilter_8bit.c",
+        "ext/mbstring/libmbfl/filters/mbfilter_utf16.c",
+        "win32/ioutil.h",
+        "ext/mbstring/libmbfl/filters/mbfilter_cjk.c"
+      ]
+    },
+    {
+      "project": "php-src",
+      "query": "How does Windows PHP unlink a wide-character filesystem path?",
+      "expected": [
+        "win32/ioutil.c"
+      ],
+      "category": "c-foreign-platform",
+      "baseline_rank": 2,
+      "baseline_paths": [
+        "ext/standard/file.c",
+        "win32/ioutil.c",
+        "ext/standard/ftp_fopen_wrapper.c",
+        "win32/ioutil.h",
+        "main/fopen_wrappers.c",
+        "ext/spl/spl_directory.c",
+        "Zend/zend_virtual_cwd.c",
+        "Zend/zend_virtual_cwd.h",
+        "ext/standard/link.c",
+        "main/streams/plain_wrapper.c"
+      ],
+      "candidate_rank": 2,
+      "candidate_paths": [
+        "ext/standard/file.c",
+        "win32/ioutil.c",
+        "ext/standard/ftp_fopen_wrapper.c",
+        "win32/ioutil.h",
+        "main/fopen_wrappers.c",
+        "ext/spl/spl_directory.c",
+        "Zend/zend_virtual_cwd.c",
+        "Zend/zend_virtual_cwd.h",
+        "ext/standard/link.c",
+        "main/streams/plain_wrapper.c"
+      ]
+    },
+    {
+      "project": "php-src",
+      "query": "Where does Windows PHP send email directly to an SMTP host?",
+      "expected": [
+        "win32/sendmail.c"
+      ],
+      "category": "c-foreign-platform",
+      "baseline_rank": 1,
+      "baseline_paths": [
+        "win32/sendmail.c",
+        "win32/sendmail.h",
+        "ext/standard/mail.c",
+        "ext/standard/php_mail.h",
+        "main/main.c",
+        "ext/sockets/conversions.c",
+        "win32/php_win32_globals.h",
+        "main/fastcgi.c",
+        "win32/sendmail.c",
+        "ext/sockets/windows_common.h"
+      ],
+      "candidate_rank": 1,
+      "candidate_paths": [
+        "win32/sendmail.c",
+        "win32/sendmail.h",
+        "ext/standard/mail.c",
+        "ext/standard/php_mail.h",
+        "main/main.c",
+        "ext/sockets/conversions.c",
+        "win32/php_win32_globals.h",
+        "main/fastcgi.c",
+        "win32/sendmail.c",
+        "ext/sockets/windows_common.h"
+      ]
+    },
+    {
+      "project": "php-src",
+      "query": "How does Windows PHP emulate a socket pair using bind listen and a second socket?",
+      "expected": [
+        "win32/sockets.c"
+      ],
+      "category": "c-foreign-platform",
+      "baseline_rank": 7,
+      "baseline_paths": [
+        "ext/sockets/sockets.c",
+        "ext/sockets/sockets.stub.php",
+        "sapi/cli/php_cli_server.c",
+        "main/network.c",
+        "main/streams/xp_socket.c",
+        "ext/standard/streamsfuncs.c",
+        "win32/sockets.c",
+        "sapi/fpm/fpm/fpm_sockets.c",
+        "ext/sockets/sockets_arginfo.h",
+        "win32/sockets.h"
+      ],
+      "candidate_rank": 7,
+      "candidate_paths": [
+        "ext/sockets/sockets.c",
+        "ext/sockets/sockets.stub.php",
+        "sapi/cli/php_cli_server.c",
+        "main/network.c",
+        "main/streams/xp_socket.c",
+        "ext/standard/streamsfuncs.c",
+        "win32/sockets.c",
+        "sapi/fpm/fpm/fpm_sockets.c",
+        "ext/sockets/sockets_arginfo.h",
+        "win32/sockets.h"
+      ]
+    }
+  ]
+}

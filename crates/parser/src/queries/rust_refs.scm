@@ -28,8 +28,8 @@
 ; Pattern 9: renamed use (use x::y as z) -- capture the source path
 (use_declaration argument: (use_as_clause path: (_) @ref))
 
-; Pattern 10: glob use (use a::b::*) -- capture the module path
-(use_declaration argument: (use_wildcard [(scoped_identifier) (identifier)] @ref))
+; Pattern 10: glob use, including nested groups and super::*
+(use_wildcard) @ref
 
 ; Pattern 11: grouped use (use a::b::{X, Y}) -- one ref per name;
 ; the enclosing scoped_use_list path is prepended in references.rs.

@@ -337,14 +337,12 @@ impl Database {
         Ok(())
     }
 
-    /// True if a co-change pair already exists in the DB. Order-insensitive
-    /// (normalized like the upserts); a self-pair errors. Used by incremental
-    /// indexing to decide whether a sub-threshold pair should
-    /// be upserted (existing pairs keep accumulating) or dropped (new noise below threshold).
+    /// True if a co-change pair has at least three observations. Order-insensitive
+    /// (normalized like the upserts); a self-pair errors.
     pub fn co_change_pair_exists(&self, file_a: &str, file_b: &str) -> Result<bool> {
         let (lo, hi) = Self::order_co_change_pair(file_a, file_b)?;
         let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM git_co_changes WHERE file_a = ?1 AND file_b = ?2",
+            "SELECT COUNT(*) FROM git_co_changes WHERE file_a = ?1 AND file_b = ?2 AND count >= 3",
             rusqlite::params![lo, hi],
             |r| r.get(0),
         )?;
@@ -352,8 +350,7 @@ impl Database {
     }
 
     /// Co-change weight for a file pair (symmetric — caller need not pre-sort).
-    /// Returns 0.0 when the pair has no recorded co-change: either the two files
-    /// have never been observed changing together, or git history isn't indexed.
+    /// Returns 0.0 when the pair has fewer than three recorded co-changes.
     pub fn co_change_weight(&self, file_a: &str, file_b: &str) -> Result<f64> {
         let (lo, hi) = if file_a <= file_b {
             (file_a, file_b)
@@ -361,7 +358,7 @@ impl Database {
             (file_b, file_a)
         };
         match self.conn.query_row(
-            "SELECT weight FROM git_co_changes WHERE file_a = ?1 AND file_b = ?2",
+            "SELECT weight FROM git_co_changes WHERE file_a = ?1 AND file_b = ?2 AND count >= 3",
             rusqlite::params![lo, hi],
             |r| r.get::<_, f64>(0),
         ) {
@@ -371,18 +368,14 @@ impl Database {
         }
     }
 
-    /// Preload every existing co-change pair as `file_a -> {file_b}`. Incremental
-    /// indexing uses this instead of `co_change_pair_exists` per pair, replacing
-    /// N round-trips inside the write transaction with one sequential scan before
-    /// it. HashMap<HashSet> is chosen so membership probes don't need to allocate
-    /// a tuple key: `existing.get(a).is_some_and(|rhs| rhs.contains(b))`.
+    /// Preload co-change pairs with at least three observations as `file_a -> {file_b}`.
     pub fn all_co_change_pairs(
         &self,
     ) -> Result<std::collections::HashMap<String, std::collections::HashSet<String>>> {
         use std::collections::{HashMap, HashSet};
         let mut stmt = self
             .conn
-            .prepare("SELECT file_a, file_b FROM git_co_changes")?;
+            .prepare("SELECT file_a, file_b FROM git_co_changes WHERE count >= 3")?;
         let mut out: HashMap<String, HashSet<String>> = HashMap::new();
         for row in stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -393,39 +386,39 @@ impl Database {
         Ok(out)
     }
 
-    /// True when at least one stored pair is recurring (observation span of
-    /// [`RECURRING_SPAN_SECS`] or more). False across the whole table means
+    /// True when at least one visible pair is recurring (observation span of
+    /// [`RECURRING_SPAN_SECS`] or more). False across visible pairs means
     /// either the index predates the recurrence columns (populated by the
     /// next `git-index --full`) or no pair really recurs; `find_coupling`
     /// combines this with the history span to tell the two apart.
     pub fn any_co_change_recurring(&self) -> Result<bool> {
         let exists: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM git_co_changes
-                           WHERE last_observed_at - first_observed_at >= ?1)",
+                           WHERE count >= 3 AND last_observed_at - first_observed_at >= ?1)",
             rusqlite::params![RECURRING_SPAN_SECS],
             |r| r.get(0),
         )?;
         Ok(exists)
     }
 
-    /// True when some pair still has no `first_observed_at`: rows written
+    /// True when some visible pair still has no `first_observed_at`: rows written
     /// before migration 0017 that no `git-index --full` has rewritten yet.
     pub fn any_co_change_missing_first_observed(&self) -> Result<bool> {
         let exists: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM git_co_changes WHERE first_observed_at IS NULL)",
+            "SELECT EXISTS(SELECT 1 FROM git_co_changes WHERE count >= 3 AND first_observed_at IS NULL)",
             [],
             |r| r.get(0),
         )?;
         Ok(exists)
     }
 
-    /// Oldest and newest co-change observation across the whole table, in
+    /// Oldest and newest co-change observation across visible pairs, in
     /// unix seconds; `None` when no pair carries timestamps. Bounds how much
     /// history the recurrence signal has had to work with.
     pub fn co_change_history_span(&self) -> Result<Option<(i64, i64)>> {
         let (first, last): (Option<i64>, Option<i64>) = self.conn.query_row(
             "SELECT MIN(COALESCE(first_observed_at, last_observed_at)), MAX(last_observed_at)
-             FROM git_co_changes",
+             FROM git_co_changes WHERE count >= 3",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
@@ -456,7 +449,7 @@ impl Database {
     }
 
     /// Top N files that historically co-change with `path`. Returns the OTHER file in each
-    /// pair, weight-sorted descending. Raw-weight order; see
+    /// pair with at least three observations, weight-sorted descending. Raw-weight order; see
     /// [`Database::co_changes_for_ranked`] for the recurrence-aware order.
     pub fn co_changes_for(&self, path: &str, limit: usize) -> Result<Vec<CoChangeRow>> {
         self.co_changes_for_ranked(path, limit, 1.0)
@@ -484,11 +477,11 @@ impl Database {
              FROM (
                  SELECT file_b AS other, weight, count, last_observed_at, windows,
                         first_observed_at, window_mask
-                 FROM git_co_changes WHERE file_a = ?1
+                 FROM git_co_changes WHERE file_a = ?1 AND count >= 3
                  UNION ALL
                  SELECT file_a AS other, weight, count, last_observed_at, windows,
                         first_observed_at, window_mask
-                 FROM git_co_changes WHERE file_b = ?1
+                 FROM git_co_changes WHERE file_b = ?1 AND count >= 3
              ) AS p
              LEFT JOIN git_files AS g ON g.path = p.other
              ORDER BY p.weight * (CASE
@@ -562,12 +555,12 @@ impl Database {
                 arms.push(format!(
                     "SELECT {param} AS qpath, file_b AS other, weight, count AS cnt, \
                  last_observed_at, windows, first_observed_at, window_mask \
-                 FROM git_co_changes WHERE file_a = {param}"
+                 FROM git_co_changes WHERE file_a = {param} AND count >= 3"
                 ));
                 arms.push(format!(
                     "SELECT {param} AS qpath, file_a AS other, weight, count AS cnt, \
                  last_observed_at, windows, first_observed_at, window_mask \
-                 FROM git_co_changes WHERE file_b = {param}"
+                 FROM git_co_changes WHERE file_b = {param} AND count >= 3"
                 ));
             }
             let limit_param = format!("?{}", batch.len() + 1);
@@ -1074,12 +1067,13 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM git_co_changes", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1, "reversed pair must not create a mirrored row");
-        assert_eq!(db.co_change_weight("a.rs", "b.rs").unwrap(), 3.0);
-        assert_eq!(db.co_change_weight("b.rs", "a.rs").unwrap(), 3.0);
+        assert_eq!(db.co_change_weight("a.rs", "b.rs").unwrap(), 0.0);
+        assert_eq!(db.co_change_weight("b.rs", "a.rs").unwrap(), 0.0);
         // Existence probes are order-insensitive too.
-        assert!(db.co_change_pair_exists("b.rs", "a.rs").unwrap());
+        assert!(!db.co_change_pair_exists("b.rs", "a.rs").unwrap());
         // Additive path normalizes as well.
         db.incr_git_co_change("b.rs", "a.rs", 1.0, 1, None).unwrap();
+        assert!(db.co_change_pair_exists("b.rs", "a.rs").unwrap());
         assert_eq!(db.co_change_weight("a.rs", "b.rs").unwrap(), 4.0);
     }
 
@@ -1109,7 +1103,7 @@ mod tests {
     fn scale_git_decay_applies_to_both_tables() {
         let db = Database::open_in_memory().unwrap();
         db.upsert_git_file("a.rs", 10.0, 4, 4, None).unwrap();
-        db.upsert_git_co_change("a.rs", "b.rs", 8.0, 2, None)
+        db.upsert_git_co_change("a.rs", "b.rs", 8.0, 3, None)
             .unwrap();
         db.scale_git_decay(0.5).unwrap();
         let churn = db.git_file("a.rs").unwrap().expect("git file row");

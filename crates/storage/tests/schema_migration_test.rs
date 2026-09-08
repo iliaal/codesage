@@ -208,6 +208,8 @@ fn fresh_db_records_migrations_exactly_once() {
         "0015_semantic_models_fingerprint",
         "0016_semantic_models_artifact_stat_key",
         "0017_git_co_changes_recurrence",
+        "0018_git_author_events",
+        "0019_file_hash_cache",
     ];
     for migration in expected_migrations {
         let count: i64 = conn

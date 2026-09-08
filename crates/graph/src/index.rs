@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -8,7 +8,7 @@ use codesage_storage::db::FingerprintInput;
 use codesage_storage::{Database, is_unique_violation};
 use rayon::prelude::*;
 
-use codesage_parser::discover::discover_files_with_excludes;
+use codesage_parser::discover::{DiscoveryReport, discover_files_report_with_cache};
 use codesage_parser::extract::extract_symbols;
 use codesage_parser::fingerprint::{FunctionFingerprint, file_fingerprints};
 use codesage_parser::parse::{ParsedTree, parse_file_tolerant};
@@ -71,7 +71,7 @@ fn fingerprint_inputs(p: &ParsedFile) -> Vec<FingerprintInput<'_>> {
 }
 
 /// Set each reference's `from_symbol` to the qualified name of the innermost
-/// symbol whose line range encloses the reference. This is what lets
+/// symbol whose source range encloses the reference. This is what lets
 /// `find_references` report the calling symbol and `impact_analysis` walk the
 /// call graph at symbol precision instead of re-deriving the caller from
 /// `(file, line)`. References with no enclosing symbol (a top-level import, a
@@ -82,14 +82,17 @@ fn populate_from_symbol(symbols: &[Symbol], refs: &mut [Reference]) {
         return;
     }
     for r in refs.iter_mut() {
+        let position = (r.line, r.col);
         let mut best: Option<&Symbol> = None;
         for s in symbols {
-            if s.line_start <= r.line && r.line <= s.line_end {
-                let span = s.line_end - s.line_start;
+            let start = (s.line_start, s.col_start);
+            let end = (s.line_end, s.col_end);
+            if start <= position && position < end {
                 match best {
-                    // Strictly smaller span = more deeply nested; ties keep the
-                    // first (outer-declared) match for determinism.
-                    Some(b) if (b.line_end - b.line_start) <= span => {}
+                    Some(b)
+                        if (b.line_start, b.col_start) > start
+                            || ((b.line_start, b.col_start) == start
+                                && (b.line_end, b.col_end) <= end) => {}
                     _ => best = Some(s),
                 }
             }
@@ -232,12 +235,19 @@ fn index(
     strategy: IndexStrategy,
     verbose: bool,
 ) -> Result<IndexStats> {
-    let files = discover_files_with_excludes(root, exclude_patterns)?;
-    index_discovered(root, db, &files, strategy, verbose)
+    let cache = if strategy == IndexStrategy::Incremental {
+        db.file_hash_cache()?
+    } else {
+        HashMap::new()
+    };
+    let discovery = discover_files_report_with_cache(root, exclude_patterns, &cache)?;
+    db.replace_file_hash_cache(&discovery.hash_cache)?;
+    index_discovery_report(root, db, &discovery, strategy, verbose)
 }
 
 /// Index an already-discovered file set. `files` is the complete set for
 /// `root`: paths in the table but not in `files` are removed as orphans.
+#[cfg(test)]
 fn index_discovered(
     root: &Path,
     db: &Database,
@@ -245,13 +255,40 @@ fn index_discovered(
     strategy: IndexStrategy,
     verbose: bool,
 ) -> Result<IndexStats> {
+    index_discovery_report(
+        root,
+        db,
+        &DiscoveryReport {
+            files: files.to_vec(),
+            failed_paths: Vec::new(),
+            hash_cache: HashMap::new(),
+            hashes_reused: 0,
+            bytes_hashed: 0,
+        },
+        strategy,
+        verbose,
+    )
+}
+
+fn index_discovery_report(
+    root: &Path,
+    db: &Database,
+    discovery: &DiscoveryReport,
+    strategy: IndexStrategy,
+    verbose: bool,
+) -> Result<IndexStats> {
+    let files = &discovery.files;
     let mut stats = IndexStats::default();
 
     if verbose {
         tracing::info!(total = files.len(), "discovered files for structural index");
     }
 
-    let discovered_paths: HashSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    let discovered_paths: HashSet<&str> = files
+        .iter()
+        .map(|f| f.path.as_str())
+        .chain(discovery.failed_paths.iter().map(String::as_str))
+        .collect();
     let existing_paths = db.all_file_paths()?;
     let orphans: Vec<&str> = existing_paths
         .iter()
@@ -271,11 +308,18 @@ fn index_discovered(
     let to_parse: Vec<&FileInfo> = match strategy {
         IndexStrategy::Full => files.iter().collect(),
         IndexStrategy::Incremental => {
-            // One sequential scan of `files` instead of one SELECT per discovered file.
             let existing_hashes = db.all_file_hashes()?;
+            let existing_languages: HashMap<_, _> = db
+                .all_files_with_id_and_language()?
+                .into_iter()
+                .map(|(_, path, language)| (path, language))
+                .collect();
             files
                 .iter()
-                .filter(|f| existing_hashes.get(&f.path) != Some(&f.content_hash))
+                .filter(|f| {
+                    existing_hashes.get(&f.path) != Some(&f.content_hash)
+                        || existing_languages.get(&f.path) != Some(&f.language)
+                })
                 .collect()
         }
     };
@@ -316,6 +360,10 @@ fn index_discovered(
         })?;
     }
 
+    stats.files_failed += discovery.failed_paths.len();
+    stats
+        .failed_paths
+        .extend(discovery.failed_paths.iter().cloned());
     Ok(stats)
 }
 

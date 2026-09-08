@@ -2,6 +2,12 @@
 
 ### Added
 
+- `edit_check` compares a proposed declaration with Git HEAD and reports signature changes and provably incompatible same-file Rust callers without writing the file.
+- `CODESAGE_PHP_DECLARATION_DEMOTE=1` enables experimental PHP declaration-path demotion with query-intent guards.
+- `assess_risk` reports informational author concentration and bus factor with a 180-day half-life over 730 days of history; run `git-index --full` to populate existing indexes.
+- `CODESAGE_QUALIFIED_GROUPS=1` enables experimental grouped qualified-name BM25 retrieval; default search remains unchanged.
+- MCP responses include an evidence-derived `next` call, or `null` when no follow-up is supported by the result.
+- Finding acknowledgments support explicit magnitude thresholds, unique-content rename transfer, and stale-acknowledgment diagnostics.
 - `find_references` reports `counts_floor: true`, `definition_count`, `ambiguous`, and a `note` when the name matches several or no indexed definitions; `impact_analysis` and `trace_call_path` carry `counts_floor: true`, and a not-found trace says it searched resolved name-based edges only.
 - `search` reports `confidence` (`high` / `low`), `margin_pct`, and `cliff_at` from the largest relative score drop in the returned page; `adaptive_limit: true` (CLI `codesage search --adaptive-limit`) truncates at that cliff instead of returning exactly `limit` rows when the drop rates `confidence: high` (rounds to ≥20%); a flat page is returned in full.
 - `search` anchors query mentions: a path, dotted module, or `Type::method` named in the query lifts its matching rows directly under the top result on the first page; a suffix shared by several indexed files anchors nothing. `CODESAGE_MENTION_ANCHOR=0` disables it.
@@ -14,6 +20,10 @@
 
 ### Changed
 
+- Experimental platform demotion supports Windows hosts and preserves pages containing only foreign-platform paths.
+- Incremental indexing caches file hashes by size, modification time, and change time with a timestamp-race guard; `index --full` rereads every file.
+- The pre-edit brief hook requires `CODESAGE_BRIEF_CANARY=1` and a valid session; concurrent fires share the session budget and corrupt gate state suppresses output.
+- `review_rehearsal` treats missing-test objections as advisory and includes the test-discovery limits in each objection's evidence.
 - MCP tools refuse a call carrying an undeclared argument, naming the field and the valid set, instead of silently ignoring it; every tool's `inputSchema` advertises `additionalProperties: false`.
 - `recommend_tests` / `codesage tests-for` `coupled` entries carry `span_days` and `recurring`, are ordered by the `find_coupling` key (one-offs at half weight, `CODESAGE_COUPLING_RECURRENCE=0` for raw), and a note names inputs whose co-change partners exceeded the 20 consulted; `assess_risk` `top_coupled` uses the same order and `codesage risk` prints count, span, and a one-off marker.
 - `assess_risk` notes name a coupled test that keeps `test_gap` false but ranks below the listed `top_coupled` rows.
@@ -21,6 +31,14 @@
 
 ### Fixed
 
+- Indexing preserves prior structural and semantic rows when discovery cannot read a file and reports the failed paths.
+- Incremental indexing reinterprets unchanged headers when adding or removing C++ sources changes their detected language.
+- Call references on the same line use source columns to identify their enclosing function.
+- File impact and reverse dependencies include import-only Python facades and JavaScript barrels.
+- Rust binary feature slices include declared implementation modules and shared modules.
+- Rust and Python glob imports retain module references for dependency and caller resolution.
+- `git-index --incremental` retains co-change observations across passes until pairs reach the display threshold.
+- Watchers reconcile edits made before startup or restart and apply live enablement and exclusion changes on project resolution.
 - `codesage tests-for` and `recommend_tests` handle more than 250 distinct input files without exceeding SQLite's compound-query limit.
 - Opening the index while another process applies the same schema migration no longer fails with a duplicate-migration error.
 

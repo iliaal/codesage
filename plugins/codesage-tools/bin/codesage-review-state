@@ -5,6 +5,7 @@ import copy
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -38,14 +39,16 @@ FINDING_FIELDS = (
 )
 SEVERITIES = {"low", "medium", "high"}
 CATEGORIES = {"bug", "security", "perf", "maintainability"}
-REVIEW_PROTOCOL_VERSION = "4"
+REVIEW_PROTOCOL_VERSION = "5"
 
 
 def slim_priors(document):
     return [
-        {field: finding.get(field) for field in PRIOR_FIELDS}
+        {**{field: finding.get(field) for field in PRIOR_FIELDS},
+         **{field: finding[field] for field in ("magnitude", "acknowledgement")
+            if field in finding}}
         for finding in document.get("findings", [])
-        if finding.get("status") in ACTIVE_PRIOR_STATUSES
+        if finding.get("status") in ACTIVE_PRIOR_STATUSES and not finding.get("ack_transferred_to")
     ]
 
 
@@ -401,6 +404,8 @@ def combine_responses(responses):
 
 def clean_finding(finding):
     cleaned = {field: copy.deepcopy(finding.get(field)) for field in FINDING_FIELDS}
+    if "magnitude" in finding:
+        cleaned["magnitude"] = clean_magnitude(finding["magnitude"])
     if cleaned["severity"] not in SEVERITIES:
         raise ValueError(f"invalid severity: {cleaned['severity']}")
     if cleaned["category"] not in CATEGORIES:
@@ -415,6 +420,127 @@ def clean_finding(finding):
     if cleaned["line"] < 1:
         raise ValueError("finding line must be positive")
     return cleaned
+
+
+def clean_magnitude(value):
+    if not isinstance(value, dict):
+        raise ValueError("magnitude must contain metric and value")
+    metric, number = value.get("metric"), value.get("value")
+    if not isinstance(metric, str) or not metric.strip():
+        raise ValueError("magnitude metric must be a nonempty string")
+    if (isinstance(number, bool) or not isinstance(number, (int, float))
+            or (isinstance(number, float) and not math.isfinite(number)) or number < 0):
+        raise ValueError("magnitude value must be finite and nonnegative")
+    return {"metric": metric, "value": number}
+
+
+def rename_priors(project, priors):
+    candidates = [prior for prior in priors if prior.get("acknowledgement")
+                  and not project_file(project, prior["file"]).exists()]
+    if not candidates:
+        return priors
+    result = subprocess.run(
+        ["git", "-C", str(project), "ls-files", "--cached", "--others",
+         "--exclude-standard", "-z"], capture_output=True, check=False,
+    )
+    if result.returncode:
+        return priors
+    by_digest = {}
+    try:
+        for raw_path in set(result.stdout.split(b"\0")) - {b""}:
+            path = os.fsdecode(raw_path)
+            source = project_file(project, path)
+            if not source.exists():
+                continue
+            if source.is_symlink() or not source.is_file():
+                return priors
+            digest = file_content_digest(project, path, {})
+            by_digest.setdefault(digest, []).append(path)
+    except (OSError, ValueError):
+        return priors
+    renamed = copy.deepcopy(priors)
+    for prior in renamed:
+        if prior not in candidates:
+            continue
+        matches = by_digest.get(prior.get("content_digest"), [])
+        if len(matches) == 1:
+            prior["file"] = matches[0]
+    return renamed
+
+
+def foreign_ack_priors(project, feature_id):
+    directory = Path(project) / ".codesage" / "findings"
+    reject_symlinked_components(directory)
+    documents = [load_json(path) for path in sorted(directory.glob("*.json"))]
+    transferred = {
+        (origin.get("feature_id"), origin.get("finding_id"))
+        for document in documents for finding in document.get("findings", [])
+        if (origin := finding.get("ack_transferred_from"))
+    }
+    priors = []
+    for document in documents:
+        if document.get("feature_id") == feature_id:
+            continue
+        for finding in document.get("findings", []):
+            if (finding.get("acknowledgement") and
+                    finding.get("status") in {"false-positive", "wont-fix"} and
+                    (document.get("feature_id"), finding.get("finding_id")) not in transferred and
+                    not project_file(project, finding["file"]).exists()):
+                prior = copy.deepcopy(finding)
+                prior["ack_transferred_from"] = {
+                    "feature_id": document.get("feature_id"),
+                    "finding_id": finding["finding_id"],
+                }
+                priors.append(prior)
+    return rename_priors(project, priors)
+
+
+def transferred_acknowledgements(project):
+    directory = Path(project) / ".codesage" / "findings"
+    reject_symlinked_components(directory)
+    transferred = {}
+    for path in sorted(directory.glob("*.json")):
+        document = load_json(path)
+        for finding in document.get("findings", []):
+            origin = finding.get("ack_transferred_from")
+            if origin:
+                key = (origin.get("feature_id"), origin.get("finding_id"))
+                transferred.setdefault(key, []).append({
+                    "feature_id": document.get("feature_id"),
+                    "finding_id": finding.get("finding_id"),
+                })
+    return transferred
+
+
+def sweep_acknowledgements(project):
+    directory = Path(project) / ".codesage" / "findings"
+    reject_symlinked_components(directory)
+    diagnostics = []
+    transferred = transferred_acknowledgements(project)
+    for path in sorted(directory.glob("*.json")):
+        document = load_json(path)
+        for finding in document.get("findings", []):
+            if not finding.get("acknowledgement"):
+                continue
+            identity = {"feature_id": document.get("feature_id"),
+                        "finding_id": finding.get("finding_id")}
+            destination = transferred.get((identity["feature_id"], identity["finding_id"]))
+            if destination:
+                diagnostics.append({**identity, "kind": "transferred",
+                                    "reason": "superseded-by-destination", "destinations": destination})
+                continue
+            try:
+                digest = file_content_digest(project, finding["file"], {})
+                reason = ("source-missing" if digest == "missing" else
+                          "source-changed-since-review" if digest != finding.get("content_digest")
+                          else None)
+            except (OSError, ValueError) as exc:
+                reason = f"source-unreadable: {exc}"
+            if reason:
+                diagnostics.append({**identity, "kind": "stale", "reason": reason})
+        diagnostics.extend({"feature_id": document.get("feature_id"), **entry}
+                           for entry in document.get("ack_sweep", []))
+    return {"ack_sweep": diagnostics}
 
 
 def must_read_paths(value):
@@ -463,10 +589,18 @@ def validate_response(project, response, existing, must_read=None):
     raw_findings = response.get("findings", [])
     if not isinstance(raw_findings, list):
         raise ValueError("response findings must be an array")
-    priors = existing.get("findings", [])
+    transferred = transferred_acknowledgements(project)
+    superseded = {finding["finding_id"]: transferred[(feature_id, finding["finding_id"])]
+                  for finding in existing.get("findings", [])
+                  if (feature_id, finding.get("finding_id")) in transferred}
+    priors = rename_priors(project, [finding for finding in existing.get("findings", [])
+                                   if finding.get("finding_id") not in superseded])
+    foreign_priors = foreign_ack_priors(project, feature_id)
+    imported_priors = []
+    transfer_diagnostics = []
     occupied = {
         finding.get("finding_id")
-        for finding in priors
+        for finding in existing.get("findings", [])
         if isinstance(finding.get("finding_id"), str)
     }
     used_ids = set()
@@ -494,6 +628,7 @@ def validate_response(project, response, existing, must_read=None):
             if matched_line is None:
                 raise ValueError("evidence has no nearby block or unique substantive line")
             finding["line"] = matched_line
+            finding["content_digest"] = file_content_digest(project, finding["file"], {})
         except (OSError, TypeError, ValueError) as exc:
             rejected.append(
                 {
@@ -504,7 +639,16 @@ def validate_response(project, response, existing, must_read=None):
             )
             continue
 
-        if any(same_candidate(finding, accepted) for accepted in findings):
+        duplicate = next((accepted for accepted in findings
+                          if same_candidate(finding, accepted)), None)
+        if duplicate is not None:
+            previous = duplicate.get("magnitude")
+            incoming = finding.get("magnitude")
+            if previous and incoming and previous["metric"] == incoming["metric"]:
+                if incoming["value"] > previous["value"]:
+                    duplicate["magnitude"] = incoming
+            else:
+                duplicate.pop("magnitude", None)
             rejected.append(
                 {
                     "file": finding.get("file"),
@@ -515,6 +659,25 @@ def validate_response(project, response, existing, must_read=None):
             continue
 
         prior = match_prior(finding, priors, used_ids)
+        if prior is None:
+            matches = [foreign for foreign in foreign_priors
+                       if match_prior(finding, [foreign], set()) is not None]
+            if len(matches) == 1:
+                prior = copy.deepcopy(matches[0])
+                prior["finding_id"] = mint_finding_id(feature_id, finding, occupied | used_ids)
+                imported_priors.append(prior)
+                foreign_priors.remove(matches[0])
+            else:
+                for candidate in [*priors, *foreign_priors]:
+                    if (candidate.get("acknowledgement") and
+                            not project_file(project, candidate["file"]).exists() and
+                            match_prior({**finding, "file": candidate["file"]},
+                                        [candidate], set()) is not None):
+                        transfer_diagnostics.append({"finding_id": candidate["finding_id"],
+                            "kind": "stale", "reason": "rename-not-proven"})
+                if len(matches) > 1:
+                    transfer_diagnostics.append({"finding_id": None, "file": finding["file"],
+                        "kind": "stale", "reason": "ambiguous-acknowledgement"})
         if prior is not None:
             finding_id = prior["finding_id"]
             finding["finding_id"] = finding_id
@@ -534,6 +697,9 @@ def validate_response(project, response, existing, must_read=None):
         "new_finding_ids": new_ids,
         "recurring_finding_ids": recurring_ids,
         "evidence_rejected": rejected,
+        "imported_priors": imported_priors,
+        "ack_transfer_diagnostics": transfer_diagnostics,
+        "superseded_priors": superseded,
     }
 
 
@@ -585,6 +751,16 @@ def merge_document(
     if mode == "revalidate" and target_finding_ids is None:
         raise ValueError("revalidation requires target finding IDs")
 
+    if validated.get("imported_priors") and mode == "review":
+        existing = copy.deepcopy(existing)
+        existing.setdefault("findings", []).extend(validated["imported_priors"])
+    elif validated.get("imported_priors"):
+        validated = copy.deepcopy(validated)
+        imported_ids = {prior["finding_id"] for prior in validated["imported_priors"]}
+        validated["new_finding_ids"].extend(sorted(imported_ids))
+        validated["recurring_finding_ids"] = [finding_id for finding_id in
+            validated["recurring_finding_ids"] if finding_id not in imported_ids]
+
     target_finding_ids = set(target_finding_ids or [])
     existing_ids = {
         finding.get("finding_id") for finding in existing.get("findings", [])
@@ -619,16 +795,25 @@ def merge_document(
         "refuted": [],
         "unverified": [],
         "evidence_rejected": validated.get("evidence_rejected", []),
+        "suppressed": [],
+        "ack_sweep": copy.deepcopy(validated.get("ack_transfer_diagnostics", [])),
     }
 
     for prior in existing.get("findings", []):
         finding_id = prior.get("finding_id")
         current = copy.deepcopy(prior)
+        if finding_id in validated.get("superseded_priors", {}):
+            current["ack_transferred_to"] = validated["superseded_priors"][finding_id]
+            merged_findings.append(current)
+            continue
         if finding_id in returned:
             update = returned[finding_id]
-            for field in FINDING_FIELDS:
+            for field in (*FINDING_FIELDS, "content_digest"):
                 if field in update:
                     current[field] = copy.deepcopy(update[field])
+            current.pop("magnitude", None)
+            if "magnitude" in update:
+                current["magnitude"] = clean_magnitude(update["magnitude"])
             current["last_seen_at"] = now
             history = current.setdefault("history", [])
             if history and history[-1].get("action") == "not-seen":
@@ -662,7 +847,29 @@ def merge_document(
                 )
                 summary["reopened"].append(finding_id)
             seen_prior_ids.add(finding_id)
-            summary["recurring"].append(finding_id)
+            ack = current.get("acknowledgement")
+            if ack and current.get("status") in {"false-positive", "wont-fix"}:
+                magnitude = current.get("magnitude")
+                reason = None
+                if not magnitude:
+                    reason = "magnitude-missing"
+                elif magnitude["metric"] != ack.get("metric"):
+                    reason = "metric-changed"
+                elif magnitude["value"] > clean_magnitude(ack)["value"]:
+                    reason = "magnitude-increased"
+                if reason:
+                    old_status = current["status"]
+                    current["status"] = "open"
+                    history.append({"action": "ack-reopened", "at": now,
+                                    "run_id": run_id, "reason": reason,
+                                    "from_status": old_status, "to_status": "open"})
+                    summary["reopened"].append(finding_id)
+                    summary["ack_sweep"].append({"finding_id": finding_id,
+                                                "kind": "stale", "reason": reason})
+                else:
+                    summary["suppressed"].append(finding_id)
+            if finding_id not in summary["suppressed"]:
+                summary["recurring"].append(finding_id)
         elif current.get("status") == "open" and (
             mode == "review" or finding_id in target_finding_ids
         ):
@@ -677,6 +884,10 @@ def merge_document(
                     }
                 )
                 summary["not_seen"].append(finding_id)
+        if (current.get("acknowledgement") and finding_id not in returned
+                and (mode == "review" or finding_id in target_finding_ids)):
+            summary["ack_sweep"].append({"finding_id": finding_id, "kind": "foreign",
+                                        "reason": "not-emitted-by-current-review"})
         merged_findings.append(current)
 
     for finding_id in validated.get("new_finding_ids", []):
@@ -737,6 +948,7 @@ def merge_document(
             "reviewed_at_sha": sha_value,
             "reviewed_state": state_value,
             "findings": merged_findings,
+            "ack_sweep": summary["ack_sweep"],
         }
     )
     return document, summary
@@ -835,9 +1047,69 @@ def default_findings_path(project, feature_id):
     return Path(project) / ".codesage" / "findings" / f"{feature_id}.json"
 
 
+def triage(project, finding_id, status, magnitude=None, note=None):
+    if not re.fullmatch(r"fnd_[0-9a-f]{8}", finding_id):
+        raise ValueError("invalid finding ID")
+    if status not in {"open", "fixed", "false-positive", "wont-fix"}:
+        raise ValueError("invalid status")
+    if magnitude is not None:
+        magnitude = clean_magnitude(magnitude)
+        if status not in {"false-positive", "wont-fix"}:
+            raise ValueError("magnitude acknowledgement requires false-positive or wont-fix")
+    directory = Path(project) / ".codesage" / "findings"
+    reject_symlinked_components(directory)
+    matches = []
+    for path in sorted(directory.glob("*.json")):
+        document = load_json(path)
+        for finding in document.get("findings", []):
+            if finding.get("finding_id") == finding_id:
+                matches.append((path, document, finding))
+    if len(matches) != 1:
+        raise ValueError(f"expected one finding {finding_id}, found {len(matches)}")
+    path, document, finding = matches[0]
+    destination = transferred_acknowledgements(project).get(
+        (document.get("feature_id"), finding_id))
+    if destination:
+        raise ValueError("finding acknowledgement was transferred; triage its destination: "
+                         + json.dumps(destination, sort_keys=True))
+    now = utc_now()
+    if magnitude is not None:
+        measured = clean_magnitude(finding.get("magnitude"))
+        if measured["metric"] != magnitude["metric"] or measured["value"] > magnitude["value"]:
+            raise ValueError("acknowledgement must use the observed metric and cover its value")
+        digest = file_content_digest(project, finding["file"], {})
+        if digest == "missing" or digest != finding.get("content_digest"):
+            raise ValueError("finding source changed since review; revalidate before acknowledging")
+    event = {"action": "triage", "at": now, "from_status": finding.get("status"),
+             "to_status": status, "note": note}
+    if magnitude is not None:
+        finding["acknowledgement"] = {**magnitude, "at": now}
+        event["acknowledgement"] = copy.deepcopy(finding["acknowledgement"])
+    else:
+        finding.pop("acknowledgement", None)
+    finding["status"] = status
+    finding["triaged_at"] = now
+    finding.setdefault("history", []).append(event)
+    document["reviewed_state"] = None
+    atomic_write_json(path, document)
+    return {"findings_path": str(path), "finding": finding}
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Deterministic CodeSage review-state operations")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    triage_parser = subparsers.add_parser("triage")
+    triage_parser.add_argument("--project", required=True)
+    triage_parser.add_argument("--finding", required=True)
+    triage_parser.add_argument("--status", required=True,
+                               choices=("open", "fixed", "false-positive", "wont-fix"))
+    triage_parser.add_argument("--magnitude", type=float)
+    triage_parser.add_argument("--metric")
+    triage_parser.add_argument("--note")
+
+    sweep = subparsers.add_parser("sweep-acks")
+    sweep.add_argument("--project", required=True)
 
     slim = subparsers.add_parser("slim-priors")
     slim.add_argument("--findings", required=True)
@@ -890,6 +1162,16 @@ def build_parser():
 
 
 def run_cli(args):
+    if args.command == "sweep-acks":
+        print_json(sweep_acknowledgements(args.project))
+        return
+    if args.command == "triage":
+        if (args.magnitude is None) != (args.metric is None):
+            raise ValueError("--magnitude and --metric must be supplied together")
+        magnitude = None if args.magnitude is None else {
+            "metric": args.metric, "value": args.magnitude}
+        print_json(triage(args.project, args.finding, args.status, magnitude, args.note))
+        return
     if args.command == "slim-priors":
         print_json(slim_priors(load_json(args.findings)))
         return

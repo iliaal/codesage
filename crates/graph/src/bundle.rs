@@ -675,6 +675,9 @@ fn import_ref_targets_symbol(
     callee_name: &str,
     sym: &Symbol,
 ) -> bool {
+    if import_ref.ends_with("::*") || (caller_file.ends_with(".py") && import_ref.ends_with(".*")) {
+        return import_ref_targets_file(import_ref, caller_file, &sym.file_path);
+    }
     if import_ref == sym.qualified_name || import_ref == sym.name {
         return true;
     }
@@ -744,10 +747,43 @@ pub(crate) fn import_ref_targets_file(
     importer_file: &str,
     target_file: &str,
 ) -> bool {
+    if importer_file.ends_with(".py") && target_file.ends_with(".py") {
+        let import_ref = import_ref.strip_suffix('*').map_or(import_ref, |module| {
+            if module.chars().all(|c| c == '.') {
+                module
+            } else {
+                module.strip_suffix('.').unwrap_or(import_ref)
+            }
+        });
+        let dots = import_ref.bytes().take_while(|b| *b == b'.').count();
+        let module = &import_ref[dots..];
+        if !module
+            .split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_alphanumeric() || c == '_'))
+            && !module.is_empty()
+        {
+            return false;
+        }
+        let path = module.replace('.', "/");
+        let resolved = if dots == 0 {
+            Some(path)
+        } else {
+            let base = importer_file.rsplit_once('/').map_or("", |(dir, _)| dir);
+            lexical_join(base, &format!("{}{}", "../".repeat(dots - 1), path))
+        };
+        return resolved.is_some_and(|path| {
+            target_file == format!("{path}.py") || target_file == format!("{path}/__init__.py")
+        });
+    }
     if import_ref.starts_with("./") || import_ref.starts_with("../") {
         return import_path_targets_file(import_ref, importer_file, target_file);
     }
     if import_ref.contains("::") {
+        if let Some(module) = import_ref.strip_suffix("::*") {
+            return rust_glob_module_candidates(module, importer_file)
+                .iter()
+                .any(|candidate| candidate == target_file);
+        }
         // `use crate::util` names util.rs directly; `use crate::util::helper`
         // names it through the parent of the imported item. External paths
         // (`std::io::Read`) derive candidates that match no indexed file.
@@ -775,6 +811,41 @@ pub(crate) fn import_ref_targets_file(
         return import_ref == target_file;
     }
     false
+}
+
+fn rust_glob_module_candidates(module: &str, importer_file: &str) -> Vec<String> {
+    let root = importer_src_root(importer_file).unwrap_or("");
+    let relative = &importer_file[root.len()..];
+    let mut parts: Vec<&str> = relative.trim_end_matches(".rs").split('/').collect();
+    if matches!(parts.last(), Some(&"lib" | &"main" | &"mod")) {
+        parts.pop();
+    }
+    let mut module_parts = module.split("::").peekable();
+    match module_parts.peek().copied() {
+        Some("crate") => {
+            parts.clear();
+            module_parts.next();
+        }
+        Some("self") => {
+            module_parts.next();
+        }
+        Some("super") => {
+            while module_parts.peek() == Some(&"super") {
+                if parts.pop().is_none() {
+                    return Vec::new();
+                }
+                module_parts.next();
+            }
+        }
+        _ => return rust_module_candidates(module, importer_file),
+    }
+    parts.extend(module_parts);
+    if parts.is_empty() {
+        vec![format!("{root}lib.rs"), format!("{root}main.rs")]
+    } else {
+        let path = parts.join("/");
+        vec![format!("{root}{path}.rs"), format!("{root}{path}/mod.rs")]
+    }
 }
 
 fn is_path_specifier(s: &str) -> bool {
@@ -903,6 +974,50 @@ fn add_related_from_file(
 #[cfg(test)]
 mod import_path_tests {
     use super::*;
+
+    #[test]
+    fn glob_imports_resolve_only_the_named_module() {
+        for (import, caller, target, unrelated) in [
+            ("crate::api::*", "src/client.rs", "src/api.rs", "src/lib.rs"),
+            (
+                "super::*",
+                "src/api/client.rs",
+                "src/api.rs",
+                "src/other/api.rs",
+            ),
+            (
+                "super::super::*",
+                "src/api/nested/client.rs",
+                "src/api.rs",
+                "other/src/lib.rs",
+            ),
+            ("self::*", "src/api/mod.rs", "src/api/mod.rs", "src/lib.rs"),
+            (
+                "crate::*",
+                "crates/app/src/client.rs",
+                "crates/app/src/lib.rs",
+                "src/lib.rs",
+            ),
+            ("pkg.api.*", "client.py", "pkg/api.py", "other/pkg/api.py"),
+            (".api.*", "pkg/client.py", "pkg/api.py", "api.py"),
+            (
+                "..*",
+                "pkg/nested/client.py",
+                "pkg/__init__.py",
+                "pkg/nested/__init__.py",
+            ),
+            (".*", "pkg/client.py", "pkg/__init__.py", "__init__.py"),
+        ] {
+            assert!(
+                import_ref_targets_file(import, caller, target),
+                "{import} from {caller} -> {target}"
+            );
+            assert!(
+                !import_ref_targets_file(import, caller, unrelated),
+                "{import} from {caller} -> {unrelated}"
+            );
+        }
+    }
 
     #[test]
     fn relative_specifier_resolves_against_the_caller_directory() {
@@ -1098,8 +1213,8 @@ mod import_path_tests {
             "src/main.c",
             "other/util.h"
         ));
-        // A bare symbol name is not a file.
-        assert!(!import_ref_targets_file("util", "main.py", "util.py"));
+        assert!(import_ref_targets_file("util", "main.py", "util.py"));
+        assert!(!import_ref_targets_file("util", "main.c", "util.c"));
     }
 
     #[test]

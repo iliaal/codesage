@@ -61,16 +61,13 @@ device = "gpu"
 reranker = "cross-encoder/ms-marco-MiniLM-L6-v2"
 
 [index]
-exclude_patterns = [
-  "**/tests/**", "**/test/**", "**/__tests__/**",
-  "**/*Test.php", "**/*.test.ts", "**/*.spec.ts",
-  "**/test_*.py", "**/*_test.py", "**/*.phpt",
-  "**/vendor/**", "**/node_modules/**",
-]
+exclude_patterns = []
 
 [docs]
 exclude_patterns = ["docs/spikes/**"]
 ```
+
+Built-in exclusions cover dependencies, build outputs, and caches; configured patterns add to them. Tests are indexed structurally and semantically by default, then demoted during search. Explicitly excluding tests reduces graph-based test discovery and test-gap evidence. The optional `[docs]` example above controls documentation checks, not indexing.
 
 `[embedding] model` / `reranker` values are validated against a built-in allowlist before any download, then loaded only from pinned Hugging Face revisions with sha256-verified tokenizer/ONNX artifacts — repo-local config is untrusted input (a cloned repo must not be able to pick the graph that gets loaded). To run a non-allowlisted or unpinned model deliberately, set `CODESAGE_ALLOW_ANY_MODEL=1`; the allowlist and pins live in `crates/embed/src/model.rs`.
 
@@ -142,8 +139,13 @@ PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go.
 
 `.h` files default to C. The discovery layer auto-flips them to C++ for any project that also contains an unambiguous C++ extension (`.cpp`, `.cc`, `.cxx`, `.hpp`, etc.). `.c` always stays C. No config knob — if you need to override on a project that mixes both styles awkwardly, raise an issue.
 
+Incremental structural indexing compares detected language as well as content hashes, so adding or removing the first or last C++ source reinterprets unchanged headers. Parser, extraction, and trust-boundary rule upgrades still require `codesage index --full`: the structural index has no interpretation-version stamp. Content hashes remain raw file hashes because watcher, staleness, and feature-map consumers share them; they must not encode parser versions. After deploying an extraction change, rebuild existing indexes explicitly.
+
+Schema migration `0019_file_hash_cache` stores verified content hashes with size, nanosecond modification/change times, and observation time. Incremental discovery reuses a hash only when the stat triple matches and both timestamps precede the observation's whole second; full indexing bypasses reuse. Files still undergo access checks. Platforms without the required timestamps hash normally. This cache does not attest structural parsing or semantic fingerprint freshness.
+
 ## MCP tools
 
+- `edit_check` -- compare a complete proposed replacement declaration against a symbol in pinned Git HEAD, without writing source, opening an index, or starting a watcher. Requires absolute `project`, repository-relative `file_path`, exact unqualified `symbol_name`, and `replacement`; optional one-based `line` disambiguates declarations. Reports arity, visibility, and same-scope overload snapshots plus working-file divergence. Provably incompatible caller checks cover same-file Rust free functions reached through explicit `self::` / `super::` paths, without imports, macros, or attributes. Other languages receive syntax-level declaration diffs; methods, indirect/external callers, and unsupported parameter semantics remain unknown. Ambiguous `.h` dialects are refused. This is not a compilation or safety verdict; source and proposed file are capped at 1 MiB, caller output at 100.
 - `project_overview` -- one bounded first-call orientation: languages, structural + semantic freshness, feature summary by kind, top-risk files, trust-boundary clusters, per-language test conventions, sample entrypoints, and suggested next calls. Pure aggregation over the index; call once at session start.
 - `search` -- semantic search with embedding + reranking; each page carries `confidence` / `margin_pct` / `cliff_at` (relevance-cliff disclosure) and honors opt-in `adaptive_limit`
 - `find_symbol` -- symbol definitions by name
@@ -166,6 +168,8 @@ PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go.
 - `feature_bundle` -- curated code bundle for one feature slice (entry + owned + tests + context as primary/related chunks, plus the entry symbol's definition and optionally its callers/callees). Same shape as `export_context` but anchored on the feature's pre-curated file list. Returns `found: false` when the `feature_id` is unknown.
 
 Every MCP tool advertises an `outputSchema` (0.7.0); agents that consult it know the result shape before they call. Each schema also declares an optional top-level `_meta` object the server may inject: budget-truncation details (`truncated`, `total_results`, `returned`, `dropped_files`) and staleness annotations (`stale_files`, `stale_warning`).
+
+Responses also include `next`, an evidence-derived `{tool, arguments}` call using retained result rows and an absolute project path. `null` marks empty, unsupported, or terminal evidence; context bundles terminate the chain, and `session_start` waits for edits. Error results preserve their original cause and add a JSON text block with `next: null`. Follow-ups are suggestions, not instructions or evidence that unreturned matches do not exist.
 
 ## MCP runtime
 
@@ -225,12 +229,14 @@ Corpus YAMLs are not bundled; bring your own. `CODESAGE_BENCH_CORPUS_DIR` (consu
 
 ## Git history intelligence (V2b slice 1)
 
+Schema migration `0018_git_author_events` retains per-file author events. After `git-index --full`, risk responses include informational `author_concentration`: author count, dominant share, effective authors (inverse squared-share sum), and `bus_factor` (fewest identities covering at least 50% of weighted commits). Events use a 180-day half-life and a 730-day window. Identity is normalized email, falling back to normalized name; it is not a verified person count, and mailmap changes are not applied retroactively. Legacy or absent author history remains unknown. This signal does not affect the risk score.
+
 `codesage git-index` runs `git log --numstat` and populates `git_files` (per-file churn score with τ=180d decay, fix count, total commits, last commit), `git_co_changes` (file pair weights, min count 3, plus migration `0017`'s `first_observed_at`, `window_mask` — bit `(ts / 90d) % 64` per shared commit, keyed to the unix epoch — and `windows = popcount(window_mask)`), and `git_index_state` (last indexed SHA). Co-change confidence is not stored: `find_coupling` derives P(other | this) as `count / git_files.total_commits` of each side.
 
 Three modes, selected via flags on `codesage git-index`:
 
 - `--full`: fresh rescan. Drops existing rows and walks the entire history. Use after big rebases that rewrite a lot of history, or to rebaseline weekly.
-- `--incremental`: scans only `<last_sha>..HEAD` and additively updates counters. Scales pre-existing weights by `exp(-Δt/τ)` so exponential decay stays mathematically exact across runs. Sub-threshold co-change pairs that straddle the incremental boundary are approximated (full rescan resolves them). `window_mask` composes exactly (`mask |= delta`, `first`/`last` take MIN/MAX) because window bits are keyed to a fixed epoch, so `windows` and `span_days` match a full rescan after every incremental pass for rows written by an 0017-aware `--full` (commits inside the 730-day history window; a `--full` still rebaselines rows whose oldest commits have aged out). Rows indexed before 0017 (`first_observed_at IS NULL`) are left unbaselined by incremental passes and keep `span_days` 0 / `recurrence` 1 until `codesage git-index --full`.
+- `--incremental`: scans only `<last_sha>..HEAD` and additively updates counters. Scales pre-existing weights by `exp(-Δt/τ)` so exponential decay stays mathematically exact across runs. Co-change observations below count 3 are retained across passes but hidden from coupling queries until they reach that threshold. Run `codesage git-index --full` after upgrading to recover observations discarded by earlier versions. `window_mask` composes exactly (`mask |= delta`, `first`/`last` take MIN/MAX) because window bits are keyed to a fixed epoch, so `windows` and `span_days` match a full rescan after every incremental pass for rows written by an 0017-aware `--full` (commits inside the 730-day history window; a `--full` still rebaselines rows whose oldest commits have aged out). Rows indexed before 0017 (`first_observed_at IS NULL`) are left unbaselined by incremental passes and keep `span_days` 0 / `recurrence` 1 until `codesage git-index --full`.
 - default (no flag, `Auto`): incremental if valid prior state exists and its SHA is an ancestor of HEAD, else full.
 
 `codesage install-hooks` now registers `post-commit`, `post-merge`, `post-checkout`, and `post-rewrite`, each running `codesage git-index --incremental` in the background. Rebased or force-updated history triggers a full rescan automatically (incremental detects when the stored SHA is no longer an ancestor of HEAD and falls back to full).

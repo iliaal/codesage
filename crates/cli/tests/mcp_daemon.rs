@@ -1106,6 +1106,17 @@ fn every_schema_bearing_tool_returns_populated_structured_content() {
     // `session_start` on the same id, so the table is ordered, not a map.
     let calls: Vec<(&str, Value, &[&str])> = vec![
         (
+            "edit_check",
+            serde_json::json!({"file_path":"src/util.rs", "symbol_name":"shared_value", "replacement":"pub fn shared_value() -> u32 { 8 }"}),
+            &[
+                "head",
+                "before",
+                "after",
+                "overloads_before",
+                "overloads_after",
+            ],
+        ),
+        (
             "project_overview",
             serde_json::json!({}),
             // `top_risk_files` is empty until git history is indexed, so it
@@ -1565,9 +1576,19 @@ fn trace_call_path_mcp_and_cli_json_agree_on_step_fields() {
         .as_object()
         .unwrap()
         .keys()
-        .filter(|k| *k != "_meta")
+        .filter(|k| *k != "_meta" && *k != "next")
         .collect();
     assert_eq!(ckeys, mkeys, "top-level field sets diverge");
+    assert_eq!(
+        mcp_report["next"],
+        serde_json::json!({
+            "tool": "list_dependencies",
+            "arguments": {
+                "project": project.path(),
+                "file_path": mcp_steps[0]["file_path"]
+            }
+        })
+    );
 }
 
 #[test]

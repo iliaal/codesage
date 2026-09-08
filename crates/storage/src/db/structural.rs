@@ -514,7 +514,8 @@ impl Database {
               )
             )
             JOIN files f_to ON s.file_id = f_to.id
-            WHERE r.kind IN ('import', 'include', 'inheritance', 'trait_use')
+            WHERE (r.kind IN ('import', 'include', 'inheritance', 'trait_use')
+                   OR (r.kind = 'import_binding' AND f_from.language = 'python'))
               AND f_from.path <> f_to.path
         "#;
         let mut stmt = self.conn.prepare(sql)?;
@@ -544,7 +545,8 @@ impl Database {
               )
             )
             JOIN files f_to ON s.file_id = f_to.id
-            WHERE r.kind IN ('import', 'include', 'inheritance', 'trait_use')
+            WHERE (r.kind IN ('import', 'include', 'inheritance', 'trait_use')
+                   OR (r.kind = 'import_binding' AND f_from.language = 'python'))
               AND f_from.path = ?1
               AND f_from.path <> f_to.path
         "#;
@@ -573,7 +575,8 @@ impl Database {
               )
             )
             JOIN files f_to ON s.file_id = f_to.id
-            WHERE r.kind IN ('import', 'include', 'inheritance', 'trait_use')
+            WHERE (r.kind IN ('import', 'include', 'inheritance', 'trait_use')
+                   OR (r.kind = 'import_binding' AND f_from.language = 'python'))
               AND f_to.path = ?1
               AND f_from.path <> f_to.path
         "#;
@@ -604,6 +607,16 @@ impl Database {
         Ok(rows)
     }
 
+    pub fn file_import_references(&self) -> Result<Vec<Reference>> {
+        self.query_refs(
+            "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col
+             FROM refs r JOIN files f ON r.from_file_id = f.id
+             WHERE r.kind IN ('import', 'include')
+             ORDER BY f.path, r.line, r.col, r.to_name",
+            [],
+        )
+    }
+
     pub fn import_cycle_cache_key(&self) -> Option<String> {
         self.conn
             .path()
@@ -614,10 +627,10 @@ impl Database {
     pub fn import_cycle_validity_token(&self) -> Result<(i64, i64, i64, i64, i64, i64)> {
         let token = self.conn.query_row(
             "SELECT
-                 (SELECT COUNT(*) FROM refs WHERE kind IN ('import', 'include', 'inheritance', 'trait_use')),
-                 (SELECT COALESCE(MAX(id), 0) FROM refs WHERE kind IN ('import', 'include', 'inheritance', 'trait_use')),
+                 (SELECT COUNT(*) FROM refs WHERE kind IN ('import', 'import_binding', 'include', 'inheritance', 'trait_use')),
+                 (SELECT COALESCE(MAX(id), 0) FROM refs WHERE kind IN ('import', 'import_binding', 'include', 'inheritance', 'trait_use')),
                  (SELECT COALESCE(SUM(line + length(to_name) + length(kind)), 0)
-                  FROM refs WHERE kind IN ('import', 'include', 'inheritance', 'trait_use')),
+                  FROM refs WHERE kind IN ('import', 'import_binding', 'include', 'inheritance', 'trait_use')),
                  (SELECT COUNT(*) FROM symbols),
                  (SELECT COALESCE(MAX(id), 0) FROM symbols),
                  (SELECT COALESCE(SUM(file_id + line_start + line_end + length(qualified_name)), 0)
@@ -667,7 +680,8 @@ impl Database {
               )
             )
             JOIN files f_to ON s.file_id = f_to.id
-            WHERE r.kind IN ('import', 'include', 'inheritance', 'trait_use')
+            WHERE (r.kind IN ('import', 'include', 'inheritance', 'trait_use')
+                   OR (r.kind = 'import_binding' AND f_from.language = 'python'))
               AND f_from.path <> f_to.path
               AND f_from.path IN ({placeholders})
               AND f_to.path IN ({placeholders})
@@ -701,7 +715,8 @@ impl Database {
         let mut imports_stmt = self.conn.prepare(
             "SELECT DISTINCT r.to_name
              FROM refs r JOIN files f ON r.from_file_id = f.id
-             WHERE f.path = ?1 AND r.kind IN ('import', 'include')",
+             WHERE f.path = ?1 AND (r.kind IN ('import', 'include')
+                   OR (r.kind = 'import_binding' AND f.language = 'python'))",
         )?;
         let imports: Vec<String> = imports_stmt
             .query_map(params![file_path], |row| row.get(0))?
@@ -731,7 +746,8 @@ impl Database {
              )
              JOIN files f_to ON s.file_id = f_to.id
              WHERE f_to.path = ?1
-               AND r.kind IN ('import', 'include')
+               AND (r.kind IN ('import', 'include')
+                    OR (r.kind = 'import_binding' AND f_from.language = 'python'))
                AND f_from.path <> f_to.path
              ORDER BY 1",
         )?;

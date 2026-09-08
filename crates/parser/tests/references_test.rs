@@ -26,7 +26,7 @@ fn rust_grouped_glob_and_renamed_use_emit_prefixed_imports() {
     let refs = refs_from_source(src, Language::Rust);
     assert!(has_ref(&refs, "std::io::Read", ReferenceKind::Import));
     assert!(has_ref(&refs, "std::io::Write", ReferenceKind::Import));
-    assert!(has_ref(&refs, "a::b", ReferenceKind::Import)); // glob module
+    assert!(has_ref(&refs, "a::b::*", ReferenceKind::Import)); // glob module
     assert!(has_ref(&refs, "x::y", ReferenceKind::Import)); // renamed source
     assert!(has_ref(&refs, "std::fmt", ReferenceKind::Import)); // grouped bare name
     assert!(has_ref(&refs, "std::cmp::Ordering", ReferenceKind::Import)); // grouped scoped name

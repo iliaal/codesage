@@ -837,6 +837,60 @@ def unit_checks() -> None:
     check(se.call_shape(lines, 1, 0, "connect") == ("bare", None) and se.call_shape(None, 1, 0, "x") == ("bare", None)
           and se.call_shape(lines, 99, 0, "x") == ("bare", None), "call_shape: stale position / missing text -> bare")
     no_imports = (frozenset(), ())
+    for language, importer, module, target, unrelated in [
+        ("rust", "src/api/client.rs", "super::*", "src/api.rs", "src/other/api.rs"),
+        ("rust", "crates/app/src/client.rs", "crate::api::*", "crates/app/src/api.rs", "src/api.rs"),
+        ("rust", "src/client.rs", "crate::*", "src/lib.rs", "other/src/lib.rs"),
+        ("rust", "src/api/mod.rs", "self::*", "src/api/mod.rs", "src/lib.rs"),
+        ("python", "pkg/client.py", ".api.*", "pkg/api.py", "api.py"),
+        ("python", "pkg/nested/client.py", "..*", "pkg/__init__.py", "pkg/nested/__init__.py"),
+        ("python", "client.py", "pkg.api.*", "pkg/api.py", "other/pkg/api.py"),
+    ]:
+        imported = (frozenset({"*"}), (module,))
+        check(se.glob_import_targets(module, language, importer, target),
+              f"glob accepts the named module: {module} from {importer}")
+        check(not se.bare_call_accepted(language, importer, imported, "run", unrelated, set()),
+              f"glob rejects an unrelated same-name definition: {module} from {importer}")
+    check(not se.glob_import_targets("super::super::*", "rust", "src/client.rs", "src/lib.rs"),
+          "glob cannot escape the crate root")
+    check(not se.glob_import_targets("...*", "python", "pkg/client.py", "__init__.py"),
+          "glob cannot escape the Python project root")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for index, (source, symbol, qualified, runtime_exported, accepted) in enumerate([
+            ("def run():\n    return 1\n", "run", "run", True, True),
+            ("def _hidden():\n    return 1\n", "_hidden", "_hidden", False, False),
+            ("__all__ = []\ndef run():\n    return 1\n", "run", "run", False, False),
+            ("__all__ = ['_hidden']\ndef _hidden():\n    return 1\n", "_hidden", "_hidden", True, True),
+            ("__all__ = [x for x in ['run']]\ndef run():\n    return 1\n", "run", "run", True, False),
+            ("class Owner:\n    def run(self):\n        return 1\n", "run", "Owner.run", False, False),
+            ("def outer():\n    def run():\n        return 1\n    return run\n", "run", "outer.run", False, False),
+            ("__all__ = []\n__all__.append('run')\ndef run():\n    return 1\n", "run", "run", True, False),
+            ("def __getattr__(name):\n    return []\ndef run():\n    return 1\n", "run", "run", False, False),
+            ("def run():\n    return 1\nrun = 3\n", "run", "run", True, False),
+        ]):
+            module = f"exports_{index}"
+            target = module + ".py"
+            (root / target).write_text(source)
+            runtime = subprocess.run(
+                [sys.executable, "-c", f"from {module} import *; print({symbol!r} in globals())"],
+                cwd=root, capture_output=True, text=True, check=True,
+            )
+            check((runtime.stdout.strip() == "True") == runtime_exported,
+                  f"Python runtime export control: {module}")
+            evidence = (frozenset({"*"}), (module + ".*",))
+            check(se.bare_call_accepted("python", "client.py", evidence, symbol, target, set(), root, qualified) == accepted,
+                  f"Python glob gold requires static top-level function export evidence: {module}")
+        check(not se.bare_call_accepted("python", "client.py", (frozenset({"*"}), ("missing.*",)),
+                                       "run", "missing.py", set(), root, "run"),
+              "Python glob gold rejects missing source")
+        invalid = "__all__ = ['missing', 'run']\ndef run():\n    return 1\n"
+        (root / "invalid_exports.py").write_text(invalid)
+        failed_import = subprocess.run([sys.executable, "-c", "from invalid_exports import *"],
+                                       cwd=root, capture_output=True, text=True)
+        check(failed_import.returncode != 0 and "AttributeError" in failed_import.stderr,
+              "Python runtime rejects __all__ naming a missing binding")
+        check(not se.python_glob_exports(invalid, "run"), "invalid __all__ cannot supply glob gold")
     check(se.bare_call_accepted("rust", "src/x.rs", (frozenset({"beta_one"}), ("crate::beta_one",)), "beta_one", "src/beta.c", set()),
           "bare_call_accepted: import row naming the symbol")
     check(not se.bare_call_accepted("rust", "src/x.rs", no_imports, "beta_one", "src/beta.c", set()),
@@ -1065,8 +1119,8 @@ def main() -> int:
         check("gold: references" in refs_text and "import/include are" in refs_text and se.SATURATION_NOTE not in refs_text,
               "known-item refs: header names gold mode, no saturation note")
         check("Names defined in 2..3 files" not in refs_text, "known-item refs: no doc-only header line")
-        check("cs-zz6" in refs_text and "`use a::b::*` ->" in refs_text and "cs-zz6" in se.__doc__,
-              "known-item refs: glob-import caveat states the recorded module path")
+        check("explicit wildcard" in refs_text and "full reindex" in refs_text and "explicit wildcard" in se.__doc__,
+              "known-item refs: glob-import rule requires a marker and names the legacy reindex remedy")
         check("structural first-hit floor" in refs_text and "receiver calls" in refs_text and "Gate counts" in refs_text,
               "known-item refs: header documents first-hit floor, receiver rule, and gate counts")
         check("259" not in se.__doc__ and "152" not in se.__doc__, "docstring states rules, not snapshot counts")

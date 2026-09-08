@@ -150,7 +150,9 @@ impl TextEmbedder for LazyEmbedder {
 use codesage_storage::{Database, SemanticAttestation};
 use rayon::prelude::*;
 
+#[cfg(test)]
 use codesage_parser::discover::discover_files_with_excludes;
+use codesage_parser::discover::{DiscoveryReport, discover_files_report_with_cache};
 
 #[derive(Debug)]
 struct ChunkedFile {
@@ -644,12 +646,10 @@ fn stored_vectors_reusable(strategy: IndexStrategy, table_state: &SemanticTableS
 }
 
 /// Record `fingerprint` as the identity of every vector in the table. A
-/// file the pass could not read has had its rows purged (see
-/// `process_semantic_batch`), so the table holds only this run's vectors and
-/// the attestation is honest; the file is named so the operator knows what
-/// has no vectors. Refusing to attest here would leave the table permanently
-/// unrecorded on a repository with one persistently unreadable file, forcing
-/// a full re-embed on every subsequent pass.
+/// failure after discovery purges its rows during a full rewrite (see
+/// `process_semantic_batch`). Discovery failures retain prior rows; callers
+/// must withhold attestation if those rows have an unknown or different
+/// fingerprint.
 fn record_fingerprint(
     db: &Database,
     fingerprint: &SemanticFingerprint,
@@ -659,7 +659,7 @@ fn record_fingerprint(
         tracing::warn!(
             files_failed = stats.files_failed,
             files = %summarize_paths(&stats.failed_paths, 10),
-            "semantic fingerprint recorded; the named files could not be read and have no vectors"
+            "semantic fingerprint recorded; the named files could not be refreshed"
         );
     }
     db.record_semantic_attestation(&SemanticAttestation {
@@ -689,13 +689,28 @@ fn semantic_index(
     fingerprint: &SemanticFingerprint,
     verbose: bool,
 ) -> Result<SemanticIndexStats> {
-    let files = discover_files_with_excludes(root, exclude_patterns)?;
-    semantic_index_discovered(root, db, embedder, &files, strategy, fingerprint, verbose)
+    let cache = if strategy == IndexStrategy::Incremental {
+        db.file_hash_cache()?
+    } else {
+        HashMap::new()
+    };
+    let discovery = discover_files_report_with_cache(root, exclude_patterns, &cache)?;
+    db.replace_file_hash_cache(&discovery.hash_cache)?;
+    semantic_index_discovery_report(
+        root,
+        db,
+        embedder,
+        &discovery,
+        strategy,
+        fingerprint,
+        verbose,
+    )
 }
 
 /// [`semantic_index`] over an already-discovered file list. Split out so the
 /// pass can be driven with a `FileInfo` whose file is unreadable, which
 /// discovery would otherwise drop before the pass ever saw it.
+#[cfg(test)]
 fn semantic_index_discovered(
     root: &Path,
     db: &Database,
@@ -705,8 +720,39 @@ fn semantic_index_discovered(
     fingerprint: &SemanticFingerprint,
     verbose: bool,
 ) -> Result<SemanticIndexStats> {
+    semantic_index_discovery_report(
+        root,
+        db,
+        embedder,
+        &DiscoveryReport {
+            files: files.to_vec(),
+            failed_paths: Vec::new(),
+            hash_cache: HashMap::new(),
+            hashes_reused: 0,
+            bytes_hashed: 0,
+        },
+        strategy,
+        fingerprint,
+        verbose,
+    )
+}
+
+fn semantic_index_discovery_report(
+    root: &Path,
+    db: &Database,
+    embedder: &mut dyn TextEmbedder,
+    discovery: &DiscoveryReport,
+    strategy: IndexStrategy,
+    fingerprint: &SemanticFingerprint,
+    verbose: bool,
+) -> Result<SemanticIndexStats> {
+    let files = &discovery.files;
     let config = ChunkConfig::default();
-    let mut stats = SemanticIndexStats::default();
+    let mut stats = SemanticIndexStats {
+        files_failed: discovery.failed_paths.len(),
+        failed_paths: discovery.failed_paths.clone(),
+        ..Default::default()
+    };
     let table_state = semantic_table_state(db, fingerprint)?;
     let reuse_stored = stored_vectors_reusable(strategy, &table_state);
     // A table whose fingerprint is absent or differs holds vectors this run
@@ -735,14 +781,23 @@ fn semantic_index_discovered(
         );
     }
 
-    let discovered_paths: HashSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    let discovered_paths: HashSet<&str> = files
+        .iter()
+        .map(|f| f.path.as_str())
+        .chain(discovery.failed_paths.iter().map(String::as_str))
+        .collect();
     let existing_chunk_paths = db.all_chunk_file_paths()?;
     let existing_semantic_hashes = db.all_semantic_file_hashes()?;
     // A full pass rewrites every row; so does a pass over a stale table, and
     // a first population of an empty table. Any of them may vouch for the
     // table's vectors afterwards.
-    let records_fingerprint = selection == IndexStrategy::Full
-        || (existing_chunk_paths.is_empty() && existing_semantic_hashes.is_empty());
+    let retained_stale_rows = stale_table
+        && discovery.failed_paths.iter().any(|path| {
+            existing_chunk_paths.contains(path) || existing_semantic_hashes.contains_key(path)
+        });
+    let records_fingerprint = !retained_stale_rows
+        && (selection == IndexStrategy::Full
+            || (existing_chunk_paths.is_empty() && existing_semantic_hashes.is_empty()));
     let orphan_chunks: Vec<&str> = existing_chunk_paths
         .iter()
         .filter(|p| !discovered_paths.contains(p.as_str()))
@@ -1359,6 +1414,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("a.rs"), "fn a() {}\n").unwrap();
         std::fs::write(root.path().join("b.rs"), "fn b() {}\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
         let db = Database::open_in_memory().unwrap();
         let mut fake = FakeEmbedder {
             prepared_with: Vec::new(),
@@ -1366,6 +1422,14 @@ mod tests {
         };
         semantic_incremental_index(root.path(), &db, &mut fake, &[], &other_fp(), false).unwrap();
         assert_eq!(fake.batches, 1);
+
+        #[cfg(unix)]
+        assert_eq!(
+            discover_files_report_with_cache(root.path(), &[], &db.file_hash_cache().unwrap())
+                .unwrap()
+                .hashes_reused,
+            2
+        );
 
         // Nothing on disk changed. Under the recorded fingerprint every file
         // would be skipped; under a different one none may be.
@@ -1472,6 +1536,92 @@ mod tests {
             db.semantic_fingerprint().unwrap().as_deref(),
             Some(test_fp().as_str())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_failures_preserve_semantic_rows_without_attesting_mixed_vectors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (strategy, change_fingerprint) in [
+            (IndexStrategy::Incremental, false),
+            (IndexStrategy::Full, false),
+            (IndexStrategy::Incremental, true),
+            (IndexStrategy::Full, true),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            for name in ["durable", "deleted", "excluded", "healthy"] {
+                std::fs::write(
+                    root.path().join(format!("{name}.rs")),
+                    format!("fn {name}() {{}}\n"),
+                )
+                .unwrap();
+            }
+            let db = Database::open_in_memory().unwrap();
+            let mut fake = FakeEmbedder {
+                prepared_with: Vec::new(),
+                batches: 0,
+            };
+            semantic_full_index(root.path(), &db, &mut fake, &[], &test_fp(), false).unwrap();
+            let original_hash = db.all_semantic_file_hashes().unwrap()["durable.rs"].clone();
+            let durable = root.path().join("durable.rs");
+            std::fs::set_permissions(&durable, std::fs::Permissions::from_mode(0o0)).unwrap();
+            if std::fs::read(&durable).is_ok() {
+                std::fs::set_permissions(&durable, std::fs::Permissions::from_mode(0o600)).unwrap();
+                eprintln!("unreadability requires a user without permission bypass");
+                continue;
+            }
+            std::fs::remove_file(root.path().join("deleted.rs")).unwrap();
+            std::fs::write(root.path().join("healthy.rs"), "fn changed() {}\n").unwrap();
+            let fingerprint = if change_fingerprint {
+                other_fp()
+            } else {
+                test_fp()
+            };
+            let stats = semantic_index(
+                root.path(),
+                &db,
+                &mut fake,
+                &["excluded.rs".to_string()],
+                strategy,
+                &fingerprint,
+                false,
+            )
+            .unwrap();
+            std::fs::set_permissions(&durable, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(stats.files_failed, 1, "{stats:?}");
+            assert_eq!(stats.failed_paths, vec!["durable.rs"]);
+            assert_eq!(stats.files_removed, 2);
+            assert_eq!(stats.files_processed, 1);
+            assert_eq!(
+                db.all_chunk_file_paths().unwrap(),
+                vec!["durable.rs", "healthy.rs"]
+            );
+            assert_eq!(
+                db.all_semantic_file_hashes().unwrap()["durable.rs"],
+                original_hash
+            );
+            assert_eq!(
+                db.semantic_fingerprint().unwrap(),
+                (!change_fingerprint).then(|| fingerprint.as_str().to_string())
+            );
+
+            std::fs::write(&durable, "fn recovered() {}\n").unwrap();
+            semantic_incremental_index(
+                root.path(),
+                &db,
+                &mut fake,
+                &["excluded.rs".to_string()],
+                &fingerprint,
+                false,
+            )
+            .unwrap();
+            assert_ne!(
+                db.all_semantic_file_hashes().unwrap()["durable.rs"],
+                original_hash
+            );
+            require_current_semantic_table(&db, &fingerprint).unwrap();
+        }
     }
 
     /// A file discovery listed but the pass cannot read (deleted or made

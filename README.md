@@ -48,7 +48,7 @@ Concrete answers to the questions a code-intelligence tool earns its keep on. Th
 | Feature-slice mapping (behavior-keyed bundles) | ✓ via `codesage map` / `features-list` / `feature-show` / `feature-for`, MCP `list_features` / `find_feature` |
 | Curated feature bundle (entry + owned + tests + context for one slice) | ✓ via `codesage feature-bundle <id>` and MCP `feature_bundle` |
 | Trust-boundary derivation (network / fs / secrets / process-exec / db / etc.) | ✓ per-file table from imports/includes/calls, aggregated per feature, feeds `assess_risk` |
-| Host-agnostic deployment (no Docker, no managed services) | ✓ single static Rust binary + one SQLite file per project |
+| Local deployment (no Docker, no managed services) | ✓ one application binary + one SQLite file per project; Linux inference needs ONNX Runtime |
 | Auto-refresh on commit/merge/checkout/rebase | ✓ git hooks installed by `codesage install-hooks` |
 | Symbol-level edits (rename, move, replace_symbol_body) | Not supported: read-only by design; pair with Serena or your editor |
 | Multimodal ingest (images / audio / video / PDFs) | Not supported: out of scope, code-intel only |
@@ -60,11 +60,11 @@ PHP, Python, C, C++, Java, Rust, JavaScript, TypeScript, Go.
 
 ## Why a single Rust binary
 
-CodeSage ships as one static Rust binary plus a local SQLite database under `.codesage/` per project. No Docker container, no external vector DB server, no embedding service, and no service manager. CLI commands run directly. MCP clients use `codesage mcp`, a stdio shim that starts or reuses a user-local Unix-socket daemon so concurrent agent sessions share one project cache, embedding model pool, reranker pool, and CUDA context.
+CodeSage ships as one application binary plus a local SQLite database under `.codesage/` per project. Linux inference loads an ONNX Runtime shared library; Apple builds link ONNX Runtime at build time. No Docker container, no external vector DB server, no embedding service, and no service manager. CLI commands run directly. MCP clients use `codesage mcp`, a stdio shim that starts or reuses a user-local Unix-socket daemon so concurrent agent sessions share one project cache, embedding model pool, reranker pool, and CUDA context. CodeSage provides no HTTP listener or remote MCP transport.
 
 The daemon is a same-UID co-trust boundary, not a same-UID isolation boundary. Its socket is private to the Unix user and checks peer credentials, but any process running as that user can ask the daemon to open any onboarded project index. Run untrusted agents under a separate Unix user when project isolation matters. MCP calls are agent-safety capped; CLI commands remain operator tools and can request larger limits or file lists.
 
-The trade-off: CUDA-accelerated embeddings on Linux need the `nvidia-*-cu12` pip packages on the host (see [CUDA setup](#cuda-setup)); on Apple Silicon, set `device = "coreml"` instead (see [CoreML setup](#coreml-setup-macos)). In exchange, install once, run everywhere, no orchestration layer, no systemd unit to manage. Tools in the same category that take the other side of this trade (SocratiCode with managed Qdrant + Ollama, GitNexus with external Qdrant) are valid for different user profiles. If your team already runs Docker Compose for everything, use those. If you want `cargo install`, `codesage init`, and an on-demand local daemon hidden behind stdio MCP, use CodeSage.
+For Linux CPU inference, install the runtime described in [CPU setup](#cpu-setup-linux). CUDA also needs the `nvidia-*-cu12` pip packages on the host (see [CUDA setup](#cuda-setup)); on Apple Silicon, set `device = "coreml"` instead (see [CoreML setup](#coreml-setup-macos)). Each host needs its matching build and runtime dependencies. If you want `cargo install`, `codesage init`, and an on-demand local daemon hidden behind stdio MCP, use CodeSage.
 
 ## 📊 Benchmarks
 
@@ -173,6 +173,10 @@ codesage doctor
 
 ## ⚙️ Recipes
 
+Before writing a proposed declaration, you can call MCP `edit_check` with `project`, `file_path`, `symbol_name`, and `replacement` (the complete declaration, including its signature and body). It compares against Git HEAD and reports signature and overload changes without modifying source or the index. Proven caller breakage is currently limited to same-file Rust free functions called through explicit `self::` or `super::` paths without imports, macros, or attributes. Other callers remain unknown; run the compiler and tests after applying the edit.
+
+`codesage risk FILE --json` also reports `author_concentration` after `codesage git-index --full`. Contributions have a 180-day half-life within a 730-day window. `bus_factor` is the smallest number of author identities accounting for at least half the weighted commits; identities use normalized email, falling back to name, and need not represent distinct people. This information does not change the risk score. Missing history remains unknown.
+
 Common pipelines using `codesage` with `git`. Each is one shell line and how to read the output.
 
 ### Risk check before committing
@@ -199,19 +203,26 @@ git diff origin/main...HEAD --name-only | codesage risk-diff
 
 Same as the pre-commit check, but scoped to everything on the branch instead of just the staged diff. Useful as the last step before `gh pr create`.
 
-### Gate a PR in CI on review objections
+### Inspect review objections in CI
 
 ```bash
-# Fail the job if the patch raises any high-severity review objection.
 # Prereq: the index must exist in CI; run `codesage index && codesage git-index`
 # in an earlier step, or cache .codesage/ between runs.
+set -o pipefail
 git diff --name-only "origin/${GITHUB_BASE_REF:-main}...HEAD" \
-  | codesage rehearse --json \
-  | jq -e '[.objections[] | select(.severity == "high")] | length == 0' >/dev/null \
-  || { echo "::error::review_rehearsal raised high-severity objections"; exit 1; }
+  | codesage rehearse --json > review.json
+jq '{objections, summary_notes}' review.json
 ```
 
-Runs `review_rehearsal` over the branch diff and fails the job when any objection is `high` severity (missing tests on a high-risk file, blast-radius, hotspot, import cycle, trust-boundary expansion). Drop `--json` to print the full severity-ranked objection list into the CI log so reviewers see the reasoning; the `summary_notes` are paste-ready for the PR description. Tune the gate by widening the `select` to `"high","medium"` for a stricter bar, or key off a specific `.category`.
+Use the report as advisory evidence by default. Missing-test objections are `medium` and include the limits of the test discovery check. Even a complete index walk does not measure runtime coverage or establish whether a patch has adequate tests. High file risk likewise describes the file, not whether a particular patch is wrong.
+
+If your team chooses a conservative merge policy, explicitly add a gate after printing the report:
+
+```bash
+jq -e '[.objections[] | select(.severity == "high")] | length == 0' review.json
+```
+
+This opt-in policy can reject patches based on heuristic risk. Read each objection's `evidence` and the report's `summary_notes`, including incomplete-check disclosures, before deciding how to handle a failure.
 
 ### What changed in the last week, ranked by risk
 
@@ -257,7 +268,7 @@ Use when answering "what slice owns this file?" or "give me the whole flow behin
 codesage trust-boundaries crates/cli/src/main.rs --json
 ```
 
-Per-file capability tags (network, filesystem, process-exec, secrets, database, user-input, external-api, serialization, auth, concurrency) derived from imports / includes / calls. The same signal contributes to `assess_risk` and surfaces a "crosses N trust boundaries, security review recommended" note when a file touches three or more.
+Per-file capability tags (network, filesystem, process-exec, secrets, database, user-input, external-api, serialization, auth, concurrency) derived from imports / includes / calls. The same signal contributes to `assess_risk` and surfaces a "crosses N trust boundaries, security review recommended" note when a file touches three or more. These tags prioritize inspection; they do not trace untrusted values from sources to sinks or establish exploitability.
 
 ## 🔌 Agent plugins
 
@@ -436,6 +447,12 @@ flowchart LR
 
 The reranker is optional. Set or remove it in `config.toml`; every other stage still runs without it.
 
+Search responses retain the `confidence` field for compatibility. It describes score separation only: `high` means the largest adjacent relative score drop rounds to at least 20%, not that an answer is correct or exists. Ranking penalties and saturation can create that separation. Read `margin_pct` and `cliff_at` as properties of the returned page; `adaptive_limit` uses the same page-local drop. The name remains unchanged because consumer misinterpretation has not been measured and renaming it would break existing clients.
+
+`CODESAGE_QUALIFIED_GROUPS=1` opts into experimental BM25 conjunctions for qualified names. Default-on adoption failed the existing benchmark gate: the 130-query validation retained 129 top-10 hits in both arms, with six rank improvements and two regressions. Default search therefore keeps its previous behavior. See the [experiment and adoption decision](bench/qualified-name/README.md).
+
+`CODESAGE_PHP_DECLARATION_DEMOTE=1` and `CODESAGE_PLATFORM_DEMOTE=1` enable separate path-ranking experiments. Both remain off by default: the 32-query evaluation found 31 targets in both arms with no first-hit improvement, and platform demotion changed no pages. See the [scope, controls, and evidence limits](bench/php-declaration/README.md).
+
 ## Configuration
 
 `codesage init` generates `.codesage/config.toml`:
@@ -451,13 +468,26 @@ reranker = "cross-encoder/ms-marco-MiniLM-L6-v2"     # optional, remove to disab
 # batch_size = 64                                    # optional; defaults to 64, or 10 on Apple
 
 [index]
-exclude_patterns = [
-  "**/tests/**", "**/vendor/**", "**/node_modules/**",
-  "**/*.test.ts", "**/*Test.php", "**/*.phpt",
-]
+exclude_patterns = []
 ```
 
 Models download from HuggingFace the first time you use them.
+
+Built-in exclusions already cover vendored dependencies, build outputs, and caches. Your `exclude_patterns` add to those defaults. Tests are indexed structurally and semantically, then demoted during search. If you explicitly exclude tests, graph-based test recommendations and test-gap evidence lose those files.
+
+## CPU setup (Linux)
+
+Linux CPU inference needs the ONNX Runtime shared library even when you build without CUDA. Use Python with `venv` support (on Debian/Ubuntu, install the matching `python3-venv` package). Install the tested runtime in a virtual environment and keep it active when running CodeSage:
+
+```bash
+python3 -m venv ~/.local/share/codesage-cpu
+source ~/.local/share/codesage-cpu/bin/activate
+python -m pip install 'onnxruntime==1.24.4'
+cargo build --release -p codesage
+export PATH="$PWD/target/release:$PATH"
+```
+
+Set `device = "cpu"` in `.codesage/config.toml`, then run `codesage index`. The loader discovers the library through Python's site-packages. If you keep the runtime elsewhere, set `ORT_DYLIB_PATH` to the full path of its `libonnxruntime.so` file. Structural-only indexing (`codesage index --no-semantic`) does not load an inference model.
 
 ## CUDA setup
 
@@ -545,7 +575,7 @@ Honest inventory of what CodeSage does not do well, measured on our canary corpo
 
 **Retrieval misses on cross-file refactor queries.** The failure mode is a commit subject like *printer: drop dependency on serde_derive* that describes a rename spanning several files with no distinctive literal to match on. Single-identifier lookups (`find_symbol`, `find_references`) are reliable. Pure semantic searches (`search`) are reliable. Diffuse multi-file refactor descriptions expressed in prose are the failure mode.
 
-**`impact_analysis` biases toward over-prediction.** The tool walks reference edges up to a configurable depth and reports every reachable file. Agents get false positives but almost never false negatives (short of a stale index). We picked that side of the precision/recall trade because an agent can filter a list of 20 candidates faster than it can recover from a missed dependency that bites in review. If you want high precision at the cost of recall, drop `--depth` to 1 and `--source-only`.
+**`impact_analysis` reports a lower bound on dependencies.** The tool walks resolved reference and import edges up to a configurable depth. Name ambiguity can add false positives, while dynamic calls, unsupported syntax, unresolved imports, and traversal limits can omit real dependencies even in a fresh index. Read `counts_floor` and boundedness disclosures before interpreting an empty result. Reducing `--depth` to 1 and adding `--source-only` narrows the report further.
 
 **MCP tool-selection rate is low today.** When CodeSage MCP tools are available in a Claude Code session alongside `Grep`, the agent picks `Grep` on code-identifier queries: 1.1% CodeSage-pick rate over 30 days of sessions, 0/10 on a controlled active harness (measured 2026-04-24, not re-measured since). We sharpened tool descriptions and per-project CLAUDE.md guidance to call this out; the next measurement cycle will show whether the intervention landed. For a hook-level workaround today, see the LSP enforcement kit in the [Complementary tools](#complementary-tools) section.
 

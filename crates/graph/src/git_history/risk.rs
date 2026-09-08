@@ -12,7 +12,7 @@ use codesage_storage::Database;
 use codesage_storage::db::CoChangeRow;
 
 use super::tests_rec::test_sibling_exists;
-use crate::impact::{MAX_FRONTIER, impact_analysis_walk};
+use crate::impact::{MAX_FRONTIER, WalkCache, impact_analysis_walk_shared};
 
 /// Reverse-dependency traversal depth shared by the blast-radius count and the
 /// structural test-coverage check. Both read the same walk, and both notes
@@ -290,12 +290,12 @@ pub fn find_coupling_ranked(
     } else if file_commits < 3 {
         Some(format!(
             "file has only {file_commits} tracked commit(s); co-change pairs need a \
-             count of 3+ to be recorded (see `codesage git-index --full` to rebaseline)"
+             count of 3+ to be shown (see `codesage git-index --full` to rebaseline)"
         ))
     } else {
         Some(format!(
             "file has {file_commits} commits but no co-change pair crosses the min-count \
-             threshold of 3; this file typically changes in isolation"
+             threshold of 3; indexed co-change evidence is insufficient to infer isolation"
         ))
     };
 
@@ -327,7 +327,16 @@ pub fn find_coupling_ranked(
 /// shape is preserved when tuning so the structural signals (churn, fix
 /// ratio) keep dominating over the security-shaped trust-boundary term.
 pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
-    Ok(assess_risk_with_context(db, file_path, None, None, MAX_FRONTIER)?.0)
+    Ok(assess_risk_with_context(
+        db,
+        file_path,
+        None,
+        None,
+        MAX_FRONTIER,
+        super::bus_factor::unix_now(),
+        None,
+    )?
+    .0)
 }
 
 /// Returns the assessment plus a `gap_check_partial` flag: `true` when
@@ -343,6 +352,8 @@ fn assess_risk_with_context(
     precomputed_cycles: Option<&[CycleEntry]>,
     precomputed_percentiles: Option<&HashMap<String, f64>>,
     max_frontier: usize,
+    now: i64,
+    cache: Option<&mut WalkCache>,
 ) -> Result<(RiskAssessment, bool)> {
     let git = db.git_file(file_path)?;
     let structural_found = db
@@ -352,6 +363,7 @@ fn assess_risk_with_context(
     if !structural_found && git.is_none() {
         return Ok((
             RiskAssessment {
+                author_concentration: None,
                 found: false,
                 file: file_path.to_string(),
                 score: 0.0,
@@ -421,7 +433,7 @@ fn assess_risk_with_context(
     // traversal: `impact_analysis` applies `source_only` as a final filter, so
     // an unfiltered walk yields both the source-file count and any test file
     // that reaches this one. Two calls would double the cost for the same rows.
-    let (dependents, walk_capped) = impact_analysis_walk(
+    let outcome = impact_analysis_walk_shared(
         db,
         &ImpactRequest {
             target: ImpactTarget::File {
@@ -431,8 +443,12 @@ fn assess_risk_with_context(
             source_only: false,
         },
         max_frontier,
+        None,
+        cache,
     )
     .with_context(|| format!("computing dependent_files for risk({file_path})"))?;
+    let dependents = outcome.entries;
+    let walk_capped = outcome.capped;
 
     // Zero dependents is only evidence of a leaf when the walk actually had
     // seeds. A file with no indexed symbols never entered the traversal, so
@@ -700,9 +716,13 @@ fn assess_risk_with_context(
     };
 
     let gap_check_partial = test_gap && (no_symbols || walk_capped);
+    let (author_concentration, author_note) =
+        super::bus_factor::risk_author_concentration(db, file_path, now)?;
+    notes.push(author_note);
 
     Ok((
         RiskAssessment {
+            author_concentration,
             found: true,
             file: file_path.to_string(),
             score,
@@ -842,6 +862,14 @@ fn compute_top_symbols(
 /// per-file decomposition and patch-level rollups (max/mean, files in each
 /// risk category, paste-ready summary notes).
 pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiffAssessment> {
+    assess_risk_diff_with_walk_cache(db, file_paths, None)
+}
+
+pub(crate) fn assess_risk_diff_with_walk_cache(
+    db: &Database,
+    file_paths: &[String],
+    mut cache: Option<&mut WalkCache>,
+) -> Result<RiskDiffAssessment> {
     if file_paths.is_empty() {
         return Ok(RiskDiffAssessment {
             empty_input: true,
@@ -871,6 +899,7 @@ pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiff
         .churn_percentiles()
         .context("bulk churn percentiles for risk diff")?;
 
+    let now = super::bus_factor::unix_now();
     let assessed: Vec<(RiskAssessment, bool)> = file_paths
         .iter()
         .map(|p| {
@@ -880,6 +909,8 @@ pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiff
                 Some(&cycles_touching_patch),
                 Some(&percentiles),
                 MAX_FRONTIER,
+                now,
+                cache.as_deref_mut(),
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1059,11 +1090,20 @@ pub fn assess_risk_batch(db: &Database, file_paths: &[String]) -> Result<RiskBat
     let percentiles = db
         .churn_percentiles()
         .context("bulk churn percentiles for risk batch")?;
+    let now = super::bus_factor::unix_now();
     let mut files: Vec<RiskAssessment> = file_paths
         .iter()
         .map(|p| {
-            assess_risk_with_context(db, p, Some(&cycles), Some(&percentiles), MAX_FRONTIER)
-                .map(|(a, _)| a)
+            assess_risk_with_context(
+                db,
+                p,
+                Some(&cycles),
+                Some(&percentiles),
+                MAX_FRONTIER,
+                now,
+                None,
+            )
+            .map(|(a, _)| a)
         })
         .collect::<Result<Vec<_>>>()?;
     if cycles_failed {
@@ -1353,8 +1393,16 @@ mod tests {
         db.upsert_git_file("Repository.php", 1.0, 0, 5, Some(1_700_000_000))
             .unwrap();
 
-        let (r, gap_check_partial) =
-            assess_risk_with_context(&db, "Repository.php", None, None, 1).unwrap();
+        let (r, gap_check_partial) = assess_risk_with_context(
+            &db,
+            "Repository.php",
+            None,
+            None,
+            1,
+            super::super::bus_factor::unix_now(),
+            None,
+        )
+        .unwrap();
 
         assert!(r.test_gap, "fixture has no tests anywhere");
         assert!(
@@ -1383,8 +1431,16 @@ mod tests {
 
         // Same fixture under the production cap: the walk completes, the full
         // three-check note returns, and the honesty notes disappear.
-        let (r_full, partial_full) =
-            assess_risk_with_context(&db, "Repository.php", None, None, MAX_FRONTIER).unwrap();
+        let (r_full, partial_full) = assess_risk_with_context(
+            &db,
+            "Repository.php",
+            None,
+            None,
+            MAX_FRONTIER,
+            super::super::bus_factor::unix_now(),
+            None,
+        )
+        .unwrap();
         assert!(!partial_full);
         assert!(
             r_full
@@ -1395,6 +1451,136 @@ mod tests {
             r_full.notes
         );
         assert!(!r_full.notes.iter().any(|n| n.contains("lower bound")));
+    }
+
+    #[test]
+    fn shared_rehearsal_walks_preserve_risk_cap_and_wider_test_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("tests")).unwrap();
+        std::fs::write(root.join("root.py"), "def anchor():\n    return 1\n").unwrap();
+        for i in 0..513 {
+            std::fs::write(
+                root.join(format!("caller_{i}.py")),
+                format!("from root import anchor\ndef hop_{i}():\n    return anchor()\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                root.join(format!("tests/test_{i}.py")),
+                format!(
+                    "from caller_{i} import hop_{i}\ndef test_{i}():\n    assert hop_{i}() == 1\n"
+                ),
+            )
+            .unwrap();
+        }
+        let db = Database::open_in_memory().unwrap();
+        crate::full_index(root, &db, &[], false).unwrap();
+        let paths = vec!["root.py".to_string()];
+        let plain = assess_risk_diff(&db, &paths).unwrap();
+        assert!(
+            plain.files[0]
+                .notes
+                .iter()
+                .any(|note| note.contains("lower bound"))
+        );
+        let mut cache = WalkCache::default();
+        let shared = assess_risk_diff_with_walk_cache(&db, &paths, Some(&mut cache)).unwrap();
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::to_value(&shared).unwrap()
+        );
+        for work_budget in [0, 50, usize::MAX] {
+            let opts = super::super::tests_rec::ReachabilityOptions {
+                work_budget,
+                min_input_budget: 0,
+                deadline: std::time::Duration::from_secs(60),
+                ..Default::default()
+            };
+            let plain =
+                super::super::tests_rec::recommend_tests_with_reachability(&db, &paths, &opts)
+                    .unwrap();
+            let shared = super::super::tests_rec::recommend_tests_with_walk_cache(
+                &db,
+                &paths,
+                &opts,
+                Some(&mut cache),
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(&plain).unwrap(),
+                serde_json::to_value(&shared).unwrap()
+            );
+            if work_budget == usize::MAX {
+                assert_eq!(shared.reachable_total, 513);
+                assert!(!shared.reach_walk_capped);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CODESAGE_WALK_BENCH_DB snapshot and CODESAGE_WALK_BENCH_FILES"]
+    fn measure_shared_rehearsal_walks_on_index() {
+        let db_path = std::env::var("CODESAGE_WALK_BENCH_DB").unwrap();
+        let db = Database::open(std::path::Path::new(&db_path)).unwrap();
+        let paths: Vec<String> = std::env::var("CODESAGE_WALK_BENCH_FILES")
+            .unwrap()
+            .split(',')
+            .map(str::to_string)
+            .collect();
+        let opts = super::super::tests_rec::ReachabilityOptions {
+            deadline: std::time::Duration::from_millis(
+                std::env::var("CODESAGE_WALK_BENCH_DEADLINE_MS")
+                    .map_or(60_000, |value| value.parse().unwrap()),
+            ),
+            ..Default::default()
+        };
+        for round in 0..3 {
+            let start = std::time::Instant::now();
+            let plain_risk = assess_risk_diff(&db, &paths).unwrap();
+            let plain_risk_elapsed = start.elapsed();
+            let plain_tests =
+                super::super::tests_rec::recommend_tests_with_reachability(&db, &paths, &opts)
+                    .unwrap();
+            let plain_elapsed = start.elapsed();
+            let start = std::time::Instant::now();
+            let mut cache = WalkCache::default();
+            let shared_risk =
+                assess_risk_diff_with_walk_cache(&db, &paths, Some(&mut cache)).unwrap();
+            let shared_risk_elapsed = start.elapsed();
+            let shared_tests = super::super::tests_rec::recommend_tests_with_walk_cache(
+                &db,
+                &paths,
+                &opts,
+                Some(&mut cache),
+            )
+            .unwrap();
+            let shared_elapsed = start.elapsed();
+            assert_eq!(
+                serde_json::to_value(&plain_risk).unwrap(),
+                serde_json::to_value(&shared_risk).unwrap()
+            );
+            let plain_json = serde_json::to_value(&plain_tests).unwrap();
+            let shared_json = serde_json::to_value(&shared_tests).unwrap();
+            if opts.deadline >= std::time::Duration::from_secs(60) {
+                assert_eq!(plain_json, shared_json);
+            } else {
+                for field in ["primary", "coupled", "unindexed_files", "unsupported_files"] {
+                    assert_eq!(plain_json[field], shared_json[field]);
+                }
+            }
+            eprintln!(
+                "round={round} separate_ms={} shared_ms={} separate_risk_ms={} shared_risk_ms={} separate_reachable={} shared_reachable={} separate_capped={} shared_capped={} cache={:?}",
+                plain_elapsed.as_millis(),
+                shared_elapsed.as_millis(),
+                plain_risk_elapsed.as_millis(),
+                shared_risk_elapsed.as_millis(),
+                plain_tests.reachable_total,
+                shared_tests.reachable_total,
+                plain_tests.reach_walk_capped,
+                shared_tests.reach_walk_capped,
+                cache.stats(),
+            );
+        }
     }
 
     #[test]

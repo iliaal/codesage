@@ -48,7 +48,7 @@ impl CodeSageServer {
         } else {
             rendered
         };
-        self.annotate_staleness(project, covered)
+        super::next::annotate(project, kind, self.annotate_staleness(project, covered))
     }
 
     /// [`Self::render`] with an explicit char budget (context-bundle tools).
@@ -59,7 +59,11 @@ impl CodeSageServer {
         kind: &str,
         budget_chars: usize,
     ) -> CallToolResult {
-        self.annotate_staleness(project, render_with_budget(r, kind, budget_chars))
+        super::next::annotate(
+            project,
+            kind,
+            self.annotate_staleness(project, render_with_budget(r, kind, budget_chars)),
+        )
     }
 
     /// Tools whose empty result is ambiguous between "no such code" and "that
@@ -304,7 +308,7 @@ fn mcp_bundle_token_budget(file_count: usize) -> usize {
 /// `Value` as `structured_content` so clients can parse without re-deserializing.
 /// Failures set `isError: true` per MCP spec; the full anyhow cause chain is
 /// included via `{:#}`.
-fn render_with_kind<T: serde::Serialize>(r: Result<T>, kind: &str) -> CallToolResult {
+pub(super) fn render_with_kind<T: serde::Serialize>(r: Result<T>, kind: &str) -> CallToolResult {
     render_with_budget(r, kind, MCP_BUDGET_CHARS)
 }
 

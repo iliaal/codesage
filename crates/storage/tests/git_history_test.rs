@@ -131,7 +131,7 @@ fn incr_co_change_ors_masks_and_widens_the_observation_span() {
     assert_eq!(r.first_observed_at, Some(1_600_000_000));
     assert_eq!(r.last_observed_at, Some(1_700_000_000));
     // A fresh row through the wrapper gets mask 0 / windows 1.
-    db.incr_git_co_change("a.rs", "c.rs", 1.0, 1, None).unwrap();
+    db.incr_git_co_change("a.rs", "c.rs", 1.0, 3, None).unwrap();
     let c = db
         .co_changes_for("a.rs", 10)
         .unwrap()
@@ -489,4 +489,63 @@ fn remove_file_cascades_to_git_tables() {
     let remaining_for_z = db.co_changes_for("src/z.rs", 10).unwrap();
     let names: Vec<&str> = remaining_for_z.iter().map(|r| r.file.as_str()).collect();
     assert_eq!(names, vec!["src/a_file.rs"]);
+}
+#[test]
+fn subthreshold_pairs_stay_hidden_from_all_coupling_readers_and_decay() {
+    let db = Database::open_in_memory().unwrap();
+    let first = 1_700_000_000;
+    let last = first + 40 * 86_400;
+    db.upsert_git_co_change_full(
+        "a.rs",
+        "b.rs",
+        &CoChangeWrite {
+            weight: 8.0,
+            count: 2,
+            window_mask: 3,
+            first_observed_at: Some(first),
+            last_observed_at: Some(last),
+        },
+    )
+    .unwrap();
+    db.upsert_git_co_change("a.rs", "legacy.rs", 2.0, 1, Some(first))
+        .unwrap();
+    assert!(!db.co_change_pair_exists("b.rs", "a.rs").unwrap());
+    assert_eq!(db.co_change_weight("b.rs", "a.rs").unwrap(), 0.0);
+    assert!(db.all_co_change_pairs().unwrap().is_empty());
+    assert!(!db.any_co_change_recurring().unwrap());
+    assert!(!db.any_co_change_missing_first_observed().unwrap());
+    assert_eq!(db.co_change_history_span().unwrap(), None);
+    for path in ["a.rs", "b.rs"] {
+        assert!(db.co_changes_for(path, 10).unwrap().is_empty());
+        assert!(db.co_changes_for_ranked(path, 10, 0.5).unwrap().is_empty());
+    }
+    let bulk = db.co_changes_for_many(&["a.rs", "b.rs"], 10, 0.5).unwrap();
+    assert!(bulk.values().all(Vec::is_empty));
+    db.scale_git_decay(0.5).unwrap();
+    db.incr_git_co_change_full(
+        "b.rs",
+        "a.rs",
+        &CoChangeWrite {
+            weight: 1.0,
+            count: 1,
+            window_mask: 4,
+            first_observed_at: Some(last),
+            last_observed_at: Some(last),
+        },
+    )
+    .unwrap();
+    let rows = db.co_changes_for("a.rs", 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].count, 3);
+    assert_eq!(rows[0].weight, 5.0);
+    assert_eq!(rows[0].window_mask, 7);
+    assert_eq!(rows[0].first_observed_at, Some(first));
+    assert!(db.co_change_pair_exists("b.rs", "a.rs").unwrap());
+    assert!(db.any_co_change_recurring().unwrap());
+    assert_eq!(db.co_change_history_span().unwrap(), Some((first, last)));
+    assert!(db.all_co_change_pairs().unwrap()["a.rs"].contains("b.rs"));
+    assert_eq!(
+        db.co_changes_for_many(&["b.rs"], 10, 0.5).unwrap()["b.rs"].len(),
+        1
+    );
 }

@@ -1,3 +1,5 @@
+mod edit_check;
+mod next;
 pub(crate) mod params;
 mod render;
 mod schema;
@@ -279,9 +281,13 @@ impl CodeSageServer {
             Ok(result) => result,
             Err(join_err) => {
                 tracing::error!(error = %join_err, "MCP tool handler panicked");
-                CallToolResult::error(vec![ContentBlock::text(format!(
-                    "internal error: the tool handler panicked ({join_err}); see the daemon log"
-                ))])
+                next::annotate(
+                    "",
+                    "",
+                    CallToolResult::error(vec![ContentBlock::text(format!(
+                        "internal error: the tool handler panicked ({join_err}); see the daemon log"
+                    ))]),
+                )
             }
         }
     }
@@ -376,6 +382,32 @@ impl CodeSageServer {
                     })
                 }),
                 "review_rehearsal",
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        name = "edit_check",
+        description = "Check a complete proposed replacement declaration before writing it. Parses against a pinned Git HEAD, reports signature argument counts, visibility, and same-scope overload changes, and lists only provably incompatible HEAD callers. Currently caller proof covers explicit self::/super:: paths to Rust free functions without macros, attributes, or imports; other supported source languages receive syntax diffs and explicit unknowns. Only the selected file is scanned. This is not a compilation or safety verdict. Does not write source or the index; reports working-file divergence from HEAD. Ambiguous .h dialects are refused.",
+        output_schema = schema_for_type::<codesage_graph::edit_check::EditCheckReport>()
+    )]
+    async fn edit_check_tool(
+        &self,
+        Parameters(params): Parameters<edit_check::EditCheckParams>,
+    ) -> CallToolResult {
+        self.blocking(move |_| {
+            let result = codesage_graph::edit_check::edit_check(
+                Path::new(&params.project),
+                &params.file_path,
+                &params.symbol_name,
+                params.line,
+                &params.replacement,
+            );
+            next::annotate(
+                &params.project,
+                "edit_check",
+                render::render_with_kind(result, "edit_check"),
             )
         })
         .await

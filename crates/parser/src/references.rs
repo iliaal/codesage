@@ -174,12 +174,12 @@ fn php_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
 
 fn python_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
     match pattern_index {
-        0 => Some(ReferenceKind::Import),   // import statement
-        1 => Some(ReferenceKind::Import),   // from X import (module)
-        2 => Some(ReferenceKind::Import),   // from X import Y (specific name)
-        3 => Some(ReferenceKind::Import),   // from X import Y as Z (aliased)
-        4 | 5 => Some(ReferenceKind::Call), // call expression
-        6 => Some(ReferenceKind::Import),   // relative import module (from . import x)
+        0 => Some(ReferenceKind::Import),        // import statement
+        1 => Some(ReferenceKind::Import),        // from X import (module)
+        2 => Some(ReferenceKind::ImportBinding), // from X import Y (specific name)
+        3 => Some(ReferenceKind::ImportBinding), // from X import Y as Z (aliased)
+        4 | 5 => Some(ReferenceKind::Call),      // call expression
+        6 => Some(ReferenceKind::Import),        // relative import module (from . import x)
         // Decorators (@property, @retry(..), @app.route, @app.route(..)).
         // Filed as Call to match Java's annotation handling, so decoration
         // sites surface through the same kind query.
@@ -435,10 +435,46 @@ pub fn extract_references(
                 .map_or_else(|| stripped.to_string(), |p| format!("{p}::{stripped}")),
             Language::Php => php_group_use_prefix(&ref_node, source)
                 .map_or_else(|| stripped.to_string(), |p| format!("{p}\\{stripped}")),
+            Language::Python if matches!(p.pattern, 1 | 6) => {
+                let glob = ref_node.parent().is_some_and(|statement| {
+                    let mut cursor = statement.walk();
+                    statement
+                        .named_children(&mut cursor)
+                        .any(|child| child.kind() == "wildcard_import")
+                });
+                if glob {
+                    let separator = if stripped.ends_with('.') { "" } else { "." };
+                    format!("{stripped}{separator}*")
+                } else {
+                    stripped.to_string()
+                }
+            }
             _ => stripped.to_string(),
         };
 
         let (row, col) = crate::position::node_start_utf8(&ref_node, source);
+        if language == Language::Python && kind == ReferenceKind::ImportBinding {
+            let statement = ref_node.parent().and_then(|parent| {
+                if parent.kind() == "aliased_import" {
+                    parent.parent()
+                } else {
+                    Some(parent)
+                }
+            });
+            if let Some(module) = statement.and_then(|node| node.child_by_field_name("module_name"))
+            {
+                let module = crate::parse::node_text_lossy(&module, source);
+                let separator = if module.ends_with('.') { "" } else { "." };
+                refs.push(Reference {
+                    from_file: file_path.to_string(),
+                    from_symbol: None,
+                    to_name: format!("{module}{separator}{to_name}"),
+                    kind: ReferenceKind::Import,
+                    line: row + 1,
+                    col,
+                });
+            }
+        }
         refs.push(Reference {
             from_file: file_path.to_string(),
             from_symbol: None,
@@ -516,6 +552,35 @@ mod tests {
     }
 
     use codesage_protocol::{Language, Reference, ReferenceKind};
+
+    #[test]
+    fn python_import_bindings_keep_their_module_context() {
+        let refs = refs_from_source(
+            "from api import run as call\nfrom . import child\n",
+            Language::Python,
+        );
+        assert!(
+            refs.iter()
+                .any(|r| r.to_name == "run" && r.kind == ReferenceKind::ImportBinding)
+        );
+        assert!(
+            !refs
+                .iter()
+                .any(|r| r.to_name == "run" && r.kind == ReferenceKind::Import)
+        );
+        assert!(
+            refs.iter()
+                .any(|r| r.to_name == "api" && r.kind == ReferenceKind::Import)
+        );
+        assert!(
+            refs.iter()
+                .any(|r| r.to_name == "api.run" && r.kind == ReferenceKind::Import)
+        );
+        assert!(
+            refs.iter()
+                .any(|r| r.to_name == ".child" && r.kind == ReferenceKind::Import)
+        );
+    }
 
     fn refs_from_source(source: &str, language: Language) -> Vec<Reference> {
         let bytes = source.as_bytes();
