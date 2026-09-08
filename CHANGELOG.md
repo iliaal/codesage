@@ -10,6 +10,7 @@
 - The reachability walk spends one pool of resolution steps in request order under a wall-clock deadline; `CODESAGE_REACH_BUDGET` / `CODESAGE_REACH_DEADLINE_MS` override the defaults (1,500,000 steps, 5 s; `review_rehearsal` uses 1.5 s).
 - `from_trace` MCP tool and `codesage from-trace` CLI command map a pasted stack trace or sanitizer report (Python, PHP incl. Xdebug, Rust, Java, Go, Node/JS, gdb/ASan/UBSan; chained stacks split, deepest cause first) onto indexed symbols and `file:line`, innermost-first; frames outside the index or matching several definitions are `unresolved` / `ambiguous` with candidates, never guessed.
 - `find_coupling` / `codesage coupling` rows carry `recurrence` (distinct 90-day windows), `span_days`, `recurring` (span ≥ 30 days), `confidence` = P(other | this), and `reverse_confidence`; non-recurring pairs rank at half weight (`CODESAGE_COUPLING_RECURRENCE=0` restores raw order), a page with no recurring pair carries a `note`, and `assess_risk` `top_coupled` rows carry the same fields.
+- `codesage doctor --docs [PATH...]` checks markdown paths, links, `path:line` anchors, `Owner::member` symbols, and `UPPER_SNAKE` values against the index and working tree; `<!-- codesage-docs: skip-file -->` or `[docs] exclude_patterns` skips a file, `--strict` exits 1 on drift, failed files, or no documents checked, `--json` output.
 
 ### Changed
 

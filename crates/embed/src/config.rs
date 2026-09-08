@@ -378,6 +378,14 @@ pub struct ProjectConfig {
     pub project: Option<ProjectMeta>,
     pub embedding: Option<EmbeddingConfig>,
     pub index: Option<IndexConfig>,
+    pub docs: Option<DocsConfig>,
+}
+
+/// `[docs]`: what `codesage doctor --docs` sweeps by default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DocsConfig {
+    /// Glob patterns (repo-relative) for markdown files the docs check skips.
+    pub exclude_patterns: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

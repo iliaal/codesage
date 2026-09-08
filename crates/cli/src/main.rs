@@ -305,11 +305,24 @@ enum Commands {
         #[arg(long, default_value_t = 15)]
         top: usize,
     },
-    /// Diagnose CodeSage installation: binary, CUDA, models, DB, hooks, MCP registration
+    /// Diagnose CodeSage installation: binary, CUDA, models, DB, hooks, MCP registration.
+    /// With --docs, check markdown claims (paths, file:line anchors, symbols, constants)
+    /// against the index and working tree instead.
     Doctor {
         /// Emit machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
+        /// Check markdown documents for claims that no longer hold. Defaults to
+        /// AGENTS.md or CLAUDE.md, README.md, and docs/**/*.md (never CHANGELOG.md)
+        #[arg(long)]
+        docs: bool,
+        /// With --docs: exit 1 on drift, a failed file, or no documents checked (default exit 0)
+        #[arg(long, requires = "docs")]
+        strict: bool,
+        /// Markdown files or directories to check instead of the defaults (with --docs).
+        /// Explicit paths bypass `[docs] exclude_patterns`; non-markdown files are skipped.
+        #[arg(value_name = "PATH", requires = "docs")]
+        paths: Vec<PathBuf>,
     },
     /// Index git history: per-file churn, fix counts, and historical co-change pairs
     GitIndex {
@@ -1163,7 +1176,13 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Uninstall { target, global } => runtime::cmd_uninstall(&target, global),
         Commands::Cleanup { dry_run } => index::cmd_cleanup(dry_run),
         Commands::Coverage { json, top } => coverage::run(json, top),
-        Commands::Doctor { json } => doctor::run(json),
+        Commands::Doctor {
+            json,
+            docs: true,
+            strict,
+            paths,
+        } => doctor::docs::run(json, strict, &paths),
+        Commands::Doctor { json, .. } => doctor::run(json),
         Commands::GitIndex {
             json,
             full,
@@ -1450,6 +1469,7 @@ mod tests {
         let cfg = ProjectConfig {
             project: None,
             embedding: None,
+            docs: None,
             index: Some(IndexConfig {
                 exclude_patterns: Some(vec!["**/my-custom/**".to_string()]),
                 watch: None,
@@ -1472,6 +1492,7 @@ mod tests {
         let cfg = ProjectConfig {
             project: None,
             embedding: None,
+            docs: None,
             index: Some(IndexConfig {
                 exclude_patterns: Some(vec![]),
                 watch: None,
@@ -1486,6 +1507,7 @@ mod tests {
         let cfg = ProjectConfig {
             project: None,
             embedding: None,
+            docs: None,
             index: Some(IndexConfig {
                 exclude_patterns: Some(vec!["skip/**".to_string()]),
                 watch: None,
