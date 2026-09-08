@@ -412,6 +412,52 @@ fn escape(s: &str) -> String {
 mod tests {
     use super::*;
 
+    fn evaluate_after_release(dir: &Path, session: &str, path: &str, payload: &str) -> Decision {
+        // Concurrent forks can retain a lock descriptor briefly after its guard drops.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let decision = evaluate(dir, session, path, payload);
+            if decision != Decision::Unavailable || std::time::Instant::now() >= deadline {
+                return decision;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn budget_check_waits_for_a_retained_lock_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = "x".repeat(SESSION_TOKEN_BUDGET * CHARS_PER_TOKEN);
+        assert_eq!(
+            evaluate(dir.path(), "retained", "a.rs", &payload),
+            Decision::Served
+        );
+        let lock = crate::fsguard::open_lockfile(
+            &state_path(dir.path(), "retained").with_extension("lock"),
+        )
+        .unwrap();
+        #[cfg(target_os = "android")]
+        crate::flock_override::lock_exclusive(&lock).unwrap();
+        #[cfg(not(target_os = "android"))]
+        lock.lock().unwrap();
+        let retained = lock.try_clone().unwrap();
+        drop(lock);
+        assert_eq!(
+            evaluate(dir.path(), "retained", "later.rs", "y"),
+            Decision::Unavailable
+        );
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                drop(retained);
+            });
+            assert_eq!(
+                evaluate_after_release(dir.path(), "retained", "later.rs", "y"),
+                Decision::Budget
+            );
+        });
+    }
+
     fn state() -> GateState {
         GateState::default()
     }
@@ -538,7 +584,7 @@ mod tests {
             Decision::Served
         );
         assert_eq!(
-            evaluate(p, "sess-1", "a.rs", "hotspot: 90%"),
+            evaluate_after_release(p, "sess-1", "a.rs", "hotspot: 90%"),
             Decision::Repeat
         );
         // A different session starts with its own budget and its own history.
@@ -592,7 +638,7 @@ mod tests {
         .unwrap();
         assert_eq!(state.tokens, SESSION_TOKEN_BUDGET);
         assert_eq!(
-            evaluate(dir.path(), "concurrent", "later.rs", "y"),
+            evaluate_after_release(dir.path(), "concurrent", "later.rs", "y"),
             Decision::Budget
         );
     }
@@ -610,7 +656,10 @@ mod tests {
             .set_times(std::fs::FileTimes::new().set_modified(UNIX_EPOCH))
             .unwrap();
         assert_eq!(evaluate(dir.path(), "new", "b.rs", "x"), Decision::Served);
-        assert_eq!(evaluate(dir.path(), "old", "c.rs", "x"), Decision::Budget);
+        assert_eq!(
+            evaluate_after_release(dir.path(), "old", "c.rs", "x"),
+            Decision::Budget
+        );
     }
 
     #[test]
@@ -625,7 +674,7 @@ mod tests {
         }
         // The repeat is the whole reason this log exists: it never reaches a
         // transcript, so nothing else can count it.
-        let d = evaluate(p, "sess", "a.rs", "hotspot: 90%");
+        let d = evaluate_after_release(p, "sess", "a.rs", "hotspot: 90%");
         log_fire(p, "sess", proj, "a.rs", d, "hotspot: 90%");
 
         let raw = std::fs::read_to_string(p.join(FIRE_LOG)).unwrap();
