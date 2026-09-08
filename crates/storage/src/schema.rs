@@ -85,6 +85,9 @@ CREATE TABLE IF NOT EXISTS git_co_changes (
     weight REAL NOT NULL DEFAULT 0,
     count INTEGER NOT NULL DEFAULT 0,
     last_observed_at INTEGER,
+    first_observed_at INTEGER,
+    window_mask INTEGER NOT NULL DEFAULT 0,
+    windows INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (file_a, file_b)
 );
 
@@ -524,7 +527,37 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
         "0016_semantic_models_artifact_stat_key",
         migrate_0016_semantic_models_artifact_stat_key,
     ),
+    (
+        "0017_git_co_changes_recurrence",
+        migrate_0017_git_co_changes_recurrence,
+    ),
 ];
+
+/// Co-change recurrence columns on `git_co_changes`: `first_observed_at`
+/// (oldest shared commit), `window_mask` (bit `(ts / 90d) % 64` per shared
+/// commit, keyed to the unix epoch so incremental ORs compose exactly with a
+/// full rescan), and `windows` (`popcount(window_mask)`, kept as a column so
+/// SQL can order by it). Rows written before the columns existed read
+/// `NULL / 0 / 1` until the next `codesage git-index --full` recomputes them.
+fn migrate_0017_git_co_changes_recurrence(conn: &Connection) -> rusqlite::Result<()> {
+    for (column, decl) in [
+        ("first_observed_at", "INTEGER"),
+        ("window_mask", "INTEGER NOT NULL DEFAULT 0"),
+        ("windows", "INTEGER NOT NULL DEFAULT 1"),
+    ] {
+        let has_column: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('git_co_changes') WHERE name = ?1",
+            rusqlite::params![column],
+            |row| row.get(0),
+        )?;
+        if has_column == 0 {
+            conn.execute_batch(&format!(
+                "ALTER TABLE git_co_changes ADD COLUMN {column} {decl};"
+            ))?;
+        }
+    }
+    Ok(())
+}
 
 /// `semantic_models.fingerprint`: the embedding setup (model, pinned files,
 /// dimension, pooling, chunker) whose vectors the chunk table holds. NULL on a
@@ -576,6 +609,15 @@ fn migrate_0014_git_files_churn_path(conn: &Connection) -> rusqlite::Result<()> 
 }
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
+    run_migration_list(conn, MIGRATIONS)
+}
+
+/// [`run_migrations`] over an explicit list, so tests can drive the loop
+/// with synthetic migrations.
+fn run_migration_list(
+    conn: &Connection,
+    migrations: &[(&str, MigrationUp)],
+) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
              id INTEGER PRIMARY KEY,
@@ -605,7 +647,7 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     //   `schema_migrations` row and skips — no new hard-error class, the
     //   same SQLITE_BUSY only past the window that a deferred BEGIN
     //   produced at COMMIT time.
-    for (name, up) in MIGRATIONS {
+    for (name, up) in migrations {
         let already: i64 = conn.query_row(
             "SELECT COUNT(*) FROM schema_migrations WHERE name = ?1",
             rusqlite::params![name],
@@ -615,10 +657,29 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
             continue;
         }
         conn.execute_batch("BEGIN IMMEDIATE")?;
+        // Re-check under the write lock: another opener may have applied and
+        // stamped this migration between the unlocked probe above and our
+        // BEGIN IMMEDIATE. Running `up` twice is usually idempotent, but the
+        // stamp INSERT would then violate the UNIQUE name and fail the open.
+        let stamped_meanwhile: i64 = match conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE name = ?1",
+            rusqlite::params![name],
+            |r| r.get(0),
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        };
+        if stamped_meanwhile > 0 {
+            conn.execute_batch("ROLLBACK")?;
+            continue;
+        }
         if let Err(e) = (|| -> rusqlite::Result<()> {
             up(conn)?;
             conn.execute(
-                "INSERT INTO schema_migrations (name) VALUES (?1)",
+                "INSERT OR IGNORE INTO schema_migrations (name) VALUES (?1)",
                 rusqlite::params![name],
             )?;
             Ok(())
@@ -631,7 +692,25 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
             return Err(e);
         }
     }
+    forget_superseded_migrations(conn)?;
     check_unknown_migrations(conn)?;
+    Ok(())
+}
+
+/// Migration names that once shipped in a development build and were renamed
+/// before release. An index stamped with one of these is fully covered by the
+/// renamed migration (which re-runs idempotently), so the stale row is
+/// dropped rather than reported as "migrated by a newer codesage" on every
+/// open.
+const SUPERSEDED_MIGRATIONS: &[&str] = &["0017_git_co_changes_windows"];
+
+fn forget_superseded_migrations(conn: &Connection) -> rusqlite::Result<()> {
+    for name in SUPERSEDED_MIGRATIONS {
+        conn.execute(
+            "DELETE FROM schema_migrations WHERE name = ?1",
+            rusqlite::params![name],
+        )?;
+    }
     Ok(())
 }
 
@@ -1074,6 +1153,111 @@ pub(crate) fn ensure_chunk_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A superseded name that is also a live migration would be deleted and
+    /// re-applied on every open; the two lists must stay disjoint.
+    #[test]
+    fn superseded_migrations_are_not_live_migrations() {
+        for superseded in SUPERSEDED_MIGRATIONS {
+            assert!(
+                MIGRATIONS.iter().all(|(name, _)| name != superseded),
+                "{superseded} is listed both as superseded and as a live migration"
+            );
+        }
+    }
+
+    const RACE_NAME: &str = "9998_race_probe";
+
+    /// A migration whose body stamps its own name, standing in for a racing
+    /// opener that committed the stamp while this one was running. A plain
+    /// `INSERT` stamp after it violates the UNIQUE name; `OR IGNORE` does not.
+    fn up_stamps_itself(conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT INTO schema_migrations (name) VALUES (?1)",
+            rusqlite::params![RACE_NAME],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn migration_stamp_already_written_inside_the_transaction_does_not_fail() {
+        let conn = open_initialized();
+        run_migration_list(&conn, &[(RACE_NAME, up_stamps_itself)])
+            .expect("stamp written during `up` must be tolerated");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE name = ?1",
+                rusqlite::params![RACE_NAME],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// The second connection that wins the race. Stashed in a static because
+    /// `busy_handler` takes a plain `fn` pointer.
+    static RACER: std::sync::Mutex<Option<Connection>> = std::sync::Mutex::new(None);
+
+    /// Invoked when the migrating connection's `BEGIN IMMEDIATE` finds the
+    /// racer holding the write lock: the racer stamps the migration and
+    /// commits, then the migrator retries and must see the stamp under its
+    /// own lock. Returns `true` (retry) only for that first invocation; a
+    /// second busy signal means the lock is held by something else and the
+    /// test should fail fast rather than spin.
+    fn racer_stamps_and_releases(_attempt: i32) -> bool {
+        let mut guard = RACER.lock().unwrap();
+        match guard.take() {
+            Some(racer) => {
+                racer
+                    .execute(
+                        "INSERT INTO schema_migrations (name) VALUES (?1)",
+                        rusqlite::params![RACE_NAME],
+                    )
+                    .unwrap();
+                racer.execute_batch("COMMIT").unwrap();
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn up_must_not_run(_conn: &Connection) -> rusqlite::Result<()> {
+        Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+            Some("migration ran although a racing opener had stamped it".to_string()),
+        ))
+    }
+
+    /// Stamp lands between the unlocked probe and the write lock: the
+    /// re-probe under `BEGIN IMMEDIATE` must skip the migration. Without the
+    /// re-probe the body runs a second time (here: errors on purpose).
+    #[test]
+    fn migration_stamped_by_a_racing_opener_between_probe_and_lock_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("race.db");
+        let conn = Connection::open(&path).unwrap();
+        init_db(&conn).unwrap();
+
+        let racer = Connection::open(&path).unwrap();
+        racer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        *RACER.lock().unwrap() = Some(racer);
+        conn.busy_handler(Some(racer_stamps_and_releases)).unwrap();
+
+        run_migration_list(&conn, &[(RACE_NAME, up_must_not_run)])
+            .expect("racing stamp must be seen under the lock and skipped");
+        assert!(
+            RACER.lock().unwrap().is_none(),
+            "the busy handler must have fired (BEGIN IMMEDIATE was blocked)"
+        );
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE name = ?1",
+                rusqlite::params![RACE_NAME],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
 
     fn open_initialized() -> Connection {
         let conn = Connection::open_in_memory().expect("open in-memory db");

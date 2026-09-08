@@ -207,6 +207,7 @@ fn fresh_db_records_migrations_exactly_once() {
         "0014_git_files_churn_path",
         "0015_semantic_models_fingerprint",
         "0016_semantic_models_artifact_stat_key",
+        "0017_git_co_changes_recurrence",
     ];
     for migration in expected_migrations {
         let count: i64 = conn
@@ -465,6 +466,59 @@ fn unknown_additive_migration_from_newer_binary_warns_but_opens() {
         warnings.iter().any(|w| w.contains("9999_from_the_future")),
         "init_db must warn naming the unknown migration, got: {warnings:?}"
     );
+}
+
+/// An index stamped by the development build that named migration 0017
+/// `0017_git_co_changes_windows` (and only added the `windows` column) must
+/// open silently: the superseded row is dropped, the renamed migration runs
+/// and adds the missing columns, and no "newer codesage" warning fires.
+#[test]
+fn superseded_0017_name_is_forgotten_and_the_renamed_migration_completes_it() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_db(&conn).expect("first init_db");
+    // Rewind to the round-1 shape: only `windows` exists, stamped under the
+    // old name.
+    conn.execute_batch(
+        "ALTER TABLE git_co_changes DROP COLUMN first_observed_at;
+         ALTER TABLE git_co_changes DROP COLUMN window_mask;
+         DELETE FROM schema_migrations WHERE name = '0017_git_co_changes_recurrence';
+         INSERT INTO schema_migrations (name) VALUES ('0017_git_co_changes_windows');",
+    )
+    .unwrap();
+
+    let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    tracing::subscriber::with_default(WarnCapture(warnings.clone()), || {
+        init_db(&conn).expect("second init_db");
+    });
+    assert!(
+        warnings.lock().unwrap().is_empty(),
+        "superseded name must not warn, got: {:?}",
+        warnings.lock().unwrap()
+    );
+
+    let names: Vec<String> = conn
+        .prepare("SELECT name FROM schema_migrations WHERE name LIKE '0017%' ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(names, vec!["0017_git_co_changes_recurrence".to_string()]);
+    for column in ["first_observed_at", "window_mask", "windows"] {
+        let present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('git_co_changes') WHERE name = ?1",
+                rusqlite::params![column],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            present, 1,
+            "{column} must exist after the renamed 0017 runs"
+        );
+    }
+    // Third open is a no-op.
+    init_db(&conn).expect("third init_db");
 }
 
 #[test]

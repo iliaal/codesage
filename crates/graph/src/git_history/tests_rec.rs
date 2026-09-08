@@ -366,20 +366,30 @@ struct BaseRecommendations {
     suppressed_sources: Vec<String>,
     /// The withheld `.phpt` paths themselves: vouched for, just not listed.
     withheld: Vec<String>,
+    /// Inputs with more co-change partners than [`COUPLED_FETCH_CAP`]: a
+    /// test ranked past the cap was never seen, so `coupled` is a lower bound.
+    coupled_cut_sources: Vec<String>,
 }
+
+/// Co-change partners consulted per changed file when looking for tests.
+/// Fetched with one extra row so an overflow is detected and disclosed.
+const COUPLED_FETCH_CAP: usize = 20;
 
 fn base_recommendations(db: &Database, file_paths: &[String]) -> Result<BaseRecommendations> {
     let mut primary: HashSet<String> = HashSet::new();
     let mut coupled: Vec<CoupledTestEntry> = Vec::new();
     let mut suppressed_sources: Vec<String> = Vec::new();
     let mut withheld: Vec<String> = Vec::new();
+    let mut coupled_cut_sources: Vec<String> = Vec::new();
 
     // One batched co-change query for the whole file list instead of one
-    // `co_changes_for` per file. Same per-file top-20 (weight DESC, name
-    // tiebreak) — `co_changes_for_many` reproduces the per-file LIMIT
-    // exactly — with a single round-trip.
+    // `co_changes_for` per file. Same per-file order as `find_coupling`
+    // (weight halved for non-recurring pairs, name tiebreak) —
+    // `co_changes_for_many` reproduces the per-file LIMIT exactly — with a
+    // single round-trip. One row past the cap tells us the cap cut.
+    let multiplier = super::risk::one_off_multiplier_from_env();
     let path_refs: Vec<&str> = file_paths.iter().map(String::as_str).collect();
-    let co_batched = db.co_changes_for_many(&path_refs, 20)?;
+    let co_batched = db.co_changes_for_many(&path_refs, COUPLED_FETCH_CAP + 1, multiplier)?;
     for path in file_paths {
         let (siblings, withheld_here) = test_sibling_paths(db, path)?;
         if !withheld_here.is_empty() {
@@ -390,15 +400,23 @@ fn base_recommendations(db: &Database, file_paths: &[String]) -> Result<BaseReco
             primary.insert(sibling);
         }
         if let Some(rows) = co_batched.get(path.as_str()) {
-            for entry in rows {
+            if rows.len() > COUPLED_FETCH_CAP {
+                coupled_cut_sources.push(path.clone());
+            }
+            for entry in rows.iter().take(COUPLED_FETCH_CAP) {
                 if matches!(FileCategory::classify(&entry.file), FileCategory::Test)
                     && !is_fixture(&entry.file)
                 {
+                    let span_days =
+                        super::risk::days_between(entry.first_observed_at, entry.last_observed_at);
                     coupled.push(CoupledTestEntry {
                         file: entry.file.clone(),
                         weight: entry.weight,
                         count: entry.count,
                         source: path.clone(),
+                        span_days,
+                        span_known: entry.first_observed_at.is_some(),
+                        recurring: super::risk::is_recurring(span_days),
                     });
                 }
             }
@@ -408,12 +426,22 @@ fn base_recommendations(db: &Database, file_paths: &[String]) -> Result<BaseReco
     // Drop coupled entries that are also in primary; primary already says "run me".
     coupled.retain(|c| !primary.contains(&c.file));
 
-    // Dedupe coupled entries by file, keeping the highest-weight pairing so the
-    // agent sees the strongest signal. Source attribution refers to that pairing.
+    // Order by the same key `find_coupling` ranks with (raw weight for
+    // recurring pairs, demoted for one-offs) and dedupe by file, keeping the
+    // strongest pairing so the agent sees the strongest signal. Source
+    // attribution refers to that pairing.
+    let rank_key = |e: &CoupledTestEntry| {
+        if e.recurring {
+            e.weight
+        } else {
+            e.weight * multiplier
+        }
+    };
     coupled.sort_by(|a, b| {
-        b.weight
-            .partial_cmp(&a.weight)
+        rank_key(b)
+            .partial_cmp(&rank_key(a))
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.file.cmp(&b.file))
     });
     let mut seen: HashSet<String> = HashSet::new();
     coupled.retain(|e| seen.insert(e.file.clone()));
@@ -426,6 +454,7 @@ fn base_recommendations(db: &Database, file_paths: &[String]) -> Result<BaseReco
         coupled,
         suppressed_sources,
         withheld,
+        coupled_cut_sources,
     })
 }
 
@@ -458,12 +487,21 @@ fn base_notes(
         && absence_override.is_none()
         && base.suppressed_sources.is_empty()
     {
-        notes.push(
-            "no test files found via sibling conventions or co-change history; \
-             run `codesage git-index` if you haven't, or add tests for these files"
-                .to_string(),
-        );
-        return notes;
+        if base.coupled_cut_sources.is_empty() {
+            notes.push(
+                "no test files found via sibling conventions or co-change history; \
+                 run `codesage git-index` if you haven't, or add tests for these files"
+                    .to_string(),
+            );
+            return notes;
+        }
+        // The fetch did not see every partner, so the absence claim is scoped
+        // to what was consulted and the cut note below completes it.
+        notes.push(format!(
+            "no test files found via sibling conventions or among the top {COUPLED_FETCH_CAP} \
+             co-change partners; run `codesage git-index` if you haven't, or add tests for \
+             these files"
+        ));
     }
     if sibling_count > 0 {
         notes.push(format!(
@@ -474,6 +512,25 @@ fn base_notes(
         notes.push(format!(
             "{} additional test file(s) suggested by co-change history",
             base.coupled.len()
+        ));
+        // A legacy row ranks at half weight without any span evidence; say
+        // so rather than let the demotion pass as a measured one-off.
+        let span_unknown = base.coupled.iter().filter(|c| !c.span_known).count();
+        if span_unknown > 0 {
+            notes.push(super::risk::span_unknown_note(
+                span_unknown,
+                &format!("the {} coupled test(s)", base.coupled.len()),
+            ));
+        }
+    }
+    if !base.coupled_cut_sources.is_empty() {
+        // A lower bound, not a verdict: a test ranked past the cap (a one-off
+        // partner demoted below twenty recurring ones, say) was never seen.
+        notes.push(format!(
+            "co-change partners beyond the top {COUPLED_FETCH_CAP} were not considered for {}; \
+             `coupled` is a lower bound there (see `codesage coupling <file>` or \
+             `find_coupling` for the full list)",
+            base.coupled_cut_sources.join(", ")
         ));
     }
     if !base.suppressed_sources.is_empty() {
@@ -788,7 +845,9 @@ pub fn recommend_tests_with_reachability(
             .map(|p| as_given.get(&p).cloned().unwrap_or(p))
             .collect()
     };
-    let base = base_recommendations(db, &file_paths)?;
+    let mut base = base_recommendations(db, &file_paths)?;
+    // Notes name inputs as the caller spelled them.
+    base.coupled_cut_sources = restore(std::mem::take(&mut base.coupled_cut_sources));
     let sibling_count = base.primary.len();
 
     // Triage before anything can short-circuit: a list of only brand-new

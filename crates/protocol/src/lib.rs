@@ -776,9 +776,57 @@ pub struct ContextBundle {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CoChangeEntry {
     pub file: String,
+    /// Raw decayed co-change weight. `find_coupling` ranks by this value
+    /// halved when the pair is not `recurring`, so a recurring pair outranks
+    /// a one-off mass commit of equal weight; the reported value is the raw
+    /// one.
     pub weight: f64,
     pub count: u32,
     pub last_observed_at: Option<i64>,
+    /// Number of distinct 90-day windows (fixed calendar grid from the unix
+    /// epoch) in which the pair co-changed. Informational: two commits
+    /// seconds apart can straddle a grid boundary and read 2, so
+    /// `recurring` is decided by `span_days` instead. Identical under
+    /// `--full` and `--incremental`. Reads 1 on rows indexed before the field
+    /// existed (rerun `codesage git-index --full` to populate).
+    #[serde(default = "default_recurrence")]
+    pub recurrence: u32,
+    /// Days between the pair's oldest and newest shared commit. 0 when the
+    /// shared commits fall inside one day, and 0 with `span_known: false` on
+    /// rows indexed before the field existed: incremental passes leave such
+    /// rows unbaselined, so only `codesage git-index --full` populates it.
+    #[serde(default)]
+    pub span_days: u32,
+    /// False when the pair was indexed before recurrence tracking and no
+    /// `--full` pass has baselined it yet; `span_days` and `recurring` then
+    /// carry no information (a `note` says so). Absent on older payloads,
+    /// which read true.
+    #[serde(default = "default_span_known")]
+    pub span_known: bool,
+    /// P(`file` changes | the queried file changes): `count` divided by the
+    /// queried file's total commits. 0.0 when that total is unknown. A lower
+    /// bound: commits touching more than 30 files contribute no pair
+    /// evidence but do count in the denominator.
+    #[serde(default)]
+    pub confidence: f32,
+    /// P(the queried file changes | `file` changes): `count` divided by
+    /// `file`'s total commits. 0.0 when that total is unknown. Same lower
+    /// bound as `confidence`.
+    #[serde(default)]
+    pub reverse_confidence: f32,
+    /// `span_days >= 30`: the pair kept co-changing over at least a month
+    /// rather than in one commit or a short burst. False on rows indexed
+    /// before `span_days` existed.
+    #[serde(default)]
+    pub recurring: bool,
+}
+
+fn default_recurrence() -> u32 {
+    1
+}
+
+fn default_span_known() -> bool {
+    true
 }
 
 /// Result envelope for `find_coupling`. Wraps the ranked list with enough
@@ -806,7 +854,11 @@ pub struct CouplingReport {
     pub file_indexed: bool,
     /// Total commits tracked for the file. 0 when not indexed.
     pub file_commits: u32,
-    /// Human-readable hint when `coupled` is empty; `None` otherwise.
+    /// Human-readable hint when `coupled` is empty; when any returned pair has
+    /// `span_known: false` (indexed before recurrence tracking, run
+    /// `codesage git-index --full`); or when no returned pair is `recurring`
+    /// (the indexed history is too short to observe recurrence, or the
+    /// coupling is short-burst evidence). `None` otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
@@ -1147,11 +1199,30 @@ pub struct ClusteredDirectory {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CoupledTestEntry {
     pub file: String,
+    /// Raw decayed co-change weight with `source`. The bucket is ordered by
+    /// this value halved when the pair is not `recurring` (the same key
+    /// `find_coupling` ranks by); the reported value is the raw one.
     pub weight: f64,
     pub count: u32,
     /// Which file in the changed set this test couples with. Lets the agent
     /// explain "I ran X.test.ts because it co-changes with X.ts (8 times)".
     pub source: String,
+    /// Days between the oldest and newest commit shared with `source`. 0 with
+    /// `span_known: false` on rows indexed before the field existed; only
+    /// `codesage git-index --full` populates it.
+    #[serde(default)]
+    pub span_days: u32,
+    /// False when the pair predates recurrence tracking and has not been
+    /// baselined by a `--full` pass; `recurring` then carries no information
+    /// and the entry ranks at half weight. Absent on older payloads, which
+    /// read true.
+    #[serde(default = "default_span_known")]
+    pub span_known: bool,
+    /// `span_days >= 30`: the pair kept co-changing over at least a month.
+    /// A one-off (single mass commit or short burst) reads false and ranks
+    /// at half weight.
+    #[serde(default)]
+    pub recurring: bool,
 }
 
 /// A test file that transitively references one of the changed files through
@@ -2419,6 +2490,48 @@ mod tests {
         assert!(report.found);
     }
 
+    /// A `find_coupling` row serialized before recurrence and confidence
+    /// existed must still deserialize: recurrence reads 1 (one window, the
+    /// pre-column meaning), the probabilities 0.0 (unknown), `recurring`
+    /// false.
+    #[test]
+    fn co_change_entry_defaults_recurrence_fields_when_absent() {
+        let entry: CoChangeEntry = serde_json::from_str(
+            r#"{"file":"src/b.rs","weight":2.5,"count":4,"last_observed_at":1700000000}"#,
+        )
+        .unwrap();
+        assert_eq!(entry.recurrence, 1);
+        assert_eq!(entry.span_days, 0);
+        assert!(
+            entry.span_known,
+            "absent field means a pre-span payload, read as known"
+        );
+        assert_eq!(entry.confidence, 0.0);
+        assert_eq!(entry.reverse_confidence, 0.0);
+        assert!(!entry.recurring);
+
+        let round_trip: CoChangeEntry = serde_json::from_str(
+            &serde_json::to_string(&CoChangeEntry {
+                file: "src/b.rs".to_string(),
+                weight: 2.5,
+                count: 4,
+                last_observed_at: None,
+                recurrence: 3,
+                span_days: 200,
+                span_known: true,
+                confidence: 0.4,
+                reverse_confidence: 1.0,
+                recurring: true,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(round_trip.recurrence, 3);
+        assert!(round_trip.recurring);
+        assert_eq!(round_trip.confidence, 0.4);
+        assert_eq!(round_trip.reverse_confidence, 1.0);
+    }
+
     /// Shaped like a real hotspot: ten coupled files (the `co_changes_for`
     /// cap), a small cycle, two boundaries, notes, one top symbol.
     fn risk_fixture() -> RiskAssessment {
@@ -2444,6 +2557,12 @@ mod tests {
                     weight: 7.5 - f64::from(i) * 0.4,
                     count: 12 - i,
                     last_observed_at: Some(1_788_000_000),
+                    recurrence: 2,
+                    span_days: 120,
+                    span_known: true,
+                    confidence: 0.5,
+                    reverse_confidence: 0.75,
+                    recurring: true,
                 })
                 .collect(),
             trust_boundaries: vec![TrustBoundary::Filesystem, TrustBoundary::Database],

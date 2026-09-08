@@ -17,7 +17,9 @@ pub use indexer::{
     IndexMode, changed_files_since, feature_touched_since, git_history_index,
     git_history_index_with_options,
 };
-pub use risk::{assess_risk, assess_risk_batch, assess_risk_diff, find_coupling};
+pub use risk::{
+    assess_risk, assess_risk_batch, assess_risk_diff, find_coupling, find_coupling_ranked,
+};
 pub(crate) use tests_rec::reach_cap_clause;
 pub use tests_rec::{
     ReachabilityOptions, abbreviate_paths, recommend_tests, recommend_tests_with_reachability,

@@ -1303,8 +1303,20 @@ fn find_coupling_populated_result_carries_index_state() {
         .unwrap();
     db.upsert_git_file("b.rs", 0.5, 0, 10, Some(1_700_000_000))
         .unwrap();
-    db.upsert_git_co_change("a.rs", "b.rs", 5.0, 5, Some(1_700_000_000))
-        .unwrap();
+    // A recurring pair: a page made only of one-off pairs carries its own
+    // note (covered in coupling_test.rs), so seed two windows here.
+    db.upsert_git_co_change_full(
+        "a.rs",
+        "b.rs",
+        &codesage_storage::db::CoChangeWrite {
+            weight: 5.0,
+            count: 5,
+            window_mask: 0b11,
+            first_observed_at: Some(1_690_000_000),
+            last_observed_at: Some(1_700_000_000),
+        },
+    )
+    .unwrap();
     let r = codesage_graph::find_coupling(&db, "a.rs", 5).unwrap();
     assert!(r.found);
     assert_eq!(r.coupled.len(), 1);
@@ -1313,7 +1325,7 @@ fn find_coupling_populated_result_carries_index_state() {
     assert_eq!(r.file_commits, 10);
     assert!(
         r.note.is_none(),
-        "note should be None when coupled is non-empty"
+        "note should be None when coupled is non-empty and recurring"
     );
 }
 

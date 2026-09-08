@@ -9,10 +9,18 @@
 - `recommend_tests` walks changed tests too: a base test class or helper under `tests/` lists the tests that extend or call it in `reachable`; a `.phpt` input lands in `primary` without capping the walk.
 - The reachability walk spends one pool of resolution steps in request order under a wall-clock deadline; `CODESAGE_REACH_BUDGET` / `CODESAGE_REACH_DEADLINE_MS` override the defaults (1,500,000 steps, 5 s; `review_rehearsal` uses 1.5 s).
 - `from_trace` MCP tool and `codesage from-trace` CLI command map a pasted stack trace or sanitizer report (Python, PHP incl. Xdebug, Rust, Java, Go, Node/JS, gdb/ASan/UBSan; chained stacks split, deepest cause first) onto indexed symbols and `file:line`, innermost-first; frames outside the index or matching several definitions are `unresolved` / `ambiguous` with candidates, never guessed.
+- `find_coupling` / `codesage coupling` rows carry `recurrence` (distinct 90-day windows), `span_days`, `recurring` (span ≥ 30 days), `confidence` = P(other | this), and `reverse_confidence`; non-recurring pairs rank at half weight (`CODESAGE_COUPLING_RECURRENCE=0` restores raw order), a page with no recurring pair carries a `note`, and `assess_risk` `top_coupled` rows carry the same fields.
 
 ### Changed
 
 - MCP tools refuse a call carrying an undeclared argument, naming the field and the valid set, instead of silently ignoring it; every tool's `inputSchema` advertises `additionalProperties: false`.
+- `recommend_tests` / `codesage tests-for` `coupled` entries carry `span_days` and `recurring`, are ordered by the `find_coupling` key (one-offs at half weight, `CODESAGE_COUPLING_RECURRENCE=0` for raw), and a note names inputs whose co-change partners exceeded the 20 consulted; `assess_risk` `top_coupled` uses the same order and `codesage risk` prints count, span, and a one-off marker.
+- `assess_risk` notes name a coupled test that keeps `test_gap` false but ranks below the listed `top_coupled` rows.
+- Schema migration `0017_git_co_changes_recurrence` adds `git_co_changes.first_observed_at`, `window_mask`, and `windows`; run `codesage git-index --full` once to populate them. Rows indexed before 0017 read `span_known: false` / `span_days: 0` with a `span unknown` note in `find_coupling`, `assess_risk`, and `recommend_tests`, and incremental passes leave them unbaselined, until that `--full`.
+
+### Fixed
+
+- Opening the index while another process applies the same schema migration no longer fails with a duplicate-migration error.
 
 ## [0.26.1] - 2026-09-06
 

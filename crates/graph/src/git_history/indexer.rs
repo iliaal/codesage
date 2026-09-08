@@ -9,6 +9,16 @@
 //! - min co-change count = 3 (drop pairs that only ever changed together once or twice)
 //! - soft-skip `chore:` / `build:` commits UNLESS message contains migrate/refactor/adopt/deprecate
 //! - no-merges only (merge commits double-count work already in their parents)
+//!
+//! Recurrence (`git_co_changes.window_mask` / `windows`): every shared commit
+//! sets bit `(ts / 90d) % 64` in the pair's mask, numbered against the unix
+//! epoch rather than any commit, so a full scan and an incremental scan set
+//! the same bits and `--incremental` composes exactly (`mask |= delta`).
+//! `windows = popcount(mask)`. The 64-bit ring wraps only for commits 64
+//! windows (~15.8 years) apart, far beyond `HISTORY_WINDOW_DAYS`; a full scan
+//! never sees two windows that share a bit, and the const assert below keeps
+//! that true if either constant moves. Incremental passes keep bits older
+//! than the history window until the next `--full` rebaselines the row.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -20,6 +30,7 @@ use codesage_parser::discover::{
 };
 use codesage_protocol::GitIndexStats;
 use codesage_storage::Database;
+use codesage_storage::db::CoChangeWrite;
 use globset::GlobSet;
 
 const DECAY_HALFLIFE_DAYS: f64 = 180.0;
@@ -37,6 +48,20 @@ const HISTORY_WINDOW_DAYS: f64 = 730.0;
 /// Avoid building O(n²) pair sets for sweeping refactor commits. Anything bigger than this
 /// is almost certainly a vendored update or auto-formatter, not a meaningful co-change.
 const MAX_FILES_PER_COMMIT_FOR_COCHANGE: usize = 30;
+/// Cell width of the fixed 90-day calendar grid (from the unix epoch) used
+/// for the recurrence window mask. Commits in different cells set different
+/// bits regardless of how close in time they are; distance-based recurrence
+/// is decided downstream from the observation span, not from this grid.
+const RECURRENCE_WINDOW_DAYS: f64 = 90.0;
+const RECURRENCE_WINDOW_SECS: i64 = (RECURRENCE_WINDOW_DAYS * SECONDS_PER_DAY) as i64;
+/// Width of the window-mask ring. The full scan's history bound must fit
+/// inside it with room to spare, or two windows the scan can both see would
+/// share a bit.
+const RECURRENCE_RING: i64 = 64;
+const _: () = assert!(
+    (HISTORY_WINDOW_DAYS / RECURRENCE_WINDOW_DAYS) as i64 + 2 < RECURRENCE_RING,
+    "history window must span fewer sub-windows than the 64-bit mask ring"
+);
 
 #[derive(Debug, Default)]
 struct FileStats {
@@ -50,7 +75,31 @@ struct FileStats {
 struct PairStats {
     weight: f64,
     count: u32,
+    first_observed_at: Option<i64>,
     last_observed_at: Option<i64>,
+    /// Bit `(ts / 90d) % 64` set for every shared commit; see the module doc.
+    window_mask: u64,
+}
+
+impl PairStats {
+    fn write(&self) -> CoChangeWrite {
+        CoChangeWrite {
+            weight: self.weight,
+            count: self.count,
+            window_mask: self.window_mask,
+            first_observed_at: self.first_observed_at,
+            last_observed_at: self.last_observed_at,
+        }
+    }
+}
+
+/// Ring index of the fixed-epoch 90-day window holding `timestamp`.
+fn recurrence_window(timestamp: i64) -> u32 {
+    ((timestamp.max(0) / RECURRENCE_WINDOW_SECS) % RECURRENCE_RING) as u32
+}
+
+fn window_bit(timestamp: i64) -> u64 {
+    1u64 << recurrence_window(timestamp)
 }
 
 /// Indexing mode. `Auto` is the recommended default — reuses prior state if valid,
@@ -201,7 +250,7 @@ fn run_full(
         }
         for ((a, b), stats) in &pairs {
             if stats.count >= MIN_CO_CHANGE_COUNT {
-                db.upsert_git_co_change(a, b, stats.weight, stats.count, stats.last_observed_at)?;
+                db.upsert_git_co_change_full(a, b, &stats.write())?;
                 co_change_kept += 1;
             }
         }
@@ -276,7 +325,7 @@ fn run_incremental(
             // straddle the boundary will be caught by the next full rescan.
             let pair_exists = existing_pairs.get(a).is_some_and(|rhs| rhs.contains(b));
             if stats.count >= MIN_CO_CHANGE_COUNT || pair_exists {
-                db.incr_git_co_change(a, b, stats.weight, stats.count, stats.last_observed_at)?;
+                db.incr_git_co_change_full(a, b, &stats.write())?;
                 co_change_kept += 1;
             }
         }
@@ -360,6 +409,10 @@ fn accumulate(
                 let pair = pairs.entry((lo.clone(), hi.clone())).or_default();
                 pair.weight += decay;
                 pair.count += 1;
+                pair.window_mask |= window_bit(commit.timestamp);
+                if pair.first_observed_at.is_none_or(|t| t > commit.timestamp) {
+                    pair.first_observed_at = Some(commit.timestamp);
+                }
                 if pair.last_observed_at.is_none_or(|t| t < commit.timestamp) {
                     pair.last_observed_at = Some(commit.timestamp);
                 }
@@ -873,6 +926,152 @@ mod tests {
             pairs.contains_key(&("Repository.php".into(), "Service.php".into())),
             "source-source pair must always be kept"
         );
+    }
+
+    const DAY: i64 = SECONDS_PER_DAY as i64;
+
+    /// Start of the fixed-epoch 90-day window containing `ts`.
+    fn window_start(ts: i64) -> i64 {
+        (ts / RECURRENCE_WINDOW_SECS) * RECURRENCE_WINDOW_SECS
+    }
+
+    /// Run `accumulate` over one two-file commit per timestamp and return
+    /// the (a.rs, b.rs) pair stats.
+    fn pair_over_commits(timestamps: &[i64]) -> PairStats {
+        let now = *timestamps.iter().max().expect("at least one commit") + DAY;
+        let mut files = HashMap::new();
+        let mut pairs = HashMap::new();
+        let changes = [make_change("a.rs"), make_change("b.rs")];
+        let kept: Vec<&FileChange> = changes.iter().collect();
+        for &ts in timestamps {
+            let commit = Commit {
+                timestamp: ts,
+                subject: "feat: x".into(),
+                changes: vec![],
+            };
+            accumulate(&mut files, &mut pairs, &commit, &kept, now, &test_glob());
+        }
+        pairs
+            .remove(&("a.rs".into(), "b.rs".into()))
+            .expect("pair accumulated")
+    }
+
+    #[test]
+    fn recurrence_is_one_for_a_single_mass_commit() {
+        let ts = 1_750_000_000;
+        let commit = Commit {
+            timestamp: ts,
+            subject: "feat: sweep".into(),
+            changes: vec![],
+        };
+        let changes = [
+            make_change("a.rs"),
+            make_change("b.rs"),
+            make_change("c.rs"),
+        ];
+        let kept: Vec<&FileChange> = changes.iter().collect();
+        let mut files = HashMap::new();
+        let mut pairs = HashMap::new();
+        accumulate(
+            &mut files,
+            &mut pairs,
+            &commit,
+            &kept,
+            ts + DAY,
+            &test_glob(),
+        );
+        assert_eq!(pairs.len(), 3);
+        for (key, stats) in &pairs {
+            assert_eq!(stats.window_mask, window_bit(ts), "{key:?}");
+            assert_eq!(stats.window_mask.count_ones(), 1);
+            assert_eq!(stats.first_observed_at, Some(ts));
+            assert_eq!(stats.last_observed_at, Some(ts));
+        }
+    }
+
+    #[test]
+    fn recurrence_is_one_for_a_burst_inside_one_window() {
+        // Three commits inside one fixed window: enough for the min-count
+        // filter, but one burst.
+        let base = window_start(1_750_000_000);
+        let stats = pair_over_commits(&[base + DAY, base + 30 * DAY, base + 60 * DAY]);
+        assert_eq!(stats.count, 3);
+        assert_eq!(stats.window_mask.count_ones(), 1);
+        assert_eq!(stats.first_observed_at, Some(base + DAY));
+        assert_eq!(stats.last_observed_at, Some(base + 60 * DAY));
+    }
+
+    #[test]
+    fn recurrence_counts_distinct_ninety_day_windows() {
+        let t = 1_750_000_000;
+        // 100-day spacing always lands in distinct windows (100 > 90).
+        let stats = pair_over_commits(&[t - 200 * DAY, t - 100 * DAY, t]);
+        assert_eq!(stats.count, 3);
+        assert_eq!(stats.window_mask.count_ones(), 3);
+        // Two commits 20 days apart may share a window; the mask has 3 or 4
+        // bits depending on where the fixed boundary falls, never fewer.
+        let stats = pair_over_commits(&[t - 200 * DAY, t - 120 * DAY, t - 100 * DAY, t]);
+        assert_eq!(stats.count, 4);
+        assert!((3..=4).contains(&stats.window_mask.count_ones()));
+        // Reordering commits never changes the mask: it is a set, not a walk.
+        let forward = pair_over_commits(&[t - 200 * DAY, t - 100 * DAY, t]);
+        let reverse = pair_over_commits(&[t, t - 100 * DAY, t - 200 * DAY]);
+        assert_eq!(forward.window_mask, reverse.window_mask);
+        assert_eq!(forward.first_observed_at, reverse.first_observed_at);
+    }
+
+    #[test]
+    fn recurrence_window_is_fixed_epoch_and_wraps_only_beyond_history() {
+        let base = window_start(1_750_000_000);
+        assert_eq!(recurrence_window(base), recurrence_window(base + 89 * DAY));
+        assert_ne!(recurrence_window(base), recurrence_window(base + 90 * DAY));
+        assert_eq!(
+            (recurrence_window(base) + 1) % RECURRENCE_RING as u32,
+            recurrence_window(base + 90 * DAY)
+        );
+        // Negative timestamps clamp to window 0 rather than going negative.
+        assert_eq!(recurrence_window(-5), 0);
+        // Within the full scan's history bound no two windows share a bit:
+        // every 90-day step across 730 days maps to a distinct ring index.
+        let steps = (HISTORY_WINDOW_DAYS / RECURRENCE_WINDOW_DAYS) as i64 + 1;
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..=steps {
+            assert!(
+                seen.insert(recurrence_window(base - i * RECURRENCE_WINDOW_SECS)),
+                "window {i} steps back aliased an earlier one"
+            );
+        }
+        // The ring wraps only 64 windows (5760 days) apart.
+        assert_eq!(
+            recurrence_window(base),
+            recurrence_window(base - RECURRENCE_RING * RECURRENCE_WINDOW_SECS)
+        );
+    }
+
+    #[test]
+    fn delta_mask_ors_onto_full_mask_exactly() {
+        // The incremental contract: full(A ∪ B) == full(A) | delta(B) for the
+        // mask, MIN for first_observed_at, MAX for last_observed_at.
+        let t = 1_750_000_000;
+        let old = [t - 300 * DAY, t - 299 * DAY, t - 298 * DAY];
+        let new: Vec<i64> = (1..=10).map(|i| t - 300 * DAY + i * 30 * DAY).collect();
+        let all: Vec<i64> = old.iter().chain(new.iter()).copied().collect();
+        let full = pair_over_commits(&all);
+        let base = pair_over_commits(&old);
+        let delta = pair_over_commits(&new);
+        assert_eq!(full.window_mask, base.window_mask | delta.window_mask);
+        assert_eq!(full.count, base.count + delta.count);
+        assert_eq!(
+            full.first_observed_at,
+            base.first_observed_at.min(delta.first_observed_at)
+        );
+        assert_eq!(
+            full.last_observed_at,
+            base.last_observed_at.max(delta.last_observed_at)
+        );
+        // 13 commits over 300 days span four 90-day windows (or five if a
+        // boundary splits the first burst), never one.
+        assert!(full.window_mask.count_ones() >= 4);
     }
 
     #[test]

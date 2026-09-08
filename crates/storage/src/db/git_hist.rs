@@ -19,7 +19,43 @@ pub struct CoChangeRow {
     pub weight: f64,
     pub count: u32,
     pub last_observed_at: Option<i64>,
+    /// Oldest shared commit; `None` on rows written before the column existed.
+    pub first_observed_at: Option<i64>,
+    /// Bit `i` set when a shared commit fell in fixed-epoch 90-day window
+    /// `(ts / 90d) % 64`. 0 on rows written before the column existed.
+    pub window_mask: u64,
+    /// `window_mask.count_ones().max(1)`: distinct 90-day windows in which
+    /// the pair co-changed. Derived on every write so SQL can order by it.
+    pub windows: u32,
+    /// `git_files.total_commits` for `file` (the other side of the pair);
+    /// 0 when that row is missing. Denominator for the reverse confidence.
+    pub other_commits: u32,
 }
+
+/// Full set of per-pair counters written by the git-history indexer.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CoChangeWrite {
+    pub weight: f64,
+    pub count: u32,
+    pub window_mask: u64,
+    pub first_observed_at: Option<i64>,
+    pub last_observed_at: Option<i64>,
+}
+
+fn windows_of(mask: u64) -> u32 {
+    mask.count_ones().max(1)
+}
+
+/// Rank multiplier applied to a pair's weight when its shared commits span
+/// less than [`RECURRING_SPAN_SECS`] (or the span is unknown on a legacy
+/// row): a pair that kept co-changing over a month or more outranks a one-off
+/// mass commit of equal raw weight. `1.0` disables the demotion.
+pub const ONE_OFF_RANK_MULTIPLIER: f64 = 0.5;
+
+/// Minimum `last_observed_at - first_observed_at` for a pair to count as
+/// recurring: 30 days. Window count alone is not used, because two commits
+/// seconds apart can straddle a fixed 90-day grid boundary.
+pub const RECURRING_SPAN_SECS: i64 = 30 * 86_400;
 
 impl Database {
     /// UPSERT a git_files row. Re-running the indexer must replace prior values, not stack.
@@ -61,8 +97,11 @@ impl Database {
         }
     }
 
-    /// UPSERT a co-change pair. Pair order is normalized (see
-    /// [`Database::order_co_change_pair`]); a self-pair errors.
+    /// UPSERT a co-change pair with no recurrence data (`window_mask = 0`,
+    /// `first_observed_at = last_observed_at`). Pair order is normalized (see
+    /// [`Database::order_co_change_pair`]); a self-pair errors. Seeded
+    /// fixtures use this; the indexer writes through
+    /// [`Database::upsert_git_co_change_full`].
     pub fn upsert_git_co_change(
         &self,
         file_a: &str,
@@ -71,15 +110,49 @@ impl Database {
         count: u32,
         last_observed_at: Option<i64>,
     ) -> Result<()> {
+        self.upsert_git_co_change_full(
+            file_a,
+            file_b,
+            &CoChangeWrite {
+                weight,
+                count,
+                window_mask: 0,
+                first_observed_at: last_observed_at,
+                last_observed_at,
+            },
+        )
+    }
+
+    /// UPSERT a co-change pair with every counter, replacing prior values.
+    /// `windows` is derived from the mask.
+    pub fn upsert_git_co_change_full(
+        &self,
+        file_a: &str,
+        file_b: &str,
+        w: &CoChangeWrite,
+    ) -> Result<()> {
         let (lo, hi) = Self::order_co_change_pair(file_a, file_b)?;
         self.conn.execute(
-            "INSERT INTO git_co_changes (file_a, file_b, weight, count, last_observed_at)
-              VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO git_co_changes (file_a, file_b, weight, count, last_observed_at,
+                                         first_observed_at, window_mask, windows)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
               ON CONFLICT(file_a, file_b) DO UPDATE SET
                   weight = excluded.weight,
                   count = excluded.count,
-                  last_observed_at = excluded.last_observed_at",
-            rusqlite::params![lo, hi, weight, count, last_observed_at],
+                  last_observed_at = excluded.last_observed_at,
+                  first_observed_at = excluded.first_observed_at,
+                  window_mask = excluded.window_mask,
+                  windows = excluded.windows",
+            rusqlite::params![
+                lo,
+                hi,
+                w.weight,
+                w.count,
+                w.last_observed_at,
+                w.first_observed_at,
+                w.window_mask as i64,
+                windows_of(w.window_mask)
+            ],
         )?;
         Ok(())
     }
@@ -179,8 +252,9 @@ impl Database {
         Ok(())
     }
 
-    /// Additive upsert for a co-change pair. See `incr_git_file` for semantics.
-    /// Pair order is normalized like [`Database::upsert_git_co_change`]; a self-pair errors.
+    /// Additive upsert for a co-change pair with no recurrence data. See
+    /// `incr_git_file` for semantics. Pair order is normalized like
+    /// [`Database::upsert_git_co_change`]; a self-pair errors.
     pub fn incr_git_co_change(
         &self,
         file_a: &str,
@@ -189,10 +263,42 @@ impl Database {
         count_delta: u32,
         last_observed_at: Option<i64>,
     ) -> Result<()> {
+        self.incr_git_co_change_full(
+            file_a,
+            file_b,
+            &CoChangeWrite {
+                weight: weight_delta,
+                count: count_delta,
+                window_mask: 0,
+                first_observed_at: last_observed_at,
+                last_observed_at,
+            },
+        )
+    }
+
+    /// Additive upsert for a co-change pair: weight and count add, the window
+    /// mask ORs, `first_observed_at` takes the older and `last_observed_at`
+    /// the newer timestamp, and `windows` is recomputed from the merged mask.
+    /// Exact under incremental indexing because the mask is keyed to a fixed
+    /// epoch, so a delta's bits are the same bits a full rescan would set.
+    ///
+    /// A row with `first_observed_at IS NULL` was written before migration
+    /// 0017 and has never been baselined by a `--full` pass. An incremental
+    /// delta must leave it that way: writing the delta's oldest commit would
+    /// turn "unknown" into a wrong measured span, and a mask built from a
+    /// partial range would be misleading. NULL stays the "not baselined"
+    /// marker until `--full` rewrites the row.
+    pub fn incr_git_co_change_full(
+        &self,
+        file_a: &str,
+        file_b: &str,
+        w: &CoChangeWrite,
+    ) -> Result<()> {
         let (lo, hi) = Self::order_co_change_pair(file_a, file_b)?;
-        self.conn.execute(
-            "INSERT INTO git_co_changes (file_a, file_b, weight, count, last_observed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+        let merged_mask: i64 = self.conn.query_row(
+            "INSERT INTO git_co_changes (file_a, file_b, weight, count, last_observed_at,
+                                         first_observed_at, window_mask, windows)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(file_a, file_b) DO UPDATE SET
                  weight = weight + excluded.weight,
                  count = count + excluded.count,
@@ -200,8 +306,33 @@ impl Database {
                      WHEN excluded.last_observed_at IS NULL THEN last_observed_at
                      WHEN last_observed_at IS NULL THEN excluded.last_observed_at
                      ELSE MAX(last_observed_at, excluded.last_observed_at)
-                 END",
-            rusqlite::params![lo, hi, weight_delta, count_delta, last_observed_at],
+                 END,
+                 first_observed_at = CASE
+                     WHEN first_observed_at IS NULL THEN NULL
+                     WHEN excluded.first_observed_at IS NULL THEN first_observed_at
+                     ELSE MIN(first_observed_at, excluded.first_observed_at)
+                 END,
+                 window_mask = CASE
+                     WHEN first_observed_at IS NULL THEN window_mask
+                     ELSE window_mask | excluded.window_mask
+                 END
+             RETURNING window_mask",
+            rusqlite::params![
+                lo,
+                hi,
+                w.weight,
+                w.count,
+                w.last_observed_at,
+                w.first_observed_at,
+                w.window_mask as i64,
+                windows_of(w.window_mask)
+            ],
+            |r| r.get(0),
+        )?;
+        // SQLite has no popcount; derive `windows` from the merged mask here.
+        self.conn.execute(
+            "UPDATE git_co_changes SET windows = ?3 WHERE file_a = ?1 AND file_b = ?2",
+            rusqlite::params![lo, hi, windows_of(merged_mask as u64)],
         )?;
         Ok(())
     }
@@ -262,6 +393,48 @@ impl Database {
         Ok(out)
     }
 
+    /// True when at least one stored pair is recurring (observation span of
+    /// [`RECURRING_SPAN_SECS`] or more). False across the whole table means
+    /// either the index predates the recurrence columns (populated by the
+    /// next `git-index --full`) or no pair really recurs; `find_coupling`
+    /// combines this with the history span to tell the two apart.
+    pub fn any_co_change_recurring(&self) -> Result<bool> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM git_co_changes
+                           WHERE last_observed_at - first_observed_at >= ?1)",
+            rusqlite::params![RECURRING_SPAN_SECS],
+            |r| r.get(0),
+        )?;
+        Ok(exists)
+    }
+
+    /// True when some pair still has no `first_observed_at`: rows written
+    /// before migration 0017 that no `git-index --full` has rewritten yet.
+    pub fn any_co_change_missing_first_observed(&self) -> Result<bool> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM git_co_changes WHERE first_observed_at IS NULL)",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(exists)
+    }
+
+    /// Oldest and newest co-change observation across the whole table, in
+    /// unix seconds; `None` when no pair carries timestamps. Bounds how much
+    /// history the recurrence signal has had to work with.
+    pub fn co_change_history_span(&self) -> Result<Option<(i64, i64)>> {
+        let (first, last): (Option<i64>, Option<i64>) = self.conn.query_row(
+            "SELECT MIN(COALESCE(first_observed_at, last_observed_at)), MAX(last_observed_at)
+             FROM git_co_changes",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(match (first, last) {
+            (Some(f), Some(l)) => Some((f, l)),
+            _ => None,
+        })
+    }
+
     /// Fetch git_files row for one path, if present.
     pub fn git_file(&self, path: &str) -> Result<Option<GitFileRow>> {
         let mut stmt = self.conn.prepare(
@@ -283,42 +456,86 @@ impl Database {
     }
 
     /// Top N files that historically co-change with `path`. Returns the OTHER file in each
-    /// pair, weight-sorted descending.
+    /// pair, weight-sorted descending. Raw-weight order; see
+    /// [`Database::co_changes_for_ranked`] for the recurrence-aware order.
     pub fn co_changes_for(&self, path: &str, limit: usize) -> Result<Vec<CoChangeRow>> {
+        self.co_changes_for_ranked(path, limit, 1.0)
+    }
+
+    /// Like [`Database::co_changes_for`], but ranks by `weight *
+    /// one_off_multiplier` for pairs whose observation span is under
+    /// [`RECURRING_SPAN_SECS`] or unknown (legacy rows with a NULL
+    /// `first_observed_at`); recurring pairs keep their raw weight. The
+    /// returned `weight` is the raw stored value either way; only the order
+    /// changes. Pass `1.0` for raw-weight order.
+    pub fn co_changes_for_ranked(
+        &self,
+        path: &str,
+        limit: usize,
+        one_off_multiplier: f64,
+    ) -> Result<Vec<CoChangeRow>> {
         // Pair is stored with file_a < file_b. For a given path, results live on
-        // either side, so query both columns and union-rank.
+        // either side, so query both columns and union-rank. The LEFT JOIN
+        // picks up the other file's commit total for the reverse confidence;
+        // a missing git_files row reads as 0.
         let mut stmt = self.conn.prepare(
-            "SELECT other, weight, count, last_observed_at FROM (
-                 SELECT file_b AS other, weight, count, last_observed_at
+            "SELECT p.other, p.weight, p.count, p.last_observed_at, p.windows,
+                    COALESCE(g.total_commits, 0), p.first_observed_at, p.window_mask
+             FROM (
+                 SELECT file_b AS other, weight, count, last_observed_at, windows,
+                        first_observed_at, window_mask
                  FROM git_co_changes WHERE file_a = ?1
                  UNION ALL
-                 SELECT file_a AS other, weight, count, last_observed_at
+                 SELECT file_a AS other, weight, count, last_observed_at, windows,
+                        first_observed_at, window_mask
                  FROM git_co_changes WHERE file_b = ?1
-             ) ORDER BY weight DESC, other LIMIT ?2",
+             ) AS p
+             LEFT JOIN git_files AS g ON g.path = p.other
+             ORDER BY p.weight * (CASE
+                          WHEN COALESCE(p.last_observed_at - p.first_observed_at, -1) >= ?4
+                          THEN 1.0 ELSE ?3 END) DESC,
+                      p.other
+             LIMIT ?2",
         )?;
         let rows = stmt
-            .query_map(rusqlite::params![path, limit as i64], |row| {
-                Ok(CoChangeRow {
-                    file: row.get(0)?,
-                    weight: row.get(1)?,
-                    count: row.get::<_, i64>(2)? as u32,
-                    last_observed_at: row.get(3)?,
-                })
-            })?
+            .query_map(
+                rusqlite::params![path, limit as i64, one_off_multiplier, RECURRING_SPAN_SECS],
+                |row| Self::co_change_row_from(row, 0),
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
+    /// Decode a `CoChangeRow` from a result row whose columns start at `off`
+    /// in the order `other, weight, count, last_observed_at, windows,
+    /// other_commits, first_observed_at, window_mask`.
+    fn co_change_row_from(row: &rusqlite::Row<'_>, off: usize) -> rusqlite::Result<CoChangeRow> {
+        Ok(CoChangeRow {
+            file: row.get(off)?,
+            weight: row.get(off + 1)?,
+            count: row.get::<_, i64>(off + 2)? as u32,
+            last_observed_at: row.get(off + 3)?,
+            windows: row.get::<_, i64>(off + 4)?.max(1) as u32,
+            other_commits: row.get::<_, i64>(off + 5)?.max(0) as u32,
+            first_observed_at: row.get(off + 6)?,
+            window_mask: row.get::<_, i64>(off + 7)? as u64,
+        })
+    }
+
     /// Top-`limit` co-changing files for every path in `paths`, in one query.
-    /// Bulk counterpart of [`Database::co_changes_for`] for callers scoring
-    /// many files at once. One row-numbered pass over the union of both pair
-    /// sides reproduces the per-file `ORDER BY weight DESC, other LIMIT`
-    /// exactly, ties included. Every requested path is present in the map,
-    /// with an empty vec when it has no recorded pairs.
+    /// Bulk counterpart of [`Database::co_changes_for_ranked`] for callers
+    /// scoring many files at once (`recommend_tests`' coupled bucket):
+    /// `one_off_multiplier` demotes pairs whose span is under
+    /// [`RECURRING_SPAN_SECS`] or unknown, `1.0` for raw order. One
+    /// row-numbered pass over the union of both pair sides reproduces the
+    /// per-file `ORDER BY ... LIMIT` exactly, ties included, so it agrees
+    /// with `find_coupling`. Every requested path is present in the map, with
+    /// an empty vec when it has no recorded pairs.
     pub fn co_changes_for_many(
         &self,
         paths: &[&str],
         limit: usize,
+        one_off_multiplier: f64,
     ) -> Result<std::collections::HashMap<String, Vec<CoChangeRow>>> {
         use std::collections::{HashMap, HashSet};
         let mut out: HashMap<String, Vec<CoChangeRow>> = HashMap::new();
@@ -345,40 +562,48 @@ impl Database {
         for (i, _) in unique.iter().enumerate() {
             let param = format!("?{}", i + 1);
             arms.push(format!(
-                "SELECT {param} AS qpath, file_b AS other, weight, count AS cnt, last_observed_at \
+                "SELECT {param} AS qpath, file_b AS other, weight, count AS cnt, \
+                 last_observed_at, windows, first_observed_at, window_mask \
                  FROM git_co_changes WHERE file_a = {param}"
             ));
             arms.push(format!(
-                "SELECT {param} AS qpath, file_a AS other, weight, count AS cnt, last_observed_at \
+                "SELECT {param} AS qpath, file_a AS other, weight, count AS cnt, \
+                 last_observed_at, windows, first_observed_at, window_mask \
                  FROM git_co_changes WHERE file_b = {param}"
             ));
         }
         let limit_param = format!("?{}", unique.len() + 1);
+        let multiplier_param = format!("?{}", unique.len() + 2);
         let sql = format!(
-            "SELECT qpath, other, weight, cnt, last_observed_at FROM (
-               SELECT qpath, other, weight, cnt, last_observed_at,
-                      ROW_NUMBER() OVER (PARTITION BY qpath ORDER BY weight DESC, other) AS rn
+            "SELECT r.qpath, r.other, r.weight, r.cnt, r.last_observed_at, r.windows,
+                    COALESCE(g.total_commits, 0), r.first_observed_at, r.window_mask
+             FROM (
+               SELECT qpath, other, weight, cnt, last_observed_at, windows,
+                      first_observed_at, window_mask,
+                      ROW_NUMBER() OVER (
+                          PARTITION BY qpath
+                          ORDER BY weight * (CASE
+                              WHEN COALESCE(last_observed_at - first_observed_at, -1)
+                                   >= {RECURRING_SPAN_SECS}
+                              THEN 1.0 ELSE {multiplier_param} END) DESC,
+                              other
+                      ) AS rn
                FROM ({})
-             ) WHERE rn <= {limit_param}",
+             ) AS r
+             LEFT JOIN git_files AS g ON g.path = r.other
+             WHERE r.rn <= {limit_param}",
             arms.join(" UNION ALL ")
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let mut bound: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(unique.len() + 1);
+        let mut bound: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(unique.len() + 2);
         for p in &unique {
             bound.push(p);
         }
         let limit_i64 = limit as i64;
         bound.push(&limit_i64);
+        bound.push(&one_off_multiplier);
         let rows = stmt.query_map(bound.as_slice(), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                CoChangeRow {
-                    file: row.get(1)?,
-                    weight: row.get(2)?,
-                    count: row.get::<_, i64>(3)? as u32,
-                    last_observed_at: row.get(4)?,
-                },
-            ))
+            Ok((row.get::<_, String>(0)?, Self::co_change_row_from(row, 1)?))
         })?;
         for row in rows {
             let (qpath, co) = row?;
@@ -440,7 +665,139 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use super::Database;
+    use super::{CoChangeWrite, Database, RECURRING_SPAN_SECS};
+
+    /// A row indexed before migration 0017 carries `first_observed_at IS NULL`
+    /// and `window_mask = 0`. Incremental deltas must leave both alone (a
+    /// delta's oldest commit is not the pair's, and a mask from a partial
+    /// range misleads), so NULL stays the "not baselined" marker and the row
+    /// ranks as one-off until a `--full` pass rewrites it.
+    #[test]
+    fn incremental_delta_onto_legacy_row_with_null_first_observed_at() {
+        let db = Database::open_in_memory().unwrap();
+        let t = 1_750_000_000_i64;
+        db.conn
+            .execute(
+                "INSERT INTO git_co_changes (file_a, file_b, weight, count, last_observed_at)
+                 VALUES ('a.rs', 'b.rs', 2.0, 3, ?1)",
+                rusqlite::params![t - 100 * 86_400],
+            )
+            .unwrap();
+        let legacy = &db.co_changes_for("a.rs", 10).unwrap()[0];
+        assert_eq!(legacy.first_observed_at, None);
+        assert_eq!((legacy.window_mask, legacy.windows), (0, 1));
+        // Unknown span ranks as one-off: a 40-day recurring peer at lower
+        // weight comes first under the multiplier.
+        db.upsert_git_co_change_full(
+            "a.rs",
+            "peer.rs",
+            &CoChangeWrite {
+                weight: 1.6,
+                count: 3,
+                window_mask: 0b1,
+                first_observed_at: Some(t - 40 * 86_400),
+                last_observed_at: Some(t),
+            },
+        )
+        .unwrap();
+        let ranked = db
+            .co_changes_for_ranked("a.rs", 10, super::ONE_OFF_RANK_MULTIPLIER)
+            .unwrap();
+        assert_eq!(
+            ranked[0].file, "peer.rs",
+            "NULL span must not rank as recurring"
+        );
+
+        // The incremental delta: one commit now, 100 days after the legacy last.
+        db.incr_git_co_change_full(
+            "a.rs",
+            "b.rs",
+            &CoChangeWrite {
+                weight: 0.5,
+                count: 1,
+                window_mask: 0b100,
+                first_observed_at: Some(t),
+                last_observed_at: Some(t),
+            },
+        )
+        .unwrap();
+        let row = db
+            .co_changes_for("a.rs", 10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.file == "b.rs")
+            .unwrap();
+        assert_eq!(row.count, 4);
+        assert_eq!(row.weight, 2.5);
+        assert_eq!(
+            row.first_observed_at, None,
+            "an incremental delta must not baseline a legacy row"
+        );
+        assert_eq!(row.last_observed_at, Some(t));
+        assert_eq!(
+            (row.window_mask, row.windows),
+            (0, 1),
+            "no partial-range mask on an unbaselined row"
+        );
+        // A second delta 30 days later changes nothing about that: still
+        // unknown span, still one-off, still no recurring pair in the table.
+        db.incr_git_co_change_full(
+            "a.rs",
+            "b.rs",
+            &CoChangeWrite {
+                weight: 0.5,
+                count: 1,
+                window_mask: 0b100,
+                first_observed_at: Some(t + 30 * 86_400),
+                last_observed_at: Some(t + 30 * 86_400),
+            },
+        )
+        .unwrap();
+        let row = db
+            .co_changes_for("a.rs", 10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.file == "b.rs")
+            .unwrap();
+        assert_eq!(row.first_observed_at, None);
+        assert_eq!((row.window_mask, row.windows), (0, 1));
+        assert!(db.any_co_change_missing_first_observed().unwrap());
+        // peer.rs spans 40 days, so the table does have a recurring pair; the
+        // legacy row is not it.
+        let ranked = db
+            .co_changes_for_ranked("a.rs", 10, super::ONE_OFF_RANK_MULTIPLIER)
+            .unwrap();
+        assert_eq!(
+            ranked[0].file, "peer.rs",
+            "legacy 3.0 * 0.5 = 1.5 stays below the 1.6 recurring peer"
+        );
+
+        // Only a full rewrite baselines the row.
+        db.upsert_git_co_change_full(
+            "a.rs",
+            "b.rs",
+            &CoChangeWrite {
+                weight: 3.0,
+                count: 5,
+                window_mask: 0b101,
+                first_observed_at: Some(t - 100 * 86_400),
+                last_observed_at: Some(t + 30 * 86_400),
+            },
+        )
+        .unwrap();
+        let row = db
+            .co_changes_for("a.rs", 10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.file == "b.rs")
+            .unwrap();
+        assert_eq!(row.first_observed_at, Some(t - 100 * 86_400));
+        assert_eq!((row.window_mask, row.windows), (0b101, 2));
+        assert!(!db.any_co_change_missing_first_observed().unwrap());
+        assert!(
+            row.last_observed_at.unwrap() - row.first_observed_at.unwrap() >= RECURRING_SPAN_SECS
+        );
+    }
 
     /// Tied weights at the LIMIT boundary must not let the cap pick an
     /// arbitrary subset: without a secondary sort key, which peers survive
@@ -579,13 +936,15 @@ mod tests {
 
         let paths = ["target.rs", "solo.rs", "unknown.rs", "target.rs"];
         let bulk = db
-            .co_changes_for_many(&paths, 3)
+            .co_changes_for_many(&paths, 3, super::ONE_OFF_RANK_MULTIPLIER)
             .expect("batch co-change lookup");
         // Every requested path is present, even the unknown and duplicated one.
         assert_eq!(bulk.len(), 3);
         assert!(bulk["unknown.rs"].is_empty());
         for p in ["target.rs", "solo.rs"] {
-            let single = db.co_changes_for(p, 3).unwrap();
+            let single = db
+                .co_changes_for_ranked(p, 3, super::ONE_OFF_RANK_MULTIPLIER)
+                .unwrap();
             let batch = &bulk[p];
             assert_eq!(
                 batch.len(),
@@ -602,7 +961,77 @@ mod tests {
         // The tie under the cap resolves the same total order both ways.
         let files: Vec<&str> = bulk["target.rs"].iter().map(|r| r.file.as_str()).collect();
         assert_eq!(files, vec!["heavy.rs", "a.rs", "b.rs"]);
-        assert!(db.co_changes_for_many(&[], 3).unwrap().is_empty());
+        assert!(db.co_changes_for_many(&[], 3, 1.0).unwrap().is_empty());
+    }
+
+    /// The bulk path feeds `recommend_tests`' coupled bucket; it must apply
+    /// the same span-based demotion as `find_coupling`, so a heavier one-off
+    /// pair ranks below a lighter recurring one and the per-path cap cuts the
+    /// one-off, not the recurring pair.
+    #[test]
+    fn co_changes_for_many_demotes_one_off_pairs_like_find_coupling() {
+        let db = Database::open_in_memory().unwrap();
+        let t = 1_750_000_000_i64;
+        // one-off: 5.0 raw, 3 days of span (halves to 2.5).
+        db.upsert_git_co_change_full(
+            "target.rs",
+            "one-off.rs",
+            &CoChangeWrite {
+                weight: 5.0,
+                count: 4,
+                window_mask: 0b1,
+                first_observed_at: Some(t - 3 * 86_400),
+                last_observed_at: Some(t),
+            },
+        )
+        .unwrap();
+        // recurring: 3.0 raw, 45 days of span (keeps 3.0).
+        db.upsert_git_co_change_full(
+            "target.rs",
+            "recurring.rs",
+            &CoChangeWrite {
+                weight: 3.0,
+                count: 3,
+                window_mask: 0b1,
+                first_observed_at: Some(t - 45 * 86_400),
+                last_observed_at: Some(t),
+            },
+        )
+        .unwrap();
+        // legacy: 4.0 raw, unknown span (halves to 2.0).
+        db.conn
+            .execute(
+                "INSERT INTO git_co_changes (file_a, file_b, weight, count, last_observed_at)
+                 VALUES ('legacy.rs', 'target.rs', 4.0, 3, ?1)",
+                rusqlite::params![t],
+            )
+            .unwrap();
+
+        let bulk = db
+            .co_changes_for_many(&["target.rs"], 10, super::ONE_OFF_RANK_MULTIPLIER)
+            .unwrap();
+        let files: Vec<&str> = bulk["target.rs"].iter().map(|r| r.file.as_str()).collect();
+        assert_eq!(files, vec!["recurring.rs", "one-off.rs", "legacy.rs"]);
+        // Raw weights are reported.
+        assert_eq!(bulk["target.rs"][1].weight, 5.0);
+
+        let capped = db
+            .co_changes_for_many(&["target.rs"], 1, super::ONE_OFF_RANK_MULTIPLIER)
+            .unwrap();
+        assert_eq!(capped["target.rs"].len(), 1);
+        assert_eq!(capped["target.rs"][0].file, "recurring.rs");
+
+        // Agrees with the per-file recurrence-ranked query.
+        let single = db
+            .co_changes_for_ranked("target.rs", 10, super::ONE_OFF_RANK_MULTIPLIER)
+            .unwrap();
+        let single_files: Vec<&str> = single.iter().map(|r| r.file.as_str()).collect();
+        assert_eq!(files, single_files);
+
+        // Multiplier 1.0 restores raw-weight order (the env toggle's path).
+        let raw = db.co_changes_for_many(&["target.rs"], 10, 1.0).unwrap();
+        let raw_files: Vec<&str> = raw["target.rs"].iter().map(|r| r.file.as_str()).collect();
+        assert_eq!(raw_files, vec!["one-off.rs", "legacy.rs", "recurring.rs"]);
     }
 
     /// Reversed pairs must land on the same stored row, not a mirrored

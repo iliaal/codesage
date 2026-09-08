@@ -47,6 +47,18 @@ pub(crate) fn cmd_git_index(
     Ok(())
 }
 
+/// Row suffix for the `coupling` and `risk` tables: an unbaselined row is not
+/// a measured one-off, so it gets its own marker.
+fn span_marker(span_known: bool, recurring: bool) -> &'static str {
+    if !span_known {
+        "  (span unknown)"
+    } else if recurring {
+        ""
+    } else {
+        "  (one-off)"
+    }
+}
+
 pub(crate) fn cmd_coupling(file: &str, limit: usize, json: bool) -> Result<()> {
     let root = find_project_root()?;
     let db = open_db(&root)?;
@@ -64,8 +76,27 @@ pub(crate) fn cmd_coupling(file: &str, limit: usize, json: bool) -> Result<()> {
             "Files that historically change with {file} ({} commits tracked):",
             report.file_commits
         );
+        println!("  weight  count  windows  span   P(other|this)  P(this|other)  file");
+        println!(
+            "  (one-off) = span under 30 days; (span unknown) = indexed before recurrence \
+             tracking, run `git-index --full`. Both rank at half weight by default; \
+             CODESAGE_COUPLING_RECURRENCE=0 or false restores raw weight order."
+        );
         for e in &report.coupled {
-            println!("  {:>6.2}  {:>4}x  {}", e.weight, e.count, e.file);
+            println!(
+                "  {:>6.2}  {:>4}x  {:>6}w  {:>4}d  {:>13.2}  {:>13.2}  {}{}",
+                e.weight,
+                e.count,
+                e.recurrence,
+                e.span_days,
+                e.confidence,
+                e.reverse_confidence,
+                e.file,
+                span_marker(e.span_known, e.recurring)
+            );
+        }
+        if let Some(note) = &report.note {
+            println!("  Note: {note}");
         }
     }
     Ok(())
@@ -108,9 +139,21 @@ pub(crate) fn cmd_risk(file: &str, json: bool) -> Result<()> {
             }
         }
         if !assessment.top_coupled.is_empty() {
-            println!("  Top coupled:");
+            println!("  Top coupled (weight, count, span):");
+            println!(
+                "    (one-off) = span under 30 days; (span unknown) = indexed before recurrence \
+                 tracking, run `git-index --full`. Both rank at half weight by default; \
+                 CODESAGE_COUPLING_RECURRENCE=0 or false restores raw weight order."
+            );
             for c in assessment.top_coupled.iter().take(5) {
-                println!("    {:>5.2}  {}", c.weight, c.file);
+                println!(
+                    "    {:>5.2}  {:>3}x  {:>4}d  {}{}",
+                    c.weight,
+                    c.count,
+                    c.span_days,
+                    c.file,
+                    span_marker(c.span_known, c.recurring)
+                );
             }
         }
         if !assessment.top_symbols.is_empty() {

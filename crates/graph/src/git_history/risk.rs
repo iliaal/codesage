@@ -79,15 +79,146 @@ type CycleComponentCache = HashMap<String, (CycleToken, Arc<Vec<Vec<String>>>)>;
 static IMPORT_CYCLE_CACHE: LazyLock<Mutex<CycleComponentCache>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Env knob for the recurrence rank multiplier in `find_coupling`. Set to `0`
+/// or `false` to rank by raw weight alone.
+pub const COUPLING_RECURRENCE_ENV: &str = "CODESAGE_COUPLING_RECURRENCE";
+
+/// `count / total` as a probability; 0.0 when the denominator is unknown.
+/// The pair count can exceed a stale `git_files` total only on an index
+/// whose two tables were written by different passes, so clamp rather than
+/// report an impossible value.
+fn conditional_probability(count: u32, total: u32) -> f32 {
+    if total == 0 {
+        0.0
+    } else {
+        (count as f32 / total as f32).min(1.0)
+    }
+}
+
+/// Days a pair must keep co-changing before it counts as recurring. Span is
+/// the sole criterion: the 90-day window count (`recurrence`) is informational
+/// because two commits seconds apart can straddle a fixed grid boundary.
+pub(crate) const RECURRING_SPAN_DAYS: u32 =
+    (codesage_storage::db::RECURRING_SPAN_SECS / 86_400) as u32;
+
+pub(crate) fn days_between(first: Option<i64>, last: Option<i64>) -> u32 {
+    match (first, last) {
+        (Some(f), Some(l)) if l > f => ((l - f) / 86_400) as u32,
+        _ => 0,
+    }
+}
+
+/// The span rule every coupling consumer applies: `find_coupling` rows,
+/// `assess_risk.top_coupled`, and `recommend_tests.coupled`.
+pub(crate) fn is_recurring(span_days: u32) -> bool {
+    span_days >= RECURRING_SPAN_DAYS
+}
+
+/// Rank multiplier for non-recurring pairs, honoring
+/// `CODESAGE_COUPLING_RECURRENCE=0` (raw order) the same way in every
+/// consumer.
+pub(crate) fn one_off_multiplier_from_env() -> f64 {
+    one_off_multiplier(crate::search::env_default_on(COUPLING_RECURRENCE_ENV))
+}
+
+pub(crate) fn one_off_multiplier(recurrence_rank: bool) -> f64 {
+    if recurrence_rank {
+        codesage_storage::db::ONE_OFF_RANK_MULTIPLIER
+    } else {
+        1.0
+    }
+}
+
+/// `"within N days"`, or `"within a day"` when the span rounds to zero (a
+/// pair needs three shared commits to be stored, so a zero span is a burst
+/// inside one day, not one commit).
+fn span_phrase(max_span: u32) -> String {
+    if max_span == 0 {
+        "within a day".to_string()
+    } else {
+        format!("within {max_span} days")
+    }
+}
+
 /// Map a storage `CoChangeRow` into the protocol `CoChangeEntry`. Shared by
 /// `find_coupling` and `assess_risk`, which read the same co-change rows.
-fn to_co_change_entry(r: CoChangeRow) -> CoChangeEntry {
+/// `this_commits` is the queried file's `git_files.total_commits`, the
+/// denominator of the forward confidence; the row carries the other side's.
+fn to_co_change_entry(r: CoChangeRow, this_commits: u32) -> CoChangeEntry {
+    let span_days = days_between(r.first_observed_at, r.last_observed_at);
     CoChangeEntry {
         file: r.file,
         weight: r.weight,
         count: r.count,
         last_observed_at: r.last_observed_at,
+        recurrence: r.windows,
+        span_days,
+        span_known: r.first_observed_at.is_some(),
+        confidence: conditional_probability(r.count, this_commits),
+        reverse_confidence: conditional_probability(r.count, r.other_commits),
+        recurring: is_recurring(span_days),
     }
+}
+
+/// Rows on a page whose span is unknown: `first_observed_at IS NULL`, written
+/// before migration 0017 and not yet baselined by a `--full` pass. Their
+/// `span_days` reads 0 and `recurring` false, which is not evidence of a
+/// burst.
+fn span_unknown_count(rows: &[CoChangeRow]) -> usize {
+    rows.iter()
+        .filter(|r| r.first_observed_at.is_none())
+        .count()
+}
+
+/// Wording shared by `find_coupling`, `assess_risk`, and `recommend_tests`
+/// when `unknown` displayed pairs (described by `scope`, e.g. "these 5
+/// pairs") have no baselined span.
+pub(crate) fn span_unknown_note(unknown: usize, scope: &str) -> String {
+    format!(
+        "span unknown for {unknown} of {scope} (indexed before recurrence tracking); run \
+         `codesage git-index --full` to populate it"
+    )
+}
+
+/// Note for a non-empty page on which no pair is `recurring` and every span
+/// is known, decided from what the whole `git_co_changes` table can show.
+/// Each probe runs only when the earlier arms did not decide.
+fn one_off_page_note(db: &Database, coupled: &[CoChangeEntry]) -> Result<String> {
+    let span = span_phrase(coupled.iter().map(|e| e.span_days).max().unwrap_or(0));
+    let threshold = RECURRING_SPAN_DAYS;
+    // A recurring pair anywhere in the index proves the data is populated:
+    // this page is short-burst evidence.
+    if db.any_co_change_recurring()? {
+        return Ok(format!(
+            "every returned pair co-changed only {span}; short-burst evidence (one mass \
+             commit or a brief stretch of work), not a recurring pattern"
+        ));
+    }
+    // Rows elsewhere without first_observed_at make the table-wide span read
+    // 0, so they must be checked before the span-based arms or the reindex
+    // hint is never offered.
+    if db.any_co_change_missing_first_observed()? {
+        return Ok(format!(
+            "every returned pair co-changed {span}, and no baselined pair in the index spans \
+             {threshold}+ days; some pairs predate recurrence tracking, so run \
+             `codesage git-index --full` to populate it"
+        ));
+    }
+    // Oldest-to-newest pair observation across surviving pairs (not repo
+    // history): under the threshold, recurrence could not have been seen yet.
+    let history_span_days = db
+        .co_change_history_span()?
+        .map(|(first, last)| days_between(Some(first), Some(last)));
+    Ok(match history_span_days {
+        Some(days) if days < threshold => format!(
+            "indexed co-change evidence spans only {days} days; recurrence cannot be \
+             observed yet, and every returned pair co-changed {span}"
+        ),
+        _ => format!(
+            "no pair in this history spans {threshold}+ days; this project's coupling is \
+             short-burst throughout, and every returned pair co-changed {span}"
+        ),
+    })
 }
 
 /// Top-N files that historically co-change with `file_path`, wrapped in a
@@ -95,22 +226,60 @@ fn to_co_change_entry(r: CoChangeRow) -> CoChangeEntry {
 /// disambiguation an agent needs: was the file never indexed, does it have
 /// history but no pair above the co-change threshold, or was the path wrong.
 ///
+/// Rows are ranked by decayed weight, halved for pairs that are not
+/// `recurring` (observation span under 30 days, or unknown on a legacy row;
+/// [`codesage_storage::db::ONE_OFF_RANK_MULTIPLIER`]), so a pair that kept
+/// co-changing over a month or more outranks a one-off mass commit of equal
+/// raw weight. `CODESAGE_COUPLING_RECURRENCE=0` restores raw-weight order.
+/// The reported `weight` is the raw value in both modes.
+///
 /// Schema change from the pre-0.4.1 `Vec<CoChangeEntry>` return type: callers
 /// that read the MCP `find_coupling` response should now index into
 /// `result.coupled` instead of treating the result as a bare array.
 pub fn find_coupling(db: &Database, file_path: &str, limit: usize) -> Result<CouplingReport> {
-    let rows = db.co_changes_for(file_path, limit)?;
-    let coupled: Vec<CoChangeEntry> = rows.into_iter().map(to_co_change_entry).collect();
+    find_coupling_ranked(
+        db,
+        file_path,
+        limit,
+        crate::search::env_default_on(COUPLING_RECURRENCE_ENV),
+    )
+}
 
+/// [`find_coupling`] with the recurrence rank multiplier as a parameter
+/// instead of an env read, so the two orders are testable side by side.
+pub fn find_coupling_ranked(
+    db: &Database,
+    file_path: &str,
+    limit: usize,
+    recurrence_rank: bool,
+) -> Result<CouplingReport> {
     let git = db.git_file(file_path)?;
     let file_indexed = git.is_some();
     let file_commits = git.as_ref().map(|g| g.total_commits).unwrap_or(0);
 
-    // Note is generated only when `coupled` is empty. Distinguishes the three
-    // dominant causes so an agent can decide whether to retry, try a
-    // different tool, or warn the user that the index needs a refresh.
+    let rows = db.co_changes_for_ranked(file_path, limit, one_off_multiplier(recurrence_rank))?;
+    let span_unknown = span_unknown_count(&rows);
+    let coupled: Vec<CoChangeEntry> = rows
+        .into_iter()
+        .map(|r| to_co_change_entry(r, file_commits))
+        .collect();
+
+    // Note distinguishes the three dominant empty-result causes so an agent
+    // can decide whether to retry, try a different tool, or warn the user
+    // that the index needs a refresh. A non-empty page gets a note when any
+    // row's span is unknown (its `recurring: false` is not evidence) or when
+    // no pair on it is recurring.
     let note = if !coupled.is_empty() {
-        None
+        if span_unknown > 0 {
+            Some(span_unknown_note(
+                span_unknown,
+                &format!("these {} pairs", coupled.len()),
+            ))
+        } else if coupled.iter().all(|e| !e.recurring) {
+            Some(one_off_page_note(db, &coupled)?)
+        } else {
+            None
+        }
     } else if !file_indexed {
         Some(
             "file has no git history (not tracked by git, no commits yet, or path shape \
@@ -225,9 +394,28 @@ fn assess_risk_with_context(
         0.0
     };
 
+    // Coupling pressure reads the raw top-10 set; the reported `top_coupled`
+    // list is the recurrence-ranked page so it agrees with `find_coupling`.
+    // The two differ only when a one-off or unknown-span pair is demoted out
+    // of or into the ten, so the coupled-test check looks at both pages and
+    // the note names a test that only the raw page holds.
     let coupled = db.co_changes_for(file_path, 10)?;
     let coupled_files = coupled.len() as u32;
-    let top_coupled: Vec<CoChangeEntry> = coupled.into_iter().map(to_co_change_entry).collect();
+    let ranked = db.co_changes_for_ranked(file_path, 10, one_off_multiplier_from_env())?;
+    let is_test = |file: &str| matches!(FileCategory::classify(file), FileCategory::Test);
+    let has_coupled_test = coupled
+        .iter()
+        .chain(ranked.iter())
+        .any(|e| is_test(&e.file));
+    let hidden_coupled_tests: Vec<_> = coupled
+        .iter()
+        .filter(|e| is_test(&e.file) && !ranked.iter().any(|r| r.file == e.file))
+        .collect();
+    let top_coupled_span_unknown = span_unknown_count(&ranked);
+    let top_coupled: Vec<CoChangeEntry> = ranked
+        .into_iter()
+        .map(|r| to_co_change_entry(r, total_commits))
+        .collect();
 
     // Reverse-dependency pressure and structural test coverage share one
     // traversal: `impact_analysis` applies `source_only` as a final filter, so
@@ -267,9 +455,6 @@ fn assess_risk_with_context(
     // a sibling nor a co-change record, and without this would be reported as
     // untested. Keep the nearest test dependent so the note can name a test the
     // agent can actually run.
-    let has_coupled_test = top_coupled
-        .iter()
-        .any(|e| matches!(FileCategory::classify(&e.file), FileCategory::Test));
     let has_sibling_test = test_sibling_exists(db, file_path)
         .with_context(|| format!("checking sibling test for risk({file_path})"))?;
     let dependent_test = dependents
@@ -367,8 +552,44 @@ fn assess_risk_with_context(
             "high coupling: {coupled_files} files historically change with this"
         ));
     }
+    if top_coupled_span_unknown > 0 {
+        notes.push(span_unknown_note(
+            top_coupled_span_unknown,
+            &format!("this file's top {} co-change pairs", top_coupled.len()),
+        ));
+    }
     if test_gap {
         notes.push(test_gap_note(no_symbols, walk_capped));
+    } else if !hidden_coupled_tests.is_empty() && !top_coupled.iter().any(|e| is_test(&e.file)) {
+        // `test_gap` is false on the strength of tests the displayed list
+        // does not show: they sit in the raw top ten but were demoted below
+        // the recurrence-ranked ten. Say so, or the two fields contradict.
+        for (unknown, label) in [(false, "one-off"), (true, "span unknown")] {
+            let tests: Vec<&str> = hidden_coupled_tests
+                .iter()
+                .filter(|e| e.first_observed_at.is_none() == unknown)
+                .map(|e| e.file.as_str())
+                .collect();
+            if tests.is_empty() {
+                continue;
+            }
+            let shown = &tests[..tests.len().min(3)];
+            let more = tests.len() - shown.len();
+            let suffix = if more > 0 {
+                format!(" (+{more} more)")
+            } else {
+                String::new()
+            };
+            let remedy = if unknown {
+                "; indexed before recurrence tracking, run `codesage git-index --full`"
+            } else {
+                ""
+            };
+            notes.push(format!(
+                "{label} coupled test(s) exist below the ranked `top_coupled` list: {}{suffix}{remedy}",
+                shown.join(", ")
+            ));
+        }
     } else if !has_sibling_test
         && !has_coupled_test
         && let Some(t) = dependent_test

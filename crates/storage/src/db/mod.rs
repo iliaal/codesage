@@ -33,7 +33,9 @@ mod git_hist;
 mod semantic;
 mod structural;
 
-pub use git_hist::{CoChangeRow, GitFileRow};
+pub use git_hist::{
+    CoChangeRow, CoChangeWrite, GitFileRow, ONE_OFF_RANK_MULTIPLIER, RECURRING_SPAN_SECS,
+};
 pub use semantic::{RawSearchRow, SemanticFreshness, SemanticValidityToken, embedding_to_bytes};
 pub use structural::{FingerprintInput, StoredFingerprint};
 

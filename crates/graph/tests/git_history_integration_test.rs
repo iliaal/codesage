@@ -547,6 +547,197 @@ fn full_then_incremental_matches_pristine_full_scan() {
     );
 }
 
+/// Commit the working tree with both git dates pinned to `unix_ts`, so the
+/// indexer's 90-day window numbering sees controlled timestamps.
+fn commit_at(root: &std::path::Path, subject: &str, unix_ts: i64) {
+    run_git(root, &["add", "."]);
+    // Git's internal date format: `<unix-timestamp> <tz-offset>`.
+    let date = format!("{unix_ts} +0000");
+    let status = Command::new("git")
+        .args(["commit", "-qm", subject])
+        .env("GIT_AUTHOR_DATE", &date)
+        .env("GIT_COMMITTER_DATE", &date)
+        .current_dir(root)
+        .status()
+        .expect("git commit starts");
+    assert!(status.success(), "git commit at {unix_ts} failed");
+}
+
+const DAY: i64 = 86_400;
+const WINDOW: i64 = 90 * DAY;
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// Write a fresh body to a.rs and b.rs and commit both at `ts`.
+fn commit_pair_at(root: &std::path::Path, tag: u32, ts: i64) {
+    std::fs::write(root.join("a.rs"), format!("fn a() {{ let _ = {tag}; }}\n")).unwrap();
+    std::fs::write(root.join("b.rs"), format!("fn b() {{ let _ = {tag}; }}\n")).unwrap();
+    commit_at(root, &format!("feat: {tag}"), ts);
+}
+
+/// Every recurrence-bearing column of the (a.rs, b.rs) row.
+fn pair_state(db: &Database) -> (u32, u32, u64, Option<i64>, Option<i64>) {
+    let rows = db.co_changes_for("a.rs", 10).unwrap();
+    assert_eq!(rows.len(), 1, "exactly one pair expected: {rows:?}");
+    assert_eq!(rows[0].file, "b.rs");
+    let r = &rows[0];
+    (
+        r.count,
+        r.windows,
+        r.window_mask,
+        r.first_observed_at,
+        r.last_observed_at,
+    )
+}
+
+#[test]
+fn incremental_recurrence_matches_full_at_every_step_over_300_days() {
+    // The reviewer's repro: three co-changes ~300 days back, then ten more
+    // 30 days apart, each followed by an incremental pass. After every step
+    // the incremental row must equal a fresh full scan bit for bit: count,
+    // windows, window_mask, first/last observation. The old newest-commit
+    // anchoring failed this at step 1 (windows never grew under
+    // --incremental); fixed-epoch numbering composes exactly.
+    let now = unix_now();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_hermetic_repo(root);
+
+    let start = now - 300 * DAY;
+    commit_pair_at(root, 1, start);
+    commit_pair_at(root, 2, start + DAY);
+    commit_pair_at(root, 3, start + 2 * DAY);
+
+    let incr_db = Database::open_in_memory().unwrap();
+    git_history_index_with_options(&incr_db, root, &[], IndexMode::Full).unwrap();
+    let (count, windows, mask, first, last) = pair_state(&incr_db);
+    assert_eq!(count, 3);
+    assert_eq!(first, Some(start));
+    assert_eq!(last, Some(start + 2 * DAY));
+    assert!(
+        (1..=2).contains(&windows),
+        "3 commits over 2 days: 1 window, 2 if split"
+    );
+    assert_eq!(mask.count_ones(), windows);
+
+    for step in 1..=10u32 {
+        let ts = start + i64::from(step) * 30 * DAY;
+        commit_pair_at(root, 3 + step, ts);
+        let incr =
+            git_history_index_with_options(&incr_db, root, &[], IndexMode::Incremental).unwrap();
+        assert_eq!(incr.commits_scanned, 1, "step {step}");
+
+        let fresh = Database::open_in_memory().unwrap();
+        git_history_index_with_options(&fresh, root, &[], IndexMode::Full).unwrap();
+        let got = pair_state(&incr_db);
+        let want = pair_state(&fresh);
+        assert_eq!(got, want, "step {step}: incremental diverged from full");
+        assert_eq!(got.0, 3 + step, "step {step}: count");
+        assert_eq!(got.4, Some(ts), "step {step}: last_observed_at");
+        assert_eq!(got.3, Some(start), "step {step}: first_observed_at");
+        // Ten 30-day steps cover 300 days: at least four 90-day windows.
+        let expected_min_windows = 1 + (step * 30) / 90;
+        assert!(
+            got.1 >= expected_min_windows,
+            "step {step}: windows {} < {expected_min_windows}",
+            got.1
+        );
+    }
+    let (count, windows, mask, ..) = pair_state(&incr_db);
+    assert_eq!(count, 13);
+    assert!(
+        windows >= 4,
+        "13 co-changes over 300 days: windows={windows}"
+    );
+    assert_eq!(mask.count_ones(), windows);
+
+    let report = find_coupling(&incr_db, "a.rs", 10).unwrap();
+    assert_eq!(report.coupled[0].recurrence, windows);
+    assert!(report.coupled[0].recurring);
+    assert_eq!(report.coupled[0].span_days, 300);
+    assert_eq!(report.coupled[0].confidence, 1.0);
+    assert_eq!(report.coupled[0].reverse_confidence, 1.0);
+    assert!(report.note.is_none());
+}
+
+#[test]
+fn hundred_day_spacing_is_one_window_per_commit_under_both_modes() {
+    // 100 > 90, so consecutive commits can never share a fixed window; four
+    // commits are four windows whether they arrive in one full scan or one
+    // at a time. Guards the off-by-one at a boundary: a commit at exactly
+    // window start belongs to the new window, not the old one.
+    let now = unix_now();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_hermetic_repo(root);
+
+    // Align the first commit on a window boundary so the boundary itself is
+    // exercised.
+    let start = ((now - 400 * DAY) / WINDOW) * WINDOW;
+    commit_pair_at(root, 1, start);
+    commit_pair_at(root, 2, start + 100 * DAY);
+    commit_pair_at(root, 3, start + 200 * DAY);
+
+    let incr_db = Database::open_in_memory().unwrap();
+    git_history_index_with_options(&incr_db, root, &[], IndexMode::Full).unwrap();
+    assert_eq!(pair_state(&incr_db).1, 3);
+
+    commit_pair_at(root, 4, start + 300 * DAY);
+    git_history_index_with_options(&incr_db, root, &[], IndexMode::Incremental).unwrap();
+    let fresh = Database::open_in_memory().unwrap();
+    git_history_index_with_options(&fresh, root, &[], IndexMode::Full).unwrap();
+    assert_eq!(pair_state(&incr_db), pair_state(&fresh));
+    assert_eq!(pair_state(&incr_db).1, 4);
+
+    // One second before the boundary stays in the previous window; the
+    // boundary second opens the next one.
+    let edge_dir = tempfile::tempdir().unwrap();
+    let edge = edge_dir.path();
+    init_hermetic_repo(edge);
+    let boundary = ((now - 100 * DAY) / WINDOW) * WINDOW;
+    commit_pair_at(edge, 1, boundary - 1);
+    commit_pair_at(edge, 2, boundary - 2);
+    commit_pair_at(edge, 3, boundary);
+    let edge_db = Database::open_in_memory().unwrap();
+    git_history_index_with_options(&edge_db, edge, &[], IndexMode::Full).unwrap();
+    assert_eq!(
+        pair_state(&edge_db).1,
+        2,
+        "boundary second starts a new window"
+    );
+}
+
+#[test]
+fn incremental_inside_one_window_does_not_grow_windows() {
+    // Delta commits landing in a window the row already has set leave
+    // `windows` unchanged and match a fresh full scan.
+    let now = unix_now();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_hermetic_repo(root);
+
+    let base = ((now - 10 * DAY) / WINDOW) * WINDOW;
+    commit_pair_at(root, 1, base + 3_600);
+    commit_pair_at(root, 2, base + 2 * 3_600);
+    commit_pair_at(root, 3, base + 3 * 3_600);
+    let db = Database::open_in_memory().unwrap();
+    git_history_index_with_options(&db, root, &[], IndexMode::Full).unwrap();
+    assert_eq!(pair_state(&db).1, 1);
+
+    commit_pair_at(root, 4, base + 4 * 3_600);
+    git_history_index_with_options(&db, root, &[], IndexMode::Incremental).unwrap();
+    let fresh = Database::open_in_memory().unwrap();
+    git_history_index_with_options(&fresh, root, &[], IndexMode::Full).unwrap();
+    assert_eq!(pair_state(&db), pair_state(&fresh));
+    assert_eq!(pair_state(&db).0, 4);
+    assert_eq!(pair_state(&db).1, 1);
+}
+
 #[test]
 fn changed_files_since_errors_on_unknown_ref() {
     let dir = tempfile::tempdir().unwrap();
