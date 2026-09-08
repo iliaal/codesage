@@ -367,11 +367,11 @@ pub fn extract_references(
     }
     let mut pending = Vec::new();
     while let Some(m) = matches.next() {
-        let Some(ref_cap) = m.captures.iter().find(|c| c.index == name_idx) else {
+        let Some(ref_cap) = m.captures().iter().find(|c| c.index == name_idx) else {
             continue;
         };
         let rhs =
-            rhs_idx.and_then(|idx| m.captures.iter().find(|c| c.index == idx).map(|c| c.node));
+            rhs_idx.and_then(|idx| m.captures().iter().find(|c| c.index == idx).map(|c| c.node));
         pending.push(Pending {
             pattern: m.pattern_index,
             node: ref_cap.node,
