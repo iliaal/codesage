@@ -306,6 +306,7 @@ const PATH_KEYS: &[&str] = &[
     "wide_blast_files",
     "fix_heavy_files",
     "hotspot_files",
+    "unscored_files",
     // `files` may contain paths or records; record fields are visited recursively.
     "files",
     "imported_by",

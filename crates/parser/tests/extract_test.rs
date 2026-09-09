@@ -899,3 +899,134 @@ class Limits {
     assert_eq!((limit.line_start, limit.line_end), (4, 4));
     assert_eq!(limit.qualified_name, "hdr::Limits::kHeaderLimit");
 }
+
+#[test]
+fn c_definitions_inside_an_if_zero_arm_are_not_symbols() {
+    // A definition parked in `#if 0` exists in no build, so symbol extraction
+    // drops it for the same reason reference extraction does.
+    let src = "#if 0\n\
+               void deadfn(void){}\n\
+               struct DeadS { int x; };\n\
+               enum dead_e { DEAD_A };\n\
+               typedef int dead_t;\n\
+               #define DEADM 1\n\
+               #endif\n\
+               void livefn(void){}\n\
+               #define LIVEM 1\n";
+    let syms = symbols_from_source(src, Language::C);
+    for name in ["deadfn", "DeadS", "dead_e", "dead_t", "DEADM"] {
+        assert!(
+            !syms.iter().any(|s| s.name == name),
+            "{name} should be masked: {syms:?}"
+        );
+    }
+    assert!(has_symbol(&syms, "livefn", SymbolKind::Function));
+    assert!(has_symbol(&syms, "LIVEM", SymbolKind::Macro));
+}
+
+#[test]
+fn c_definitions_under_configuration_guards_remain_symbols() {
+    let src = "#ifdef X\n\
+               void ifdef_fn(void){}\n\
+               #else\n\
+               void ifdef_else_fn(void){}\n\
+               #endif\n\
+               #ifndef Y\n\
+               void ifndef_fn(void){}\n\
+               #endif\n\
+               #if N > 1\n\
+               void expr_fn(void){}\n\
+               #endif\n\
+               #if 1\n\
+               void if_one_fn(void){}\n\
+               #endif\n";
+    let syms = symbols_from_source(src, Language::C);
+    for name in [
+        "ifdef_fn",
+        "ifdef_else_fn",
+        "ifndef_fn",
+        "expr_fn",
+        "if_one_fn",
+    ] {
+        assert!(has_symbol(&syms, name, SymbolKind::Function), "{name}");
+    }
+}
+
+#[test]
+fn c_function_enclosing_an_if_zero_block_is_still_a_symbol() {
+    // Only the dead arm is masked; the live function that contains it is not.
+    let src = "void dead_caller(void) {\n#if 0\n  real_target();\n#endif\n}\n";
+    let syms = symbols_from_source(src, Language::C);
+    assert!(has_symbol(&syms, "dead_caller", SymbolKind::Function));
+}
+
+#[test]
+fn cpp_definitions_inside_an_if_zero_arm_are_not_symbols() {
+    let src = "#if 0\n\
+               class DeadC { void dead_m(){} };\n\
+               void dead_fn(){}\n\
+               #else\n\
+               class ElseC { void else_m(){} };\n\
+               #endif\n\
+               class LiveC { void live_m(){} };\n";
+    let syms = symbols_from_source(src, Language::Cpp);
+    for name in ["DeadC", "dead_m", "dead_fn"] {
+        assert!(
+            !syms.iter().any(|s| s.name == name),
+            "{name} should be masked: {syms:?}"
+        );
+    }
+    assert!(has_symbol(&syms, "ElseC", SymbolKind::Class));
+    assert!(has_symbol(&syms, "else_m", SymbolKind::Method));
+    assert!(has_symbol(&syms, "LiveC", SymbolKind::Class));
+    assert!(has_symbol(&syms, "live_m", SymbolKind::Method));
+}
+
+#[test]
+fn c_if_zero_left_unterminated_by_a_brace_keeps_later_symbols() {
+    // Error recovery consumes the real `#endif` into the unclosed struct and
+    // inserts a zero-width MISSING one at EOF, so the group node reaches the
+    // end of the file. An unconfirmed terminator must mask nothing.
+    let src = "#if 0\n\
+               struct S {\n\
+               #endif\n\
+                 int x;\n\
+               };\n\
+               void live(void){ live_t(); }\n";
+    let syms = symbols_from_source(src, Language::C);
+    assert!(has_symbol(&syms, "S", SymbolKind::Struct), "{syms:?}");
+    assert!(has_symbol(&syms, "live", SymbolKind::Function), "{syms:?}");
+}
+
+#[test]
+fn c_if_zero_with_no_endif_keeps_later_symbols() {
+    let src = "#if 0\n\
+               struct Kept { int x; };\n\
+               void kept(void){ kept_t(); }\n";
+    let syms = symbols_from_source(src, Language::C);
+    assert!(has_symbol(&syms, "Kept", SymbolKind::Struct), "{syms:?}");
+    assert!(has_symbol(&syms, "kept", SymbolKind::Function), "{syms:?}");
+}
+
+#[test]
+fn cpp_if_zero_left_unterminated_by_a_brace_keeps_later_symbols() {
+    let src = "#if 0\n\
+               class C {\n\
+               #endif\n\
+                 int x;\n\
+               };\n\
+               void live(){ live_t(); }\n";
+    let syms = symbols_from_source(src, Language::Cpp);
+    assert!(has_symbol(&syms, "C", SymbolKind::Class), "{syms:?}");
+    assert!(has_symbol(&syms, "live", SymbolKind::Function), "{syms:?}");
+}
+
+#[test]
+fn cpp_if_zero_with_no_endif_keeps_later_symbols() {
+    let src = "#if 0\n\
+               class Kept { int x; };\n\
+               void kept(){ kept_t(); }\n";
+    let syms = symbols_from_source(src, Language::Cpp);
+    assert!(has_symbol(&syms, "Kept", SymbolKind::Class), "{syms:?}");
+    assert!(has_symbol(&syms, "kept", SymbolKind::Function), "{syms:?}");
+}

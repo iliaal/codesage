@@ -345,6 +345,7 @@ pub fn extract_references(
     let name_idx = spec.ref_idx;
 
     let root = tree.root_node();
+    let dead = crate::preproc::DeadRegions::scan(root, source, language);
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, root, source);
     let rhs_idx = spec.rhs_idx;
@@ -360,6 +361,11 @@ pub fn extract_references(
         let Some(ref_cap) = m.captures().iter().find(|c| c.index == name_idx) else {
             continue;
         };
+        // A reference parked in a dead `#if 0` arm exists in no build, so the
+        // row must not exist at all — see `crate::preproc`.
+        if dead.covers(&ref_cap.node) {
+            continue;
+        }
         let rhs =
             rhs_idx.and_then(|idx| m.captures().iter().find(|c| c.index == idx).map(|c| c.node));
         pending.push(Pending {

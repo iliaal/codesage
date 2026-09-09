@@ -397,10 +397,20 @@ pub fn init_db_read_only(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
-    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     // Cover brief checkpoint contention even when callers bypass the writer lockfile.
+    // Set before the journal-mode switch: entering WAL needs a moment of exclusive
+    // access, and without a timeout a concurrent reader fails it with SQLITE_BUSY.
     conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+    // A reader that outlasts the timeout still wins the race. The index is
+    // rebuildable and the next opener retries the switch, so keep opening in the
+    // current mode instead of failing.
+    if let Err(e) = conn.execute_batch("PRAGMA journal_mode=WAL;") {
+        tracing::warn!(
+            error = %e,
+            "could not switch index to WAL journal mode; continuing in the current mode"
+        );
+    }
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     // WAL/NORMAL may lose commits since the last checkpoint on power loss, but
     // this derived index is rebuildable. Negative cache_size is KiB (64 MiB);
     // mmap uses the OS page cache without pinning RSS.
@@ -1195,6 +1205,47 @@ mod tests {
         init_db(&conn).expect("init_db");
         let mode = pragma_string(&conn, "journal_mode");
         assert_eq!(mode.to_lowercase(), "wal", "expected WAL journal mode");
+    }
+
+    /// A reader holding an open transaction on a database still in rollback
+    /// mode blocks the switch into WAL. The busy timeout must already be set so
+    /// init_db waits for the reader instead of failing at once and leaving the
+    /// database in `delete` mode.
+    #[test]
+    fn init_db_waits_for_a_reader_before_switching_to_wal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fresh.db");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let reader_path = path.clone();
+        let reader = std::thread::spawn(move || {
+            let reader = Connection::open(&reader_path).expect("open reader");
+            assert_eq!(
+                pragma_string(&reader, "journal_mode").to_lowercase(),
+                "delete",
+                "fresh database must start in rollback mode"
+            );
+            reader.execute_batch("BEGIN").expect("begin read txn");
+            let _: i64 = reader
+                .query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get(0))
+                .expect("read under the open transaction");
+            ready_tx.send(()).expect("signal ready");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            reader.execute_batch("COMMIT").expect("end read txn");
+        });
+        ready_rx.recv().expect("reader ready");
+
+        let conn = Connection::open(&path).expect("open file db");
+        // rusqlite installs a 5 s busy timeout on open; clear it so the test
+        // pins init_db's own ordering rather than the driver default.
+        conn.busy_timeout(std::time::Duration::ZERO)
+            .expect("clear driver default busy timeout");
+        init_db(&conn).expect("init_db must wait for the reader, not fail on SQLITE_BUSY");
+        assert_eq!(
+            pragma_string(&conn, "journal_mode").to_lowercase(),
+            "wal",
+            "the switch must complete once the reader releases its lock"
+        );
+        reader.join().expect("reader thread");
     }
 
     #[test]

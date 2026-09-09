@@ -8,9 +8,13 @@
 ### Changed
 
 - `codesage doctor --docs` also checks Google-style `kCamelCase` constant values, not only `UPPER_SNAKE`.
+- `assess_risk` and `assess_risk_batch` report `unscored` for a file with no indexed git history. `assess_risk_diff` excludes unscored files from `max_score` / `mean_score`, names them in `unscored_files`, and adds `scored_file_count`; they remain in `files`.
 
 ### Fixed
 
+- C and C++ extraction skips a literal `#if 0` body and the dead arm of a literal `#if 1`; that code yields no references, symbols, or clone fingerprints. `#ifdef` / `#ifndef` / `#if EXPR` arms stay live. Run `codesage index --full` for existing indexes.
+- `codesage git-index` measures its history window and decay reference from HEAD's committer date, not the wall clock; a pinned or archived checkout now indexes its history. The window is stamped `730d@HEAD` or `730d@now`. Run `codesage git-index --full` to rebaseline.
+- Opening an index tolerates a WAL journal-mode switch that loses a race with a concurrent reader.
 - The watcher bounds queued filesystem events and retains reconciliation work after event loss or failed recovery.
 
 ## [0.28.0] - 2026-09-08

@@ -61,25 +61,6 @@ fn index_test_file(db: &Database, path: &str) {
 }
 
 #[test]
-fn score_zero_and_note_when_no_git_history() {
-    let (_dir, db) = setup_project();
-    let r = assess_risk(&db, "Repository.php").unwrap();
-    assert!(r.found);
-    assert_eq!(r.total_commits, 0);
-    assert_eq!(r.fix_count, 0);
-    assert!(
-        r.score < 0.2,
-        "score without history should stay low, got {}",
-        r.score
-    );
-    assert!(
-        r.notes.iter().any(|n| n.contains("no git history")),
-        "expected 'no git history' note, got {:?}",
-        r.notes
-    );
-}
-
-#[test]
 fn missing_path_is_unknown_not_test_gap() {
     let (_dir, db) = setup_project();
 
@@ -89,6 +70,13 @@ fn missing_path_is_unknown_not_test_gap() {
     assert_eq!(r.score, 0.0);
     assert!(!r.test_gap);
     assert!(r.notes.iter().any(|n| n.contains("not indexed")));
+    // Nothing was measured, so the 0.0 is a placeholder, not a low score.
+    assert!(r.unscored, "an unknown path measures nothing");
+    assert!(
+        r.notes.iter().any(|n| n.contains("placeholder")),
+        "expected the placeholder-score note, got {:?}",
+        r.notes
+    );
 }
 
 #[test]
@@ -1804,5 +1792,547 @@ fn diff_summary_keeps_hop_claim_when_all_gap_checks_completed() {
             .any(|n| n.contains("or within 2 dependency hops")),
         "completed checks keep the full claim, got {:?}",
         r.summary_notes
+    );
+}
+
+/// Repository.php with the seeded history below: churn percentile 1.0 of five
+/// rows, 40/80 fixes, two dependents (Controller + Service), no coupling, and
+/// a test gap. Pins the measured composite so the unscored state cannot move
+/// a score that WAS measured.
+const REPOSITORY_SCORED: f64 = 0.32 * 1.0 + 0.18 * 0.5 + 0.09 * (2.0 / 20.0) + 0.13;
+
+/// Controller.php: churn percentile 3/5, no fixes, no dependents, test gap.
+const CONTROLLER_SCORED: f64 = 0.32 * 0.6 + 0.13;
+
+/// Seed the five-row churn distribution the two constants above assume.
+fn seed_hot_repository_history(db: &Database) {
+    db.upsert_git_file("Repository.php", 100.0, 40, 80, Some(1_700_000_000))
+        .unwrap();
+    for (p, c) in [
+        ("Controller.php", 1.0_f64),
+        ("Service.php", 2.0),
+        ("other_a.php", 0.5),
+        ("other_b.php", 0.7),
+    ] {
+        db.upsert_git_file(p, c, 0, 5, Some(1_700_000_000)).unwrap();
+    }
+}
+
+#[test]
+fn no_git_row_is_unscored_not_a_low_score() {
+    let (_dir, db) = setup_project();
+    let r = assess_risk(&db, "Repository.php").unwrap();
+
+    assert!(r.found, "the file is structurally indexed");
+    assert!(
+        r.unscored,
+        "a file with no git_files row must report the unscored state, got score {}",
+        r.score
+    );
+    assert_eq!(r.total_commits, 0);
+    assert_eq!(r.fix_count, 0);
+    assert_eq!(r.churn_percentile, 0.0);
+    assert!(
+        r.score < 0.2,
+        "structural-only composite should stay low, got {}",
+        r.score
+    );
+    assert!(
+        r.notes.iter().any(|n| n.contains("no git history")),
+        "expected 'no git history' note, got {:?}",
+        r.notes
+    );
+    let unscored_note = r
+        .notes
+        .iter()
+        .find(|n| n.starts_with("unscored:"))
+        .unwrap_or_else(|| panic!("expected an `unscored:` note, got {:?}", r.notes));
+    assert!(
+        unscored_note.contains("unmeasured, not zero"),
+        "the note must name the failure mode, got {unscored_note:?}"
+    );
+    assert!(
+        unscored_note.contains("exclude this file"),
+        "the note must say the aggregates skip this file, got {unscored_note:?}"
+    );
+}
+
+#[test]
+fn measured_file_keeps_its_score_and_no_unscored_state() {
+    let (_dir, db) = setup_project();
+    seed_hot_repository_history(&db);
+
+    let r = assess_risk(&db, "Repository.php").unwrap();
+
+    assert!(!r.unscored, "a file with a git_files row is measured");
+    assert_eq!(r.churn_percentile, 1.0);
+    assert_eq!(r.fix_ratio, 0.5);
+    assert_eq!(r.dependent_files, 2);
+    assert_eq!(r.coupled_files, 0);
+    assert!(r.test_gap);
+    assert!(r.trust_boundaries.is_empty());
+    assert!(
+        (r.score - REPOSITORY_SCORED).abs() < 1e-12,
+        "measured score moved: {} != {REPOSITORY_SCORED}",
+        r.score
+    );
+    assert!(
+        !r.notes.iter().any(|n| n.starts_with("unscored:")),
+        "a measured file must carry no unscored note, got {:?}",
+        r.notes
+    );
+    assert!(
+        !r.notes.iter().any(|n| n.contains("no git history")),
+        "a measured file must carry no missing-history note, got {:?}",
+        r.notes
+    );
+}
+
+#[test]
+fn risk_diff_excludes_unscored_files_from_max_and_mean_but_still_lists_them() {
+    let (_dir, db) = setup_project();
+    seed_hot_repository_history(&db);
+    // Indexed structurally, never seen by `git-index`: the excluded-path case.
+    index_test_file(&db, "new_module.php");
+
+    let input = vec![
+        "Repository.php".to_string(),
+        "Controller.php".to_string(),
+        "new_module.php".to_string(),
+    ];
+    let r = codesage_graph::assess_risk_diff(&db, &input).unwrap();
+
+    assert_eq!(r.files.len(), 3, "no file may vanish from the response");
+    let unscored: Vec<&codesage_protocol::RiskAssessment> =
+        r.files.iter().filter(|f| f.unscored).collect();
+    assert_eq!(unscored.len(), 1);
+    assert_eq!(unscored[0].file, "new_module.php");
+    assert_eq!(r.unscored_files, vec!["new_module.php".to_string()]);
+    assert_eq!(r.scored_file_count, 2);
+
+    let expected_mean = (REPOSITORY_SCORED + CONTROLLER_SCORED) / 2.0;
+    assert!(
+        (r.max_score - REPOSITORY_SCORED).abs() < 1e-12,
+        "max must be the hot scored file, got {}",
+        r.max_score
+    );
+    assert!(
+        (r.mean_score - expected_mean).abs() < 1e-12,
+        "mean must average the two scored files only, got {} != {expected_mean}",
+        r.mean_score
+    );
+    assert_eq!(r.max_risk_file.as_deref(), Some("Repository.php"));
+
+    // The pre-fix behavior: the unmeasured file's structural score dragged the mean down.
+    let all_files_mean =
+        (REPOSITORY_SCORED + CONTROLLER_SCORED + unscored[0].score) / r.files.len() as f64;
+    assert!(
+        (r.mean_score - all_files_mean).abs() > 0.05,
+        "the exclusion must actually change the mean ({} vs {all_files_mean})",
+        r.mean_score
+    );
+
+    let note = r
+        .summary_notes
+        .iter()
+        .find(|n| n.contains("no indexed git history"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected an unscored summary note, got {:?}",
+                r.summary_notes
+            )
+        });
+    assert!(
+        note.contains("1 of 3 file(s)") && note.contains("new_module.php"),
+        "the note must count and name the excluded files, got {note:?}"
+    );
+    assert!(
+        note.contains("not low-risk"),
+        "the note must refuse the safety reading, got {note:?}"
+    );
+}
+
+/// A repository whose git history was never indexed: every file is unscored,
+/// so the aggregates carry no measurement at all and must say so.
+#[test]
+fn risk_diff_over_repo_without_git_index_reports_nothing_scored() {
+    let (_dir, db) = setup_project();
+
+    let input = vec!["Repository.php".to_string(), "Controller.php".to_string()];
+    let r = codesage_graph::assess_risk_diff(&db, &input).unwrap();
+
+    assert!(!r.empty_input, "the caller did supply files");
+    assert_eq!(r.files.len(), 2);
+    assert_eq!(r.scored_file_count, 0);
+    assert_eq!(r.max_score, 0.0);
+    assert_eq!(r.mean_score, 0.0);
+    assert!(
+        r.max_risk_file.is_none(),
+        "no scored file can be the riskiest, got {:?}",
+        r.max_risk_file
+    );
+    assert_eq!(r.unscored_files.len(), 2);
+    assert!(
+        r.files.iter().all(|f| f.unscored),
+        "every entry must carry the unscored state"
+    );
+    assert!(
+        r.files.iter().any(|f| f.score > 0.0),
+        "structural signals still score, which is exactly why max/mean must not average them"
+    );
+    let note = r
+        .summary_notes
+        .iter()
+        .find(|n| n.contains("no indexed git history"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected an unscored summary note, got {:?}",
+                r.summary_notes
+            )
+        });
+    assert!(
+        note.contains("by convention rather than measurements")
+            && note.contains("codesage git-index"),
+        "the note must disown the 0.00 aggregates and give the remedy, got {note:?}"
+    );
+}
+
+#[test]
+fn risk_batch_agrees_with_assess_risk_on_scored_and_unscored_files() {
+    let (_dir, db) = setup_project();
+    seed_hot_repository_history(&db);
+    index_test_file(&db, "new_module.php");
+
+    // Two files keep note aliasing off, so `notes` compare verbatim.
+    let input = vec!["Repository.php".to_string(), "new_module.php".to_string()];
+    let batch = codesage_graph::assess_risk_batch(&db, &input).unwrap();
+
+    assert!(batch.legend.is_empty(), "no aliasing below three files");
+    assert_eq!(batch.files.len(), 2);
+    for (path, batched) in input.iter().zip(batch.files.iter()) {
+        let single = assess_risk(&db, path).unwrap();
+        assert_eq!(&batched.file, path);
+        assert_eq!(
+            single.unscored, batched.unscored,
+            "{path}: unscored state must match the per-file call"
+        );
+        assert_eq!(
+            single.score.to_bits(),
+            batched.score.to_bits(),
+            "{path}: single {} != batch {}",
+            single.score,
+            batched.score
+        );
+        assert_eq!(single.notes, batched.notes, "{path}: notes must match");
+    }
+    assert!(!batch.files[0].unscored);
+    assert!(batch.files[1].unscored);
+    assert!(
+        (batch.files[0].score - REPOSITORY_SCORED).abs() < 1e-12,
+        "batch must reproduce the pinned measured score, got {}",
+        batch.files[0].score
+    );
+}
+
+/// The unscored note is aliasable, so a wide patch of new files stays cheap.
+#[test]
+fn risk_batch_aliases_the_unscored_note_at_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let files = ["ClassA.php", "ClassB.php", "ClassC.php"];
+    for p in &files {
+        let class = p.trim_end_matches(".php");
+        std::fs::write(
+            root.join(p),
+            format!("<?php\nnamespace App;\nclass {class} {{\n  public function run() {{ return 1; }}\n}}\n"),
+        )
+        .unwrap();
+    }
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+
+    let input: Vec<String> = files.iter().map(|s| s.to_string()).collect();
+    let r = codesage_graph::assess_risk_batch(&db, &input).unwrap();
+
+    let full = r
+        .legend
+        .get("US")
+        .unwrap_or_else(|| panic!("US missing from legend, got {:?}", r.legend));
+    assert!(full.starts_with("unscored:"), "US resolves to {full}");
+    let aliased: usize = r
+        .files
+        .iter()
+        .map(|f| f.notes.iter().filter(|n| *n == "US").count())
+        .sum();
+    assert_eq!(aliased, 3, "every unscored note should alias");
+    assert!(
+        r.files.iter().all(|f| f.unscored),
+        "aliasing must not hide the structured flag"
+    );
+}
+
+const DAY: i64 = 86_400;
+/// Old enough that every wall-clock window in the risk pipeline excludes it,
+/// and far enough past the 730-day boundary that the fixture cannot straddle
+/// it mid-run.
+const PINNED_AGE_DAYS: i64 = 1_000;
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+fn run_git(root: &std::path::Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .status()
+        .expect("git command starts");
+    assert!(status.success(), "git {args:?} failed");
+}
+
+/// Same isolation the git-history integration fixtures use: no signing, no
+/// inherited hooks, no dependence on the developer's global git identity.
+fn init_hermetic_repo(root: &std::path::Path) {
+    run_git(root, &["init", "-q"]);
+    run_git(root, &["config", "user.email", "review@example.invalid"]);
+    run_git(root, &["config", "user.name", "Review"]);
+    run_git(root, &["config", "commit.gpgsign", "false"]);
+    std::fs::create_dir_all(root.join(".git/disabled-hooks")).unwrap();
+    run_git(root, &["config", "core.hooksPath", ".git/disabled-hooks"]);
+}
+
+/// Commit the working tree at `unix_ts` under `author`, pinning both git dates
+/// so the indexer's anchor and the author-event timestamps are controlled.
+fn commit_as_at(root: &std::path::Path, subject: &str, author: &str, unix_ts: i64) {
+    run_git(root, &["add", "."]);
+    let date = format!("{unix_ts} +0000");
+    let status = std::process::Command::new("git")
+        .args(["commit", "-qm", subject])
+        .env("GIT_AUTHOR_DATE", &date)
+        .env("GIT_COMMITTER_DATE", &date)
+        .env("GIT_AUTHOR_NAME", author)
+        .env("GIT_AUTHOR_EMAIL", format!("{author}@example.invalid"))
+        .current_dir(root)
+        .status()
+        .expect("git commit starts");
+    assert!(status.success(), "git commit at {unix_ts} failed");
+}
+
+/// A checkout whose newest commit predates the 730-day author window measured
+/// from the wall clock. The indexer anchors that window on HEAD and writes
+/// every author event, so the read side has to anchor the same way or it
+/// reports "no qualifying commits" over data it is holding.
+#[test]
+fn author_concentration_is_reported_when_head_predates_the_wall_clock_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_hermetic_repo(root);
+
+    let head_at = unix_now() - PINNED_AGE_DAYS * DAY;
+    for (i, author) in ["ada", "ada", "grace"].iter().enumerate() {
+        std::fs::write(
+            root.join("lib.rs"),
+            format!("pub fn run() -> u32 {{ {i} }}\n"),
+        )
+        .unwrap();
+        commit_as_at(
+            root,
+            &format!("feat: revision {i}"),
+            author,
+            head_at - (2 - i as i64) * 30 * DAY,
+        );
+    }
+
+    let db = Database::open_in_memory().unwrap();
+    full_index(root, &db, &[], false).unwrap();
+    codesage_graph::git_history_index(&db, root).unwrap();
+
+    // Guard the regime: without it the assertion below could pass on a
+    // fixture the wall clock never excluded in the first place.
+    let events = db.git_author_events("lib.rs").unwrap();
+    assert_eq!(
+        events.len(),
+        3,
+        "three commits touch lib.rs, got {events:?}"
+    );
+    let wall_clock_cutoff = unix_now() - 730 * DAY;
+    assert!(
+        events.iter().all(|(_, ts)| *ts < wall_clock_cutoff),
+        "fixture must sit outside a wall-clock author window, got {events:?}"
+    );
+
+    let r = assess_risk(&db, "lib.rs").unwrap();
+    let concentration = r.author_concentration.unwrap_or_else(|| {
+        panic!(
+            "author concentration must be reported for a HEAD-anchored window, notes {:?}",
+            r.notes
+        )
+    });
+    assert_eq!(
+        concentration.author_count, 2,
+        "two identities touch lib.rs, got {concentration:?}"
+    );
+    assert_eq!(concentration.bus_factor, 1);
+    assert!(
+        (concentration.dominant_share - 2.0 / 3.0).abs() < 0.2,
+        "ada holds two of three commits, got {concentration:?}"
+    );
+    assert!(
+        !r.notes
+            .iter()
+            .any(|n| n.contains("author concentration unavailable")),
+        "no unavailability note may remain, got {:?}",
+        r.notes
+    );
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.starts_with("author concentration:")),
+        "the measurement note must be present, got {:?}",
+        r.notes
+    );
+}
+
+/// The count is still the cause of an empty coupling page, so the count keeps
+/// its wording; the window is added because it decides which commits the count
+/// could have come from.
+#[test]
+fn find_coupling_low_commit_note_adds_the_window_on_a_pinned_checkout() {
+    let (_dir, db) = setup_project();
+    let pinned = unix_now() - PINNED_AGE_DAYS * DAY;
+    db.upsert_git_file("cold.rs", 0.1, 0, 1, Some(pinned))
+        .unwrap();
+
+    let r = codesage_graph::find_coupling(&db, "cold.rs", 5).unwrap();
+    let note = r.note.expect("note required");
+    assert!(
+        note.contains("only 1 tracked commit"),
+        "the measured cause must survive: {note}"
+    );
+    assert!(
+        note.contains("730d@HEAD"),
+        "the note must name the indexed window: {note}"
+    );
+    assert!(
+        note.contains("touching this file"),
+        "the note must name what the newest commit was read from: {note}"
+    );
+    assert!(
+        note.contains("730 days before HEAD"),
+        "the note must name the slice that was scanned: {note}"
+    );
+}
+
+/// A genuinely new file keeps the plain count wording: a spurious window claim
+/// would misattribute a thin history on a current index.
+#[test]
+fn find_coupling_low_commit_note_stays_plain_for_a_recent_commit() {
+    let (_dir, db) = setup_project();
+    db.upsert_git_file("fresh.rs", 0.1, 0, 1, Some(unix_now() - DAY))
+        .unwrap();
+
+    let r = codesage_graph::find_coupling(&db, "fresh.rs", 5).unwrap();
+    let note = r.note.expect("note required");
+    assert!(
+        note.contains("only 1 tracked commit"),
+        "the count note must still fire: {note}"
+    );
+    assert!(
+        !note.contains("730d@HEAD"),
+        "a current index must not carry a window disclosure: {note}"
+    );
+}
+
+/// Seed a visible co-change pair whose observations sit at `observed_at`, so
+/// the read side has a repo-wide newest-commit reference for paths that carry
+/// no `git_files` row of their own.
+fn seed_index_newest_commit(db: &Database, observed_at: i64) {
+    db.upsert_git_co_change_full(
+        "a.rs",
+        "b.rs",
+        &codesage_storage::db::CoChangeWrite {
+            weight: 3.0,
+            count: 3,
+            window_mask: 0b1,
+            first_observed_at: Some(observed_at),
+            last_observed_at: Some(observed_at),
+        },
+    )
+    .unwrap();
+}
+
+/// An unscored file on a pinned checkout: the note has to offer the window as a
+/// cause beside "too new" and "never indexed", and must not become a third
+/// line duplicating `UNSCORED_NOTE`.
+#[test]
+fn unscored_note_names_the_window_on_a_pinned_checkout() {
+    let (_dir, db) = setup_project();
+    seed_index_newest_commit(&db, unix_now() - PINNED_AGE_DAYS * DAY);
+
+    let r = assess_risk(&db, "Repository.php").unwrap();
+    assert!(
+        r.unscored,
+        "the fixture seeds no git_files row for this path"
+    );
+    let history_note = r
+        .notes
+        .iter()
+        .find(|n| n.contains("no git history"))
+        .unwrap_or_else(|| panic!("expected the no-git-history note, got {:?}", r.notes));
+    assert!(
+        history_note.contains("730d@HEAD"),
+        "the note must name the indexed window: {history_note}"
+    );
+    assert!(
+        history_note.contains("in this index"),
+        "with no row of its own the reference is the whole index: {history_note}"
+    );
+    assert!(
+        history_note.contains("last commit older than the indexed window"),
+        "the window must be offered as a cause: {history_note}"
+    );
+    assert_eq!(
+        r.notes
+            .iter()
+            .filter(|n| n.contains("no git history"))
+            .count(),
+        1,
+        "the window must extend the existing note, not add a third: {:?}",
+        r.notes
+    );
+    assert_eq!(
+        r.notes
+            .iter()
+            .filter(|n| n.starts_with("unscored:"))
+            .count(),
+        1,
+        "exactly one unscored note, got {:?}",
+        r.notes
+    );
+}
+
+/// The same path on a current index keeps the original two causes and no
+/// window disclosure.
+#[test]
+fn unscored_note_stays_plain_on_a_current_index() {
+    let (_dir, db) = setup_project();
+    seed_index_newest_commit(&db, unix_now() - DAY);
+
+    let r = assess_risk(&db, "Repository.php").unwrap();
+    let history_note = r
+        .notes
+        .iter()
+        .find(|n| n.contains("no git history"))
+        .unwrap_or_else(|| panic!("expected the no-git-history note, got {:?}", r.notes));
+    assert!(
+        history_note.contains("file too new"),
+        "the original causes must survive: {history_note}"
+    );
+    assert!(
+        !history_note.contains("730d@HEAD"),
+        "a current index must not carry a window disclosure: {history_note}"
     );
 }

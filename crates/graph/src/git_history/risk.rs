@@ -11,6 +11,9 @@ use codesage_protocol::{
 use codesage_storage::Database;
 use codesage_storage::db::CoChangeRow;
 
+use super::indexer::{
+    HISTORY_WINDOW_DAYS, HistoryAnchor, HistoryAnchorSource, history_predates_wall_clock_window,
+};
 use super::tests_rec::test_sibling_exists;
 use crate::impact::{MAX_FRONTIER, WalkCache, impact_analysis_walk_shared};
 
@@ -30,6 +33,29 @@ const _: () = assert!(
 const NO_STRUCTURAL_SIGNALS_NOTE: &str = "structural signals unavailable: file has no indexed \
      symbols, so the reverse-dependency walk and the dependency-hop test check could not run \
      (0 dependents means unknown, not zero)";
+
+/// Every cause of a missing `git_files` row, including the history window: a
+/// pass measures [`HISTORY_WINDOW_DAYS`] back from HEAD, so a file untouched
+/// for longer than that gets no row on any checkout. A `const` so it stays
+/// exact-string aliasable in [`ALIASABLE_NOTES`]; the window-qualified variant
+/// [`pinned_window_clause`] produces carries a date, is therefore not
+/// categorical, and correctly does not alias.
+const NO_GIT_HISTORY_NOTE: &str = "no git history for this file (file too new, last commit older \
+     than the indexed window, or `codesage git-index` hasn't been run)";
+
+/// Fired when the file has no `git_files` row. The composite still reports
+/// its structural terms, but churn (0.32), fix ratio (0.18), and coupling
+/// pressure (0.09) were not measured, so the number must not be read as a
+/// low-risk verdict. Paired with [`codesage_protocol::RiskAssessment::unscored`].
+const UNSCORED_NOTE: &str = "unscored: no indexed git history for this file, so the churn, \
+     fix-ratio, and coupling-pressure terms (0.59 of the composite weight) are unmeasured, not \
+     zero — the score covers structural signals only, and patch max/mean scores exclude this file";
+
+/// [`UNSCORED_NOTE`] for a path in neither index: nothing at all was
+/// measured, so the 0.0 score is a placeholder.
+const UNSCORED_NOT_INDEXED_NOTE: &str = "unscored: no signal of any kind was measured for this \
+     path, so the 0.0 score is a placeholder, not a low-risk verdict; patch max/mean scores \
+     exclude this file";
 
 /// Fired when import-cycle detection errored. The score's cycle term is
 /// omitted rather than failing the call, but omission must not read as
@@ -163,6 +189,98 @@ pub(crate) fn span_unknown_note(unknown: usize, scope: &str) -> String {
     )
 }
 
+/// Newest commit timestamp this index holds, the read-side stand-in for the
+/// pass's [`HistoryAnchor`]. Read from the co-change span because the query
+/// API exposes no `MAX(git_files.last_commit_at)` and the read side holds no
+/// repository root to re-resolve HEAD from. `None` when no visible pair
+/// carries a timestamp; the regime is then undecidable, and nothing is claimed.
+fn newest_indexed_commit(db: &Database) -> Result<Option<i64>> {
+    Ok(db.co_change_history_span()?.map(|(_first, last)| last))
+}
+
+/// `YYYY-MM-DD` in UTC. Commit epochs are the only timestamps these notes
+/// render, and a note pasted into a review has to name something that stays
+/// true after printing, which an age does not. Hinnant's civil-from-days; the
+/// workspace carries no date crate.
+fn utc_date(timestamp: i64) -> String {
+    let days = timestamp.div_euclid(86_400);
+    // Shift the epoch to 0000-03-01 so leap days land at the end of a cycle.
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let march_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * march_month + 2) / 5 + 1;
+    let month = if march_month < 10 {
+        march_month + 3
+    } else {
+        march_month - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Disclosure for an index whose newest commit a wall-clock history window
+/// would exclude. The indexer measures [`HISTORY_WINDOW_DAYS`] back from
+/// HEAD's own committer epoch, so a pinned or archived checkout still gets
+/// indexed in full; a note reporting thin or absent history on such an index
+/// has to name the window, or it reads as a claim about the code instead of
+/// about the slice that was scanned. `scope` names what `newest_commit_at` was
+/// read from. `None` when the newest commit falls inside a wall-clock window
+/// (the ordinary case) or is unknown.
+fn pinned_window_clause(newest_commit_at: Option<i64>, now: i64, scope: &str) -> Option<String> {
+    let newest = newest_commit_at?;
+    if !history_predates_wall_clock_window(newest, now) {
+        return None;
+    }
+    // Only `source` selects the stamp; the epoch travels so the string stays
+    // owned by the indexer rather than duplicated here. Rows exist only
+    // because a pass resolved a HEAD, so the read side never has to describe
+    // the wall-clock regime.
+    let stamp = HistoryAnchor {
+        epoch: newest,
+        source: HistoryAnchorSource::HeadCommit,
+    }
+    .window_stamp();
+    let days = HISTORY_WINDOW_DAYS as i64;
+    Some(format!(
+        "newest indexed commit {scope} is {} (UTC), which a wall-clock {days}-day window would \
+         exclude; the indexed window is {stamp}, measured from HEAD's commit date, so this \
+         covers the {days} days before HEAD",
+        utc_date(newest)
+    ))
+}
+
+/// Qualify `note` with a window clause when one applies, so the cause the note
+/// already names keeps its wording instead of being replaced by the window.
+fn with_window_clause(note: &str, clause: Option<String>) -> String {
+    match clause {
+        Some(clause) => format!("{note}; {clause}"),
+        None => note.to_string(),
+    }
+}
+
+/// The window one report is read against: the wall clock its disclosure
+/// predicate compares to, and the newest commit the index holds. Probed once
+/// per public call, so every file in a batch describes the same window and the
+/// co-change aggregate runs once instead of once per unscored file.
+#[derive(Debug, Clone, Copy)]
+struct IndexWindow {
+    now: i64,
+    newest_commit_at: Option<i64>,
+}
+
+impl IndexWindow {
+    fn probe(db: &Database) -> Result<Self> {
+        Ok(Self {
+            now: super::bus_factor::unix_now(),
+            newest_commit_at: newest_indexed_commit(db)?,
+        })
+    }
+}
+
 /// Note for a non-empty page on which no pair is `recurring` and every span
 /// is known, decided from what the whole `git_co_changes` table can show.
 /// Each probe runs only when the earlier arms did not decide.
@@ -204,6 +322,21 @@ fn one_off_page_note(db: &Database, coupled: &[CoChangeEntry]) -> Result<String>
     })
 }
 
+/// Files named inline by the unscored summary note; the full list stays in
+/// `RiskDiffAssessment::unscored_files`, so a wide patch cannot bloat the note.
+const UNSCORED_NOTE_SAMPLE: usize = 5;
+
+/// Comma-joined sample of `names`, with a `(+N more)` tail past `cap`.
+fn name_sample(names: &[String], cap: usize) -> String {
+    let shown: Vec<&str> = names.iter().take(cap).map(String::as_str).collect();
+    let more = names.len().saturating_sub(shown.len());
+    if more > 0 {
+        format!("{} (+{more} more)", shown.join(", "))
+    } else {
+        shown.join(", ")
+    }
+}
+
 /// Top-N files that historically co-change with `file_path`, wrapped in a
 /// report that explains empty results. See [`CouplingReport`] for the
 /// disambiguation an agent needs: was the file never indexed, does it have
@@ -235,6 +368,16 @@ pub fn find_coupling_ranked(
     let git = db.git_file(file_path)?;
     let file_indexed = git.is_some();
     let file_commits = git.as_ref().map(|g| g.total_commits).unwrap_or(0);
+    let now = super::bus_factor::unix_now();
+    // The file's own newest commit is the specific reference when it has a
+    // row; only the pathless arm below has to fall back to the whole index.
+    let file_window = || {
+        pinned_window_clause(
+            git.as_ref().and_then(|g| g.last_commit_at),
+            now,
+            "touching this file",
+        )
+    };
 
     let rows = db.co_changes_for_ranked(file_path, limit, one_off_multiplier(recurrence_rank))?;
     let span_unknown = span_unknown_count(&rows);
@@ -256,21 +399,29 @@ pub fn find_coupling_ranked(
             None
         }
     } else if !file_indexed {
-        Some(
-            "file has no git history (not tracked by git, no commits yet, or path shape \
-             does not match the index — verify with `codesage status` or \
-             `codesage git-index --full`)"
-                .to_string(),
-        )
+        // No row means no per-file reference, so the whole index answers
+        // whether the window is a candidate cause alongside the others.
+        Some(with_window_clause(
+            "file has no git history (not tracked by git, no commits yet, last commit older \
+             than the indexed window, or path shape does not match the index — verify with \
+             `codesage status` or `codesage git-index --full`)",
+            pinned_window_clause(newest_indexed_commit(db)?, now, "in this index"),
+        ))
     } else if file_commits < 3 {
-        Some(format!(
-            "file has only {file_commits} tracked commit(s); co-change pairs need a \
-             count of 3+ to be shown (see `codesage git-index --full` to rebaseline)"
+        Some(with_window_clause(
+            &format!(
+                "file has only {file_commits} tracked commit(s); co-change pairs need a \
+                 count of 3+ to be shown (see `codesage git-index --full` to rebaseline)"
+            ),
+            file_window(),
         ))
     } else {
-        Some(format!(
-            "file has {file_commits} commits but no co-change pair crosses the min-count \
-             threshold of 3; indexed co-change evidence is insufficient to infer isolation"
+        Some(with_window_clause(
+            &format!(
+                "file has {file_commits} commits but no co-change pair crosses the min-count \
+                 threshold of 3; indexed co-change evidence is insufficient to infer isolation"
+            ),
+            file_window(),
         ))
     };
 
@@ -283,19 +434,81 @@ pub fn find_coupling_ranked(
     })
 }
 
+/// Composite weight per signal in [`assess_risk`]'s decomposition. Named so
+/// the bounds below are machine-checked instead of asserted in prose; the
+/// values are the literals the score expression always used.
+const CHURN_WEIGHT: f64 = 0.32;
+const FIX_RATIO_WEIGHT: f64 = 0.18;
+const DEPENDENT_WEIGHT: f64 = 0.09;
+const COUPLING_WEIGHT: f64 = 0.09;
+const TEST_GAP_WEIGHT: f64 = 0.13;
+const CYCLE_WEIGHT: f64 = 0.09;
+const TRUST_BOUNDARY_WEIGHT: f64 = 0.10;
+
+/// Max score at or above which `assess_risk_diff` warns.
+const MAX_SCORE_WARNING: f64 = 0.50;
+
+/// Weight an unscored file can still accumulate. Churn and fix ratio read
+/// `git_files` and measure 0.0 without a row. Coupling pressure reads
+/// `git_co_changes`, which only ever gains a row alongside `git_files` because
+/// `run_full` and `run_incremental` derive both from the same filtered commit
+/// pass, so an unscored file has no visible pair either; that is a producer
+/// invariant, not a schema constraint, and it carries the whole margin — with
+/// coupling included the bound is exactly [`MAX_SCORE_WARNING`], which the
+/// `>=` gate fires on.
+const UNSCORED_REACHABLE_WEIGHT: f64 =
+    DEPENDENT_WEIGHT + TEST_GAP_WEIGHT + CYCLE_WEIGHT + TRUST_BOUNDARY_WEIGHT;
+
+/// Excluding unscored files from `assess_risk_diff`'s `max_score` /
+/// `mean_score` must not be able to silence the max-score warning, or the
+/// exclusion would hide a threshold crossing rather than a non-measurement.
+/// Retuning a structural weight upward has to fail here, not in review.
+const _: () = assert!(
+    UNSCORED_REACHABLE_WEIGHT < MAX_SCORE_WARNING,
+    "an unmeasured file's remaining weight must stay under the max-score warning gate"
+);
+
+/// The seven weights bound the score at 1.0, which every consumer threshold
+/// (and the `0.0..=1.0` contract on [`codesage_protocol::RiskAssessment`])
+/// reads as a fraction of. Binary f64 cannot land on 1.0 exactly, so the
+/// check is a tolerance rather than an equality.
+const _: () = assert!(
+    CHURN_WEIGHT
+        + FIX_RATIO_WEIGHT
+        + DEPENDENT_WEIGHT
+        + COUPLING_WEIGHT
+        + TEST_GAP_WEIGHT
+        + CYCLE_WEIGHT
+        + TRUST_BOUNDARY_WEIGHT
+        > 0.999_999_999
+        && CHURN_WEIGHT
+            + FIX_RATIO_WEIGHT
+            + DEPENDENT_WEIGHT
+            + COUPLING_WEIGHT
+            + TEST_GAP_WEIGHT
+            + CYCLE_WEIGHT
+            + TRUST_BOUNDARY_WEIGHT
+            < 1.000_000_001,
+    "the composite weights must still sum to 1.0 so the score stays a 0..1 fraction"
+);
+
 /// Risk score for a single file. Composes:
-/// - churn percentile (0..1) — weight 0.32
-/// - fix ratio (fix_count / total_commits, capped at 1.0) — weight 0.18
-/// - dependent file pressure (capped via 20 dependents) — weight 0.09
-/// - coupled file pressure (capped via 10 coupled) — weight 0.09
+/// - churn percentile (0..1) — weight [`CHURN_WEIGHT`]
+/// - fix ratio (fix_count / total_commits, capped at 1.0) — [`FIX_RATIO_WEIGHT`]
+/// - dependent file pressure (capped via 20 dependents) — [`DEPENDENT_WEIGHT`]
+/// - coupled file pressure (capped via 10 coupled) — [`COUPLING_WEIGHT`]
 /// - test gap (no sibling test, no test among coupled, and no test within
-///   `DEPENDENT_DEPTH` reverse-dependency hops) — weight 0.13
-/// - cycle membership ((cycle_size - 1) / 4, capped at size 5) — weight 0.09
-/// - trust boundary count (capped at 5 distinct boundaries) — weight 0.10
+///   `DEPENDENT_DEPTH` reverse-dependency hops) — [`TEST_GAP_WEIGHT`]
+/// - cycle membership ((cycle_size - 1) / 4, capped at size 5) — [`CYCLE_WEIGHT`]
+/// - trust boundary count (capped at 5 distinct boundaries) — [`TRUST_BOUNDARY_WEIGHT`]
 ///
 /// Includes the signal decomposition; structural signals remain usable without git history.
 /// Every field is populated and `verbose` starts true; a caller that wants
 /// the trimmed wire shape flips it with [`RiskAssessment::set_verbose`].
+///
+/// A file with no `git_files` row comes back `unscored: true` with
+/// [`UNSCORED_NOTE`]: the three history terms were not measured, so the
+/// remaining composite is a partial reading, not a quiet-file verdict.
 ///
 /// The seven weights sum to 1.0, bounding the score.
 pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
@@ -305,7 +518,7 @@ pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
         None,
         None,
         MAX_FRONTIER,
-        super::bus_factor::unix_now(),
+        IndexWindow::probe(db)?,
         None,
     )?
     .0)
@@ -324,7 +537,7 @@ fn assess_risk_with_context(
     precomputed_cycles: Option<&[CycleEntry]>,
     precomputed_percentiles: Option<&HashMap<String, f64>>,
     max_frontier: usize,
-    now: i64,
+    window: IndexWindow,
     cache: Option<&mut WalkCache>,
 ) -> Result<(RiskAssessment, bool)> {
     let git = db.git_file(file_path)?;
@@ -339,6 +552,7 @@ fn assess_risk_with_context(
                 found: false,
                 file: file_path.to_string(),
                 score: 0.0,
+                unscored: true,
                 verbose: true,
                 churn_score: 0.0,
                 churn_percentile: 0.0,
@@ -356,6 +570,7 @@ fn assess_risk_with_context(
                 notes: vec![
                     "file is not indexed (path may be wrong, excluded, deleted, or index is stale)"
                         .to_string(),
+                    UNSCORED_NOT_INDEXED_NOTE.to_string(),
                 ],
                 top_symbols: Vec::new(),
             },
@@ -468,20 +683,29 @@ fn assess_risk_with_context(
         .with_context(|| format!("loading trust boundaries for risk({file_path})"))?;
     let trust_boundary_term = (trust_boundaries.len() as f64 / 5.0).min(1.0);
 
-    let score = 0.32 * churn_percentile
-        + 0.18 * fix_ratio
-        + 0.09 * dep_pressure
-        + 0.09 * coup_pressure
-        + 0.13 * test_gap_term
-        + 0.09 * cycle_term
-        + 0.10 * trust_boundary_term;
+    let score = CHURN_WEIGHT * churn_percentile
+        + FIX_RATIO_WEIGHT * fix_ratio
+        + DEPENDENT_WEIGHT * dep_pressure
+        + COUPLING_WEIGHT * coup_pressure
+        + TEST_GAP_WEIGHT * test_gap_term
+        + CYCLE_WEIGHT * cycle_term
+        + TRUST_BOUNDARY_WEIGHT * trust_boundary_term;
+
+    // No git row means the history terms were never measured, not that they
+    // measured zero. The flag travels with the score; the notes explain it.
+    let unscored = git.is_none();
 
     let mut notes = Vec::new();
-    if git.is_none() {
-        notes.push(
-            "no git history for this file (file too new, or `codesage git-index` hasn't been run)"
-                .to_string(),
-        );
+    if unscored {
+        // This is the note that names the cause, so the window belongs here
+        // rather than as a third line beside `UNSCORED_NOTE`. With no row
+        // there is no per-file timestamp, so the whole index supplies the
+        // reference.
+        notes.push(with_window_clause(
+            NO_GIT_HISTORY_NOTE,
+            pinned_window_clause(window.newest_commit_at, window.now, "in this index"),
+        ));
+        notes.push(UNSCORED_NOTE.to_string());
     }
     if no_symbols {
         notes.push(NO_STRUCTURAL_SIGNALS_NOTE.to_string());
@@ -653,8 +877,19 @@ fn assess_risk_with_context(
     };
 
     let gap_check_partial = test_gap && (no_symbols || walk_capped);
+    // `git_author_events` is keyed by path and the pass already clipped it to
+    // the window it measured from HEAD, so the newest commit touching this
+    // file admits every event the pass retained. Measuring from the wall clock
+    // instead empties the window on a checkout older than it — the one case
+    // the anchor exists for. Author shares are scale-invariant under the
+    // half-life decay, so the anchor changes which events qualify, never the
+    // concentration computed from them.
+    let author_anchor = git
+        .as_ref()
+        .and_then(|g| g.last_commit_at)
+        .unwrap_or(window.now);
     let (author_concentration, author_note) =
-        super::bus_factor::risk_author_concentration(db, file_path, now)?;
+        super::bus_factor::risk_author_concentration(db, file_path, author_anchor)?;
     notes.push(author_note);
 
     Ok((
@@ -663,6 +898,7 @@ fn assess_risk_with_context(
             found: true,
             file: file_path.to_string(),
             score,
+            unscored,
             verbose: true,
             churn_score,
             churn_percentile,
@@ -787,7 +1023,14 @@ fn compute_top_symbols(
         .collect())
 }
 
-/// Per-file risk assessments and patch-level rollups for a list of changed files.
+/// Per-file risk assessments and patch-level rollups for a list of changed
+/// files.
+///
+/// `max_score` / `mean_score` / `max_risk_file` cover only files whose git
+/// history was measured. Files without a `git_files` row keep their entry in
+/// `files` (with `unscored: true` and a partial structural score) and are
+/// named in `unscored_files`, so the aggregate never averages an unmeasured
+/// zero into a reassuring number.
 pub fn assess_risk_diff(db: &Database, file_paths: &[String]) -> Result<RiskDiffAssessment> {
     assess_risk_diff_with_walk_cache(db, file_paths, None)
 }
@@ -826,7 +1069,7 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
         .churn_percentiles()
         .context("bulk churn percentiles for risk diff")?;
 
-    let now = super::bus_factor::unix_now();
+    let window = IndexWindow::probe(db)?;
     let assessed: Vec<(RiskAssessment, bool)> = file_paths
         .iter()
         .map(|p| {
@@ -836,7 +1079,7 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
                 Some(&cycles_touching_patch),
                 Some(&percentiles),
                 MAX_FRONTIER,
-                now,
+                window,
                 cache.as_deref_mut(),
             )
         })
@@ -851,9 +1094,29 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
         }
     }
 
-    let max_score = files.iter().map(|f| f.score).fold(0.0_f64, f64::max);
-    let mean_score = files.iter().map(|f| f.score).sum::<f64>() / files.len() as f64;
-    let max_risk_file = files
+    // Aggregating an unmeasured file's structural-only score would let a
+    // patch look calm because its riskiest file has no indexed history.
+    // Excluded from the aggregates, listed by name, never dropped from
+    // `files` or the structural rollups. The exclusion cannot hide a
+    // threshold crossing: churn, fix ratio, and coupling carry 0.59 of the
+    // weight and all three need a git row, so an unscored file caps at 0.41 —
+    // under the 0.50 gate of the max-score warning further down. The bound is
+    // asserted at [`UNSCORED_REACHABLE_WEIGHT`]; the per-file gates in
+    // `rehearsal` read `files` directly, so they see unscored rows either way.
+    let unscored_files: Vec<String> = files
+        .iter()
+        .filter(|f| f.unscored)
+        .map(|f| f.file.clone())
+        .collect();
+    let scored: Vec<&RiskAssessment> = files.iter().filter(|f| !f.unscored).collect();
+    let scored_file_count = scored.len() as u32;
+    let max_score = scored.iter().map(|f| f.score).fold(0.0_f64, f64::max);
+    let mean_score = if scored.is_empty() {
+        0.0
+    } else {
+        scored.iter().map(|f| f.score).sum::<f64>() / scored.len() as f64
+    };
+    let max_risk_file = scored
         .iter()
         .max_by(|a, b| {
             a.score
@@ -928,9 +1191,28 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
             wide_blast_files.len()
         ));
     }
-    if max_score >= 0.50 {
+    // Sits directly above the max-score line it qualifies.
+    if !unscored_files.is_empty() {
+        let total = files.len();
+        let listed = name_sample(&unscored_files, UNSCORED_NOTE_SAMPLE);
+        if scored_file_count == 0 {
+            summary_notes.push(format!(
+                "no indexed git history for any of the {total} file(s) in this patch, so \
+                 max/mean are 0.00 by convention rather than measurements: {listed} (run \
+                 `codesage git-index`)"
+            ));
+        } else {
+            summary_notes.push(format!(
+                "{} of {total} file(s) have no indexed git history and are excluded from \
+                 max/mean (unmeasured, not low-risk): {listed}",
+                unscored_files.len()
+            ));
+        }
+    }
+    if max_score >= MAX_SCORE_WARNING {
         summary_notes.push(format!(
-            "max risk score {max_score:.2}; consider smaller patch and broader test sweep"
+            "max risk score {max_score:.2} over {scored_file_count} scored file(s); consider \
+             smaller patch and broader test sweep"
         ));
     }
 
@@ -972,6 +1254,8 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
         max_score,
         mean_score,
         max_risk_file,
+        unscored_files,
+        scored_file_count,
         test_gap_files,
         wide_blast_files,
         fix_heavy_files,
@@ -1002,7 +1286,7 @@ pub fn assess_risk_batch(db: &Database, file_paths: &[String]) -> Result<RiskBat
     let percentiles = db
         .churn_percentiles()
         .context("bulk churn percentiles for risk batch")?;
-    let now = super::bus_factor::unix_now();
+    let window = IndexWindow::probe(db)?;
     let mut cache = WalkCache::default();
     let mut files: Vec<RiskAssessment> = file_paths
         .iter()
@@ -1013,7 +1297,7 @@ pub fn assess_risk_batch(db: &Database, file_paths: &[String]) -> Result<RiskBat
                 Some(&cycles),
                 Some(&percentiles),
                 MAX_FRONTIER,
-                now,
+                window,
                 Some(&mut cache),
             )
             .map(|(a, _)| a)
@@ -1036,13 +1320,12 @@ pub fn assess_risk_batch(db: &Database, file_paths: &[String]) -> Result<RiskBat
 /// match gets `T`, next gets `NG`, etc., so output is stable.
 const ALIASABLE_NOTES: &[(&str, &str)] = &[
     ("T", TEST_GAP_NOTE),
-    (
-        "NG",
-        "no git history for this file (file too new, or `codesage git-index` hasn't been run)",
-    ),
+    ("NG", NO_GIT_HISTORY_NOTE),
     ("NS", NO_STRUCTURAL_SIGNALS_NOTE),
     ("TU", TEST_GAP_UNMEASURED_NOTE),
     ("CF", CYCLE_SIGNAL_FAILED_NOTE),
+    ("US", UNSCORED_NOTE),
+    ("UI", UNSCORED_NOT_INDEXED_NOTE),
 ];
 
 /// In-place alias of categorical notes that appear in ≥3 files of the
@@ -1257,6 +1540,62 @@ mod tests {
         (dir, db)
     }
 
+    const DAY: i64 = 86_400;
+
+    #[test]
+    fn utc_date_renders_civil_dates_across_leap_and_century_rules() {
+        assert_eq!(utc_date(0), "1970-01-01");
+        assert_eq!(utc_date(1_700_000_000), "2023-11-14");
+        // Leap day in a year divisible by 400, and the day after.
+        assert_eq!(utc_date(951_782_400), "2000-02-29");
+        assert_eq!(utc_date(951_868_800), "2000-03-01");
+        // 1900 is not a leap year, so 1900-02-28 is followed by 1900-03-01.
+        assert_eq!(utc_date(-2_203_977_600), "1900-02-28");
+        assert_eq!(utc_date(-2_203_891_200), "1900-03-01");
+        // The last second of a UTC day still renders that day.
+        assert_eq!(utc_date(1_699_920_000), "2023-11-14");
+        assert_eq!(utc_date(1_700_006_399), "2023-11-14");
+    }
+
+    /// The clause has to fire exactly on the regime the anchor exists for, and
+    /// stay silent otherwise: a spurious window claim on a current index would
+    /// misattribute a genuinely thin history.
+    #[test]
+    fn pinned_window_clause_names_the_window_only_when_it_would_have_hidden_the_history() {
+        let now = 1_700_000_000;
+        let window = HISTORY_WINDOW_DAYS as i64 * DAY;
+
+        let inside = pinned_window_clause(Some(now - window + DAY), now, "touching this file");
+        assert!(
+            inside.is_none(),
+            "a commit inside the wall-clock window is the ordinary case: {inside:?}"
+        );
+        let unknown = pinned_window_clause(None, now, "in this index");
+        assert!(
+            unknown.is_none(),
+            "an unknown newest commit must not be reported as pinned: {unknown:?}"
+        );
+
+        let outside = pinned_window_clause(Some(now - window - DAY), now, "touching this file")
+            .expect("a commit outside the wall-clock window must be disclosed");
+        assert!(
+            outside.contains("touching this file"),
+            "the clause must name its reference: {outside}"
+        );
+        assert!(
+            outside.contains("2021-11-13"),
+            "the clause must name the newest indexed commit's date: {outside}"
+        );
+        assert!(
+            outside.contains("730d@HEAD"),
+            "the clause must carry the indexer's window stamp: {outside}"
+        );
+        assert!(
+            outside.contains("730 days before HEAD"),
+            "the clause must say which slice was scanned: {outside}"
+        );
+    }
+
     #[test]
     fn test_gap_note_variants_claim_only_what_ran() {
         let full = test_gap_note(false, false);
@@ -1291,7 +1630,7 @@ mod tests {
             None,
             None,
             1,
-            super::super::bus_factor::unix_now(),
+            IndexWindow::probe(&db).unwrap(),
             None,
         )
         .unwrap();
@@ -1327,7 +1666,7 @@ mod tests {
             None,
             None,
             MAX_FRONTIER,
-            super::super::bus_factor::unix_now(),
+            IndexWindow::probe(&db).unwrap(),
             None,
         )
         .unwrap();
@@ -1527,15 +1866,15 @@ mod tests {
 
     fn assert_batch_matches_uncached(db: &Database, paths: &[String]) -> RiskBatchAssessment {
         let batch = assess_risk_batch(db, paths).unwrap();
-        let now = batch
-            .files
-            .iter()
-            .find_map(|file| file.author_concentration.as_ref().map(|value| value.as_of))
-            .unwrap_or_else(super::super::bus_factor::unix_now);
+        // Both runs probe the wall clock separately, but it reaches the output
+        // only through `history_predates_wall_clock_window`, whose answer for
+        // a given row flips once per 730 days. Fixtures seed timestamps well
+        // clear of that boundary, so the two probes agree.
+        let window = IndexWindow::probe(db).unwrap();
         let mut expected: Vec<_> = paths
             .iter()
             .map(|path| {
-                assess_risk_with_context(db, path, None, None, MAX_FRONTIER, now, None)
+                assess_risk_with_context(db, path, None, None, MAX_FRONTIER, window, None)
                     .unwrap()
                     .0
             })

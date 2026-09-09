@@ -4,6 +4,7 @@ pub mod extract;
 pub mod fingerprint;
 pub mod parse;
 pub mod position;
+mod preproc;
 pub mod rationale;
 pub mod references;
 pub mod validate;

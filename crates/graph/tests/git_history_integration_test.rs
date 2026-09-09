@@ -661,3 +661,276 @@ fn changed_files_since_errors_on_unknown_ref() {
 
     assert!(changed_files_since(root, "no-such-ref").is_err());
 }
+
+/// Keep the window checks aligned with the indexer's history bound.
+const HISTORY_WINDOW_DAYS: i64 = 730;
+/// Churn decay time constant in days, mirroring `DECAY_TAU_SECS`.
+const DECAY_TAU_DAYS: f64 = 180.0;
+
+/// Commit `path` with `lines` one-line functions at `unix_ts`, so the numstat
+/// added count — and therefore the churn units — are exact.
+fn commit_file_at(root: &std::path::Path, path: &str, lines: usize, subject: &str, unix_ts: i64) {
+    let body: String = (0..lines).map(|i| format!("fn f{i}() {{}}\n")).collect();
+    std::fs::write(root.join(path), body).unwrap();
+    commit_at(root, subject, unix_ts);
+}
+
+/// Three co-changing commits whose newest is `head_ts`, spread over 400 days.
+fn old_head_repo(root: &std::path::Path, head_ts: i64) {
+    init_hermetic_repo(root);
+    commit_pair_at(root, 1, head_ts - 400 * DAY);
+    commit_pair_at(root, 2, head_ts - 200 * DAY);
+    commit_pair_at(root, 3, head_ts);
+}
+
+#[test]
+fn old_head_checkout_still_indexes_files_and_co_changes() {
+    // A pinned checkout whose newest commit predates the history window must
+    // still produce history: the window is anchored on HEAD, not the wall clock.
+    let head_ts = unix_now() - (HISTORY_WINDOW_DAYS + 270) * DAY;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    old_head_repo(root, head_ts);
+
+    let db = Database::open_in_memory().unwrap();
+    let stats = git_history_index_with_options(&db, root, &[], IndexMode::Full).unwrap();
+
+    assert_eq!(
+        stats.commits_scanned, 3,
+        "every commit of an old checkout must be scanned"
+    );
+    assert_eq!(stats.files_tracked, 2, "git_files must not be empty");
+    assert_eq!(
+        stats.co_change_pairs, 1,
+        "git_co_changes must not be empty at the visibility threshold"
+    );
+
+    let a = db.git_file("a.rs").unwrap().expect("a.rs row");
+    assert_eq!(a.total_commits, 3);
+    assert!(a.churn_score > 0.0, "churn must not decay to nothing");
+
+    let pairs = db.co_changes_for("a.rs", 10).unwrap();
+    assert_eq!(pairs.len(), 1, "co-change row must be queryable: {pairs:?}");
+    assert_eq!(pairs[0].file, "b.rs");
+    assert_eq!(pairs[0].count, 3);
+
+    let report = find_coupling(&db, "a.rs", 10).unwrap();
+    assert_eq!(
+        report.coupled.len(),
+        1,
+        "find_coupling must report the pair: {report:?}"
+    );
+    assert_eq!(report.coupled[0].span_days, 400);
+}
+
+#[test]
+fn head_inside_the_window_still_admits_the_whole_history() {
+    // The failure mode that looks like it worked: HEAD is 700 days old, so a
+    // wall-clock window admits only the 30-day sliver between HEAD's age and
+    // the 730-day bound — 2 of 20 commits. That truncates `total_commits`,
+    // which is the denominator of find_coupling's confidence, and drops the
+    // pair under the count floor so coupling blames the file's commit count.
+    let head_ts = unix_now() - 700 * DAY;
+    let commits = 20;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_hermetic_repo(root);
+    for step in 0..commits {
+        commit_pair_at(
+            root,
+            step + 1,
+            head_ts - i64::from(commits - 1 - step) * 30 * DAY,
+        );
+    }
+
+    let db = Database::open_in_memory().unwrap();
+    let stats = git_history_index_with_options(&db, root, &[], IndexMode::Full).unwrap();
+    assert_eq!(
+        stats.commits_scanned, 20,
+        "the window must be measured from HEAD, not from the wall clock"
+    );
+    assert_eq!(stats.co_change_pairs, 1);
+
+    let a = db.git_file("a.rs").unwrap().expect("a.rs row");
+    assert_eq!(
+        a.total_commits, 20,
+        "truncated commit counts corrupt every ratio derived from them"
+    );
+    // 19 rewrites at 0.02 units plus the 570-day-old creation at 0.01.
+    assert!(
+        a.churn_score > 0.1,
+        "570 days of monthly work should accumulate churn, got {}",
+        a.churn_score
+    );
+
+    let pairs = db.co_changes_for("a.rs", 10).unwrap();
+    assert_eq!(pairs.len(), 1, "pair must clear the count floor: {pairs:?}");
+    assert_eq!(pairs[0].count, 20);
+
+    let report = find_coupling(&db, "a.rs", 10).unwrap();
+    assert_eq!(report.file_commits, 20, "confidence denominator");
+    assert_eq!(report.coupled.len(), 1);
+    assert_eq!(report.coupled[0].confidence, 1.0);
+    assert_eq!(report.coupled[0].reverse_confidence, 1.0);
+    assert_eq!(report.coupled[0].span_days, 570);
+    assert!(
+        report.note.is_none(),
+        "a complete history must not be explained away: {:?}",
+        report.note
+    );
+}
+
+#[test]
+fn churn_decay_anchors_on_head_not_the_wall_clock() {
+    // Two single-file commits 400 days apart, the newest at HEAD. The weights
+    // must be the decay measured from HEAD, so the file touched at HEAD keeps
+    // its full churn units however old the checkout is.
+    let head_ts = unix_now() - (HISTORY_WINDOW_DAYS + 270) * DAY;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    init_hermetic_repo(root);
+    commit_file_at(root, "old.rs", 50, "feat: old", head_ts - 400 * DAY);
+    commit_file_at(root, "new.rs", 50, "feat: new", head_ts);
+
+    let db = Database::open_in_memory().unwrap();
+    git_history_index_with_options(&db, root, &[], IndexMode::Full).unwrap();
+
+    // 50 added lines / 100 = 0.5 churn units, undecayed at the anchor.
+    let fresh = db
+        .git_file("new.rs")
+        .unwrap()
+        .expect("new.rs row")
+        .churn_score;
+    let aged = db
+        .git_file("old.rs")
+        .unwrap()
+        .expect("old.rs row")
+        .churn_score;
+    assert!(
+        (fresh - 0.5).abs() < 1e-9,
+        "HEAD's own commit must be undecayed: churn={fresh}"
+    );
+    let expected_aged = 0.5 * (-400.0 / DECAY_TAU_DAYS).exp();
+    assert!(
+        (aged - expected_aged).abs() < 1e-9,
+        "400-day-old commit must decay from HEAD: churn={aged} expected={expected_aged}"
+    );
+    assert!(
+        fresh > aged * 9.0,
+        "recent work must outrank 400-day-old work: {fresh} vs {aged}"
+    );
+}
+
+#[test]
+fn history_weights_are_invariant_under_backdating_the_whole_repo() {
+    // Same repository shape, one pinned 1000 days back: anchoring on HEAD makes
+    // the output a function of (repo, HEAD) rather than of the wall clock.
+    let now = unix_now();
+    let recent_dir = tempfile::tempdir().unwrap();
+    let old_dir = tempfile::tempdir().unwrap();
+    old_head_repo(recent_dir.path(), now);
+    old_head_repo(old_dir.path(), now - 1000 * DAY);
+
+    let recent_db = Database::open_in_memory().unwrap();
+    let old_db = Database::open_in_memory().unwrap();
+    let recent =
+        git_history_index_with_options(&recent_db, recent_dir.path(), &[], IndexMode::Full)
+            .unwrap();
+    let old =
+        git_history_index_with_options(&old_db, old_dir.path(), &[], IndexMode::Full).unwrap();
+
+    assert_eq!(recent.commits_scanned, old.commits_scanned);
+    assert_eq!(recent.files_tracked, old.files_tracked);
+    assert_eq!(recent.co_change_pairs, old.co_change_pairs);
+
+    for path in ["a.rs", "b.rs"] {
+        let want = recent_db.git_file(path).unwrap().expect("recent row");
+        let got = old_db.git_file(path).unwrap().expect("backdated row");
+        assert_eq!(got.total_commits, want.total_commits, "{path}");
+        // The recent repo's HEAD is seconds old, the backdated one 1000 days:
+        // a wall-clock anchor would differ by exp(-1000/180) ~= 0.0039.
+        assert!(
+            (got.churn_score - want.churn_score).abs() < 1e-6,
+            "{path}: backdated churn {} vs recent {}",
+            got.churn_score,
+            want.churn_score
+        );
+    }
+    let want = recent_db.co_changes_for("a.rs", 10).unwrap();
+    let got = old_db.co_changes_for("a.rs", 10).unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].count, want[0].count);
+    assert!(
+        (got[0].weight - want[0].weight).abs() < 1e-6,
+        "backdated pair weight {} vs recent {}",
+        got[0].weight,
+        want[0].weight
+    );
+}
+
+#[test]
+fn incremental_over_old_head_checkout_matches_a_pristine_full_scan() {
+    // The incremental path must use the same anchor as the full path, or it
+    // re-introduces the wall clock for every pass after the first.
+    let head_ts = unix_now() - (HISTORY_WINDOW_DAYS + 270) * DAY;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    old_head_repo(root, head_ts);
+
+    let db_incr = Database::open_in_memory().unwrap();
+    let full = git_history_index_with_options(&db_incr, root, &[], IndexMode::Full).unwrap();
+    assert_eq!(full.files_tracked, 2);
+
+    commit_pair_at(root, 4, head_ts + DAY);
+    let incr = git_history_index_with_options(&db_incr, root, &[], IndexMode::Incremental).unwrap();
+    assert_eq!(
+        incr.commits_scanned, 1,
+        "incremental must scan only the new commit"
+    );
+
+    let db_full = Database::open_in_memory().unwrap();
+    git_history_index_with_options(&db_full, root, &[], IndexMode::Full).unwrap();
+
+    for path in ["a.rs", "b.rs"] {
+        let got = db_incr.git_file(path).unwrap().expect("incremental row");
+        let want = db_full.git_file(path).unwrap().expect("pristine row");
+        assert_eq!(got.total_commits, 4, "{path}: every commit counted");
+        assert_eq!(got.total_commits, want.total_commits, "{path}");
+        assert!(
+            (got.churn_score - want.churn_score).abs() < 1e-9,
+            "{path}: incremental churn {} vs pristine {}",
+            got.churn_score,
+            want.churn_score
+        );
+    }
+    let got = db_incr.co_changes_for("a.rs", 10).unwrap();
+    let want = db_full.co_changes_for("a.rs", 10).unwrap();
+    assert_eq!(got.len(), 1, "pair must survive the incremental pass");
+    assert_eq!(got[0].count, 4);
+    assert_eq!(got[0].count, want[0].count);
+    assert!(
+        (got[0].weight - want[0].weight).abs() < 1e-9,
+        "incremental pair weight {} vs pristine {}",
+        got[0].weight,
+        want[0].weight
+    );
+}
+
+#[test]
+fn repository_without_head_reports_the_missing_head_instead_of_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    init_hermetic_repo(dir.path());
+    let db = Database::open_in_memory().unwrap();
+    let err = git_history_index_with_options(&db, dir.path(), &[], IndexMode::Full).unwrap_err();
+    assert!(
+        err.to_string().contains("git rev-parse HEAD failed"),
+        "an empty repository must report the missing HEAD: {err}"
+    );
+
+    let bare = tempfile::tempdir().unwrap();
+    let err = git_history_index_with_options(&db, bare.path(), &[], IndexMode::Full).unwrap_err();
+    assert!(
+        err.to_string().contains("git rev-parse HEAD"),
+        "a non-repository must report the missing HEAD: {err}"
+    );
+}

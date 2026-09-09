@@ -249,6 +249,7 @@ pub fn extract_symbols(
     let def_idx = spec.def_idx;
 
     let root = tree.root_node();
+    let dead = crate::preproc::DeadRegions::scan(root, source, language);
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, root, source);
 
@@ -278,6 +279,12 @@ pub fn extract_symbols(
 
         let name_node = name_cap.node;
         let def_node = def_cap.node;
+
+        // A definition parked in a dead `#if 0` arm exists in no build, and
+        // must not claim a `seen_defs` key either — see `crate::preproc`.
+        if dead.covers(&def_node) {
+            continue;
+        }
 
         // Multi-declarator fields share a def node; keep each distinct name.
         let def_id = (

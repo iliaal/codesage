@@ -913,6 +913,19 @@ pub struct RiskAssessment {
     pub found: bool,
     pub file: String,
     pub score: f64,
+    /// True when this file has no `git_files` row, so every history-derived
+    /// term of `score` — churn percentile, fix ratio, and coupling pressure,
+    /// 0.59 of the composite weight — was never measured. `score` then
+    /// carries the structural terms alone and is not a low-risk verdict:
+    /// absence of history is absence of evidence. Four situations produce it
+    /// — a brand-new file, a path excluded from git indexing, `codesage
+    /// git-index` never run, and history that fell outside the indexer's
+    /// window — and a `notes[]` line names the state. `assess_risk_diff`
+    /// excludes these files from `max_score` / `mean_score` and lists them
+    /// under `unscored_files`. Not gated by `verbose`: it qualifies `score`
+    /// itself, so it must reach every caller that reads the score.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unscored: bool,
     /// Wire switch, not a measurement: when false the decomposition scalars
     /// and `top_coupled` are left out of the serialized form. Never
     /// serialized itself, and defaults to false when parsed: a trimmed
@@ -1007,6 +1020,7 @@ impl Serialize for RiskAssessment {
         let emit_top_symbols = !self.top_symbols.is_empty();
         let len = 3
             + usize::from(self.author_concentration.is_some())
+            + usize::from(self.unscored)
             + if self.verbose { 10 } else { 0 }
             + usize::from(emit_cycle_files)
             + usize::from(emit_top_coupled)
@@ -1017,6 +1031,9 @@ impl Serialize for RiskAssessment {
         s.serialize_field("found", &self.found)?;
         s.serialize_field("file", &self.file)?;
         s.serialize_field("score", &self.score)?;
+        if self.unscored {
+            s.serialize_field("unscored", &self.unscored)?;
+        }
         if let Some(authors) = &self.author_concentration {
             s.serialize_field("author_concentration", authors)?;
         }
@@ -1062,13 +1079,33 @@ pub struct RiskDiffAssessment {
     pub empty_input: bool,
     /// Per-file decomposition. Same shape as a single `assess_risk` call.
     pub files: Vec<RiskAssessment>,
-    /// Highest score across the patch. The signal that should drive the agent's
-    /// caution: split the patch, add tests, request review.
+    /// Highest score among the patch's *scored* files. The signal that should
+    /// drive the agent's caution: split the patch, add tests, request review.
+    /// Files with no indexed git history are excluded (see `unscored_files`);
+    /// 0.0 when `scored_file_count` is 0.
     pub max_score: f64,
+    /// Mean score over the patch's *scored* files — `scored_file_count` is the
+    /// denominator. 0.0 when nothing in the patch was scored.
     pub mean_score: f64,
-    /// File contributing `max_score`. None when the patch is empty.
+    /// File contributing `max_score`. None when the patch is empty or no file
+    /// in it was scored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_risk_file: Option<String>,
+    /// Patch files whose history signals were never measured
+    /// ([`RiskAssessment::unscored`]). They are excluded from `max_score` /
+    /// `mean_score` — averaging their structural-only score reports a
+    /// reassuring number for a patch whose riskiest file merely has no
+    /// indexed history — and named here so they stay visible. They remain in
+    /// `files` with their structural score, and in the structural rollups
+    /// (`test_gap_files`, `wide_blast_files`).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub unscored_files: Vec<String>,
+    /// How many files contributed to `max_score` / `mean_score`: the mean's
+    /// denominator. `0` means no file in this patch had indexed git history,
+    /// so both aggregates are 0.0 by convention rather than measurements —
+    /// read `unscored_files` and run `codesage git-index`.
+    #[serde(default)]
+    pub scored_file_count: u32,
     /// Files with `test_gap == true`. Adding tests for these closes the most
     /// common reviewer concern.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -1152,7 +1189,9 @@ impl RiskDiffAssessment {
 pub struct RiskBatchAssessment {
     /// Per-file decomposition, in the order of the request's `file_paths`.
     /// One [`RiskAssessment`] per input path. Ordering preserved so the
-    /// agent can zip with its own list.
+    /// agent can zip with its own list. There is no cross-file aggregate to
+    /// correct here, so an unmeasured file is disclosed per entry:
+    /// [`RiskAssessment::unscored`] plus its `notes[]` line.
     pub files: Vec<RiskAssessment>,
     /// Same shape and semantics as [`RiskDiffAssessment::legend`]: short
     /// codes for categorical notes that repeated in ≥3 files. Empty when
@@ -2567,6 +2606,7 @@ mod tests {
             found: true,
             file: "src/lib.rs".to_string(),
             score: 0.61,
+            unscored: false,
             verbose: true,
             churn_score: 12.5,
             churn_percentile: 0.94,
@@ -2695,6 +2735,41 @@ mod tests {
             "expected >=48% reduction, got {saved}/{} bytes",
             full_json.len()
         );
+    }
+
+    /// `unscored` qualifies `score`, so the verbose switch must not hide it
+    /// and the hand-written `Serialize` must place it beside the number it
+    /// disclaims. A scored assessment keeps the key off the wire entirely.
+    #[test]
+    fn risk_assessment_unscored_reaches_the_wire_in_both_verbosities() {
+        let mut scored = risk_fixture();
+        for verbose in [true, false] {
+            scored.set_verbose(verbose);
+            let json = serde_json::to_string(&scored).unwrap();
+            assert!(
+                !json.contains("unscored"),
+                "a scored assessment must not emit the key: {json}"
+            );
+        }
+
+        let mut unscored = risk_fixture();
+        unscored.unscored = true;
+        for verbose in [true, false] {
+            unscored.set_verbose(verbose);
+            let json = serde_json::to_string(&unscored).unwrap();
+            let keys = json_keys(&json);
+            assert_eq!(
+                &keys[..4],
+                ["found", "file", "score", "unscored"],
+                "unscored must sit next to the score it qualifies: {json}"
+            );
+            let mut back: RiskAssessment = serde_json::from_str(&json).unwrap();
+            back.set_verbose(verbose);
+            assert!(back.unscored, "unscored must round-trip: {json}");
+            if verbose {
+                assert_eq!(format!("{back:?}"), format!("{unscored:?}"));
+            }
+        }
     }
 
     /// Guards the hand-written `Serialize`: a field added to the struct but

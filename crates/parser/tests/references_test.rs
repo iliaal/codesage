@@ -281,3 +281,302 @@ fn python_decorators_name_the_applied_symbol() {
     assert!(has_ref(&refs, "retry", ReferenceKind::Call));
     assert!(has_ref(&refs, "route", ReferenceKind::Call));
 }
+
+fn ref_count(refs: &[codesage_protocol::Reference], name: &str) -> usize {
+    refs.iter().filter(|r| r.to_name == name).count()
+}
+
+#[test]
+fn c_call_in_an_if_zero_arm_is_not_a_reference() {
+    // The bead cs-j0p reproducer: the dead row inflated `find_references`,
+    // breaking the `counts_floor` promise that true >= reported, and named
+    // `dead_caller` as a caller in every configuration.
+    let src = "void real_target(void) {}\n\
+               void live_caller(void) { real_target(); }\n\
+               void dead_caller(void) {\n\
+               #if 0\n\
+                   real_target();\n\
+               #endif\n\
+               }\n";
+    let refs = refs_from_source(src, Language::C);
+    assert_eq!(ref_count(&refs, "real_target"), 1, "{refs:?}");
+    assert_eq!(
+        refs.iter()
+            .find(|r| r.to_name == "real_target")
+            .map(|r| r.line),
+        Some(2)
+    );
+}
+
+#[test]
+fn c_call_in_an_if_one_arm_stays_live() {
+    let src = "void d(void){\n#if 1\nlive();\n#endif\n}\n";
+    let refs = refs_from_source(src, Language::C);
+    assert!(has_ref(&refs, "live", ReferenceKind::Call), "{refs:?}");
+}
+
+#[test]
+fn c_if_zero_else_keeps_the_else_arm_only() {
+    let src = "void d(void){\n#if 0\ndead();\n#else\nlive();\n#endif\n}\n";
+    let refs = refs_from_source(src, Language::C);
+    assert!(has_ref(&refs, "live", ReferenceKind::Call), "{refs:?}");
+    assert_eq!(ref_count(&refs, "dead"), 0, "{refs:?}");
+}
+
+#[test]
+fn c_if_one_else_keeps_the_if_arm_only() {
+    let src = "void d(void){\n#if 1\nlive();\n#else\ndead();\n#endif\n}\n";
+    let refs = refs_from_source(src, Language::C);
+    assert!(has_ref(&refs, "live", ReferenceKind::Call), "{refs:?}");
+    assert_eq!(ref_count(&refs, "dead"), 0, "{refs:?}");
+}
+
+#[test]
+fn c_nested_conditional_inside_if_zero_is_fully_masked() {
+    let src = "void d(void){\n\
+               #if 0\n\
+               #ifdef Q\n\
+               dead_a();\n\
+               #else\n\
+               dead_b();\n\
+               #endif\n\
+               dead_c();\n\
+               #endif\n\
+               live();\n\
+               }\n";
+    let refs = refs_from_source(src, Language::C);
+    assert_eq!(ref_count(&refs, "dead_a"), 0, "{refs:?}");
+    assert_eq!(ref_count(&refs, "dead_b"), 0, "{refs:?}");
+    assert_eq!(ref_count(&refs, "dead_c"), 0, "{refs:?}");
+    assert!(has_ref(&refs, "live", ReferenceKind::Call), "{refs:?}");
+}
+
+#[test]
+fn c_ifdef_ifndef_and_expression_guards_all_stay_live() {
+    // Configuration, not dead code: CodeSage indexes a file once with no
+    // configuration, so masking these would trade an over-count for a much
+    // larger under-count.
+    let src = "void d(void){\n\
+               #ifdef X\n\
+               live_ifdef();\n\
+               #else\n\
+               live_ifdef_else();\n\
+               #endif\n\
+               #ifndef Y\n\
+               live_ifndef();\n\
+               #endif\n\
+               #if defined(Z) && N > 1\n\
+               live_expr();\n\
+               #endif\n\
+               }\n";
+    let refs = refs_from_source(src, Language::C);
+    for name in ["live_ifdef", "live_ifdef_else", "live_ifndef", "live_expr"] {
+        assert!(
+            has_ref(&refs, name, ReferenceKind::Call),
+            "{name}: {refs:?}"
+        );
+    }
+}
+
+#[test]
+fn c_elif_and_else_arms_of_an_if_zero_stay_live() {
+    // `#if 0` proves only its own arm dead; which of the arms below runs is a
+    // build fact, exactly like a bare `#if EXPR`.
+    let src = "void d(void){\n\
+               #if 0\n\
+               dead();\n\
+               #elif FOO\n\
+               live_elif();\n\
+               #else\n\
+               live_else();\n\
+               #endif\n\
+               }\n";
+    let refs = refs_from_source(src, Language::C);
+    assert_eq!(ref_count(&refs, "dead"), 0, "{refs:?}");
+    assert!(has_ref(&refs, "live_elif", ReferenceKind::Call), "{refs:?}");
+    assert!(has_ref(&refs, "live_else", ReferenceKind::Call), "{refs:?}");
+}
+
+#[test]
+fn c_elif_and_else_arms_after_an_if_one_are_dead() {
+    // Once a group is taken, the preprocessor skips every later group of the
+    // conditional in every configuration.
+    let src = "void d(void){\n\
+               #if 1\n\
+               live();\n\
+               #elif FOO\n\
+               dead_elif();\n\
+               #else\n\
+               dead_else();\n\
+               #endif\n\
+               }\n";
+    let refs = refs_from_source(src, Language::C);
+    assert!(has_ref(&refs, "live", ReferenceKind::Call), "{refs:?}");
+    assert_eq!(ref_count(&refs, "dead_elif"), 0, "{refs:?}");
+    assert_eq!(ref_count(&refs, "dead_else"), 0, "{refs:?}");
+}
+
+#[test]
+fn c_elif_zero_arm_is_dead_and_the_chain_below_it_stays_live() {
+    let src = "void d(void){\n\
+               #if FOO\n\
+               live_if();\n\
+               #elif 0\n\
+               dead_elif();\n\
+               #else\n\
+               live_else();\n\
+               #endif\n\
+               }\n";
+    let refs = refs_from_source(src, Language::C);
+    assert!(has_ref(&refs, "live_if", ReferenceKind::Call), "{refs:?}");
+    assert_eq!(ref_count(&refs, "dead_elif"), 0, "{refs:?}");
+    assert!(has_ref(&refs, "live_else", ReferenceKind::Call), "{refs:?}");
+}
+
+#[test]
+fn c_include_inside_if_zero_is_not_a_reference() {
+    // Same decision as the dead call: the header is included in no build.
+    let src = "#if 0\n#include \"dead.h\"\n#endif\n#include \"live.h\"\n";
+    let refs = refs_from_source(src, Language::C);
+    assert!(has_ref(&refs, "live.h", ReferenceKind::Include), "{refs:?}");
+    assert_eq!(ref_count(&refs, "dead.h"), 0, "{refs:?}");
+}
+
+#[test]
+fn cpp_if_zero_masks_calls_includes_bases_instantiations_and_usings() {
+    // cpp_refs.scm is a separate query with eleven more patterns than C's.
+    let src = "#if 0\n\
+               #include \"dead.h\"\n\
+               using ns::dead_using;\n\
+               class DeadC : public DeadBase { void m() { dead_call(); } };\n\
+               #endif\n\
+               #include \"live.h\"\n\
+               using ns::live_using;\n\
+               class LiveC : public LiveBase { void n() { live_call(); } };\n\
+               void f(){\n\
+               #if 0\n\
+                 auto *p = new DeadT();\n\
+               #endif\n\
+                 auto *q = new LiveT();\n\
+               }\n";
+    let refs = refs_from_source(src, Language::Cpp);
+    for name in ["dead.h", "ns::dead_using", "DeadBase", "dead_call", "DeadT"] {
+        assert_eq!(ref_count(&refs, name), 0, "{name}: {refs:?}");
+    }
+    assert!(has_ref(&refs, "live.h", ReferenceKind::Include), "{refs:?}");
+    assert!(
+        has_ref(&refs, "ns::live_using", ReferenceKind::Import),
+        "{refs:?}"
+    );
+    assert!(
+        has_ref(&refs, "LiveBase", ReferenceKind::Inheritance),
+        "{refs:?}"
+    );
+    assert!(has_ref(&refs, "live_call", ReferenceKind::Call), "{refs:?}");
+    assert!(
+        has_ref(&refs, "LiveT", ReferenceKind::Instantiation),
+        "{refs:?}"
+    );
+}
+
+#[test]
+fn cpp_if_one_else_keeps_the_if_arm_only() {
+    let src = "void d(){\n#if 1\nlive();\n#else\ndead();\n#endif\n}\n";
+    let refs = refs_from_source(src, Language::Cpp);
+    assert!(has_ref(&refs, "live", ReferenceKind::Call), "{refs:?}");
+    assert_eq!(ref_count(&refs, "dead"), 0, "{refs:?}");
+}
+
+#[test]
+fn cpp_if_zero_else_keeps_the_else_arm_only() {
+    let src = "void d(){\n#if 0\ndead();\n#else\nlive();\n#endif\n}\n";
+    let refs = refs_from_source(src, Language::Cpp);
+    assert!(has_ref(&refs, "live", ReferenceKind::Call), "{refs:?}");
+    assert_eq!(ref_count(&refs, "dead"), 0, "{refs:?}");
+}
+
+#[test]
+fn cpp_ifdef_and_expression_guards_all_stay_live() {
+    let src = "void d(){\n\
+               #ifdef X\n\
+               live_ifdef();\n\
+               #else\n\
+               live_else();\n\
+               #endif\n\
+               #ifndef Y\n\
+               live_ifndef();\n\
+               #endif\n\
+               #if N > 1\n\
+               live_expr();\n\
+               #endif\n\
+               }\n";
+    let refs = refs_from_source(src, Language::Cpp);
+    for name in ["live_ifdef", "live_else", "live_ifndef", "live_expr"] {
+        assert!(
+            has_ref(&refs, name, ReferenceKind::Call),
+            "{name}: {refs:?}"
+        );
+    }
+}
+
+#[test]
+fn c_if_zero_left_unterminated_by_a_brace_masks_nothing() {
+    // The `#endif` is swallowed by the unclosed `struct S {`, so tree-sitter
+    // inserts a zero-width MISSING one at EOF and the group node spans the
+    // rest of the file. Masking that span would delete real references.
+    let src = "#if 0\n\
+               struct S {\n\
+               #endif\n\
+                 int x;\n\
+               };\n\
+               void live(void){ live_t(); }\n";
+    let refs = refs_from_source(src, Language::C);
+    assert!(has_ref(&refs, "live_t", ReferenceKind::Call), "{refs:?}");
+    assert_eq!(
+        refs.iter().find(|r| r.to_name == "live_t").map(|r| r.line),
+        Some(6)
+    );
+}
+
+#[test]
+fn c_if_zero_with_no_endif_masks_nothing() {
+    let src = "#if 0\n\
+               struct Kept { int x; };\n\
+               void kept(void){ kept_t(); }\n";
+    let refs = refs_from_source(src, Language::C);
+    assert!(has_ref(&refs, "kept_t", ReferenceKind::Call), "{refs:?}");
+}
+
+#[test]
+fn c_elif_zero_left_unterminated_masks_nothing() {
+    let src = "#if FOO\n\
+               void a(void){}\n\
+               #elif 0\n\
+               struct S {\n\
+               #endif\n\
+                 int x; };\n\
+               void live(void){ live_t(); }\n";
+    let refs = refs_from_source(src, Language::C);
+    assert!(has_ref(&refs, "live_t", ReferenceKind::Call), "{refs:?}");
+}
+
+#[test]
+fn cpp_if_zero_left_unterminated_by_a_brace_masks_nothing() {
+    let src = "#if 0\n\
+               class C {\n\
+               #endif\n\
+                 int x;\n\
+               };\n\
+               void live(){ live_t(); }\n";
+    let refs = refs_from_source(src, Language::Cpp);
+    assert!(has_ref(&refs, "live_t", ReferenceKind::Call), "{refs:?}");
+}
+
+#[test]
+fn cpp_if_zero_with_no_endif_masks_nothing() {
+    let src = "#if 0\n\
+               class Kept { int x; };\n\
+               void kept(){ kept_t(); }\n";
+    let refs = refs_from_source(src, Language::Cpp);
+    assert!(has_ref(&refs, "kept_t", ReferenceKind::Call), "{refs:?}");
+}

@@ -112,6 +112,7 @@ pub fn file_fingerprints(
     let kind_map = crate::extract::kind_map_for(language);
 
     let root = tree.root_node();
+    let dead = crate::preproc::DeadRegions::scan(root, source, language);
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&spec.query, root, source);
 
@@ -132,6 +133,11 @@ pub fn file_fingerprints(
             continue;
         };
         let def = def_cap.node;
+        // Keep the fingerprinted set equal to the indexed symbol set: a
+        // definition in a dead `#if 0` arm is not a symbol either.
+        if dead.covers(&def) {
+            continue;
+        }
         let captured = crate::parse::node_text_lossy(&name_cap.node, source);
         let name = if language == Language::Cpp {
             crate::extract::cpp_bare_name(&captured)
@@ -380,5 +386,23 @@ fn alpha(items: &[i32]) -> i32 {
         assert_eq!(p.len(), 1);
         assert!(jaccard_checked(&r[0], &r[0]).is_some());
         assert_eq!(jaccard_checked(&r[0], &p[0]), None);
+    }
+
+    #[test]
+    fn c_function_inside_an_if_zero_arm_is_not_fingerprinted() {
+        // The fingerprinted set must stay equal to the indexed symbol set,
+        // which excludes definitions in dead preprocessor arms. Both bodies
+        // clear MIN_LEAF_NODES, so only the mask can drop the dead one.
+        let body = "(int *xs, int n) {\n\
+                    int total = 0;\n\
+                    for (int i = 0; i < n; i++) {\n\
+                    if (xs[i] > 0) { total += xs[i] * 2; } else { total -= 1; }\n\
+                    }\n\
+                    return total;\n\
+                    }\n";
+        let src = format!("#if 0\nint dead{body}#endif\nint live{body}");
+        let out = fps(&src, Language::C);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].name, "live");
     }
 }

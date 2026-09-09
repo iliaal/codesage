@@ -2,7 +2,10 @@
 //!
 //! Source patterns from repowise's git_indexer.py, re-implemented from algorithm:
 //! - one subprocess for the whole repo
-//! - exponential decay (τ=180 days) on commit age
+//! - exponential decay (τ=180 days) on commit age, measured from HEAD's own
+//!   committer epoch rather than the wall clock, so a pinned checkout is not
+//!   flattened (or emptied outright) by how long ago it was tagged; see
+//!   [`HistoryAnchor`]
 //! - per-commit churn weight = decay * min((added+deleted)/100, 3.0); the clamp
 //!   prevents one historic refactor from dominating forever
 //! - co-change pair weight = sum over commits where both files appear, weighted by decay
@@ -21,8 +24,9 @@
 //! than the history window until the next `--full` rebaselines the row.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use anyhow::{Context, Result, anyhow};
 use codesage_parser::discover::{
@@ -35,13 +39,14 @@ use globset::GlobSet;
 
 use super::bus_factor::normalized_author;
 
-const DECAY_HALFLIFE_DAYS: f64 = 180.0;
+const DECAY_TAU_DAYS: f64 = 180.0;
 const SECONDS_PER_DAY: f64 = 86_400.0;
 const CHURN_CLAMP: f64 = 3.0;
 const CHURN_DIVISOR: f64 = 100.0;
 const MIN_CO_CHANGE_COUNT: u32 = 3;
 /// Bound onboarding cost by excluding old commits whose decayed weight is small.
-const HISTORY_WINDOW_DAYS: f64 = 730.0;
+/// Measured back from the pass's [`HistoryAnchor`], not from the wall clock.
+pub const HISTORY_WINDOW_DAYS: f64 = 730.0;
 /// Bound quadratic pair generation and suppress broad mechanical co-changes.
 const MAX_FILES_PER_COMMIT_FOR_COCHANGE: usize = 30;
 /// Cell width of the fixed 90-day calendar grid (from the unix epoch) used
@@ -98,6 +103,141 @@ fn window_bit(timestamp: i64) -> u64 {
     1u64 << recurrence_window(timestamp)
 }
 
+/// Which clock a pass measures the history window and the churn decay from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryAnchorSource {
+    /// HEAD's own committer epoch. Output is then a function of (repo, HEAD),
+    /// so a pinned checkout reads the same on whatever day it is indexed.
+    HeadCommit,
+    /// Wall clock, reached only when there is no HEAD to read: an empty
+    /// repository, or no usable git.
+    WallClock,
+}
+
+/// Reference point for [`HISTORY_WINDOW_DAYS`] and the churn decay.
+///
+/// Measuring from the wall clock empties `git_files` and `git_co_changes`
+/// entirely for a checkout whose newest commit predates the window, and
+/// flattens churn into noise well before that, so a pass measures from HEAD's
+/// own committer epoch instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryAnchor {
+    pub epoch: i64,
+    pub source: HistoryAnchorSource,
+}
+
+impl HistoryAnchor {
+    /// Oldest commit timestamp this pass admits.
+    pub fn cutoff(&self) -> i64 {
+        history_window_cutoff(self.epoch)
+    }
+
+    /// Stamp for operator-facing notes. The two regimes have to stay
+    /// distinguishable, or an empty answer cannot name its cause.
+    pub fn window_stamp(&self) -> String {
+        let days = HISTORY_WINDOW_DAYS as i64;
+        match self.source {
+            HistoryAnchorSource::HeadCommit => format!("{days}d@HEAD"),
+            HistoryAnchorSource::WallClock => format!("{days}d@now"),
+        }
+    }
+}
+
+/// Anchor at the already-resolved HEAD commit. Every pass resolves HEAD before
+/// choosing a mode, so the anchor costs one `git log -1`, memoized per (root,
+/// SHA); a read-side consumer that holds no path uses
+/// [`history_predates_wall_clock_window`] against the newest timestamp its
+/// rows carry instead.
+fn anchor_at_commit(root: &Path, sha: &str) -> HistoryAnchor {
+    match commit_epoch(root, sha) {
+        Some(epoch) => HistoryAnchor {
+            epoch,
+            source: HistoryAnchorSource::HeadCommit,
+        },
+        None => {
+            tracing::warn!(
+                %sha,
+                root = %root.display(),
+                "no committer date for HEAD; measuring history from the wall clock"
+            );
+            wall_clock_anchor()
+        }
+    }
+}
+
+fn wall_clock_anchor() -> HistoryAnchor {
+    HistoryAnchor {
+        epoch: unix_now(),
+        source: HistoryAnchorSource::WallClock,
+    }
+}
+
+/// Whether the newest commit an index holds predates a wall-clock window, so
+/// the history is visible only because the anchor follows HEAD. Read-side
+/// callers pass the newest timestamp they already hold: a row's
+/// `last_commit_at`, or the upper bound of
+/// [`codesage_storage::Database::co_change_history_span`].
+pub fn history_predates_wall_clock_window(newest_commit_at: i64, now: i64) -> bool {
+    newest_commit_at < history_window_cutoff(now)
+}
+
+/// Time references for one pass: where this pass measures from, and the anchor
+/// the already-stored rows were last decayed to.
+#[derive(Debug, Clone, Copy)]
+struct PassAnchors {
+    current: HistoryAnchor,
+    previous: i64,
+}
+
+type CommitEpochKey = (PathBuf, String);
+
+/// One entry per (root, HEAD) pair; bounds a daemon that indexes for weeks.
+const COMMIT_EPOCH_MEMO_CAP: usize = 256;
+
+fn commit_epoch_memo() -> &'static Mutex<HashMap<CommitEpochKey, i64>> {
+    static MEMO: OnceLock<Mutex<HashMap<CommitEpochKey, i64>>> = OnceLock::new();
+    MEMO.get_or_init(Mutex::default)
+}
+
+/// The map carries no invariant a panicking holder could have broken.
+fn lock_memo<K, V>(memo: &Mutex<HashMap<K, V>>) -> MutexGuard<'_, HashMap<K, V>> {
+    memo.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Committer epoch of `sha`, memoized per (root, SHA). `sha` must be a resolved
+/// object name: the memo assumes an immutable date, which a symbolic revision
+/// such as `HEAD` would not have.
+fn commit_epoch(root: &Path, sha: &str) -> Option<i64> {
+    // `--` would not neutralize an attached-value option such as `-O/path`.
+    if sha.starts_with('-') {
+        return None;
+    }
+    let key = (root.to_path_buf(), sha.to_string());
+    let memo = commit_epoch_memo();
+    if let Some(hit) = lock_memo(memo).get(&key) {
+        return Some(*hit);
+    }
+    let epoch = read_commit_epoch(root, sha)?;
+    let mut guard = lock_memo(memo);
+    if guard.len() >= COMMIT_EPOCH_MEMO_CAP {
+        guard.clear();
+    }
+    guard.insert(key, epoch);
+    Some(epoch)
+}
+
+fn read_commit_epoch(root: &Path, sha: &str) -> Option<i64> {
+    let out = Command::new("git")
+        .args(["log", "-1", "--format=%ct", sha, "--"])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    std::str::from_utf8(&out.stdout).ok()?.trim().parse().ok()
+}
+
 /// Indexing mode. `Auto` is the recommended default — reuses prior state if valid,
 /// falls back to full rescan otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,14 +265,19 @@ pub fn git_history_index_with_options(
 ) -> Result<GitIndexStats> {
     let (exclude_set, test_like_set) = compile_excludes(extra_excludes)?;
     let head_sha = resolve_head_sha(root)?;
+    let anchor = anchor_at_commit(root, &head_sha);
+    log_anchor(root, anchor);
 
     let effective_mode = match mode {
         IndexMode::Full => IndexMode::Full,
         IndexMode::Incremental | IndexMode::Auto => match db.get_git_index_state()? {
             Some((last_sha, last_indexed_at)) if last_sha == head_sha => {
+                // HEAD is unchanged, so the anchor is too: the decay below is a
+                // no-op unless the last pass measured from a different clock.
+                let previous = previous_anchor(root, &last_sha, last_indexed_at, anchor);
                 db.execute_batch(|db| {
-                    decay_git_history_to_now(db, last_indexed_at, unix_now())?;
-                    db.prune_git_author_events(history_window_cutoff(unix_now()))?;
+                    decay_git_history_between(db, previous, anchor.epoch)?;
+                    db.prune_git_author_events(anchor.cutoff())?;
                     db.set_git_index_state(&head_sha)
                 })?;
                 return Ok(GitIndexStats {
@@ -153,11 +298,15 @@ pub fn git_history_index_with_options(
     };
 
     match effective_mode {
-        IndexMode::Full => run_full(db, root, &exclude_set, &test_like_set, &head_sha),
+        IndexMode::Full => run_full(db, root, &exclude_set, &test_like_set, &head_sha, anchor),
         IndexMode::Incremental => {
             let (last_sha, last_at) = db
                 .get_git_index_state()?
                 .expect("incremental path checked state present above");
+            let anchors = PassAnchors {
+                current: anchor,
+                previous: previous_anchor(root, &last_sha, last_at, anchor),
+            };
             run_incremental(
                 db,
                 root,
@@ -165,10 +314,49 @@ pub fn git_history_index_with_options(
                 &test_like_set,
                 &head_sha,
                 &last_sha,
-                last_at,
+                anchors,
             )
         }
         IndexMode::Auto => unreachable!("resolved above"),
+    }
+}
+
+/// Make the regime visible: an empty or flat history has to be traceable to its
+/// anchor without a rerun.
+fn log_anchor(root: &Path, anchor: HistoryAnchor) {
+    let window = anchor.window_stamp();
+    if history_predates_wall_clock_window(anchor.epoch, unix_now()) {
+        tracing::warn!(
+            root = %root.display(),
+            %window,
+            anchor = anchor.epoch,
+            "HEAD predates a wall-clock history window; measuring history from HEAD"
+        );
+    } else {
+        tracing::debug!(
+            root = %root.display(),
+            %window,
+            anchor = anchor.epoch,
+            "git history anchor"
+        );
+    }
+}
+
+/// The anchor the previous pass measured from, recovered from the SHA it
+/// recorded. A commit's date is immutable, so this reproduces that pass's
+/// reference exactly; the recorded wall-clock stamp is the fallback for a SHA
+/// git can no longer read. Rows written before the anchor followed HEAD were
+/// decayed to the wall clock, so a checkout more than a few months old needs
+/// one `git-index --full` to rebaseline.
+fn previous_anchor(
+    root: &Path,
+    last_sha: &str,
+    last_indexed_at: i64,
+    current: HistoryAnchor,
+) -> i64 {
+    match current.source {
+        HistoryAnchorSource::HeadCommit => commit_epoch(root, last_sha).unwrap_or(last_indexed_at),
+        HistoryAnchorSource::WallClock => last_indexed_at,
     }
 }
 
@@ -202,9 +390,9 @@ fn run_full(
     exclude_set: &GlobSet,
     test_like_set: &GlobSet,
     head_sha: &str,
+    anchor: HistoryAnchor,
 ) -> Result<GitIndexStats> {
-    let now = unix_now();
-    let raw = run_git_log(root, None, history_window_cutoff(now))?;
+    let raw = run_git_log(root, None, anchor.cutoff())?;
     let commits = parse_log(&raw);
 
     let mut files: HashMap<String, FileStats> = HashMap::new();
@@ -221,7 +409,7 @@ fn run_full(
             &mut pairs,
             commit,
             &kept_changes,
-            now,
+            anchor.epoch,
             test_like_set,
         );
     }
@@ -265,11 +453,11 @@ fn run_incremental(
     test_like_set: &GlobSet,
     head_sha: &str,
     last_sha: &str,
-    last_indexed_at: i64,
+    anchors: PassAnchors,
 ) -> Result<GitIndexStats> {
-    let now = unix_now();
+    let anchor = anchors.current;
     let range = format!("{last_sha}..{head_sha}");
-    let raw = run_git_log(root, Some(&range), history_window_cutoff(now))?;
+    let raw = run_git_log(root, Some(&range), anchor.cutoff())?;
     let commits = parse_log(&raw);
 
     let mut files: HashMap<String, FileStats> = HashMap::new();
@@ -286,7 +474,7 @@ fn run_incremental(
             &mut pairs,
             commit,
             &kept_changes,
-            now,
+            anchor.epoch,
             test_like_set,
         );
     }
@@ -294,8 +482,8 @@ fn run_incremental(
     // Commit decay and deltas together so a crash cannot leave only the decay applied.
     let mut co_change_kept = 0usize;
     db.execute_batch(|db| {
-        decay_git_history_to_now(db, last_indexed_at, now)?;
-        db.prune_git_author_events(history_window_cutoff(now))?;
+        decay_git_history_between(db, anchors.previous, anchor.epoch)?;
+        db.prune_git_author_events(anchor.cutoff())?;
         write_author_events(db, &commits, exclude_set)?;
         for (path, stats) in &files {
             db.incr_git_file(
@@ -323,8 +511,10 @@ fn run_incremental(
     })
 }
 
-fn history_window_cutoff(now: i64) -> i64 {
-    now - (HISTORY_WINDOW_DAYS * SECONDS_PER_DAY) as i64
+/// Oldest commit timestamp a pass measuring from `anchor` admits. Clamped at
+/// the epoch so `git log --since=@<n>` never receives a negative second.
+fn history_window_cutoff(anchor: i64) -> i64 {
+    (anchor - (HISTORY_WINDOW_DAYS * SECONDS_PER_DAY) as i64).max(0)
 }
 
 fn write_author_events(db: &Database, commits: &[Commit], excludes: &GlobSet) -> Result<()> {
@@ -344,10 +534,12 @@ fn write_author_events(db: &Database, commits: &[Commit], excludes: &GlobSet) ->
     Ok(())
 }
 
-fn decay_git_history_to_now(db: &Database, last_indexed_at: i64, now: i64) -> Result<()> {
-    let delta_seconds = (now - last_indexed_at).max(0) as f64;
+/// Age stored weights from the anchor they were computed at to this pass's
+/// anchor, so incremental deltas compose into the same totals as a full scan.
+fn decay_git_history_between(db: &Database, from_anchor: i64, to_anchor: i64) -> Result<()> {
+    let delta_seconds = (to_anchor - from_anchor).max(0) as f64;
     if delta_seconds > 0.0 {
-        let factor = (-delta_seconds / (DECAY_HALFLIFE_DAYS * SECONDS_PER_DAY)).exp();
+        let factor = (-delta_seconds / (DECAY_TAU_DAYS * SECONDS_PER_DAY)).exp();
         db.scale_git_decay(factor)?;
     }
     Ok(())
@@ -370,11 +562,11 @@ fn accumulate(
     pairs: &mut HashMap<(String, String), PairStats>,
     commit: &Commit,
     kept_changes: &[&FileChange],
-    now: i64,
+    anchor: i64,
     test_like_set: &GlobSet,
 ) {
-    let age_days = ((now - commit.timestamp).max(0) as f64) / SECONDS_PER_DAY;
-    let decay = (-age_days / DECAY_HALFLIFE_DAYS).exp();
+    let age_days = ((anchor - commit.timestamp).max(0) as f64) / SECONDS_PER_DAY;
+    let decay = (-age_days / DECAY_TAU_DAYS).exp();
     let is_fix = is_fix_commit(&commit.subject);
 
     for change in kept_changes {
@@ -1037,14 +1229,14 @@ mod tests {
     }
 
     #[test]
-    fn decay_git_history_to_now_scales_existing_weights() {
+    fn decay_git_history_between_anchors_scales_existing_weights() {
         let db = Database::open_in_memory().unwrap();
         db.upsert_git_file("src/a.rs", 10.0, 0, 1, None).unwrap();
         db.upsert_git_co_change("src/a.rs", "src/b.rs", 6.0, 3, None)
             .unwrap();
 
-        let now = (DECAY_HALFLIFE_DAYS * SECONDS_PER_DAY) as i64;
-        decay_git_history_to_now(&db, 0, now).unwrap();
+        let now = (DECAY_TAU_DAYS * SECONDS_PER_DAY) as i64;
+        decay_git_history_between(&db, 0, now).unwrap();
 
         let file = db.git_file("src/a.rs").unwrap().expect("git file");
         assert!(file.churn_score < 10.0);
@@ -1054,5 +1246,88 @@ mod tests {
         assert_eq!(pair.len(), 1);
         assert!(pair[0].weight < 6.0);
         assert!(pair[0].weight > 2.0);
+    }
+
+    #[test]
+    fn decay_between_equal_anchors_is_a_no_op() {
+        // Re-running a pass on an unchanged HEAD must not age stored weights.
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_git_file("src/a.rs", 10.0, 0, 1, None).unwrap();
+        decay_git_history_between(&db, 1_700_000_000, 1_700_000_000).unwrap();
+        let file = db.git_file("src/a.rs").unwrap().expect("git file");
+        assert_eq!(file.churn_score, 10.0);
+    }
+
+    #[test]
+    fn window_cutoff_measures_back_from_the_anchor_and_clamps_at_the_epoch() {
+        let anchor = 1_800_000_000;
+        let span = (HISTORY_WINDOW_DAYS * SECONDS_PER_DAY) as i64;
+        assert_eq!(history_window_cutoff(anchor), anchor - span);
+        assert_eq!(
+            HistoryAnchor {
+                epoch: anchor,
+                source: HistoryAnchorSource::HeadCommit,
+            }
+            .cutoff(),
+            anchor - span
+        );
+        // A history that starts before 1972 must not hand git a negative second.
+        assert_eq!(history_window_cutoff(DAY), 0);
+    }
+
+    #[test]
+    fn window_stamp_distinguishes_the_two_regimes() {
+        let head = HistoryAnchor {
+            epoch: 1,
+            source: HistoryAnchorSource::HeadCommit,
+        };
+        let wall = HistoryAnchor {
+            epoch: 1,
+            source: HistoryAnchorSource::WallClock,
+        };
+        assert_eq!(head.window_stamp(), "730d@HEAD");
+        assert_eq!(wall.window_stamp(), "730d@now");
+        assert_ne!(head.window_stamp(), wall.window_stamp());
+    }
+
+    #[test]
+    fn history_predates_wall_clock_window_names_the_regime_that_matters() {
+        let now = 1_800_000_000;
+        let span = (HISTORY_WINDOW_DAYS * SECONDS_PER_DAY) as i64;
+        assert!(history_predates_wall_clock_window(now - span - DAY, now));
+        assert!(!history_predates_wall_clock_window(now - span + DAY, now));
+        assert!(!history_predates_wall_clock_window(now, now));
+    }
+
+    #[test]
+    fn anchor_falls_back_to_the_wall_clock_without_a_head() {
+        // An initialized repository with an unborn HEAD: no panic, and the
+        // fallback names itself rather than passing for a HEAD-anchored pass.
+        let empty = tempfile::tempdir().unwrap();
+        let status = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(empty.path())
+            .status()
+            .expect("git init runs");
+        assert!(status.success());
+        assert!(
+            resolve_head_sha(empty.path()).is_err(),
+            "fixture must have an unborn HEAD"
+        );
+
+        let anchor = anchor_at_commit(empty.path(), "HEAD");
+        assert_eq!(anchor.source, HistoryAnchorSource::WallClock);
+        assert!(
+            (anchor.epoch - unix_now()).abs() < 60,
+            "wall-clock fallback should be ~now, got {}",
+            anchor.epoch
+        );
+        assert_eq!(anchor.window_stamp(), "730d@now");
+    }
+
+    #[test]
+    fn commit_epoch_rejects_dash_prefixed_revisions() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(commit_epoch(dir.path(), "-O/etc/passwd"), None);
     }
 }

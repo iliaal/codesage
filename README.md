@@ -185,7 +185,7 @@ Common pipelines using `codesage` with `git`. Each is one shell line and how to 
 git diff --cached --name-only | codesage risk-diff
 ```
 
-Pipes the staged file list through `assess_risk_diff`. Output shows the max risk score, files in each risk bucket (hotspot, fix-heavy, test-gap, wide blast radius), and paste-ready summary notes for the commit message or PR description. If `max_score >= 0.6` or `test_gap_files` is non-empty, add tests, split the patch, or call it out in the PR description.
+Pipes the staged file list through `assess_risk_diff`. Output shows the max risk score, files in each risk bucket (hotspot, fix-heavy, test-gap, wide blast radius), and paste-ready summary notes for the commit message or PR description. If `max_score >= 0.6` or `test_gap_files` is non-empty, add tests, split the patch, or call it out in the PR description. Check `unscored_files` too: those files have no indexed git history, so `max_score` did not evaluate them at all.
 
 ### Tests to run after editing
 

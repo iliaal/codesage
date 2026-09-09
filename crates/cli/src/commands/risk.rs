@@ -53,6 +53,11 @@ fn span_marker(span_known: bool, recurring: bool) -> &'static str {
     }
 }
 
+/// A score without git history covers structural terms only.
+fn unscored_marker(unscored: bool) -> &'static str {
+    if unscored { "  (unscored)" } else { "" }
+}
+
 pub(crate) fn cmd_coupling(file: &str, limit: usize, json: bool) -> Result<()> {
     let root = find_project_root()?;
     let db = open_db(&root)?;
@@ -201,6 +206,7 @@ pub(crate) fn cmd_risk_diff(files: Vec<String>, json: bool) -> Result<()> {
             ("fix-heavy", &assessment.fix_heavy_files),
             ("test gap", &assessment.test_gap_files),
             ("wide blast radius", &assessment.wide_blast_files),
+            ("unscored", &assessment.unscored_files),
         ] {
             if !label.1.is_empty() {
                 println!("  {} ({}):", label.0, label.1.len());
@@ -232,7 +238,12 @@ pub(crate) fn cmd_risk_batch(files: Vec<String>, json: bool) -> Result<()> {
     } else {
         println!("Per-file risk: {} file(s)", assessment.files.len());
         for f in &assessment.files {
-            println!("  {:>5.2}  {}", f.score, f.file);
+            println!(
+                "  {:>5.2}  {}{}",
+                f.score,
+                f.file,
+                unscored_marker(f.unscored)
+            );
         }
         if !assessment.legend.is_empty() {
             println!("  Legend:");

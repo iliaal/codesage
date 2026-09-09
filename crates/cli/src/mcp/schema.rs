@@ -360,6 +360,168 @@ mod tests {
         assert!(!refs.contains("\"col\""), "{refs}");
     }
 
+    /// Follow a `$ref` into `$defs` so nested per-file schemas can be checked.
+    fn resolve<'a>(
+        root: &'a serde_json::Value,
+        schema: &'a serde_json::Value,
+    ) -> &'a serde_json::Value {
+        let Some(reference) = schema.get("$ref").and_then(|r| r.as_str()) else {
+            return schema;
+        };
+        let name = reference
+            .strip_prefix("#/$defs/")
+            .unwrap_or_else(|| panic!("unexpected $ref form: {reference}"));
+        root.get("$defs")
+            .and_then(|defs| defs.get(name))
+            .unwrap_or_else(|| panic!("`{name}` missing from $defs: {root}"))
+    }
+
+    /// Every key an actual response carries must be described by the
+    /// advertised schema; otherwise an agent that reads `outputSchema` plans
+    /// against a shape it will not receive.
+    fn assert_response_keys_described(
+        root: &serde_json::Value,
+        schema: &serde_json::Value,
+        response: &serde_json::Value,
+        what: &str,
+    ) {
+        let schema = resolve(root, schema);
+        let props = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .unwrap_or_else(|| panic!("{what}: schema declares no properties: {schema}"));
+        let object = response
+            .as_object()
+            .unwrap_or_else(|| panic!("{what}: response is not an object: {response}"));
+        for key in object.keys() {
+            assert!(
+                props.contains_key(key),
+                "{what}: response carries `{key}`, absent from the advertised schema \
+                 (properties: {:?})",
+                props.keys().collect::<Vec<_>>()
+            );
+        }
+        // A schema that requires a field the response omits is equally wrong.
+        if let Some(required) = schema.get("required").and_then(|r| r.as_array()) {
+            for field in required {
+                let field = field.as_str().expect("required entry is a string");
+                assert!(
+                    object.contains_key(field),
+                    "{what}: schema requires `{field}`, missing from the response: {response}"
+                );
+            }
+        }
+    }
+
+    /// One PHP class, indexed structurally, with git history for
+    /// `Repository.php` only: `New.php` exercises the unscored branch.
+    fn risk_fixture() -> (tempfile::TempDir, codesage_storage::Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for (name, class) in [("Repository.php", "Repository"), ("New.php", "New")] {
+            std::fs::write(
+                root.join(name),
+                format!(
+                    "<?php\nnamespace App;\nclass {class} {{\n  public function run() {{ return 1; }}\n}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let db = codesage_storage::Database::open_in_memory().unwrap();
+        codesage_graph::full_index(root, &db, &[], false).unwrap();
+        db.upsert_git_file("Repository.php", 10.0, 2, 8, Some(1_700_000_000))
+            .unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn risk_output_schemas_match_scored_and_unscored_responses() {
+        let server = CodeSageServer::new();
+        let mut tools = server.tool_router.list_all();
+        finalize_tools_for_listing(&mut tools);
+        let schema = |name: &str| {
+            serde_json::Value::Object(
+                (*tools
+                    .iter()
+                    .find(|t| t.name.as_ref() == name)
+                    .and_then(|t| t.output_schema.clone())
+                    .unwrap_or_else(|| panic!("tool `{name}` must advertise an outputSchema")))
+                .clone(),
+            )
+        };
+
+        let (_dir, db) = risk_fixture();
+        let paths = ["Repository.php".to_string(), "New.php".to_string()];
+
+        let single = schema("assess_risk");
+        for (path, expect_unscored) in [("Repository.php", false), ("New.php", true)] {
+            for verbose in [false, true] {
+                let mut assessment = codesage_graph::assess_risk(&db, path).unwrap();
+                assert_eq!(
+                    assessment.unscored,
+                    expect_unscored,
+                    "{path}: fixture must exercise the {} branch",
+                    if expect_unscored {
+                        "unscored"
+                    } else {
+                        "scored"
+                    }
+                );
+                assessment.set_verbose(verbose);
+                let response = serde_json::to_value(&assessment).unwrap();
+                assert_eq!(
+                    response.get("unscored").is_some(),
+                    expect_unscored,
+                    "{path}: `unscored` is emitted only when true: {response}"
+                );
+                assert_response_keys_described(
+                    &single,
+                    &single,
+                    &response,
+                    &format!("assess_risk({path}, verbose={verbose})"),
+                );
+            }
+        }
+
+        let batch = schema("assess_risk_batch");
+        let batch_response =
+            serde_json::to_value(codesage_graph::assess_risk_batch(&db, &paths).unwrap()).unwrap();
+        assert_response_keys_described(&batch, &batch, &batch_response, "assess_risk_batch");
+        let item_schema = batch["properties"]["files"]["items"].clone();
+        for file in batch_response["files"].as_array().expect("files array") {
+            assert_response_keys_described(&batch, &item_schema, file, "assess_risk_batch.files[]");
+        }
+
+        let diff = schema("assess_risk_diff");
+        let diff_result = codesage_graph::assess_risk_diff(&db, &paths).unwrap();
+        assert_eq!(diff_result.unscored_files, vec!["New.php".to_string()]);
+        assert_eq!(diff_result.scored_file_count, 1);
+        let diff_response = serde_json::to_value(&diff_result).unwrap();
+        for key in ["unscored_files", "scored_file_count"] {
+            assert!(
+                diff_response.get(key).is_some(),
+                "the mixed fixture must exercise `{key}`: {diff_response}"
+            );
+        }
+        assert_response_keys_described(&diff, &diff, &diff_response, "assess_risk_diff");
+        let diff_item = diff["properties"]["files"]["items"].clone();
+        for file in diff_response["files"].as_array().expect("files array") {
+            assert_response_keys_described(&diff, &diff_item, file, "assess_risk_diff.files[]");
+        }
+
+        // Unmeasured state must not be verbose-gated away or made mandatory.
+        let risk_props = resolve(&single, &single)["properties"].clone();
+        assert!(
+            risk_props.get("unscored").is_some(),
+            "assess_risk schema must describe `unscored`"
+        );
+        let required = single["required"].as_array().expect("required array");
+        assert!(
+            !required.iter().any(|r| r == "unscored"),
+            "`unscored` is emitted only when true and must not be required"
+        );
+    }
+
     #[test]
     fn graph_tools_declare_resolution_honesty_fields() {
         let server = CodeSageServer::new();
