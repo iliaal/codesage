@@ -33,3 +33,15 @@
     declarator: (pointer_declarator
       declarator: (function_declarator
         declarator: (identifier) @name)))) @def
+
+; Pattern 8: file-scope const object with an initializer → Constant.
+; Anchored to translation_unit so function-local consts stay out of the index,
+; and gated on the qualifier text because `volatile` and `_Atomic` are
+; type_qualifier nodes too. Pointer declarators are deliberately excluded: in
+; `const char *p` the pointer itself is mutable.
+(translation_unit
+  (declaration
+    (type_qualifier) @_qual
+    declarator: (init_declarator
+      declarator: (identifier) @name)
+    (#any-of? @_qual "const" "constexpr")) @def)

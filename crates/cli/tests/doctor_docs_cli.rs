@@ -239,3 +239,47 @@ fn strict_reports_unreadable_directories_alongside_checked_documents() {
     }
     std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
+
+#[test]
+fn cpp_constexpr_constant_values_are_checked_through_the_indexer() {
+    let dir = project();
+    let root = dir.path();
+    std::fs::create_dir(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/retry.cc"),
+        "namespace net {\nconstexpr int kMaxRetries = 3;\n}\n",
+    )
+    .unwrap();
+    let output = codesage(root)
+        .args(["index", "--no-semantic"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    for (documented, drifted) in [("5", 1usize), ("3", 0)] {
+        std::fs::write(
+            root.join("README.md"),
+            format!("`kMaxRetries` defaults to {documented}.\n"),
+        )
+        .unwrap();
+        let output = codesage(root)
+            .args(["doctor", "--docs", "--strict", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(i32::from(drifted == 1)),
+            "{documented}: {output:?}"
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["claims_checked"], 1, "{documented}: {report}");
+        let findings = report["drifted"].as_array().unwrap();
+        assert_eq!(findings.len(), drifted, "{documented}: {report}");
+        if drifted == 1 {
+            assert_eq!(findings[0]["class"], "constant");
+            assert_eq!(findings[0]["claim"], "kMaxRetries = 5");
+            let reason = findings[0]["reason"].as_str().unwrap();
+            assert!(reason.contains("doc says 5"), "{reason}");
+            assert!(reason.contains("source says 3"), "{reason}");
+        }
+    }
+}

@@ -75,6 +75,60 @@ migration, or CLI semantic-fingerprint freshness checks. A shippable field would
 need those paths implemented and verified. Search timing excludes embedding,
 includes shared caches and warmup, and is not a production latency claim.
 
+## Hybrid-gate coupling a shippable field must handle
+
+The FTS sidecar carries one indexed column, `content`, and its companion
+`fts5vocab` table runs in `row` mode (`crates/storage/src/schema.rs:201`,
+`:214`). Row mode reports `doc` per term aggregated across every indexed
+column, and `Database::token_doc_frequency`
+(`crates/storage/src/db/semantic.rs:544`) reads that column to decide
+`query_has_rare_literal` (`crates/graph/src/search.rs:67`) against
+`RARE_TOKEN_DF_THRESHOLD`, 1% (`:58`). Adding a second indexed column raises
+the measured document frequency of a term wherever the new column introduces
+it into a row whose `content` lacks it, so a call name currently below 1%
+can cross the threshold and switch hybrid BM25 retrieval off for a query
+that fuses today. A term absent from `content` but present in the new column
+crosses the other way, from `doc` 0 to a nonzero sub-1% count, and switches
+fusion on for a query that does not fuse today. That second direction is the
+likelier one, because the bar is asymmetric: turning fusion on needs the new
+column to contribute a single document for a term that `content` lacks,
+while turning it off needs a term already near the threshold to gain enough
+documents to cross 129. Neither direction is exercised by this run. The
+ranking change and the gate change would ship together and be confounded in
+the result.
+
+The results above are not affected. 150 of the 170 queries resolve the gate
+before the document-frequency branch: the 80 caller probes and 50 of the
+controls contain a backtick or `::`, and the 20 Serde dotted controls return
+true at the dotted-identifier branch. The 20 Laravel backslash-qualified
+controls do reach the document-frequency lookup, but are insensitive to it.
+Two independent facts make them so: the FTS tokenizer splits on the
+backslash at index time, so the full string is never a term, while the
+gate's own splitter (`crates/graph/src/search.rs:86-88`) splits only on `|`,
+whitespace, `,`, and `;` and trims leading and trailing characters that are
+neither alphanumeric nor `_`, so it looks up the whole backslash string.
+`doc` is 0 in both arms and the `doc > 0` guard skips it. Verified against
+the Laravel index: all 20 lowercased backslash strings are absent from the
+vocabulary, while `compilesincludes` reads `doc` 3 against 12,998 chunks,
+where the strict 1% comparison makes a term rare at 129 chunks or fewer.
+
+Do not "fix" the gate splitter to split on the backslash without
+re-measuring. Splitting on it returns a present sub-1% segment for 17 of
+those 20 queries (`Compilers` 117, `PotentiallyTranslatedString` 6,
+`EncryptedPrivateChannel` 1, `Providers` 115, `Concurrency` 55, and others),
+so the gate would flip for them.
+
+A future run that includes document-frequency-gated queries must hold the
+gate constant across arms, either by restricting the vocabulary to `content`
+with a `col`-mode table and selecting `AND col = 'content'`, or by pinning
+`CODESAGE_HYBRID` to `always` or `never`. Those are the only recognized
+values; anything else, including `1` and `true`, falls through to the gated
+default (`crates/graph/src/search.rs:1275`). It is read once per process and
+`pipeline.rs` runs both arms in one process, so one value serves both, but
+`evaluate.py` strips every `CODESAGE_*` variable from the search subprocess,
+so pinning it means editing the runner. Treat the gate decision as a
+separate measurement from the ranking effect.
+
 ## Reproduce
 
 Build CUDA release dependencies, then use matching Jina 768-dimensional indexes:

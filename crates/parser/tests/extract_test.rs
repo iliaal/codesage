@@ -624,3 +624,278 @@ fn c_recovered_typedef_emits_each_symbol_row_once() {
     );
     assert!(has_symbol(&syms, "after", SymbolKind::Function), "{syms:?}");
 }
+
+const C_CONSTS: &str = "#define kLegacyLimit 7
+const int kBatchSize = 32;
+static const int kFlushEvery = 4;
+
+int plain_var = 5;
+volatile int volatile_var = 6;
+
+enum log_level { LOG_DEBUG, LOG_INFO };
+
+const char *k_name = \"x\";
+
+void f(void) {
+    const int k_local = 7;
+}
+";
+
+const CPP_CONSTS: &str = "constexpr int kMaxRetries = 3;
+const int kBatchSize = 32;
+
+namespace n {
+constexpr int kTimeoutMs = 500;
+}
+
+class C {
+    static constexpr int kMaxDepth = 9;
+    static const int kFlushEvery = 4;
+    const int ctor_initialised;
+    int mutable_field;
+    int size() const;
+};
+
+int plain_var = 5;
+volatile int volatile_var = 6;
+
+enum class Color { kRed, kBlue };
+
+void f() {
+    const int k_local = 7;
+}
+";
+
+/// A header valid as both C and C++, so one fixture exercises both `.scm` files.
+const HEADER_CONSTS: &str = "#pragma once
+constexpr int kHeaderLimit = 11;
+";
+
+/// Exactly one `Constant` row named `name`, returned for line and
+/// qualified-name assertions.
+fn only_constant<'a>(
+    syms: &'a [codesage_protocol::Symbol],
+    name: &str,
+) -> &'a codesage_protocol::Symbol {
+    let found: Vec<_> = syms
+        .iter()
+        .filter(|s| s.name == name && s.kind == SymbolKind::Constant)
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "expected exactly one Constant named {name}, got {found:?}"
+    );
+    found[0]
+}
+
+fn constant_names(syms: &[codesage_protocol::Symbol]) -> Vec<&str> {
+    syms.iter()
+        .filter(|s| s.kind == SymbolKind::Constant)
+        .map(|s| s.name.as_str())
+        .collect()
+}
+
+#[test]
+fn c_file_scope_const_declarations_are_constants() {
+    let syms = symbols_from_source(C_CONSTS, Language::C);
+
+    let batch = only_constant(&syms, "kBatchSize");
+    assert_eq!((batch.line_start, batch.line_end), (2, 2));
+    assert_eq!(batch.qualified_name, "kBatchSize");
+
+    let flush = only_constant(&syms, "kFlushEvery");
+    assert_eq!((flush.line_start, flush.line_end), (3, 3));
+}
+
+#[test]
+fn c_constexpr_file_scope_declaration_is_a_constant() {
+    let syms = symbols_from_source("constexpr int kRetries = 3;\n", Language::C);
+    let retries = only_constant(&syms, "kRetries");
+    assert_eq!((retries.line_start, retries.line_end), (1, 1));
+}
+
+#[test]
+fn c_mutable_variables_are_not_constants() {
+    let syms = symbols_from_source(C_CONSTS, Language::C);
+    assert!(
+        !has_symbol(&syms, "plain_var", SymbolKind::Constant),
+        "plain `int plain_var = 5;` must not be a Constant: {syms:?}"
+    );
+    assert!(
+        !syms.iter().any(|s| s.name == "plain_var"),
+        "plain `int plain_var = 5;` must not be indexed at all: {syms:?}"
+    );
+    assert!(
+        !syms.iter().any(|s| s.name == "volatile_var"),
+        "`volatile` is a type_qualifier but not a constant: {syms:?}"
+    );
+}
+
+#[test]
+fn c_enumerators_are_not_indexed() {
+    let syms = symbols_from_source(C_CONSTS, Language::C);
+    assert!(has_symbol(&syms, "log_level", SymbolKind::Enum));
+    for enumerator in ["LOG_DEBUG", "LOG_INFO"] {
+        assert!(
+            !syms.iter().any(|s| s.name == enumerator),
+            "enum variants stay unindexed: {syms:?}"
+        );
+    }
+}
+
+#[test]
+fn c_function_local_const_is_not_indexed() {
+    let syms = symbols_from_source(C_CONSTS, Language::C);
+    assert!(
+        !syms.iter().any(|s| s.name == "k_local"),
+        "function-local consts stay out of the index: {syms:?}"
+    );
+}
+
+#[test]
+fn c_pointer_to_const_declarator_is_not_a_constant() {
+    let syms = symbols_from_source(C_CONSTS, Language::C);
+    assert!(
+        !syms.iter().any(|s| s.name == "k_name"),
+        "`const char *p` leaves the pointer mutable: {syms:?}"
+    );
+}
+
+#[test]
+fn c_define_still_maps_to_macro() {
+    let syms = symbols_from_source(C_CONSTS, Language::C);
+    assert!(has_symbol(&syms, "kLegacyLimit", SymbolKind::Macro));
+    assert!(!has_symbol(&syms, "kLegacyLimit", SymbolKind::Constant));
+}
+
+#[test]
+fn cpp_const_declaration_forms_are_constants() {
+    let syms = symbols_from_source(CPP_CONSTS, Language::Cpp);
+
+    let retries = only_constant(&syms, "kMaxRetries");
+    assert_eq!((retries.line_start, retries.line_end), (1, 1));
+    assert_eq!(retries.qualified_name, "kMaxRetries");
+
+    let batch = only_constant(&syms, "kBatchSize");
+    assert_eq!((batch.line_start, batch.line_end), (2, 2));
+
+    let timeout = only_constant(&syms, "kTimeoutMs");
+    assert_eq!((timeout.line_start, timeout.line_end), (5, 5));
+    assert_eq!(timeout.qualified_name, "n::kTimeoutMs");
+
+    let depth = only_constant(&syms, "kMaxDepth");
+    assert_eq!((depth.line_start, depth.line_end), (9, 9));
+    assert_eq!(depth.qualified_name, "C::kMaxDepth");
+
+    let flush = only_constant(&syms, "kFlushEvery");
+    assert_eq!((flush.line_start, flush.line_end), (10, 10));
+    assert_eq!(flush.qualified_name, "C::kFlushEvery");
+}
+
+#[test]
+fn cpp_constinit_declaration_is_a_constant() {
+    let syms = symbols_from_source("constinit int kInit = 4;\n", Language::Cpp);
+    assert_eq!(only_constant(&syms, "kInit").line_start, 1);
+}
+
+#[test]
+fn cpp_mutable_variables_are_not_constants() {
+    let syms = symbols_from_source(CPP_CONSTS, Language::Cpp);
+    assert!(
+        !syms.iter().any(|s| s.name == "plain_var"),
+        "plain `int plain_var = 5;` must not be indexed: {syms:?}"
+    );
+    assert!(
+        !syms.iter().any(|s| s.name == "volatile_var"),
+        "`volatile` is a type_qualifier but not a constant: {syms:?}"
+    );
+    assert!(
+        !syms.iter().any(|s| s.name == "mutable_field"),
+        "an unqualified member is not a constant: {syms:?}"
+    );
+}
+
+#[test]
+fn cpp_mutable_keyword_declaration_is_not_a_constant() {
+    let syms = symbols_from_source("class C { mutable int cached = 1; };\n", Language::Cpp);
+    assert_eq!(
+        constant_names(&syms),
+        Vec::<&str>::new(),
+        "`mutable` parses as a type_qualifier and must stay gated out: {syms:?}"
+    );
+}
+
+#[test]
+fn cpp_enumerators_are_not_indexed() {
+    let syms = symbols_from_source(CPP_CONSTS, Language::Cpp);
+    assert!(has_symbol(&syms, "Color", SymbolKind::Enum));
+    for enumerator in ["kRed", "kBlue"] {
+        assert!(
+            !syms.iter().any(|s| s.name == enumerator),
+            "enum class variants stay unindexed: {syms:?}"
+        );
+    }
+}
+
+#[test]
+fn cpp_function_local_const_is_not_indexed() {
+    let syms = symbols_from_source(CPP_CONSTS, Language::Cpp);
+    assert!(
+        !syms.iter().any(|s| s.name == "k_local"),
+        "function-local consts stay out of the index: {syms:?}"
+    );
+}
+
+#[test]
+fn cpp_const_member_without_an_initializer_is_not_a_constant() {
+    let syms = symbols_from_source(CPP_CONSTS, Language::Cpp);
+    assert!(
+        !syms.iter().any(|s| s.name == "ctor_initialised"),
+        "a const member initialized by a constructor carries no literal: {syms:?}"
+    );
+}
+
+#[test]
+fn cpp_const_qualified_member_function_stays_a_method() {
+    let syms = symbols_from_source(CPP_CONSTS, Language::Cpp);
+    let size = syms.iter().find(|s| s.name == "size").expect("size method");
+    assert_eq!(size.kind, SymbolKind::Method);
+    assert!(!has_symbol(&syms, "size", SymbolKind::Constant));
+}
+
+#[test]
+fn cpp_repeated_qualifiers_emit_one_constant_row() {
+    let syms = symbols_from_source("static const volatile int kMixed = 8;\n", Language::Cpp);
+    let mixed = only_constant(&syms, "kMixed");
+    assert_eq!(mixed.line_start, 1);
+}
+
+#[test]
+fn header_constants_extract_under_both_dialects() {
+    for language in [Language::C, Language::Cpp] {
+        let syms = symbols_from_source(HEADER_CONSTS, language);
+        let limit = only_constant(&syms, "kHeaderLimit");
+        assert_eq!(
+            (limit.line_start, limit.line_end),
+            (2, 2),
+            "{language:?} header constant"
+        );
+        assert_eq!(limit.qualified_name, "kHeaderLimit", "{language:?}");
+    }
+}
+
+#[test]
+fn cpp_header_in_class_constant_extracts_from_header_shaped_source() {
+    let src = "#pragma once
+namespace hdr {
+class Limits {
+    static constexpr int kHeaderLimit = 11;
+};
+}
+";
+    let syms = symbols_from_source(src, Language::Cpp);
+    let limit = only_constant(&syms, "kHeaderLimit");
+    assert_eq!((limit.line_start, limit.line_end), (4, 4));
+    assert_eq!(limit.qualified_name, "hdr::Limits::kHeaderLimit");
+}

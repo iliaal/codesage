@@ -122,3 +122,35 @@
   declarator: (reference_declarator
     (function_declarator
       declarator: (operator_name) @name))) @def
+
+; Pattern 23: file-scope const/constexpr object with an initializer → Constant.
+; Anchored to translation_unit so function-local consts stay out of the index,
+; and gated on the qualifier text because `volatile`, `mutable` and the other
+; cv-qualifiers are type_qualifier nodes too. Pointer declarators are
+; deliberately excluded: in `const char *p` the pointer itself is mutable.
+(translation_unit
+  (declaration
+    (type_qualifier) @_qual
+    declarator: (init_declarator
+      declarator: (identifier) @name)
+    (#any-of? @_qual "const" "constexpr" "constinit")) @def)
+
+; Pattern 24: namespace-scope (and `extern "C" {}`-scope) const → Constant.
+(declaration_list
+  (declaration
+    (type_qualifier) @_qual
+    declarator: (init_declarator
+      declarator: (identifier) @name)
+    (#any-of? @_qual "const" "constexpr" "constinit")) @def)
+
+; Pattern 25: in-class const/constexpr member with an in-class initializer →
+; Constant. `static` is not required, so a non-static const field with a default
+; initializer is a Constant too; a member initialized only in a constructor body
+; has no default_value and stays out. A field_declaration occurs only in a class,
+; struct or union body, so no anchor is needed, and requiring a bare
+; field_identifier declarator keeps member function declarations out.
+(field_declaration
+  (type_qualifier) @_qual
+  declarator: (field_identifier) @name
+  default_value: (_)
+  (#any-of? @_qual "const" "constexpr" "constinit")) @def

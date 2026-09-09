@@ -3,6 +3,11 @@
 ### Added
 
 - `codesage-report` renders filtered findings through a deterministic formatter with acknowledgement diagnostics.
+- C++ `const` / `constexpr` / `constinit` declarations with an initializer index as constants at file, namespace, and class scope, and C `const` / `constexpr` declarations at file scope; run `codesage index --full` to populate existing indexes. Enumerators, mutable variables, function-local declarations, and pointer declarators stay unindexed.
+
+### Changed
+
+- `codesage doctor --docs` also checks Google-style `kCamelCase` constant values, not only `UPPER_SNAKE`.
 
 ### Fixed
 

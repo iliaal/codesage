@@ -1373,6 +1373,11 @@ static TYPE_NAME: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Z][A-Za-z0-9_]*$").expect("static regex"));
 static UPPER_SNAKE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Z][A-Z0-9_]+$").expect("static regex"));
+// Google C++ `kName` constants. The mandatory uppercase second character keeps
+// prose such as `key` or `kebab` out; no underscores and only the single-letter
+// `k` prefix keep it from spreading to other Hungarian-style prefixes.
+static K_CAMEL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^k[A-Z][A-Za-z0-9]*$").expect("static regex"));
 static CONSTANT_TAIL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"^([^`]*?)(?:=|\bis|\(default|\bdefaults to)\s*(`?)("[^"]*"|'[^']*'|true|false|-?\d[\d_,]*(?:\.\d+)?[KMGkmg]?)(`?)(?:\W|$)"#,
@@ -1640,7 +1645,7 @@ pub(crate) fn extract(markdown: &str) -> Extraction {
                 );
                 continue;
             }
-            if UPPER_SNAKE.is_match(tok) {
+            if is_constant_name(tok) {
                 let tail_start = line.len() - line[end..].trim_start_matches('`').len();
                 let tail_end = sentence_end(line, tail_start);
                 let tail = &line[tail_start..tail_end];
@@ -1912,6 +1917,11 @@ pub(crate) fn classify_symbol(tok: &str) -> Option<(Option<String>, String, Symb
     None
 }
 
+/// A bare token spelled like a constant: `UPPER_SNAKE` or Google C++ `kCamel`.
+pub(crate) fn is_constant_name(tok: &str) -> bool {
+    UPPER_SNAKE.is_match(tok) || K_CAMEL.is_match(tok)
+}
+
 /// The literal a sentence attaches to a constant name: `= 5`, `is 5`,
 /// `(default 5)`, or `defaults to 5`, with no other code span in between and
 /// no unit word after the number.
@@ -2087,6 +2097,65 @@ A column anchor crates/cli/src/main.rs:12:7 is fine.
                 },
             ]
         );
+    }
+
+    #[test]
+    fn extracts_k_camel_constant_claims_and_rejects_lookalikes() {
+        let claims = extract_claims(
+            "`kMaxRetries` defaults to 5 and `kBatchSize` = 32; `kFoo` is 1.\n\
+             `kfoo` is 1, `Kind` is 2, `key` is 3, `k` is 4, `kebab` is 5, `k_max` is 6, `mFoo` is 7.\n",
+        );
+        let constants: Vec<ClaimDetail> = claims
+            .into_iter()
+            .filter(|c| c.class == ClaimClass::Constant)
+            .map(|c| c.detail)
+            .collect();
+        assert_eq!(
+            constants,
+            vec![
+                ClaimDetail::Constant {
+                    name: "kMaxRetries".into(),
+                    literal: "5".into()
+                },
+                ClaimDetail::Constant {
+                    name: "kBatchSize".into(),
+                    literal: "32".into()
+                },
+                ClaimDetail::Constant {
+                    name: "kFoo".into(),
+                    literal: "1".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn constant_name_shapes() {
+        for name in [
+            "kMaxRetries",
+            "kBatchSize",
+            "kFoo",
+            "kA1",
+            "BATCH_SIZE",
+            "MAX_CHUNK_CHARS",
+        ] {
+            assert!(is_constant_name(name), "{name}");
+        }
+        for name in [
+            "k",
+            "kfoo",
+            "Kind",
+            "kebab",
+            "key",
+            "k_max",
+            "kMax_Retries",
+            "mFoo",
+            "gCount",
+            "s_value",
+            "K",
+        ] {
+            assert!(!is_constant_name(name), "{name}");
+        }
     }
 
     #[test]
@@ -2481,6 +2550,30 @@ A column anchor crates/cli/src/main.rs:12:7 is fine.
                 "Mux",
                 SymbolKind::Struct,
                 "src/db/net/mux.go",
+                1,
+                1,
+            )],
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/retry.cc"),
+            "constexpr int kMaxRetries = 3;\n",
+        )
+        .unwrap();
+        let cc_id = db
+            .upsert_file(&FileInfo {
+                path: "src/retry.cc".into(),
+                language: Language::Cpp,
+                content_hash: "h5".into(),
+            })
+            .unwrap();
+        db.insert_symbols(
+            cc_id,
+            &[sym(
+                "kMaxRetries",
+                "kMaxRetries",
+                SymbolKind::Constant,
+                "src/retry.cc",
                 1,
                 1,
             )],
@@ -3124,6 +3217,50 @@ A column anchor crates/cli/src/main.rs:12:7 is fine.
         let (checked, drifted) = check(&fx, "`CODESAGE_WATCH_IDLE_SECS` defaults to 300.\n");
         assert_eq!(checked, 0);
         assert!(drifted.is_empty());
+    }
+
+    #[test]
+    fn k_camel_constant_drift_reports_like_upper_snake() {
+        let fx = seeded();
+        let (checked, drifted) = check(&fx, "`kMaxRetries` defaults to 5.\n");
+        assert_eq!(checked, 1, "{drifted:?}");
+        assert_eq!(drifted.len(), 1, "{drifted:?}");
+        assert_eq!(drifted[0].class, ClaimClass::Constant);
+        assert_eq!(drifted[0].claim, "kMaxRetries = 5");
+        assert_eq!(
+            drifted[0].reason,
+            "constant value drift: doc says 5, source says 3"
+        );
+        assert_eq!(drifted[0].suggestion, None);
+    }
+
+    #[test]
+    fn k_camel_constant_matching_source_holds() {
+        let fx = seeded();
+        let (checked, drifted) = check(&fx, "Retry `kMaxRetries` = 3 times.\n");
+        assert_eq!(checked, 1, "{drifted:?}");
+        assert!(drifted.is_empty(), "{drifted:?}");
+    }
+
+    #[test]
+    fn unindexed_k_camel_constant_is_undecidable() {
+        let markdown = "`kUnknownLimit` is 7.\n";
+        let constants: Vec<ClaimDetail> = extract_claims(markdown)
+            .into_iter()
+            .filter(|c| c.class == ClaimClass::Constant)
+            .map(|c| c.detail)
+            .collect();
+        assert_eq!(
+            constants,
+            vec![ClaimDetail::Constant {
+                name: "kUnknownLimit".into(),
+                literal: "7".into()
+            }]
+        );
+        let fx = seeded();
+        let (checked, drifted) = check(&fx, markdown);
+        assert_eq!(checked, 0, "{drifted:?}");
+        assert!(drifted.is_empty(), "{drifted:?}");
     }
 
     #[test]

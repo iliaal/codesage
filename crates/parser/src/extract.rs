@@ -131,6 +131,7 @@ fn c_kind_map(pattern_index: usize) -> Option<SymbolKind> {
         5 => Some(SymbolKind::Constant), // typedef
         6 => Some(SymbolKind::Macro),
         7 => Some(SymbolKind::Function), // double-pointer return
+        8 => Some(SymbolKind::Constant), // file-scope const object
         _ => None,
     }
 }
@@ -153,6 +154,8 @@ fn cpp_kind_map(pattern_index: usize) -> Option<SymbolKind> {
         13 => Some(SymbolKind::Macro),
         14..=18 => Some(SymbolKind::Method), // in-class declarations (no body)
         19..=22 => Some(SymbolKind::Function), // in-class definitions (refined to Method)
+        // 23 file scope, 24 namespace scope, 25 in-class static member.
+        23..=25 => Some(SymbolKind::Constant),
         _ => None,
     }
 }

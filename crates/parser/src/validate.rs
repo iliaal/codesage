@@ -35,8 +35,8 @@ pub fn validate_all_queries() -> Result<()> {
 const EXPECTED_SYMBOL_PATTERN_COUNTS: &[(Language, usize)] = &[
     (Language::Php, 8),
     (Language::Python, 2),
-    (Language::C, 8),
-    (Language::Cpp, 23),
+    (Language::C, 9),
+    (Language::Cpp, 26),
     (Language::Java, 9),
     (Language::Rust, 10),
     (Language::JavaScript, 12),
