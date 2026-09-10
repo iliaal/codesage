@@ -306,16 +306,21 @@ mod tests {
                     Some("h" | "hpp" | "hh" | "hxx" | "cpp" | "cc" | "cxx") => Language::Cpp,
                     _ => continue,
                 };
-                let Ok(bytes) = std::fs::read(&path) else { continue };
-                let Ok(tree) = parse_file(&bytes, lang) else { continue };
+                let Ok(bytes) = std::fs::read(&path) else {
+                    continue;
+                };
+                let Ok(tree) = parse_file(&bytes, lang) else {
+                    continue;
+                };
                 let rel = path.to_string_lossy().into_owned();
                 files += 1;
                 for s in crate::extract::extract_symbols(&tree, &bytes, lang, &rel).unwrap() {
-                    rows.push(format!("S\t{rel}\t{}\t{:?}\t{}", s.line_start, s.kind, s.name));
+                    rows.push(format!(
+                        "S\t{rel}\t{}\t{:?}\t{}",
+                        s.line_start, s.kind, s.name
+                    ));
                 }
-                for r in
-                    crate::references::extract_references(&tree, &bytes, lang, &rel).unwrap()
-                {
+                for r in crate::references::extract_references(&tree, &bytes, lang, &rel).unwrap() {
                     rows.push(format!("R\t{rel}\t{}\t{:?}\t{}", r.line, r.kind, r.to_name));
                 }
             }
