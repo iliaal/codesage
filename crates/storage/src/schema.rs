@@ -397,13 +397,10 @@ pub fn init_db_read_only(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
-    // Cover brief checkpoint contention even when callers bypass the writer lockfile.
-    // Set before the journal-mode switch: entering WAL needs a moment of exclusive
-    // access, and without a timeout a concurrent reader fails it with SQLITE_BUSY.
+    // Set the timeout before WAL's exclusive-lock attempt to tolerate brief contention.
     conn.execute_batch("PRAGMA busy_timeout=5000;")?;
-    // A reader that outlasts the timeout still wins the race. The index is
-    // rebuildable and the next opener retries the switch, so keep opening in the
-    // current mode instead of failing.
+    // The index is rebuildable; retain the current mode if contention outlasts
+    // the timeout, and let the next opener retry WAL.
     if let Err(e) = conn.execute_batch("PRAGMA journal_mode=WAL;") {
         tracing::warn!(
             error = %e,
@@ -1290,9 +1287,7 @@ mod tests {
         insert_chunk_pair(&conn, table, 1, "fn one");
         insert_chunk_pair(&conn, table, 2, "fn two");
 
-        // Diverge while keeping counts equal: drop chunk id=2, add id=3
-        // to the chunk table only. Counts are 2 == 2 but MAX(id)=3 vs
-        // MAX(rowid)=2 — the previous count-only check skipped repair here.
+        // Equal counts conceal drift; differing maximum IDs must trigger repair.
         conn.execute(&format!("DELETE FROM \"{table}\" WHERE id = 2"), [])
             .unwrap();
         conn.execute(

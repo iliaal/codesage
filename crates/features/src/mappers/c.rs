@@ -343,9 +343,7 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
         let dir = parent_dir(cm);
         let project_name = cmake_project_name(&body);
 
-        // Collect late-bound `target_sources(name [PRIVATE|PUBLIC|INTERFACE] …)`
-        // additions first so the target loop below can merge them when it
-        // sees the matching `add_executable` / `add_library`.
+        // Collect target_sources first: additions may follow target declarations.
         let mut extra_sources: HashMap<String, Vec<String>> = HashMap::new();
         for args in cmake_command_args(&body, "target_sources") {
             let mut words = cmake_split_args(&args);
@@ -353,17 +351,12 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
                 continue;
             }
             let name = resolve_cmake_target_name(&words.remove(0), project_name.as_deref());
-            // Real CMake requires a PRIVATE|PUBLIC|INTERFACE scope keyword
-            // here; tolerate its absence rather than skipping the call, but
-            // drop the keyword if present so a phantom "PRIVATE" source
-            // never lands in `extra_sources`.
+            // Tolerate missing scope keywords; present keywords are not sources.
             strip_target_sources_scope(&mut words);
             extra_sources.entry(name).or_default().extend(words);
         }
 
-        // `add_executable(...)` plus the legacy FindCUDA `cuda_add_executable(...)`
-        // macro; the latter always marks the target CUDA, the former is CUDA
-        // only if it pulls in a `.cu` / `.cuh` source.
+        // FindCUDA macros imply CUDA even without a .cu/.cuh source.
         let exe_calls: Vec<(String, bool)> = cmake_command_args(&body, "add_executable")
             .into_iter()
             .map(|a| (a, false))
@@ -382,17 +375,13 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
             if !is_valid_target_name(&name) {
                 continue;
             }
-            // `add_executable(name [WIN32] [MACOSX_BUNDLE] [EXCLUDE_FROM_ALL] …)`
-            // — option keywords are not sources.
             strip_cmake_target_options(&mut words);
             let mut all_sources: Vec<String> = words;
             if let Some(extra) = extra_sources.get(&name) {
                 all_sources.extend(extra.iter().cloned());
             }
             let is_cuda = macro_is_cuda || all_sources.iter().any(|s| is_cuda_source(s));
-            // Variable substitution (${VAR}) and absolute paths are not
-            // resolvable without a full CMake interpreter; skip the target
-            // rather than emit a misleading seed.
+            // Unresolved variables or absolute paths make target ownership uncertain.
             if all_sources.iter().any(|s| is_pathological_source(s)) {
                 continue;
             }
@@ -401,9 +390,7 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
                 .filter(|s| is_c_or_cpp_compilable(s))
                 .cloned()
                 .collect();
-            // Header-only executables can't actually link as a binary.
-            // Empty `all_sources` after a sourceless declaration with no
-            // matching target_sources() is treated the same.
+            // Executables need a compilable source; headers alone cannot link.
             if compilable.is_empty() {
                 continue;
             }
@@ -484,8 +471,6 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
             if !is_valid_target_name(&name) {
                 continue;
             }
-            // `add_library(name [SHARED|STATIC|MODULE|OBJECT|INTERFACE] [EXCLUDE_FROM_ALL] …)`
-            // — neither the library-type keyword nor EXCLUDE_FROM_ALL is a source.
             strip_library_type_keyword(&mut words);
             strip_cmake_target_options(&mut words);
             let mut all_sources: Vec<String> = words;
@@ -496,9 +481,7 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
             if all_sources.iter().any(|s| is_pathological_source(s)) {
                 continue;
             }
-            // Libraries can legitimately be header-only (INTERFACE), so we
-            // accept zero compilable sources — but still require something
-            // in the source list, otherwise the target has no files at all.
+            // Header-only libraries are valid; targets without any files are not.
             if all_sources.is_empty() {
                 continue;
             }
@@ -519,8 +502,6 @@ fn cmake_targets(ctx: &MapperContext, files: &[String]) -> Result<Vec<FeatureSee
             }
             let language = lang_for_path(&entry);
             let owned_files = filter_target_sources(ctx, &dir, &all_sources);
-            // Drop the seed if every source was filtered (e.g., a vendored
-            // INTERFACE library whose only file lives under vendor/).
             if owned_files.is_empty() {
                 continue;
             }
@@ -563,15 +544,14 @@ fn main_function_targets(
         if !ctx.allowed(rel) {
             continue;
         }
-        // Test harnesses define main() too. Prefer suppressing a test-shaped CLI
-        // over flooding feature lists with harness binaries.
+        // A test harness's main() is not a CLI feature.
         if is_c_or_cpp_test_path(rel) {
             continue;
         }
         let abs = root.join(rel);
         // Gate allocations before reading; raw bytes allow non-UTF-8 C comments.
         if !fs::metadata(&abs).is_ok_and(|m| m.len() <= 2_000_000) {
-            continue; // skip huge generated sources
+            continue;
         }
         let Ok(source) = fs::read(&abs) else { continue };
         let parser = if lang_for_path(rel) == Language::Cpp {

@@ -79,8 +79,6 @@ impl FeatureMapper for GoMapper {
     }
 }
 
-// ---- Discovery ----------------------------------------------------------
-
 fn read_module_path(go_mod: &Path) -> Option<String> {
     let raw = read_to_string_bounded(go_mod).ok().flatten()?;
     let re = Regex::new(r"(?m)^\s*module\s+(\S+)").ok()?;
@@ -178,8 +176,6 @@ fn read_go_package_name(root: &Path, dir_rel: &str) -> Option<String> {
     None
 }
 
-// ---- Per-package file classification -----------------------------------
-
 fn collect_package_files(ctx: &MapperContext, dir_rel: &str) -> Result<GoPackageFiles> {
     let root = ctx.root;
     let dir = if dir_rel.is_empty() {
@@ -262,8 +258,6 @@ fn is_generated_go_file(abs: &Path, file_name: &str) -> bool {
     header_re.is_match(head)
 }
 
-// ---- Same-repo import context (capped) ---------------------------------
-
 const IMPORT_CONTEXT_CAP_DEFAULT: usize = 24;
 
 // Read each call so an earlier mapping cannot freeze another project's setting.
@@ -344,8 +338,6 @@ fn extract_go_imports(source: &str) -> Vec<String> {
     }
     imports.into_iter().collect()
 }
-
-// ---- Seed construction --------------------------------------------------
 
 fn make_seed(
     pkg: &GoPackage,

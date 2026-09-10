@@ -76,9 +76,7 @@ fn fp_to_blob(fp: &[u64]) -> Vec<u8> {
 }
 
 fn blob_to_fp(b: &[u8]) -> Vec<u64> {
-    // A non-8-multiple blob is corrupt; return empty so the caller's
-    // fixed-length conversion rejects it rather than silently dropping the
-    // trailing bytes and decoding a plausible-but-wrong signature.
+    // Reject partial u64s via the caller's fixed-length check; never truncate corruption.
     if !b.len().is_multiple_of(8) {
         return Vec::new();
     }

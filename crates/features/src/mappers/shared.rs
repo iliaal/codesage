@@ -182,9 +182,7 @@ pub fn collect_source_files(
     exclude_pred: impl Fn(&str) -> bool,
     cap: usize,
 ) -> Vec<String> {
-    // Collect-then-sort-then-truncate, same rationale as `walk_files`:
-    // each per-dir walk is already sorted, but stopping at `cap`
-    // mid-iteration would bias survivors toward the dirs listed first.
+    // Truncate after the global sort so directory order cannot bias survivors.
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for dir in scan_dirs {
         for rel in walk_files(ctx.root, dir, walk_cap, ctx.excludes) {

@@ -45,10 +45,7 @@ def check(cond: bool, label: str) -> None:
         failures.append(f"  {label}")
 
 
-# --------------------------------------------------------------------
-# agent-tool-selection-harness.py — fnd_178331ec / fnd_ac7bcade
 # Skipping permissions would bypass --allowedTools and contaminate the comparison.
-# --------------------------------------------------------------------
 harness = _load("agent-tool-selection-harness.py", "harness")
 
 with_cmd = harness.build_command("find the auth handler", with_codesage=True, max_turns=10)
@@ -119,10 +116,6 @@ check(
     "harness: unexpected tool use is reported",
 )
 
-# --------------------------------------------------------------------
-# generate-llm-corpus.py — fnd_a15786db (negative --num-cases) +
-# fnd_136d5663 (unsorted candidates) + YAML quoting hardening
-# --------------------------------------------------------------------
 gen = _load("generate-llm-corpus.py", "gen")
 
 raised = False
@@ -255,9 +248,6 @@ with tempfile.TemporaryDirectory() as td:
         f"gen: parse_codex_query_output reads schema file, got {parsed!r}",
     )
 
-# --------------------------------------------------------------------
-# extract-eval-cases.py — fnd_32ebb1d9 (YAML injection via path)
-# --------------------------------------------------------------------
 extract = _load("extract-eval-cases.py", "extract")
 
 
@@ -673,9 +663,6 @@ with tempfile.TemporaryDirectory() as td:
     text = out.read_text()
     check('"src/a: b.py"' in text, "extract: path with ': ' is double-quoted in output")
 
-# --------------------------------------------------------------------
-# concurrency-audit.py — fnd_75310863 (timeout reported as clean)
-# --------------------------------------------------------------------
 audit = _load("concurrency-audit.py", "audit")
 
 clean_state = {
@@ -735,11 +722,7 @@ with tempfile.TemporaryDirectory() as td:
         "audit: restore_db removes audit-created database files when there was no original backup",
     )
 
-# --------------------------------------------------------------------
-# --------------------------------------------------------------------
-
-# extract-eval-cases.py — fnd_f243e0e9: control chars in query text must not
-# survive into emitted YAML (PyYAML rejects raw C0 control chars even in quotes).
+# PyYAML rejects raw C0 control characters even inside quotes.
 dq = extract._yaml_dq("hello\x1b[31mworld\x00")
 check("\x1b" not in dq and "\x00" not in dq, "extract: _yaml_dq strips control chars")
 if yaml is not None:
@@ -758,8 +741,6 @@ if yaml is not None:
             ok = False
         check(ok, "extract: control-char query round-trips through YAML")
 
-# generate-llm-corpus.py — fnd_4c49b101: the id field embeds the filename stem
-# and must be quoted so a stem with ': ' doesn't break the corpus parse.
 if yaml is not None:
     doc = gen.format_corpus_yaml(
         "/proj",
@@ -772,7 +753,7 @@ if yaml is not None:
         ok = False
     check(ok, "gen: id with ': ' round-trips through YAML")
 
-# concurrency-audit.py — fnd_c8431abd: children share one timeout deadline.
+# Children share one timeout deadline.
 hang = [sys.executable, "-c", "import time; time.sleep(30)"]
 t0 = time.time()
 results = audit.run_parallel([hang, hang], Path("."), timeout_s=2)
@@ -837,7 +818,6 @@ inconclusive_state = dict(
 v = audit.classify_verdict([{"returncode": 0}, {"returncode": 0}], inconclusive_state)
 check("INCONCLUSIVE" in v, f"audit: semantic inconclusive is not clean (got {v!r})")
 
-# agent-tool-selection-harness.py — fnd_329c8aed / fnd_42e0caa2
 raised = False
 try:
     harness.positive_int("-1")
@@ -861,7 +841,6 @@ except ValueError:
 check(raised, "harness: failed subprocess results cannot be scored")
 
 
-# --------------------------------------------------------------------
 # Extensionless scripts need an explicit SourceFileLoader.
 _ndcg_spec = importlib.util.spec_from_loader(
     "semble_ndcg_runner",

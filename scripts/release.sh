@@ -1,32 +1,11 @@
 #!/usr/bin/env bash
-# Release ceremony for codesage.
-#
-#   scripts/release.sh [-y|--yes] [--include-approved-prose] X.Y.Z
-#
-# Does:
-#   1. Pre-flight checks (on master, clean tree, in sync with origin, tag free).
-#      --include-approved-prose permits only README.md/CHANGELOG.md content
-#      edits approved for this release; the release commit includes them.
-#      Exception: if a previous run already committed + tagged HEAD but never
-#      pushed, the script resumes at the push step instead of dying on the tag.
-#   2. Move `## [Unreleased]` content into a new `## [X.Y.Z] - YYYY-MM-DD` block
-#      and append the matching link reference.
-#   3. Bump `[workspace.package].version`, both plugin manifests, and the
-#      Claude marketplace version.
-#   4. Build the release binary with `--features cuda` so Cargo.lock is up to date.
-#   5. Prompt, then commit + tag.
-#   6. Prompt, then refresh the required Codex and Claude Code plugins and push
-#      master + tag. If either CLI is unavailable or its integration fails to
-#      refresh, stop before the push so the release can be resumed after repair.
-#   7. Refresh whichever `codesage` is on PATH so the maintainer's local install
-#      jumps to the new version, then restart and check the shared daemon.
-#      Skipped if no install is found or the binary path is not writable.
-#
-# The two prompts are deliberate: every hard-to-reverse step stops and asks.
-# Pass `-y` / `--yes` to auto-confirm both prompts when driving the script from
-# a non-interactive context (e.g. an agent that has already run the lint/tests
-# gate via `.agents/skills/release/references/workflow.md`).
-# Pre-release lint/tests are the shared release workflow's job.
+# scripts/release.sh [-y|--yes] [--include-approved-prose] X.Y.Z
+# Run the shared release workflow's lint/tests first. This script prepares
+# metadata and a CUDA build, confirms commit/tag and push separately, then
+# refreshes the writable PATH install and daemon. --yes confirms both prompts.
+# --include-approved-prose includes approved README.md/CHANGELOG.md edits.
+# Both agent plugins must refresh before pushing; a tagged but unpushed release
+# can resume after repair.
 
 set -euo pipefail
 
@@ -92,9 +71,7 @@ git fetch origin master --quiet
 local_sha=$(git rev-parse HEAD)
 remote_sha=$(git rev-parse origin/master)
 
-# A previous run that committed + tagged but never finished pushing leaves the
-# tag at HEAD and absent from origin; that exact state is safe to resume at the
-# push phase. Any other pre-existing tag state is an error.
+# Resume only when the existing tag is at HEAD and absent from origin.
 RESUME=0
 if git rev-parse "v$VERSION" >/dev/null 2>&1; then
 	tag_sha=$(git rev-parse "v$VERSION^{commit}")
@@ -118,9 +95,7 @@ elif [[ "$local_sha" != "$remote_sha" ]]; then
 	die "local master ($local_sha) differs from origin/master ($remote_sha)"
 fi
 
-# CHANGELOG section ordering / validity gate (shared iliaal/* convention).
-# Runs before any mutation so a malformed [Unreleased] block stops the release
-# cleanly rather than getting stamped into a version section.
+# Validate before mutation so malformed entries cannot become release notes.
 python3 "$ROOT/scripts/check-changelog.py" "$ROOT/CHANGELOG.md" ||
 	die "CHANGELOG [Unreleased] failed validation (see above)"
 python3 "$ROOT/scripts/check-plugin-versions.py" --root "$ROOT" ||
@@ -242,19 +217,12 @@ PYEOF
 		echo "Proceed? [y/N] y  (--yes)"
 		ans=y
 	else
-		# EOF (piped stdin / closed TTY) under `set -e` would abort here
-		# mid-ceremony after the tag step; treat it as an empty answer so
-		# the explicit abort below fires instead of an unexplained exit.
+		# Treat EOF as rejection so set -e cannot bypass the explicit abort message.
 		read -r -p "Proceed? [y/N] " ans || ans=""
 	fi
 	[[ "$ans" == "y" || "$ans" == "Y" ]] || die "aborted before commit"
 
-	# Commit by pathspec, not `git commit -am`: -a would sweep stray edits
-	# and the Cargo.lock refresh into the release. These are exactly the
-	# files this script mutates above (CHANGELOG + version bumps), approved
-	# README prose when requested, plus the
-	# Cargo.lock the --features cuda build refreshes (absent in checkouts
-	# without a lockfile — only existing paths are committed).
+	# Explicit paths exclude stray edits while including the CUDA lockfile refresh.
 	RELEASE_FILES=(
 		CHANGELOG.md
 		Cargo.toml
@@ -285,7 +253,6 @@ if [[ "$ASSUME_YES" -eq 1 ]]; then
 	echo "Push master + v$VERSION to origin? [y/N] y  (--yes)"
 	ans=y
 else
-	# Same EOF guard as the commit prompt above.
 	read -r -p "Push master + v$VERSION to origin? [y/N] " ans || ans=""
 fi
 if [[ "$ans" == "y" || "$ans" == "Y" ]]; then

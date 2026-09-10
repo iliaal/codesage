@@ -877,13 +877,8 @@ fn assess_risk_with_context(
     };
 
     let gap_check_partial = test_gap && (no_symbols || walk_capped);
-    // `git_author_events` is keyed by path and the pass already clipped it to
-    // the window it measured from HEAD, so the newest commit touching this
-    // file admits every event the pass retained. Measuring from the wall clock
-    // instead empties the window on a checkout older than it — the one case
-    // the anchor exists for. Author shares are scale-invariant under the
-    // half-life decay, so the anchor changes which events qualify, never the
-    // concentration computed from them.
+    // The file's newest commit retains every HEAD-window event, even on old
+    // checkouts. Shifting the decay anchor preserves relative author shares.
     let author_anchor = git
         .as_ref()
         .and_then(|g| g.last_commit_at)
@@ -1084,8 +1079,7 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
             )
         })
         .collect::<Result<Vec<_>>>()?;
-    // gap_check_partial is only ever true on files whose test_gap fired, so
-    // this count is a subset of `test_gap_files` by construction.
+    // Partial checks are a subset of test_gap_files.
     let partial_gap_count = assessed.iter().filter(|(_, partial)| *partial).count();
     let mut files: Vec<RiskAssessment> = assessed.into_iter().map(|(a, _)| a).collect();
     if cycles_failed {
@@ -1094,15 +1088,9 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
         }
     }
 
-    // Aggregating an unmeasured file's structural-only score would let a
-    // patch look calm because its riskiest file has no indexed history.
-    // Excluded from the aggregates, listed by name, never dropped from
-    // `files` or the structural rollups. The exclusion cannot hide a
-    // threshold crossing: churn, fix ratio, and coupling carry 0.59 of the
-    // weight and all three need a git row, so an unscored file caps at 0.41 —
-    // under the 0.50 gate of the max-score warning further down. The bound is
-    // asserted at [`UNSCORED_REACHABLE_WEIGHT`]; the per-file gates in
-    // `rehearsal` read `files` directly, so they see unscored rows either way.
+    // Unmeasured scores must not dilute aggregates; retain their rows for
+    // structural rollups and rehearsal's per-file gates. For indexer-written
+    // data, UNSCORED_REACHABLE_WEIGHT bounds them below the 0.50 warning gate.
     let unscored_files: Vec<String> = files
         .iter()
         .filter(|f| f.unscored)

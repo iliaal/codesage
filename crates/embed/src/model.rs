@@ -741,12 +741,8 @@ pub fn cached_model_artifacts(model: &str) -> Option<ModelArtifacts> {
     };
     let cache = hf_cache_from_env()?.repo(repo);
     let ort_runtime = ort_runtime_dylib().ok()?;
-    // The same artifact set `resolve_model_artifacts` describes, or the two
-    // digests never converge and every pass re-embeds: a pin that declares
-    // no sidecar yields `onnx_data: None` here as there, even when a
-    // `model.onnx_data` is sitting in the snapshot. That anomaly is not this
-    // probe's to report (it returns `Option`, never an error); resolution
-    // refuses it in `refuse_undeclared_sidecar` before any session is served.
+    // Match resolution's artifact set or every pass re-embeds. Resolution
+    // rejects undeclared sidecars; this non-failing probe omits them.
     let onnx_data = match sidecar_expectation(model, allow_any) {
         SidecarExpectation::Absent => None,
         SidecarExpectation::Required | SidecarExpectation::Unknown => cache.get(ONNX_DATA_ARTIFACT),
@@ -859,11 +855,8 @@ fn memoized_artifacts(key: &ArtifactKey) -> Option<ArtifactMemo> {
     match unreadable {
         None => Some(entry.clone()),
         Some((path, error)) => {
-            // Any stat failure invalidates, not only ENOENT: EACCES, EIO, and
-            // ELOOP also mean the path cannot be opened, and re-resolving is
-            // the safe direction. The line is what distinguishes "the cache
-            // was cleared" from a directory that lost read permission and now
-            // costs a full resolution per pass.
+            // Invalidate on any stat error; log the cause to distinguish
+            // eviction from persistent access failures.
             tracing::debug!(
                 path = %path.display(),
                 error = %error,
@@ -1216,10 +1209,7 @@ fn verify_with_refetch<P>(
 /// must not get an arbitrary external file deleted on the eviction path.
 /// On containment failure only the symlink itself is removed.
 fn evict_cached_artifact(path: &Path) -> Result<()> {
-    // The pin verifier shares `fingerprint::cached_file_digest`, keyed on
-    // (size, mtime): a refetch that lands within the same mtime tick with
-    // the same length would otherwise verify against the evicted bytes'
-    // hash. Purge first; a purge with no refetch just costs a re-read.
+    // Purge before refetch: identical size/mtime must not reuse the old digest.
     crate::fingerprint::forget_cached_digest(path);
     if let Ok(target) = std::fs::read_link(path) {
         let blob = if target.is_absolute() {

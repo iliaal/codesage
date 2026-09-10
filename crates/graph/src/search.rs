@@ -1046,12 +1046,7 @@ static SYMBOL_QUERY_RE: OnceLock<Regex> = OnceLock::new();
 
 fn symbol_query_re() -> &'static Regex {
     SYMBOL_QUERY_RE.get_or_init(|| {
-        // Four shapes accepted:
-        //  1. namespace-qualified: Foo::Bar, foo.bar, foo->bar, Foo\Bar
-        //  2. leading underscore:  _foo, _Foo, _
-        //  3. contains uppercase or underscore in body: fooBar, my_func, Foo
-        //  4. starts with uppercase: Foo, FOO
-        // Plain lowercase words (e.g. "session", "login") are NL, not symbols.
+        // Qualification, underscores, or capitals distinguish symbols from prose.
         Regex::new(
             r"^(?:[A-Za-z_][A-Za-z0-9_]*(?:(?:::|\\|->|\.)[A-Za-z_][A-Za-z0-9_]*)+|_[A-Za-z0-9_]*|[A-Za-z][A-Za-z0-9]*[A-Z_][A-Za-z0-9_]*|[A-Z][A-Za-z0-9]*)$",
         )
@@ -1085,8 +1080,7 @@ fn extract_embedded_symbols(query: &str) -> Vec<String> {
     seen.into_iter().collect()
 }
 
-// Lowercase + strip `_` (snake_case) and `-` (kebab-case, common in JS/TS),
-// so `ModuleRef` matches both `module_ref.py` and `module-ref.ts`.
+// Match ModuleRef against both module_ref.py and module-ref.ts.
 fn normalize_stem(s: &str) -> String {
     s.to_lowercase()
         .chars()
@@ -1144,10 +1138,7 @@ fn compile_definition_pattern(symbol_name: &str) -> Option<Regex> {
             .collect::<Vec<_>>()
             .join("|")
     });
-    // Match: optional start-of-line/whitespace + keyword + whitespace +
-    // (optional namespace prefix `foo.` or `Foo::`)* + symbol_name +
-    // (whitespace, opening paren/brace/bracket, `<`, `:`, `;`, or end-of-line).
-    // (?m) so `^` and `$` anchor to line boundaries inside chunk content.
+    // Allow namespace prefixes, but require a declaration keyword and name boundary.
     let pattern = format!(
         r"(?m)(?:^|\s)(?:{kw_alts})\s+(?:[A-Za-z_]\w*(?:\.|::))*{escaped}(?:\s|[<({{:\[;]|$)"
     );
@@ -1809,11 +1800,7 @@ fn apply_file_saturation(results: &mut [SearchResult]) {
 const DIR_SATURATION_THRESHOLD_DEFAULT: usize = 2;
 const DIR_SATURATION_DECAY_DEFAULT: f32 = 0.75;
 
-// Env overrides for tuning without rebuilds. Cached on first read.
-// `CODESAGE_DIR_SATURATION_THRESHOLD` accepts a positive integer; values < 1
-// fall back to the default. `CODESAGE_DIR_SATURATION_DECAY` accepts a float in
-// (0.0, 1.0]; values outside that range fall back to the default. A decay of
-// 1.0 effectively disables the signal (no decrement past threshold).
+// Read tuning once per process; decay 1.0 disables directory saturation.
 static DIR_SATURATION_THRESHOLD: OnceLock<usize> = OnceLock::new();
 static DIR_SATURATION_DECAY: OnceLock<f32> = OnceLock::new();
 
