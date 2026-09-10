@@ -4,12 +4,14 @@
 
 ### Added
 
+- `CODESAGE_OVERVIEW_CACHE=0` disables daemon ranking reuse for comparison or troubleshooting; set it before starting the daemon.
 - `codesage daemon stats` reports bounded request and execution diagnostics, cache reuse, and outstanding work without starting a daemon.
 - `codesage-report` renders filtered findings through a deterministic formatter with acknowledgement diagnostics.
 - C++ `const` / `constexpr` / `constinit` declarations with an initializer index as constants at file, namespace, and class scope, and C `const` / `constexpr` declarations at file scope; run `codesage index --full` to populate existing indexes. Enumerators, mutable variables, function-local declarations, and pointer declarators stay unindexed.
 
 ### Changed
 
+- `project_overview` and `session_start` reuse a generation-validated risk ranking in the daemon and share concurrent ranking computations, reducing repeated analysis while keeping freshness annotations per request.
 - MCP tools bound queued and running work and report timeout, cancellation, saturation, shutdown, database-busy, and incomplete-analysis errors with physical continuation status.
 - `codesage doctor --docs` also checks Google-style `kCamelCase` constant values, not only `UPPER_SNAKE`.
 - `assess_risk` and `assess_risk_batch` report `unscored` for a file with no indexed git history. `assess_risk_diff` excludes unscored files from `max_score` / `mean_score`, names them in `unscored_files`, and adds `scored_file_count`; they remain in `files`.
