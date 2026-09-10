@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.29.0] - 2026-09-10
+
 ### Added
 
 - `codesage daemon stats` reports bounded request and execution diagnostics, cache reuse, and outstanding work without starting a daemon.
@@ -951,5 +953,7 @@ Initial public release.
 
 [0.27.0]: https://github.com/iliaal/codesage/releases/tag/v0.27.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.28.0...HEAD
 [0.28.0]: https://github.com/iliaal/codesage/releases/tag/v0.28.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.29.0...HEAD
+[0.29.0]: https://github.com/iliaal/codesage/releases/tag/v0.29.0
