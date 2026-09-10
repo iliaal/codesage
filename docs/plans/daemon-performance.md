@@ -1,6 +1,6 @@
 # Plan: bounded daemon work and shared risk caching
 
-Status: implementation, independent review, and performance acceptance complete. Commit, push, and verified local deployment remain pending. Historical checkpoints below preserve earlier failures and pending states; the final acceptance section supersedes their status claims.
+Status: implementation, independent review, performance acceptance, commit, push, verified local deployment, and bead closure complete. Historical checkpoints below preserve earlier failures and pending states; the final accepted evidence and delivery sections supersede their status claims.
 
 Beads: `cs-h1u` (P1), `cs-3bo` (P1), and `cs-88g` (P2).
 
@@ -179,9 +179,9 @@ Verify: independent review of cancellation and cache races; fresh full-gate resu
 
 Exit: all three beads' capability and evidence requirements are satisfied. Any unresolved native lifetime, invalidation, completeness, or successful-workload requirement remains open and is reported explicitly.
 
-## Next step
+## Delivery disposition
 
-Commit the reviewed explicit paths, preserving the unrelated AGENTS.md appendix and `.plan/task_plan.md`. Push master, back up the installed binary, stop the old daemon, atomically install the verified CUDA binary, and exercise the installed MCP/diagnostic/GPU paths before closing the beads. No version release or dependency-policy change is included.
+Implementation commit `3d15ee4` is on origin/master, the verified CUDA binary is installed, and all three beads are closed as fixed. The unrelated AGENTS.md appendix and `.plan/task_plan.md` remain untouched. The separately requested version release awaits an explicit version; no dependency-policy change is included.
 
 Retain earlier mobile deadline failures and bind their disposition to the later source-specific measurements; do not increase client timeouts or reduce analysis coverage. Pinned inputs and retained reports remain under `/tmp/codesage-daemon-baseline.H7CPFS`. Keep unchecked tasks open until their verification passes; `in_progress` does not mean accepted. The user's execution goal authorizes implementation, commit, push, and deployment after acceptance and review gates. The approved unchanged baseline `cargo deny` findings remain documented exceptions; no dependency-policy change or advisory suppression is authorized.
 
@@ -260,6 +260,15 @@ The following records historical implementation observations in chronological or
 - Capability acceptance is complete; commit, push, deployment, installed-path verification, and bead closure are not claimed yet.
 - The final optional counter cleanup was implemented and independently cleared, superseding its earlier deferral. All 21 dispatch tests and the full CUDA sanity gate passed afterward. Delivery binary `194cfe6e1b7c255ff1178b8434e31ce842fa9631c45fbb562e1a9f92cf3e0321` has Rust manifest `3db8b9aab255159936af189bffc8dd0bcd1c5c09e3b93325bfe7c8f90cf6fc24`; earlier comparative measurements remain bound to their recorded binaries.
 - Delivery-binary smoke completed with valid inputs: 54/54 ordinary calls succeeded; 48 intentionally abandoned calls exercised cancellation, disconnect, and local-only timeout. All endpoint work snapshots drained. Five-second post-response CPU was 0.00/0.01/0.92 seconds respectively; local-only timeout does not signal server cancellation.
+
+## Verified local delivery
+
+- Implementation commit `3d15ee4a86aef69c36f9f66efe15fe7cb64273d1` was pushed to origin/master. The installed binary, running daemon executable, and release build share SHA-256 `194cfe6e1b7c255ff1178b8434e31ce842fa9631c45fbb562e1a9f92cf3e0321`.
+- The installed `codesage mcp --project <absolute project>` path completed two overview calls with matching stable output and a real GPU search returning three results. The recorded cold/warm overview times were 1.082 seconds and 9.445 milliseconds; this deployment smoke is a single observation, not another comparative campaign. Diagnostics recorded one cache miss and one hit. A later `codesage daemon stats --json --recent 0` confirmed no active requests, queued/running work, shared waiters, or retired flights. The running process mapped CUDA, CUDA runtime, and cuDNN libraries.
+- The first probe's daemon disappeared after the executor command ended. A control experiment showed that an ordinary child process disappeared across command boundaries while a detached child survived. Starting the installed daemon with `setsid -f codesage daemon` kept it reachable across independent commands and the repeated installed-path probe. This executor-specific launch workaround required no product change; the precise terminating signal was not observed.
+- The previous installed binary remains at `/tmp/codesage-deploy.CTE2fK/codesage.previous`, with SHA-256 `db61979eb17d43dde006dc9d92d7c480e13a25b8273ab32c3f4dbca0fe19590d`. Installed smoke evidence is retained at `/tmp/codesage-deploy.CTE2fK/installed-detached-smoke.json`. These local temporary artifacts are not durable release assets.
+- The approved baseline dependency-policy exceptions remain unchanged: no license allowlist, the unmaintained `paste` advisory RUSTSEC-2024-0436, and a yanked `der` warning. No advisory suppression or dependency-policy remediation was made.
+- A fresh closeout run of `bash scripts/sanity-check.sh --cuda` passed, with its complete output retained in `/tmp/codesage-deploy.CTE2fK/closeout-sanity.log`. Independent closeout review verified the delivery identities, control reports, installed probe, and outstanding-work counters without actionable findings. `cs-h1u`, `cs-3bo`, and `cs-88g` are closed with reason `fixed`, no assignee, and no state labels.
 
 ## References
 
