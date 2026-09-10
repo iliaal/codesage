@@ -56,6 +56,15 @@ pub(crate) fn cmd_daemon_stop(runtime_dir: Option<PathBuf>) -> Result<()> {
     rt.block_on(daemon::run_daemon_stop(runtime_dir))
 }
 
+pub(crate) fn cmd_daemon_stats(
+    runtime_dir: Option<PathBuf>,
+    json: bool,
+    recent: usize,
+) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(daemon::run_daemon_stats(runtime_dir, json, recent))
+}
+
 fn resolve_install_targets(target: &str) -> Result<Vec<Box<dyn installer::AgentTarget>>> {
     if target == "all" {
         return Ok(installer::all_targets());

@@ -64,6 +64,12 @@ CodeSage ships as one application binary plus a local SQLite database under `.co
 
 CLI `search` and `export` also reuse the running daemon's reranker. Without a daemon, they load a private session; inputs exceeding the daemon's per-text byte cap explicitly use private inference.
 
+Use `codesage daemon stats --json --recent 20` to inspect the current daemon's request outcomes, cache reuse, queues, and outstanding executions. It connects only to an existing daemon from the same build and does not start one. `--recent` accepts 0 through 256; retained diagnostics exclude query text, source, and response bodies.
+
+For comparison or troubleshooting, set `CODESAGE_OVERVIEW_CACHE=0` to disable ranking reuse or `CODESAGE_DIAGNOSTICS=0` to disable diagnostic collection. Set these before starting the daemon; an existing daemon keeps its original environment. Diagnostics-disabled mode still reports scheduler limits and outstanding work. Neither switch disables admission limits or cancellation.
+
+The daemon shares the indexed risk ranking across `project_overview` and `session_start`, while refreshing Git and working-file annotations for each call. It bounds requests and physical work separately. Cancelling one caller does not cancel a shared ranking needed by another caller. Timeout, cancellation, saturation, shutdown, database contention, and incomplete analysis produce explicit tool errors. A client timeout alone does not prove work stopped: native inference or a download can continue until its worker exits. Check `work_continuing` and the execution diagnostics before interpreting a timeout as reclaimed capacity.
+
 The daemon is a same-UID co-trust boundary, not a same-UID isolation boundary. Its socket is private to the Unix user and checks peer credentials, but any process running as that user can ask the daemon to open any onboarded project index. Run untrusted agents under a separate Unix user when project isolation matters. MCP calls are agent-safety capped; CLI commands remain operator tools and can request larger limits or file lists.
 
 For Linux CPU inference, install the runtime described in [CPU setup](#cpu-setup-linux). CUDA also needs the `nvidia-*-cu12` pip packages on the host (see [CUDA setup](#cuda-setup)); on Apple Silicon, set `device = "coreml"` instead (see [CoreML setup](#coreml-setup-macos)). Each host needs its matching build and runtime dependencies. If you want `cargo install`, `codesage init`, and an on-demand local daemon hidden behind stdio MCP, use CodeSage.

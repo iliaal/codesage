@@ -84,6 +84,16 @@ struct ModelEntry<T> {
 
 type ModelMap<T> = Mutex<HashMap<String, ModelEntry<T>>>;
 
+fn model_lock<T>(mutex: &Mutex<T>) -> Result<parking_lot::MutexGuard<'_, T>> {
+    loop {
+        codesage_protocol::work::checkpoint()?;
+        if let Some(guard) = mutex.try_lock_for(Duration::from_millis(25)) {
+            codesage_protocol::work::checkpoint()?;
+            return Ok(guard);
+        }
+    }
+}
+
 /// Hold the map lock only for lookup; load under the per-key lock to prevent duplicate sessions.
 fn get_or_load_slot<T, F>(map: &ModelMap<T>, key: String, load: F) -> Result<Arc<Mutex<T>>>
 where
@@ -98,7 +108,7 @@ where
         entry.last_used = Instant::now();
         entry.slot.clone()
     };
-    let mut slot_guard = slot.lock();
+    let mut slot_guard = model_lock(&slot)?;
     if let Some(arc) = slot_guard.as_ref() {
         return Ok(arc.clone());
     }
@@ -136,6 +146,10 @@ fn evict_idle_from_map<T>(map: &ModelMap<T>, timeout: Duration) -> usize {
 }
 
 pub(crate) struct CodeSageServerState {
+    pub(super) diagnostics: super::diagnostics::Diagnostics,
+    pub(super) work: super::work::WorkCoordinator,
+    pub(super) overview_cache: super::overview_cache::OverviewCache,
+    pub(super) overview_cache_enabled: bool,
     projects: Mutex<HashMap<PathBuf, ProjectState>>,
     /// Raw-path cache avoids repeated canonicalization; `projects` deduplicates canonical roots.
     resolved: Mutex<HashMap<String, ProjectState>>,
@@ -461,6 +475,13 @@ fn check_expected_fingerprint(expected: Option<&str>, produces: &str, probe: boo
 impl CodeSageServerState {
     pub(crate) fn new() -> Self {
         Self {
+            diagnostics: super::diagnostics::Diagnostics::new(
+                std::env::var("CODESAGE_DIAGNOSTICS").as_deref() != Ok("0"),
+            ),
+            work: super::work::WorkCoordinator::new(super::work::WorkLimits::default())
+                .expect("built-in work limits are valid"),
+            overview_cache: super::overview_cache::OverviewCache::default(),
+            overview_cache_enabled: std::env::var("CODESAGE_OVERVIEW_CACHE").as_deref() != Ok("0"),
             projects: Mutex::new(HashMap::new()),
             resolved: Mutex::new(HashMap::new()),
             embedders: Mutex::new(HashMap::new()),
@@ -468,6 +489,15 @@ impl CodeSageServerState {
             watchers: Mutex::new(HashMap::new()),
             watcher_lifecycle: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub(crate) fn shutdown_work(&self) {
+        self.work.shutdown();
+    }
+
+    pub(crate) fn active_work(&self) -> usize {
+        let snapshot = self.work.snapshot();
+        snapshot.running.iter().sum::<usize>() + snapshot.queued.iter().sum::<usize>()
     }
 
     /// Evict unused models without touching in-flight references. Call malloc_trim once
@@ -587,7 +617,7 @@ impl CodeSageServer {
         }
     }
 
-    fn resolve_project_inner(&self, project: &str) -> Result<ProjectState> {
+    pub(super) fn resolve_project_inner(&self, project: &str) -> Result<ProjectState> {
         // Cached roots still need config-mtime and index-existence checks after edits or resets.
         {
             let guard = self.state.resolved.lock();
@@ -815,7 +845,7 @@ impl CodeSageServer {
     fn open_db_for(&self, state: &ProjectState) -> Result<Database> {
         let config = self.semantic_embedding_config(state)?;
         let embedder_arc = self.get_or_load_embedder(config)?;
-        let dim = embedder_arc.lock().dim();
+        let dim = model_lock(&embedder_arc)?.dim();
         let db = Database::open_for_model_existing(&state.db_path, &config.model, dim)?;
         let fingerprint = crate::commands::index::resolved_fingerprint(&db, config, dim)?;
         codesage_graph::require_current_semantic_table(&db, &fingerprint)?;
@@ -1019,7 +1049,7 @@ impl CodeSageServer {
             );
         }
         let embedder_arc = self.get_or_load_embedder(config)?;
-        let mut embedder = embedder_arc.lock();
+        let mut embedder = model_lock(&embedder_arc)?;
         let dim = embedder.dim();
         let fingerprint = session_fingerprint(config, &embedder)?;
         check_expected_fingerprint(expected_fingerprint, fingerprint.as_str(), texts.is_empty())?;
@@ -1099,7 +1129,7 @@ impl CodeSageServer {
             .transpose()?;
 
         let query_embedding = {
-            let mut guard = embedder_arc.lock();
+            let mut guard = model_lock(&embedder_arc)?;
             // Config compatibility is insufficient: verify the resident session's execution provider too.
             let produces = session_fingerprint(config, &guard)?;
             codesage_graph::require_current_semantic_table(&db, &produces)?;
@@ -1108,7 +1138,7 @@ impl CodeSageServer {
 
         let rerank_fn: Option<codesage_graph::RerankFn<'_>> = reranker_arc.map(|rr| {
             // Hold the model lock only during inference, not SQL retrieval or post-processing.
-            Box::new(move |q: &str, docs: &[&str]| rr.lock().score_pairs(q, docs))
+            Box::new(move |q: &str, docs: &[&str]| model_lock(&rr)?.score_pairs(q, docs))
                 as Box<dyn FnMut(&str, &[&str]) -> Result<Vec<f32>>>
         });
 

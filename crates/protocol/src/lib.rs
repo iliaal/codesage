@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 pub mod stat_cache;
+pub mod work;
 
 pub const DEFAULT_EMBEDDING_DIM: usize = 384;
 

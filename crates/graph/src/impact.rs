@@ -10,7 +10,10 @@ use codesage_protocol::{
 };
 use codesage_storage::Database;
 
-use crate::bundle::{import_ref_targets_file, resolve_callee_definitions};
+use crate::bundle::{
+    import_ref_targets_file, import_refs_for_file, resolve_callee_definitions,
+    resolve_callee_definitions_with_imports,
+};
 
 pub(crate) fn is_qualified_symbol_name(name: &str) -> bool {
     name.contains('\\') || name.contains('.') || name.contains("::")
@@ -49,16 +52,27 @@ pub(crate) struct WalkOutcome {
     pub seed_count: usize,
 }
 
+type DefinitionKey = (String, String, u32);
+type ResolvedDefinitions = Arc<Vec<DefinitionKey>>;
+
 /// Request-local resolved edges shared across walks with different frontier
 /// and work limits. Admission is still charged on cache hits.
 #[derive(Default)]
 pub(crate) struct WalkCache {
     references: HashMap<(String, String, u32), Arc<Vec<Reference>>>,
+    resolutions: HashMap<(String, String), ResolvedDefinitions>,
+    caller_imports: HashMap<String, Arc<Vec<String>>>,
     reference_bytes: usize,
     file_imports: Option<Arc<Vec<Reference>>>,
     import_matches: HashMap<String, Arc<Vec<usize>>>,
     #[cfg(test)]
     hits: usize,
+    #[cfg(test)]
+    resolution_hits: usize,
+    #[cfg(test)]
+    resolution_loads: usize,
+    #[cfg(test)]
+    caller_import_loads: usize,
 }
 
 impl WalkCache {
@@ -67,14 +81,11 @@ impl WalkCache {
 
     #[cfg(test)]
     pub(crate) fn stats(&self) -> (usize, usize, usize) {
-        (
-            self.hits,
-            self.references.len() + self.import_matches.len(),
-            self.reference_bytes,
-        )
+        (self.hits, self.entry_count(), self.reference_bytes)
     }
 
     fn references(&mut self, db: &Database, sym: &Symbol) -> Result<Arc<Vec<Reference>>> {
+        codesage_protocol::work::checkpoint()?;
         let key = symbol_identity_key(sym);
         if let Some(rows) = self.references.get(&key) {
             #[cfg(test)]
@@ -83,7 +94,8 @@ impl WalkCache {
             }
             return Ok(Arc::clone(rows));
         }
-        let rows = Arc::new(references_for_symbol(db, sym)?);
+        let raw = db.find_references(&sym.name, None)?;
+        let rows = Arc::new(resolve_references_to_symbol(db, sym, raw, Some(self))?);
         let bytes = rows.iter().fold(
             rows.capacity()
                 .saturating_mul(std::mem::size_of::<Reference>())
@@ -96,7 +108,7 @@ impl WalkCache {
                     .saturating_add(row.from_symbol.as_ref().map_or(0, String::capacity))
             },
         );
-        if self.references.len() + self.import_matches.len() < Self::MAX_SYMBOLS
+        if self.entry_count() < Self::MAX_SYMBOLS
             && bytes <= Self::MAX_REFERENCE_BYTES.saturating_sub(self.reference_bytes)
         {
             self.reference_bytes += bytes;
@@ -105,12 +117,91 @@ impl WalkCache {
         Ok(rows)
     }
 
+    fn entry_count(&self) -> usize {
+        self.references.len()
+            + self.import_matches.len()
+            + self.resolutions.len()
+            + self.caller_imports.len()
+    }
+
+    fn resolve(
+        &mut self,
+        db: &Database,
+        caller_file: &str,
+        spelling: &str,
+    ) -> Result<ResolvedDefinitions> {
+        codesage_protocol::work::checkpoint()?;
+        let key = (caller_file.to_string(), spelling.to_string());
+        if let Some(rows) = self.resolutions.get(&key) {
+            #[cfg(test)]
+            {
+                self.resolution_hits += 1;
+            }
+            return Ok(Arc::clone(rows));
+        }
+        #[cfg(test)]
+        {
+            self.resolution_loads += 1;
+        }
+        let rows = definition_keys(resolve_callee_definitions_with_imports(
+            db,
+            caller_file,
+            spelling,
+            &mut || self.caller_imports(db, caller_file),
+        )?);
+        let bytes = rows.iter().fold(
+            rows.capacity()
+                .saturating_mul(std::mem::size_of::<DefinitionKey>())
+                .saturating_add(key.0.capacity())
+                .saturating_add(key.1.capacity()),
+            |bytes, row| {
+                bytes
+                    .saturating_add(row.0.capacity())
+                    .saturating_add(row.1.capacity())
+            },
+        );
+        if self.entry_count() < Self::MAX_SYMBOLS
+            && bytes <= Self::MAX_REFERENCE_BYTES.saturating_sub(self.reference_bytes)
+        {
+            self.reference_bytes += bytes;
+            self.resolutions.insert(key, Arc::clone(&rows));
+        }
+        Ok(rows)
+    }
+
+    fn caller_imports(&mut self, db: &Database, caller_file: &str) -> Result<Arc<Vec<String>>> {
+        codesage_protocol::work::checkpoint()?;
+        if let Some(imports) = self.caller_imports.get(caller_file) {
+            return Ok(Arc::clone(imports));
+        }
+        #[cfg(test)]
+        {
+            self.caller_import_loads += 1;
+        }
+        let imports = Arc::new(import_refs_for_file(db, caller_file)?);
+        let key = caller_file.to_string();
+        let bytes = imports.iter().fold(
+            imports
+                .capacity()
+                .saturating_mul(std::mem::size_of::<String>())
+                .saturating_add(key.capacity()),
+            |bytes, import| bytes.saturating_add(import.capacity()),
+        );
+        if self.entry_count() < Self::MAX_SYMBOLS
+            && bytes <= Self::MAX_REFERENCE_BYTES.saturating_sub(self.reference_bytes)
+        {
+            self.reference_bytes += bytes;
+            self.caller_imports.insert(key, Arc::clone(&imports));
+        }
+        Ok(imports)
+    }
+
     fn remember_imports(&mut self, file: &str, matches: Vec<usize>) {
         let bytes = matches
             .capacity()
             .saturating_mul(std::mem::size_of::<usize>())
             .saturating_add(file.len());
-        if self.references.len() + self.import_matches.len() < Self::MAX_SYMBOLS
+        if self.entry_count() < Self::MAX_SYMBOLS
             && bytes <= Self::MAX_REFERENCE_BYTES.saturating_sub(self.reference_bytes)
         {
             self.reference_bytes += bytes;
@@ -219,6 +310,7 @@ pub(crate) fn impact_analysis_walk_shared(
     mut budget: Option<&mut WalkBudget>,
     mut cache: Option<&mut WalkCache>,
 ) -> Result<WalkOutcome> {
+    codesage_protocol::work::checkpoint()?;
     if let Some(b) = budget.as_deref_mut()
         && (b.exhausted || b.over_deadline())
     {
@@ -309,6 +401,7 @@ pub(crate) fn impact_analysis_walk_shared(
     let mut frontier_capped = false;
 
     for depth in 1..=req.depth as u32 {
+        codesage_protocol::work::checkpoint()?;
         let mut next_files = Vec::new();
         let mut pending_callers: Vec<(String, Option<String>, u32)> = Vec::new();
         let mut budget_spent = false;
@@ -316,6 +409,7 @@ pub(crate) fn impact_analysis_walk_shared(
         if let Some(b) = budget.as_deref_mut() {
             let mut priced: Vec<(usize, usize)> = Vec::new();
             for (idx, sym) in frontier.iter().enumerate() {
+                codesage_protocol::work::checkpoint()?;
                 // Pricing alone can exhaust the deadline on wide frontiers.
                 if idx % 256 == 0 && b.over_deadline() {
                     break;
@@ -328,6 +422,7 @@ pub(crate) fn impact_analysis_walk_shared(
             priced.sort_unstable();
             let mut admitted = vec![false; frontier.len()];
             for (cost, idx) in priced {
+                codesage_protocol::work::checkpoint()?;
                 if cost > b.remaining {
                     b.exhausted = true;
                     break;
@@ -337,6 +432,7 @@ pub(crate) fn impact_analysis_walk_shared(
             }
             for (idx, sym) in frontier.iter().enumerate() {
                 if !admitted[idx] {
+                    codesage_protocol::work::checkpoint()?;
                     continue;
                 }
                 if b.over_deadline() {
@@ -351,6 +447,7 @@ pub(crate) fn impact_analysis_walk_shared(
             budget_spent = b.exhausted;
         } else {
             for sym in &frontier {
+                codesage_protocol::work::checkpoint()?;
                 if !visited_symbols.insert(symbol_identity_key(sym)) {
                     continue;
                 }
@@ -362,7 +459,9 @@ pub(crate) fn impact_analysis_walk_shared(
             }
         }
         for (sym, refs) in level {
+            codesage_protocol::work::checkpoint()?;
             for r in refs.iter() {
+                codesage_protocol::work::checkpoint()?;
                 if origin_files.contains(&r.from_file) {
                     continue;
                 }
@@ -395,6 +494,7 @@ pub(crate) fn impact_analysis_walk_shared(
         }
 
         for file in &file_frontier {
+            codesage_protocol::work::checkpoint()?;
             if !visited_files.insert(file.clone()) {
                 continue;
             }
@@ -415,6 +515,7 @@ pub(crate) fn impact_analysis_walk_shared(
                 .as_ref()
                 .map_or(file_imports.len(), |rows| rows.len())
             {
+                codesage_protocol::work::checkpoint()?;
                 if index % 256 == 0
                     && let Some(b) = budget.as_deref_mut()
                     && b.over_deadline()
@@ -486,6 +587,7 @@ pub(crate) fn impact_analysis_walk_shared(
 
         let mut next_frontier: Vec<Symbol> = Vec::new();
         for (from_file, from_symbol, line) in &pending_callers {
+            codesage_protocol::work::checkpoint()?;
             let Some(syms) = syms_by_file.get(from_file) else {
                 continue;
             };
@@ -500,6 +602,7 @@ pub(crate) fn impact_analysis_walk_shared(
             // innermost symbol whose range contains the line.
             let mut best: Option<&Symbol> = None;
             for s in syms {
+                codesage_protocol::work::checkpoint()?;
                 if s.line_start <= *line && s.line_end >= *line {
                     let span = s.line_end - s.line_start;
                     match best {
@@ -615,6 +718,7 @@ pub fn impact_analysis_report(
         if opts.include_forward {
             let mut fwd: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
             for f in &target_files {
+                codesage_protocol::work::checkpoint()?;
                 // Avoid the wrapper's imported_by resolution; only imports are needed.
                 for imp in db.list_file_dependencies(f)?.imports {
                     fwd.insert(imp);
@@ -671,7 +775,9 @@ fn collect_sibling_symbols(
     let mut seen_names: HashSet<String> = HashSet::new();
     let mut out: Vec<SiblingSymbol> = Vec::new();
     for f in target_files {
+        codesage_protocol::work::checkpoint()?;
         for s in db.symbols_for_file(f)? {
+            codesage_protocol::work::checkpoint()?;
             if let Some(n) = target_name
                 && (s.name == n || s.qualified_name == n)
             {
@@ -734,7 +840,7 @@ pub(crate) fn references_for_symbol(db: &Database, sym: &Symbol) -> Result<Vec<R
     // Source references may use a bare spelling even for qualified definitions.
     // Tail lookup admits both; import-aware resolution filters candidates below.
     let raw = db.find_references(&sym.name, None)?;
-    resolve_references_to_symbol(db, sym, raw)
+    resolve_references_to_symbol(db, sym, raw, None)
 }
 
 /// Second half of [`references_for_symbol`]: keep only the raw rows whose
@@ -743,33 +849,52 @@ fn resolve_references_to_symbol(
     db: &Database,
     sym: &Symbol,
     raw: Vec<Reference>,
+    mut shared: Option<&mut WalkCache>,
 ) -> Result<Vec<Reference>> {
     // A reverse edge must agree with forward import-aware resolution.
     // Cache repeated (caller file, spelling) lookups.
     let mut out = Vec::with_capacity(raw.len());
-    let mut cache: HashMap<(String, String), Vec<Symbol>> = HashMap::new();
+    let mut cache = HashMap::new();
+    let identity = symbol_identity_key(sym);
     for r in raw {
+        codesage_protocol::work::checkpoint()?;
         let cache_key = (r.from_file.clone(), r.to_name.clone());
         if !cache.contains_key(&cache_key) {
-            let resolved = resolve_callee_definitions(db, &r.from_file, &r.to_name)?;
+            let resolved = match shared.as_deref_mut() {
+                Some(shared) => shared.resolve(db, &r.from_file, &r.to_name)?,
+                None => resolved_definition_keys(db, &r.from_file, &r.to_name)?,
+            };
             cache.insert(cache_key.clone(), resolved);
         }
-        if cache[&cache_key].iter().any(|s| same_symbol_def(s, sym)) {
+        if cache[&cache_key].contains(&identity) {
             out.push(r);
         }
     }
     Ok(out)
 }
 
-/// Identity test for two `Symbol`s naming the same definition. `Symbol` carries
-/// no stable id, so we key on the triple that uniquely locates a definition:
-/// file, qualified name, and start line.
-fn same_symbol_def(a: &Symbol, b: &Symbol) -> bool {
-    a.file_path == b.file_path
-        && a.qualified_name == b.qualified_name
-        && a.line_start == b.line_start
+fn resolved_definition_keys(
+    db: &Database,
+    caller_file: &str,
+    spelling: &str,
+) -> Result<ResolvedDefinitions> {
+    Ok(definition_keys(resolve_callee_definitions(
+        db,
+        caller_file,
+        spelling,
+    )?))
 }
 
+fn definition_keys(symbols: Vec<Symbol>) -> ResolvedDefinitions {
+    Arc::new(
+        symbols
+            .into_iter()
+            .map(|sym| (sym.file_path, sym.qualified_name, sym.line_start))
+            .collect(),
+    )
+}
+
+/// Symbols have no stable id; this triple identifies one definition.
 fn symbol_identity_key(sym: &Symbol) -> (String, String, u32) {
     (
         sym.file_path.clone(),
@@ -781,6 +906,359 @@ fn symbol_identity_key(sym: &Symbol) -> (String, String, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn setup_resolution_project() -> (Database, Vec<Symbol>) {
+        let db = Database::open_in_memory().unwrap();
+        db.execute_raw_for_tests(
+            "INSERT INTO files (id, path, language, content_hash) VALUES
+                (1, 'base.ts', 'typescript', 'base'),
+                (2, 'other.ts', 'typescript', 'other'),
+                (3, 'caller.ts', 'typescript', 'caller'),
+                (4, 'orphan.ts', 'typescript', 'orphan');
+             INSERT INTO symbols
+                (file_id, name, qualified_name, kind, line_start, line_end, col_start, col_end)
+                VALUES (1, 'anchor', 'anchor', 'function', 1, 1, 0, 20),
+                       (2, 'anchor', 'anchor', 'function', 1, 1, 0, 20);
+             INSERT INTO refs (from_file_id, to_name, to_name_tail, kind, line, col) VALUES
+                (3, './base', 'base', 'import', 1, 0),
+                (3, 'anchor', 'anchor', 'call', 2, 0),
+                (3, 'anchor', 'anchor', 'call', 3, 0),
+                (4, 'anchor', 'anchor', 'call', 1, 0),
+                (4, 'anchor', 'anchor', 'call', 2, 0);",
+        )
+        .unwrap();
+        let mut symbols = db.find_symbols("anchor", None).unwrap();
+        symbols.sort_by(|a, b| a.file_path.cmp(&b.file_path));
+        assert_eq!(symbols.len(), 2);
+        (db, symbols)
+    }
+
+    fn assert_same_references(actual: &[Reference], expected: &[Reference]) {
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+
+    fn setup_caller_import_project() -> Database {
+        let (db, _) = setup_resolution_project();
+        db.execute_raw_for_tests(
+            "INSERT INTO symbols
+                (file_id, name, qualified_name, kind, line_start, line_end, col_start, col_end)
+                VALUES (1, 'second', 'second', 'function', 2, 2, 0, 20),
+                       (2, 'second', 'second', 'function', 2, 2, 0, 20),
+                       (1, 'unique', 'Scope::unique', 'function', 3, 3, 0, 20);
+             INSERT INTO refs (from_file_id, to_name, to_name_tail, kind, line, col)
+                VALUES (3, './base', 'base', 'import', 4, 0);",
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn caller_imports_reuse_decoded_evidence_across_spellings_without_crossing_callers() {
+        let db = setup_caller_import_project();
+        let mut cache = WalkCache::default();
+        for (caller, expected_file) in [("caller.ts", Some("base.ts")), ("orphan.ts", None)] {
+            for spelling in ["anchor", "second"] {
+                let actual = cache.resolve(&db, caller, spelling).unwrap();
+                assert_eq!(
+                    actual,
+                    resolved_definition_keys(&db, caller, spelling).unwrap()
+                );
+                assert_eq!(actual.first().map(|row| row.0.as_str()), expected_file);
+                assert_eq!(actual.len(), usize::from(expected_file.is_some()));
+            }
+        }
+        assert_eq!(cache.caller_import_loads, 2);
+        assert_eq!(cache.caller_imports["caller.ts"].as_slice(), ["./base"]);
+        assert!(cache.caller_imports["orphan.ts"].is_empty());
+        assert_eq!(cache.entry_count(), 6);
+        assert!(cache.reference_bytes <= WalkCache::MAX_REFERENCE_BYTES);
+    }
+
+    #[test]
+    fn caller_imports_stay_lazy_for_unique_and_qualified_resolution() {
+        let db = setup_caller_import_project();
+        db.execute_raw_for_tests(
+            "INSERT INTO refs (from_file_id, to_name, to_name_tail, kind, line, col)
+             VALUES (3, 'unrelated_noise', 'unrelated_noise', 'invalid_resolution_kind', 5, 0);",
+        )
+        .unwrap();
+        let mut cache = WalkCache::default();
+        for spelling in ["unique", "Scope::unique", "scope::UNIQUE", "missing"] {
+            assert_eq!(
+                cache.resolve(&db, "caller.ts", spelling).unwrap(),
+                resolved_definition_keys(&db, "caller.ts", spelling).unwrap()
+            );
+        }
+        assert_eq!(cache.caller_import_loads, 0);
+        assert!(cache.caller_imports.is_empty());
+        let error = cache.resolve(&db, "caller.ts", "anchor").unwrap_err();
+        assert!(format!("{error:#}").contains("invalid_resolution_kind"));
+    }
+
+    #[test]
+    fn caller_imports_share_entry_and_byte_limits_with_other_walk_evidence() {
+        let db = setup_caller_import_project();
+        for byte_full in [false, true] {
+            let mut cache = WalkCache::default();
+            if byte_full {
+                cache.reference_bytes = WalkCache::MAX_REFERENCE_BYTES;
+            } else {
+                for index in 0..WalkCache::MAX_SYMBOLS {
+                    cache
+                        .import_matches
+                        .insert(index.to_string(), Arc::new(Vec::new()));
+                }
+            }
+            let retained = (cache.entry_count(), cache.reference_bytes);
+            for spelling in ["anchor", "second"] {
+                assert_eq!(
+                    cache.resolve(&db, "caller.ts", spelling).unwrap(),
+                    resolved_definition_keys(&db, "caller.ts", spelling).unwrap()
+                );
+            }
+            assert_eq!(cache.caller_import_loads, 2);
+            assert!(cache.caller_imports.is_empty());
+            assert_eq!((cache.entry_count(), cache.reference_bytes), retained);
+        }
+    }
+
+    #[test]
+    fn retained_caller_imports_charge_capacities_before_resolutions_are_admitted() {
+        let db = setup_caller_import_project();
+        let mut cache = WalkCache::default();
+        for index in 0..WalkCache::MAX_SYMBOLS - 1 {
+            cache
+                .import_matches
+                .insert(index.to_string(), Arc::new(Vec::new()));
+        }
+        let rows = cache.resolve(&db, "caller.ts", "anchor").unwrap();
+        assert_eq!(rows[0].0, "base.ts");
+        assert!(cache.resolutions.is_empty());
+        assert_eq!(cache.entry_count(), WalkCache::MAX_SYMBOLS);
+        let (key, imports) = cache.caller_imports.get_key_value("caller.ts").unwrap();
+        assert_eq!(
+            cache.reference_bytes,
+            key.capacity()
+                + imports.capacity() * std::mem::size_of::<String>()
+                + imports.iter().map(String::capacity).sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn oversized_caller_import_evidence_falls_back_without_poisoning_small_entries() {
+        let db = setup_caller_import_project();
+        db.execute_raw_for_tests(&format!(
+            "INSERT INTO refs (from_file_id, to_name, to_name_tail, kind, line, col)
+             VALUES (3, printf('%.*c', {}, 'x'), 'oversized', 'import', 5, 0)",
+            WalkCache::MAX_REFERENCE_BYTES + 1
+        ))
+        .unwrap();
+        let mut cache = WalkCache::default();
+        for spelling in ["anchor", "second"] {
+            let actual = cache.resolve(&db, "caller.ts", spelling).unwrap();
+            assert_eq!(
+                actual,
+                resolved_definition_keys(&db, "caller.ts", spelling).unwrap()
+            );
+            assert_eq!(actual[0].0, "base.ts");
+        }
+        assert_eq!(cache.caller_import_loads, 2);
+        assert!(cache.caller_imports.is_empty());
+        assert_eq!(cache.resolutions.len(), 2);
+        assert!(cache.reference_bytes < WalkCache::MAX_REFERENCE_BYTES);
+        assert!(cache.caller_imports(&db, "orphan.ts").unwrap().is_empty());
+        assert!(cache.caller_imports.contains_key("orphan.ts"));
+    }
+
+    #[test]
+    fn caller_import_errors_do_not_cache_partial_evidence_or_block_retry() {
+        let db = setup_caller_import_project();
+        db.execute_raw_for_tests(
+            "INSERT INTO refs (from_file_id, to_name, to_name_tail, kind, line, col)
+             VALUES (3, 'unrelated_noise', 'unrelated_noise', 'invalid_resolution_kind', 5, 0);",
+        )
+        .unwrap();
+        let mut cache = WalkCache::default();
+        let actual = cache.resolve(&db, "caller.ts", "anchor").unwrap_err();
+        let expected = resolved_definition_keys(&db, "caller.ts", "anchor").unwrap_err();
+        assert_eq!(format!("{actual:#}"), format!("{expected:#}"));
+        assert!(format!("{actual:#}").contains("invalid_resolution_kind"));
+        assert!(cache.caller_imports.is_empty());
+        assert!(cache.resolutions.is_empty());
+        assert_eq!(cache.reference_bytes, 0);
+        db.execute_raw_for_tests("DELETE FROM refs WHERE to_name = 'unrelated_noise'")
+            .unwrap();
+        for spelling in ["anchor", "second"] {
+            let actual = cache.resolve(&db, "caller.ts", spelling).unwrap();
+            assert_eq!(
+                actual,
+                resolved_definition_keys(&db, "caller.ts", spelling).unwrap()
+            );
+            assert_eq!(actual[0].0, "base.ts");
+        }
+        assert_eq!(cache.caller_import_loads, 2);
+    }
+
+    #[test]
+    fn cancelled_work_cannot_reuse_warm_caller_import_evidence() {
+        use codesage_protocol::work::{StopReason, WorkControl, WorkStopped};
+
+        let db = setup_caller_import_project();
+        let mut cache = WalkCache::default();
+        assert_eq!(
+            cache.resolve(&db, "caller.ts", "anchor").unwrap()[0].0,
+            "base.ts"
+        );
+        let control = WorkControl::new(None);
+        control.cancel(StopReason::ClientCancelled);
+        let _scope = control.enter();
+        let error = cache.caller_imports(&db, "caller.ts").unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<WorkStopped>().unwrap().reason,
+            StopReason::ClientCancelled
+        );
+        assert_eq!(cache.caller_import_loads, 1);
+    }
+
+    #[test]
+    fn shared_resolutions_reuse_positive_and_empty_membership_across_symbols() {
+        let (db, symbols) = setup_resolution_project();
+        let mut cache = WalkCache::default();
+        for (sym, expected_count) in symbols.iter().zip([2, 0]) {
+            let expected = references_for_symbol(&db, sym).unwrap();
+            assert_eq!(expected.len(), expected_count);
+            let actual = cache.references(&db, sym).unwrap();
+            assert_same_references(&actual, &expected);
+        }
+        assert_eq!(cache.resolution_loads, 2);
+        assert_eq!(cache.resolution_hits, 2);
+        assert_eq!(cache.resolutions.len(), 2);
+        assert!(cache.resolutions[&("orphan.ts".into(), "anchor".into())].is_empty());
+        assert!(cache.reference_bytes <= WalkCache::MAX_REFERENCE_BYTES);
+
+        let mut different_line = symbols[0].clone();
+        different_line.line_start += 1;
+        assert!(cache.references(&db, &different_line).unwrap().is_empty());
+        let mut different_name = symbols[0].clone();
+        different_name.qualified_name = "Different::anchor".into();
+        assert!(cache.references(&db, &different_name).unwrap().is_empty());
+        assert_eq!(cache.resolution_loads, 2);
+        assert_eq!(cache.resolution_hits, 6);
+    }
+
+    #[test]
+    fn full_shared_resolution_pool_preserves_within_symbol_deduplication() {
+        let (db, symbols) = setup_resolution_project();
+        for byte_full in [false, true] {
+            let mut cache = WalkCache::default();
+            if byte_full {
+                cache.reference_bytes = WalkCache::MAX_REFERENCE_BYTES;
+            } else {
+                for index in 0..WalkCache::MAX_SYMBOLS {
+                    cache
+                        .import_matches
+                        .insert(index.to_string(), Arc::new(Vec::new()));
+                }
+            }
+            for sym in &symbols {
+                let expected = references_for_symbol(&db, sym).unwrap();
+                assert_same_references(&cache.references(&db, sym).unwrap(), &expected);
+            }
+            assert_eq!(cache.resolution_loads, 4);
+            assert_eq!(cache.resolution_hits, 0);
+            assert!(cache.resolutions.is_empty());
+            assert!(cache.references.is_empty());
+            assert!(cache.entry_count() <= WalkCache::MAX_SYMBOLS);
+        }
+    }
+
+    #[test]
+    fn oversized_resolution_key_falls_back_without_retention_or_repeated_decode() {
+        let (db, symbols) = setup_resolution_project();
+        let mut raw = db.find_references("anchor", None).unwrap();
+        raw.truncate(2);
+        assert_eq!(raw.len(), 2);
+        for row in &mut raw {
+            row.from_file = "x".repeat(WalkCache::MAX_REFERENCE_BYTES + 1);
+        }
+        let expected = resolve_references_to_symbol(&db, &symbols[0], raw.clone(), None).unwrap();
+        assert!(expected.is_empty());
+        let mut cache = WalkCache::default();
+        let actual = resolve_references_to_symbol(&db, &symbols[0], raw, Some(&mut cache)).unwrap();
+        assert_same_references(&actual, &expected);
+        assert_eq!(cache.resolution_loads, 1);
+        assert_eq!(cache.reference_bytes, 0);
+        assert!(cache.resolutions.is_empty());
+    }
+
+    #[test]
+    fn shared_resolution_errors_preserve_full_outgoing_decoder_and_allow_retry() {
+        let (db, symbols) = setup_resolution_project();
+        db.execute_raw_for_tests(
+            "INSERT INTO refs (from_file_id, to_name, to_name_tail, kind, line, col)
+             VALUES (3, 'unrelated_noise', 'unrelated_noise', 'invalid_resolution_kind', 4, 0);",
+        )
+        .unwrap();
+        let expected = references_for_symbol(&db, &symbols[0]).unwrap_err();
+        let mut cache = WalkCache::default();
+        let actual = cache.references(&db, &symbols[0]).unwrap_err();
+        assert_eq!(format!("{actual:#}"), format!("{expected:#}"));
+        assert!(format!("{actual:#}").contains("invalid_resolution_kind"));
+        assert!(
+            !cache
+                .resolutions
+                .contains_key(&("caller.ts".into(), "anchor".into()))
+        );
+        db.execute_raw_for_tests("DELETE FROM refs WHERE to_name = 'unrelated_noise'")
+            .unwrap();
+        let retried = cache.references(&db, &symbols[0]).unwrap();
+        assert_eq!(retried.len(), 2);
+        assert_same_references(&retried, &references_for_symbol(&db, &symbols[0]).unwrap());
+    }
+
+    #[test]
+    fn fresh_resolution_cache_observes_changed_import_targets() {
+        let (db, symbols) = setup_resolution_project();
+        let mut before = WalkCache::default();
+        assert_eq!(before.references(&db, &symbols[0]).unwrap().len(), 2);
+        db.execute_raw_for_tests(
+            "UPDATE refs SET to_name = './other', to_name_tail = 'other' WHERE kind = 'import'",
+        )
+        .unwrap();
+        let mut after = WalkCache::default();
+        for (sym, count) in symbols.iter().zip([0, 2]) {
+            let actual = after.references(&db, sym).unwrap();
+            assert_eq!(actual.len(), count);
+            assert_same_references(&actual, &references_for_symbol(&db, sym).unwrap());
+        }
+        assert_eq!(after.resolution_hits, 2);
+    }
+
+    #[test]
+    fn cancelled_work_cannot_reuse_warm_resolutions_or_reverse_edges() {
+        use codesage_protocol::work::{StopReason, WorkControl, WorkStopped};
+
+        let (db, symbols) = setup_resolution_project();
+        let mut cache = WalkCache::default();
+        assert_eq!(cache.references(&db, &symbols[0]).unwrap().len(), 2);
+        let control = WorkControl::new(None);
+        control.cancel(StopReason::ClientCancelled);
+        let _scope = control.enter();
+        for error in [
+            cache.resolve(&db, "caller.ts", "anchor").unwrap_err(),
+            cache.references(&db, &symbols[0]).unwrap_err(),
+        ] {
+            assert_eq!(
+                error.downcast_ref::<WorkStopped>().unwrap().reason,
+                StopReason::ClientCancelled
+            );
+        }
+        assert_eq!(cache.resolution_hits, 0);
+        assert_eq!(cache.hits, 0);
+    }
 
     /// One class with two callers, so the depth-1 pass leaves two symbols in
     /// the next frontier.

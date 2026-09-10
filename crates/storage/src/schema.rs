@@ -388,9 +388,18 @@ pub(crate) fn init_vec_extension() {
 /// SQLite retries internally until this bound, then returns SQLITE_BUSY.
 pub(crate) const READ_BUSY_TIMEOUT_MS: i64 = 30_000;
 
+pub(crate) fn set_busy_timeout(conn: &Connection, ordinary_ms: i64) -> rusqlite::Result<()> {
+    let millis = if codesage_protocol::work::current().is_some() {
+        100
+    } else {
+        ordinary_ms as u64
+    };
+    conn.busy_timeout(std::time::Duration::from_millis(millis))
+}
+
 /// Connection-local read pragmas; init_db also changes journal mode and migrates.
 pub fn init_db_read_only(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(&format!("PRAGMA busy_timeout={READ_BUSY_TIMEOUT_MS};"))?;
+    set_busy_timeout(conn, READ_BUSY_TIMEOUT_MS)?;
     conn.execute_batch("PRAGMA mmap_size=268435456;")?;
     conn.execute_batch("PRAGMA cache_size=-65536;")?;
     Ok(())
@@ -398,7 +407,7 @@ pub fn init_db_read_only(conn: &Connection) -> rusqlite::Result<()> {
 
 pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
     // Set the timeout before WAL's exclusive-lock attempt to tolerate brief contention.
-    conn.execute_batch("PRAGMA busy_timeout=5000;")?;
+    set_busy_timeout(conn, 5000)?;
     // The index is rebuildable; retain the current mode if contention outlasts
     // the timeout, and let the next opener retry WAL.
     if let Err(e) = conn.execute_batch("PRAGMA journal_mode=WAL;") {

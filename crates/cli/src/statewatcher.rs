@@ -224,7 +224,7 @@ fn run_statewatcher_with_admission(
     let debounce = Duration::from_millis(config.debounce_ms);
     let disabled_marker = watch_disabled_path(&config.project_root);
 
-    write_status(&config.project_root, config.mode, 0, false, false)?;
+    write_status(&config.project_root, config.mode, 0, true, false, false)?;
     let _status_guard = StatusGuard(watch_status_path(&config.project_root));
 
     let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
@@ -240,6 +240,7 @@ fn run_statewatcher_with_admission(
     // Register watches first: events racing the scan stay queued for replay.
     let mut bulk_retry_at = Some(Instant::now());
     let mut startup_failures = Some(0);
+    let mut startup_reconciled = false;
     let mut bulk_cooldown_until: Option<Instant> = None;
     let mut removal_retry_at: Option<Instant> = None;
     let mut removal_fail_count: u32 = 0;
@@ -295,8 +296,13 @@ fn run_statewatcher_with_admission(
                 "filesystem notification loss; retaining full reconciliation obligation"
             );
         }
-        match rx.recv_timeout(POLL_INTERVAL) {
+        let received_event = match rx.recv_timeout(POLL_INTERVAL) {
             Ok(event) => {
+                publish_status(
+                    &config,
+                    &mut status_written,
+                    (parked.len(), true, refresh.parked(), startup_reconciled),
+                );
                 for path in &event.paths {
                     if path.starts_with(&config.project_root)
                         && path.file_name().is_some_and(|name| name == ".gitignore")
@@ -428,11 +434,18 @@ fn run_statewatcher_with_admission(
                         "batch threshold reached, triggering bulk incremental index"
                     );
                     let outcome = startup_outcome(
-                        run_bulk_guarded(&config, &mut embedder, &mut deferred_since),
+                        run_bulk_guarded(
+                            &config,
+                            &mut embedder,
+                            &mut deferred_since,
+                            &mut semantic_retries,
+                            &mut parked,
+                        ),
                         &mut startup_failures,
                     );
                     bulk_cooldown_until = bulk_cooldown_after(outcome, Instant::now());
                     if outcome == WorkOutcome::Done {
+                        startup_reconciled = true;
                         // A bulk pass may remove the last C++ file and revert header parsing.
                         header_is_cpp = header_dialect_is_cpp(&config.db_path);
                         removed_prefixes.clear();
@@ -447,10 +460,11 @@ fn run_statewatcher_with_admission(
                     );
                     continue;
                 }
+                true
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => false,
             Err(mpsc::RecvTimeoutError::Disconnected) => break "watcher channel closed",
-        }
+        };
 
         if config.shutdown.load(Ordering::Relaxed) {
             tracing::info!("shutdown requested, draining pending work");
@@ -474,6 +488,27 @@ fn run_statewatcher_with_admission(
         if disabled_marker.exists() {
             break "disabled marker present";
         }
+
+        publish_status(
+            &config,
+            &mut status_written,
+            (
+                parked.len(),
+                refresh.pending()
+                    || received_event
+                    || bulk_retry_at.is_some()
+                    || !pending.is_empty()
+                    || !currently_indexing.is_empty()
+                    || !recheck_queue.is_empty()
+                    || !removed_paths.is_empty()
+                    || !removed_prefixes.is_empty()
+                    || !semantic_retries.is_empty()
+                    || !parked.is_empty()
+                    || admission.lost.load(Ordering::Acquire),
+                refresh.parked(),
+                startup_reconciled,
+            ),
+        );
 
         if refresh.reload && refresh.due(Instant::now()) {
             let replacement = (|| {
@@ -506,7 +541,13 @@ fn run_statewatcher_with_admission(
                 bulk_retry_at.is_some_and(|at| Instant::now() >= at)
             }
         {
-            let raw_outcome = run_bulk_guarded(&config, &mut embedder, &mut deferred_since);
+            let raw_outcome = run_bulk_guarded(
+                &config,
+                &mut embedder,
+                &mut deferred_since,
+                &mut semantic_retries,
+                &mut parked,
+            );
             let outcome = if refresh.reconciling {
                 match raw_outcome {
                     WorkOutcome::Done => refresh = FilterRefresh::default(),
@@ -519,11 +560,9 @@ fn run_statewatcher_with_admission(
             };
             bulk_cooldown_until = bulk_cooldown_after(outcome, Instant::now());
             if outcome == WorkOutcome::Done {
+                startup_reconciled = true;
                 header_is_cpp = header_dialect_is_cpp(&config.db_path);
                 removed_prefixes.clear();
-                semantic_retries
-                    .retain(|path, _| !filter.is_ignored(&project_root.join(path), false));
-                parked.retain(|path, _| !filter.is_ignored(&project_root.join(path), false));
             }
             bulk_retry_at = apply_bulk_outcome(
                 outcome,
@@ -533,25 +572,6 @@ fn run_statewatcher_with_admission(
                 debounce,
                 bulk_cooldown_until,
             );
-        }
-
-        let next_status = (
-            parked.len(),
-            refresh.pending() || admission.lost.load(Ordering::Acquire),
-            refresh.parked(),
-        );
-        if status_written != Some(next_status) {
-            if let Err(error) = write_status(
-                &config.project_root,
-                config.mode,
-                next_status.0,
-                next_status.1,
-                next_status.2,
-            ) {
-                tracing::warn!(error = %error, "refreshing watch status");
-            } else {
-                status_written = Some(next_status);
-            }
         }
 
         if refresh.reconciling {
@@ -1404,6 +1424,8 @@ fn run_bulk_guarded(
     config: &StateWatcherConfig,
     embedder: &mut EmbedderHandle,
     deferred_since: &mut Option<Instant>,
+    semantic_retries: &mut HashMap<PathBuf, u32>,
+    parked: &mut HashMap<PathBuf, Instant>,
 ) -> WorkOutcome {
     if config.backpressure {
         let reason = backpressure_reason(&config.project_root);
@@ -1411,7 +1433,12 @@ fn run_bulk_guarded(
             return WorkOutcome::Skipped;
         }
     }
-    run_bulk_incremental(config, embedder)
+    let outcome = run_bulk_incremental(config, embedder);
+    if outcome == WorkOutcome::Done {
+        semantic_retries.clear();
+        parked.clear();
+    }
+    outcome
 }
 
 /// Bound a continuous deferral streak with [`BACKPRESSURE_MAX_DEFER`].
@@ -1898,6 +1925,29 @@ pub struct WatchStatus {
     pub reconciliation_pending: bool,
     #[serde(default)]
     pub reconciliation_parked: bool,
+    #[serde(default)]
+    pub startup_reconciled: bool,
+}
+
+fn publish_status(
+    config: &StateWatcherConfig,
+    written: &mut Option<(usize, bool, bool, bool)>,
+    next: (usize, bool, bool, bool),
+) {
+    if *written == Some(next) {
+        return;
+    }
+    match write_status(
+        &config.project_root,
+        config.mode,
+        next.0,
+        next.1,
+        next.2,
+        next.3,
+    ) {
+        Ok(()) => *written = Some(next),
+        Err(error) => tracing::warn!(error = %error, "refreshing watch status"),
+    }
 }
 
 pub fn watch_status_path(root: &Path) -> PathBuf {
@@ -1914,6 +1964,7 @@ fn write_status(
     stale_parked: usize,
     reconciliation_pending: bool,
     reconciliation_parked: bool,
+    startup_reconciled: bool,
 ) -> Result<()> {
     let started_at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1926,6 +1977,7 @@ fn write_status(
         stale_parked,
         reconciliation_pending,
         reconciliation_parked,
+        startup_reconciled,
     };
     let path = watch_status_path(root);
     let json = serde_json::to_string(&status)?;
@@ -2050,7 +2102,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".codesage")).unwrap();
         std::os::unix::fs::symlink(&victim, watch_status_path(root)).unwrap();
 
-        assert!(write_status(root, WatcherMode::Foreground, 0, false, false).is_err());
+        assert!(write_status(root, WatcherMode::Foreground, 0, false, false, false).is_err());
         assert_eq!(std::fs::read(&victim).unwrap(), b"PRIVATE KEY");
     }
 
@@ -2061,10 +2113,11 @@ mod tests {
         let root = dir.path();
         std::fs::create_dir_all(root.join(".codesage")).unwrap();
 
-        write_status(root, WatcherMode::Foreground, 0, false, false).unwrap();
+        write_status(root, WatcherMode::Foreground, 0, false, false, true).unwrap();
 
         let status = read_status(root).expect("status must round-trip");
         assert_eq!(status.pid, std::process::id());
+        assert!(status.startup_reconciled);
     }
 
     #[test]
@@ -2320,6 +2373,8 @@ mod tests {
         let producer = admission.clone();
         let registrations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts = registrations.clone();
+        let failed_registrations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let failed_attempts = failed_registrations.clone();
         let recovered = Arc::new(AtomicBool::new(false));
         let permit_recovery = recovered.clone();
         let shutdown = config.shutdown.clone();
@@ -2335,6 +2390,7 @@ mod tests {
                             watch_tree(watcher, root, filter)?;
                             saturate_admission(&producer);
                         } else if !permit_recovery.load(Ordering::Acquire) {
+                            failed_attempts.fetch_add(1, Ordering::Release);
                             anyhow::bail!("registration unavailable");
                         } else {
                             watch_tree(watcher, root, filter)?;
@@ -2350,7 +2406,8 @@ mod tests {
                 )
             })),
         };
-        await_watcher_condition(|| read_status(root).is_some_and(|s| s.reconciliation_pending));
+        await_watcher_condition(|| failed_registrations.load(Ordering::Acquire) >= 1);
+        assert!(read_status(root).unwrap().reconciliation_pending);
         assert!(!watcher.thread.as_ref().unwrap().is_finished());
         std::fs::remove_file(root.join("gone.rs")).unwrap();
         std::fs::write(root.join(".gitignore"), "excluded.rs\n").unwrap();
@@ -2688,7 +2745,13 @@ mod tests {
         std::fs::write(root.join("excluded.rs"), "fn excluded_gap() {}\n").unwrap();
         let _watcher = RunningWatcher::start(config);
         await_watcher_condition(|| watch_status_path(root).exists());
+        let status = read_status(root).unwrap();
+        assert!(status.reconciliation_pending);
+        assert!(!status.startup_reconciled);
         std::thread::sleep(Duration::from_millis(600));
+        let status = read_status(root).unwrap();
+        assert!(status.reconciliation_pending);
+        assert!(!status.startup_reconciled);
         assert!(db.symbol_exists("before_lock").unwrap());
         assert!(!db.symbol_exists("gap_while_locked").unwrap());
         std::fs::write(root.join("late.rs"), "fn arrived_while_locked() {}\n").unwrap();
@@ -2699,6 +2762,9 @@ mod tests {
         });
         std::fs::write(root.join("late.rs"), "fn post_reconciliation() {}\n").unwrap();
         await_watcher_condition(|| db.symbol_exists("post_reconciliation").unwrap());
+        await_watcher_condition(|| {
+            read_status(root).is_some_and(|s| s.startup_reconciled && !s.reconciliation_pending)
+        });
         assert!(!db.symbol_exists("arrived_while_locked").unwrap());
         assert!(!db.symbol_exists("excluded_gap").unwrap());
     }
@@ -2727,6 +2793,7 @@ mod tests {
             2,
             refresh.pending(),
             refresh.parked(),
+            false,
         )
         .unwrap();
         let status = read_status(root).unwrap();
@@ -2790,18 +2857,31 @@ mod tests {
         std::fs::write(root.join("main.rs"), "fn existing() {}\n").unwrap();
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider_attempts = attempts.clone();
+        let registrations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider_registrations = registrations.clone();
+        let filter_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider_filter_attempts = filter_attempts.clone();
         let mut config = test_config(root);
         config.embedder = Some(Arc::new(move || {
-            provider_attempts.fetch_add(1, Ordering::Relaxed);
+            provider_attempts.fetch_add(1, Ordering::Release);
+            if provider_registrations.load(Ordering::Acquire) > 1 {
+                provider_filter_attempts.fetch_add(1, Ordering::Release);
+            }
             anyhow::bail!("test provider unavailable")
         }));
-        let _watcher = RunningWatcher::start(config);
-        await_watcher_condition(|| attempts.load(Ordering::Relaxed) >= 3);
+        let _watcher =
+            RunningWatcher::start_with_registration(config, move |watcher, root, filter| {
+                watch_tree(watcher, root, filter)?;
+                registrations.fetch_add(1, Ordering::Release);
+                Ok(())
+            });
+        await_watcher_condition(|| attempts.load(Ordering::Acquire) >= 3);
         std::fs::write(root.join(".gitignore"), "excluded.rs\n").unwrap();
-        await_watcher_condition(|| read_status(root).is_some_and(|s| s.reconciliation_pending));
-        let before = attempts.load(Ordering::Relaxed);
+        await_watcher_condition(|| filter_attempts.load(Ordering::Acquire) >= 1);
+        assert!(read_status(root).unwrap().reconciliation_pending);
+        let before = attempts.load(Ordering::Acquire);
         std::thread::sleep(Duration::from_millis(550));
-        assert_eq!(attempts.load(Ordering::Relaxed), before);
+        assert_eq!(attempts.load(Ordering::Acquire), before);
         assert!(read_status(root).unwrap().reconciliation_pending);
     }
 
@@ -3761,6 +3841,109 @@ mod tests {
             "second retry waits at least one extra debounce"
         );
         assert!(currently_indexing.is_empty());
+    }
+
+    #[test]
+    fn successful_bulk_recovery_clears_semantic_retry_and_parked_obligations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        for name in ["retry.rs", "parked.rs"] {
+            std::fs::write(root.join(name), "fn recovery_subject() {}\n").unwrap();
+        }
+        let mut config = test_config(root);
+        config.embedder = Some(Arc::new(|| anyhow::bail!("embedder unavailable")));
+        let filter = WatchFilter::new(root, &config.exclude_patterns).unwrap();
+        let mut embedder = EmbedderHandle::new(config.embedder.clone());
+        let mut pending = HashMap::new();
+        let mut indexing = HashSet::new();
+        let mut recheck = HashSet::new();
+        let mut retries = HashMap::new();
+        let mut parked = HashMap::new();
+        for _ in 0..=MAX_SEMANTIC_RETRIES {
+            process_ready(
+                &config,
+                &mut pending,
+                &mut indexing,
+                &mut recheck,
+                &mut retries,
+                &mut parked,
+                &filter,
+                &mut embedder,
+                false,
+                vec![PathBuf::from("parked.rs")],
+            );
+        }
+        process_ready(
+            &config,
+            &mut pending,
+            &mut indexing,
+            &mut recheck,
+            &mut retries,
+            &mut parked,
+            &filter,
+            &mut embedder,
+            false,
+            vec![PathBuf::from("retry.rs")],
+        );
+        assert_eq!(retries.get(Path::new("retry.rs")), Some(&1));
+        assert!(parked.contains_key(Path::new("parked.rs")));
+        assert!(pending.contains_key(Path::new("retry.rs")));
+        let retained_retries = retries.clone();
+        let retained_parked = parked.clone();
+        let mut deferred = None;
+        let lock = hold_lock(root);
+        assert_eq!(
+            run_bulk_guarded(
+                &config,
+                &mut embedder,
+                &mut deferred,
+                &mut retries,
+                &mut parked
+            ),
+            WorkOutcome::Skipped
+        );
+        assert_eq!(retries, retained_retries);
+        assert_eq!(parked, retained_parked);
+        drop(lock);
+        assert_eq!(
+            run_bulk_guarded(
+                &config,
+                &mut embedder,
+                &mut deferred,
+                &mut retries,
+                &mut parked
+            ),
+            WorkOutcome::Failed
+        );
+        assert_eq!(retries, retained_retries);
+        assert_eq!(parked, retained_parked);
+
+        config.embedder = None;
+        let mut embedder = EmbedderHandle::new(None);
+        let outcome = run_bulk_guarded(
+            &config,
+            &mut embedder,
+            &mut deferred,
+            &mut retries,
+            &mut parked,
+        );
+        assert_eq!(outcome, WorkOutcome::Done);
+        let mut removed = Vec::new();
+        let bulk_retry = apply_bulk_outcome(
+            outcome,
+            &mut pending,
+            &mut removed,
+            Instant::now(),
+            Duration::from_millis(config.debounce_ms),
+            None,
+        );
+        assert!(bulk_retry.is_none());
+        assert!(pending.is_empty());
+        assert!(retries.is_empty());
+        assert!(parked.is_empty());
+        assert!(indexing.is_empty());
+        assert!(recheck.is_empty());
     }
 
     #[test]

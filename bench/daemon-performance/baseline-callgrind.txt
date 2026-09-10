@@ -1,0 +1,66 @@
+--------------------------------------------------------------------------------
+Profile data file '/tmp/codesage-daemon-baseline.H7CPFS/callgrind-overview-complete.out' (creator: callgrind-3.18.1)
+--------------------------------------------------------------------------------
+I1 cache:
+D1 cache:
+LL cache:
+Timerange: Basic block 0 - 3132769037
+Trigger: Program termination
+Profiled target:  /tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage overview --json (PID 87660, part 1)
+Events recorded:  Ir
+Events shown:     Ir
+Event sort order: Ir
+Thresholds:       90
+Include dirs:
+User annotated:
+Auto-annotation:  on
+
+--------------------------------------------------------------------------------
+Ir
+--------------------------------------------------------------------------------
+14,858,710,727 (100.0%)  PROGRAM TOTALS
+
+--------------------------------------------------------------------------------
+Ir                       file:function
+--------------------------------------------------------------------------------
+14,858,710,727 (100.0%)  ???:0x0000000000020290 [/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2]
+14,856,742,852 (99.99%)  ???:(below main) [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+14,856,742,840 (99.99%)  ./csu/../csu/libc-start.c:__libc_start_main@@GLIBC_2.34 [/usr/lib/x86_64-linux-gnu/libc.so.6]
+14,856,741,654 (99.99%)  ./csu/../sysdeps/nptl/libc_start_call_main.h:(below main) [/usr/lib/x86_64-linux-gnu/libc.so.6]
+14,856,741,594 (99.99%)  ???:main [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+14,856,741,585 (99.99%)  ???:_RNvNtCsjrHSEGnQ3l9_3std2rt19lang_start_internal [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+14,856,611,357 (99.99%)  ???:_ZN3std2rt10lang_start28_$u7b$$u7b$closure$u7d$$u7d$17h0d51886629bd8da7E.llvm.6110361118406329139 [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+14,856,611,354 (99.99%)  ???:std::sys::backtrace::__rust_begin_short_backtrace [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+14,856,611,352 (99.99%)  ???:codesage::main [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+14,856,126,134 (99.98%)  ???:codesage::commands::session::cmd_overview [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+14,852,928,295 (99.96%)  ???:codesage_graph::overview::build_project_overview [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+14,845,707,207 (99.91%)  ???:codesage_graph::session::top_risk_files [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+14,845,078,668 (99.91%)  ???:_ZN14codesage_graph7session16compute_top_risk17h2ad6191dcdb5a636E.llvm.11350808634468526738 [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+14,844,832,834 (99.91%)  ???:codesage_graph::session::risk_scores [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+14,843,343,498 (99.90%)  ???:codesage_graph::git_history::risk::assess_risk_batch [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+14,695,413,949 (98.90%)  ???:<alloc::vec::Vec<T> as alloc::vec::spec_from_iter::SpecFromIter<T,I>>::from_iter [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+14,230,766,479 (95.77%)  ???:codesage_graph::git_history::risk::assess_risk_with_context [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+12,879,665,944 (86.68%)  ???:codesage_graph::impact::impact_analysis_walk_shared [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+ 8,021,868,497 (53.99%)  ???:codesage_graph::impact::WalkCache::references [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+ 8,003,619,076 (53.86%)  ???:codesage_graph::impact::references_for_symbol [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+ 7,507,770,686 (50.53%)  ???:core::iter::adapters::try_process [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+ 7,314,218,204 (49.23%)  ???:<core::iter::adapters::GenericShunt<I,R> as core::iter::traits::iterator::Iterator>::next [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+ 7,118,103,012 (47.91%)  ???:codesage_graph::bundle::resolve_callee_definitions [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+ 7,044,208,641 (47.41%)  ???:<alloc::vec::Vec<T> as alloc::vec::spec_from_iter::SpecFromIter<T,I>>::from_iter'2 [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+ 5,651,771,111 (38.04%)  ???:codesage_storage::db::structural::<impl codesage_storage::db::Database>::refs_outgoing_for_file_id [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+ 5,204,625,028 (35.03%)  ???:sqlite3_step [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+ 4,961,483,450 (33.39%)  ???:sqlite3VdbeExec [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+ 4,216,147,810 (28.37%)  ???:codesage_graph::bundle::import_ref_targets_file [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+ 4,047,513,776 (27.24%)  ???:_ZN94_$LT$rusqlite..row..Rows$u20$as$u20$fallible_streaming_iterator..FallibleStreamingIterator$GT$7advance17h7f8c113e71fb192eE.llvm.15015402435548638346 [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+ 3,494,624,146 (23.52%)  ???:codesage_graph::bundle::rust_module_candidates [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+ 2,859,242,209 (19.24%)  ???:rusqlite::row::Row::get [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+ 2,030,966,896 (13.67%)  ???:_RNvNvNtCslNYArtu3iFV_5alloc3fmt6format12format_inner [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+ 1,790,592,481 (12.05%)  ???:_RNvNtCsgEmfK2I1SDS_4core3fmt5write [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+ 1,491,936,554 (10.04%)  ???:_RNvXsZ_NtCslNYArtu3iFV_5alloc6stringNtB5_6StringNtNtCsgEmfK2I1SDS_4core3fmt5Write9write_str [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+ 1,246,167,512 ( 8.39%)  ???:rusqlite::statement::Statement::value_ref [/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage]
+
+--------------------------------------------------------------------------------
+The following files chosen for auto-annotation could not be found:
+--------------------------------------------------------------------------------
+  ./csu/../csu/libc-start.c
+  ./csu/../sysdeps/nptl/libc_start_call_main.h

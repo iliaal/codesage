@@ -320,6 +320,7 @@ fn base_recommendations(db: &Database, file_paths: &[String]) -> Result<BaseReco
     let path_refs: Vec<&str> = file_paths.iter().map(String::as_str).collect();
     let co_batched = db.co_changes_for_many(&path_refs, COUPLED_FETCH_CAP + 1, multiplier)?;
     for path in file_paths {
+        codesage_protocol::work::checkpoint()?;
         let (siblings, withheld_here) = test_sibling_paths(db, path)?;
         if !withheld_here.is_empty() {
             suppressed_sources.push(path.clone());
@@ -466,6 +467,7 @@ fn base_notes(
 /// Sibling and co-change recommendations without a graph walk. The pre-edit
 /// hook needs this cheap path; graph reachability is a separate entry point.
 pub fn recommend_tests(db: &Database, file_paths: &[String]) -> Result<TestRecommendations> {
+    codesage_protocol::work::checkpoint()?;
     let base = base_recommendations(db, file_paths)?;
     let notes = base_notes(&base, base.primary.len(), None);
     Ok(TestRecommendations {
@@ -581,6 +583,7 @@ fn reachable_test_files(
     let mut pool = opts.work_budget;
     let mut budget = WalkBudget::new(0, Some(Instant::now() + opts.deadline));
     for (i, path) in walkable.iter().enumerate() {
+        codesage_protocol::work::checkpoint()?;
         let queued = walkable.len() - i - 1;
         let reserved = opts.min_input_budget.saturating_mul(queued);
         let share = pool
@@ -610,6 +613,7 @@ fn reachable_test_files(
             out.no_symbol.push(path.clone());
         }
         for entry in outcome.entries {
+            codesage_protocol::work::checkpoint()?;
             if entry.category != FileCategory::Test
                 || is_fixture(&entry.file_path)
                 || inputs.contains(entry.file_path.as_str())
@@ -710,6 +714,7 @@ pub(crate) fn recommend_tests_with_walk_cache(
     cache: Option<&mut WalkCache>,
 ) -> Result<TestRecommendations> {
     // Match normalized paths, but report the caller's first spelling.
+    codesage_protocol::work::checkpoint()?;
     // Blank/root inputs name no file; equivalent spellings share one walk.
     let mut blank_inputs = 0usize;
     let mut root_inputs = 0usize;
@@ -717,6 +722,7 @@ pub(crate) fn recommend_tests_with_walk_cache(
     let mut as_given: HashMap<String, String> = HashMap::new();
     let mut file_paths: Vec<String> = Vec::with_capacity(file_paths_in.len());
     for given in file_paths_in {
+        codesage_protocol::work::checkpoint()?;
         if given.trim().is_empty() {
             blank_inputs += 1;
             continue;
@@ -790,6 +796,7 @@ pub(crate) fn recommend_tests_with_walk_cache(
     let mut primary = base.primary.clone();
     let mut changed_tests = 0usize;
     for path in &triage.changed_tests {
+        codesage_protocol::work::checkpoint()?;
         if !primary.contains(path) {
             primary.push(path.clone());
             changed_tests += 1;

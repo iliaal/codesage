@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use codesage_protocol::{
@@ -527,6 +527,17 @@ pub(crate) fn resolve_callee_definitions(
     caller_file: &str,
     to_name: &str,
 ) -> Result<Vec<Symbol>> {
+    resolve_callee_definitions_with_imports(db, caller_file, to_name, &mut || {
+        Ok(Arc::new(import_refs_for_file(db, caller_file)?))
+    })
+}
+
+pub(crate) fn resolve_callee_definitions_with_imports(
+    db: &Database,
+    caller_file: &str,
+    to_name: &str,
+    load_imports: &mut dyn FnMut() -> Result<Arc<Vec<String>>>,
+) -> Result<Vec<Symbol>> {
     let candidates = db.find_symbols(to_name, None)?;
     if is_qualified_symbol_name(to_name) {
         let exact: Vec<Symbol> = candidates
@@ -550,7 +561,7 @@ pub(crate) fn resolve_callee_definitions(
     if candidates.len() <= 1 {
         return Ok(candidates);
     }
-    let import_refs = import_refs_for_file(db, caller_file)?;
+    let import_refs = load_imports()?;
 
     // Local calls need no import edge.
     let is_local = |s: &Symbol| s.file_path == caller_file;
@@ -570,7 +581,7 @@ pub(crate) fn resolve_callee_definitions(
 }
 
 // Fetch outgoing imports without computing list_file_dependencies' reverse edges.
-fn import_refs_for_file(db: &Database, caller_file: &str) -> Result<Vec<String>> {
+pub(crate) fn import_refs_for_file(db: &Database, caller_file: &str) -> Result<Vec<String>> {
     let mut refs = Vec::new();
     if let Some(file_id) = db.file_id_for_path(caller_file)? {
         for (to_name, kind) in db.refs_outgoing_for_file_id(file_id)? {

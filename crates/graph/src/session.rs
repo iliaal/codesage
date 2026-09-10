@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
+use codesage_protocol::work::checkpoint;
 use codesage_protocol::{SessionDiff, SessionRiskEntry, SessionRiskRegression, SessionSnapshot};
 use codesage_storage::Database;
 
@@ -13,6 +14,70 @@ const SESSIONS_DIR: &str = "sessions";
 
 /// Only these highest-risk files receive per-file deltas at session end.
 const TOP_RISK_BASELINE: usize = 50;
+
+#[derive(Clone, Debug)]
+pub struct CompleteRiskRanking {
+    rows: Vec<SessionRiskEntry>,
+}
+
+impl CompleteRiskRanking {
+    pub fn allocated_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.rows
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<SessionRiskEntry>()),
+            )
+            .saturating_add(
+                self.rows
+                    .iter()
+                    .map(|row| row.file.capacity())
+                    .fold(0usize, usize::saturating_add),
+            )
+    }
+
+    pub fn rows(&self) -> &[SessionRiskEntry] {
+        &self.rows
+    }
+
+    pub fn into_rows(self) -> Vec<SessionRiskEntry> {
+        self.rows
+    }
+}
+
+#[derive(Debug)]
+pub struct IncompleteRiskRanking {
+    cause: anyhow::Error,
+}
+
+impl std::fmt::Display for IncompleteRiskRanking {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("risk ranking is incomplete: one or more score components failed")
+    }
+}
+
+impl std::error::Error for IncompleteRiskRanking {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cause.as_ref())
+    }
+}
+
+pub fn top_risk_ranking(db: &Database) -> Result<CompleteRiskRanking> {
+    top_risk_ranking_with_policy(
+        db,
+        crate::search::env_default_on("CODESAGE_COUPLING_RECURRENCE"),
+    )
+}
+
+pub fn top_risk_ranking_with_policy(
+    db: &Database,
+    recurrence: bool,
+) -> Result<CompleteRiskRanking> {
+    let _policy = crate::git_history::CompletePolicy::enter(recurrence);
+    Ok(CompleteRiskRanking {
+        rows: top_risk_files(db, TOP_RISK_BASELINE)?,
+    })
+}
 
 /// Ignore smaller deltas caused by churn-percentile shifts and scoring jitter.
 const RISK_REGRESSION_THRESHOLD: f64 = 0.05;
@@ -32,14 +97,31 @@ pub fn session_start(
     db: &Database,
     session_id: &str,
 ) -> Result<SessionSnapshot> {
+    checkpoint()?;
+    validate_session_id(session_id)?;
+    let read = db.read_snapshot()?;
+    let ranking = top_risk_ranking(db)?;
+    let snapshot = build_session_snapshot_with_top_risk(project_root, db, session_id, &ranking)?;
+    drop(read);
+    persist_session_snapshot(project_root, &snapshot)?;
+    Ok(snapshot)
+}
+
+/// The caller must pin and validate the database snapshot associated with `ranking`.
+pub fn build_session_snapshot_with_top_risk(
+    project_root: &Path,
+    db: &Database,
+    session_id: &str,
+    ranking: &CompleteRiskRanking,
+) -> Result<SessionSnapshot> {
+    checkpoint()?;
     validate_session_id(session_id)?;
 
     let files = db.all_file_paths().context("listing indexed files")?;
     let file_count = files.len() as u32;
     let symbol_count = db.symbol_count().context("counting symbols")? as u32;
     let cycles = compute_cycles(db).context("computing import cycles")?;
-    let top_risk_files =
-        compute_top_risk(db, &files, TOP_RISK_BASELINE).context("computing top-risk baseline")?;
+    let top_risk_files = ranking.rows.clone();
     let git_head = read_git_head(project_root);
 
     let snapshot = SessionSnapshot {
@@ -53,12 +135,19 @@ pub fn session_start(
         git_head,
     };
 
-    write_snapshot(project_root, &snapshot)?;
+    checkpoint()?;
     Ok(snapshot)
+}
+
+pub fn persist_session_snapshot(project_root: &Path, snapshot: &SessionSnapshot) -> Result<()> {
+    validate_session_id(&snapshot.session_id)?;
+    write_snapshot(project_root, snapshot)
 }
 
 /// Diff the current index against a saved baseline, retaining it for reuse.
 pub fn session_end(project_root: &Path, db: &Database, session_id: &str) -> Result<SessionDiff> {
+    checkpoint()?;
+    let _policy = crate::git_history::CompletePolicy::enter_current();
     validate_session_id(session_id)?;
     let snapshot = read_snapshot(project_root, session_id).with_context(|| {
         format!("loading session snapshot '{session_id}' (was session_start called?)")
@@ -99,13 +188,15 @@ pub fn session_end(project_root: &Path, db: &Database, session_id: &str) -> Resu
         .filter(|e| now_files_set.contains(e.file.as_str()))
         .map(|e| e.file.clone())
         .collect();
-    let (after_scores, mut risk_assessment_failed) = risk_scores(db, &baseline_files);
+    let (after_scores, risk_failure) = risk_scores(db, &baseline_files)?;
+    let mut risk_assessment_failed = risk_failure.is_some();
     let after_by_file: HashMap<&str, f64> =
         after_scores.iter().map(|(f, s)| (f.as_str(), *s)).collect();
 
     let mut risk_regressions: Vec<SessionRiskRegression> = Vec::new();
     let mut max_risk_regression = 0.0_f64;
     for entry in &snapshot.top_risk_files {
+        checkpoint()?;
         if !now_files_set.contains(entry.file.as_str()) {
             continue;
         }
@@ -215,7 +306,7 @@ fn compute_cycles(db: &Database) -> Result<Vec<Vec<String>>> {
     if edges.is_empty() {
         return Ok(Vec::new());
     }
-    let components = crate::scc::tarjan_scc(&edges);
+    let components = crate::scc::tarjan_scc(&edges)?;
     let mut out: Vec<Vec<String>> = components
         .into_iter()
         .filter(|c| c.len() >= 2)
@@ -232,6 +323,8 @@ fn compute_cycles(db: &Database) -> Result<Vec<Vec<String>>> {
 /// Backs `project_overview`. Returns empty when no files are indexed or git
 /// history hasn't been indexed (every file scores ~0 without it).
 pub fn top_risk_files(db: &Database, limit: usize) -> Result<Vec<SessionRiskEntry>> {
+    checkpoint()?;
+    let _policy = crate::git_history::CompletePolicy::enter_current();
     let files: Vec<String> = db
         .all_files_with_id_and_language()?
         .into_iter()
@@ -241,7 +334,7 @@ pub fn top_risk_files(db: &Database, limit: usize) -> Result<Vec<SessionRiskEntr
 }
 
 /// Score every file via one batched risk call, return the top `limit` by
-/// score. Files with a risk computation error are skipped (logged).
+/// score. Unrecovered score components invalidate the complete ranking.
 fn compute_top_risk(
     db: &Database,
     files: &[String],
@@ -262,7 +355,11 @@ fn compute_top_risk(
     } else {
         files.to_vec()
     };
-    let (pairs, _any_failed) = risk_scores(db, &candidates);
+    checkpoint()?;
+    let (pairs, failure) = risk_scores(db, &candidates)?;
+    if let Some(cause) = failure {
+        return Err(IncompleteRiskRanking { cause }.into());
+    }
     let mut scored: Vec<SessionRiskEntry> = pairs
         .into_iter()
         .map(|(file, score)| SessionRiskEntry { file, score })
@@ -277,30 +374,50 @@ fn compute_top_risk(
 }
 
 /// Batch shared graph work; fall back to per-file scoring on batch failure.
-/// Omit failed files and return a flag indicating incomplete scores.
-fn risk_scores(db: &Database, files: &[String]) -> (Vec<(String, f64)>, bool) {
+/// Retain the first unrecovered error alongside any completed scores.
+type RiskScores = (Vec<(String, f64)>, Option<anyhow::Error>);
+
+fn risk_scores(db: &Database, files: &[String]) -> Result<RiskScores> {
+    checkpoint()?;
     if files.is_empty() {
-        return (Vec::new(), false);
+        return Ok((Vec::new(), None));
     }
     match assess_risk_batch(db, files) {
-        Ok(batch) => (
+        Ok(batch) => Ok((
             batch.files.into_iter().map(|r| (r.file, r.score)).collect(),
-            false,
-        ),
-        Err(e) => {
-            tracing::warn!(error = %e, "batched risk scoring failed; falling back to per-file assess_risk");
+            None,
+        )),
+        batch => {
+            checkpoint()?;
+            if let Err(e) = batch {
+                if e.downcast_ref::<codesage_protocol::work::WorkStopped>()
+                    .is_some()
+                {
+                    return Err(e);
+                }
+                tracing::warn!(error = %e, "batched risk scoring failed; falling back to per-file assess_risk");
+            }
             let mut out = Vec::with_capacity(files.len());
-            let mut any_failed = false;
+            let mut failure = None;
             for f in files {
+                checkpoint()?;
                 match assess_risk(db, f) {
                     Ok(r) => out.push((r.file, r.score)),
                     Err(e) => {
+                        checkpoint()?;
+                        if e.downcast_ref::<codesage_protocol::work::WorkStopped>()
+                            .is_some()
+                        {
+                            return Err(e);
+                        }
                         tracing::warn!(error = %e, file = %f, "assess_risk failed; skipping");
-                        any_failed = true;
+                        if failure.is_none() {
+                            failure = Some(e);
+                        }
                     }
                 }
             }
-            (out, any_failed)
+            Ok((out, failure))
         }
     }
 }
@@ -373,6 +490,7 @@ fn write_snapshot(project_root: &Path, snap: &SessionSnapshot) -> Result<()> {
         "snapshot payload too large to write ({} bytes, max {MAX_SNAPSHOT_BYTES})",
         json.len()
     );
+    checkpoint()?;
     crate::state_file::replace(&path, &json)
         .with_context(|| format!("writing snapshot {}", path.display()))?;
     Ok(())
@@ -454,6 +572,20 @@ fn reject_snapshot_symlink(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ranking_payload_accounts_for_truncated_vector_and_string_capacity() {
+        let mut rows = Vec::with_capacity(400);
+        let mut file = String::with_capacity(1024);
+        file.push_str("src/a.rs");
+        rows.push(SessionRiskEntry { file, score: 0.5 });
+        let expected = std::mem::size_of::<CompleteRiskRanking>()
+            + rows.capacity() * std::mem::size_of::<SessionRiskEntry>()
+            + rows[0].file.capacity();
+        let ranking = CompleteRiskRanking { rows };
+        assert_eq!(ranking.allocated_bytes(), expected);
+        assert!(ranking.allocated_bytes() >= 400 * std::mem::size_of::<SessionRiskEntry>() + 1024);
+    }
 
     #[test]
     fn concurrent_snapshots_of_one_session_remain_complete() {

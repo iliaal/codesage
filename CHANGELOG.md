@@ -2,16 +2,20 @@
 
 ### Added
 
+- `codesage daemon stats` reports bounded request and execution diagnostics, cache reuse, and outstanding work without starting a daemon.
 - `codesage-report` renders filtered findings through a deterministic formatter with acknowledgement diagnostics.
 - C++ `const` / `constexpr` / `constinit` declarations with an initializer index as constants at file, namespace, and class scope, and C `const` / `constexpr` declarations at file scope; run `codesage index --full` to populate existing indexes. Enumerators, mutable variables, function-local declarations, and pointer declarators stay unindexed.
 
 ### Changed
 
+- MCP tools bound queued and running work and report timeout, cancellation, saturation, shutdown, database-busy, and incomplete-analysis errors with physical continuation status.
 - `codesage doctor --docs` also checks Google-style `kCamelCase` constant values, not only `UPPER_SNAKE`.
 - `assess_risk` and `assess_risk_batch` report `unscored` for a file with no indexed git history. `assess_risk_diff` excludes unscored files from `max_score` / `mean_score`, names them in `unscored_files`, and adds `scored_file_count`; they remain in `files`.
 
 ### Fixed
 
+- `project_overview` and `session_start` recompute cycle risk for their read snapshot after same-shape index updates.
+- MCP cancellation and disconnects stop cooperative analysis; native inference and nested download workers remain accounted until they exit.
 - C and C++ extraction skips a literal `#if 0` body and the dead arm of a literal `#if 1`; that code yields no references, symbols, or clone fingerprints. `#ifdef` / `#ifndef` / `#if EXPR` arms stay live. Run `codesage index --full` for existing indexes.
 - `codesage git-index` measures its history window and decay reference from HEAD's committer date, not the wall clock; a pinned or archived checkout now indexes its history. The window is stamped `730d@HEAD` or `730d@now`. Run `codesage git-index --full` to rebaseline.
 - Opening an index tolerates a WAL journal-mode switch that loses a race with a concurrent reader.

@@ -10,10 +10,12 @@ use std::collections::HashMap;
 /// of node names. Nodes not in any edge are omitted (they can't be part of a
 /// multi-node cycle). Order within each SCC matches finish-order from the DFS;
 /// callers that need stable output should sort.
-pub(crate) fn tarjan_scc(edges: &[(String, String)]) -> Vec<Vec<String>> {
+pub(crate) fn tarjan_scc(edges: &[(String, String)]) -> anyhow::Result<Vec<Vec<String>>> {
+    codesage_protocol::work::checkpoint()?;
     let mut idx_of: HashMap<&str, usize> = HashMap::new();
     let mut nodes: Vec<&str> = Vec::new();
     for (a, b) in edges {
+        codesage_protocol::work::checkpoint()?;
         for n in [a.as_str(), b.as_str()] {
             if !idx_of.contains_key(n) {
                 idx_of.insert(n, nodes.len());
@@ -24,6 +26,7 @@ pub(crate) fn tarjan_scc(edges: &[(String, String)]) -> Vec<Vec<String>> {
     let n = nodes.len();
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (a, b) in edges {
+        codesage_protocol::work::checkpoint()?;
         let u = idx_of[a.as_str()];
         let v = idx_of[b.as_str()];
         adj[u].push(v);
@@ -39,6 +42,7 @@ pub(crate) fn tarjan_scc(edges: &[(String, String)]) -> Vec<Vec<String>> {
 
     // Entries retain (node, next child) so DFS can resume after descending.
     for start in 0..n {
+        codesage_protocol::work::checkpoint()?;
         if index[start] != UNVISITED {
             continue;
         }
@@ -51,6 +55,7 @@ pub(crate) fn tarjan_scc(edges: &[(String, String)]) -> Vec<Vec<String>> {
         work.push((start, 0));
 
         while let Some(&(v, i)) = work.last() {
+            codesage_protocol::work::checkpoint()?;
             if i < adj[v].len() {
                 let w = adj[v][i];
                 work.last_mut().unwrap().1 = i + 1;
@@ -68,6 +73,7 @@ pub(crate) fn tarjan_scc(edges: &[(String, String)]) -> Vec<Vec<String>> {
                 if lowlink[v] == index[v] {
                     let mut component: Vec<String> = Vec::new();
                     loop {
+                        codesage_protocol::work::checkpoint()?;
                         let w = stack.pop().expect("stack underflow");
                         on_stack[w] = false;
                         component.push(nodes[w].to_string());
@@ -84,5 +90,27 @@ pub(crate) fn tarjan_scc(edges: &[(String, String)]) -> Vec<Vec<String>> {
             }
         }
     }
-    components
+    Ok(components)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codesage_protocol::work::{StopReason, WorkControl, WorkStopped};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn active_scc_deadline_returns_error_instead_of_partial_components() {
+        let edges: Vec<_> = (0..200_000)
+            .map(|i| (format!("node-{i}"), format!("node-{}", i + 1)))
+            .collect();
+        let control = WorkControl::new(Some(Instant::now() + Duration::from_millis(5)));
+        let _scope = control.enter();
+        assert_eq!(control.reason(), None);
+        let error = tarjan_scc(&edges).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<WorkStopped>().unwrap().reason,
+            StopReason::DeadlineExceeded
+        );
+    }
 }

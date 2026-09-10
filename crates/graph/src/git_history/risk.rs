@@ -94,6 +94,34 @@ static IMPORT_CYCLE_CACHE: LazyLock<Mutex<CycleComponentCache>> =
 /// or `false` to rank by raw weight alone.
 pub const COUPLING_RECURRENCE_ENV: &str = "CODESAGE_COUPLING_RECURRENCE";
 
+thread_local! {
+    static COMPLETE_POLICY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) struct CompletePolicy(Option<bool>);
+
+impl CompletePolicy {
+    pub(crate) fn enter_current() -> Self {
+        Self::enter(recurrence_policy())
+    }
+
+    pub(crate) fn enter(recurrence: bool) -> Self {
+        Self(COMPLETE_POLICY.replace(Some(recurrence)))
+    }
+}
+
+impl Drop for CompletePolicy {
+    fn drop(&mut self) {
+        COMPLETE_POLICY.set(self.0);
+    }
+}
+
+fn recurrence_policy() -> bool {
+    COMPLETE_POLICY
+        .get()
+        .unwrap_or_else(|| crate::search::env_default_on(COUPLING_RECURRENCE_ENV))
+}
+
 /// `count / total` as a probability; 0.0 when the denominator is unknown.
 /// The pair count can exceed a stale `git_files` total only on an index
 /// whose two tables were written by different passes, so clamp rather than
@@ -129,7 +157,7 @@ pub(crate) fn is_recurring(span_days: u32) -> bool {
 /// `CODESAGE_COUPLING_RECURRENCE=0` (raw order) the same way in every
 /// consumer.
 pub(crate) fn one_off_multiplier_from_env() -> f64 {
-    one_off_multiplier(crate::search::env_default_on(COUPLING_RECURRENCE_ENV))
+    one_off_multiplier(recurrence_policy())
 }
 
 pub(crate) fn one_off_multiplier(recurrence_rank: bool) -> f64 {
@@ -349,12 +377,7 @@ fn name_sample(names: &[String], cap: usize) -> String {
 /// raw weight. `CODESAGE_COUPLING_RECURRENCE=0` restores raw-weight order.
 /// The reported `weight` is the raw value in both modes.
 pub fn find_coupling(db: &Database, file_path: &str, limit: usize) -> Result<CouplingReport> {
-    find_coupling_ranked(
-        db,
-        file_path,
-        limit,
-        crate::search::env_default_on(COUPLING_RECURRENCE_ENV),
-    )
+    find_coupling_ranked(db, file_path, limit, recurrence_policy())
 }
 
 /// [`find_coupling`] with the recurrence rank multiplier as a parameter
@@ -540,6 +563,7 @@ fn assess_risk_with_context(
     window: IndexWindow,
     cache: Option<&mut WalkCache>,
 ) -> Result<(RiskAssessment, bool)> {
+    codesage_protocol::work::checkpoint()?;
     let git = db.git_file(file_path)?;
     let structural_found = db
         .file_id_for_path(file_path)
@@ -665,6 +689,13 @@ fn assess_risk_with_context(
             Ok(Some(cycle)) => cycle_membership(&[cycle], file_path),
             Ok(None) => (false, 0, Vec::new()),
             Err(e) => {
+                codesage_protocol::work::checkpoint()?;
+                if COMPLETE_POLICY.get().is_some()
+                    || e.downcast_ref::<codesage_protocol::work::WorkStopped>()
+                        .is_some()
+                {
+                    return Err(e);
+                }
                 tracing::warn!(error = %e, file = %file_path, "cycle detection failed; omitting cycle signal from risk score");
                 cycle_signal_failed = true;
                 (false, 0, Vec::new())
@@ -854,6 +885,12 @@ fn assess_risk_with_context(
             }
             Ok(_) => {}
             Err(e) => {
+                codesage_protocol::work::checkpoint()?;
+                if e.downcast_ref::<codesage_protocol::work::WorkStopped>()
+                    .is_some()
+                {
+                    return Err(e);
+                }
                 tracing::warn!(error = %e, file = %file_path, "cycle-break guidance failed; omitting from risk notes");
             }
         }
@@ -870,6 +907,12 @@ fn assess_risk_with_context(
     let top_symbols = match compute_top_symbols(db, file_path, in_cycle, cycle_size) {
         Ok(v) => v,
         Err(e) => {
+            codesage_protocol::work::checkpoint()?;
+            if e.downcast_ref::<codesage_protocol::work::WorkStopped>()
+                .is_some()
+            {
+                return Err(e);
+            }
             // Missing symbol detail must not discard the file assessment.
             tracing::warn!(error = %e, file = %file_path, "top-symbols computation failed; omitting from risk");
             Vec::new()
@@ -886,6 +929,8 @@ fn assess_risk_with_context(
     let (author_concentration, author_note) =
         super::bus_factor::risk_author_concentration(db, file_path, author_anchor)?;
     notes.push(author_note);
+
+    codesage_protocol::work::checkpoint()?;
 
     Ok((
         RiskAssessment {
@@ -1052,6 +1097,13 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
     let cycles_touching_patch = match find_cycles_touching(db, file_paths) {
         Ok(c) => c,
         Err(e) => {
+            codesage_protocol::work::checkpoint()?;
+            if COMPLETE_POLICY.get().is_some()
+                || e.downcast_ref::<codesage_protocol::work::WorkStopped>()
+                    .is_some()
+            {
+                return Err(e);
+            }
             tracing::warn!(error = %e, "cycle detection failed; omitting cycles_touching_patch");
             cycles_failed = true;
             Vec::new()
@@ -1259,6 +1311,7 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
 /// without patch-level aggregation. See [`RiskBatchAssessment`] for the
 /// design distinction vs [`assess_risk_diff`].
 pub fn assess_risk_batch(db: &Database, file_paths: &[String]) -> Result<RiskBatchAssessment> {
+    codesage_protocol::work::checkpoint()?;
     if file_paths.is_empty() {
         return Ok(RiskBatchAssessment::default());
     }
@@ -1266,6 +1319,13 @@ pub fn assess_risk_batch(db: &Database, file_paths: &[String]) -> Result<RiskBat
     let cycles = match find_cycles_touching(db, file_paths) {
         Ok(c) => c,
         Err(e) => {
+            codesage_protocol::work::checkpoint()?;
+            if COMPLETE_POLICY.get().is_some()
+                || e.downcast_ref::<codesage_protocol::work::WorkStopped>()
+                    .is_some()
+            {
+                return Err(e);
+            }
             tracing::warn!(error = %e, "cycle detection failed; omitting batch cycle signal");
             cycles_failed = true;
             Vec::new()
@@ -1361,6 +1421,7 @@ fn find_cycles_touching(db: &Database, patch_files: &[String]) -> Result<Vec<Cyc
     let components = import_cycle_components(db)?;
     let mut out: Vec<CycleEntry> = Vec::new();
     for component in components.iter() {
+        codesage_protocol::work::checkpoint()?;
         // Trivial SCCs (single-node, no self-edge) aren't cycles.
         if component.len() < 2 {
             continue;
@@ -1409,11 +1470,18 @@ fn find_cycle_containing_file(db: &Database, file_path: &str) -> Result<Option<C
 }
 
 fn import_cycle_components(db: &Database) -> Result<Arc<Vec<Vec<String>>>> {
-    let Some(key) = db.import_cycle_cache_key() else {
+    codesage_protocol::work::checkpoint()?;
+    // The cross-request token can collide after same-shape reindexing.
+    let cache_key = if COMPLETE_POLICY.get().is_some() {
+        None
+    } else {
+        db.import_cycle_cache_key()
+    };
+    let Some(key) = cache_key else {
         let edges = db
             .enumerate_file_import_edges()
             .with_context(|| "enumerate_file_import_edges")?;
-        return Ok(Arc::new(crate::scc::tarjan_scc(&edges)));
+        return Ok(Arc::new(crate::scc::tarjan_scc(&edges)?));
     };
     let token = db.import_cycle_validity_token()?;
     if let Some((_, cached)) = IMPORT_CYCLE_CACHE
@@ -1428,7 +1496,7 @@ fn import_cycle_components(db: &Database) -> Result<Arc<Vec<Vec<String>>>> {
     let edges = db
         .enumerate_file_import_edges()
         .with_context(|| "enumerate_file_import_edges")?;
-    let components = Arc::new(crate::scc::tarjan_scc(&edges));
+    let components = Arc::new(crate::scc::tarjan_scc(&edges)?);
     IMPORT_CYCLE_CACHE
         .lock()
         .expect("import cycle cache lock poisoned")
@@ -1440,6 +1508,7 @@ fn import_cycle_components(db: &Database) -> Result<Arc<Vec<Vec<String>>>> {
 fn pick_max_churn(db: &Database, members: &[String]) -> Result<Option<String>> {
     let mut best: Option<(f64, String)> = None;
     for m in members {
+        codesage_protocol::work::checkpoint()?;
         if let Some(row) = db.git_file(m)? {
             match &best {
                 Some((score, _)) if row.churn_score <= *score => {}

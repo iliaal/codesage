@@ -16,6 +16,19 @@ const ENTRYPOINT_CAP: usize = 15;
 const TOP_RISK_CAP: usize = 10;
 
 pub fn build_project_overview(root: &Path, db: &Database) -> Result<ProjectOverview> {
+    let read = db.read_snapshot()?;
+    let ranking = crate::session::top_risk_ranking(db)?;
+    let overview = build_project_overview_with_top_risk(root, db, &ranking)?;
+    drop(read);
+    Ok(overview)
+}
+
+pub fn build_project_overview_with_top_risk(
+    root: &Path,
+    db: &Database,
+    ranking: &crate::session::CompleteRiskRanking,
+) -> Result<ProjectOverview> {
+    codesage_protocol::work::checkpoint()?;
     let files = db.all_files_with_id_and_language()?;
 
     let mut lang_counts: HashMap<Language, usize> = HashMap::new();
@@ -75,7 +88,7 @@ pub fn build_project_overview(root: &Path, db: &Database) -> Result<ProjectOverv
         })
         .collect();
 
-    let top_risk_files = crate::session::top_risk_files(db, TOP_RISK_CAP)?;
+    let top_risk_files = ranking.rows().iter().take(TOP_RISK_CAP).cloned().collect();
 
     let trust_boundary_clusters: Vec<TrustBoundaryCount> = db
         .trust_boundary_counts()?
@@ -89,6 +102,7 @@ pub fn build_project_overview(root: &Path, db: &Database) -> Result<ProjectOverv
     let test_conventions = test_conventions_for(&languages);
     let suggested_next_calls = suggested_next_calls(&freshness);
 
+    codesage_protocol::work::checkpoint()?;
     Ok(ProjectOverview {
         project_root: root.display().to_string(),
         languages,

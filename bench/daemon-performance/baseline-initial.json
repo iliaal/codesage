@@ -1,0 +1,690 @@
+{
+  "schema_version": 1,
+  "publication_redactions": ["projects[0].source: local project path removed; raw report retained privately"],
+  "binary": "/tmp/codesage-daemon-baseline.H7CPFS/target/release/codesage",
+  "binary_sha256": "55ac01b2cbe4ee478b120a8cc154d07558ee5b797bad35105379bbb7e78cd7db",
+  "source_commit": "a337b5dbcdab33c682e6f21005994e5592cf8910",
+  "build_features": "cuda",
+  "binary_version": "codesage 0.28.0 (release)\n  target: x86_64-unknown-linux\n  features compiled: cpu, cuda\n  device configured: gpu",
+  "host": {
+    "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.35",
+    "cpu_count": 32,
+    "clock_ticks": 100
+  },
+  "cpu_method": "/proc/PID/stat utime+stime for isolated foreground daemon, includes native threads; excludes harness/children",
+  "wall_method": "time.monotonic; response interval includes client handshakes; individual request wall starts at send",
+  "parity_exclusions": [
+    "top-level _meta",
+    "freshness.structural_summary",
+    "suggested_next_calls[].reason"
+  ],
+  "projects": [
+    {
+      "source": "[redacted local project path]",
+      "snapshot": "/tmp/codesage-daemon-baseline.H7CPFS/project",
+      "database_sha256": "4936636f4eac5ef3628bde50c03166dfb97f7d4e18ef336a58f22692a943a4dd",
+      "counts": {
+        "files": 197,
+        "symbols": 6171,
+        "refs": 62668
+      },
+      "config_sha256": "a74048981c173b3500e7c9cb1b8a346544ceb09425d2af2b9801eb16ec4bd670",
+      "config": "[project]\nname = \"codesage\"\n\n[embedding]\nmodel = \"jinaai/jina-embeddings-v2-base-code\"\ndevice = \"gpu\"\nreranker = \"cross-encoder/ms-marco-MiniLM-L6-v2\"\n",
+      "copied_indexed_files": 197,
+      "missing_indexed_files": 0,
+      "method": "SQLite online backup; indexed source copied after backup",
+      "git_metadata": "omitted; freshness is intentionally not comparable to original project",
+      "source_atomicity": "database snapshot is atomic; working files are not an atomic snapshot"
+    }
+  ],
+  "scenarios": [
+    {
+      "scenario": "cold",
+      "summary": {
+        "requests": 1,
+        "successes": 1,
+        "tool_error": 0,
+        "protocol_error": 0,
+        "client_timeout": 0,
+        "cancelled": 0,
+        "disconnected": 0,
+        "p50_s": 2.046879469999112,
+        "p95_s": null,
+        "p99_s": null
+      },
+      "requests": [
+        {
+          "tool": "project_overview",
+          "wall_s": 2.046879469999112,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        }
+      ],
+      "wall_to_responses_s": 2.047830791969318,
+      "process_cpu_to_responses_s": 2.02,
+      "post_response_observation_s": 0,
+      "process_cpu_after_responses_s": 0.0,
+      "stats_before": {
+        "available": false,
+        "reason": "daemon_stats unsupported or unsuccessful"
+      },
+      "stats_after": {
+        "available": false,
+        "reason": "daemon_stats unsupported or unsuccessful"
+      },
+      "round": 0
+    },
+    {
+      "scenario": "warm",
+      "summary": {
+        "requests": 20,
+        "successes": 20,
+        "tool_error": 0,
+        "protocol_error": 0,
+        "client_timeout": 0,
+        "cancelled": 0,
+        "disconnected": 0,
+        "p50_s": 1.801085151033476,
+        "p95_s": 2.2247595069929957,
+        "p99_s": null
+      },
+      "requests": [
+        {
+          "tool": "project_overview",
+          "wall_s": 1.6516013169893995,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 1.6855578750255518,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 1.7163337499951012,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 1.887494369992055,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 1.8264354270067997,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 1.651751346013043,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 1.7326292319921777,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 2.004985224979464,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 1.801085151033476,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 1.6180545429815538,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 1.9232651659986004,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 1.8722455850220285,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 2.2823836249881424,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 2.2247595069929957,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 1.8748146769939922,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 1.8127721879864112,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 1.6854514349834062,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 1.7742513850098476,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 1.707199705997482,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 1.8733210859936662,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        }
+      ],
+      "wall_to_responses_s": 36.61463753902353,
+      "process_cpu_to_responses_s": 36.54,
+      "post_response_observation_s": 0,
+      "process_cpu_after_responses_s": 0.0,
+      "stats_before": {
+        "available": false,
+        "reason": "daemon_stats unsupported or unsuccessful"
+      },
+      "stats_after": {
+        "available": false,
+        "reason": "daemon_stats unsupported or unsuccessful"
+      },
+      "round": 0
+    },
+    {
+      "scenario": "concurrent",
+      "summary": {
+        "requests": 16,
+        "successes": 16,
+        "tool_error": 0,
+        "protocol_error": 0,
+        "client_timeout": 0,
+        "cancelled": 0,
+        "disconnected": 0,
+        "p50_s": 6.594872853951529,
+        "p95_s": null,
+        "p99_s": null
+      },
+      "requests": [
+        {
+          "tool": "project_overview",
+          "wall_s": 6.629373332019895,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 6.246884139021859,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 6.266941006993875,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 6.609231099952012,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 6.5506163950194605,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 6.612532667000778,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 6.638486027019098,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 6.624280256044585,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 6.600994003994856,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 6.572120610973798,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 6.594872853951529,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 5.985089580004569,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 6.637755400966853,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 6.534105324011762,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 6.599767280975357,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 6.5889684010180645,
+          "outcome": "success",
+          "stable_sha256": "5766af9b995dcbadba06bec07cd78f31e8097281d8e2bf8167056a0612b0f8ec"
+        }
+      ],
+      "wall_to_responses_s": 6.643723217013758,
+      "process_cpu_to_responses_s": 82.78999999999999,
+      "post_response_observation_s": 0,
+      "process_cpu_after_responses_s": 0.0,
+      "stats_before": {
+        "available": false,
+        "reason": "daemon_stats unsupported or unsuccessful"
+      },
+      "stats_after": {
+        "available": false,
+        "reason": "daemon_stats unsupported or unsuccessful"
+      },
+      "round": 0
+    },
+    {
+      "scenario": "cancel",
+      "summary": {
+        "requests": 16,
+        "successes": 0,
+        "tool_error": 0,
+        "protocol_error": 0,
+        "client_timeout": 0,
+        "cancelled": 16,
+        "disconnected": 0,
+        "p50_s": null,
+        "p95_s": null,
+        "p99_s": null
+      },
+      "requests": [
+        {
+          "tool": "project_overview",
+          "wall_s": 0.05076912196818739,
+          "outcome": "cancelled"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.050751161004882306,
+          "outcome": "cancelled"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.050745058979373425,
+          "outcome": "cancelled"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.05074184900149703,
+          "outcome": "cancelled"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.05073810799513012,
+          "outcome": "cancelled"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.050736246979795396,
+          "outcome": "cancelled"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.050736135977786034,
+          "outcome": "cancelled"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.0507336370064877,
+          "outcome": "cancelled"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.05073095398256555,
+          "outcome": "cancelled"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.050729667011182755,
+          "outcome": "cancelled"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.05072770902188495,
+          "outcome": "cancelled"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.05072563700377941,
+          "outcome": "cancelled"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.050724565982818604,
+          "outcome": "cancelled"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.05072232795646414,
+          "outcome": "cancelled"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.05072004295652732,
+          "outcome": "cancelled"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.0507191110518761,
+          "outcome": "cancelled"
+        }
+      ],
+      "wall_to_responses_s": 0.05544167896732688,
+      "process_cpu_to_responses_s": 0.24,
+      "post_response_observation_s": 5.0,
+      "process_cpu_after_responses_s": 67.89,
+      "stats_before": {
+        "available": false,
+        "reason": "daemon_stats unsupported or unsuccessful"
+      },
+      "stats_after": {
+        "available": false,
+        "reason": "daemon_stats unsupported or unsuccessful"
+      },
+      "round": 0
+    },
+    {
+      "scenario": "disconnect",
+      "summary": {
+        "requests": 16,
+        "successes": 0,
+        "tool_error": 0,
+        "protocol_error": 0,
+        "client_timeout": 0,
+        "cancelled": 0,
+        "disconnected": 16,
+        "p50_s": null,
+        "p95_s": null,
+        "p99_s": null
+      },
+      "requests": [
+        {
+          "tool": "project_overview",
+          "wall_s": 0.05108811100944877,
+          "outcome": "disconnected"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.051062475016806275,
+          "outcome": "disconnected"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.05104992201086134,
+          "outcome": "disconnected"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.05104073998518288,
+          "outcome": "disconnected"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.051033287949394435,
+          "outcome": "disconnected"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.051027531968429685,
+          "outcome": "disconnected"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.05102043796796352,
+          "outcome": "disconnected"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.05101320898393169,
+          "outcome": "disconnected"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.051008125010412186,
+          "outcome": "disconnected"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.05100010702153668,
+          "outcome": "disconnected"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.05099607299780473,
+          "outcome": "disconnected"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.05099171301117167,
+          "outcome": "disconnected"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.05098508100491017,
+          "outcome": "disconnected"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.05097906797891483,
+          "outcome": "disconnected"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.050950596982147545,
+          "outcome": "disconnected"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.050935914972797036,
+          "outcome": "disconnected"
+        }
+      ],
+      "wall_to_responses_s": 0.056310122017748654,
+      "process_cpu_to_responses_s": 0.27,
+      "post_response_observation_s": 5.0,
+      "process_cpu_after_responses_s": 68.69,
+      "stats_before": {
+        "available": false,
+        "reason": "daemon_stats unsupported or unsuccessful"
+      },
+      "stats_after": {
+        "available": false,
+        "reason": "daemon_stats unsupported or unsuccessful"
+      },
+      "round": 0
+    },
+    {
+      "scenario": "local_timeout",
+      "summary": {
+        "requests": 16,
+        "successes": 0,
+        "tool_error": 0,
+        "protocol_error": 0,
+        "client_timeout": 16,
+        "cancelled": 0,
+        "disconnected": 0,
+        "p50_s": null,
+        "p95_s": null,
+        "p99_s": null
+      },
+      "requests": [
+        {
+          "tool": "project_overview",
+          "wall_s": 0.050744483014568686,
+          "outcome": "client_timeout"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.050702511973213404,
+          "outcome": "client_timeout"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.0506828089710325,
+          "outcome": "client_timeout"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.05067051900550723,
+          "outcome": "client_timeout"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.05069979198742658,
+          "outcome": "client_timeout"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.05069216701667756,
+          "outcome": "client_timeout"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.050683000998105854,
+          "outcome": "client_timeout"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.05067386297741905,
+          "outcome": "client_timeout"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.050662563007790595,
+          "outcome": "client_timeout"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.050545258971396834,
+          "outcome": "client_timeout"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.050528587016742676,
+          "outcome": "client_timeout"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.0505159409949556,
+          "outcome": "client_timeout"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.0505045719910413,
+          "outcome": "client_timeout"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.050495515984948725,
+          "outcome": "client_timeout"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.05048555601388216,
+          "outcome": "client_timeout"
+        },
+        {
+          "tool": "project_overview",
+          "wall_s": 0.05047479399945587,
+          "outcome": "client_timeout"
+        }
+      ],
+      "wall_to_responses_s": 0.053422119992319494,
+      "process_cpu_to_responses_s": 0.27,
+      "post_response_observation_s": 5.0,
+      "process_cpu_after_responses_s": 68.65,
+      "stats_before": {
+        "available": false,
+        "reason": "daemon_stats unsupported or unsuccessful"
+      },
+      "stats_after": {
+        "available": false,
+        "reason": "daemon_stats unsupported or unsuccessful"
+      },
+      "round": 0
+    }
+  ],
+  "rounds": 1,
+  "optional_scenarios": {
+    "model": "not requested; no inference measurement",
+    "watcher": "not requested; no watcher measurement"
+  },
+  "explicit_environment": {}
+}

@@ -1,9 +1,13 @@
+mod diagnostics;
+mod dispatch;
 mod edit_check;
 mod next;
+mod overview_cache;
 pub(crate) mod params;
 mod render;
 mod schema;
 mod state;
+mod work;
 
 pub(crate) use state::{CodeSageServerState, WATCHER_STOP_WAIT};
 
@@ -233,6 +237,9 @@ impl CodeSageServer {
     where
         F: FnOnce(&Self) -> CallToolResult + Send + 'static,
     {
+        if let Ok(request) = dispatch::CURRENT_REQUEST.try_with(Arc::clone) {
+            return self.controlled_blocking(request, f).await;
+        }
         let this = self.clone();
         match tokio::task::spawn_blocking(move || f(&this)).await {
             Ok(result) => result,
@@ -252,6 +259,14 @@ impl CodeSageServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for CodeSageServer {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> std::result::Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        self.dispatch_tool(request, context).await
+    }
+
     fn get_info(&self) -> ServerInfo {
         use rmcp::model::ServerCapabilities;
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -293,13 +308,16 @@ impl CodeSageServer {
 impl CodeSageServer {
     #[tool(
         name = "project_overview",
-        description = "First-call orientation for a project: one bounded response with languages and file/symbol counts, index freshness (structural drift vs git HEAD + semantic coverage), mapped feature summary by kind, a sample of entrypoints (routes/CLI/services/libraries), the top-risk files, trust-boundary clusters, the test-file naming conventions per language, and suggested next CodeSage calls for common intents. Pure aggregation of already-indexed facts — no semantic search, no analysis. Call this once at the start of a session to orient before reaching for `search`/`find_symbol`/`assess_risk`. `top_risk_files` is empty until git history is indexed; `freshness.structural_kind` of `behind_head`/`unrelated_ancestor` means structural results may be stale (re-run `codesage index`).",
+        description = "First-call orientation for a project: one bounded response with languages and file/symbol counts, index freshness (structural drift vs git HEAD + semantic coverage), mapped feature summary by kind, a sample of entrypoints (routes/CLI/services/libraries), the top-risk files, trust-boundary clusters, the test-file naming conventions per language, and suggested next CodeSage calls for common intents. Aggregates indexed facts and computes risk analysis, reusing a shared ranking when the index is unchanged; no semantic search or model inference. Call this once at the start of a session to orient before reaching for `search`/`find_symbol`/`assess_risk`. `top_risk_files` is empty until git history is indexed; `freshness.structural_kind` of `behind_head`/`unrelated_ancestor` means structural results may be stale (re-run `codesage index`).",
         output_schema = schema_for_type::<ProjectOverview>()
     )]
     async fn project_overview_tool(
         &self,
         Parameters(params): Parameters<ProjectOverviewParams>,
     ) -> CallToolResult {
+        if let Ok(request) = dispatch::CURRENT_REQUEST.try_with(Arc::clone) {
+            return self.cached_overview(request, params.project).await;
+        }
         self.blocking(move |s| {
             s.render(
                 &params.project,
@@ -849,6 +867,15 @@ impl CodeSageServer {
         &self,
         Parameters(params): Parameters<SessionParams>,
     ) -> CallToolResult {
+        if let Ok(request) = dispatch::CURRENT_REQUEST.try_with(Arc::clone) {
+            return self
+                .cached_session_start(
+                    request,
+                    params.project,
+                    params.session_id.unwrap_or_else(|| "default".to_string()),
+                )
+                .await;
+        }
         self.blocking(move |s| {
             let session_id = params
                 .session_id

@@ -99,6 +99,80 @@ pub struct Database {
     pub(super) chunk_table: String,
 }
 
+pub struct ReadSnapshot<'a> {
+    _transaction: rusqlite::Transaction<'a>,
+}
+
+/// An unsupported VFS cannot attest that this connection still names its opened file.
+#[cfg(unix)]
+pub fn connection_path_still_matches_open_file(
+    conn: &Connection,
+    expected_path: &Path,
+) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let Some(opened_path) = conn.path().filter(|path| !path.is_empty()) else {
+        return Ok(false);
+    };
+    let identity = |path: &Path| -> Result<Option<(u64, u64)>> {
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => Ok(Some((metadata.dev(), metadata.ino()))),
+            Ok(_) => Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    };
+    let Some(expected) = identity(expected_path)? else {
+        return Ok(false);
+    };
+    if identity(Path::new(opened_path))? != Some(expected) {
+        return Ok(false);
+    }
+    let mut moved: std::ffi::c_int = 0;
+    // SAFETY: conn owns a live SQLite handle for this call; HAS_MOVED accepts a
+    // writable int pointer, retains no pointer, and does not execute SQL callbacks.
+    let code = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            conn.handle(),
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+            (&mut moved as *mut std::ffi::c_int).cast(),
+        )
+    };
+    match code {
+        rusqlite::ffi::SQLITE_OK => Ok(moved == 0
+            && identity(expected_path)? == Some(expected)
+            && identity(Path::new(opened_path))? == Some(expected)),
+        rusqlite::ffi::SQLITE_NOTFOUND => Ok(false),
+        code => Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None).into()),
+    }
+}
+
+#[cfg(not(unix))]
+pub fn connection_path_still_matches_open_file(
+    _conn: &Connection,
+    _expected_path: &Path,
+) -> Result<bool> {
+    Ok(false)
+}
+
+fn install_work_control(conn: &Connection) -> Result<()> {
+    let Some(control) = codesage_protocol::work::current() else {
+        return Ok(());
+    };
+    control.check()?;
+    let interrupt = conn.get_interrupt_handle();
+    let registration = control.on_cancel(std::sync::Arc::new(move || interrupt.interrupt()));
+    conn.progress_handler(
+        256,
+        Some(move || {
+            let _registration = &registration;
+            control.reason().is_some()
+        }),
+    )?;
+    conn.busy_timeout(std::time::Duration::from_millis(100))?;
+    Ok(())
+}
+
 pub(super) fn quote_ident(identifier: &str) -> String {
     identifier.replace('"', "\"\"")
 }
@@ -233,6 +307,7 @@ fn open_connection(path: &Path, create: bool) -> Result<Connection> {
             other => other.into(),
         })?
     };
+    install_work_control(&conn)?;
     init_db(&conn)?;
     Ok(conn)
 }
@@ -267,8 +342,9 @@ fn open_connection_no_migrations(path: &Path) -> Result<Connection> {
         }
         other => other.into(),
     })?;
+    install_work_control(&conn)?;
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-    conn.execute_batch(&format!("PRAGMA busy_timeout={READ_BUSY_TIMEOUT_MS};"))?;
+    crate::schema::set_busy_timeout(&conn, READ_BUSY_TIMEOUT_MS)?;
     conn.execute_batch("PRAGMA mmap_size=268435456;")?;
     conn.execute_batch("PRAGMA cache_size=-65536;")?;
     Ok(conn)
@@ -558,6 +634,7 @@ fn record_semantic_model_table(
     chunk_table: &str,
     model: &str,
     dim: usize,
+    refresh_indexed_at: bool,
 ) -> Result<()> {
     conn.execute(
         "DELETE FROM semantic_models
@@ -570,13 +647,38 @@ fn record_semantic_model_table(
          ON CONFLICT(chunk_table) DO UPDATE SET
              model = excluded.model,
              dim = excluded.dim,
-             indexed_at = excluded.indexed_at",
-        params![chunk_table, model, dim as i64],
+             indexed_at = excluded.indexed_at
+         WHERE ?4 OR semantic_models.model <> excluded.model
+                  OR semantic_models.dim <> excluded.dim",
+        params![chunk_table, model, dim as i64, refresh_indexed_at],
     )?;
     Ok(())
 }
 
 impl Database {
+    pub fn path_still_matches_open_file(&self, expected_path: &Path) -> Result<bool> {
+        connection_path_still_matches_open_file(&self.conn, expected_path)
+    }
+    /// Compare only across reads from this same connection, outside a snapshot.
+    pub fn data_version(&self) -> Result<i64> {
+        codesage_protocol::work::checkpoint()?;
+        Ok(self
+            .conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))?)
+    }
+
+    /// Pin all subsequent reads until the returned guard drops.
+    pub fn read_snapshot(&self) -> Result<ReadSnapshot<'_>> {
+        codesage_protocol::work::checkpoint()?;
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        Ok(ReadSnapshot {
+            _transaction: transaction,
+        })
+    }
+
     /// Open/create a structural handle without selecting a semantic chunk table.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = open_connection(path, true)?;
@@ -632,6 +734,15 @@ impl Database {
     /// which is sound precisely in the case that forced it: nothing can be
     /// writing to a database on a filesystem nobody can write to.
     pub fn open_read_only(path: &Path) -> Result<Self> {
+        Self::open_read_only_impl(path, codesage_protocol::work::current().is_none())
+    }
+
+    /// Preserve WAL and locking semantics even when a normal read cannot open.
+    pub fn open_read_only_strict(path: &Path) -> Result<Self> {
+        Self::open_read_only_impl(path, false)
+    }
+
+    fn open_read_only_impl(path: &Path, allow_immutable: bool) -> Result<Self> {
         use rusqlite::OpenFlags;
         init_vec_extension();
         reject_symlinked_db_path(path)?;
@@ -654,12 +765,34 @@ impl Database {
             .map(|_| ())
         };
         let conn = match Connection::open_with_flags(path, flags) {
-            Ok(conn) if probe(&conn).is_ok() => conn,
-            _ => {
+            Ok(conn) => {
+                install_work_control(&conn)?;
+                match probe(&conn) {
+                    Ok(()) => conn,
+                    Err(error) => {
+                        codesage_protocol::work::checkpoint()?;
+                        if !allow_immutable || !immutable_fallback_allowed(&error) {
+                            return Err(error.into());
+                        }
+                        let uri = format!("file:{}?immutable=1", path.display());
+                        let fallback = Connection::open_with_flags(&uri, flags).map_err(|_| {
+                            anyhow::anyhow!("could not read {} read-only: {error}", path.display())
+                        })?;
+                        install_work_control(&fallback)?;
+                        probe(&fallback)?;
+                        fallback
+                    }
+                }
+            }
+            Err(error) => {
+                if !allow_immutable || !immutable_fallback_allowed(&error) {
+                    return Err(error.into());
+                }
                 let uri = format!("file:{}?immutable=1", path.display());
                 let conn = Connection::open_with_flags(&uri, flags).map_err(|e| {
                     anyhow::anyhow!("could not open {} read-only: {e}", path.display())
                 })?;
+                install_work_control(&conn)?;
                 probe(&conn).map_err(|e| {
                     anyhow::anyhow!("could not read {} read-only: {e}", path.display())
                 })?;
@@ -753,7 +886,7 @@ impl Database {
                 }
             }
         }
-        record_semantic_model_table(&conn, &chunk_table, model, dim)?;
+        record_semantic_model_table(&conn, &chunk_table, model, dim, repair_fts)?;
         harden_db_path_permissions(path)?;
         Ok(Database { conn, chunk_table })
     }
@@ -785,7 +918,7 @@ impl Database {
                  the rebuild repopulates both sides row by row, healing it without a rewrite"
             );
         }
-        record_semantic_model_table(&conn, &chunk_table, model, dim)?;
+        record_semantic_model_table(&conn, &chunk_table, model, dim, true)?;
         // Interrupted rebuilds must not leave an old attestation over mixed vectors.
         clear_semantic_fingerprint_for(&conn, &chunk_table)?;
         harden_db_path_permissions(path)?;
@@ -850,6 +983,7 @@ impl Database {
     pub fn open_in_memory() -> Result<Self> {
         init_vec_extension();
         let conn = Connection::open_in_memory()?;
+        install_work_control(&conn)?;
         init_db(&conn)?;
         let chunk_table = model_table_name("default", DEFAULT_EMBEDDING_DIM);
         ensure_semantic_model_compatible(
@@ -860,7 +994,7 @@ impl Database {
             None,
         )?;
         ensure_chunk_table(&conn, &chunk_table, DEFAULT_EMBEDDING_DIM)?;
-        record_semantic_model_table(&conn, &chunk_table, "default", DEFAULT_EMBEDDING_DIM)?;
+        record_semantic_model_table(&conn, &chunk_table, "default", DEFAULT_EMBEDDING_DIM, true)?;
         Ok(Database { conn, chunk_table })
     }
 
@@ -1060,6 +1194,11 @@ impl Database {
     }
 }
 
+fn immutable_fallback_allowed(error: &rusqlite::Error) -> bool {
+    matches!(error, rusqlite::Error::SqliteFailure(code, _)
+        if matches!(code.code, rusqlite::ErrorCode::ReadOnly | rusqlite::ErrorCode::CannotOpen | rusqlite::ErrorCode::PermissionDenied))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1160,6 +1299,121 @@ mod tests {
         let structural = Database::open(&path).unwrap();
         assert_eq!(structural.semantic_fingerprint().unwrap(), None);
         assert!(structural.record_semantic_fingerprint("x").is_err());
+    }
+
+    #[test]
+    fn semantic_read_opens_preserve_registration_and_observer_generation() {
+        const MODEL: &str = "fp/read-open";
+        const DIM: usize = 2;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = Database::open_for_model(&path, MODEL, DIM).unwrap();
+        let attestation = SemanticAttestation {
+            fingerprint: "read-open-fingerprint".to_string(),
+            artifact_digest: Some("read-open-digest".to_string()),
+            artifact_stat_key: Some("read-open-stat-key".to_string()),
+        };
+        db.insert_chunks(
+            "src/lib.rs",
+            "rust",
+            &[("fn read_open() {}", 1, 1, &[0.1, 0.2])],
+        )
+        .unwrap();
+        db.record_semantic_attestation(&attestation).unwrap();
+        db.conn
+            .execute("UPDATE semantic_models SET indexed_at = 1", [])
+            .unwrap();
+        let observer = Connection::open(&path).unwrap();
+        let generation: i64 = observer
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .unwrap();
+        for fingerprint_gate in [false, true, false, true] {
+            let reopened = if fingerprint_gate {
+                Database::open_for_model_existing_with_fingerprint(
+                    &path,
+                    MODEL,
+                    DIM,
+                    &attestation.fingerprint,
+                )
+            } else {
+                Database::open_for_model_existing(&path, MODEL, DIM)
+            }
+            .unwrap();
+            let observed: i64 = observer
+                .query_row("PRAGMA data_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                observed, generation,
+                "semantic read open committed an index mutation"
+            );
+            let indexed_at: i64 = reopened
+                .conn
+                .query_row(
+                    "SELECT indexed_at FROM semantic_models WHERE chunk_table = ?1",
+                    params![reopened.chunk_table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(indexed_at, 1);
+            assert_eq!(
+                reopened.semantic_attestation().unwrap(),
+                Some(attestation.clone())
+            );
+            let chunks = reopened.chunks_for_file("src/lib.rs").unwrap();
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].content, "fn read_open() {}");
+        }
+    }
+
+    #[test]
+    fn semantic_write_and_rebuild_opens_refresh_registration() {
+        const MODEL: &str = "fp/write-open";
+        const DIM: usize = 2;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = Database::open_for_model(&path, MODEL, DIM).unwrap();
+        db.insert_chunks(
+            "src/lib.rs",
+            "rust",
+            &[("fn write_open() {}", 1, 1, &[0.1, 0.2])],
+        )
+        .unwrap();
+        for mode in 0..3 {
+            db.record_semantic_fingerprint("write-open-fingerprint")
+                .unwrap();
+            db.conn
+                .execute("UPDATE semantic_models SET indexed_at = 1", [])
+                .unwrap();
+            let reopened = match mode {
+                0 => Database::open_for_model(&path, MODEL, DIM),
+                1 => Database::open_for_model_with_fingerprint(
+                    &path,
+                    MODEL,
+                    DIM,
+                    "write-open-fingerprint",
+                ),
+                _ => Database::open_for_model_rebuild(&path, MODEL, DIM),
+            }
+            .unwrap();
+            let indexed_at: i64 = reopened
+                .conn
+                .query_row(
+                    "SELECT indexed_at FROM semantic_models WHERE chunk_table = ?1",
+                    params![reopened.chunk_table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(indexed_at > 1, "write open must retain timestamp refresh");
+            assert_eq!(reopened.chunk_count().unwrap(), 1);
+            assert_eq!(
+                reopened.semantic_fingerprint().unwrap().as_deref(),
+                if mode == 2 {
+                    None
+                } else {
+                    Some("write-open-fingerprint")
+                }
+            );
+        }
     }
 
     #[test]

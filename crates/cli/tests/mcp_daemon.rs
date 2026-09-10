@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use codesage_protocol::{FileInfo, Language};
 use codesage_storage::Database;
 use serde_json::Value;
 
@@ -1361,6 +1362,684 @@ fn every_schema_bearing_tool_returns_populated_structured_content() {
     }
 }
 
+#[test]
+fn warm_overview_reuses_the_cold_ranking_execution() {
+    let project = tempfile::tempdir().unwrap();
+    onboard_rich_fixture(project.path());
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut session = McpSession::start(runtime.path());
+    session.initialize();
+
+    let cold = call_mcp_tool(
+        &mut session,
+        2,
+        "project_overview",
+        serde_json::json!({"project": project.path()}),
+    );
+    assert!(
+        !cold["top_risk_files"].as_array().unwrap().is_empty(),
+        "fixture must exercise ranking work: {cold}"
+    );
+    let after_cold = daemon_stats(&mut session, 3, 256);
+    assert_eq!(overview_ranking_executions(&after_cold), 1, "{after_cold}");
+
+    let warm = call_mcp_tool(
+        &mut session,
+        4,
+        "project_overview",
+        serde_json::json!({"project": project.path()}),
+    );
+    assert_eq!(
+        warm, cold,
+        "cache reuse must preserve every stable overview field and envelope annotation"
+    );
+    let after_warm = daemon_stats(&mut session, 5, 256);
+    assert_eq!(
+        overview_ranking_executions(&after_warm),
+        1,
+        "a stable warm request must not execute the ranking again: {after_warm}"
+    );
+    assert_eq!(after_warm["tools"]["project_overview"]["requests"], 2);
+    assert_eq!(after_warm["counters"]["request_reuse"]["miss"], 1);
+    assert_eq!(after_warm["counters"]["request_reuse"]["hit"], 1);
+}
+
+#[test]
+fn semantic_search_preserves_cached_ranking_until_semantic_index_mutation() {
+    let project = tempfile::tempdir().unwrap();
+    onboard_rich_fixture(project.path());
+    seed_fixture_chunks(project.path());
+    let db_path = project.path().join(".codesage/index.db");
+    let db = Database::open_for_model_existing(&db_path, "jinaai/jina-embeddings-v2-base-code", 4)
+        .unwrap();
+    let registration = rusqlite::Connection::open(&db_path).unwrap();
+    assert_eq!(
+        registration
+            .execute(
+                "UPDATE semantic_models SET indexed_at = 1 WHERE model = ?1 AND dim = 4",
+                ["jinaai/jina-embeddings-v2-base-code"],
+            )
+            .unwrap(),
+        1
+    );
+    drop(registration);
+
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut session = McpSession::start_with_env(
+        runtime.path(),
+        &[("CODESAGE_MCP_TEST_QUERY_EMBEDDING", "0.1,0.2,0.3,0.4")],
+    );
+    session.initialize();
+    let cold = call_mcp_tool(
+        &mut session,
+        2,
+        "project_overview",
+        serde_json::json!({"project": project.path()}),
+    );
+    assert!(!cold["top_risk_files"].as_array().unwrap().is_empty());
+    assert_eq!(cold["freshness"]["semantic_indexed_files"], 0);
+    let after_cold = daemon_stats(&mut session, 3, 256);
+    assert_eq!(overview_ranking_executions(&after_cold), 1, "{after_cold}");
+
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": {
+            "name": "search",
+            "arguments": {"project": project.path(), "query": "inner step", "limit": 3},
+        },
+    });
+    let response = session.request(4, &request.to_string());
+    assert!(response.get("error").is_none(), "{response}");
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let search = &response["result"]["structuredContent"];
+    assert_eq!(search["_meta"]["test_override"], true, "{search}");
+    let mut text_payloads: Vec<Value> = response["result"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|block| block["text"].as_str())
+        .filter_map(|text| serde_json::from_str(text).ok())
+        .collect();
+    assert_eq!(text_payloads.len(), 1, "{response}");
+    let mut text_payload = text_payloads.pop().unwrap();
+    let text_meta = text_payload
+        .as_object_mut()
+        .unwrap()
+        .entry("_meta")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .unwrap();
+    assert!(!text_meta.contains_key("test_override"), "{response}");
+    text_meta.insert("test_override".to_string(), Value::Bool(true));
+    assert_eq!(
+        &text_payload, search,
+        "debug search payloads may differ only by the structured-only override marker"
+    );
+    assert!(
+        search["results"].as_array().unwrap().iter().any(|row| {
+            row["file_path"] == "src/helper.rs"
+                && row["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("pub fn inner_step"))
+        }),
+        "seeded semantic search must return the indexed declaration: {search}"
+    );
+    let warm = call_mcp_tool(
+        &mut session,
+        5,
+        "project_overview",
+        serde_json::json!({"project": project.path()}),
+    );
+    assert_eq!(warm, cold, "semantic reads must preserve overview output");
+    let after_search = daemon_stats(&mut session, 6, 256);
+    assert_eq!(
+        overview_ranking_executions(&after_search),
+        1,
+        "semantic search must not invalidate the cached ranking: {after_search}"
+    );
+    assert_eq!(after_search["counters"]["request_reuse"]["miss"], 1);
+    assert_eq!(after_search["counters"]["request_reuse"]["hit"], 1);
+
+    let source = std::fs::read(project.path().join("src/lib.rs")).unwrap();
+    db.upsert_semantic_file_hash(
+        "src/lib.rs",
+        &codesage_parser::discover::content_hash(&source),
+    )
+    .unwrap();
+    assert_eq!(db.semantic_file_count().unwrap(), 1);
+    let updated = call_mcp_tool(
+        &mut session,
+        7,
+        "project_overview",
+        serde_json::json!({"project": project.path()}),
+    );
+    assert_eq!(updated["freshness"]["semantic_indexed_files"], 1);
+    assert_eq!(updated["freshness"]["semantic_indexed"], true);
+    assert_eq!(updated["top_risk_files"], cold["top_risk_files"]);
+    let after_mutation = daemon_stats(&mut session, 8, 256);
+    assert_eq!(
+        overview_ranking_executions(&after_mutation),
+        2,
+        "a real semantic index mutation must invalidate the same cached ranking: {after_mutation}"
+    );
+    assert_eq!(after_mutation["counters"]["request_reuse"]["miss"], 2);
+    assert_eq!(after_mutation["counters"]["request_reuse"]["hit"], 1);
+}
+
+#[test]
+fn session_start_reuses_all_cached_rows_beyond_the_overview_cap() {
+    let project = tempfile::tempdir().unwrap();
+    for index in 0..55 {
+        let path = project.path().join(format!("src/extra_{index}.rs"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            format!("pub fn extra_{index}() -> u32 {{ {index} }}\n"),
+        )
+        .unwrap();
+    }
+    onboard_rich_fixture(project.path());
+    let uncached = Command::new(env!("CARGO_BIN_EXE_codesage"))
+        .args([
+            "session-start",
+            "--session-id",
+            "uncached-reference",
+            "--json",
+        ])
+        .current_dir(project.path())
+        .output()
+        .expect("run uncached session-start reference");
+    assert!(
+        uncached.status.success(),
+        "uncached session-start failed: {}",
+        String::from_utf8_lossy(&uncached.stderr)
+    );
+    let uncached: Value =
+        serde_json::from_slice(&uncached.stdout).expect("uncached session-start JSON");
+    let reference_rows = uncached["top_risk_files"]
+        .as_array()
+        .expect("uncached top_risk_files");
+    assert_eq!(
+        reference_rows.len(),
+        50,
+        "fixture must exceed the top-50 session baseline: {uncached}"
+    );
+
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut session = McpSession::start(runtime.path());
+    session.initialize();
+
+    let overview = call_mcp_tool(
+        &mut session,
+        2,
+        "project_overview",
+        serde_json::json!({"project": project.path()}),
+    );
+    let overview_rows = overview["top_risk_files"].as_array().unwrap().len();
+    assert_eq!(
+        overview_rows, 10,
+        "fixture must cross the overview cap: {overview}"
+    );
+    assert_eq!(
+        overview["top_risk_files"].as_array().unwrap(),
+        &reference_rows[..overview_rows],
+        "overview must expose the exact first ten rows of the uncached ranking"
+    );
+
+    let session_start = call_mcp_tool(
+        &mut session,
+        3,
+        "session_start",
+        serde_json::json!({"project": project.path(), "session_id": "cached-top-50"}),
+    );
+    let session_rows = session_start["top_risk_file_count"]
+        .as_u64()
+        .expect("top_risk_file_count") as usize;
+    assert_eq!(
+        session_rows,
+        reference_rows.len(),
+        "session summary must report the complete top-50 ranking: {session_start}"
+    );
+    let snapshot_path = session_start["snapshot_path"]
+        .as_str()
+        .expect("snapshot_path");
+    let cached_snapshot: Value = serde_json::from_slice(
+        &std::fs::read(snapshot_path).expect("read cached daemon session snapshot"),
+    )
+    .expect("cached daemon session snapshot JSON");
+    assert_eq!(
+        cached_snapshot["top_risk_files"], uncached["top_risk_files"],
+        "daemon session persistence must match uncached top-50 scores and order exactly"
+    );
+    let stats = daemon_stats(&mut session, 4, 256);
+    assert_eq!(
+        overview_ranking_executions(&stats),
+        1,
+        "session_start must reuse the cold overview's top-50 ranking: {stats}"
+    );
+    assert_eq!(stats["counters"]["request_reuse"]["miss"], 1);
+    assert_eq!(stats["counters"]["request_reuse"]["hit"], 1);
+}
+
+#[test]
+fn hidden_daemon_stats_and_cli_report_the_same_shared_state() {
+    let project = tempfile::tempdir().unwrap();
+    onboard_rich_fixture(project.path());
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut session = McpSession::start(runtime.path());
+    session.initialize();
+    call_mcp_tool(
+        &mut session,
+        2,
+        "project_overview",
+        serde_json::json!({"project": project.path()}),
+    );
+
+    let listed = session.request(3, r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#);
+    assert!(
+        listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool["name"] != "daemon_stats"),
+        "operator diagnostics must remain hidden from advertised MCP tools: {listed}"
+    );
+    let direct = daemon_stats(&mut session, 4, 256);
+    assert_eq!(direct["tools"]["project_overview"]["requests"], 1);
+    assert_eq!(overview_ranking_executions(&direct), 1);
+    assert_eq!(direct["work"]["closed"], false, "{direct}");
+    assert_eq!(direct["work"]["requests"], 0, "{direct}");
+    assert_eq!(direct["work"]["queued"], serde_json::json!([0, 0, 0]));
+    assert_eq!(direct["work"]["running"], serde_json::json!([0, 0, 0]));
+    assert!(direct["work"]["limits"].is_object(), "{direct}");
+
+    let cli = Command::new(env!("CARGO_BIN_EXE_codesage"))
+        .args([
+            "daemon",
+            "stats",
+            "--json",
+            "--recent",
+            "256",
+            "--runtime-dir",
+        ])
+        .arg(runtime.path())
+        .output()
+        .expect("run codesage daemon stats");
+    assert!(
+        cli.status.success(),
+        "codesage daemon stats failed: {}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let cli_stats: Value = serde_json::from_slice(&cli.stdout).expect("daemon stats JSON");
+    assert_eq!(
+        cli_stats, direct,
+        "the CLI must query the existing daemon rather than a fresh diagnostics state"
+    );
+}
+
+#[test]
+fn runtime_diagnostics_switch_preserves_overview_and_session_results() {
+    assert_runtime_toggle_results(false, true);
+}
+
+#[test]
+fn runtime_cache_switch_recomputes_complete_overview_and_session_results() {
+    assert_runtime_toggle_results(true, false);
+}
+
+#[test]
+fn runtime_combined_switches_preserve_overview_and_session_results() {
+    assert_runtime_toggle_results(false, false);
+}
+
+fn assert_runtime_toggle_results(diagnostics_enabled: bool, cache_enabled: bool) {
+    let project = tempfile::tempdir().unwrap();
+    for index in 0..12 {
+        let path = project.path().join(format!("src/toggle_{index}.rs"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            format!("pub fn toggle_{index}() -> u32 {{ {index} }}\n"),
+        )
+        .unwrap();
+    }
+    onboard_rich_fixture(project.path());
+    let baseline_runtime = tempfile::tempdir().unwrap();
+    let _baseline_cleanup = DaemonCleanup {
+        runtime_dir: baseline_runtime.path().to_path_buf(),
+    };
+    let mut baseline = McpSession::start_with_env(
+        baseline_runtime.path(),
+        &[
+            ("CODESAGE_DIAGNOSTICS", "1"),
+            ("CODESAGE_OVERVIEW_CACHE", "1"),
+        ],
+    );
+    baseline.initialize();
+    let reference_overview = call_mcp_tool(
+        &mut baseline,
+        2,
+        "project_overview",
+        serde_json::json!({"project": project.path()}),
+    );
+    assert_eq!(
+        reference_overview["top_risk_files"]
+            .as_array()
+            .unwrap()
+            .len(),
+        10
+    );
+    let mut reference_session = call_mcp_tool(
+        &mut baseline,
+        3,
+        "session_start",
+        serde_json::json!({"project": project.path(), "session_id": "runtime-toggles"}),
+    );
+    let snapshot_path = reference_session["snapshot_path"].as_str().unwrap();
+    let mut reference_snapshot: Value =
+        serde_json::from_slice(&std::fs::read(snapshot_path).unwrap()).unwrap();
+    assert!(
+        reference_snapshot["top_risk_files"]
+            .as_array()
+            .unwrap()
+            .len()
+            > 10
+    );
+    let reference_stats = daemon_stats(&mut baseline, 4, 256);
+    assert_eq!(reference_stats["enabled"], true, "{reference_stats}");
+    assert_eq!(reference_stats["overview_cache_enabled"], true);
+    assert_eq!(overview_ranking_executions(&reference_stats), 1);
+    assert_eq!(reference_stats["counters"]["request_reuse"]["miss"], 1);
+    assert_eq!(reference_stats["counters"]["request_reuse"]["hit"], 1);
+
+    let runtime = tempfile::tempdir().unwrap();
+    let _cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut session = McpSession::start_with_env(
+        runtime.path(),
+        &[
+            (
+                "CODESAGE_DIAGNOSTICS",
+                if diagnostics_enabled { "1" } else { "0" },
+            ),
+            (
+                "CODESAGE_OVERVIEW_CACHE",
+                if cache_enabled { "1" } else { "0" },
+            ),
+        ],
+    );
+    session.initialize();
+    for id in [2, 3] {
+        let overview = call_mcp_tool(
+            &mut session,
+            id,
+            "project_overview",
+            serde_json::json!({"project": project.path()}),
+        );
+        assert_eq!(
+            overview, reference_overview,
+            "runtime switches changed overview output"
+        );
+    }
+    let target_snapshot_path = project
+        .path()
+        .join(".codesage/sessions/runtime-toggles-disabled.json");
+    assert!(!target_snapshot_path.exists());
+    let mut started = call_mcp_tool(
+        &mut session,
+        4,
+        "session_start",
+        serde_json::json!({"project": project.path(), "session_id": "runtime-toggles-disabled"}),
+    );
+    assert_eq!(started["session_id"], "runtime-toggles-disabled");
+    assert_eq!(
+        started["snapshot_path"],
+        serde_json::json!(target_snapshot_path)
+    );
+    assert!(
+        started["created_at"].as_i64().unwrap()
+            >= reference_session["created_at"].as_i64().unwrap()
+    );
+    for field in ["session_id", "snapshot_path", "created_at"] {
+        started.as_object_mut().unwrap().remove(field);
+        reference_session.as_object_mut().unwrap().remove(field);
+    }
+    assert_eq!(
+        started, reference_session,
+        "runtime switches changed session summary"
+    );
+    let mut snapshot: Value =
+        serde_json::from_slice(&std::fs::read(&target_snapshot_path).unwrap()).unwrap();
+    assert_eq!(snapshot["session_id"], "runtime-toggles-disabled");
+    assert!(
+        snapshot["created_at"].as_i64().unwrap()
+            >= reference_snapshot["created_at"].as_i64().unwrap()
+    );
+    for field in ["session_id", "created_at"] {
+        snapshot.as_object_mut().unwrap().remove(field);
+        reference_snapshot.as_object_mut().unwrap().remove(field);
+    }
+    assert_eq!(
+        snapshot, reference_snapshot,
+        "runtime switches changed persisted snapshot facts"
+    );
+
+    let stats = daemon_stats(&mut session, 5, 256);
+    assert_eq!(stats["enabled"], diagnostics_enabled, "{stats}");
+    assert_eq!(stats["overview_cache_enabled"], cache_enabled, "{stats}");
+    assert_eq!(
+        stats["work"], reference_stats["work"],
+        "disabling diagnostics must retain the same drained work gauges and admission limits"
+    );
+    assert_eq!(stats["work"]["closed"], false);
+    assert_eq!(stats["work"]["requests"], 0);
+    assert_eq!(stats["work"]["queued"], serde_json::json!([0, 0, 0]));
+    assert_eq!(stats["work"]["running"], serde_json::json!([0, 0, 0]));
+    if diagnostics_enabled {
+        assert!(!cache_enabled);
+        assert_eq!(stats["tools"]["project_overview"]["requests"], 2);
+        assert_eq!(stats["tools"]["project_overview"]["executions"], 4);
+        assert_eq!(stats["tools"]["session_start"]["requests"], 1);
+        assert_eq!(stats["tools"]["session_start"]["executions"], 2);
+        let executions = stats["recent_executions"].as_array().unwrap();
+        for (tool, expected) in [("project_overview", 2), ("session_start", 1)] {
+            for class in ["interactive", "analysis"] {
+                let rows: Vec<_> = executions
+                    .iter()
+                    .filter(|row| row["tool"] == tool && row["work_class"] == class)
+                    .collect();
+                assert_eq!(rows.len(), expected, "{tool} {class} work: {stats}");
+                let ids: std::collections::HashSet<_> = rows
+                    .iter()
+                    .map(|row| {
+                        assert_eq!(row["outcome"], "success", "{row}");
+                        assert_eq!(row["phase"], "running", "{row}");
+                        row["id"].as_u64().unwrap()
+                    })
+                    .collect();
+                assert_eq!(ids.len(), expected, "executions must have distinct IDs");
+            }
+        }
+        assert_eq!(overview_ranking_executions(&stats), 0);
+        assert_eq!(stats["gauges"]["cache"], serde_json::json!({}));
+        for reuse in ["hit", "miss", "shared"] {
+            assert!(
+                stats["counters"]["request_reuse"].get(reuse).is_none(),
+                "cache bypass recorded {reuse}: {stats}"
+            );
+        }
+    } else {
+        for field in [
+            "counters",
+            "gauges",
+            "tools",
+            "active_requests",
+            "active_executions",
+            "recent_requests",
+            "recent_executions",
+            "retention",
+        ] {
+            assert!(
+                stats.get(field).is_none(),
+                "disabled diagnostics retained {field}: {stats}"
+            );
+        }
+    }
+}
+
+#[test]
+fn warm_overview_keeps_git_freshness_and_working_file_annotations_live() {
+    let project = tempfile::tempdir().unwrap();
+    onboard_rich_fixture(project.path());
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut session = McpSession::start(runtime.path());
+    session.initialize();
+
+    let cold = call_mcp_tool(
+        &mut session,
+        2,
+        "project_overview",
+        serde_json::json!({"project": project.path()}),
+    );
+    assert_eq!(cold["freshness"]["structural_kind"], "fresh", "{cold}");
+    let indexed_head = cold["freshness"]["head_sha"]
+        .as_str()
+        .expect("fresh overview head_sha")
+        .to_string();
+    let changed = cold["top_risk_files"][0]["file"]
+        .as_str()
+        .expect("ranked fixture file")
+        .to_string();
+    append_line(&project.path().join(&changed), "");
+    run_git(project.path(), &["add", "--", &changed]);
+    run_git(project.path(), &["commit", "-qm", "advance head"]);
+
+    let warm = call_mcp_tool(
+        &mut session,
+        3,
+        "project_overview",
+        serde_json::json!({"project": project.path()}),
+    );
+    assert_eq!(warm["freshness"]["indexed_sha"], indexed_head, "{warm}");
+    assert_ne!(warm["freshness"]["head_sha"], indexed_head, "{warm}");
+    assert_eq!(
+        warm["freshness"]["structural_kind"], "behind_head",
+        "{warm}"
+    );
+    assert!(
+        warm["_meta"]["stale_files"]
+            .as_array()
+            .is_some_and(|files| files.iter().any(|file| file.as_str() == Some(&changed))),
+        "warm rendering must hash current files after serving cached ranking rows: {warm}"
+    );
+    let stats = daemon_stats(&mut session, 4, 256);
+    assert_eq!(
+        overview_ranking_executions(&stats),
+        1,
+        "Git and working-tree refresh must not invalidate database-derived ranking: {stats}"
+    );
+}
+
+#[test]
+fn structural_database_write_invalidates_the_cached_ranking() {
+    let project = tempfile::tempdir().unwrap();
+    onboard_rich_fixture(project.path());
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut session = McpSession::start(runtime.path());
+    session.initialize();
+
+    let cold = call_mcp_tool(
+        &mut session,
+        2,
+        "project_overview",
+        serde_json::json!({"project": project.path()}),
+    );
+    let cold_files = cold["file_count"].as_u64().expect("file_count");
+    let body = "pub fn inserted_after_cold_overview() {}\n";
+    std::fs::write(project.path().join("src/inserted.rs"), body).unwrap();
+    let db = Database::open(&project.path().join(".codesage/index.db")).unwrap();
+    db.upsert_file(&FileInfo {
+        path: "src/inserted.rs".to_string(),
+        language: Language::Rust,
+        content_hash: codesage_parser::discover::content_hash(body.as_bytes()),
+    })
+    .unwrap();
+    drop(db);
+
+    let updated = call_mcp_tool(
+        &mut session,
+        3,
+        "project_overview",
+        serde_json::json!({"project": project.path()}),
+    );
+    assert_eq!(updated["file_count"], cold_files + 1, "{updated}");
+    let stats = daemon_stats(&mut session, 4, 256);
+    assert_eq!(
+        overview_ranking_executions(&stats),
+        2,
+        "a different PRAGMA data_version must force a new physical ranking: {stats}"
+    );
+    assert_eq!(stats["counters"]["request_reuse"]["miss"], 2);
+}
+
+#[test]
+fn canonical_project_aliases_share_one_cached_ranking() {
+    let project = tempfile::tempdir().unwrap();
+    onboard_rich_fixture(project.path());
+    let aliases = tempfile::tempdir().unwrap();
+    let alias = aliases.path().join("project-alias");
+    std::os::unix::fs::symlink(project.path(), &alias).unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let _daemon_cleanup = DaemonCleanup {
+        runtime_dir: runtime.path().to_path_buf(),
+    };
+    let mut session = McpSession::start(runtime.path());
+    session.initialize();
+
+    let original = call_mcp_tool(
+        &mut session,
+        2,
+        "project_overview",
+        serde_json::json!({"project": project.path()}),
+    );
+    let through_alias = call_mcp_tool(
+        &mut session,
+        3,
+        "project_overview",
+        serde_json::json!({"project": alias}),
+    );
+    assert_eq!(through_alias["project_root"], original["project_root"]);
+    assert_eq!(through_alias["top_risk_files"], original["top_risk_files"]);
+    let stats = daemon_stats(&mut session, 4, 256);
+    assert_eq!(
+        overview_ranking_executions(&stats),
+        1,
+        "canonical aliases must not allocate independent cache entries: {stats}"
+    );
+    assert_eq!(stats["counters"]["request_reuse"]["hit"], 1);
+}
+
 /// Reject empty branches even when their response shape is valid.
 fn carries_data(value: &Value) -> bool {
     match value {
@@ -1725,6 +2404,89 @@ fn run_codesage(root: &std::path::Path, args: &[&str]) {
         "codesage {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+fn run_git(root: &std::path::Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args([
+            "-c",
+            "user.email=fixture@codesage.test",
+            "-c",
+            "user.name=fixture",
+        ])
+        .args(args)
+        .current_dir(root)
+        .output()
+        .expect("run git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn call_mcp_tool(session: &mut McpSession, id: u64, tool: &str, arguments: Value) -> Value {
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {"name": tool, "arguments": arguments},
+    });
+    let response = session.request(id, &request.to_string());
+    assert!(
+        response.get("error").is_none(),
+        "{tool} returned a JSON-RPC error: {response}"
+    );
+    assert_ne!(
+        response["result"]["isError"],
+        Value::Bool(true),
+        "{tool} failed: {response}"
+    );
+    let structured = response["result"]["structuredContent"].clone();
+    let content = response["result"]["content"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{tool} result must carry text content: {response}"));
+    let mut json_blocks: Vec<Value> = content
+        .iter()
+        .filter_map(|block| block["text"].as_str())
+        .filter_map(|text| serde_json::from_str(text).ok())
+        .collect();
+    assert_eq!(
+        json_blocks.len(),
+        1,
+        "{tool} must carry exactly one JSON payload text block alongside any banners: {response}"
+    );
+    let text_payload = json_blocks.pop().unwrap();
+    assert_eq!(
+        text_payload, structured,
+        "{tool} JSON text payload must match structuredContent exactly"
+    );
+    if structured["_meta"]["stale_files"].is_array() {
+        assert!(
+            content
+                .iter()
+                .filter_map(|block| block["text"].as_str())
+                .any(|text| serde_json::from_str::<Value>(text).is_err()
+                    && text.contains("changed on disk")),
+            "{tool} stale-file metadata must retain its user-visible warning banner: {response}"
+        );
+    }
+    structured
+}
+
+fn daemon_stats(session: &mut McpSession, id: u64, recent: usize) -> Value {
+    call_mcp_tool(
+        session,
+        id,
+        "daemon_stats",
+        serde_json::json!({"recent": recent}),
+    )
+}
+
+fn overview_ranking_executions(stats: &Value) -> u64 {
+    stats["tools"]["overview_ranking"]["executions"]
+        .as_u64()
+        .unwrap_or(0)
 }
 
 /// Whole-file spans ensure every symbol overlaps a seeded chunk.

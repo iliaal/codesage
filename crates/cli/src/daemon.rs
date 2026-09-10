@@ -24,6 +24,8 @@ mod unix {
 
     use anyhow::{Context, Result, bail};
     use rmcp::ServiceExt;
+    use rmcp::model::{CallToolRequestParams, ClientRequest, ServerResult};
+    use rmcp::service::PeerRequestOptions;
     use tokio::{
         io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf, copy},
         net::{UnixListener, UnixStream},
@@ -31,6 +33,7 @@ mod unix {
         task::JoinSet,
         time::sleep,
     };
+    use tokio_util::sync::CancellationToken;
 
     use crate::mcp::{CodeSageServer, CodeSageServerState};
 
@@ -235,6 +238,64 @@ mod unix {
             }
         );
         println!("  log:    {}", paths.log.display());
+        Ok(())
+    }
+
+    pub(crate) async fn run_daemon_stats(
+        runtime_dir: Option<PathBuf>,
+        json: bool,
+        recent: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(recent <= 256, "--recent must be at most 256");
+        let paths = DaemonPaths::for_current_exe(runtime_dir)?;
+        let stream = tokio::time::timeout(START_TIMEOUT, UnixStream::connect(&paths.socket))
+            .await
+            .context("timed out connecting to daemon")?
+            .with_context(|| {
+                format!(
+                    "no compatible daemon listening at {}",
+                    paths.socket.display()
+                )
+            })?;
+        let client = tokio::time::timeout(START_TIMEOUT, ().serve(stream))
+            .await
+            .context("daemon stats handshake timed out")?
+            .context("daemon stats handshake failed")?;
+        let operation = async {
+            let params = CallToolRequestParams::new("daemon_stats").with_arguments(
+                serde_json::Map::from_iter([("recent".into(), recent.into())]),
+            );
+            let request = client
+                .send_cancellable_request(
+                    ClientRequest::CallToolRequest(rmcp::model::Request::new(params)),
+                    PeerRequestOptions::with_timeout(START_TIMEOUT - Duration::from_millis(100)),
+                )
+                .await
+                .context("sending daemon stats request")?;
+            let result = request
+                .await_response()
+                .await
+                .context("daemon stats request failed")?;
+            let ServerResult::CallToolResult(result) = result else {
+                bail!("daemon stats returned an unexpected response");
+            };
+            if result.is_error == Some(true) {
+                bail!("daemon refused statistics request");
+            }
+            result
+                .structured_content
+                .context("daemon stats returned no structured content")
+        };
+        let result = tokio::time::timeout(START_TIMEOUT, operation)
+            .await
+            .context("daemon stats request timed out during send or cancellation");
+        client.cancellation_token().cancel();
+        let value = result??;
+        if json {
+            println!("{}", serde_json::to_string(&value)?);
+        } else {
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
         Ok(())
     }
 
@@ -468,6 +529,8 @@ mod unix {
             reason = shutdown_reason,
             "codesage MCP daemon shutting down"
         );
+        state.shutdown_work();
+        let drain_deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN;
 
         // Give watchers a bounded drain before process exit reaps their remaining threads.
         let still_stopping = state.shutdown_all_watchers(SHUTDOWN_DRAIN);
@@ -483,7 +546,11 @@ mod unix {
         let in_flight = clients.len();
         let abandoned = if in_flight > 0 {
             tracing::info!(in_flight, "draining in-flight client connections");
-            let still_in_flight = drain_client_tasks(&mut clients, SHUTDOWN_DRAIN).await;
+            let still_in_flight = drain_client_tasks(
+                &mut clients,
+                drain_deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await;
             if still_in_flight > 0 {
                 tracing::warn!(
                     still_in_flight,
@@ -495,6 +562,16 @@ mod unix {
         } else {
             0
         };
+        while state.active_work() > 0 && tokio::time::Instant::now() < drain_deadline {
+            sleep(Duration::from_millis(25)).await;
+        }
+        let outstanding_work = state.active_work();
+        if outstanding_work > 0 {
+            tracing::warn!(
+                outstanding_work,
+                "physical work still running after shutdown drain; process exit will reap it"
+            );
+        }
 
         // Best-effort cleanup. The runtime dir is left in place because
         // other daemon keys may share it.
@@ -513,7 +590,6 @@ mod unix {
     }
 
     /// Transport inactivity ceiling, measured from the last client byte, not connection start.
-    /// rmcp tool dispatch is private, so this also bounds hung requests without per-tool timeouts.
     /// `CODESAGE_CLIENT_IDLE_MAX_SECS=0` disables the ceiling.
     const DEFAULT_CLIENT_IDLE_MAX: Duration = Duration::from_secs(4 * 3600);
 
@@ -542,6 +618,7 @@ mod unix {
         last_activity: Arc<Mutex<Instant>>,
         /// Diagnostic activity across clients; separate from this connection's idle ceiling.
         daemon_last_byte: Arc<Mutex<Instant>>,
+        cancellation: CancellationToken,
     }
 
     impl AsyncRead for ActivityStream {
@@ -552,11 +629,16 @@ mod unix {
         ) -> Poll<io::Result<()>> {
             let this = self.get_mut();
             let before = buf.filled().len();
+            let can_read = buf.remaining() > 0;
             let r = Pin::new(&mut this.inner).poll_read(cx, buf);
             if matches!(r, Poll::Ready(Ok(()))) && buf.filled().len() > before {
                 let now = Instant::now();
                 *lock_clock(&this.last_activity) = now;
                 *lock_clock(&this.daemon_last_byte) = now;
+            } else if matches!(r, Poll::Ready(Err(_)))
+                || (can_read && matches!(r, Poll::Ready(Ok(()))))
+            {
+                this.cancellation.cancel();
             }
             r
         }
@@ -586,16 +668,19 @@ mod unix {
         daemon_last_byte: Arc<Mutex<Instant>>,
     ) -> Result<()> {
         let last_activity = Arc::new(Mutex::new(Instant::now()));
+        let cancellation = CancellationToken::new();
+        let _cancel_on_exit = cancellation.clone().drop_guard();
         let tracked = ActivityStream {
             inner: stream,
             last_activity: last_activity.clone(),
             daemon_last_byte,
+            cancellation: cancellation.clone(),
         };
         let idle_max = client_idle_max();
 
         // Bound pre-initialize silence too: the post-handshake idle check cannot reap these peers.
         // Zero disables both ceilings.
-        let serve_fut = server.serve(tracked);
+        let serve_fut = server.serve_with_ct(tracked, cancellation);
         let service = if idle_max.is_zero() {
             serve_fut
                 .await
@@ -1440,6 +1525,46 @@ mod unix {
     mod tests {
         use super::*;
 
+        #[tokio::test]
+        async fn transport_eof_cancels_service_without_response_drain() {
+            use tokio::io::AsyncReadExt;
+
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            let cancellation = CancellationToken::new();
+            let clock = Arc::new(Mutex::new(Instant::now()));
+            let mut tracked = ActivityStream {
+                inner: stream,
+                last_activity: clock.clone(),
+                daemon_last_byte: clock,
+                cancellation: cancellation.clone(),
+            };
+            peer.write_all(b"x").await.unwrap();
+            let mut byte = [0];
+            assert_eq!(tracked.read(&mut byte).await.unwrap(), 1);
+            assert!(!cancellation.is_cancelled());
+            drop(peer);
+            assert_eq!(tracked.read(&mut byte).await.unwrap(), 0);
+            assert!(cancellation.is_cancelled());
+        }
+
+        #[tokio::test]
+        async fn empty_read_does_not_cancel_live_transport() {
+            use tokio::io::AsyncReadExt;
+
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            let cancellation = CancellationToken::new();
+            let clock = Arc::new(Mutex::new(Instant::now()));
+            let mut tracked = ActivityStream {
+                inner: stream,
+                last_activity: clock.clone(),
+                daemon_last_byte: clock,
+                cancellation: cancellation.clone(),
+            };
+            peer.write_all(b"x").await.unwrap();
+            assert_eq!(tracked.read(&mut []).await.unwrap(), 0);
+            assert!(!cancellation.is_cancelled());
+        }
+
         fn pathname_capacity() -> usize {
             (1..1024)
                 .find(|&len| {
@@ -2068,8 +2193,8 @@ mod unix {
 
 #[cfg(unix)]
 pub(crate) use unix::{
-    default_runtime_dir, run_daemon, run_daemon_status, run_daemon_stop, run_mcp_shim,
-    running_daemon_socket,
+    default_runtime_dir, run_daemon, run_daemon_stats, run_daemon_status, run_daemon_stop,
+    run_mcp_shim, running_daemon_socket,
 };
 
 /// No daemon exists off Unix, so no CLI command can borrow its session.
@@ -2096,6 +2221,15 @@ pub(crate) async fn run_daemon(_runtime_dir: Option<PathBuf>) -> Result<()> {
 
 #[cfg(not(unix))]
 pub(crate) async fn run_daemon_status(_runtime_dir: Option<PathBuf>) -> Result<()> {
+    bail!("codesage MCP daemon requires Unix domain sockets")
+}
+
+#[cfg(not(unix))]
+pub(crate) async fn run_daemon_stats(
+    _runtime_dir: Option<PathBuf>,
+    _json: bool,
+    _recent: usize,
+) -> Result<()> {
     bail!("codesage MCP daemon requires Unix domain sockets")
 }
 

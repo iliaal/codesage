@@ -91,6 +91,7 @@ fn meta_property_schema() -> serde_json::Value {
             "clamps": { "type": "array", "items": { "type": "object", "properties": { "param": { "type": "string" }, "requested": {}, "applied": {} } }, "description": "numeric params adjusted from requested to applied (over-max limits capped, min_jaccard clamped to [0, 1])" },
             "stale_files": { "type": "array", "items": { "type": "string" }, "description": "referenced files that changed on disk since indexing" },
             "stale_warning": { "type": "string", "description": "human-readable staleness notice" },
+            "ranking_recomputed": { "type": "boolean", "description": "cached overview or session ranking could not be reused and was recomputed for this request's read snapshot; does not imply analysis failed or that the index changed during computation" },
             "test_override": { "type": "boolean", "description": "response was served through the debug-only test query-embedding override (debug builds only); production responses never carry it" }
         }
     })
@@ -205,6 +206,7 @@ mod tests {
                 "clamps",
                 "stale_files",
                 "stale_warning",
+                "ranking_recomputed",
                 "test_override",
             ] {
                 assert!(
@@ -213,6 +215,15 @@ mod tests {
                     tool.name
                 );
             }
+            assert_eq!(meta["properties"]["ranking_recomputed"]["type"], "boolean");
+            assert!(
+                !meta
+                    .get("required")
+                    .and_then(|value| value.as_array())
+                    .is_some_and(|fields| fields.iter().any(|field| field == "ranking_recomputed")),
+                "tool `{}` must not require `_meta.ranking_recomputed`",
+                tool.name
+            );
             if let Some(required) = out.get("required").and_then(|r| r.as_array()) {
                 assert!(
                     !required.iter().any(|v| v == "_meta"),

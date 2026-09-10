@@ -159,24 +159,50 @@ fn hf_with_deadline<T: Send + 'static>(
     action: &str,
     work: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
+    codesage_protocol::work::checkpoint()?;
+    let control = codesage_protocol::work::current();
+    let controlled = control.is_some();
+    let lease = control.as_ref().and_then(|control| control.worker_lease());
     let timeout = hf_download_timeout();
+    let started = std::time::Instant::now();
     let (tx, rx) = mpsc::sync_channel(1);
 
     thread::spawn(move || {
-        let _ = tx.send(work());
+        let _lease = lease;
+        let _scope = control.as_ref().map(|control| control.enter());
+        let result = (|| {
+            codesage_protocol::work::checkpoint()?;
+            let result = work()?;
+            codesage_protocol::work::checkpoint()?;
+            Ok(result)
+        })();
+        let _ = tx.send(result);
     });
 
-    match rx.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            anyhow::bail!(
-                "timed out after {}s {action} from HuggingFace; \
-                 set {HF_DOWNLOAD_TIMEOUT_ENV} to adjust the limit",
-                timeout.as_secs()
-            )
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            anyhow::bail!("HuggingFace worker exited before {action}")
+    loop {
+        codesage_protocol::work::checkpoint()?;
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let wait = if controlled {
+            remaining.min(Duration::from_millis(25))
+        } else {
+            remaining
+        };
+        match rx.recv_timeout(wait) {
+            Ok(result) => {
+                codesage_protocol::work::checkpoint()?;
+                return result;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) if started.elapsed() < timeout => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                anyhow::bail!(
+                    "timed out after {}s {action} from HuggingFace; \
+                     set {HF_DOWNLOAD_TIMEOUT_ENV} to adjust the limit",
+                    timeout.as_secs()
+                )
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("HuggingFace worker exited before {action}")
+            }
         }
     }
 }
@@ -1726,6 +1752,45 @@ fn detect_dim(session: &Session) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hf_cancelled_caller_retains_nested_worker_lease() {
+        use codesage_protocol::work::{StopReason, WorkControl, WorkStopped};
+        use std::sync::{Arc, mpsc};
+        use std::time::{Duration, Instant};
+
+        let control = WorkControl::new(None);
+        let lease: Arc<dyn Send + Sync> = Arc::new(());
+        let weak_lease = Arc::downgrade(&lease);
+        control.set_work_lease(weak_lease.clone());
+        let caller_control = control.clone();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let caller = std::thread::spawn(move || {
+            let _lease = lease;
+            let _scope = caller_control.enter();
+            super::hf_with_deadline("controlled test worker", move || {
+                assert!(codesage_protocol::work::current().is_some());
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        control.cancel(StopReason::ClientCancelled);
+        let error = caller.join().unwrap().unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<WorkStopped>().unwrap().reason,
+            StopReason::ClientCancelled
+        );
+        assert!(weak_lease.upgrade().is_some());
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while weak_lease.upgrade().is_some() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(weak_lease.upgrade().is_none());
+    }
+
     use super::*;
     use std::cell::Cell;
     use std::fs;

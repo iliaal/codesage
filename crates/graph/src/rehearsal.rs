@@ -46,6 +46,7 @@ pub fn build_review_rehearsal(
     db: &Database,
     files: &[String],
 ) -> Result<ReviewRehearsal> {
+    codesage_protocol::work::checkpoint()?;
     if files.is_empty() {
         return Ok(ReviewRehearsal {
             files: Vec::new(),
@@ -91,7 +92,9 @@ pub fn build_review_rehearsal(
             seen.insert(a.file.as_str());
         }
         for cluster in &risk.clustered_directories {
+            codesage_protocol::work::checkpoint()?;
             for omitted in &cluster.omitted_files {
+                codesage_protocol::work::checkpoint()?;
                 if !seen.insert(omitted.as_str()) {
                     continue;
                 }
@@ -269,6 +272,7 @@ pub fn build_review_rehearsal(
 
     // Query every input directly so clustering cannot omit boundary evidence.
     for f in files {
+        codesage_protocol::work::checkpoint()?;
         let tb = db
             .trust_boundaries_for_file_path(f)
             .with_context(|| format!("loading trust boundaries for rehearsal({f})"))?;
@@ -299,12 +303,14 @@ pub fn build_review_rehearsal(
             orphan_files.push(f.clone());
         }
         for feat in &feats {
+            codesage_protocol::work::checkpoint()?;
             area_files
                 .entry(entry_area(&feat.entry_path))
                 .or_default()
                 .insert(f.clone());
         }
         for feat in feats {
+            codesage_protocol::work::checkpoint()?;
             let core_change = feat.files.iter().any(|r| {
                 r.path == *f && matches!(r.role, FeatureFileRole::Entry | FeatureFileRole::Owned)
             });

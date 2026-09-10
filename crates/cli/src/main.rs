@@ -559,6 +559,14 @@ enum DaemonAction {
     Run,
     /// Print the running daemon's pid + socket, or "not running"
     Status,
+    /// Print bounded request and execution diagnostics from the running daemon
+    Stats {
+        #[arg(long)]
+        json: bool,
+        /// Maximum recent request and execution records (0-256)
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(0..=256))]
+        recent: u16,
+    },
     /// Send SIGTERM to the running daemon and wait for it to exit
     Stop,
 }
@@ -1078,6 +1086,9 @@ fn run(cli: Cli) -> Result<()> {
         } => match action.unwrap_or(DaemonAction::Run) {
             DaemonAction::Run => runtime::cmd_daemon(runtime_dir),
             DaemonAction::Status => runtime::cmd_daemon_status(runtime_dir),
+            DaemonAction::Stats { json, recent } => {
+                runtime::cmd_daemon_stats(runtime_dir, json, usize::from(recent))
+            }
             DaemonAction::Stop => runtime::cmd_daemon_stop(runtime_dir),
         },
         Commands::InstallHooks { with_leak_check } => hooks::cmd_install_hooks(with_leak_check),

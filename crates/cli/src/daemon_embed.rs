@@ -7,8 +7,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use codesage_graph::TextEmbedder;
 use rmcp::ServiceExt;
-use rmcp::model::CallToolRequestParams;
-use rmcp::service::{RoleClient, RunningService};
+use rmcp::model::{CallToolRequestParams, ClientRequest, ServerResult};
+use rmcp::service::{PeerRequestOptions, RoleClient, RunningService};
 
 use crate::mcp::params::EmbedTextsResult;
 use crate::mcp::{
@@ -201,11 +201,32 @@ impl DaemonEmbedder {
         );
         let params = CallToolRequestParams::new("embed_texts").with_arguments(arguments);
         let result = self.rt.block_on(async {
-            tokio::time::timeout(timeout, self.client.call_tool(params))
+            let delivery_grace = Duration::from_millis(100).min(timeout / 10);
+            let operation = async {
+                let request = self
+                .client
+                .send_cancellable_request(
+                    ClientRequest::CallToolRequest(rmcp::model::Request::new(params)),
+                    PeerRequestOptions::with_timeout(timeout.saturating_sub(delivery_grace)),
+                )
                 .await
-                .map_err(|_| anyhow::anyhow!("daemon embed_texts timed out after {timeout:?}"))?
-                .map_err(|e| anyhow::anyhow!("daemon embed_texts failed: {e}"))
+                .context("sending daemon embed_texts")?;
+                request
+                .await_response()
+                .await
+                .context("daemon embed_texts failed")
+            };
+            match tokio::time::timeout(timeout, operation).await {
+                Ok(result) => result,
+                Err(_) => {
+                    self.client.cancellation_token().cancel();
+                    bail!("daemon embed_texts timeout after {timeout:?}; transport did not complete cancellation");
+                }
+            }
         })?;
+        let ServerResult::CallToolResult(result) = result else {
+            bail!("daemon embed_texts returned an unexpected response");
+        };
         if result.is_error == Some(true) {
             let text = result
                 .content
@@ -400,6 +421,7 @@ pub(crate) mod tests {
         pub(crate) fingerprint_after_probe: Option<String>,
         /// Texts embedded so far, across every accepted non-empty request.
         pub(crate) embedded: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        pub(crate) cancelled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     }
 
     impl FakeDaemon {
@@ -412,6 +434,7 @@ pub(crate) mod tests {
                 fingerprint_after_probe: None,
                 fail_next: Default::default(),
                 embedded: Default::default(),
+                cancelled: None,
             }
         }
     }
@@ -442,7 +465,7 @@ pub(crate) mod tests {
         async fn call_tool(
             &self,
             request: CallToolRequestParams,
-            _context: RequestContext<RoleServer>,
+            context: RequestContext<RoleServer>,
         ) -> Result<CallToolResponse, ErrorData> {
             assert_eq!(request.name, "embed_texts");
             let args = request.arguments.unwrap_or_default();
@@ -455,6 +478,13 @@ pub(crate) mod tests {
                 .into());
             }
             let texts: Vec<String> = serde_json::from_value(args["texts"].clone()).unwrap();
+            if !texts.is_empty()
+                && let Some(cancelled) = &self.cancelled
+            {
+                context.ct.cancelled().await;
+                cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Ok(CallToolResult::error(vec![ContentBlock::text("cancelled")]).into());
+            }
             if !texts.is_empty()
                 && self
                     .fail_next
@@ -537,6 +567,89 @@ pub(crate) mod tests {
             });
         });
         (dir, socket, handle)
+    }
+
+    #[test]
+    fn embedding_timeout_notifies_daemon_while_connection_stays_open() {
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let daemon = FakeDaemon {
+            cancelled: Some(cancelled.clone()),
+            ..FakeDaemon::new(4, "m")
+        };
+        let (_dir, socket, handle) = spawn_fake(daemon);
+        let client = DaemonEmbedder::connect_to(&socket, "/p", "m").unwrap();
+        let error = client
+            .call(&["wait for cancellation"], Duration::from_millis(50))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("timeout"), "{error:#}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !cancelled.load(std::sync::atomic::Ordering::SeqCst)
+            && std::time::Instant::now() < deadline
+        {
+            client
+                .rt
+                .block_on(async { tokio::time::sleep(Duration::from_millis(10)).await });
+        }
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(client.call(&[], Duration::from_secs(1)).is_ok());
+        drop(client);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn embedding_timeout_bounds_a_peer_that_stops_reading() {
+        use std::io::{BufRead, BufReader, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("non-reading.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let (release, wait) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let result = match request["method"].as_str() {
+                    Some("initialize") => json!({
+                        "protocolVersion": request["params"]["protocolVersion"],
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "non-reading", "version": "1"}
+                    }),
+                    Some("tools/call") => json!({
+                        "content": [],
+                        "structuredContent": {"model": "m", "dim": 4,
+                            "fingerprint": fp_a().as_str(), "embeddings": []}
+                    }),
+                    _ => continue,
+                };
+                writeln!(
+                    stream,
+                    "{}",
+                    json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+                )
+                .unwrap();
+                if request["method"] == "tools/call" {
+                    wait.recv_timeout(Duration::from_secs(3)).unwrap();
+                    break;
+                }
+            }
+        });
+        let client = DaemonEmbedder::connect_to(&socket, "/p", "m").unwrap();
+        let large_text = "x".repeat(2 * 1024 * 1024);
+        let started = std::time::Instant::now();
+        let result = client.call(&[&large_text], Duration::from_millis(100));
+        let elapsed = started.elapsed();
+        release.send(()).unwrap();
+        drop(client);
+        server.join().unwrap();
+        let error = result.unwrap_err();
+        assert!(format!("{error:#}").contains("timeout"), "{error:#}");
+        assert!(elapsed < Duration::from_secs(1), "blocked for {elapsed:?}");
     }
 
     #[test]

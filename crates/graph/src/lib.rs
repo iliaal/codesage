@@ -31,7 +31,7 @@ pub use git_history::{
 pub use impact::{impact_analysis, impact_analysis_report};
 pub use index::{full_index, incremental_index, index_files, remove_files};
 pub use lookups::{find_references, find_symbol, list_dependencies, list_dependencies_batch};
-pub use overview::build_project_overview;
+pub use overview::{build_project_overview, build_project_overview_with_top_risk};
 pub use rehearsal::{build_branch_only_rehearsal, build_review_rehearsal};
 pub use search::{RerankFn, search, search_page};
 pub use semantic::{
@@ -40,6 +40,10 @@ pub use semantic::{
     resolve_semantic_fingerprint_for_artifacts, semantic_full_index, semantic_incremental_index,
     semantic_index_files, semantic_remove_files, semantic_table_state, summarize_paths,
 };
-pub use session::{session_end, session_start, top_risk_files};
+pub use session::{
+    CompleteRiskRanking, IncompleteRiskRanking, build_session_snapshot_with_top_risk,
+    persist_session_snapshot, session_end, session_start, top_risk_files, top_risk_ranking,
+    top_risk_ranking_with_policy,
+};
 pub use similar::find_similar;
 pub use trace_locate::from_trace;

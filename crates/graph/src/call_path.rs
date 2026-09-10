@@ -33,6 +33,7 @@ fn key_of(s: &Symbol) -> SymbolKey {
 
 /// Breadth-first over callee edges, so the first path found is a shortest one.
 pub fn trace_call_path(db: &Database, req: &CallPathRequest) -> Result<CallPathReport> {
+    codesage_protocol::work::checkpoint()?;
     let origins = db.find_symbols(&req.from, None)?;
     if origins.is_empty() {
         return Ok(unfound(format!("symbol '{}' not found", req.from), false));
@@ -51,6 +52,7 @@ pub fn trace_call_path(db: &Database, req: &CallPathRequest) -> Result<CallPathR
     let mut origin_keys: HashSet<SymbolKey> = HashSet::new();
 
     for o in &origins {
+        codesage_protocol::work::checkpoint()?;
         let k = key_of(o);
         origin_keys.insert(k.clone());
         if target_keys.contains(&k) {
@@ -70,6 +72,7 @@ pub fn trace_call_path(db: &Database, req: &CallPathRequest) -> Result<CallPathR
 
     let mut hit_bound = false;
     while let Some((sym, depth)) = queue.pop_front() {
+        codesage_protocol::work::checkpoint()?;
         if depth >= req.max_depth {
             hit_bound = true;
             continue;
@@ -79,6 +82,7 @@ pub fn trace_call_path(db: &Database, req: &CallPathRequest) -> Result<CallPathR
             break;
         }
         for callee in callees_of(db, &sym)? {
+            codesage_protocol::work::checkpoint()?;
             let (def, call_line) = callee;
             let k = key_of(&def);
             if target_keys.contains(&k) {
@@ -130,6 +134,7 @@ fn callees_of(db: &Database, sym: &Symbol) -> Result<Vec<(Symbol, u32)>> {
     let mut cache: HashMap<(String, String), Vec<Symbol>> = HashMap::new();
     let mut examined = 0usize;
     for r in refs {
+        codesage_protocol::work::checkpoint()?;
         if !is_call_edge(r.kind) {
             continue;
         }
@@ -154,6 +159,7 @@ fn callees_of(db: &Database, sym: &Symbol) -> Result<Vec<(Symbol, u32)>> {
             cache.insert(cache_key.clone(), resolved);
         }
         for def in &cache[&cache_key] {
+            codesage_protocol::work::checkpoint()?;
             if def.file_path == sym.file_path
                 && def.qualified_name == sym.qualified_name
                 && def.line_start == sym.line_start
