@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Changed
+
+- Hugging Face artifact downloads use ureq with rustls instead of reqwest.
+
 ## [0.29.0] - 2026-09-10
 
 ### Added
