@@ -43,7 +43,7 @@ regex = "1"
 clap = { version = "4", features = ["derive"] }
 
 rmcp = { version = "3.1", features = ["server", "client", "transport-io", "macros"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["macros", "net", "io-util", "io-std", "rt-multi-thread", "signal", "sync", "time"] }
 schemars = "1.2"
 
 rayon = "1.12"
@@ -60,4 +60,4 @@ tree-sitter-typescript = "0.23"
 tree-sitter-go = "0.25"
 
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
-hf-hub = "0.5"
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }

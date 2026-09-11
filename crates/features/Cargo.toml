@@ -13,7 +13,6 @@ globset.workspace = true
 ignore.workspace = true
 regex.workspace = true
 tracing.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 tree-sitter.workspace = true
 tree-sitter-c.workspace = true

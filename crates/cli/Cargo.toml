@@ -32,7 +32,7 @@ parking_lot.workspace = true
 rusqlite.workspace = true
 rmcp.workspace = true
 tokio.workspace = true
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", default-features = false }
 schemars.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

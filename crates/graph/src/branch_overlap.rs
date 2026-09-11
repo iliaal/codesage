@@ -292,10 +292,12 @@ fn run_git(mut command: Command, operation: &str, deadline: Instant) -> Result<V
     })();
     if result.is_err() && !reaped {
         #[cfg(unix)]
-        let _ = rustix::process::kill_process_group(
-            rustix::process::Pid::from_child(&child),
-            rustix::process::Signal::KILL,
-        );
+        // SAFETY: `process_group(0)` above puts this child in its own group
+        // whose pgid equals `child.id()`. The `Child` is still owned here
+        // (not yet waited). `killpg` of that pgid also stops lazy-fetch
+        // helpers that inherited the group; a race where the group is already
+        // gone returns ESRCH, which we ignore.
+        let _ = unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
         let _ = child.kill();
     }
     let _ = child.wait();
