@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.30.0] - 2026-09-12
+
 ### Changed
 
 - `codesage index` refreshes unchanged files after parser, extraction, or trust-boundary rule upgrades; `codesage status` reports stored interpretation versions.
@@ -968,5 +970,7 @@ Initial public release.
 
 [0.28.0]: https://github.com/iliaal/codesage/releases/tag/v0.28.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.29.0...HEAD
 [0.29.0]: https://github.com/iliaal/codesage/releases/tag/v0.29.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.30.0...HEAD
+[0.30.0]: https://github.com/iliaal/codesage/releases/tag/v0.30.0
