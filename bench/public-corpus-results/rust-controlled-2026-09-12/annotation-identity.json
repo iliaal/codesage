@@ -1,0 +1,26 @@
+{
+  "tokio": {
+    "sha256": {
+      "d899d610039d6e84de0bb2f236c5e8d75c5c5049": "0ffec1f71b133f6695d80c877c3d6edd21d0f2e0e3a4a3d84660b87d30b10301",
+      "a772a37d558c11bffbd99b18141705df3f2982be": "0ffec1f71b133f6695d80c877c3d6edd21d0f2e0e3a4a3d84660b87d30b10301"
+    },
+    "byte_identical": true,
+    "query_count": 20
+  },
+  "serde": {
+    "sha256": {
+      "d899d610039d6e84de0bb2f236c5e8d75c5c5049": "f9bd5a3704ed60992157b188d0e80ed347d4b29036cb254c2ed881819c7047f7",
+      "a772a37d558c11bffbd99b18141705df3f2982be": "f9bd5a3704ed60992157b188d0e80ed347d4b29036cb254c2ed881819c7047f7"
+    },
+    "byte_identical": true,
+    "query_count": 20
+  },
+  "axum": {
+    "sha256": {
+      "d899d610039d6e84de0bb2f236c5e8d75c5c5049": "5371e0e7dc6fb02c261022c2f766c210647433c0e7a0ec64c3093b22e6da3f0a",
+      "a772a37d558c11bffbd99b18141705df3f2982be": "5371e0e7dc6fb02c261022c2f766c210647433c0e7a0ec64c3093b22e6da3f0a"
+    },
+    "byte_identical": true,
+    "query_count": 20
+  }
+}

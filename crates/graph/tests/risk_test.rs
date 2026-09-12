@@ -2203,6 +2203,8 @@ fn author_concentration_is_reported_when_head_predates_the_wall_clock_window() {
 fn find_coupling_low_commit_note_adds_the_window_on_a_pinned_checkout() {
     let (_dir, db) = setup_project();
     let pinned = unix_now() - PINNED_AGE_DAYS * DAY;
+    db.set_git_index_state_with_anchor("fixture-head", Some(("HEAD", pinned)))
+        .unwrap();
     db.upsert_git_file("cold.rs", 0.1, 0, 1, Some(pinned))
         .unwrap();
 
@@ -2270,7 +2272,10 @@ fn seed_index_newest_commit(db: &Database, observed_at: i64) {
 #[test]
 fn unscored_note_names_the_window_on_a_pinned_checkout() {
     let (_dir, db) = setup_project();
-    seed_index_newest_commit(&db, unix_now() - PINNED_AGE_DAYS * DAY);
+    let pinned = unix_now() - PINNED_AGE_DAYS * DAY;
+    db.set_git_index_state_with_anchor("fixture-head", Some(("HEAD", pinned)))
+        .unwrap();
+    seed_index_newest_commit(&db, pinned);
 
     let r = assess_risk(&db, "Repository.php").unwrap();
     assert!(

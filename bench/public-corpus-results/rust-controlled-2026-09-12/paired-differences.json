@@ -1,0 +1,721 @@
+[
+  {
+    "repo": "tokio",
+    "query": "how the async mutex prevents concurrent access",
+    "score_018": 1.0,
+    "score_028": 1.0,
+    "delta": 0.0,
+    "paths_018": [
+      "sync/mutex.rs",
+      "sync/barrier.rs",
+      "sync/mod.rs",
+      "io/async_fd.rs",
+      "fs/file.rs",
+      "sync/rwlock.rs",
+      "sync/once_cell.rs",
+      "sync/semaphore.rs"
+    ],
+    "paths_028": [
+      "sync/mutex.rs",
+      "sync/mod.rs",
+      "sync/barrier.rs",
+      "io/async_fd.rs",
+      "fs/file.rs",
+      "sync/rwlock.rs",
+      "sync/once_cell.rs",
+      "sync/semaphore.rs"
+    ]
+  },
+  {
+    "repo": "tokio",
+    "query": "how the timer wheel tracks sleep deadlines",
+    "score_018": 0.46845052016107697,
+    "score_028": 0.46845052016107697,
+    "delta": 0.0,
+    "paths_018": [
+      "runtime/time/mod.rs",
+      "runtime/time/wheel/mod.rs",
+      "runtime/time_alt/wheel/mod.rs",
+      "runtime/time/wheel/level.rs",
+      "runtime/time_alt/timer.rs",
+      "runtime/time/entry.rs",
+      "time/sleep.rs",
+      "runtime/time_alt/wheel/level.rs",
+      "runtime/scheduler/util/time_alt.rs",
+      "runtime/mod.rs"
+    ],
+    "paths_028": [
+      "runtime/time/mod.rs",
+      "runtime/time/wheel/mod.rs",
+      "runtime/time_alt/wheel/mod.rs",
+      "runtime/time/wheel/level.rs",
+      "runtime/time_alt/timer.rs",
+      "runtime/time/entry.rs",
+      "time/sleep.rs",
+      "runtime/time_alt/wheel/level.rs",
+      "runtime/mod.rs",
+      "runtime/scheduler/util/time_alt.rs"
+    ]
+  },
+  {
+    "repo": "tokio",
+    "query": "running non-async blocking code inside the async runtime",
+    "score_018": 0.0,
+    "score_028": 0.0,
+    "delta": 0.0,
+    "paths_018": [
+      "task/mod.rs",
+      "task/local.rs",
+      "sync/mpsc/bounded.rs",
+      "runtime/handle.rs",
+      "lib.rs",
+      "runtime/runtime.rs",
+      "runtime/local_runtime/runtime.rs",
+      "io/async_fd.rs",
+      "future/block_on.rs",
+      "runtime/blocking/shutdown.rs"
+    ],
+    "paths_028": [
+      "task/mod.rs",
+      "task/local.rs",
+      "sync/mpsc/bounded.rs",
+      "runtime/handle.rs",
+      "lib.rs",
+      "runtime/runtime.rs",
+      "runtime/local_runtime/runtime.rs",
+      "runtime/blocking/shutdown.rs",
+      "io/async_fd.rs",
+      "future/block_on.rs"
+    ]
+  },
+  {
+    "repo": "tokio",
+    "query": "how tasks that are not Send can run on a single thread",
+    "score_018": 1.0,
+    "score_028": 1.0,
+    "delta": 0.0,
+    "paths_018": [
+      "task/local.rs",
+      "runtime/task/mod.rs",
+      "runtime/scheduler/multi_thread/worker.rs",
+      "runtime/task/list.rs",
+      "lib.rs",
+      "task/mod.rs",
+      "runtime/metrics/runtime.rs",
+      "runtime/blocking/pool.rs",
+      "task/spawn.rs",
+      "runtime/scheduler/multi_thread/worker/taskdump.rs"
+    ],
+    "paths_028": [
+      "task/local.rs",
+      "runtime/task/mod.rs",
+      "runtime/scheduler/multi_thread/worker.rs",
+      "runtime/task/list.rs",
+      "lib.rs",
+      "task/mod.rs",
+      "runtime/metrics/runtime.rs",
+      "runtime/blocking/pool.rs",
+      "sync/semaphore.rs",
+      "task/spawn.rs"
+    ]
+  },
+  {
+    "repo": "tokio",
+    "query": "how the runtime builder configures thread pool size and flavour",
+    "score_018": 1.0,
+    "score_028": 1.0,
+    "delta": 0.0,
+    "paths_018": [
+      "runtime/builder.rs",
+      "runtime/runtime.rs",
+      "runtime/blocking/pool.rs",
+      "runtime/metrics/runtime.rs",
+      "runtime/blocking/mod.rs",
+      "task/builder.rs",
+      "runtime/scheduler/current_thread/mod.rs",
+      "runtime/mod.rs",
+      "runtime/scheduler/multi_thread/handle.rs",
+      "runtime/scheduler/multi_thread/mod.rs"
+    ],
+    "paths_028": [
+      "runtime/builder.rs",
+      "runtime/blocking/pool.rs",
+      "runtime/runtime.rs",
+      "runtime/metrics/runtime.rs",
+      "task/builder.rs",
+      "runtime/blocking/mod.rs",
+      "runtime/scheduler/current_thread/mod.rs",
+      "runtime/mod.rs",
+      "runtime/scheduler/multi_thread/handle.rs",
+      "runtime/scheduler/multi_thread/mod.rs"
+    ]
+  },
+  {
+    "repo": "tokio",
+    "query": "rate-limiting concurrent operations with a semaphore",
+    "score_018": 0.6309297535714575,
+    "score_028": 0.6309297535714575,
+    "delta": 0.0,
+    "paths_018": [
+      "sync/mod.rs",
+      "sync/semaphore.rs",
+      "sync/mpsc/chan.rs",
+      "sync/batch_semaphore.rs",
+      "sync/mpsc/bounded.rs",
+      "runtime/blocking/sharded_queue.rs",
+      "sync/mutex.rs",
+      "sync/rwlock.rs"
+    ],
+    "paths_028": [
+      "sync/mod.rs",
+      "sync/semaphore.rs",
+      "sync/mpsc/chan.rs",
+      "sync/batch_semaphore.rs",
+      "sync/mpsc/bounded.rs",
+      "runtime/blocking/sharded_queue.rs",
+      "sync/mpsc/unbounded.rs",
+      "sync/mutex.rs"
+    ]
+  },
+  {
+    "repo": "tokio",
+    "query": "Notify",
+    "score_018": 1.0,
+    "score_028": 1.0,
+    "delta": 0.0,
+    "paths_018": [
+      "sync/notify.rs",
+      "sync/watch.rs",
+      "runtime/scheduler/multi_thread/worker.rs",
+      "signal/registry.rs",
+      "runtime/io/scheduled_io.rs",
+      "sync/oneshot.rs",
+      "runtime/task/state.rs",
+      "signal/windows.rs",
+      "runtime/signal/mod.rs",
+      "sync/set_once.rs"
+    ],
+    "paths_028": [
+      "sync/notify.rs",
+      "sync/watch.rs",
+      "runtime/scheduler/multi_thread/worker.rs",
+      "signal/registry.rs",
+      "runtime/io/scheduled_io.rs",
+      "sync/set_once.rs",
+      "runtime/task/state.rs",
+      "signal/windows.rs",
+      "runtime/signal/mod.rs",
+      "sync/oneshot.rs"
+    ]
+  },
+  {
+    "repo": "tokio",
+    "query": "async file I/O operations",
+    "score_018": 0.5802792108518124,
+    "score_028": 0.5912352048230277,
+    "delta": 0.010955993971215272,
+    "paths_018": [
+      "io/async_fd.rs",
+      "fs/file.rs",
+      "fs/read_to_string.rs",
+      "io/mod.rs",
+      "sync/mod.rs",
+      "io/util/async_read_ext.rs",
+      "process/windows.rs",
+      "fs/mod.rs",
+      "io/util/empty.rs",
+      "fs/read.rs"
+    ],
+    "paths_028": [
+      "io/async_fd.rs",
+      "fs/file.rs",
+      "fs/read_to_string.rs",
+      "io/mod.rs",
+      "sync/mod.rs",
+      "io/util/async_read_ext.rs",
+      "fs/mod.rs",
+      "process/windows.rs",
+      "io/util/empty.rs",
+      "fs/read.rs"
+    ]
+  },
+  {
+    "repo": "serde",
+    "query": "Deserialize and Deserializer trait definitions",
+    "score_018": 1.0,
+    "score_028": 1.0,
+    "delta": 0.0,
+    "paths_018": [
+      "serde_core/src/de/mod.rs",
+      "serde_core/src/de/value.rs",
+      "serde_core/src/macros.rs",
+      "serde/src/private/de.rs",
+      "serde_derive/src/internals/attr.rs",
+      "serde_derive/src/de/identifier.rs",
+      "serde_derive/src/de.rs",
+      "serde_core/src/de/impls.rs",
+      "serde_core/src/private/content.rs",
+      "serde_derive/src/lib.rs"
+    ],
+    "paths_028": [
+      "serde_core/src/de/mod.rs",
+      "serde_core/src/de/value.rs",
+      "serde_core/src/macros.rs",
+      "serde_derive/src/internals/attr.rs",
+      "serde_derive/src/de/identifier.rs",
+      "serde_derive/src/de.rs",
+      "serde/src/private/de.rs",
+      "serde_core/src/de/impls.rs",
+      "serde_core/src/private/content.rs",
+      "serde_derive/src/lib.rs"
+    ]
+  },
+  {
+    "repo": "serde",
+    "query": "how derive macros generate Deserialize code for structs and enums",
+    "score_018": 0.0,
+    "score_028": 0.0,
+    "delta": 0.0,
+    "paths_018": [
+      "serde_derive/src/de/identifier.rs",
+      "serde_derive/src/lib.rs",
+      "serde_derive/src/de/enum_.rs",
+      "serde_core/src/de/impls.rs",
+      "serde_derive/src/internals/attr.rs",
+      "serde/src/private/de.rs",
+      "serde_core/src/private/content.rs",
+      "serde_core/src/de/mod.rs",
+      "serde_core/src/macros.rs",
+      "serde_derive/src/de/enum_untagged.rs"
+    ],
+    "paths_028": [
+      "serde_derive/src/de/identifier.rs",
+      "serde_derive/src/lib.rs",
+      "serde_derive/src/de/enum_.rs",
+      "serde_core/src/de/impls.rs",
+      "serde_derive/src/internals/attr.rs",
+      "serde/src/private/de.rs",
+      "serde_core/src/de/mod.rs",
+      "serde_core/src/macros.rs",
+      "serde_core/src/private/content.rs",
+      "serde_derive/src/de/enum_untagged.rs"
+    ]
+  },
+  {
+    "repo": "serde",
+    "query": "serde_derive Container Variant and Field AST types for Rust struct and enum introspection",
+    "score_018": 0.6309297535714575,
+    "score_028": 0.6309297535714575,
+    "delta": 0.0,
+    "paths_018": [
+      "serde_derive/src/de/identifier.rs",
+      "serde_derive/src/internals/ast.rs",
+      "serde_derive/src/pretend.rs",
+      "serde_derive/src/ser.rs",
+      "serde_derive/src/internals/attr.rs",
+      "serde_derive/src/de/enum_adjacently.rs",
+      "serde_core/src/de/mod.rs",
+      "serde/src/private/de.rs",
+      "serde_derive/src/de/enum_untagged.rs",
+      "serde/src/private/ser.rs"
+    ],
+    "paths_028": [
+      "serde_derive/src/de/identifier.rs",
+      "serde_derive/src/internals/ast.rs",
+      "serde_derive/src/pretend.rs",
+      "serde_derive/src/ser.rs",
+      "serde_derive/src/de/enum_untagged.rs",
+      "serde_derive/src/internals/attr.rs",
+      "serde_core/src/de/mod.rs",
+      "serde/src/private/de.rs",
+      "serde_derive/src/de/enum_externally.rs",
+      "serde/src/private/ser.rs"
+    ]
+  },
+  {
+    "repo": "serde",
+    "query": "Deserialize",
+    "score_018": 1.0,
+    "score_028": 1.0,
+    "delta": 0.0,
+    "paths_018": [
+      "serde_core/src/de/mod.rs",
+      "serde_core/src/de/ignored_any.rs",
+      "serde/src/private/de.rs",
+      "serde_core/src/macros.rs",
+      "serde_derive/src/de/identifier.rs",
+      "serde_derive/src/de/struct_.rs",
+      "serde_core/src/de/impls.rs",
+      "serde_derive/src/de/enum_adjacently.rs",
+      "serde_core/src/de/value.rs"
+    ],
+    "paths_028": [
+      "serde_core/src/de/mod.rs",
+      "serde_core/src/de/ignored_any.rs",
+      "serde/src/private/de.rs",
+      "serde_derive/src/de/identifier.rs",
+      "serde_core/src/macros.rs",
+      "serde_derive/src/de/struct_.rs",
+      "serde_core/src/de/impls.rs",
+      "serde_derive/src/de/enum_adjacently.rs",
+      "serde_core/src/de/value.rs"
+    ]
+  },
+  {
+    "repo": "serde",
+    "query": "Visitor",
+    "score_018": 1.0,
+    "score_028": 1.0,
+    "delta": 0.0,
+    "paths_018": [
+      "serde_core/src/de/mod.rs",
+      "serde/src/private/de.rs",
+      "serde_derive/src/de/tuple.rs",
+      "serde_derive/src/ser.rs",
+      "serde_derive/src/bound.rs",
+      "serde_core/src/de/impls.rs",
+      "serde_derive/src/internals/receiver.rs",
+      "serde_derive/src/de/enum_adjacently.rs"
+    ],
+    "paths_028": [
+      "serde_core/src/de/mod.rs",
+      "serde/src/private/de.rs",
+      "serde_derive/src/de/tuple.rs",
+      "serde_derive/src/bound.rs",
+      "serde_derive/src/ser.rs",
+      "serde_core/src/de/impls.rs",
+      "serde_derive/src/internals/receiver.rs",
+      "serde_derive/src/de/enum_adjacently.rs"
+    ]
+  },
+  {
+    "repo": "axum",
+    "query": "how axum Handler trait dispatches requests to async handler functions",
+    "score_018": 1.0,
+    "score_028": 1.0,
+    "delta": 0.0,
+    "paths_018": [
+      "handler/mod.rs",
+      "middleware/map_request.rs",
+      "middleware/map_response.rs",
+      "lib.rs",
+      "routing/method_routing.rs",
+      "handler/service.rs",
+      "extract/ws.rs",
+      "serve/mod.rs",
+      "extract/connect_info.rs",
+      "middleware/from_fn.rs"
+    ],
+    "paths_028": [
+      "handler/mod.rs",
+      "middleware/map_request.rs",
+      "middleware/map_response.rs",
+      "routing/method_routing.rs",
+      "handler/service.rs",
+      "lib.rs",
+      "extract/ws.rs",
+      "serve/mod.rs",
+      "extract/connect_info.rs",
+      "middleware/from_fn.rs"
+    ]
+  },
+  {
+    "repo": "axum",
+    "query": "Path extractor for capturing URL path parameters",
+    "score_018": 1.0,
+    "score_028": 1.0,
+    "delta": 0.0,
+    "paths_018": [
+      "extract/path/mod.rs",
+      "extract/original_uri.rs",
+      "extract/matched_path.rs",
+      "routing/path_router.rs",
+      "routing/strip_prefix.rs",
+      "extract/nested_path.rs",
+      "extract/path/de.rs",
+      "extract/mod.rs",
+      "routing/url_params.rs"
+    ],
+    "paths_028": [
+      "extract/path/mod.rs",
+      "extract/original_uri.rs",
+      "extract/matched_path.rs",
+      "routing/path_router.rs",
+      "routing/strip_prefix.rs",
+      "extract/nested_path.rs",
+      "extract/mod.rs",
+      "extract/path/de.rs"
+    ]
+  },
+  {
+    "repo": "axum",
+    "query": "Json extractor and response for deserializing and serializing JSON bodies",
+    "score_018": 1.0,
+    "score_028": 1.0,
+    "delta": 0.0,
+    "paths_018": [
+      "json.rs",
+      "lib.rs",
+      "extract/rejection.rs",
+      "test_helpers/test_client.rs",
+      "extract/path/mod.rs",
+      "form.rs",
+      "response/mod.rs",
+      "handler/mod.rs",
+      "middleware/mod.rs"
+    ],
+    "paths_028": [
+      "json.rs",
+      "lib.rs",
+      "extract/rejection.rs",
+      "test_helpers/test_client.rs",
+      "extract/path/mod.rs",
+      "form.rs",
+      "response/mod.rs",
+      "handler/mod.rs",
+      "middleware/from_extractor.rs"
+    ]
+  },
+  {
+    "repo": "axum",
+    "query": "from_fn middleware for wrapping handlers with async functions",
+    "score_018": 1.0,
+    "score_028": 1.0,
+    "delta": 0.0,
+    "paths_018": [
+      "middleware/from_fn.rs",
+      "middleware/map_request.rs",
+      "handler/mod.rs",
+      "lib.rs",
+      "handler/service.rs",
+      "extract/matched_path.rs",
+      "routing/method_routing.rs",
+      "middleware/map_response.rs",
+      "extract/connect_info.rs",
+      "routing/mod.rs"
+    ],
+    "paths_028": [
+      "middleware/from_fn.rs",
+      "middleware/map_request.rs",
+      "handler/mod.rs",
+      "lib.rs",
+      "handler/service.rs",
+      "routing/method_routing.rs",
+      "extract/matched_path.rs",
+      "middleware/map_response.rs",
+      "extract/connect_info.rs",
+      "routing/mod.rs"
+    ]
+  },
+  {
+    "repo": "axum",
+    "query": "error handling and how errors are converted to responses",
+    "score_018": 0.5,
+    "score_028": 0.5,
+    "delta": 0.0,
+    "paths_018": [
+      "handler/mod.rs",
+      "extract/path/mod.rs",
+      "error_handling/mod.rs",
+      "extract/multipart.rs",
+      "response/mod.rs",
+      "routing/not_found.rs",
+      "form.rs",
+      "response/redirect.rs",
+      "json.rs",
+      "middleware/map_request.rs"
+    ],
+    "paths_028": [
+      "handler/mod.rs",
+      "extract/path/mod.rs",
+      "error_handling/mod.rs",
+      "extract/multipart.rs",
+      "routing/not_found.rs",
+      "response/mod.rs",
+      "form.rs",
+      "response/redirect.rs",
+      "routing/method_routing.rs",
+      "json.rs"
+    ]
+  },
+  {
+    "repo": "axum",
+    "query": "Form extractor for parsing URL-encoded request bodies",
+    "score_018": 1.0,
+    "score_028": 1.0,
+    "delta": 0.0,
+    "paths_018": [
+      "form.rs",
+      "extract/raw_form.rs",
+      "extract/multipart.rs",
+      "extract/path/mod.rs",
+      "middleware/from_extractor.rs",
+      "lib.rs",
+      "extract/raw_query.rs",
+      "middleware/from_fn.rs",
+      "extract/rejection.rs"
+    ],
+    "paths_028": [
+      "form.rs",
+      "extract/raw_form.rs",
+      "extract/multipart.rs",
+      "extract/path/mod.rs",
+      "json.rs",
+      "middleware/from_extractor.rs",
+      "extract/raw_query.rs",
+      "middleware/from_fn.rs",
+      "lib.rs",
+      "extract/rejection.rs"
+    ]
+  },
+  {
+    "repo": "axum",
+    "query": "BoxedIntoRoute and type-erased route storage",
+    "score_018": 0.3562071871080222,
+    "score_028": 0.3562071871080222,
+    "delta": 0.0,
+    "paths_018": [
+      "boxed.rs",
+      "routing/method_routing.rs",
+      "routing/mod.rs",
+      "extract/path/mod.rs",
+      "extract/nested_path.rs",
+      "routing/route.rs",
+      "extract/matched_path.rs",
+      "lib.rs",
+      "extract/original_uri.rs"
+    ],
+    "paths_028": [
+      "boxed.rs",
+      "routing/method_routing.rs",
+      "routing/mod.rs",
+      "extract/path/mod.rs",
+      "extract/nested_path.rs",
+      "routing/route.rs",
+      "extract/matched_path.rs",
+      "lib.rs"
+    ]
+  },
+  {
+    "repo": "axum",
+    "query": "parsing uploaded binary file parts from HTTP requests",
+    "score_018": 1.0,
+    "score_028": 1.0,
+    "delta": 0.0,
+    "paths_018": [
+      "extract/multipart.rs",
+      "extract/raw_query.rs",
+      "extract/path/mod.rs",
+      "routing/method_filter.rs",
+      "form.rs",
+      "extract/state.rs",
+      "middleware/from_extractor.rs",
+      "response/sse.rs",
+      "json.rs",
+      "error_handling/mod.rs"
+    ],
+    "paths_028": [
+      "extract/multipart.rs",
+      "extract/raw_query.rs",
+      "extract/path/mod.rs",
+      "routing/method_filter.rs",
+      "form.rs",
+      "middleware/from_extractor.rs",
+      "extract/state.rs",
+      "response/sse.rs",
+      "extract/query.rs",
+      "body/mod.rs"
+    ]
+  },
+  {
+    "repo": "axum",
+    "query": "how axum maps Tower middleware layers onto the router",
+    "score_018": 0.0,
+    "score_028": 0.0,
+    "delta": 0.0,
+    "paths_018": [
+      "middleware/map_request.rs",
+      "middleware/map_response.rs",
+      "handler/mod.rs",
+      "lib.rs",
+      "extension.rs",
+      "routing/route.rs",
+      "extract/nested_path.rs",
+      "routing/path_router.rs",
+      "extract/connect_info.rs",
+      "extract/matched_path.rs"
+    ],
+    "paths_028": [
+      "middleware/map_request.rs",
+      "middleware/map_response.rs",
+      "handler/mod.rs",
+      "lib.rs",
+      "extension.rs",
+      "routing/route.rs",
+      "extract/nested_path.rs",
+      "routing/path_router.rs",
+      "extract/connect_info.rs",
+      "routing/method_routing.rs"
+    ]
+  },
+  {
+    "repo": "axum",
+    "query": "rejection types and rejection responses for failed extractions",
+    "score_018": 1.0,
+    "score_028": 1.0,
+    "delta": 0.0,
+    "paths_018": [
+      "extract/rejection.rs",
+      "extract/path/mod.rs",
+      "extract/multipart.rs",
+      "form.rs",
+      "json.rs",
+      "extract/ws.rs",
+      "extension.rs",
+      "extract/query.rs",
+      "response/mod.rs"
+    ],
+    "paths_028": [
+      "extract/rejection.rs",
+      "extract/multipart.rs",
+      "extract/path/mod.rs",
+      "form.rs",
+      "extension.rs",
+      "extract/ws.rs",
+      "json.rs",
+      "extract/query.rs",
+      "response/mod.rs"
+    ]
+  },
+  {
+    "repo": "axum",
+    "query": "Router",
+    "score_018": 1.0,
+    "score_028": 1.0,
+    "delta": 0.0,
+    "paths_018": [
+      "routing/mod.rs",
+      "extract/path/mod.rs",
+      "routing/path_router.rs",
+      "extract/state.rs",
+      "serve/mod.rs",
+      "service_ext.rs",
+      "extract/matched_path.rs",
+      "lib.rs",
+      "handler/mod.rs",
+      "routing/method_routing.rs"
+    ],
+    "paths_028": [
+      "routing/mod.rs",
+      "extract/path/mod.rs",
+      "extract/state.rs",
+      "routing/method_routing.rs",
+      "serve/mod.rs",
+      "service_ext.rs",
+      "extract/matched_path.rs",
+      "lib.rs",
+      "handler/mod.rs",
+      "routing/path_router.rs"
+    ]
+  }
+]

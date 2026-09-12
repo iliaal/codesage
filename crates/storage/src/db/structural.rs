@@ -1,5 +1,7 @@
 //! Files / symbols / refs / dependencies.
 
+use std::collections::HashMap;
+
 use anyhow::Result;
 use codesage_protocol::{
     DependencyEntry, FileInfo, Language, RationaleEntry, Reference, ReferenceKind, Symbol,
@@ -118,6 +120,42 @@ impl Database {
         set_index_state(&self.conn, "structural_index_state", sha)
     }
 
+    pub fn all_file_interpretations(&self) -> Result<HashMap<String, Option<String>>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, interpretation FROM files")?;
+        Ok(stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn file_interpretation_counts(&self) -> Result<Vec<(Option<String>, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT interpretation, COUNT(*) FROM files GROUP BY interpretation ORDER BY interpretation",
+        )?;
+        Ok(stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as usize)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn file_interpretation_matches(&self, path: &str, interpretation: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1 AND interpretation = ?2)",
+            params![path, interpretation],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Stamp only after all structural and derived rows have been written,
+    /// inside the same per-file transaction.
+    pub fn record_file_interpretation(&self, file_id: i64, interpretation: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE files SET interpretation = ?2 WHERE id = ?1",
+            params![file_id, interpretation],
+        )?;
+        Ok(())
+    }
+
     // Reuse prepared statements across the per-file indexing pass.
     pub fn upsert_file(&self, file: &FileInfo) -> Result<i64> {
         self.conn
@@ -127,7 +165,8 @@ impl Database {
                  ON CONFLICT(path) DO UPDATE SET
                    language = excluded.language,
                    content_hash = excluded.content_hash,
-                   indexed_at = excluded.indexed_at",
+                   indexed_at = excluded.indexed_at,
+                   interpretation = NULL",
             )?
             .execute(params![
                 file.path,
@@ -155,6 +194,10 @@ impl Database {
         self.conn
             .prepare_cached("UPDATE files SET boundaries_derived_at = 0 WHERE id = ?1")?
             .execute(params![file_id])?;
+        // Semantic headers depend on symbols, even when source bytes did not change.
+        self.conn
+            .prepare_cached("DELETE FROM semantic_files WHERE path = ?1")?
+            .execute(params![file.path])?;
 
         Ok(file_id)
     }

@@ -1,6 +1,7 @@
 //! Git history: git_files, git_co_changes, and git_index_state.
 
 use anyhow::Result;
+use rusqlite::OptionalExtension;
 
 use super::Database;
 
@@ -182,7 +183,58 @@ impl Database {
 
     /// Record the commit SHA we just indexed up to. indexed_at stamped with unixepoch().
     pub fn set_git_index_state(&self, sha: &str) -> Result<()> {
-        super::set_index_state(&self.conn, "git_index_state", sha)
+        self.set_git_index_state_with_anchor(sha, None)
+    }
+
+    pub fn git_history_anchor(&self) -> Result<Option<(String, i64)>> {
+        let migrated: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('git_index_state') WHERE name = 'anchor_source')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !migrated {
+            return Ok(None);
+        }
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT anchor_source, anchor_epoch FROM git_index_state
+             WHERE id = 1 AND anchor_source IS NOT NULL AND anchor_epoch IS NOT NULL",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn set_git_index_state_with_anchor(
+        &self,
+        sha: &str,
+        anchor: Option<(&str, i64)>,
+    ) -> Result<()> {
+        self.conn.execute_batch("SAVEPOINT git_history_anchor")?;
+        let result = (|| -> Result<()> {
+            super::set_index_state(&self.conn, "git_index_state", sha)?;
+            // State writes from older binaries invalidate provenance through the trigger.
+            self.conn.execute(
+                "UPDATE git_index_state SET anchor_source = ?1, anchor_epoch = ?2 WHERE id = 1",
+                rusqlite::params![
+                    anchor.map(|(source, _)| source),
+                    anchor.map(|(_, epoch)| epoch)
+                ],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("RELEASE git_history_anchor")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK TO git_history_anchor");
+                let _ = self.conn.execute_batch("RELEASE git_history_anchor");
+                Err(error)
+            }
+        }
     }
 
     /// Age churn and co-change weights atomically before incremental deltas.
@@ -619,6 +671,95 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::{CoChangeWrite, Database, RECURRING_SPAN_SECS};
+
+    #[test]
+    fn rejected_anchor_write_rolls_back_the_state_update_and_invalidation() {
+        let db = Database::open_in_memory().unwrap();
+        db.set_git_index_state_with_anchor("baseline", Some(("HEAD", 1_500_000_000)))
+            .unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER reject_anchor BEFORE UPDATE OF anchor_source ON git_index_state
+             WHEN NEW.anchor_source = 'reject' BEGIN SELECT RAISE(ABORT, 'rejected anchor'); END;",
+            )
+            .unwrap();
+        let error = db
+            .set_git_index_state_with_anchor("failed", Some(("reject", 1_600_000_000)))
+            .unwrap_err();
+        assert!(error.to_string().contains("rejected anchor"), "{error}");
+        assert_eq!(db.get_git_index_state().unwrap().unwrap().0, "baseline");
+        assert_eq!(
+            db.git_history_anchor().unwrap(),
+            Some(("HEAD".into(), 1_500_000_000))
+        );
+        db.set_git_index_state_with_anchor("recovered", Some(("HEAD", 1_700_000_000)))
+            .unwrap();
+        assert_eq!(db.get_git_index_state().unwrap().unwrap().0, "recovered");
+    }
+
+    #[test]
+    fn legacy_state_updates_invalidate_anchor_even_when_sha_and_timestamp_are_unchanged() {
+        let db = Database::open_in_memory().unwrap();
+        for legacy_sha in ["current", "advanced"] {
+            db.set_git_index_state_with_anchor("current", Some(("HEAD", 1_500_000_000)))
+                .unwrap();
+            let before = db.get_git_index_state().unwrap().unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO git_index_state (id, last_sha, last_indexed_at)
+                 VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET
+                     last_sha = excluded.last_sha,
+                     last_indexed_at = excluded.last_indexed_at",
+                    rusqlite::params![legacy_sha, before.1],
+                )
+                .unwrap();
+            assert_eq!(
+                db.get_git_index_state().unwrap().unwrap(),
+                (legacy_sha.into(), before.1)
+            );
+            assert_eq!(
+                db.git_history_anchor().unwrap(),
+                None,
+                "legacy writer: {legacy_sha}"
+            );
+        }
+        db.set_git_index_state_with_anchor("rebuilt", Some(("HEAD", 1_600_000_000)))
+            .unwrap();
+        assert_eq!(
+            db.git_history_anchor().unwrap(),
+            Some(("HEAD".into(), 1_600_000_000))
+        );
+    }
+
+    #[test]
+    fn history_anchor_migration_preserves_legacy_rows_without_certifying_them() {
+        let db = Database::open_in_memory().unwrap();
+        db.conn
+            .execute_batch(
+                "DROP TRIGGER git_index_state_invalidate_anchor;
+             ALTER TABLE git_index_state DROP COLUMN anchor_epoch;
+             ALTER TABLE git_index_state DROP COLUMN anchor_source;
+             DELETE FROM schema_migrations WHERE name = '0021_git_history_anchor';",
+            )
+            .unwrap();
+        super::super::set_index_state(&db.conn, "git_index_state", "legacy").unwrap();
+        db.upsert_git_file("old.rs", 1.0, 0, 1, Some(1_500_000_000))
+            .unwrap();
+        assert_eq!(db.git_history_anchor().unwrap(), None);
+        crate::schema::init_db(&db.conn).unwrap();
+        assert_eq!(db.get_git_index_state().unwrap().unwrap().0, "legacy");
+        assert_eq!(db.git_file("old.rs").unwrap().unwrap().total_commits, 1);
+        assert_eq!(db.git_history_anchor().unwrap(), None);
+        db.set_git_index_state_with_anchor("new", Some(("HEAD", 1_600_000_000)))
+            .unwrap();
+        assert_eq!(
+            db.git_history_anchor().unwrap(),
+            Some(("HEAD".into(), 1_600_000_000))
+        );
+        db.set_git_index_state("unknown-writer").unwrap();
+        assert_eq!(db.git_history_anchor().unwrap(), None);
+    }
 
     #[test]
     fn incremental_delta_onto_legacy_row_with_null_first_observed_at() {

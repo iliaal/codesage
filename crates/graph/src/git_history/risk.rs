@@ -258,25 +258,30 @@ fn utc_date(timestamp: i64) -> String {
 /// about the slice that was scanned. `scope` names what `newest_commit_at` was
 /// read from. `None` when the newest commit falls inside a wall-clock window
 /// (the ordinary case) or is unknown.
-fn pinned_window_clause(newest_commit_at: Option<i64>, now: i64, scope: &str) -> Option<String> {
+fn pinned_window_clause(
+    newest_commit_at: Option<i64>,
+    now: i64,
+    scope: &str,
+    anchor: Option<HistoryAnchor>,
+) -> Option<String> {
     let newest = newest_commit_at?;
     if !history_predates_wall_clock_window(newest, now) {
         return None;
     }
-    // Only `source` selects the stamp; the epoch travels so the string stays
-    // owned by the indexer rather than duplicated here. Rows exist only
-    // because a pass resolved a HEAD, so the read side never has to describe
-    // the wall-clock regime.
-    let stamp = HistoryAnchor {
-        epoch: newest,
-        source: HistoryAnchorSource::HeadCommit,
-    }
-    .window_stamp();
     let days = HISTORY_WINDOW_DAYS as i64;
+    let provenance = match anchor {
+        Some(anchor) => {
+            let reference = match anchor.source {
+                HistoryAnchorSource::HeadCommit => "HEAD",
+                HistoryAnchorSource::WallClock => "the indexing pass's wall clock",
+            };
+            format!("the indexed window is {}, measured from {reference} at {} (UTC), so this covers the {days} days before {reference}", anchor.window_stamp(), utc_date(anchor.epoch))
+        }
+        None => "the indexed window provenance is unknown; run `codesage git-index --full` to establish the history window".to_string(),
+    };
     Some(format!(
         "newest indexed commit {scope} is {} (UTC), which a wall-clock {days}-day window would \
-         exclude; the indexed window is {stamp}, measured from HEAD's commit date, so this \
-         covers the {days} days before HEAD",
+         exclude; {provenance}",
         utc_date(newest)
     ))
 }
@@ -298,6 +303,7 @@ fn with_window_clause(note: &str, clause: Option<String>) -> String {
 struct IndexWindow {
     now: i64,
     newest_commit_at: Option<i64>,
+    anchor: Option<HistoryAnchor>,
 }
 
 impl IndexWindow {
@@ -305,6 +311,7 @@ impl IndexWindow {
         Ok(Self {
             now: super::bus_factor::unix_now(),
             newest_commit_at: newest_indexed_commit(db)?,
+            anchor: HistoryAnchor::indexed(db)?,
         })
     }
 }
@@ -392,6 +399,7 @@ pub fn find_coupling_ranked(
     let file_indexed = git.is_some();
     let file_commits = git.as_ref().map(|g| g.total_commits).unwrap_or(0);
     let now = super::bus_factor::unix_now();
+    let anchor = HistoryAnchor::indexed(db)?;
     // The file's own newest commit is the specific reference when it has a
     // row; only the pathless arm below has to fall back to the whole index.
     let file_window = || {
@@ -399,6 +407,7 @@ pub fn find_coupling_ranked(
             git.as_ref().and_then(|g| g.last_commit_at),
             now,
             "touching this file",
+            anchor,
         )
     };
 
@@ -428,7 +437,7 @@ pub fn find_coupling_ranked(
             "file has no git history (not tracked by git, no commits yet, last commit older \
              than the indexed window, or path shape does not match the index — verify with \
              `codesage status` or `codesage git-index --full`)",
-            pinned_window_clause(newest_indexed_commit(db)?, now, "in this index"),
+            pinned_window_clause(newest_indexed_commit(db)?, now, "in this index", anchor),
         ))
     } else if file_commits < 3 {
         Some(with_window_clause(
@@ -734,7 +743,12 @@ fn assess_risk_with_context(
         // reference.
         notes.push(with_window_clause(
             NO_GIT_HISTORY_NOTE,
-            pinned_window_clause(window.newest_commit_at, window.now, "in this index"),
+            pinned_window_clause(
+                window.newest_commit_at,
+                window.now,
+                "in this index",
+                window.anchor,
+            ),
         ));
         notes.push(UNSCORED_NOTE.to_string());
     }
@@ -922,12 +936,15 @@ fn assess_risk_with_context(
     let gap_check_partial = test_gap && (no_symbols || walk_capped);
     // The file's newest commit retains every HEAD-window event, even on old
     // checkouts. Shifting the decay anchor preserves relative author shares.
-    let author_anchor = git
-        .as_ref()
-        .and_then(|g| g.last_commit_at)
-        .unwrap_or(window.now);
+    let file_author_anchor = git.as_ref().and_then(|g| g.last_commit_at);
+    let author_anchor = file_author_anchor.unwrap_or(window.now);
+    let anchor_name = if file_author_anchor.is_some() {
+        "the newest indexed commit for this file"
+    } else {
+        "query time (730d@now)"
+    };
     let (author_concentration, author_note) =
-        super::bus_factor::risk_author_concentration(db, file_path, author_anchor)?;
+        super::bus_factor::risk_author_concentration(db, file_path, author_anchor, anchor_name)?;
     notes.push(author_note);
 
     codesage_protocol::work::checkpoint()?;
@@ -1621,20 +1638,26 @@ mod tests {
     fn pinned_window_clause_names_the_window_only_when_it_would_have_hidden_the_history() {
         let now = 1_700_000_000;
         let window = HISTORY_WINDOW_DAYS as i64 * DAY;
+        let anchor = Some(HistoryAnchor {
+            epoch: now - window - DAY,
+            source: HistoryAnchorSource::HeadCommit,
+        });
 
-        let inside = pinned_window_clause(Some(now - window + DAY), now, "touching this file");
+        let inside =
+            pinned_window_clause(Some(now - window + DAY), now, "touching this file", anchor);
         assert!(
             inside.is_none(),
             "a commit inside the wall-clock window is the ordinary case: {inside:?}"
         );
-        let unknown = pinned_window_clause(None, now, "in this index");
+        let unknown = pinned_window_clause(None, now, "in this index", anchor);
         assert!(
             unknown.is_none(),
             "an unknown newest commit must not be reported as pinned: {unknown:?}"
         );
 
-        let outside = pinned_window_clause(Some(now - window - DAY), now, "touching this file")
-            .expect("a commit outside the wall-clock window must be disclosed");
+        let outside =
+            pinned_window_clause(Some(now - window - DAY), now, "touching this file", anchor)
+                .expect("a commit outside the wall-clock window must be disclosed");
         assert!(
             outside.contains("touching this file"),
             "the clause must name its reference: {outside}"
@@ -1651,6 +1674,19 @@ mod tests {
             outside.contains("730 days before HEAD"),
             "the clause must say which slice was scanned: {outside}"
         );
+        let wall = pinned_window_clause(
+            Some(now - window - DAY),
+            now,
+            "touching this file",
+            Some(HistoryAnchor {
+                epoch: now - DAY,
+                source: HistoryAnchorSource::WallClock,
+            }),
+        )
+        .unwrap();
+        assert!(wall.contains("730d@now"), "{wall}");
+        assert!(wall.contains("indexing pass's wall clock"), "{wall}");
+        assert!(!wall.contains("730d@HEAD"), "{wall}");
     }
 
     #[test]

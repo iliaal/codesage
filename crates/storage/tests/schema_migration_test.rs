@@ -196,6 +196,8 @@ fn fresh_db_records_migrations_exactly_once() {
         "0017_git_co_changes_recurrence",
         "0018_git_author_events",
         "0019_file_hash_cache",
+        "0020_file_interpretation",
+        "0021_git_history_anchor",
     ];
     for migration in expected_migrations {
         let count: i64 = conn
@@ -217,6 +219,27 @@ fn fresh_db_records_migrations_exactly_once() {
         expected_migrations.len() as i64,
         "second init_db must not re-apply migrations"
     );
+}
+
+#[test]
+fn legacy_interpretation_is_unknown_without_rewriting_raw_hashes() {
+    let conn = Connection::open_in_memory().unwrap();
+    create_old_schema(&conn);
+    conn.execute(
+        "INSERT INTO files (path, language, content_hash) VALUES ('old.py', 'python', 'raw-hash')",
+        [],
+    )
+    .unwrap();
+    init_db(&conn).unwrap();
+    init_db(&conn).unwrap();
+    let row: (String, Option<String>) = conn
+        .query_row(
+            "SELECT content_hash, interpretation FROM files WHERE path = 'old.py'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(row, ("raw-hash".to_string(), None));
 }
 
 #[test]

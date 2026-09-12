@@ -1,0 +1,130 @@
+{
+  "path_normalization": {
+    "token": "${HOME}",
+    "scope": "Captured operator home-directory prefix in provenance, runtime mappings, and run receipts was replaced by this literal token for publication.",
+    "preserved": "All captured SHA-256 values, source revisions, query paths, scores, and query logs are unchanged. Hashes identify the original measured binaries, models, source files, and indexed content; they do not hash the normalized JSON documents."
+  },
+  "arms": {
+    "018": {
+      "source_commit": "5aaf49ec5ffe9c61757a9827301e7250f5ec6c79",
+      "source_clean": true,
+      "binary_sha256": "18756bf4853193b7182fa93cfae3576e785ea8c519e3a8635e360d5936c59ec7",
+      "build_command": "CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR=/tmp/codesage-five-eval-018 cargo build --locked --release -p codesage --features cuda",
+      "build_cwd": "${HOME}/ai/codesage/.worktrees/goal-eval-v018",
+      "version": "codesage 0.18.0 (release)\n  target: x86_64-unknown-linux\n  features compiled: cpu, cuda\n  device configured: none (no project config)\n",
+      "Cargo.lock_sha256": "d5525545ee8fb262ca5b865463c7f20617b1563d821815d93d1c99ba698c7b35",
+      "dependencies": {
+        "ort": "2.0.0-rc.12",
+        "ort-sys": "2.0.0-rc.12",
+        "rusqlite": "0.40.1",
+        "tokenizers": "0.23.1",
+        "tree-sitter": "0.26.11",
+        "tree-sitter-rust": "0.24.2"
+      },
+      "source_files": {
+        "crates/embed/src/model.rs": "c5dbc3bf3e05014f2f4c5db61f086cf6fdfbdf0a0249bff1376ff227d248d9f7",
+        "crates/embed/src/config.rs": "8fb7ff58dfe7e6e86a63af51969013f63c4f308f96ff9d780743e1edb934a4ea",
+        "crates/embed/src/chunk.rs": "3dcd4519d83e91981c9d7173474d655fa7dd2e94f1782aea7d0b7d770e1430c7",
+        "crates/embed/src/reranker.rs": "11855984309ac16571ac4d3fee184553d7f2d95b0b20db99452810918f26c073",
+        "crates/graph/src/search.rs": "16bfc8b0857de9c70329886892a2dec6c7d1ae0dc83cd80e564fd29d88b97df5"
+      }
+    },
+    "028": {
+      "source_commit": "8be4cbb8d7c8e9ea4c5ea29fa95ea3a9aefb7584",
+      "source_clean": true,
+      "binary_sha256": "7cf5cc45d1920179987ffead8e24c1dd044b6354ef1b5382f067eea012218e15",
+      "build_command": "CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR=/tmp/codesage-five-eval-028 cargo build --locked --release -p codesage --features cuda",
+      "build_cwd": "${HOME}/ai/codesage/.worktrees/goal-eval-v028",
+      "version": "codesage 0.28.0 (release)\n  target: x86_64-unknown-linux\n  features compiled: cpu, cuda\n  device configured: none (no project config)\n",
+      "Cargo.lock_sha256": "a16cae54d4481cf650323ca4b4cbf2bd8ed769ff29123888e866321789c2630c",
+      "dependencies": {
+        "ort": "2.0.0-rc.13",
+        "ort-sys": "2.0.0-rc.13",
+        "rusqlite": "0.40.2",
+        "tokenizers": "0.23.1",
+        "tree-sitter": "0.27.0",
+        "tree-sitter-rust": "0.24.2"
+      },
+      "source_files": {
+        "crates/embed/src/model.rs": "144aa2b33f5e93a77aa0cd2721d8f9766b71cf62436a668119e03abcba5b5286",
+        "crates/embed/src/config.rs": "0de97039deea7b59963f70385bbb126040a0bb3187e75b9b0e2cab2e73a5c8d4",
+        "crates/embed/src/chunk.rs": "b7a0316e0e699abedf9b18773b7c9506a60b5845fc11d9e9d605fb1eddcafc6a",
+        "crates/embed/src/reranker.rs": "1114891408c7e46ade7cd50f3cf7aa0bf1eb2e078fd089b70766fec8a01f2cab",
+        "crates/graph/src/search.rs": "5fef6a56795869f45e12752bf40ab01978ed32d939b5caf305c9344522a1e6a4"
+      }
+    }
+  },
+  "models": {
+    "jinaai/jina-embeddings-v2-base-code": {
+      "revision": "516f4baf13dec4ddddda8631e019b5737c8bc250",
+      "artifacts": {
+        "tokenizer.json": "b01c78a902aa4facb2f47f95449f48e2f7bbfea5d2472ee2f6ce92323c6f86e5",
+        "onnx/model.onnx": "63363fc178428b74620c6f3780cbc7191883fa5c7f84c0945c45eb5c4256733b"
+      }
+    },
+    "cross-encoder/ms-marco-MiniLM-L6-v2": {
+      "revision": "c5ee24cb16019beea0893ab7796b1df96625c6b8",
+      "artifacts": {
+        "tokenizer.json": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+        "onnx/model.onnx": "5d3e70fd0c9ff14b9b5169a51e957b7a9c74897afd0a35ce4bd318150c1d4d4a"
+      }
+    }
+  },
+  "tokenization": {
+    "tokenizers": "0.23.1",
+    "max_length": 512,
+    "truncation": "default",
+    "padding": "BatchLongest",
+    "embedding_pooling": "attention-masked mean",
+    "embedding_normalization": "L2",
+    "embedding_batch_size": 64
+  },
+  "environment_policy": "remove all inherited CODESAGE_* variables, then set only CODESAGE_WATCH=0 and per-arm isolated CODESAGE_DAEMON_RUNTIME_DIR; pin ORT_DYLIB_PATH",
+  "inherited_removed": {
+    "CODESAGE_QUALIFIED_NAME_BOOST": "1",
+    "CODESAGE_BENCH_CORPUS_DIR": "${HOME}/ai/retrieval-bench"
+  },
+  "native_runtime": {
+    "path": "${HOME}/.local/lib/python3.11/site-packages/onnxruntime/capi/libonnxruntime.so.1.24.4",
+    "sha256": "b10825f4306b01a4951c528554f2495c4597080c63637b300669544d9c142e76"
+  },
+  "runner": {
+    "path": "bench/semble-ndcg-runner",
+    "source_commit": "901b4340d1411c1f9600d94c9a1eca3cbb179634",
+    "sha256": "6be624e84ad74336963aae05674556c7e064f06edadd587558f77ba398473f11"
+  },
+  "annotation_revision": "a772a37d558c11bffbd99b18141705df3f2982be",
+  "historical_annotation_revision": "d899d610039d6e84de0bb2f236c5e8d75c5c5049",
+  "all_three_rust_annotations_byte_identical": true,
+  "repositories": [
+    {
+      "name": "tokio",
+      "language": "rust",
+      "url": "https://github.com/tokio-rs/tokio.git",
+      "revision": "5db10f538b683fe88d699dfd11be31d193db011c",
+      "benchmark_root": "tokio/src",
+      "archive_sha256": "421c296dd0246bd1ae43bc653e69b2bcabdf6ff93ad460a1aa9e0ad345b7992c",
+      "annotation_sha256": "0ffec1f71b133f6695d80c877c3d6edd21d0f2e0e3a4a3d84660b87d30b10301",
+      "config_sha256": "6e2269fa78f6508379a8935e5a2034e92d5b46bfd121a5db6a8ae66522f27d63"
+    },
+    {
+      "name": "serde",
+      "language": "rust",
+      "url": "https://github.com/serde-rs/serde.git",
+      "revision": "fa7da4a93567ed347ad0735c28e439fca688ef26",
+      "archive_sha256": "d90527e41d2cd38f11b756f81ed1a712e89a6062d686bfe6ee8fa92d70fed60e",
+      "annotation_sha256": "f9bd5a3704ed60992157b188d0e80ed347d4b29036cb254c2ed881819c7047f7",
+      "config_sha256": "6d9a2268e018a634eb5ef2f0f5d05ac4e439b2d87ba795b2705237d2e43c754b"
+    },
+    {
+      "name": "axum",
+      "language": "rust",
+      "url": "https://github.com/tokio-rs/axum.git",
+      "revision": "309d1bd9530eec2217134cb262760af1df42ee3b",
+      "benchmark_root": "axum/src",
+      "archive_sha256": "36032eed192f48776b49fa312b01a47777e7eeb4cd8955c4a0b5d16d6f09cbd8",
+      "annotation_sha256": "5371e0e7dc6fb02c261022c2f766c210647433c0e7a0ec64c3093b22e6da3f0a",
+      "config_sha256": "6e2269fa78f6508379a8935e5a2034e92d5b46bfd121a5db6a8ae66522f27d63"
+    }
+  ]
+}

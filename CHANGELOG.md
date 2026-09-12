@@ -2,7 +2,14 @@
 
 ### Changed
 
+- `codesage index` refreshes unchanged files after parser, extraction, or trust-boundary rule upgrades; `codesage status` reports stored interpretation versions.
 - Hugging Face artifact downloads use ureq with rustls instead of reqwest.
+
+### Fixed
+
+- `review_rehearsal` and `codesage rehearse` disclose missing git history and qualify partial risk scores while retaining structural warnings.
+- `risk` and `coupling` use recorded history-window provenance; legacy indexes require `git-index --full` to establish it.
+- `risk` distinguishes absent author history from commits outside the evaluation window and names that window's anchor.
 
 ## [0.29.0] - 2026-09-10
 

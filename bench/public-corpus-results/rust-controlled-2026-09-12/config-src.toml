@@ -1,0 +1,16 @@
+[project]
+name = "src"
+
+[embedding]
+model = "jinaai/jina-embeddings-v2-base-code"
+device = "gpu"
+reranker = "cross-encoder/ms-marco-MiniLM-L6-v2"
+# Optional. Defaults to 64 on non-Apple targets and 10 on Apple targets.
+# batch_size = 64
+
+[index]
+# Built-in defaults always apply (vendored deps, build outputs, lock files,
+# caches, IDE state). Test files are indexed structurally and semantically,
+# then demoted at search time. See DEFAULT_EXCLUDE_PATTERNS in
+# crates/parser/src/discover.rs. Patterns listed here ADD to the defaults.
+exclude_patterns = []

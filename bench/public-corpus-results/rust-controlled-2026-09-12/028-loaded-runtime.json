@@ -1,0 +1,31 @@
+[
+  {
+    "pid": 328668,
+    "libraries": [
+      {
+        "path": "${HOME}/.local/lib/python3.11/site-packages/nvidia/cuda_runtime/lib/libcudart.so.12",
+        "sha256": "256e6409e4f06f618e1fb53d4844a6b81cdded1013afa8ade40c22f99eb133b7"
+      },
+      {
+        "path": "${HOME}/.local/lib/python3.11/site-packages/onnxruntime/capi/libonnxruntime.so.1.24.4",
+        "sha256": "b10825f4306b01a4951c528554f2495c4597080c63637b300669544d9c142e76"
+      },
+      {
+        "path": "${HOME}/.local/lib/python3.11/site-packages/onnxruntime/capi/libonnxruntime_providers_cuda.so",
+        "sha256": "3c4645a1f7c9b687b5480b8bd6235311b139b657a7ebee19f95c7340efac1c76"
+      },
+      {
+        "path": "${HOME}/.local/lib/python3.11/site-packages/onnxruntime/capi/libonnxruntime_providers_shared.so",
+        "sha256": "086ec1d5388f64153d9c63470d126693db9a182c8ce236d3a1119068471b8a0d"
+      },
+      {
+        "path": "/usr/lib/wsl/drivers/nvrzi.inf_amd64_7b78107e1fc5c295/libcuda.so.1.1",
+        "sha256": "0b3e055fbff7912cdac2e3f81e746be251bc3af2d1a2513a5e40a2d4ac98a91d"
+      },
+      {
+        "path": "/usr/lib/wsl/lib/libcuda.so.1",
+        "sha256": "57e0db4fcada1712297e0c9ab0d7d4beff59c663468876f77a262eda98a6e0b8"
+      }
+    ]
+  }
+]

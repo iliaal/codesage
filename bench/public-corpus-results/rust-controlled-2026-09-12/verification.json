@@ -1,0 +1,14 @@
+{
+  "queries_per_arm": 60,
+  "clean_queries": 120,
+  "independently_recomputed_scores": 120,
+  "means_unrounded": {
+    "018": 0.7650839145975534,
+    "028": 0.7652665144970736
+  },
+  "delta_unrounded": 0.00018259989952018607,
+  "improved_queries": 1,
+  "regressed_queries": 0,
+  "unchanged_queries": 59,
+  "annotation_and_config_hashes_match": true
+}

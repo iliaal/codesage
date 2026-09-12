@@ -1,0 +1,22 @@
+[
+  {
+    "name": "tokio",
+    "language": "rust",
+    "url": "https://github.com/tokio-rs/tokio.git",
+    "revision": "5db10f538b683fe88d699dfd11be31d193db011c",
+    "benchmark_root": "tokio/src"
+  },
+  {
+    "name": "serde",
+    "language": "rust",
+    "url": "https://github.com/serde-rs/serde.git",
+    "revision": "fa7da4a93567ed347ad0735c28e439fca688ef26"
+  },
+  {
+    "name": "axum",
+    "language": "rust",
+    "url": "https://github.com/tokio-rs/axum.git",
+    "revision": "309d1bd9530eec2217134cb262760af1df42ee3b",
+    "benchmark_root": "axum/src"
+  }
+]

@@ -127,6 +127,26 @@ pub struct HistoryAnchor {
 }
 
 impl HistoryAnchor {
+    pub(crate) fn indexed(db: &Database) -> Result<Option<Self>> {
+        Ok(db.git_history_anchor()?.and_then(|(source, epoch)| {
+            let source = match source.as_str() {
+                "HEAD" => HistoryAnchorSource::HeadCommit,
+                "now" => HistoryAnchorSource::WallClock,
+                _ => return None,
+            };
+            Some(Self { epoch, source })
+        }))
+    }
+
+    fn persist(self, db: &Database, sha: &str, full: bool) -> Result<()> {
+        let established = full || Self::indexed(db)?.is_some_and(|old| old.source == self.source);
+        let source = match self.source {
+            HistoryAnchorSource::HeadCommit => "HEAD",
+            HistoryAnchorSource::WallClock => "now",
+        };
+        db.set_git_index_state_with_anchor(sha, established.then_some((source, self.epoch)))
+    }
+
     /// Oldest commit timestamp this pass admits.
     pub fn cutoff(&self) -> i64 {
         history_window_cutoff(self.epoch)
@@ -278,7 +298,7 @@ pub fn git_history_index_with_options(
                 db.execute_batch(|db| {
                     decay_git_history_between(db, previous, anchor.epoch)?;
                     db.prune_git_author_events(anchor.cutoff())?;
-                    db.set_git_index_state(&head_sha)
+                    anchor.persist(db, &head_sha, false)
                 })?;
                 return Ok(GitIndexStats {
                     commits_scanned: 0,
@@ -435,7 +455,7 @@ fn run_full(
                 co_change_kept += 1;
             }
         }
-        db.set_git_index_state(head_sha)?;
+        anchor.persist(db, head_sha, true)?;
         Ok(())
     })?;
 
@@ -500,7 +520,7 @@ fn run_incremental(
                 co_change_kept += 1;
             }
         }
-        db.set_git_index_state(head_sha)?;
+        anchor.persist(db, head_sha, false)?;
         Ok(())
     })?;
 
@@ -1288,6 +1308,32 @@ mod tests {
         assert_eq!(head.window_stamp(), "730d@HEAD");
         assert_eq!(wall.window_stamp(), "730d@now");
         assert_ne!(head.window_stamp(), wall.window_stamp());
+    }
+
+    #[test]
+    fn incremental_provenance_survives_only_with_the_same_established_regime() {
+        let db = Database::open_in_memory().unwrap();
+        let head = HistoryAnchor {
+            epoch: 1_500_000_000,
+            source: HistoryAnchorSource::HeadCommit,
+        };
+        let wall = HistoryAnchor {
+            epoch: 1_600_000_000,
+            source: HistoryAnchorSource::WallClock,
+        };
+        head.persist(&db, "a", false).unwrap();
+        assert_eq!(HistoryAnchor::indexed(&db).unwrap(), None);
+        wall.persist(&db, "a", true).unwrap();
+        assert_eq!(HistoryAnchor::indexed(&db).unwrap(), Some(wall));
+        head.persist(&db, "b", false).unwrap();
+        assert_eq!(HistoryAnchor::indexed(&db).unwrap(), None);
+        head.persist(&db, "b", true).unwrap();
+        let next = HistoryAnchor {
+            epoch: head.epoch + 86_400,
+            ..head
+        };
+        next.persist(&db, "c", false).unwrap();
+        assert_eq!(HistoryAnchor::indexed(&db).unwrap(), Some(next));
     }
 
     #[test]

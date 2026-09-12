@@ -101,6 +101,11 @@ pub enum IndexStrategy {
 
 const STRUCTURAL_INDEX_BATCH_SIZE: usize = 50;
 
+/// Bump the relevant component whenever unchanged bytes can yield different
+/// symbols, references, fingerprints, or trust boundaries. Raw hashes stay separate.
+pub const STRUCTURAL_INTERPRETATION: &str =
+    "codesage/structural/v1;parser-queries=1;extraction=1;trust-boundaries=1";
+
 /// Skip and record unreadable or unparseable files; retain degraded parses.
 fn parse_batch(root: &Path, batch: &[&FileInfo], stats: &mut IndexStats) -> Vec<ParsedFile> {
     let results: Vec<(&FileInfo, Result<ParsedFile>)> =
@@ -139,6 +144,7 @@ fn write_one(db: &Database, p: &ParsedFile) -> Result<()> {
     db.insert_fingerprints(file_id, &fingerprint_inputs(p))?;
     let boundaries = derive_from_refs(&p.refs, p.info.language);
     db.replace_file_trust_boundaries(file_id, &boundaries)?;
+    db.record_file_interpretation(file_id, STRUCTURAL_INTERPRETATION)?;
     Ok(())
 }
 
@@ -285,6 +291,7 @@ fn index_discovery_report(
         IndexStrategy::Full => files.iter().collect(),
         IndexStrategy::Incremental => {
             let existing_hashes = db.all_file_hashes()?;
+            let interpretations = db.all_file_interpretations()?;
             let existing_languages: HashMap<_, _> = db
                 .all_files_with_id_and_language()?
                 .into_iter()
@@ -295,6 +302,8 @@ fn index_discovery_report(
                 .filter(|f| {
                     existing_hashes.get(&f.path) != Some(&f.content_hash)
                         || existing_languages.get(&f.path) != Some(&f.language)
+                        || interpretations.get(&f.path).and_then(Option::as_deref)
+                            != Some(STRUCTURAL_INTERPRETATION)
                 })
                 .collect()
         }
@@ -414,6 +423,179 @@ mod tests {
             language,
             content_hash: content_hash(source),
         }
+    }
+
+    #[test]
+    fn interpretation_upgrade_reparses_unchanged_bytes_and_keeps_raw_hashes() {
+        let root = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let info = file(
+            root.path(),
+            "a.py",
+            Language::Python,
+            b"def actual():\n    open('x')\n",
+        );
+        seed_symbol(&db, &info, "obsolete");
+        let id = db.all_files_with_id_and_language().unwrap()[0].0;
+        db.record_file_interpretation(
+            id,
+            "codesage/structural/v1;parser-queries=0;extraction=1;trust-boundaries=1",
+        )
+        .unwrap();
+        let stats = incremental_index(root.path(), &db, &[], false).unwrap();
+        assert_eq!(stats.files_indexed, 1);
+        assert_eq!(db.symbols_for_file("a.py").unwrap()[0].name, "actual");
+        assert_eq!(db.all_file_hashes().unwrap()["a.py"], info.content_hash);
+        assert_eq!(
+            db.all_file_interpretations().unwrap()["a.py"].as_deref(),
+            Some(STRUCTURAL_INTERPRETATION)
+        );
+        assert_eq!(
+            incremental_index(root.path(), &db, &[], false)
+                .unwrap()
+                .files_skipped,
+            1
+        );
+        let fresh = Database::open_in_memory().unwrap();
+        full_index(root.path(), &fresh, &[], false).unwrap();
+        assert_eq!(
+            db.symbols_for_file("a.py").unwrap(),
+            fresh.symbols_for_file("a.py").unwrap()
+        );
+        assert_eq!(
+            db.trust_boundaries_for_file_path("a.py").unwrap(),
+            fresh.trust_boundaries_for_file_path("a.py").unwrap()
+        );
+    }
+
+    #[test]
+    fn targeted_pass_does_not_attest_untouched_or_failed_legacy_files() {
+        let root = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let good = file(
+            root.path(),
+            "a.py",
+            Language::Python,
+            b"def actual(): pass\n",
+        );
+        let failed = unreadable("failed.py", Language::Python);
+        let untouched = unreadable("untouched.py", Language::Python);
+        for info in [&good, &failed, &untouched] {
+            seed_symbol(&db, info, "obsolete");
+        }
+        let stats = index_files(root.path(), &db, &[good, failed], false).unwrap();
+        assert_eq!(stats.files_indexed, 1);
+        assert_eq!(stats.failed_paths, ["failed.py"]);
+        let versions = db.all_file_interpretations().unwrap();
+        assert_eq!(versions["a.py"].as_deref(), Some(STRUCTURAL_INTERPRETATION));
+        assert_eq!(versions["failed.py"], None);
+        assert_eq!(versions["untouched.py"], None);
+        assert_eq!(
+            db.symbols_for_file("failed.py").unwrap()[0].name,
+            "obsolete"
+        );
+    }
+
+    #[test]
+    fn old_writer_cannot_preserve_current_interpretation_for_matching_raw_hashes() {
+        for source in [b"def actual(): pass\n".as_slice(), b"def updated(): pass\n"] {
+            let root = tempfile::tempdir().unwrap();
+            let db = Database::open_in_memory().unwrap();
+            file(
+                root.path(),
+                "a.py",
+                Language::Python,
+                b"def actual(): pass\n",
+            );
+            full_index(root.path(), &db, &[], false).unwrap();
+            let info = file(root.path(), "a.py", Language::Python, source);
+            db.execute_raw_for_tests(&format!(
+                "INSERT INTO files (path, language, content_hash, indexed_at)
+                 VALUES ('a.py', 'python', '{}', unixepoch())
+                 ON CONFLICT(path) DO UPDATE SET
+                   language = excluded.language,
+                   content_hash = excluded.content_hash,
+                   indexed_at = excluded.indexed_at;
+                 DELETE FROM symbols WHERE file_id = (SELECT id FROM files WHERE path = 'a.py');",
+                info.content_hash,
+            ))
+            .unwrap();
+            db.upsert_semantic_file_hash("a.py", &info.content_hash)
+                .unwrap();
+            assert_eq!(db.all_file_interpretations().unwrap()["a.py"], None);
+            let stats = incremental_index(root.path(), &db, &[], false).unwrap();
+            assert_eq!(stats.files_indexed, 1);
+            assert_eq!(db.symbols_for_file("a.py").unwrap().len(), 1);
+            assert_eq!(db.all_file_hashes().unwrap()["a.py"], info.content_hash);
+            assert_eq!(
+                db.all_file_interpretations().unwrap()["a.py"].as_deref(),
+                Some(STRUCTURAL_INTERPRETATION)
+            );
+            assert_eq!(db.all_semantic_file_hashes().unwrap().len(), 0);
+        }
+    }
+
+    #[test]
+    fn structural_rewrite_invalidates_semantic_hashes_for_every_model() {
+        let root = tempfile::tempdir().unwrap();
+        let database_dir = tempfile::tempdir().unwrap();
+        let database_path = database_dir.path().join("index.db");
+        let first = Database::open_for_model(&database_path, "first", 3).unwrap();
+        let second = Database::open_for_model(&database_path, "second", 3).unwrap();
+        let info = file(
+            root.path(),
+            "a.py",
+            Language::Python,
+            b"def actual(): pass\n",
+        );
+        seed_symbol(&first, &info, "obsolete");
+        for db in [&first, &second] {
+            db.upsert_semantic_file_hash("a.py", &info.content_hash)
+                .unwrap();
+            db.upsert_semantic_file_hash("untouched.py", "untouched")
+                .unwrap();
+        }
+        index_files(root.path(), &first, &[info], false).unwrap();
+        for db in [&first, &second] {
+            assert_eq!(
+                db.all_semantic_file_hashes().unwrap(),
+                HashMap::from([("untouched.py".to_string(), "untouched".to_string())])
+            );
+        }
+    }
+
+    #[test]
+    fn failed_boundary_write_rolls_back_interpretation_and_semantic_invalidation() {
+        let root = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let info = file(
+            root.path(),
+            "a.py",
+            Language::Python,
+            b"def actual():\n    open('x')\n",
+        );
+        seed_symbol(&db, &info, "obsolete");
+        let id = db.all_files_with_id_and_language().unwrap()[0].0;
+        db.record_file_interpretation(id, "old-parser").unwrap();
+        db.upsert_semantic_file_hash("a.py", &info.content_hash)
+            .unwrap();
+        db.execute_raw_for_tests(
+            "CREATE TRIGGER fail_boundaries BEFORE UPDATE OF boundaries_derived_at ON files
+             WHEN NEW.boundaries_derived_at > 0
+             BEGIN SELECT RAISE(ABORT, 'boundary write rejected'); END;",
+        )
+        .unwrap();
+        let error = index_files(root.path(), &db, std::slice::from_ref(&info), false).unwrap_err();
+        assert!(format!("{error:#}").contains("boundary write rejected"));
+        assert_eq!(
+            db.all_file_interpretations().unwrap()["a.py"].as_deref(),
+            Some("old-parser")
+        );
+        assert_eq!(
+            db.all_semantic_file_hashes().unwrap()["a.py"],
+            info.content_hash
+        );
+        assert_eq!(db.symbols_for_file("a.py").unwrap()[0].name, "obsolete");
     }
 
     /// Simulate a file disappearing after discovery.

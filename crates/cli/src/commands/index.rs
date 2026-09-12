@@ -572,6 +572,35 @@ struct StatusReport {
     drift: codesage_graph::drift::DriftReport,
     drift_summary: String,
     semantic: SemanticStatus,
+    interpretation: InterpretationStatus,
+}
+
+#[derive(serde::Serialize)]
+struct InterpretationStatus {
+    current: &'static str,
+    stored: std::collections::BTreeMap<String, usize>,
+    unrecorded_files: usize,
+    stale_files: usize,
+}
+
+fn interpretation_status(db: &Database) -> Result<InterpretationStatus> {
+    let mut status = InterpretationStatus {
+        current: codesage_graph::STRUCTURAL_INTERPRETATION,
+        stored: std::collections::BTreeMap::new(),
+        unrecorded_files: 0,
+        stale_files: 0,
+    };
+    for (version, count) in db.file_interpretation_counts()? {
+        if version.as_deref() != Some(status.current) {
+            status.stale_files += count;
+        }
+        if let Some(version) = version {
+            status.stored.insert(version, count);
+        } else {
+            status.unrecorded_files += count;
+        }
+    }
+    Ok(status)
 }
 
 #[derive(serde::Serialize)]
@@ -705,6 +734,7 @@ pub(crate) fn cmd_status(json: bool) -> Result<()> {
         drift_summary: drift.summary(),
         drift,
         semantic: semantic_status(&root)?,
+        interpretation: interpretation_status(&db)?,
     };
 
     if json {
@@ -719,6 +749,16 @@ pub(crate) fn cmd_status(json: bool) -> Result<()> {
     println!("References: {}", report.references);
     println!("Chunks:     {}", report.chunks);
     println!("Drift:      {}", report.drift_summary);
+    println!("Interpretation: current {}", report.interpretation.current);
+    for (version, count) in &report.interpretation.stored {
+        println!("  Stored: {version} ({count} files)");
+    }
+    if report.interpretation.stale_files != 0 {
+        println!(
+            "  {} stale files ({} unrecorded); run `codesage index`",
+            report.interpretation.stale_files, report.interpretation.unrecorded_files
+        );
+    }
     print_semantic_status(&report.semantic);
     Ok(())
 }
@@ -1135,5 +1175,38 @@ mod tests {
             v.get("indexed_files").is_none(),
             "absent counts must be omitted, not null: {v}"
         );
+    }
+
+    #[test]
+    fn status_reports_mixed_interpretations_without_attesting_the_index() {
+        let db = Database::open_in_memory().unwrap();
+        for (path, version) in [
+            (
+                "current.py",
+                Some(codesage_graph::STRUCTURAL_INTERPRETATION),
+            ),
+            ("old.py", Some("old-parser")),
+            ("legacy.py", None),
+        ] {
+            let id = db
+                .upsert_file(&codesage_protocol::FileInfo {
+                    path: path.to_string(),
+                    language: codesage_protocol::Language::Python,
+                    content_hash: "same".to_string(),
+                })
+                .unwrap();
+            if let Some(version) = version {
+                db.record_file_interpretation(id, version).unwrap();
+            }
+        }
+        let status = serde_json::to_value(interpretation_status(&db).unwrap()).unwrap();
+        assert_eq!(status["current"], codesage_graph::STRUCTURAL_INTERPRETATION);
+        assert_eq!(status["stored"]["old-parser"], 1);
+        assert_eq!(
+            status["stored"][codesage_graph::STRUCTURAL_INTERPRETATION],
+            1
+        );
+        assert_eq!(status["unrecorded_files"], 1);
+        assert_eq!(status["stale_files"], 2);
     }
 }

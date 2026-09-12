@@ -1030,6 +1030,35 @@ mod tests {
     }
 
     #[test]
+    fn interpretation_upgrade_refreshes_semantic_headers_without_content_changes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.py"), "def actual(): pass\n").unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let files = discover_files_with_excludes(root.path(), &[]).unwrap();
+        db.upsert_file(&files[0]).unwrap();
+        let mut fake = FakeEmbedder {
+            prepared_with: Vec::new(),
+            batches: 0,
+        };
+        semantic_incremental_index(root.path(), &db, &mut fake, &[], &test_fp(), false).unwrap();
+        let before = db.chunk_embeddings_for_file("a.py").unwrap()[0].0.clone();
+        assert!(!before.contains("# actual (function)"));
+
+        crate::index::incremental_index(root.path(), &db, &[], false).unwrap();
+        let stats = semantic_incremental_index(root.path(), &db, &mut fake, &[], &test_fp(), false)
+            .unwrap();
+        assert_eq!(stats.files_processed, 1);
+        assert_eq!(stats.chunks_created, 1);
+        assert_eq!(fake.batches, 2);
+        let after = db.chunk_embeddings_for_file("a.py").unwrap()[0].0.clone();
+        assert!(after.contains("# actual (function)"), "{after}");
+        assert_eq!(
+            db.all_semantic_file_hashes().unwrap()["a.py"],
+            files[0].content_hash
+        );
+    }
+
+    #[test]
     fn changed_file_constructs_the_embedder_once_with_the_file_count() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("a.rs"), "fn a() {}\n").unwrap();

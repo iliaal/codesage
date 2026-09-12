@@ -120,6 +120,30 @@ pub fn build_review_rehearsal(
         .map(|a| (a.file.as_str(), *a))
         .collect();
 
+    if !risk.unscored_files.is_empty() {
+        let mut evidence: Vec<String> = risk.unscored_files.iter().map(|file| {
+            match by_file.get(file.as_str()) {
+                Some(a) if a.found => format!("{file}: no indexed git history; any available structural signals remain in this rehearsal"),
+                _ => format!("{file}: not indexed; no risk signals were measured"),
+            }
+        }).collect();
+        evidence.push("Run `codesage git-index` and re-run the rehearsal; new, excluded, or out-of-window files may still have no history. For unindexed paths, check the path and index configuration and run `codesage index`.".to_string());
+        objections.push(ReviewObjection {
+            severity: if risk.scored_file_count == 0 {
+                ReviewSeverity::Medium
+            } else {
+                ReviewSeverity::Low
+            },
+            category: "unscored-risk".to_string(),
+            title: format!(
+                "{} file(s) have unscored risk: indexed git history is missing",
+                risk.unscored_files.len()
+            ),
+            evidence,
+            files: risk.unscored_files.clone(),
+        });
+    }
+
     if !risk.test_gap_files.is_empty() {
         let mut evidence = vec![
             "Advisory: test discovery does not measure runtime coverage or establish whether this patch needs additional tests."
@@ -161,7 +185,7 @@ pub fn build_review_rehearsal(
                 .to_string(),
         );
         for a in &high {
-            evidence.push(format!("{} (score {:.2})", a.file, a.score));
+            evidence.push(risk_score_evidence(a));
             for s in a.top_symbols.iter().take(HOTSPOT_EVIDENCE_CAP) {
                 evidence.push(format!(
                     "  hot symbol: {} @ line {} ({})",
@@ -173,8 +197,9 @@ pub fn build_review_rehearsal(
             severity: ReviewSeverity::High,
             category: "high-risk-file".to_string(),
             title: format!(
-                "{} high-risk file(s) in the patch (score ≥ 0.60)",
-                high.len()
+                "{} high-risk file(s) in the patch (score ≥ 0.60){}",
+                high.len(),
+                unscored_band_qualifier(&high)
             ),
             evidence,
             files: high.iter().map(|a| a.file.clone()).collect(),
@@ -185,13 +210,11 @@ pub fn build_review_rehearsal(
             severity: ReviewSeverity::Medium,
             category: "high-risk-file".to_string(),
             title: format!(
-                "{} elevated-risk file(s) in the patch (score 0.40–0.60)",
-                elevated.len()
+                "{} elevated-risk file(s) in the patch (score 0.40–0.60){}",
+                elevated.len(),
+                unscored_band_qualifier(&elevated)
             ),
-            evidence: elevated
-                .iter()
-                .map(|a| format!("{} (score {:.2})", a.file, a.score))
-                .collect(),
+            evidence: elevated.iter().map(|a| risk_score_evidence(a)).collect(),
             files: elevated.iter().map(|a| a.file.clone()).collect(),
         });
     }
@@ -414,6 +437,25 @@ pub fn build_branch_only_rehearsal(root: &Path, files: &[String]) -> ReviewRehea
     }
 }
 
+fn risk_score_evidence(assessment: &RiskAssessment) -> String {
+    if assessment.unscored {
+        format!(
+            "{} (partial score {:.2}; unscored: no indexed git history)",
+            assessment.file, assessment.score
+        )
+    } else {
+        format!("{} (score {:.2})", assessment.file, assessment.score)
+    }
+}
+
+fn unscored_band_qualifier(assessments: &[&RiskAssessment]) -> &'static str {
+    if assessments.iter().any(|assessment| assessment.unscored) {
+        "; includes unscored files with partial scores"
+    } else {
+        ""
+    }
+}
+
 fn entry_area(entry_path: &str) -> String {
     std::path::Path::new(entry_path)
         .parent()
@@ -590,6 +632,134 @@ mod tests {
             content_hash: format!("test-hash-{path}"),
         })
         .unwrap();
+    }
+
+    #[test]
+    fn unscored_risk_objection_tracks_history_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let paths = vec!["src/first.rs".to_string(), "src/second.rs".to_string()];
+        for path in &paths {
+            index_rust_file(&db, path);
+        }
+        for (scored, expected) in [
+            (0, Some(ReviewSeverity::Medium)),
+            (1, Some(ReviewSeverity::Low)),
+            (2, None),
+        ] {
+            if scored > 0 {
+                db.upsert_git_file(&paths[scored - 1], 1.0, 0, 1, Some(1_700_000_000))
+                    .unwrap();
+            }
+            let report = build_review_rehearsal(dir.path(), &db, &paths).unwrap();
+            let objections: Vec<_> = report
+                .objections
+                .iter()
+                .filter(|o| o.category == "unscored-risk")
+                .collect();
+            assert_eq!(
+                objections.len(),
+                usize::from(expected.is_some()),
+                "{report:?}"
+            );
+            if let Some(severity) = expected {
+                assert_eq!(objections[0].severity, severity);
+                assert_eq!(objections[0].files, paths[scored..]);
+                assert!(
+                    objections[0]
+                        .evidence
+                        .iter()
+                        .any(|e| e.contains("codesage git-index"))
+                );
+                for path in &paths[scored..] {
+                    assert!(objections[0].evidence.iter().any(|e| e.contains(path)));
+                }
+            }
+        }
+        let empty = build_review_rehearsal(dir.path(), &db, &[]).unwrap();
+        assert!(empty.objections.is_empty());
+    }
+
+    #[test]
+    fn unscored_elevated_risk_preserves_qualified_structural_warnings() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..25 {
+            let imported = if i < 5 { (i + 1) % 5 } else { 0 };
+            std::fs::write(
+                dir.path().join(format!("File{i}.php")),
+                format!("<?php\nnamespace App;\nuse App\\Class{imported};\nclass Class{i} {{}}\n"),
+            )
+            .unwrap();
+        }
+        let db = Database::open_in_memory().unwrap();
+        crate::full_index(dir.path(), &db, &[], false).unwrap();
+        db.replace_file_trust_boundaries(
+            db.file_id_for_path("File0.php").unwrap().unwrap(),
+            &[
+                TrustBoundary::Network,
+                TrustBoundary::Filesystem,
+                TrustBoundary::Database,
+                TrustBoundary::Secrets,
+                TrustBoundary::ProcessExec,
+            ],
+        )
+        .unwrap();
+        let risk = assess_risk(&db, "File0.php").unwrap();
+        assert!(risk.unscored && risk.score >= 0.40, "{risk:?}");
+        let report = build_review_rehearsal(dir.path(), &db, &["File0.php".to_string()]).unwrap();
+        let band = report
+            .objections
+            .iter()
+            .find(|o| o.category == "high-risk-file")
+            .unwrap();
+        assert!(band.title.contains("unscored"), "{band:?}");
+        assert!(
+            band.evidence.iter().any(|e| e.contains("File0.php")
+                && e.contains("partial score")
+                && e.contains("no indexed git history")),
+            "{band:?}"
+        );
+        for category in [
+            "missing-tests",
+            "blast-radius",
+            "import-cycle",
+            "unscored-risk",
+        ] {
+            assert!(
+                report.objections.iter().any(|o| o.category == category),
+                "missing {category}: {report:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unscored_objection_includes_clustered_and_unindexed_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let mut paths: Vec<_> = (0..7).map(|i| format!("src/new{i}.rs")).collect();
+        for path in &paths {
+            index_rust_file(&db, path);
+        }
+        paths.push("absent.rs".to_string());
+        let risk = crate::assess_risk_diff(&db, &paths).unwrap();
+        assert!(!risk.clustered_directories.is_empty());
+        let report = build_review_rehearsal(dir.path(), &db, &paths).unwrap();
+        let objection = report
+            .objections
+            .iter()
+            .find(|o| o.category == "unscored-risk")
+            .unwrap();
+        assert_eq!(objection.severity, ReviewSeverity::Medium);
+        assert_eq!(
+            objection.files.iter().collect::<BTreeSet<_>>(),
+            paths.iter().collect::<BTreeSet<_>>()
+        );
+        assert!(
+            objection
+                .evidence
+                .iter()
+                .any(|e| e == "absent.rs: not indexed; no risk signals were measured")
+        );
     }
 
     #[test]

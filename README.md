@@ -224,6 +224,8 @@ jq '{objections, summary_notes}' review.json
 
 Use the report as advisory evidence by default. Missing-test objections are `medium` and include the limits of the test discovery check. Even a complete index walk does not measure runtime coverage or establish whether a patch has adequate tests. High file risk likewise describes the file, not whether a particular patch is wrong.
 
+If your patch includes files without indexed git history, `unscored-risk` names them. Its severity is `low` for mixed patches and `medium` when every file lacks history. Run `codesage git-index` and repeat the rehearsal before relying on history-based risk signals. Structural warnings still apply, and their risk bands identify structural-only scores.
+
 If your team chooses a conservative merge policy, explicitly add a gate after printing the report:
 
 ```bash
@@ -431,7 +433,7 @@ flowchart LR
     G --> H[(sqlite-vec<br/>chunks_jina_768)]
 ```
 
-Parsing happens in parallel via Rayon; SQLite writes are batched. Re-running `codesage index` is incremental: only files whose content hash changed are re-parsed and re-embedded.
+Parsing happens in parallel via Rayon; SQLite writes are batched. Re-running `codesage index` is incremental: changes to file contents, detected language, or the parser's interpretation identity trigger structural parsing. After an extraction upgrade, run `codesage index` to refresh unchanged files automatically. Structural updates also invalidate semantic reuse so symbol-derived chunk headers are refreshed. Use `codesage status` to see stored interpretation versions and files awaiting refresh.
 
 ## Search pipeline
 

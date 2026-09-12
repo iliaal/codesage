@@ -1,0 +1,126 @@
+{
+  "tokio": {
+    "arms": {
+      "018": {
+        "files": 373,
+        "files_sha256": "7873e4da456decb2e4ce34059d1547365d08ff9841f813f5f3f9c74d4cb22a69",
+        "symbols": 5070,
+        "symbols_sha256": "17756ac873754f303b05cd3326d5e1e9a145946d0515d62d56cdfb6150211016",
+        "chunks": 3024,
+        "chunks_sha256": "a7da52ea0d370308ee9b85cec6b55674f96086f711d67b1269b8779b91b13f53",
+        "integrity": [
+          [
+            "ok"
+          ]
+        ]
+      },
+      "028": {
+        "files": 373,
+        "files_sha256": "7873e4da456decb2e4ce34059d1547365d08ff9841f813f5f3f9c74d4cb22a69",
+        "symbols": 5070,
+        "symbols_sha256": "17756ac873754f303b05cd3326d5e1e9a145946d0515d62d56cdfb6150211016",
+        "chunks": 3024,
+        "chunks_sha256": "7eb15c97a56ced7d5c17151a0f1013e4fd900bbb3bbff3d6fe24f28379903af0",
+        "integrity": [
+          [
+            "ok"
+          ]
+        ]
+      }
+    },
+    "changed_chunk_files": [
+      "macros/cfg.rs",
+      "net/tcp/listener.rs",
+      "net/udp.rs",
+      "net/unix/datagram/socket.rs",
+      "net/unix/listener.rs",
+      "runtime/blocking/sharded_queue.rs",
+      "runtime/builder.rs",
+      "runtime/handle.rs",
+      "runtime/task/trace/tree.rs",
+      "runtime/time_alt/entry.rs",
+      "sync/oneshot.rs",
+      "sync/semaphore.rs",
+      "task/blocking.rs",
+      "task/local.rs"
+    ],
+    "removed_chunks": 19,
+    "added_chunks": 19
+  },
+  "serde": {
+    "arms": {
+      "018": {
+        "files": 208,
+        "files_sha256": "255a3e5615bd4205a6be18c2510685b8193e35ec7aa5b9af31a4310056b7625d",
+        "symbols": 3029,
+        "symbols_sha256": "6874d85c10e1a4e62da8c43632cdb26c02759753361982fe6116cb9341d6cffc",
+        "chunks": 1147,
+        "chunks_sha256": "b041ddd59eb40af8245e9d7cc72711819df8e5d85005c69d596e3cebf1a53855",
+        "integrity": [
+          [
+            "ok"
+          ]
+        ]
+      },
+      "028": {
+        "files": 208,
+        "files_sha256": "255a3e5615bd4205a6be18c2510685b8193e35ec7aa5b9af31a4310056b7625d",
+        "symbols": 3029,
+        "symbols_sha256": "6874d85c10e1a4e62da8c43632cdb26c02759753361982fe6116cb9341d6cffc",
+        "chunks": 1147,
+        "chunks_sha256": "11b7fe37311b1ca312e56bd5efa02569c29e1397f179e9fbd3eabf887571cdc9",
+        "integrity": [
+          [
+            "ok"
+          ]
+        ]
+      }
+    },
+    "changed_chunk_files": [
+      "test_suite/tests/test_gen.rs"
+    ],
+    "removed_chunks": 1,
+    "added_chunks": 1
+  },
+  "axum": {
+    "arms": {
+      "018": {
+        "files": 58,
+        "files_sha256": "9f95f3c02eb42d65a4de448927d3447ac4fc915c21eeb931fd130937407d8d40",
+        "symbols": 1509,
+        "symbols_sha256": "73b64c4a522108ededcacf492be8e118e6fa0211cce3622c2198c65c02322a21",
+        "chunks": 507,
+        "chunks_sha256": "e57fce2f59ad21deaa2f3cc52c1fb00e9989cc60c6fe58fe82ab3399dd1dae9e",
+        "integrity": [
+          [
+            "ok"
+          ]
+        ]
+      },
+      "028": {
+        "files": 58,
+        "files_sha256": "9f95f3c02eb42d65a4de448927d3447ac4fc915c21eeb931fd130937407d8d40",
+        "symbols": 1509,
+        "symbols_sha256": "73b64c4a522108ededcacf492be8e118e6fa0211cce3622c2198c65c02322a21",
+        "chunks": 507,
+        "chunks_sha256": "6fc10dd535e5e62b1083b1f8fe477398e6bc7227e1fa70669bf2423f83a33632",
+        "integrity": [
+          [
+            "ok"
+          ]
+        ]
+      }
+    },
+    "changed_chunk_files": [
+      "extract/multipart.rs",
+      "extract/ws.rs",
+      "form.rs",
+      "json.rs",
+      "lib.rs",
+      "routing/method_filter.rs",
+      "routing/tests/mod.rs"
+    ],
+    "removed_chunks": 12,
+    "added_chunks": 12
+  }
+}

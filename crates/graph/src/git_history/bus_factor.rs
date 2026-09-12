@@ -14,11 +14,18 @@ pub(crate) fn risk_author_concentration(
     db: &codesage_storage::Database,
     path: &str,
     now: i64,
+    anchor_name: &str,
 ) -> anyhow::Result<(Option<codesage_protocol::AuthorConcentration>, String)> {
     if !db.git_authors_complete()? {
         return Ok((None, "author concentration unavailable: run codesage git-index --full to populate author history".into()));
     }
     let events = db.git_author_events(path)?;
+    if events.is_empty() {
+        return Ok((
+            None,
+            "author concentration unavailable: no indexed author history for this path".into(),
+        ));
+    }
     let cutoff = now.saturating_sub(i64::from(AUTHOR_HISTORY_DAYS) * 86_400);
     if events
         .iter()
@@ -35,7 +42,9 @@ pub(crate) fn risk_author_concentration(
     ) else {
         return Ok((
             None,
-            "author concentration unavailable: no qualifying commits in the last 730 days".into(),
+            format!(
+                "author concentration unavailable: no qualifying commits in the {AUTHOR_HISTORY_DAYS}-day window anchored at {anchor_name} (Unix timestamp {now})"
+            ),
         ));
     };
     let note = format!(

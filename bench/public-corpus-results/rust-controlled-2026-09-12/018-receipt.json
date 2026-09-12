@@ -1,0 +1,44 @@
+{
+  "arm": "018",
+  "started": "2026-09-12T22:37:29.999359+00:00",
+  "binary_sha256": "18756bf4853193b7182fa93cfae3576e785ea8c519e3a8635e360d5936c59ec7",
+  "env": {
+    "CODESAGE_WATCH": "0",
+    "CODESAGE_DAEMON_RUNTIME_DIR": "/tmp/codesage-five-eval-data/runtime-018",
+    "ORT_DYLIB_PATH": "${HOME}/.local/lib/python3.11/site-packages/onnxruntime/capi/libonnxruntime.so.1.24.4"
+  },
+  "index": [
+    {
+      "name": "tokio",
+      "returncode": 0,
+      "command": [
+        "/tmp/codesage-five-eval-018/release/codesage",
+        "index",
+        "--full",
+        "--no-features"
+      ]
+    },
+    {
+      "name": "serde",
+      "returncode": 0,
+      "command": [
+        "/tmp/codesage-five-eval-018/release/codesage",
+        "index",
+        "--full",
+        "--no-features"
+      ]
+    },
+    {
+      "name": "axum",
+      "returncode": 0,
+      "command": [
+        "/tmp/codesage-five-eval-018/release/codesage",
+        "index",
+        "--full",
+        "--no-features"
+      ]
+    }
+  ],
+  "score_returncode": 0,
+  "finished": "2026-09-12T22:44:49.423029+00:00"
+}

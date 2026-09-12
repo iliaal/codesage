@@ -247,6 +247,65 @@ fn assert_followups(server: &mut Server, tools: &BTreeMap<String, Value>, first:
     }
 }
 
+#[test]
+fn rehearsal_discloses_unscored_history_through_mcp() {
+    let project = tempfile::tempdir().unwrap();
+    fixture(project.path());
+    std::fs::write(project.path().join("fresh.rs"), "pub fn fresh() {}\n").unwrap();
+    run(
+        project.path(),
+        env!("CARGO_BIN_EXE_codesage"),
+        &["index", "--no-semantic"],
+    );
+    let mut server = Server::start();
+    let listed = server.request("tools/list", json!({}));
+    let tool = listed["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "review_rehearsal")
+        .unwrap();
+    assert!(
+        tool["outputSchema"]["properties"]
+            .get("objections")
+            .is_some()
+    );
+    for (paths, severity) in [
+        (json!(["fresh.rs"]), Some("medium")),
+        (json!(["fresh.rs", "src/lib.rs"]), Some("low")),
+        (json!(["src/lib.rs"]), None),
+    ] {
+        let result = server.call(
+            project.path(),
+            "review_rehearsal",
+            json!({"file_paths":paths}),
+        );
+        assert_ne!(result["isError"], true, "{result}");
+        let objections: Vec<_> = result["structuredContent"]["objections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o["category"] == "unscored-risk")
+            .collect();
+        assert_eq!(
+            objections.len(),
+            usize::from(severity.is_some()),
+            "{result}"
+        );
+        if let Some(severity) = severity {
+            assert_eq!(objections[0]["severity"], severity);
+            assert_eq!(objections[0]["files"], json!(["fresh.rs"]));
+            assert!(
+                objections[0]["evidence"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.as_str().unwrap().contains("codesage git-index"))
+            );
+        }
+    }
+}
+
 fn contains_string(value: &Value, wanted: &str) -> bool {
     match value {
         Value::String(s) => s == wanted,

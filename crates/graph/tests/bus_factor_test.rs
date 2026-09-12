@@ -125,7 +125,7 @@ fn legacy_and_empty_author_history_are_disclosed_separately() {
         empty
             .notes
             .iter()
-            .any(|note| note.contains("no qualifying commits"))
+            .any(|note| note.contains("no indexed author history for this path"))
     );
     assert_eq!(legacy.score, empty.score);
     db.upsert_git_author_event("feature.rs", "missing-identity", "", i64::MAX)
@@ -138,6 +138,114 @@ fn legacy_and_empty_author_history_are_disclosed_separately() {
             .iter()
             .any(|note| note.contains("author identities are missing"))
     );
+}
+
+#[test]
+fn filtered_author_history_names_the_actual_anchor_without_changing_risk() {
+    let db = Database::open_in_memory().unwrap();
+    let anchor = 1_700_000_000;
+    db.upsert_git_file("feature.rs", 1.0, 0, 1, Some(anchor))
+        .unwrap();
+    db.reset_git_authors().unwrap();
+    let empty = assess_risk(&db, "feature.rs").unwrap();
+    db.upsert_git_author_event(
+        "feature.rs",
+        "old",
+        "email:a@example.com",
+        anchor - 731 * DAY,
+    )
+    .unwrap();
+    let filtered = assess_risk(&db, "feature.rs").unwrap();
+    assert!(filtered.author_concentration.is_none());
+    assert!(
+        filtered
+            .notes
+            .iter()
+            .any(|note| note.contains("730-day window")
+                && note.contains("newest indexed commit for this file")
+                && note.contains("1700000000")),
+        "{:?}",
+        filtered.notes
+    );
+    assert_eq!(filtered.score, empty.score);
+    db.upsert_file(&codesage_protocol::FileInfo {
+        path: "untracked.rs".into(),
+        language: codesage_protocol::Language::Rust,
+        content_hash: "fixture".into(),
+    })
+    .unwrap();
+    let absent = assess_risk(&db, "untracked.rs").unwrap();
+    assert!(
+        absent
+            .notes
+            .iter()
+            .any(|note| note.contains("no indexed author history for this path")),
+        "{:?}",
+        absent.notes
+    );
+    db.upsert_git_author_event("untracked.rs", "old", "email:a@example.com", 1)
+        .unwrap();
+    let filtered = assess_risk(&db, "untracked.rs").unwrap();
+    assert!(
+        filtered.notes.iter().any(|note| note.contains("730d@now")),
+        "{:?}",
+        filtered.notes
+    );
+    assert_eq!(absent.score, filtered.score);
+}
+
+#[test]
+fn legacy_history_window_remains_unknown_until_full_rebuild() {
+    let root = tempfile::tempdir().unwrap();
+    git(root.path(), &["init", "-q"]);
+    let old = 1_500_000_000;
+    commit(root.path(), "a@example.com", old, "fn first() {}\n");
+    let sha = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root.path())
+        .output()
+        .unwrap();
+    assert!(sha.status.success());
+    let db = Database::open_in_memory().unwrap();
+    db.set_git_index_state(String::from_utf8(sha.stdout).unwrap().trim())
+        .unwrap();
+    db.upsert_git_file("feature.rs", 1.0, 0, 1, Some(old))
+        .unwrap();
+    let unknown = || {
+        let note = codesage_graph::find_coupling(&db, "feature.rs", 5)
+            .unwrap()
+            .note
+            .unwrap();
+        assert!(note.contains("window provenance is unknown"), "{note}");
+        assert!(note.contains("git-index --full"), "{note}");
+        assert!(!note.contains("730d@HEAD"), "{note}");
+    };
+    unknown();
+    git_history_index_with_options(&db, root.path(), &[], IndexMode::Incremental).unwrap();
+    unknown();
+    commit(root.path(), "b@example.com", old + DAY, "fn second() {}\n");
+    git_history_index_with_options(&db, root.path(), &[], IndexMode::Incremental).unwrap();
+    unknown();
+    git_history_index_with_options(&db, root.path(), &[], IndexMode::Full).unwrap();
+    let note = codesage_graph::find_coupling(&db, "feature.rs", 5)
+        .unwrap()
+        .note
+        .unwrap();
+    assert!(note.contains("730d@HEAD"), "{note}");
+    assert!(note.contains("730 days before HEAD"), "{note}");
+    git_history_index_with_options(&db, root.path(), &[], IndexMode::Incremental).unwrap();
+    let note = codesage_graph::find_coupling(&db, "feature.rs", 5)
+        .unwrap()
+        .note
+        .unwrap();
+    assert!(note.contains("730d@HEAD"), "{note}");
+    db.execute_raw_for_tests(
+        "UPDATE git_index_state SET last_sha = last_sha, last_indexed_at = last_indexed_at",
+    )
+    .unwrap();
+    unknown();
+    git_history_index_with_options(&db, root.path(), &[], IndexMode::Incremental).unwrap();
+    unknown();
 }
 
 #[test]

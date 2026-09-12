@@ -13,7 +13,8 @@ CREATE TABLE IF NOT EXISTS files (
     -- derived. Lets the targeted backfill distinguish "rule-clean empty
     -- set" from "never-derived empty set"; updated by every
     -- `replace_file_trust_boundaries` call.
-    boundaries_derived_at INTEGER NOT NULL DEFAULT 0
+    boundaries_derived_at INTEGER NOT NULL DEFAULT 0,
+    interpretation TEXT
 );
 
 CREATE TABLE IF NOT EXISTS symbols (
@@ -492,7 +493,41 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
     ),
     ("0018_git_author_events", migrate_0018_git_author_events),
     ("0019_file_hash_cache", migrate_0019_file_hash_cache),
+    ("0020_file_interpretation", migrate_0020_file_interpretation),
+    ("0021_git_history_anchor", migrate_0021_git_history_anchor),
 ];
+
+fn migrate_0020_file_interpretation(conn: &Connection) -> rusqlite::Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('files') WHERE name = 'interpretation')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        conn.execute_batch("ALTER TABLE files ADD COLUMN interpretation TEXT;")?;
+    }
+    // Older additive-schema-compatible writers do not know to clear this stamp.
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS files_clear_interpretation
+         AFTER UPDATE OF language, content_hash, indexed_at ON files
+         BEGIN
+             UPDATE files SET interpretation = NULL WHERE id = NEW.id;
+         END;",
+    )?;
+    Ok(())
+}
+
+fn migrate_0021_git_history_anchor(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "ALTER TABLE git_index_state ADD COLUMN anchor_source TEXT;
+         ALTER TABLE git_index_state ADD COLUMN anchor_epoch INTEGER;
+         CREATE TRIGGER git_index_state_invalidate_anchor
+         AFTER UPDATE OF last_sha, last_indexed_at ON git_index_state
+         BEGIN
+             UPDATE git_index_state SET anchor_source = NULL, anchor_epoch = NULL WHERE id = NEW.id;
+         END;",
+    )
+}
 
 fn migrate_0019_file_hash_cache(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(

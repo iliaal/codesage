@@ -1080,6 +1080,9 @@ fn reindex_one(
             ) {
                 Ok(stats) => {
                     if stats.files_indexed > 0 {
+                        if semantic_enabled {
+                            *stale_semantic = Some(file_info.clone());
+                        }
                         tracing::info!(
                             path = %rel_str,
                             symbols = stats.symbols_found,
@@ -1119,6 +1122,10 @@ fn structural_hash_is_fresh(
         return false;
     };
     matches!(db.get_file_hash(rel_str), Ok(Some(stored)) if stored == content_hash)
+        && matches!(
+            db.file_interpretation_matches(rel_str, codesage_graph::STRUCTURAL_INTERPRETATION),
+            Ok(true)
+        )
 }
 
 fn semantic_hash_is_fresh(config: &StateWatcherConfig, rel_str: &str, content_hash: &str) -> bool {
@@ -3437,6 +3444,41 @@ mod tests {
             WorkOutcome::Done
         );
         assert!(stale.is_none());
+    }
+
+    #[test]
+    fn watcher_upgrades_unchanged_legacy_structure_and_queues_semantic_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codesage")).unwrap();
+        let src = "def actual(): pass\n";
+        std::fs::write(root.join("a.py"), src).unwrap();
+        let config = test_config(root);
+        let hash = content_hash(src.as_bytes());
+        let db = Database::open_for_model(
+            &config.db_path,
+            &config.embed_config.model,
+            codesage_storage::db::DEFAULT_EMBEDDING_DIM,
+        )
+        .unwrap();
+        db.upsert_file(&FileInfo {
+            path: "a.py".to_string(),
+            language: codesage_protocol::Language::Python,
+            content_hash: hash.clone(),
+        })
+        .unwrap();
+        db.upsert_semantic_file_hash("a.py", &hash).unwrap();
+        assert!(semantic_hash_is_fresh(&config, "a.py", &hash));
+        assert!(!structural_hash_is_fresh(&config, "a.py", &hash));
+        let mut stale = None;
+        assert_eq!(
+            reindex_one(&config, Path::new("a.py"), true, false, &mut stale),
+            WorkOutcome::Done,
+        );
+        assert_eq!(db.symbols_for_file("a.py").unwrap()[0].name, "actual");
+        assert_eq!(stale.unwrap().content_hash, hash);
+        assert!(structural_hash_is_fresh(&config, "a.py", &hash));
+        assert!(!semantic_hash_is_fresh(&config, "a.py", &hash));
     }
 
     #[test]
