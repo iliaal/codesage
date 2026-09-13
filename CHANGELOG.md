@@ -1,8 +1,10 @@
 ## [Unreleased]
 
+## [0.30.1] - 2026-09-13
+
 ### Added
 
-- `codesage install-hooks --strict` exits 1 when a requested hook was skipped because a non-codesage hook already occupies its path; every run now ends with a `summary: N installed, M skipped` line.
+- `codesage install-hooks` reports installed and skipped hook counts; `--strict` exits 1 if any requested hook is skipped.
 
 ## [0.30.0] - 2026-09-12
 
@@ -976,5 +978,7 @@ Initial public release.
 
 [0.29.0]: https://github.com/iliaal/codesage/releases/tag/v0.29.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.30.0...HEAD
 [0.30.0]: https://github.com/iliaal/codesage/releases/tag/v0.30.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.30.1...HEAD
+[0.30.1]: https://github.com/iliaal/codesage/releases/tag/v0.30.1
