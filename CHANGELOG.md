@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Added
+
+- `codesage install-hooks --strict` exits 1 when a requested hook was skipped because a non-codesage hook already occupies its path; every run now ends with a `summary: N installed, M skipped` line.
+
 ## [0.30.0] - 2026-09-12
 
 ### Changed

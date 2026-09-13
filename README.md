@@ -170,7 +170,7 @@ codesage risk src/auth/session.ts                           # score with decompo
 # MCP for Claude Code / Codex / Cursor (stdio shim starts/reuses one local daemon)
 claude mcp add --scope user codesage -- codesage mcp
 
-# Auto-reindex on git operations
+# Auto-reindex on git operations (--strict: exit 1 if an existing hook was left untouched)
 codesage install-hooks
 
 # Diagnose installation

@@ -7,14 +7,19 @@ use anyhow::{Context, Result, bail};
 use crate::find_project_root;
 use crate::util::{self, git_common_dir};
 
-pub(crate) fn cmd_install_hooks(with_leak_check: bool) -> Result<()> {
+/// Outcome of one `install-hooks` run. `skipped` names every hook the command
+/// was asked to wire but left untouched, with the printed reason.
+#[derive(Debug, Default)]
+pub(crate) struct InstallOutcome {
+    pub(crate) installed: Vec<PathBuf>,
+    pub(crate) skipped: Vec<String>,
+}
+
+pub(crate) fn cmd_install_hooks(with_leak_check: bool, strict: bool) -> Result<()> {
     let root = find_project_root()?;
     if !root.join(".git").exists() {
         bail!("not a git repository (no .git at project root)");
     }
-
-    let (hooks_dir, is_husky) = resolve_hooks_dir(&root)?;
-    std::fs::create_dir_all(&hooks_dir)?;
 
     let codesage_bin =
         std::env::current_exe().context("resolving current_exe for git hook body")?;
@@ -28,11 +33,38 @@ pub(crate) fn cmd_install_hooks(with_leak_check: bool) -> Result<()> {
         })?
         .to_owned();
 
-    let hook_body = generate_post_commit_hook_body(&codesage_path);
+    let outcome = install_hooks_at(&root, &codesage_path, with_leak_check)?;
+    println!(
+        "summary: {} installed, {} skipped",
+        outcome.installed.len(),
+        outcome.skipped.len()
+    );
+    if strict && !outcome.skipped.is_empty() {
+        bail!(
+            "{} hook(s) skipped: {} (--strict)",
+            outcome.skipped.len(),
+            outcome.skipped.join(", ")
+        );
+    }
+
+    Ok(())
+}
+
+/// A pre-existing hook without the codesage marker is user-owned: it is never
+/// overwritten, only reported. The caller decides whether that is an error.
+pub(crate) fn install_hooks_at(
+    root: &std::path::Path,
+    codesage_path: &str,
+    with_leak_check: bool,
+) -> Result<InstallOutcome> {
+    let (hooks_dir, is_husky) = resolve_hooks_dir(root)?;
+    std::fs::create_dir_all(&hooks_dir)?;
+
+    let hook_body = generate_post_commit_hook_body(codesage_path);
 
     // Incremental git indexing detects rewritten ancestry and falls back to a full scan.
     let hook_names = ["post-commit", "post-merge", "post-checkout", "post-rewrite"];
-    let mut installed: Vec<PathBuf> = Vec::new();
+    let mut outcome = InstallOutcome::default();
     for name in &hook_names {
         let path = hooks_dir.join(name);
         if path.exists() {
@@ -48,6 +80,7 @@ pub(crate) fn cmd_install_hooks(with_leak_check: bool) -> Result<()> {
                      `codesage git-index --incremental --lock-wait 60` into your existing \
                      hook (backgrounded), or move it aside and re-run `codesage install-hooks`"
                 );
+                outcome.skipped.push(format!("{name} (foreign hook)"));
                 continue;
             }
         }
@@ -61,16 +94,16 @@ pub(crate) fn cmd_install_hooks(with_leak_check: bool) -> Result<()> {
         }
 
         println!("installed: {}", path.display());
-        installed.push(path);
+        outcome.installed.push(path);
     }
 
-    if is_husky && !installed.is_empty() {
-        exclude_husky_hook_paths(&root, &installed)?;
+    if is_husky && !outcome.installed.is_empty() {
+        exclude_husky_hook_paths(root, &outcome.installed)?;
     }
 
-    install_leak_check_hook(&root, &hooks_dir, is_husky, with_leak_check, &mut installed)?;
+    install_leak_check_hook(root, &hooks_dir, is_husky, with_leak_check, &mut outcome)?;
 
-    Ok(())
+    Ok(outcome)
 }
 
 /// Sequence both passes because they share the index lock; failure in one must not skip the other.
@@ -211,12 +244,15 @@ fn install_leak_check_hook(
     hooks_dir: &std::path::Path,
     is_husky: bool,
     enabled: bool,
-    installed: &mut Vec<PathBuf>,
+    outcome: &mut InstallOutcome,
 ) -> Result<()> {
     let script = root.join("scripts/leak-check.sh");
     if !script.exists() {
         if enabled {
             println!("skip: --with-leak-check passed but no scripts/leak-check.sh in repo");
+            outcome
+                .skipped
+                .push("pre-commit (no scripts/leak-check.sh)".to_owned());
         }
         return Ok(());
     }
@@ -241,6 +277,7 @@ fn install_leak_check_hook(
                  pre-commit hook, or move it aside and re-run \
                  `codesage install-hooks --with-leak-check`"
             );
+            outcome.skipped.push("pre-commit (foreign hook)".to_owned());
             return Ok(());
         }
     }
@@ -259,7 +296,7 @@ fn install_leak_check_hook(
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
     }
     println!("installed: {} (leak-check)", path.display());
-    installed.push(path.clone());
+    outcome.installed.push(path.clone());
 
     if is_husky {
         exclude_husky_hook_paths(root, std::slice::from_ref(&path))?;
@@ -798,6 +835,15 @@ mod tests {
         let content = wait_for("hook skip:");
         assert_eq!(content.matches("hook skip:").count(), 2, "{content}");
         assert_eq!(content.matches("hook start").count(), 5, "{content}");
+    }
+
+    fn init_git_repo(root: &std::path::Path) {
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed");
     }
 
     #[cfg(unix)]
@@ -1460,23 +1506,24 @@ mod tests {
     #[test]
     fn leak_check_hook_requires_explicit_opt_in() {
         let (_dir, root, hooks_dir) = leak_check_fixture();
-        let mut installed = Vec::new();
+        let mut outcome = InstallOutcome::default();
 
-        install_leak_check_hook(&root, &hooks_dir, false, false, &mut installed).unwrap();
+        install_leak_check_hook(&root, &hooks_dir, false, false, &mut outcome).unwrap();
 
         assert!(
             !hooks_dir.join("pre-commit").exists(),
             "pre-commit hook must not be installed without --with-leak-check"
         );
-        assert!(installed.is_empty());
+        assert!(outcome.installed.is_empty());
+        assert!(outcome.skipped.is_empty(), "opt-out is not a skip");
     }
 
     #[test]
     fn leak_check_hook_installed_with_opt_in() {
         let (_dir, root, hooks_dir) = leak_check_fixture();
-        let mut installed = Vec::new();
+        let mut outcome = InstallOutcome::default();
 
-        install_leak_check_hook(&root, &hooks_dir, false, true, &mut installed).unwrap();
+        install_leak_check_hook(&root, &hooks_dir, false, true, &mut outcome).unwrap();
 
         let hook = hooks_dir.join("pre-commit");
         let body = std::fs::read_to_string(&hook).expect("pre-commit hook written");
@@ -1488,7 +1535,8 @@ mod tests {
             body.contains("scripts/leak-check.sh"),
             "hook must exec the repo's leak-check script:\n{body}"
         );
-        assert_eq!(installed, vec![hook.clone()]);
+        assert_eq!(outcome.installed, vec![hook.clone()]);
+        assert!(outcome.skipped.is_empty());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1502,13 +1550,17 @@ mod tests {
         let (_dir, root, hooks_dir) = leak_check_fixture();
         let foreign = "#!/bin/sh\n# user's own hook\nexit 0\n";
         std::fs::write(hooks_dir.join("pre-commit"), foreign).unwrap();
-        let mut installed = Vec::new();
+        let mut outcome = InstallOutcome::default();
 
-        install_leak_check_hook(&root, &hooks_dir, false, true, &mut installed).unwrap();
+        install_leak_check_hook(&root, &hooks_dir, false, true, &mut outcome).unwrap();
 
         let body = std::fs::read_to_string(hooks_dir.join("pre-commit")).unwrap();
         assert_eq!(body, foreign, "foreign pre-commit hook must be untouched");
-        assert!(installed.is_empty());
+        assert!(outcome.installed.is_empty());
+        assert_eq!(
+            outcome.skipped,
+            vec!["pre-commit (foreign hook)".to_owned()]
+        );
     }
 
     #[test]
@@ -1517,11 +1569,60 @@ mod tests {
         let root = dir.path().to_path_buf();
         let hooks_dir = root.join(".git/hooks");
         std::fs::create_dir_all(&hooks_dir).unwrap();
-        let mut installed = Vec::new();
+        let mut outcome = InstallOutcome::default();
 
-        install_leak_check_hook(&root, &hooks_dir, false, true, &mut installed).unwrap();
+        install_leak_check_hook(&root, &hooks_dir, false, true, &mut outcome).unwrap();
 
         assert!(!hooks_dir.join("pre-commit").exists());
-        assert!(installed.is_empty());
+        assert!(outcome.installed.is_empty());
+        assert_eq!(
+            outcome.skipped,
+            vec!["pre-commit (no scripts/leak-check.sh)".to_owned()]
+        );
+    }
+
+    #[test]
+    fn install_hooks_at_reports_foreign_hook_as_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_git_repo(root);
+        let hooks_dir = root.join(".git/hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let foreign = "#!/bin/sh\n# user's own hook\nexit 0\n";
+        std::fs::write(hooks_dir.join("post-commit"), foreign).unwrap();
+
+        let outcome = install_hooks_at(root, "/usr/bin/codesage", false).unwrap();
+
+        assert_eq!(outcome.installed.len(), 3, "{outcome:?}");
+        assert_eq!(
+            outcome.skipped,
+            vec!["post-commit (foreign hook)".to_owned()]
+        );
+        let body = std::fs::read_to_string(hooks_dir.join("post-commit")).unwrap();
+        assert_eq!(body, foreign, "foreign post-commit hook must be untouched");
+        assert!(
+            std::fs::read_to_string(hooks_dir.join("post-merge"))
+                .unwrap()
+                .contains("codesage install-hooks")
+        );
+    }
+
+    #[test]
+    fn install_hooks_at_is_idempotent_on_own_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        init_git_repo(root);
+
+        let first = install_hooks_at(root, "/usr/bin/codesage", false).unwrap();
+        let second = install_hooks_at(root, "/usr/bin/codesage", false).unwrap();
+
+        assert_eq!(first.installed.len(), 4);
+        assert!(first.skipped.is_empty());
+        assert_eq!(
+            second.installed.len(),
+            4,
+            "own hooks are rewritten, not skipped"
+        );
+        assert!(second.skipped.is_empty());
     }
 }

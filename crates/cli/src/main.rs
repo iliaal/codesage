@@ -274,6 +274,10 @@ enum Commands {
         /// code, so it never auto-wires on a fresh clone.
         #[arg(long)]
         with_leak_check: bool,
+        /// Exit 1 when any requested hook was skipped because a non-codesage hook
+        /// already occupies its path (default exit 0 with `skip:` lines and a summary)
+        #[arg(long)]
+        strict: bool,
     },
     /// Register CodeSage as an MCP server in another agent (codex, opencode)
     Install {
@@ -1091,7 +1095,10 @@ fn run(cli: Cli) -> Result<()> {
             }
             DaemonAction::Stop => runtime::cmd_daemon_stop(runtime_dir),
         },
-        Commands::InstallHooks { with_leak_check } => hooks::cmd_install_hooks(with_leak_check),
+        Commands::InstallHooks {
+            with_leak_check,
+            strict,
+        } => hooks::cmd_install_hooks(with_leak_check, strict),
         Commands::Install { target, global } => runtime::cmd_install(&target, global),
         Commands::Uninstall { target, global } => runtime::cmd_uninstall(&target, global),
         Commands::Cleanup { dry_run } => index::cmd_cleanup(dry_run),
