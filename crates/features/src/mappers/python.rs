@@ -13,6 +13,9 @@ use crate::mappers::shared::{
 };
 use crate::mappers::types::{FeatureMapper, FeatureSeed, MapperContext, SeedFile, SeedTest};
 
+mod django;
+mod prefixes;
+
 /// Read a TOML-like section through the next header, without unsupported regex look-around.
 fn extract_section(body: &str, section: &str) -> Option<String> {
     let header = format!("[{section}]");
@@ -532,7 +535,7 @@ fn main_guard_modules(files: &[PyFile]) -> Result<Vec<FeatureSeed>> {
 }
 
 /// Map literal Flask/Blueprint routes, defaulting to GET when methods are absent
-/// or unparseable. Blueprint mount prefixes are not expanded.
+/// or unparseable. Blueprint registrations in other files remain unresolved.
 fn flask_routes(files: &[PyFile]) -> Result<Vec<FeatureSeed>> {
     python_framework_routes(files, PythonFramework::Flask)
 }
@@ -602,10 +605,10 @@ fn python_framework_routes(
     let mut out = Vec::new();
     let ctor_pattern: &str = match framework {
         PythonFramework::Flask => {
-            r"(?m)^\s*([A-Za-z_][\w]*)\s*=\s*(?:flask\s*\.\s*)?(?:Flask|Blueprint)\s*\("
+            r"(?m)^[ \t]*([A-Za-z_][\w]*)\s*=\s*(?:flask\s*\.\s*)?(Flask|Blueprint)\s*\("
         }
         PythonFramework::FastApi => {
-            r"(?m)^\s*([A-Za-z_][\w]*)\s*=\s*(?:fastapi\s*\.\s*)?(?:FastAPI|APIRouter)\s*\("
+            r"(?m)^[ \t]*([A-Za-z_][\w]*)\s*=\s*(?:fastapi\s*\.\s*)?(FastAPI|APIRouter)\s*\("
         }
     };
     let ctor_re = Regex::new(ctor_pattern)?;
@@ -619,16 +622,11 @@ fn python_framework_routes(
         if !raw.contains(framework.import_token()) {
             continue;
         }
-        let source = strip_line_comments(raw, '#');
+        let source = prefixes::route_source(raw);
         if !import_re.is_match(&source) {
             continue;
         }
-        let mut receivers: Vec<String> = Vec::new();
-        for cap in ctor_re.captures_iter(&source) {
-            if let Some(name) = cap.get(1) {
-                receivers.push(name.as_str().to_string());
-            }
-        }
+        let receivers = prefixes::receivers(&source, &ctor_re, framework)?;
         if receivers.is_empty() {
             continue;
         }
@@ -651,13 +649,13 @@ struct PendingDecorator {
 fn emit_python_routes_for(
     source: &str,
     rel: &str,
-    recv: &str,
+    recv: &prefixes::Receiver,
     framework: PythonFramework,
     emitted: &mut BTreeSet<(String, String)>,
     out: &mut Vec<FeatureSeed>,
 ) -> Result<()> {
-    let start_re = build_decorator_start_re(recv, framework)?;
-    let decorator_re = build_decorator_extract_re(recv, framework)?;
+    let start_re = build_decorator_start_re(&recv.name, framework)?;
+    let decorator_re = build_decorator_extract_re(&recv.name, framework)?;
     let def_re = python_def_re();
 
     let mut pending: Vec<PendingDecorator> = Vec::new();
@@ -696,12 +694,15 @@ fn emit_python_routes_for(
                 out,
                 emitted,
                 rel,
-                recv,
+                recv: &recv.name,
                 framework,
             };
             for p in pending.drain(..) {
                 for method in &p.methods {
-                    push_python_route_seed(&mut ctx, method, &p.path, Some(&fn_name));
+                    for prefix in &recv.prefixes {
+                        let path = prefixes::join_route(framework, prefix, &p.path);
+                        push_python_route_seed(&mut ctx, method, &path, Some(&fn_name));
+                    }
                 }
             }
             continue;
@@ -729,7 +730,7 @@ fn build_decorator_start_re(recv: &str, framework: PythonFramework) -> Result<Re
 fn build_decorator_extract_re(recv: &str, framework: PythonFramework) -> Result<Regex> {
     let methods = framework.method_tokens().join("|");
     Ok(Regex::new(&format!(
-        r#"@\s*{recv}\s*\.\s*({methods})\s*\(\s*(?:path\s*=\s*)?['"]([^'"]+)['"](.*)"#,
+        r#"@\s*{recv}\s*\.\s*({methods})\s*\((.*)"#,
         recv = regex::escape(recv),
     ))?)
 }
@@ -745,16 +746,19 @@ fn parse_decorator(
 ) -> Option<PendingDecorator> {
     let caps = decorator_re.captures(full)?;
     let method_token = caps.get(1)?.as_str().to_string();
-    let path = caps.get(2)?.as_str().to_string();
-    if path.is_empty() {
-        return None;
-    }
-    let rest = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+    let tail = caps.get(2)?.as_str();
+    let args = split_top_level_args(tail.trim().strip_suffix(')')?.trim());
+    let first = args.first()?.trim();
+    let path_arg = first
+        .strip_prefix("path")
+        .and_then(|s| s.trim_start().strip_prefix('='));
+    let path = prefixes::string_literal(path_arg.unwrap_or(first))?;
+    let rest = args.get(1..).unwrap_or_default().join(",");
     let methods = match method_token.as_str() {
         // Flask `route` defaults to GET when no `methods=` kwarg is supplied.
-        "route" => parse_methods_kwarg(rest).unwrap_or_else(|| vec!["GET".to_string()]),
+        "route" => parse_methods_kwarg(&rest).unwrap_or_else(|| vec!["GET".to_string()]),
         // Require explicit parseable methods for api_route; do not infer a method set.
-        "api_route" => parse_methods_kwarg(rest)?,
+        "api_route" => parse_methods_kwarg(&rest)?,
         verb => vec![verb.to_uppercase()],
     };
     if methods.is_empty() {
@@ -914,53 +918,8 @@ fn push_python_route_seed(
     });
 }
 
-/// Map literal path/re_path/url entries in urlpatterns. Skip include mounts;
-/// child URLconfs contribute unprefixed routes. HTTP methods are unavailable at
-/// this layer, so auth-sensitive tags depend only on path shape.
 fn django_routes(files: &[PyFile]) -> Result<Vec<FeatureSeed>> {
-    let mut out = Vec::new();
-    let import_re = Regex::new(
-        r"(?m)^\s*(?:from\s+django\.(?:urls|conf\.urls)\s+import\b|import\s+django\.(?:urls|conf\.urls)\b)",
-    )?;
-    // group 1 = the char before the helper (or start), used to reject
-    // attribute access like `views.url(`; group 2 = the helper name.
-    let call_re = Regex::new(r"(^|[^.\w])(path|re_path|url)\s*\(")?;
-
-    for f in files {
-        let rel = &f.rel;
-        let raw = &f.contents;
-        if !raw.contains("urlpatterns") || !raw.contains("django") {
-            continue;
-        }
-        let source = strip_line_comments(raw, '#');
-        if !import_re.is_match(&source) {
-            continue;
-        }
-        let mut emitted: BTreeSet<String> = BTreeSet::new();
-        for body in django_urlpatterns_bodies(&source) {
-            let body_bytes = body.as_bytes();
-            for cap in call_re.captures_iter(&body) {
-                let whole = cap.get(0).expect("group 0");
-                let helper = cap.get(2).expect("helper group").as_str();
-                let open_idx = whole.end() - 1;
-                if body_bytes.get(open_idx) != Some(&b'(') {
-                    continue;
-                }
-                let Some(close) = find_balanced_close(body_bytes, open_idx) else {
-                    continue;
-                };
-                let args = &body[open_idx + 1..close];
-                let Some((route, symbol)) = parse_django_route(helper, args) else {
-                    continue;
-                };
-                if route.is_empty() || !emitted.insert(route.clone()) {
-                    continue;
-                }
-                push_django_route_seed(&mut out, rel, &route, symbol.as_deref());
-            }
-        }
-    }
-    Ok(out)
+    django::routes(files)
 }
 
 fn push_django_route_seed(
@@ -1020,31 +979,6 @@ fn django_urlpatterns_bodies(source: &str) -> Vec<String> {
         }
     }
     out
-}
-
-/// Parse one `path()` / `re_path()` / `url()` call's argument string into a
-/// `(normalized_route, view_symbol)` pair. Returns `None` to skip the call:
-/// when the first positional arg isn't a string literal, when the second
-/// positional arg is an `include(...)` mount (not expanded), or when a
-/// regex route can't be normalized.
-fn parse_django_route(helper: &str, args: &str) -> Option<(String, Option<String>)> {
-    let parts = split_top_level_args(args);
-    let raw_route = django_string_literal(parts.first()?)?;
-    let view_raw = parts.get(1).map(|s| s.trim()).unwrap_or("");
-    if view_raw.starts_with("include") {
-        return None;
-    }
-    let route = if helper == "path" {
-        ensure_leading_slash(&strip_django_converters(&raw_route))
-    } else {
-        normalize_django_regex_route(&raw_route)?
-    };
-    let symbol = if view_raw.is_empty() {
-        None
-    } else {
-        django_view_symbol(view_raw)
-    };
-    Some((route, symbol))
 }
 
 /// Strip Django `path()` converter prefixes: `<int:year>` → `<year>`,
@@ -1131,42 +1065,6 @@ fn django_view_symbol(raw: &str) -> Option<String> {
     } else {
         None
     }
-}
-
-/// Extract the value of a leading string literal from an argument slice,
-/// tolerating Python string prefixes (`r`, `b`, `u`, `f`). Returns `None`
-/// when the slice doesn't start with a quoted literal.
-fn django_string_literal(arg: &str) -> Option<String> {
-    let s = arg.trim_start();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len()
-        && matches!(
-            bytes[i],
-            b'r' | b'R' | b'b' | b'B' | b'u' | b'U' | b'f' | b'F'
-        )
-    {
-        i += 1;
-    }
-    let quote = *bytes.get(i)?;
-    if quote != b'"' && quote != b'\'' {
-        return None;
-    }
-    i += 1;
-    let start = i;
-    let mut escaped = false;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if escaped {
-            escaped = false;
-        } else if c == b'\\' {
-            escaped = true;
-        } else if c == quote {
-            return Some(s[start..i].to_string());
-        }
-        i += 1;
-    }
-    None
 }
 
 /// Split a call's argument string on top-level commas, respecting string

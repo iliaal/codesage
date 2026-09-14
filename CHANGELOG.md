@@ -1,5 +1,13 @@
 ## [Unreleased]
 
+### Added
+
+- Python route slices include literal Flask Blueprint and FastAPI router prefixes and recursively mounted Django URL routes.
+
+### Fixed
+
+- `/codesage-review` and `/codesage-revalidate` retain changed context and test files in nested Git projects.
+
 ## [0.30.1] - 2026-09-13
 
 ### Added
