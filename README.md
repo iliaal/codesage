@@ -272,6 +272,10 @@ codesage feature-bundle feat_<id> --json     # bundle the slice's code for an LL
 
 Use when answering "what slice owns this file?" or "give me the whole flow behind /users". The bundle is the same shape as `export_context` but anchored on the feature's curated file list instead of semantic search results.
 
+Python route slices include literal Flask Blueprint prefixes from constructors and same-file registrations, FastAPI `APIRouter` constructor prefixes, and Django include chains resolved within the project. Repeated mounts produce separate route slices. Dynamic prefixes, cross-file Blueprint registrations, and FastAPI `include_router` expansion remain unresolved.
+
+After upgrading, run `codesage map` in an existing project to refresh its route slices, then inspect them with `codesage features-list --kind route --json`. Remapping applies the new prefix rules even when source files have not changed.
+
 ### Trust-boundary inspection
 
 ```bash

@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.31.0] - 2026-09-14
+
 ### Added
 
 - Python route slices include literal Flask Blueprint and FastAPI router prefixes and recursively mounted Django URL routes.
@@ -988,5 +990,7 @@ Initial public release.
 
 [0.30.0]: https://github.com/iliaal/codesage/releases/tag/v0.30.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.30.1...HEAD
 [0.30.1]: https://github.com/iliaal/codesage/releases/tag/v0.30.1
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.31.0...HEAD
+[0.31.0]: https://github.com/iliaal/codesage/releases/tag/v0.31.0
