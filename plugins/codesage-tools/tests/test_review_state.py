@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -1380,6 +1381,197 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(leftovers, [])
 
 
+class ChangedFilesTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.repo = self.root / "repo"
+        self.project = self.repo / "app"
+        self.project.mkdir(parents=True)
+        self.git("init", "-q")
+        self.git("config", "user.name", "Test")
+        self.git("config", "user.email", "test@example.invalid")
+        self.paths = ["main.rs", "owned.rs", "context.rs", "tests/check.rs",
+                      "tests/space tab\tline\n雪.rs", "renamed.rs"]
+        for path in self.paths[:-1]:
+            source = self.project / path
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text(f"original {path}\n")
+        (self.repo / "sibling.rs").write_text("sibling original\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "baseline")
+        self.sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.feature = self.root / "feature.json"
+        self.feature.write_text(json.dumps({
+            "feature_id": "feat_changed",
+            "entry_path": "main.rs",
+            "files": [{"path": path, "role": "entry" if path == "main.rs" else
+                       "owned" if path == "owned.rs" else "context"}
+                      for path in self.paths],
+        }))
+        self.findings = self.root / "findings.json"
+        self.findings.write_text(json.dumps({"reviewed_at_sha": self.sha, "findings": []}))
+
+    def git(self, *args):
+        return subprocess.run(["git", "-C", str(self.repo), "-c", "core.fsmonitor=false",
+                               *args], capture_output=True, text=True, check=True)
+
+    def changed(self, *extra, check=True):
+        return subprocess.run([str(SCRIPT), "changed-files", "--project", str(self.project),
+                               "--feature", str(self.feature), "--findings", str(self.findings),
+                               *extra], capture_output=True, text=True, check=check, cwd=self.root)
+
+    def test_nested_git_changes_reach_plan_with_project_relative_paths(self):
+        (self.project / "context.rs").write_text("committed change\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "context change")
+        (self.project / "tests/check.rs").write_text("staged change\n")
+        self.git("add", ".")
+        unusual = self.paths[4]
+        (self.project / unusual).write_text("unstaged change\n")
+        (self.repo / "sibling.rs").write_text("forbidden sibling change\n")
+        changed_file = self.root / "changed.json"
+        result = self.changed("--output", str(changed_file))
+        expected = sorted(["context.rs", "tests/check.rs", unusual])
+        self.assertEqual(json.loads(result.stdout), expected)
+        self.assertEqual(json.loads(changed_file.read_text()), expected)
+        risk = self.root / "risk.json"
+        risk.write_text(json.dumps([{"file": "main.rs", "score": 0.1},
+                                   {"file": "owned.rs", "score": 0.4}]))
+        plan = subprocess.run([str(SCRIPT), "plan-feature", "--project", str(self.project),
+                               "--feature", str(self.feature), "--risk", str(risk),
+                               "--changed", str(changed_file)], capture_output=True,
+                              text=True, check=True)
+        value = json.loads(plan.stdout)
+        self.assertEqual(value["must_read"], ["main.rs", *expected, "owned.rs"])
+        self.assertEqual(value["omitted_file_count"], 0)
+
+    def test_rename_preserves_both_endpoints_and_untracked_files(self):
+        self.git("mv", "app/context.rs", "app/renamed.rs")
+        (self.project / self.paths[4]).unlink()
+        self.git("rm", "--", "app/" + self.paths[4])
+        (self.project / self.paths[4]).write_text("untracked replacement\n")
+        self.assertEqual(json.loads(self.changed().stdout),
+                         sorted(["context.rs", "renamed.rs", self.paths[4]]))
+
+    def test_staged_change_reverted_in_worktree_remains_changed(self):
+        original = (self.project / "context.rs").read_text()
+        (self.project / "context.rs").write_text("staged change\n")
+        self.git("add", ".")
+        (self.project / "context.rs").write_text(original)
+        self.assertEqual(json.loads(self.changed().stdout), ["context.rs"])
+
+    def test_revalidation_unions_only_targeted_finding_paths(self):
+        self.findings.write_text(json.dumps({"reviewed_at_sha": self.sha, "findings": [
+            {"finding_id": "fnd_target", "file": "tests/check.rs"},
+            {"finding_id": "fnd_other", "file": "context.rs"},
+        ]}))
+        targets = self.root / "targets.json"
+        targets.write_text('["fnd_target"]')
+        self.assertEqual(json.loads(self.changed("--target-ids", str(targets)).stdout),
+                         ["tests/check.rs"])
+
+    def test_invalid_review_sha_fails_instead_of_reporting_no_changes(self):
+        self.findings.write_text(json.dumps({"reviewed_at_sha": "f" * 40}))
+        result = self.changed(check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("Git changed-file collection failed", result.stderr)
+
+    def test_untracked_literal_path_and_sibling_rename_are_scoped(self):
+        literal = ":(glob)*.rs"
+        feature = json.loads(self.feature.read_text())
+        feature["files"].append({"path": literal, "role": "context"})
+        self.feature.write_text(json.dumps(feature))
+        (self.project / literal).write_text("new context\n")
+        self.git("mv", "sibling.rs", "app/renamed.rs")
+        self.assertEqual(json.loads(self.changed().stdout), [literal, "renamed.rs"])
+
+    def test_no_prior_sha_collects_pending_changes_in_root_project(self):
+        self.project = self.repo
+        self.feature.write_text(json.dumps({"feature_id": "feat_root", "files": [
+            {"path": "sibling.rs", "role": "context"}]}))
+        self.findings.write_text("{}")
+        (self.repo / "sibling.rs").write_text("pending root change\n")
+        self.assertEqual(json.loads(self.changed().stdout), ["sibling.rs"])
+
+    def test_fsmonitor_command_is_not_executed(self):
+        hook = self.root / "fsmonitor"
+        marker = self.root / "hook-executed"
+        hook.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n")
+        hook.chmod(0o755)
+        self.git("config", "core.fsmonitor", str(hook))
+        (self.project / "context.rs").write_text("pending change\n")
+        subprocess.run(["git", "-C", str(self.repo), "status", "--porcelain"],
+                       capture_output=True, check=True)
+        self.assertTrue(marker.exists())
+        marker.unlink()
+        self.assertEqual(json.loads(self.changed().stdout), ["context.rs"])
+        self.assertFalse(marker.exists())
+
+    def test_missing_target_fails_instead_of_dropping_selected_finding(self):
+        targets = self.root / "targets.json"
+        targets.write_text('["fnd_missing"]')
+        result = self.changed("--target-ids", str(targets), check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("target finding IDs are missing", result.stderr)
+
+    def test_initial_review_without_git_produces_an_empty_change_list(self):
+        self.project = self.root / "plain"
+        self.project.mkdir()
+        self.findings.write_text("{}")
+        self.assertEqual(json.loads(self.changed().stdout), [])
+
+    def test_revalidation_without_git_preserves_selected_target_paths(self):
+        self.project = self.root / "plain"
+        self.project.mkdir()
+        self.findings.write_text(json.dumps({"reviewed_at_sha": None, "findings": [
+            {"finding_id": "fnd_target", "file": "context.rs"},
+        ]}))
+        targets = self.root / "targets.json"
+        targets.write_text('["fnd_target"]')
+        self.assertEqual(json.loads(self.changed("--target-ids", str(targets)).stdout),
+                         ["context.rs"])
+
+    def test_missing_repository_with_recorded_sha_remains_an_error(self):
+        self.project = self.root / "plain"
+        self.project.mkdir()
+        result = self.changed(check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+    def test_corrupt_git_metadata_without_prior_sha_remains_an_error(self):
+        self.project = self.root / "broken"
+        self.project.mkdir()
+        (self.project / ".git").mkdir()
+        self.findings.write_text("{}")
+        result = self.changed(check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+    def test_broken_worktree_gitfile_without_prior_sha_remains_an_error(self):
+        self.project = self.root / "broken"
+        self.project.mkdir()
+        (self.project / ".git").write_text("gitdir: /nonexistent/codesage-test-gitdir\n")
+        self.findings.write_text("{}")
+        result = self.changed(check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+
+    def test_missing_git_executable_without_prior_sha_remains_an_error(self):
+        self.project = self.root / "plain"
+        self.project.mkdir()
+        self.findings.write_text("{}")
+        result = subprocess.run([
+            sys.executable, str(SCRIPT), "changed-files", "--project", str(self.project),
+            "--feature", str(self.feature), "--findings", str(self.findings),
+        ], capture_output=True, text=True, env={**os.environ, "PATH": str(self.root / "missing")})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("git", result.stderr)
+
+
 class CliContractTests(unittest.TestCase):
     def test_plan_feature_cli_writes_the_same_plan_it_prints(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1606,6 +1798,7 @@ class ProtocolContractTests(unittest.TestCase):
         for subcommand in (
             "slim-priors",
             "feature-states",
+            "changed-files",
             "plan-feature",
             "combine",
             "validate",
@@ -1624,6 +1817,8 @@ class ProtocolContractTests(unittest.TestCase):
         self.assertIn("needs-confirmation", command)
         self.assertIn("--mode revalidate", command)
         self.assertIn("plan-feature", command)
+        self.assertIn("changed-files", command)
+        self.assertIn("--target-ids", command)
         self.assertIn("--must-read", command)
         self.assertIn("not proof of a fix", command)
         self.assertNotIn("flip to `fixed` automatically", command)

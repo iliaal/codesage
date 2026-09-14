@@ -118,7 +118,16 @@ For each planned feature:
    ```
 
    Use `[]` when the file doesn't exist. Never inline full histories or prior suggested fixes.
-2. If the findings document has `reviewed_at_sha`, compute changed slice files in the orchestrator with `git -C "$PROJECT" diff --name-only <sha> -- <feature paths>`. Include committed and working-tree changes. Reviewers don't receive Bash. Write the JSON array, or `[]`, to `$PROJECT/.codesage/reviews/<RUN_ID>/changed/<feature_id>.json`.
+2. Collect changed slice files through the deterministic helper:
+
+   ```bash
+   "$REVIEW_STATE" changed-files \
+     --project "$PROJECT" \
+     --feature "$PROJECT/.codesage/reviews/$RUN_ID/features/<feature_id>.json" \
+     --output "$PROJECT/.codesage/reviews/$RUN_ID/changed/<feature_id>.json"
+   ```
+
+   The helper reads the feature's findings document, compares committed changes since `reviewed_at_sha` when present, and unions staged, unstaged, and untracked slice paths. Git paths are NUL-delimited and relative to the selected project, including nested projects; sibling changes are excluded, and renames retain both endpoints. Without a prior SHA, it collects pending changes, or returns `[]` for a project outside Git. Collection errors and unavailable recorded commits fail the feature; never replace them with `[]`. Reviewers don't receive Bash.
 3. Compute a bounded, deterministic coverage plan:
 
    ```bash
