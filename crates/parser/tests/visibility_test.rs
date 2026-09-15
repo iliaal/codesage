@@ -25,6 +25,13 @@ pub(super) fn super_fn() {}
 pub(in crate::a) fn in_fn() {}
 pub(in crate) fn in_crate_fn() {}
 pub(self) fn self_fn() {}
+pub(/* note */ crate) fn commented_crate_fn() {}
+pub (crate) fn spaced_crate_fn() {}
+pub(crate /* trailing */) fn trailing_comment_fn() {}
+pub(
+    // comment
+    super
+) fn multiline_super_fn() {}
 struct PrivateStruct;
 pub struct PublicStruct;
 enum PrivateEnum { A }
@@ -74,6 +81,19 @@ fn rust_free_items_carry_modifier_visibility() {
     assert_eq!(visibility_of(&syms, "in_fn"), Some(Visibility::Crate));
     assert_eq!(visibility_of(&syms, "in_crate_fn"), Some(Visibility::Crate));
     assert_eq!(visibility_of(&syms, "self_fn"), Some(Visibility::Module));
+    // Comments and whitespace inside the parentheses do not shift the read.
+    for name in [
+        "commented_crate_fn",
+        "spaced_crate_fn",
+        "trailing_comment_fn",
+        "multiline_super_fn",
+    ] {
+        assert_eq!(
+            visibility_of(&syms, name),
+            Some(Visibility::Crate),
+            "{name}"
+        );
+    }
     assert_eq!(
         visibility_of(&syms, "PrivateStruct"),
         Some(Visibility::Module)
@@ -162,9 +182,10 @@ fn rust_methods_follow_impl_and_trait_rules() {
         by_kind(codesage_protocol::SymbolKind::Method),
         Some(Visibility::Module)
     );
+    // The impl block follows the trait in the source, so its row is last.
     let impl_row = hidden
         .iter()
-        .find(|s| s.line_start > 30)
+        .max_by_key(|s| s.line_start)
         .expect("impl-block method row");
     assert_eq!(impl_row.visibility, Some(Visibility::Public));
 }
