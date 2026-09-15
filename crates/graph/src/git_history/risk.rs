@@ -159,15 +159,20 @@ impl ImportCycles {
         self.suppressed_by_file.get(file).copied().unwrap_or(0)
     }
 
-    /// Suppressed pairs with both endpoints among `members`.
-    fn lazy_edges_within(&self, members: &[String]) -> u32 {
+    /// Suppressed pairs with at least one endpoint among `members`. A pair with
+    /// both endpoints inside would be counted from each side, so it is
+    /// subtracted once; none exist today because such a pair already shares
+    /// the eager component and is never suppressed.
+    fn lazy_edges_touching(&self, members: &[String]) -> u32 {
         let set: HashSet<&str> = members.iter().map(String::as_str).collect();
-        members
+        let incident: u32 = members.iter().map(|m| self.lazy_edges_for(m)).sum();
+        let internal = members
             .iter()
             .filter_map(|m| self.suppressed_from.get(m))
             .flatten()
             .filter(|to| set.contains(to.as_str()))
-            .count() as u32
+            .count() as u32;
+        incident - internal
     }
 }
 
@@ -1578,7 +1583,7 @@ fn find_cycles_touching(db: &Database, patch_files: &[String]) -> Result<PatchCy
             continue;
         }
         let max_churn_file = pick_max_churn(db, component)?;
-        let lazy_edges = cycles.lazy_edges_within(component);
+        let lazy_edges = cycles.lazy_edges_touching(component);
         let mut members = component.clone();
         members.sort();
         let size = members.len() as u32;
@@ -1622,7 +1627,7 @@ fn cycle_entry_for_file(
         members.sort();
         let size = members.len() as u32;
         let max_churn_file = pick_max_churn(db, &members)?;
-        let lazy_edges = cycles.lazy_edges_within(&members);
+        let lazy_edges = cycles.lazy_edges_touching(&members);
         return Ok(Some(CycleEntry {
             members,
             size,
@@ -2214,7 +2219,7 @@ mod tests {
         use codesage_protocol::{FileInfo, Language, Reference, ReferenceKind, Symbol, SymbolKind};
 
         let db = Database::open_in_memory().unwrap();
-        for path in ["a.py", "b.py", "c.py", "x.py", "y.py"] {
+        for path in ["a.py", "b.py", "c.py", "d.py", "x.py", "y.py"] {
             db.upsert_file(&FileInfo {
                 path: path.to_string(),
                 language: Language::Python,
@@ -2227,6 +2232,7 @@ mod tests {
             ("a.py", "fa"),
             ("b.py", "fb"),
             ("c.py", "fc"),
+            ("d.py", "fd"),
             ("x.py", "fx"),
             ("y.py", "fy"),
         ] {
@@ -2255,12 +2261,20 @@ mod tests {
             col: 0,
             lazy,
         };
-        // Eager ring a -> c -> b -> a, plus a lazy a -> b shortcut inside it.
+        // Eager ring a -> c -> b -> a, plus a lazy a -> b shortcut inside it
+        // (redundant) and a lazy a -> d that would pull the eager d -> b
+        // spoke into the ring (enlargement).
         db.insert_references(
             ids("a.py"),
-            &[imp("a.py", "fc", 1, false), imp("a.py", "fb", 2, true)],
+            &[
+                imp("a.py", "fc", 1, false),
+                imp("a.py", "fb", 2, true),
+                imp("a.py", "fd", 3, true),
+            ],
         )
         .unwrap();
+        db.insert_references(ids("d.py"), &[imp("d.py", "fb", 1, false)])
+            .unwrap();
         db.insert_references(ids("c.py"), &[imp("c.py", "fb", 1, false)])
             .unwrap();
         db.insert_references(ids("b.py"), &[imp("b.py", "fa", 1, false)])
@@ -2272,19 +2286,48 @@ mod tests {
             .unwrap();
 
         let cycles = ImportCycles::load(&db).unwrap();
+        let mut suppressed = cycles.suppressed_pairs.clone();
+        suppressed.sort();
         assert_eq!(
-            cycles.suppressed_pairs,
-            vec![("x.py".to_string(), "y.py".to_string())]
+            suppressed,
+            vec![
+                ("a.py".to_string(), "d.py".to_string()),
+                ("x.py".to_string(), "y.py".to_string()),
+            ]
         );
 
+        // The ring member touched by the enlarging pair reports it; the
+        // redundant a -> b shortcut is invisible everywhere.
         let ring = assess_risk(&db, "a.py").unwrap();
         assert!(ring.in_cycle);
         assert_eq!(ring.cycle_size, 3);
-        assert_eq!(ring.lazy_edges, 0);
-        let json = serde_json::to_value(&ring).unwrap();
+        assert_eq!(ring.lazy_edges, 1);
+        let untouched = assess_risk(&db, "c.py").unwrap();
+        assert!(untouched.in_cycle);
+        assert_eq!(untouched.lazy_edges, 0);
+        let json = serde_json::to_value(&untouched).unwrap();
         assert!(json.get("lazy_edges").is_none(), "{json}");
-        let entry = cycle_entry_for_file(&db, &cycles, "a.py").unwrap().unwrap();
-        assert_eq!(entry.lazy_edges, 0);
+        let entry = cycle_entry_for_file(&db, &cycles, "c.py").unwrap().unwrap();
+        assert_eq!(entry.members, vec!["a.py", "b.py", "c.py"]);
+        assert_eq!(entry.lazy_edges, 1);
+        let spoke = assess_risk(&db, "d.py").unwrap();
+        assert!(!spoke.in_cycle);
+        assert_eq!(spoke.lazy_edges, 1);
+
+        let dir = tempfile::tempdir().unwrap();
+        let report = crate::build_review_rehearsal(dir.path(), &db, &["c.py".to_string()]).unwrap();
+        let objection = report
+            .objections
+            .iter()
+            .find(|o| o.category == "import-cycle")
+            .expect("ring still objects");
+        assert!(
+            objection
+                .evidence
+                .iter()
+                .any(|e| e.starts_with("lazy_edges: 1 ")),
+            "{objection:?}"
+        );
 
         for file in ["x.py", "y.py"] {
             let open = assess_risk(&db, file).unwrap();

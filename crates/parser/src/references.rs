@@ -342,52 +342,59 @@ fn lazy_scope_kinds(language: Language) -> &'static [&'static str] {
 }
 
 /// True when `function` runs where it is written: the callee of a call
-/// expression, the constructor of a `new` expression, or the receiver of
-/// `.call(...)` / `.apply(...)`, each directly or through parentheses.
+/// expression, the constructor of a `new` expression, the receiver of a
+/// `.call` / `.apply` chain that is finally called, or a `.bind(...)` result
+/// that is itself invoked, each directly or through parentheses.
 /// `(function () { ... })()` and `(function () { ... }).call(this)` run when
-/// their enclosing scope does, so they defer nothing by themselves; `.bind`
-/// only produces another function.
+/// their enclosing scope does, so they defer nothing by themselves; a stored
+/// `.bind(this)` or an unread `.call` only produces another function.
 fn is_immediately_invoked(function: &Node, source: &[u8]) -> bool {
-    let mut callee = *function;
-    let mut parent = function.parent();
-    while let Some(p) = parent {
+    let mut node = *function;
+    loop {
+        let mut parent = node.parent();
+        while let Some(p) = parent {
+            if p.kind() != "parenthesized_expression" {
+                break;
+            }
+            node = p;
+            parent = p.parent();
+        }
+        let Some(p) = parent else {
+            return false;
+        };
+        let is_field = |field: &str| {
+            p.child_by_field_name(field)
+                .is_some_and(|child| child.id() == node.id())
+        };
         match p.kind() {
-            "parenthesized_expression" => {
-                callee = p;
-                parent = p.parent();
-            }
-            "call_expression" => {
-                return p
-                    .child_by_field_name("function")
-                    .is_some_and(|f| f.id() == callee.id());
-            }
-            "new_expression" => {
-                return p
-                    .child_by_field_name("constructor")
-                    .is_some_and(|c| c.id() == callee.id());
-            }
-            "member_expression" => {
-                let is_receiver = p
-                    .child_by_field_name("object")
-                    .is_some_and(|o| o.id() == callee.id());
-                let invokes = p.child_by_field_name("property").is_some_and(|prop| {
-                    matches!(
-                        crate::parse::node_text_lossy(&prop, source).as_str(),
-                        "call" | "apply"
-                    )
-                });
-                let called = p.parent().is_some_and(|call| {
-                    call.kind() == "call_expression"
-                        && call
-                            .child_by_field_name("function")
-                            .is_some_and(|f| f.id() == p.id())
-                });
-                return is_receiver && invokes && called;
+            "call_expression" => return is_field("function"),
+            "new_expression" => return is_field("constructor"),
+            "member_expression" if is_field("object") => {
+                let property = p
+                    .child_by_field_name("property")
+                    .map(|prop| crate::parse::node_text_lossy(&prop, source))
+                    .unwrap_or_default();
+                match property.as_str() {
+                    // Calling `f.call` calls `f`; keep climbing from the member.
+                    "call" | "apply" => node = p,
+                    // Only a bound function that is then called counts.
+                    "bind" => match p.parent() {
+                        Some(bind_call)
+                            if bind_call.kind() == "call_expression"
+                                && bind_call
+                                    .child_by_field_name("function")
+                                    .is_some_and(|f| f.id() == p.id()) =>
+                        {
+                            node = bind_call
+                        }
+                        _ => return false,
+                    },
+                    _ => return false,
+                }
             }
             _ => return false,
         }
     }
-    false
 }
 
 /// True when an import directive sits inside a function, method, closure, or
@@ -718,10 +725,13 @@ mod tests {
 
     #[test]
     fn javascript_call_apply_and_new_invoked_wrappers_are_eager_but_bind_is_lazy() {
-        let src = "(function () { require('./call'); }).call(this);\n(function () { require('./apply'); }.apply(null, []));\nnew (function () { require('./ctor'); })();\nconst bound = (function () { require('./bound'); }).bind(this);\nconst later = (function () { require('./later'); }).call;\n";
+        let src = "(function () { require('./call'); }).call(this);\n(function () { require('./apply'); }.apply(null, []));\nnew (function () { require('./ctor'); })();\n(function () { require('./chain'); }).call.call(null, this);\n(function () { require('./bound-now'); }).bind(this)();\n(function () { require('./bound-call'); }).bind(this).call(null);\nconst bound = (function () { require('./bound'); }).bind(this);\nconst later = (function () { require('./later'); }).call;\n";
         let refs = refs_from_source(src, Language::JavaScript);
         assert_eq!(lazy_flags(&refs, "./call"), vec![false]);
         assert_eq!(lazy_flags(&refs, "./apply"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./chain"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./bound-now"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./bound-call"), vec![false]);
         assert_eq!(lazy_flags(&refs, "./ctor"), vec![false]);
         assert_eq!(lazy_flags(&refs, "./bound"), vec![true]);
         // `.call` read but never invoked.

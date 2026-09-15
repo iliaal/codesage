@@ -371,6 +371,8 @@ pub struct Reference {
     /// immediately invoked: the module is loaded on use, not at load time.
     /// Cycle detection drops a file pair whose import edges are all lazy;
     /// dependency listings, impact analysis, and call resolution keep them.
+    /// A wrapper invoked where it is written (`(...)()`, `new`, `.call`,
+    /// `.apply`, or a `.bind(...)` that is itself called) is load-time.
     /// Always false for other kinds and for languages whose imports,
     /// includes, or `use` aliases resolve at compile time (C, C++, Rust,
     /// PHP, Java, Go).
@@ -1261,9 +1263,9 @@ pub struct CycleEntry {
     pub size: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_churn_file: Option<String>,
-    /// Lazy-only import pairs with both endpoints among `members`, excluded
-    /// from this SCC because every directive is a function-body import.
-    /// Absent when zero.
+    /// Lazy-only import pairs (every directive a function-body import) with
+    /// at least one endpoint among `members` that would enlarge this SCC if
+    /// counted as load-time edges. Absent when zero.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub lazy_edges: u32,
 }
