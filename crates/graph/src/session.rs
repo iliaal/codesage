@@ -50,6 +50,12 @@ pub struct IncompleteRiskRanking {
     cause: anyhow::Error,
 }
 
+impl IncompleteRiskRanking {
+    pub fn new(cause: anyhow::Error) -> Self {
+        Self { cause }
+    }
+}
+
 impl std::fmt::Display for IncompleteRiskRanking {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("risk ranking is incomplete: one or more score components failed")
@@ -358,7 +364,7 @@ fn compute_top_risk(
     checkpoint()?;
     let (pairs, failure) = risk_scores(db, &candidates)?;
     if let Some(cause) = failure {
-        return Err(IncompleteRiskRanking { cause }.into());
+        return Err(IncompleteRiskRanking::new(cause).into());
     }
     let mut scored: Vec<SessionRiskEntry> = pairs
         .into_iter()

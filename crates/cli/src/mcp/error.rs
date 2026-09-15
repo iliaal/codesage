@@ -168,6 +168,10 @@ impl McpError {
         self.source = Some(source);
         self
     }
+
+    fn source_error(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        std::error::Error::source(self)
+    }
 }
 
 impl fmt::Display for McpError {
@@ -196,20 +200,28 @@ pub(crate) struct Classified {
     pub(crate) remedy: Option<Remedy>,
 }
 
-/// Work-control stops, admission refusals, and database contention anywhere in
-/// the chain outrank code-level wrappers: a model load cancelled at a checkpoint
-/// is a cancellation, not a model failure. Otherwise the outermost recognized
-/// cause decides.
+/// Work-control stops and admission refusals anywhere in the chain outrank
+/// code-level wrappers: a model load cancelled at a checkpoint is a
+/// cancellation, not a model failure. Otherwise the outermost recognized cause
+/// decides, so `IncompleteRiskRanking` over a busy database stays incomplete
+/// while a typed wrapper over a busy database reports the contention.
 pub(crate) fn classify(error: &anyhow::Error) -> Classified {
     if let Some(classified) = error.chain().find_map(classify_interruption) {
         return classified;
     }
     for cause in error.chain() {
         if let Some(typed) = cause.downcast_ref::<McpError>() {
+            let beneath = std::iter::successors(typed.source_error(), |e| e.source());
+            if let Some(busy) = beneath.into_iter().find_map(classify_busy) {
+                return busy;
+            }
             return Classified {
                 code: typed.code,
                 remedy: typed.remedy.clone(),
             };
+        }
+        if let Some(busy) = classify_busy(cause) {
+            return busy;
         }
         if cause.is::<codesage_graph::IncompleteRiskRanking>() {
             return Classified {
@@ -257,43 +269,40 @@ pub(crate) fn classify(error: &anyhow::Error) -> Classified {
 }
 
 fn classify_interruption(cause: &(dyn std::error::Error + 'static)) -> Option<Classified> {
-    {
-        if let Some(admission) = cause.downcast_ref::<super::work::AdmissionError>() {
-            use super::work::AdmissionError;
-            return Some(match admission {
-                AdmissionError::Saturated => Classified {
-                    code: ErrorCode::Saturated,
-                    remedy: Some(Remedy::retry()),
-                },
-                AdmissionError::Shutdown => Classified {
-                    code: ErrorCode::Shutdown,
-                    remedy: None,
-                },
-                AdmissionError::Stopped(reason) => stopped(*reason),
-                AdmissionError::InvalidLimits | AdmissionError::ProjectAlreadyAttached => {
-                    Classified {
-                        code: ErrorCode::Internal,
-                        remedy: None,
-                    }
-                }
-            });
-        }
+    if let Some(admission) = cause.downcast_ref::<super::work::AdmissionError>() {
+        use super::work::AdmissionError;
+        return match admission {
+            AdmissionError::Saturated => Some(Classified {
+                code: ErrorCode::Saturated,
+                remedy: Some(Remedy::retry()),
+            }),
+            AdmissionError::Shutdown => Some(Classified {
+                code: ErrorCode::Shutdown,
+                remedy: None,
+            }),
+            AdmissionError::Stopped(reason) => Some(stopped(*reason)),
+            // Programming errors, not interruptions; let the outer pass decide.
+            AdmissionError::InvalidLimits | AdmissionError::ProjectAlreadyAttached => None,
+        };
     }
     if let Some(work) = cause.downcast_ref::<WorkStopped>() {
         return Some(stopped(work.reason));
     }
-    if let Some(rusqlite::Error::SqliteFailure(code, _)) = cause.downcast_ref::<rusqlite::Error>()
-        && matches!(
-            code.code,
-            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-        )
-    {
-        return Some(Classified {
-            code: ErrorCode::DbBusy,
-            remedy: Some(Remedy::retry()),
-        });
-    }
     None
+}
+
+fn classify_busy(cause: &(dyn std::error::Error + 'static)) -> Option<Classified> {
+    let rusqlite::Error::SqliteFailure(code, _) = cause.downcast_ref::<rusqlite::Error>()? else {
+        return None;
+    };
+    matches!(
+        code.code,
+        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+    )
+    .then(|| Classified {
+        code: ErrorCode::DbBusy,
+        remedy: Some(Remedy::retry()),
+    })
 }
 
 fn stopped(reason: StopReason) -> Classified {
@@ -474,6 +483,36 @@ mod tests {
         }));
         assert_eq!(classify(&cancelled).code, ErrorCode::Cancelled);
         assert_eq!(legacy_status(&cancelled), Some("cancelled"));
+
+        let internal = wrap(anyhow::Error::new(AdmissionError::InvalidLimits));
+        assert_eq!(
+            classify(&internal).code,
+            ErrorCode::Model,
+            "a programming-error admission variant must not pre-empt the outer pass"
+        );
+    }
+
+    #[test]
+    fn incomplete_ranking_over_a_busy_database_stays_incomplete() {
+        let busy = || {
+            anyhow::Error::new(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                None,
+            ))
+        };
+        let incomplete = anyhow::Error::new(codesage_graph::IncompleteRiskRanking::new(busy()));
+        assert!(
+            incomplete
+                .chain()
+                .any(|cause| cause.downcast_ref::<rusqlite::Error>().is_some()),
+            "fixture must expose the busy cause through source()"
+        );
+        assert_eq!(classify(&incomplete).code, ErrorCode::Incomplete);
+        assert_eq!(legacy_status(&incomplete), Some("incomplete"));
+
+        let bare = busy();
+        assert_eq!(classify(&bare).code, ErrorCode::DbBusy);
+        assert_eq!(legacy_status(&bare), Some("database-busy"));
     }
 
     #[test]
