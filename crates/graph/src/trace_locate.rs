@@ -1740,6 +1740,7 @@ SUMMARY: AddressSanitizer: heap-use-after-free /home/u/proj/src/parse.c:123:12 i
             col_start: 0,
             col_end: 0,
             rationale: Vec::new(),
+            visibility: None,
         }
     }
 

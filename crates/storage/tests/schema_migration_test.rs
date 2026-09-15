@@ -198,6 +198,7 @@ fn fresh_db_records_migrations_exactly_once() {
         "0019_file_hash_cache",
         "0020_file_interpretation",
         "0021_git_history_anchor",
+        "0023_symbols_visibility",
     ];
     for migration in expected_migrations {
         let count: i64 = conn
@@ -649,6 +650,7 @@ fn sample_symbol() -> codesage_protocol::Symbol {
         col_start: 0,
         col_end: 10,
         rationale: Vec::new(),
+        visibility: None,
     }
 }
 

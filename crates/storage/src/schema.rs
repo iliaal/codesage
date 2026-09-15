@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS symbols (
     line_end INTEGER NOT NULL,
     col_start INTEGER NOT NULL,
     col_end INTEGER NOT NULL,
-    rationale TEXT NOT NULL DEFAULT '[]'
+    rationale TEXT NOT NULL DEFAULT '[]',
+    visibility TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
@@ -495,7 +496,22 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
     ("0019_file_hash_cache", migrate_0019_file_hash_cache),
     ("0020_file_interpretation", migrate_0020_file_interpretation),
     ("0021_git_history_anchor", migrate_0021_git_history_anchor),
+    ("0023_symbols_visibility", migrate_0023_symbols_visibility),
 ];
+
+/// Nullable so rows written by older binaries read back as "unknown" rather
+/// than as a visibility claim; the interpretation bump reparses them.
+fn migrate_0023_symbols_visibility(conn: &Connection) -> rusqlite::Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('symbols') WHERE name = 'visibility')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        conn.execute_batch("ALTER TABLE symbols ADD COLUMN visibility TEXT;")?;
+    }
+    Ok(())
+}
 
 fn migrate_0020_file_interpretation(conn: &Connection) -> rusqlite::Result<()> {
     let exists: bool = conn.query_row(

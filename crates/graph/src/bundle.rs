@@ -3,7 +3,8 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use codesage_protocol::{
-    ContextBundle, ExportRequest, ReferenceKind, SearchRequest, SearchResult, Symbol, SymbolSummary,
+    ContextBundle, ExportRequest, ReferenceKind, SearchRequest, SearchResult, Symbol,
+    SymbolSummary, Visibility,
 };
 use codesage_storage::Database;
 
@@ -538,7 +539,14 @@ pub(crate) fn resolve_callee_definitions_with_imports(
     to_name: &str,
     load_imports: &mut dyn FnMut() -> Result<Arc<Vec<String>>>,
 ) -> Result<Vec<Symbol>> {
-    let candidates = db.find_symbols(to_name, None)?;
+    // Gate before any strategy runs: a candidate the caller cannot name must
+    // not resurface through a looser tier (lone-candidate return, case fold,
+    // import evidence).
+    let candidates: Vec<Symbol> = db
+        .find_symbols(to_name, None)?
+        .into_iter()
+        .filter(|s| visibility_admits(s, caller_file))
+        .collect();
     if is_qualified_symbol_name(to_name) {
         let exact: Vec<Symbol> = candidates
             .iter()
@@ -578,6 +586,48 @@ pub(crate) fn resolve_callee_definitions_with_imports(
         })
         .collect();
     Ok(filtered)
+}
+
+/// Whether a reference in `caller_file` may name `sym` under its recorded
+/// visibility. Unknown visibility admits; the gate only ever removes.
+pub(crate) fn visibility_admits(sym: &Symbol, caller_file: &str) -> bool {
+    if sym.file_path == caller_file {
+        return true;
+    }
+    match sym.visibility {
+        None | Some(Visibility::Public) => true,
+        Some(Visibility::File) => false,
+        Some(Visibility::Module) => rust_module_subtree(&sym.file_path)
+            .is_some_and(|prefix| caller_file.starts_with(&prefix)),
+        Some(Visibility::Crate) => match (
+            importer_src_root(caller_file),
+            importer_src_root(&sym.file_path),
+        ) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        },
+    }
+}
+
+/// Path approximation of a Rust module's descendants: `a/b.rs` owns `a/b/`,
+/// while `mod.rs`, `lib.rs`, and `main.rs` own their own directory. `#[path]`
+/// attributes and `include!` are not modelled, and `pub(in path)` collapses
+/// to this same rule.
+fn rust_module_subtree(def_file: &str) -> Option<String> {
+    let (dir, name) = def_file
+        .rsplit_once('/')
+        .map_or(("", def_file), |(dir, name)| (dir, name));
+    let stem = name.strip_suffix(".rs")?;
+    let dir_prefix = if dir.is_empty() {
+        String::new()
+    } else {
+        format!("{dir}/")
+    };
+    if matches!(stem, "mod" | "lib" | "main") {
+        Some(dir_prefix)
+    } else {
+        Some(format!("{dir_prefix}{stem}/"))
+    }
 }
 
 // Fetch outgoing imports without computing list_file_dependencies' reverse edges.
@@ -1259,6 +1309,7 @@ mod context_export_tests {
             col_start: 0,
             col_end: 0,
             rationale: vec![],
+            visibility: None,
         }
     }
 
@@ -1367,6 +1418,71 @@ mod context_export_tests {
         assert!(
             refs.is_empty(),
             "qualified method without exact refs must not fall back to all bare `find` references: {refs:?}"
+        );
+    }
+
+    fn visible(name: &str, file: &str, visibility: Option<Visibility>) -> Symbol {
+        Symbol {
+            visibility,
+            ..symbol(name, name, file)
+        }
+    }
+
+    #[test]
+    fn visibility_gate_by_level() {
+        let unknown = visible("f", "src/a.rs", None);
+        assert!(visibility_admits(&unknown, "tests/t.rs"));
+        let public = visible("f", "src/a.rs", Some(Visibility::Public));
+        assert!(visibility_admits(&public, "tests/t.rs"));
+
+        let file = visible("f", "util.c", Some(Visibility::File));
+        assert!(visibility_admits(&file, "util.c"));
+        assert!(!visibility_admits(&file, "main.c"));
+
+        let module = visible("f", "src/store.rs", Some(Visibility::Module));
+        assert!(visibility_admits(&module, "src/store.rs"));
+        assert!(visibility_admits(&module, "src/store/cache.rs"));
+        assert!(visibility_admits(&module, "src/store/deep/leaf.rs"));
+        assert!(!visibility_admits(&module, "src/api.rs"));
+        assert!(!visibility_admits(&module, "src/storefront.rs"));
+        let root_module = visible("f", "src/lib.rs", Some(Visibility::Module));
+        assert!(visibility_admits(&root_module, "src/any/depth.rs"));
+        assert!(!visibility_admits(&root_module, "tests/t.rs"));
+        let mod_rs = visible("f", "crates/x/src/net/mod.rs", Some(Visibility::Module));
+        assert!(visibility_admits(&mod_rs, "crates/x/src/net/tcp.rs"));
+        assert!(!visibility_admits(&mod_rs, "crates/x/src/lib.rs"));
+
+        let crate_level = visible("f", "crates/a/src/x.rs", Some(Visibility::Crate));
+        assert!(visibility_admits(&crate_level, "crates/a/src/y/z.rs"));
+        assert!(!visibility_admits(&crate_level, "crates/b/src/y.rs"));
+        assert!(!visibility_admits(&crate_level, "crates/a/tests/t.rs"));
+        let top_crate = visible("f", "src/x.rs", Some(Visibility::Crate));
+        assert!(visibility_admits(&top_crate, "src/y.rs"));
+        assert!(!visibility_admits(&top_crate, "build.rs"));
+    }
+
+    #[test]
+    fn lone_file_visible_candidate_is_rejected_cross_file() {
+        let db = Database::open_in_memory().unwrap();
+        let util = db
+            .upsert_file(&FileInfo {
+                path: "util.c".to_string(),
+                language: Language::C,
+                content_hash: "u".to_string(),
+            })
+            .unwrap();
+        db.insert_symbols(util, &[visible("helper", "util.c", Some(Visibility::File))])
+            .unwrap();
+        assert!(
+            resolve_callee_definitions(&db, "main.c", "helper")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            resolve_callee_definitions(&db, "util.c", "helper")
+                .unwrap()
+                .len(),
+            1
         );
     }
 

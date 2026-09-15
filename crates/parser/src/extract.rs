@@ -1,7 +1,7 @@
 use std::sync::LazyLock;
 
 use anyhow::Result;
-use codesage_protocol::{Language, Symbol, SymbolKind};
+use codesage_protocol::{Language, Symbol, SymbolKind, Visibility};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Query, QueryCursor, Tree};
 
@@ -348,6 +348,12 @@ pub fn extract_symbols(
             _ => Vec::new(),
         };
 
+        let visibility = match language {
+            Language::Rust => rust_visibility(&def_node),
+            Language::C | Language::Cpp => c_visibility(&def_node, source, language, file_path),
+            _ => None,
+        };
+
         let symbol = Symbol {
             name,
             qualified_name,
@@ -358,6 +364,7 @@ pub fn extract_symbols(
             col_start,
             col_end,
             rationale,
+            visibility,
         };
         if seen_rows.insert(symbol_row_key(&symbol)) {
             symbols.push(symbol);
@@ -464,6 +471,88 @@ fn is_inside_impl_or_class(node: &Node, language: Language) -> bool {
         }
     }
     false
+}
+
+/// Rust reach of an item from its `visibility_modifier`. Items inside a trait
+/// body take the trait's modifier; methods of `impl Trait for Type` are
+/// Public whatever they are written with, since the trait decides who may
+/// call them. `macro_rules!` scoping is textual, so macros stay unknown.
+fn rust_visibility(def_node: &Node) -> Option<Visibility> {
+    if def_node.kind() == "macro_definition" {
+        return None;
+    }
+    let mut current = def_node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "impl_item" => {
+                if parent.child_by_field_name("trait").is_some() {
+                    return Some(Visibility::Public);
+                }
+                break;
+            }
+            "trait_item" => return Some(rust_modifier_visibility(&parent)),
+            // A nested item is scoped by its own modifier, not the outer fn's.
+            "function_item" => break,
+            _ => {}
+        }
+        current = parent.parent();
+    }
+    Some(rust_modifier_visibility(def_node))
+}
+
+fn rust_modifier_visibility(item: &Node) -> Visibility {
+    let mut cursor = item.walk();
+    let Some(modifier) = item
+        .children(&mut cursor)
+        .find(|c| c.kind() == "visibility_modifier")
+    else {
+        return Visibility::Module;
+    };
+    let mut inner = modifier.walk();
+    let mut scoped = Visibility::Public;
+    for child in modifier.children(&mut inner) {
+        match child.kind() {
+            "crate" => scoped = Visibility::Crate,
+            // `pub(self)`, `pub(super)`, `pub(in path)`: no wider than the
+            // ancestor module, which the Module rule already approximates.
+            "self" | "super" | "in" | "scoped_identifier" | "identifier" => {
+                scoped = Visibility::Module;
+            }
+            _ => {}
+        }
+    }
+    scoped
+}
+
+/// C/C++ internal linkage: a `static` function or file-scope object is
+/// nameable only from its own translation unit. A `static` in a header is
+/// meant to be textually included by several units, so it stays unknown.
+/// Class-member `static` is storage, not linkage, and is skipped.
+fn c_visibility(
+    def_node: &Node,
+    source: &[u8],
+    language: Language,
+    file_path: &str,
+) -> Option<Visibility> {
+    if !matches!(def_node.kind(), "function_definition" | "declaration") {
+        return None;
+    }
+    if is_c_header_path(file_path) {
+        return None;
+    }
+    if language == Language::Cpp && is_inside_impl_or_class(def_node, language) {
+        return None;
+    }
+    let mut cursor = def_node.walk();
+    let is_static = def_node.children(&mut cursor).any(|c| {
+        c.kind() == "storage_class_specifier" && c.utf8_text(source).ok() == Some("static")
+    });
+    is_static.then_some(Visibility::File)
+}
+
+fn is_c_header_path(file_path: &str) -> bool {
+    let ext = file_path.rsplit_once('.').map_or("", |(_, ext)| ext);
+    matches!(ext, "h" | "hh" | "hpp" | "hxx" | "inl" | "ipp" | "tcc")
 }
 
 /// Remove C++ scope prefixes, preserving destructor and operator names.

@@ -104,7 +104,7 @@ const STRUCTURAL_INDEX_BATCH_SIZE: usize = 50;
 /// Bump the relevant component whenever unchanged bytes can yield different
 /// symbols, references, fingerprints, or trust boundaries. Raw hashes stay separate.
 pub const STRUCTURAL_INTERPRETATION: &str =
-    "codesage/structural/v1;parser-queries=1;extraction=1;trust-boundaries=1";
+    "codesage/structural/v1;parser-queries=1;extraction=2;trust-boundaries=1";
 
 /// Skip and record unreadable or unparseable files; retain degraded parses.
 fn parse_batch(root: &Path, batch: &[&FileInfo], stats: &mut IndexStats) -> Vec<ParsedFile> {
@@ -621,6 +621,7 @@ mod tests {
                 col_start: 0,
                 col_end: 1,
                 rationale: Vec::new(),
+                visibility: None,
             }],
         )
         .unwrap();

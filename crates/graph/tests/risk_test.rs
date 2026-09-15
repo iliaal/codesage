@@ -1461,6 +1461,7 @@ fn top_symbols_rank_by_line_count_and_ref_count() {
         col_start: 0,
         col_end: 0,
         rationale: Vec::new(),
+        visibility: None,
     };
 
     // big: 100 lines, no callers → score = ln(101) + 0 = ~4.62
@@ -1558,6 +1559,7 @@ fn top_symbols_populates_on_known_hot_file_and_caps_at_five() {
             col_start: 0,
             col_end: 0,
             rationale: Vec::new(),
+            visibility: None,
         });
     }
     db.insert_symbols(hot_id, &syms).unwrap();

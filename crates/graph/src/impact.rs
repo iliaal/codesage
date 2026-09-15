@@ -1586,6 +1586,7 @@ mod tests {
                 col_start: 0,
                 col_end: 0,
                 rationale: vec![],
+                visibility: None,
             })
             .collect();
         db.insert_symbols(repo, &syms).unwrap();
