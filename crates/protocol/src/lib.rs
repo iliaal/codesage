@@ -1385,9 +1385,15 @@ pub struct TestRecommendations {
     /// Runnable shell commands derived from `primary`, `reachable`, the
     /// inline test modules of the changed files, and the `test_command` of
     /// any mapped feature owning a changed file. Suggestions built from
-    /// paths and manifests; nothing is executed. Deduplicated, in a stable
-    /// order: convention commands, then inline, then feature commands.
-    /// Empty from the cheap `recommend_tests` variant.
+    /// paths and manifests; nothing is executed. Paths and names are
+    /// single-quoted when they hold anything outside `[A-Za-z0-9_./:@%+=,-]`;
+    /// feature `test_command` values are re-exported verbatim (one holding a
+    /// line break or NUL is dropped and named in `notes`). Deduplicated, in
+    /// a stable order: inline commands for the changed files' own test
+    /// modules, then feature commands, then convention commands; a string
+    /// produced by two sources keeps the more specific one
+    /// (`feature_test_command` > `inline` > `convention`). Empty from the
+    /// cheap `recommend_tests` variant.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub commands: Vec<TestCommand>,
     /// Test modules living inside the changed files themselves: Rust
@@ -1407,8 +1413,10 @@ pub struct TestCommand {
     /// Shell command, relative to the project root (`cargo test -p acme
     /// --test integration`, `pytest tests/test_x.py`, `go test ./pkg/util`).
     pub command: String,
-    /// What the command exercises: test file paths, or module ids for inline
-    /// modules (`search::tests`), or the changed files a feature owns.
+    /// What the command exercises: test file paths; a `.phpt` directory
+    /// withheld from `primary` for size (`ext/standard/tests`); module ids
+    /// for inline modules (`search::tests`); or, for a feature command, the
+    /// changed files the feature owns, as the caller spelled them.
     pub covers: Vec<String>,
     /// Runner family: `cargo`, `pytest`, `phpunit`, `artisan`, `run-tests`,
     /// `go`, `vitest`, `jest`, `maven`, `gradle`; for feature commands, the
@@ -1428,9 +1436,11 @@ pub struct InlineTestModule {
     /// Rust: the crate-relative module path (`search::tests`). Python: the
     /// dotted module of the file (`pkg.mod`).
     pub module: String,
-    /// Rust: `#[test]`-attributed functions when the source is readable,
-    /// otherwise indexed functions inside the module whose names start with
-    /// `test` (an undercount for modules that do not follow that naming).
+    /// Rust: functions carrying `#[test]`, `#[tokio::test]`, `#[rstest]`,
+    /// `#[sqlx::test]`, `#[async_std::test]`, or `#[test_case]` when the
+    /// source is readable and at most 1 MiB; otherwise indexed functions
+    /// inside the module whose names start with `test` (an undercount for
+    /// modules that do not follow that naming).
     /// Python: indexed `test_*` functions and methods in the file.
     pub test_count: usize,
 }

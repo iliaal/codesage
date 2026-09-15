@@ -145,10 +145,102 @@ fn rust_fixture_yields_per_target_cargo_commands_and_the_inline_module() {
         r.notes
     );
 
-    // Convention commands precede inline ones, each group sorted by text.
-    let inline_pos = cmds.iter().position(|c| c.ends_with("tests::")).unwrap();
-    let last_convention = cmds.iter().rposition(|c| c.contains("--test ")).unwrap();
-    assert!(last_convention < inline_pos, "{cmds:?}");
+    // The changed file's own tests lead; the convention sweep follows,
+    // sorted by text.
+    assert_eq!(
+        cmds,
+        vec![
+            "cargo test -p acme-core tests::",
+            "cargo test -p acme-core --test integration",
+            "cargo test -p acme-core --test other",
+            "cargo test -p acme-core --test suite",
+        ]
+    );
+}
+
+#[test]
+fn more_than_three_targets_collapse_into_the_crate_suite() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "Cargo.toml", "[package]\nname = \"wide\"\n");
+    write(root, "src/lib.rs", "pub fn f() {}\n");
+    for i in 0..4 {
+        write(root, &format!("tests/t{i}.rs"), "#[test]\nfn t() {}\n");
+    }
+    let db = indexed(root);
+
+    let r = recs(root, &db, &["src/lib.rs"]);
+
+    assert_eq!(commands(&r), vec!["cargo test -p wide"]);
+    assert_eq!(
+        find(&r, "cargo test -p wide").covers,
+        vec!["tests/t0.rs", "tests/t1.rs", "tests/t2.rs", "tests/t3.rs"]
+    );
+}
+
+#[test]
+fn hostile_file_names_are_single_quoted() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for name in ["a b", "x;id", "y$(whoami)", "it's"] {
+        write(root, &format!("pkg/{name}.py"), "def f():\n    return 1\n");
+        write(
+            root,
+            &format!("tests/test_{name}.py"),
+            "def test_f():\n    assert True\n",
+        );
+    }
+    let db = indexed(root);
+
+    let r = recs(
+        root,
+        &db,
+        &[
+            "pkg/a b.py",
+            "pkg/x;id.py",
+            "pkg/y$(whoami).py",
+            "pkg/it's.py",
+        ],
+    );
+
+    assert_eq!(
+        commands(&r),
+        vec![
+            "pytest 'tests/test_a b.py' 'tests/test_it'\\''s.py' 'tests/test_x;id.py' \
+             'tests/test_y$(whoami).py'"
+        ]
+    );
+    assert_eq!(
+        find(&r, commands(&r)[0]).covers,
+        vec![
+            "tests/test_a b.py",
+            "tests/test_it's.py",
+            "tests/test_x;id.py",
+            "tests/test_y$(whoami).py"
+        ]
+    );
+}
+
+#[test]
+fn rust_paths_without_a_readable_manifest_omit_the_package_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // A workspace-only manifest: no `[package]` anywhere on the ancestor chain.
+    write(root, "Cargo.toml", "[workspace]\nmembers = []\n");
+    write(
+        root,
+        "crates/graph/src/lib.rs",
+        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {}\n}\n",
+    );
+    write(root, "crates/graph/tests/it.rs", "#[test]\nfn t() {}\n");
+    let db = indexed(root);
+
+    let r = recs(root, &db, &["crates/graph/src/lib.rs"]);
+
+    assert_eq!(
+        commands(&r),
+        vec!["cargo test tests::", "cargo test --test it"]
+    );
 }
 
 #[test]
@@ -569,15 +661,95 @@ fn feature_test_command_is_merged_with_its_own_source() {
     assert_eq!(cmd.source, "feature_test_command");
     assert_eq!(cmd.framework, "cargo");
     assert_eq!(cmd.covers, vec!["./src/lib.rs".to_string()]);
-    // Feature commands trail convention and inline commands.
+    // Inline first, then the feature's runner, then the convention sweep.
     assert_eq!(
-        r.commands.last().map(|c| c.command.as_str()),
-        Some("cargo test --package acme-core")
+        commands(&r),
+        vec![
+            "cargo test -p acme-core tests::",
+            "cargo test --package acme-core",
+            "cargo test -p acme-core --test integration",
+            "cargo test -p acme-core --test other",
+            "cargo test -p acme-core --test suite",
+        ]
+    );
+}
+
+fn feature_with_command(entry_path: &str, test_command: &str) -> FeatureRecord {
+    FeatureRecord {
+        feature_id: format!("feat_{:016x}", test_command.len()),
+        title: entry_path.to_string(),
+        summary: String::new(),
+        kind: FeatureKind::Library,
+        source: "cargo-lib".to_string(),
+        confidence: FeatureConfidence::High,
+        entry_path: entry_path.to_string(),
+        entry_symbol: None,
+        entry_route: None,
+        entry_command: None,
+        test_command: Some(test_command.to_string()),
+        language: Language::Rust,
+        tags: Vec::new(),
+        trust_boundaries: Vec::new(),
+        files: vec![FeatureFileRef {
+            path: entry_path.to_string(),
+            role: FeatureFileRole::Entry,
+            reason: None,
+        }],
+    }
+}
+
+#[test]
+fn identical_command_from_two_sources_keeps_the_feature_source() {
+    let dir = rust_fixture();
+    let root = dir.path();
+    let db = indexed(root);
+    db.upsert_feature(&feature_with_command(
+        "src/lib.rs",
+        "cargo test -p acme-core --test integration",
+    ))
+    .unwrap();
+
+    let r = recs(root, &db, &["src/lib.rs"]);
+
+    let cmd = find(&r, "cargo test -p acme-core --test integration");
+    assert_eq!(cmd.source, "feature_test_command");
+    assert_eq!(
+        cmd.covers,
+        vec!["src/lib.rs".to_string(), "tests/integration.rs".to_string()]
+    );
+    assert_eq!(
+        commands(&r)
+            .iter()
+            .filter(|c| **c == "cargo test -p acme-core --test integration")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn multiline_feature_command_is_dropped_with_a_note() {
+    let dir = rust_fixture();
+    let root = dir.path();
+    let db = indexed(root);
+    let feature = feature_with_command("src/lib.rs", "cargo test\nrm -rf /");
+    db.upsert_feature(&feature).unwrap();
+
+    let r = recs(root, &db, &["src/lib.rs"]);
+
+    assert!(
+        r.commands
+            .iter()
+            .all(|c| c.source != "feature_test_command"),
+        "{:?}",
+        r.commands
     );
     assert!(
-        commands(&r).contains(&"cargo test -p acme-core --test integration"),
-        "convention commands still present: {:?}",
-        commands(&r)
+        r.notes.iter().any(|n| n.starts_with(&format!(
+            "feature test_command dropped from `commands` for {}",
+            feature.feature_id
+        ))),
+        "{:?}",
+        r.notes
     );
 }
 
@@ -596,9 +768,9 @@ fn rehearsal_summary_quotes_the_top_commands() {
         .unwrap_or_else(|| panic!("no test-commands note in {:?}", rehearsal.summary_notes));
     assert_eq!(
         note,
-        "Test commands: cargo test -p acme-core --test integration; \
-         cargo test -p acme-core --test other; cargo test -p acme-core --test suite; \
-         cargo test -p acme-core tests::"
+        "Test commands: cargo test -p acme-core tests::; \
+         cargo test -p acme-core --test integration; cargo test -p acme-core --test other; \
+         cargo test -p acme-core --test suite"
     );
     assert!(
         rehearsal
@@ -614,14 +786,29 @@ fn rehearsal_summary_quotes_the_top_commands() {
 fn rehearsal_note_caps_at_five_commands() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    write(root, "Cargo.toml", "[package]\nname = \"many\"\n");
-    write(root, "src/lib.rs", "pub fn f() {}\n");
+    write(
+        root,
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/*\"]\n",
+    );
+    let mut files = Vec::new();
     for i in 0..7 {
-        write(root, &format!("tests/t{i}.rs"), "#[test]\nfn t() {}\n");
+        write(
+            root,
+            &format!("crates/c{i}/Cargo.toml"),
+            &format!("[package]\nname = \"c{i}\"\n"),
+        );
+        write(root, &format!("crates/c{i}/src/lib.rs"), "pub fn f() {}\n");
+        write(
+            root,
+            &format!("crates/c{i}/tests/it.rs"),
+            "#[test]\nfn t() {}\n",
+        );
+        files.push(format!("crates/c{i}/src/lib.rs"));
     }
     let db = indexed(root);
 
-    let rehearsal = build_review_rehearsal(root, &db, &["src/lib.rs".to_string()]).unwrap();
+    let rehearsal = build_review_rehearsal(root, &db, &files).unwrap();
 
     let note = rehearsal
         .summary_notes
@@ -630,8 +817,8 @@ fn rehearsal_note_caps_at_five_commands() {
         .unwrap_or_else(|| panic!("no test-commands note in {:?}", rehearsal.summary_notes));
     assert_eq!(
         note,
-        "Test commands: cargo test -p many --test t0; cargo test -p many --test t1; \
-         cargo test -p many --test t2; cargo test -p many --test t3; \
-         cargo test -p many --test t4 (+2 more)"
+        "Test commands: cargo test -p c0 --test it; cargo test -p c1 --test it; \
+         cargo test -p c2 --test it; cargo test -p c3 --test it; \
+         cargo test -p c4 --test it (+2 more)"
     );
 }

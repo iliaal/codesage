@@ -910,7 +910,7 @@ pub(crate) fn recommend_tests_with_walk_cache(
             )
         })
         .collect();
-    let (commands, inline_test_modules) = super::test_commands::derive(
+    let derived = super::test_commands::derive(
         db,
         &super::test_commands::CommandContext {
             root: opts.project_root.as_deref(),
@@ -919,8 +919,9 @@ pub(crate) fn recommend_tests_with_walk_cache(
             changed: &changed,
         },
     )?;
-    recs.commands = commands;
-    recs.inline_test_modules = inline_test_modules;
+    recs.commands = derived.commands;
+    recs.inline_test_modules = derived.modules;
+    recs.notes.extend(derived.notes);
     if !recs.inline_test_modules.is_empty() {
         let total: usize = recs.inline_test_modules.iter().map(|m| m.test_count).sum();
         recs.notes.push(format!(

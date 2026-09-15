@@ -18,6 +18,25 @@ pub(super) const SOURCE_FEATURE: &str = "feature_test_command";
 /// doc comments may sit between the gate and the item.
 const CFG_TEST_LOOKBACK: usize = 3;
 
+/// Above this many integration-test targets in one crate the per-target
+/// commands collapse into the crate's whole suite.
+const CARGO_PER_TARGET_CAP: usize = 3;
+
+/// Largest source file read to count `#[test]` attributes; the same bound
+/// `edit_check` puts on a source file. Larger files use the symbol count.
+const MAX_SOURCE_BYTES: u64 = 1_048_576;
+
+/// Test-function attributes counted inside a Rust test module. Matched as a
+/// line prefix after trimming, so `#[tokio::test(flavor = ...)]` counts.
+const TEST_ATTRIBUTES: [&str; 6] = [
+    "#[test]",
+    "#[tokio::test",
+    "#[rstest",
+    "#[sqlx::test",
+    "#[async_std::test",
+    "#[test_case",
+];
+
 pub(super) struct CommandContext<'a> {
     pub root: Option<&'a Path>,
     /// Test files to run: `primary` plus `reachable` paths.
@@ -28,18 +47,59 @@ pub(super) struct CommandContext<'a> {
     pub changed: &'a [(String, String)],
 }
 
-pub(super) fn derive(
-    db: &Database,
-    ctx: &CommandContext<'_>,
-) -> Result<(Vec<TestCommand>, Vec<InlineTestModule>)> {
-    let convention = convention_commands(ctx.root, ctx.test_files, ctx.withheld_phpt);
+pub(super) struct Derived {
+    pub commands: Vec<TestCommand>,
+    pub modules: Vec<InlineTestModule>,
+    pub notes: Vec<String>,
+}
+
+/// Bytes that need no quoting in a POSIX shell word.
+fn shell_safe_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"_./:@%+=,-".contains(&b)
+}
+
+/// Quote one shell word with POSIX single quotes when it holds anything
+/// outside `[A-Za-z0-9_./:@%+=,-]`; a clean token is returned unchanged so
+/// ordinary commands stay readable.
+pub(crate) fn shell_quote(token: &str) -> String {
+    if !token.is_empty() && token.bytes().all(shell_safe_byte) {
+        return token.to_string();
+    }
+    format!("'{}'", token.replace('\'', "'\\''"))
+}
+
+fn quoted_join(tokens: &[String]) -> String {
+    tokens
+        .iter()
+        .map(|t| shell_quote(t))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn source_rank(source: &str) -> u8 {
+    match source {
+        SOURCE_FEATURE => 3,
+        SOURCE_INLINE => 2,
+        _ => 1,
+    }
+}
+
+pub(super) fn derive(db: &Database, ctx: &CommandContext<'_>) -> Result<Derived> {
     let (inline, modules) = inline_commands(db, ctx)?;
-    let feature = feature_commands(db, ctx.changed)?;
+    let (feature, notes) = feature_commands(db, ctx.changed)?;
+    let convention = convention_commands(ctx.root, ctx.test_files, ctx.withheld_phpt);
     let mut merged: Vec<TestCommand> = Vec::new();
-    for group in [convention, inline, feature] {
+    // The edited file's own tests lead; the mapped runner follows; the
+    // convention sweep comes last. An identical string keeps the most
+    // specific source.
+    for group in [inline, feature, convention] {
         for cmd in finish_group(group) {
             match merged.iter_mut().find(|m| m.command == cmd.command) {
                 Some(existing) => {
+                    if source_rank(&cmd.source) > source_rank(&existing.source) {
+                        existing.source = cmd.source;
+                        existing.framework = cmd.framework;
+                    }
                     existing.covers.extend(cmd.covers);
                     existing.covers.sort();
                     existing.covers.dedup();
@@ -48,7 +108,11 @@ pub(super) fn derive(
             }
         }
     }
-    Ok((merged, modules))
+    Ok(Derived {
+        commands: merged,
+        modules,
+        notes,
+    })
 }
 
 /// Sort one source group by command text and merge duplicates.
@@ -101,12 +165,18 @@ fn root_has(root: Option<&Path>, names: &[&str]) -> bool {
     root.is_some_and(|root| names.iter().any(|n| root.join(n).is_file()))
 }
 
+/// Integration-test entries per crate dir: `(target, path)` pairs, target
+/// `None` for a file with no `--test` target of its own.
+type RustTargets = BTreeMap<String, (RustCrate, Vec<(Option<String>, String)>)>;
+
 fn convention_commands(
     root: Option<&Path>,
     test_files: &[String],
     withheld_phpt: &[String],
 ) -> Vec<TestCommand> {
     let mut out = Vec::new();
+    // Rust targets are keyed by crate dir so one crate's targets collapse together.
+    let mut rust: RustTargets = BTreeMap::new();
     let mut python: Vec<String> = Vec::new();
     let mut php: Vec<String> = Vec::new();
     let mut phpt_dirs: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -117,7 +187,14 @@ fn convention_commands(
 
     for path in test_files {
         match extension(path) {
-            "rs" => out.push(rust_integration_command(root, path)),
+            "rs" => {
+                let krate = RustCrate::for_path(root, path);
+                let target = rust_integration_target(&krate, path);
+                rust.entry(krate.dir.clone())
+                    .or_insert_with(|| (krate, Vec::new()))
+                    .1
+                    .push((target, path.clone()));
+            }
             "py" => python.push(path.clone()),
             "php" => php.push(path.clone()),
             "phpt" => phpt_dirs
@@ -145,10 +222,26 @@ fn convention_commands(
         phpt_dirs.entry(parent_dir(path).to_string()).or_default();
     }
 
+    for (_, (krate, entries)) in rust {
+        let named_targets = entries.iter().filter(|(t, _)| t.is_some()).count();
+        let whole_suite = format!("cargo test{}", krate.package_flag());
+        if named_targets > CARGO_PER_TARGET_CAP {
+            let covers = entries.into_iter().map(|(_, p)| p).collect();
+            out.push(command(whole_suite, covers, "cargo", SOURCE_CONVENTION));
+            continue;
+        }
+        for (target, path) in entries {
+            let cmd = match target {
+                Some(target) => format!("{whole_suite} --test {}", shell_quote(&target)),
+                None => whole_suite.clone(),
+            };
+            out.push(command(cmd, vec![path], "cargo", SOURCE_CONVENTION));
+        }
+    }
     if !python.is_empty() {
         python.sort();
         out.push(command(
-            format!("pytest {}", python.join(" ")),
+            format!("pytest {}", quoted_join(&python)),
             python,
             "pytest",
             SOURCE_CONVENTION,
@@ -162,7 +255,7 @@ fn convention_commands(
             ("vendor/bin/phpunit", "phpunit")
         };
         out.push(command(
-            format!("{runner} {}", php.join(" ")),
+            format!("{runner} {}", quoted_join(&php)),
             php,
             framework,
             SOURCE_CONVENTION,
@@ -176,7 +269,7 @@ fn convention_commands(
         }
         paths.sort();
         out.push(command(
-            format!("php run-tests.php {target}"),
+            format!("php run-tests.php {}", shell_quote(target)),
             paths,
             "run-tests",
             SOURCE_CONVENTION,
@@ -186,7 +279,7 @@ fn convention_commands(
         let dirs: Vec<String> = go_dirs.into_iter().collect();
         go_paths.sort();
         out.push(command(
-            format!("go test {}", dirs.join(" ")),
+            format!("go test {}", quoted_join(&dirs)),
             go_paths,
             "go",
             SOURCE_CONVENTION,
@@ -213,14 +306,14 @@ fn convention_commands(
             ("npx jest", "jest")
         };
         out.push(command(
-            format!("{runner} {}", js.join(" ")),
+            format!("{runner} {}", quoted_join(&js)),
             js,
             framework,
             SOURCE_CONVENTION,
         ));
     }
     if !java.is_empty() {
-        let classes: Vec<&str> = java.keys().map(String::as_str).collect();
+        let classes: Vec<String> = java.keys().map(|c| shell_quote(c)).collect();
         let mut covers: Vec<String> = java.values().flatten().cloned().collect();
         covers.sort();
         let gradle =
@@ -234,8 +327,12 @@ fn convention_commands(
                 SOURCE_CONVENTION,
             ));
         } else {
+            // `-Dtest=` takes a comma list, so the list is quoted as one word.
             out.push(command(
-                format!("mvn -Dtest={} test", classes.join(",")),
+                format!(
+                    "mvn -Dtest={} test",
+                    shell_quote(&java.keys().cloned().collect::<Vec<_>>().join(","))
+                ),
                 covers,
                 "maven",
                 SOURCE_CONVENTION,
@@ -245,18 +342,60 @@ fn convention_commands(
     out
 }
 
-/// The crate a Rust path belongs to: the components before the first `src`
-/// or `tests` segment, plus the `[package] name` from that directory's
-/// `Cargo.toml` when the root is known and the manifest is readable.
+/// The crate a Rust path belongs to. With a project root, the nearest
+/// ancestor directory holding a `Cargo.toml` with a `[package] name`; the
+/// name feeds `-p`. Without one (or when no manifest is found) the crate dir
+/// is the prefix before the first `src` or `tests` segment and `-p` is
+/// omitted, since a guessed package name makes Cargo fail outright.
 struct RustCrate {
     dir: String,
     name: Option<String>,
 }
 
 impl RustCrate {
+    fn for_path(root: Option<&Path>, path: &str) -> Self {
+        if let Some(root) = root
+            && let Some(found) = Self::nearest_manifest(root, path)
+        {
+            return found;
+        }
+        let parts: Vec<&str> = path.split('/').collect();
+        let boundary = parts
+            .iter()
+            .position(|p| *p == "src" || *p == "tests")
+            .unwrap_or(parts.len().saturating_sub(1));
+        Self {
+            dir: parts[..boundary].join("/"),
+            name: None,
+        }
+    }
+
+    fn nearest_manifest(root: &Path, path: &str) -> Option<Self> {
+        let mut dir = parent_dir(path).to_string();
+        loop {
+            let manifest = if dir.is_empty() {
+                root.join("Cargo.toml")
+            } else {
+                root.join(&dir).join("Cargo.toml")
+            };
+            if let Ok(text) = std::fs::read_to_string(&manifest)
+                && let Some(name) = cargo_package_name(&text)
+            {
+                return Some(Self {
+                    dir,
+                    name: Some(name),
+                });
+            }
+            if dir.is_empty() {
+                return None;
+            }
+            dir = parent_dir(&dir).to_string();
+        }
+    }
+
     fn package_flag(&self) -> String {
         match &self.name {
-            Some(name) => format!(" -p {name}"),
+            Some(name) => format!(" -p {}", shell_quote(name)),
             None => String::new(),
         }
     }
@@ -270,31 +409,6 @@ impl RustCrate {
         };
         path.strip_prefix(prefix.as_str())
     }
-}
-
-fn rust_crate_for(root: Option<&Path>, path: &str) -> RustCrate {
-    let parts: Vec<&str> = path.split('/').collect();
-    let boundary = parts
-        .iter()
-        .position(|p| *p == "src" || *p == "tests")
-        .unwrap_or(parts.len().saturating_sub(1));
-    let dir = parts[..boundary].join("/");
-    let manifest_name = root.and_then(|root| {
-        let manifest = if dir.is_empty() {
-            root.join("Cargo.toml")
-        } else {
-            root.join(&dir).join("Cargo.toml")
-        };
-        let text = std::fs::read_to_string(manifest).ok()?;
-        cargo_package_name(&text)
-    });
-    let name = manifest_name.or_else(|| {
-        dir.rsplit('/')
-            .next()
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    });
-    RustCrate { dir, name }
 }
 
 /// `name = "..."` inside `[package]`. A line scan is enough: the value is a
@@ -325,26 +439,19 @@ fn cargo_package_name(manifest: &str) -> Option<String> {
     None
 }
 
-/// `cargo test -p <crate> --test <target>` for `<crate>/tests/<target>.rs`
-/// and `<crate>/tests/<target>/main.rs`; any other Rust test file falls back
-/// to the crate's whole suite, since a module of an integration test has no
-/// target of its own.
-fn rust_integration_command(root: Option<&Path>, path: &str) -> TestCommand {
-    let krate = rust_crate_for(root, path);
-    let target = krate.rest_under(path, "tests").and_then(|rest| {
-        if let Some(name) = rest.strip_suffix("/main.rs") {
-            (!name.contains('/')).then(|| name.to_string())
-        } else if !rest.contains('/') {
-            rest.strip_suffix(".rs").map(str::to_string)
-        } else {
-            None
-        }
-    });
-    let cmd = match target {
-        Some(target) => format!("cargo test{} --test {target}", krate.package_flag()),
-        None => format!("cargo test{}", krate.package_flag()),
-    };
-    command(cmd, vec![path.to_string()], "cargo", SOURCE_CONVENTION)
+/// The `--test` target for `<crate>/tests/<target>.rs` and
+/// `<crate>/tests/<target>/main.rs`. `None` for any other Rust test file: a
+/// module of an integration test has no target of its own, so the caller
+/// falls back to the crate's whole suite.
+fn rust_integration_target(krate: &RustCrate, path: &str) -> Option<String> {
+    let rest = krate.rest_under(path, "tests")?;
+    if let Some(name) = rest.strip_suffix("/main.rs") {
+        (!name.contains('/')).then(|| name.to_string())
+    } else if !rest.contains('/') {
+        rest.strip_suffix(".rs").map(str::to_string)
+    } else {
+        None
+    }
 }
 
 /// Crate-relative module path of a file under `src/`: `lib.rs`, `main.rs`,
@@ -385,12 +492,23 @@ fn count_test_attributes(lines: &[&str], line_start: u32, line_end: u32) -> usiz
     lines[begin..end]
         .iter()
         .map(|l| l.trim_start())
-        .filter(|l| l.starts_with("#[test]") || l.starts_with("#[tokio::test"))
+        .filter(|l| TEST_ATTRIBUTES.iter().any(|attr| l.starts_with(attr)))
         .count()
 }
 
 fn within(sym: &Symbol, module: &Symbol) -> bool {
     sym.line_start > module.line_start && sym.line_end <= module.line_end
+}
+
+/// The changed file's text when the root is known and the file is within
+/// [`MAX_SOURCE_BYTES`]; otherwise `None` and the symbol count is used.
+fn read_source_bounded(root: Option<&Path>, path: &str) -> Option<String> {
+    let full = root?.join(path);
+    let size = std::fs::metadata(&full).ok()?.len();
+    if size > MAX_SOURCE_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(full).ok()
 }
 
 /// Outermost test modules of one Rust file with their test counts. Nested
@@ -466,13 +584,11 @@ fn inline_commands(
                 if symbols.iter().all(|s| s.kind != SymbolKind::Module) {
                     continue;
                 }
-                let krate = rust_crate_for(ctx.root, path);
+                let krate = RustCrate::for_path(ctx.root, path);
                 let Some(module_path) = rust_module_path(&krate, path) else {
                     continue;
                 };
-                let source = ctx
-                    .root
-                    .and_then(|root| std::fs::read_to_string(root.join(path)).ok());
+                let source = read_source_bounded(ctx.root, path);
                 for (name, count) in rust_inline_modules(&symbols, source.as_deref()) {
                     let module = if module_path.is_empty() {
                         name
@@ -480,7 +596,11 @@ fn inline_commands(
                         format!("{module_path}::{name}")
                     };
                     commands.push(command(
-                        format!("cargo test{} {module}::", krate.package_flag()),
+                        format!(
+                            "cargo test{} {}",
+                            krate.package_flag(),
+                            shell_quote(&format!("{module}::"))
+                        ),
                         vec![module.clone()],
                         "cargo",
                         SOURCE_INLINE,
@@ -511,7 +631,7 @@ fn inline_commands(
     if !python_files.is_empty() {
         python_files.sort();
         commands.push(command(
-            format!("pytest {}", python_files.join(" ")),
+            format!("pytest {}", quoted_join(&python_files)),
             python_files,
             "pytest",
             SOURCE_INLINE,
@@ -520,8 +640,14 @@ fn inline_commands(
     Ok((commands, modules))
 }
 
-fn feature_commands(db: &Database, changed: &[(String, String)]) -> Result<Vec<TestCommand>> {
+/// Mapped feature `test_command` values, re-exported verbatim. A value with
+/// a newline or NUL cannot be one shell command and is dropped with a note.
+fn feature_commands(
+    db: &Database,
+    changed: &[(String, String)],
+) -> Result<(Vec<TestCommand>, Vec<String>)> {
     let mut by_command: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut dropped: BTreeSet<String> = BTreeSet::new();
     for (normalized, given) in changed {
         codesage_protocol::work::checkpoint()?;
         for feature in db.features_for_file(normalized)? {
@@ -532,24 +658,55 @@ fn feature_commands(db: &Database, changed: &[(String, String)]) -> Result<Vec<T
             if cmd.is_empty() {
                 continue;
             }
+            if cmd.contains(['\n', '\r', '\0']) {
+                dropped.insert(feature.feature_id.clone());
+                continue;
+            }
             by_command
                 .entry(cmd.to_string())
                 .or_default()
                 .push(given.clone());
         }
     }
-    Ok(by_command
+    let commands = by_command
         .into_iter()
         .map(|(cmd, covers)| {
             let framework = cmd.split_whitespace().next().unwrap_or("").to_string();
             command(cmd, covers, &framework, SOURCE_FEATURE)
         })
-        .collect())
+        .collect();
+    let mut notes = Vec::new();
+    if !dropped.is_empty() {
+        let ids: Vec<String> = dropped.into_iter().collect();
+        notes.push(format!(
+            "feature test_command dropped from `commands` for {} (contains a line break or NUL); \
+             see `feature_bundle` for the raw value",
+            ids.join(", ")
+        ));
+    }
+    Ok((commands, notes))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_quote_leaves_clean_tokens_alone_and_quotes_the_rest() {
+        assert_eq!(shell_quote("tests/test_a.py"), "tests/test_a.py");
+        assert_eq!(
+            shell_quote("crate-name_1:x@y%z+w=v,u"),
+            "crate-name_1:x@y%z+w=v,u"
+        );
+        assert_eq!(shell_quote("a b.py"), "'a b.py'");
+        assert_eq!(shell_quote("x;id.py"), "'x;id.py'");
+        assert_eq!(shell_quote("y$(whoami).py"), "'y$(whoami).py'");
+        assert_eq!(shell_quote("z`id`.py"), "'z`id`.py'");
+        assert_eq!(shell_quote("it's.py"), "'it'\\''s.py'");
+        assert_eq!(shell_quote("a\nb.py"), "'a\nb.py'");
+        assert_eq!(shell_quote("*.py"), "'*.py'");
+        assert_eq!(shell_quote(""), "''");
+    }
 
     #[test]
     fn cargo_package_name_reads_the_package_section_only() {
@@ -582,21 +739,51 @@ mod tests {
     }
 
     #[test]
-    fn rust_integration_target_names_follow_cargo_layout() {
-        let cmd = |p: &str| rust_integration_command(None, p).command;
+    fn without_a_manifest_the_package_flag_is_omitted() {
+        let krate = RustCrate::for_path(None, "crates/graph/tests/risk_test.rs");
+        assert_eq!(krate.dir, "crates/graph");
+        assert_eq!(krate.name, None);
+        assert_eq!(krate.package_flag(), "");
+        let target = |p: &str| rust_integration_target(&RustCrate::for_path(None, p), p);
         assert_eq!(
-            cmd("crates/graph/tests/risk_test.rs"),
-            "cargo test -p graph --test risk_test"
+            target("crates/graph/tests/risk_test.rs").as_deref(),
+            Some("risk_test")
         );
         assert_eq!(
-            cmd("crates/graph/tests/suite/main.rs"),
-            "cargo test -p graph --test suite"
+            target("crates/graph/tests/suite/main.rs").as_deref(),
+            Some("suite")
         );
+        assert_eq!(target("crates/graph/tests/suite/helpers.rs"), None);
         assert_eq!(
-            cmd("crates/graph/tests/suite/helpers.rs"),
-            "cargo test -p graph"
+            target("tests/integration.rs").as_deref(),
+            Some("integration")
         );
-        assert_eq!(cmd("tests/integration.rs"), "cargo test --test integration");
+    }
+
+    #[test]
+    fn nearest_manifest_wins_over_the_first_segment_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |rel: &str, text: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        write("Cargo.toml", "[workspace]\nmembers = [\"tests/helper\"]\n");
+        write("tests/helper/Cargo.toml", "[package]\nname = \"helper\"\n");
+        write("tests/helper/src/lib.rs", "");
+        let krate = RustCrate::for_path(Some(root), "tests/helper/src/lib.rs");
+        assert_eq!(krate.dir, "tests/helper");
+        assert_eq!(krate.name.as_deref(), Some("helper"));
+        assert_eq!(
+            rust_module_path(&krate, "tests/helper/src/lib.rs").as_deref(),
+            Some("")
+        );
+
+        // A workspace-only root manifest names no package.
+        let krate = RustCrate::for_path(Some(root), "src/lib.rs");
+        assert_eq!(krate.dir, "");
+        assert_eq!(krate.name, None);
     }
 
     #[test]
@@ -612,5 +799,28 @@ mod tests {
         assert!(cfg_test_gated(&lines, 3));
         let far = ["#[cfg(test)]", "", "", "", "mod tests {"];
         assert!(!cfg_test_gated(&far, 5));
+    }
+
+    #[test]
+    fn test_attribute_count_recognizes_the_documented_runners() {
+        let lines = [
+            "mod tests {",
+            "    #[test]",
+            "    fn a() {}",
+            "    #[tokio::test(flavor = \"multi_thread\")]",
+            "    async fn b() {}",
+            "    #[rstest]",
+            "    fn c() {}",
+            "    #[sqlx::test]",
+            "    async fn d() {}",
+            "    #[async_std::test]",
+            "    async fn e() {}",
+            "    #[test_case(1)]",
+            "    fn f() {}",
+            "    #[cfg(test)]",
+            "    fn helper() {}",
+            "}",
+        ];
+        assert_eq!(count_test_attributes(&lines, 1, lines.len() as u32), 6);
     }
 }
