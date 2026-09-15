@@ -561,7 +561,10 @@ impl CodeSageServer {
     ) -> CallToolResult {
         self.blocking(move |s| {
             if let Err(refusal) = check_embed_texts_caps(&params.texts) {
-                return error::render_mcp_error("embed_texts", None, refusal);
+                return render::render_with_kind::<()>(
+                    Err(anyhow::Error::new(refusal)),
+                    "embed_texts",
+                );
             }
             // Digest budgeting/truncation would corrupt raw vectors.
             match s.embed_texts_for(
@@ -572,13 +575,12 @@ impl CodeSageServer {
             ) {
                 Ok(result) => match serde_json::to_value(&result) {
                     Ok(value) => CallToolResult::structured(value),
-                    Err(e) => error::render_error(
+                    Err(e) => render::render_with_kind::<()>(
+                        Err(anyhow::Error::new(e).context("embed_texts: serializing result")),
                         "embed_texts",
-                        None,
-                        &anyhow::Error::new(e).context("embed_texts: serializing result"),
                     ),
                 },
-                Err(e) => error::render_error("embed_texts", None, &e),
+                Err(e) => render::render_with_kind::<()>(Err(e), "embed_texts"),
             }
         })
         .await
@@ -598,13 +600,12 @@ impl CodeSageServer {
             move |s| match s.rerank_pairs_for(&params, || context.ct.is_cancelled()) {
                 Ok(result) => match serde_json::to_value(result) {
                     Ok(value) => CallToolResult::structured(value),
-                    Err(error) => error::render_error(
+                    Err(error) => render::render_with_kind::<()>(
+                        Err(anyhow::Error::new(error).context("rerank_pairs: serializing result")),
                         "rerank_pairs",
-                        None,
-                        &anyhow::Error::new(error).context("rerank_pairs: serializing result"),
                     ),
                 },
-                Err(error) => error::render_error("rerank_pairs", None, &error),
+                Err(error) => render::render_with_kind::<()>(Err(error), "rerank_pairs"),
             },
         )
         .await

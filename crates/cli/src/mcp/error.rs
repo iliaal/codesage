@@ -77,8 +77,13 @@ impl ErrorCode {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Remedy {
-    /// A shell command the operator runs.
-    Command(String),
+    /// A shell command the operator runs, optionally in `cwd`. The directory is
+    /// a separate field rather than interpolated so a path can never become
+    /// shell syntax.
+    Command {
+        command: String,
+        cwd: Option<String>,
+    },
     /// A complete tool call.
     Call { tool: String, arguments: Value },
     /// The failing tool again, with the original arguments and these
@@ -99,9 +104,27 @@ impl Remedy {
         Self::Retry { overrides }
     }
 
+    pub(crate) fn command(command: &str) -> Self {
+        Self::Command {
+            command: command.to_owned(),
+            cwd: None,
+        }
+    }
+
+    pub(crate) fn command_in(command: &str, cwd: impl Into<String>) -> Self {
+        Self::Command {
+            command: command.to_owned(),
+            cwd: Some(cwd.into()),
+        }
+    }
+
     fn resolve(self, tool: &str, arguments: Option<&Map<String, Value>>) -> Value {
         match self {
-            Self::Command(command) => json!({ "command": command }),
+            Self::Command { command, cwd: None } => json!({ "command": command }),
+            Self::Command {
+                command,
+                cwd: Some(cwd),
+            } => json!({ "command": command, "cwd": cwd }),
             Self::Call { tool, arguments } => json!({ "tool": tool, "arguments": arguments }),
             Self::Retry { overrides } => {
                 let mut merged = arguments.cloned().unwrap_or_default();
@@ -137,8 +160,8 @@ impl McpError {
         self
     }
 
-    pub(crate) fn command(self, command: impl Into<String>) -> Self {
-        self.remedy(Remedy::Command(command.into()))
+    pub(crate) fn command(self, command: &str) -> Self {
+        self.remedy(Remedy::command(command))
     }
 
     pub(crate) fn source(mut self, source: anyhow::Error) -> Self {
@@ -173,37 +196,20 @@ pub(crate) struct Classified {
     pub(crate) remedy: Option<Remedy>,
 }
 
-/// Walk the cause chain outermost-first; the first recognized cause decides.
+/// Work-control stops, admission refusals, and database contention anywhere in
+/// the chain outrank code-level wrappers: a model load cancelled at a checkpoint
+/// is a cancellation, not a model failure. Otherwise the outermost recognized
+/// cause decides.
 pub(crate) fn classify(error: &anyhow::Error) -> Classified {
+    if let Some(classified) = error.chain().find_map(classify_interruption) {
+        return classified;
+    }
     for cause in error.chain() {
         if let Some(typed) = cause.downcast_ref::<McpError>() {
             return Classified {
                 code: typed.code,
                 remedy: typed.remedy.clone(),
             };
-        }
-        if let Some(admission) = cause.downcast_ref::<super::work::AdmissionError>() {
-            use super::work::AdmissionError;
-            return match admission {
-                AdmissionError::Saturated => Classified {
-                    code: ErrorCode::Saturated,
-                    remedy: Some(Remedy::retry()),
-                },
-                AdmissionError::Shutdown => Classified {
-                    code: ErrorCode::Shutdown,
-                    remedy: None,
-                },
-                AdmissionError::Stopped(reason) => stopped(*reason),
-                AdmissionError::InvalidLimits | AdmissionError::ProjectAlreadyAttached => {
-                    Classified {
-                        code: ErrorCode::Internal,
-                        remedy: None,
-                    }
-                }
-            };
-        }
-        if let Some(work) = cause.downcast_ref::<WorkStopped>() {
-            return stopped(work.reason);
         }
         if cause.is::<codesage_graph::IncompleteRiskRanking>() {
             return Classified {
@@ -225,30 +231,17 @@ pub(crate) fn classify(error: &anyhow::Error) -> Classified {
         if cause.is::<codesage_graph::StaleSemanticTable>() {
             return Classified {
                 code: ErrorCode::Model,
-                remedy: Some(Remedy::Command(REINDEX_FULL_COMMAND.to_owned())),
+                remedy: Some(Remedy::command(REINDEX_FULL_COMMAND)),
             };
         }
-        if let Some(rusqlite::Error::SqliteFailure(code, message)) =
+        if let Some(rusqlite::Error::SqliteFailure(_, Some(message))) =
             cause.downcast_ref::<rusqlite::Error>()
+            && message.contains(SCHEMA_TOO_NEW_MARKER)
         {
-            if matches!(
-                code.code,
-                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-            ) {
-                return Classified {
-                    code: ErrorCode::DbBusy,
-                    remedy: Some(Remedy::retry()),
-                };
-            }
-            if message
-                .as_deref()
-                .is_some_and(|text| text.contains(SCHEMA_TOO_NEW_MARKER))
-            {
-                return Classified {
-                    code: ErrorCode::SchemaTooNew,
-                    remedy: Some(Remedy::Command(UPGRADE_COMMAND.to_owned())),
-                };
-            }
+            return Classified {
+                code: ErrorCode::SchemaTooNew,
+                remedy: Some(Remedy::command(UPGRADE_COMMAND)),
+            };
         }
         if cause.is::<serde_json::Error>() {
             return Classified {
@@ -261,6 +254,46 @@ pub(crate) fn classify(error: &anyhow::Error) -> Classified {
         code: ErrorCode::Internal,
         remedy: None,
     }
+}
+
+fn classify_interruption(cause: &(dyn std::error::Error + 'static)) -> Option<Classified> {
+    {
+        if let Some(admission) = cause.downcast_ref::<super::work::AdmissionError>() {
+            use super::work::AdmissionError;
+            return Some(match admission {
+                AdmissionError::Saturated => Classified {
+                    code: ErrorCode::Saturated,
+                    remedy: Some(Remedy::retry()),
+                },
+                AdmissionError::Shutdown => Classified {
+                    code: ErrorCode::Shutdown,
+                    remedy: None,
+                },
+                AdmissionError::Stopped(reason) => stopped(*reason),
+                AdmissionError::InvalidLimits | AdmissionError::ProjectAlreadyAttached => {
+                    Classified {
+                        code: ErrorCode::Internal,
+                        remedy: None,
+                    }
+                }
+            });
+        }
+    }
+    if let Some(work) = cause.downcast_ref::<WorkStopped>() {
+        return Some(stopped(work.reason));
+    }
+    if let Some(rusqlite::Error::SqliteFailure(code, _)) = cause.downcast_ref::<rusqlite::Error>()
+        && matches!(
+            code.code,
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+        )
+    {
+        return Some(Classified {
+            code: ErrorCode::DbBusy,
+            remedy: Some(Remedy::retry()),
+        });
+    }
+    None
 }
 
 fn stopped(reason: StopReason) -> Classified {
@@ -404,11 +437,68 @@ mod tests {
         ));
         let classified = classify(&error);
         assert_eq!(classified.code, ErrorCode::SchemaTooNew);
-        assert_eq!(
-            classified.remedy,
-            Some(Remedy::Command(UPGRADE_COMMAND.to_owned()))
-        );
+        assert_eq!(classified.remedy, Some(Remedy::command(UPGRADE_COMMAND)));
         assert_eq!(legacy_status(&error), None);
+    }
+
+    #[test]
+    fn interruptions_beneath_a_typed_wrapper_outrank_it() {
+        let wrap = |inner: anyhow::Error| {
+            anyhow::Error::new(
+                McpError::new(ErrorCode::Model, "embedding model unavailable")
+                    .command(DOCTOR_COMMAND)
+                    .source(inner.context("loading embedding model")),
+            )
+        };
+        let timeout = wrap(anyhow::Error::new(WorkStopped {
+            reason: StopReason::DeadlineExceeded,
+        }));
+        let classified = classify(&timeout);
+        assert_eq!(classified.code, ErrorCode::Timeout);
+        assert_eq!(classified.remedy, Some(Remedy::retry()));
+        assert_eq!(legacy_status(&timeout), Some("timeout"));
+
+        let saturated = wrap(anyhow::Error::new(AdmissionError::Saturated));
+        assert_eq!(classify(&saturated).code, ErrorCode::Saturated);
+        assert_eq!(legacy_status(&saturated), Some("saturated"));
+
+        let busy = wrap(anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        )));
+        assert_eq!(classify(&busy).code, ErrorCode::DbBusy);
+        assert_eq!(legacy_status(&busy), Some("database-busy"));
+
+        let cancelled = wrap(anyhow::Error::new(WorkStopped {
+            reason: StopReason::ClientCancelled,
+        }));
+        assert_eq!(classify(&cancelled).code, ErrorCode::Cancelled);
+        assert_eq!(legacy_status(&cancelled), Some("cancelled"));
+    }
+
+    #[test]
+    fn command_remedies_keep_the_directory_out_of_the_command_string() {
+        let hostile = "/tmp/a'; echo INJECTED; :'b";
+        let result = render_mcp_error(
+            "find_symbol",
+            None,
+            McpError::new(ErrorCode::NotOnboarded, "not onboarded")
+                .remedy(Remedy::command_in(ONBOARD_COMMAND, hostile)),
+        );
+        let remedy = &block(&result)["error"]["remedy"];
+        assert_eq!(remedy["command"], ONBOARD_COMMAND);
+        assert_eq!(remedy["cwd"], hostile);
+        assert!(!remedy["command"].as_str().unwrap().contains("/tmp"));
+
+        let plain = render_mcp_error(
+            "search",
+            None,
+            McpError::new(ErrorCode::Model, "model").command(DOCTOR_COMMAND),
+        );
+        assert_eq!(
+            block(&plain)["error"]["remedy"],
+            json!({ "command": DOCTOR_COMMAND })
+        );
     }
 
     #[test]
@@ -421,10 +511,7 @@ mod tests {
         );
         let classified = classify(&error);
         assert_eq!(classified.code, ErrorCode::Model);
-        assert_eq!(
-            classified.remedy,
-            Some(Remedy::Command(DOCTOR_COMMAND.to_owned()))
-        );
+        assert_eq!(classified.remedy, Some(Remedy::command(DOCTOR_COMMAND)));
         let text = format!("{error:#}");
         assert!(text.contains("embedding model unavailable"), "{text}");
         assert!(text.contains("resolving model files"), "{text}");

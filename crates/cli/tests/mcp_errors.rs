@@ -219,17 +219,25 @@ fn parameter_and_routing_failures_name_the_tool_and_code() {
     );
     let onboarding = failure(&result, "list_dependencies");
     assert_eq!(onboarding.block["error"]["code"], "E_NOT_ONBOARDED");
-    let command = onboarding.block["error"]["remedy"]["command"]
-        .as_str()
-        .expect("command remedy");
-    assert!(
-        command.ends_with("codesage init && codesage index"),
-        "{command}"
+    let remedy = &onboarding.block["error"]["remedy"];
+    assert_eq!(remedy["command"], "codesage init && codesage index");
+    assert_eq!(
+        remedy["cwd"],
+        json!(plain.path().canonicalize().unwrap()),
+        "the directory travels as a field, never inside the command: {remedy}"
     );
-    assert!(
-        command.contains(plain.path().to_str().unwrap()),
-        "remedy runs in the project: {command}"
+    assert_eq!(remedy.as_object().unwrap().len(), 2, "{remedy}");
+
+    // A directory name that is shell syntax stays inert data.
+    let hostile = plain.path().join("a'; echo INJECTED; :'b");
+    std::fs::create_dir(&hostile).unwrap();
+    let result = server.call(
+        "list_dependencies",
+        json!({"project": hostile, "file_path": "src/lib.rs"}),
     );
+    let remedy = failure(&result, "list_dependencies").block["error"]["remedy"].clone();
+    assert_eq!(remedy["command"], "codesage init && codesage index");
+    assert_eq!(remedy["cwd"], json!(hostile.canonicalize().unwrap()));
     assert!(
         onboarding.text.contains("not onboarded"),
         "{}",

@@ -683,7 +683,10 @@ impl CodeSageServer {
                         canonical.display()
                     ),
                 )
-                .command(format!("cd '{}' && {ONBOARD_COMMAND}", canonical.display()))
+                .remedy(super::error::Remedy::command_in(
+                    ONBOARD_COMMAND,
+                    canonical.to_string_lossy(),
+                ))
                 .into());
             }
         }

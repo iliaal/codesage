@@ -264,7 +264,13 @@ fn normalize_error(
             render_mcp_error(tool, arguments, McpError::new(ErrorCode::Internal, message));
         super::error::contract_block(&rendered).unwrap_or_default()
     });
-    block.entry("tool").or_insert_with(|| json!(tool));
+    if block
+        .get("tool")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        block.insert("tool".into(), json!(tool));
+    }
     let status = result_outcome(result);
     let (phase, continuing, request_id, persisted) = match ticket {
         Some(ticket) => {
@@ -1737,6 +1743,41 @@ mod tests {
             snapshot["counters"]["execution_outcomes"]["database-busy"],
             1
         );
+    }
+
+    #[test]
+    fn normalize_error_synthesizes_a_contract_block_for_bare_text_failures() {
+        let mut bare = CallToolResult::error(vec![ContentBlock::text("boom from a foreign path")]);
+        normalize_error(&mut bare, "find_symbol", None, None);
+        let block = status(&bare);
+        assert_eq!(block["tool"], "find_symbol");
+        assert_eq!(block["error"]["code"], "E_INTERNAL");
+        assert_eq!(block["error"]["message"], "boom from a foreign path");
+        assert_eq!(block["error"]["remedy"], serde_json::Value::Null);
+        assert_eq!(block["status"], "error");
+        assert_eq!(block["complete"], false);
+        assert_eq!(block["request_id"], serde_json::Value::Null);
+        assert_eq!(block["work_continuing"], false);
+        assert_eq!(bare.content.len(), 2);
+
+        let mut unnamed = super::super::error::render_mcp_error(
+            "",
+            None,
+            McpError::new(ErrorCode::Internal, "handler panicked"),
+        );
+        normalize_error(&mut unnamed, "search", None, None);
+        assert_eq!(status(&unnamed)["tool"], "search");
+        assert_eq!(status(&unnamed)["error"]["code"], "E_INTERNAL");
+        let blocks = unnamed
+            .content
+            .iter()
+            .filter(|block| {
+                block
+                    .as_text()
+                    .is_some_and(|text| text.text.contains("\"status\""))
+            })
+            .count();
+        assert_eq!(blocks, 1, "the block is replaced, not duplicated");
     }
 
     #[test]
