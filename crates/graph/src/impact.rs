@@ -22,6 +22,31 @@ pub(crate) fn is_qualified_symbol_name(name: &str) -> bool {
 /// Bound per-level fan-out; capped walks report counts as lower bounds.
 pub(crate) const MAX_FRONTIER: usize = 512;
 
+/// An unqualified symbol target that names several distinct definitions.
+/// Typed so callers can offer the first candidate as a machine-usable retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmbiguousSymbol {
+    pub name: String,
+    pub definitions: usize,
+    /// Sorted, deduplicated qualified names; always at least two.
+    pub candidates: Vec<String>,
+}
+
+impl std::fmt::Display for AmbiguousSymbol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ambiguous symbol '{}': {} definitions — qualify with one of: {}, \
+             or target a single file instead",
+            self.name,
+            self.definitions,
+            self.candidates.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for AmbiguousSymbol {}
+
 pub fn impact_analysis(db: &Database, req: &ImpactRequest) -> Result<Vec<ImpactEntry>> {
     Ok(impact_analysis_walk(db, req, MAX_FRONTIER)?.0)
 }
@@ -332,12 +357,12 @@ pub(crate) fn impact_analysis_walk_shared(
                 candidates.sort();
                 candidates.dedup();
                 if candidates.len() > 1 {
-                    anyhow::bail!(
-                        "ambiguous symbol '{name}': {} definitions — qualify with one of: {}, \
-                         or target a single file instead",
-                        syms.len(),
-                        candidates.join(", ")
-                    );
+                    return Err(AmbiguousSymbol {
+                        name: name.clone(),
+                        definitions: syms.len(),
+                        candidates,
+                    }
+                    .into());
                 }
             }
             syms

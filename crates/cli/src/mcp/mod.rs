@@ -1,6 +1,7 @@
 mod diagnostics;
 mod dispatch;
 mod edit_check;
+mod error;
 mod next;
 mod overview_cache;
 pub(crate) mod params;
@@ -32,7 +33,7 @@ use codesage_protocol::{
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, tool::schema_for_type, wrapper::Parameters},
-    model::{CallToolResult, ContentBlock, Implementation, ServerInfo},
+    model::{CallToolResult, Implementation, ServerInfo},
     tool, tool_handler, tool_router,
 };
 
@@ -60,9 +61,10 @@ pub(crate) const EMBED_TEXTS_OVER_CAP: &str = "embed_texts: over cap:";
 /// Stable identity refusal prefix: the CLI must abort rather than fall back privately.
 pub(crate) const EMBED_TEXTS_FINGERPRINT_MISMATCH: &str = "embed_texts: fingerprint mismatch:";
 
-fn check_embed_texts_caps(texts: &[String]) -> Result<(), String> {
+fn check_embed_texts_caps(texts: &[String]) -> Result<(), error::McpError> {
+    let over_cap = |message: String| Err(error::McpError::new(error::ErrorCode::OverCap, message));
     if texts.len() > MAX_MCP_EMBED_TEXTS {
-        return Err(format!(
+        return over_cap(format!(
             "{EMBED_TEXTS_OVER_CAP} {} texts exceeds the per-call cap of {MAX_MCP_EMBED_TEXTS}",
             texts.len()
         ));
@@ -70,7 +72,7 @@ fn check_embed_texts_caps(texts: &[String]) -> Result<(), String> {
     let mut total = 0usize;
     for (i, text) in texts.iter().enumerate() {
         if text.len() > MAX_MCP_EMBED_TEXT_BYTES {
-            return Err(format!(
+            return over_cap(format!(
                 "{EMBED_TEXTS_OVER_CAP} text {i} is {} bytes, over the per-text cap of {MAX_MCP_EMBED_TEXT_BYTES}",
                 text.len()
             ));
@@ -78,7 +80,7 @@ fn check_embed_texts_caps(texts: &[String]) -> Result<(), String> {
         total += text.len();
     }
     if total > MAX_MCP_EMBED_TOTAL_BYTES {
-        return Err(format!(
+        return over_cap(format!(
             "{EMBED_TEXTS_OVER_CAP} {total} bytes in total, over the per-call cap of {MAX_MCP_EMBED_TOTAL_BYTES}"
         ));
     }
@@ -181,22 +183,35 @@ fn session_start_report(
     }
 }
 
-fn validate_file_list_len(paths: &[String], tool: &str) -> Result<()> {
+/// `field` names the argument so the remedy can retry with the list cut to the cap.
+fn validate_file_list_len(paths: &[String], tool: &str, field: &str) -> Result<()> {
     if paths.len() > MAX_MCP_FILE_PATHS {
-        anyhow::bail!(
-            "{tool} accepts at most {MAX_MCP_FILE_PATHS} file paths per call (got {})",
-            paths.len()
-        );
+        return Err(error::McpError::new(
+            error::ErrorCode::OverCap,
+            format!(
+                "{tool} accepts at most {MAX_MCP_FILE_PATHS} file paths per call (got {})",
+                paths.len()
+            ),
+        )
+        .remedy(error::Remedy::retry_with(
+            field,
+            serde_json::json!(paths[..MAX_MCP_FILE_PATHS]),
+        ))
+        .into());
     }
     Ok(())
 }
 
 fn validate_non_empty_file_list(paths: &[String], tool: &str) -> Result<()> {
-    validate_file_list_len(paths, tool)?;
+    validate_file_list_len(paths, tool, "file_paths")?;
     if paths.is_empty() {
-        anyhow::bail!(
-            "{tool}: no file paths provided (pass at least one file path as args or pipe via stdin)"
-        );
+        return Err(error::McpError::new(
+            error::ErrorCode::EmptyInput,
+            format!(
+                "{tool}: no file paths provided (pass at least one file path as args or pipe via stdin)"
+            ),
+        )
+        .into());
     }
     Ok(())
 }
@@ -245,12 +260,20 @@ impl CodeSageServer {
             Ok(result) => result,
             Err(join_err) => {
                 tracing::error!(error = %join_err, "MCP tool handler panicked");
+                // Only reached outside `dispatch_tool`, which always scopes a request.
                 next::annotate(
                     "",
                     "",
-                    CallToolResult::error(vec![ContentBlock::text(format!(
-                        "internal error: the tool handler panicked ({join_err}); see the daemon log"
-                    ))]),
+                    error::render_mcp_error(
+                        "",
+                        None,
+                        error::McpError::new(
+                            error::ErrorCode::Internal,
+                            format!(
+                                "internal error: the tool handler panicked ({join_err}); see the daemon log"
+                            ),
+                        ),
+                    ),
                 )
             }
         }
@@ -511,7 +534,7 @@ impl CodeSageServer {
                 &params.project,
                 req.paths
                     .as_ref()
-                    .map(|paths| validate_file_list_len(paths, "search.paths"))
+                    .map(|paths| validate_file_list_len(paths, "search.paths", "paths"))
                     .unwrap_or(Ok(()))
                     .and_then(|()| {
                         s.with_project_query(&params.project, &query_for_embed, |db, emb, rr| {
@@ -538,7 +561,7 @@ impl CodeSageServer {
     ) -> CallToolResult {
         self.blocking(move |s| {
             if let Err(refusal) = check_embed_texts_caps(&params.texts) {
-                return CallToolResult::error(vec![ContentBlock::text(refusal)]);
+                return error::render_mcp_error("embed_texts", None, refusal);
             }
             // Digest budgeting/truncation would corrupt raw vectors.
             match s.embed_texts_for(
@@ -549,11 +572,13 @@ impl CodeSageServer {
             ) {
                 Ok(result) => match serde_json::to_value(&result) {
                     Ok(value) => CallToolResult::structured(value),
-                    Err(e) => CallToolResult::error(vec![ContentBlock::text(format!(
-                        "embed_texts: serializing result: {e}"
-                    ))]),
+                    Err(e) => error::render_error(
+                        "embed_texts",
+                        None,
+                        &anyhow::Error::new(e).context("embed_texts: serializing result"),
+                    ),
                 },
-                Err(e) => CallToolResult::error(vec![ContentBlock::text(format!("{e:#}"))]),
+                Err(e) => error::render_error("embed_texts", None, &e),
             }
         })
         .await
@@ -573,11 +598,13 @@ impl CodeSageServer {
             move |s| match s.rerank_pairs_for(&params, || context.ct.is_cancelled()) {
                 Ok(result) => match serde_json::to_value(result) {
                     Ok(value) => CallToolResult::structured(value),
-                    Err(error) => CallToolResult::error(vec![ContentBlock::text(format!(
-                        "rerank_pairs: serializing result: {error}"
-                    ))]),
+                    Err(error) => error::render_error(
+                        "rerank_pairs",
+                        None,
+                        &anyhow::Error::new(error).context("rerank_pairs: serializing result"),
+                    ),
                 },
-                Err(error) => CallToolResult::error(vec![ContentBlock::text(format!("{error:#}"))]),
+                Err(error) => error::render_error("rerank_pairs", None, &error),
             },
         )
         .await
@@ -1004,16 +1031,37 @@ impl CodeSageServer {
                 .session_id
                 .clone()
                 .unwrap_or_else(|| "default".to_string());
-            s.render(
-                &params.project,
-                s.with_project_root_db(&params.project, |root, db| {
+            let result = s
+                .with_project_root_db(&params.project, |root, db| {
                     session_end(root, db, &session_id)
-                }),
-                "session_end",
-            )
+                })
+                .map_err(|e| missing_snapshot_error(&params.project, &session_id, e));
+            s.render(&params.project, result, "session_end")
         })
         .await
     }
+}
+
+/// A missing snapshot file is the one `session_end` failure with a machine remedy.
+fn missing_snapshot_error(project: &str, session_id: &str, error: anyhow::Error) -> anyhow::Error {
+    let missing = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    });
+    if !missing {
+        return error;
+    }
+    error::McpError::new(
+        error::ErrorCode::NotFound,
+        format!("no session snapshot `{session_id}`; call session_start first"),
+    )
+    .remedy(error::Remedy::Call {
+        tool: "session_start".to_owned(),
+        arguments: serde_json::json!({ "project": project, "session_id": session_id }),
+    })
+    .source(error)
+    .into()
 }
 
 /// Fill omitted/empty projects on tools/call messages and batches; preserve other lines.
@@ -1142,15 +1190,17 @@ mod tests {
     #[test]
     fn embed_texts_caps_bound_count_per_text_and_total_bytes() {
         let ok: Vec<String> = vec!["a".repeat(MAX_MCP_EMBED_TEXT_BYTES); 3];
-        assert_eq!(check_embed_texts_caps(&ok), Ok(()));
+        assert!(check_embed_texts_caps(&ok).is_ok());
 
         let too_many: Vec<String> = vec![String::from("x"); MAX_MCP_EMBED_TEXTS + 1];
         let err = check_embed_texts_caps(&too_many).unwrap_err();
+        assert_eq!(err.code, error::ErrorCode::OverCap);
+        let err = err.to_string();
         assert!(err.starts_with(EMBED_TEXTS_OVER_CAP), "{err}");
         assert!(err.contains("per-call cap"), "{err}");
 
         let one_big = vec![String::from("ok"), "b".repeat(MAX_MCP_EMBED_TEXT_BYTES + 1)];
-        let err = check_embed_texts_caps(&one_big).unwrap_err();
+        let err = check_embed_texts_caps(&one_big).unwrap_err().to_string();
         assert!(err.starts_with(EMBED_TEXTS_OVER_CAP), "{err}");
         assert!(err.contains("text 1 is"), "{err}");
         assert!(err.contains("per-text cap"), "{err}");
@@ -1162,7 +1212,7 @@ mod tests {
             "fixture must stay under the count cap"
         );
         let aggregate: Vec<String> = vec!["c".repeat(per_text); count];
-        let err = check_embed_texts_caps(&aggregate).unwrap_err();
+        let err = check_embed_texts_caps(&aggregate).unwrap_err().to_string();
         assert!(err.starts_with(EMBED_TEXTS_OVER_CAP), "{err}");
         assert!(err.contains("in total"), "{err}");
     }

@@ -284,48 +284,16 @@ fn render_with_budget<T: serde::Serialize>(
             result
         }
         Err(e) => {
-            let status = error_status(&e);
-            let mut content = vec![ContentBlock::text(format!("Error: {e:#}"))];
-            if let Some(status) = status {
-                content.push(ContentBlock::text(
-                    serde_json::json!({
-                        "status": status, "complete": false, "next": null,
-                    })
-                    .to_string(),
-                ));
-            }
-            CallToolResult::error(content)
+            // Handlers render inside the request's blocking scope, which knows the
+            // tool name and arguments; `kind` is the fallback outside dispatch.
+            let request = super::dispatch::current_request();
+            let (tool, arguments) = match &request {
+                Some(request) => (request.tool.as_str(), Some(request.arguments.as_ref())),
+                None => (kind, None),
+            };
+            super::error::render_error(tool, arguments, &e)
         }
     }
-}
-
-pub(super) fn error_status(error: &anyhow::Error) -> Option<&'static str> {
-    error.chain().find_map(|cause| {
-        if let Some(error) = cause.downcast_ref::<super::work::AdmissionError>() {
-            return match error {
-                super::work::AdmissionError::Saturated => Some("saturated"),
-                super::work::AdmissionError::Shutdown => Some("shutdown"),
-                super::work::AdmissionError::Stopped(reason) => Some(reason.as_str()),
-                _ => None,
-            };
-        }
-        if let Some(stopped) = cause.downcast_ref::<codesage_protocol::work::WorkStopped>() {
-            return Some(stopped.reason.as_str());
-        }
-        if cause.is::<codesage_graph::IncompleteRiskRanking>() {
-            return Some("incomplete");
-        }
-        if let Some(rusqlite::Error::SqliteFailure(code, _)) =
-            cause.downcast_ref::<rusqlite::Error>()
-            && matches!(
-                code.code,
-                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-            )
-        {
-            return Some("database-busy");
-        }
-        None
-    })
 }
 
 /// Bound per-response disk hashing even for unusually broad results.
