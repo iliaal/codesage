@@ -341,34 +341,65 @@ fn lazy_scope_kinds(language: Language) -> &'static [&'static str] {
     }
 }
 
-/// True when `function` is the callee of a call expression, directly or
-/// through parentheses: `(function () { ... })()` runs when its enclosing
-/// scope does, so it defers nothing by itself.
-fn is_immediately_invoked(function: &Node) -> bool {
+/// True when `function` runs where it is written: the callee of a call
+/// expression, the constructor of a `new` expression, or the receiver of
+/// `.call(...)` / `.apply(...)`, each directly or through parentheses.
+/// `(function () { ... })()` and `(function () { ... }).call(this)` run when
+/// their enclosing scope does, so they defer nothing by themselves; `.bind`
+/// only produces another function.
+fn is_immediately_invoked(function: &Node, source: &[u8]) -> bool {
     let mut callee = *function;
     let mut parent = function.parent();
     while let Some(p) = parent {
-        if p.kind() != "parenthesized_expression" {
-            return p.kind() == "call_expression"
-                && p.child_by_field_name("function")
+        match p.kind() {
+            "parenthesized_expression" => {
+                callee = p;
+                parent = p.parent();
+            }
+            "call_expression" => {
+                return p
+                    .child_by_field_name("function")
                     .is_some_and(|f| f.id() == callee.id());
+            }
+            "new_expression" => {
+                return p
+                    .child_by_field_name("constructor")
+                    .is_some_and(|c| c.id() == callee.id());
+            }
+            "member_expression" => {
+                let is_receiver = p
+                    .child_by_field_name("object")
+                    .is_some_and(|o| o.id() == callee.id());
+                let invokes = p.child_by_field_name("property").is_some_and(|prop| {
+                    matches!(
+                        crate::parse::node_text_lossy(&prop, source).as_str(),
+                        "call" | "apply"
+                    )
+                });
+                let called = p.parent().is_some_and(|call| {
+                    call.kind() == "call_expression"
+                        && call
+                            .child_by_field_name("function")
+                            .is_some_and(|f| f.id() == p.id())
+                });
+                return is_receiver && invokes && called;
+            }
+            _ => return false,
         }
-        callee = p;
-        parent = p.parent();
     }
     false
 }
 
 /// True when an import directive sits inside a function, method, closure, or
 /// arrow-function body that is not immediately invoked, for `language`.
-fn import_is_lazy(node: &Node, language: Language) -> bool {
+fn import_is_lazy(node: &Node, source: &[u8], language: Language) -> bool {
     let kinds = lazy_scope_kinds(language);
     if kinds.is_empty() {
         return false;
     }
     let mut current = node.parent();
     while let Some(n) = current {
-        if kinds.contains(&n.kind()) && !is_immediately_invoked(&n) {
+        if kinds.contains(&n.kind()) && !is_immediately_invoked(&n, source) {
             return true;
         }
         current = n.parent();
@@ -504,7 +535,7 @@ pub fn extract_references(
         let lazy = matches!(
             kind,
             ReferenceKind::Import | ReferenceKind::ImportBinding | ReferenceKind::Include
-        ) && import_is_lazy(&ref_node, language);
+        ) && import_is_lazy(&ref_node, source, language);
         if language == Language::Python && kind == ReferenceKind::ImportBinding {
             let statement = ref_node.parent().and_then(|parent| {
                 if parent.kind() == "aliased_import" {
@@ -683,6 +714,18 @@ mod tests {
         assert_eq!(lazy_flags(&refs, "./inner"), vec![true]);
         // Parenthesized but never called: still a deferred body.
         assert_eq!(lazy_flags(&refs, "./factory"), vec![true]);
+    }
+
+    #[test]
+    fn javascript_call_apply_and_new_invoked_wrappers_are_eager_but_bind_is_lazy() {
+        let src = "(function () { require('./call'); }).call(this);\n(function () { require('./apply'); }.apply(null, []));\nnew (function () { require('./ctor'); })();\nconst bound = (function () { require('./bound'); }).bind(this);\nconst later = (function () { require('./later'); }).call;\n";
+        let refs = refs_from_source(src, Language::JavaScript);
+        assert_eq!(lazy_flags(&refs, "./call"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./apply"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./ctor"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./bound"), vec![true]);
+        // `.call` read but never invoked.
+        assert_eq!(lazy_flags(&refs, "./later"), vec![true]);
     }
 
     #[test]

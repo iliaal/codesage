@@ -106,23 +106,24 @@ impl ImportCycles {
         let suppressed_pairs = if pairs.lazy_only.is_empty() {
             Vec::new()
         } else {
+            // A lazy pair already inside an eager ring is redundant with it;
+            // only pairs that join a ring once counted are suppressed edges.
+            let eager_component = component_index(&components);
             let mut all = pairs.eager;
             all.extend(pairs.lazy_only.iter().cloned());
             let full = crate::scc::tarjan_scc(&all)?;
-            let mut component_of: HashMap<&str, usize> = HashMap::new();
-            for (i, component) in full.iter().enumerate().filter(|(_, c)| c.len() >= 2) {
-                for file in component {
-                    component_of.insert(file.as_str(), i);
-                }
-            }
+            let full_component = component_index(&full);
             pairs
                 .lazy_only
                 .into_iter()
                 .filter(|(from, to)| {
-                    matches!(
-                        (component_of.get(from.as_str()), component_of.get(to.as_str())),
-                        (Some(a), Some(b)) if a == b
-                    )
+                    let same = |index: &HashMap<&str, usize>| {
+                        matches!(
+                            (index.get(from.as_str()), index.get(to.as_str())),
+                            (Some(a), Some(b)) if a == b
+                        )
+                    };
+                    same(&full_component) && !same(&eager_component)
                 })
                 .collect()
         };
@@ -168,6 +169,17 @@ impl ImportCycles {
             .filter(|to| set.contains(to.as_str()))
             .count() as u32
     }
+}
+
+/// Map each member of a non-trivial component to that component's index.
+fn component_index(components: &[Vec<String>]) -> HashMap<&str, usize> {
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    for (i, component) in components.iter().enumerate().filter(|(_, c)| c.len() >= 2) {
+        for file in component {
+            index.insert(file.as_str(), i);
+        }
+    }
+    index
 }
 
 /// Cycles touching a patch, sharing the SCC result so per-file assessments
@@ -2194,6 +2206,90 @@ mod tests {
                 paths.len(),
                 start.elapsed().as_millis()
             );
+        }
+    }
+
+    #[test]
+    fn lazy_pair_inside_an_eager_ring_is_not_a_suppressed_edge() {
+        use codesage_protocol::{FileInfo, Language, Reference, ReferenceKind, Symbol, SymbolKind};
+
+        let db = Database::open_in_memory().unwrap();
+        for path in ["a.py", "b.py", "c.py", "x.py", "y.py"] {
+            db.upsert_file(&FileInfo {
+                path: path.to_string(),
+                language: Language::Python,
+                content_hash: "hash".to_string(),
+            })
+            .unwrap();
+        }
+        let ids = |path: &str| db.file_id_for_path(path).unwrap().unwrap();
+        for (path, name) in [
+            ("a.py", "fa"),
+            ("b.py", "fb"),
+            ("c.py", "fc"),
+            ("x.py", "fx"),
+            ("y.py", "fy"),
+        ] {
+            db.insert_symbols(
+                ids(path),
+                &[Symbol {
+                    name: name.to_string(),
+                    qualified_name: name.to_string(),
+                    kind: SymbolKind::Function,
+                    file_path: path.to_string(),
+                    line_start: 1,
+                    line_end: 2,
+                    col_start: 0,
+                    col_end: 0,
+                    rationale: Vec::new(),
+                }],
+            )
+            .unwrap();
+        }
+        let imp = |from: &str, to: &str, line: u32, lazy: bool| Reference {
+            from_file: from.to_string(),
+            from_symbol: None,
+            to_name: to.to_string(),
+            kind: ReferenceKind::Import,
+            line,
+            col: 0,
+            lazy,
+        };
+        // Eager ring a -> c -> b -> a, plus a lazy a -> b shortcut inside it.
+        db.insert_references(
+            ids("a.py"),
+            &[imp("a.py", "fc", 1, false), imp("a.py", "fb", 2, true)],
+        )
+        .unwrap();
+        db.insert_references(ids("c.py"), &[imp("c.py", "fb", 1, false)])
+            .unwrap();
+        db.insert_references(ids("b.py"), &[imp("b.py", "fa", 1, false)])
+            .unwrap();
+        // Lazy x -> y that would close a cycle with the eager y -> x.
+        db.insert_references(ids("x.py"), &[imp("x.py", "fy", 1, true)])
+            .unwrap();
+        db.insert_references(ids("y.py"), &[imp("y.py", "fx", 1, false)])
+            .unwrap();
+
+        let cycles = ImportCycles::load(&db).unwrap();
+        assert_eq!(
+            cycles.suppressed_pairs,
+            vec![("x.py".to_string(), "y.py".to_string())]
+        );
+
+        let ring = assess_risk(&db, "a.py").unwrap();
+        assert!(ring.in_cycle);
+        assert_eq!(ring.cycle_size, 3);
+        assert_eq!(ring.lazy_edges, 0);
+        let json = serde_json::to_value(&ring).unwrap();
+        assert!(json.get("lazy_edges").is_none(), "{json}");
+        let entry = cycle_entry_for_file(&db, &cycles, "a.py").unwrap().unwrap();
+        assert_eq!(entry.lazy_edges, 0);
+
+        for file in ["x.py", "y.py"] {
+            let open = assess_risk(&db, file).unwrap();
+            assert!(!open.in_cycle, "{open:?}");
+            assert_eq!(open.lazy_edges, 1, "{open:?}");
         }
     }
 
