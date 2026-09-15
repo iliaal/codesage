@@ -371,6 +371,54 @@ mod tests {
         assert!(!refs.contains("\"col\""), "{refs}");
     }
 
+    #[test]
+    fn recommend_tests_schema_describes_commands_and_inline_modules() {
+        let server = CodeSageServer::new();
+        let mut tools = server.tool_router.list_all();
+        finalize_tools_for_listing(&mut tools);
+        let schema = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "recommend_tests")
+            .and_then(|t| t.output_schema.clone())
+            .expect("recommend_tests must advertise an outputSchema");
+        let required = schema["required"].as_array().expect("required array");
+        for key in ["commands", "inline_test_modules"] {
+            assert!(
+                schema["properties"].get(key).is_some(),
+                "recommend_tests schema must describe `{key}`"
+            );
+            assert!(
+                !required.iter().any(|r| r == key),
+                "`{key}` is omitted when empty and must not be required"
+            );
+        }
+        let root = serde_json::Value::Object((*schema).clone());
+        let items = &schema["properties"]["commands"]["items"];
+        let command = resolve(&root, items);
+        for key in ["command", "covers", "framework", "source"] {
+            assert!(
+                command["properties"].get(key).is_some(),
+                "TestCommand schema must describe `{key}`: {command}"
+            );
+        }
+        let module = resolve(&root, &schema["properties"]["inline_test_modules"]["items"]);
+        for key in ["file", "module", "test_count"] {
+            assert!(
+                module["properties"].get(key).is_some(),
+                "InlineTestModule schema must describe `{key}`: {module}"
+            );
+        }
+        let rehearsal = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "review_rehearsal")
+            .and_then(|t| t.output_schema.clone())
+            .expect("review_rehearsal must advertise an outputSchema");
+        assert!(
+            rehearsal["properties"].get("summary_notes").is_some(),
+            "review_rehearsal quotes test commands through `summary_notes`"
+        );
+    }
+
     /// Follow a `$ref` into `$defs` so nested per-file schemas can be checked.
     fn resolve<'a>(
         root: &'a serde_json::Value,

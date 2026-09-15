@@ -14,6 +14,9 @@ use crate::impact::WalkCache;
 /// Reachable test paths named verbatim in the rehearsal summary; the rest
 /// are folded into a "+N more" count (`reachable_total` carries the number).
 const REHEARSAL_REACHABLE_NOTE_CAP: usize = 5;
+/// Commands quoted verbatim in the rehearsal summary before the rest collapse
+/// to a count.
+const REHEARSAL_COMMAND_NOTE_CAP: usize = 5;
 
 /// Wall-clock cap on the rehearsal's reachability walk. `assess_risk_diff`
 /// shares resolved reverse edges with this walk while retaining its narrower
@@ -512,6 +515,21 @@ fn test_notes(tests: &codesage_protocol::TestRecommendations) -> Vec<String> {
     } else if !tests.coupled.is_empty() {
         let coupled: Vec<String> = tests.coupled.iter().map(|c| c.file.clone()).collect();
         notes.push(format!("Coupled tests to consider: {}", coupled.join(", ")));
+    }
+    if !tests.commands.is_empty() {
+        let shown: Vec<&str> = tests
+            .commands
+            .iter()
+            .take(REHEARSAL_COMMAND_NOTE_CAP)
+            .map(|c| c.command.as_str())
+            .collect();
+        let more = tests.commands.len().saturating_sub(shown.len());
+        let suffix = if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        };
+        notes.push(format!("Test commands: {}{suffix}", shown.join("; ")));
     }
     // Reachability can add tests beyond sibling conventions; disclose incomplete walks.
     let cap_clause = reach_cap_clause(tests)

@@ -1382,9 +1382,57 @@ pub struct TestRecommendations {
     /// was usable even though the index may hold tests.
     #[serde(default)]
     pub indexed_test_files: usize,
+    /// Runnable shell commands derived from `primary`, `reachable`, the
+    /// inline test modules of the changed files, and the `test_command` of
+    /// any mapped feature owning a changed file. Suggestions built from
+    /// paths and manifests; nothing is executed. Deduplicated, in a stable
+    /// order: convention commands, then inline, then feature commands.
+    /// Empty from the cheap `recommend_tests` variant.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub commands: Vec<TestCommand>,
+    /// Test modules living inside the changed files themselves: Rust
+    /// `#[cfg(test)] mod tests` blocks and Python `test_*` functions. These
+    /// never appear in `primary`, since the file is not a test file, yet a
+    /// change to the file is a change to them.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub inline_test_modules: Vec<InlineTestModule>,
     /// Human-readable rationale.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub notes: Vec<String>,
+}
+
+/// One runnable test command suggested by `recommend_tests`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TestCommand {
+    /// Shell command, relative to the project root (`cargo test -p acme
+    /// --test integration`, `pytest tests/test_x.py`, `go test ./pkg/util`).
+    pub command: String,
+    /// What the command exercises: test file paths, or module ids for inline
+    /// modules (`search::tests`), or the changed files a feature owns.
+    pub covers: Vec<String>,
+    /// Runner family: `cargo`, `pytest`, `phpunit`, `artisan`, `run-tests`,
+    /// `go`, `vitest`, `jest`, `maven`, `gradle`; for feature commands, the
+    /// command's first token.
+    pub framework: String,
+    /// `convention` (from `primary` / `reachable` paths), `inline` (a test
+    /// module inside a changed file), or `feature_test_command` (the mapped
+    /// feature's own runner).
+    pub source: String,
+}
+
+/// A test module inside a changed source file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct InlineTestModule {
+    /// Repo-relative path of the changed file.
+    pub file: String,
+    /// Rust: the crate-relative module path (`search::tests`). Python: the
+    /// dotted module of the file (`pkg.mod`).
+    pub module: String,
+    /// Rust: `#[test]`-attributed functions when the source is readable,
+    /// otherwise indexed functions inside the module whose names start with
+    /// `test` (an undercount for modules that do not follow that naming).
+    /// Python: indexed `test_*` functions and methods in the file.
+    pub test_count: usize,
 }
 
 /// One file in `SessionSnapshot.top_risk_files`. Captured at session start
