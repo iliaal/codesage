@@ -5,8 +5,9 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Context, Result};
 use codesage_protocol::{
-    ClusteredDirectory, CoChangeEntry, CouplingReport, CycleEntry, FileCategory, ImpactRequest,
-    ImpactTarget, RiskAssessment, RiskBatchAssessment, RiskDiffAssessment, TopSymbol,
+    ClusteredDirectory, CoChangeEntry, CouplingReport, CycleEntry, FileCategory, Handle,
+    ImpactRequest, ImpactTarget, RiskAssessment, RiskBatchAssessment, RiskDiffAssessment,
+    TopSymbol,
 };
 use codesage_storage::Database;
 use codesage_storage::db::CoChangeRow;
@@ -184,6 +185,7 @@ fn span_phrase(max_span: u32) -> String {
 fn to_co_change_entry(r: CoChangeRow, this_commits: u32) -> CoChangeEntry {
     let span_days = days_between(r.first_observed_at, r.last_observed_at);
     CoChangeEntry {
+        handle: Handle::file(r.file.as_str()).to_string(),
         file: r.file,
         weight: r.weight,
         count: r.count,
@@ -1578,6 +1580,7 @@ fn cluster_by_directory(
         let top_files: Vec<RiskAssessment> = items.iter().take(3).cloned().collect();
         let omitted_files: Vec<String> = items.iter().skip(3).map(|f| f.file.clone()).collect();
         clusters.push(ClusteredDirectory {
+            handle: Handle::dir(dir.as_str()).to_string(),
             directory: dir,
             count,
             top_files,
@@ -2114,6 +2117,7 @@ mod tests {
             line: 1,
             col: 0,
             to: None,
+            from_line: None,
         };
         db.insert_references(ids("cyc_a.php"), &[imp("cyc_a.php", "App\\CycleB")])
             .unwrap();

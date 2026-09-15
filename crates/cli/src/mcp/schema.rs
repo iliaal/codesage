@@ -610,17 +610,26 @@ mod tests {
             "the overload marker is internal: {symbol_row}"
         );
 
+        let declares_optional = |row: &serde_json::Value, key: &str, what: &str| {
+            assert_eq!(
+                row["properties"][key]["type"],
+                json!(["string", "null"]),
+                "{what}: `{key}` is a nullable string: {row}"
+            );
+            assert!(
+                !row["required"]
+                    .as_array()
+                    .is_some_and(|r| r.iter().any(|k| k == key)),
+                "{what}: `{key}` is omitted when unknown and must not be required: {row}"
+            );
+        };
         let find_references = schema("find_references");
         let reference_row = items(&find_references, &["results"]);
-        requires(&reference_row, "from", "find_references");
-        requires(&reference_row, "to", "find_references");
-        assert_eq!(
-            reference_row["properties"]["from"]["type"],
-            json!(["string", "null"])
-        );
-        assert_eq!(
-            reference_row["properties"]["to"]["type"],
-            json!(["string", "null"])
+        declares_optional(&reference_row, "from", "find_references");
+        declares_optional(&reference_row, "to", "find_references");
+        assert!(
+            find_references["properties"].get("to_resolution").is_some(),
+            "find_references must describe `to_resolution`: {find_references}"
         );
 
         let search = schema("search");
@@ -654,6 +663,49 @@ mod tests {
             &items(&impact, &["sibling_symbols"]),
             "handle",
             "impact_analysis sibling_symbols",
+        );
+
+        // File-shaped rows carry `file:` handles (`dir:` for clusters). These
+        // fields default on deserialization for stored snapshots, so they are
+        // declared but not required.
+        let declares = |row: &serde_json::Value, what: &str| {
+            assert_eq!(
+                row["properties"]["handle"]["type"],
+                json!("string"),
+                "{what}: row schema must declare a string `handle`: {row}"
+            );
+        };
+        declares(&items(&impact, &["results"]), "impact_analysis results");
+        declares(&schema("list_dependencies"), "list_dependencies");
+        declares(
+            &items(&schema("find_coupling"), &["coupled"]),
+            "find_coupling coupled",
+        );
+        let risk = schema("assess_risk");
+        requires(&risk, "handle", "assess_risk");
+        declares(&items(&risk, &["top_coupled"]), "assess_risk top_coupled");
+        let diff = schema("assess_risk_diff");
+        requires(
+            &items(&diff, &["files"]),
+            "handle",
+            "assess_risk_diff files",
+        );
+        declares(
+            &items(&diff, &["clustered_directories"]),
+            "assess_risk_diff clustered_directories",
+        );
+        requires(
+            &items(&schema("assess_risk_batch"), &["files"]),
+            "handle",
+            "assess_risk_batch files",
+        );
+        let tests = schema("recommend_tests");
+        declares(&items(&tests, &["coupled"]), "recommend_tests coupled");
+        declares(&items(&tests, &["reachable"]), "recommend_tests reachable");
+        declares_optional(
+            &items(&schema("from_trace"), &["frames"]),
+            "handle",
+            "from_trace frames",
         );
     }
 

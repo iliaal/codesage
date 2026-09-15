@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use codesage_protocol::handle::mark_overloads;
 use codesage_protocol::{
-    DependencyEntry, FileInfo, Language, RationaleEntry, Reference, ReferenceKind, Symbol,
+    DependencyEntry, FileInfo, Handle, Language, RationaleEntry, Reference, ReferenceKind, Symbol,
     SymbolKind, TrustBoundary,
 };
 use rusqlite::params;
@@ -489,6 +489,7 @@ impl Database {
                 line: row.get(4)?,
                 col: row.get(5)?,
                 to: None,
+                from_line: None,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -694,6 +695,7 @@ impl Database {
     pub fn list_file_dependencies(&self, file_path: &str) -> Result<DependencyEntry> {
         if self.file_id_for_path(file_path)?.is_none() {
             return Ok(DependencyEntry {
+                handle: Handle::file(file_path).to_string(),
                 file_path: file_path.to_string(),
                 found: false,
                 note: Some(
@@ -749,6 +751,7 @@ impl Database {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         Ok(DependencyEntry {
+            handle: Handle::file(file_path).to_string(),
             file_path: file_path.to_string(),
             found: true,
             note: None,

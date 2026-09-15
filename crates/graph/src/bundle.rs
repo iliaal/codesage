@@ -1272,6 +1272,7 @@ mod context_export_tests {
             line: 5,
             col: 12,
             to: None,
+            from_line: None,
         }
     }
 
@@ -1293,6 +1294,7 @@ mod context_export_tests {
             line: 1,
             col: 0,
             to: None,
+            from_line: None,
         };
         db.insert_references(
             file_id,

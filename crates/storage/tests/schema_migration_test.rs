@@ -662,6 +662,7 @@ fn sample_reference(kind: codesage_protocol::ReferenceKind) -> codesage_protocol
         line: 2,
         col: 4,
         to: None,
+        from_line: None,
     }
 }
 

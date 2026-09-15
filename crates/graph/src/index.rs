@@ -662,6 +662,7 @@ mod tests {
             line,
             col,
             to: None,
+            from_line: None,
         };
         let mut refs = vec![
             r("foo", ReferenceKind::Call, 3, 4),

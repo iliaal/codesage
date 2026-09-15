@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use codesage_parser::detect::detect_language;
 use codesage_protocol::{
-    CoupledTestEntry, FileCategory, ImpactRequest, ImpactTarget, ReachableTestEntry,
+    CoupledTestEntry, FileCategory, Handle, ImpactRequest, ImpactTarget, ReachableTestEntry,
     TestRecommendations,
 };
 use codesage_storage::Database;
@@ -340,6 +340,7 @@ fn base_recommendations(db: &Database, file_paths: &[String]) -> Result<BaseReco
                     let span_days =
                         super::risk::days_between(entry.first_observed_at, entry.last_observed_at);
                     coupled.push(CoupledTestEntry {
+                        handle: Handle::file(entry.file.as_str()).to_string(),
                         file: entry.file.clone(),
                         weight: entry.weight,
                         count: entry.count,
@@ -625,6 +626,7 @@ fn reachable_test_files(
                 .get(&entry.file_path)
                 .expect("the walk records an edge count for every entry it returns");
             let candidate = ReachableTestEntry {
+                handle: Handle::file(entry.file_path.as_str()).to_string(),
                 path: entry.file_path,
                 distance: entry.distance,
                 edge_count,
@@ -978,6 +980,7 @@ mod tests {
             line,
             col: 4,
             to: None,
+            from_line: None,
         }
     }
 

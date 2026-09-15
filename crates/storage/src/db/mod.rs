@@ -1685,6 +1685,7 @@ mod tests {
             line: 1,
             col: 0,
             to: None,
+            from_line: None,
         }
     }
 

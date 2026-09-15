@@ -551,6 +551,7 @@ mod tests {
     fn reachable_note_caps_at_five_and_carries_the_lower_bound_clause() {
         use codesage_protocol::{ReachableTestEntry, TestRecommendations};
         let entry = |i: usize| ReachableTestEntry {
+            handle: format!("file:tests/T{i}.php"),
             path: format!("tests/T{i}.php"),
             distance: 1,
             edge_count: 1,
@@ -874,6 +875,7 @@ mod tests {
                         line: 2,
                         col: 0,
                         to: None,
+                        from_line: None,
                     }],
                 )
                 .unwrap();

@@ -24,7 +24,7 @@ fn setup() -> (tempfile::TempDir, Database) {
     std::fs::write(root.join("src/helper.rs"), "pub fn inner() -> u32 { 7 }\n").unwrap();
     std::fs::write(
         root.join("src/over.cpp"),
-        "int run(int x) { return x; }\nint run(double x) { return (int)x; }\nint stop() { return 0; }\n",
+        "int helper() { return 1; }\nint run(int x) { return helper() + x; }\nint run(double x) { return helper(); }\nint stop() { return 0; }\n",
     )
     .unwrap();
     let db = Database::open_in_memory().unwrap();
@@ -86,10 +86,11 @@ fn handles_round_trip_through_find_symbol_references_impact_and_trace() {
         .find(|r| r.from_symbol.is_none())
         .unwrap_or_else(|| panic!("a file-scope import: {:?}", refs.results));
     let wire: serde_json::Value = serde_json::to_value(file_scope).unwrap();
-    assert!(wire["from"].is_null(), "{wire}");
+    assert!(wire.get("from").is_none(), "omitted at file scope: {wire}");
     assert!(
-        wire.get("to").is_some(),
-        "`to` is always on the wire: {wire}"
+        refs.to_resolution.is_none(),
+        "a small fixture never caps: {:?}",
+        refs.to_resolution
     );
 
     // The handle names the impact target by its qualified part.
@@ -174,5 +175,39 @@ fn overloads_in_one_file_carry_line_handles() {
         .iter()
         .map(|s| (s.name.as_str(), s.overloaded))
         .collect();
-    assert_eq!(flagged, [("run", true), ("run", true), ("stop", false)]);
+    assert_eq!(
+        flagged,
+        [
+            ("helper", false),
+            ("run", true),
+            ("run", true),
+            ("stop", false)
+        ]
+    );
+
+    // Both overloads call `helper`; each caller row names its own overload,
+    // with the same `@line` handle `find_symbol` emitted for it.
+    let refs = find_references(
+        &db,
+        &FindReferencesRequest {
+            symbol_name: "helper".to_string(),
+            kind: None,
+        },
+    )
+    .unwrap();
+    let mut froms: Vec<String> = refs
+        .results
+        .iter()
+        .filter(|r| r.from_symbol.as_deref() == Some("run"))
+        .map(|r| {
+            let wire: serde_json::Value = serde_json::to_value(r).unwrap();
+            wire["from"].as_str().unwrap().to_string()
+        })
+        .collect();
+    froms.sort();
+    froms.dedup();
+    assert_eq!(froms, handles, "{:?}", refs.results);
+    for r in &refs.results {
+        assert_eq!(r.to.as_deref(), Some("sym:src/over.cpp#helper"), "{r:?}");
+    }
 }

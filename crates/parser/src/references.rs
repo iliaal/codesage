@@ -461,6 +461,7 @@ pub fn extract_references(
                     line: row + 1,
                     col,
                     to: None,
+                    from_line: None,
                 });
             }
         }
@@ -472,6 +473,7 @@ pub fn extract_references(
             line: row + 1,
             col,
             to: None,
+            from_line: None,
         });
     }
 

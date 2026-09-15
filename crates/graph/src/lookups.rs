@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use codesage_protocol::{
     DependencyEntry, FindReferencesRequest, FindReferencesResults, FindSymbolRequest, Reference,
-    Symbol,
+    Symbol, ToResolution,
 };
 use codesage_storage::Database;
 
@@ -25,9 +26,7 @@ pub fn find_references(
     let mut results = db.find_references(&req.symbol_name, req.kind)?;
     let definitions = db.find_symbols(&req.symbol_name, None)?;
     let definition_count = definitions.len();
-    if definition_count > 0 {
-        attach_resolved_targets(db, &mut results)?;
-    }
+    let to_resolution = attach_handles(db, &mut results, &definitions)?;
     let ambiguous = definition_count > 1;
     let note = if ambiguous {
         // Bare candidates cannot disambiguate impact_analysis; offer files instead.
@@ -85,40 +84,115 @@ pub fn find_references(
         definition_count,
         ambiguous,
         note,
+        to_resolution,
     })
 }
 
-/// Fill each row's `to` with the handle of the one definition its callsite
-/// resolves to, through the same import-aware forward resolution
-/// `impact_analysis` uses; null when none or several resolve. Resolution is
-/// cached per (caller file, spelling) and imports per caller file, so the
-/// cost is bounded by distinct callers, not by rows.
-fn attach_resolved_targets(db: &Database, rows: &mut [Reference]) -> Result<()> {
+/// Distinct (caller file, spelling) pairs `find_references` resolves before
+/// leaving the remaining rows without `to`.
+pub const MAX_TO_RESOLUTION_PAIRS: usize = 256;
+
+/// Wall-clock budget for the whole handle pass; the enclosing work deadline
+/// wins when it is sooner.
+const TO_RESOLUTION_BUDGET: Duration = Duration::from_millis(750);
+
+/// Fill each row's handles. `from` gains `@line` when the enclosing
+/// definition is one of several same-named definitions in its file, so it
+/// matches the handle `find_symbol` emits for that caller. `to` is the
+/// handle of the one definition the callsite resolves to, through the same
+/// import-aware forward resolution `impact_analysis` uses; it stays `None`
+/// when none or several resolve.
+///
+/// Cost is bounded three ways: symbols are loaded once per caller file,
+/// resolution is cached per (caller file, spelling) and stops after
+/// [`MAX_TO_RESOLUTION_PAIRS`] distinct pairs, and the pass as a whole stops
+/// at [`TO_RESOLUTION_BUDGET`]. When either stop fires, the returned
+/// [`ToResolution`] says so and rows after the stop carry no `to`.
+fn attach_handles(
+    db: &Database,
+    rows: &mut [Reference],
+    definitions: &[Symbol],
+) -> Result<Option<ToResolution>> {
+    let mut deadline = Instant::now() + TO_RESOLUTION_BUDGET;
+    if let Some(work) = codesage_protocol::work::current().and_then(|w| w.deadline()) {
+        deadline = deadline.min(work);
+    }
+    let sole_definition = match definitions {
+        [only] => Some(only),
+        _ => None,
+    };
+    let mut file_symbols: HashMap<String, Arc<Vec<Symbol>>> = HashMap::new();
     let mut resolved: HashMap<(String, String), Option<String>> = HashMap::new();
     let mut imports: HashMap<String, Arc<Vec<String>>> = HashMap::new();
+    let mut capped = false;
     for row in rows.iter_mut() {
         codesage_protocol::work::checkpoint()?;
-        let key = (row.from_file.clone(), row.to_name.clone());
-        if !resolved.contains_key(&key) {
-            let from_file = row.from_file.as_str();
-            let definitions =
-                resolve_callee_definitions_with_imports(db, from_file, &row.to_name, &mut || {
-                    if let Some(cached) = imports.get(from_file) {
-                        return Ok(Arc::clone(cached));
-                    }
-                    let loaded = Arc::new(import_refs_for_file(db, from_file)?);
-                    imports.insert(from_file.to_string(), Arc::clone(&loaded));
-                    Ok(loaded)
-                })?;
-            let handle = match definitions.as_slice() {
-                [only] => Some(only.handle().to_string()),
-                _ => None,
-            };
-            resolved.insert(key.clone(), handle);
+        if Instant::now() >= deadline {
+            capped = true;
+            break;
         }
-        row.to = resolved[&key].clone();
+        if let Some(caller) = row.from_symbol.as_deref() {
+            let symbols = match file_symbols.get(&row.from_file) {
+                Some(cached) => Arc::clone(cached),
+                None => {
+                    let loaded = Arc::new(db.symbols_for_file(&row.from_file)?);
+                    file_symbols.insert(row.from_file.clone(), Arc::clone(&loaded));
+                    loaded
+                }
+            };
+            row.from_line = enclosing_definition(&symbols, caller, row.line)
+                .filter(|s| s.overloaded)
+                .map(|s| s.line_start);
+        }
+        if definitions.is_empty() {
+            continue;
+        }
+        if let Some(only) = sole_definition
+            && only.file_path == row.from_file
+        {
+            row.to = Some(only.handle().to_string());
+            continue;
+        }
+        let key = (row.from_file.clone(), row.to_name.clone());
+        if let Some(cached) = resolved.get(&key) {
+            row.to = cached.clone();
+            continue;
+        }
+        if resolved.len() >= MAX_TO_RESOLUTION_PAIRS {
+            capped = true;
+            continue;
+        }
+        let from_file = row.from_file.as_str();
+        let candidates =
+            resolve_callee_definitions_with_imports(db, from_file, &row.to_name, &mut || {
+                if let Some(cached) = imports.get(from_file) {
+                    return Ok(Arc::clone(cached));
+                }
+                let loaded = Arc::new(import_refs_for_file(db, from_file)?);
+                imports.insert(from_file.to_string(), Arc::clone(&loaded));
+                Ok(loaded)
+            })?;
+        let handle = match candidates.as_slice() {
+            [only] => Some(only.handle().to_string()),
+            _ => None,
+        };
+        row.to = handle.clone();
+        resolved.insert(key, handle);
     }
-    Ok(())
+    Ok(capped.then_some(ToResolution {
+        resolved_pairs: resolved.len(),
+        capped,
+    }))
+}
+
+/// The innermost definition named `caller` (as `from_symbol` stores it: the
+/// qualified name, or the bare name for older rows) whose range holds `line`.
+fn enclosing_definition<'a>(symbols: &'a [Symbol], caller: &str, line: u32) -> Option<&'a Symbol> {
+    symbols
+        .iter()
+        .filter(|s| s.qualified_name == caller || s.name == caller)
+        .filter(|s| s.line_start <= line && line <= s.line_end)
+        .max_by_key(|s| s.line_start)
 }
 
 fn distinct_sorted<'a>(items: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
@@ -214,6 +288,7 @@ mod tests {
             line: 5,
             col: 12,
             to: None,
+            from_line: None,
         }
     }
 
@@ -353,6 +428,77 @@ mod tests {
             note.contains("1 of them carry only the bare name"),
             "{note}"
         );
+    }
+
+    /// Two same-named definitions in different files force real resolution
+    /// for every caller file; past the pair cap, rows keep no `to` and the
+    /// envelope says so.
+    #[test]
+    fn to_resolution_caps_distinct_pairs_and_discloses_it() {
+        let db = Database::open_in_memory().unwrap();
+        let a = file(&db, "def_a.rs");
+        let b = file(&db, "def_b.rs");
+        db.insert_symbols(a, &[symbol("target", "def_a.rs")])
+            .unwrap();
+        db.insert_symbols(b, &[symbol("target", "def_b.rs")])
+            .unwrap();
+        let callers = MAX_TO_RESOLUTION_PAIRS + 3;
+        for i in 0..callers {
+            let path = format!("caller_{i:03}.rs");
+            let id = file(&db, &path);
+            db.insert_references(id, &[reference("target", &path)])
+                .unwrap();
+        }
+
+        let out = lookup(&db, "target");
+        assert_eq!(out.results.len(), callers);
+        assert_eq!(
+            out.to_resolution,
+            Some(ToResolution {
+                resolved_pairs: MAX_TO_RESOLUTION_PAIRS,
+                capped: true,
+            })
+        );
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(json["to_resolution"]["capped"], true, "{json}");
+    }
+
+    #[test]
+    fn to_resolution_is_silent_under_the_cap() {
+        let db = Database::open_in_memory().unwrap();
+        let a = file(&db, "def_a.rs");
+        let b = file(&db, "def_b.rs");
+        db.insert_symbols(a, &[symbol("target", "def_a.rs")])
+            .unwrap();
+        db.insert_symbols(b, &[symbol("target", "def_b.rs")])
+            .unwrap();
+        for i in 0..3 {
+            let path = format!("caller_{i}.rs");
+            let id = file(&db, &path);
+            db.insert_references(id, &[reference("target", &path)])
+                .unwrap();
+        }
+
+        let out = lookup(&db, "target");
+        assert_eq!(out.results.len(), 3);
+        assert_eq!(out.to_resolution, None);
+        let json = serde_json::to_value(&out).unwrap();
+        assert!(json.get("to_resolution").is_none(), "{json}");
+    }
+
+    /// One definition in the caller's own file resolves without a
+    /// resolution pass at all.
+    #[test]
+    fn same_file_sole_definition_resolves_to_without_pairs() {
+        let db = Database::open_in_memory().unwrap();
+        let a = file(&db, "a.rs");
+        db.insert_symbols(a, &[symbol("helper", "a.rs")]).unwrap();
+        db.insert_references(a, &[reference("helper", "a.rs")])
+            .unwrap();
+
+        let out = lookup(&db, "helper");
+        assert_eq!(out.results[0].to.as_deref(), Some("sym:a.rs#helper"));
+        assert_eq!(out.to_resolution, None);
     }
 
     #[test]

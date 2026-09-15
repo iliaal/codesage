@@ -11,8 +11,8 @@ use std::sync::LazyLock;
 
 use anyhow::Result;
 use codesage_protocol::{
-    FromTraceReport, FromTraceRequest, Language, Symbol, SymbolKind, TraceFrame, TraceFrameStatus,
-    TraceSymbol,
+    FromTraceReport, FromTraceRequest, Handle, Language, Symbol, SymbolKind, TraceFrame,
+    TraceFrameStatus, TraceSymbol,
 };
 use codesage_storage::Database;
 use regex::Regex;
@@ -1042,7 +1042,8 @@ fn apply_qualified(frame: &mut TraceFrame, pool: &NamePool) -> bool {
         [] => false,
         [one] => {
             frame.status = TraceFrameStatus::Resolved;
-            frame.file.get_or_insert_with(|| one.file_path.clone());
+            let file = frame.file.get_or_insert_with(|| one.file_path.clone());
+            frame.handle = Some(Handle::file(file.as_str()).to_string());
             frame.symbol = Some(trace_symbol(one));
             true
         }
@@ -1073,6 +1074,7 @@ fn resolve_frame(
     raw: RawFrame,
 ) -> Result<TraceFrame> {
     let mut frame = TraceFrame {
+        handle: None,
         index: index_in_report,
         stack,
         raw: raw.raw,
@@ -1118,6 +1120,7 @@ fn resolve_frame(
         }
     };
     frame.file = Some(path.clone());
+    frame.handle = Some(Handle::file(path.as_str()).to_string());
     frame.status = TraceFrameStatus::Resolved;
 
     let symbols = db.symbols_for_file(&path)?;

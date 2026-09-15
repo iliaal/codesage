@@ -196,31 +196,35 @@ fn declare_symbol_handle(schema: &mut schemars::Schema) {
         schema,
         "handle",
         "`sym:<file_path>#<qualified_name>`; `@<line_start>` is appended only when several \
-         definitions in the file share the qualified name. Accepted wherever a tool takes a \
-         symbol or file target.",
+         definitions in the file share the qualified name. Emitted on every symbol row; input \
+         acceptance arrives with the resolver.",
     );
 }
 
-fn declare_reference_handles(schema: &mut schemars::Schema) {
+/// Declare an optional (nullable, omitted when absent) string property.
+fn declare_optional_string_property(schema: &mut schemars::Schema, name: &str, description: &str) {
     let Some(object) = schema.as_object_mut() else {
         return;
     };
-    if let Some(properties) = object.get_mut("properties").and_then(|p| p.as_object_mut()) {
+    let properties = object
+        .entry("properties")
+        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+    if let Some(properties) = properties.as_object_mut() {
         properties.insert(
-            "from".to_string(),
-            serde_json::json!({
-                "type": ["string", "null"],
-                "description": "`sym:<from_file>#<from_symbol>` handle of the enclosing symbol; null at file scope."
-            }),
+            name.to_string(),
+            serde_json::json!({"type": ["string", "null"], "description": description}),
         );
     }
-    if let Some(required) = object.get_mut("required").and_then(|r| r.as_array_mut()) {
-        for key in ["from", "to"] {
-            if !required.iter().any(|r| r == key) {
-                required.push(serde_json::Value::String(key.to_string()));
-            }
-        }
-    }
+}
+
+fn declare_reference_handles(schema: &mut schemars::Schema) {
+    declare_optional_string_property(
+        schema,
+        "from",
+        "`sym:<from_file>#<from_symbol>` handle of the enclosing symbol (`@<line_start>` when \
+         that symbol is one of several same-named definitions in the file); omitted at file \
+         scope.",
+    );
 }
 
 fn declare_chunk_handle(schema: &mut schemars::Schema) {
@@ -229,6 +233,10 @@ fn declare_chunk_handle(schema: &mut schemars::Schema) {
         "handle",
         "`chunk:<file_path>:<start_line>-<end_line>` handle of this chunk.",
     );
+}
+
+fn declare_file_handle(schema: &mut schemars::Schema) {
+    declare_string_property(schema, "handle", "`file:<path>` handle of this file.");
 }
 
 impl Serialize for Symbol {
@@ -470,31 +478,43 @@ pub struct Reference {
     #[serde(skip)]
     pub col: u32,
     /// `sym:` handle of the definition this reference resolves to, when
-    /// exactly one does; null when it resolves to none or several. Filled by
-    /// the graph layer, never stored.
-    #[serde(default)]
+    /// exactly one does; `None` (omitted on the wire) when it resolves to
+    /// none or several, or when resolution was capped. Filled by the graph
+    /// layer, never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
+    /// `line_start` of the enclosing definition when it is one of several
+    /// same-named definitions in `from_file`, so `from` carries `@line`.
+    /// Filled by the graph layer, never stored or sent.
+    #[serde(skip)]
+    pub from_line: Option<u32>,
 }
 
 impl Reference {
     /// `sym:<from_file>#<from_symbol>`, the enclosing symbol; `None` at file
-    /// scope.
+    /// scope. Carries `@<line_start>` when `from_line` is set.
     pub fn from_handle(&self) -> Option<Handle> {
         self.from_symbol
             .as_deref()
-            .map(|q| Handle::symbol(self.from_file.as_str(), q, None))
+            .map(|q| Handle::symbol(self.from_file.as_str(), q, self.from_line))
     }
 }
 
 impl Serialize for Reference {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("Reference", 7)?;
+        let from = self.from_handle().map(|h| h.to_string());
+        let len = 5 + usize::from(from.is_some()) + usize::from(self.to.is_some());
+        let mut s = serializer.serialize_struct("Reference", len)?;
         s.serialize_field("from_file", &self.from_file)?;
         s.serialize_field("from_symbol", &self.from_symbol)?;
-        s.serialize_field("from", &self.from_handle().map(|h| h.to_string()))?;
+        if let Some(from) = &from {
+            s.serialize_field("from", from)?;
+        }
         s.serialize_field("to_name", &self.to_name)?;
-        s.serialize_field("to", &self.to)?;
+        if let Some(to) = &self.to {
+            s.serialize_field("to", to)?;
+        }
         s.serialize_field("kind", &self.kind)?;
         s.serialize_field("line", &self.line)?;
         s.end()
@@ -529,6 +549,9 @@ pub struct FindReferencesRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DependencyEntry {
+    /// `file:<file_path>`.
+    #[serde(default)]
+    pub handle: String,
     pub file_path: String,
     #[serde(default)]
     pub found: bool,
@@ -856,6 +879,9 @@ pub struct ImpactReason {
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ImpactEntry {
+    /// `file:<file_path>`.
+    #[serde(default)]
+    pub handle: String,
     pub file_path: String,
     pub distance: u32,
     pub category: FileCategory,
@@ -933,6 +959,9 @@ pub struct ContextBundle {
 /// One co-changing file pair, ranked by exponentially-decayed weight.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CoChangeEntry {
+    /// `file:<file>`.
+    #[serde(default)]
+    pub handle: String,
     pub file: String,
     /// Raw decayed co-change weight. `find_coupling` ranks by this value
     /// halved when the pair is not `recurring`, so a recurring pair outranks
@@ -1064,6 +1093,7 @@ pub struct AuthorConcentration {
 /// below to apply the switch; the `#[serde]` attributes here drive
 /// `Deserialize` and the `JsonSchema` derive.
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[schemars(transform = declare_file_handle)]
 pub struct RiskAssessment {
     /// Informational commit-author concentration; does not affect `score`.
     /// Identities are normalized emails, falling back to names, not verified people.
@@ -1190,9 +1220,10 @@ impl Serialize for RiskAssessment {
             + usize::from(emit_trust)
             + usize::from(emit_notes)
             + usize::from(emit_top_symbols);
-        let mut s = serializer.serialize_struct("RiskAssessment", len)?;
+        let mut s = serializer.serialize_struct("RiskAssessment", len + 1)?;
         s.serialize_field("found", &self.found)?;
         s.serialize_field("file", &self.file)?;
+        s.serialize_field("handle", &Handle::file(self.file.as_str()).to_string())?;
         s.serialize_field("score", &self.score)?;
         if self.unscored {
             s.serialize_field("unscored", &self.unscored)?;
@@ -1403,6 +1434,9 @@ pub struct CycleEntry {
 /// risk score are detailed; the rest are listed by name.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ClusteredDirectory {
+    /// `dir:<directory>`.
+    #[serde(default)]
+    pub handle: String,
     pub directory: String,
     pub count: u32,
     pub top_files: Vec<RiskAssessment>,
@@ -1415,6 +1449,9 @@ pub struct ClusteredDirectory {
 /// A test file recommended for a change, with the reason it was suggested.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CoupledTestEntry {
+    /// `file:<file>`.
+    #[serde(default)]
+    pub handle: String,
     pub file: String,
     /// Raw decayed co-change weight with `source`. The bucket is ordered by
     /// this value halved when the pair is not `recurring` (the same key
@@ -1446,6 +1483,9 @@ pub struct CoupledTestEntry {
 /// resolved call/import edges.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReachableTestEntry {
+    /// `file:<path>`.
+    #[serde(default)]
+    pub handle: String,
     /// Repo-relative path of the test file, as the index stores it.
     pub path: String,
     /// Reverse-dependency hops from `via` to this test (1 = the test
@@ -1899,6 +1939,20 @@ pub struct FindReferencesResults {
     /// How to read an ambiguous or definition-less result; absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub note: Option<String>,
+    /// Present only when per-row `to` resolution stopped early: rows past
+    /// the cap carry no `to`, which then means "not resolved", not
+    /// "resolves to nothing".
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub to_resolution: Option<ToResolution>,
+}
+
+/// Why some `find_references` rows lack `to`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ToResolution {
+    /// Distinct (caller file, spelling) pairs that were resolved.
+    pub resolved_pairs: usize,
+    /// True when the pair cap or the time budget stopped resolution.
+    pub capped: bool,
 }
 
 fn default_true() -> bool {
@@ -2171,6 +2225,10 @@ pub struct TraceSymbol {
 /// One frame of a parsed trace, mapped onto the index.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TraceFrame {
+    /// `file:<file>` once the frame resolves to an indexed file; absent for
+    /// ambiguous and unresolved frames.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub handle: Option<String>,
     /// Position in `frames`, 0 = innermost frame of stack 0 (see
     /// `FromTraceReport.root_cause_first` for what stack 0 means).
     pub index: usize,
@@ -2745,6 +2803,7 @@ mod tests {
 
         let round_trip: CoChangeEntry = serde_json::from_str(
             &serde_json::to_string(&CoChangeEntry {
+                handle: "file:src/b.rs".to_string(),
                 file: "src/b.rs".to_string(),
                 weight: 2.5,
                 count: 4,
@@ -2788,6 +2847,7 @@ mod tests {
             cycle_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
             top_coupled: (0..10)
                 .map(|i| CoChangeEntry {
+                    handle: format!("file:src/coupled_{i}.rs"),
                     file: format!("src/coupled_{i}.rs"),
                     weight: 7.5 - f64::from(i) * 0.4,
                     count: 12 - i,
@@ -2853,6 +2913,7 @@ mod tests {
             [
                 "found",
                 "file",
+                "handle",
                 "score",
                 "churn_score",
                 "churn_percentile",
@@ -2881,6 +2942,7 @@ mod tests {
             [
                 "found",
                 "file",
+                "handle",
                 "score",
                 "cycle_files",
                 "trust_boundaries",
@@ -2926,8 +2988,8 @@ mod tests {
             let json = serde_json::to_string(&unscored).unwrap();
             let keys = json_keys(&json);
             assert_eq!(
-                &keys[..4],
-                ["found", "file", "score", "unscored"],
+                &keys[..5],
+                ["found", "file", "handle", "score", "unscored"],
                 "unscored must sit next to the score it qualifies: {json}"
             );
             let mut back: RiskAssessment = serde_json::from_str(&json).unwrap();
@@ -3004,6 +3066,7 @@ mod tests {
         let mut diff = RiskDiffAssessment {
             files: vec![risk_fixture()],
             clustered_directories: vec![ClusteredDirectory {
+                handle: "dir:src".to_string(),
                 directory: "src".to_string(),
                 count: 5,
                 top_files: vec![risk_fixture()],
@@ -3126,6 +3189,7 @@ mod tests {
             line: 12,
             col: 8,
             to: None,
+            from_line: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(!json.contains("\"col\""), "{json}");
@@ -3134,8 +3198,9 @@ mod tests {
         assert_eq!(back.line, 12);
     }
 
-    /// `from` derives from the stored caller; `to` is null until the graph
-    /// layer resolves it, and both fields are always present on the wire.
+    /// `from` derives from the stored caller (plus `from_line` for an
+    /// overloaded caller); `to` travels only once the graph layer resolves
+    /// it. Both are omitted, not null, when absent.
     #[test]
     fn reference_wire_carries_from_and_to_handles() {
         let mut r = Reference {
@@ -3146,10 +3211,11 @@ mod tests {
             line: 12,
             col: 8,
             to: None,
+            from_line: None,
         };
         let json: serde_json::Value = serde_json::to_value(&r).unwrap();
         assert_eq!(json["from"], "sym:src/a.rs#a::run");
-        assert_eq!(json["to"], serde_json::Value::Null);
+        assert!(json.get("to").is_none(), "{json}");
         assert_eq!(
             json_keys(&serde_json::to_string(&r).unwrap()),
             [
@@ -3157,19 +3223,22 @@ mod tests {
                 "from_symbol",
                 "from",
                 "to_name",
-                "to",
                 "kind",
                 "line"
             ]
         );
 
         r.to = Some("sym:src/db.rs#Database::open".to_string());
-        let back: Reference = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        r.from_line = Some(10);
+        let json: serde_json::Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["from"], "sym:src/a.rs#a::run@10");
+        assert_eq!(json["to"], "sym:src/db.rs#Database::open");
+        let back: Reference = serde_json::from_value(json).unwrap();
         assert_eq!(back.to.as_deref(), Some("sym:src/db.rs#Database::open"));
 
         r.from_symbol = None;
         let json: serde_json::Value = serde_json::to_value(&r).unwrap();
-        assert_eq!(json["from"], serde_json::Value::Null);
+        assert!(json.get("from").is_none(), "{json}");
     }
 
     #[test]

@@ -117,6 +117,7 @@ pub fn derive_for_files(
                     line: 0,
                     col: 0,
                     to: None,
+                    from_line: None,
                 })
                 .collect();
             let boundaries = derive_from_refs(&in_memory, *language);
@@ -149,6 +150,7 @@ mod tests {
             line: 0,
             col: 0,
             to: None,
+            from_line: None,
         }
     }
 
@@ -323,6 +325,7 @@ mod tests {
             line: 0,
             col: 0,
             to: None,
+            from_line: None,
         };
         let b = derive_from_refs(&[r], Language::Rust);
         assert!(

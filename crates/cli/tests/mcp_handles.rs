@@ -110,8 +110,23 @@ fn run(root: &Path, args: &[&str]) {
     );
 }
 
+fn git(root: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn fixture(root: &Path) {
     std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    std::fs::create_dir_all(root.join("cluster")).unwrap();
     std::fs::write(
         root.join("Cargo.toml"),
         "[package]\nname = \"handles_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
@@ -122,9 +137,58 @@ fn fixture(root: &Path) {
         "pub mod helper;\nuse crate::helper::inner;\npub fn outer() -> u32 { inner() }\n",
     )
     .unwrap();
-    std::fs::write(root.join("src/helper.rs"), "pub fn inner() -> u32 { 7 }\n").unwrap();
+    for name in ["a", "b", "c", "d", "e"] {
+        std::fs::write(
+            root.join(format!("cluster/{name}.rs")),
+            format!("pub fn cluster_{name}() {{}}\n"),
+        )
+        .unwrap();
+    }
+    git(root, &["init", "-q"]);
+    for revision in 0..3 {
+        std::fs::write(
+            root.join("src/helper.rs"),
+            format!("pub fn inner() -> u32 {{ 7 }}\n// revision {revision}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("tests/helper_test.rs"),
+            format!(
+                "#[test]\nfn checks_inner() {{ assert_eq!(handles_fixture::helper::inner(), 7); }}\n// revision {revision}\n"
+            ),
+        )
+        .unwrap();
+        // A Python pair whose test is not a sibling by convention, so it can
+        // only be recommended through co-change history and reachability.
+        std::fs::write(
+            root.join("engine.py"),
+            format!("def calculate_payload():\n    return {revision}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("tests/test_behavior.py"),
+            format!(
+                "from engine import calculate_payload\n\ndef test_behavior():\n    assert calculate_payload() == {revision}\n"
+            ),
+        )
+        .unwrap();
+        git(root, &["add", "."]);
+        git(
+            root,
+            &[
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        );
+    }
     run(root, &["init"]);
     run(root, &["index", "--no-semantic"]);
+    run(root, &["git-index", "--full"]);
     let db = Database::open_for_model(
         &root.join(".codesage/index.db"),
         "jinaai/jina-embeddings-v2-base-code",
@@ -177,13 +241,8 @@ fn every_row_emitting_tool_carries_handles() {
     let references = server.call(&root, "find_references", json!({"name": "inner"}));
     let mut saw_caller = false;
     for row in rows(&references, "results", "find_references") {
-        assert!(
-            row.get("from").is_some(),
-            "find_references: no `from`: {row}"
-        );
-        assert!(row.get("to").is_some(), "find_references: no `to`: {row}");
         if row["from_symbol"].is_null() {
-            assert!(row["from"].is_null(), "{row}");
+            assert!(row.get("from").is_none(), "omitted at file scope: {row}");
         } else {
             let from = assert_handle(row, "from", "sym:", "find_references");
             assert_eq!(from, "sym:src/lib.rs#outer");
@@ -261,5 +320,107 @@ fn every_row_emitting_tool_carries_handles() {
     assert_eq!(bundle["found"], true, "{bundle}");
     for row in rows(&bundle, "primary", "feature_bundle") {
         assert_handle(row, "handle", "chunk:", "feature_bundle");
+    }
+
+    // File-shaped rows carry `file:` handles.
+    let impact = server.call(&root, "impact_analysis", json!({"target": "inner"}));
+    for row in rows(&impact, "results", "impact_analysis") {
+        assert_eq!(
+            assert_handle(row, "handle", "file:", "impact_analysis"),
+            format!("file:{}", row["file_path"].as_str().unwrap())
+        );
+    }
+
+    let deps = server.call(
+        &root,
+        "list_dependencies",
+        json!({"file_path": "src/lib.rs"}),
+    );
+    assert_eq!(
+        assert_handle(&deps, "handle", "file:", "list_dependencies"),
+        "file:src/lib.rs"
+    );
+
+    let coupling = server.call(
+        &root,
+        "find_coupling",
+        json!({"file_path": "src/helper.rs"}),
+    );
+    for row in rows(&coupling, "coupled", "find_coupling") {
+        assert_eq!(
+            assert_handle(row, "handle", "file:", "find_coupling"),
+            format!("file:{}", row["file"].as_str().unwrap())
+        );
+    }
+
+    let risk = server.call(
+        &root,
+        "assess_risk",
+        json!({"file_path": "src/helper.rs", "verbose": true}),
+    );
+    assert_eq!(
+        assert_handle(&risk, "handle", "file:", "assess_risk"),
+        "file:src/helper.rs"
+    );
+    for row in rows(&risk, "top_coupled", "assess_risk") {
+        assert_handle(row, "handle", "file:", "assess_risk top_coupled");
+    }
+
+    let tests = server.call(
+        &root,
+        "recommend_tests",
+        json!({"file_paths": ["engine.py"]}),
+    );
+    for row in rows(&tests, "coupled", "recommend_tests") {
+        assert_eq!(
+            assert_handle(row, "handle", "file:", "recommend_tests coupled"),
+            format!("file:{}", row["file"].as_str().unwrap())
+        );
+    }
+    // The fixture's reachability walk does not reach the Python test, so the
+    // bucket may be empty here; the row shape is pinned by the schema test.
+    for row in tests["reachable"].as_array().into_iter().flatten() {
+        assert_eq!(
+            assert_handle(row, "handle", "file:", "recommend_tests reachable"),
+            format!("file:{}", row["path"].as_str().unwrap())
+        );
+    }
+
+    let trace = server.call(
+        &root,
+        "from_trace",
+        json!({"trace": "thread 'main' panicked at src/helper.rs:1:5:\nboom\n   0: handles_fixture::helper::inner\n             at ./src/helper.rs:1:1\n   1: handles_fixture::outer\n             at ./src/lib.rs:3:1\n"}),
+    );
+    let mut resolved = 0;
+    for frame in rows(&trace, "frames", "from_trace") {
+        if frame["status"] == "resolved" {
+            assert_eq!(
+                assert_handle(frame, "handle", "file:", "from_trace"),
+                format!("file:{}", frame["file"].as_str().unwrap())
+            );
+            resolved += 1;
+        } else {
+            assert!(frame.get("handle").is_none(), "{frame}");
+        }
+    }
+    assert!(resolved > 0, "{trace}");
+
+    let cluster_files: Vec<String> = ["a", "b", "c", "d", "e"]
+        .iter()
+        .map(|n| format!("cluster/{n}.rs"))
+        .collect();
+    let diff = server.call(
+        &root,
+        "assess_risk_diff",
+        json!({"file_paths": cluster_files}),
+    );
+    for cluster in rows(&diff, "clustered_directories", "assess_risk_diff") {
+        assert_eq!(
+            assert_handle(cluster, "handle", "dir:", "assess_risk_diff"),
+            format!("dir:{}", cluster["directory"].as_str().unwrap())
+        );
+        for row in rows(cluster, "top_files", "assess_risk_diff cluster") {
+            assert_handle(row, "handle", "file:", "assess_risk_diff top_files");
+        }
     }
 }
