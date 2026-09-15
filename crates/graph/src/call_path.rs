@@ -207,6 +207,7 @@ fn reconstruct(
 
 fn step_of(s: &Symbol, call_line: Option<u32>) -> CallPathStep {
     CallPathStep {
+        handle: s.handle().to_string(),
         name: s.name.clone(),
         qualified_name: s.qualified_name.clone(),
         file_path: s.file_path.clone(),
@@ -251,6 +252,7 @@ mod tests {
                 col_start: 0,
                 col_end: 0,
                 rationale: vec![],
+                overloaded: false,
             }],
         )
         .unwrap();

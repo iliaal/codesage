@@ -460,6 +460,7 @@ pub fn extract_references(
                     kind: ReferenceKind::Import,
                     line: row + 1,
                     col,
+                    to: None,
                 });
             }
         }
@@ -470,6 +471,7 @@ pub fn extract_references(
             kind,
             line: row + 1,
             col,
+            to: None,
         });
     }
 

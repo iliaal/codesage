@@ -788,6 +788,7 @@ fn collect_sibling_symbols(
                 continue;
             }
             out.push(SiblingSymbol {
+                handle: s.handle().to_string(),
                 name: s.name,
                 kind: s.kind,
                 line: s.line_start,
@@ -1586,6 +1587,7 @@ mod tests {
                 col_start: 0,
                 col_end: 0,
                 rationale: vec![],
+                overloaded: false,
             })
             .collect();
         db.insert_symbols(repo, &syms).unwrap();
@@ -1607,6 +1609,7 @@ mod tests {
                 kind: ReferenceKind::Call,
                 line: 10 + i as u32,
                 col: 0,
+                to: None,
             })
             .collect();
         // Five repeats of already-recorded (symbol, kind, line) reasons at a
@@ -1619,6 +1622,7 @@ mod tests {
                 kind: ReferenceKind::Call,
                 line: 10 + i as u32,
                 col: 8,
+                to: None,
             });
         }
         db.insert_references(caller, &refs).unwrap();

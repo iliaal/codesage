@@ -1259,6 +1259,7 @@ mod context_export_tests {
             col_start: 0,
             col_end: 0,
             rationale: vec![],
+            overloaded: false,
         }
     }
 
@@ -1270,6 +1271,7 @@ mod context_export_tests {
             kind: ReferenceKind::Call,
             line: 5,
             col: 12,
+            to: None,
         }
     }
 
@@ -1290,6 +1292,7 @@ mod context_export_tests {
             kind,
             line: 1,
             col: 0,
+            to: None,
         };
         db.insert_references(
             file_id,

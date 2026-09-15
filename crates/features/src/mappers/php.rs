@@ -1148,6 +1148,7 @@ pub(crate) fn laravel_route_handler_refs(root: &Path) -> Result<Vec<Reference>> 
             kind: ReferenceKind::RouteHandler,
             line: r.line,
             col: 0,
+            to: None,
         });
     }
     Ok(refs)

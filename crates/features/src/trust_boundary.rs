@@ -116,6 +116,7 @@ pub fn derive_for_files(
                     kind,
                     line: 0,
                     col: 0,
+                    to: None,
                 })
                 .collect();
             let boundaries = derive_from_refs(&in_memory, *language);
@@ -147,6 +148,7 @@ mod tests {
             kind: ReferenceKind::Import,
             line: 0,
             col: 0,
+            to: None,
         }
     }
 
@@ -320,6 +322,7 @@ mod tests {
             kind: ReferenceKind::Inheritance,
             line: 0,
             col: 0,
+            to: None,
         };
         let b = derive_from_refs(&[r], Language::Rust);
         assert!(

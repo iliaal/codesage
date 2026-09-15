@@ -1,12 +1,16 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use anyhow::Result;
 use codesage_protocol::{
-    DependencyEntry, FindReferencesRequest, FindReferencesResults, FindSymbolRequest, Symbol,
+    DependencyEntry, FindReferencesRequest, FindReferencesResults, FindSymbolRequest, Reference,
+    Symbol,
 };
 use codesage_storage::Database;
 
-use crate::bundle::import_ref_targets_file;
+use crate::bundle::{
+    import_ref_targets_file, import_refs_for_file, resolve_callee_definitions_with_imports,
+};
 use crate::impact::is_qualified_symbol_name;
 
 pub fn find_symbol(db: &Database, req: &FindSymbolRequest) -> Result<Vec<Symbol>> {
@@ -18,9 +22,12 @@ pub fn find_references(
     db: &Database,
     req: &FindReferencesRequest,
 ) -> Result<FindReferencesResults> {
-    let results = db.find_references(&req.symbol_name, req.kind)?;
+    let mut results = db.find_references(&req.symbol_name, req.kind)?;
     let definitions = db.find_symbols(&req.symbol_name, None)?;
     let definition_count = definitions.len();
+    if definition_count > 0 {
+        attach_resolved_targets(db, &mut results)?;
+    }
     let ambiguous = definition_count > 1;
     let note = if ambiguous {
         // Bare candidates cannot disambiguate impact_analysis; offer files instead.
@@ -79,6 +86,39 @@ pub fn find_references(
         ambiguous,
         note,
     })
+}
+
+/// Fill each row's `to` with the handle of the one definition its callsite
+/// resolves to, through the same import-aware forward resolution
+/// `impact_analysis` uses; null when none or several resolve. Resolution is
+/// cached per (caller file, spelling) and imports per caller file, so the
+/// cost is bounded by distinct callers, not by rows.
+fn attach_resolved_targets(db: &Database, rows: &mut [Reference]) -> Result<()> {
+    let mut resolved: HashMap<(String, String), Option<String>> = HashMap::new();
+    let mut imports: HashMap<String, Arc<Vec<String>>> = HashMap::new();
+    for row in rows.iter_mut() {
+        codesage_protocol::work::checkpoint()?;
+        let key = (row.from_file.clone(), row.to_name.clone());
+        if !resolved.contains_key(&key) {
+            let from_file = row.from_file.as_str();
+            let definitions =
+                resolve_callee_definitions_with_imports(db, from_file, &row.to_name, &mut || {
+                    if let Some(cached) = imports.get(from_file) {
+                        return Ok(Arc::clone(cached));
+                    }
+                    let loaded = Arc::new(import_refs_for_file(db, from_file)?);
+                    imports.insert(from_file.to_string(), Arc::clone(&loaded));
+                    Ok(loaded)
+                })?;
+            let handle = match definitions.as_slice() {
+                [only] => Some(only.handle().to_string()),
+                _ => None,
+            };
+            resolved.insert(key.clone(), handle);
+        }
+        row.to = resolved[&key].clone();
+    }
+    Ok(())
 }
 
 fn distinct_sorted<'a>(items: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
@@ -161,6 +201,7 @@ mod tests {
             col_start: 0,
             col_end: 0,
             rationale: vec![],
+            overloaded: false,
         }
     }
 
@@ -172,6 +213,7 @@ mod tests {
             kind: ReferenceKind::Call,
             line: 5,
             col: 12,
+            to: None,
         }
     }
 

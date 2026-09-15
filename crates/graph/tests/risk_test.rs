@@ -1461,6 +1461,7 @@ fn top_symbols_rank_by_line_count_and_ref_count() {
         col_start: 0,
         col_end: 0,
         rationale: Vec::new(),
+        overloaded: false,
     };
 
     // big: 100 lines, no callers → score = ln(101) + 0 = ~4.62
@@ -1483,6 +1484,7 @@ fn top_symbols_rank_by_line_count_and_ref_count() {
         kind: ReferenceKind::Call,
         line,
         col: 0,
+        to: None,
     };
     let mut refs: Vec<Reference> = (0..20).map(|i| mk_ref("small_hot", 10 + i)).collect();
     refs.push(mk_ref("tiny", 200));
@@ -1558,6 +1560,7 @@ fn top_symbols_populates_on_known_hot_file_and_caps_at_five() {
             col_start: 0,
             col_end: 0,
             rationale: Vec::new(),
+            overloaded: false,
         });
     }
     db.insert_symbols(hot_id, &syms).unwrap();
@@ -1571,6 +1574,7 @@ fn top_symbols_populates_on_known_hot_file_and_caps_at_five() {
             kind: ReferenceKind::Call,
             line: 10 + i,
             col: 0,
+            to: None,
         })
         .collect();
     db.insert_references(caller_id, &refs).unwrap();

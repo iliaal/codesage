@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
+use codesage_protocol::handle::mark_overloads;
 use codesage_protocol::{
     DependencyEntry, FileInfo, Language, RationaleEntry, Reference, ReferenceKind, Symbol,
     SymbolKind, TrustBoundary,
@@ -36,6 +37,7 @@ fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
         col_start: row.get(6)?,
         col_end: row.get(7)?,
         rationale: deserialize_rationale(&rationale_json),
+        overloaded: false,
     })
 }
 
@@ -400,6 +402,8 @@ impl Database {
         let rows = stmt.query_map(params![name], row_to_symbol)?;
 
         let mut symbols: Vec<Symbol> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        // Mark before the kind filter: the sibling set must be complete.
+        mark_overloads(&mut symbols);
         if let Some(k) = kind {
             symbols.retain(|s| s.kind == k);
         }
@@ -484,6 +488,7 @@ impl Database {
                 kind: row_reference_kind(&kind_str)?,
                 line: row.get(4)?,
                 col: row.get(5)?,
+                to: None,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -785,6 +790,9 @@ impl Database {
             let sym = sym_res?;
             out.entry(sym.file_path.clone()).or_default().push(sym);
         }
+        for symbols in out.values_mut() {
+            mark_overloads(symbols);
+        }
         Ok(out)
     }
 
@@ -796,9 +804,10 @@ impl Database {
              WHERE f.path = ?1
              ORDER BY s.line_start",
         )?;
-        let rows = stmt
+        let mut rows = stmt
             .query_map(params![file_path], row_to_symbol)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        mark_overloads(&mut rows);
         Ok(rows)
     }
 

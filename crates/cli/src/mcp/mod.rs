@@ -1374,6 +1374,7 @@ mod tests {
                 col_start: 0,
                 col_end: 0,
                 rationale: vec![],
+                overloaded: false,
             }],
         )
         .unwrap();

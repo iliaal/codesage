@@ -2091,6 +2091,7 @@ mod tests {
             col_start: 0,
             col_end: 0,
             rationale: Vec::new(),
+            overloaded: false,
         };
         let ids = |path: &str| db.file_id_for_path(path).unwrap().unwrap();
         db.insert_symbols(
@@ -2112,6 +2113,7 @@ mod tests {
             kind: ReferenceKind::Import,
             line: 1,
             col: 0,
+            to: None,
         };
         db.insert_references(ids("cyc_a.php"), &[imp("cyc_a.php", "App\\CycleB")])
             .unwrap();

@@ -785,6 +785,7 @@ mod tests {
                             col_start: 0,
                             col_end: 1,
                             rationale: Vec::new(),
+                            overloaded: false,
                         }],
                     )
                     .unwrap();
@@ -858,6 +859,7 @@ mod tests {
                     col_start: 0,
                     col_end: 1,
                     rationale: Vec::new(),
+                    overloaded: false,
                 }],
             )
             .unwrap();
@@ -871,6 +873,7 @@ mod tests {
                         kind: ReferenceKind::Call,
                         line: 2,
                         col: 0,
+                        to: None,
                     }],
                 )
                 .unwrap();
