@@ -5,6 +5,7 @@ mod call_path;
 pub mod drift;
 pub mod edit_check;
 mod git_history;
+pub mod hook_health;
 mod impact;
 mod index;
 mod lookups;

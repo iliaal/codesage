@@ -205,22 +205,54 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
          # for the whole wait — is retried by the next hook. An empty stamp\n\
          # (no HEAD, or a digest stage failed) is never recorded.\n\
          lockdir=\"$root/.codesage/hook-index.lock\"\n\
+         pidfile=\"$lockdir/pid\"\n\
          # Single-flight: rapid commits must not queue serial full passes.\n\
          # `mkdir` is atomic; the loser logs and exits 0 — the winner's stamp\n\
-         # covers the same tree. A lockdir older than 30 minutes is a SIGKILL\n\
-         # orphan (no trap runs on SIGKILL): reap it and take over. The\n\
-         # subshell's EXIT trap releases the lock on every other path.\n\
+         # covers the same tree. The winner records its pid inside the lock\n\
+         # so a SIGKILLed run (no trap runs on SIGKILL) is recognised by the\n\
+         # next fire: a lock whose pid is dead is reaped at once, whatever its\n\
+         # age. A lock without a pid file (written by an older hook) is a\n\
+         # SIGKILL orphan once it is 30 minutes old. The subshell's EXIT trap\n\
+         # releases the lock on every other path.\n\
+         lockpid=\"\"\n\
+         if [ -f \"$pidfile\" ] && [ ! -L \"$pidfile\" ]; then\n\
+           lockpid=\"$(head -c 32 \"$pidfile\" 2>/dev/null)\"\n\
+           case $lockpid in ''|*[!0-9]*) lockpid=\"\" ;; esac\n\
+         fi\n\
+         # `kill -0` fails with EPERM on another user's live process; `ps -p`\n\
+         # answers that case.\n\
+         pid_alive() {{ kill -0 \"$1\" 2>/dev/null || ps -p \"$1\" >/dev/null 2>&1; }}\n\
          if mkdir \"$lockdir\" 2>/dev/null; then\n\
            :\n\
-         elif [ -n \"$(find \"$lockdir\" -mmin +30 2>/dev/null)\" ] && rmdir \"$lockdir\" 2>/dev/null && mkdir \"$lockdir\" 2>/dev/null; then\n\
-           echo \"[$(date)] $(basename \"$0\") hook start (reaped stale lock)\" >>\"$log\"\n\
+         elif [ -n \"$lockpid\" ] && ! pid_alive \"$lockpid\" && rm -f \"$pidfile\" && rmdir \"$lockdir\" 2>/dev/null && mkdir \"$lockdir\" 2>/dev/null; then\n\
+           echo \"[$(date)] $(basename \"$0\") reaped dead lock pid=$lockpid\" >>\"$log\"\n\
+         elif [ -z \"$lockpid\" ] && [ -n \"$(find \"$lockdir\" -mmin +30 2>/dev/null)\" ] && rmdir \"$lockdir\" 2>/dev/null && mkdir \"$lockdir\" 2>/dev/null; then\n\
+           echo \"[$(date)] $(basename \"$0\") reaped stale lock\" >>\"$log\"\n\
          else\n\
            echo \"[$(date)] $(basename \"$0\") hook skip: another index already running\" >>\"$log\"\n\
            exit 0\n\
          fi\n\
-         ( trap 'rmdir \"$lockdir\" 2>/dev/null' EXIT INT TERM\n\
+         # `$$` inside `( ... ) &` is still the parent's pid, which exits at\n\
+         # once; the subshell learns its own pid from a child's PPID.\n\
+         # shellcheck disable=SC2016 # the inner sh expands $PPID itself\n\
+         ( pid=\"$(exec sh -c 'echo \"$PPID\"')\"\n\
+           case $pid in ''|*[!0-9]*) pid=\"\" ;; esac\n\
+           hook_exit() {{\n\
+             rc=$?\n\
+             echo \"[$(date)] $(basename \"$0\") hook exit=$rc pid=$pid\" >>\"$log\"\n\
+             rm -f \"$pidfile\"\n\
+             rmdir \"$lockdir\" 2>/dev/null\n\
+           }}\n\
+           trap hook_exit EXIT\n\
+           trap 'exit 130' INT\n\
+           trap 'exit 143' TERM\n\
+           # Same symlink guard as the state file: the pid write must land\n\
+           # inside the lock directory and nowhere else.\n\
+           if [ -n \"$pid\" ] && [ ! -L \"$pidfile\" ] && {{ [ ! -e \"$pidfile\" ] || [ -f \"$pidfile\" ]; }}; then\n\
+             printf '%s\\n' \"$pid\" >\"$pidfile\"\n\
+           fi\n\
            cd \"$root\" || exit 0\n\
-           echo \"[$(date)] $(basename \"$0\") hook start\" >>\"$log\"\n\
+           echo \"[$(date)] $(basename \"$0\") hook start pid=$pid\" >>\"$log\"\n\
            # shellcheck disable=SC2086 # IONICE and NICE are command words, split on purpose\n\
            $IONICE $NICE {bin} index --lock-wait 60 >>\"$log\" 2>&1; rc=$?\n\
            echo \"[$(date)] index exit=$rc\" >>\"$log\"\n\
@@ -228,7 +260,9 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
            # shellcheck disable=SC2086\n\
            $IONICE $NICE {bin} git-index --incremental --lock-wait 60 >>\"$log\" 2>&1; rc=$?\n\
            echo \"[$(date)] git-index exit=$rc\" >>\"$log\"\n\
-           [ -n \"$stamp\" ] && [ \"$index_rc\" -eq 0 ] && [ \"$rc\" -eq 0 ] && printf '%s\\n' \"$stamp\" >\"$state\" ) >>\"$log\" 2>&1 &\n\
+           [ -n \"$stamp\" ] && [ \"$index_rc\" -eq 0 ] && [ \"$rc\" -eq 0 ] && printf '%s\\n' \"$stamp\" >\"$state\"\n\
+           [ \"$index_rc\" -ne 0 ] && exit \"$index_rc\"\n\
+           exit \"$rc\" ) >>\"$log\" 2>&1 &\n\
          exit 0\n",
     )
 }
@@ -1104,8 +1138,126 @@ mod tests {
             "lock loser must log the skip:\n{body}"
         );
         assert!(
-            body.contains("trap 'rmdir"),
+            body.contains("trap hook_exit EXIT") && body.contains("rmdir \"$lockdir\""),
             "the background subshell must release the lock on exit:\n{body}"
+        );
+    }
+
+    #[test]
+    fn post_commit_hook_body_records_its_pid_and_logs_exit_and_reaps() {
+        let body = generate_post_commit_hook_body("/usr/local/bin/codesage");
+        assert!(
+            body.contains("pidfile=\"$lockdir/pid\"")
+                && body.contains("printf '%s\\n' \"$pid\" >\"$pidfile\""),
+            "the winner must record its pid inside the lock:\n{body}"
+        );
+        assert!(
+            body.contains("[ ! -L \"$pidfile\" ]"),
+            "the pid write must refuse a symlink:\n{body}"
+        );
+        assert!(
+            body.contains("hook start pid=$pid") && body.contains("hook exit=$rc pid=$pid"),
+            "start and exit lines must carry the pid:\n{body}"
+        );
+        assert!(
+            body.contains("reaped dead lock pid=$lockpid")
+                && body.contains("reaped stale lock")
+                && body.contains("-mmin +30"),
+            "dead-pid reap must coexist with the 30-minute age reap:\n{body}"
+        );
+        assert!(
+            body.contains("trap 'exit 130' INT") && body.contains("trap 'exit 143' TERM"),
+            "signals must route through the EXIT trap so the exit line is logged:\n{body}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_commit_hook_reaps_a_lock_whose_pid_is_dead_regardless_of_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_repo_with_one_commit(root);
+        let hook = install_hook_with_stub(root, "#!/bin/sh\nexit 0\n");
+        let log = root.join(".codesage/hooks.log");
+        let lockdir = root.join(".codesage/hook-index.lock");
+        std::fs::create_dir_all(&lockdir).unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        std::fs::write(lockdir.join("pid"), format!("{dead}\n")).unwrap();
+
+        assert!(run_script(&hook, root).success());
+        let content = wait_for_log(&log, "hook exit=0");
+        assert!(
+            content.contains(&format!("reaped dead lock pid={dead}")),
+            "dead-pid lock must be reaped at once:\n{content}"
+        );
+        assert!(
+            !content.contains("another index already running"),
+            "a dead lock must not block the run:\n{content}"
+        );
+        let start = content
+            .lines()
+            .find(|l| l.contains("hook start pid="))
+            .unwrap_or_else(|| panic!("no start line:\n{content}"));
+        let pid: u32 = start
+            .rsplit("pid=")
+            .next()
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("start line lacks a numeric pid: {start}"));
+        assert_ne!(pid, dead);
+        assert!(
+            content.contains(&format!("hook exit=0 pid={pid}")),
+            "exit line must name the same pid:\n{content}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while lockdir.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!lockdir.exists(), "lock must be released after the run");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_commit_hook_keeps_a_lock_whose_pid_is_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_repo_with_one_commit(root);
+        let hook = install_hook_with_stub(root, "#!/bin/sh\nexit 0\n");
+        let log = root.join(".codesage/hooks.log");
+        let lockdir = root.join(".codesage/hook-index.lock");
+        std::fs::create_dir_all(&lockdir).unwrap();
+        std::fs::write(lockdir.join("pid"), format!("{}\n", std::process::id())).unwrap();
+
+        assert!(run_script(&hook, root).success());
+        let content = wait_for_log(&log, "another index already running");
+        assert_eq!(content.matches("hook start").count(), 0, "{content}");
+        assert!(!content.contains("reaped"), "{content}");
+        assert!(
+            lockdir.join("pid").is_file(),
+            "live lock must be left intact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_commit_hook_logs_a_nonzero_exit_line_when_a_pass_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_repo_with_one_commit(root);
+        let hook = install_hook_with_stub(
+            root,
+            "#!/bin/sh\n[ \"$1\" = git-index ] && exit 3\nexit 0\n",
+        );
+        let log = root.join(".codesage/hooks.log");
+        assert!(run_script(&hook, root).success());
+        let content = wait_for_log(&log, "hook exit=3");
+        assert!(content.contains("] git-index exit=3"), "{content}");
+        assert!(
+            !root.join(".codesage/hook-state").exists(),
+            "a failed pass must not record the stamp"
         );
     }
 

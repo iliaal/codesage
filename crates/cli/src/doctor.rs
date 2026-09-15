@@ -23,6 +23,20 @@ struct Check {
     name: &'static str,
     status: Status,
     message: String,
+    /// Carried only by the `hook_health` check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hook_health: Option<codesage_protocol::HookHealth>,
+}
+
+impl Check {
+    fn new(name: &'static str, status: Status, message: String) -> Self {
+        Self {
+            name,
+            status,
+            message,
+            hook_health: None,
+        }
+    }
 }
 
 const REQUIRED_HOOKS: &[&str] = &["post-commit", "post-merge", "post-checkout", "post-rewrite"];
@@ -40,14 +54,15 @@ pub fn run(json: bool) -> Result<()> {
         checks.push(check_db(root));
         checks.push(check_disk(root));
         checks.push(check_hooks(root));
+        checks.push(check_hook_health(root));
         checks.push(check_index_drift(root));
         checks.push(check_semantic_freshness(root));
     } else {
-        checks.push(Check {
-            name: "project",
-            status: Status::Skip,
-            message: "not in a codesage project (run `codesage init` first)".to_string(),
-        });
+        checks.push(Check::new(
+            "project",
+            Status::Skip,
+            "not in a codesage project (run `codesage init` first)".to_string(),
+        ));
     }
 
     checks.push(check_cuda(project.as_deref()));
@@ -93,46 +108,38 @@ fn check_binary() -> Check {
     } else {
         "no-cuda"
     };
-    Check {
-        name: "binary",
-        status: Status::Pass,
-        message: format!("codesage {version} ({profile}, {cuda})"),
-    }
+    Check::new(
+        "binary",
+        Status::Pass,
+        format!("codesage {version} ({profile}, {cuda})"),
+    )
 }
 
 /// Detect grammar/query mismatches before indexing would panic.
 fn check_queries() -> Check {
     match codesage_parser::validate::validate_all_queries() {
-        Ok(()) => Check {
-            name: "queries",
-            status: Status::Pass,
-            message: "embedded tree-sitter queries valid against their grammars".to_string(),
-        },
-        Err(e) => Check {
-            name: "queries",
-            status: Status::Fail,
-            message: format!("{e:#}"),
-        },
+        Ok(()) => Check::new(
+            "queries",
+            Status::Pass,
+            "embedded tree-sitter queries valid against their grammars".to_string(),
+        ),
+        Err(e) => Check::new("queries", Status::Fail, format!("{e:#}")),
     }
 }
 
 fn check_config(root: &Path) -> Check {
     let config_path = root.join(PROJECT_DIR).join("config.toml");
     if !config_path.exists() {
-        return Check {
-            name: "config",
-            status: Status::Fail,
-            message: format!("missing {}", config_path.display()),
-        };
+        return Check::new(
+            "config",
+            Status::Fail,
+            format!("missing {}", config_path.display()),
+        );
     }
     let config = match load_project_config(root) {
         Ok(c) => c,
         Err(e) => {
-            return Check {
-                name: "config",
-                status: Status::Fail,
-                message: format!("{e:#}"),
-            };
+            return Check::new("config", Status::Fail, format!("{e:#}"));
         }
     };
     let emb = config.embedding.unwrap_or_default();
@@ -141,21 +148,21 @@ fn check_config(root: &Path) -> Check {
         .as_deref()
         .map(|r| format!(" reranker={r}"))
         .unwrap_or_default();
-    Check {
-        name: "config",
-        status: Status::Pass,
-        message: format!("model={} device={}{reranker}", emb.model, emb.device),
-    }
+    Check::new(
+        "config",
+        Status::Pass,
+        format!("model={} device={}{reranker}", emb.model, emb.device),
+    )
 }
 
 fn check_db(root: &Path) -> Check {
     let db_path = root.join(PROJECT_DIR).join(DB_FILE);
     if !db_path.exists() {
-        return Check {
-            name: "db",
-            status: Status::Warn,
-            message: format!("missing {} (run `codesage index`)", db_path.display()),
-        };
+        return Check::new(
+            "db",
+            Status::Warn,
+            format!("missing {} (run `codesage index`)", db_path.display()),
+        );
     }
     // Inspection must also work on read-only checkouts without chmod or migrations.
     match Database::open_read_only(&db_path) {
@@ -163,17 +170,13 @@ fn check_db(root: &Path) -> Check {
             let f = db.file_count().unwrap_or(0);
             let s = db.symbol_count().unwrap_or(0);
             let r = db.reference_count().unwrap_or(0);
-            Check {
-                name: "db",
-                status: Status::Pass,
-                message: format!("schema OK; files={f} symbols={s} refs={r}"),
-            }
+            Check::new(
+                "db",
+                Status::Pass,
+                format!("schema OK; files={f} symbols={s} refs={r}"),
+            )
         }
-        Err(e) => Check {
-            name: "db",
-            status: Status::Fail,
-            message: format!("failed to open: {e}"),
-        },
+        Err(e) => Check::new("db", Status::Fail, format!("failed to open: {e}")),
     }
 }
 
@@ -186,11 +189,11 @@ fn check_disk(root: &Path) -> Check {
         .filter(|m| m.is_file())
         .map(|m| m.len())
         .unwrap_or(0);
-    Check {
-        name: "disk",
-        status: Status::Pass,
-        message: format!("index.db {}", format_bytes(size)),
-    }
+    Check::new(
+        "disk",
+        Status::Pass,
+        format!("index.db {}", format_bytes(size)),
+    )
 }
 
 fn check_coreml(project: Option<&Path>) -> Check {
@@ -204,28 +207,24 @@ fn check_coreml(project: Option<&Path>) -> Check {
         .unwrap_or(false);
 
     if !want_coreml {
-        return Check {
-            name: "coreml",
-            status: Status::Pass,
-            message: "config requests non-CoreML device; CoreML not required".to_string(),
-        };
+        return Check::new(
+            "coreml",
+            Status::Pass,
+            "config requests non-CoreML device; CoreML not required".to_string(),
+        );
     }
 
     if !cfg!(target_vendor = "apple") {
-        return Check {
-            name: "coreml",
-            status: Status::Fail,
-            message: "config wants device=coreml but this binary is not running on Apple hardware"
+        return Check::new(
+            "coreml",
+            Status::Fail,
+            "config wants device=coreml but this binary is not running on Apple hardware"
                 .to_string(),
-        };
+        );
     }
 
-    Check {
-        name: "coreml",
-        status: Status::Pass,
-        message: "device=coreml on Apple hardware; ORT statically linked at build time with CoreML EP; first session may compile CoreML submodels (slow once per process)"
-            .to_string(),
-    }
+    Check::new("coreml", Status::Pass, "device=coreml on Apple hardware; ORT statically linked at build time with CoreML EP; first session may compile CoreML submodels (slow once per process)"
+            .to_string())
 }
 
 fn check_cuda(project: Option<&Path>) -> Check {
@@ -240,34 +239,32 @@ fn check_cuda(project: Option<&Path>) -> Check {
     let built_with_cuda = cfg!(feature = "cuda");
 
     if !want_gpu {
-        return Check {
-            name: "cuda",
-            status: Status::Pass,
-            message: "config requests CPU; CUDA not required".to_string(),
-        };
+        return Check::new(
+            "cuda",
+            Status::Pass,
+            "config requests CPU; CUDA not required".to_string(),
+        );
     }
     if !built_with_cuda {
-        return Check {
-            name: "cuda",
-            status: Status::Fail,
-            message: "config wants device=gpu but binary built WITHOUT cuda feature; rebuild with `cargo build --release --features cuda`".to_string(),
-        };
+        return Check::new("cuda", Status::Fail, "config wants device=gpu but binary built WITHOUT cuda feature; rebuild with `cargo build --release --features cuda`".to_string());
     }
     match codesage_embed::nvidia_lib_dirs() {
-        dirs if dirs.is_empty() => Check {
-            name: "cuda",
-            status: Status::Warn,
-            message:
-                "nvidia libs not found; set CODESAGE_NVIDIA_LIBS, or install the `nvidia-*-cu12` pip \
-                 packages (cudnn, cublas, cuda-runtime, cufft, curand, cuda-nvrtc). First \
-                 GPU session will likely fail to register the CUDA provider."
-                    .to_string(),
-        },
-        dirs => Check {
-            name: "cuda",
-            status: Status::Pass,
-            message: format!("cuda feature compiled; {} nvidia lib dir(s) discovered", dirs.len()),
-        },
+        dirs if dirs.is_empty() => Check::new(
+            "cuda",
+            Status::Warn,
+            "nvidia libs not found; set CODESAGE_NVIDIA_LIBS, or install the `nvidia-*-cu12` pip \
+             packages (cudnn, cublas, cuda-runtime, cufft, curand, cuda-nvrtc). First \
+             GPU session will likely fail to register the CUDA provider."
+                .to_string(),
+        ),
+        dirs => Check::new(
+            "cuda",
+            Status::Pass,
+            format!(
+                "cuda feature compiled; {} nvidia lib dir(s) discovered",
+                dirs.len()
+            ),
+        ),
     }
 }
 
@@ -298,15 +295,15 @@ fn check_models(project: Option<&Path>) -> Check {
         disallowed.push(m.clone());
     }
     if !disallowed.is_empty() {
-        return Check {
-            name: "models",
-            status: Status::Fail,
-            message: format!(
+        return Check::new(
+            "models",
+            Status::Fail,
+            format!(
                 "{} not on the validated-model allowlist; will ERROR at first load, not download. \
                  Set CODESAGE_ALLOW_ANY_MODEL=1 to run a model you trust.",
                 disallowed.join(", ")
             ),
-        };
+        );
     }
 
     let embed_present = model_in_cache(&cache, &embed_model);
@@ -340,21 +337,13 @@ fn check_models(project: Option<&Path>) -> Check {
             }
         ));
     }
-    Check {
-        name: "models",
-        status,
-        message: parts.join(" | "),
-    }
+    Check::new("models", status, parts.join(" | "))
 }
 
 fn check_hooks(root: &Path) -> Check {
     use crate::commands::hooks::{HooksLayout, classify_hooks_path, read_hooks_path};
     if git_common_dir(root).is_none() {
-        return Check {
-            name: "hooks",
-            status: Status::Skip,
-            message: "not a git repository".to_string(),
-        };
+        return Check::new("hooks", Status::Skip, "not a git repository".to_string());
     }
     let configured = read_hooks_path(root);
     let (hooks_dir, kind, husky_runtime_missing) =
@@ -366,11 +355,7 @@ fn check_hooks(root: &Path) -> Check {
                 runtime_present,
             }) => (user_dir, "husky", (!runtime_present).then_some(runtime_dir)),
             Err(e) => {
-                return Check {
-                    name: "hooks",
-                    status: Status::Warn,
-                    message: format!("{e:#}"),
-                };
+                return Check::new("hooks", Status::Warn, format!("{e:#}"));
             }
         };
 
@@ -406,52 +391,52 @@ fn check_hooks(root: &Path) -> Check {
     if let Some(runtime_dir) = husky_runtime_missing
         && !installed.is_empty()
     {
-        return Check {
-            name: "hooks",
-            status: Status::Warn,
-            message: format!(
+        return Check::new(
+            "hooks",
+            Status::Warn,
+            format!(
                 "husky: {} hook(s) installed in {} but husky's runtime dir {} does not exist; \
                  git runs no hooks until a package-manager install regenerates it",
                 installed.len(),
                 hooks_dir.display(),
                 runtime_dir.display()
             ),
-        };
+        );
     }
 
     if !dead_binaries.is_empty() {
-        return Check {
-            name: "hooks",
-            status: Status::Warn,
-            message: format!(
+        return Check::new(
+            "hooks",
+            Status::Warn,
+            format!(
                 "{kind}: installed hooks invoke {} which is missing or not executable (re-run `codesage install-hooks`)",
                 dead_binaries.join(", ")
             ),
-        };
+        );
     }
 
     if !unparseable.is_empty() {
-        return Check {
-            name: "hooks",
-            status: Status::Warn,
-            message: format!(
+        return Check::new(
+            "hooks",
+            Status::Warn,
+            format!(
                 "{kind}: installed hook(s) [{}] carry the marker but no parseable binary path \
                  (re-run `codesage install-hooks` to refresh them)",
                 unparseable.join(",")
             ),
-        };
+        );
     }
 
     if installed.len() == REQUIRED_HOOKS.len() {
-        Check {
-            name: "hooks",
-            status: Status::Pass,
-            message: format!(
+        Check::new(
+            "hooks",
+            Status::Pass,
+            format!(
                 "{kind}: all {} installed at {}",
                 REQUIRED_HOOKS.len(),
                 hooks_dir.display()
             ),
-        }
+        )
     } else if !foreign.is_empty() {
         let mut parts = Vec::new();
         if !installed.is_empty() {
@@ -469,30 +454,136 @@ fn check_hooks(root: &Path) -> Check {
                 missing.join(",")
             ));
         }
-        Check {
-            name: "hooks",
-            status: Status::Warn,
-            message: format!("{kind}: {}", parts.join(" ")),
-        }
+        Check::new(
+            "hooks",
+            Status::Warn,
+            format!("{kind}: {}", parts.join(" ")),
+        )
     } else if installed.is_empty() {
-        Check {
-            name: "hooks",
-            status: Status::Warn,
-            message: format!(
+        Check::new(
+            "hooks",
+            Status::Warn,
+            format!(
                 "{kind}: no codesage hooks at {} (run `codesage install-hooks`)",
                 hooks_dir.display()
             ),
-        }
+        )
     } else {
-        Check {
-            name: "hooks",
-            status: Status::Warn,
-            message: format!(
+        Check::new(
+            "hooks",
+            Status::Warn,
+            format!(
                 "{kind}: installed=[{}] missing=[{}]",
                 installed.join(","),
                 missing.join(",")
             ),
+        )
+    }
+}
+
+/// Lock and log state of the indexing hooks. Reaps a lock whose recorded pid
+/// is dead: doctor is an operator command, so unlike `project_overview` it
+/// may clear the way for the next hook fire.
+fn check_hook_health(root: &Path) -> Check {
+    use codesage_graph::hook_health::{
+        self, LOCK_ABSENT, LOCK_HELD_DEAD, LOCK_HELD_LIVE, STALE_LOCK_SECS,
+    };
+    let Some(mut health) = hook_health::inspect(root) else {
+        return Check::new(
+            "hook_health",
+            Status::Skip,
+            "not a git repository".to_string(),
+        );
+    };
+    let mut status = Status::Pass;
+    let mut parts = Vec::new();
+
+    let since = health
+        .lock
+        .since
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let age = health.lock.age_secs.map(format_age).unwrap_or_default();
+    match health.lock.state.as_str() {
+        s if s == LOCK_ABSENT => parts.push("lock: absent".to_string()),
+        s if s == LOCK_HELD_LIVE => parts.push(format!(
+            "lock: held by live pid {} since {since}{age} (index in progress)",
+            health.lock.pid.unwrap_or(0)
+        )),
+        s if s == LOCK_HELD_DEAD => {
+            let pid = health.lock.pid.unwrap_or(0);
+            match hook_health::reap_dead_lock(root) {
+                Ok(Some(_)) => {
+                    health.lock.reaped = true;
+                    parts.push(format!(
+                        "lock: held by dead pid {pid} since {since}{age} (reaped; the next hook fire indexes again)"
+                    ));
+                }
+                Ok(None) => parts.push(format!(
+                    "lock: held by dead pid {pid} since {since}{age} (released by another process before doctor could reap it)"
+                )),
+                Err(e) => {
+                    status = Status::Warn;
+                    parts.push(format!(
+                        "lock: held by dead pid {pid} since {since}{age}; reap failed: {e:#}"
+                    ));
+                }
+            }
         }
+        _ => {
+            let stale = health.lock.age_secs.is_some_and(|a| a >= STALE_LOCK_SECS);
+            if stale {
+                status = Status::Warn;
+            }
+            parts.push(format!(
+                "lock: held without pid since {since}{age} ({})",
+                if stale {
+                    "older than 30 minutes; the next hook fire reaps it"
+                } else {
+                    "pre-upgrade hook or just started; reaped by age after 30 minutes"
+                }
+            ));
+        }
+    }
+
+    match (&health.last_run, health.last_exit) {
+        (Some(run), Some(0)) => parts.push(format!("last run {run} exit=0")),
+        (Some(run), Some(code)) => {
+            status = Status::Warn;
+            parts.push(format!("last run {run} exit={code}"));
+        }
+        (Some(run), None) => parts.push(format!(
+            "last run {run} exit=unknown (no exit line: still running, killed, or pre-upgrade hook)"
+        )),
+        (None, _) => parts.push("last run: none logged".to_string()),
+    }
+
+    if health.installed_hooks.is_empty() {
+        parts.push("installed hooks: none".to_string());
+    } else {
+        parts.push(format!(
+            "installed hooks: {}",
+            health.installed_hooks.join(",")
+        ));
+    }
+
+    Check {
+        name: "hook_health",
+        status,
+        message: parts.join("; "),
+        hook_health: Some(health),
+    }
+}
+
+fn format_age(secs: u64) -> String {
+    if secs < 60 {
+        format!(" ({secs}s ago)")
+    } else if secs < 3600 {
+        format!(" ({}m ago)", secs / 60)
+    } else if secs < 86_400 {
+        format!(" ({}h{:02}m ago)", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!(" ({}d{:02}h ago)", secs / 86_400, (secs % 86_400) / 3600)
     }
 }
 
@@ -539,21 +630,21 @@ fn is_executable_file(path: &Path) -> bool {
 fn check_index_drift(root: &Path) -> Check {
     let db_path = root.join(PROJECT_DIR).join(DB_FILE);
     if !db_path.exists() {
-        return Check {
-            name: "index-drift",
-            status: Status::Skip,
-            message: "no index.db yet (run `codesage index`)".to_string(),
-        };
+        return Check::new(
+            "index-drift",
+            Status::Skip,
+            "no index.db yet (run `codesage index`)".to_string(),
+        );
     }
     // A newer binary may have migrated the DB; inspection must not attempt migrations.
     let db = match Database::open_existing_read(&db_path) {
         Ok(db) => db,
         Err(e) => {
-            return Check {
-                name: "index-drift",
-                status: Status::Fail,
-                message: format!("failed to open index: {e}"),
-            };
+            return Check::new(
+                "index-drift",
+                Status::Fail,
+                format!("failed to open index: {e}"),
+            );
         }
     };
     let report = check_drift(root, &db);
@@ -563,43 +654,31 @@ fn check_index_drift(root: &Path) -> Check {
         DriftKind::BehindHead | DriftKind::UnrelatedAncestor => Status::Warn,
         DriftKind::Unknown => Status::Warn,
     };
-    Check {
-        name: "index-drift",
-        status,
-        message: report.summary(),
-    }
+    Check::new("index-drift", status, report.summary())
 }
 
 /// Report fingerprint mismatch; empty tables have no vectors to attest.
 fn fingerprint_gate(db: &Database, expected: &str) -> Option<Check> {
     match db.require_semantic_fingerprint(expected) {
         Ok(()) => None,
-        Err(e) => Some(Check {
-            name: "semantic",
-            status: Status::Fail,
-            message: format!("{e:#}"),
-        }),
+        Err(e) => Some(Check::new("semantic", Status::Fail, format!("{e:#}"))),
     }
 }
 
 fn check_semantic_freshness(root: &Path) -> Check {
     let db_path = root.join(PROJECT_DIR).join(DB_FILE);
     if !db_path.exists() {
-        return Check {
-            name: "semantic",
-            status: Status::Skip,
-            message: "no index.db yet (run `codesage index`)".to_string(),
-        };
+        return Check::new(
+            "semantic",
+            Status::Skip,
+            "no index.db yet (run `codesage index`)".to_string(),
+        );
     }
 
     let config = match load_project_config(root) {
         Ok(config) => config,
         Err(e) => {
-            return Check {
-                name: "semantic",
-                status: Status::Fail,
-                message: format!("{e:#}"),
-            };
+            return Check::new("semantic", Status::Fail, format!("{e:#}"));
         }
     };
     let emb_config = config.embedding.unwrap_or_default();
@@ -607,19 +686,19 @@ fn check_semantic_freshness(root: &Path) -> Check {
     let db = match Database::open_for_existing_model(&db_path, &model) {
         Ok(db) => db,
         Err(e) => {
-            return Check {
-                name: "semantic",
-                status: Status::Fail,
-                message: format!("failed to open semantic index: {e}"),
-            };
+            return Check::new(
+                "semantic",
+                Status::Fail,
+                format!("failed to open semantic index: {e}"),
+            );
         }
     };
     if db.chunk_table_name().is_empty() {
-        return Check {
-            name: "semantic",
-            status: Status::Warn,
-            message: format!("no semantic chunks for model {model}; run `codesage index`"),
-        };
+        return Check::new(
+            "semantic",
+            Status::Warn,
+            format!("no semantic chunks for model {model}; run `codesage index`"),
+        );
     }
     // Check cached model identity without loading/downloading a model.
     // Unavailable artifacts skip this gate; the models check reports cache misses.
@@ -636,32 +715,32 @@ fn check_semantic_freshness(root: &Path) -> Check {
     }
 
     match db.semantic_freshness() {
-        Ok(Some(freshness)) if freshness.is_fresh() => Check {
-            name: "semantic",
-            status: Status::Pass,
-            message: format!(
+        Ok(Some(freshness)) if freshness.is_fresh() => Check::new(
+            "semantic",
+            Status::Pass,
+            format!(
                 "fresh for model {model}; {} files tracked",
                 freshness.indexed_files
             ),
-        },
-        Ok(Some(freshness)) => Check {
-            name: "semantic",
-            status: Status::Warn,
-            message: format!(
+        ),
+        Ok(Some(freshness)) => Check::new(
+            "semantic",
+            Status::Warn,
+            format!(
                 "{} stale file(s), {} missing file(s) for model {model}; run `codesage index`",
                 freshness.stale_files, freshness.missing_files
             ),
-        },
-        Ok(None) => Check {
-            name: "semantic",
-            status: Status::Warn,
-            message: format!("semantic freshness unavailable for model {model}"),
-        },
-        Err(e) => Check {
-            name: "semantic",
-            status: Status::Fail,
-            message: format!("failed to check semantic freshness: {e}"),
-        },
+        ),
+        Ok(None) => Check::new(
+            "semantic",
+            Status::Warn,
+            format!("semantic freshness unavailable for model {model}"),
+        ),
+        Err(e) => Check::new(
+            "semantic",
+            Status::Fail,
+            format!("failed to check semantic freshness: {e}"),
+        ),
     }
 }
 
@@ -671,11 +750,7 @@ fn check_mcp() -> Check {
         .arg("list")
         .output();
     let Ok(out) = out else {
-        return Check {
-            name: "mcp",
-            status: Status::Skip,
-            message: "claude CLI not in PATH".to_string(),
-        };
+        return Check::new("mcp", Status::Skip, "claude CLI not in PATH".to_string());
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
     let registered = stdout.lines().any(|l| {
@@ -683,17 +758,13 @@ fn check_mcp() -> Check {
         l.starts_with("codesage:") || l.starts_with("codesage ")
     });
     if registered {
-        Check {
-            name: "mcp",
-            status: Status::Pass,
-            message: "codesage registered with Claude Code".to_string(),
-        }
+        Check::new(
+            "mcp",
+            Status::Pass,
+            "codesage registered with Claude Code".to_string(),
+        )
     } else {
-        Check {
-            name: "mcp",
-            status: Status::Warn,
-            message: "codesage NOT registered; run `claude mcp add --scope user codesage -- codesage mcp` (or use the codesage-tools plugin)".to_string(),
-        }
+        Check::new("mcp", Status::Warn, "codesage NOT registered; run `claude mcp add --scope user codesage -- codesage mcp` (or use the codesage-tools plugin)".to_string())
     }
 }
 
@@ -778,6 +849,147 @@ mod tests {
         )
         .unwrap();
         dir
+    }
+
+    #[test]
+    fn check_hook_health_skips_outside_git_and_reports_absent_lock_inside() {
+        let dir = tempfile::tempdir().unwrap();
+        let check = check_hook_health(dir.path());
+        assert_eq!(check.status, Status::Skip, "{}", check.message);
+        assert!(check.hook_health.is_none());
+
+        let dir = init_git_repo();
+        write_codesage_hook(dir.path(), "post-commit");
+        let check = check_hook_health(dir.path());
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(check.message.contains("lock: absent"), "{}", check.message);
+        assert!(
+            check.message.contains("last run: none logged"),
+            "{}",
+            check.message
+        );
+        let health = check.hook_health.as_ref().expect("hook_health payload");
+        assert_eq!(health.installed_hooks, vec!["post-commit".to_string()]);
+        assert_eq!(health.lock.state, "absent");
+        let json = serde_json::to_value(&check).unwrap();
+        assert!(json["hook_health"]["lock"]["state"] == "absent", "{json}");
+        let plain = serde_json::to_value(check_hooks(dir.path())).unwrap();
+        assert!(
+            plain.get("hook_health").is_none(),
+            "other checks must not carry the field: {plain}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_hook_health_reaps_a_dead_pid_lock_and_says_so() {
+        let dir = init_git_repo();
+        let lockdir = dir.path().join(".codesage/hook-index.lock");
+        std::fs::create_dir_all(&lockdir).unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        std::fs::write(lockdir.join("pid"), format!("{dead}\n")).unwrap();
+        std::fs::write(
+            dir.path().join(".codesage/hooks.log"),
+            "[Sun Sep 14 07:09:37 UTC 2026] post-merge hook start pid=42\n",
+        )
+        .unwrap();
+
+        let check = check_hook_health(dir.path());
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(
+            check
+                .message
+                .contains(&format!("held by dead pid {dead} since ")),
+            "{}",
+            check.message
+        );
+        assert!(check.message.contains("(reaped;"), "{}", check.message);
+        assert!(
+            check
+                .message
+                .contains("last run Sun Sep 14 07:09:37 UTC 2026 exit=unknown"),
+            "{}",
+            check.message
+        );
+        let health = check.hook_health.unwrap();
+        assert_eq!(health.lock.state, "held_dead");
+        assert_eq!(health.lock.pid, Some(dead));
+        assert!(health.lock.reaped);
+        assert_eq!(health.last_exit, None);
+        assert!(!lockdir.exists(), "doctor must remove the dead lock");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_hook_health_leaves_a_live_pid_lock_alone() {
+        let dir = init_git_repo();
+        let lockdir = dir.path().join(".codesage/hook-index.lock");
+        std::fs::create_dir_all(&lockdir).unwrap();
+        let me = std::process::id();
+        std::fs::write(lockdir.join("pid"), me.to_string()).unwrap();
+        std::fs::write(
+            dir.path().join(".codesage/hooks.log"),
+            "[Sun Sep 14 07:09:37 UTC 2026] post-merge hook start pid=42\n\
+             [Sun Sep 14 07:09:40 UTC 2026] post-merge hook exit=7 pid=42\n",
+        )
+        .unwrap();
+
+        let check = check_hook_health(dir.path());
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(
+            check
+                .message
+                .contains(&format!("held by live pid {me} since ")),
+            "{}",
+            check.message
+        );
+        assert!(check.message.contains(" exit=7"), "{}", check.message);
+        let health = check.hook_health.unwrap();
+        assert_eq!(health.lock.state, "held_live");
+        assert_eq!(health.last_exit, Some(7));
+        assert!(!health.lock.reaped);
+        assert!(
+            lockdir.join("pid").is_file(),
+            "live lock must survive doctor"
+        );
+    }
+
+    #[test]
+    fn check_hook_health_reports_a_pidless_lock_by_age() {
+        let dir = init_git_repo();
+        let lockdir = dir.path().join(".codesage/hook-index.lock");
+        std::fs::create_dir_all(&lockdir).unwrap();
+
+        let check = check_hook_health(dir.path());
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        assert!(
+            check.message.contains("held without pid since "),
+            "{}",
+            check.message
+        );
+        assert!(
+            lockdir.is_dir(),
+            "a pidless lock is the hook's to reap by age"
+        );
+
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 60);
+        std::fs::File::open(&lockdir)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let check = check_hook_health(dir.path());
+        assert_eq!(check.status, Status::Warn, "{}", check.message);
+        assert!(
+            check.message.contains("older than 30 minutes"),
+            "{}",
+            check.message
+        );
+        let health = check.hook_health.unwrap();
+        assert_eq!(health.lock.state, "held_no_pid");
+        assert!(health.lock.age_secs.is_some_and(|a| a >= 31 * 60));
+        assert!(lockdir.is_dir());
     }
 
     #[test]
