@@ -284,6 +284,12 @@ pub fn build_review_rehearsal(
         if let Some(target) = &c.max_churn_file {
             evidence.push(format!("best refactor target: {target}"));
         }
+        if c.lazy_edges > 0 {
+            evidence.push(format!(
+                "lazy_edges: {} (function-body import pair(s) touching this cycle, excluded from cycle detection)",
+                c.lazy_edges
+            ));
+        }
         objections.push(ReviewObjection {
             severity: ReviewSeverity::Medium,
             category: "import-cycle".to_string(),
@@ -871,6 +877,7 @@ mod tests {
                         kind: ReferenceKind::Call,
                         line: 2,
                         col: 0,
+                        lazy: false,
                     }],
                 )
                 .unwrap();

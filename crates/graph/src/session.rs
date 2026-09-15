@@ -120,7 +120,7 @@ pub fn build_session_snapshot_with_top_risk(
     let files = db.all_file_paths().context("listing indexed files")?;
     let file_count = files.len() as u32;
     let symbol_count = db.symbol_count().context("counting symbols")? as u32;
-    let cycles = compute_cycles(db).context("computing import cycles")?;
+    let (cycles, lazy_edges) = compute_cycles(db).context("computing import cycles")?;
     let top_risk_files = ranking.rows.clone();
     let git_head = read_git_head(project_root);
 
@@ -131,6 +131,7 @@ pub fn build_session_snapshot_with_top_risk(
         symbol_count,
         files,
         cycles,
+        lazy_edges,
         top_risk_files,
         git_head,
     };
@@ -168,7 +169,7 @@ pub fn session_end(project_root: &Path, db: &Database, session_id: &str) -> Resu
         .collect();
     removed_files.sort();
 
-    let now_cycles = compute_cycles(db).context("computing current cycles")?;
+    let (now_cycles, lazy_edges) = compute_cycles(db).context("computing current cycles")?;
     let snap_cycles_set: HashSet<Vec<String>> = snapshot.cycles.iter().cloned().collect();
     let now_cycles_set: HashSet<Vec<String>> = now_cycles.iter().cloned().collect();
     let mut new_cycles: Vec<Vec<String>> = now_cycles_set
@@ -288,6 +289,7 @@ pub fn session_end(project_root: &Path, db: &Database, session_id: &str) -> Resu
         removed_files,
         new_cycles,
         resolved_cycles,
+        lazy_edges,
         risk_regressions,
         max_risk_regression,
         summary_notes,
@@ -296,15 +298,17 @@ pub fn session_end(project_root: &Path, db: &Database, session_id: &str) -> Resu
     })
 }
 
-/// Compute all non-trivial SCCs in the file-level import graph. Each cycle
-/// is returned as a sorted member list; the outer Vec is sorted by
-/// (descending size, members) for stable equality across recompute.
-fn compute_cycles(db: &Database) -> Result<Vec<Vec<String>>> {
+/// Compute all non-trivial SCCs in the file-level load-time import graph,
+/// plus the count of file pairs excluded because every import between them
+/// is lazy. Each cycle is returned as a sorted member list; the outer Vec is
+/// sorted by (descending size, members) for stable equality across recompute.
+fn compute_cycles(db: &Database) -> Result<(Vec<Vec<String>>, u32)> {
     let edges = db
         .enumerate_file_import_edges()
         .context("enumerate_file_import_edges")?;
+    let lazy_edges = db.lazy_import_pairs().context("lazy_import_pairs")?.len() as u32;
     if edges.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), lazy_edges));
     }
     let components = crate::scc::tarjan_scc(&edges)?;
     let mut out: Vec<Vec<String>> = components
@@ -316,7 +320,7 @@ fn compute_cycles(db: &Database) -> Result<Vec<Vec<String>>> {
         })
         .collect();
     out.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-    Ok(out)
+    Ok((out, lazy_edges))
 }
 
 /// The top-`limit` highest-risk files across the whole indexed project.
@@ -629,6 +633,7 @@ mod tests {
             symbol_count: 0,
             files: Vec::new(),
             cycles: Vec::new(),
+            lazy_edges: 0,
             top_risk_files: Vec::new(),
             git_head: None,
         }

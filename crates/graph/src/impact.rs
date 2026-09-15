@@ -1607,6 +1607,7 @@ mod tests {
                 kind: ReferenceKind::Call,
                 line: 10 + i as u32,
                 col: 0,
+                lazy: false,
             })
             .collect();
         // Five repeats of already-recorded (symbol, kind, line) reasons at a
@@ -1619,6 +1620,7 @@ mod tests {
                 kind: ReferenceKind::Call,
                 line: 10 + i as u32,
                 col: 8,
+                lazy: false,
             });
         }
         db.insert_references(caller, &refs).unwrap();

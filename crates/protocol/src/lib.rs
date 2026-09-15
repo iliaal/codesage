@@ -366,6 +366,13 @@ pub struct Reference {
     /// JSON; `line` is what agents navigate by.
     #[serde(skip)]
     pub col: u32,
+    /// True for an import, import-binding, or include directive written
+    /// inside a function, method, closure, or arrow-function body: the module
+    /// is loaded on use, not at load time. Cycle detection drops a file pair
+    /// whose import edges are all lazy; dependency listings, impact analysis,
+    /// and call resolution keep them. Always false for other kinds.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub lazy: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -754,6 +761,10 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ContextBundle {
     /// False when the requested target (symbol or feature_id) does not
@@ -978,6 +989,12 @@ pub struct RiskAssessment {
     /// response staleness scan reaches them only through this field.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub cycle_files: Vec<String>,
+    /// Cross-file import pairs touching this file whose directives are all
+    /// lazy (written inside a function body) and were therefore excluded from
+    /// cycle detection. Emitted only when nonzero, regardless of `verbose`,
+    /// so an unaffected assessment serializes byte-identically.
+    #[serde(default)]
+    pub lazy_edges: u32,
     /// Top co-changers, useful for the agent to know which tests/files to also
     /// touch. Present only when the caller asked for `verbose` output; use
     /// `find_coupling` or `recommend_tests` for the same data on demand.
@@ -1019,11 +1036,13 @@ impl Serialize for RiskAssessment {
         let emit_trust = !self.trust_boundaries.is_empty();
         let emit_notes = !self.notes.is_empty();
         let emit_top_symbols = !self.top_symbols.is_empty();
+        let emit_lazy_edges = self.lazy_edges > 0;
         let len = 3
             + usize::from(self.author_concentration.is_some())
             + usize::from(self.unscored)
             + if self.verbose { 10 } else { 0 }
             + usize::from(emit_cycle_files)
+            + usize::from(emit_lazy_edges)
             + usize::from(emit_top_coupled)
             + usize::from(emit_trust)
             + usize::from(emit_notes)
@@ -1052,6 +1071,9 @@ impl Serialize for RiskAssessment {
         }
         if emit_cycle_files {
             s.serialize_field("cycle_files", &self.cycle_files)?;
+        }
+        if emit_lazy_edges {
+            s.serialize_field("lazy_edges", &self.lazy_edges)?;
         }
         if emit_top_coupled {
             s.serialize_field("top_coupled", &self.top_coupled)?;
@@ -1235,6 +1257,10 @@ pub struct CycleEntry {
     pub size: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_churn_file: Option<String>,
+    /// Import pairs touching a member that were excluded from this SCC because
+    /// every directive is lazy (function-body import). Absent when zero.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub lazy_edges: u32,
 }
 
 /// A directory that contributed ≥5 files to a patch. The top-3 files by
@@ -1416,6 +1442,10 @@ pub struct SessionSnapshot {
     /// the outer Vec is sorted by (descending size, members) for stable
     /// equality across snapshot/recompute cycles.
     pub cycles: Vec<Vec<String>>,
+    /// Cross-file import pairs excluded from `cycles` because every directive
+    /// is lazy (function-body import). Absent when zero.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub lazy_edges: u32,
     /// Top-N highest-risk files at snapshot time. Used as the baseline set
     /// for `risk_regressions` in the diff. Files outside this set don't
     /// get a per-file risk delta even if their risk goes up — keeps the
@@ -1487,6 +1517,10 @@ pub struct SessionDiff {
     /// the agent's edits). Reported for completeness; doesn't affect pass.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub resolved_cycles: Vec<Vec<String>>,
+    /// Cross-file import pairs excluded from cycle detection at `session_end`
+    /// because every directive is lazy (function-body import). Absent when zero.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub lazy_edges: u32,
     /// Per-file risk-score regressions (delta ≥ 0.05) for files in the
     /// snapshot's top-risk baseline.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -2620,6 +2654,7 @@ mod tests {
             in_cycle: true,
             cycle_size: 3,
             cycle_files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            lazy_edges: 0,
             top_coupled: (0..10)
                 .map(|i| CoChangeEntry {
                     file: format!("src/coupled_{i}.rs"),
@@ -2936,6 +2971,7 @@ mod tests {
             kind: ReferenceKind::Call,
             line: 12,
             col: 8,
+            lazy: false,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(!json.contains("\"col\""), "{json}");

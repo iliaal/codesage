@@ -1270,6 +1270,7 @@ mod context_export_tests {
             kind: ReferenceKind::Call,
             line: 5,
             col: 12,
+            lazy: false,
         }
     }
 
@@ -1290,6 +1291,7 @@ mod context_export_tests {
             kind,
             line: 1,
             col: 0,
+            lazy: false,
         };
         db.insert_references(
             file_id,

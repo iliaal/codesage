@@ -1483,6 +1483,7 @@ fn top_symbols_rank_by_line_count_and_ref_count() {
         kind: ReferenceKind::Call,
         line,
         col: 0,
+        lazy: false,
     };
     let mut refs: Vec<Reference> = (0..20).map(|i| mk_ref("small_hot", 10 + i)).collect();
     refs.push(mk_ref("tiny", 200));
@@ -1571,6 +1572,7 @@ fn top_symbols_populates_on_known_hot_file_and_caps_at_five() {
             kind: ReferenceKind::Call,
             line: 10 + i,
             col: 0,
+            lazy: false,
         })
         .collect();
     db.insert_references(caller_id, &refs).unwrap();

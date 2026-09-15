@@ -198,6 +198,7 @@ fn fresh_db_records_migrations_exactly_once() {
         "0019_file_hash_cache",
         "0020_file_interpretation",
         "0021_git_history_anchor",
+        "0022_refs_lazy",
     ];
     for migration in expected_migrations {
         let count: i64 = conn
@@ -660,6 +661,7 @@ fn sample_reference(kind: codesage_protocol::ReferenceKind) -> codesage_protocol
         kind,
         line: 2,
         col: 4,
+        lazy: false,
     }
 }
 

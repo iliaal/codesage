@@ -976,6 +976,7 @@ mod tests {
             kind: ReferenceKind::Call,
             line,
             col: 4,
+            lazy: false,
         }
     }
 

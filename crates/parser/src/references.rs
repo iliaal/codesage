@@ -316,6 +316,44 @@ fn member_is_callee(property: &Node) -> bool {
             .is_some_and(|f| f.id() == member.id())
 }
 
+/// Node kinds whose body defers an import directive to call time. Languages
+/// missing here (PHP `use`, Java `import`, Go `import`) only admit imports at
+/// file or namespace scope, so nothing they emit can be lazy.
+fn lazy_scope_kinds(language: Language) -> &'static [&'static str] {
+    match language {
+        Language::Python => &["function_definition"],
+        Language::JavaScript | Language::TypeScript => &[
+            "function_declaration",
+            "function_expression",
+            "generator_function_declaration",
+            "generator_function",
+            "arrow_function",
+            "method_definition",
+        ],
+        Language::Rust => &["function_item", "closure_expression"],
+        Language::C => &["function_definition"],
+        Language::Cpp => &["function_definition", "lambda_expression"],
+        Language::Php | Language::Java | Language::Go => &[],
+    }
+}
+
+/// True when an import/include directive sits inside a function, method,
+/// closure, or arrow-function body for `language`.
+fn import_is_lazy(node: &Node, language: Language) -> bool {
+    let kinds = lazy_scope_kinds(language);
+    if kinds.is_empty() {
+        return false;
+    }
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if kinds.contains(&n.kind()) {
+            return true;
+        }
+        current = n.parent();
+    }
+    false
+}
+
 /// The pattern-index → `ReferenceKind` map for a language. Counterpart to
 /// `crate::extract::kind_map_for`; shared by `extract_references` and the
 /// validation gate so both agree on what each `@ref` pattern means.
@@ -441,6 +479,10 @@ pub fn extract_references(
         };
 
         let (row, col) = crate::position::node_start_utf8(&ref_node, source);
+        let lazy = matches!(
+            kind,
+            ReferenceKind::Import | ReferenceKind::ImportBinding | ReferenceKind::Include
+        ) && import_is_lazy(&ref_node, language);
         if language == Language::Python && kind == ReferenceKind::ImportBinding {
             let statement = ref_node.parent().and_then(|parent| {
                 if parent.kind() == "aliased_import" {
@@ -460,6 +502,7 @@ pub fn extract_references(
                     kind: ReferenceKind::Import,
                     line: row + 1,
                     col,
+                    lazy,
                 });
             }
         }
@@ -470,6 +513,7 @@ pub fn extract_references(
             kind,
             line: row + 1,
             col,
+            lazy,
         });
     }
 
@@ -556,6 +600,90 @@ mod tests {
             refs.iter()
                 .any(|r| r.to_name == ".child" && r.kind == ReferenceKind::Import)
         );
+    }
+
+    fn lazy_flags(refs: &[Reference], name: &str) -> Vec<bool> {
+        refs.iter()
+            .filter(|r| r.to_name == name)
+            .map(|r| r.lazy)
+            .collect()
+    }
+
+    #[test]
+    fn python_function_body_imports_are_lazy_and_module_scope_imports_are_not() {
+        let src = "import os\nfrom a import run\nclass K:\n    import json\n    def m(self):\n        import sys\n        from b import other as o\ndef f():\n    from . import child\n    return other()\n";
+        let refs = refs_from_source(src, Language::Python);
+        assert_eq!(lazy_flags(&refs, "os"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "a"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "run"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "a.run"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "json"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "sys"), vec![true]);
+        assert_eq!(lazy_flags(&refs, "b"), vec![true]);
+        assert_eq!(lazy_flags(&refs, "b.other"), vec![true]);
+        assert_eq!(lazy_flags(&refs, ".child"), vec![true]);
+        // Binding row (lazy) plus the call row inside f (never lazy).
+        assert_eq!(lazy_flags(&refs, "other"), vec![true, false]);
+    }
+
+    #[test]
+    fn javascript_require_inside_functions_is_lazy() {
+        let src = "import top from './top.js';\nconst eager = require('./eager');\nfunction f() { const { x } = require('./fn'); return x; }\nconst g = () => require('./arrow');\nclass C { m() { return require('./method'); } }\n";
+        let refs = refs_from_source(src, Language::JavaScript);
+        assert_eq!(lazy_flags(&refs, "./top.js"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./eager"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "eager"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./fn"), vec![true]);
+        assert_eq!(lazy_flags(&refs, "x"), vec![true]);
+        assert_eq!(lazy_flags(&refs, "./arrow"), vec![true]);
+        assert_eq!(lazy_flags(&refs, "./method"), vec![true]);
+        // Call rows are never lazy, wherever they sit.
+        assert_eq!(lazy_flags(&refs, "require"), vec![false; 4]);
+    }
+
+    #[test]
+    fn typescript_require_inside_functions_is_lazy() {
+        let src = "import top = require('./top');\nexport function f(): number { const m = require('./fn'); return m.x; }\n";
+        let refs = refs_from_source(src, Language::TypeScript);
+        assert_eq!(lazy_flags(&refs, "./top"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./fn"), vec![true]);
+        assert_eq!(lazy_flags(&refs, "m"), vec![true]);
+    }
+
+    #[test]
+    fn rust_function_local_use_is_lazy_and_item_use_is_not() {
+        let src = "use crate::top::A;\nfn f() {\n    use crate::inner::B;\n    let c = || { use crate::closure::C; C::new() };\n    B::new(); c()\n}\n";
+        let refs = refs_from_source(src, Language::Rust);
+        assert_eq!(lazy_flags(&refs, "crate::top::A"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "crate::inner::B"), vec![true]);
+        assert_eq!(lazy_flags(&refs, "crate::closure::C"), vec![true]);
+    }
+
+    #[test]
+    fn c_include_inside_a_function_body_is_lazy() {
+        let src = "#include <stdio.h>\n#include \"top.h\"\nint main(void) {\n#include \"body.h\"\n    return 0;\n}\n";
+        let refs = refs_from_source(src, Language::C);
+        assert_eq!(lazy_flags(&refs, "top.h"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "body.h"), vec![true]);
+    }
+
+    #[test]
+    fn php_and_java_and_go_imports_are_never_lazy() {
+        let php = refs_from_source(
+            "<?php\nnamespace App;\nuse App\\Models\\User;\nclass K { function m() { return new User(); } }\n",
+            Language::Php,
+        );
+        assert!(php.iter().all(|r| !r.lazy), "{php:?}");
+        let java = refs_from_source(
+            "import java.util.List;\nclass K { void m() { List<String> l = null; } }\n",
+            Language::Java,
+        );
+        assert!(java.iter().all(|r| !r.lazy), "{java:?}");
+        let go = refs_from_source(
+            "package main\nimport \"fmt\"\nfunc main() { fmt.Println() }\n",
+            Language::Go,
+        );
+        assert!(go.iter().all(|r| !r.lazy), "{go:?}");
     }
 
     fn refs_from_source(source: &str, language: Language) -> Vec<Reference> {

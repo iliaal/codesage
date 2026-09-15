@@ -85,7 +85,33 @@ fn test_gap_note(no_symbols: bool, walk_capped: bool) -> String {
 }
 
 type CycleToken = (i64, i64, i64, i64, i64, i64);
-type CycleComponentCache = HashMap<String, (CycleToken, Arc<Vec<Vec<String>>>)>;
+type CycleComponentCache = HashMap<String, (CycleToken, Arc<ImportCycles>)>;
+
+/// Tarjan SCCs over the load-time import graph plus the file pairs the graph
+/// omitted because every import directive between them is lazy.
+pub(crate) struct ImportCycles {
+    pub(crate) components: Vec<Vec<String>>,
+    pub(crate) lazy_pairs: Vec<(String, String)>,
+}
+
+impl ImportCycles {
+    /// Lazy-only pairs with either endpoint in `files`.
+    fn lazy_edges_touching<'a>(&self, files: impl Iterator<Item = &'a str>) -> u32 {
+        let files: HashSet<&str> = files.collect();
+        self.lazy_pairs
+            .iter()
+            .filter(|(from, to)| files.contains(from.as_str()) || files.contains(to.as_str()))
+            .count() as u32
+    }
+}
+
+/// Cycles touching a patch, with the lazy pairs the cut removed so per-file
+/// assessments can disclose `lazy_edges` without recomputing the SCCs.
+#[derive(Default)]
+pub(crate) struct PatchCycles {
+    pub(crate) entries: Vec<CycleEntry>,
+    pub(crate) lazy_pairs: Vec<(String, String)>,
+}
 
 static IMPORT_CYCLE_CACHE: LazyLock<Mutex<CycleComponentCache>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -566,7 +592,7 @@ pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
 fn assess_risk_with_context(
     db: &Database,
     file_path: &str,
-    precomputed_cycles: Option<&[CycleEntry]>,
+    precomputed_cycles: Option<&PatchCycles>,
     precomputed_percentiles: Option<&HashMap<String, f64>>,
     max_frontier: usize,
     window: IndexWindow,
@@ -598,6 +624,7 @@ fn assess_risk_with_context(
                 in_cycle: false,
                 cycle_size: 0,
                 cycle_files: Vec::new(),
+                lazy_edges: 0,
                 top_coupled: Vec::new(),
                 trust_boundaries: Vec::new(),
                 notes: vec![
@@ -691,12 +718,24 @@ fn assess_risk_with_context(
 
     // Cycle lookup failure must not discard the other risk signals.
     let mut cycle_signal_failed = false;
-    let (in_cycle, cycle_size, cycle_files) = if let Some(cycles) = precomputed_cycles {
-        cycle_membership(cycles, file_path)
+    let (in_cycle, cycle_size, cycle_files, lazy_edges) = if let Some(cycles) = precomputed_cycles {
+        let (in_cycle, size, files) = cycle_membership(&cycles.entries, file_path);
+        let lazy = cycles
+            .lazy_pairs
+            .iter()
+            .filter(|(from, to)| from == file_path || to == file_path)
+            .count() as u32;
+        (in_cycle, size, files, lazy)
     } else {
-        match find_cycle_containing_file(db, file_path) {
-            Ok(Some(cycle)) => cycle_membership(&[cycle], file_path),
-            Ok(None) => (false, 0, Vec::new()),
+        match import_cycle_components(db) {
+            Ok(cycles) => {
+                let lazy = cycles.lazy_edges_touching(std::iter::once(file_path));
+                let (in_cycle, size, files) = match cycle_entry_for_file(db, &cycles, file_path)? {
+                    Some(cycle) => cycle_membership(&[cycle], file_path),
+                    None => (false, 0, Vec::new()),
+                };
+                (in_cycle, size, files, lazy)
+            }
             Err(e) => {
                 codesage_protocol::work::checkpoint()?;
                 if COMPLETE_POLICY.get().is_some()
@@ -707,7 +746,7 @@ fn assess_risk_with_context(
                 }
                 tracing::warn!(error = %e, file = %file_path, "cycle detection failed; omitting cycle signal from risk score");
                 cycle_signal_failed = true;
-                (false, 0, Vec::new())
+                (false, 0, Vec::new(), 0)
             }
         }
     };
@@ -968,6 +1007,7 @@ fn assess_risk_with_context(
             in_cycle,
             cycle_size,
             cycle_files,
+            lazy_edges,
             top_coupled,
             trust_boundaries,
             notes,
@@ -1111,7 +1151,7 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
     // Cycles are graph-wide SCCs; compute once for the patch, then reuse the
     // result for per-file scores and the patch-level cycle list.
     let mut cycles_failed = false;
-    let cycles_touching_patch = match find_cycles_touching(db, file_paths) {
+    let patch_cycles = match find_cycles_touching(db, file_paths) {
         Ok(c) => c,
         Err(e) => {
             codesage_protocol::work::checkpoint()?;
@@ -1123,7 +1163,7 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
             }
             tracing::warn!(error = %e, "cycle detection failed; omitting cycles_touching_patch");
             cycles_failed = true;
-            Vec::new()
+            PatchCycles::default()
         }
     };
 
@@ -1140,7 +1180,7 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
             assess_risk_with_context(
                 db,
                 p,
-                Some(&cycles_touching_patch),
+                Some(&patch_cycles),
                 Some(&percentiles),
                 MAX_FRONTIER,
                 window,
@@ -1280,6 +1320,7 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
                 .to_string(),
         );
     }
+    let cycles_touching_patch = patch_cycles.entries;
     if !cycles_touching_patch.is_empty() {
         let biggest = cycles_touching_patch
             .iter()
@@ -1345,7 +1386,7 @@ pub fn assess_risk_batch(db: &Database, file_paths: &[String]) -> Result<RiskBat
             }
             tracing::warn!(error = %e, "cycle detection failed; omitting batch cycle signal");
             cycles_failed = true;
-            Vec::new()
+            PatchCycles::default()
         }
     };
     let percentiles = db
@@ -1433,11 +1474,11 @@ fn alias_categorical_notes_in_place(files: &mut [&mut RiskAssessment]) -> BTreeM
 /// See [`CycleEntry`] docs for the "cycles the patch touches" vs
 /// "cycles the patch introduces" distinction. We do not have a
 /// pre-patch index to diff against, so this returns both.
-fn find_cycles_touching(db: &Database, patch_files: &[String]) -> Result<Vec<CycleEntry>> {
+fn find_cycles_touching(db: &Database, patch_files: &[String]) -> Result<PatchCycles> {
     let patch: HashSet<&str> = patch_files.iter().map(|s| s.as_str()).collect();
-    let components = import_cycle_components(db)?;
+    let cycles = import_cycle_components(db)?;
     let mut out: Vec<CycleEntry> = Vec::new();
-    for component in components.iter() {
+    for component in cycles.components.iter() {
         codesage_protocol::work::checkpoint()?;
         // Trivial SCCs (single-node, no self-edge) aren't cycles.
         if component.len() < 2 {
@@ -1447,6 +1488,7 @@ fn find_cycles_touching(db: &Database, patch_files: &[String]) -> Result<Vec<Cyc
             continue;
         }
         let max_churn_file = pick_max_churn(db, component)?;
+        let lazy_edges = cycles.lazy_edges_touching(component.iter().map(String::as_str));
         let mut members = component.clone();
         members.sort();
         let size = members.len() as u32;
@@ -1454,17 +1496,30 @@ fn find_cycles_touching(db: &Database, patch_files: &[String]) -> Result<Vec<Cyc
             members,
             size,
             max_churn_file,
+            lazy_edges,
         });
     }
     out.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.members.cmp(&b.members)));
-    Ok(out)
+    Ok(PatchCycles {
+        entries: out,
+        lazy_pairs: cycles.lazy_pairs.clone(),
+    })
 }
 
 /// Use the same Tarjan SCCs as [`find_cycles_touching`] so single-file and
 /// batch assessments agree, including on large graphs.
+#[cfg(test)]
 fn find_cycle_containing_file(db: &Database, file_path: &str) -> Result<Option<CycleEntry>> {
-    let components = import_cycle_components(db)?;
-    for component in components.iter() {
+    let cycles = import_cycle_components(db)?;
+    cycle_entry_for_file(db, &cycles, file_path)
+}
+
+fn cycle_entry_for_file(
+    db: &Database,
+    cycles: &ImportCycles,
+    file_path: &str,
+) -> Result<Option<CycleEntry>> {
+    for component in cycles.components.iter() {
         // Trivial SCCs (single-node, no self-edge) aren't cycles — same rule
         // as `find_cycles_touching`.
         if component.len() < 2 {
@@ -1477,16 +1532,31 @@ fn find_cycle_containing_file(db: &Database, file_path: &str) -> Result<Option<C
         members.sort();
         let size = members.len() as u32;
         let max_churn_file = pick_max_churn(db, &members)?;
+        let lazy_edges = cycles.lazy_edges_touching(members.iter().map(String::as_str));
         return Ok(Some(CycleEntry {
             members,
             size,
             max_churn_file,
+            lazy_edges,
         }));
     }
     Ok(None)
 }
 
-fn import_cycle_components(db: &Database) -> Result<Arc<Vec<Vec<String>>>> {
+fn load_import_cycles(db: &Database) -> Result<ImportCycles> {
+    let edges = db
+        .enumerate_file_import_edges()
+        .with_context(|| "enumerate_file_import_edges")?;
+    let lazy_pairs = db
+        .lazy_import_pairs()
+        .with_context(|| "lazy_import_pairs")?;
+    Ok(ImportCycles {
+        components: crate::scc::tarjan_scc(&edges)?,
+        lazy_pairs,
+    })
+}
+
+fn import_cycle_components(db: &Database) -> Result<Arc<ImportCycles>> {
     codesage_protocol::work::checkpoint()?;
     // The cross-request token can collide after same-shape reindexing.
     let cache_key = if COMPLETE_POLICY.get().is_some() {
@@ -1495,10 +1565,7 @@ fn import_cycle_components(db: &Database) -> Result<Arc<Vec<Vec<String>>>> {
         db.import_cycle_cache_key()
     };
     let Some(key) = cache_key else {
-        let edges = db
-            .enumerate_file_import_edges()
-            .with_context(|| "enumerate_file_import_edges")?;
-        return Ok(Arc::new(crate::scc::tarjan_scc(&edges)?));
+        return Ok(Arc::new(load_import_cycles(db)?));
     };
     let token = db.import_cycle_validity_token()?;
     if let Some((_, cached)) = IMPORT_CYCLE_CACHE
@@ -1510,10 +1577,7 @@ fn import_cycle_components(db: &Database) -> Result<Arc<Vec<Vec<String>>>> {
         return Ok(Arc::clone(cached));
     }
 
-    let edges = db
-        .enumerate_file_import_edges()
-        .with_context(|| "enumerate_file_import_edges")?;
-    let components = Arc::new(crate::scc::tarjan_scc(&edges)?);
+    let components = Arc::new(load_import_cycles(db)?);
     IMPORT_CYCLE_CACHE
         .lock()
         .expect("import cycle cache lock poisoned")
@@ -2112,6 +2176,7 @@ mod tests {
             kind: ReferenceKind::Import,
             line: 1,
             col: 0,
+            lazy: false,
         };
         db.insert_references(ids("cyc_a.php"), &[imp("cyc_a.php", "App\\CycleB")])
             .unwrap();
@@ -2127,8 +2192,9 @@ mod tests {
         );
         assert_eq!(single.size, 2);
 
-        let batch =
-            find_cycles_touching(&db, &["cyc_a.php".to_string(), "lone.php".to_string()]).unwrap();
+        let batch = find_cycles_touching(&db, &["cyc_a.php".to_string(), "lone.php".to_string()])
+            .unwrap()
+            .entries;
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].members, single.members);
         assert_eq!(batch[0].size, single.size);

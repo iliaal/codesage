@@ -58,7 +58,8 @@ CREATE TABLE IF NOT EXISTS refs (
     to_name_tail TEXT NOT NULL DEFAULT '',
     kind TEXT NOT NULL,
     line INTEGER NOT NULL,
-    col INTEGER NOT NULL
+    col INTEGER NOT NULL,
+    lazy INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_refs_to_name ON refs(to_name);
@@ -495,7 +496,23 @@ const MIGRATIONS: &[(&str, MigrationUp)] = &[
     ("0019_file_hash_cache", migrate_0019_file_hash_cache),
     ("0020_file_interpretation", migrate_0020_file_interpretation),
     ("0021_git_history_anchor", migrate_0021_git_history_anchor),
+    ("0022_refs_lazy", migrate_0022_refs_lazy),
 ];
+
+/// Adds `refs.lazy` (1 when the import directive sits inside a function
+/// body). Existing rows default to 0; the bumped structural interpretation
+/// reparses them on the next `codesage index`.
+fn migrate_0022_refs_lazy(conn: &Connection) -> rusqlite::Result<()> {
+    let has_column: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('refs') WHERE name = 'lazy'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_column == 0 {
+        conn.execute_batch("ALTER TABLE refs ADD COLUMN lazy INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    Ok(())
+}
 
 fn migrate_0020_file_interpretation(conn: &Connection) -> rusqlite::Result<()> {
     let exists: bool = conn.query_row(

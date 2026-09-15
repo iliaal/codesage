@@ -172,6 +172,7 @@ mod tests {
             kind: ReferenceKind::Call,
             line: 5,
             col: 12,
+            lazy: false,
         }
     }
 

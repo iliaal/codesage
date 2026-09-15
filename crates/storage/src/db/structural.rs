@@ -228,8 +228,8 @@ impl Database {
 
     pub fn insert_references(&self, file_id: i64, refs: &[Reference]) -> Result<()> {
         let mut stmt = self.conn.prepare_cached(
-            "INSERT INTO refs (from_file_id, from_symbol, to_name, to_name_tail, kind, line, col)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO refs (from_file_id, from_symbol, to_name, to_name_tail, kind, line, col, lazy)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?;
 
         for r in refs {
@@ -241,6 +241,7 @@ impl Database {
                 r.kind.as_str(),
                 r.line,
                 r.col,
+                i64::from(r.lazy),
             ])?;
         }
         Ok(())
@@ -438,14 +439,14 @@ impl Database {
 
         let mut refs = if is_qualified {
             self.query_refs(
-                "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col
+                "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy
                  FROM refs r JOIN files f ON r.from_file_id = f.id
                  WHERE r.to_name = ?1",
                 params![to_name],
             )?
         } else {
             self.query_refs(
-                "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col
+                "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy
                  FROM refs r JOIN files f ON r.from_file_id = f.id
                  WHERE r.to_name_tail = ?1 OR r.to_name = ?1",
                 params![to_name],
@@ -465,7 +466,7 @@ impl Database {
         line_end: u32,
     ) -> Result<Vec<Reference>> {
         self.query_refs(
-            "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col
+            "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy
              FROM refs r JOIN files f ON r.from_file_id = f.id
              WHERE f.path = ?1 AND r.line BETWEEN ?2 AND ?3
              ORDER BY r.line, r.col",
@@ -484,16 +485,36 @@ impl Database {
                 kind: row_reference_kind(&kind_str)?,
                 line: row.get(4)?,
                 col: row.get(5)?,
+                lazy: row.get::<_, i64>(6)? != 0,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Distinct cross-file import/include/inheritance/trait-use edges, plus Python
-    /// import bindings. Match qualified names or short names unique to one file.
+    /// Distinct cross-file load-time import/include/inheritance/trait-use
+    /// edges, plus Python import bindings. Match qualified names or short
+    /// names unique to one file. A pair whose directives are all lazy
+    /// (function-body imports) is excluded; see [`Self::lazy_import_pairs`].
     pub fn enumerate_file_import_edges(&self) -> Result<Vec<(String, String)>> {
-        let sql = r#"
-            SELECT DISTINCT f_from.path, f_to.path
+        self.file_import_pairs(false)
+    }
+
+    /// Cross-file pairs connected only by lazy (function-body) import
+    /// directives. These are the edges `enumerate_file_import_edges` drops.
+    pub fn lazy_import_pairs(&self) -> Result<Vec<(String, String)>> {
+        self.file_import_pairs(true)
+    }
+
+    fn file_import_pairs(&self, lazy_only: bool) -> Result<Vec<(String, String)>> {
+        // MIN(lazy) = 0 means at least one load-time directive joins the pair.
+        let having = if lazy_only {
+            "HAVING MIN(r.lazy) = 1"
+        } else {
+            "HAVING MIN(r.lazy) = 0"
+        };
+        let sql = format!(
+            r#"
+            SELECT f_from.path, f_to.path
             FROM refs r
             JOIN files f_from ON r.from_file_id = f_from.id
             JOIN symbols s ON (
@@ -512,8 +533,11 @@ impl Database {
             WHERE (r.kind IN ('import', 'include', 'inheritance', 'trait_use')
                    OR (r.kind = 'import_binding' AND f_from.language = 'python'))
               AND f_from.path <> f_to.path
-        "#;
-        let mut stmt = self.conn.prepare(sql)?;
+            GROUP BY f_from.path, f_to.path
+            {having}
+        "#
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -601,7 +625,7 @@ impl Database {
 
     pub fn file_import_references(&self) -> Result<Vec<Reference>> {
         self.query_refs(
-            "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col
+            "SELECT f.path, r.from_symbol, r.to_name, r.kind, r.line, r.col, r.lazy
              FROM refs r JOIN files f ON r.from_file_id = f.id
              WHERE r.kind IN ('import', 'include')
              ORDER BY f.path, r.line, r.col, r.to_name",
@@ -621,7 +645,7 @@ impl Database {
             "SELECT
                  (SELECT COUNT(*) FROM refs WHERE kind IN ('import', 'import_binding', 'include', 'inheritance', 'trait_use')),
                  (SELECT COALESCE(MAX(id), 0) FROM refs WHERE kind IN ('import', 'import_binding', 'include', 'inheritance', 'trait_use')),
-                 (SELECT COALESCE(SUM(line + length(to_name) + length(kind)), 0)
+                 (SELECT COALESCE(SUM(line + length(to_name) + length(kind) + lazy), 0)
                   FROM refs WHERE kind IN ('import', 'import_binding', 'include', 'inheritance', 'trait_use')),
                  (SELECT COUNT(*) FROM symbols),
                  (SELECT COALESCE(MAX(id), 0) FROM symbols),
@@ -642,7 +666,8 @@ impl Database {
         Ok(token)
     }
 
-    /// Import edges with both endpoints in `files`, avoiding a whole-index sweep.
+    /// Load-time import edges with both endpoints in `files`, avoiding a
+    /// whole-index sweep. Pairs joined only by lazy directives are excluded.
     pub fn import_edges_within(&self, files: &[&str]) -> Result<Vec<(String, String)>> {
         if files.len() < 2 {
             return Ok(Vec::new());
@@ -652,7 +677,7 @@ impl Database {
             .join(", ");
         let sql = format!(
             r#"
-            SELECT DISTINCT f_from.path, f_to.path
+            SELECT f_from.path, f_to.path
             FROM refs r
             JOIN files f_from ON r.from_file_id = f_from.id
             JOIN symbols s ON (
@@ -673,6 +698,8 @@ impl Database {
               AND f_from.path <> f_to.path
               AND f_from.path IN ({placeholders})
               AND f_to.path IN ({placeholders})
+            GROUP BY f_from.path, f_to.path
+            HAVING MIN(r.lazy) = 0
             "#
         );
         // The file list is bound twice — once per IN clause, in order.
