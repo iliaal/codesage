@@ -509,19 +509,21 @@ fn rust_modifier_visibility(item: &Node) -> Visibility {
         return Visibility::Module;
     };
     let mut inner = modifier.walk();
-    let mut scoped = Visibility::Public;
-    for child in modifier.children(&mut inner) {
-        match child.kind() {
-            "crate" => scoped = Visibility::Crate,
-            // `pub(self)`, `pub(super)`, `pub(in path)`: no wider than the
-            // ancestor module, which the Module rule already approximates.
-            "self" | "super" | "in" | "scoped_identifier" | "identifier" => {
-                scoped = Visibility::Module;
-            }
-            _ => {}
-        }
+    let mut children = modifier
+        .children(&mut inner)
+        .skip_while(|c| c.kind() != "(");
+    let Some(scope) = children.nth(1) else {
+        return Visibility::Public;
+    };
+    match scope.kind() {
+        "crate" => Visibility::Crate,
+        "self" => Visibility::Module,
+        // `pub(super)` and `pub(in path)` reach an ancestor module, which the
+        // Module gate (defining module's subtree) would under-approximate.
+        // Crate is the nearest level that never rejects a legal edge.
+        "super" | "in" => Visibility::Crate,
+        _ => Visibility::Public,
     }
-    scoped
 }
 
 /// C/C++ internal linkage: a `static` function or file-scope object is
@@ -552,7 +554,7 @@ fn c_visibility(
 
 fn is_c_header_path(file_path: &str) -> bool {
     let ext = file_path.rsplit_once('.').map_or("", |(_, ext)| ext);
-    matches!(ext, "h" | "hh" | "hpp" | "hxx" | "inl" | "ipp" | "tcc")
+    crate::detect::is_c_header_extension(ext)
 }
 
 /// Remove C++ scope prefixes, preserving destructor and operator names.

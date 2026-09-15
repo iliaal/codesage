@@ -138,6 +138,20 @@ fn rust_crate_fn_resolves_within_src_root_but_not_from_integration_tests() {
 }
 
 #[test]
+fn rust_pub_super_item_resolves_from_parent_module_file() {
+    let db = fixture_db("rust");
+    assert_eq!(
+        visibility_of(&db, "src/store/cache.rs", "evict"),
+        Some(Visibility::Crate)
+    );
+    assert_eq!(
+        dependents(&db, "evict"),
+        BTreeSet::from(["src/store.rs".to_string()])
+    );
+    assert!(path_found(&db, "open_public", "evict"));
+}
+
+#[test]
 fn rust_pub_items_and_trait_impl_methods_resolve_cross_file() {
     let db = fixture_db("rust");
     assert_eq!(

@@ -23,6 +23,7 @@ fn private_fn() {}
 pub(crate) fn crate_fn() {}
 pub(super) fn super_fn() {}
 pub(in crate::a) fn in_fn() {}
+pub(in crate) fn in_crate_fn() {}
 pub(self) fn self_fn() {}
 struct PrivateStruct;
 pub struct PublicStruct;
@@ -67,8 +68,11 @@ fn rust_free_items_carry_modifier_visibility() {
     assert_eq!(visibility_of(&syms, "exported"), Some(Visibility::Public));
     assert_eq!(visibility_of(&syms, "private_fn"), Some(Visibility::Module));
     assert_eq!(visibility_of(&syms, "crate_fn"), Some(Visibility::Crate));
-    assert_eq!(visibility_of(&syms, "super_fn"), Some(Visibility::Module));
-    assert_eq!(visibility_of(&syms, "in_fn"), Some(Visibility::Module));
+    // Ancestor-scoped reach is recorded as Crate: the Module gate covers only
+    // the defining module's subtree, which is narrower than `super`.
+    assert_eq!(visibility_of(&syms, "super_fn"), Some(Visibility::Crate));
+    assert_eq!(visibility_of(&syms, "in_fn"), Some(Visibility::Crate));
+    assert_eq!(visibility_of(&syms, "in_crate_fn"), Some(Visibility::Crate));
     assert_eq!(visibility_of(&syms, "self_fn"), Some(Visibility::Module));
     assert_eq!(
         visibility_of(&syms, "PrivateStruct"),
@@ -203,6 +207,13 @@ fn c_static_in_header_stays_unknown() {
     let syms = symbols(C_SOURCE, Language::C, "include/util.h");
     assert_eq!(visibility_of(&syms, "file_helper"), None);
     assert_eq!(visibility_of(&syms, "FILE_LIMIT"), None);
+    // Every header extension the language router indexes is exempt.
+    for path in ["k.hh", "k.hpp", "k.hxx", "k.h++", "k.cuh", "k.tpp", "k.ipp"] {
+        let syms = symbols(C_SOURCE, Language::Cpp, path);
+        assert_eq!(visibility_of(&syms, "file_helper"), None, "{path}");
+    }
+    let syms = symbols(C_SOURCE, Language::Cpp, "k.cu");
+    assert_eq!(visibility_of(&syms, "file_helper"), Some(Visibility::File));
 }
 
 const CPP_SOURCE: &str = r#"

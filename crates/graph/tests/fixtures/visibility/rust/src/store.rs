@@ -1,5 +1,7 @@
 mod cache;
 
+use self::cache::evict;
+
 pub struct Store;
 
 pub trait Backend {
@@ -19,5 +21,5 @@ pub(crate) fn crate_only() -> u8 {
 }
 
 pub fn open_public() -> u8 {
-    open_private() + cache::cached()
+    open_private() + cache::cached() + evict()
 }

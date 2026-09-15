@@ -33,6 +33,16 @@ pub fn detect_language_with_dialect(path: &Path, header_is_cpp: bool) -> Option<
     }
 }
 
+/// Every header extension the routing above indexes as C or C++. A `static`
+/// definition in one of these is textually included, so symbol extraction
+/// leaves its visibility unknown instead of file-local.
+pub fn is_c_header_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "h" | "hh" | "hpp" | "hxx" | "h++" | "cuh" | "tpp" | "ipp"
+    )
+}
+
 /// Extensions that switch project-wide `.h` parsing to C++.
 pub fn is_unambiguous_cpp_extension(ext: &str) -> bool {
     matches!(

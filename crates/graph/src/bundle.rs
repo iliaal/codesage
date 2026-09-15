@@ -541,9 +541,12 @@ pub(crate) fn resolve_callee_definitions_with_imports(
 ) -> Result<Vec<Symbol>> {
     // Gate before any strategy runs: a candidate the caller cannot name must
     // not resurface through a looser tier (lone-candidate return, case fold,
-    // import evidence).
-    let candidates: Vec<Symbol> = db
-        .find_symbols(to_name, None)?
+    // import evidence). The lone-candidate shortcut keys on the pre-gate
+    // count, so a homonym set the gate thins to one survivor still owes the
+    // same import evidence as the full set did.
+    let all_candidates = db.find_symbols(to_name, None)?;
+    let total_candidates = all_candidates.len();
+    let candidates: Vec<Symbol> = all_candidates
         .into_iter()
         .filter(|s| visibility_admits(s, caller_file))
         .collect();
@@ -566,7 +569,7 @@ pub(crate) fn resolve_callee_definitions_with_imports(
             return Ok(folded);
         }
     }
-    if candidates.len() <= 1 {
+    if total_candidates <= 1 {
         return Ok(candidates);
     }
     let import_refs = load_imports()?;
@@ -589,7 +592,9 @@ pub(crate) fn resolve_callee_definitions_with_imports(
 }
 
 /// Whether a reference in `caller_file` may name `sym` under its recorded
-/// visibility. Unknown visibility admits; the gate only ever removes.
+/// visibility. Unknown visibility, and an undecidable crate boundary, admit:
+/// this filter narrows the candidate set and never adds evidence, so the
+/// tiers after it still apply.
 pub(crate) fn visibility_admits(sym: &Symbol, caller_file: &str) -> bool {
     if sym.file_path == caller_file {
         return true;
@@ -599,20 +604,30 @@ pub(crate) fn visibility_admits(sym: &Symbol, caller_file: &str) -> bool {
         Some(Visibility::File) => false,
         Some(Visibility::Module) => rust_module_subtree(&sym.file_path)
             .is_some_and(|prefix| caller_file.starts_with(&prefix)),
+        // Same `src/` root approximates the crate; `src/bin/*.rs` is a
+        // separate target admitted by that approximation. A caller with no
+        // root that still sits under the definition's package directory
+        // (`tests/`, `benches/`, `build.rs`) is a sibling target and cannot
+        // see the item. Anything else — a flat layout, a `[lib] path`
+        // override, an index rooted inside `src/` — is undecidable and admits.
         Some(Visibility::Crate) => match (
             importer_src_root(caller_file),
             importer_src_root(&sym.file_path),
         ) {
             (Some(a), Some(b)) => a == b,
-            _ => false,
+            (None, Some(def_root)) => {
+                let package_dir = def_root.strip_suffix("src/").unwrap_or(def_root);
+                !caller_file.starts_with(package_dir)
+            }
+            (_, None) => true,
         },
     }
 }
 
 /// Path approximation of a Rust module's descendants: `a/b.rs` owns `a/b/`,
 /// while `mod.rs`, `lib.rs`, and `main.rs` own their own directory. `#[path]`
-/// attributes and `include!` are not modelled, and `pub(in path)` collapses
-/// to this same rule.
+/// attributes and `include!` are not modelled; `pub(super)` and `pub(in path)`
+/// are recorded as Crate rather than squeezed into this rule.
 fn rust_module_subtree(def_file: &str) -> Option<String> {
     let (dir, name) = def_file
         .rsplit_once('/')
@@ -1459,6 +1474,78 @@ mod context_export_tests {
         let top_crate = visible("f", "src/x.rs", Some(Visibility::Crate));
         assert!(visibility_admits(&top_crate, "src/y.rs"));
         assert!(!visibility_admits(&top_crate, "build.rs"));
+        assert!(!visibility_admits(&top_crate, "tests/t.rs"));
+        // No `src/` root on the definition side is undecidable, and
+        // undecidable admits; so is a rootless caller outside the package.
+        let flat = visible("f", "helper.rs", Some(Visibility::Crate));
+        assert!(visibility_admits(&flat, "main.rs"));
+        assert!(visibility_admits(&flat, "sub/other.rs"));
+        let flat_def = visible("f", "lib/helper.rs", Some(Visibility::Crate));
+        assert!(visibility_admits(&flat_def, "src/main.rs"));
+        assert!(visibility_admits(&crate_level, "tools/gen.rs"));
+    }
+
+    #[test]
+    fn flat_layout_crate_item_resolves() {
+        let db = Database::open_in_memory().unwrap();
+        let helper = db
+            .upsert_file(&FileInfo {
+                path: "helper.rs".to_string(),
+                language: Language::Rust,
+                content_hash: "h".to_string(),
+            })
+            .unwrap();
+        db.insert_symbols(
+            helper,
+            &[visible("shared", "helper.rs", Some(Visibility::Crate))],
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_callee_definitions(&db, "main.rs", "shared")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// The gate may thin a homonym set to one survivor; that survivor still
+    /// owes the import evidence the full set owed, so no edge is invented.
+    #[test]
+    fn gate_survivor_of_homonym_set_still_needs_import_evidence() {
+        let db = Database::open_in_memory().unwrap();
+        let add = |path: &str, visibility| {
+            let id = db
+                .upsert_file(&FileInfo {
+                    path: path.to_string(),
+                    language: Language::Rust,
+                    content_hash: path.to_string(),
+                })
+                .unwrap();
+            db.insert_symbols(id, &[visible("parse", path, visibility)])
+                .unwrap();
+        };
+        add("b.rs", Some(Visibility::Module));
+        add("c.rs", Some(Visibility::Public));
+
+        let no_imports = &mut || Ok(Arc::new(Vec::new()));
+        let one_survivor =
+            resolve_callee_definitions_with_imports(&db, "a.rs", "parse", no_imports).unwrap();
+        assert!(one_survivor.is_empty(), "{one_survivor:?}");
+
+        let mut imported = || Ok(Arc::new(vec!["c::parse".to_string()]));
+        let evidenced =
+            resolve_callee_definitions_with_imports(&db, "a.rs", "parse", &mut imported).unwrap();
+        assert_eq!(evidenced.len(), 1);
+        assert_eq!(evidenced[0].file_path, "c.rs");
+
+        add("d.rs", Some(Visibility::Public));
+        let two_survivors =
+            resolve_callee_definitions_with_imports(&db, "a.rs", "parse", no_imports).unwrap();
+        assert!(two_survivors.is_empty(), "{two_survivors:?}");
+        let evidenced =
+            resolve_callee_definitions_with_imports(&db, "a.rs", "parse", &mut imported).unwrap();
+        assert_eq!(evidenced.len(), 1);
+        assert_eq!(evidenced[0].file_path, "c.rs");
     }
 
     #[test]
