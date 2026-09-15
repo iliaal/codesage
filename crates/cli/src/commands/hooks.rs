@@ -113,6 +113,7 @@ pub(crate) fn install_hooks_at(
 /// Keep the configured device: mixing CPU/CUDA vectors would violate the fingerprint.
 pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
     let bin = shell_single_quote(bin);
+    let stale_min = codesage_graph::hook_health::STALE_LOCK_SECS / 60;
     format!(
         "#!/bin/sh\n\
          # installed by codesage install-hooks\n\
@@ -208,26 +209,52 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
          pidfile=\"$lockdir/pid\"\n\
          # Single-flight: rapid commits must not queue serial full passes.\n\
          # `mkdir` is atomic; the loser logs and exits 0 — the winner's stamp\n\
-         # covers the same tree. The winner records its pid inside the lock\n\
-         # so a SIGKILLed run (no trap runs on SIGKILL) is recognised by the\n\
-         # next fire: a lock whose pid is dead is reaped at once, whatever its\n\
-         # age. A lock without a pid file (written by an older hook) is a\n\
-         # SIGKILL orphan once it is 30 minutes old. The subshell's EXIT trap\n\
-         # releases the lock on every other path.\n\
+         # covers the same tree. The winner's subshell records its pid inside\n\
+         # the lock so a SIGKILLed run (no trap runs on SIGKILL) is recognised\n\
+         # by the next fire: a lock whose pid is dead, or belongs to a process\n\
+         # that is not a hook run (pid reuse), is reaped at once whatever its\n\
+         # age. Any lock older than {stale_min} minutes is reaped as well — a\n\
+         # run waits at most 60 s per pass on the project lock, so no live run\n\
+         # holds the lock that long — which also covers locks written by older\n\
+         # hooks that carry no pid file. Reapers serialise through a second\n\
+         # `mkdir` (`.reap`): the holder re-reads the pid, renames the lock\n\
+         # away, and re-creates it, so of N concurrent fires exactly one\n\
+         # proceeds and a lock that was already reaped and re-taken is left\n\
+         # alone. A `.reap` orphaned by a crash mid-reap ages out like the\n\
+         # lock itself.\n\
          lockpid=\"\"\n\
          if [ -f \"$pidfile\" ] && [ ! -L \"$pidfile\" ]; then\n\
            lockpid=\"$(head -c 32 \"$pidfile\" 2>/dev/null)\"\n\
            case $lockpid in ''|*[!0-9]*) lockpid=\"\" ;; esac\n\
          fi\n\
-         # `kill -0` fails with EPERM on another user's live process; `ps -p`\n\
-         # answers that case.\n\
-         pid_alive() {{ kill -0 \"$1\" 2>/dev/null || ps -p \"$1\" >/dev/null 2>&1; }}\n\
+         # A live pid counts only if its command line is a hook run (this\n\
+         # hooks directory or the codesage binary); anything else is reuse.\n\
+         hook_alive() {{\n\
+           args=\"$(ps -p \"$1\" -o args= 2>/dev/null)\" || return 1\n\
+           case $args in *codesage*|*\"$(dirname \"$0\")/\"*) return 0 ;; esac\n\
+           return 1\n\
+         }}\n\
+         [ -n \"$(find \"$lockdir.reap\" -mmin +{stale_min} 2>/dev/null)\" ] && rmdir \"$lockdir.reap\" 2>/dev/null\n\
+         # The reap is logged by whoever renamed the lock away, even if a\n\
+         # plain `mkdir` from another fire wins the re-creation: that fire\n\
+         # runs, this one skips, and the tree is covered either way.\n\
+         claim_lock() {{\n\
+           mkdir \"$lockdir.reap\" 2>/dev/null || return 1\n\
+           claimed=1\n\
+           if [ \"$(head -c 32 \"$pidfile\" 2>/dev/null)\" = \"$1\" ] && mv \"$lockdir\" \"$lockdir.dead.$$\" 2>/dev/null; then\n\
+             rm -rf \"$lockdir.dead.$$\"\n\
+             echo \"[$(date)] $(basename \"$0\") reaped $2 lock${{1:+ pid=$1}}\" >>\"$log\"\n\
+             mkdir \"$lockdir\" 2>/dev/null && claimed=0\n\
+           fi\n\
+           rmdir \"$lockdir.reap\" 2>/dev/null\n\
+           return \"$claimed\"\n\
+         }}\n\
          if mkdir \"$lockdir\" 2>/dev/null; then\n\
            :\n\
-         elif [ -n \"$lockpid\" ] && ! pid_alive \"$lockpid\" && rm -f \"$pidfile\" && rmdir \"$lockdir\" 2>/dev/null && mkdir \"$lockdir\" 2>/dev/null; then\n\
-           echo \"[$(date)] $(basename \"$0\") reaped dead lock pid=$lockpid\" >>\"$log\"\n\
-         elif [ -z \"$lockpid\" ] && [ -n \"$(find \"$lockdir\" -mmin +30 2>/dev/null)\" ] && rmdir \"$lockdir\" 2>/dev/null && mkdir \"$lockdir\" 2>/dev/null; then\n\
-           echo \"[$(date)] $(basename \"$0\") reaped stale lock\" >>\"$log\"\n\
+         elif [ -n \"$lockpid\" ] && ! hook_alive \"$lockpid\" && claim_lock \"$lockpid\" dead; then\n\
+           :\n\
+         elif [ -n \"$(find \"$lockdir\" -mmin +{stale_min} 2>/dev/null)\" ] && claim_lock \"$lockpid\" stale; then\n\
+           :\n\
          else\n\
            echo \"[$(date)] $(basename \"$0\") hook skip: another index already running\" >>\"$log\"\n\
            exit 0\n\
@@ -237,19 +264,28 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
          # shellcheck disable=SC2016 # the inner sh expands $PPID itself\n\
          ( pid=\"$(exec sh -c 'echo \"$PPID\"')\"\n\
            case $pid in ''|*[!0-9]*) pid=\"\" ;; esac\n\
+           # Release only a lock this run still owns: a reaper that took the\n\
+           # lock over must not have its lock removed by the run it displaced.\n\
            hook_exit() {{\n\
              rc=$?\n\
              echo \"[$(date)] $(basename \"$0\") hook exit=$rc pid=$pid\" >>\"$log\"\n\
-             rm -f \"$pidfile\"\n\
+             if [ -n \"$pid\" ]; then\n\
+               [ \"$(head -c 32 \"$pidfile\" 2>/dev/null)\" = \"$pid\" ] || return 0\n\
+               rm -f \"$pidfile\"\n\
+             elif [ -e \"$pidfile\" ]; then\n\
+               return 0\n\
+             fi\n\
              rmdir \"$lockdir\" 2>/dev/null\n\
            }}\n\
            trap hook_exit EXIT\n\
+           # sh runs a signal trap only after the foreground child returns, so\n\
+           # the exit line for INT/TERM follows the in-flight pass.\n\
            trap 'exit 130' INT\n\
            trap 'exit 143' TERM\n\
            # Same symlink guard as the state file: the pid write must land\n\
            # inside the lock directory and nowhere else.\n\
            if [ -n \"$pid\" ] && [ ! -L \"$pidfile\" ] && {{ [ ! -e \"$pidfile\" ] || [ -f \"$pidfile\" ]; }}; then\n\
-             printf '%s\\n' \"$pid\" >\"$pidfile\"\n\
+             printf '%s' \"$pid\" >\"$pidfile\"\n\
            fi\n\
            cd \"$root\" || exit 0\n\
            echo \"[$(date)] $(basename \"$0\") hook start pid=$pid\" >>\"$log\"\n\
@@ -1148,8 +1184,29 @@ mod tests {
         let body = generate_post_commit_hook_body("/usr/local/bin/codesage");
         assert!(
             body.contains("pidfile=\"$lockdir/pid\"")
-                && body.contains("printf '%s\\n' \"$pid\" >\"$pidfile\""),
+                && body.contains("printf '%s' \"$pid\" >\"$pidfile\""),
             "the winner must record its pid inside the lock:\n{body}"
+        );
+        assert!(
+            body.contains("mkdir \"$lockdir.reap\" 2>/dev/null || return 1")
+                && body.contains(
+                    "[ \"$(head -c 32 \"$pidfile\" 2>/dev/null)\" = \"$1\" ] && mv \"$lockdir\" \"$lockdir.dead.$$\" 2>/dev/null"
+                ),
+            "reaping must hold the .reap mutex, re-read the pid, and rename the lock away:\n{body}"
+        );
+        assert!(
+            body.contains("[ \"$(head -c 32 \"$pidfile\" 2>/dev/null)\" = \"$pid\" ] || return 0"),
+            "the EXIT trap must release only a lock this run still owns:\n{body}"
+        );
+        assert!(
+            body.contains("ps -p \"$1\" -o args="),
+            "a live pid must be believed only when its command line is a hook run:\n{body}"
+        );
+        let stale_min = codesage_graph::hook_health::STALE_LOCK_SECS / 60;
+        assert!(
+            body.contains(&format!("-mmin +{stale_min} "))
+                && body.contains(&format!("{stale_min} minutes")),
+            "the age ceiling must come from STALE_LOCK_SECS:\n{body}"
         );
         assert!(
             body.contains("[ ! -L \"$pidfile\" ]"),
@@ -1160,8 +1217,9 @@ mod tests {
             "start and exit lines must carry the pid:\n{body}"
         );
         assert!(
-            body.contains("reaped dead lock pid=$lockpid")
-                && body.contains("reaped stale lock")
+            body.contains("reaped $2 lock${1:+ pid=$1}")
+                && body.contains("claim_lock \"$lockpid\" dead")
+                && body.contains("claim_lock \"$lockpid\" stale")
                 && body.contains("-mmin +30"),
             "dead-pid reap must coexist with the 30-minute age reap:\n{body}"
         );
@@ -1217,6 +1275,64 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(!lockdir.exists(), "lock must be released after the run");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_commit_hook_concurrent_fires_reap_a_dead_lock_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_repo_with_one_commit(root);
+        let hook = install_hook_with_stub(root, "#!/bin/sh\nsleep 1\nexit 0\n");
+        let log = root.join(".codesage/hooks.log");
+        let lockdir = root.join(".codesage/hook-index.lock");
+        std::fs::create_dir_all(&lockdir).unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        std::fs::write(lockdir.join("pid"), dead.to_string()).unwrap();
+
+        const FIRES: usize = 6;
+        let children: Vec<_> = (0..FIRES)
+            .map(|_| {
+                std::process::Command::new(&hook)
+                    .current_dir(root)
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for mut c in children {
+            assert!(c.wait().unwrap().success());
+        }
+        wait_for_log(&log, "hook exit=0");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let content = loop {
+            let c = std::fs::read_to_string(&log).unwrap_or_default();
+            let settled = c.matches("hook exit=").count()
+                + c.matches("another index already running").count();
+            if settled >= FIRES || std::time::Instant::now() >= deadline {
+                break c;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert_eq!(
+            content.matches("hook start").count(),
+            1,
+            "exactly one fire may claim the dead lock:\n{content}"
+        );
+        assert_eq!(content.matches("reaped dead lock").count(), 1, "{content}");
+        assert_eq!(
+            content.matches("another index already running").count(),
+            FIRES - 1,
+            "{content}"
+        );
+        assert_eq!(content.matches("hook exit=").count(), 1, "{content}");
+        assert!(
+            std::fs::read_dir(root.join(".codesage"))
+                .unwrap()
+                .all(|e| !e.unwrap().file_name().to_string_lossy().contains(".dead.")),
+            "no graveyard directory left behind"
+        );
     }
 
     #[cfg(unix)]

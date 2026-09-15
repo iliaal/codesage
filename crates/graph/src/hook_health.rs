@@ -12,15 +12,19 @@ use codesage_protocol::{HookHealth, HookLockState};
 use crate::drift::git_common_dir;
 
 /// Hooks `codesage install-hooks` wires for indexing.
-pub const INDEXING_HOOKS: &[&str] = &["post-commit", "post-merge", "post-checkout", "post-rewrite"];
+pub(crate) const INDEXING_HOOKS: &[&str] =
+    &["post-commit", "post-merge", "post-checkout", "post-rewrite"];
 
 /// Marker the installer writes into every hook body it owns.
-pub const HOOK_MARKER: &str = "codesage install-hooks";
+pub(crate) const HOOK_MARKER: &str = "codesage install-hooks";
 
 pub const LOCK_DIR: &str = ".codesage/hook-index.lock";
 pub const LOG_FILE: &str = ".codesage/hooks.log";
 
-/// A lock this old without a pid file is reaped by the next hook fire.
+/// A lock this old is an orphan whatever its pid says: a hook run waits at
+/// most 60 s per pass on the project lock and never holds this one for 30
+/// minutes. The hook template interpolates this value (in minutes) into its
+/// `find -mmin` reap, so the two sites cannot drift.
 pub const STALE_LOCK_SECS: u64 = 30 * 60;
 
 /// How much of the log tail is scanned for the last run and exit lines.
@@ -31,10 +35,13 @@ pub const LOCK_HELD_LIVE: &str = "held_live";
 pub const LOCK_HELD_DEAD: &str = "held_dead";
 pub const LOCK_HELD_NO_PID: &str = "held_no_pid";
 
-/// Directory Git runs hooks from for this checkout. Honors `core.hooksPath`
-/// (absolute or root-relative); a Husky runtime dir (`…/_`) is mapped to the
-/// user hooks directory beside it, where the installer writes.
-pub fn hooks_dir(root: &Path) -> Option<PathBuf> {
+/// Directory Git runs hooks from for this checkout; `None` outside a Git
+/// repository, even when a global `core.hooksPath` is set. Honors
+/// `core.hooksPath` (absolute or root-relative); a Husky runtime dir (`…/_`)
+/// is mapped to the user hooks directory beside it, where the installer
+/// writes.
+pub(crate) fn hooks_dir(root: &Path) -> Option<PathBuf> {
+    let common = git_common_dir(root)?;
     let configured = Command::new("git")
         .args(["config", "--type=path", "--get", "core.hooksPath"])
         .current_dir(root)
@@ -59,12 +66,12 @@ pub fn hooks_dir(root: &Path) -> Option<PathBuf> {
             }
             Some(resolved)
         }
-        None => git_common_dir(root).map(|common| common.join("hooks")),
+        None => Some(common.join("hooks")),
     }
 }
 
 /// Names from `INDEXING_HOOKS` whose file in `hooks_dir` carries the marker.
-pub fn installed_hooks(hooks_dir: &Path) -> Vec<String> {
+pub(crate) fn installed_hooks(hooks_dir: &Path) -> Vec<String> {
     INDEXING_HOOKS
         .iter()
         .filter(|name| {
@@ -88,25 +95,58 @@ pub fn inspect(root: &Path) -> Option<HookHealth> {
     })
 }
 
-/// Remove the lock when its recorded pid is dead. Returns the reaped pid.
-/// A live pid, a lock without a pid, and an absent lock are left alone.
-pub fn reap_dead_lock(root: &Path) -> Result<Option<u32>> {
-    let state = lock_state(root);
-    if state.state != LOCK_HELD_DEAD {
+/// Remove a lock no hook run can own: its recorded pid is dead or belongs to
+/// an unrelated process, or its holder is live but the lock is older than
+/// `STALE_LOCK_SECS`. Returns the state that was reaped. A fresh live lock,
+/// a lock without a pid, and an absent lock are left alone.
+///
+/// Reapers serialise through the hook's `.reap` mutex directory; under it the
+/// state is re-read, the lock renamed away, and removed, so a concurrent hook
+/// fire and doctor cannot both believe they reaped it. `Ok(None)` also covers
+/// a mutex already held by another reaper.
+pub fn reap_orphan_lock(root: &Path) -> Result<Option<HookLockState>> {
+    if !is_reapable(&lock_state(root)) {
         return Ok(None);
     }
     let lockdir = root.join(LOCK_DIR);
-    let pidfile = lockdir.join("pid");
-    match std::fs::remove_file(&pidfile) {
+    let mutex = root.join(format!("{LOCK_DIR}.reap"));
+    match std::fs::create_dir(&mutex) {
         Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("removing {}", pidfile.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("creating {}", mutex.display())),
     }
-    match std::fs::remove_dir(&lockdir) {
-        Ok(()) => Ok(state.pid),
-        // The hook itself won the race; the lock is gone either way.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(state.pid),
-        Err(e) => Err(e).with_context(|| format!("removing {}", lockdir.display())),
+    let _release = ReleaseOnDrop(&mutex);
+
+    let state = lock_state(root);
+    if !is_reapable(&state) {
+        return Ok(None);
+    }
+    let graveyard = root.join(format!("{LOCK_DIR}.dead.{}", std::process::id()));
+    match std::fs::rename(&lockdir, &graveyard) {
+        Ok(()) => {}
+        // A hook fire claimed it first; the lock is gone either way.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Some(state)),
+        Err(e) => return Err(e).with_context(|| format!("renaming {}", lockdir.display())),
+    }
+    let removed = if graveyard.is_dir() {
+        std::fs::remove_dir_all(&graveyard)
+    } else {
+        std::fs::remove_file(&graveyard)
+    };
+    removed.with_context(|| format!("removing {}", graveyard.display()))?;
+    Ok(Some(state))
+}
+
+fn is_reapable(state: &HookLockState) -> bool {
+    let stale = state.age_secs.is_some_and(|a| a >= STALE_LOCK_SECS);
+    state.state == LOCK_HELD_DEAD || (state.state == LOCK_HELD_LIVE && stale)
+}
+
+struct ReleaseOnDrop<'a>(&'a Path);
+
+impl Drop for ReleaseOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(self.0);
     }
 }
 
@@ -136,7 +176,7 @@ pub fn lock_state(root: &Path) -> HookLockState {
         .flatten();
     let state = match pid {
         None => LOCK_HELD_NO_PID,
-        Some(pid) if pid_alive(pid) => LOCK_HELD_LIVE,
+        Some(pid) if hook_run_alive(pid) => LOCK_HELD_LIVE,
         Some(_) => LOCK_HELD_DEAD,
     };
     HookLockState {
@@ -160,10 +200,33 @@ fn read_pid(pidfile: &Path) -> Option<u32> {
     (pid > 0).then_some(pid)
 }
 
+/// A live pid counts as the lock holder only when its command line is a hook
+/// run: it names the codesage binary or a hooks directory. A recycled pid
+/// pointing at an unrelated process is treated as dead.
+fn hook_run_alive(pid: u32) -> bool {
+    if !pid_alive(pid) {
+        return false;
+    }
+    let Ok(out) = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "args="])
+        .output()
+    else {
+        // No usable `ps`: liveness alone has to do.
+        return true;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let args = String::from_utf8_lossy(&out.stdout);
+    let args = args.trim();
+    !args.is_empty()
+        && (args.contains("codesage") || args.contains("/hooks/") || args.contains(".husky"))
+}
+
 /// `kill(pid, 0)`: ESRCH is the only proof of death. EPERM means a live
 /// process owned by another user. Off Unix nothing is provably dead.
 #[cfg(unix)]
-pub fn pid_alive(pid: u32) -> bool {
+pub(crate) fn pid_alive(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return true;
     };
@@ -177,13 +240,14 @@ pub fn pid_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-pub fn pid_alive(_pid: u32) -> bool {
+pub(crate) fn pid_alive(_pid: u32) -> bool {
     true
 }
 
-/// (timestamp of the newest `hook start` line, exit code of a `hook exit=`
-/// line logged after it). Scans only the log tail; a missing, non-regular,
-/// or unreadable log yields `(None, None)`.
+/// (timestamp of the newest `hook start` line, exit code of the newest
+/// `hook exit=` line at or after it). Scans only the log tail; a missing,
+/// non-regular, or unreadable log yields `(None, None)`, and a start line
+/// outside the window yields `(None, last_exit)`.
 fn parse_log_tail(log: &Path) -> (Option<String>, Option<i32>) {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -234,12 +298,12 @@ fn parse_log_text(text: &str, truncated_head: bool) -> (Option<String>, Option<i
             return (stamp, last_exit);
         }
     }
-    (None, None)
+    (None, last_exit)
 }
 
 /// Unix seconds as `YYYY-MM-DDTHH:MM:SSZ` (proleptic Gregorian, no leap
 /// seconds), avoiding a date-time dependency for one field.
-pub fn format_utc(unix: u64) -> String {
+pub(crate) fn format_utc(unix: u64) -> String {
     let days = unix / 86_400;
     let secs = unix % 86_400;
     // Howard Hinnant's civil-from-days.
@@ -302,6 +366,24 @@ mod tests {
             parse_log_text("garbage] post-commit hook start\n", true),
             (None, None)
         );
+        assert_eq!(
+            parse_log_text(
+                "start pid=9 fell before the window\n[Sun Sep 14 07:09:41 UTC 2026] post-merge hook exit=7 pid=9\n",
+                true
+            ),
+            (None, Some(7)),
+            "an exit parsed inside the window survives a start line outside it"
+        );
+    }
+
+    #[test]
+    fn stale_lock_ceiling_is_a_whole_number_of_minutes_for_the_template() {
+        assert_eq!(
+            STALE_LOCK_SECS % 60,
+            0,
+            "the hook interpolates minutes into find -mmin"
+        );
+        assert_eq!(STALE_LOCK_SECS / 60, 30);
     }
 
     #[cfg(unix)]
@@ -322,21 +404,66 @@ mod tests {
         let live = lock_state(root);
         assert_eq!(live.state, LOCK_HELD_LIVE);
         assert_eq!(live.pid, Some(std::process::id()));
-        assert_eq!(
-            reap_dead_lock(root).unwrap(),
-            None,
-            "a live lock is never reaped"
+        assert!(
+            reap_orphan_lock(root).unwrap().is_none(),
+            "a fresh live lock is never reaped"
         );
         assert!(lockdir.is_dir());
 
+        let old = SystemTime::now() - std::time::Duration::from_secs(STALE_LOCK_SECS + 60);
+        std::fs::File::open(&lockdir)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let stale_live = lock_state(root);
+        assert_eq!(stale_live.state, LOCK_HELD_LIVE);
+        assert!(stale_live.age_secs.is_some_and(|a| a >= STALE_LOCK_SECS));
+        let reaped = reap_orphan_lock(root)
+            .unwrap()
+            .expect("stale live lock is reaped");
+        assert_eq!(reaped.state, LOCK_HELD_LIVE);
+        assert!(!lockdir.exists(), "a live lock past the ceiling is removed");
+
+        std::fs::create_dir_all(&lockdir).unwrap();
+        std::fs::write(lockdir.join("pid"), "1").unwrap();
+        assert_eq!(
+            lock_state(root).state,
+            LOCK_HELD_DEAD,
+            "pid 1 is alive but no hook run: reuse reads as dead"
+        );
+        assert!(reap_orphan_lock(root).unwrap().is_some());
+        assert!(!lockdir.exists());
+
+        std::fs::create_dir_all(&lockdir).unwrap();
         let dead = spawn_and_reap_pid();
         std::fs::write(lockdir.join("pid"), dead.to_string()).unwrap();
         let state = lock_state(root);
         assert_eq!(state.state, LOCK_HELD_DEAD);
         assert_eq!(state.pid, Some(dead));
-        assert_eq!(reap_dead_lock(root).unwrap(), Some(dead));
+        let reaped = reap_orphan_lock(root).unwrap().unwrap();
+        assert_eq!(reaped.pid, Some(dead));
         assert!(!lockdir.exists(), "dead-pid lock must be removed");
         assert_eq!(lock_state(root).state, LOCK_ABSENT);
+        assert!(
+            std::fs::read_dir(root.join(".codesage")).unwrap().all(|e| {
+                let name = e.unwrap().file_name().to_string_lossy().into_owned();
+                !name.contains(".dead.") && !name.ends_with(".reap")
+            }),
+            "no graveyard or mutex directory left behind"
+        );
+
+        std::fs::create_dir_all(&lockdir).unwrap();
+        std::fs::write(lockdir.join("pid"), dead.to_string()).unwrap();
+        let mutex = root.join(format!("{LOCK_DIR}.reap"));
+        std::fs::create_dir(&mutex).unwrap();
+        assert!(
+            reap_orphan_lock(root).unwrap().is_none(),
+            "another reaper holds the mutex: leave the lock to it"
+        );
+        assert!(lockdir.is_dir() && mutex.is_dir());
+        std::fs::remove_dir(&mutex).unwrap();
+        assert!(reap_orphan_lock(root).unwrap().is_some());
+        assert!(!lockdir.exists());
     }
 
     #[test]
@@ -353,7 +480,7 @@ mod tests {
             std::fs::write(root.join("planted"), "1\n").unwrap();
             std::os::unix::fs::symlink(root.join("planted"), lockdir.join("pid")).unwrap();
             assert_eq!(lock_state(root).state, LOCK_HELD_NO_PID);
-            assert_eq!(reap_dead_lock(root).unwrap(), None);
+            assert!(reap_orphan_lock(root).unwrap().is_none());
             assert!(lockdir.is_dir());
         }
     }
@@ -362,7 +489,11 @@ mod tests {
     fn inspect_is_none_outside_git_and_lists_marked_hooks_inside() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        assert!(inspect(root).is_none());
+        assert!(
+            inspect(root).is_none(),
+            "a non-repository yields nothing even when ~/.gitconfig sets core.hooksPath"
+        );
+        assert!(hooks_dir(root).is_none());
 
         assert!(
             Command::new("git")
