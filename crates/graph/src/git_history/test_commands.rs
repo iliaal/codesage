@@ -3,8 +3,8 @@
 //! Everything here is derived from indexed paths, symbol rows, and manifest
 //! files that happen to exist under the project root. Nothing is executed.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Component, Path};
 
 use anyhow::Result;
 use codesage_protocol::{InlineTestModule, Symbol, SymbolKind, TestCommand};
@@ -61,19 +61,82 @@ fn shell_safe_byte(b: u8) -> bool {
 /// Quote one shell word with POSIX single quotes when it holds anything
 /// outside `[A-Za-z0-9_./:@%+=,-]`; a clean token is returned unchanged so
 /// ordinary commands stay readable.
-pub(crate) fn shell_quote(token: &str) -> String {
+fn shell_quote(token: &str) -> String {
     if !token.is_empty() && token.bytes().all(shell_safe_byte) {
         return token.to_string();
     }
     format!("'{}'", token.replace('\'', "'\\''"))
 }
 
-fn quoted_join(tokens: &[String]) -> String {
-    tokens
+/// A repo-relative path as a positional argument: one starting with `-`
+/// would be read as a runner flag, so it is anchored with `./` first.
+fn path_arg(path: &str) -> String {
+    if path.starts_with('-') {
+        shell_quote(&format!("./{path}"))
+    } else {
+        shell_quote(path)
+    }
+}
+
+fn path_args(paths: &[String]) -> String {
+    paths
         .iter()
-        .map(|t| shell_quote(t))
+        .map(|p| path_arg(p))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Whether a name token (cargo target, module filter, Java class) can be
+/// placed after a flag. None of these can legally start with `-`, so a
+/// token that does is dropped and named in a note rather than emitted.
+fn flag_safe(token: &str) -> bool {
+    !token.starts_with('-')
+}
+
+fn dropped_token_note(what: &str, token: &str) -> String {
+    format!("{what} `{token}` starts with `-` and was left out of `commands`")
+}
+
+/// One `[package] name` lookup per directory per request. `reads` counts
+/// manifest opens so tests can pin the memo.
+#[derive(Default)]
+struct ManifestMemo {
+    names: HashMap<String, Option<String>>,
+    reads: usize,
+}
+
+impl ManifestMemo {
+    /// `dir` is repo-relative; anything absolute or climbing with `..`
+    /// never reaches the filesystem.
+    fn package_name(&mut self, root: &Path, dir: &str) -> Option<String> {
+        if !safe_relative_dir(dir) {
+            return None;
+        }
+        if let Some(cached) = self.names.get(dir) {
+            return cached.clone();
+        }
+        let manifest = if dir.is_empty() {
+            root.join("Cargo.toml")
+        } else {
+            root.join(dir).join("Cargo.toml")
+        };
+        self.reads += 1;
+        let name = std::fs::metadata(&manifest)
+            .ok()
+            .filter(|m| m.is_file() && m.len() <= MAX_SOURCE_BYTES)
+            .and_then(|_| std::fs::read_to_string(&manifest).ok())
+            .and_then(|text| cargo_package_name(&text));
+        self.names.insert(dir.to_string(), name.clone());
+        name
+    }
+}
+
+fn safe_relative_dir(dir: &str) -> bool {
+    let path = Path::new(dir);
+    !path.is_absolute()
+        && path
+            .components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
 fn source_rank(source: &str) -> u8 {
@@ -85,9 +148,18 @@ fn source_rank(source: &str) -> u8 {
 }
 
 pub(super) fn derive(db: &Database, ctx: &CommandContext<'_>) -> Result<Derived> {
-    let (inline, modules) = inline_commands(db, ctx)?;
-    let (feature, notes) = feature_commands(db, ctx.changed)?;
-    let convention = convention_commands(ctx.root, ctx.test_files, ctx.withheld_phpt);
+    let mut memo = ManifestMemo::default();
+    let mut notes = Vec::new();
+    let (inline, modules) = inline_commands(db, ctx, &mut memo, &mut notes)?;
+    let (feature, feature_notes) = feature_commands(db, ctx.changed)?;
+    notes.extend(feature_notes);
+    let convention = convention_commands(
+        ctx.root,
+        ctx.test_files,
+        ctx.withheld_phpt,
+        &mut memo,
+        &mut notes,
+    );
     let mut merged: Vec<TestCommand> = Vec::new();
     // The edited file's own tests lead; the mapped runner follows; the
     // convention sweep comes last. An identical string keeps the most
@@ -173,6 +245,8 @@ fn convention_commands(
     root: Option<&Path>,
     test_files: &[String],
     withheld_phpt: &[String],
+    memo: &mut ManifestMemo,
+    notes: &mut Vec<String>,
 ) -> Vec<TestCommand> {
     let mut out = Vec::new();
     // Rust targets are keyed by crate dir so one crate's targets collapse together.
@@ -188,8 +262,14 @@ fn convention_commands(
     for path in test_files {
         match extension(path) {
             "rs" => {
-                let krate = RustCrate::for_path(root, path);
+                let krate = RustCrate::for_path(root, path, memo);
                 let target = rust_integration_target(&krate, path);
+                if let Some(t) = &target
+                    && !flag_safe(t)
+                {
+                    notes.push(dropped_token_note("cargo test target", t));
+                    continue;
+                }
                 rust.entry(krate.dir.clone())
                     .or_insert_with(|| (krate, Vec::new()))
                     .1
@@ -241,7 +321,7 @@ fn convention_commands(
     if !python.is_empty() {
         python.sort();
         out.push(command(
-            format!("pytest {}", quoted_join(&python)),
+            format!("pytest {}", path_args(&python)),
             python,
             "pytest",
             SOURCE_CONVENTION,
@@ -255,7 +335,7 @@ fn convention_commands(
             ("vendor/bin/phpunit", "phpunit")
         };
         out.push(command(
-            format!("{runner} {}", quoted_join(&php)),
+            format!("{runner} {}", path_args(&php)),
             php,
             framework,
             SOURCE_CONVENTION,
@@ -269,7 +349,7 @@ fn convention_commands(
         }
         paths.sort();
         out.push(command(
-            format!("php run-tests.php {}", shell_quote(target)),
+            format!("php run-tests.php {}", path_arg(target)),
             paths,
             "run-tests",
             SOURCE_CONVENTION,
@@ -279,7 +359,7 @@ fn convention_commands(
         let dirs: Vec<String> = go_dirs.into_iter().collect();
         go_paths.sort();
         out.push(command(
-            format!("go test {}", quoted_join(&dirs)),
+            format!("go test {}", path_args(&dirs)),
             go_paths,
             "go",
             SOURCE_CONVENTION,
@@ -306,12 +386,16 @@ fn convention_commands(
             ("npx jest", "jest")
         };
         out.push(command(
-            format!("{runner} {}", quoted_join(&js)),
+            format!("{runner} {}", path_args(&js)),
             js,
             framework,
             SOURCE_CONVENTION,
         ));
     }
+    for class in java.keys().filter(|c| !flag_safe(c)) {
+        notes.push(dropped_token_note("Java test class", class));
+    }
+    java.retain(|class, _| flag_safe(class));
     if !java.is_empty() {
         let classes: Vec<String> = java.keys().map(|c| shell_quote(c)).collect();
         let mut covers: Vec<String> = java.values().flatten().cloned().collect();
@@ -353,9 +437,9 @@ struct RustCrate {
 }
 
 impl RustCrate {
-    fn for_path(root: Option<&Path>, path: &str) -> Self {
+    fn for_path(root: Option<&Path>, path: &str, memo: &mut ManifestMemo) -> Self {
         if let Some(root) = root
-            && let Some(found) = Self::nearest_manifest(root, path)
+            && let Some(found) = Self::nearest_manifest(root, path, memo)
         {
             return found;
         }
@@ -370,17 +454,10 @@ impl RustCrate {
         }
     }
 
-    fn nearest_manifest(root: &Path, path: &str) -> Option<Self> {
+    fn nearest_manifest(root: &Path, path: &str, memo: &mut ManifestMemo) -> Option<Self> {
         let mut dir = parent_dir(path).to_string();
         loop {
-            let manifest = if dir.is_empty() {
-                root.join("Cargo.toml")
-            } else {
-                root.join(&dir).join("Cargo.toml")
-            };
-            if let Ok(text) = std::fs::read_to_string(&manifest)
-                && let Some(name) = cargo_package_name(&text)
-            {
+            if let Some(name) = memo.package_name(root, &dir) {
                 return Some(Self {
                     dir,
                     name: Some(name),
@@ -568,6 +645,8 @@ fn python_test_count(symbols: &[Symbol]) -> usize {
 fn inline_commands(
     db: &Database,
     ctx: &CommandContext<'_>,
+    memo: &mut ManifestMemo,
+    notes: &mut Vec<String>,
 ) -> Result<(Vec<TestCommand>, Vec<InlineTestModule>)> {
     let test_set: BTreeSet<&str> = ctx.test_files.iter().map(String::as_str).collect();
     let mut commands = Vec::new();
@@ -584,7 +663,7 @@ fn inline_commands(
                 if symbols.iter().all(|s| s.kind != SymbolKind::Module) {
                     continue;
                 }
-                let krate = RustCrate::for_path(ctx.root, path);
+                let krate = RustCrate::for_path(ctx.root, path, memo);
                 let Some(module_path) = rust_module_path(&krate, path) else {
                     continue;
                 };
@@ -595,6 +674,10 @@ fn inline_commands(
                     } else {
                         format!("{module_path}::{name}")
                     };
+                    if !flag_safe(&module) {
+                        notes.push(dropped_token_note("cargo test filter", &module));
+                        continue;
+                    }
                     commands.push(command(
                         format!(
                             "cargo test{} {}",
@@ -631,7 +714,7 @@ fn inline_commands(
     if !python_files.is_empty() {
         python_files.sort();
         commands.push(command(
-            format!("pytest {}", quoted_join(&python_files)),
+            format!("pytest {}", path_args(&python_files)),
             python_files,
             "pytest",
             SOURCE_INLINE,
@@ -739,12 +822,69 @@ mod tests {
     }
 
     #[test]
+    fn path_arg_anchors_leading_dashes() {
+        assert_eq!(path_arg("-x_test.py"), "./-x_test.py");
+        assert_eq!(path_arg("-p evil.py"), "'./-p evil.py'");
+        assert_eq!(path_arg("tests/-x.py"), "tests/-x.py");
+        assert!(!flag_safe("-Dfoo"));
+        assert!(flag_safe("FooTest"));
+    }
+
+    #[test]
+    fn manifest_memo_rejects_escaping_dirs_without_touching_the_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut memo = ManifestMemo::default();
+        for bad in ["../x", "a/../../x", "/etc", "/"] {
+            assert_eq!(memo.package_name(dir.path(), bad), None, "{bad}");
+        }
+        assert_eq!(memo.reads, 0);
+        assert!(safe_relative_dir(""));
+        assert!(safe_relative_dir("crates/graph"));
+        assert!(safe_relative_dir("./crates"));
+    }
+
+    #[test]
+    fn manifest_memo_reads_each_directory_once_per_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |rel: &str, text: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        write("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
+        write("crates/graph/Cargo.toml", "[package]\nname = \"graph\"\n");
+        let mut memo = ManifestMemo::default();
+        for path in [
+            "crates/graph/src/a.rs",
+            "crates/graph/src/b.rs",
+            "crates/graph/src/deep/c.rs",
+            "crates/graph/tests/t.rs",
+            "crates/other/src/x.rs",
+        ] {
+            RustCrate::for_path(Some(root), path, &mut memo);
+        }
+        // Distinct directories visited: crates/graph/src, crates/graph/src/deep,
+        // crates/graph, crates/graph/tests, crates/other/src, crates/other,
+        // crates, "" — each opened once.
+        assert_eq!(memo.reads, 8, "{:?}", memo.names.keys().collect::<Vec<_>>());
+        assert_eq!(
+            memo.names.get("crates/graph").cloned().flatten().as_deref(),
+            Some("graph")
+        );
+    }
+
+    #[test]
     fn without_a_manifest_the_package_flag_is_omitted() {
-        let krate = RustCrate::for_path(None, "crates/graph/tests/risk_test.rs");
+        let mut memo = ManifestMemo::default();
+        let krate = RustCrate::for_path(None, "crates/graph/tests/risk_test.rs", &mut memo);
         assert_eq!(krate.dir, "crates/graph");
         assert_eq!(krate.name, None);
         assert_eq!(krate.package_flag(), "");
-        let target = |p: &str| rust_integration_target(&RustCrate::for_path(None, p), p);
+        let target = |p: &str| {
+            let mut memo = ManifestMemo::default();
+            rust_integration_target(&RustCrate::for_path(None, p, &mut memo), p)
+        };
         assert_eq!(
             target("crates/graph/tests/risk_test.rs").as_deref(),
             Some("risk_test")
@@ -772,7 +912,8 @@ mod tests {
         write("Cargo.toml", "[workspace]\nmembers = [\"tests/helper\"]\n");
         write("tests/helper/Cargo.toml", "[package]\nname = \"helper\"\n");
         write("tests/helper/src/lib.rs", "");
-        let krate = RustCrate::for_path(Some(root), "tests/helper/src/lib.rs");
+        let mut memo = ManifestMemo::default();
+        let krate = RustCrate::for_path(Some(root), "tests/helper/src/lib.rs", &mut memo);
         assert_eq!(krate.dir, "tests/helper");
         assert_eq!(krate.name.as_deref(), Some("helper"));
         assert_eq!(
@@ -781,7 +922,7 @@ mod tests {
         );
 
         // A workspace-only root manifest names no package.
-        let krate = RustCrate::for_path(Some(root), "src/lib.rs");
+        let krate = RustCrate::for_path(Some(root), "src/lib.rs", &mut memo);
         assert_eq!(krate.dir, "");
         assert_eq!(krate.name, None);
     }

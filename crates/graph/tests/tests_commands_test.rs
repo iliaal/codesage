@@ -222,6 +222,20 @@ fn hostile_file_names_are_single_quoted() {
 }
 
 #[test]
+fn leading_dash_paths_are_anchored_with_dot_slash() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "-x.py", "def f():\n    return 1\n");
+    write(root, "-x_test.py", "def test_f():\n    assert True\n");
+    let db = indexed(root);
+
+    let r = recs(root, &db, &["-x.py"]);
+
+    assert_eq!(commands(&r), vec!["pytest ./-x_test.py"]);
+    assert_eq!(find(&r, "pytest ./-x_test.py").covers, vec!["-x_test.py"]);
+}
+
+#[test]
 fn rust_paths_without_a_readable_manifest_omit_the_package_flag() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
