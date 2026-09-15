@@ -299,19 +299,14 @@ pub fn session_end(project_root: &Path, db: &Database, session_id: &str) -> Resu
 }
 
 /// Compute all non-trivial SCCs in the file-level load-time import graph,
-/// plus the count of file pairs excluded because every import between them
-/// is lazy. Each cycle is returned as a sorted member list; the outer Vec is
+/// plus the count of lazy-only file pairs that would have closed or enlarged
+/// a cycle. Each cycle is returned as a sorted member list; the outer Vec is
 /// sorted by (descending size, members) for stable equality across recompute.
 fn compute_cycles(db: &Database) -> Result<(Vec<Vec<String>>, u32)> {
-    let edges = db
-        .enumerate_file_import_edges()
-        .context("enumerate_file_import_edges")?;
-    let lazy_edges = db.lazy_import_pairs().context("lazy_import_pairs")?.len() as u32;
-    if edges.is_empty() {
-        return Ok((Vec::new(), lazy_edges));
-    }
-    let components = crate::scc::tarjan_scc(&edges)?;
-    let mut out: Vec<Vec<String>> = components
+    let cycles = crate::git_history::ImportCycles::load(db).context("loading import cycles")?;
+    let lazy_edges = cycles.suppressed_pairs.len() as u32;
+    let mut out: Vec<Vec<String>> = cycles
+        .components
         .into_iter()
         .filter(|c| c.len() >= 2)
         .map(|mut c| {

@@ -11,6 +11,13 @@ use rusqlite::params;
 
 use crate::schema::name_tail;
 
+/// Cross-file import pairs split by whether any load-time directive joins them.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ImportPairs {
+    pub eager: Vec<(String, String)>,
+    pub lazy_only: Vec<(String, String)>,
+}
+
 use super::{
     Database, get_index_state, row_enum, row_reference_kind, row_symbol_kind, set_index_state,
 };
@@ -496,25 +503,21 @@ impl Database {
     /// names unique to one file. A pair whose directives are all lazy
     /// (function-body imports) is excluded; see [`Self::lazy_import_pairs`].
     pub fn enumerate_file_import_edges(&self) -> Result<Vec<(String, String)>> {
-        self.file_import_pairs(false)
+        Ok(self.enumerate_file_import_pairs()?.eager)
     }
 
     /// Cross-file pairs connected only by lazy (function-body) import
     /// directives. These are the edges `enumerate_file_import_edges` drops.
     pub fn lazy_import_pairs(&self) -> Result<Vec<(String, String)>> {
-        self.file_import_pairs(true)
+        Ok(self.enumerate_file_import_pairs()?.lazy_only)
     }
 
-    fn file_import_pairs(&self, lazy_only: bool) -> Result<Vec<(String, String)>> {
-        // MIN(lazy) = 0 means at least one load-time directive joins the pair.
-        let having = if lazy_only {
-            "HAVING MIN(r.lazy) = 1"
-        } else {
-            "HAVING MIN(r.lazy) = 0"
-        };
-        let sql = format!(
-            r#"
-            SELECT f_from.path, f_to.path
+    /// Both partitions of the cross-file import graph from one pass over the
+    /// refs x symbols join. `MIN(lazy) = 0` means at least one load-time
+    /// directive joins the pair.
+    pub fn enumerate_file_import_pairs(&self) -> Result<ImportPairs> {
+        let sql = r#"
+            SELECT f_from.path, f_to.path, MIN(r.lazy)
             FROM refs r
             JOIN files f_from ON r.from_file_id = f_from.id
             JOIN symbols s ON (
@@ -534,16 +537,24 @@ impl Database {
                    OR (r.kind = 'import_binding' AND f_from.language = 'python'))
               AND f_from.path <> f_to.path
             GROUP BY f_from.path, f_to.path
-            {having}
-        "#
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        "#;
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut pairs = ImportPairs::default();
+        for row in stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })? {
+            let (from, to, min_lazy) = row?;
+            if min_lazy == 0 {
+                pairs.eager.push((from, to));
+            } else {
+                pairs.lazy_only.push((from, to));
+            }
+        }
+        Ok(pairs)
     }
 
     pub fn import_targets_for_file(&self, file_path: &str) -> Result<Vec<String>> {

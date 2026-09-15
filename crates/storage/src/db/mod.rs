@@ -27,7 +27,7 @@ pub use git_hist::{
     CoChangeRow, CoChangeWrite, GitFileRow, ONE_OFF_RANK_MULTIPLIER, RECURRING_SPAN_SECS,
 };
 pub use semantic::{RawSearchRow, SemanticFreshness, SemanticValidityToken, embedding_to_bytes};
-pub use structural::{FingerprintInput, StoredFingerprint};
+pub use structural::{FingerprintInput, ImportPairs, StoredFingerprint};
 
 /// Reject unknown stored enums as typed conversion errors; never relabel schema skew.
 pub(super) fn row_enum<T>(

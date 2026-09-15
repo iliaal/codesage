@@ -316,9 +316,11 @@ fn member_is_callee(property: &Node) -> bool {
             .is_some_and(|f| f.id() == member.id())
 }
 
-/// Node kinds whose body defers an import directive to call time. Languages
-/// missing here (PHP `use`, Java `import`, Go `import`) only admit imports at
-/// file or namespace scope, so nothing they emit can be lazy.
+/// Node kinds whose body defers an import directive to call time. Only
+/// languages that resolve imports at runtime qualify: a C/C++ `#include` in a
+/// function body is still textual inclusion, a Rust `use` in a function is a
+/// compile-time alias, and PHP `use`, Java `import`, and Go `import` are only
+/// admitted at file or namespace scope.
 fn lazy_scope_kinds(language: Language) -> &'static [&'static str] {
     match language {
         Language::Python => &["function_definition"],
@@ -330,15 +332,35 @@ fn lazy_scope_kinds(language: Language) -> &'static [&'static str] {
             "arrow_function",
             "method_definition",
         ],
-        Language::Rust => &["function_item", "closure_expression"],
-        Language::C => &["function_definition"],
-        Language::Cpp => &["function_definition", "lambda_expression"],
-        Language::Php | Language::Java | Language::Go => &[],
+        Language::Rust
+        | Language::C
+        | Language::Cpp
+        | Language::Php
+        | Language::Java
+        | Language::Go => &[],
     }
 }
 
-/// True when an import/include directive sits inside a function, method,
-/// closure, or arrow-function body for `language`.
+/// True when `function` is the callee of a call expression, directly or
+/// through parentheses: `(function () { ... })()` runs when its enclosing
+/// scope does, so it defers nothing by itself.
+fn is_immediately_invoked(function: &Node) -> bool {
+    let mut callee = *function;
+    let mut parent = function.parent();
+    while let Some(p) = parent {
+        if p.kind() != "parenthesized_expression" {
+            return p.kind() == "call_expression"
+                && p.child_by_field_name("function")
+                    .is_some_and(|f| f.id() == callee.id());
+        }
+        callee = p;
+        parent = p.parent();
+    }
+    false
+}
+
+/// True when an import directive sits inside a function, method, closure, or
+/// arrow-function body that is not immediately invoked, for `language`.
 fn import_is_lazy(node: &Node, language: Language) -> bool {
     let kinds = lazy_scope_kinds(language);
     if kinds.is_empty() {
@@ -346,7 +368,7 @@ fn import_is_lazy(node: &Node, language: Language) -> bool {
     }
     let mut current = node.parent();
     while let Some(n) = current {
-        if kinds.contains(&n.kind()) {
+        if kinds.contains(&n.kind()) && !is_immediately_invoked(&n) {
             return true;
         }
         current = n.parent();
@@ -651,20 +673,43 @@ mod tests {
     }
 
     #[test]
-    fn rust_function_local_use_is_lazy_and_item_use_is_not() {
-        let src = "use crate::top::A;\nfn f() {\n    use crate::inner::B;\n    let c = || { use crate::closure::C; C::new() };\n    B::new(); c()\n}\n";
-        let refs = refs_from_source(src, Language::Rust);
-        assert_eq!(lazy_flags(&refs, "crate::top::A"), vec![false]);
-        assert_eq!(lazy_flags(&refs, "crate::inner::B"), vec![true]);
-        assert_eq!(lazy_flags(&refs, "crate::closure::C"), vec![true]);
+    fn javascript_module_scope_iife_require_is_eager_but_nested_iife_is_lazy() {
+        let src = "(function () { const a = require('./iife'); })();\n(() => require('./arrow-iife'))();\n(async function () { require('./async-iife'); }());\nfunction outer() { (function () { require('./inner'); })(); }\nconst h = (function () { return require('./factory'); });\n";
+        let refs = refs_from_source(src, Language::JavaScript);
+        assert_eq!(lazy_flags(&refs, "./iife"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "a"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./arrow-iife"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./async-iife"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./inner"), vec![true]);
+        // Parenthesized but never called: still a deferred body.
+        assert_eq!(lazy_flags(&refs, "./factory"), vec![true]);
     }
 
     #[test]
-    fn c_include_inside_a_function_body_is_lazy() {
+    fn python_nested_and_async_function_imports_are_lazy() {
+        let src = "async def a():\n    import aio\ndef outer():\n    def inner():\n        import deep\n    return inner\n";
+        let refs = refs_from_source(src, Language::Python);
+        assert_eq!(lazy_flags(&refs, "aio"), vec![true]);
+        assert_eq!(lazy_flags(&refs, "deep"), vec![true]);
+    }
+
+    #[test]
+    fn rust_function_local_use_stays_eager() {
+        let src = "use crate::top::A;\nfn f() {\n    use crate::inner::B;\n    let c = || { use crate::closure::C; C::new() };\n    B::new(); c()\n}\n";
+        let refs = refs_from_source(src, Language::Rust);
+        assert_eq!(lazy_flags(&refs, "crate::top::A"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "crate::inner::B"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "crate::closure::C"), vec![false]);
+    }
+
+    #[test]
+    fn c_and_cpp_include_inside_a_function_body_stays_eager() {
         let src = "#include <stdio.h>\n#include \"top.h\"\nint main(void) {\n#include \"body.h\"\n    return 0;\n}\n";
         let refs = refs_from_source(src, Language::C);
         assert_eq!(lazy_flags(&refs, "top.h"), vec![false]);
-        assert_eq!(lazy_flags(&refs, "body.h"), vec![true]);
+        assert_eq!(lazy_flags(&refs, "body.h"), vec![false]);
+        let refs = refs_from_source(src, Language::Cpp);
+        assert_eq!(lazy_flags(&refs, "body.h"), vec![false]);
     }
 
     #[test]

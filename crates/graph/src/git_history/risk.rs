@@ -87,30 +87,103 @@ fn test_gap_note(no_symbols: bool, walk_capped: bool) -> String {
 type CycleToken = (i64, i64, i64, i64, i64, i64);
 type CycleComponentCache = HashMap<String, (CycleToken, Arc<ImportCycles>)>;
 
-/// Tarjan SCCs over the load-time import graph plus the file pairs the graph
-/// omitted because every import directive between them is lazy.
+/// Tarjan SCCs over the load-time import graph plus the lazy-only file pairs
+/// the cut suppressed: pairs that share a non-trivial SCC once lazy edges are
+/// counted, i.e. the ones that would have closed or enlarged a cycle.
 pub(crate) struct ImportCycles {
     pub(crate) components: Vec<Vec<String>>,
-    pub(crate) lazy_pairs: Vec<(String, String)>,
+    pub(crate) suppressed_pairs: Vec<(String, String)>,
+    suppressed_by_file: HashMap<String, u32>,
+    suppressed_from: HashMap<String, Vec<String>>,
 }
 
 impl ImportCycles {
-    /// Lazy-only pairs with either endpoint in `files`.
-    fn lazy_edges_touching<'a>(&self, files: impl Iterator<Item = &'a str>) -> u32 {
-        let files: HashSet<&str> = files.collect();
-        self.lazy_pairs
+    pub(crate) fn load(db: &Database) -> Result<Self> {
+        let pairs = db
+            .enumerate_file_import_pairs()
+            .with_context(|| "enumerate_file_import_pairs")?;
+        let components = crate::scc::tarjan_scc(&pairs.eager)?;
+        let suppressed_pairs = if pairs.lazy_only.is_empty() {
+            Vec::new()
+        } else {
+            let mut all = pairs.eager;
+            all.extend(pairs.lazy_only.iter().cloned());
+            let full = crate::scc::tarjan_scc(&all)?;
+            let mut component_of: HashMap<&str, usize> = HashMap::new();
+            for (i, component) in full.iter().enumerate().filter(|(_, c)| c.len() >= 2) {
+                for file in component {
+                    component_of.insert(file.as_str(), i);
+                }
+            }
+            pairs
+                .lazy_only
+                .into_iter()
+                .filter(|(from, to)| {
+                    matches!(
+                        (component_of.get(from.as_str()), component_of.get(to.as_str())),
+                        (Some(a), Some(b)) if a == b
+                    )
+                })
+                .collect()
+        };
+        let mut suppressed_by_file: HashMap<String, u32> = HashMap::new();
+        let mut suppressed_from: HashMap<String, Vec<String>> = HashMap::new();
+        for (from, to) in &suppressed_pairs {
+            *suppressed_by_file.entry(from.clone()).or_insert(0) += 1;
+            *suppressed_by_file.entry(to.clone()).or_insert(0) += 1;
+            suppressed_from
+                .entry(from.clone())
+                .or_default()
+                .push(to.clone());
+        }
+        Ok(Self {
+            components,
+            suppressed_pairs,
+            suppressed_by_file,
+            suppressed_from,
+        })
+    }
+
+    fn empty() -> Self {
+        Self {
+            components: Vec::new(),
+            suppressed_pairs: Vec::new(),
+            suppressed_by_file: HashMap::new(),
+            suppressed_from: HashMap::new(),
+        }
+    }
+
+    /// Suppressed pairs with either endpoint equal to `file`.
+    fn lazy_edges_for(&self, file: &str) -> u32 {
+        self.suppressed_by_file.get(file).copied().unwrap_or(0)
+    }
+
+    /// Suppressed pairs with both endpoints among `members`.
+    fn lazy_edges_within(&self, members: &[String]) -> u32 {
+        let set: HashSet<&str> = members.iter().map(String::as_str).collect();
+        members
             .iter()
-            .filter(|(from, to)| files.contains(from.as_str()) || files.contains(to.as_str()))
+            .filter_map(|m| self.suppressed_from.get(m))
+            .flatten()
+            .filter(|to| set.contains(to.as_str()))
             .count() as u32
     }
 }
 
-/// Cycles touching a patch, with the lazy pairs the cut removed so per-file
-/// assessments can disclose `lazy_edges` without recomputing the SCCs.
-#[derive(Default)]
+/// Cycles touching a patch, sharing the SCC result so per-file assessments
+/// can disclose `lazy_edges` without recomputing or copying it.
 pub(crate) struct PatchCycles {
     pub(crate) entries: Vec<CycleEntry>,
-    pub(crate) lazy_pairs: Vec<(String, String)>,
+    cycles: Arc<ImportCycles>,
+}
+
+impl PatchCycles {
+    fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+            cycles: Arc::new(ImportCycles::empty()),
+        }
+    }
 }
 
 static IMPORT_CYCLE_CACHE: LazyLock<Mutex<CycleComponentCache>> =
@@ -720,17 +793,22 @@ fn assess_risk_with_context(
     let mut cycle_signal_failed = false;
     let (in_cycle, cycle_size, cycle_files, lazy_edges) = if let Some(cycles) = precomputed_cycles {
         let (in_cycle, size, files) = cycle_membership(&cycles.entries, file_path);
-        let lazy = cycles
-            .lazy_pairs
-            .iter()
-            .filter(|(from, to)| from == file_path || to == file_path)
-            .count() as u32;
-        (in_cycle, size, files, lazy)
+        (
+            in_cycle,
+            size,
+            files,
+            cycles.cycles.lazy_edges_for(file_path),
+        )
     } else {
-        match import_cycle_components(db) {
-            Ok(cycles) => {
-                let lazy = cycles.lazy_edges_touching(std::iter::once(file_path));
-                let (in_cycle, size, files) = match cycle_entry_for_file(db, &cycles, file_path)? {
+        // Every lookup, including the churn read inside the entry, degrades
+        // together so a git_files fault cannot discard the other signals.
+        let signal = import_cycle_components(db).and_then(|cycles| {
+            let entry = cycle_entry_for_file(db, &cycles, file_path)?;
+            Ok((entry, cycles.lazy_edges_for(file_path)))
+        });
+        match signal {
+            Ok((entry, lazy)) => {
+                let (in_cycle, size, files) = match entry {
                     Some(cycle) => cycle_membership(&[cycle], file_path),
                     None => (false, 0, Vec::new()),
                 };
@@ -1163,7 +1241,7 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
             }
             tracing::warn!(error = %e, "cycle detection failed; omitting cycles_touching_patch");
             cycles_failed = true;
-            PatchCycles::default()
+            PatchCycles::empty()
         }
     };
 
@@ -1386,7 +1464,7 @@ pub fn assess_risk_batch(db: &Database, file_paths: &[String]) -> Result<RiskBat
             }
             tracing::warn!(error = %e, "cycle detection failed; omitting batch cycle signal");
             cycles_failed = true;
-            PatchCycles::default()
+            PatchCycles::empty()
         }
     };
     let percentiles = db
@@ -1488,7 +1566,7 @@ fn find_cycles_touching(db: &Database, patch_files: &[String]) -> Result<PatchCy
             continue;
         }
         let max_churn_file = pick_max_churn(db, component)?;
-        let lazy_edges = cycles.lazy_edges_touching(component.iter().map(String::as_str));
+        let lazy_edges = cycles.lazy_edges_within(component);
         let mut members = component.clone();
         members.sort();
         let size = members.len() as u32;
@@ -1502,7 +1580,7 @@ fn find_cycles_touching(db: &Database, patch_files: &[String]) -> Result<PatchCy
     out.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.members.cmp(&b.members)));
     Ok(PatchCycles {
         entries: out,
-        lazy_pairs: cycles.lazy_pairs.clone(),
+        cycles,
     })
 }
 
@@ -1532,7 +1610,7 @@ fn cycle_entry_for_file(
         members.sort();
         let size = members.len() as u32;
         let max_churn_file = pick_max_churn(db, &members)?;
-        let lazy_edges = cycles.lazy_edges_touching(members.iter().map(String::as_str));
+        let lazy_edges = cycles.lazy_edges_within(&members);
         return Ok(Some(CycleEntry {
             members,
             size,
@@ -1541,19 +1619,6 @@ fn cycle_entry_for_file(
         }));
     }
     Ok(None)
-}
-
-fn load_import_cycles(db: &Database) -> Result<ImportCycles> {
-    let edges = db
-        .enumerate_file_import_edges()
-        .with_context(|| "enumerate_file_import_edges")?;
-    let lazy_pairs = db
-        .lazy_import_pairs()
-        .with_context(|| "lazy_import_pairs")?;
-    Ok(ImportCycles {
-        components: crate::scc::tarjan_scc(&edges)?,
-        lazy_pairs,
-    })
 }
 
 fn import_cycle_components(db: &Database) -> Result<Arc<ImportCycles>> {
@@ -1565,7 +1630,7 @@ fn import_cycle_components(db: &Database) -> Result<Arc<ImportCycles>> {
         db.import_cycle_cache_key()
     };
     let Some(key) = cache_key else {
-        return Ok(Arc::new(load_import_cycles(db)?));
+        return Ok(Arc::new(ImportCycles::load(db)?));
     };
     let token = db.import_cycle_validity_token()?;
     if let Some((_, cached)) = IMPORT_CYCLE_CACHE
@@ -1577,7 +1642,7 @@ fn import_cycle_components(db: &Database) -> Result<Arc<ImportCycles>> {
         return Ok(Arc::clone(cached));
     }
 
-    let components = Arc::new(load_import_cycles(db)?);
+    let components = Arc::new(ImportCycles::load(db)?);
     IMPORT_CYCLE_CACHE
         .lock()
         .expect("import cycle cache lock poisoned")
@@ -2130,6 +2195,86 @@ mod tests {
                 start.elapsed().as_millis()
             );
         }
+    }
+
+    #[test]
+    fn cycle_churn_lookup_failure_degrades_instead_of_aborting() {
+        use codesage_protocol::{FileInfo, Language, Reference, ReferenceKind, Symbol, SymbolKind};
+
+        let db = Database::open_in_memory().unwrap();
+        for path in ["cyc_a.php", "cyc_b.php"] {
+            db.upsert_file(&FileInfo {
+                path: path.to_string(),
+                language: Language::Php,
+                content_hash: "hash".to_string(),
+            })
+            .unwrap();
+        }
+        let ids = |path: &str| db.file_id_for_path(path).unwrap().unwrap();
+        let sym = |name: &str, qualified: &str, file: &str| Symbol {
+            name: name.to_string(),
+            qualified_name: qualified.to_string(),
+            kind: SymbolKind::Class,
+            file_path: file.to_string(),
+            line_start: 1,
+            line_end: 5,
+            col_start: 0,
+            col_end: 0,
+            rationale: Vec::new(),
+        };
+        db.insert_symbols(
+            ids("cyc_a.php"),
+            &[sym("CycleA", "App\\CycleA", "cyc_a.php")],
+        )
+        .unwrap();
+        db.insert_symbols(
+            ids("cyc_b.php"),
+            &[sym("CycleB", "App\\CycleB", "cyc_b.php")],
+        )
+        .unwrap();
+        let imp = |from: &str, to: &str| Reference {
+            from_file: from.to_string(),
+            from_symbol: None,
+            to_name: to.to_string(),
+            kind: ReferenceKind::Import,
+            line: 1,
+            col: 0,
+            lazy: false,
+        };
+        db.insert_references(ids("cyc_a.php"), &[imp("cyc_a.php", "App\\CycleB")])
+            .unwrap();
+        db.insert_references(ids("cyc_b.php"), &[imp("cyc_b.php", "App\\CycleA")])
+            .unwrap();
+        db.upsert_git_file("cyc_b.php", 1.0, 0, 1, Some(1_700_000_000))
+            .unwrap();
+        assert!(assess_risk(&db, "cyc_a.php").unwrap().in_cycle);
+
+        // Only the peer's churn row faults, so the assessed file's own reads
+        // succeed and the failure surfaces inside pick_max_churn.
+        db.execute_raw_for_tests(
+            "CREATE TABLE git_files_backing AS SELECT * FROM git_files;
+             DROP TABLE git_files;
+             CREATE VIEW git_files AS
+             SELECT path,
+                    CASE WHEN path = 'cyc_b.php' THEN json_extract('{', '$') ELSE churn_score END
+                        AS churn_score,
+                    fix_count, total_commits, last_commit_at, indexed_at
+             FROM git_files_backing;",
+        )
+        .unwrap();
+        assert!(db.git_file("cyc_b.php").is_err());
+        assert!(db.git_file("cyc_a.php").unwrap().is_none());
+
+        let degraded = assess_risk(&db, "cyc_a.php").unwrap();
+        assert!(!degraded.in_cycle, "{degraded:?}");
+        assert_eq!(degraded.cycle_size, 0);
+        assert!(degraded.cycle_files.is_empty());
+        assert_eq!(degraded.lazy_edges, 0);
+        assert!(
+            degraded.notes.iter().any(|n| n == CYCLE_SIGNAL_FAILED_NOTE),
+            "{:?}",
+            degraded.notes
+        );
     }
 
     #[test]
