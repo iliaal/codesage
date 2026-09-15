@@ -606,10 +606,12 @@ pub(crate) fn visibility_admits(sym: &Symbol, caller_file: &str) -> bool {
             .is_some_and(|prefix| caller_file.starts_with(&prefix)),
         // Same `src/` root approximates the crate; `src/bin/*.rs` is a
         // separate target admitted by that approximation. A caller with no
-        // root that still sits under the definition's package directory
-        // (`tests/`, `benches/`, `build.rs`) is a sibling target and cannot
-        // see the item. Anything else — a flat layout, a `[lib] path`
-        // override, an index rooted inside `src/` — is undecidable and admits.
+        // root is rejected only when it is provably a sibling target of the
+        // defining package: under a nested package's directory, or in the
+        // standard separate-target locations of a root-level package
+        // (`tests/`, `benches/`, `examples/`, `build.rs`). Anything else, a
+        // flat layout, a `[lib] path` override, an index rooted inside
+        // `src/`, a `tools/` script, is undecidable and admits.
         Some(Visibility::Crate) => match (
             importer_src_root(caller_file),
             importer_src_root(&sym.file_path),
@@ -617,11 +619,23 @@ pub(crate) fn visibility_admits(sym: &Symbol, caller_file: &str) -> bool {
             (Some(a), Some(b)) => a == b,
             (None, Some(def_root)) => {
                 let package_dir = def_root.strip_suffix("src/").unwrap_or(def_root);
-                !caller_file.starts_with(package_dir)
+                if package_dir.is_empty() {
+                    !is_root_sibling_target(caller_file)
+                } else {
+                    !caller_file.starts_with(package_dir)
+                }
             }
             (_, None) => true,
         },
     }
+}
+
+/// Cargo's conventional non-`src/` targets of a root-level package.
+fn is_root_sibling_target(caller_file: &str) -> bool {
+    caller_file == "build.rs"
+        || ["tests/", "benches/", "examples/"]
+            .iter()
+            .any(|dir| caller_file.starts_with(dir))
 }
 
 /// Path approximation of a Rust module's descendants: `a/b.rs` owns `a/b/`,
@@ -1482,7 +1496,17 @@ mod context_export_tests {
         assert!(visibility_admits(&flat, "sub/other.rs"));
         let flat_def = visible("f", "lib/helper.rs", Some(Visibility::Crate));
         assert!(visibility_admits(&flat_def, "src/main.rs"));
-        assert!(visibility_admits(&crate_level, "tools/gen.rs"));
+        // Rootless callers outside the package get the same answer under a
+        // nested and a root-level package layout.
+        for caller in ["tools/gen.rs", "lib/foo.rs", "xtask/main.rs"] {
+            assert!(visibility_admits(&crate_level, caller), "{caller}");
+            assert!(visibility_admits(&top_crate, caller), "{caller}");
+        }
+        for caller in ["tests/t.rs", "benches/b.rs", "examples/e.rs", "build.rs"] {
+            assert!(!visibility_admits(&top_crate, caller), "{caller}");
+        }
+        assert!(!visibility_admits(&crate_level, "crates/a/benches/b.rs"));
+        assert!(!visibility_admits(&crate_level, "crates/a/build.rs"));
     }
 
     #[test]

@@ -508,11 +508,13 @@ fn rust_modifier_visibility(item: &Node) -> Visibility {
     else {
         return Visibility::Module;
     };
+    // Comments are extras and can sit anywhere inside the parentheses, so
+    // look for the scope keyword rather than the token after `(`.
     let mut inner = modifier.walk();
-    let mut children = modifier
+    let Some(scope) = modifier
         .children(&mut inner)
-        .skip_while(|c| c.kind() != "(");
-    let Some(scope) = children.nth(1) else {
+        .find(|c| matches!(c.kind(), "crate" | "self" | "super" | "in"))
+    else {
         return Visibility::Public;
     };
     match scope.kind() {
