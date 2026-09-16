@@ -892,8 +892,43 @@ pub(crate) fn recommend_tests_with_walk_cache(
         unsupported_files: restore(triage.unsupported),
         unmodelled,
         indexed_test_files,
+        commands: Vec::new(),
+        inline_test_modules: Vec::new(),
         notes,
     };
+
+    // Commands cover what the buckets vouch for; coupled tests are history,
+    // not something a runner can be pointed at with confidence.
+    let mut command_targets: Vec<String> = recs.primary.clone();
+    command_targets.extend(recs.reachable.iter().map(|e| e.path.clone()));
+    let changed: Vec<(String, String)> = file_paths
+        .iter()
+        .map(|p| {
+            (
+                p.clone(),
+                as_given.get(p).cloned().unwrap_or_else(|| p.clone()),
+            )
+        })
+        .collect();
+    let derived = super::test_commands::derive(
+        db,
+        &super::test_commands::CommandContext {
+            root: opts.project_root.as_deref(),
+            test_files: &command_targets,
+            withheld_phpt: &base.withheld,
+            changed: &changed,
+        },
+    )?;
+    recs.commands = derived.commands;
+    recs.inline_test_modules = derived.modules;
+    recs.notes.extend(derived.notes);
+    if !recs.inline_test_modules.is_empty() {
+        let total: usize = recs.inline_test_modules.iter().map(|m| m.test_count).sum();
+        recs.notes.push(format!(
+            "{} inline test module(s) in the changed files ({total} test(s)); see `commands` for how to run them",
+            recs.inline_test_modules.len()
+        ));
+    }
 
     if indexed_test_files == 0 {
         recs.notes.push(
