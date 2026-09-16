@@ -957,6 +957,48 @@ mod tests {
 
     #[test]
     fn search_definition_trace_survives_the_mcp_budget_complete() {
+        const CHILD_MODE: &str = "CODESAGE_TEST_TRACE_BUDGET_CHILD";
+        let mode = match std::env::var(CHILD_MODE) {
+            Ok(mode) => mode,
+            Err(_) => {
+                let overrides: Vec<_> = std::env::vars_os()
+                    .map(|(name, _)| name)
+                    .filter(|name| {
+                        name.to_str()
+                            .is_some_and(|name| name.starts_with("CODESAGE_"))
+                    })
+                    .collect();
+                for mode in ["0", "1"] {
+                    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                    for name in &overrides {
+                        command.env_remove(name);
+                    }
+                    let output = command
+                        .args([
+                            "--exact",
+                            "mcp::render::tests::search_definition_trace_survives_the_mcp_budget_complete",
+                            "--nocapture",
+                        ])
+                        .env(CHILD_MODE, mode)
+                        .env("CODESAGE_QUALIFIED_NAME_BOOST", mode)
+                        .output()
+                        .unwrap();
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    assert!(
+                        output.status.success() && stdout.contains("1 passed; 0 failed"),
+                        "qualified-name boost {mode}: {}\n{stdout}\n{stderr}",
+                        output.status
+                    );
+                }
+                return;
+            }
+        };
+        let expected_score = match mode.as_str() {
+            "0" => 3569.556640625,
+            "1" => 7139.11328125,
+            _ => panic!("unexpected child mode: {mode}"),
+        };
         let names: Vec<String> = (0..149)
             .map(|i| {
                 format!(
@@ -995,7 +1037,7 @@ mod tests {
         request.explain = true;
         let page = codesage_graph::search_page(&db, &embedding, None, &request).unwrap();
         assert_eq!(page.results[0].score, plain.results[0].score);
-        assert_eq!(f64::from(page.results[0].score), 7139.11328125);
+        assert_eq!(f64::from(page.results[0].score), expected_score);
         let source_trace = page.results[0].trace.as_ref().unwrap();
         let rendered = render_with_kind(Ok(&page), "search");
         let payload = rendered.structured_content.unwrap();
