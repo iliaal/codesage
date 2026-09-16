@@ -22,7 +22,7 @@
 - Import-cycle detection no longer counts imports written inside a function body; a file pair connected only by such lazy imports is excluded from `assess_risk`, `assess_risk_diff`, `review_rehearsal`, and `session_end` cycle checks while `list_dependencies` and `impact_analysis` keep the edge.
 - `impact_analysis`, `trace_call_path`, and `export_context` no longer resolve a C/C++ `static` function or a non-`pub` Rust item as a callee from a file that cannot name it; a lone survivor of the visibility gate still needs import evidence.
 - The indexing hook records its pid in `.codesage/hook-index.lock/pid`, logs `hook start` and `hook exit` lines on every path including signals, and reaps a lock whose pid is dead or belongs to a non-hook process on the next fire regardless of age.
-- Concurrent hook fires against an orphaned lock start exactly one indexing pass; a killed run no longer blocks indexing for 30 minutes.
+- Concurrent hook fires against an orphaned lock start exactly one indexing pass; a killed run no longer blocks indexing for 30 minutes, while a live run's lock is never reaped and pre-upgrade pidless locks age out after 30 minutes.
 
 ## [0.31.0] - 2026-09-14
 
