@@ -4,7 +4,7 @@
 
 - Symbol rows (`find_symbol`, bundles, `trace_call_path`, `impact_analysis` siblings) carry `handle`: `sym:<path>#<qualified>`, with `@<line>` only for same-file overloads; search and bundle chunks carry `chunk:<path>:<start>-<end>`.
 - File-shaped rows (`impact_analysis`, `list_dependencies`, `find_coupling`, `assess_risk*`, `recommend_tests`, resolved `from_trace` frames) carry `file:<path>`; `assess_risk_diff` clustered directories carry `dir:<path>`.
-- `find_references` rows carry `from` (enclosing symbol handle) and `to` (the definition the callsite resolves to with qualified, same-file, or import evidence); `to_resolution` discloses when `to` resolution hit its bound.
+- `find_references` rows carry `from` (enclosing symbol handle) and `to` (the definition the callsite resolves to with qualified, same-file, import, or owning-type evidence); `to_resolution` discloses when `to` resolution hit its bound.
 - `find_symbol` rows carry `visibility` (`public`, `crate`, `module`, `file`) for C, C++, and Rust.
 - `recommend_tests` returns `commands` (runnable cargo, pytest, phpunit/artisan, run-tests.php, go test, vitest/jest, maven/gradle commands plus a mapped feature's `test_command`) and `inline_test_modules` (Rust `#[cfg(test)]` modules and Python `test_*` functions in the changed files); `review_rehearsal` quotes up to five commands.
 - `codesage doctor` reports `hook_health` (installed indexing hooks, last hook run and exit, `hook-index.lock` state) and reaps a lock held by a dead pid; `project_overview` reports `hook_health` without reaping.
