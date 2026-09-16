@@ -28,7 +28,7 @@ pub use git_history::{
     find_coupling_ranked, git_history_index, git_history_index_with_options, recommend_tests,
     recommend_tests_with_reachability,
 };
-pub use impact::{impact_analysis, impact_analysis_report};
+pub use impact::{AmbiguousSymbol, impact_analysis, impact_analysis_report};
 pub use index::{
     STRUCTURAL_INTERPRETATION, full_index, incremental_index, index_files, remove_files,
 };

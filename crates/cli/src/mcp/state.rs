@@ -12,6 +12,7 @@ use codesage_storage::Database;
 use parking_lot::Mutex;
 
 use super::CodeSageServer;
+use super::error::{DOCTOR_COMMAND, ErrorCode, McpError, ONBOARD_COMMAND};
 use super::params::{EmbedTextsResult, RerankPairsParams, RerankPairsResult};
 
 const MCP_TEST_QUERY_EMBEDDING_ENV: &str = "CODESAGE_MCP_TEST_QUERY_EMBEDDING";
@@ -435,6 +436,15 @@ fn embedder_pool_key(config: &EmbeddingConfig, artifact_digest: &str) -> Result<
     ))
 }
 
+/// Model resolution, download, and session creation failures share one code
+/// and remedy; the cause chain stays attached for the readable message.
+fn model_error(context: &str, error: anyhow::Error) -> anyhow::Error {
+    McpError::new(ErrorCode::Model, context)
+        .command(DOCTOR_COMMAND)
+        .source(error)
+        .into()
+}
+
 /// [`embedder_pool_key`] over the model files a load would open, resolving
 /// them (downloading on a cache miss) exactly as `Embedder::new` is about to.
 fn resolved_embedder_pool_key(config: &EmbeddingConfig) -> Result<String> {
@@ -629,14 +639,20 @@ impl CodeSageServer {
         }
         let path = PathBuf::from(project);
         if !path.is_absolute() {
-            bail!(
-                "`project` must be an absolute path, got `{}`. Pass the absolute project root.",
-                project
-            );
+            return Err(McpError::new(
+                ErrorCode::ProjectPath,
+                format!(
+                    "`project` must be an absolute path, got `{project}`. Pass the absolute project root."
+                ),
+            )
+            .into());
         }
-        let canonical = path
-            .canonicalize()
-            .map_err(|e| anyhow::anyhow!("project path `{}` does not exist: {}", project, e))?;
+        let canonical = path.canonicalize().map_err(|e| {
+            McpError::new(
+                ErrorCode::ProjectPath,
+                format!("project path `{project}` does not exist: {e}"),
+            )
+        })?;
         {
             let guard = self.state.projects.lock();
             if let Some(state) = guard.get(&canonical)
@@ -658,12 +674,20 @@ impl CodeSageServer {
                 break;
             }
             if !enclosing.pop() {
-                bail!(
-                    "project `{}` is not onboarded (no .codesage/index.db). \
-                    Run `/codesage-onboard {}` to initialize.",
-                    canonical.display(),
-                    canonical.display()
-                );
+                return Err(McpError::new(
+                    ErrorCode::NotOnboarded,
+                    format!(
+                        "project `{}` is not onboarded (no .codesage/index.db). \
+                         Run `/codesage-onboard {}` to initialize.",
+                        canonical.display(),
+                        canonical.display()
+                    ),
+                )
+                .remedy(super::error::Remedy::command_in(
+                    ONBOARD_COMMAND,
+                    canonical.to_string_lossy(),
+                ))
+                .into());
             }
         }
         let canonical = enclosing;
@@ -807,15 +831,18 @@ impl CodeSageServer {
     }
 
     fn get_or_load_embedder(&self, config: &EmbeddingConfig) -> Result<Arc<Mutex<Embedder>>> {
-        let key = resolved_embedder_pool_key(config)?;
-        get_or_load_slot(&self.state.embedders, key, || {
-            Embedder::new(config).with_context(|| {
-                format!(
-                    "loading embedding model '{}' on device '{}'",
-                    config.model, config.device
-                )
+        let load = || -> Result<Arc<Mutex<Embedder>>> {
+            let key = resolved_embedder_pool_key(config)?;
+            get_or_load_slot(&self.state.embedders, key, || {
+                Embedder::new(config).with_context(|| {
+                    format!(
+                        "loading embedding model '{}' on device '{}'",
+                        config.model, config.device
+                    )
+                })
             })
-        })
+        };
+        load().map_err(|error| model_error("embedding model unavailable", error))
     }
 
     fn get_or_load_reranker(
@@ -829,6 +856,7 @@ impl CodeSageServer {
                 format!("loading reranker model '{reranker_model}' on device '{device}'")
             })
         })
+        .map_err(|error| model_error("reranker model unavailable", error))
     }
 
     fn semantic_embedding_config<'a>(
@@ -836,7 +864,9 @@ impl CodeSageServer {
         state: &'a ProjectState,
     ) -> Result<&'a EmbeddingConfig> {
         if let Some(error) = &state.embedding_config_error {
-            bail!("{error}");
+            return Err(McpError::new(ErrorCode::Model, error.clone())
+                .command(DOCTOR_COMMAND)
+                .into());
         }
         Ok(&state.embedding_config)
     }

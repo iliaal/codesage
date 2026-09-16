@@ -1,20 +1,55 @@
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use codesage_protocol::work::{StopReason, WorkControl};
+use codesage_protocol::work::{StopReason, WorkControl, WorkStopped};
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::model::{CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock};
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer};
-use serde_json::json;
+use serde_json::{Map, Value, json};
 
 use super::CodeSageServer;
 use super::diagnostics::{ExecutionTicket, RequestTicket};
+use super::error::{ErrorCode, McpError, legacy_status, render_error, render_mcp_error};
 use super::work::{ExecutionLease, WorkClass};
 
 tokio::task_local! {
     pub(super) static CURRENT_REQUEST: Arc<ToolRequest>;
+}
+
+thread_local! {
+    /// Mirror of [`CURRENT_REQUEST`] for the blocking worker running a request's
+    /// operation, where task-locals are unavailable.
+    static BLOCKING_REQUEST: RefCell<Option<Arc<ToolRequest>>> = const { RefCell::new(None) };
+}
+
+struct BlockingRequestScope {
+    previous: Option<Arc<ToolRequest>>,
+}
+
+impl BlockingRequestScope {
+    fn enter(request: Arc<ToolRequest>) -> Self {
+        let previous = BLOCKING_REQUEST.with(|slot| slot.replace(Some(request)));
+        Self { previous }
+    }
+}
+
+impl Drop for BlockingRequestScope {
+    fn drop(&mut self) {
+        BLOCKING_REQUEST.with(|slot| {
+            slot.replace(self.previous.take());
+        });
+    }
+}
+
+/// The request being served on this task or blocking worker, if any.
+pub(super) fn current_request() -> Option<Arc<ToolRequest>> {
+    if let Ok(request) = CURRENT_REQUEST.try_with(Arc::clone) {
+        return Some(request);
+    }
+    BLOCKING_REQUEST.with(|slot| slot.borrow().clone())
 }
 
 #[derive(Clone)]
@@ -24,6 +59,8 @@ pub(super) struct ToolRequest {
     pub(super) project: PathBuf,
     pub(super) tool: String,
     pub(super) class: WorkClass,
+    /// The call's arguments, so retry remedies can echo them.
+    pub(super) arguments: Arc<Map<String, Value>>,
 }
 
 struct CancelOnDrop(WorkControl);
@@ -158,22 +195,27 @@ fn class_name(class: WorkClass) -> &'static str {
     }
 }
 
-fn stopped_result(status: &str, ticket: &RequestTicket) -> CallToolResult {
-    let mut result = CallToolResult::error(vec![ContentBlock::text(
-        json!({"status":status}).to_string(),
-    )]);
-    normalize_error(&mut result, ticket);
+fn stopped_result(
+    reason: StopReason,
+    tool: &str,
+    arguments: Option<&Map<String, Value>>,
+    ticket: &RequestTicket,
+) -> CallToolResult {
+    let mut result = render_error(tool, arguments, &anyhow::Error::new(WorkStopped { reason }));
+    normalize_error(&mut result, tool, arguments, Some(ticket));
     result
 }
 
-fn client_cancelled_result(control: &WorkControl, ticket: &RequestTicket) -> CallToolResult {
+fn client_cancelled_result(
+    control: &WorkControl,
+    tool: &str,
+    arguments: Option<&Map<String, Value>>,
+    ticket: &RequestTicket,
+) -> CallToolResult {
     control.cancel(StopReason::ClientCancelled);
-    let status = control
-        .reason()
-        .map(StopReason::as_str)
-        .unwrap_or("cancelled");
-    ticket.finish(status);
-    stopped_result(status, ticket)
+    let reason = control.reason().unwrap_or(StopReason::ClientCancelled);
+    ticket.finish(reason.as_str());
+    stopped_result(reason, tool, arguments, ticket)
 }
 
 fn result_outcome(result: &CallToolResult) -> &'static str {
@@ -200,27 +242,66 @@ fn result_outcome(result: &CallToolResult) -> &'static str {
     "error"
 }
 
-fn normalize_error(result: &mut CallToolResult, ticket: &RequestTicket) {
+/// Complete the contract block with request metadata. A failed result that
+/// carries no block (a foreign bare-text error) gets one synthesized as
+/// `E_INTERNAL` from its first text so every failure names its tool and code.
+fn normalize_error(
+    result: &mut CallToolResult,
+    tool: &str,
+    arguments: Option<&Map<String, Value>>,
+    ticket: Option<&RequestTicket>,
+) {
     if result.is_error != Some(true) {
         return;
     }
+    let mut block = super::error::contract_block(result).unwrap_or_else(|| {
+        let message = result
+            .content
+            .iter()
+            .find_map(|block| block.as_text().map(|text| text.text.clone()))
+            .unwrap_or_else(|| "tool failed without a message".to_owned());
+        let rendered =
+            render_mcp_error(tool, arguments, McpError::new(ErrorCode::Internal, message));
+        super::error::contract_block(&rendered).unwrap_or_default()
+    });
+    if block
+        .get("tool")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        block.insert("tool".into(), json!(tool));
+    }
     let status = result_outcome(result);
-    let (phase, continuing) = ticket.work_state();
-    let metadata = json!({"status":status,"complete":false,"phase":phase,
-        "work_continuing":continuing,"next":null,"request_id":ticket.id(),
-        "persistence_committed":ticket.persistence_committed()});
+    let (phase, continuing, request_id, persisted) = match ticket {
+        Some(ticket) => {
+            let (phase, continuing) = ticket.work_state();
+            (
+                json!(phase),
+                json!(continuing),
+                json!(ticket.id()),
+                json!(ticket.persistence_committed()),
+            )
+        }
+        None => (Value::Null, json!(false), Value::Null, json!(false)),
+    };
+    block.insert("status".into(), json!(status));
+    block.insert("complete".into(), json!(false));
+    block.insert("phase".into(), phase);
+    block.insert("work_continuing".into(), continuing);
+    block.insert("next".into(), Value::Null);
+    block.insert("request_id".into(), request_id);
+    block.insert("persistence_committed".into(), persisted);
+    let metadata = Value::Object(block).to_string();
     for content in &mut result.content {
         if let Some(text) = content.as_text()
             && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text.text)
             && value.get("status").is_some()
         {
-            *content = ContentBlock::text(metadata.to_string());
+            *content = ContentBlock::text(metadata);
             return;
         }
     }
-    result
-        .content
-        .push(ContentBlock::text(metadata.to_string()));
+    result.content.push(ContentBlock::text(metadata));
 }
 
 fn disclose_ranking_recomputation(result: &mut CallToolResult) {
@@ -542,17 +623,24 @@ impl CodeSageServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let arguments: Arc<Map<String, Value>> =
+            Arc::new(request.arguments.clone().unwrap_or_default());
         if request.name == "daemon_stats" {
-            let recent = request.arguments.as_ref().and_then(|a| a.get("recent"));
-            let recent = match recent {
+            let recent = match arguments.get("recent") {
                 None => 20,
                 Some(value) => match value.as_u64().filter(|v| *v <= 256) {
                     Some(value) => value as usize,
                     None => {
-                        return Ok(CallToolResult::error(vec![ContentBlock::text(
-                            "daemon_stats recent must be an integer from 0 to 256",
-                        )])
-                        .into());
+                        let mut result = render_mcp_error(
+                            "daemon_stats",
+                            Some(&arguments),
+                            McpError::new(
+                                ErrorCode::Param,
+                                "daemon_stats recent must be an integer from 0 to 256",
+                            ),
+                        );
+                        normalize_error(&mut result, "daemon_stats", Some(&arguments), None);
+                        return Ok(result.into());
                     }
                 },
             };
@@ -565,6 +653,7 @@ impl CodeSageServer {
         let tool = request.name.to_string();
         let class = class_for(&tool);
         let ticket = Arc::new(self.state.diagnostics.begin_request(&tool, None));
+        let tool_name = tool.clone();
         ticket.set_class(class_name(class));
         let timeout = if class == WorkClass::Native {
             Duration::from_secs(120)
@@ -575,28 +664,33 @@ impl CodeSageServer {
         let mut logical = match self.state.work.try_request(&control) {
             Ok(lease) => lease,
             Err(error) => {
-                let mut result = super::render::render_with_kind::<()>(Err(error.into()), "");
-                normalize_error(&mut result, &ticket);
+                let mut result = render_error(&tool, Some(&arguments), &error.into());
+                normalize_error(&mut result, &tool, Some(&arguments), Some(&ticket));
                 ticket.finish(result_outcome(&result));
                 return Ok(result.into());
             }
         };
         if let Err(error) = validate_arguments(&request) {
             ticket.finish("error");
-            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                "failed to deserialize parameters: {error}"
-            ))])
-            .into());
+            let mut result = render_mcp_error(
+                &tool,
+                Some(&arguments),
+                McpError::new(
+                    ErrorCode::Param,
+                    format!("failed to deserialize parameters: {error}"),
+                ),
+            );
+            normalize_error(&mut result, &tool, Some(&arguments), Some(&ticket));
+            return Ok(result.into());
         }
         let _cancel_on_drop = CancelOnDrop(control.clone());
-        let raw_project = request
-            .arguments
-            .as_ref()
-            .and_then(|a| a.get("project"))
+        let raw_project = arguments
+            .get("project")
             .and_then(|p| p.as_str())
             .map(str::to_owned);
         let request_control = control.clone();
         let request_ticket = ticket.clone();
+        let request_arguments = arguments.clone();
         let operation = async {
             let project = if let Some(raw_project) = raw_project {
                 let preflight = Arc::new(ToolRequest {
@@ -605,6 +699,7 @@ impl CodeSageServer {
                     project: PathBuf::from("<preflight>"),
                     tool: tool.clone(),
                     class: WorkClass::Interactive,
+                    arguments: request_arguments.clone(),
                 });
                 let server = self.clone();
                 let evidence_only = matches!(tool.as_str(), "edit_check" | "review_rehearsal");
@@ -630,14 +725,14 @@ impl CodeSageServer {
                 match project {
                     Ok(project) => project,
                     Err(error) => {
-                        return Ok(super::render::render_with_kind::<()>(Err(error), "").into());
+                        return Ok(render_error(&tool, Some(&request_arguments), &error).into());
                     }
                 }
             } else {
                 PathBuf::from("<unresolved>")
             };
             if let Err(error) = logical.attach_project(&project) {
-                return Ok(super::render::render_with_kind::<()>(Err(error.into()), "").into());
+                return Ok(render_error(&tool, Some(&request_arguments), &error.into()).into());
             }
             request_ticket.set_project(&project.to_string_lossy());
             let scope = Arc::new(ToolRequest {
@@ -646,6 +741,7 @@ impl CodeSageServer {
                 project,
                 tool,
                 class,
+                arguments: request_arguments,
             });
             CURRENT_REQUEST
                 .scope(
@@ -659,11 +755,11 @@ impl CodeSageServer {
             result = operation => {
                 if let Some(reason) = control.reason() {
                     ticket.finish(reason.as_str());
-                    return Ok(stopped_result(reason.as_str(), &ticket).into());
+                    return Ok(stopped_result(reason, &tool_name, Some(&arguments), &ticket).into());
                 }
                 let mut result = result;
                 if let Ok(CallToolResponse::Complete(response)) = &mut result {
-                    normalize_error(response, &ticket);
+                    normalize_error(response, &tool_name, Some(&arguments), Some(&ticket));
                 }
                 let outcome = match &result {
                     Ok(CallToolResponse::Complete(result)) => result_outcome(result),
@@ -673,12 +769,12 @@ impl CodeSageServer {
                 result
             }
             () = context.ct.cancelled() => {
-                Ok(client_cancelled_result(&control, &ticket).into())
+                Ok(client_cancelled_result(&control, &tool_name, Some(&arguments), &ticket).into())
             }
             () = stopped(&control) => {
-                let status = control.reason().map(StopReason::as_str).unwrap_or("cancelled");
-                ticket.finish(status);
-                Ok(stopped_result(status, &ticket).into())
+                let reason = control.reason().unwrap_or(StopReason::ClientCancelled);
+                ticket.finish(reason.as_str());
+                Ok(stopped_result(reason, &tool_name, Some(&arguments), &ticket).into())
             }
         }
     }
@@ -709,7 +805,7 @@ impl CodeSageServer {
             Ok(lease) => lease,
             Err(error) => {
                 let error = anyhow::Error::new(error);
-                ticket.finish(super::render::error_status(&error).unwrap_or("error"));
+                ticket.finish(legacy_status(&error).unwrap_or("error"));
                 return Err(error);
             }
         };
@@ -736,6 +832,7 @@ impl CodeSageServer {
         drop(erased);
         tokio::task::spawn_blocking(move || {
             let _scope = request.control.enter();
+            let _request_scope = BlockingRequestScope::enter(request.clone());
             let phase = if request.class == WorkClass::Native {
                 "native"
             } else {
@@ -747,7 +844,7 @@ impl CodeSageServer {
             let result = operation();
             *resources.outcome.lock() = match &result {
                 Ok(value) => classify(value),
-                Err(error) => super::render::error_status(error).unwrap_or("error"),
+                Err(error) => legacy_status(error).unwrap_or("error"),
             };
             result
         })
@@ -764,12 +861,14 @@ impl CodeSageServer {
         F: FnOnce(&Self) -> CallToolResult + Send + 'static,
     {
         let server = self.clone();
+        let tool = request.tool.clone();
+        let arguments = request.arguments.clone();
         match self
             .run_controlled(request, move || Ok(f(&server)), result_outcome)
             .await
         {
             Ok(result) => result,
-            Err(error) => super::render::render_with_kind::<()>(Err(error), ""),
+            Err(error) => render_error(&tool, Some(&arguments), &error),
         }
     }
 }
@@ -819,6 +918,7 @@ mod tests {
             project: root.to_path_buf(),
             tool: tool.into(),
             class: WorkClass::Analysis,
+            arguments: Arc::default(),
         })
     }
 
@@ -1230,7 +1330,12 @@ mod tests {
         assert_eq!(persisted.files, ["retained/1.rs", "retained/2.rs"]);
         request.control.cancel(StopReason::ClientCancelled);
         request.ticket.finish("cancelled");
-        let response = status(&stopped_result("cancelled", &request.ticket));
+        let response = status(&stopped_result(
+            StopReason::ClientCancelled,
+            "session_start",
+            None,
+            &request.ticket,
+        ));
         assert_eq!(response["work_continuing"], true);
         assert_eq!(response["persistence_committed"], false);
         release.send(()).unwrap();
@@ -1246,7 +1351,12 @@ mod tests {
         assert_eq!(retained["persistence_committed"], true);
         assert_eq!(retained["outcome"], "cancelled");
         assert_eq!(
-            status(&stopped_result("cancelled", &request.ticket))["work_continuing"],
+            status(&stopped_result(
+                StopReason::ClientCancelled,
+                "session_start",
+                None,
+                &request.ticket
+            ))["work_continuing"],
             false
         );
     }
@@ -1611,6 +1721,7 @@ mod tests {
             project: PathBuf::from("/fixture"),
             tool: "find_symbol".into(),
             class: WorkClass::Interactive,
+            arguments: Arc::default(),
         });
         let error = server
             .run_controlled::<(), _>(
@@ -1635,6 +1746,41 @@ mod tests {
     }
 
     #[test]
+    fn normalize_error_synthesizes_a_contract_block_for_bare_text_failures() {
+        let mut bare = CallToolResult::error(vec![ContentBlock::text("boom from a foreign path")]);
+        normalize_error(&mut bare, "find_symbol", None, None);
+        let block = status(&bare);
+        assert_eq!(block["tool"], "find_symbol");
+        assert_eq!(block["error"]["code"], "E_INTERNAL");
+        assert_eq!(block["error"]["message"], "boom from a foreign path");
+        assert_eq!(block["error"]["remedy"], serde_json::Value::Null);
+        assert_eq!(block["status"], "error");
+        assert_eq!(block["complete"], false);
+        assert_eq!(block["request_id"], serde_json::Value::Null);
+        assert_eq!(block["work_continuing"], false);
+        assert_eq!(bare.content.len(), 2);
+
+        let mut unnamed = super::super::error::render_mcp_error(
+            "",
+            None,
+            McpError::new(ErrorCode::Internal, "handler panicked"),
+        );
+        normalize_error(&mut unnamed, "search", None, None);
+        assert_eq!(status(&unnamed)["tool"], "search");
+        assert_eq!(status(&unnamed)["error"]["code"], "E_INTERNAL");
+        let blocks = unnamed
+            .content
+            .iter()
+            .filter(|block| {
+                block
+                    .as_text()
+                    .is_some_and(|text| text.text.contains("\"status\""))
+            })
+            .count();
+        assert_eq!(blocks, 1, "the block is replaced, not duplicated");
+    }
+
+    #[test]
     fn cancellation_response_keeps_persistence_and_physical_state() {
         let diagnostics = super::super::diagnostics::Diagnostics::default();
         let request = diagnostics.begin_request("session_start", None);
@@ -1643,16 +1789,18 @@ mod tests {
         request.link_execution_ticket(&execution);
         request.finish("cancelled");
         request.mark_persisted();
-        let metadata = status(&stopped_result("cancelled", &request));
+        let stopped =
+            || stopped_result(StopReason::ClientCancelled, "session_start", None, &request);
+        let metadata = status(&stopped());
         assert_eq!(metadata["request_id"], request.id());
         assert_eq!(metadata["persistence_committed"], true);
         assert_eq!(metadata["phase"], "running");
         assert_eq!(metadata["work_continuing"], true);
+        assert_eq!(metadata["status"], "cancelled");
+        assert_eq!(metadata["tool"], "session_start");
+        assert_eq!(metadata["error"]["code"], "E_CANCELLED");
         execution.finish("cancelled");
-        assert_eq!(
-            status(&stopped_result("cancelled", &request))["work_continuing"],
-            false
-        );
+        assert_eq!(status(&stopped())["work_continuing"], false);
     }
 
     #[test]
@@ -1661,8 +1809,9 @@ mod tests {
         let request = diagnostics.begin_request("project_overview", None);
         let control = WorkControl::new(None);
         control.cancel(StopReason::Shutdown);
-        let result = client_cancelled_result(&control, &request);
+        let result = client_cancelled_result(&control, "project_overview", None, &request);
         assert_eq!(status(&result)["status"], "shutdown");
+        assert_eq!(status(&result)["error"]["code"], "E_SHUTDOWN");
         let snapshot = diagnostics.snapshot(1);
         assert_eq!(snapshot["recent_requests"][0]["outcome"], "shutdown");
         assert_eq!(snapshot["counters"]["request_outcomes"]["shutdown"], 1);
