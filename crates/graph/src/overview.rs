@@ -287,14 +287,21 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        assert!(
-            std::process::Command::new("git")
-                .args(["init", "-q"])
-                .current_dir(root)
-                .status()
-                .unwrap()
-                .success()
-        );
+        for args in [
+            &["init", "-q"][..],
+            &["config", "core.hooksPath", ".git/hooks"][..],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
         let hooks = root.join(".git/hooks");
         std::fs::create_dir_all(&hooks).unwrap();
         std::fs::write(

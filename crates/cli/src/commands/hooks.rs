@@ -213,10 +213,10 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
          # the lock so a SIGKILLed run (no trap runs on SIGKILL) is recognised\n\
          # by the next fire: a lock whose pid is dead, or belongs to a process\n\
          # that is not a hook run (pid reuse), is reaped at once whatever its\n\
-         # age. Any lock older than {stale_min} minutes is reaped as well — a\n\
-         # run waits at most 60 s per pass on the project lock, so no live run\n\
-         # holds the lock that long — which also covers locks written by older\n\
-         # hooks that carry no pid file. Reapers serialise through a second\n\
+         # age. A lock whose pid is a live hook run is never reaped — a first\n\
+         # full semantic pass can run well past {stale_min} minutes. Only a\n\
+         # lock written by an older hook, with no pid file, is reaped by age\n\
+         # ({stale_min} minutes). Reapers serialise through a second\n\
          # `mkdir` (`.reap`): the holder re-reads the pid, renames the lock\n\
          # away, and re-creates it, so of N concurrent fires exactly one\n\
          # proceeds and a lock that was already reaped and re-taken is left\n\
@@ -227,17 +227,24 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
            lockpid=\"$(head -c 32 \"$pidfile\" 2>/dev/null)\"\n\
            case $lockpid in ''|*[!0-9]*) lockpid=\"\" ;; esac\n\
          fi\n\
-         # A live pid counts only if its command line is a hook run (this\n\
-         # hooks directory or the codesage binary); anything else is reuse.\n\
+         # Liveness comes from the `kill -0` builtin (EPERM still means alive),\n\
+         # with `ps -p` as a fallback. `ps -o args=` only demotes a live pid\n\
+         # whose command line is readable and is not a hook run (codesage,\n\
+         # this hooks directory, or a Husky dir): pid reuse. A missing or\n\
+         # BusyBox `ps` never turns a live run into a dead one.\n\
          hook_alive() {{\n\
-           args=\"$(ps -p \"$1\" -o args= 2>/dev/null)\" || return 1\n\
-           case $args in *codesage*|*\"$(dirname \"$0\")/\"*) return 0 ;; esac\n\
+           kill -0 \"$1\" 2>/dev/null || ps -p \"$1\" >/dev/null 2>&1 || return 1\n\
+           args=\"$(ps -p \"$1\" -o args= 2>/dev/null)\" || return 0\n\
+           [ -n \"$args\" ] || return 0\n\
+           case $args in *codesage*|*\"$(dirname \"$0\")/\"*|*.husky*) return 0 ;; esac\n\
            return 1\n\
          }}\n\
          [ -n \"$(find \"$lockdir.reap\" -mmin +{stale_min} 2>/dev/null)\" ] && rmdir \"$lockdir.reap\" 2>/dev/null\n\
          # The reap is logged by whoever renamed the lock away, even if a\n\
          # plain `mkdir` from another fire wins the re-creation: that fire\n\
-         # runs, this one skips, and the tree is covered either way.\n\
+         # runs, this one skips, and the tree is covered either way. For a\n\
+         # pidless lock the pid re-read compares empty to empty: it only\n\
+         # proves no pid appeared since the first look, not identity.\n\
          claim_lock() {{\n\
            mkdir \"$lockdir.reap\" 2>/dev/null || return 1\n\
            claimed=1\n\
@@ -253,7 +260,7 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
            :\n\
          elif [ -n \"$lockpid\" ] && ! hook_alive \"$lockpid\" && claim_lock \"$lockpid\" dead; then\n\
            :\n\
-         elif [ -n \"$(find \"$lockdir\" -mmin +{stale_min} 2>/dev/null)\" ] && claim_lock \"$lockpid\" stale; then\n\
+         elif [ -z \"$lockpid\" ] && [ -n \"$(find \"$lockdir\" -mmin +{stale_min} 2>/dev/null)\" ] && claim_lock \"\" stale; then\n\
            :\n\
          else\n\
            echo \"[$(date)] $(basename \"$0\") hook skip: another index already running\" >>\"$log\"\n\
@@ -1199,8 +1206,9 @@ mod tests {
             "the EXIT trap must release only a lock this run still owns:\n{body}"
         );
         assert!(
-            body.contains("ps -p \"$1\" -o args="),
-            "a live pid must be believed only when its command line is a hook run:\n{body}"
+            body.contains("kill -0 \"$1\" 2>/dev/null || ps -p \"$1\" >/dev/null 2>&1 || return 1")
+                && body.contains("args=\"$(ps -p \"$1\" -o args= 2>/dev/null)\" || return 0"),
+            "liveness must come from kill -0, and a failing ps must never demote a live pid:\n{body}"
         );
         let stale_min = codesage_graph::hook_health::STALE_LOCK_SECS / 60;
         assert!(
@@ -1219,9 +1227,10 @@ mod tests {
         assert!(
             body.contains("reaped $2 lock${1:+ pid=$1}")
                 && body.contains("claim_lock \"$lockpid\" dead")
-                && body.contains("claim_lock \"$lockpid\" stale")
+                && body.contains("[ -z \"$lockpid\" ] && [ -n \"$(find \"$lockdir\" -mmin +")
+                && body.contains("claim_lock \"\" stale")
                 && body.contains("-mmin +30"),
-            "dead-pid reap must coexist with the 30-minute age reap:\n{body}"
+            "dead-pid reap must coexist with the pidless-only 30-minute age reap:\n{body}"
         );
         assert!(
             body.contains("trap 'exit 130' INT") && body.contains("trap 'exit 143' TERM"),
@@ -1332,6 +1341,52 @@ mod tests {
                 .unwrap()
                 .all(|e| !e.unwrap().file_name().to_string_lossy().contains(".dead.")),
             "no graveyard directory left behind"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_commit_hook_keeps_a_live_lock_when_ps_is_unusable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_repo_with_one_commit(root);
+        let hook = install_hook_with_stub(root, "#!/bin/sh\nexit 0\n");
+        let log = root.join(".codesage/hooks.log");
+        let lockdir = root.join(".codesage/hook-index.lock");
+        std::fs::create_dir_all(&lockdir).unwrap();
+        // A live process whose command line is not hook-shaped: only `ps -o
+        // args=` could demote it, and here `ps` is BusyBox-shaped and fails.
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::fs::write(lockdir.join("pid"), sleeper.id().to_string()).unwrap();
+        let fake_bin = root.join("fakebin");
+        std::fs::create_dir_all(&fake_bin).unwrap();
+        std::fs::write(fake_bin.join("ps"), "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(fake_bin.join("ps"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let path = format!(
+            "{}:{}",
+            fake_bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let status = std::process::Command::new(&hook)
+            .current_dir(root)
+            .env("PATH", path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let content = wait_for_log(&log, "another index already running");
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+        assert_eq!(content.matches("hook start").count(), 0, "{content}");
+        assert!(!content.contains("reaped"), "{content}");
+        assert!(
+            lockdir.join("pid").is_file(),
+            "live lock must survive a broken ps"
         );
     }
 

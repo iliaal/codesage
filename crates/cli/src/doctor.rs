@@ -482,9 +482,9 @@ fn check_hooks(root: &Path) -> Check {
 }
 
 /// Lock and log state of the indexing hooks. Reaps a lock no hook run can
-/// own (dead or reused pid, or any live holder past `STALE_LOCK_SECS`):
-/// doctor is an operator command, so unlike `project_overview` it may clear
-/// the way for the next hook fire.
+/// own (dead or reused pid, or pidless and past `STALE_LOCK_SECS`): doctor
+/// is an operator command, so unlike `project_overview` it may clear the way
+/// for the next hook fire. A live hook run's lock is only reported.
 fn check_hook_health(root: &Path) -> Check {
     use codesage_graph::hook_health::{
         self, LOCK_ABSENT, LOCK_HELD_DEAD, LOCK_HELD_LIVE, STALE_LOCK_SECS,
@@ -532,15 +532,13 @@ fn check_hook_health(root: &Path) -> Check {
         s if s == LOCK_ABSENT => parts.push("lock: absent".to_string()),
         s if s == LOCK_HELD_LIVE && stale => {
             status = Status::Warn;
-            reap(
-                &mut parts,
-                &mut status,
-                &format!("held by live pid {pid}"),
-                &format!("older than {stale_min} minutes, no hook run holds the lock that long"),
-            );
+            let minutes = health.lock.age_secs.unwrap_or(0) / 60;
+            parts.push(format!(
+                "lock: held by live pid {pid} since {since}{age} (hook run still running for {minutes} minutes; a first full pass can take this long, not reaped)"
+            ));
         }
         s if s == LOCK_HELD_LIVE => parts.push(format!(
-            "lock: held by live pid {pid} since {since}{age} (index in progress; reaped by age after {stale_min} minutes)"
+            "lock: held by live pid {pid} since {since}{age} (index in progress)"
         )),
         s if s == LOCK_HELD_DEAD => reap(
             &mut parts,
@@ -548,19 +546,18 @@ fn check_hook_health(root: &Path) -> Check {
             &format!("held by dead pid {pid}"),
             "pid is dead or belongs to an unrelated process",
         ),
-        _ => {
-            if stale {
-                status = Status::Warn;
-            }
-            parts.push(format!(
-                "lock: held without pid since {since}{age} ({})",
-                if stale {
-                    format!("older than {stale_min} minutes; the next hook fire reaps it")
-                } else {
-                    format!("pre-upgrade hook or just started; reaped by age after {stale_min} minutes")
-                }
-            ));
+        _ if stale => {
+            status = Status::Warn;
+            reap(
+                &mut parts,
+                &mut status,
+                "held without pid",
+                &format!("older than {stale_min} minutes, written by a pre-pid hook"),
+            );
         }
+        _ => parts.push(format!(
+            "lock: held without pid since {since}{age} (pre-upgrade hook or just started; reaped by age after {stale_min} minutes)"
+        )),
     }
 
     match (&health.last_run, health.last_exit) {
@@ -812,12 +809,20 @@ mod tests {
 
     fn init_git_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        let status = std::process::Command::new("git")
-            .arg("init")
-            .current_dir(dir.path())
-            .status()
-            .unwrap();
-        assert!(status.success(), "git init failed");
+        // Hermetic: no user or system git config (init templates, hooksPath).
+        for args in [
+            &["init"][..],
+            &["config", "core.hooksPath", ".git/hooks"][..],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .current_dir(dir.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        }
         dir
     }
 
@@ -975,7 +980,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn check_hook_health_reaps_a_live_pid_lock_past_the_ceiling() {
+    fn check_hook_health_warns_on_a_live_pid_lock_past_the_ceiling_without_reaping() {
         use codesage_graph::hook_health::STALE_LOCK_SECS;
         let dir = init_git_repo();
         let lockdir = dir.path().join(".codesage/hook-index.lock");
@@ -999,14 +1004,17 @@ mod tests {
             check.message
         );
         assert!(
-            check.message.contains("older than 30 minutes") && check.message.contains("; reaped,"),
+            check.message.contains("still running for") && check.message.contains("not reaped"),
             "{}",
             check.message
         );
         let health = check.hook_health.unwrap();
         assert_eq!(health.lock.state, "held_live");
-        assert!(health.lock.reaped);
-        assert!(!lockdir.exists(), "a live lock past the ceiling is removed");
+        assert!(!health.lock.reaped);
+        assert!(
+            lockdir.join("pid").is_file(),
+            "a live hook run's lock is never reaped"
+        );
     }
 
     #[cfg(unix)]
@@ -1015,11 +1023,20 @@ mod tests {
         let dir = init_git_repo();
         let lockdir = dir.path().join(".codesage/hook-index.lock");
         std::fs::create_dir_all(&lockdir).unwrap();
-        std::fs::write(lockdir.join("pid"), "1").unwrap();
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let reused = sleeper.id();
+        std::fs::write(lockdir.join("pid"), reused.to_string()).unwrap();
 
         let check = check_hook_health(dir.path());
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
         assert!(
-            check.message.contains("held by dead pid 1 since ")
+            check
+                .message
+                .contains(&format!("held by dead pid {reused} since "))
                 && check.message.contains("unrelated process"),
             "{}",
             check.message
@@ -1029,7 +1046,7 @@ mod tests {
         assert!(health.lock.reaped);
         assert!(
             !lockdir.exists(),
-            "pid 1 is live but no hook run: the lock is reaped"
+            "a live `sleep` is no hook run: the lock is reaped"
         );
     }
 
@@ -1063,10 +1080,15 @@ mod tests {
             "{}",
             check.message
         );
+        assert!(check.message.contains("; reaped,"), "{}", check.message);
         let health = check.hook_health.unwrap();
         assert_eq!(health.lock.state, "held_no_pid");
         assert!(health.lock.age_secs.is_some_and(|a| a >= 31 * 60));
-        assert!(lockdir.is_dir());
+        assert!(health.lock.reaped);
+        assert!(
+            !lockdir.exists(),
+            "doctor reaps a pidless lock past the ceiling"
+        );
     }
 
     #[test]
