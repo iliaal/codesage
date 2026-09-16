@@ -3301,6 +3301,36 @@ mod tests {
         assert_eq!(legacy.col_end, 5);
     }
 
+    /// `visibility` travels only when known, last on the wire, and an absent
+    /// key reads back as unknown.
+    #[test]
+    fn symbol_wire_emits_visibility_only_when_known() {
+        let mut known = symbol_fixture("open");
+        known.visibility = Some(Visibility::File);
+        let value = serde_json::to_value(&known).unwrap();
+        assert_eq!(value["visibility"], "file", "{value}");
+        let json = serde_json::to_string(&known).unwrap();
+        assert_eq!(
+            json_keys(&json),
+            [
+                "handle",
+                "name",
+                "kind",
+                "file_path",
+                "line_start",
+                "line_end",
+                "visibility"
+            ]
+        );
+        let back: Symbol = serde_json::from_value(value).unwrap();
+        assert_eq!(back.visibility, Some(Visibility::File));
+
+        let unknown = serde_json::to_value(symbol_fixture("open")).unwrap();
+        assert!(unknown.get("visibility").is_none(), "{unknown}");
+        let back: Symbol = serde_json::from_value(unknown).unwrap();
+        assert_eq!(back.visibility, None);
+    }
+
     /// An overloaded definition emits `@line_start` and the flag survives a
     /// round trip through the wire.
     #[test]
