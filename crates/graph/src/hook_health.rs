@@ -33,7 +33,7 @@ const LOG_TAIL_BYTES: u64 = 64 * 1024;
 pub const LOCK_ABSENT: &str = "absent";
 pub const LOCK_HELD_LIVE: &str = "held_live";
 pub const LOCK_HELD_DEAD: &str = "held_dead";
-pub const LOCK_HELD_NO_PID: &str = "held_no_pid";
+pub(crate) const LOCK_HELD_NO_PID: &str = "held_no_pid";
 
 /// Directory Git runs hooks from for this checkout; `None` outside a Git
 /// repository, even when a global `core.hooksPath` is set. Honors
@@ -248,12 +248,21 @@ fn hook_run_alive(pid: u32, root: &Path, hooks_dir: Option<&Path>) -> bool {
     names_hook_file(args, root, hooks_dir)
 }
 
+/// Husky runs `.husky/_/<hook>` (the generated wrapper), which sources the
+/// user hook in `.husky/`, so both spellings count; `hooks_dir()` maps the
+/// runtime dir to its parent, hence the explicit `<dir>/_` arms.
 fn names_hook_file(args: &str, root: &Path, hooks_dir: Option<&Path>) -> bool {
-    let mut dirs: Vec<String> = vec![".git/hooks".to_string(), ".husky".to_string()];
+    let mut dirs: Vec<String> = vec![
+        ".git/hooks".to_string(),
+        ".husky".to_string(),
+        ".husky/_".to_string(),
+    ];
     if let Some(dir) = hooks_dir {
         dirs.push(dir.display().to_string());
+        dirs.push(dir.join("_").display().to_string());
         if let Ok(rel) = dir.strip_prefix(root) {
             dirs.push(rel.display().to_string());
+            dirs.push(rel.join("_").display().to_string());
         }
     }
     INDEXING_HOOKS.iter().any(|name| {
@@ -423,6 +432,8 @@ mod tests {
             "/bin/sh .git/hooks/post-commit",
             "sh /srv/proj/.git/hooks/post-merge",
             "sh -e .husky/post-checkout",
+            "/bin/sh .husky/_/post-commit",
+            "sh /srv/proj/.husky/_/post-merge",
         ] {
             assert!(
                 names_hook_file(args, root, Some(abs)),

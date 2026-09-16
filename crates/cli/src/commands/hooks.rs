@@ -116,7 +116,13 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
     let stale_min = codesage_graph::hook_health::STALE_LOCK_SECS / 60;
     let hook_run_patterns = codesage_graph::hook_health::INDEXING_HOOKS
         .iter()
-        .flat_map(|name| [format!("*/hooks/{name}*"), format!("*.husky/{name}*")])
+        .flat_map(|name| {
+            [
+                format!("*/hooks/{name}*"),
+                format!("*.husky/{name}*"),
+                format!("*.husky/_/{name}*"),
+            ]
+        })
         .collect::<Vec<_>>()
         .join("|");
     format!(
@@ -780,6 +786,7 @@ mod tests {
         let root = dir.path();
         for args in [
             vec!["init", "-q"],
+            vec!["config", "core.hooksPath", ".git/hooks"],
             vec!["config", "user.email", "t@example.com"],
             vec!["config", "user.name", "t"],
         ] {
@@ -924,15 +931,23 @@ mod tests {
         assert_eq!(content.matches("hook start").count(), 5, "{content}");
     }
 
+    /// Pins `core.hooksPath` repo-locally: product code reads it through the
+    /// test process's own git environment, which a user's global config
+    /// could otherwise redirect.
     fn init_git_repo(root: &std::path::Path) {
-        let status = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .current_dir(root)
-            .status()
-            .unwrap();
-        assert!(status.success(), "git init failed");
+        for args in [
+            &["init", "-q"][..],
+            &["config", "core.hooksPath", ".git/hooks"][..],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .current_dir(root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        }
     }
 
     /// A live process whose command line is hook-shaped (`sh -c 'sleep 30'
@@ -950,6 +965,7 @@ mod tests {
     fn git_repo_with_one_commit(root: &std::path::Path) {
         for args in [
             vec!["init", "-q"],
+            vec!["config", "core.hooksPath", ".git/hooks"],
             vec!["config", "user.email", "t@example.com"],
             vec!["config", "user.name", "t"],
         ] {
@@ -1237,8 +1253,10 @@ mod tests {
         assert!(
             body.contains("kill -0 \"$1\" 2>/dev/null || ps -p \"$1\" >/dev/null 2>&1 || return 1")
                 && body.contains("args=\"$(ps -p \"$1\" -o args= 2>/dev/null)\" || return 0")
-                && body.contains("*/hooks/post-commit*|*.husky/post-commit*|*/hooks/post-merge*")
-                && body.contains("*/hooks/post-rewrite*|*.husky/post-rewrite*) return 0")
+                && body.contains(
+                    "*/hooks/post-commit*|*.husky/post-commit*|*.husky/_/post-commit*|*/hooks/post-merge*"
+                )
+                && body.contains("*.husky/post-rewrite*|*.husky/_/post-rewrite*) return 0")
                 && !body.contains("*codesage*"),
             "liveness must come from kill -0, and a failing ps must never demote a live pid:\n{body}"
         );

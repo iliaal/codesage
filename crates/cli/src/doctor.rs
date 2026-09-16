@@ -1036,6 +1036,50 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn check_hook_health_keeps_a_live_husky_wrapper_run() {
+        let dir = init_git_repo();
+        let root = dir.path();
+        let status = std::process::Command::new("git")
+            .args(["config", "core.hooksPath", ".husky/_"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .current_dir(root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::create_dir_all(root.join(".husky/_")).unwrap();
+        std::fs::write(root.join(".husky/_/h"), "#!/bin/sh\n").unwrap();
+        std::fs::write(
+            root.join(".husky/post-commit"),
+            "#!/bin/sh\n# installed by codesage install-hooks\n",
+        )
+        .unwrap();
+        let lockdir = root.join(".codesage/hook-index.lock");
+        std::fs::create_dir_all(&lockdir).unwrap();
+        // Husky runs the generated wrapper, not the user hook file.
+        let mut holder = std::process::Command::new("sh")
+            .args(["-c", "sleep 30", ".husky/_/post-commit"])
+            .current_dir(root)
+            .spawn()
+            .unwrap();
+        std::fs::write(lockdir.join("pid"), holder.id().to_string()).unwrap();
+
+        let check = check_hook_health(root);
+        let _ = holder.kill();
+        let _ = holder.wait();
+        assert_eq!(check.status, Status::Pass, "{}", check.message);
+        let health = check.hook_health.unwrap();
+        assert_eq!(health.installed_hooks, vec!["post-commit".to_string()]);
+        assert_eq!(health.lock.state, "held_live", "{}", check.message);
+        assert!(!health.lock.reaped);
+        assert!(
+            lockdir.join("pid").is_file(),
+            "a live Husky wrapper run must not be reaped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn check_hook_health_treats_a_reused_pid_as_dead() {
         let dir = init_git_repo();
         let lockdir = dir.path().join(".codesage/hook-index.lock");
