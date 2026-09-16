@@ -2248,6 +2248,7 @@ mod tests {
                     col_start: 0,
                     col_end: 0,
                     rationale: Vec::new(),
+                    visibility: None,
                 }],
             )
             .unwrap();
@@ -2360,6 +2361,7 @@ mod tests {
             col_start: 0,
             col_end: 0,
             rationale: Vec::new(),
+            visibility: None,
         };
         db.insert_symbols(
             ids("cyc_a.php"),

@@ -1,5 +1,29 @@
 ## [Unreleased]
 
+### Added
+
+- Symbol rows (`find_symbol`, bundles, `trace_call_path`, `impact_analysis` siblings) carry `handle`: `sym:<path>#<qualified>`, with `@<line>` only for same-file overloads; search and bundle chunks carry `chunk:<path>:<start>-<end>`.
+- File-shaped rows (`impact_analysis`, `list_dependencies`, `find_coupling`, `assess_risk*`, `recommend_tests`, resolved `from_trace` frames) carry `file:<path>`; `assess_risk_diff` clustered directories carry `dir:<path>`.
+- `find_references` rows carry `from` (enclosing symbol handle) and `to` (the definition the callsite resolves to with qualified, same-file, or import evidence); `to_resolution` discloses when `to` resolution hit its bound.
+- `find_symbol` rows carry `visibility` (`public`, `crate`, `module`, `file`) for C, C++, and Rust.
+- `recommend_tests` returns `commands` (runnable cargo, pytest, phpunit/artisan, run-tests.php, go test, vitest/jest, maven/gradle commands plus a mapped feature's `test_command`) and `inline_test_modules` (Rust `#[cfg(test)]` modules and Python `test_*` functions in the changed files); `review_rehearsal` quotes up to five commands.
+- `codesage doctor` reports `hook_health` (installed indexing hooks, last hook run and exit, `hook-index.lock` state) and reaps a lock held by a dead pid; `project_overview` reports `hook_health` without reaping.
+- Reference rows carry `lazy: true` for imports inside a Python function or a JavaScript/TypeScript function body not invoked in place; `assess_risk`, `assess_risk_diff`, `review_rehearsal`, and session snapshots disclose `lazy_edges` when such imports were excluded from cycle detection.
+
+### Changed
+
+- Every failed MCP `tools/call` carries a JSON block with `tool`, `error.code`, `error.message`, and `error.remedy` (a tool call, a shell command with optional `cwd`, or null); parameter validation, project routing, `daemon_stats`, and internal-tool failures included. Legacy `status` / `complete` / `next` fields are unchanged.
+- Error codes: `E_PARAM`, `E_PROJECT_PATH`, `E_NOT_ONBOARDED`, `E_SCHEMA_TOO_NEW`, `E_NOT_FOUND`, `E_AMBIGUOUS`, `E_EMPTY_INPUT`, `E_OVER_CAP`, `E_MODEL`, `E_DB_BUSY`, `E_SATURATED`, `E_TIMEOUT`, `E_CANCELLED`, `E_SHUTDOWN`, `E_INCOMPLETE`, `E_INTERNAL`.
+- `impact_analysis` on an ambiguous symbol returns `E_AMBIGUOUS` with a retry naming the first qualified candidate.
+- Schema migrations `0022_refs_lazy` and `0023_symbols_visibility`; the next `codesage index` reparses existing files under `extraction=2`.
+
+### Fixed
+
+- Import-cycle detection no longer counts imports written inside a function body; a file pair connected only by such lazy imports is excluded from `assess_risk`, `assess_risk_diff`, `review_rehearsal`, and `session_end` cycle checks while `list_dependencies` and `impact_analysis` keep the edge.
+- `impact_analysis`, `trace_call_path`, and `export_context` no longer resolve a C/C++ `static` function or a non-`pub` Rust item as a callee from a file that cannot name it; a lone survivor of the visibility gate still needs import evidence.
+- The indexing hook records its pid in `.codesage/hook-index.lock/pid`, logs `hook start` and `hook exit` lines on every path including signals, and reaps a lock whose pid is dead or belongs to a non-hook process on the next fire regardless of age.
+- Concurrent hook fires against an orphaned lock start exactly one indexing pass; a killed run no longer blocks indexing for 30 minutes.
+
 ## [0.31.0] - 2026-09-14
 
 ### Added
