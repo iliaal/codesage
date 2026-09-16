@@ -12,8 +12,7 @@ use codesage_protocol::{HookHealth, HookLockState};
 use crate::drift::git_common_dir;
 
 /// Hooks `codesage install-hooks` wires for indexing.
-pub(crate) const INDEXING_HOOKS: &[&str] =
-    &["post-commit", "post-merge", "post-checkout", "post-rewrite"];
+pub const INDEXING_HOOKS: &[&str] = &["post-commit", "post-merge", "post-checkout", "post-rewrite"];
 
 /// Marker the installer writes into every hook body it owns.
 pub(crate) const HOOK_MARKER: &str = "codesage install-hooks";
@@ -92,7 +91,7 @@ pub fn inspect(root: &Path) -> Option<HookHealth> {
         installed_hooks: installed_hooks(&dir),
         last_run,
         last_exit,
-        lock: lock_state(root),
+        lock: lock_state_in(root, Some(&dir)),
     })
 }
 
@@ -108,7 +107,8 @@ pub fn inspect(root: &Path) -> Option<HookHealth> {
 /// fire and doctor cannot both believe they reaped it. `Ok(None)` also covers
 /// a mutex already held by another reaper.
 pub fn reap_orphan_lock(root: &Path) -> Result<Option<HookLockState>> {
-    if !is_reapable(&lock_state(root)) {
+    let dir = hooks_dir(root);
+    if !is_reapable(&lock_state_in(root, dir.as_deref())) {
         return Ok(None);
     }
     let lockdir = root.join(LOCK_DIR);
@@ -131,7 +131,7 @@ pub fn reap_orphan_lock(root: &Path) -> Result<Option<HookLockState>> {
     }
     let _release = ReleaseOnDrop(&mutex);
 
-    let state = lock_state(root);
+    let state = lock_state_in(root, dir.as_deref());
     if !is_reapable(&state) {
         return Ok(None);
     }
@@ -165,6 +165,12 @@ impl Drop for ReleaseOnDrop<'_> {
 }
 
 pub fn lock_state(root: &Path) -> HookLockState {
+    lock_state_in(root, hooks_dir(root).as_deref())
+}
+
+/// `lock_state` with an already-resolved hooks directory, so callers that
+/// hold one do not spawn `git` again.
+fn lock_state_in(root: &Path, hooks_dir: Option<&Path>) -> HookLockState {
     let lockdir = root.join(LOCK_DIR);
     let Ok(meta) = std::fs::symlink_metadata(&lockdir) else {
         return HookLockState {
@@ -190,7 +196,7 @@ pub fn lock_state(root: &Path) -> HookLockState {
         .flatten();
     let state = match pid {
         None => LOCK_HELD_NO_PID,
-        Some(pid) if hook_run_alive(pid, hooks_dir(root).as_deref()) => LOCK_HELD_LIVE,
+        Some(pid) if hook_run_alive(pid, root, hooks_dir) => LOCK_HELD_LIVE,
         Some(_) => LOCK_HELD_DEAD,
     };
     HookLockState {
@@ -216,9 +222,12 @@ fn read_pid(pidfile: &Path) -> Option<u32> {
 
 /// Same rule as the hook template's `hook_alive`: liveness from `kill(pid,
 /// 0)`; `ps -o args=` only demotes a live pid whose readable command line
-/// names neither codesage, nor this project's hooks directory, nor a Husky
-/// dir (pid reuse). A missing or BusyBox `ps` never demotes.
-fn hook_run_alive(pid: u32, hooks_dir: Option<&Path>) -> bool {
+/// names no hook file — `<hooks_dir>/<hook>` spelled absolute or relative to
+/// `root`, `.git/hooks/<hook>`, or Husky's `.husky/<hook>` — which is pid
+/// reuse, including a recycled pid now running the codesage binary. A
+/// missing or BusyBox `ps` never demotes. Pid-bearing locks have no age
+/// backstop by design; this check is what frees them.
+fn hook_run_alive(pid: u32, root: &Path, hooks_dir: Option<&Path>) -> bool {
     if !pid_alive(pid) {
         return false;
     }
@@ -236,9 +245,21 @@ fn hook_run_alive(pid: u32, hooks_dir: Option<&Path>) -> bool {
     if args.is_empty() {
         return true;
     }
-    args.contains("codesage")
-        || args.contains(".husky")
-        || hooks_dir.is_some_and(|d| args.contains(&d.display().to_string()))
+    names_hook_file(args, root, hooks_dir)
+}
+
+fn names_hook_file(args: &str, root: &Path, hooks_dir: Option<&Path>) -> bool {
+    let mut dirs: Vec<String> = vec![".git/hooks".to_string(), ".husky".to_string()];
+    if let Some(dir) = hooks_dir {
+        dirs.push(dir.display().to_string());
+        if let Ok(rel) = dir.strip_prefix(root) {
+            dirs.push(rel.display().to_string());
+        }
+    }
+    INDEXING_HOOKS.iter().any(|name| {
+        dirs.iter()
+            .any(|dir| args.contains(&format!("{dir}/{name}")))
+    })
 }
 
 /// `kill(pid, 0)`: ESRCH is the only proof of death. EPERM means a live
@@ -395,6 +416,45 @@ mod tests {
     }
 
     #[test]
+    fn hook_run_predicate_keys_on_hook_file_names_in_any_spelling() {
+        let root = Path::new("/srv/proj");
+        let abs = Path::new("/srv/proj/.git/hooks");
+        for args in [
+            "/bin/sh .git/hooks/post-commit",
+            "sh /srv/proj/.git/hooks/post-merge",
+            "sh -e .husky/post-checkout",
+        ] {
+            assert!(
+                names_hook_file(args, root, Some(abs)),
+                "{args:?} must read as a hook run"
+            );
+        }
+        let custom = Path::new("/srv/proj/tools/git-hooks");
+        assert!(names_hook_file(
+            "sh tools/git-hooks/post-commit",
+            root,
+            Some(custom)
+        ));
+        assert!(names_hook_file(
+            "sh /srv/proj/tools/git-hooks/post-commit",
+            root,
+            Some(custom)
+        ));
+        for args in [
+            "codesage daemon",
+            "/home/u/codesage/target/debug/codesage index",
+            "sleep 30",
+            "sh .git/hooks/pre-commit",
+            "sh tools/git-hooks/post-commit",
+        ] {
+            assert!(
+                !names_hook_file(args, root, Some(abs)),
+                "{args:?} must not read as an indexing hook run"
+            );
+        }
+    }
+
+    #[test]
     fn stale_lock_ceiling_is_a_whole_number_of_minutes_for_the_template() {
         assert_eq!(
             STALE_LOCK_SECS % 60,
@@ -418,10 +478,18 @@ mod tests {
         assert_eq!(no_pid.pid, None);
         assert!(no_pid.since_unix.is_some() && no_pid.since.is_some());
 
-        std::fs::write(lockdir.join("pid"), format!("{}\n", std::process::id())).unwrap();
+        let mut holder = Command::new("sh")
+            .args(["-c", "sleep 30", ".git/hooks/post-commit"])
+            .current_dir(root)
+            .spawn()
+            .unwrap();
+        std::fs::write(lockdir.join("pid"), format!("{}\n", holder.id())).unwrap();
         let live = lock_state(root);
-        assert_eq!(live.state, LOCK_HELD_LIVE);
-        assert_eq!(live.pid, Some(std::process::id()));
+        assert_eq!(
+            live.state, LOCK_HELD_LIVE,
+            "a git-invoked hook runs as `sh .git/hooks/<hook>`: relative argv must count"
+        );
+        assert_eq!(live.pid, Some(holder.id()));
         assert!(
             reap_orphan_lock(root).unwrap().is_none(),
             "a fresh live lock is never reaped"
@@ -441,6 +509,8 @@ mod tests {
             "a live hook run's lock is never reaped, however old"
         );
         assert!(lockdir.is_dir());
+        let _ = holder.kill();
+        let _ = holder.wait();
         std::fs::remove_dir_all(&lockdir).unwrap();
 
         std::fs::create_dir_all(&lockdir).unwrap();
@@ -456,14 +526,17 @@ mod tests {
         assert!(!lockdir.exists());
 
         std::fs::create_dir_all(&lockdir).unwrap();
-        let mut sleeper = Command::new("sleep").arg("30").spawn().unwrap();
+        let mut sleeper = Command::new("sh")
+            .args(["-c", "sleep 30", "/usr/local/bin/codesage"])
+            .spawn()
+            .unwrap();
         std::fs::write(lockdir.join("pid"), sleeper.id().to_string()).unwrap();
         let reused = lock_state(root);
         let _ = sleeper.kill();
         let _ = sleeper.wait();
         assert_eq!(
             reused.state, LOCK_HELD_DEAD,
-            "a live `sleep` is no hook run: reuse reads as dead"
+            "a live process that only names the codesage binary is no hook run: reuse reads as dead"
         );
         assert!(reap_orphan_lock(root).unwrap().is_some());
         assert!(!lockdir.exists());

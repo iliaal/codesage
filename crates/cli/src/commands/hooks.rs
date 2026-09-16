@@ -114,6 +114,11 @@ pub(crate) fn install_hooks_at(
 pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
     let bin = shell_single_quote(bin);
     let stale_min = codesage_graph::hook_health::STALE_LOCK_SECS / 60;
+    let hook_run_patterns = codesage_graph::hook_health::INDEXING_HOOKS
+        .iter()
+        .flat_map(|name| [format!("*/hooks/{name}*"), format!("*.husky/{name}*")])
+        .collect::<Vec<_>>()
+        .join("|");
     format!(
         "#!/bin/sh\n\
          # installed by codesage install-hooks\n\
@@ -229,14 +234,17 @@ pub(crate) fn generate_post_commit_hook_body(bin: &str) -> String {
          fi\n\
          # Liveness comes from the `kill -0` builtin (EPERM still means alive),\n\
          # with `ps -p` as a fallback. `ps -o args=` only demotes a live pid\n\
-         # whose command line is readable and is not a hook run (codesage,\n\
-         # this hooks directory, or a Husky dir): pid reuse. A missing or\n\
-         # BusyBox `ps` never turns a live run into a dead one.\n\
+         # whose command line is readable and is not a hook run — one that\n\
+         # names a hook file (this hooks directory, `*/hooks/<hook>`, or a\n\
+         # Husky `.husky/<hook>`): pid reuse, including a recycled pid now\n\
+         # running the codesage binary itself. A missing or BusyBox `ps`\n\
+         # never turns a live run into a dead one. Pid-bearing locks have no\n\
+         # age backstop by design; only this check frees them.\n\
          hook_alive() {{\n\
            kill -0 \"$1\" 2>/dev/null || ps -p \"$1\" >/dev/null 2>&1 || return 1\n\
            args=\"$(ps -p \"$1\" -o args= 2>/dev/null)\" || return 0\n\
            [ -n \"$args\" ] || return 0\n\
-           case $args in *codesage*|*\"$(dirname \"$0\")/\"*|*.husky*) return 0 ;; esac\n\
+           case $args in *\"$(dirname \"$0\")/\"*|{hook_run_patterns}) return 0 ;; esac\n\
            return 1\n\
          }}\n\
          [ -n \"$(find \"$lockdir.reap\" -mmin +{stale_min} 2>/dev/null)\" ] && rmdir \"$lockdir.reap\" 2>/dev/null\n\
@@ -777,6 +785,8 @@ mod tests {
         ] {
             let status = std::process::Command::new("git")
                 .args(&args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .current_dir(root)
                 .status()
                 .unwrap();
@@ -917,10 +927,23 @@ mod tests {
     fn init_git_repo(root: &std::path::Path) {
         let status = std::process::Command::new("git")
             .args(["init", "-q"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .current_dir(root)
             .status()
             .unwrap();
         assert!(status.success(), "git init failed");
+    }
+
+    /// A live process whose command line is hook-shaped (`sh -c 'sleep 30'
+    /// .git/hooks/post-commit`), standing in for a running hook subshell.
+    #[cfg(unix)]
+    fn spawn_hook_shaped_sleeper(root: &std::path::Path) -> std::process::Child {
+        std::process::Command::new("sh")
+            .args(["-c", "sleep 30", ".git/hooks/post-commit"])
+            .current_dir(root)
+            .spawn()
+            .unwrap()
     }
 
     #[cfg(unix)]
@@ -932,6 +955,8 @@ mod tests {
         ] {
             let status = std::process::Command::new("git")
                 .args(&args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .current_dir(root)
                 .status()
                 .unwrap();
@@ -941,6 +966,8 @@ mod tests {
         for args in [vec!["add", "a.txt"], vec!["commit", "-q", "-m", "one"]] {
             let status = std::process::Command::new("git")
                 .args(&args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .current_dir(root)
                 .status()
                 .unwrap();
@@ -1067,6 +1094,8 @@ mod tests {
         for args in [vec!["add", "big.bin"], vec!["commit", "-q", "-m", "big"]] {
             let status = std::process::Command::new("git")
                 .args(&args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .current_dir(root)
                 .status()
                 .unwrap();
@@ -1207,7 +1236,10 @@ mod tests {
         );
         assert!(
             body.contains("kill -0 \"$1\" 2>/dev/null || ps -p \"$1\" >/dev/null 2>&1 || return 1")
-                && body.contains("args=\"$(ps -p \"$1\" -o args= 2>/dev/null)\" || return 0"),
+                && body.contains("args=\"$(ps -p \"$1\" -o args= 2>/dev/null)\" || return 0")
+                && body.contains("*/hooks/post-commit*|*.husky/post-commit*|*/hooks/post-merge*")
+                && body.contains("*/hooks/post-rewrite*|*.husky/post-rewrite*) return 0")
+                && !body.contains("*codesage*"),
             "liveness must come from kill -0, and a failing ps must never demote a live pid:\n{body}"
         );
         let stale_min = codesage_graph::hook_health::STALE_LOCK_SECS / 60;
@@ -1400,10 +1432,13 @@ mod tests {
         let log = root.join(".codesage/hooks.log");
         let lockdir = root.join(".codesage/hook-index.lock");
         std::fs::create_dir_all(&lockdir).unwrap();
-        std::fs::write(lockdir.join("pid"), format!("{}\n", std::process::id())).unwrap();
+        let mut holder = spawn_hook_shaped_sleeper(root);
+        std::fs::write(lockdir.join("pid"), format!("{}\n", holder.id())).unwrap();
 
         assert!(run_script(&hook, root).success());
         let content = wait_for_log(&log, "another index already running");
+        let _ = holder.kill();
+        let _ = holder.wait();
         assert_eq!(content.matches("hook start").count(), 0, "{content}");
         assert!(!content.contains("reaped"), "{content}");
         assert!(

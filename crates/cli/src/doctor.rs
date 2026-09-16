@@ -807,6 +807,17 @@ use crate::util::format_bytes;
 mod tests {
     use super::*;
 
+    /// A live process whose command line is hook-shaped, exactly as git
+    /// invokes a hook: `sh .git/hooks/post-commit` relative to the root.
+    #[cfg(unix)]
+    fn spawn_hook_shaped_sleeper(root: &Path) -> std::process::Child {
+        std::process::Command::new("sh")
+            .args(["-c", "sleep 30", ".git/hooks/post-commit"])
+            .current_dir(root)
+            .spawn()
+            .unwrap()
+    }
+
     fn init_git_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         // Hermetic: no user or system git config (init templates, hooksPath).
@@ -949,7 +960,8 @@ mod tests {
         let dir = init_git_repo();
         let lockdir = dir.path().join(".codesage/hook-index.lock");
         std::fs::create_dir_all(&lockdir).unwrap();
-        let me = std::process::id();
+        let mut holder = spawn_hook_shaped_sleeper(dir.path());
+        let me = holder.id();
         std::fs::write(lockdir.join("pid"), me.to_string()).unwrap();
         std::fs::write(
             dir.path().join(".codesage/hooks.log"),
@@ -959,6 +971,8 @@ mod tests {
         .unwrap();
 
         let check = check_hook_health(dir.path());
+        let _ = holder.kill();
+        let _ = holder.wait();
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(
             check
@@ -985,7 +999,8 @@ mod tests {
         let dir = init_git_repo();
         let lockdir = dir.path().join(".codesage/hook-index.lock");
         std::fs::create_dir_all(&lockdir).unwrap();
-        let me = std::process::id();
+        let mut holder = spawn_hook_shaped_sleeper(dir.path());
+        let me = holder.id();
         std::fs::write(lockdir.join("pid"), me.to_string()).unwrap();
         let old =
             std::time::SystemTime::now() - std::time::Duration::from_secs(STALE_LOCK_SECS + 60);
@@ -995,6 +1010,8 @@ mod tests {
             .unwrap();
 
         let check = check_hook_health(dir.path());
+        let _ = holder.kill();
+        let _ = holder.wait();
         assert_eq!(check.status, Status::Warn, "{}", check.message);
         assert!(
             check
@@ -1023,8 +1040,9 @@ mod tests {
         let dir = init_git_repo();
         let lockdir = dir.path().join(".codesage/hook-index.lock");
         std::fs::create_dir_all(&lockdir).unwrap();
-        let mut sleeper = std::process::Command::new("sleep")
-            .arg("30")
+        // Unrelated argv that even names the binary: not a hook file, so reuse.
+        let mut sleeper = std::process::Command::new("sh")
+            .args(["-c", "sleep 30", "/usr/local/bin/codesage"])
             .spawn()
             .unwrap();
         let reused = sleeper.id();
