@@ -201,6 +201,29 @@ fn mcp_reports_break_before_writing_without_touching_index_or_starting_watcher()
 
     let missing = failure(&session.request("tools/call", json!({"name":"edit_check", "arguments":{"project":root, "file_path":"lib.rs", "symbol_name":"absent", "replacement":"fn absent() {}"}})));
     assert_eq!(missing["error"]["code"], "E_NOT_FOUND", "{missing}");
+
+    let renamed = failure(&session.request("tools/call", json!({"name":"edit_check", "arguments":{"project":root, "file_path":"lib.rs", "symbol_name":"f", "replacement":"fn g() {}"}})));
+    assert_eq!(renamed["error"]["code"], "E_PARAM", "{renamed}");
+    assert!(
+        renamed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("retain the selected symbol name"),
+        "{renamed}"
+    );
+
+    let broken = failure(&session.request("tools/call", json!({"name":"edit_check", "arguments":{"project":root, "file_path":"lib.rs", "symbol_name":"f", "replacement":"fn f( {"}})));
+    assert_eq!(broken["error"]["code"], "E_PARAM", "{broken}");
+
+    let not_at_head = failure(&session.request("tools/call", json!({"name":"edit_check", "arguments":{"project":root, "file_path":"nope.rs", "symbol_name":"f", "replacement":"fn f() {}"}})));
+    assert_eq!(not_at_head["error"]["code"], "E_NOT_FOUND", "{not_at_head}");
+    assert!(
+        not_at_head["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not at Git HEAD"),
+        "{not_at_head}"
+    );
     assert_eq!(missing["error"]["remedy"], Value::Null, "{missing}");
 
     std::fs::write(root.join("dup.rs"), "fn f() {}\nmod inner { fn f() {} }\n").unwrap();
@@ -240,7 +263,7 @@ fn failure(result: &Value) -> Value {
         .iter()
         .filter_map(|part| part["text"].as_str())
         .filter_map(|text| serde_json::from_str::<Value>(text).ok())
-        .filter(|value| value.get("status").is_some())
+        .filter(Value::is_object)
         .collect();
     assert_eq!(blocks.len(), 1, "one contract block per failure: {result}");
     let block = blocks.into_iter().next().unwrap();

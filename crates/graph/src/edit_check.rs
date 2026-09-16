@@ -140,23 +140,31 @@ pub fn edit_check(
         .trim()
         .to_owned();
     let object = format!("{head}:{file}");
+    let entry = git(&root, &["ls-tree", &head, "--", file])?;
+    if entry.is_empty() {
+        return Err(EditCheckRefusal::NotFound(format!("`{file}` is not at Git HEAD")).into());
+    }
+    if !(entry.starts_with(b"100644 ") || entry.starts_with(b"100755 ")) {
+        return Err(
+            EditCheckRefusal::Param("HEAD path must be a regular source file".into()).into(),
+        );
+    }
     let size: usize = String::from_utf8(git(&root, &["cat-file", "-s", &object])?)?
         .trim()
         .parse()?;
     if size > MAX_SOURCE_BYTES {
         return Err(EditCheckRefusal::OverCap("HEAD file exceeds 1 MiB".into()).into());
     }
-    let entry = git(&root, &["ls-tree", &head, "--", file])?;
-    ensure!(
-        entry.starts_with(b"100644 ") || entry.starts_with(b"100755 "),
-        "HEAD path must be a regular source file"
-    );
     let source = String::from_utf8(git(&root, &["cat-file", "blob", &object])?)?;
-    let language = detect_language(Path::new(file)).context("unsupported source language")?;
-    ensure!(
-        Path::new(file).extension().is_none_or(|ext| ext != "h"),
-        "ambiguous .h dialect: use an unambiguous source file"
-    );
+    let Some(language) = detect_language(Path::new(file)) else {
+        return Err(EditCheckRefusal::Param("unsupported source language".into()).into());
+    };
+    if Path::new(file).extension().is_some_and(|ext| ext == "h") {
+        return Err(EditCheckRefusal::Param(
+            "ambiguous .h dialect: use an unambiguous source file".into(),
+        )
+        .into());
+    }
     let mut report = check_source(&source, language, file, symbol, line, replacement)?;
     report.head = head;
     report.worktree_matches_head = worktree_matches(&root.join(file), source.as_bytes());
@@ -474,10 +482,9 @@ fn check_source(
         return Err(EditCheckRefusal::OverCap("proposed file exceeds 1 MiB".into()).into());
     }
     let new_tree = parse_file(proposed.as_bytes(), language)?;
-    ensure!(
-        !new_tree.root_node().has_error(),
-        "replacement produces syntax errors"
-    );
+    if new_tree.root_node().has_error() {
+        return Err(EditCheckRefusal::Param("replacement produces syntax errors".into()).into());
+    }
     let mut new_nodes = Vec::new();
     walk(new_tree.root_node(), &mut new_nodes);
     let start = old.start_byte();
@@ -492,20 +499,28 @@ fn check_source(
                 && scope(*n) == scope(old)
         })
         .collect();
-    ensure!(
-        candidates.len() == 1,
-        "replacement must contain exactly one complete declaration in the original scope"
-    );
+    if candidates.len() != 1 {
+        return Err(EditCheckRefusal::Param(
+            "replacement must contain exactly one complete declaration in the original scope"
+                .into(),
+        )
+        .into());
+    }
     let new = candidates[0];
-    ensure!(
-        name(new, &proposed) == Some(symbol),
-        "replacement must retain the selected symbol name"
-    );
-    ensure!(
-        proposed[start..new.start_byte()].trim().is_empty()
-            && proposed[new.end_byte()..end].trim().is_empty(),
-        "replacement must contain only the complete declaration"
-    );
+    if name(new, &proposed) != Some(symbol) {
+        return Err(EditCheckRefusal::Param(
+            "replacement must retain the selected symbol name".into(),
+        )
+        .into());
+    }
+    if !(proposed[start..new.start_byte()].trim().is_empty()
+        && proposed[new.end_byte()..end].trim().is_empty())
+    {
+        return Err(EditCheckRefusal::Param(
+            "replacement must contain only the complete declaration".into(),
+        )
+        .into());
+    }
     let before = signature(old, source, language);
     let after = signature(new, &proposed, language);
     let mut overloads_before: Vec<_> = nodes
