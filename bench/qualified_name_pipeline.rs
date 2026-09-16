@@ -48,9 +48,21 @@ fn main() -> anyhow::Result<()> {
             Some(Box::new(|q, docs| reranker.score_pairs(q, docs))),
             &req,
         )?;
+        let explained = if args.get(3).is_some_and(|arg| arg == "--explain-parity") {
+            let req: SearchRequest =
+                serde_json::from_value(json!({"query": query, "limit": 10, "explain": true}))?;
+            Some(candidate::search(
+                db,
+                &embedding,
+                Some(Box::new(|q, docs| reranker.score_pairs(q, docs))),
+                &req,
+            )?)
+        } else {
+            None
+        };
         println!(
             "{}",
-            json!({"case": case, "baseline": before, "candidate": after})
+            json!({"case": case, "baseline": before, "candidate": after, "explained": explained})
         );
     }
     Ok(())
