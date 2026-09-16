@@ -477,7 +477,7 @@ pub struct Reference {
     /// JSON; `line` is what agents navigate by.
     #[serde(skip)]
     pub col: u32,
-    /// `sym:` handle of the definition this reference resolves to with qualified, same-file, or import evidence; omitted otherwise, including when resolution was capped. Filled by the graph layer, never stored.
+    /// `sym:` handle of the definition this reference resolves to when the spelling is qualified, the definition is in the same file, or the caller file imports the definition or references its owning type; omitted otherwise, including when resolution was capped. Filled by the graph layer, never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "String")]
     pub to: Option<String>,
@@ -2971,22 +2971,6 @@ mod tests {
     /// `unscored` qualifies `score`, so the verbose switch must not hide it
     /// and the hand-written `Serialize` must place it beside the number it
     /// disclaims. A scored assessment keeps the key off the wire entirely.
-    /// A caller-echoed path that is not repository-relative gets no handle,
-    /// since `Handle::parse` would reject it.
-    #[test]
-    fn risk_assessment_omits_handle_for_paths_outside_the_repository() {
-        for hostile in ["../../../etc/passwd", "/etc/passwd", "src\\x.rs"] {
-            let mut risk = risk_fixture();
-            risk.file = hostile.to_string();
-            risk.found = false;
-            let json: serde_json::Value = serde_json::to_value(&risk).unwrap();
-            assert!(json.get("handle").is_none(), "{hostile}: {json}");
-            assert_eq!(json["file"], hostile);
-        }
-        let json: serde_json::Value = serde_json::to_value(risk_fixture()).unwrap();
-        assert_eq!(json["handle"], "file:src/lib.rs");
-    }
-
     #[test]
     fn risk_assessment_unscored_reaches_the_wire_in_both_verbosities() {
         let mut scored = risk_fixture();
@@ -3017,6 +3001,22 @@ mod tests {
                 assert_eq!(format!("{back:?}"), format!("{unscored:?}"));
             }
         }
+    }
+
+    /// A caller-echoed path that is not repository-relative gets no handle,
+    /// since `Handle::parse` would reject it.
+    #[test]
+    fn risk_assessment_omits_handle_for_paths_outside_the_repository() {
+        for hostile in ["../../../etc/passwd", "/etc/passwd", "src\\x.rs"] {
+            let mut risk = risk_fixture();
+            risk.file = hostile.to_string();
+            risk.found = false;
+            let json: serde_json::Value = serde_json::to_value(&risk).unwrap();
+            assert!(json.get("handle").is_none(), "{hostile}: {json}");
+            assert_eq!(json["file"], hostile);
+        }
+        let json: serde_json::Value = serde_json::to_value(risk_fixture()).unwrap();
+        assert_eq!(json["handle"], "file:src/lib.rs");
     }
 
     /// Guards the hand-written `Serialize`: a field added to the struct but

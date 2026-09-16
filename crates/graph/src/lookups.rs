@@ -347,9 +347,10 @@ fn last_segment(name: &str) -> &str {
     &name[cut..]
 }
 
-/// An import target names `owner` when it is the owner, ends in the owner
-/// (`use codesage_storage::Database` for `Database::open`), or is a namespace
-/// the owner sits under, at a segment boundary.
+/// An import target names `owner` when it is the owner or ends in the owner
+/// at a segment boundary (`use codesage_storage::Database` for
+/// `Database::open`). A namespace import (`use App\Lib;`) is an ancestor,
+/// not the owner, and names nothing here.
 fn names_owner(import: &str, owner: &str) -> bool {
     if import == owner {
         return true;
@@ -358,9 +359,6 @@ fn names_owner(import: &str, owner: &str) -> bool {
         import
             .strip_suffix(owner)
             .is_some_and(|head| head.ends_with(sep))
-            || owner
-                .strip_prefix(import)
-                .is_some_and(|tail| tail.starts_with(sep))
     })
 }
 
@@ -885,8 +883,22 @@ mod tests {
             )],
         )
         .unwrap();
+        let namespace_only = file(&db, "src/Ns.php");
+        db.insert_references(
+            namespace_only,
+            &[
+                reference_at("App\\Lib", "src/Ns.php", None, 3, ReferenceKind::Import),
+                reference_at("phpbar", "src/Ns.php", None, 9, ReferenceKind::Call),
+            ],
+        )
+        .unwrap();
 
         let out = lookup(&db, "phpbar");
+        assert_eq!(
+            to_of(&out, "src/Ns.php", "phpbar"),
+            None,
+            "`use App\\Lib;` is an ancestor namespace, not the owner"
+        );
         assert_eq!(
             to_of(&out, "src/Ctl.php", "phpbar").as_deref(),
             Some("sym:src/Lib/Foo.php#App\\Lib\\Foo\\phpbar")
@@ -1048,8 +1060,12 @@ mod tests {
         assert_eq!(last_segment("App\\Lib\\Foo"), "Foo");
         assert_eq!(last_segment("pkg.Class"), "Class");
         assert!(names_owner("codesage_storage::Database", "Database"));
-        assert!(names_owner("App\\Lib", "App\\Lib\\Foo"));
+        assert!(
+            !names_owner("App\\Lib", "App\\Lib\\Foo"),
+            "a namespace import is an ancestor, not the owner"
+        );
         assert!(!names_owner("App\\Library", "App\\Lib\\Foo"));
+        assert!(names_owner("App\\Lib\\Foo", "App\\Lib\\Foo"));
         assert!(!names_owner("tokio", "OverviewCache"));
         assert_eq!(file_stem("src/util.c"), "util");
         assert_eq!(file_stem("util.h"), "util");
