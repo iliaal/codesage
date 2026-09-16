@@ -301,6 +301,18 @@ pub(crate) fn cmd_tests_for(files: Vec<String>, json: bool) -> Result<()> {
                 );
             }
         }
+        if !recs.inline_test_modules.is_empty() {
+            println!("Inline test modules (inside the changed files):");
+            for m in &recs.inline_test_modules {
+                println!("  {}  {}  ({} test(s))", m.file, m.module, m.test_count);
+            }
+        }
+        if !recs.commands.is_empty() {
+            println!("Commands:");
+            for c in &recs.commands {
+                println!("  {}  [{}, {}]", c.command, c.framework, c.source);
+            }
+        }
         if recs.reach_walk_capped {
             if !recs.unwalked_files.is_empty() {
                 println!(
