@@ -66,6 +66,8 @@ CLI `search` and `export` also reuse the running daemon's reranker. Without a da
 
 Use `codesage daemon stats --json --recent 20` to inspect the current daemon's request outcomes, cache reuse, queues, and outstanding executions. It connects only to an existing daemon from the same build and does not start one. `--recent` accepts 0 through 256; retained diagnostics exclude query text, source, and response bodies.
 
+The `project_cache` gauges report cached canonical roots and raw paths, capped at 64 and 256 respectively, plus watcher and lifecycle lock counts. Cache eviction preserves live watchers; when every candidate is watched, new paths resolve without cache admission. Active watchers have no hard count limit.
+
 For comparison or troubleshooting, set `CODESAGE_OVERVIEW_CACHE=0` to disable ranking reuse or `CODESAGE_DIAGNOSTICS=0` to disable diagnostic collection. Set these before starting the daemon; an existing daemon keeps its original environment. Diagnostics-disabled mode still reports scheduler limits and outstanding work. Neither switch disables admission limits or cancellation.
 
 The daemon shares the indexed risk ranking across `project_overview` and `session_start`, while refreshing Git and working-file annotations for each call. It bounds requests and physical work separately. Cancelling one caller does not cancel a shared ranking needed by another caller. Timeout, cancellation, saturation, shutdown, database contention, and incomplete analysis produce explicit tool errors. A client timeout alone does not prove work stopped: native inference or a download can continue until its worker exits. Check `work_continuing` and the execution diagnostics before interpreting a timeout as reclaimed capacity.

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -146,14 +146,131 @@ fn evict_idle_from_map<T>(map: &ModelMap<T>, timeout: Duration) -> usize {
     count
 }
 
+const PROJECT_CACHE_CAPACITY: usize = 64;
+const RAW_PROJECT_CACHE_CAPACITY: usize = 256;
+
+#[derive(Default)]
+struct ProjectCache {
+    projects: VecDeque<(PathBuf, ProjectState)>,
+    resolved: VecDeque<(String, PathBuf)>,
+}
+
+impl ProjectCache {
+    fn canonical(&mut self, root: &Path) -> Option<ProjectState> {
+        let position = self
+            .projects
+            .iter()
+            .position(|(key, state)| key == root && state.still_valid())?;
+        let entry = self.projects.remove(position)?;
+        let state = entry.1.clone();
+        self.projects.push_back(entry);
+        Some(state)
+    }
+
+    fn raw(&mut self, project: &str) -> Option<ProjectState> {
+        let position = self.resolved.iter().position(|(key, _)| key == project)?;
+        let root = self.resolved.get(position)?.1.clone();
+        let state = self.canonical(&root)?;
+        let entry = self.resolved.remove(position)?;
+        self.resolved.push_back(entry);
+        Some(state)
+    }
+
+    fn insert(
+        &mut self,
+        project: &str,
+        root: &Path,
+        state: &ProjectState,
+        watchers: &HashMap<PathBuf, WatcherEntry>,
+    ) -> bool {
+        let existing = self.projects.iter().position(|(key, _)| key == root);
+        if let Some(position) = existing {
+            self.projects.remove(position);
+        } else if self.projects.len() == PROJECT_CACHE_CAPACITY {
+            let Some(position) = self
+                .projects
+                .iter()
+                .position(|(key, _)| !watcher_is_alive(watchers, key))
+            else {
+                // Cache admission must not terminate a live watcher or reject a tool call.
+                return false;
+            };
+            if let Some((evicted, _)) = self.projects.remove(position) {
+                self.resolved.retain(|(_, root)| root != &evicted);
+            }
+        }
+        self.projects.push_back((root.to_path_buf(), state.clone()));
+        if let Some(position) = self.resolved.iter().position(|(key, _)| key == project) {
+            self.resolved.remove(position);
+        } else if self.resolved.len() == RAW_PROJECT_CACHE_CAPACITY {
+            let Some(position) = self
+                .resolved
+                .iter()
+                .position(|(_, key)| !watcher_is_alive(watchers, key))
+            else {
+                return existing.is_none();
+            };
+            self.resolved.remove(position);
+        }
+        self.resolved
+            .push_back((project.to_string(), root.to_path_buf()));
+        existing.is_none()
+    }
+}
+
+fn watcher_is_alive(watchers: &HashMap<PathBuf, WatcherEntry>, root: &Path) -> bool {
+    watchers
+        .get(root)
+        .is_some_and(|entry| entry.alive.load(Ordering::SeqCst))
+}
+
+struct WatcherLifecycleLease<'a> {
+    registry: &'a Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
+    root: PathBuf,
+    slot: Option<Arc<Mutex<()>>>,
+}
+
+impl<'a> WatcherLifecycleLease<'a> {
+    fn acquire(registry: &'a Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>, root: &Path) -> Self {
+        let slot = registry
+            .lock()
+            .entry(root.to_path_buf())
+            .or_default()
+            .clone();
+        Self {
+            registry,
+            root: root.to_path_buf(),
+            slot: Some(slot),
+        }
+    }
+
+    fn lock(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.slot
+            .as_ref()
+            .expect("a live lifecycle lease owns its slot until drop")
+            .lock()
+    }
+}
+
+impl Drop for WatcherLifecycleLease<'_> {
+    fn drop(&mut self) {
+        let mut registry = self.registry.lock();
+        if let Some(slot) = self.slot.take() {
+            if Arc::strong_count(&slot) == 2 {
+                registry.remove(&self.root);
+            }
+            // Release our reference under the registry lock so concurrent last drops see it.
+            drop(slot);
+        }
+    }
+}
+
 pub(crate) struct CodeSageServerState {
     pub(super) diagnostics: super::diagnostics::Diagnostics,
     pub(super) work: super::work::WorkCoordinator,
     pub(super) overview_cache: super::overview_cache::OverviewCache,
     pub(super) overview_cache_enabled: bool,
-    projects: Mutex<HashMap<PathBuf, ProjectState>>,
-    /// Raw-path cache avoids repeated canonicalization; `projects` deduplicates canonical roots.
-    resolved: Mutex<HashMap<String, ProjectState>>,
+    project_cache: Mutex<ProjectCache>,
     embedders: ModelMap<Embedder>,
     rerankers: ModelMap<Reranker>,
     /// One watcher per canonical project root, started lazily and reaped on shutdown.
@@ -492,8 +609,7 @@ impl CodeSageServerState {
                 .expect("built-in work limits are valid"),
             overview_cache: super::overview_cache::OverviewCache::default(),
             overview_cache_enabled: std::env::var("CODESAGE_OVERVIEW_CACHE").as_deref() != Ok("0"),
-            projects: Mutex::new(HashMap::new()),
-            resolved: Mutex::new(HashMap::new()),
+            project_cache: Mutex::new(ProjectCache::default()),
             embedders: Mutex::new(HashMap::new()),
             rerankers: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
@@ -508,6 +624,28 @@ impl CodeSageServerState {
     pub(crate) fn active_work(&self) -> usize {
         let snapshot = self.work.snapshot();
         snapshot.running.iter().sum::<usize>() + snapshot.queued.iter().sum::<usize>()
+    }
+
+    fn cache_project(&self, project: &str, root: &Path, state: &ProjectState) -> bool {
+        let mut watchers = self.watchers.lock();
+        watchers.retain(|_, entry| entry.alive.load(Ordering::SeqCst));
+        self.project_cache
+            .lock()
+            .insert(project, root, state, &watchers)
+    }
+
+    pub(super) fn project_cache_stats(&self) -> serde_json::Value {
+        let watchers = self.watchers.lock();
+        let cache = self.project_cache.lock();
+        serde_json::json!({
+            "canonical_roots": cache.projects.len(),
+            "raw_paths": cache.resolved.len(),
+            "canonical_capacity": PROJECT_CACHE_CAPACITY,
+            "raw_capacity": RAW_PROJECT_CACHE_CAPACITY,
+            "live_watchers": watchers.values().filter(|entry| entry.alive.load(Ordering::SeqCst)).count(),
+            "watcher_entries": watchers.len(),
+            "lifecycle_locks": self.watcher_lifecycle.lock().len(),
+        })
     }
 
     /// Evict unused models without touching in-flight references. Call malloc_trim once
@@ -546,13 +684,7 @@ impl CodeSageServer {
         let Some(root) = state.db_path.parent().and_then(|p| p.parent()) else {
             return;
         };
-        let lifecycle = self
-            .state
-            .watcher_lifecycle
-            .lock()
-            .entry(root.to_path_buf())
-            .or_default()
-            .clone();
+        let lifecycle = WatcherLifecycleLease::acquire(&self.state.watcher_lifecycle, root);
         let _lifecycle = lifecycle.lock();
         if !state.db_path.exists() {
             self.stop_project_watcher(root);
@@ -629,13 +761,8 @@ impl CodeSageServer {
 
     pub(super) fn resolve_project_inner(&self, project: &str) -> Result<ProjectState> {
         // Cached roots still need config-mtime and index-existence checks after edits or resets.
-        {
-            let guard = self.state.resolved.lock();
-            if let Some(state) = guard.get(project)
-                && state.still_valid()
-            {
-                return Ok(state.clone());
-            }
+        if let Some(state) = self.state.project_cache.lock().raw(project) {
+            return Ok(state);
         }
         let path = PathBuf::from(project);
         if !path.is_absolute() {
@@ -654,16 +781,9 @@ impl CodeSageServer {
             )
         })?;
         {
-            let guard = self.state.projects.lock();
-            if let Some(state) = guard.get(&canonical)
-                && state.still_valid()
-            {
-                let state = state.clone();
-                drop(guard);
-                self.state
-                    .resolved
-                    .lock()
-                    .insert(project.to_string(), state.clone());
+            let state = self.state.project_cache.lock().canonical(&canonical);
+            if let Some(state) = state {
+                self.state.cache_project(project, &canonical, &state);
                 return Ok(state);
             }
         }
@@ -709,18 +829,11 @@ impl CodeSageServer {
         if state.embedding_config_error.is_some() {
             return Ok(state);
         }
-        // Reloads replace stale state; only first registration writes drift telemetry.
-        let newly_registered = {
-            let mut guard = self.state.projects.lock();
-            guard.insert(canonical.clone(), state.clone()).is_none()
-        };
+        // Reloads replace stale state; admission after an eviction registers it again.
+        let newly_registered = self.state.cache_project(project, &canonical, &state);
         if newly_registered && let Err(e) = write_drift_log_for_project(&canonical, &db_path) {
             tracing::debug!(error = %e, "drift log append failed");
         }
-        self.state
-            .resolved
-            .lock()
-            .insert(project.to_string(), state.clone());
         Ok(state)
     }
 
@@ -1832,6 +1945,247 @@ mod tests {
             std::fs::write(codesage_dir.join("config.toml"), content).unwrap();
         }
         (dir, root)
+    }
+
+    #[test]
+    fn resolve_project_caps_raw_aliases() {
+        let (_dir, root) = onboarded_project(Some("[index]\nwatch = false\n"));
+        let server = CodeSageServer::new();
+        for suffix in 0..RAW_PROJECT_CACHE_CAPACITY {
+            let raw = format!("{}{}", root.display(), "/.".repeat(suffix));
+            let state = server.resolve_project_inner(&raw).unwrap();
+            assert_eq!(state.db_path, root.join(".codesage/index.db"));
+        }
+        server
+            .resolve_project_inner(root.to_str().unwrap())
+            .unwrap();
+        server
+            .resolve_project_inner(&format!("{}{}", root.display(), "/.".repeat(256)))
+            .unwrap();
+        assert_eq!(server.state.project_cache_stats()["canonical_roots"], 1);
+        assert_eq!(server.state.project_cache_stats()["raw_paths"], 256);
+        let cache = server.state.project_cache.lock();
+        assert!(
+            cache
+                .resolved
+                .iter()
+                .any(|(raw, _)| raw == root.to_str().unwrap())
+        );
+        assert!(
+            !cache
+                .resolved
+                .iter()
+                .any(|(raw, _)| raw == &format!("{}/.", root.display()))
+        );
+    }
+
+    #[test]
+    fn project_cache_evicts_least_recent_root_and_reloads_it() {
+        let projects: Vec<_> = (0..=PROJECT_CACHE_CAPACITY)
+            .map(|_| onboarded_project(Some("[index]\nwatch = false\n")))
+            .collect();
+        let server = CodeSageServer::new();
+        for (_, root) in &projects[..PROJECT_CACHE_CAPACITY] {
+            server.resolve_project(root.to_str().unwrap()).unwrap();
+        }
+        server
+            .resolve_project(projects[0].1.to_str().unwrap())
+            .unwrap();
+        server
+            .resolve_project(projects[PROJECT_CACHE_CAPACITY].1.to_str().unwrap())
+            .unwrap();
+        {
+            let cache = server.state.project_cache.lock();
+            assert_eq!(cache.projects.len(), PROJECT_CACHE_CAPACITY);
+            assert!(
+                cache
+                    .projects
+                    .iter()
+                    .any(|(root, _)| root == &projects[0].1)
+            );
+            assert!(
+                !cache
+                    .projects
+                    .iter()
+                    .any(|(root, _)| root == &projects[1].1)
+            );
+            assert!(
+                !cache
+                    .resolved
+                    .iter()
+                    .any(|(_, root)| root == &projects[1].1)
+            );
+        }
+        std::fs::write(
+            projects[1].1.join(".codesage/config.toml"),
+            "[embedding]\nmodel = \"reloaded/model\"\ndevice = \"cpu\"\n[index]\nwatch = false\n",
+        )
+        .unwrap();
+        let reloaded = server
+            .resolve_project(projects[1].1.to_str().unwrap())
+            .unwrap();
+        assert_eq!(reloaded.embedding_config.model, "reloaded/model");
+        assert_eq!(server.state.project_cache_stats()["canonical_roots"], 64);
+        assert_eq!(server.state.project_cache_stats()["lifecycle_locks"], 0);
+    }
+
+    #[test]
+    fn pinned_root_alias_pressure_preserves_the_watcher_and_cache_bounds() {
+        let (_dir, root) = onboarded_project(Some("[index]\nwatch = false\n"));
+        let server = CodeSageServer::new();
+        let state = server
+            .resolve_project_inner(root.to_str().unwrap())
+            .unwrap();
+        let (shutdown, alive) = fake_watcher(
+            &server.state.watchers,
+            &root,
+            &watcher_config_key(&state),
+            Duration::ZERO,
+        );
+        for suffix in 1..=RAW_PROJECT_CACHE_CAPACITY + 16 {
+            let raw = format!("{}{}", root.display(), "/.".repeat(suffix));
+            assert_eq!(
+                server.resolve_project_inner(&raw).unwrap().db_path,
+                state.db_path
+            );
+        }
+        let stats = server.state.project_cache_stats();
+        assert_eq!(stats["raw_paths"], 256);
+        assert_eq!(stats["canonical_roots"], 1);
+        assert_eq!(stats["live_watchers"], 1);
+        assert!(alive.load(Ordering::SeqCst));
+        assert!(!shutdown.load(Ordering::SeqCst));
+        assert!(
+            server
+                .state
+                .project_cache
+                .lock()
+                .resolved
+                .iter()
+                .any(|(raw, _)| raw == root.to_str().unwrap())
+        );
+        assert_eq!(
+            server.state.shutdown_all_watchers(Duration::from_secs(5)),
+            0
+        );
+    }
+
+    #[test]
+    fn all_pinned_roots_allow_uncached_resolution_without_replacing_watchers() {
+        let projects: Vec<_> = (0..=PROJECT_CACHE_CAPACITY)
+            .map(|_| onboarded_project(Some("[index]\nwatch = false\n")))
+            .collect();
+        let server = CodeSageServer::new();
+        let mut watchers = Vec::new();
+        for (_, root) in &projects {
+            let state = server
+                .resolve_project_inner(root.to_str().unwrap())
+                .unwrap();
+            watchers.push(fake_watcher(
+                &server.state.watchers,
+                root,
+                &watcher_config_key(&state),
+                Duration::ZERO,
+            ));
+        }
+        let extra = &projects[PROJECT_CACHE_CAPACITY].1;
+        for _ in 0..3 {
+            let state = server
+                .resolve_project_inner(extra.to_str().unwrap())
+                .unwrap();
+            assert_eq!(state.db_path, extra.join(".codesage/index.db"));
+            server.ensure_watcher(extra, &state);
+        }
+        let stats = server.state.project_cache_stats();
+        assert_eq!(stats["canonical_roots"], 64);
+        assert_eq!(stats["raw_paths"], 64);
+        assert_eq!(stats["live_watchers"], 65);
+        assert_eq!(stats["watcher_entries"], 65);
+        assert!(
+            !server
+                .state
+                .project_cache
+                .lock()
+                .projects
+                .iter()
+                .any(|(root, _)| root == extra)
+        );
+        for ((_, root), (shutdown, alive)) in projects.iter().zip(&watchers) {
+            assert!(!shutdown.load(Ordering::SeqCst));
+            assert!(alive.load(Ordering::SeqCst));
+            assert!(Arc::ptr_eq(
+                &server.state.watchers.lock()[root].alive,
+                alive
+            ));
+        }
+        watchers[0].0.store(true, Ordering::SeqCst);
+        assert!(wait_for_watcher_exit(
+            &watchers[0].1,
+            Instant::now() + Duration::from_secs(5)
+        ));
+        server
+            .resolve_project_inner(extra.to_str().unwrap())
+            .unwrap();
+        assert!(
+            server
+                .state
+                .project_cache
+                .lock()
+                .projects
+                .iter()
+                .any(|(root, _)| root == extra)
+        );
+        assert_eq!(server.state.project_cache_stats()["canonical_roots"], 64);
+        assert_eq!(server.state.project_cache_stats()["watcher_entries"], 64);
+        assert_eq!(
+            server.state.shutdown_all_watchers(Duration::from_secs(5)),
+            0
+        );
+    }
+
+    #[test]
+    fn lifecycle_lease_keeps_waiters_on_the_same_lock() {
+        let registry = Mutex::new(HashMap::new());
+        let root = Path::new("/project");
+        let first = WatcherLifecycleLease::acquire(&registry, root);
+        let waiting = WatcherLifecycleLease::acquire(&registry, root);
+        drop(first);
+        let next = WatcherLifecycleLease::acquire(&registry, root);
+        assert!(Arc::ptr_eq(
+            waiting.slot.as_ref().unwrap(),
+            next.slot.as_ref().unwrap()
+        ));
+        let guard = waiting.lock();
+        assert!(next.slot.as_ref().unwrap().try_lock().is_none());
+        drop(guard);
+        drop(waiting);
+        assert_eq!(registry.lock().len(), 1);
+        drop(next);
+        assert!(registry.lock().is_empty());
+    }
+
+    #[test]
+    fn concurrent_lifecycle_leases_serialize_and_release_the_registry() {
+        use std::sync::atomic::AtomicUsize;
+
+        let registry = Mutex::new(HashMap::new());
+        let entered = AtomicUsize::new(0);
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    for _ in 0..256 {
+                        let lease = WatcherLifecycleLease::acquire(&registry, Path::new("/shared"));
+                        let _guard = lease.lock();
+                        assert_eq!(entered.fetch_add(1, Ordering::SeqCst), 0);
+                        std::thread::yield_now();
+                        assert_eq!(entered.fetch_sub(1, Ordering::SeqCst), 1);
+                    }
+                });
+            }
+        });
+        assert!(registry.lock().is_empty());
     }
 
     #[test]

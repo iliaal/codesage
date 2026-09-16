@@ -1663,6 +1663,15 @@ fn hidden_daemon_stats_and_cli_report_the_same_shared_state() {
     assert_eq!(overview_ranking_executions(&direct), 1);
     assert_eq!(direct["work"]["closed"], false, "{direct}");
     assert_eq!(direct["work"]["requests"], 0, "{direct}");
+    assert_eq!(direct["project_cache"]["canonical_roots"], 1, "{direct}");
+    assert_eq!(direct["project_cache"]["raw_paths"], 1, "{direct}");
+    assert_eq!(
+        direct["project_cache"]["canonical_capacity"], 64,
+        "{direct}"
+    );
+    assert_eq!(direct["project_cache"]["raw_capacity"], 256, "{direct}");
+    assert_eq!(direct["project_cache"]["live_watchers"], 0, "{direct}");
+    assert_eq!(direct["project_cache"]["lifecycle_locks"], 0, "{direct}");
     assert_eq!(direct["work"]["queued"], serde_json::json!([0, 0, 0]));
     assert_eq!(direct["work"]["running"], serde_json::json!([0, 0, 0]));
     assert!(direct["work"]["limits"].is_object(), "{direct}");

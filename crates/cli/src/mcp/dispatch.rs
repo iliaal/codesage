@@ -646,6 +646,7 @@ impl CodeSageServer {
             };
             let mut snapshot = self.state.diagnostics.snapshot(recent);
             snapshot["overview_cache_enabled"] = json!(self.state.overview_cache_enabled);
+            snapshot["project_cache"] = self.state.project_cache_stats();
             snapshot["work"] = serde_json::to_value(self.state.work.snapshot())
                 .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
             return Ok(CallToolResult::structured(snapshot).into());
