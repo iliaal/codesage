@@ -93,3 +93,8 @@
 (nested_type_identifier
   module: (identifier) @rhs
   name: (type_identifier) @ref)
+
+; Pattern 21: type uses, including nested annotations and generic arguments.
+; references.rs excludes declaration names; pattern 20 keeps its existing
+; ImportBinding row independently of the TypeHint row.
+(type_identifier) @ref

@@ -33,3 +33,7 @@
 
 ; Pattern 10: dotted decorator with arguments (@app.route("/x"))
 (decorator (call function: (attribute attribute: (identifier) @ref)))
+
+; Pattern 11: class bases; references.rs unwraps generic/parenthesized bases
+; and rejects keyword arguments and dynamic factory expressions.
+(class_definition superclasses: (argument_list (_) @ref))

@@ -176,8 +176,9 @@ fn python_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
         3 => Some(ReferenceKind::ImportBinding), // from X import Y as Z (aliased)
         4 | 5 => Some(ReferenceKind::Call),      // call expression
         6 => Some(ReferenceKind::Import),        // relative import module (from . import x)
-        // Classify decorators as calls, matching Java annotations.
+        // Preserve Call for decorators and Java annotations so existing kind filters keep working.
         7..=10 => Some(ReferenceKind::Call),
+        11 => Some(ReferenceKind::Inheritance),
         _ => None,
     }
 }
@@ -269,7 +270,41 @@ fn ts_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
         18 => Some(ReferenceKind::ImportBinding),     // import x = require("m") (binding)
         19 => Some(ReferenceKind::Import),            // import x = require("m") (module)
         20 => Some(ReferenceKind::ImportBinding),     // type via module namespace (ns.Type)
+        21 => Some(ReferenceKind::TypeHint),
         _ => None,
+    }
+}
+
+fn python_base_name(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        node = match node.kind() {
+            "identifier" => return Some(node),
+            "attribute" => return node.child_by_field_name("attribute"),
+            "subscript" => node.child_by_field_name("value")?,
+            "parenthesized_expression" => node.named_child(0)?,
+            _ => return None,
+        };
+    }
+}
+
+fn ts_type_is_declaration(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    match parent.kind() {
+        "class"
+        | "class_declaration"
+        | "abstract_class_declaration"
+        | "interface_declaration"
+        | "type_alias_declaration"
+        | "type_parameter"
+        | "mapped_type_clause" => parent
+            .child_by_field_name("name")
+            .is_some_and(|name| name.id() == node.id()),
+        "infer_type" => parent
+            .named_child(0)
+            .is_some_and(|name| name.id() == node.id()),
+        _ => false,
     }
 }
 
@@ -466,9 +501,21 @@ pub fn extract_references(
         }
         let rhs =
             rhs_idx.and_then(|idx| m.captures().iter().find(|c| c.index == idx).map(|c| c.node));
+        let node = if language == Language::Python && m.pattern_index == 11 {
+            let Some(base) = python_base_name(ref_cap.node) else {
+                continue;
+            };
+            base
+        } else {
+            ref_cap.node
+        };
+        if language == Language::TypeScript && m.pattern_index == 21 && ts_type_is_declaration(node)
+        {
+            continue;
+        }
         pending.push(Pending {
             pattern: m.pattern_index,
-            node: ref_cap.node,
+            node,
             rhs,
         });
     }

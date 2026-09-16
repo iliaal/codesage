@@ -49,6 +49,78 @@ fn python_relative_import_module_edge_is_captured() {
 }
 
 #[test]
+fn python_inheritance_names_bases_without_type_arguments_or_metaclasses() {
+    let source = "class Child(Base, pkg.Qualified, Generic[Item], pkg.Other[Value], (Wrapped), metaclass=Meta):\n    pass\nclass Dynamic(factory()):\n    pass\n";
+    let refs = refs_from_source(source, Language::Python);
+    let bases: Vec<_> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Inheritance)
+        .map(|r| r.to_name.as_str())
+        .collect();
+    assert_eq!(bases, ["Base", "Qualified", "Generic", "Other", "Wrapped"]);
+    assert!(has_ref(&refs, "factory", ReferenceKind::Call));
+}
+
+#[test]
+fn typescript_type_hints_cover_annotations_generics_and_qualified_types() {
+    let source = "function f(x: Foo): Bar { return x; }\nfunction g<T extends Bound = Default>(x: Container<Input[]>): ns.Result<Output> { return x; }\nconst value: Left | Right & Extra = input;\n";
+    let refs = refs_from_source(source, Language::TypeScript);
+    let types: Vec<_> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::TypeHint)
+        .map(|r| r.to_name.as_str())
+        .collect();
+    assert_eq!(
+        types,
+        [
+            "Foo",
+            "Bar",
+            "Bound",
+            "Default",
+            "Container",
+            "Input",
+            "Result",
+            "Output",
+            "Left",
+            "Right",
+            "Extra"
+        ]
+    );
+}
+
+#[test]
+fn typescript_type_declarations_are_not_type_hint_uses() {
+    let source = "class DeclaredClass {}\nabstract class DeclaredAbstract {}\nconst value = class DeclaredExpression {};\ninterface DeclaredInterface {}\ntype DeclaredAlias<DeclaredParameter> = Target;\ntype Mapped = { [DeclaredKey in Keys]: Item };\ntype Inferred = Source extends infer DeclaredInferred extends Bound ? Yes : No;\n";
+    let refs = refs_from_source(source, Language::TypeScript);
+    let types: Vec<_> = refs
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::TypeHint)
+        .map(|r| r.to_name.as_str())
+        .collect();
+    assert_eq!(
+        types,
+        ["Target", "Keys", "Item", "Source", "Bound", "Yes", "No"]
+    );
+}
+
+#[test]
+fn typescript_namespace_type_hints_preserve_import_binding_references() {
+    let refs = refs_from_source(
+        "import * as api from './api';\nfunction f(x: api.Request): local.deep.Response {}\n",
+        Language::TypeScript,
+    );
+    assert!(has_ref(&refs, "Request", ReferenceKind::ImportBinding));
+    assert!(has_ref(&refs, "Request", ReferenceKind::TypeHint));
+    assert!(has_ref(&refs, "Response", ReferenceKind::TypeHint));
+    assert!(!has_ref(&refs, "Response", ReferenceKind::ImportBinding));
+    let request = refs
+        .iter()
+        .find(|r| r.to_name == "Request" && r.kind == ReferenceKind::TypeHint)
+        .unwrap();
+    assert_eq!((request.line, request.col), (2, 18));
+}
+
+#[test]
 fn javascript_reexport_inheritance_and_instantiation() {
     let src = "export { a } from \"./m\";\nclass Foo extends Bar {}\nconst x = new Baz();\n";
     let refs = refs_from_source(src, Language::JavaScript);
