@@ -316,6 +316,104 @@ fn member_is_callee(property: &Node) -> bool {
             .is_some_and(|f| f.id() == member.id())
 }
 
+/// Node kinds whose body defers an import directive to call time. Only
+/// languages that resolve imports at runtime qualify: a C/C++ `#include` in a
+/// function body is still textual inclusion, a Rust `use` in a function is a
+/// compile-time alias, and PHP `use`, Java `import`, and Go `import` are only
+/// admitted at file or namespace scope.
+fn lazy_scope_kinds(language: Language) -> &'static [&'static str] {
+    match language {
+        Language::Python => &["function_definition"],
+        Language::JavaScript | Language::TypeScript => &[
+            "function_declaration",
+            "function_expression",
+            "generator_function_declaration",
+            "generator_function",
+            "arrow_function",
+            "method_definition",
+        ],
+        Language::Rust
+        | Language::C
+        | Language::Cpp
+        | Language::Php
+        | Language::Java
+        | Language::Go => &[],
+    }
+}
+
+/// True when `function` runs where it is written: the callee of a call
+/// expression, the constructor of a `new` expression, the receiver of a
+/// `.call` / `.apply` chain that is finally called, or a `.bind(...)` result
+/// that is itself invoked, each directly or through parentheses.
+/// `(function () { ... })()` and `(function () { ... }).call(this)` run when
+/// their enclosing scope does, so they defer nothing by themselves; a stored
+/// `.bind(this)` or an unread `.call` only produces another function.
+fn is_immediately_invoked(function: &Node, source: &[u8]) -> bool {
+    let mut node = *function;
+    loop {
+        let mut parent = node.parent();
+        while let Some(p) = parent {
+            if p.kind() != "parenthesized_expression" {
+                break;
+            }
+            node = p;
+            parent = p.parent();
+        }
+        let Some(p) = parent else {
+            return false;
+        };
+        let is_field = |field: &str| {
+            p.child_by_field_name(field)
+                .is_some_and(|child| child.id() == node.id())
+        };
+        match p.kind() {
+            "call_expression" => return is_field("function"),
+            "new_expression" => return is_field("constructor"),
+            "member_expression" if is_field("object") => {
+                let property = p
+                    .child_by_field_name("property")
+                    .map(|prop| crate::parse::node_text_lossy(&prop, source))
+                    .unwrap_or_default();
+                match property.as_str() {
+                    // Calling `f.call` calls `f`; keep climbing from the member.
+                    "call" | "apply" => node = p,
+                    // Only a bound function that is then called counts.
+                    "bind" => match p.parent() {
+                        Some(bind_call)
+                            if bind_call.kind() == "call_expression"
+                                && bind_call
+                                    .child_by_field_name("function")
+                                    .is_some_and(|f| f.id() == p.id()) =>
+                        {
+                            node = bind_call
+                        }
+                        _ => return false,
+                    },
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// True when an import directive sits inside a function, method, closure, or
+/// arrow-function body that is not immediately invoked, for `language`.
+fn import_is_lazy(node: &Node, source: &[u8], language: Language) -> bool {
+    let kinds = lazy_scope_kinds(language);
+    if kinds.is_empty() {
+        return false;
+    }
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if kinds.contains(&n.kind()) && !is_immediately_invoked(&n, source) {
+            return true;
+        }
+        current = n.parent();
+    }
+    false
+}
+
 /// The pattern-index → `ReferenceKind` map for a language. Counterpart to
 /// `crate::extract::kind_map_for`; shared by `extract_references` and the
 /// validation gate so both agree on what each `@ref` pattern means.
@@ -441,6 +539,10 @@ pub fn extract_references(
         };
 
         let (row, col) = crate::position::node_start_utf8(&ref_node, source);
+        let lazy = matches!(
+            kind,
+            ReferenceKind::Import | ReferenceKind::ImportBinding | ReferenceKind::Include
+        ) && import_is_lazy(&ref_node, source, language);
         if language == Language::Python && kind == ReferenceKind::ImportBinding {
             let statement = ref_node.parent().and_then(|parent| {
                 if parent.kind() == "aliased_import" {
@@ -460,6 +562,7 @@ pub fn extract_references(
                     kind: ReferenceKind::Import,
                     line: row + 1,
                     col,
+                    lazy,
                 });
             }
         }
@@ -470,6 +573,7 @@ pub fn extract_references(
             kind,
             line: row + 1,
             col,
+            lazy,
         });
     }
 
@@ -556,6 +660,128 @@ mod tests {
             refs.iter()
                 .any(|r| r.to_name == ".child" && r.kind == ReferenceKind::Import)
         );
+    }
+
+    fn lazy_flags(refs: &[Reference], name: &str) -> Vec<bool> {
+        refs.iter()
+            .filter(|r| r.to_name == name)
+            .map(|r| r.lazy)
+            .collect()
+    }
+
+    #[test]
+    fn python_function_body_imports_are_lazy_and_module_scope_imports_are_not() {
+        let src = "import os\nfrom a import run\nclass K:\n    import json\n    def m(self):\n        import sys\n        from b import other as o\ndef f():\n    from . import child\n    return other()\n";
+        let refs = refs_from_source(src, Language::Python);
+        assert_eq!(lazy_flags(&refs, "os"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "a"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "run"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "a.run"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "json"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "sys"), vec![true]);
+        assert_eq!(lazy_flags(&refs, "b"), vec![true]);
+        assert_eq!(lazy_flags(&refs, "b.other"), vec![true]);
+        assert_eq!(lazy_flags(&refs, ".child"), vec![true]);
+        // Binding row (lazy) plus the call row inside f (never lazy).
+        assert_eq!(lazy_flags(&refs, "other"), vec![true, false]);
+    }
+
+    #[test]
+    fn javascript_require_inside_functions_is_lazy() {
+        let src = "import top from './top.js';\nconst eager = require('./eager');\nfunction f() { const { x } = require('./fn'); return x; }\nconst g = () => require('./arrow');\nclass C { m() { return require('./method'); } }\n";
+        let refs = refs_from_source(src, Language::JavaScript);
+        assert_eq!(lazy_flags(&refs, "./top.js"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./eager"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "eager"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./fn"), vec![true]);
+        assert_eq!(lazy_flags(&refs, "x"), vec![true]);
+        assert_eq!(lazy_flags(&refs, "./arrow"), vec![true]);
+        assert_eq!(lazy_flags(&refs, "./method"), vec![true]);
+        // Call rows are never lazy, wherever they sit.
+        assert_eq!(lazy_flags(&refs, "require"), vec![false; 4]);
+    }
+
+    #[test]
+    fn typescript_require_inside_functions_is_lazy() {
+        let src = "import top = require('./top');\nexport function f(): number { const m = require('./fn'); return m.x; }\n";
+        let refs = refs_from_source(src, Language::TypeScript);
+        assert_eq!(lazy_flags(&refs, "./top"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./fn"), vec![true]);
+        assert_eq!(lazy_flags(&refs, "m"), vec![true]);
+    }
+
+    #[test]
+    fn javascript_module_scope_iife_require_is_eager_but_nested_iife_is_lazy() {
+        let src = "(function () { const a = require('./iife'); })();\n(() => require('./arrow-iife'))();\n(async function () { require('./async-iife'); }());\nfunction outer() { (function () { require('./inner'); })(); }\nconst h = (function () { return require('./factory'); });\n";
+        let refs = refs_from_source(src, Language::JavaScript);
+        assert_eq!(lazy_flags(&refs, "./iife"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "a"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./arrow-iife"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./async-iife"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./inner"), vec![true]);
+        // Parenthesized but never called: still a deferred body.
+        assert_eq!(lazy_flags(&refs, "./factory"), vec![true]);
+    }
+
+    #[test]
+    fn javascript_call_apply_and_new_invoked_wrappers_are_eager_but_bind_is_lazy() {
+        let src = "(function () { require('./call'); }).call(this);\n(function () { require('./apply'); }.apply(null, []));\nnew (function () { require('./ctor'); })();\n(function () { require('./chain'); }).call.call(null, this);\n(function () { require('./bound-now'); }).bind(this)();\n(function () { require('./bound-call'); }).bind(this).call(null);\nconst bound = (function () { require('./bound'); }).bind(this);\nconst later = (function () { require('./later'); }).call;\n";
+        let refs = refs_from_source(src, Language::JavaScript);
+        assert_eq!(lazy_flags(&refs, "./call"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./apply"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./chain"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./bound-now"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./bound-call"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./ctor"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "./bound"), vec![true]);
+        // `.call` read but never invoked.
+        assert_eq!(lazy_flags(&refs, "./later"), vec![true]);
+    }
+
+    #[test]
+    fn python_nested_and_async_function_imports_are_lazy() {
+        let src = "async def a():\n    import aio\ndef outer():\n    def inner():\n        import deep\n    return inner\n";
+        let refs = refs_from_source(src, Language::Python);
+        assert_eq!(lazy_flags(&refs, "aio"), vec![true]);
+        assert_eq!(lazy_flags(&refs, "deep"), vec![true]);
+    }
+
+    #[test]
+    fn rust_function_local_use_stays_eager() {
+        let src = "use crate::top::A;\nfn f() {\n    use crate::inner::B;\n    let c = || { use crate::closure::C; C::new() };\n    B::new(); c()\n}\n";
+        let refs = refs_from_source(src, Language::Rust);
+        assert_eq!(lazy_flags(&refs, "crate::top::A"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "crate::inner::B"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "crate::closure::C"), vec![false]);
+    }
+
+    #[test]
+    fn c_and_cpp_include_inside_a_function_body_stays_eager() {
+        let src = "#include <stdio.h>\n#include \"top.h\"\nint main(void) {\n#include \"body.h\"\n    return 0;\n}\n";
+        let refs = refs_from_source(src, Language::C);
+        assert_eq!(lazy_flags(&refs, "top.h"), vec![false]);
+        assert_eq!(lazy_flags(&refs, "body.h"), vec![false]);
+        let refs = refs_from_source(src, Language::Cpp);
+        assert_eq!(lazy_flags(&refs, "body.h"), vec![false]);
+    }
+
+    #[test]
+    fn php_and_java_and_go_imports_are_never_lazy() {
+        let php = refs_from_source(
+            "<?php\nnamespace App;\nuse App\\Models\\User;\nclass K { function m() { return new User(); } }\n",
+            Language::Php,
+        );
+        assert!(php.iter().all(|r| !r.lazy), "{php:?}");
+        let java = refs_from_source(
+            "import java.util.List;\nclass K { void m() { List<String> l = null; } }\n",
+            Language::Java,
+        );
+        assert!(java.iter().all(|r| !r.lazy), "{java:?}");
+        let go = refs_from_source(
+            "package main\nimport \"fmt\"\nfunc main() { fmt.Println() }\n",
+            Language::Go,
+        );
+        assert!(go.iter().all(|r| !r.lazy), "{go:?}");
     }
 
     fn refs_from_source(source: &str, language: Language) -> Vec<Reference> {

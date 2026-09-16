@@ -27,7 +27,7 @@ pub use git_hist::{
     CoChangeRow, CoChangeWrite, GitFileRow, ONE_OFF_RANK_MULTIPLIER, RECURRING_SPAN_SECS,
 };
 pub use semantic::{RawSearchRow, SemanticFreshness, SemanticValidityToken, embedding_to_bytes};
-pub use structural::{FingerprintInput, StoredFingerprint};
+pub use structural::{FingerprintInput, ImportPairs, StoredFingerprint};
 
 /// Reject unknown stored enums as typed conversion errors; never relabel schema skew.
 pub(super) fn row_enum<T>(
@@ -1682,6 +1682,7 @@ mod tests {
             kind,
             line: 1,
             col: 0,
+            lazy: false,
         }
     }
 
@@ -1907,6 +1908,74 @@ mod tests {
     }
 
     #[test]
+    fn lazy_only_import_pairs_leave_the_cycle_graph_but_one_eager_directive_restores_them() {
+        let db = Database::open_in_memory().unwrap();
+        let a_id = db.upsert_file(&make_file("a.py")).unwrap();
+        db.insert_symbols(
+            a_id,
+            &[make_qualified_symbol("run", "run", SymbolKind::Function)],
+        )
+        .unwrap();
+        let b_id = db.upsert_file(&make_file("b.py")).unwrap();
+        db.insert_symbols(
+            b_id,
+            &[make_qualified_symbol(
+                "other",
+                "other",
+                SymbolKind::Function,
+            )],
+        )
+        .unwrap();
+        let import = |from: &str, to: &str, lazy: bool| Reference {
+            from_file: from.to_string(),
+            to_name: to.to_string(),
+            kind: ReferenceKind::Import,
+            lazy,
+            ..make_reference("unused", ReferenceKind::Import)
+        };
+        db.insert_references(a_id, &[import("a.py", "other", true)])
+            .unwrap();
+        db.insert_references(b_id, &[import("b.py", "run", false)])
+            .unwrap();
+
+        assert_eq!(
+            db.enumerate_file_import_edges().unwrap(),
+            vec![("b.py".to_string(), "a.py".to_string())]
+        );
+        assert_eq!(
+            db.lazy_import_pairs().unwrap(),
+            vec![("a.py".to_string(), "b.py".to_string())]
+        );
+        assert_eq!(db.import_edges_within(&["a.py", "b.py"]).unwrap().len(), 1);
+        let token_before = db.import_cycle_validity_token().unwrap();
+
+        let mut rows = db.find_references("other", None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows.remove(0).lazy);
+
+        db.insert_references(
+            a_id,
+            &[Reference {
+                line: 7,
+                ..import("a.py", "other", false)
+            }],
+        )
+        .unwrap();
+        let mut edges = db.enumerate_file_import_edges().unwrap();
+        edges.sort();
+        assert_eq!(
+            edges,
+            vec![
+                ("a.py".to_string(), "b.py".to_string()),
+                ("b.py".to_string(), "a.py".to_string()),
+            ]
+        );
+        assert!(db.lazy_import_pairs().unwrap().is_empty());
+        assert_eq!(db.import_edges_within(&["a.py", "b.py"]).unwrap().len(), 2);
+        assert_ne!(db.import_cycle_validity_token().unwrap(), token_before);
+    }
+
+    #[test]
     fn upsert_file_clears_stale_trust_boundaries() {
         let db = Database::open_in_memory().unwrap();
         let file_id = db.upsert_file(&make_file("src/a.rs")).unwrap();
@@ -2043,16 +2112,19 @@ mod tests {
                 Reference {
                     line: 1,
                     col: 0,
+                    lazy: false,
                     ..make_reference("Before", ReferenceKind::Call)
                 },
                 Reference {
                     line: 3,
                     col: 0,
+                    lazy: false,
                     ..make_reference("Inside", ReferenceKind::Call)
                 },
                 Reference {
                     line: 8,
                     col: 0,
+                    lazy: false,
                     ..make_reference("After", ReferenceKind::Call)
                 },
             ],

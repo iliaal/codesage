@@ -85,7 +85,123 @@ fn test_gap_note(no_symbols: bool, walk_capped: bool) -> String {
 }
 
 type CycleToken = (i64, i64, i64, i64, i64, i64);
-type CycleComponentCache = HashMap<String, (CycleToken, Arc<Vec<Vec<String>>>)>;
+type CycleComponentCache = HashMap<String, (CycleToken, Arc<ImportCycles>)>;
+
+/// Tarjan SCCs over the load-time import graph plus the lazy-only file pairs
+/// the cut suppressed: pairs that share a non-trivial SCC once lazy edges are
+/// counted, i.e. the ones that would have closed or enlarged a cycle.
+pub(crate) struct ImportCycles {
+    pub(crate) components: Vec<Vec<String>>,
+    pub(crate) suppressed_pairs: Vec<(String, String)>,
+    suppressed_by_file: HashMap<String, u32>,
+    suppressed_from: HashMap<String, Vec<String>>,
+}
+
+impl ImportCycles {
+    pub(crate) fn load(db: &Database) -> Result<Self> {
+        let pairs = db
+            .enumerate_file_import_pairs()
+            .with_context(|| "enumerate_file_import_pairs")?;
+        let components = crate::scc::tarjan_scc(&pairs.eager)?;
+        let suppressed_pairs = if pairs.lazy_only.is_empty() {
+            Vec::new()
+        } else {
+            // A lazy pair already inside an eager ring is redundant with it;
+            // only pairs that join a ring once counted are suppressed edges.
+            let eager_component = component_index(&components);
+            let mut all = pairs.eager;
+            all.extend(pairs.lazy_only.iter().cloned());
+            let full = crate::scc::tarjan_scc(&all)?;
+            let full_component = component_index(&full);
+            pairs
+                .lazy_only
+                .into_iter()
+                .filter(|(from, to)| {
+                    let same = |index: &HashMap<&str, usize>| {
+                        matches!(
+                            (index.get(from.as_str()), index.get(to.as_str())),
+                            (Some(a), Some(b)) if a == b
+                        )
+                    };
+                    same(&full_component) && !same(&eager_component)
+                })
+                .collect()
+        };
+        let mut suppressed_by_file: HashMap<String, u32> = HashMap::new();
+        let mut suppressed_from: HashMap<String, Vec<String>> = HashMap::new();
+        for (from, to) in &suppressed_pairs {
+            *suppressed_by_file.entry(from.clone()).or_insert(0) += 1;
+            *suppressed_by_file.entry(to.clone()).or_insert(0) += 1;
+            suppressed_from
+                .entry(from.clone())
+                .or_default()
+                .push(to.clone());
+        }
+        Ok(Self {
+            components,
+            suppressed_pairs,
+            suppressed_by_file,
+            suppressed_from,
+        })
+    }
+
+    fn empty() -> Self {
+        Self {
+            components: Vec::new(),
+            suppressed_pairs: Vec::new(),
+            suppressed_by_file: HashMap::new(),
+            suppressed_from: HashMap::new(),
+        }
+    }
+
+    /// Suppressed pairs with either endpoint equal to `file`.
+    fn lazy_edges_for(&self, file: &str) -> u32 {
+        self.suppressed_by_file.get(file).copied().unwrap_or(0)
+    }
+
+    /// Suppressed pairs with at least one endpoint among `members`. A pair with
+    /// both endpoints inside would be counted from each side, so it is
+    /// subtracted once; none exist today because such a pair already shares
+    /// the eager component and is never suppressed.
+    fn lazy_edges_touching(&self, members: &[String]) -> u32 {
+        let set: HashSet<&str> = members.iter().map(String::as_str).collect();
+        let incident: u32 = members.iter().map(|m| self.lazy_edges_for(m)).sum();
+        let internal = members
+            .iter()
+            .filter_map(|m| self.suppressed_from.get(m))
+            .flatten()
+            .filter(|to| set.contains(to.as_str()))
+            .count() as u32;
+        incident - internal
+    }
+}
+
+/// Map each member of a non-trivial component to that component's index.
+fn component_index(components: &[Vec<String>]) -> HashMap<&str, usize> {
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    for (i, component) in components.iter().enumerate().filter(|(_, c)| c.len() >= 2) {
+        for file in component {
+            index.insert(file.as_str(), i);
+        }
+    }
+    index
+}
+
+/// Cycles touching a patch, sharing the SCC result so per-file assessments
+/// can disclose `lazy_edges` without recomputing or copying it.
+pub(crate) struct PatchCycles {
+    pub(crate) entries: Vec<CycleEntry>,
+    cycles: Arc<ImportCycles>,
+}
+
+impl PatchCycles {
+    fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+            cycles: Arc::new(ImportCycles::empty()),
+        }
+    }
+}
 
 static IMPORT_CYCLE_CACHE: LazyLock<Mutex<CycleComponentCache>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -566,7 +682,7 @@ pub fn assess_risk(db: &Database, file_path: &str) -> Result<RiskAssessment> {
 fn assess_risk_with_context(
     db: &Database,
     file_path: &str,
-    precomputed_cycles: Option<&[CycleEntry]>,
+    precomputed_cycles: Option<&PatchCycles>,
     precomputed_percentiles: Option<&HashMap<String, f64>>,
     max_frontier: usize,
     window: IndexWindow,
@@ -598,6 +714,7 @@ fn assess_risk_with_context(
                 in_cycle: false,
                 cycle_size: 0,
                 cycle_files: Vec::new(),
+                lazy_edges: 0,
                 top_coupled: Vec::new(),
                 trust_boundaries: Vec::new(),
                 notes: vec![
@@ -691,12 +808,29 @@ fn assess_risk_with_context(
 
     // Cycle lookup failure must not discard the other risk signals.
     let mut cycle_signal_failed = false;
-    let (in_cycle, cycle_size, cycle_files) = if let Some(cycles) = precomputed_cycles {
-        cycle_membership(cycles, file_path)
+    let (in_cycle, cycle_size, cycle_files, lazy_edges) = if let Some(cycles) = precomputed_cycles {
+        let (in_cycle, size, files) = cycle_membership(&cycles.entries, file_path);
+        (
+            in_cycle,
+            size,
+            files,
+            cycles.cycles.lazy_edges_for(file_path),
+        )
     } else {
-        match find_cycle_containing_file(db, file_path) {
-            Ok(Some(cycle)) => cycle_membership(&[cycle], file_path),
-            Ok(None) => (false, 0, Vec::new()),
+        // Every lookup, including the churn read inside the entry, degrades
+        // together so a git_files fault cannot discard the other signals.
+        let signal = import_cycle_components(db).and_then(|cycles| {
+            let entry = cycle_entry_for_file(db, &cycles, file_path)?;
+            Ok((entry, cycles.lazy_edges_for(file_path)))
+        });
+        match signal {
+            Ok((entry, lazy)) => {
+                let (in_cycle, size, files) = match entry {
+                    Some(cycle) => cycle_membership(&[cycle], file_path),
+                    None => (false, 0, Vec::new()),
+                };
+                (in_cycle, size, files, lazy)
+            }
             Err(e) => {
                 codesage_protocol::work::checkpoint()?;
                 if COMPLETE_POLICY.get().is_some()
@@ -707,7 +841,7 @@ fn assess_risk_with_context(
                 }
                 tracing::warn!(error = %e, file = %file_path, "cycle detection failed; omitting cycle signal from risk score");
                 cycle_signal_failed = true;
-                (false, 0, Vec::new())
+                (false, 0, Vec::new(), 0)
             }
         }
     };
@@ -968,6 +1102,7 @@ fn assess_risk_with_context(
             in_cycle,
             cycle_size,
             cycle_files,
+            lazy_edges,
             top_coupled,
             trust_boundaries,
             notes,
@@ -1111,7 +1246,7 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
     // Cycles are graph-wide SCCs; compute once for the patch, then reuse the
     // result for per-file scores and the patch-level cycle list.
     let mut cycles_failed = false;
-    let cycles_touching_patch = match find_cycles_touching(db, file_paths) {
+    let patch_cycles = match find_cycles_touching(db, file_paths) {
         Ok(c) => c,
         Err(e) => {
             codesage_protocol::work::checkpoint()?;
@@ -1123,7 +1258,7 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
             }
             tracing::warn!(error = %e, "cycle detection failed; omitting cycles_touching_patch");
             cycles_failed = true;
-            Vec::new()
+            PatchCycles::empty()
         }
     };
 
@@ -1140,7 +1275,7 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
             assess_risk_with_context(
                 db,
                 p,
-                Some(&cycles_touching_patch),
+                Some(&patch_cycles),
                 Some(&percentiles),
                 MAX_FRONTIER,
                 window,
@@ -1280,6 +1415,7 @@ pub(crate) fn assess_risk_diff_with_walk_cache(
                 .to_string(),
         );
     }
+    let cycles_touching_patch = patch_cycles.entries;
     if !cycles_touching_patch.is_empty() {
         let biggest = cycles_touching_patch
             .iter()
@@ -1345,7 +1481,7 @@ pub fn assess_risk_batch(db: &Database, file_paths: &[String]) -> Result<RiskBat
             }
             tracing::warn!(error = %e, "cycle detection failed; omitting batch cycle signal");
             cycles_failed = true;
-            Vec::new()
+            PatchCycles::empty()
         }
     };
     let percentiles = db
@@ -1433,11 +1569,11 @@ fn alias_categorical_notes_in_place(files: &mut [&mut RiskAssessment]) -> BTreeM
 /// See [`CycleEntry`] docs for the "cycles the patch touches" vs
 /// "cycles the patch introduces" distinction. We do not have a
 /// pre-patch index to diff against, so this returns both.
-fn find_cycles_touching(db: &Database, patch_files: &[String]) -> Result<Vec<CycleEntry>> {
+fn find_cycles_touching(db: &Database, patch_files: &[String]) -> Result<PatchCycles> {
     let patch: HashSet<&str> = patch_files.iter().map(|s| s.as_str()).collect();
-    let components = import_cycle_components(db)?;
+    let cycles = import_cycle_components(db)?;
     let mut out: Vec<CycleEntry> = Vec::new();
-    for component in components.iter() {
+    for component in cycles.components.iter() {
         codesage_protocol::work::checkpoint()?;
         // Trivial SCCs (single-node, no self-edge) aren't cycles.
         if component.len() < 2 {
@@ -1447,6 +1583,7 @@ fn find_cycles_touching(db: &Database, patch_files: &[String]) -> Result<Vec<Cyc
             continue;
         }
         let max_churn_file = pick_max_churn(db, component)?;
+        let lazy_edges = cycles.lazy_edges_touching(component);
         let mut members = component.clone();
         members.sort();
         let size = members.len() as u32;
@@ -1454,17 +1591,30 @@ fn find_cycles_touching(db: &Database, patch_files: &[String]) -> Result<Vec<Cyc
             members,
             size,
             max_churn_file,
+            lazy_edges,
         });
     }
     out.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.members.cmp(&b.members)));
-    Ok(out)
+    Ok(PatchCycles {
+        entries: out,
+        cycles,
+    })
 }
 
 /// Use the same Tarjan SCCs as [`find_cycles_touching`] so single-file and
 /// batch assessments agree, including on large graphs.
+#[cfg(test)]
 fn find_cycle_containing_file(db: &Database, file_path: &str) -> Result<Option<CycleEntry>> {
-    let components = import_cycle_components(db)?;
-    for component in components.iter() {
+    let cycles = import_cycle_components(db)?;
+    cycle_entry_for_file(db, &cycles, file_path)
+}
+
+fn cycle_entry_for_file(
+    db: &Database,
+    cycles: &ImportCycles,
+    file_path: &str,
+) -> Result<Option<CycleEntry>> {
+    for component in cycles.components.iter() {
         // Trivial SCCs (single-node, no self-edge) aren't cycles — same rule
         // as `find_cycles_touching`.
         if component.len() < 2 {
@@ -1477,16 +1627,18 @@ fn find_cycle_containing_file(db: &Database, file_path: &str) -> Result<Option<C
         members.sort();
         let size = members.len() as u32;
         let max_churn_file = pick_max_churn(db, &members)?;
+        let lazy_edges = cycles.lazy_edges_touching(&members);
         return Ok(Some(CycleEntry {
             members,
             size,
             max_churn_file,
+            lazy_edges,
         }));
     }
     Ok(None)
 }
 
-fn import_cycle_components(db: &Database) -> Result<Arc<Vec<Vec<String>>>> {
+fn import_cycle_components(db: &Database) -> Result<Arc<ImportCycles>> {
     codesage_protocol::work::checkpoint()?;
     // The cross-request token can collide after same-shape reindexing.
     let cache_key = if COMPLETE_POLICY.get().is_some() {
@@ -1495,10 +1647,7 @@ fn import_cycle_components(db: &Database) -> Result<Arc<Vec<Vec<String>>>> {
         db.import_cycle_cache_key()
     };
     let Some(key) = cache_key else {
-        let edges = db
-            .enumerate_file_import_edges()
-            .with_context(|| "enumerate_file_import_edges")?;
-        return Ok(Arc::new(crate::scc::tarjan_scc(&edges)?));
+        return Ok(Arc::new(ImportCycles::load(db)?));
     };
     let token = db.import_cycle_validity_token()?;
     if let Some((_, cached)) = IMPORT_CYCLE_CACHE
@@ -1510,10 +1659,7 @@ fn import_cycle_components(db: &Database) -> Result<Arc<Vec<Vec<String>>>> {
         return Ok(Arc::clone(cached));
     }
 
-    let edges = db
-        .enumerate_file_import_edges()
-        .with_context(|| "enumerate_file_import_edges")?;
-    let components = Arc::new(crate::scc::tarjan_scc(&edges)?);
+    let components = Arc::new(ImportCycles::load(db)?);
     IMPORT_CYCLE_CACHE
         .lock()
         .expect("import cycle cache lock poisoned")
@@ -2069,6 +2215,208 @@ mod tests {
     }
 
     #[test]
+    fn lazy_pair_inside_an_eager_ring_is_not_a_suppressed_edge() {
+        use codesage_protocol::{FileInfo, Language, Reference, ReferenceKind, Symbol, SymbolKind};
+
+        let db = Database::open_in_memory().unwrap();
+        for path in ["a.py", "b.py", "c.py", "d.py", "x.py", "y.py"] {
+            db.upsert_file(&FileInfo {
+                path: path.to_string(),
+                language: Language::Python,
+                content_hash: "hash".to_string(),
+            })
+            .unwrap();
+        }
+        let ids = |path: &str| db.file_id_for_path(path).unwrap().unwrap();
+        for (path, name) in [
+            ("a.py", "fa"),
+            ("b.py", "fb"),
+            ("c.py", "fc"),
+            ("d.py", "fd"),
+            ("x.py", "fx"),
+            ("y.py", "fy"),
+        ] {
+            db.insert_symbols(
+                ids(path),
+                &[Symbol {
+                    name: name.to_string(),
+                    qualified_name: name.to_string(),
+                    kind: SymbolKind::Function,
+                    file_path: path.to_string(),
+                    line_start: 1,
+                    line_end: 2,
+                    col_start: 0,
+                    col_end: 0,
+                    rationale: Vec::new(),
+                }],
+            )
+            .unwrap();
+        }
+        let imp = |from: &str, to: &str, line: u32, lazy: bool| Reference {
+            from_file: from.to_string(),
+            from_symbol: None,
+            to_name: to.to_string(),
+            kind: ReferenceKind::Import,
+            line,
+            col: 0,
+            lazy,
+        };
+        // Eager ring a -> c -> b -> a, plus a lazy a -> b shortcut inside it
+        // (redundant) and a lazy a -> d that would pull the eager d -> b
+        // spoke into the ring (enlargement).
+        db.insert_references(
+            ids("a.py"),
+            &[
+                imp("a.py", "fc", 1, false),
+                imp("a.py", "fb", 2, true),
+                imp("a.py", "fd", 3, true),
+            ],
+        )
+        .unwrap();
+        db.insert_references(ids("d.py"), &[imp("d.py", "fb", 1, false)])
+            .unwrap();
+        db.insert_references(ids("c.py"), &[imp("c.py", "fb", 1, false)])
+            .unwrap();
+        db.insert_references(ids("b.py"), &[imp("b.py", "fa", 1, false)])
+            .unwrap();
+        // Lazy x -> y that would close a cycle with the eager y -> x.
+        db.insert_references(ids("x.py"), &[imp("x.py", "fy", 1, true)])
+            .unwrap();
+        db.insert_references(ids("y.py"), &[imp("y.py", "fx", 1, false)])
+            .unwrap();
+
+        let cycles = ImportCycles::load(&db).unwrap();
+        let mut suppressed = cycles.suppressed_pairs.clone();
+        suppressed.sort();
+        assert_eq!(
+            suppressed,
+            vec![
+                ("a.py".to_string(), "d.py".to_string()),
+                ("x.py".to_string(), "y.py".to_string()),
+            ]
+        );
+
+        // The ring member touched by the enlarging pair reports it; the
+        // redundant a -> b shortcut is invisible everywhere.
+        let ring = assess_risk(&db, "a.py").unwrap();
+        assert!(ring.in_cycle);
+        assert_eq!(ring.cycle_size, 3);
+        assert_eq!(ring.lazy_edges, 1);
+        let untouched = assess_risk(&db, "c.py").unwrap();
+        assert!(untouched.in_cycle);
+        assert_eq!(untouched.lazy_edges, 0);
+        let json = serde_json::to_value(&untouched).unwrap();
+        assert!(json.get("lazy_edges").is_none(), "{json}");
+        let entry = cycle_entry_for_file(&db, &cycles, "c.py").unwrap().unwrap();
+        assert_eq!(entry.members, vec!["a.py", "b.py", "c.py"]);
+        assert_eq!(entry.lazy_edges, 1);
+        let spoke = assess_risk(&db, "d.py").unwrap();
+        assert!(!spoke.in_cycle);
+        assert_eq!(spoke.lazy_edges, 1);
+
+        let dir = tempfile::tempdir().unwrap();
+        let report = crate::build_review_rehearsal(dir.path(), &db, &["c.py".to_string()]).unwrap();
+        let objection = report
+            .objections
+            .iter()
+            .find(|o| o.category == "import-cycle")
+            .expect("ring still objects");
+        assert!(
+            objection
+                .evidence
+                .iter()
+                .any(|e| e.starts_with("lazy_edges: 1 ")),
+            "{objection:?}"
+        );
+
+        for file in ["x.py", "y.py"] {
+            let open = assess_risk(&db, file).unwrap();
+            assert!(!open.in_cycle, "{open:?}");
+            assert_eq!(open.lazy_edges, 1, "{open:?}");
+        }
+    }
+
+    #[test]
+    fn cycle_churn_lookup_failure_degrades_instead_of_aborting() {
+        use codesage_protocol::{FileInfo, Language, Reference, ReferenceKind, Symbol, SymbolKind};
+
+        let db = Database::open_in_memory().unwrap();
+        for path in ["cyc_a.php", "cyc_b.php"] {
+            db.upsert_file(&FileInfo {
+                path: path.to_string(),
+                language: Language::Php,
+                content_hash: "hash".to_string(),
+            })
+            .unwrap();
+        }
+        let ids = |path: &str| db.file_id_for_path(path).unwrap().unwrap();
+        let sym = |name: &str, qualified: &str, file: &str| Symbol {
+            name: name.to_string(),
+            qualified_name: qualified.to_string(),
+            kind: SymbolKind::Class,
+            file_path: file.to_string(),
+            line_start: 1,
+            line_end: 5,
+            col_start: 0,
+            col_end: 0,
+            rationale: Vec::new(),
+        };
+        db.insert_symbols(
+            ids("cyc_a.php"),
+            &[sym("CycleA", "App\\CycleA", "cyc_a.php")],
+        )
+        .unwrap();
+        db.insert_symbols(
+            ids("cyc_b.php"),
+            &[sym("CycleB", "App\\CycleB", "cyc_b.php")],
+        )
+        .unwrap();
+        let imp = |from: &str, to: &str| Reference {
+            from_file: from.to_string(),
+            from_symbol: None,
+            to_name: to.to_string(),
+            kind: ReferenceKind::Import,
+            line: 1,
+            col: 0,
+            lazy: false,
+        };
+        db.insert_references(ids("cyc_a.php"), &[imp("cyc_a.php", "App\\CycleB")])
+            .unwrap();
+        db.insert_references(ids("cyc_b.php"), &[imp("cyc_b.php", "App\\CycleA")])
+            .unwrap();
+        db.upsert_git_file("cyc_b.php", 1.0, 0, 1, Some(1_700_000_000))
+            .unwrap();
+        assert!(assess_risk(&db, "cyc_a.php").unwrap().in_cycle);
+
+        // Only the peer's churn row faults, so the assessed file's own reads
+        // succeed and the failure surfaces inside pick_max_churn.
+        db.execute_raw_for_tests(
+            "CREATE TABLE git_files_backing AS SELECT * FROM git_files;
+             DROP TABLE git_files;
+             CREATE VIEW git_files AS
+             SELECT path,
+                    CASE WHEN path = 'cyc_b.php' THEN json_extract('{', '$') ELSE churn_score END
+                        AS churn_score,
+                    fix_count, total_commits, last_commit_at, indexed_at
+             FROM git_files_backing;",
+        )
+        .unwrap();
+        assert!(db.git_file("cyc_b.php").is_err());
+        assert!(db.git_file("cyc_a.php").unwrap().is_none());
+
+        let degraded = assess_risk(&db, "cyc_a.php").unwrap();
+        assert!(!degraded.in_cycle, "{degraded:?}");
+        assert_eq!(degraded.cycle_size, 0);
+        assert!(degraded.cycle_files.is_empty());
+        assert_eq!(degraded.lazy_edges, 0);
+        assert!(
+            degraded.notes.iter().any(|n| n == CYCLE_SIGNAL_FAILED_NOTE),
+            "{:?}",
+            degraded.notes
+        );
+    }
+
+    #[test]
     fn single_file_cycle_matches_batch_scc_members() {
         use codesage_protocol::{FileInfo, Language, Reference, ReferenceKind, Symbol, SymbolKind};
 
@@ -2112,6 +2460,7 @@ mod tests {
             kind: ReferenceKind::Import,
             line: 1,
             col: 0,
+            lazy: false,
         };
         db.insert_references(ids("cyc_a.php"), &[imp("cyc_a.php", "App\\CycleB")])
             .unwrap();
@@ -2127,8 +2476,9 @@ mod tests {
         );
         assert_eq!(single.size, 2);
 
-        let batch =
-            find_cycles_touching(&db, &["cyc_a.php".to_string(), "lone.php".to_string()]).unwrap();
+        let batch = find_cycles_touching(&db, &["cyc_a.php".to_string(), "lone.php".to_string()])
+            .unwrap()
+            .entries;
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].members, single.members);
         assert_eq!(batch[0].size, single.size);
