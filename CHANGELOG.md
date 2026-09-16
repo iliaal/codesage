@@ -13,6 +13,7 @@
 ### Changed
 
 - Every failed MCP `tools/call` carries a JSON block with `tool`, `error.code`, `error.message`, and `error.remedy` (a tool call, a shell command with optional `cwd`, or null); parameter validation, project routing, `daemon_stats`, and internal-tool failures included. Legacy `status` / `complete` / `next` fields are unchanged.
+- A failed MCP `tools/call` carries exactly one JSON block; the trailing `{"next":null}` block is no longer appended.
 - Error codes: `E_PARAM`, `E_PROJECT_PATH`, `E_NOT_ONBOARDED`, `E_SCHEMA_TOO_NEW`, `E_NOT_FOUND`, `E_AMBIGUOUS`, `E_EMPTY_INPUT`, `E_OVER_CAP`, `E_MODEL`, `E_DB_BUSY`, `E_SATURATED`, `E_TIMEOUT`, `E_CANCELLED`, `E_SHUTDOWN`, `E_INCOMPLETE`, `E_INTERNAL`.
 - `impact_analysis` on an ambiguous symbol returns `E_AMBIGUOUS` with a retry naming the first qualified candidate.
 - Schema migrations `0022_refs_lazy` and `0023_symbols_visibility`; the next `codesage index` reparses existing files under `extraction=2`.
@@ -20,8 +21,8 @@
 ### Fixed
 
 - Import-cycle detection no longer counts imports written inside a function body; a file pair connected only by such lazy imports is excluded from `assess_risk`, `assess_risk_diff`, `review_rehearsal`, and `session_end` cycle checks while `list_dependencies` and `impact_analysis` keep the edge.
-- `impact_analysis`, `trace_call_path`, and `export_context` no longer resolve a C/C++ `static` function or a non-`pub` Rust item as a callee from a file that cannot name it; a lone survivor of the visibility gate still needs import evidence.
-- The indexing hook records its pid in `.codesage/hook-index.lock/pid`, logs `hook start` and `hook exit` lines on every path including signals, and reaps a lock whose pid is dead or belongs to a non-hook process on the next fire regardless of age.
+- `impact_analysis`, `trace_call_path`, `export_context`, the `to` handle on `find_references` rows, and the `reachable` walk behind `recommend_tests` / `review_rehearsal` no longer resolve a C/C++ `static` function or a non-`pub` Rust item as a callee from a file that cannot name it; a lone survivor of the visibility gate still needs import evidence.
+- The indexing hook records its pid in `.codesage/hook-index.lock/pid`, logs `hook start` and `hook exit` lines on every path including signals, and reaps a lock whose pid is dead or belongs to a non-hook process on the next fire regardless of age; a run launched through Husky's `.husky/_/<hook>` wrapper counts as a hook.
 - Concurrent hook fires against an orphaned lock start exactly one indexing pass; a killed run no longer blocks indexing for 30 minutes, while a live run's lock is never reaped and pre-upgrade pidless locks age out after 30 minutes.
 
 ## [0.31.0] - 2026-09-14
