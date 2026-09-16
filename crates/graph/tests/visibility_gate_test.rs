@@ -5,8 +5,10 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use codesage_graph::{full_index, impact_analysis, trace_call_path};
-use codesage_protocol::{CallPathRequest, ImpactRequest, ImpactTarget, Visibility};
+use codesage_graph::{find_references, full_index, impact_analysis, trace_call_path};
+use codesage_protocol::{
+    CallPathRequest, FindReferencesRequest, ImpactRequest, ImpactTarget, Visibility,
+};
 use codesage_storage::Database;
 
 fn fixture_db(name: &str) -> Database {
@@ -65,13 +67,92 @@ fn c_static_helper_is_not_a_cross_file_callee() {
         visibility_of(&db, "util.c", "helper"),
         Some(Visibility::File)
     );
-    // The name-based raw row from main.c still exists; resolution drops it.
+    // The name-based raw row from main.c stays in storage; callee resolution
+    // (impact, trace, and the `to` handle on find_references) drops it.
     let raw = db.find_references("helper", None).unwrap();
     assert!(raw.iter().any(|r| r.from_file == "main.c"), "{raw:?}");
 
     assert_eq!(dependents(&db, "helper"), BTreeSet::new());
     assert!(!path_found(&db, "main", "helper"));
     assert!(path_found(&db, "util_entry", "helper"));
+}
+
+/// A two-file C project whose `only_here` definition carries `storage`
+/// (`static` or nothing); `other.c` includes `util.h` and calls it.
+fn c_project_with_storage(storage: &str) -> (tempfile::TempDir, Database) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("util.h"), "int only_here(int x);\n").unwrap();
+    std::fs::write(
+        root.join("util.c"),
+        format!("#include \"util.h\"\n\n{storage}int only_here(int x) {{ return x + 1; }}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("other.c"),
+        "#include \"util.h\"\n\nint other_entry(int x) { return only_here(x); }\n",
+    )
+    .unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let stats = full_index(root, &db, &[], false).unwrap();
+    assert_eq!(stats.files_indexed, 3, "{stats:?}");
+    (dir, db)
+}
+
+/// The `to` handles on every `find_references` row that `other.c` emits for
+/// `only_here`; the raw rows themselves are name-based and always present.
+fn to_handles_from_other(db: &Database) -> Vec<Option<String>> {
+    let refs = find_references(
+        db,
+        &FindReferencesRequest {
+            symbol_name: "only_here".to_string(),
+            kind: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(refs.definition_count, 1, "{:?}", refs.results);
+    assert!(refs.to_resolution.is_none(), "{:?}", refs.to_resolution);
+    let handles: Vec<Option<String>> = refs
+        .results
+        .iter()
+        .filter(|r| r.from_file == "other.c")
+        .map(|r| r.to.clone())
+        .collect();
+    assert!(
+        !handles.is_empty(),
+        "a raw row from other.c: {:?}",
+        refs.results
+    );
+    handles
+}
+
+#[test]
+fn c_static_definition_gets_no_to_handle_from_an_including_file() {
+    let (_dir, db) = c_project_with_storage("static ");
+    assert_eq!(
+        visibility_of(&db, "util.c", "only_here"),
+        Some(Visibility::File)
+    );
+    assert!(
+        to_handles_from_other(&db).iter().all(Option::is_none),
+        "file-local linkage is not nameable from other.c"
+    );
+}
+
+#[test]
+fn c_external_definition_gets_a_to_handle_through_the_header_include() {
+    let (_dir, db) = c_project_with_storage("");
+    assert_ne!(
+        visibility_of(&db, "util.c", "only_here"),
+        Some(Visibility::File)
+    );
+    let handles = to_handles_from_other(&db);
+    assert!(
+        handles
+            .iter()
+            .all(|h| h.as_deref() == Some("sym:util.c#only_here")),
+        "{handles:?}"
+    );
 }
 
 #[test]
