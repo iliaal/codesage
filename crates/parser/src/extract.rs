@@ -339,14 +339,24 @@ pub fn extract_symbols(
         let (start_row, col_start) = crate::position::node_start_utf8(&def_node, source);
         let (end_row, col_end) = crate::position::node_end_utf8(&def_node, source);
 
-        let rationale = match language {
+        let mut rationale = match language {
             Language::Rust => crate::rationale::extract_rust_rationale(&def_node, source),
             Language::Python => crate::rationale::extract_python_rationale(&def_node, source),
-            Language::C | Language::Cpp | Language::Go | Language::Php => {
-                crate::rationale::extract_clike_rationale(&def_node, source)
+            Language::C
+            | Language::Cpp
+            | Language::Go
+            | Language::Php
+            | Language::Java
+            | Language::JavaScript
+            | Language::TypeScript => {
+                crate::rationale::extract_clike_symbol_rationale(&def_node, &name_node, source)
             }
-            _ => Vec::new(),
         };
+        if matches!(language, Language::C | Language::Cpp) && def_node.kind() == "preproc_def" {
+            rationale.extend(crate::rationale::extract_macro_trailing_rationale(
+                &def_node, source, language,
+            ));
+        }
 
         let visibility = match language {
             Language::Rust => rust_visibility(&def_node),

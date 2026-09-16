@@ -2,45 +2,12 @@
 //! `WHY`, `NOTE`, and `IMPORTANT` require a colon; `FIXME`, `HACK`, `XXX`, and
 //! `TODO` also accept whitespace. Ordinary API descriptions are not rationale.
 
-use codesage_protocol::{RationaleEntry, RationaleKind};
+use codesage_protocol::{Language, RationaleEntry, RationaleKind};
 use tree_sitter::Node;
 
 /// Collect adjacent marked comments across Rust attributes, in source order.
 pub fn extract_rust_rationale(def_node: &Node, source: &[u8]) -> Vec<RationaleEntry> {
-    let mut entries = Vec::new();
-    let mut next_start_row = def_node.start_position().row;
-    let mut sib = def_node.prev_sibling();
-    while let Some(node) = sib {
-        match node.kind() {
-            "line_comment" | "block_comment" => {
-                // Rust line comments include the newline; its next row is not content.
-                let end = node.end_position();
-                let last_content_row = if end.column == 0 && end.row > node.start_position().row {
-                    end.row - 1
-                } else {
-                    end.row
-                };
-                if last_content_row + 1 != next_start_row {
-                    break;
-                }
-                if let Ok(text) = node.utf8_text(source) {
-                    let stripped = strip_rust_comment_markers(text);
-                    if let Some(parsed) = parse_marker_line(&stripped, &node) {
-                        entries.push(parsed);
-                    }
-                }
-                next_start_row = node.start_position().row;
-            }
-            "attribute_item" | "inner_attribute_item" => {
-                // Attributes bridge the comment-to-definition adjacency chain.
-                next_start_row = node.start_position().row;
-            }
-            _ => break,
-        }
-        sib = node.prev_sibling();
-    }
-    entries.reverse();
-    entries
+    extract_clike_rationale(def_node, source)
 }
 
 /// Collect Python rationale from line comments immediately above a definition
@@ -69,6 +36,8 @@ pub fn extract_python_rationale(def_node: &Node, source: &[u8]) -> Vec<Rationale
     }
 
     entries.reverse();
+
+    append_trailing_rationale(def_node, source, &mut entries);
 
     if let Some(parsed) = extract_python_docstring(def_node, source) {
         entries.push(parsed);
@@ -107,7 +76,10 @@ fn walk_python_prev_comments(
             sib = node.prev_sibling();
             continue;
         }
-        if node.kind() == "comment" && node.end_position().row + 1 == *next_start_row {
+        if node.kind() == "comment"
+            && node.end_position().row + 1 == *next_start_row
+            && starts_on_empty_line(&node, source)
+        {
             if let Some(parsed) = parse_python_comment(&node, source) {
                 entries.push(parsed);
             }
@@ -120,23 +92,246 @@ fn walk_python_prev_comments(
     true
 }
 
-/// Collect adjacent C/C++/Go/PHP rationale across PHP attributes, in source order.
+/// Collect adjacent C-family rationale across attributes and declaration wrappers.
 /// Scan block-comment lines for the first marker, including interior docblock lines.
 pub fn extract_clike_rationale(def_node: &Node, source: &[u8]) -> Vec<RationaleEntry> {
     let mut entries = Vec::new();
-    let mut next_start_row = def_node.start_position().row;
-    let mut sib = def_node.prev_sibling();
+    let mut anchor = *def_node;
+    loop {
+        append_leading_comments(&anchor, source, &mut entries);
+        if anchor != *def_node {
+            append_same_line_comments(&anchor, source, &mut entries);
+        }
+        let Some(parent) = declaration_parent(&anchor) else {
+            break;
+        };
+        anchor = parent;
+    }
+    append_trailing_rationale(def_node, source, &mut entries);
+    entries
+}
+
+pub(crate) fn extract_clike_symbol_rationale(
+    def_node: &Node,
+    name_node: &Node,
+    source: &[u8],
+) -> Vec<RationaleEntry> {
+    let (member, group) = if is_declarator(def_node)
+        && let Some(group) = def_node.parent().filter(is_declaration_group)
+    {
+        (*def_node, group)
+    } else if is_declaration_group(def_node) {
+        let mut member = *name_node;
+        while let Some(parent) = member.parent() {
+            if parent == *def_node {
+                break;
+            }
+            member = parent;
+        }
+        if !is_declarator(&member) {
+            return extract_clike_rationale(def_node, source);
+        }
+        (member, *def_node)
+    } else {
+        return extract_clike_rationale(def_node, source);
+    };
+
+    let mut entries = Vec::new();
+    append_leading_comments(&member, source, &mut entries);
+    let owns_member_tail = if matches!(member.kind(), "const_spec" | "var_spec") {
+        append_same_line_comments(name_node, source, &mut entries);
+        let mut cursor = member.walk();
+        member
+            .children(&mut cursor)
+            .enumerate()
+            .filter(|(index, _)| member.field_name_for_child(*index as u32) == Some("name"))
+            .map(|(_, child)| child)
+            .last()
+            .is_none_or(|last| last == *name_node)
+    } else {
+        true
+    };
+    if owns_member_tail {
+        append_trailing_rationale(&member, source, &mut entries);
+    }
+    let (tail, last_member) = declarator_tail(&member);
+    if owns_member_tail && tail != member {
+        append_same_line_comments(&tail, source, &mut entries);
+    }
+    let mut anchor = group;
+    loop {
+        append_leading_comments(&anchor, source, &mut entries);
+        if owns_member_tail && last_member {
+            append_same_line_comments(&anchor, source, &mut entries);
+        }
+        let Some(parent) = declaration_parent(&anchor) else {
+            break;
+        };
+        anchor = parent;
+    }
+    entries.sort_by_key(|entry| (entry.line_start, entry.line_end));
+    entries
+}
+
+fn is_declaration_group(node: &Node) -> bool {
+    matches!(
+        node.kind(),
+        "declaration"
+            | "field_declaration"
+            | "const_declaration"
+            | "var_declaration"
+            | "type_declaration"
+            | "type_definition"
+            | "lexical_declaration"
+            | "variable_declaration"
+    )
+}
+
+fn is_declarator(node: &Node) -> bool {
+    matches!(
+        node.kind(),
+        "variable_declarator"
+            | "init_declarator"
+            | "const_element"
+            | "const_spec"
+            | "var_spec"
+            | "type_spec"
+            | "type_alias"
+            | "field_identifier"
+            | "type_identifier"
+            | "function_declarator"
+            | "pointer_declarator"
+            | "reference_declarator"
+    )
+}
+
+fn declarator_tail<'a>(member: &Node<'a>) -> (Node<'a>, bool) {
+    let mut tail = *member;
+    let mut sibling = member.next_sibling();
+    while let Some(node) = sibling {
+        if node.kind() == "," || is_declarator(&node) {
+            return (tail, false);
+        }
+        if node.kind() == ";" {
+            break;
+        }
+        if node.is_named() && !is_comment(&node) {
+            tail = node;
+        }
+        sibling = node.next_sibling();
+    }
+    (tail, true)
+}
+
+pub(crate) fn extract_macro_trailing_rationale(
+    definition: &Node,
+    source: &[u8],
+    language: Language,
+) -> Vec<RationaleEntry> {
+    if definition.has_error() {
+        return Vec::new();
+    }
+    let Some(name) = definition.child_by_field_name("name") else {
+        return Vec::new();
+    };
+    let replacement = &source[name.end_byte()..definition.end_byte()];
+    let mut comments = Vec::new();
+    let hidden_line_comment = definition
+        .child_by_field_name("value")
+        .is_some_and(|value| {
+            source[value.byte_range()]
+                .windows(2)
+                .any(|pair| pair == b"//")
+        });
+    let mut cursor = definition.walk();
+    let literal_boundary = replacement.iter().any(|&byte| matches!(byte, b'"' | b'\''))
+        && definition
+            .named_children(&mut cursor)
+            .any(|node| is_comment(&node));
+    if hidden_line_comment || literal_boundary {
+        let prefix = b"void codesage_macro(void) { (void)(";
+        let mut fragment = prefix.to_vec();
+        fragment.extend_from_slice(replacement);
+        fragment.extend_from_slice(b"\n); }");
+        let Ok(tree) = crate::parse::parse_file(&fragment, language) else {
+            return Vec::new();
+        };
+        let mut pending = vec![tree.root_node()];
+        while let Some(node) = pending.pop() {
+            if is_comment(&node)
+                && node.start_byte() >= prefix.len()
+                && node.end_byte() <= prefix.len() + replacement.len()
+            {
+                let mut entry = node
+                    .utf8_text(&fragment)
+                    .ok()
+                    .and_then(|text| parse_clike_comment(text, &node));
+                if let Some(entry) = entry.as_mut() {
+                    entry.line_start += name.end_position().row as u32;
+                    entry.line_end += name.end_position().row as u32;
+                }
+                comments.push((
+                    name.end_byte() + node.start_byte() - prefix.len(),
+                    name.end_byte() + node.end_byte() - prefix.len(),
+                    entry,
+                ));
+            } else if !matches!(
+                node.kind(),
+                "string_literal" | "raw_string_literal" | "char_literal" | "concatenated_string"
+            ) {
+                let mut cursor = node.walk();
+                pending.extend(node.named_children(&mut cursor));
+            }
+        }
+    } else {
+        let mut cursor = definition.walk();
+        for node in definition.named_children(&mut cursor).filter(is_comment) {
+            comments.push((
+                node.start_byte(),
+                node.end_byte(),
+                node.utf8_text(source)
+                    .ok()
+                    .and_then(|text| parse_clike_comment(text, &node)),
+            ));
+        }
+    }
+    comments.sort_by_key(|(start, _, _)| *start);
+    let mut boundary = definition.end_byte();
+    let mut trailing = Vec::new();
+    for (start, end, entry) in comments.into_iter().rev() {
+        if !source[end..boundary].iter().all(u8::is_ascii_whitespace) {
+            break;
+        }
+        boundary = start;
+        if let Some(entry) = entry {
+            trailing.push(entry);
+        }
+    }
+    let code = &source[definition.start_byte()..boundary];
+    let code_end = code
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(0, |index| index + 1);
+    let row = definition.start_position().row
+        + code[..code_end]
+            .iter()
+            .filter(|&&byte| byte == b'\n')
+            .count();
+    trailing.reverse();
+    trailing.retain(|entry| entry.line_start == row as u32 + 1);
+    trailing
+}
+
+fn append_leading_comments(anchor: &Node, source: &[u8], entries: &mut Vec<RationaleEntry>) {
+    let first_entry = entries.len();
+    let mut next_start_row = anchor.start_position().row;
+    let mut sib = anchor.prev_sibling();
     while let Some(node) = sib {
         match node.kind() {
-            "comment" => {
-                // Some grammars include the newline; its next row is not content.
-                let end = node.end_position();
-                let last_content_row = if end.column == 0 && end.row > node.start_position().row {
-                    end.row - 1
-                } else {
-                    end.row
-                };
-                if last_content_row + 1 != next_start_row {
+            "comment" | "line_comment" | "block_comment" => {
+                if last_content_row(&node, source) + 1 != next_start_row
+                    || !starts_on_empty_line(&node, source)
+                {
                     break;
                 }
                 if let Ok(text) = node.utf8_text(source)
@@ -146,16 +341,171 @@ pub fn extract_clike_rationale(def_node: &Node, source: &[u8]) -> Vec<RationaleE
                 }
                 next_start_row = node.start_position().row;
             }
-            // PHP attributes bridge the comment-to-definition adjacency chain.
-            "attribute_list" => {
+            "attribute_list" | "attribute_item" | "inner_attribute_item" => {
+                next_start_row = node.start_position().row;
+            }
+            "decorator" => {
+                let end_row = last_content_row(&node, source);
+                if !(end_row..=end_row + 1).contains(&next_start_row) {
+                    break;
+                }
                 next_start_row = node.start_position().row;
             }
             _ => break,
         }
         sib = node.prev_sibling();
     }
-    entries.reverse();
-    entries
+    entries[first_entry..].reverse();
+}
+
+fn starts_on_empty_line(node: &Node, source: &[u8]) -> bool {
+    let start = node.start_byte();
+    let line_start = source[..start]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i + 1);
+    source[line_start..start]
+        .iter()
+        .all(u8::is_ascii_whitespace)
+}
+
+fn declaration_parent<'a>(node: &Node<'a>) -> Option<Node<'a>> {
+    let parent = node.parent()?;
+    if !matches!(
+        parent.kind(),
+        "export_statement"
+            | "lexical_declaration"
+            | "variable_declaration"
+            | "expression_statement"
+            | "const_declaration"
+            | "var_declaration"
+            | "declaration"
+            | "template_declaration"
+            | "ambient_declaration"
+            | "type_declaration"
+    ) {
+        return None;
+    }
+    let mut cursor = parent.walk();
+    (parent
+        .named_children(&mut cursor)
+        .filter(|child| {
+            !is_comment(child)
+                && !matches!(
+                    child.kind(),
+                    "decorator" | "template_parameter_list" | "requires_clause"
+                )
+        })
+        .count()
+        == 1)
+        .then_some(parent)
+}
+
+fn is_comment(node: &Node) -> bool {
+    matches!(node.kind(), "comment" | "line_comment" | "block_comment")
+}
+
+fn last_content_row(node: &Node, source: &[u8]) -> usize {
+    let trailing_newlines = source[node.byte_range()]
+        .iter()
+        .rev()
+        .take_while(|byte| byte.is_ascii_whitespace())
+        .filter(|&&byte| byte == b'\n')
+        .count();
+    node.end_position().row.saturating_sub(trailing_newlines)
+}
+
+fn append_same_line_comments(anchor: &Node, source: &[u8], entries: &mut Vec<RationaleEntry>) {
+    let row = last_content_row(anchor, source);
+    let mut sibling = anchor.next_sibling();
+    while let Some(node) = sibling {
+        if node.start_position().row != row {
+            break;
+        }
+        if is_comment(&node) {
+            if let Ok(text) = node.utf8_text(source)
+                && let Some(entry) = parse_clike_comment(text, &node)
+            {
+                entries.push(entry);
+            }
+        } else if !matches!(node.kind(), ";" | ",") {
+            break;
+        }
+        sibling = node.next_sibling();
+    }
+}
+
+fn append_trailing_rationale(def_node: &Node, source: &[u8], entries: &mut Vec<RationaleEntry>) {
+    append_same_line_comments(def_node, source, entries);
+
+    // Python header comments and TypeScript extras after `}` live inside the definition.
+    let definition = if matches!(
+        def_node.kind(),
+        "variable_declarator" | "assignment_expression"
+    ) {
+        let mut value = def_node
+            .child_by_field_name("value")
+            .or_else(|| def_node.child_by_field_name("right"))
+            .unwrap_or(*def_node);
+        while value.kind() == "parenthesized_expression" {
+            let mut cursor = value.walk();
+            let mut children = value.named_children(&mut cursor).filter(|n| !is_comment(n));
+            let Some(inner) = children.next() else {
+                break;
+            };
+            if children.next().is_some() {
+                break;
+            }
+            value = inner;
+        }
+        if value.child_by_field_name("body").is_some() {
+            value
+        } else {
+            *def_node
+        }
+    } else {
+        *def_node
+    };
+    let mut cursor = definition.walk();
+    for child in definition.children(&mut cursor) {
+        if child.kind() == ":" {
+            append_same_line_comments(&child, source, entries);
+        }
+    }
+    let body = definition.child_by_field_name("body").or_else(|| {
+        let type_node = definition.child_by_field_name("type")?;
+        match type_node.kind() {
+            "interface_type" => Some(type_node),
+            "struct_type" => {
+                let mut cursor = type_node.walk();
+                type_node
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == "field_declaration_list")
+            }
+            _ => None,
+        }
+    });
+    if let Some(body) = body {
+        append_same_line_comments(&body, source, entries);
+        let inline_header_row = body
+            .prev_sibling()
+            .filter(|previous| previous.kind() == ":")
+            .map(|colon| colon.end_position().row)
+            .filter(|&row| row == body.start_position().row);
+        let mut cursor = body.walk();
+        for child in body.children(&mut cursor) {
+            if matches!(child.kind(), "{" | "}") {
+                append_same_line_comments(&child, source, entries);
+            } else if is_comment(&child)
+                && inline_header_row == Some(child.start_position().row)
+                && let Ok(text) = child.utf8_text(source)
+                && let Some(entry) = parse_clike_comment(text, &child)
+            {
+                entries.push(entry);
+            }
+        }
+    }
+    entries.sort_by_key(|entry| (entry.line_start, entry.line_end));
 }
 
 /// Parse one C-family / PHP comment node into at most one rationale entry. The
@@ -164,13 +514,26 @@ pub fn extract_clike_rationale(def_node: &Node, source: &[u8]) -> Vec<RationaleE
 /// `// WHY: ...` and a multi-line `/** ... * WHY: ... */` docblock resolve.
 fn parse_clike_comment(raw: &str, node: &Node) -> Option<RationaleEntry> {
     let body = strip_clike_comment_markers(raw);
-    for line in body.lines() {
+    if let Some(entry) = parse_marker_line(&body, node) {
+        return Some(entry);
+    }
+    let mut lines = body.lines();
+    while let Some(line) = lines.next() {
         let line = line.trim_start();
         let line = line.strip_prefix('*').map(str::trim_start).unwrap_or(line);
-        if let Some((kind, text)) = parse_marker(line) {
+        if let Some((kind, mut text)) = parse_marker(line) {
+            for continuation in lines {
+                let continuation = continuation.trim_start();
+                let continuation = continuation
+                    .strip_prefix('*')
+                    .map(str::trim_start)
+                    .unwrap_or(continuation);
+                text.push('\n');
+                text.push_str(continuation);
+            }
             return Some(RationaleEntry {
                 kind,
-                text,
+                text: text.trim_end().to_string(),
                 line_start: node.start_position().row as u32 + 1,
                 line_end: node.end_position().row as u32 + 1,
             });
