@@ -37,3 +37,6 @@
 
 ; Pattern 12: braced use without a leading path (use {a, b}) -- one ref per name
 (use_declaration argument: (use_list [(identifier) (scoped_identifier)] @ref))
+
+; Pattern 13: external module declaration, excluding inline module bodies
+(mod_item name: (identifier) @ref !body)

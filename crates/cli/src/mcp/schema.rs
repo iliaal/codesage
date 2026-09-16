@@ -441,6 +441,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolution_reports_advertise_optional_bounds() {
+        let server = CodeSageServer::new();
+        let mut tools = server.tool_router.list_all();
+        finalize_tools_for_listing(&mut tools);
+        for name in [
+            "impact_analysis",
+            "export_context",
+            "feature_bundle",
+            "trace_call_path",
+        ] {
+            let schema = tools
+                .iter()
+                .find(|tool| tool.name.as_ref() == name)
+                .and_then(|tool| tool.output_schema.as_ref())
+                .unwrap();
+            assert_eq!(schema["properties"]["bounded"]["type"], "boolean", "{name}");
+            assert!(
+                !schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|key| key == "bounded"),
+                "{name}"
+            );
+        }
+    }
+
     /// Follow a `$ref` into `$defs` so nested per-file schemas can be checked.
     fn resolve<'a>(
         root: &'a serde_json::Value,

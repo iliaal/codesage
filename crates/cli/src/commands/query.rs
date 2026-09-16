@@ -176,6 +176,9 @@ pub(crate) fn cmd_dependencies(file: &str, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&deps)?);
     } else {
         println!("File: {}", deps.file_path);
+        if let Some(note) = &deps.note {
+            println!("{note}");
+        }
         if deps.imports.is_empty() {
             println!("\nImports: (none)");
         } else {
@@ -261,6 +264,9 @@ pub(crate) fn cmd_trace(from: &str, to: &str, max_depth: usize, json: bool) -> R
         report.length,
         if report.length == 1 { "" } else { "s" }
     );
+    if let Some(note) = &report.note {
+        println!("  {note}");
+    }
     for (i, step) in report.steps.iter().enumerate() {
         let arrow = if i == 0 { " " } else { "\u{2192}" };
         match step.call_line {
@@ -417,6 +423,9 @@ pub(crate) fn cmd_impact(
         return Ok(());
     }
 
+    if report.bounded {
+        println!("Resolution reached a bound; affected files are a lower bound.");
+    }
     if report.results.is_empty()
         && report.forward_dependencies.is_empty()
         && report.sibling_symbols.is_empty()
@@ -546,6 +555,9 @@ fn print_bundle_ingest(bundle: &ContextBundle, target: &str, is_symbol: bool) {
     println!("=== CodeSage context bundle ===");
     println!("Target: {target_label}");
     println!("Description: {}", bundle.target_description);
+    if bundle.bounded {
+        println!("Resolution reached a bound; related code may be incomplete.");
+    }
     println!(
         "Counts: {} chunks across {} files ({} primary, {} related)",
         all_results.len(),
@@ -650,6 +662,9 @@ fn render_file_tree(paths: &[&String]) -> Vec<String> {
 fn print_bundle_markdown(bundle: &ContextBundle) {
     println!("# Context: {}", bundle.target_description);
     println!();
+    if bundle.bounded {
+        println!("Resolution reached a bound; related code may be incomplete.\n");
+    }
 
     if !bundle.primary.is_empty() {
         println!("## Primary matches ({})\n", bundle.primary.len());

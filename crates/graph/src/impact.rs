@@ -11,8 +11,8 @@ use codesage_protocol::{
 use codesage_storage::Database;
 
 use crate::bundle::{
-    import_ref_targets_file, import_refs_for_file, resolve_callee_definitions,
-    resolve_callee_definitions_with_imports,
+    import_ref_targets_file_with_modules, import_refs_for_file, resolve_callee_definitions,
+    resolve_callee_definitions_with_modules,
 };
 
 pub(crate) fn is_qualified_symbol_name(name: &str) -> bool {
@@ -90,6 +90,7 @@ pub(crate) struct WalkCache {
     reference_bytes: usize,
     file_imports: Option<Arc<Vec<Reference>>>,
     import_matches: HashMap<String, Arc<Vec<usize>>>,
+    rust_modules: Option<Arc<crate::rust_modules::RustModules>>,
     #[cfg(test)]
     hits: usize,
     #[cfg(test)]
@@ -101,6 +102,15 @@ pub(crate) struct WalkCache {
 }
 
 impl WalkCache {
+    fn rust_modules(&mut self, db: &Database) -> Result<Arc<crate::rust_modules::RustModules>> {
+        if let Some(modules) = &self.rust_modules {
+            return Ok(Arc::clone(modules));
+        }
+        let modules = Arc::new(crate::rust_modules::RustModules::load(db)?);
+        self.rust_modules = Some(Arc::clone(&modules));
+        Ok(modules)
+    }
+
     const MAX_SYMBOLS: usize = 8192;
     const MAX_REFERENCE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -109,7 +119,11 @@ impl WalkCache {
         (self.hits, self.entry_count(), self.reference_bytes)
     }
 
-    fn references(&mut self, db: &Database, sym: &Symbol) -> Result<Arc<Vec<Reference>>> {
+    pub(crate) fn references(
+        &mut self,
+        db: &Database,
+        sym: &Symbol,
+    ) -> Result<Arc<Vec<Reference>>> {
         codesage_protocol::work::checkpoint()?;
         let key = symbol_identity_key(sym);
         if let Some(rows) = self.references.get(&key) {
@@ -149,6 +163,32 @@ impl WalkCache {
             + self.caller_imports.len()
     }
 
+    pub(crate) fn context_capped(&self) -> bool {
+        self.rust_modules
+            .as_ref()
+            .is_some_and(|modules| modules.capped())
+    }
+
+    pub(crate) fn resolve_symbols(
+        &mut self,
+        db: &Database,
+        caller_file: &str,
+        spelling: &str,
+    ) -> Result<Vec<Symbol>> {
+        let modules = if caller_file.ends_with(".rs") {
+            self.rust_modules(db)?
+        } else {
+            Arc::new(crate::rust_modules::RustModules::default())
+        };
+        resolve_callee_definitions_with_modules(
+            db,
+            caller_file,
+            spelling,
+            &mut || self.caller_imports(db, caller_file),
+            &modules,
+        )
+    }
+
     fn resolve(
         &mut self,
         db: &Database,
@@ -168,12 +208,7 @@ impl WalkCache {
         {
             self.resolution_loads += 1;
         }
-        let rows = definition_keys(resolve_callee_definitions_with_imports(
-            db,
-            caller_file,
-            spelling,
-            &mut || self.caller_imports(db, caller_file),
-        )?);
+        let rows = definition_keys(self.resolve_symbols(db, caller_file, spelling)?);
         let bytes = rows.iter().fold(
             rows.capacity()
                 .saturating_mul(std::mem::size_of::<DefinitionKey>())
@@ -333,8 +368,10 @@ pub(crate) fn impact_analysis_walk_shared(
     req: &ImpactRequest,
     max_frontier: usize,
     mut budget: Option<&mut WalkBudget>,
-    mut cache: Option<&mut WalkCache>,
+    cache: Option<&mut WalkCache>,
 ) -> Result<WalkOutcome> {
+    let mut local_cache = WalkCache::default();
+    let mut cache = Some(cache.unwrap_or(&mut local_cache));
     codesage_protocol::work::checkpoint()?;
     if let Some(b) = budget.as_deref_mut()
         && (b.exhausted || b.over_deadline())
@@ -383,6 +420,18 @@ pub(crate) fn impact_analysis_walk_shared(
         });
     }
 
+    let rust_modules = if file_frontier.iter().any(|file| file.ends_with(".rs"))
+        || seed_symbols
+            .iter()
+            .any(|symbol| symbol.file_path.ends_with(".rs"))
+    {
+        match cache.as_deref_mut() {
+            Some(cache) => cache.rust_modules(db)?,
+            None => Arc::new(crate::rust_modules::RustModules::load(db)?),
+        }
+    } else {
+        Arc::new(crate::rust_modules::RustModules::default())
+    };
     let origin_files: HashSet<String> = match &req.target {
         ImpactTarget::File { path } => {
             let mut s = HashSet::new();
@@ -551,7 +600,12 @@ pub(crate) fn impact_analysis_walk_shared(
                 let reference_index = cached_matches.as_ref().map_or(index, |rows| rows[index]);
                 let r = &file_imports[reference_index];
                 if cached_matches.is_none()
-                    && !import_ref_targets_file(&r.to_name, &r.from_file, file)
+                    && !import_ref_targets_file_with_modules(
+                        &r.to_name,
+                        &r.from_file,
+                        file,
+                        &rust_modules,
+                    )
                 {
                     continue;
                 }
@@ -698,7 +752,7 @@ pub(crate) fn impact_analysis_walk_shared(
     });
     Ok(WalkOutcome {
         entries,
-        capped: frontier_capped,
+        capped: frontier_capped || cache.as_ref().is_some_and(|cache| cache.context_capped()),
         edge_counts,
         seed_count,
     })
@@ -716,7 +770,7 @@ pub fn impact_analysis_report(
     req: &ImpactRequest,
     opts: &ImpactOptions,
 ) -> Result<ImpactReport> {
-    let mut entries = impact_analysis(db, req)?;
+    let (mut entries, bounded) = impact_analysis_walk(db, req, MAX_FRONTIER)?;
 
     // Summary reflects the full result set, before any limit truncation.
     let summary = if opts.summary_only {
@@ -763,6 +817,7 @@ pub fn impact_analysis_report(
     }
 
     Ok(ImpactReport {
+        bounded,
         results: entries,
         forward_dependencies,
         sibling_symbols,

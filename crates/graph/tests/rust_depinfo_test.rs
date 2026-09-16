@@ -40,9 +40,12 @@ fn prerequisites(depinfo: &str) -> Result<Vec<String>, String> {
     Ok(paths)
 }
 
-fn compiler_sources(root: &Path) -> Option<BTreeSet<String>> {
+fn compiler_sources(root: &Path, test_target: Option<&str>) -> Option<BTreeSet<String>> {
+    let target = test_target.map_or_else(|| vec!["--lib"], |name| vec!["--test", name]);
     let output = match Command::new("cargo")
-        .args(["check", "--offline", "--quiet", "--lib", "--target-dir"])
+        .args(["check", "--offline", "--quiet"])
+        .args(target)
+        .arg("--target-dir")
         .arg(root.join("target"))
         .current_dir(root)
         .env_remove("CARGO_BUILD_TARGET")
@@ -66,6 +69,14 @@ fn compiler_sources(root: &Path) -> Option<BTreeSet<String>> {
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "d"))
+        .filter(|path| {
+            test_target.is_none_or(|target| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&format!("{target}-"))
+            })
+        })
         .collect();
     assert_eq!(
         depfiles.len(),
@@ -81,7 +92,10 @@ fn compiler_sources(root: &Path) -> Option<BTreeSet<String>> {
         sources.insert(local.to_str().unwrap().replace('\\', "/"));
     }
     assert!(
-        sources.contains("src/lib.rs"),
+        sources.contains(&test_target.map_or_else(
+            || "src/lib.rs".to_string(),
+            |target| format!("tests/{target}.rs")
+        )),
         "missing crate root: {sources:?}"
     );
     assert!(
@@ -91,11 +105,11 @@ fn compiler_sources(root: &Path) -> Option<BTreeSet<String>> {
     Some(sources)
 }
 
-fn reachable_sources(db: &Database) -> BTreeSet<String> {
+fn reachable_sources(db: &Database, root_file: &str) -> BTreeSet<String> {
     let files = db.indexed_files_with_prefix("").unwrap();
     let paths: Vec<_> = files.iter().map(String::as_str).collect();
     let entries = list_dependencies_batch(db, &paths).unwrap();
-    let mut reachable = BTreeSet::from(["src/lib.rs".to_string()]);
+    let mut reachable = BTreeSet::from([root_file.to_string()]);
     loop {
         let before = reachable.len();
         for entry in &entries {
@@ -114,6 +128,16 @@ fn reachable_sources(db: &Database) -> BTreeSet<String> {
 }
 
 fn compare(files: &[(&str, &str)], edition: &str, missing: &[&str], extra: &[&str]) {
+    compare_target(files, edition, missing, extra, None);
+}
+
+fn compare_target(
+    files: &[(&str, &str)],
+    edition: &str,
+    missing: &[&str],
+    extra: &[&str],
+    test_target: Option<&str>,
+) {
     let dir = tempfile::Builder::new()
         .prefix("codesage depinfo ")
         .tempdir()
@@ -129,12 +153,16 @@ fn compare(files: &[(&str, &str)], edition: &str, missing: &[&str], extra: &[&st
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, source).unwrap();
     }
-    let Some(compiler) = compiler_sources(root) else {
+    let Some(compiler) = compiler_sources(root, test_target) else {
         return;
     };
     let db = Database::open_in_memory().unwrap();
     full_index(root, &db, &[], false).unwrap();
-    let graph = reachable_sources(&db);
+    let root_file = test_target.map_or_else(
+        || "src/lib.rs".to_string(),
+        |target| format!("tests/{target}.rs"),
+    );
+    let graph = reachable_sources(&db, &root_file);
     if missing.is_empty() && extra.is_empty() {
         assert_eq!(graph, compiler, "graph and compiler source sets differ");
     } else {
@@ -144,6 +172,44 @@ fn compare(files: &[(&str, &str)], edition: &str, missing: &[&str], extra: &[&st
         eprintln!("Unsupported extraction: missing={observed_missing:?}, extra={observed_extra:?}");
         assert_eq!(observed_missing, missing.iter().copied().collect());
         assert_eq!(observed_extra, extra.iter().copied().collect());
+    }
+}
+
+#[test]
+fn flat_included_test_modules_match_cargo_without_claiming_sibling_decoys() {
+    compare_target(
+        &[
+            ("src/lib.rs", ""),
+            (
+                "tests/t.rs",
+                "mod support; fn parent() {} #[test] fn check() { support::run(); }",
+            ),
+            (
+                "tests/support.rs",
+                "mod child; use super::parent; use self::child::*; pub fn run() { parent(); value(); }",
+            ),
+            ("tests/support/child.rs", "pub fn value() {}"),
+            ("tests/child.rs", "pub fn value() {}"),
+        ],
+        "2024",
+        &[],
+        &[],
+        Some("t"),
+    );
+}
+
+#[test]
+fn an_included_modules_hypothetical_root_dependencies_do_not_suppress_another_target() {
+    let files = [
+        ("src/lib.rs", ""),
+        ("tests/a.rs", "mod b;"),
+        ("tests/b.rs", "mod c;"),
+        ("tests/b/c.rs", ""),
+        ("tests/c.rs", "mod leaf;"),
+        ("tests/leaf.rs", ""),
+    ];
+    for target in ["a", "c"] {
+        compare_target(&files, "2024", &[], &[], Some(target));
     }
 }
 
@@ -181,14 +247,14 @@ fn pub_use_and_local_env_module_match_compiler_transitively() {
 }
 
 #[test]
-fn bare_pub_mod_is_classified_as_missing_declaration_edge() {
+fn bare_pub_mod_matches_compiler_sources() {
     compare(
         &[
             ("src/lib.rs", "pub mod env;"),
             ("src/env.rs", "pub fn value() {}"),
         ],
         "2024",
-        &["src/env.rs"],
+        &[],
         &[],
     );
 }
@@ -227,14 +293,14 @@ fn cfg_attr_relocation_exposes_both_missing_and_spurious_sources() {
 }
 
 #[test]
-fn edition_2015_leading_colons_are_classified_as_unresolved() {
+fn edition_2015_module_declarations_match_compiler_sources() {
     compare(
         &[
             ("src/lib.rs", "pub mod env; pub use ::env::value;"),
             ("src/env.rs", "pub fn value() {}"),
         ],
         "2015",
-        &["src/env.rs"],
+        &[],
         &[],
     );
 }

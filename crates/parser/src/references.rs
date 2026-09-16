@@ -223,6 +223,7 @@ fn rust_ref_kind(pattern_index: usize) -> Option<ReferenceKind> {
         7 => Some(ReferenceKind::Inheritance), // impl Trait for Type
         8 => Some(ReferenceKind::TypeHint),    // type of an impl block
         9..=12 => Some(ReferenceKind::Import), // renamed / glob / grouped / braced use
+        13 => Some(ReferenceKind::Import),     // external module declaration
         _ => None,
     }
 }
@@ -564,6 +565,35 @@ pub fn extract_references(
         // Grouped-import leaves are captured bare; prepend the enclosing base
         // path so the stored name resolves the same way a flat import does.
         let to_name = match language {
+            Language::Rust if p.pattern == 13 => {
+                if rust_module_has_path_attribute(ref_node.parent(), source) {
+                    continue;
+                }
+                let mut parts = vec![stripped.trim_start_matches("r#").to_string()];
+                let mut ancestor = ref_node.parent().and_then(|node| node.parent());
+                while let Some(node) = ancestor {
+                    if node.kind() == "mod_item"
+                        && let Some(name) = node.child_by_field_name("name")
+                    {
+                        if rust_module_has_path_attribute(Some(node), source) {
+                            parts.clear();
+                            break;
+                        }
+                        parts.push(
+                            crate::parse::node_text_lossy(&name, source)
+                                .trim_start_matches("r#")
+                                .to_string(),
+                        );
+                    }
+                    ancestor = node.parent();
+                }
+                if parts.is_empty() {
+                    continue;
+                }
+                parts.reverse();
+                // A module declaration names a file, never an item in its parent.
+                format!("./{}", parts.join("/"))
+            }
             Language::Rust => rust_grouped_use_prefix(&ref_node, source)
                 .map_or_else(|| stripped.to_string(), |p| format!("{p}::{stripped}")),
             Language::Php => php_group_use_prefix(&ref_node, source)
@@ -629,6 +659,44 @@ pub fn extract_references(
     }
 
     Ok(refs)
+}
+
+fn rust_module_has_path_attribute(node: Option<tree_sitter::Node<'_>>, source: &[u8]) -> bool {
+    let mut previous = node.and_then(|node| node.prev_named_sibling());
+    while let Some(attribute) = previous {
+        if matches!(attribute.kind(), "line_comment" | "block_comment") {
+            previous = attribute.prev_named_sibling();
+            continue;
+        }
+        if attribute.kind() != "attribute_item" {
+            break;
+        }
+        if let Some(inner) = attribute.named_child(0)
+            && let Some(name) = inner.named_child(0)
+        {
+            let name = crate::parse::node_text_lossy(&name, source);
+            if name == "path" || (name == "cfg_attr" && rust_path_assignment(inner, source)) {
+                return true;
+            }
+        }
+        previous = attribute.prev_named_sibling();
+    }
+    false
+}
+
+fn rust_path_assignment(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "identifier"
+            && crate::parse::node_text_lossy(&node, source) == "path"
+            && node.next_sibling().is_some_and(|next| next.kind() == "=")
+        {
+            return true;
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    false
 }
 
 /// Strip matching quotes, preserving partial one-byte captures from malformed input.
@@ -839,6 +907,52 @@ mod tests {
         let bytes = source.as_bytes();
         let tree = crate::parse::parse_file(bytes, language).unwrap();
         super::extract_references(&tree, bytes, language, "inline").unwrap()
+    }
+
+    #[test]
+    fn rust_external_modules_keep_their_scope_without_claiming_inline_modules() {
+        let refs = refs_from_source(
+            "#[doc = \"path=example\"] mod sibling; mod outer { pub mod child; mod nested { mod leaf; } } mod r#type { mod r#match; }",
+            Language::Rust,
+        );
+        let imports: Vec<_> = refs
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Import)
+            .map(|r| r.to_name.as_str())
+            .collect();
+        assert_eq!(
+            imports,
+            [
+                "./sibling",
+                "./outer/child",
+                "./outer/nested/leaf",
+                "./type/match"
+            ]
+        );
+    }
+
+    #[test]
+    fn rust_path_attributes_do_not_claim_the_default_module_file() {
+        let refs = refs_from_source(
+            "#[path = \"elsewhere.rs\"] /* module */ mod redirected; #[path = \"elsewhere\"] mod outer { mod child; } #[cfg_attr(feature = \"a\", path = \"other.rs\")] mod conditional;",
+            Language::Rust,
+        );
+        assert!(refs.iter().all(|r| r.kind != ReferenceKind::Import));
+    }
+
+    #[test]
+    fn rust_nested_cfg_attributes_distinguish_path_assignments_from_quoted_text() {
+        let refs = refs_from_source(
+            r#"#[cfg_attr(feature = "a", cfg_attr(feature = "b", path = "other.rs"))] mod redirected;
+               #[cfg_attr(feature = "a", doc = "path = example.rs")] mod preserved;"#,
+            Language::Rust,
+        );
+        let imports: Vec<_> = refs
+            .iter()
+            .filter(|reference| reference.kind == ReferenceKind::Import)
+            .map(|reference| reference.to_name.as_str())
+            .collect();
+        assert_eq!(imports, ["./preserved"]);
     }
 
     fn rows(refs: &[Reference], name: &str, kind: ReferenceKind) -> usize {

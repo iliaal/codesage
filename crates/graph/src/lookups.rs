@@ -10,8 +10,8 @@ use codesage_protocol::{
 use codesage_storage::Database;
 
 use crate::bundle::{
-    import_ref_targets_file, import_ref_targets_symbol, import_refs_for_file,
-    resolve_callee_definitions_with_imports,
+    import_ref_targets_file_with_modules, import_ref_targets_symbol_with_modules,
+    import_refs_for_file, resolve_callee_definitions_with_modules,
 };
 use crate::impact::is_qualified_symbol_name;
 
@@ -178,10 +178,19 @@ fn attach_handles(
             continue;
         }
         let from_file = row.from_file.as_str();
-        let candidates =
-            resolve_callee_definitions_with_imports(db, from_file, &row.to_name, &mut || {
-                caches.imports(from_file)
-            })?;
+        let modules = if from_file.ends_with(".rs") {
+            caches.modules(db)?
+        } else {
+            Arc::new(crate::rust_modules::RustModules::default())
+        };
+        let candidates = resolve_callee_definitions_with_modules(
+            db,
+            from_file,
+            &row.to_name,
+            &mut || caches.imports(from_file),
+            &modules,
+        )?;
+        capped |= modules.capped();
         let handle = match candidates.as_slice() {
             [only] if caches.has_evidence(from_file, &row.to_name, only)? => {
                 Some(only.handle().to_string())
@@ -216,6 +225,7 @@ struct EvidenceCaches<'a> {
     symbols: HashMap<String, Arc<Vec<Symbol>>>,
     imports: HashMap<String, Arc<Vec<String>>>,
     outgoing: HashMap<String, Arc<Vec<(String, ReferenceKind)>>>,
+    modules: Option<Arc<crate::rust_modules::RustModules>>,
 }
 
 impl<'a> EvidenceCaches<'a> {
@@ -225,7 +235,17 @@ impl<'a> EvidenceCaches<'a> {
             symbols: HashMap::new(),
             imports: HashMap::new(),
             outgoing: HashMap::new(),
+            modules: None,
         }
+    }
+
+    fn modules(&mut self, db: &Database) -> Result<Arc<crate::rust_modules::RustModules>> {
+        if let Some(modules) = &self.modules {
+            return Ok(Arc::clone(modules));
+        }
+        let modules = Arc::new(crate::rust_modules::RustModules::load(db)?);
+        self.modules = Some(Arc::clone(&modules));
+        Ok(modules)
     }
 
     fn symbols(&mut self, file: &str) -> Result<Arc<Vec<Symbol>>> {
@@ -281,10 +301,17 @@ impl<'a> EvidenceCaches<'a> {
             return Ok(true);
         }
         let imports = self.imports(caller_file)?;
-        if imports
-            .iter()
-            .any(|imp| import_ref_targets_symbol(imp, caller_file, spelling, candidate))
-        {
+        let modules = if caller_file.ends_with(".rs") {
+            self.modules(self.db)?
+        } else {
+            Arc::new(crate::rust_modules::RustModules::default())
+        };
+        if modules.qualified_target(self.db, caller_file, spelling, candidate)? {
+            return Ok(true);
+        }
+        if imports.iter().any(|imp| {
+            import_ref_targets_symbol_with_modules(imp, caller_file, spelling, candidate, &modules)
+        }) {
             return Ok(true);
         }
         if let Some(owner) = owner_of(&candidate.qualified_name) {
@@ -408,11 +435,18 @@ pub fn list_dependencies(db: &Database, file_path: &str) -> Result<DependencyEnt
 /// Resolve dependencies in input order, sharing one project-wide import query.
 pub fn list_dependencies_batch(db: &Database, file_paths: &[&str]) -> Result<Vec<DependencyEntry>> {
     let all_refs = db.import_include_refs_all()?;
+    let modules = crate::rust_modules::RustModules::from_imports(db, &all_refs)?;
     let mut out = Vec::with_capacity(file_paths.len());
     for file_path in file_paths {
         let mut entry = db.list_file_dependencies(file_path)?;
         if entry.found {
-            resolve_path_imported_by(&mut entry, &all_refs);
+            resolve_path_imported_by(&mut entry, &all_refs, &modules);
+            if let Some(note) = modules.note(&entry.file_path, &entry.imported_by) {
+                entry.note = Some(match entry.note.take() {
+                    Some(existing) => format!("{existing} {note}"),
+                    None => note.to_string(),
+                });
+            }
         }
         out.push(entry);
     }
@@ -420,14 +454,18 @@ pub fn list_dependencies_batch(db: &Database, file_paths: &[&str]) -> Result<Vec
 }
 
 /// Resolve path imports that cannot join against symbol names in SQL.
-fn resolve_path_imported_by(entry: &mut DependencyEntry, all_refs: &[(String, String)]) {
+fn resolve_path_imported_by(
+    entry: &mut DependencyEntry,
+    all_refs: &[(String, String)],
+    modules: &crate::rust_modules::RustModules,
+) {
     let mut known: HashSet<String> = entry.imported_by.iter().cloned().collect();
     known.insert(entry.file_path.clone());
     for (from_path, to_name) in all_refs {
         if known.contains(from_path) {
             continue;
         }
-        if import_ref_targets_file(to_name, from_path, &entry.file_path) {
+        if import_ref_targets_file_with_modules(to_name, from_path, &entry.file_path, modules) {
             known.insert(from_path.clone());
             entry.imported_by.push(from_path.clone());
         }

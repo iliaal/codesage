@@ -1,4 +1,5 @@
-use codesage_graph::{full_index, list_dependencies, list_dependencies_batch};
+use codesage_graph::{find_references, full_index, list_dependencies, list_dependencies_batch};
+use codesage_protocol::{FindReferencesRequest, ReferenceKind};
 use codesage_storage::Database;
 
 fn indexed(files: &[(&str, &str)]) -> (tempfile::TempDir, Database) {
@@ -33,6 +34,255 @@ fn rust_use_crate_import_appears_in_imported_by() {
         vec!["src/lib.rs".to_string()],
         "use crate::util::helper must resolve back to src/util.rs"
     );
+}
+
+#[test]
+fn rust_binary_crate_import_uses_the_binary_directory() {
+    let (_dir, db) = indexed(&[
+        (
+            "src/bin/tool.rs",
+            "use crate::foo::helper; fn main() { helper(); }",
+        ),
+        ("src/bin/foo.rs", "pub fn helper() {}"),
+        ("src/foo.rs", "pub fn helper() {}"),
+    ]);
+    assert!(
+        list_dependencies(&db, "src/foo.rs")
+            .unwrap()
+            .imported_by
+            .is_empty()
+    );
+    assert_eq!(
+        list_dependencies(&db, "src/bin/foo.rs")
+            .unwrap()
+            .imported_by,
+        vec!["src/bin/tool.rs"]
+    );
+    let refs = find_references(
+        &db,
+        &FindReferencesRequest {
+            symbol_name: "helper".into(),
+            kind: Some(ReferenceKind::Call),
+        },
+    )
+    .unwrap();
+    assert_eq!(refs.results.len(), 1);
+    assert_eq!(
+        refs.results[0].to.as_deref(),
+        Some("sym:src/bin/foo.rs#helper")
+    );
+}
+
+#[test]
+fn rust_integration_test_module_is_a_sibling_import() {
+    let (_dir, db) = indexed(&[
+        (
+            "tests/t.rs",
+            "mod support; #[test] fn check() { support::helper(); }",
+        ),
+        ("tests/support.rs", "pub fn helper() {}"),
+        ("src/support.rs", "pub fn helper() {}"),
+    ]);
+    assert!(
+        list_dependencies(&db, "src/support.rs")
+            .unwrap()
+            .imported_by
+            .is_empty()
+    );
+    assert_eq!(
+        list_dependencies(&db, "tests/support.rs")
+            .unwrap()
+            .imported_by,
+        vec!["tests/t.rs"]
+    );
+}
+
+#[test]
+fn rust_flat_targets_admit_crate_visible_shared_modules() {
+    for (entry, module) in [
+        ("tests/t.rs", "tests/support/mod.rs"),
+        ("src/bin/tool.rs", "src/bin/support/mod.rs"),
+    ] {
+        let (_dir, db) = indexed(&[
+            (entry, "mod support; use support::f; fn run() { f(); }"),
+            (module, "pub(crate) fn f() {}"),
+            ("src/support.rs", "pub(crate) fn f() {}"),
+        ]);
+        let refs = find_references(
+            &db,
+            &FindReferencesRequest {
+                symbol_name: "f".into(),
+                kind: Some(ReferenceKind::Call),
+            },
+        )
+        .unwrap();
+        assert_eq!(refs.results.len(), 1);
+        assert_eq!(
+            refs.results[0].to,
+            Some(format!("sym:{module}#f")),
+            "{entry}"
+        );
+    }
+}
+
+#[test]
+fn rust_flat_included_modules_keep_child_self_and_super_context() {
+    for root in ["tests", "src/bin"] {
+        let entry = format!("{root}/t.rs");
+        let support = format!("{root}/support.rs");
+        let child = format!("{root}/support/child.rs");
+        let decoy = format!("{root}/child.rs");
+        let (_dir, db) = indexed(&[
+            (
+                &entry,
+                "mod support; fn parent() {} fn main() { support::run(); }",
+            ),
+            (
+                &support,
+                "mod child; use super::parent; use self::child::*; pub fn run() { parent(); value(); }",
+            ),
+            (&child, "pub fn value() {}"),
+            (&decoy, "pub fn value() {}"),
+        ]);
+        let child_deps = list_dependencies(&db, &child).unwrap();
+        assert_eq!(child_deps.imported_by, vec![support.clone()]);
+        assert!(
+            child_deps
+                .note
+                .unwrap()
+                .contains("standalone Cargo targets")
+        );
+        assert!(
+            list_dependencies(&db, &decoy)
+                .unwrap()
+                .imported_by
+                .is_empty()
+        );
+        for (name, file) in [("parent", &entry), ("value", &child)] {
+            let refs = find_references(
+                &db,
+                &FindReferencesRequest {
+                    symbol_name: name.into(),
+                    kind: Some(ReferenceKind::Call),
+                },
+            )
+            .unwrap();
+            assert_eq!(refs.results.len(), 1);
+            assert_eq!(refs.results[0].to, Some(format!("sym:{file}#{name}")));
+        }
+    }
+}
+
+#[test]
+fn rust_shared_modules_do_not_choose_one_of_several_parent_targets() {
+    let (_dir, db) = indexed(&[
+        ("tests/a.rs", "mod support; pub fn parent() {}"),
+        ("tests/b.rs", "mod support; pub fn parent() {}"),
+        (
+            "tests/support.rs",
+            "mod child; use super::*; pub fn run() { parent(); }",
+        ),
+        ("tests/support/child.rs", "pub fn child() {}"),
+    ]);
+    assert_eq!(
+        list_dependencies(&db, "tests/support/child.rs")
+            .unwrap()
+            .imported_by,
+        vec!["tests/support.rs"]
+    );
+    for root in ["tests/a.rs", "tests/b.rs"] {
+        assert!(list_dependencies(&db, root).unwrap().imported_by.is_empty());
+    }
+    let refs = find_references(
+        &db,
+        &FindReferencesRequest {
+            symbol_name: "parent".into(),
+            kind: Some(ReferenceKind::Call),
+        },
+    )
+    .unwrap();
+    assert_eq!(refs.results.len(), 1);
+    assert_eq!(refs.results[0].to, None);
+}
+
+#[test]
+fn rust_included_flat_modules_do_not_expose_private_items_to_their_parent() {
+    let (_dir, db) = indexed(&[
+        (
+            "tests/t.rs",
+            "mod support; use support::hidden; fn run() { hidden(); }",
+        ),
+        ("tests/support.rs", "fn hidden() {}"),
+    ]);
+    let refs = find_references(
+        &db,
+        &FindReferencesRequest {
+            symbol_name: "hidden".into(),
+            kind: Some(ReferenceKind::Call),
+        },
+    )
+    .unwrap();
+    assert_eq!(refs.results.len(), 1);
+    assert_eq!(refs.results[0].to, None);
+}
+
+#[test]
+fn rust_conventional_target_subdirectories_keep_their_own_modules() {
+    for target in [
+        "src/bin/tool",
+        "tests/check",
+        "benches/bench",
+        "examples/demo",
+    ] {
+        let entry = format!("crates/app/{target}/main.rs");
+        let helper = format!("crates/app/{target}/helper.rs");
+        let nested = format!("crates/app/{target}/helper/nested.rs");
+        let (_dir, db) = indexed(&[
+            (&entry, "mod helper; use crate::helper::*; fn main() {}"),
+            (&helper, "mod nested; pub fn help() {}"),
+            (&nested, "pub fn nested() {}"),
+            ("crates/app/src/helper.rs", "pub fn help() {}"),
+        ]);
+        assert_eq!(
+            list_dependencies(&db, &helper).unwrap().imported_by,
+            vec![entry]
+        );
+        assert_eq!(
+            list_dependencies(&db, &nested).unwrap().imported_by,
+            vec![helper]
+        );
+        assert!(
+            list_dependencies(&db, "crates/app/src/helper.rs")
+                .unwrap()
+                .imported_by
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn rust_inline_module_declarations_resolve_only_external_children() {
+    let (_dir, db) = indexed(&[
+        ("tests/t.rs", "mod outer { mod support; }"),
+        ("tests/outer/support.rs", "pub fn helper() {}"),
+        ("tests/support.rs", "pub fn helper() {}"),
+        ("tests/outer.rs", "pub fn helper() {}"),
+    ]);
+    assert_eq!(
+        list_dependencies(&db, "tests/outer/support.rs")
+            .unwrap()
+            .imported_by,
+        vec!["tests/t.rs"]
+    );
+    for unrelated in ["tests/support.rs", "tests/outer.rs"] {
+        assert!(
+            list_dependencies(&db, unrelated)
+                .unwrap()
+                .imported_by
+                .is_empty(),
+            "{unrelated}"
+        );
+    }
 }
 
 #[test]

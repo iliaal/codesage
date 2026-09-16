@@ -8,7 +8,7 @@ use codesage_protocol::{
 };
 use codesage_storage::Database;
 
-use crate::impact::{is_qualified_symbol_name, references_for_symbol};
+use crate::impact::{WalkCache, is_qualified_symbol_name};
 use crate::search::{RerankFn, annotate_with_symbols, env_default_on, parse_db_language, search};
 
 /// Default-on; opt-out via `CODESAGE_BUNDLE_LINE_NUMBERS=0` (or "false").
@@ -137,9 +137,10 @@ pub fn export_context(
         }
     }
 
+    let mut bounded = false;
     if req.include_callees || req.include_callers {
         let related_symbols: Vec<Symbol> = symbol_defs.iter().take(5).cloned().collect();
-        add_related_for_symbols(
+        bounded = add_related_for_symbols(
             db,
             &related_symbols,
             req.include_callers,
@@ -151,6 +152,7 @@ pub fn export_context(
     }
 
     Ok(finalize_bundle(ContextBundle {
+        bounded,
         found: true,
         target_description: format!("query: {query}"),
         primary,
@@ -185,6 +187,7 @@ pub fn export_context_for_symbol(
     let defs = db.find_symbols(sym_name, None)?;
     if defs.is_empty() {
         return Ok(ContextBundle {
+            bounded: false,
             found: false,
             target_description: format!("symbol: {sym_name} (not found)"),
             primary: Vec::new(),
@@ -214,8 +217,9 @@ pub fn export_context_for_symbol(
     let mut related: Vec<SearchResult> = Vec::new();
     let mut related_keys: HashSet<(String, u32)> = primary_keys.clone();
 
+    let mut bounded = false;
     if req.include_callers || req.include_callees {
-        add_related_for_symbols(
+        bounded = add_related_for_symbols(
             db,
             &defs,
             req.include_callers,
@@ -227,6 +231,7 @@ pub fn export_context_for_symbol(
     }
 
     Ok(finalize_bundle(ContextBundle {
+        bounded,
         found: true,
         target_description: format!("symbol: {sym_name}"),
         primary,
@@ -260,6 +265,7 @@ pub fn feature_bundle(
         Some(f) => f,
         None => {
             return Ok(ContextBundle {
+                bounded: false,
                 found: false,
                 target_description: format!("feature: {feature_id} (not found)"),
                 primary: Vec::new(),
@@ -332,9 +338,10 @@ pub fn feature_bundle(
         }
     }
 
+    let mut bounded = false;
     if (include_callers || include_callees) && !symbol_definitions.is_empty() {
         let anchors: Vec<Symbol> = symbol_definitions.iter().take(3).cloned().collect();
-        add_related_for_symbols(
+        bounded = add_related_for_symbols(
             db,
             &anchors,
             include_callers,
@@ -361,6 +368,7 @@ pub fn feature_bundle(
     Ok(finalize_bundle(ContextBundle {
         found: true,
         target_description: format!("feature: {} ({})", feature.title, feature.feature_id),
+        bounded,
         primary,
         related,
         symbol_definitions,
@@ -448,23 +456,32 @@ fn add_related_for_symbols(
     limit: usize,
     related: &mut Vec<SearchResult>,
     related_keys: &mut HashSet<(String, u32)>,
-) -> Result<()> {
+) -> Result<bool> {
+    let mut cache = WalkCache::default();
     let mut seen_callee_defs: HashSet<(String, String, u32)> = HashSet::new();
     for sym in symbols {
         if include_callers {
-            add_callers_for_symbol(db, sym, limit, related, related_keys)?;
+            add_callers_for_symbol(db, sym, limit, related, related_keys, &mut cache)?;
         }
         if related.len() >= limit {
             break;
         }
         if include_callees {
-            add_callees_for_symbol(db, sym, limit, related, related_keys, &mut seen_callee_defs)?;
+            add_callees_for_symbol(
+                db,
+                sym,
+                limit,
+                related,
+                related_keys,
+                &mut seen_callee_defs,
+                &mut cache,
+            )?;
         }
         if related.len() >= limit {
             break;
         }
     }
-    Ok(())
+    Ok(cache.context_capped())
 }
 
 fn add_callers_for_symbol(
@@ -473,9 +490,10 @@ fn add_callers_for_symbol(
     limit: usize,
     related: &mut Vec<SearchResult>,
     related_keys: &mut HashSet<(String, u32)>,
+    cache: &mut WalkCache,
 ) -> Result<()> {
-    let refs = references_for_symbol(db, sym)?;
-    for r in refs {
+    let refs = cache.references(db, sym)?;
+    for r in refs.iter() {
         if related.len() >= limit {
             break;
         }
@@ -491,6 +509,7 @@ fn add_callees_for_symbol(
     related: &mut Vec<SearchResult>,
     related_keys: &mut HashSet<(String, u32)>,
     seen_defs: &mut HashSet<(String, String, u32)>,
+    cache: &mut WalkCache,
 ) -> Result<()> {
     let refs = db.references_in_file_range(&sym.file_path, sym.line_start, sym.line_end)?;
     for r in refs {
@@ -500,7 +519,7 @@ fn add_callees_for_symbol(
         if !is_callee_reference(r.kind) {
             continue;
         }
-        for def in resolve_callee_definitions(db, &sym.file_path, &r.to_name)? {
+        for def in cache.resolve_symbols(db, &sym.file_path, &r.to_name)? {
             let key = (
                 def.file_path.clone(),
                 def.qualified_name.clone(),
@@ -542,17 +561,71 @@ pub(crate) fn resolve_callee_definitions_with_imports(
     to_name: &str,
     load_imports: &mut dyn FnMut() -> Result<Arc<Vec<String>>>,
 ) -> Result<Vec<Symbol>> {
+    let modules = if caller_file.ends_with(".rs") {
+        crate::rust_modules::RustModules::load(db)?
+    } else {
+        crate::rust_modules::RustModules::default()
+    };
+    resolve_callee_definitions_with_modules(db, caller_file, to_name, load_imports, &modules)
+}
+
+pub(crate) fn resolve_callee_definitions_with_modules(
+    db: &Database,
+    caller_file: &str,
+    to_name: &str,
+    load_imports: &mut dyn FnMut() -> Result<Arc<Vec<String>>>,
+    modules: &crate::rust_modules::RustModules,
+) -> Result<Vec<Symbol>> {
     // Gate before any strategy runs: a candidate the caller cannot name must
     // not resurface through a looser tier (lone-candidate return, case fold,
     // import evidence). The lone-candidate shortcut keys on the pre-gate
     // count, so a homonym set the gate thins to one survivor still owes the
     // same import evidence as the full set did.
-    let all_candidates = db.find_symbols(to_name, None)?;
+    let mut all_candidates = db.find_symbols(to_name, None)?;
+    let mut module_qualified = false;
+    if caller_file.ends_with(".rs")
+        && all_candidates.is_empty()
+        && let Some((_, tail)) = to_name.rsplit_once("::")
+    {
+        let tail_candidates = db.find_symbols(tail, None)?;
+        let mut seen = HashSet::new();
+        let mut ambiguous = HashSet::new();
+        for symbol in &tail_candidates {
+            let key = (&symbol.file_path, &symbol.qualified_name, symbol.line_start);
+            if !seen.insert(key) {
+                ambiguous.insert(key);
+            }
+        }
+        for symbol in &tail_candidates {
+            codesage_protocol::work::checkpoint()?;
+            if !ambiguous.contains(&(&symbol.file_path, &symbol.qualified_name, symbol.line_start))
+                && modules.qualified_target(db, caller_file, to_name, symbol)?
+            {
+                all_candidates.push(symbol.clone());
+            }
+        }
+        module_qualified = true;
+    }
     let total_candidates = all_candidates.len();
     let candidates: Vec<Symbol> = all_candidates
         .into_iter()
-        .filter(|s| visibility_admits(s, caller_file))
+        .filter(|s| {
+            if s.visibility == Some(Visibility::Module)
+                && let Some(admits) = modules.module_contains(&s.file_path, caller_file)
+            {
+                return admits;
+            }
+            if s.visibility == Some(Visibility::Crate)
+                && let Some(admits) = modules.same_crate(caller_file, &s.file_path)
+            {
+                return admits;
+            }
+            visibility_admits(s, caller_file)
+        })
         .collect();
+    if module_qualified {
+        return Ok(candidates);
+    }
     if is_qualified_symbol_name(to_name) {
         let exact: Vec<Symbol> = candidates
             .iter()
@@ -586,9 +659,9 @@ pub(crate) fn resolve_callee_definitions_with_imports(
         .into_iter()
         .filter(|s| {
             is_local(s)
-                || import_refs
-                    .iter()
-                    .any(|imp| import_ref_targets_symbol(imp, caller_file, to_name, s))
+                || import_refs.iter().any(|imp| {
+                    import_ref_targets_symbol_with_modules(imp, caller_file, to_name, s, modules)
+                })
         })
         .collect();
     Ok(filtered)
@@ -607,19 +680,15 @@ pub(crate) fn visibility_admits(sym: &Symbol, caller_file: &str) -> bool {
         Some(Visibility::File) => false,
         Some(Visibility::Module) => rust_module_subtree(&sym.file_path)
             .is_some_and(|prefix| caller_file.starts_with(&prefix)),
-        // Same `src/` root approximates the crate; `src/bin/*.rs` is a
-        // separate target admitted by that approximation. A caller with no
-        // root is rejected only when it is provably a sibling target of the
-        // defining package: under a nested package's directory, or in the
-        // standard separate-target locations of a root-level package
-        // (`tests/`, `benches/`, `examples/`, `build.rs`). Anything else, a
-        // flat layout, a `[lib] path` override, an index rooted inside
-        // `src/`, a `tools/` script, is undecidable and admits.
+        // Shared modules can belong to several targets. Compare conventional
+        // target directories; custom Cargo paths remain undecidable.
         Some(Visibility::Crate) => match (
-            importer_src_root(caller_file),
-            importer_src_root(&sym.file_path),
+            rust_crate_layout(caller_file).map(|layout| layout.0),
+            rust_crate_layout(&sym.file_path).map(|layout| layout.0),
         ) {
-            (Some(a), Some(b)) => a == b,
+            (Some(a), Some(b)) => {
+                a == b || rust_shared_target_module(a, b) || rust_shared_target_module(b, a)
+            }
             (None, Some(def_root)) => {
                 let package_dir = def_root.strip_suffix("src/").unwrap_or(def_root);
                 if package_dir.is_empty() {
@@ -631,6 +700,13 @@ pub(crate) fn visibility_admits(sym: &Symbol, caller_file: &str) -> bool {
             (_, None) => true,
         },
     }
+}
+
+fn rust_shared_target_module(container: &str, nested: &str) -> bool {
+    ["src/bin/", "tests/", "benches/", "examples/"]
+        .iter()
+        .any(|marker| container == *marker || container.ends_with(&format!("/{marker}")))
+        && nested.starts_with(container)
 }
 
 /// Cargo's conventional non-`src/` targets of a root-level package.
@@ -655,7 +731,9 @@ fn rust_module_subtree(def_file: &str) -> Option<String> {
     } else {
         format!("{dir}/")
     };
-    if matches!(stem, "mod" | "lib" | "main") {
+    if matches!(stem, "mod" | "lib" | "main")
+        || rust_crate_layout(def_file).is_some_and(|(_, is_root)| is_root)
+    {
         Some(dir_prefix)
     } else {
         Some(format!("{dir_prefix}{stem}/"))
@@ -713,15 +791,52 @@ pub(crate) fn import_ref_targets_symbol(
         .any(|c| c == &sym.file_path)
 }
 
-/// Resolve within the importer's `src/` root to avoid claiming sibling crates.
-/// Try generic layouts only when no such root is derivable.
+pub(crate) fn import_ref_targets_symbol_with_modules(
+    import_ref: &str,
+    caller_file: &str,
+    callee_name: &str,
+    sym: &Symbol,
+    modules: &crate::rust_modules::RustModules,
+) -> bool {
+    if caller_file.ends_with(".rs") {
+        if import_ref.starts_with("./") {
+            return false;
+        }
+        if import_ref.ends_with("::*") {
+            return import_ref_targets_file_with_modules(
+                import_ref,
+                caller_file,
+                &sym.file_path,
+                modules,
+            );
+        }
+        if let Some((module, tail)) = import_ref.rsplit_once("::")
+            && (tail == callee_name || tail == sym.name)
+            && let Some(candidates) = modules.candidates(caller_file, module)
+        {
+            return candidates.contains(&sym.file_path);
+        }
+    }
+    import_ref_targets_symbol(import_ref, caller_file, callee_name, sym)
+}
+
+/// Resolve conventional Cargo targets without crossing into the library's `src/`.
 fn rust_module_candidates(module: &str, importer_file: &str) -> Vec<String> {
+    if module == "crate"
+        || module.starts_with("crate::")
+        || module == "self"
+        || module.starts_with("self::")
+        || module == "super"
+        || module.starts_with("super::")
+    {
+        return rust_glob_module_candidates(module, importer_file);
+    }
     let module = module.strip_prefix("crate::").unwrap_or(module);
     if module.is_empty() || module == "crate" {
         return Vec::new();
     }
     let module_path = module.replace("::", "/");
-    if let Some(src_root) = importer_src_root(importer_file) {
+    if let Some((src_root, _)) = rust_crate_layout(importer_file) {
         return vec![
             format!("{src_root}{module_path}.rs"),
             format!("{src_root}{module_path}/mod.rs"),
@@ -735,13 +850,39 @@ fn rust_module_candidates(module: &str, importer_file: &str) -> Vec<String> {
     ]
 }
 
-/// The `src/` root the importer lives under, trailing slash included:
-/// `crates/app/src/lib.rs` → `crates/app/src/`, `src/lib.rs` → `src/`.
-fn importer_src_root(importer_file: &str) -> Option<&str> {
-    if let Some(idx) = importer_file.rfind("/src/") {
-        return Some(&importer_file[..idx + "/src/".len()]);
+/// Conventional target directory and whether this file is its root. Shared
+/// modules and manifest `path` overrides cannot establish unique crate membership.
+pub(crate) fn rust_crate_layout(file: &str) -> Option<(&str, bool)> {
+    let source_start = file
+        .rfind("/src/")
+        .map(|i| i + 1)
+        .or_else(|| file.starts_with("src/").then_some(0));
+    if let Some(start) = source_start
+        && !file[start..].starts_with("src/bin/")
+    {
+        let root_end = start + "src/".len();
+        return Some((
+            &file[..root_end],
+            matches!(&file[root_end..], "lib.rs" | "main.rs"),
+        ));
     }
-    importer_file.strip_prefix("src/").map(|_| "src/")
+    for marker in ["src/bin/", "tests/", "benches/", "examples/"] {
+        let start = file
+            .rfind(&format!("/{marker}"))
+            .map(|i| i + 1)
+            .or_else(|| file.starts_with(marker).then_some(0));
+        if let Some(start) = start {
+            let end = start + marker.len();
+            return Some(match file[end..].find('/') {
+                Some(subdir) => {
+                    let root_end = end + subdir + 1;
+                    (&file[..root_end], &file[root_end..] == "main.rs")
+                }
+                None => (&file[..end], true),
+            });
+        }
+    }
+    None
 }
 
 /// File-level counterpart of [`import_ref_targets_symbol`]: true when the
@@ -820,11 +961,41 @@ pub(crate) fn import_ref_targets_file(
     false
 }
 
+pub(crate) fn import_ref_targets_file_with_modules(
+    import_ref: &str,
+    importer_file: &str,
+    target_file: &str,
+    modules: &crate::rust_modules::RustModules,
+) -> bool {
+    if importer_file.ends_with(".rs") {
+        if let Some(declaration) = import_ref.strip_prefix("./") {
+            let module = format!("self::{}", declaration.replace('/', "::"));
+            if let Some(candidates) = modules.candidates(importer_file, &module) {
+                return candidates.iter().any(|candidate| candidate == target_file);
+            }
+        } else if import_ref.contains("::") {
+            let module = import_ref.strip_suffix("::*").unwrap_or(import_ref);
+            if let Some(mut candidates) = modules.candidates(importer_file, module) {
+                if !import_ref.ends_with("::*")
+                    && let Some((parent, _)) = module.rsplit_once("::")
+                    && let Some(parent_candidates) = modules.candidates(importer_file, parent)
+                {
+                    candidates.extend(parent_candidates);
+                }
+                return candidates.iter().any(|candidate| candidate == target_file);
+            }
+        }
+    }
+    import_ref_targets_file(import_ref, importer_file, target_file)
+}
+
 fn rust_glob_module_candidates(module: &str, importer_file: &str) -> Vec<String> {
-    let root = importer_src_root(importer_file).unwrap_or("");
+    let (root, is_root) = rust_crate_layout(importer_file).unwrap_or(("", false));
     let relative = &importer_file[root.len()..];
     let mut parts: Vec<&str> = relative.trim_end_matches(".rs").split('/').collect();
-    if matches!(parts.last(), Some(&"lib" | &"main" | &"mod")) {
+    if is_root {
+        parts.clear();
+    } else if matches!(parts.last(), Some(&"lib" | &"main" | &"mod")) {
         parts.pop();
     }
     let mut module_parts = module.split("::").peekable();
@@ -848,7 +1019,11 @@ fn rust_glob_module_candidates(module: &str, importer_file: &str) -> Vec<String>
     }
     parts.extend(module_parts);
     if parts.is_empty() {
-        vec![format!("{root}lib.rs"), format!("{root}main.rs")]
+        if is_root {
+            vec![importer_file.to_string()]
+        } else {
+            vec![format!("{root}lib.rs"), format!("{root}main.rs")]
+        }
     } else {
         let path = parts.join("/");
         vec![format!("{root}{path}.rs"), format!("{root}{path}/mod.rs")]
@@ -869,6 +1044,13 @@ const IMPORT_EXTENSIONS: [&str; 12] = [
 ];
 
 fn import_path_targets_file(spec: &str, caller_file: &str, sym_file: &str) -> bool {
+    if caller_file.ends_with(".rs") && spec.starts_with("./") {
+        return rust_module_subtree(caller_file)
+            .and_then(|base| lexical_join(base.trim_end_matches('/'), spec))
+            .is_some_and(|path| {
+                sym_file == format!("{path}.rs") || sym_file == format!("{path}/mod.rs")
+            });
+    }
     if spec.starts_with("./") || spec.starts_with("../") {
         let base = caller_file.rsplit_once('/').map_or("", |(dir, _)| dir);
         return match lexical_join(base, spec) {
@@ -990,6 +1172,25 @@ mod import_path_tests {
                 "other/src/lib.rs",
             ),
             ("self::*", "src/api/mod.rs", "src/api/mod.rs", "src/lib.rs"),
+            (
+                "crate::foo::*",
+                "src/bin/tool.rs",
+                "src/bin/foo.rs",
+                "src/foo.rs",
+            ),
+            (
+                "self::*",
+                "src/bin/tool.rs",
+                "src/bin/tool.rs",
+                "src/bin/tool/mod.rs",
+            ),
+            ("crate::*", "tests/t.rs", "tests/t.rs", "src/lib.rs"),
+            (
+                "self::support::*",
+                "tests/t.rs",
+                "tests/support.rs",
+                "tests/t/support.rs",
+            ),
             (
                 "crate::*",
                 "crates/app/src/client.rs",
@@ -1452,8 +1653,11 @@ mod context_export_tests {
         db.insert_references(cache_file, &[reference("find", "app/cache_controller.py")])
             .unwrap();
 
-        let refs = references_for_symbol(&db, &symbol("find", "Repository.find", "app/models.py"))
-            .unwrap();
+        let refs = crate::impact::references_for_symbol(
+            &db,
+            &symbol("find", "Repository.find", "app/models.py"),
+        )
+        .unwrap();
 
         assert!(
             refs.is_empty(),
@@ -1500,6 +1704,15 @@ mod context_export_tests {
         assert!(visibility_admits(&top_crate, "src/y.rs"));
         assert!(!visibility_admits(&top_crate, "build.rs"));
         assert!(!visibility_admits(&top_crate, "tests/t.rs"));
+        assert!(!visibility_admits(&top_crate, "src/bin/tool.rs"));
+        assert!(!visibility_admits(&crate_level, "crates/a/src/bin/tool.rs"));
+        let binary = visible("f", "src/bin/tool/helper.rs", Some(Visibility::Crate));
+        assert!(visibility_admits(&binary, "src/bin/tool/main.rs"));
+        assert!(!visibility_admits(&binary, "src/lib.rs"));
+        assert!(!visibility_admits(&binary, "src/bin/other/main.rs"));
+        let test_root = visible("f", "tests/t.rs", Some(Visibility::Module));
+        assert!(visibility_admits(&test_root, "tests/support.rs"));
+        assert!(!visibility_admits(&test_root, "src/lib.rs"));
         // No `src/` root on the definition side is undecidable, and
         // undecidable admits; so is a rootless caller outside the package.
         let flat = visible("f", "helper.rs", Some(Visibility::Crate));

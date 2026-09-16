@@ -710,7 +710,8 @@ pub fn recommend_tests_with_reachability(
     file_paths_in: &[String],
     opts: &ReachabilityOptions,
 ) -> Result<TestRecommendations> {
-    recommend_tests_with_walk_cache(db, file_paths_in, opts, None)
+    let mut cache = WalkCache::default();
+    recommend_tests_with_walk_cache(db, file_paths_in, opts, Some(&mut cache))
 }
 
 pub(crate) fn recommend_tests_with_walk_cache(

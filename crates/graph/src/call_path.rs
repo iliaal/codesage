@@ -6,7 +6,7 @@ use anyhow::Result;
 use codesage_protocol::{CallPathReport, CallPathRequest, CallPathStep, ReferenceKind, Symbol};
 use codesage_storage::Database;
 
-use crate::bundle::resolve_callee_definitions;
+use crate::impact::WalkCache;
 
 /// Control-flow edges only: imports and type relationships do not prove a call.
 /// Route handlers count as framework dispatch.
@@ -71,6 +71,7 @@ pub fn trace_call_path(db: &Database, req: &CallPathRequest) -> Result<CallPathR
     }
 
     let mut hit_bound = false;
+    let mut cache = WalkCache::default();
     while let Some((sym, depth)) = queue.pop_front() {
         codesage_protocol::work::checkpoint()?;
         if depth >= req.max_depth {
@@ -81,7 +82,9 @@ pub fn trace_call_path(db: &Database, req: &CallPathRequest) -> Result<CallPathR
             hit_bound = true;
             break;
         }
-        for callee in callees_of(db, &sym)? {
+        let callees = callees_of(db, &sym, &mut cache, &mut hit_bound)?;
+        hit_bound |= cache.context_capped();
+        for callee in callees {
             codesage_protocol::work::checkpoint()?;
             let (def, call_line) = callee;
             let k = key_of(&def);
@@ -93,8 +96,8 @@ pub fn trace_call_path(db: &Database, req: &CallPathRequest) -> Result<CallPathR
                     found: true,
                     steps,
                     length,
-                    note: None,
-                    bounded: false,
+                    note: hit_bound.then(|| "A call chain was found, but a resolution bound may have hidden a shorter chain.".to_string()),
+                    bounded: hit_bound,
                     counts_floor: true,
                 });
             }
@@ -108,7 +111,7 @@ pub fn trace_call_path(db: &Database, req: &CallPathRequest) -> Result<CallPathR
     let note = if hit_bound {
         format!(
             "no call chain within {} hop{} via resolved name-based edges (search stopped at a \
-             bound, so a longer path may exist)",
+             bound, so an omitted path may exist)",
             req.max_depth,
             if req.max_depth == 1 { "" } else { "s" }
         )
@@ -127,7 +130,12 @@ pub fn trace_call_path(db: &Database, req: &CallPathRequest) -> Result<CallPathR
 /// call site. Routes through `resolve_callee_definitions`, so a name with
 /// several definitions is narrowed by the calling file's imports rather than
 /// fanning out to every same-named symbol.
-fn callees_of(db: &Database, sym: &Symbol) -> Result<Vec<(Symbol, u32)>> {
+fn callees_of(
+    db: &Database,
+    sym: &Symbol,
+    resolver: &mut WalkCache,
+    hit_bound: &mut bool,
+) -> Result<Vec<(Symbol, u32)>> {
     let refs = db.references_in_file_range(&sym.file_path, sym.line_start, sym.line_end)?;
     let mut out = Vec::new();
     let mut seen: HashSet<SymbolKey> = HashSet::new();
@@ -146,6 +154,7 @@ fn callees_of(db: &Database, sym: &Symbol) -> Result<Vec<(Symbol, u32)>> {
         }
         examined += 1;
         if examined > MAX_REFS_PER_SYMBOL {
+            *hit_bound = true;
             tracing::debug!(
                 symbol = %sym.qualified_name,
                 cap = MAX_REFS_PER_SYMBOL,
@@ -155,7 +164,7 @@ fn callees_of(db: &Database, sym: &Symbol) -> Result<Vec<(Symbol, u32)>> {
         }
         let cache_key = (sym.file_path.clone(), r.to_name.clone());
         if !cache.contains_key(&cache_key) {
-            let resolved = resolve_callee_definitions(db, &sym.file_path, &r.to_name)?;
+            let resolved = resolver.resolve_symbols(db, &sym.file_path, &r.to_name)?;
             cache.insert(cache_key.clone(), resolved);
         }
         for def in &cache[&cache_key] {

@@ -132,6 +132,9 @@ pub(crate) fn cmd_feature_bundle(
         println!("{}", serde_json::to_string_pretty(&bundle)?);
     } else {
         println!("{}", bundle.target_description);
+        if bundle.bounded {
+            println!("Resolution reached a bound; related code may be incomplete.");
+        }
         println!("  primary ({}):", bundle.primary.len());
         for r in &bundle.primary {
             println!(

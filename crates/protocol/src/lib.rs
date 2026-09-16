@@ -1045,6 +1045,9 @@ fn is_zero_u32(value: &u32) -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ContextBundle {
+    /// True when caller/callee expansion omitted evidence at a resolution bound.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bounded: bool,
     /// False when the requested target (symbol or feature_id) does not
     /// exist in the index; the bundle is empty in that case.
     #[serde(default = "default_found")]
@@ -2141,7 +2144,7 @@ pub struct FindReferencesResults {
 pub struct ToResolution {
     /// Distinct (caller file, spelling) pairs that were resolved.
     pub resolved_pairs: usize,
-    /// True when the pair cap or the time budget stopped resolution.
+    /// True when the pair cap, time budget, or Rust module-context limit stopped resolution.
     pub capped: bool,
 }
 
@@ -2328,13 +2331,11 @@ pub struct CallPathReport {
     pub steps: Vec<CallPathStep>,
     /// Edge count — one less than `steps.len()`.
     pub length: usize,
-    /// Why an unfound path is unfound: the origin or target did not resolve,
-    /// or the search hit its depth or breadth bound before reaching the
-    /// target. Distinguishes "no such path" from "stopped looking".
+    /// Why a path was not found, or how a resolution bound limits the result.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub note: Option<String>,
-    /// True when a bound stopped the search, so `found: false` is not proof
-    /// that no path exists.
+    /// True when a search or resolution bound omitted evidence. A missing
+    /// path may exist, and a found path may have an omitted shorter alternative.
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub bounded: bool,
     /// Always `true`: the walk follows resolved name-based callee edges only,
@@ -2518,6 +2519,9 @@ pub struct FromTraceReport {
 /// only when the matching [`ImpactOptions`] flag is set.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ImpactReport {
+    /// True when graph expansion or Rust module resolution stopped at a bound.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bounded: bool,
     /// Reverse impact: files affected by changing the target, by distance.
     pub results: Vec<ImpactEntry>,
     /// Forward dependencies — the import targets (modules/symbols) the target's
@@ -2543,6 +2547,7 @@ pub struct ImpactReport {
 impl Default for ImpactReport {
     fn default() -> Self {
         Self {
+            bounded: false,
             results: Vec::new(),
             forward_dependencies: Vec::new(),
             sibling_symbols: Vec::new(),
@@ -3014,6 +3019,19 @@ mod tests {
         let bundle: ContextBundle =
             serde_json::from_str(r#"{"target_description":"symbol: foo","primary":[]}"#).unwrap();
         assert!(bundle.found);
+        assert!(!bundle.bounded);
+        assert!(
+            serde_json::to_value(&bundle)
+                .unwrap()
+                .get("bounded")
+                .is_none()
+        );
+        assert!(
+            serde_json::to_value(ImpactReport::default())
+                .unwrap()
+                .get("bounded")
+                .is_none()
+        );
 
         let report: CouplingReport =
             serde_json::from_str(r#"{"coupled":[],"file_indexed":true,"file_commits":4}"#).unwrap();

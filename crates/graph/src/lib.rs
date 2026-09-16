@@ -11,6 +11,7 @@ mod index;
 mod lookups;
 mod overview;
 mod rehearsal;
+mod rust_modules;
 mod scc;
 mod search;
 mod semantic;

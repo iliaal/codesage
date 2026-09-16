@@ -50,7 +50,7 @@ const EXPECTED_REF_PATTERN_COUNTS: &[(Language, usize)] = &[
     (Language::C, 3),
     (Language::Cpp, 14),
     (Language::Java, 16),
-    (Language::Rust, 13),
+    (Language::Rust, 14),
     (Language::JavaScript, 18),
     (Language::TypeScript, 22),
     (Language::Go, 3),

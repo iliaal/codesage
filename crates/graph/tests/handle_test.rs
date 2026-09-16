@@ -8,7 +8,7 @@ use codesage_graph::{
 };
 use codesage_protocol::{
     CallPathRequest, FindReferencesRequest, FindSymbolRequest, Handle, ImpactOptions,
-    ImpactRequest, ImpactTarget,
+    ImpactRequest, ImpactTarget, ReferenceKind,
 };
 use codesage_storage::Database;
 
@@ -185,13 +185,40 @@ fn overloads_in_one_file_carry_line_handles() {
         ]
     );
 
+    let all_refs = find_references(
+        &db,
+        &FindReferencesRequest {
+            symbol_name: "helper".to_string(),
+            kind: None,
+        },
+    )
+    .unwrap();
+    let module_imports: Vec<_> = all_refs
+        .results
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Import)
+        .collect();
+    assert_eq!(module_imports.len(), 1);
+    assert_eq!(module_imports[0].from_file, "src/lib.rs");
+    assert_eq!(module_imports[0].to_name, "./helper");
+    assert_eq!(module_imports[0].to, None);
+    let calls: Vec<_> = all_refs
+        .results
+        .iter()
+        .filter(|r| r.kind == ReferenceKind::Call)
+        .collect();
+    assert_eq!(calls.len(), 2);
+    for call in calls {
+        assert_eq!(call.to.as_deref(), Some("sym:src/over.cpp#helper"));
+    }
+
     // Both overloads call `helper`; each caller row names its own overload,
     // with the same `@line` handle `find_symbol` emitted for it.
     let refs = find_references(
         &db,
         &FindReferencesRequest {
             symbol_name: "helper".to_string(),
-            kind: None,
+            kind: Some(ReferenceKind::Call),
         },
     )
     .unwrap();
