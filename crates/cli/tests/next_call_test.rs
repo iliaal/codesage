@@ -510,11 +510,15 @@ fn every_advertised_tool_emits_executable_evidence_derived_terminating_next() {
     let error = server.call(project.path(), "recommend_tests", json!({"file_paths":[]}));
     assert_eq!(error["isError"], true);
     assert!(error.get("structuredContent").is_none());
-    assert!(
-        error["content"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|block| block["text"] == "{\"next\":null}")
-    );
+    let blocks: Vec<Value> = error["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|block| block["text"].as_str())
+        .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+        .filter(Value::is_object)
+        .collect();
+    assert_eq!(blocks.len(), 1, "one contract block per failure: {error}");
+    assert!(blocks[0].get("status").is_some(), "{error}");
+    assert_eq!(blocks[0]["next"], Value::Null, "{error}");
 }

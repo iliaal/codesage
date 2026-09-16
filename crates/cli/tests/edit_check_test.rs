@@ -167,9 +167,15 @@ fn mcp_reports_break_before_writing_without_touching_index_or_starting_watcher()
     }
     let error = session.request("tools/call", json!({"name":"edit_check", "arguments":{"project":root, "file_path":"../lib.rs", "symbol_name":"f", "replacement":"fn f() {}"}}));
     assert_eq!(error["isError"], true);
-    assert!(error["content"].as_array().unwrap().iter().any(|part| {
-        part["text"]
-            .as_str()
-            .is_some_and(|s| s.contains("\"next\":null"))
-    }));
+    let blocks: Vec<Value> = error["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|part| part["text"].as_str())
+        .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+        .filter(Value::is_object)
+        .collect();
+    assert_eq!(blocks.len(), 1, "one contract block per failure: {error}");
+    assert!(blocks[0].get("status").is_some(), "{error}");
+    assert_eq!(blocks[0]["next"], Value::Null, "{error}");
 }

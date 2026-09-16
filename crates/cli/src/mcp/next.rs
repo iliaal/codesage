@@ -38,8 +38,8 @@ pub(super) fn schema() -> Value {
 }
 
 pub(super) fn annotate(project: &str, kind: &str, mut result: CallToolResult) -> CallToolResult {
+    // Failed results already carry `next: null` in their contract block.
     if result.is_error == Some(true) {
-        result.content.push(ContentBlock::text("{\"next\":null}"));
         return result;
     }
     let Some(payload) = result.structured_content.as_mut() else {
