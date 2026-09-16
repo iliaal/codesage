@@ -802,7 +802,7 @@ fn import_path_targets_file(spec: &str, caller_file: &str, sym_file: &str) -> bo
 /// Joins `spec` onto `base`, resolving `.` and `..` textually. Returns `None`
 /// when the specifier escapes above the project root, which cannot name an
 /// indexed file.
-fn lexical_join(base: &str, spec: &str) -> Option<String> {
+pub(crate) fn lexical_join(base: &str, spec: &str) -> Option<String> {
     let mut parts: Vec<&str> = if base.is_empty() {
         Vec::new()
     } else {

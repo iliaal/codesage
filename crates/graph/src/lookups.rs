@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use codesage_protocol::{
     DependencyEntry, FindReferencesRequest, FindReferencesResults, FindSymbolRequest, Reference,
-    Symbol, ToResolution,
+    ReferenceKind, Symbol, SymbolKind, ToResolution,
 };
 use codesage_storage::Database;
 
@@ -129,20 +129,13 @@ fn attach_handles(
     definitions: &[Symbol],
     budget: Duration,
 ) -> Result<Option<ToResolution>> {
-    let mut file_symbols: HashMap<String, Arc<Vec<Symbol>>> = HashMap::new();
+    let mut caches = EvidenceCaches::new(db);
     for row in rows.iter_mut() {
         codesage_protocol::work::checkpoint()?;
         let Some(caller) = row.from_symbol.as_deref() else {
             continue;
         };
-        let symbols = match file_symbols.get(&row.from_file) {
-            Some(cached) => Arc::clone(cached),
-            None => {
-                let loaded = Arc::new(db.symbols_for_file(&row.from_file)?);
-                file_symbols.insert(row.from_file.clone(), Arc::clone(&loaded));
-                loaded
-            }
-        };
+        let symbols = caches.symbols(&row.from_file)?;
         row.from_line = enclosing_definition(&symbols, caller, row.line)
             .filter(|s| s.overloaded)
             .map(|s| s.line_start);
@@ -160,7 +153,6 @@ fn attach_handles(
         _ => None,
     };
     let mut resolved: HashMap<(String, String), Option<String>> = HashMap::new();
-    let mut imports: HashMap<String, Arc<Vec<String>>> = HashMap::new();
     let mut capped = false;
     for row in rows.iter_mut() {
         codesage_protocol::work::checkpoint()?;
@@ -186,24 +178,12 @@ fn attach_handles(
             continue;
         }
         let from_file = row.from_file.as_str();
-        let mut load_imports = || {
-            if let Some(cached) = imports.get(from_file) {
-                return Ok(Arc::clone(cached));
-            }
-            let loaded = Arc::new(import_refs_for_file(db, from_file)?);
-            imports.insert(from_file.to_string(), Arc::clone(&loaded));
-            Ok(loaded)
-        };
-        let candidates = resolve_callee_definitions_with_imports(
-            db,
-            from_file,
-            &row.to_name,
-            &mut load_imports,
-        )?;
+        let candidates =
+            resolve_callee_definitions_with_imports(db, from_file, &row.to_name, &mut || {
+                caches.imports(from_file)
+            })?;
         let handle = match candidates.as_slice() {
-            [only]
-                if resolution_has_evidence(from_file, &row.to_name, only, &mut load_imports)? =>
-            {
+            [only] if caches.has_evidence(from_file, &row.to_name, only)? => {
                 Some(only.handle().to_string())
             }
             _ => None,
@@ -229,25 +209,171 @@ fn spelling_names(spelling: &str, sym: &Symbol) -> bool {
     }
 }
 
-/// Evidence that `candidate` is the definition `spelling` at `caller_file`
-/// refers to, beyond being the only one with that name: a qualified spelling
-/// that matches, the caller's own file, or an import edge into it.
-fn resolution_has_evidence(
-    caller_file: &str,
-    spelling: &str,
-    candidate: &Symbol,
-    load_imports: &mut dyn FnMut() -> Result<Arc<Vec<String>>>,
-) -> Result<bool> {
-    if is_qualified_symbol_name(spelling) && candidate.qualified_name == spelling {
-        return Ok(true);
+/// Per-caller-file lookups shared by the `from` and `to` passes, each loaded
+/// at most once per file.
+struct EvidenceCaches<'a> {
+    db: &'a Database,
+    symbols: HashMap<String, Arc<Vec<Symbol>>>,
+    imports: HashMap<String, Arc<Vec<String>>>,
+    outgoing: HashMap<String, Arc<Vec<(String, ReferenceKind)>>>,
+}
+
+impl<'a> EvidenceCaches<'a> {
+    fn new(db: &'a Database) -> Self {
+        Self {
+            db,
+            symbols: HashMap::new(),
+            imports: HashMap::new(),
+            outgoing: HashMap::new(),
+        }
     }
-    if candidate.file_path == caller_file {
-        return Ok(true);
+
+    fn symbols(&mut self, file: &str) -> Result<Arc<Vec<Symbol>>> {
+        if let Some(cached) = self.symbols.get(file) {
+            return Ok(Arc::clone(cached));
+        }
+        let loaded = Arc::new(self.db.symbols_for_file(file)?);
+        self.symbols.insert(file.to_string(), Arc::clone(&loaded));
+        Ok(loaded)
     }
-    let imports = load_imports()?;
-    Ok(imports
+
+    /// The import-shaped refs bundle resolution consumes.
+    fn imports(&mut self, file: &str) -> Result<Arc<Vec<String>>> {
+        if let Some(cached) = self.imports.get(file) {
+            return Ok(Arc::clone(cached));
+        }
+        let loaded = Arc::new(import_refs_for_file(self.db, file)?);
+        self.imports.insert(file.to_string(), Arc::clone(&loaded));
+        Ok(loaded)
+    }
+
+    /// Every outgoing ref of `file`, with its kind.
+    fn outgoing(&mut self, file: &str) -> Result<Arc<Vec<(String, ReferenceKind)>>> {
+        if let Some(cached) = self.outgoing.get(file) {
+            return Ok(Arc::clone(cached));
+        }
+        let rows = match self.db.file_id_for_path(file)? {
+            Some(id) => self.db.refs_outgoing_for_file_id(id)?,
+            None => Vec::new(),
+        };
+        let loaded = Arc::new(rows);
+        self.outgoing.insert(file.to_string(), Arc::clone(&loaded));
+        Ok(loaded)
+    }
+
+    /// Evidence that `candidate` is the definition `spelling` at `caller_file`
+    /// refers to, beyond being the only one with that name: a qualified
+    /// spelling that matches, the caller's own file, an import edge into the
+    /// symbol, an import or type reference naming its owner, or (C/C++) an
+    /// include of the header that pairs with its file (`util.h` for
+    /// `util.c`). A header that itself declares the name is a second
+    /// candidate, which bundle resolution already narrows by include path.
+    fn has_evidence(
+        &mut self,
+        caller_file: &str,
+        spelling: &str,
+        candidate: &Symbol,
+    ) -> Result<bool> {
+        if is_qualified_symbol_name(spelling) && candidate.qualified_name == spelling {
+            return Ok(true);
+        }
+        if candidate.file_path == caller_file {
+            return Ok(true);
+        }
+        let imports = self.imports(caller_file)?;
+        if imports
+            .iter()
+            .any(|imp| import_ref_targets_symbol(imp, caller_file, spelling, candidate))
+        {
+            return Ok(true);
+        }
+        if let Some(owner) = owner_of(&candidate.qualified_name) {
+            if imports.iter().any(|imp| names_owner(imp, owner)) {
+                return Ok(true);
+            }
+            if candidate.kind == SymbolKind::Method {
+                let owner_tail = last_segment(owner);
+                let outgoing = self.outgoing(caller_file)?;
+                if outgoing.iter().any(|(name, kind)| {
+                    matches!(
+                        kind,
+                        ReferenceKind::Import
+                            | ReferenceKind::ImportBinding
+                            | ReferenceKind::TypeHint
+                            | ReferenceKind::Instantiation
+                    ) && last_segment(name) == owner_tail
+                }) {
+                    return Ok(true);
+                }
+            }
+        }
+        if is_c_family(caller_file) && is_c_family(&candidate.file_path) {
+            let candidate_stem = file_stem(&candidate.file_path);
+            let outgoing = self.outgoing(caller_file)?;
+            if outgoing.iter().any(|(name, kind)| {
+                *kind == ReferenceKind::Include
+                    && file_stem(name.trim_matches(|c| matches!(c, '<' | '>' | '"')))
+                        == candidate_stem
+            }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+const SEGMENT_SEPARATORS: [&str; 3] = ["::", "\\", "."];
+
+/// `qualified` without its last segment: `App\Lib\Foo::bar` → `App\Lib\Foo`,
+/// `Database::open` → `Database`; `None` for a bare name.
+fn owner_of(qualified: &str) -> Option<&str> {
+    SEGMENT_SEPARATORS
         .iter()
-        .any(|imp| import_ref_targets_symbol(imp, caller_file, spelling, candidate)))
+        .filter_map(|sep| qualified.rfind(sep))
+        .max()
+        .map(|pos| &qualified[..pos])
+        .filter(|owner| !owner.is_empty())
+}
+
+/// The last segment of a qualified or path-like name.
+fn last_segment(name: &str) -> &str {
+    let cut = SEGMENT_SEPARATORS
+        .iter()
+        .map(|sep| (sep, name.rfind(sep)))
+        .filter_map(|(sep, pos)| pos.map(|p| p + sep.len()))
+        .chain(name.rfind('/').map(|p| p + 1))
+        .max()
+        .unwrap_or(0);
+    &name[cut..]
+}
+
+/// An import target names `owner` when it is the owner, ends in the owner
+/// (`use codesage_storage::Database` for `Database::open`), or is a namespace
+/// the owner sits under, at a segment boundary.
+fn names_owner(import: &str, owner: &str) -> bool {
+    if import == owner {
+        return true;
+    }
+    SEGMENT_SEPARATORS.iter().any(|sep| {
+        import
+            .strip_suffix(owner)
+            .is_some_and(|head| head.ends_with(sep))
+            || owner
+                .strip_prefix(import)
+                .is_some_and(|tail| tail.starts_with(sep))
+    })
+}
+
+fn is_c_family(path: &str) -> bool {
+    matches!(
+        path.rsplit_once('.').map(|(_, ext)| ext),
+        Some("c" | "h" | "cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx")
+    )
+}
+
+fn file_stem(path: &str) -> &str {
+    let name = path.rsplit_once('/').map_or(path, |(_, name)| name);
+    name.rsplit_once('.').map_or(name, |(stem, _)| stem)
 }
 
 /// The innermost definition named `caller` (as `from_symbol` stores it: the
@@ -709,6 +835,224 @@ mod tests {
             "imported"
         );
         assert_eq!(out.to_resolution, None);
+    }
+
+    fn method_symbol(name: &str, qualified_name: &str, file_path: &str) -> Symbol {
+        let mut s = qualified_symbol(name, qualified_name, file_path);
+        s.kind = SymbolKind::Method;
+        s
+    }
+
+    /// PHP: `use App\Lib\Foo;` names the owner of `App\Lib\Foo\phpbar`, so
+    /// a call spelled by the bare method name resolves from that file only.
+    #[test]
+    fn owner_import_resolves_a_method_of_the_imported_class() {
+        let db = Database::open_in_memory().unwrap();
+        let foo = file(&db, "src/Lib/Foo.php");
+        let ctl = file(&db, "src/Ctl.php");
+        let stranger = file(&db, "src/Other.php");
+        db.insert_symbols(
+            foo,
+            &[method_symbol(
+                "phpbar",
+                "App\\Lib\\Foo\\phpbar",
+                "src/Lib/Foo.php",
+            )],
+        )
+        .unwrap();
+        db.insert_references(
+            ctl,
+            &[
+                reference_at(
+                    "App\\Lib\\Foo",
+                    "src/Ctl.php",
+                    None,
+                    3,
+                    ReferenceKind::Import,
+                ),
+                reference_at("phpbar", "src/Ctl.php", None, 9, ReferenceKind::Call),
+            ],
+        )
+        .unwrap();
+        db.insert_references(
+            stranger,
+            &[reference_at(
+                "phpbar",
+                "src/Other.php",
+                None,
+                9,
+                ReferenceKind::Call,
+            )],
+        )
+        .unwrap();
+
+        let out = lookup(&db, "phpbar");
+        assert_eq!(
+            to_of(&out, "src/Ctl.php", "phpbar").as_deref(),
+            Some("sym:src/Lib/Foo.php#App\\Lib\\Foo\\phpbar")
+        );
+        assert_eq!(
+            to_of(&out, "src/Other.php", "phpbar"),
+            None,
+            "no import names the owner"
+        );
+    }
+
+    /// C: `#include "util.h"` pairs with `util.c`; an unrelated include is
+    /// not evidence.
+    #[test]
+    fn include_stem_resolves_c_definitions() {
+        let db = Database::open_in_memory().unwrap();
+        let util = file(&db, "src/util.c");
+        let a = file(&db, "src/a.c");
+        let c = file(&db, "src/c.c");
+        db.insert_symbols(util, &[symbol("do_work", "src/util.c")])
+            .unwrap();
+        db.insert_references(
+            a,
+            &[
+                reference_at("util.h", "src/a.c", None, 1, ReferenceKind::Include),
+                reference_at("do_work", "src/a.c", None, 7, ReferenceKind::Call),
+            ],
+        )
+        .unwrap();
+        db.insert_references(
+            c,
+            &[
+                reference_at("<stdio.h>", "src/c.c", None, 1, ReferenceKind::Include),
+                reference_at("do_work", "src/c.c", None, 7, ReferenceKind::Call),
+            ],
+        )
+        .unwrap();
+
+        let out = lookup(&db, "do_work");
+        assert_eq!(
+            to_of(&out, "src/a.c", "do_work").as_deref(),
+            Some("sym:src/util.c#do_work")
+        );
+        assert_eq!(to_of(&out, "src/c.c", "do_work"), None, "unrelated include");
+    }
+
+    /// Rust: `use codesage_storage::Database;` or a `Database` type hint
+    /// vouches for `db.upsert_file()` resolving to `Database::upsert_file`;
+    /// `String::new` and a bare `new` without owner evidence stay unresolved.
+    #[test]
+    fn owner_tail_and_type_reference_resolve_cross_file_methods() {
+        let db = Database::open_in_memory().unwrap();
+        let storage = file(&db, "crates/storage/src/db/mod.rs");
+        let importer = file(&db, "crates/graph/src/x.rs");
+        let hinted = file(&db, "crates/graph/src/y.rs");
+        let stranger = file(&db, "crates/graph/src/z.rs");
+        db.insert_symbols(
+            storage,
+            &[
+                method_symbol(
+                    "upsert_file",
+                    "Database::upsert_file",
+                    "crates/storage/src/db/mod.rs",
+                ),
+                method_symbol("new", "OverviewCache::new", "crates/storage/src/db/mod.rs"),
+            ],
+        )
+        .unwrap();
+        db.insert_references(
+            importer,
+            &[
+                reference_at(
+                    "codesage_storage::Database",
+                    "crates/graph/src/x.rs",
+                    None,
+                    1,
+                    ReferenceKind::Import,
+                ),
+                reference_at(
+                    "upsert_file",
+                    "crates/graph/src/x.rs",
+                    None,
+                    8,
+                    ReferenceKind::Call,
+                ),
+                reference_at(
+                    "String::new",
+                    "crates/graph/src/x.rs",
+                    None,
+                    9,
+                    ReferenceKind::Call,
+                ),
+                reference_at(
+                    "new",
+                    "crates/graph/src/x.rs",
+                    None,
+                    10,
+                    ReferenceKind::Call,
+                ),
+            ],
+        )
+        .unwrap();
+        db.insert_references(
+            hinted,
+            &[
+                reference_at(
+                    "Database",
+                    "crates/graph/src/y.rs",
+                    None,
+                    2,
+                    ReferenceKind::TypeHint,
+                ),
+                reference_at(
+                    "upsert_file",
+                    "crates/graph/src/y.rs",
+                    None,
+                    8,
+                    ReferenceKind::Call,
+                ),
+            ],
+        )
+        .unwrap();
+        db.insert_references(
+            stranger,
+            &[reference_at(
+                "upsert_file",
+                "crates/graph/src/z.rs",
+                None,
+                8,
+                ReferenceKind::Call,
+            )],
+        )
+        .unwrap();
+
+        let out = lookup(&db, "upsert_file");
+        let expected = Some("sym:crates/storage/src/db/mod.rs#Database::upsert_file");
+        assert_eq!(
+            to_of(&out, "crates/graph/src/x.rs", "upsert_file").as_deref(),
+            expected
+        );
+        assert_eq!(
+            to_of(&out, "crates/graph/src/y.rs", "upsert_file").as_deref(),
+            expected
+        );
+        assert_eq!(to_of(&out, "crates/graph/src/z.rs", "upsert_file"), None);
+
+        let out = lookup(&db, "new");
+        assert_eq!(to_of(&out, "crates/graph/src/x.rs", "String::new"), None);
+        assert_eq!(to_of(&out, "crates/graph/src/x.rs", "new"), None);
+    }
+
+    #[test]
+    fn owner_helpers_split_on_language_separators() {
+        assert_eq!(owner_of("App\\Lib\\Foo::bar"), Some("App\\Lib\\Foo"));
+        assert_eq!(owner_of("Database::open"), Some("Database"));
+        assert_eq!(owner_of("pkg.Class.method"), Some("pkg.Class"));
+        assert_eq!(owner_of("bare"), None);
+        assert_eq!(last_segment("codesage_storage::Database"), "Database");
+        assert_eq!(last_segment("App\\Lib\\Foo"), "Foo");
+        assert_eq!(last_segment("pkg.Class"), "Class");
+        assert!(names_owner("codesage_storage::Database", "Database"));
+        assert!(names_owner("App\\Lib", "App\\Lib\\Foo"));
+        assert!(!names_owner("App\\Library", "App\\Lib\\Foo"));
+        assert!(!names_owner("tokio", "OverviewCache"));
+        assert_eq!(file_stem("src/util.c"), "util");
+        assert_eq!(file_stem("util.h"), "util");
     }
 
     /// `from` handles are computed for every row before the `to` budget is
