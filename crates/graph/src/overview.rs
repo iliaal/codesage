@@ -101,6 +101,7 @@ pub fn build_project_overview_with_top_risk(
 
     let test_conventions = test_conventions_for(&languages);
     let suggested_next_calls = suggested_next_calls(&freshness);
+    let hook_health = crate::hook_health::inspect(root);
 
     codesage_protocol::work::checkpoint()?;
     Ok(ProjectOverview {
@@ -116,6 +117,7 @@ pub fn build_project_overview_with_top_risk(
         test_conventions,
         entrypoints,
         suggested_next_calls,
+        hook_health,
     })
 }
 
@@ -274,6 +276,66 @@ mod tests {
         assert_eq!(overview.symbol_count, 0);
         assert!(overview.top_risk_files.is_empty());
         assert!(overview.trust_boundary_clusters.is_empty());
+        assert!(
+            overview.hook_health.is_none(),
+            "a non-git temp dir has no hooks to report"
+        );
+    }
+
+    #[test]
+    fn build_overview_reports_hook_health_without_reaping() {
+        let db = Database::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "core.hooksPath", ".git/hooks"][..],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .current_dir(root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let hooks = root.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(
+            hooks.join("post-merge"),
+            "#!/bin/sh\n# installed by codesage install-hooks\n",
+        )
+        .unwrap();
+        let lockdir = root.join(crate::hook_health::LOCK_DIR);
+        std::fs::create_dir_all(&lockdir).unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        std::fs::write(lockdir.join("pid"), dead.to_string()).unwrap();
+        std::fs::write(
+            root.join(crate::hook_health::LOG_FILE),
+            "[Sun Sep 14 07:09:37 UTC 2026] post-merge hook start pid=42\n",
+        )
+        .unwrap();
+
+        let overview = build_project_overview(root, &db).unwrap();
+        let health = overview.hook_health.expect("git repo reports hook health");
+        assert_eq!(health.installed_hooks, vec!["post-merge".to_string()]);
+        assert_eq!(
+            health.last_run.as_deref(),
+            Some("Sun Sep 14 07:09:37 UTC 2026")
+        );
+        assert_eq!(health.last_exit, None, "no exit line was logged");
+        assert_eq!(health.lock.state, crate::hook_health::LOCK_HELD_DEAD);
+        assert_eq!(health.lock.pid, Some(dead));
+        assert!(!health.lock.reaped);
+        assert!(
+            lockdir.is_dir(),
+            "overview is read-only: the dead lock stays"
+        );
     }
 
     #[test]

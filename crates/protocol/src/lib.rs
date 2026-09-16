@@ -2540,6 +2540,55 @@ pub struct ProjectOverview {
     /// Recommended next CodeSage calls for common intents, given this project's
     /// current state.
     pub suggested_next_calls: Vec<SuggestedCall>,
+    /// Git-hook indexing health: installed codesage hooks, the last logged
+    /// run, and the single-flight lock state. Read-only here; `codesage
+    /// doctor` reaps a dead-pid lock. Absent when the project is not a Git
+    /// repository.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub hook_health: Option<HookHealth>,
+}
+
+/// Health of the `codesage install-hooks` indexing hooks, derived from the
+/// hooks directory, `.codesage/hooks.log`, and `.codesage/hook-index.lock`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct HookHealth {
+    /// Hook names carrying the codesage marker, in installation order.
+    pub installed_hooks: Vec<String>,
+    /// Timestamp text of the newest `hook start` line in `hooks.log`, as the
+    /// hook logged it. `None` when no run was logged or the log is unreadable.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub last_run: Option<String>,
+    /// Exit status of that run's `hook exit=` line. `None` when the run has
+    /// not logged an exit: still running, killed before its EXIT trap, or
+    /// written by a hook older than exit logging.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub last_exit: Option<i32>,
+    /// State of the single-flight lock directory.
+    pub lock: HookLockState,
+}
+
+/// The `.codesage/hook-index.lock` directory as observed. `held_dead` and
+/// `held_no_pid` describe a lock no running hook owns: the hook reaps the
+/// former on its next fire and the latter once it is 30 minutes old.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct HookLockState {
+    /// `absent`, `held_live`, `held_dead`, or `held_no_pid`.
+    pub state: String,
+    /// Pid recorded inside the lock, when present and well-formed.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub pid: Option<u32>,
+    /// Lock directory modification time as Unix seconds.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub since_unix: Option<u64>,
+    /// `since_unix` rendered as UTC ISO 8601.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub since: Option<String>,
+    /// Seconds the lock has been held, relative to the observation.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub age_secs: Option<u64>,
+    /// True when the observer removed a dead-pid lock (only `codesage doctor`
+    /// does; `project_overview` never reaps).
+    pub reaped: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
