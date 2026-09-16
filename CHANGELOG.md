@@ -1,8 +1,10 @@
 ## [Unreleased]
 
+## [0.33.0] - 2026-09-16
+
 ### Added
 
-- `search` accepts `explain: true` (CLI `--explain`) to show each result's score transitions and dense, BM25, and reranker signals without changing ranking; MCP budgeting preserves complete retained traces and distinguishes budget drops from unmatched queries.
+- `search` accepts `explain: true` (CLI `--explain`) to show score transitions and dense, BM25, and reranker signals without changing ranking.
 - Symbol rationale covers marked leading and same-line trailing comments in all nine languages; the next `codesage index` refreshes unchanged files under `extraction=3`.
 
 ### Fixed
@@ -1037,5 +1039,7 @@ Initial public release.
 
 [0.31.0]: https://github.com/iliaal/codesage/releases/tag/v0.31.0
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.32.0...HEAD
 [0.32.0]: https://github.com/iliaal/codesage/releases/tag/v0.32.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.33.0...HEAD
+[0.33.0]: https://github.com/iliaal/codesage/releases/tag/v0.33.0
