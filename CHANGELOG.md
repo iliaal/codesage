@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+## [0.32.0] - 2026-09-16
+
 ### Added
 
 - Symbol rows (`find_symbol`, bundles, `trace_call_path`, `impact_analysis` siblings) carry `handle`: `sym:<path>#<qualified>`, with `@<line>` only for same-file overloads; search and bundle chunks carry `chunk:<path>:<start>-<end>`.
@@ -1017,5 +1019,7 @@ Initial public release.
 
 [0.30.1]: https://github.com/iliaal/codesage/releases/tag/v0.30.1
 
-[Unreleased]: https://github.com/iliaal/codesage/compare/v0.31.0...HEAD
 [0.31.0]: https://github.com/iliaal/codesage/releases/tag/v0.31.0
+
+[Unreleased]: https://github.com/iliaal/codesage/compare/v0.32.0...HEAD
+[0.32.0]: https://github.com/iliaal/codesage/releases/tag/v0.32.0
