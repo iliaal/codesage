@@ -11,6 +11,10 @@
 - Generated indexing hooks pass ShellCheck 0.9 and 0.10 without false unreachable-code warnings for EXIT cleanup.
 - The daemon bounds project routing caches to 64 canonical roots and 256 raw paths, preserves live watchers under cache pressure, and reports cache sizes in `codesage daemon stats`.
 
+### Security
+
+- Model downloads use rustls 0.23.45, which rejects TLS 1.3 handshake messages sent at the wrong encryption level (RUSTSEC-2026-0285).
+
 ## [0.32.0] - 2026-09-16
 
 ### Added
