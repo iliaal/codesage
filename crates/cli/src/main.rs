@@ -597,16 +597,29 @@ pub(crate) fn db_path(root: &Path) -> PathBuf {
     root.join(PROJECT_DIR).join(DB_FILE)
 }
 
+/// Refusals are typed `E_PROJECT_PATH` so the MCP contract names the code when
+/// an evidence-only tool routes here instead of through the project pool.
 pub(crate) fn evidence_root(path: &Path) -> Result<PathBuf> {
-    anyhow::ensure!(path.is_absolute(), "project must be an absolute path");
-    let canonical = path.canonicalize().context("resolving project path")?;
-    anyhow::ensure!(canonical.is_dir(), "project must be a directory");
+    use mcp::error::{ErrorCode, McpError};
+    let project_path =
+        |message: String| anyhow::Error::new(McpError::new(ErrorCode::ProjectPath, message));
+    if !path.is_absolute() {
+        return Err(project_path("project must be an absolute path".into()));
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| project_path(format!("resolving project path: {e}")))?;
+    if !canonical.is_dir() {
+        return Err(project_path("project must be a directory".into()));
+    }
     for ancestor in canonical.ancestors() {
         if ancestor.join(PROJECT_DIR).is_dir() || ancestor.join(".git").exists() {
             return Ok(ancestor.to_path_buf());
         }
     }
-    anyhow::bail!("no CodeSage project or Git repository found")
+    Err(project_path(
+        "no CodeSage project or Git repository found".into(),
+    ))
 }
 
 pub(crate) fn open_db(root: &Path) -> Result<Database> {

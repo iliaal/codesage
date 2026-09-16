@@ -13,6 +13,43 @@ use tree_sitter::Node;
 const MAX_SOURCE_BYTES: usize = 1_048_576;
 const MAX_CALLERS: usize = 100;
 
+/// A request refused before or during the check. Typed so the MCP layer can
+/// name the error code from the variant instead of matching message text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditCheckRefusal {
+    /// `project` is not an absolute Git worktree root.
+    ProjectPath(String),
+    /// A parameter is malformed.
+    Param(String),
+    /// A parameter or the pinned source exceeds a byte cap.
+    OverCap(String),
+    /// No declaration at HEAD matches `symbol` (and `line`, when given).
+    NotFound(String),
+    /// Several declarations at HEAD match; `lines` are their one-based start
+    /// lines, sorted, so a retry can pass one.
+    Ambiguous { message: String, lines: Vec<usize> },
+}
+
+impl EditCheckRefusal {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::ProjectPath(message)
+            | Self::Param(message)
+            | Self::OverCap(message)
+            | Self::NotFound(message)
+            | Self::Ambiguous { message, .. } => message,
+        }
+    }
+}
+
+impl std::fmt::Display for EditCheckRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for EditCheckRefusal {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Arity {
     pub minimum: usize,
@@ -76,24 +113,29 @@ pub fn edit_check(
     line: Option<usize>,
     replacement: &str,
 ) -> Result<EditCheckReport> {
-    ensure!(project.is_absolute(), "project must be absolute");
-    ensure!(
-        !file.is_empty()
-            && Path::new(file)
-                .components()
-                .all(|c| matches!(c, Component::Normal(_))),
-        "file must be a repository-relative path without traversal"
-    );
-    ensure!(
-        replacement.len() <= MAX_SOURCE_BYTES,
-        "replacement exceeds 1 MiB"
-    );
+    if !project.is_absolute() {
+        return Err(EditCheckRefusal::ProjectPath("project must be absolute".into()).into());
+    }
+    if file.is_empty()
+        || !Path::new(file)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+    {
+        return Err(EditCheckRefusal::Param(
+            "file must be a repository-relative path without traversal".into(),
+        )
+        .into());
+    }
+    if replacement.len() > MAX_SOURCE_BYTES {
+        return Err(EditCheckRefusal::OverCap("replacement exceeds 1 MiB".into()).into());
+    }
     let root = project.canonicalize()?;
     let git_root = git(&root, &["rev-parse", "--show-toplevel"])?;
-    ensure!(
-        Path::new(std::str::from_utf8(&git_root)?.trim_end()).canonicalize()? == root,
-        "project must be the Git worktree root"
-    );
+    if Path::new(std::str::from_utf8(&git_root)?.trim_end()).canonicalize()? != root {
+        return Err(
+            EditCheckRefusal::ProjectPath("project must be the Git worktree root".into()).into(),
+        );
+    }
     let head = String::from_utf8(git(&root, &["rev-parse", "--verify", "HEAD^{commit}"])?)?
         .trim()
         .to_owned();
@@ -101,7 +143,9 @@ pub fn edit_check(
     let size: usize = String::from_utf8(git(&root, &["cat-file", "-s", &object])?)?
         .trim()
         .parse()?;
-    ensure!(size <= MAX_SOURCE_BYTES, "HEAD file exceeds 1 MiB");
+    if size > MAX_SOURCE_BYTES {
+        return Err(EditCheckRefusal::OverCap("HEAD file exceeds 1 MiB".into()).into());
+    }
     let entry = git(&root, &["ls-tree", &head, "--", file])?;
     ensure!(
         entry.starts_with(b"100644 ") || entry.starts_with(b"100755 "),
@@ -398,18 +442,37 @@ fn check_source(
                 && line.is_none_or(|line| n.start_position().row + 1 == line)
         })
         .collect();
-    ensure!(
-        matches.len() == 1,
-        "expected one named declaration at HEAD; found {} (supply its start line to disambiguate)",
-        matches.len()
-    );
-    let old = matches[0];
+    let old = match matches.as_slice() {
+        [old] => *old,
+        [] => {
+            return Err(EditCheckRefusal::NotFound(format!(
+                "no declaration named '{symbol}'{} at HEAD in {file}",
+                line.map_or(String::new(), |line| format!(" starting at line {line}"))
+            ))
+            .into());
+        }
+        several => {
+            let lines: Vec<usize> = several.iter().map(|n| n.start_position().row + 1).collect();
+            return Err(EditCheckRefusal::Ambiguous {
+                message: format!(
+                    "expected one declaration named '{symbol}' at HEAD; found {} starting at lines {} (supply `line` to disambiguate)",
+                    lines.len(),
+                    lines
+                        .iter()
+                        .map(usize::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                lines,
+            }
+            .into());
+        }
+    };
     let mut proposed = source.to_owned();
     proposed.replace_range(old.byte_range(), replacement);
-    ensure!(
-        proposed.len() <= MAX_SOURCE_BYTES,
-        "proposed file exceeds 1 MiB"
-    );
+    if proposed.len() > MAX_SOURCE_BYTES {
+        return Err(EditCheckRefusal::OverCap("proposed file exceeds 1 MiB".into()).into());
+    }
     let new_tree = parse_file(proposed.as_bytes(), language)?;
     ensure!(
         !new_tree.root_node().has_error(),

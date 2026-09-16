@@ -4,6 +4,7 @@
 
 use std::fmt;
 
+use codesage_graph::edit_check::EditCheckRefusal;
 use codesage_protocol::work::{StopReason, WorkStopped};
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::{Map, Value, json};
@@ -244,6 +245,32 @@ pub(crate) fn classify(error: &anyhow::Error) -> Classified {
             return Classified {
                 code: ErrorCode::Model,
                 remedy: Some(Remedy::command(REINDEX_FULL_COMMAND)),
+            };
+        }
+        if let Some(refusal) = cause.downcast_ref::<EditCheckRefusal>() {
+            return match refusal {
+                EditCheckRefusal::ProjectPath(_) => Classified {
+                    code: ErrorCode::ProjectPath,
+                    remedy: None,
+                },
+                EditCheckRefusal::Param(_) => Classified {
+                    code: ErrorCode::Param,
+                    remedy: None,
+                },
+                EditCheckRefusal::OverCap(_) => Classified {
+                    code: ErrorCode::OverCap,
+                    remedy: None,
+                },
+                EditCheckRefusal::NotFound(_) => Classified {
+                    code: ErrorCode::NotFound,
+                    remedy: None,
+                },
+                EditCheckRefusal::Ambiguous { lines, .. } => Classified {
+                    code: ErrorCode::Ambiguous,
+                    remedy: lines
+                        .first()
+                        .map(|line| Remedy::retry_with("line", json!(line))),
+                },
             };
         }
         if let Some(rusqlite::Error::SqliteFailure(_, Some(message))) =
@@ -555,6 +582,47 @@ mod tests {
         assert!(text.contains("embedding model unavailable"), "{text}");
         assert!(text.contains("resolving model files"), "{text}");
         assert!(text.contains("not on the allowlist"), "{text}");
+    }
+
+    #[test]
+    fn edit_check_refusals_classify_by_variant_through_context() {
+        let cases = [
+            (
+                EditCheckRefusal::ProjectPath("project must be absolute".into()),
+                ErrorCode::ProjectPath,
+                None,
+            ),
+            (
+                EditCheckRefusal::Param("file must be repository-relative".into()),
+                ErrorCode::Param,
+                None,
+            ),
+            (
+                EditCheckRefusal::OverCap("replacement exceeds 1 MiB".into()),
+                ErrorCode::OverCap,
+                None,
+            ),
+            (
+                EditCheckRefusal::NotFound("no declaration named 'f'".into()),
+                ErrorCode::NotFound,
+                None,
+            ),
+            (
+                EditCheckRefusal::Ambiguous {
+                    message: "found 2".into(),
+                    lines: vec![3, 9],
+                },
+                ErrorCode::Ambiguous,
+                Some(Remedy::retry_with("line", json!(3))),
+            ),
+        ];
+        for (refusal, code, remedy) in cases {
+            let error = anyhow::Error::new(refusal.clone()).context("checking edit");
+            let classified = classify(&error);
+            assert_eq!(classified.code, code, "{refusal:?}");
+            assert_eq!(classified.remedy, remedy, "{refusal:?}");
+            assert_eq!(legacy_status(&error), None, "{refusal:?}");
+        }
     }
 
     #[test]

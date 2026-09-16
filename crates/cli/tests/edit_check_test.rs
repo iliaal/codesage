@@ -165,17 +165,88 @@ fn mcp_reports_break_before_writing_without_touching_index_or_starting_watcher()
         assert_eq!(run(root, "git", &["rev-parse", "HEAD"]), head);
         assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), git_index);
     }
-    let error = session.request("tools/call", json!({"name":"edit_check", "arguments":{"project":root, "file_path":"../lib.rs", "symbol_name":"f", "replacement":"fn f() {}"}}));
-    assert_eq!(error["isError"], true);
-    let blocks: Vec<Value> = error["content"]
-        .as_array()
-        .unwrap()
+    let traversal = failure(&session.request("tools/call", json!({"name":"edit_check", "arguments":{"project":root, "file_path":"../lib.rs", "symbol_name":"f", "replacement":"fn f() {}"}})));
+    assert_eq!(traversal["error"]["code"], "E_PARAM", "{traversal}");
+    assert_eq!(traversal["error"]["remedy"], Value::Null, "{traversal}");
+    assert!(
+        traversal["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("without traversal"),
+        "{traversal}"
+    );
+
+    let relative = failure(&session.request("tools/call", json!({"name":"edit_check", "arguments":{"project":"relative/path", "file_path":"lib.rs", "symbol_name":"f", "replacement":"fn f() {}"}})));
+    assert_eq!(relative["error"]["code"], "E_PROJECT_PATH", "{relative}");
+    assert_eq!(relative["error"]["remedy"], Value::Null, "{relative}");
+    assert!(
+        relative["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("absolute"),
+        "{relative}"
+    );
+
+    let oversize = "x".repeat(1_048_576 + 10);
+    let over_cap = failure(&session.request("tools/call", json!({"name":"edit_check", "arguments":{"project":root, "file_path":"lib.rs", "symbol_name":"f", "replacement":oversize}})));
+    assert_eq!(over_cap["error"]["code"], "E_OVER_CAP", "{over_cap}");
+    assert_eq!(over_cap["error"]["remedy"], Value::Null, "{over_cap}");
+    assert!(
+        over_cap["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("replacement exceeds 1 MiB"),
+        "{over_cap}"
+    );
+
+    let missing = failure(&session.request("tools/call", json!({"name":"edit_check", "arguments":{"project":root, "file_path":"lib.rs", "symbol_name":"absent", "replacement":"fn absent() {}"}})));
+    assert_eq!(missing["error"]["code"], "E_NOT_FOUND", "{missing}");
+    assert_eq!(missing["error"]["remedy"], Value::Null, "{missing}");
+
+    std::fs::write(root.join("dup.rs"), "fn f() {}\nmod inner { fn f() {} }\n").unwrap();
+    run(root, "git", &["add", "dup.rs"]);
+    run(
+        root,
+        "git",
+        &[
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "commit",
+            "-qm",
+            "duplicate declarations",
+        ],
+    );
+    let ambiguous = failure(&session.request("tools/call", json!({"name":"edit_check", "arguments":{"project":root, "file_path":"dup.rs", "symbol_name":"f", "replacement":"fn f() {}"}})));
+    assert_eq!(ambiguous["error"]["code"], "E_AMBIGUOUS", "{ambiguous}");
+    assert_eq!(
+        ambiguous["error"]["remedy"],
+        json!({"tool": "edit_check", "arguments": {"project": root, "file_path": "dup.rs", "symbol_name": "f", "replacement": "fn f() {}", "line": 1}}),
+        "{ambiguous}"
+    );
+    let disambiguated = session.request("tools/call", json!({"name":"edit_check", "arguments":{"project":root, "file_path":"dup.rs", "symbol_name":"f", "replacement":"fn f() {}", "line": 2}}));
+    assert_ne!(disambiguated["isError"], true, "{disambiguated}");
+}
+
+/// The contract block of a failed `edit_check` result; mirrors `failure` in
+/// `mcp_errors.rs` for the fields this fixture checks.
+fn failure(result: &Value) -> Value {
+    assert_eq!(result["isError"], true, "{result}");
+    assert!(result.get("structuredContent").is_none(), "{result}");
+    let content = result["content"].as_array().unwrap();
+    let text = content[0]["text"].as_str().unwrap();
+    let blocks: Vec<Value> = content
         .iter()
         .filter_map(|part| part["text"].as_str())
         .filter_map(|text| serde_json::from_str::<Value>(text).ok())
-        .filter(Value::is_object)
+        .filter(|value| value.get("status").is_some())
         .collect();
-    assert_eq!(blocks.len(), 1, "one contract block per failure: {error}");
-    assert!(blocks[0].get("status").is_some(), "{error}");
-    assert_eq!(blocks[0]["next"], Value::Null, "{error}");
+    assert_eq!(blocks.len(), 1, "one contract block per failure: {result}");
+    let block = blocks.into_iter().next().unwrap();
+    assert_eq!(block["tool"], "edit_check", "{block}");
+    assert_eq!(block["complete"], false, "{block}");
+    assert_eq!(block["next"], Value::Null, "{block}");
+    assert_eq!(block["error"]["message"], text, "{block}");
+    block
 }

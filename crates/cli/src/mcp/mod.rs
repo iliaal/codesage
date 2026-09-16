@@ -1,7 +1,7 @@
 mod diagnostics;
 mod dispatch;
 mod edit_check;
-mod error;
+pub(crate) mod error;
 mod next;
 mod overview_cache;
 pub(crate) mod params;
